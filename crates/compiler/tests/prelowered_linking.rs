@@ -148,8 +148,9 @@ fn client() -> TypedProgram {
 
 #[test]
 fn a_declaration_links_to_the_prelowered_body() {
-    let lib = Arc::new(library());
+    let lib = library();
     let twice_id = lib.functions.values().next().expect("twice").id;
+    let lib = Arc::new(zyntax_compiler::bytecode::LazyModule::eager(lib));
 
     let mut program = client();
     let config = LoweringConfig {
@@ -196,7 +197,7 @@ fn a_declaration_links_to_the_prelowered_body() {
 fn the_linked_program_runs() {
     use zyntax_compiler::cranelift_backend::CraneliftBackend;
 
-    let lib = Arc::new(library());
+    let lib = Arc::new(zyntax_compiler::bytecode::LazyModule::eager(library()));
     let mut program = client();
     let module = lower(
         "app",

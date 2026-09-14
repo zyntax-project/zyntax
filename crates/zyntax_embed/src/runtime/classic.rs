@@ -829,7 +829,7 @@ impl ZyntaxRuntime {
         &self,
         program: &mut zyntax_typed_ast::TypedProgram,
         type_registry: &mut zyntax_typed_ast::TypeRegistry,
-        prelowered: &mut Vec<std::sync::Arc<HirModule>>,
+        prelowered: &mut Vec<std::sync::Arc<zyntax_compiler::bytecode::LazyModule>>,
     ) -> RuntimeResult<()> {
         crate::import_chain::process_imports_for_traits(
             &self.grammars,

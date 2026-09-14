@@ -20,7 +20,7 @@
 //! let module = deserialize_module(&bytecode, Format::Postcard)?;
 //! ```
 
-use crate::hir::HirModule;
+use crate::hir::{HirFunction, HirModule};
 use std::io::{Read, Write};
 use thiserror::Error;
 
@@ -57,6 +57,142 @@ pub enum Format {
     Json,
     /// Bincode format (alternative binary format)
     Bincode,
+    /// Postcard, with each function body encoded on its own so a reader
+    /// can decode only the bodies it reaches; see [`LazyModule`].
+    Split,
+}
+
+/// A module whose function bodies stay encoded until asked for.
+///
+/// A program links against a library it reaches a little of; decoding
+/// every body up front was most of what loading the library cost. The
+/// shell holds everything but the bodies: globals, types, externs, and
+/// for each function with a body a stub with its id, name and
+/// signature and no blocks. [`Self::function`] decodes a body on
+/// demand, relocating its ids by the same base the shell's were.
+#[derive(Debug)]
+pub struct LazyModule {
+    shell: HirModule,
+    /// Encoded bodies by function id, ids in them unrelocated.
+    bodies: std::collections::HashMap<crate::hir::HirId, Vec<u8>>,
+    /// What every id in the shell was shifted by on decode.
+    base: u32,
+}
+
+/// The wire shape of [`Format::Split`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SplitPayload {
+    shell: HirModule,
+    bodies: Vec<(crate::hir::HirId, Vec<u8>)>,
+    /// The largest id anywhere in the module, before relocation.
+    max_id: u32,
+}
+
+impl LazyModule {
+    /// A module already in memory: nothing to decode later.
+    pub fn eager(module: HirModule) -> Self {
+        Self {
+            shell: module,
+            bodies: std::collections::HashMap::new(),
+            base: 0,
+        }
+    }
+
+    /// The shell: globals, types, externs, and a stub for each function
+    /// with a body. A stub has the function's id, name, signature and
+    /// attributes and no blocks; the body comes from [`Self::function`].
+    pub fn shell(&self) -> &HirModule {
+        &self.shell
+    }
+
+    /// Whether `id` names a function of this module.
+    pub fn has_function(&self, id: crate::hir::HirId) -> bool {
+        self.shell.functions.contains_key(&id)
+    }
+
+    /// The function `id`, its body decoded if it was not yet.
+    pub fn function(&self, id: crate::hir::HirId) -> Option<HirFunction> {
+        match self.bodies.get(&id) {
+            Some(bytes) => {
+                let base = self.base;
+                crate::hir::HirId::relocated_by(base, || postcard::from_bytes(bytes).ok())
+            }
+            None => self.shell.functions.get(&id).cloned(),
+        }
+    }
+
+    /// Every function, decoded.
+    pub fn functions(&self) -> impl Iterator<Item = (crate::hir::HirId, HirFunction)> + '_ {
+        self.shell
+            .functions
+            .keys()
+            .filter_map(move |id| self.function(*id).map(|f| (*id, f)))
+    }
+
+    /// The whole module, every body decoded.
+    pub fn into_module(self) -> HirModule {
+        let mut module = self.shell;
+        let bodies: Vec<(crate::hir::HirId, HirFunction)> = self
+            .bodies
+            .keys()
+            .filter_map(|id| {
+                let base = self.base;
+                crate::hir::HirId::relocated_by(base, || {
+                    postcard::from_bytes(&self.bodies[id]).ok()
+                })
+                .map(|f| (*id, f))
+            })
+            .collect();
+        for (id, f) in bodies {
+            module.functions.insert(id, f);
+        }
+        module
+    }
+}
+
+/// Serialize a module as [`Format::Split`].
+pub fn serialize_module_split(module: &HirModule) -> Result<Vec<u8>> {
+    let mut shell = module.clone();
+    let mut bodies = Vec::new();
+    for (id, function) in shell.functions.iter_mut() {
+        if function.is_external {
+            continue;
+        }
+        let bytes = postcard::to_allocvec(&*function)
+            .map_err(|e| BytecodeError::SerializationError(e.to_string()))?;
+        bodies.push((*id, bytes));
+        function.blocks.clear();
+        function.values.clear();
+        function.locals.clear();
+    }
+    let payload = SplitPayload {
+        shell,
+        bodies,
+        max_id: max_hir_id(module),
+    };
+    let payload = postcard::to_allocvec(&payload)
+        .map_err(|e| BytecodeError::SerializationError(e.to_string()))?;
+    Ok(with_header(module, Format::Split, payload))
+}
+
+/// Read a [`Format::Split`] module without decoding its bodies. Any
+/// other format is decoded whole and wrapped.
+pub fn deserialize_module_lazy(bytes: &[u8]) -> Result<LazyModule> {
+    let (header, payload) = checked_payload(bytes)?;
+    if Format::from_u8(header.format)? != Format::Split {
+        return deserialize_module(bytes).map(LazyModule::eager);
+    }
+    let base = crate::hir::HirId::next_unminted();
+    let split: SplitPayload = crate::hir::HirId::relocated_by(base, || {
+        postcard::from_bytes(payload)
+            .map_err(|e| BytecodeError::DeserializationError(e.to_string()))
+    })?;
+    crate::hir::HirId::ensure_counter_above(base.saturating_add(split.max_id));
+    Ok(LazyModule {
+        shell: split.shell,
+        bodies: split.bodies.into_iter().collect(),
+        base,
+    })
 }
 
 /// Bytecode file header
@@ -131,6 +267,7 @@ impl Format {
             Format::Postcard => 0,
             Format::Json => 1,
             Format::Bincode => 2,
+            Format::Split => 3,
         }
     }
 
@@ -139,6 +276,7 @@ impl Format {
             0 => Ok(Format::Postcard),
             1 => Ok(Format::Json),
             2 => Ok(Format::Bincode),
+            3 => Ok(Format::Split),
             _ => Err(BytecodeError::InvalidFormat),
         }
     }
@@ -185,25 +323,38 @@ pub fn serialize_module(module: &HirModule, format: Format) -> Result<Vec<u8>> {
             .map_err(|e| BytecodeError::SerializationError(e.to_string()))?,
         Format::Bincode => bincode::serialize(module)
             .map_err(|e| BytecodeError::SerializationError(e.to_string()))?,
+        Format::Split => return serialize_module_split(module),
     };
+    Ok(with_header(module, format, payload))
+}
 
-    // Calculate checksum
+/// The header for `payload`, then the payload.
+fn with_header(module: &HirModule, format: Format, payload: Vec<u8>) -> Vec<u8> {
     let checksum = crc32fast::hash(&payload);
-
-    // Create header
     let mut header = BytecodeHeader::new(module, format);
     header.payload_size = payload.len() as u64;
     header.checksum = checksum;
-
-    // Serialize header using raw 44-byte format (matches deserialize_raw_header)
     let header_bytes = serialize_raw_header(&header);
-
-    // Combine header and payload
     let mut result = Vec::with_capacity(header_bytes.len() + payload.len());
     result.extend_from_slice(&header_bytes);
     result.extend_from_slice(&payload);
+    result
+}
 
-    Ok(result)
+/// The header and the payload it covers, once the header has been
+/// validated and the payload's checksum has been verified.
+fn checked_payload(bytes: &[u8]) -> Result<(BytecodeHeader, &[u8])> {
+    const HEADER_SIZE: usize = 44;
+    if bytes.len() < HEADER_SIZE {
+        return Err(BytecodeError::InvalidFormat);
+    }
+    let (header, header_size) = deserialize_raw_header(bytes)?;
+    header.validate()?;
+    let payload = &bytes[header_size..];
+    if crc32fast::hash(payload) != header.checksum {
+        return Err(BytecodeError::ChecksumMismatch);
+    }
+    Ok((header, payload))
 }
 
 /// Serialize a HIR module to a writer
@@ -299,24 +450,10 @@ fn deserialize_raw_header(bytes: &[u8]) -> Result<(BytecodeHeader, usize)> {
 
 /// Deserialize a HIR module from bytecode
 pub fn deserialize_module(bytes: &[u8]) -> Result<HirModule> {
-    const HEADER_SIZE: usize = 44;
-    if bytes.len() < HEADER_SIZE {
-        return Err(BytecodeError::InvalidFormat);
-    }
-
-    // Use raw 44-byte header format (matches serialize_raw_header)
-    let (header, header_size) = deserialize_raw_header(bytes)?;
-
-    // Validate header
-    header.validate()?;
-
-    // Extract payload
-    let payload = &bytes[header_size..];
-
-    // Verify checksum
-    let checksum = crc32fast::hash(payload);
-    if checksum != header.checksum {
-        return Err(BytecodeError::ChecksumMismatch);
+    let (header, payload) = checked_payload(bytes)?;
+    let format = Format::from_u8(header.format)?;
+    if format == Format::Split {
+        return deserialize_module_lazy(bytes).map(LazyModule::into_module);
     }
 
     // Deserialize payload. The module's ids were minted by whichever
@@ -324,7 +461,6 @@ pub fn deserialize_module(bytes: &[u8]) -> Result<HirModule> {
     // is shifted above the next unminted one; the counter is then moved
     // past the highest id the module holds, so later `HirId::new()`
     // calls cannot land on one of them either.
-    let format = Format::from_u8(header.format)?;
     let module: HirModule =
         crate::hir::HirId::relocated_by(crate::hir::HirId::next_unminted(), || match format {
             Format::Postcard => postcard::from_bytes(payload)
@@ -333,6 +469,7 @@ pub fn deserialize_module(bytes: &[u8]) -> Result<HirModule> {
                 .map_err(|e| BytecodeError::DeserializationError(e.to_string())),
             Format::Bincode => bincode::deserialize(payload)
                 .map_err(|e| BytecodeError::DeserializationError(e.to_string())),
+            Format::Split => unreachable!("handled above"),
         })?;
     advance_hir_id_counter(&module);
 
@@ -342,6 +479,11 @@ pub fn deserialize_module(bytes: &[u8]) -> Result<HirModule> {
 /// Bump the global `HirId` counter above every id defined in `module`.
 /// See [`HirId::ensure_counter_above`].
 fn advance_hir_id_counter(module: &HirModule) {
+    crate::hir::HirId::ensure_counter_above(max_hir_id(module));
+}
+
+/// The largest id anywhere in `module`.
+fn max_hir_id(module: &HirModule) -> u32 {
     let mut max_id = module.id.as_u32();
     for func in module.functions.values() {
         max_id = max_id.max(func.id.as_u32());
@@ -367,7 +509,7 @@ fn advance_hir_id_counter(module: &HirModule) {
     for id in module.handlers.keys() {
         max_id = max_id.max(id.as_u32());
     }
-    crate::hir::HirId::ensure_counter_above(max_id);
+    max_id
 }
 
 /// Deserialize a HIR module from a reader

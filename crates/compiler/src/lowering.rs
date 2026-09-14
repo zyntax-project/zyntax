@@ -421,7 +421,7 @@ pub struct LoweringConfig {
     /// declarations name. A declaration matching one of their functions
     /// is linked to it instead of being lowered, and the modules' contents
     /// join the program's module.
-    pub prelowered: Vec<Arc<HirModule>>,
+    pub prelowered: Vec<Arc<crate::bytecode::LazyModule>>,
 }
 
 impl std::fmt::Debug for LoweringConfig {
@@ -550,19 +550,19 @@ impl LoweringContext {
             prelowered_functions: config
                 .prelowered
                 .iter()
-                .flat_map(|m| m.functions.values().map(|f| (f.name, f.id)))
+                .flat_map(|m| m.shell().functions.values().map(|f| (f.name, f.id)))
                 .collect(),
             prelowered_bodies: config
                 .prelowered
                 .iter()
-                .flat_map(|m| m.functions.values())
+                .flat_map(|m| m.shell().functions.values())
                 .filter(|f| !f.is_external)
                 .map(|f| f.name)
                 .collect(),
             prelowered_globals: config
                 .prelowered
                 .iter()
-                .flat_map(|m| m.globals.values().map(|g| (g.name, g.id)))
+                .flat_map(|m| m.shell().globals.values().map(|g| (g.name, g.id)))
                 .collect(),
             dropped_for: std::collections::HashMap::new(),
             type_registry,
@@ -699,6 +699,7 @@ impl LoweringContext {
     /// [`Self::adopt_all_prelowered`].
     fn adopt_prelowered(&mut self) {
         for prelowered in &self.config.prelowered {
+            let prelowered = prelowered.shell();
             for (id, global) in &prelowered.globals {
                 self.module.globals.insert(*id, global.clone());
             }
@@ -712,8 +713,8 @@ impl LoweringContext {
     /// a host may call any of them.
     fn adopt_all_prelowered(&mut self) {
         for prelowered in &self.config.prelowered {
-            for (id, function) in &prelowered.functions {
-                self.module.functions.insert(*id, function.clone());
+            for (id, function) in prelowered.functions() {
+                self.module.functions.insert(id, function);
             }
         }
     }
@@ -730,7 +731,7 @@ impl LoweringContext {
             .prelowered
             .iter()
             .enumerate()
-            .flat_map(|(m, module)| module.functions.keys().map(move |id| (*id, m)))
+            .flat_map(|(m, module)| module.shell().functions.keys().map(move |id| (*id, m)))
             .collect();
         if by_id.is_empty() {
             return false;
@@ -768,7 +769,9 @@ impl LoweringContext {
             let Some(&m) = by_id.get(&target) else {
                 continue;
             };
-            let function = self.config.prelowered[m].functions[&target].clone();
+            let Some(function) = self.config.prelowered[m].function(target) else {
+                continue;
+            };
             pending.extend(targets_of(&function));
             self.module.functions.insert(target, function);
             adopted = true;

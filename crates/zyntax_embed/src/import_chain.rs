@@ -139,7 +139,7 @@ pub(crate) fn process_imports_for_traits(
     snapshot_modules: &SnapshotModules,
     program: &mut zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
-    prelowered: &mut Vec<std::sync::Arc<zyntax_compiler::hir::HirModule>>,
+    prelowered: &mut Vec<std::sync::Arc<zyntax_compiler::bytecode::LazyModule>>,
 ) -> RuntimeResult<()> {
     // Track imports processed during *this* lowering. Previously
     // lived in a thread-local — that caused a silent bug where the
@@ -171,7 +171,7 @@ fn process_imports_inner(
     snapshot_modules: &SnapshotModules,
     program: &mut zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
-    prelowered: &mut Vec<std::sync::Arc<zyntax_compiler::hir::HirModule>>,
+    prelowered: &mut Vec<std::sync::Arc<zyntax_compiler::bytecode::LazyModule>>,
     processed: &mut std::collections::HashSet<String>,
 ) -> RuntimeResult<()> {
     use zyntax_typed_ast::typed_ast::TypedDeclaration;
@@ -240,7 +240,7 @@ fn process_imports_inner(
                 if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
                     eprintln!(
                         "[IMPORT-LINK] {module_name} arrives lowered ({} functions)",
-                        hir.functions.len()
+                        hir.shell().functions.len()
                     );
                 }
                 prelowered.push(std::sync::Arc::clone(hir));

@@ -255,7 +255,7 @@ impl Snapshot {
                     .hir
                     .slice(&self.blobs, &entry.name)
                     .map_err(|e| e.to_string())?;
-                let hir = zyntax_compiler::bytecode::deserialize_module(hir_bytes)
+                let hir = zyntax_compiler::bytecode::deserialize_module_lazy(hir_bytes)
                     .map_err(|e| e.to_string())?;
                 if trace {
                     eprintln!(
@@ -354,7 +354,7 @@ pub fn lower_for_snapshot(
     name: &str,
     program: zyntax_typed_ast::TypedProgram,
     builtins: indexmap::IndexMap<String, String>,
-    prelowered: Vec<Arc<HirModule>>,
+    prelowered: Vec<Arc<zyntax_compiler::bytecode::LazyModule>>,
 ) -> Result<HirModule, SnapshotError> {
     lower_for_snapshot_releasing(name, program, builtins, prelowered, false)
 }
@@ -366,7 +366,7 @@ pub fn lower_for_snapshot_releasing(
     name: &str,
     program: zyntax_typed_ast::TypedProgram,
     builtins: indexmap::IndexMap<String, String>,
-    prelowered: Vec<Arc<HirModule>>,
+    prelowered: Vec<Arc<zyntax_compiler::bytecode::LazyModule>>,
     automatic_release: bool,
 ) -> Result<HirModule, SnapshotError> {
     let none_grammars = std::collections::HashMap::new();
@@ -481,9 +481,11 @@ impl SnapshotBuilder {
         hir: &HirModule,
     ) -> Result<Self, SnapshotError> {
         strip_bodies(&mut program);
+        // Bodies encoded one by one, so a program decodes the ones it
+        // reaches and no others.
         let encoded = zyntax_compiler::bytecode::serialize_module(
             hir,
-            zyntax_compiler::bytecode::Format::Postcard,
+            zyntax_compiler::bytecode::Format::Split,
         )
         .map_err(|e| SnapshotError::Encode(e.to_string()))?;
         let pointer_size = u8::try_from(zyntax_compiler::target_pointer_size())

@@ -20,7 +20,7 @@ pub struct CompiledImport {
     /// held HIR this compiler can use. The program's function bodies
     /// are then absent: the declarations type a caller, the HIR is what
     /// runs.
-    hir: Option<std::sync::Arc<zyntax_compiler::hir::HirModule>>,
+    hir: Option<std::sync::Arc<zyntax_compiler::bytecode::LazyModule>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -70,13 +70,13 @@ impl CompiledImport {
     }
 
     /// Attach the module's lowered form.
-    pub fn with_hir(mut self, hir: std::sync::Arc<zyntax_compiler::hir::HirModule>) -> Self {
+    pub fn with_hir(mut self, hir: std::sync::Arc<zyntax_compiler::bytecode::LazyModule>) -> Self {
         self.hir = Some(hir);
         self
     }
 
     /// The module's lowered form, when it arrived with one.
-    pub fn hir(&self) -> Option<&std::sync::Arc<zyntax_compiler::hir::HirModule>> {
+    pub fn hir(&self) -> Option<&std::sync::Arc<zyntax_compiler::bytecode::LazyModule>> {
         self.hir.as_ref()
     }
 

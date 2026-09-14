@@ -32,7 +32,7 @@ pub(crate) struct Inputs<'a> {
     /// Names a program can be entered through; empty builds everything.
     pub entry_names: Vec<String>,
     /// Modules already lowered, beyond what the program's imports bring.
-    pub prelowered: Vec<Arc<HirModule>>,
+    pub prelowered: Vec<Arc<zyntax_compiler::bytecode::LazyModule>>,
 }
 
 /// A lowered program.
