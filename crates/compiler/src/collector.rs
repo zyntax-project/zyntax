@@ -500,19 +500,35 @@ impl<'a> Marker<'a> {
             return;
         }
         if let Some((&payload, &total)) = self.reg.large.range(..=a).next_back() {
-            if a < payload + total - pool_alloc::SLAB_HEADER && self.large_marked.insert(payload) {
+            let len = total - pool_alloc::SLAB_HEADER;
+            if a < payload + len && self.large_marked.insert(payload) {
+                if !mapped(payload, payload + len) {
+                    eprintln!(
+                        "[gc] large block {payload:#x}..{:#x} is not mapped; skipped",
+                        payload + len
+                    );
+                    return;
+                }
                 self.marked_bytes += total;
-                self.work.push((payload, total - pool_alloc::SLAB_HEADER));
+                self.work.push((payload, len));
             }
         }
     }
 
-    /// Read every aligned word in `[lo, hi)` as a possible pointer.
-    fn scan(&mut self, lo: usize, hi: usize) {
-        if trace_detail() && !mapped(lo, hi) {
-            eprintln!("[gc]   UNMAPPED {lo:#x}..{hi:#x}, skipped");
+    /// [`Self::scan`] of memory outside the heap, checked to be mapped
+    /// first: a range registered by something that has since gone is
+    /// the one fault a collection can take, and a skipped range with a
+    /// report beats a dead process.
+    fn scan_outside(&mut self, what: &str, lo: usize, hi: usize) {
+        if !mapped(lo, hi) {
+            eprintln!("[gc] {what} {lo:#x}..{hi:#x} is not mapped; skipped");
             return;
         }
+        self.scan(lo, hi);
+    }
+
+    /// Read every aligned word in `[lo, hi)` as a possible pointer.
+    fn scan(&mut self, lo: usize, hi: usize) {
         let mut p = (lo + 7) & !7;
         while p + 8 <= hi {
             // SAFETY: the caller hands over memory it owns and that is
@@ -615,8 +631,8 @@ impl<'a> Marker<'a> {
     }
 }
 
-/// Whether every page of `[lo, hi)` is mapped; a diagnostic, asked
-/// only when tracing. `msync` refuses a range with a hole in it.
+/// Whether every page of `[lo, hi)` is mapped. `msync` refuses a range
+/// with a hole in it.
 #[cfg(unix)]
 fn mapped(lo: usize, hi: usize) -> bool {
     let page = 16384usize;
@@ -780,7 +796,7 @@ fn collect_from(sp: usize) {
                     eprintln!("[gc]   stack {lo:#x}..{hi:#x} ({} KB)", (hi - lo) >> 10);
                 }
                 let before = marker.marked_bytes;
-                marker.scan(lo, hi);
+                marker.scan_outside("stack", lo, hi);
                 if trace_detail() {
                     eprintln!(
                         "[gc]     {} KB reached directly",
@@ -794,7 +810,7 @@ fn collect_from(sp: usize) {
             if trace_detail() {
                 eprintln!("[gc]   global {a:#x} ({l} bytes)");
             }
-            marker.scan(a, a + l);
+            marker.scan_outside("global", a, a + l);
         }
         let direct = marker.marked_bytes;
         let roots_at = started.elapsed();

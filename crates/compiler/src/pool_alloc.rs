@@ -160,7 +160,20 @@ fn slab_of(ptr: *mut u8) -> *mut Header {
 /// # Safety
 /// `slab` must be the base of a live slab.
 pub(crate) unsafe fn slab_layout(slab: usize) -> (usize, usize) {
-    (*(slab as *const Header)).slab_class_and_used()
+    let head = &*(slab as *const Header);
+    let (class, used) = head.slab_class_and_used();
+    // A header only the pool writes; anything else here was written
+    // by a program reaching below its first block. Such a slab is
+    // reported and left alone, as if set aside.
+    if head.magic != MAGIC || used > SLAB || (class >= CLASSES && class != RETIRED) {
+        eprintln!(
+            "[pool] slab {slab:#x} has header magic {:#x}, class {class}, used {used}, \
+             which the pool did not write; a block's owner wrote below it",
+            head.magic
+        );
+        return (RETIRED, HEADER);
+    }
+    (class, used)
 }
 
 /// Bytes at the front of a slab before its first block.
@@ -189,10 +202,23 @@ fn pop_swept(class: usize) -> *mut u8 {
 /// Every block on this thread's free and swept lists, by address.
 pub(crate) fn for_each_free_block(mut f: impl FnMut(usize)) {
     let mut walk = |lists: &[Cell<*mut u8>; CLASSES]| {
-        for list in lists.iter() {
+        for (class, list) in lists.iter().enumerate() {
+            let mut prev: *mut u8 = std::ptr::null_mut();
             let mut p = list.get();
             while !p.is_null() {
+                // A link that leaves the slabs was written through a
+                // block after its release. The walk stops there: the
+                // sweep rebuilds every list, so what follows the bad
+                // link is recovered as unreached rather than followed.
+                if !in_a_slab(p) || (p as usize) & (STEP - 1) != 0 {
+                    eprintln!(
+                        "[pool] free list of class {class} holds {p:p} after {prev:p}, \
+                         which is not a block of this pool; a released block was written to"
+                    );
+                    break;
+                }
                 f(p as usize);
+                prev = p;
                 // SAFETY: a block on a free list holds the next block
                 // in its first word.
                 p = unsafe { *(p as *mut *mut u8) };
@@ -832,6 +858,38 @@ mod tests {
             for size in [1usize, 8, 16, 17, 24, 64, 255, 1024] {
                 let p = zyntax_alloc(size);
                 assert_eq!(p as usize % 16, 0, "size {size} came back misaligned");
+                zyntax_free(p);
+            }
+        }
+    }
+
+    /// Every block the pool hands out is found in the slab index, its
+    /// slab is aligned to the slab size, and a large block or a foreign
+    /// pointer is not in the index.
+    #[test]
+    fn the_index_knows_every_pooled_block_and_nothing_else() {
+        unsafe {
+            let mut blocks = Vec::new();
+            for size in [1usize, 16, 24, 32, 100, 512, 1024] {
+                for _ in 0..3000 {
+                    let p = zyntax_alloc(size);
+                    assert!(in_a_slab(p), "{p:p} (size {size}) is not in the index");
+                    assert!(in_a_slab(p.add(size - 1)));
+                    assert_eq!(
+                        slab_of(p) as usize % SLAB,
+                        0,
+                        "the slab of {p:p} is not aligned"
+                    );
+                    blocks.push(p);
+                }
+            }
+            let big = zyntax_alloc(MAX_POOLED * 4);
+            assert!(!in_a_slab(big));
+            let foreign = Box::into_raw(Box::new([0u8; 64])) as *mut u8;
+            assert!(!in_a_slab(foreign));
+            drop(Box::from_raw(foreign as *mut [u8; 64]));
+            zyntax_free(big);
+            for p in blocks {
                 zyntax_free(p);
             }
         }
