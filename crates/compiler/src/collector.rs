@@ -59,6 +59,7 @@
 //! its own: a program that runs under it with the floor lowered, as
 //! the Python frontend's pressure test does.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -136,9 +137,6 @@ struct Local {
     /// Bytes the last collection allowed before the next.
     budget: usize,
     collecting: bool,
-    /// Whether this thread owns the collector, with the owner
-    /// generation the answer was made for; `None` until asked.
-    owner: Option<(usize, bool)>,
 }
 
 thread_local! {
@@ -148,7 +146,6 @@ thread_local! {
             spent: 0,
             budget: MIN_HEAP,
             collecting: false,
-            owner: None,
         })
     };
 }
@@ -219,16 +216,29 @@ pub fn is_enabled() -> bool {
 
 /// Whether the calling thread is the one the collector belongs to.
 fn on_owner_thread() -> bool {
+    pool_alloc::with_mutator_mark(owner_by_mark)
+}
+
+/// Whether the calling thread is the one the collector belongs to,
+/// read from the mark the pool keeps for the thread: the owner
+/// generation the thread was last confirmed for, or a value that is
+/// none until it is. A thread that is not the owner is never marked,
+/// so it asks each time; it asks once, since the answer ends the
+/// collector.
+#[inline]
+pub(crate) fn owner_by_mark(mark: &Cell<usize>) -> bool {
     let generation = OWNER_GENERATION.load(Ordering::Relaxed);
-    match local().owner {
-        Some((g, b)) if g == generation => b,
-        _ => {
-            let b = *OWNER.lock().unwrap_or_else(|e| e.into_inner())
-                == Some(std::thread::current().id());
-            update(|l| l.owner = Some((generation, b)));
-            b
-        }
+    mark.get() == generation || confirm_owner(mark, generation)
+}
+
+#[inline(never)]
+fn confirm_owner(mark: &Cell<usize>, generation: usize) -> bool {
+    let owner =
+        *OWNER.lock().unwrap_or_else(|e| e.into_inner()) == Some(std::thread::current().id());
+    if owner {
+        mark.set(generation);
     }
+    owner
 }
 
 /// A slab the pool has just taken from the system.
@@ -264,22 +274,40 @@ pub(crate) fn large_total(payload: usize) -> Option<usize> {
     registry().large.get(&payload).copied()
 }
 
-/// The calling thread uses the pool. A second mutator thread has a
-/// stack the collector would never read, so it ends the collector.
+/// The calling thread uses the pool: whether the collector is on and
+/// this is its thread. A second mutator thread has a stack the
+/// collector would never read, so it ends the collector.
 pub(crate) fn note_thread() -> bool {
+    if !is_enabled() {
+        return false;
+    }
     if on_owner_thread() {
         return true;
     }
+    second_thread();
+    false
+}
+
+/// [`note_thread`] for the pool's release path, given the mark it
+/// already has in hand.
+#[inline]
+pub(crate) fn note_thread_mark(mark: &Cell<usize>) {
+    if is_enabled() && !owner_by_mark(mark) {
+        second_thread();
+    }
+}
+
+#[inline(never)]
+fn second_thread() {
     disable();
     if trace() {
         eprintln!("[gc] off: the pool is used from a second thread");
     }
-    false
 }
 
 /// Fresh bytes the pool has handed out, spent against the budget.
 pub(crate) fn note_carved(bytes: usize) {
-    if !is_enabled() || !note_thread() {
+    if !note_thread() {
         return;
     }
     update(|l| l.spent += bytes);

@@ -185,20 +185,6 @@ pub(crate) fn class_slot_bytes(class: usize) -> usize {
     slot_bytes(class)
 }
 
-/// A block of `class` the collector reclaimed, or null.
-#[inline]
-fn pop_swept(class: usize) -> *mut u8 {
-    SWEPT.with(|lists| {
-        let head = lists[class].get();
-        if !head.is_null() {
-            // SAFETY: a block on the list holds the next in its first
-            // word.
-            lists[class].set(unsafe { *(head as *mut *mut u8) });
-        }
-        head
-    })
-}
-
 /// Every block on this thread's free and swept lists, by address.
 pub(crate) fn for_each_free_block(mut f: impl FnMut(usize)) {
     let mut walk = |lists: &[Cell<*mut u8>; CLASSES]| {
@@ -225,20 +211,20 @@ pub(crate) fn for_each_free_block(mut f: impl FnMut(usize)) {
             }
         }
     };
-    FREE.with(&mut walk);
-    SWEPT.with(&mut walk);
+    POOL.with(|p| {
+        walk(&p.free);
+        walk(&p.swept);
+    });
 }
 
 /// Empty this thread's free and swept lists; the collector fills the
 /// swept lists again from what its sweep finds unreached.
 pub(crate) fn clear_free_lists() {
-    for lists in [&FREE, &SWEPT] {
-        lists.with(|lists| {
-            for list in lists.iter() {
-                list.set(std::ptr::null_mut());
-            }
-        });
-    }
+    POOL.with(|p| {
+        for list in p.free.iter().chain(p.swept.iter()) {
+            list.set(std::ptr::null_mut());
+        }
+    });
 }
 
 /// Put a chain of reclaimed blocks of `class`, threaded through their
@@ -249,9 +235,9 @@ pub(crate) fn clear_free_lists() {
 /// Every block on the chain must be one of `class` from this pool
 /// that nothing reads any more.
 pub(crate) unsafe fn push_free_chain(class: usize, head: usize, tail: usize) {
-    SWEPT.with(|lists| {
-        *(tail as *mut *mut u8) = lists[class].get();
-        lists[class].set(head as *mut u8);
+    POOL.with(|p| {
+        *(tail as *mut *mut u8) = p.swept[class].get();
+        p.swept[class].set(head as *mut u8);
     });
 }
 
@@ -264,27 +250,62 @@ pub(crate) unsafe fn poison(block: usize, class: usize) {
     let _ = (block, class);
 }
 
-thread_local! {
-    /// Head of each pool's free list. A block on a list stores the
+/// A thread's share of the pool. One thread-local rather than one per
+/// field: on some targets every thread-local looked up is a call, and
+/// an allocation or release needs all of this at once.
+///
+/// `Cell` rather than `RefCell`: this is the hot path, and a borrow
+/// flag checked twice per allocation is a real share of what the pool
+/// exists to save.
+struct Lists {
+    /// Head of each class's free list. A block on a list stores the
     /// next pointer in its payload, which is why a class must be at
     /// least a pointer wide.
-    ///
-    /// `Cell` rather than `RefCell`: this is the hot path, and a
-    /// borrow flag checked twice per allocation is a real share of
-    /// what the pool exists to save.
-    static FREE: [Cell<*mut u8>; CLASSES] =
-        const { [const { Cell::new(std::ptr::null_mut()) }; CLASSES] };
+    free: [Cell<*mut u8>; CLASSES],
     /// Blocks the collector's sweep found unreached, by class. Served
     /// after the free list and counted like fresh storage, since a
     /// program that lives on these is one whose garbage the collector
     /// has to keep finding.
-    static SWEPT: [Cell<*mut u8>; CLASSES] =
-        const { [const { Cell::new(std::ptr::null_mut()) }; CLASSES] };
+    swept: [Cell<*mut u8>; CLASSES],
     /// The slab being carved for each class. One per class: a slab
     /// serves a single class, so that masking a block's address back to
     /// it says which. How much of it is spoken for is in its header.
-    static SLAB_PTR: [Cell<*mut u8>; CLASSES] =
-        const { [const { Cell::new(std::ptr::null_mut()) }; CLASSES] };
+    slab: [Cell<*mut u8>; CLASSES],
+    /// The collector's mark of whether this thread is the one it
+    /// belongs to, kept here so a release checks it without a second
+    /// lookup; the collector owns its meaning.
+    mutator: Cell<usize>,
+}
+
+const NO_LISTS: [Cell<*mut u8>; CLASSES] = [const { Cell::new(std::ptr::null_mut()) }; CLASSES];
+
+thread_local! {
+    static POOL: Lists = const {
+        Lists {
+            free: NO_LISTS,
+            swept: NO_LISTS,
+            slab: NO_LISTS,
+            mutator: Cell::new(usize::MAX),
+        }
+    };
+}
+
+/// Take the head of a list, or null.
+///
+/// # Safety
+/// A block on the list holds the next block in its first word.
+#[inline]
+unsafe fn pop(list: &Cell<*mut u8>) -> *mut u8 {
+    let head = list.get();
+    if !head.is_null() {
+        list.set(*(head as *mut *mut u8));
+    }
+    head
+}
+
+/// The collector's mark for the calling thread; see [`Lists::mutator`].
+pub(crate) fn with_mutator_mark<R>(f: impl FnOnce(&Cell<usize>) -> R) -> R {
+    POOL.with(|p| f(&p.mutator))
 }
 
 /// Slabs the collector found empty, waiting to be carved again.
@@ -369,53 +390,47 @@ pub unsafe extern "C" fn zyntax_alloc(size: usize) -> *mut u8 {
     #[cfg(debug_assertions)]
     SERVED.fetch_add(1, Ordering::Relaxed);
 
-    // A block already on this pool's list.
-    let reused = FREE.with(|lists| {
-        let head = lists[class].get();
+    // A block already on this pool's list, then one the collector
+    // reclaimed, which counts as fresh.
+    let reused = POOL.with(|p| {
+        let head = pop(&p.free[class]);
+        #[cfg(not(target_arch = "wasm32"))]
         if head.is_null() {
-            return std::ptr::null_mut();
+            let swept = pop(&p.swept[class]);
+            if !swept.is_null() {
+                crate::collector::note_spent(slot_bytes(class));
+            }
+            return swept;
         }
-        // The next pointer lives in the payload of the free block.
-        lists[class].set(*(head as *mut *mut u8));
         head
     });
     if !reused.is_null() {
         return reused;
     }
+    alloc_slow(class, size)
+}
 
-    // Then a block the collector reclaimed, which counts as fresh.
+/// Nothing to reuse means the heap grows. The collector gets its say
+/// first: what it finds unreached serves the request after all.
+/// Otherwise carve: the rest of a slab goes on the free list in one
+/// go, so the bookkeeping is paid once per slab and the blocks come
+/// off the list like any other.
+#[inline(never)]
+unsafe fn alloc_slow(class: usize, size: usize) -> *mut u8 {
     #[cfg(not(target_arch = "wasm32"))]
-    {
-        let swept = pop_swept(class);
+    if crate::collector::wants_collection() {
+        crate::collector::collect();
+        let swept = POOL.with(|p| pop(&p.swept[class]));
         if !swept.is_null() {
             crate::collector::note_spent(slot_bytes(class));
             return swept;
         }
-        // Nothing to reuse means the heap grows. The collector gets
-        // its say first: what it finds unreached serves the request
-        // after all.
-        if crate::collector::wants_collection() {
-            crate::collector::collect();
-            let swept = pop_swept(class);
-            if !swept.is_null() {
-                crate::collector::note_spent(slot_bytes(class));
-                return swept;
-            }
-        }
     }
-
-    // Otherwise carve. The rest of a slab goes on the free list in one
-    // go, so the bookkeeping is paid once per slab and the blocks come
-    // off the list like any other.
     if !refill(class) {
         // Out of memory for a slab; the request itself may still fit.
         return large_alloc(size);
     }
-    FREE.with(|lists| {
-        let head = lists[class].get();
-        lists[class].set(*(head as *mut *mut u8));
-        head
-    })
+    POOL.with(|p| pop(&p.free[class]))
 }
 
 /// Put the rest of `class`'s slab on the free list, taking another
@@ -428,7 +443,8 @@ pub unsafe extern "C" fn zyntax_alloc(size: usize) -> *mut u8 {
 /// nothing else names.
 unsafe fn refill(class: usize) -> bool {
     let want = slot_bytes(class);
-    let (slab, used) = SLAB_PTR.with(|sp| {
+    let (slab, used) = POOL.with(|p| {
+        let sp = &p.slab;
         let mut slab = sp[class].get();
         let (slab_class, mut used) = if slab.is_null() {
             (RETIRED, SLAB)
@@ -467,7 +483,8 @@ unsafe fn refill(class: usize) -> bool {
     let first = slab.add(used);
     let last = first.add((count - 1) * want);
     let mut p = last;
-    FREE.with(|lists| {
+    POOL.with(|lists| {
+        let lists = &lists.free;
         let mut next = lists[class].get();
         loop {
             *(p as *mut *mut u8) = next;
@@ -616,12 +633,6 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
-    // A thread that frees will allocate from its own list without
-    // ever carving, which is the other way a second mutator appears.
-    #[cfg(not(target_arch = "wasm32"))]
-    if crate::collector::is_enabled() {
-        crate::collector::note_thread();
-    }
     // An address no allocator returns is not passed on to one either:
     // libc would fault on it for its own reasons and the report would
     // name libc rather than whatever produced it. Loud where a
@@ -641,6 +652,8 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
     // for a block from another allocator the memory in front of it or
     // where its slab header would be may not be mapped at all.
     if !in_a_slab(ptr) {
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::collector::note_thread();
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(total) = crate::collector::forget_large(ptr as usize) {
             sys_dealloc(
@@ -688,13 +701,18 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
     #[cfg(debug_assertions)]
     std::ptr::write_bytes(block, POISON, slot_bytes(class));
 
-    FREE.with(|lists| {
+    POOL.with(|p| {
+        // A thread that frees will allocate from its own list without
+        // ever carving, which is the other way a second mutator
+        // appears; the mark is read here, where the lists already are.
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::collector::note_thread_mark(&p.mutator);
         // Threaded through the block's own first word. A freed block
         // holds nothing a live one needed, and the poison above is
         // overwritten here for that word alone, which is why the test
         // for it reads past the first pointer.
-        *(block as *mut *mut u8) = lists[class].get();
-        lists[class].set(block);
+        *(block as *mut *mut u8) = p.free[class].get();
+        p.free[class].set(block);
     });
 }
 
