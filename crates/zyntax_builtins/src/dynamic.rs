@@ -180,7 +180,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         "zb_unbox_instance_raw",
         &[("x", any())],
         i64(),
-        Some("zyntax_box_data"),
+        Some("zyntax_box_pointer"),
     ));
     // The box accessors. The `data` and payload readers take a box that
     // is known to be one, and are the loads they name; the tag reader

@@ -4,8 +4,9 @@
 //! display }` (`zrtl::DynamicBoxRepr`), with the value behind `data`.
 //! Every operation on one is a runtime call: `zyntax_box_i64` and its
 //! kin allocate a box and a payload, the readers `zyntax_box_header_tag`,
-//! `zyntax_box_data` and `zyntax_box_payload_{i64,f64,bool}` load a word
-//! or two out of a box the caller has checked already, and
+//! `zyntax_box_data`, `zyntax_box_pointer` and
+//! `zyntax_box_payload_{i64,f64,bool}` load a word or two out of a box
+//! the caller has checked already, and
 //! `zyntax_box_free` releases one. As calls they are opaque: nothing
 //! hoists one out of a loop, merges two of the same box, drops one
 //! nobody reads, or sees an allocation whose every use is in view.
@@ -101,7 +102,7 @@ enum Read {
 fn read_of(symbol: &str) -> Option<Read> {
     match symbol {
         "zyntax_box_header_tag" => Some(Read::Tag),
-        "zyntax_box_data" => Some(Read::Data),
+        "zyntax_box_data" | "zyntax_box_pointer" => Some(Read::Data),
         "zyntax_box_payload_i64" | "zyntax_box_payload_f64" => Some(Read::Payload),
         "zyntax_box_payload_bool" => Some(Read::PayloadByte),
         _ => None,

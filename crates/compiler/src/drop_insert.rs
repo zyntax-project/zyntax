@@ -395,10 +395,18 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
             .copied()
             .filter(|p| {
                 let derived = derived_values_local(func, *p, facts);
-                !uses_are_all_borrows(func, &derived, facts)
-                    || phis_using_any(func, &derived)
-                        .iter()
-                        .any(|other| !candidates.contains(other))
+                let kept = !uses_are_all_borrows(func, &derived, facts);
+                let handed_on = phis_using_any(func, &derived)
+                    .iter()
+                    .any(|other| !candidates.contains(other));
+                if (kept || handed_on) && trace_enabled() {
+                    eprintln!(
+                        "[drop] {}: phi {:?} cannot own its value (kept by a use {kept}, handed to a phi that does not own {handed_on})",
+                        func.name.resolve_global().unwrap_or_default(),
+                        p
+                    );
+                }
+                kept || handed_on
             })
             .collect();
         for p in dropped {
@@ -424,7 +432,7 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
                 let mut agreed: Option<Release> = None;
                 let mut known = true;
                 for (val, _) in &phi.incoming {
-                    let r = if *val == phi.result {
+                    let r = if *val == phi.result || is_null_value(func, *val) {
                         continue;
                     } else if let Some(r) = sites.get(val) {
                         *r
@@ -548,6 +556,11 @@ fn phi_incomings_owned(
         if *val == phi.result {
             continue;
         }
+        // Nothing arrives: what an error path hands on in place of
+        // storage, and releasing nothing is a no-op.
+        if is_null_value(func, *val) {
+            continue;
+        }
         let round_back_edge = body.is_some_and(|b| b.contains(pred));
         let owned = sites.contains_key(val) || candidates.contains(val);
         // Nothing but owning phis may keep the incoming.
@@ -581,10 +594,11 @@ fn phi_incomings_owned(
         }
         if trace_enabled() {
             eprintln!(
-                "[drop] {}: phi {:?} cannot own incoming {:?} (owned {owned}, kept elsewhere {kept_elsewhere}, borrowed only {borrowed_only}, back edge {round_back_edge})",
+                "[drop] {}: phi {:?} cannot own incoming {:?} = {} (owned {owned}, kept elsewhere {kept_elsewhere}, borrowed only {borrowed_only}, back edge {round_back_edge})",
                 func.name.resolve_global().unwrap_or_default(),
                 phi.result,
-                val
+                val,
+                describe_value(func, *val)
             );
         }
         // An accumulator's seed a string from anywhere: a copy is ours.
@@ -595,6 +609,38 @@ fn phi_incomings_owned(
         return None;
     }
     Some(copies)
+}
+
+/// The instruction, phi or constant defining `value`, for the trace.
+fn describe_value(func: &HirFunction, value: HirId) -> String {
+    for block in func.blocks.values() {
+        if let Some(inst) = block
+            .instructions
+            .iter()
+            .find(|i| i.result_id() == Some(value))
+        {
+            return format!("{inst:?}");
+        }
+        if let Some(phi) = block.phis.iter().find(|p| p.result == value) {
+            return format!("{phi:?}");
+        }
+    }
+    func.values
+        .get(&value)
+        .map(|v| format!("{:?}: {:?}", v.kind, v.ty))
+        .unwrap_or_default()
+}
+
+/// Whether `value` is the null pointer, by name or as a zero of pointer
+/// type.
+fn is_null_value(func: &HirFunction, value: HirId) -> bool {
+    func.values.get(&value).is_some_and(|v| match &v.kind {
+        crate::hir::HirValueKind::Constant(HirConstant::Null(_)) => true,
+        crate::hir::HirValueKind::Constant(
+            HirConstant::I64(0) | HirConstant::USize(0) | HirConstant::ISize(0),
+        ) => matches!(v.ty, HirType::Ptr(_)),
+        _ => false,
+    })
 }
 
 /// The block holding the phi `result`.
@@ -928,14 +974,6 @@ fn functions_returning_owned_storage(
         // Every return hands back an allocation, or nothing: a null is
         // what an error path returns in place of one, and releasing
         // nothing is a no-op.
-        let returns_nothing = |v: &HirId| {
-            func.values.get(v).is_some_and(|value| {
-                matches!(
-                    value.kind,
-                    crate::hir::HirValueKind::Constant(HirConstant::Null(_))
-                )
-            })
-        };
         let mut returns = 0usize;
         let mut all_return_it = true;
         for block in func.blocks.values() {
@@ -943,7 +981,7 @@ fn functions_returning_owned_storage(
                 returns += 1;
                 if !values
                     .iter()
-                    .any(|v| derived.contains(v) || returns_nothing(v))
+                    .any(|v| derived.contains(v) || is_null_value(func, *v))
                 {
                     all_return_it = false;
                     if trace_enabled() {
@@ -1095,6 +1133,7 @@ pub(crate) fn symbol_role(name: &str) -> Option<SymbolRole> {
         | "zyntax_box_get_tag"
         | "zyntax_box_header_tag"
         | "zyntax_box_data"
+        | "zyntax_box_pointer"
         | "zyntax_box_payload_i64"
         | "zyntax_box_payload_f64"
         | "zyntax_box_payload_bool" => Some(SymbolRole::BORROWS),

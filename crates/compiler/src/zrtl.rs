@@ -1867,6 +1867,14 @@ pub unsafe extern "C" fn zyntax_box_data(boxed: *const DynamicBoxRepr) -> *mut u
     (*boxed).data
 }
 
+/// See [`zyntax_box_data`]. The pointer a `zyntax_box_ptr` box holds:
+/// the box does not own what it points at, so the result is not the
+/// box's storage under another name and outlives the box.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_pointer(boxed: *const DynamicBoxRepr) -> *mut u8 {
+    (*boxed).data
+}
+
 /// See [`zyntax_box_data`].
 #[no_mangle]
 pub unsafe extern "C" fn zyntax_box_header_tag(boxed: *const DynamicBoxRepr) -> u32 {
@@ -2068,6 +2076,7 @@ pub fn box_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
         ("zyntax_box_get_bool", zyntax_box_get_bool as *const u8, 1),
         ("zyntax_box_get_tag", zyntax_box_get_tag as *const u8, 1),
         ("zyntax_box_data", zyntax_box_data as *const u8, 1),
+        ("zyntax_box_pointer", zyntax_box_pointer as *const u8, 1),
         (
             "zyntax_box_header_tag",
             zyntax_box_header_tag as *const u8,
