@@ -169,6 +169,20 @@ pub trait FiberCfg: Send + Sync {
     unsafe fn fiber_take_error(&self, _fiber: *mut FiberRepr) -> i64 {
         0
     }
+
+    /// The native stack windows a conservative collector reads, as
+    /// `(low, high)` address pairs, given the collector's own stack
+    /// pointer and the top of the thread's stack. A backend with
+    /// fibers of its own reports each suspended fiber's live window and
+    /// splits the running chain where one stack was left for another;
+    /// without fibers there is the one window.
+    fn stack_windows(&self, sp: usize, host_top: usize, out: &mut dyn FnMut(usize, usize)) {
+        out(sp, host_top);
+    }
+
+    /// Heap addresses the backend keeps on the program's behalf, such
+    /// as fiber environments, which a collector treats as roots.
+    fn held_addresses(&self, _out: &mut dyn FnMut(usize)) {}
 }
 
 /// `FiberError` variant tags matching the prelude enum declaration:

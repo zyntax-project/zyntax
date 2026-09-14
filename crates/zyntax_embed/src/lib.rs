@@ -208,6 +208,7 @@ pub use zyn_peg::runtime::{
 pub use zyntax_typed_ast::TypedProgram;
 
 // Re-export tiered compilation types
+pub use zyntax_compiler::collector::Collector;
 #[cfg(feature = "native")]
 pub use zyntax_compiler::tiered_backend::{OptimizationTier, TieredConfig, TieredStatistics};
 

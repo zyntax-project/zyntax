@@ -33,6 +33,7 @@ pub mod bytecode; // HIR bytecode serialization/deserialization
 pub mod cast_classify; // Pure classification of source/target coercions → CastKind
 pub mod cfg;
 pub mod cfg_simplify;
+pub mod collector; // Conservative mark-sweep over the pool's storage
 pub mod const_eval;
 pub mod const_fold;
 pub mod cse;

@@ -1037,6 +1037,18 @@ impl TieredRuntime {
         self.automatic_release = on;
     }
 
+    /// What reclaims the storage the compiler cannot prove dead. The
+    /// collector runs on the thread this is called from, and the
+    /// program's code must run natively on it: see
+    /// `zyntax_compiler::collector`.
+    pub fn set_collector(&mut self, collector: zyntax_compiler::collector::Collector) {
+        use zyntax_compiler::collector::{self, Collector};
+        match collector {
+            Collector::None => collector::disable(),
+            Collector::MarkSweep => collector::enable(),
+        }
+    }
+
     /// Load all ZRTL plugins from a directory
     ///
     /// Loads all `.zrtl` files from the specified directory.

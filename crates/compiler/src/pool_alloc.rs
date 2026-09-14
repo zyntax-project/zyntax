@@ -104,6 +104,11 @@ const POISON: u8 = 0x55;
 /// two and slabs have to be aligned to it.
 const SLAB: usize = 64 * 1024;
 
+/// A slab header's second word: the size class in the low half and the
+/// bytes carved so far, header included, in the half above.
+const CLASS_MASK: usize = 0xFFFF_FFFF;
+const USED_SHIFT: u32 = 32;
+
 /// Set in a header's `class` to mark a block libc owns, with the rest
 /// of the word carrying its total length.
 ///
@@ -123,10 +128,84 @@ struct Header {
     class: usize,
 }
 
+impl Header {
+    /// A slab's size class and how many bytes of it are carved.
+    #[inline]
+    fn slab_class_and_used(&self) -> (usize, usize) {
+        (self.class & CLASS_MASK, self.class >> USED_SHIFT)
+    }
+}
+
 /// The slab a block belongs to. Only meaningful for a pooled block.
 #[inline]
 fn slab_of(ptr: *mut u8) -> *mut Header {
     ((ptr as usize) & !(SLAB - 1)) as *mut Header
+}
+
+/// The size class and carved extent of the slab at `slab`, which must
+/// be one this pool made.
+///
+/// # Safety
+/// `slab` must be the base of a live slab.
+pub(crate) unsafe fn slab_layout(slab: usize) -> (usize, usize) {
+    (*(slab as *const Header)).slab_class_and_used()
+}
+
+/// Bytes at the front of a slab before its first block.
+pub(crate) const SLAB_HEADER: usize = HEADER;
+/// Bytes per slab and its alignment.
+pub(crate) const SLAB_BYTES: usize = SLAB;
+/// Bytes a block in `class` occupies; see [`slot_bytes`].
+pub(crate) fn class_slot_bytes(class: usize) -> usize {
+    slot_bytes(class)
+}
+
+/// Every block on this thread's free lists, by address.
+pub(crate) fn for_each_free_block(mut f: impl FnMut(usize)) {
+    FREE.with(|lists| {
+        for list in lists.iter() {
+            let mut p = list.get();
+            while !p.is_null() {
+                f(p as usize);
+                // SAFETY: a block on a free list holds the next block
+                // in its first word.
+                p = unsafe { *(p as *mut *mut u8) };
+            }
+        }
+    });
+}
+
+/// Empty this thread's free lists; the collector fills them again from
+/// what its sweep finds unreached.
+pub(crate) fn clear_free_lists() {
+    FREE.with(|lists| {
+        for list in lists.iter() {
+            list.set(std::ptr::null_mut());
+        }
+    });
+}
+
+/// Put a chain of blocks of `class`, threaded through their first
+/// words from `head` to `tail`, at the front of this thread's free
+/// list.
+///
+/// # Safety
+/// Every block on the chain must be one of `class` from this pool
+/// that nothing reads any more.
+pub(crate) unsafe fn push_free_chain(class: usize, head: usize, tail: usize) {
+    FREE.with(|lists| {
+        *(tail as *mut *mut u8) = lists[class].get();
+        lists[class].set(head as *mut u8);
+    });
+}
+
+/// Overwrite a block's payload with the debug poison; nothing in a
+/// release build.
+pub(crate) unsafe fn poison(block: usize, class: usize) {
+    #[cfg(debug_assertions)]
+    std::ptr::write_bytes(block as *mut u8, POISON, slot_bytes(class));
+    #[cfg(not(debug_assertions))]
+    let _ = (block, class);
 }
 
 thread_local! {
@@ -223,6 +302,25 @@ pub unsafe extern "C" fn zyntax_alloc(size: usize) -> *mut u8 {
         return reused;
     }
 
+    // Nothing to reuse means the heap grows. The collector gets its
+    // say first: what it finds unreached goes on the lists, and a
+    // list that filled up serves the request after all.
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::collector::wants_collection() {
+        crate::collector::collect();
+        let reused = FREE.with(|lists| {
+            let head = lists[class].get();
+            if head.is_null() {
+                return std::ptr::null_mut();
+            }
+            lists[class].set(*(head as *mut *mut u8));
+            head
+        });
+        if !reused.is_null() {
+            return reused;
+        }
+    }
+
     // Otherwise carve one, taking a fresh slab for this class if the
     // current one cannot fit. A slab is aligned to its own size so that
     // masking any block in it lands on its header.
@@ -238,15 +336,23 @@ pub unsafe extern "C" fn zyntax_alloc(size: usize) -> *mut u8 {
                 // Said once per slab rather than once per block.
                 let head = slab as *mut Header;
                 (*head).magic = MAGIC;
-                (*head).class = class;
+                (*head).class = class | (HEADER << USED_SHIFT);
                 sp[class].set(slab);
                 used = HEADER;
+                #[cfg(not(target_arch = "wasm32"))]
+                crate::collector::note_slab(slab as usize);
             }
-            let block = sp[class].get().add(used);
+            let slab = sp[class].get();
+            let block = slab.add(used);
             su[class].set(used + want);
+            // The header keeps the carved extent too, so a reader that
+            // only has the slab knows where its blocks end.
+            (*(slab as *mut Header)).class = class | ((used + want) << USED_SHIFT);
             block
         })
     });
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::collector::note_carved(want);
     if block.is_null() {
         // Out of memory for a slab; the request itself may still fit.
         return large_alloc(size);
@@ -267,7 +373,22 @@ unsafe fn large_alloc(size: usize) -> *mut u8 {
     (*head).class = LARGE_MARK | total;
     #[cfg(debug_assertions)]
     LARGE_LIVE.fetch_add(1, Ordering::Relaxed);
-    block.add(HEADER)
+    let payload = block.add(HEADER);
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::collector::note_large(payload as usize, total);
+    payload
+}
+
+/// Release a large block by its payload address, for the collector.
+///
+/// # Safety
+/// `payload` must have come from [`large_alloc`] and be unreached.
+pub(crate) unsafe fn free_large(payload: usize) {
+    let block = (payload as *mut u8).sub(HEADER);
+    let total = (*(block as *const Header)).class & !LARGE_MARK;
+    sys_dealloc(block, Layout::from_size_align_unchecked(total, HEADER));
+    #[cfg(debug_assertions)]
+    LARGE_LIVE.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Whether an address could have come from here at all.
@@ -297,6 +418,12 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
+    // A thread that frees will allocate from its own list without
+    // ever carving, which is the other way a second mutator appears.
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::collector::is_enabled() {
+        crate::collector::note_thread();
+    }
     // An address no allocator returns is not passed on to one either:
     // libc would fault on it for its own reasons and the report would
     // name libc rather than whatever produced it. Loud where a
@@ -324,6 +451,8 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
     let head = ptr.sub(HEADER) as *const Header;
     if (*head).magic == MAGIC && (*head).class & LARGE_MARK != 0 {
         let total = (*head).class & !LARGE_MARK;
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::collector::forget_large(ptr as usize);
         sys_dealloc(
             ptr.sub(HEADER),
             Layout::from_size_align_unchecked(total, HEADER),
@@ -340,7 +469,7 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
     // large mark, so arriving here says nothing was mistaken above.
     let slab = slab_of(ptr);
     let class = if (*slab).magic == MAGIC && (*slab).class & LARGE_MARK == 0 {
-        (*slab).class
+        (*slab).class & CLASS_MASK
     } else {
         // Hand it to the allocator that most likely owns it rather than
         // threading a foreign block onto a free list.
@@ -381,7 +510,7 @@ unsafe fn usable_size(ptr: *mut u8) -> Option<usize> {
     }
     let slab = slab_of(ptr);
     if (*slab).magic == MAGIC && (*slab).class & LARGE_MARK == 0 {
-        Some(slot_bytes((*slab).class))
+        Some(slot_bytes((*slab).class & CLASS_MASK))
     } else {
         None
     }

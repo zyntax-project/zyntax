@@ -304,6 +304,9 @@ pub struct CraneliftBackend {
     function_map: HashMap<HirId, FuncId>,
     /// Mapping from HIR globals to Cranelift data IDs
     global_map: HashMap<HirId, cranelift_module::DataId>,
+    /// Globals the program writes and has defined, whose storage the
+    /// collector reads for pointers once it is finalized.
+    root_globals: HashSet<HirId>,
     /// Mapping from HIR values to Cranelift values
     value_map: HashMap<HirId, Value>,
     /// Mapping from HIR blocks to Cranelift blocks
@@ -569,6 +572,7 @@ impl CraneliftBackend {
             data_desc: DataDescription::new(),
             function_map: HashMap::new(),
             global_map: HashMap::new(),
+            root_globals: HashSet::new(),
             value_map: HashMap::new(),
             block_map: HashMap::new(),
             compiled_functions: HashMap::new(),
@@ -879,6 +883,7 @@ impl CraneliftBackend {
 
         // Finalize the module
         let _ = self.module.finalize_definitions();
+        self.register_root_globals();
 
         // A lazy function's cell holds its stub until its first call.
         for (hir_id, stub) in std::mem::take(&mut self.lazy_stubs) {
@@ -6659,8 +6664,26 @@ impl CraneliftBackend {
         self.module
             .define_data(data_id, &self.data_desc)
             .map_err(|e| CompilerError::CodeGen(format!("Failed to define global: {}", e)))?;
+        // A dispatch table holds code addresses, never heap ones.
+        if !global.is_const && !matches!(&global.initializer, Some(HirConstant::VTable(_))) {
+            self.root_globals.insert(id);
+        }
 
         Ok(())
+    }
+
+    /// Hand the collector the storage of every mutable global, once
+    /// the module is finalized and the storage has its address.
+    fn register_root_globals(&self) {
+        if !crate::collector::is_enabled() {
+            return;
+        }
+        for id in &self.root_globals {
+            if let Some(&data_id) = self.global_map.get(id) {
+                let (ptr, len) = self.module.get_finalized_data(data_id);
+                crate::collector::add_root_range(ptr, len);
+            }
+        }
     }
 
     /// Translate function signature
@@ -9118,6 +9141,7 @@ impl CraneliftBackend {
         self.module.finalize_definitions().map_err(|e| {
             CompilerError::Backend(format!("Failed to finalize definitions: {}", e))
         })?;
+        self.register_root_globals();
 
         // Update function pointers after finalization
         for (hir_id, compiled_func) in &self.compiled_functions {
@@ -9731,6 +9755,7 @@ impl CraneliftBackend {
         // Clear state that depends on the old module
         self.function_map.clear();
         self.global_map.clear();
+        self.root_globals.clear();
         self.compiled_functions.clear();
         // Note: hot_reload.function_pointers still has the old pointers
         // They remain valid but won't be part of the new module

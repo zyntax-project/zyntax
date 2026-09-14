@@ -330,6 +330,61 @@ impl FiberCfg for KrioFiberBackend {
         fiber.cancel();
     }
 
+    fn stack_windows(&self, sp: usize, host_top: usize, out: &mut dyn FnMut(usize, usize)) {
+        let running: Vec<usize> = RUNNING.with(|r| r.borrow().clone());
+        // SAFETY: every handle in RUNNING and TASK_FIBERS is a live
+        // Box<Fiber> until fiber_free removes it.
+        let fiber = |h: usize| unsafe { &*(h as *const Fiber) };
+        let top_of = |f: &Fiber| {
+            let (start, len) = f.stack_range();
+            start as usize + len
+        };
+        // The host stack was left where the outermost running fiber
+        // was entered; each running fiber's stack where it entered the
+        // next; the innermost is the one the collector runs on.
+        let host_low = match running.first() {
+            Some(&h) => fiber(h).caller_sp() as usize,
+            None => sp,
+        };
+        out(host_low, host_top);
+        for (i, &h) in running.iter().enumerate() {
+            let low = match running.get(i + 1) {
+                Some(&inner) => fiber(inner).caller_sp() as usize,
+                None => sp,
+            };
+            out(low, top_of(fiber(h)));
+        }
+        // A suspended fiber's window starts at the saved stack pointer,
+        // below which its context switch spilled the registers.
+        TASK_FIBERS.with(|m| {
+            for set in m.borrow().values() {
+                for &h in set {
+                    if running.contains(&h) {
+                        continue;
+                    }
+                    let f = fiber(h);
+                    if matches!(f.state(), krio_fiber::FiberState::Suspended) {
+                        out(f.saved_sp() as usize, top_of(f));
+                    }
+                }
+            }
+        });
+    }
+
+    fn held_addresses(&self, out: &mut dyn FnMut(usize)) {
+        ENV_MAP.with(|m| {
+            for &env in m.borrow().values() {
+                out(env);
+            }
+        });
+        // An error payload waits here until the caller takes it.
+        ERROR_MAP.with(|m| {
+            for &(_, payload) in m.borrow().values() {
+                out(payload as usize);
+            }
+        });
+    }
+
     unsafe fn fiber_free(&self, fiber: *mut FiberRepr) {
         if fiber.is_null() {
             return;
