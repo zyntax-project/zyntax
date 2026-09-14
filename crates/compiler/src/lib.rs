@@ -73,6 +73,7 @@ pub mod reduction_vectorize;
 pub(crate) mod return_infer; // Return types for declarations that don't state one
 pub mod runtime;
 pub mod scalar_replace_alloc; // Eliminate non-escaping Call(Intrinsic::Malloc) allocations (heap SROA)
+pub mod sign_fold; // Compares against zero decided by the sign of what is compared
 pub mod ssa;
 pub mod stdlib; // Standard library implementation using HIR Builder
 pub mod target_vector; // How wide a vector the target accepts, and lanes per element
@@ -1768,6 +1769,7 @@ pub struct InterpOptStats {
     pub aggregate_split: aggregate_split::AggregateSplitStats,
     pub scalar_replace_alloc: scalar_replace_alloc::ScalarReplaceAllocStats,
     pub dead_store: dead_store::DeadStoreStats,
+    pub sign_fold: sign_fold::SignFoldStats,
     pub licm: licm::LicmStats,
     pub affine_loop: affine_loop::AffineLoopStats,
     pub inline: inline::InlineStats,
@@ -1926,6 +1928,10 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
         }
         let cf = const_fold::fold_module(module);
         timed("const_fold", &mut at);
+        let sf = sign_fold::run_module(module);
+        stats.sign_fold.compares += sf.compares;
+        stats.sign_fold.selects += sf.selects;
+        timed("sign_fold", &mut at);
         let cs = cse::eliminate_module(module);
         timed("cse", &mut at);
         // load_cse runs after value-cse so canonical pointer ids are
@@ -2014,6 +2020,8 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
         timed("cfg_simplify", &mut at);
 
         let made_progress = cf.folded > 0
+            || sf.compares > 0
+            || sf.selects > 0
             || cs.eliminated > 0
             || fma.contracted > 0
             || lcse.eliminated > 0
