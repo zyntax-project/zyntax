@@ -778,6 +778,10 @@ pub(crate) fn member_ty(member: crate::stdlib::Member) -> Ty {
 pub(crate) struct ClassInfo {
     pub(crate) name: String,
     pub(crate) base: Option<usize>,
+    /// How many classes the class and everything deriving from it are:
+    /// they hold the indices from this one's for that many, since
+    /// classes are numbered in preorder of the hierarchy.
+    pub(crate) descendants: usize,
     /// Every field in layout order: the class tag first, then the
     /// base's fields, then this class's own.
     pub(crate) fields: Vec<(String, Ty)>,
@@ -822,14 +826,7 @@ impl Module {
 
     /// Whether `k` is `base` or derives from it.
     pub(crate) fn is_subclass(&self, k: usize, base: usize) -> bool {
-        let mut at = Some(k);
-        while let Some(c) = at {
-            if c == base {
-                return true;
-            }
-            at = self.classes[c].base;
-        }
-        false
+        k >= base && k < base + self.classes[base].descendants
     }
 
     /// The classes deriving from `owner` that define `method` themselves.

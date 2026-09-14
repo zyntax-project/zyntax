@@ -336,11 +336,11 @@ pub fn parse_program_with(
             module: origin.map(str::to_string),
         })
         .collect();
-    for (k, def) in class_defs.iter().enumerate() {
+    for def in &class_defs {
         for m in &def.methods {
             items.push(types::Item {
                 name: types::method_fn(&def.name, m.name.as_str()),
-                class: Some(k),
+                class: Some(class_index[&def.name]),
                 def: m,
                 module: def.module.clone(),
             });

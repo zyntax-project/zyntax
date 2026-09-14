@@ -1364,13 +1364,23 @@ impl<'m> Lowerer<'m> {
                     span,
                 )
             }
+            // A value of another class is a TypeError, raised where the
+            // instance is wanted.
             (Ty::Object, Ty::Class(k)) => {
                 let address = addr_call(
                     &format!("{}$unbox", self.module.classes[k as usize].name),
                     vec![v.node],
                     span,
                 );
-                cast(address, target, span)
+                let checked = Val {
+                    node: cast(address, target, span),
+                    ty: target,
+                };
+                if self.guards {
+                    self.guard(checked, span).node
+                } else {
+                    checked.node
+                }
             }
             // Up or down one chain, the instance is the same address.
             (Ty::Class(a), Ty::Class(b))
@@ -1465,6 +1475,11 @@ impl<'m> Lowerer<'m> {
             (Ty::Object, Ty::Float) => "zb_box_payload_f64",
             (Ty::Object, Ty::Bool) => "zb_box_payload_truth",
             (Ty::Object, Ty::Str) => "zb_box_get_str",
+            // The box is known to hold an instance of the class.
+            (Ty::Object, Ty::Class(_)) => {
+                let address = addr_call("zb_unbox_instance_raw", vec![v.node], span);
+                return cast(address, target, span);
+            }
             _ => return self.coerce(v, target),
         };
         call(read, vec![v.node], target, span)
@@ -5152,8 +5167,9 @@ impl<'m> Lowerer<'m> {
                     id: name.id.clone(),
                     ctx: py::ExprContext::Store,
                 });
+                // The match settled the class, so the read is trusted.
                 let value = Val {
-                    node: self.coerce(value, ty),
+                    node: self.trusted(value, ty),
                     ty,
                 };
                 self.bind(&target, value, hspan, &mut handler)?;

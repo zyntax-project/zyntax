@@ -105,11 +105,12 @@ pub(crate) fn collect<'a>(
 /// The classes as the module first knows them: names, bases, methods,
 /// and the class tag as the only field.
 pub(crate) fn skeletons(defs: &[ClassDef<'_>]) -> Result<(Vec<ClassInfo>, HashMap<String, usize>)> {
-    let mut classes = Vec::new();
-    let mut index = HashMap::new();
-    for def in defs {
+    // A base is declared before what derives from it.
+    let mut declared: HashMap<&str, usize> = HashMap::new();
+    let mut base_of: Vec<Option<usize>> = Vec::with_capacity(defs.len());
+    for (i, def) in defs.iter().enumerate() {
         let base = match &def.base {
-            Some(b) => Some(*index.get(b).ok_or_else(|| {
+            Some(b) => Some(*declared.get(b.as_str()).ok_or_else(|| {
                 let e = Error::unsupported(
                     format!(
                         "class {} deriving from `{b}`, which is not a class defined before it",
@@ -124,10 +125,53 @@ pub(crate) fn skeletons(defs: &[ClassDef<'_>]) -> Result<(Vec<ClassInfo>, HashMa
             })?),
             None => None,
         };
+        declared.insert(def.name.as_str(), i);
+        base_of.push(base);
+    }
+    // Classes are numbered in preorder of the hierarchy, each right
+    // after its base and before the next of its base's children, so a
+    // class's descendants are a contiguous range after it: one compare
+    // pair tells whether an instance is one.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); defs.len()];
+    let mut roots = Vec::new();
+    for (i, base) in base_of.iter().enumerate() {
+        match base {
+            Some(b) => children[*b].push(i),
+            None => roots.push(i),
+        }
+    }
+    let mut order: Vec<usize> = Vec::with_capacity(defs.len());
+    let mut descendants: Vec<usize> = vec![1; defs.len()];
+    fn visit(
+        i: usize,
+        children: &[Vec<usize>],
+        order: &mut Vec<usize>,
+        descendants: &mut [usize],
+    ) -> usize {
+        order.push(i);
+        let mut size = 1;
+        for &c in &children[i] {
+            size += visit(c, children, order, descendants);
+        }
+        descendants[i] = size;
+        size
+    }
+    for r in roots {
+        visit(r, &children, &mut order, &mut descendants);
+    }
+    let mut position: Vec<usize> = vec![0; defs.len()];
+    for (k, &i) in order.iter().enumerate() {
+        position[i] = k;
+    }
+    let mut classes = Vec::with_capacity(defs.len());
+    let mut index = HashMap::new();
+    for &i in &order {
+        let def = &defs[i];
         index.insert(def.name.clone(), classes.len());
         classes.push(ClassInfo {
             name: def.name.clone(),
-            base,
+            base: base_of[i].map(|b| position[b]),
+            descendants: descendants[i],
             fields: vec![("$class".to_string(), Ty::Int)],
             methods: def.methods.iter().map(|m| m.name.to_string()).collect(),
             type_id: None,
@@ -525,24 +569,28 @@ fn unboxer(module: &Module, k: usize, span: Span) -> TypedFunction {
         Ty::Bool,
         span,
     );
+    // The class and everything deriving from it are one range of kinds.
     let kind = call("zb_any_kind", vec![x.clone()], Ty::Int, span);
-    let mut accepted: Option<Node> = None;
-    for c in 0..module.classes.len() {
-        if module.is_subclass(c, k) {
-            let this = binary(
-                BinaryOp::Eq,
-                kind.clone(),
-                int_lit(zyntax_builtins::INSTANCE_KIND_BASE + c as i64, span),
-                Ty::Bool,
-                span,
-            );
-            accepted = Some(match accepted {
-                None => this,
-                Some(prev) => binary(BinaryOp::Or, prev, this, Ty::Bool, span),
-            });
-        }
-    }
-    let accepted = accepted.expect("a class accepts itself");
+    let first = zyntax_builtins::INSTANCE_KIND_BASE + k as i64;
+    let accepted = binary(
+        BinaryOp::And,
+        binary(
+            BinaryOp::Ge,
+            kind.clone(),
+            int_lit(first, span),
+            Ty::Bool,
+            span,
+        ),
+        binary(
+            BinaryOp::Lt,
+            kind,
+            int_lit(first + class.descendants as i64, span),
+            Ty::Bool,
+            span,
+        ),
+        Ty::Bool,
+        span,
+    );
     let not_accepted = node(
         TypedExpression::Unary(zyntax_typed_ast::typed_ast::TypedUnary {
             op: zyntax_typed_ast::UnaryOp::Not,
