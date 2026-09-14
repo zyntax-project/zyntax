@@ -34,3 +34,4 @@ zyntax_builtins = { path = "../zyntax_builtins" }
 indexmap = "2"
 
 [dev-dependencies]
+libc = "0.2"
