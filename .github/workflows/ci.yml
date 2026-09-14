@@ -34,6 +34,9 @@ jobs:
   native-platform-tests:
     name: native tests (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # A hung test must fail the job, not hold the runner for the six
+    # hours the default allows.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

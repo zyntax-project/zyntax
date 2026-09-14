@@ -21,6 +21,25 @@ fn rss_mb() -> u64 {
         / 1024
 }
 
+/// Load and run one kernel the way one harness iteration does, then
+/// drop it. The name goes straight to the process's stderr, past the
+/// test harness's capture, so a kernel that never returns is named in
+/// the log rather than lost with the rest of the output.
+fn run_kernel(path: &Path) {
+    use std::io::Write;
+    let name = path.file_stem().unwrap_or_default().to_string_lossy();
+    let _ = writeln!(std::io::stderr(), "[probe] {name}");
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut rt) = ZynML::new() else {
+        return;
+    };
+    if rt.load_source(&src).is_ok() {
+        let _ = rt.call_with_result::<i64>("main");
+    }
+}
+
 fn kernels() -> Vec<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmarks");
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -58,23 +77,11 @@ fn a_second_pass_does_not_cost_what_the_first_did() {
     let files = kernels();
     let before_first = rss_mb();
     for f in &files {
-        if let Ok(src) = std::fs::read_to_string(f) {
-            if let Ok(mut rt) = ZynML::new() {
-                if rt.load_source(&src).is_ok() {
-                    let _ = rt.call_with_result::<i64>("main");
-                }
-            }
-        }
+        run_kernel(f);
     }
     let after_first = rss_mb();
     for f in &files {
-        if let Ok(src) = std::fs::read_to_string(f) {
-            if let Ok(mut rt) = ZynML::new() {
-                if rt.load_source(&src).is_ok() {
-                    let _ = rt.call_with_result::<i64>("main");
-                }
-            }
-        }
+        run_kernel(f);
     }
     let after_second = rss_mb();
     println!("\n  after pass 1: {after_first} MB");
@@ -110,13 +117,7 @@ fn a_second_pass_does_not_cost_what_the_first_did() {
     let mut prev = rss_mb();
     for f in &files {
         let name = f.file_stem().unwrap().to_string_lossy().to_string();
-        if let Ok(src) = std::fs::read_to_string(f) {
-            if let Ok(mut rt) = ZynML::new() {
-                if rt.load_source(&src).is_ok() {
-                    let _ = rt.call_with_result::<i64>("main");
-                }
-            }
-        }
+        run_kernel(f);
         let now = rss_mb();
         let d = now as i64 - prev as i64;
         if d != 0 {
@@ -135,22 +136,7 @@ fn report_memory_per_kernel() {
     let mut rows: Vec<(String, u64)> = Vec::new();
     for f in kernels() {
         let name = f.file_stem().unwrap().to_string_lossy().to_string();
-        let src = match std::fs::read_to_string(&f) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        // Load and run once, then drop, exactly as one harness
-        // iteration does.
-        {
-            let mut rt = match ZynML::new() {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            if rt.load_source(&src).is_err() {
-                continue;
-            }
-            let _ = rt.call_with_result::<i64>("main");
-        }
+        run_kernel(&f);
         let now = rss_mb();
         println!("  {:<34}{:>10}{:>10}", name, now, now as i64 - prev as i64);
         rows.push((name, now.saturating_sub(prev)));
