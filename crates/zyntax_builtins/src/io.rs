@@ -10,7 +10,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     // The exception the frontend raises keeps the message, so it is the
     // callee's from the call on.
     let kind = local("kind", string());
-    let message = owned("message", string());
+    let message = kept("message", string());
     // A frontend with exceptions turns the error into one and gets
     // control back; otherwise the program ends the way an uncaught
     // exception ends it: the kind and message on stderr, and status 1.

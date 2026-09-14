@@ -271,7 +271,7 @@ fn param(name: &str, ty: Ty, span: Span) -> TypedParameter {
         attributes: lower::dynamic_attribute(ty, span),
         ownership: match ty {
             Ty::Int | Ty::Float | Ty::Bool | Ty::None => ParamOwnership::Copied,
-            _ => ParamOwnership::Owned,
+            _ => ParamOwnership::Shared,
         },
         span,
     }

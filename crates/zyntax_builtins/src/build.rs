@@ -99,23 +99,24 @@ pub struct Local {
     pub ty: Type,
     /// As a parameter: whether the function keeps what it is passed, so
     /// the caller must not release it afterwards.
-    pub owned: bool,
+    pub kept: bool,
 }
 
 pub fn local(name: &'static str, ty: Type) -> Local {
     Local {
         name,
         ty,
-        owned: false,
+        kept: false,
     }
 }
 
-/// A parameter the function stores somewhere that outlives the call.
-pub fn owned(name: &'static str, ty: Type) -> Local {
+/// A parameter the function keeps somewhere that outlives the call. The
+/// caller keeps it too: a heap value has no sole holder here.
+pub fn kept(name: &'static str, ty: Type) -> Local {
     Local {
         name,
         ty,
-        owned: true,
+        kept: true,
     }
 }
 
@@ -168,8 +169,8 @@ impl Local {
             Mutability::Mutable,
             SPAN,
         );
-        if self.owned {
-            p.ownership = ParamOwnership::Owned;
+        if self.kept {
+            p.ownership = ParamOwnership::Shared;
         }
         p
     }

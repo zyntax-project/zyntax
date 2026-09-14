@@ -368,10 +368,13 @@ pub(crate) fn int32_lit(v: i32, span: Span) -> Node {
 /// A Python function may keep anything it is handed: store it in a
 /// list, capture it, return it. So a caller keeps no claim on a heap
 /// value it passes.
+/// A heap value is shared between caller and callee: the callee may keep
+/// it, so the caller does not release it, and the same value may arrive
+/// twice in one call.
 fn ownership_of(ty: Ty) -> ParamOwnership {
     match ty {
         Ty::Int | Ty::Float | Ty::Bool | Ty::None => ParamOwnership::Copied,
-        _ => ParamOwnership::Owned,
+        _ => ParamOwnership::Shared,
     }
 }
 

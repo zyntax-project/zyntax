@@ -38,10 +38,10 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
 fn dict(list_type: TypeId) -> Vec<Decl> {
     let anys = list_of(list_type, any());
     let d = local("d", anys.clone());
-    let k = owned("k", any());
-    let v = owned("v", any());
+    let k = kept("k", any());
+    let v = kept("v", any());
     // Returned when the key is absent, so the caller cannot release it.
-    let default = owned("default", any());
+    let default = kept("default", any());
     let i = local("i", i64());
     let n = local("n", i64());
     let out = local("out", anys.clone());
@@ -336,7 +336,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
     let anys = list_of(list_type, any());
     let s = local("s", anys.clone());
     let other = local("other", anys.clone());
-    let v = owned("v", any());
+    let v = kept("v", any());
     let i = local("i", i64());
     let n = local("n", i64());
     let out = local("out", anys.clone());

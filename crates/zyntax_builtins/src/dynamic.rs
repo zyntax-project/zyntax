@@ -812,8 +812,8 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ret(box_i64(sub(int(0), number_i64(x.e(), cat.e())))),
         ],
     ));
-    let kept = owned("x", any());
-    d.push(define("zb_any_pos", &[&kept], any(), vec![ret(kept.e())]));
+    let same = kept("x", any());
+    d.push(define("zb_any_pos", &[&same], any(), vec![ret(same.e())]));
     let f = local("f", f64());
     let n = local("n", i64());
     d.push(define(
@@ -1198,7 +1198,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         ))
     };
     let boxed_dict = |x: Expr| and(eq(category(x.clone()), int(CUSTOM)), is_dict(x));
-    let v = owned("v", any());
+    let v = kept("v", any());
     d.push(define(
         "zb_any_setitem",
         &[&x, &i, &v],

@@ -480,6 +480,11 @@ pub enum ParamOwnership {
     /// The callee takes ownership. The caller may not use the value
     /// again, and is no longer responsible for releasing it.
     Owned,
+    /// The callee may keep the value, and so may the caller: neither is
+    /// its sole holder, as with a reference-counted or collected value.
+    /// The caller does not release it after the call, and passing it
+    /// twice in one call is fine.
+    Shared,
 }
 
 impl ParamOwnership {

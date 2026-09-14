@@ -144,6 +144,7 @@ fn golang_features_analysis() {
                     kind: ParameterKind::Regular,
                     default_value: None,
                     attributes: vec![],
+                    ownership: Default::default(),
                 },
                 TypedMethodParam {
                     name: arena.intern_string("p"),
@@ -158,6 +159,7 @@ fn golang_features_analysis() {
                     kind: ParameterKind::Regular,
                     default_value: None,
                     attributes: vec![],
+                    ownership: Default::default(),
                 },
             ],
             return_type: Type::Tuple(vec![

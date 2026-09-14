@@ -70,7 +70,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         Some("krio_fiber_env"),
     ));
     let code = local("code", usize());
-    let env = owned("env", any());
+    let env = kept("env", any());
     d.push(define(
         "zb_fiber_start",
         &[&code, &env],
@@ -139,7 +139,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let args: Vec<Local> = (0..MAX_CALL_ARITY)
         .map(|i| {
             let name: &'static str = Box::leak(format!("a{i}").into_boxed_str());
-            owned(name, any())
+            kept(name, any())
         })
         .collect();
     let fp_name = |n: usize| format!("zb_unbox_fnptr_raw_{n}");
