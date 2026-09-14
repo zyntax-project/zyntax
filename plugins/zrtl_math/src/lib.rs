@@ -50,7 +50,10 @@ fn init_rng() {
     if getrandom::getrandom(&mut seed_bytes).is_ok() {
         let seed = u64::from_ne_bytes(seed_bytes);
         // Ensure non-zero state
-        RNG_STATE.store(if seed != 0 { seed } else { 0x853c49e6748fea9b }, Ordering::Release);
+        RNG_STATE.store(
+            if seed != 0 { seed } else { 0x853c49e6748fea9b },
+            Ordering::Release,
+        );
     } else {
         RNG_STATE.store(0x853c49e6748fea9b, Ordering::Release);
     }
