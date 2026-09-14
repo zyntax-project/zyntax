@@ -27,7 +27,7 @@ pub mod associated_type_resolver; // Associated type resolution for trait dispat
 pub mod async_support;
 pub mod auto_vectorize;
 pub mod borrow_check; // HIR-level borrow checking pass
-pub mod box_reads; // A checked box's readers as the loads they are
+pub mod boxes; // Dynamic boxes made, read and released in HIR
 pub mod builtin_class; // Wrapper-class dispatch for compiler-known built-in types (Fiber, future SimdVector, etc.)
 pub mod bytecode; // HIR bytecode serialization/deserialization
 pub mod cast_classify; // Pure classification of source/target coercions → CastKind
@@ -1774,7 +1774,7 @@ pub struct InterpOptStats {
     pub auto_vectorize: auto_vectorize::AutoVectorizeStats,
     pub cfg_simplify: cfg_simplify::CfgSimplifyStats,
     pub drop_insert: drop_insert::DropStats,
-    pub box_reads: box_reads::BoxReadStats,
+    pub boxes: boxes::BoxStats,
     /// Release functions synthesised for types that own another.
     pub drop_glue_emitted: usize,
     pub tco: tco::TcoStats,
@@ -2220,12 +2220,14 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     // see them as calls are placed, and the loads get one more chance
     // to leave a loop or merge with each other.
     let br = if expand_box_reads {
-        box_reads::run_module(module)
+        boxes::run_module(module)
     } else {
-        box_reads::BoxReadStats::default()
+        boxes::BoxStats::default()
     };
-    stats.box_reads.expanded += br.expanded;
-    if br.expanded > 0 {
+    stats.boxes.expanded += br.expanded;
+    stats.boxes.made += br.made;
+    stats.boxes.released += br.released;
+    if br.expanded + br.made + br.released > 0 {
         let lc = licm::run_module(module);
         stats.licm.hoisted += lc.hoisted;
         stats.licm.loops_visited += lc.loops_visited;

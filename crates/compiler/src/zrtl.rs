@@ -1776,17 +1776,24 @@ pub unsafe extern "C" fn zyntax_box_get_opaque(boxed: *const DynamicBoxRepr) -> 
     (*boxed).data
 }
 
-/// Free a DynamicBox created by zyntax_box_* functions
+/// Free a DynamicBox created by zyntax_box_* functions.
+///
+/// The header goes back through the pool's release, which hands a block
+/// it did not make to the system allocator: a box may have been made by
+/// the runtime here (the system allocator), by a plugin through the SDK
+/// (the same), or by compiled code through the allocation intrinsic
+/// (the pool), and this is the one release all three reach.
 #[no_mangle]
 pub unsafe extern "C" fn zyntax_box_free(boxed: *mut DynamicBoxRepr) {
-    if !boxed.is_null() {
-        let b = Box::from_raw(boxed);
-        if let Some(dropper) = b.dropper {
-            if !b.data.is_null() {
-                dropper(b.data);
-            }
+    if boxed.is_null() {
+        return;
+    }
+    if let Some(dropper) = (*boxed).dropper {
+        if !(*boxed).data.is_null() {
+            dropper((*boxed).data);
         }
     }
+    crate::pool_alloc::zyntax_free(boxed as *mut u8);
 }
 
 /// Get the value from a DynamicBox as i64
@@ -1849,7 +1856,7 @@ pub unsafe extern "C" fn zyntax_box_get_f64(boxed: *const DynamicBoxRepr) -> f64
 /// The payload readers of a box the caller has already checked: the box
 /// is not null, and its tag says its payload has the width read. Each is
 /// the loads it names and nothing else, so the compiler replaces a call
-/// to one with those loads (`box_reads`); the symbols stand for the
+/// to one with those loads (`boxes`); the symbols stand for the
 /// paths that keep the call.
 ///
 /// # Safety
