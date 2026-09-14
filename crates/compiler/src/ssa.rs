@@ -106,6 +106,23 @@ fn default_const_for(ty: &HirType) -> crate::hir::HirConstant {
     }
 }
 
+/// The integer constant `n` at type `ty`.
+fn int_const_for(ty: &HirType, n: i128) -> crate::hir::HirConstant {
+    use crate::hir::HirConstant;
+    match ty {
+        HirType::I8 => HirConstant::I8(n as i8),
+        HirType::I16 => HirConstant::I16(n as i16),
+        HirType::I32 => HirConstant::I32(n as i32),
+        HirType::U8 => HirConstant::U8(n as u8),
+        HirType::U16 => HirConstant::U16(n as u16),
+        HirType::U32 => HirConstant::U32(n as u32),
+        HirType::U64 => HirConstant::U64(n as u64),
+        HirType::USize => HirConstant::USize(n as u64),
+        HirType::ISize => HirConstant::ISize(n as i64),
+        _ => HirConstant::I64(n as i64),
+    }
+}
+
 // Aggregate-aware size in bytes for an HIR type. Needed by array-literal
 // lowering: bench n-body `[sun, jupiter, ...]` allocates 5 × 56-byte `Body`
 // structs; without walking into `HirType::Struct`/`Array` the per-elem
@@ -10520,6 +10537,51 @@ impl SsaBuilder {
     /// Whether a truncating remainder must be corrected to carry the
     /// divisor's sign: it is nonzero and its sign differs from the
     /// divisor's. Shared by floor division and floor remainder.
+    /// `log2(d)` when `v` is the integer constant `d`, a positive power
+    /// of two.
+    fn positive_power_of_two(&self, v: HirId) -> Option<u32> {
+        let value = self.function.values.get(&v)?;
+        let HirValueKind::Constant(c) = &value.kind else {
+            return None;
+        };
+        let d: i128 = match c {
+            HirConstant::I8(x) => *x as i128,
+            HirConstant::I16(x) => *x as i128,
+            HirConstant::I32(x) => *x as i128,
+            HirConstant::I64(x) => *x as i128,
+            HirConstant::ISize(x) => *x as i128,
+            HirConstant::U8(x) => *x as i128,
+            HirConstant::U16(x) => *x as i128,
+            HirConstant::U32(x) => *x as i128,
+            HirConstant::U64(x) => *x as i128,
+            HirConstant::USize(x) => *x as i128,
+            _ => return None,
+        };
+        (d > 0 && (d & (d - 1)) == 0).then(|| d.trailing_zeros())
+    }
+
+    /// The sign of an integer constant, when `v` is one.
+    fn constant_sign(&self, v: HirId) -> Option<std::cmp::Ordering> {
+        let value = self.function.values.get(&v)?;
+        let HirValueKind::Constant(c) = &value.kind else {
+            return None;
+        };
+        let d: i128 = match c {
+            HirConstant::I8(x) => *x as i128,
+            HirConstant::I16(x) => *x as i128,
+            HirConstant::I32(x) => *x as i128,
+            HirConstant::I64(x) => *x as i128,
+            HirConstant::ISize(x) => *x as i128,
+            HirConstant::U8(x) => *x as i128,
+            HirConstant::U16(x) => *x as i128,
+            HirConstant::U32(x) => *x as i128,
+            HirConstant::U64(x) => *x as i128,
+            HirConstant::USize(x) => *x as i128,
+            _ => return None,
+        };
+        Some(d.cmp(&0))
+    }
+
     fn floor_correction_needed(
         &mut self,
         block: HirId,
@@ -10535,6 +10597,19 @@ impl SsaBuilder {
             (B::Ne, B::Lt)
         };
         let zero = self.scalar_const(ty, default_const_for(ty));
+        // A divisor of known sign needs only the remainder's: a nonzero
+        // remainder of the other sign, which is one compare.
+        if !float {
+            match self.constant_sign(divisor) {
+                Some(std::cmp::Ordering::Greater) => {
+                    return self.emit_bin(block, B::Lt, ty, rem, zero)
+                }
+                Some(std::cmp::Ordering::Less) => {
+                    return self.emit_bin(block, B::Gt, ty, rem, zero)
+                }
+                _ => {}
+            }
+        }
         let nonzero = self.emit_bin(block, ne, ty, rem, zero);
         let rem_neg = self.emit_bin(block, lt, ty, rem, zero);
         let div_neg = self.emit_bin(block, lt, ty, divisor, zero);
@@ -10600,6 +10675,19 @@ impl SsaBuilder {
                 self.emit_select(b, fix, shifted, rem, &ty)
             }
             (_, true) => self.emit_intrinsic(b, crate::hir::Intrinsic::Pow, vec![l, r], &ty),
+            // Dividing by a positive power of two, flooring is what the
+            // arithmetic shift does and the remainder is the low bits,
+            // for either sign of the dividend.
+            (FrontendOp::FloorDiv, false) if self.positive_power_of_two(r).is_some() => {
+                let shift = self.positive_power_of_two(r).unwrap_or_default();
+                let by = self.scalar_const(&ty, int_const_for(&ty, shift as i128));
+                self.emit_bin(b, B::Shr, &ty, l, by)
+            }
+            (FrontendOp::FloorRem, false) if self.positive_power_of_two(r).is_some() => {
+                let shift = self.positive_power_of_two(r).unwrap_or_default();
+                let mask = self.scalar_const(&ty, int_const_for(&ty, (1i128 << shift) - 1));
+                self.emit_bin(b, B::And, &ty, l, mask)
+            }
             (FrontendOp::FloorDiv, false) => {
                 let q = self.emit_bin(b, B::Div, &ty, l, r);
                 let rem = self.emit_bin(b, B::Rem, &ty, l, r);
