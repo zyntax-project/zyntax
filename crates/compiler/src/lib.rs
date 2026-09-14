@@ -37,6 +37,7 @@ pub mod const_eval;
 pub mod const_fold;
 pub mod cse;
 pub mod dce; // Reachability-based dead-code elimination at the function level
+pub mod dead_store; // Dead stores into storage allocated in the same block
 pub mod drop_glue; // Recursive release derived from a type's own fields
 pub mod drop_insert; // Speculative drop-site analysis: insert free() for non-escaping mallocs
 pub mod effect_analysis; // Effect inference and checking for algebraic effects
@@ -1766,6 +1767,7 @@ pub struct InterpOptStats {
     pub load_cse: load_cse::LoadCseStats,
     pub aggregate_split: aggregate_split::AggregateSplitStats,
     pub scalar_replace_alloc: scalar_replace_alloc::ScalarReplaceAllocStats,
+    pub dead_store: dead_store::DeadStoreStats,
     pub licm: licm::LicmStats,
     pub affine_loop: affine_loop::AffineLoopStats,
     pub inline: inline::InlineStats,
@@ -1949,6 +1951,11 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
         // (Call results are opaque); this is the HIR-only path.
         let sra = scalar_replace_alloc::run_module(module);
         timed("scalar_replace_alloc", &mut at);
+        // A field a constructor defaulted and its caller then set: the
+        // default's store is dead once both are in one block.
+        let ds = dead_store::run_module(module);
+        stats.dead_store.removed += ds.removed;
+        timed("dead_store", &mut at);
         let il = inline::run_module(module);
         timed("inline", &mut at);
         let lc = licm::run_module(module);
