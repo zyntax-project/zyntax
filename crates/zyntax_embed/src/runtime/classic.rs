@@ -1282,6 +1282,13 @@ impl ZyntaxRuntime {
         );
         // Also register with the backend so Cranelift can resolve the symbol during JIT linking
         self.backend.register_runtime_symbol(name, ptr);
+        if let Ok(mut interp) = self.interp.lock() {
+            interp.register_symbol(
+                name.to_string(),
+                ptr,
+                u8::try_from(arg_count).unwrap_or(u8::MAX),
+            );
+        }
     }
 
     /// Register an external function together with a typed signature.
@@ -1325,6 +1332,12 @@ impl ZyntaxRuntime {
             },
         );
         self.backend.register_runtime_symbol(name, ptr);
+        // The interpreter's own JIT resolves only what it was handed:
+        // on Linux and Windows the executable's symbols are not there
+        // to find, so a symbol left out of its table fails to link.
+        if let Ok(mut interp) = self.interp.lock() {
+            interp.register_symbol(name.to_string(), ptr, sig.param_count);
+        }
 
         // Mirror what `load_plugin` does for ZRTL symbol metadata.
         self.plugin_signatures.insert(name.to_string(), sig);
