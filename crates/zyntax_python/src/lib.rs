@@ -190,11 +190,27 @@ struct Library {
 }
 
 fn library() -> Result<Library> {
-    let module = snapshot()?
+    let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
+    let t0 = std::time::Instant::now();
+    let snapshot = snapshot()?;
+    let t1 = std::time::Instant::now();
+    let module = snapshot
         .module(LIBRARY_MODULE)
         .map_err(|e| Error::Library(e.to_string()))?
         .ok_or_else(|| Error::Library(format!("the snapshot has no `{LIBRARY_MODULE}`")))?;
-    let type_registry = module.program().type_registry.clone();
+    let t2 = std::time::Instant::now();
+    let program = module.program();
+    let t3 = std::time::Instant::now();
+    let type_registry = program.type_registry.clone();
+    if trace {
+        eprintln!(
+            "[LIBRARY] snapshot load {:.2} ms, module {:.2} ms, program {:.2} ms, registry clone {:.2} ms",
+            (t1 - t0).as_secs_f64() * 1000.0,
+            (t2 - t1).as_secs_f64() * 1000.0,
+            (t3 - t2).as_secs_f64() * 1000.0,
+            t3.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let list_type = type_registry
         .get_type_by_name(intern("List"))
         .map(|def| def.id)

@@ -244,7 +244,10 @@ impl Snapshot {
                     .artifact
                     .slice(&self.blobs, &entry.name)
                     .map_err(|e| e.to_string())?;
+                let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
+                let t0 = std::time::Instant::now();
                 let import = CompiledImport::decode(bytes).map_err(|e| e.to_string())?;
+                let t1 = std::time::Instant::now();
                 let Some(lowered) = entry.lowered.as_ref().filter(|l| l.usable_here()) else {
                     return Ok(import);
                 };
@@ -254,6 +257,16 @@ impl Snapshot {
                     .map_err(|e| e.to_string())?;
                 let hir = zyntax_compiler::bytecode::deserialize_module(hir_bytes)
                     .map_err(|e| e.to_string())?;
+                if trace {
+                    eprintln!(
+                        "[SNAPSHOT] {}: program {:.2} ms ({} bytes), hir {:.2} ms ({} bytes)",
+                        entry.name,
+                        (t1 - t0).as_secs_f64() * 1000.0,
+                        bytes.len(),
+                        t1.elapsed().as_secs_f64() * 1000.0,
+                        hir_bytes.len()
+                    );
+                }
                 Ok(import.with_hir(Arc::new(hir)))
             })
             .as_ref()
