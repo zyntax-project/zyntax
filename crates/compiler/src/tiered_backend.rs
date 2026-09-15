@@ -220,8 +220,10 @@ impl TieredConfig {
 /// Per-function state held alongside its beadie bound bead.
 struct FunctionEntry {
     bound: TieredBound,
-    /// Pre-cloned HIR function, captured by promotion closures.
-    function: Arc<HirFunction>,
+    /// The body a reload swapped in, when one has; otherwise the body is
+    /// the module's, read through [`Self::body`] when a promotion needs
+    /// it, so registering a module copies no function.
+    function: Option<Arc<HirFunction>>,
     /// Shared module context needed to recompile effectful functions. A
     /// per-function promotion cannot resolve effects, handlers, globals, or
     /// callees from the function body alone.
@@ -229,6 +231,34 @@ struct FunctionEntry {
     /// OSR registry id for this function. Embedded as a constant in
     /// tier-0 probe call sites so JIT'd code can find the bead.
     bead_id: u64,
+}
+
+impl FunctionEntry {
+    /// The function's current body.
+    fn body(&self, id: HirId) -> Arc<HirFunction> {
+        match &self.function {
+            Some(f) => Arc::clone(f),
+            None => Arc::new(
+                self.module
+                    .functions
+                    .get(&id)
+                    .cloned()
+                    .expect("a registered function is in its module"),
+            ),
+        }
+    }
+
+    /// The function's name, as its module records it.
+    fn name(&self, id: HirId) -> Option<String> {
+        match &self.function {
+            Some(f) => f.name.resolve_global(),
+            None => self
+                .module
+                .functions
+                .get(&id)
+                .and_then(|f| f.name.resolve_global()),
+        }
+    }
 }
 
 /// Everything needed to restore the generation a reload replaced.
@@ -583,7 +613,7 @@ impl TieredBackend {
                 *func_id,
                 FunctionEntry {
                     bound,
-                    function: Arc::new(function.clone()),
+                    function: None,
                     module: Arc::clone(&module_context),
                     bead_id,
                 },
@@ -1072,9 +1102,9 @@ impl TieredBackend {
                     .compiled()
                     .map(|p| p as usize)
                     .unwrap_or(0);
-                old_body = Some(Arc::clone(&fn_entry.function));
+                old_body = Some(fn_entry.body(old_id));
                 fn_entry.bound.bead().swap_compiled(entry_ptr as *mut ());
-                fn_entry.function = Arc::new(body.clone());
+                fn_entry.function = Some(Arc::new(body.clone()));
             }
 
             // A resume point is only sound where the old code's probe
@@ -1171,7 +1201,7 @@ impl TieredBackend {
                 new_id,
                 FunctionEntry {
                     bound,
-                    function: Arc::new(body.clone()),
+                    function: Some(Arc::new(body.clone())),
                     module: Arc::new(merged.clone()),
                     bead_id,
                 },
@@ -1290,7 +1320,7 @@ impl TieredBackend {
                         .bead()
                         .swap_compiled(swap.old_entry as *mut ());
                 }
-                fn_entry.function = Arc::clone(&swap.old_body);
+                fn_entry.function = Some(Arc::clone(&swap.old_body));
             }
             self.cranelift
                 .with_lock(|be| be.publish_call_target(swap.id, swap.old_entry));
@@ -1492,9 +1522,9 @@ impl TieredBackend {
             }
         }
         self.functions
-            .values()
-            .find(|e| e.function.name.resolve_global().as_deref() == Some(function))
-            .map(|e| e.module.as_ref())
+            .iter()
+            .find(|(id, e)| e.name(**id).as_deref() == Some(function))
+            .map(|(_, e)| e.module.as_ref())
     }
 
     /// A perform resolves its handler op statically when nothing is in
@@ -1802,7 +1832,7 @@ impl TieredBackend {
         };
 
         // Build a closure beadie can call from any tier broker thread.
-        let func_arc = Arc::clone(&entry.function);
+        let func_arc = entry.body(func_id);
         let module_arc = Arc::clone(&entry.module);
         let bead_id = entry.bead_id;
         let cranelift = Arc::clone(&self.cranelift);
@@ -2004,21 +2034,21 @@ impl TieredBackend {
 
         // bead id -> everything a compile needs, so the handler can run on
         // the thread that raised the request without reaching for `self`.
-        let by_bead: HashMap<u64, (HirId, TieredBound, Arc<HirFunction>, Arc<HirModule>)> = self
-            .functions
-            .iter()
-            .map(|(id, e)| {
-                (
-                    e.bead_id,
+        let by_bead: HashMap<u64, (HirId, TieredBound, Option<Arc<HirFunction>>, Arc<HirModule>)> =
+            self.functions
+                .iter()
+                .map(|(id, e)| {
                     (
-                        *id,
-                        e.bound.clone(),
-                        Arc::clone(&e.function),
-                        Arc::clone(&e.module),
-                    ),
-                )
-            })
-            .collect();
+                        e.bead_id,
+                        (
+                            *id,
+                            e.bound.clone(),
+                            e.function.clone(),
+                            Arc::clone(&e.module),
+                        ),
+                    )
+                })
+                .collect();
 
         // The bead of each function, for queueing a promoted function's
         // callees after it.
@@ -2031,13 +2061,20 @@ impl TieredBackend {
         let top_tier = tier_idx == OptimizationTier::Optimized.index();
 
         osr::set_promotion_requester(move |bead_id| {
-            let Some((func_id, bound, func_arc, module_arc)) = by_bead.get(&bead_id) else {
+            let Some((func_id, bound, swapped, module_arc)) = by_bead.get(&bead_id) else {
                 if osr::osr_trace_enabled() {
                     eprintln!("[osr] request for unknown bead={bead_id}");
                 }
                 return;
             };
-            let func_arc = Arc::clone(func_arc);
+            // The body: the one a reload swapped in, else the module's.
+            let func_arc = match swapped {
+                Some(f) => Arc::clone(f),
+                None => match module_arc.functions.get(func_id) {
+                    Some(f) => Arc::new(f.clone()),
+                    None => return,
+                },
+            };
             let module_arc = Arc::clone(module_arc);
             let cranelift = Arc::clone(&cranelift);
             #[cfg(feature = "llvm-backend")]
@@ -2095,7 +2132,7 @@ impl TieredBackend {
             .get(&func_id)
             .ok_or_else(|| CompilerError::Backend(format!("Function {:?} not found", func_id)))?;
 
-        let func_arc = Arc::clone(&entry.function);
+        let func_arc = entry.body(func_id);
         let module_arc = Arc::clone(&entry.module);
         let bead_id = entry.bead_id;
         let cranelift = Arc::clone(&self.cranelift);
