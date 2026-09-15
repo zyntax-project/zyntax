@@ -258,7 +258,7 @@ pub struct SsaBuilder {
     /// Generated closure functions (collected during translation)
     closure_functions: Vec<HirFunction>,
     /// Function symbol table for resolving function references
-    function_symbols: IndexMap<InternedString, HirId>,
+    function_symbols: Arc<IndexMap<InternedString, HirId>>,
     /// Generated string globals (collected during translation)
     string_globals: Vec<crate::hir::HirGlobal>,
     /// Track which variables are written in each block (for loop phi placement)
@@ -297,7 +297,7 @@ pub struct SsaBuilder {
     let_names: HashSet<InternedString>,
     /// External function link names (alias -> ZRTL symbol)
     /// e.g., "tensor_add" -> "$Tensor$add"
-    extern_link_names: IndexMap<InternedString, String>,
+    extern_link_names: Arc<IndexMap<InternedString, String>>,
     /// Captured yield values for active compute-expression lowering contexts.
     /// Empty outside compute expression translation.
     compute_yield_stack: Vec<Vec<HirId>>,
@@ -309,13 +309,13 @@ pub struct SsaBuilder {
     /// Default parameter info for functions with optional parameters.
     /// Maps function name -> `Vec<TypedParameter>` (for filling in defaults at call sites).
     function_default_params:
-        IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>,
+        Arc<IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>>,
     /// Return types for user-defined functions.
     /// Maps function name -> Type (for resolving call expression types when parser sets Unit).
-    function_return_types: IndexMap<InternedString, Type>,
+    function_return_types: Arc<IndexMap<InternedString, Type>>,
     /// Declared parameter types per function, extern included, so a
     /// call site can coerce each argument to what the callee declared.
-    function_param_types: IndexMap<InternedString, Vec<Type>>,
+    function_param_types: Arc<IndexMap<InternedString, Vec<Type>>>,
     /// Phase H, M1.3: effect-operation index for the enclosing
     /// function. If `self.function.signature.effects` is non-empty,
     /// the caller (LoweringContext) builds this map from the
@@ -400,12 +400,12 @@ pub struct SsaBuilder {
     ///
     /// Populated by lowering before any body is processed (fiber
     /// defs can be called from anywhere).
-    fiber_fn_names: HashSet<InternedString>,
+    fiber_fn_names: Arc<HashSet<InternedString>>,
     /// Names this program declares with a body of its own. The Call
     /// handler consults it before the intrinsic alias map: a name the
     /// program defines is that definition, not a built-in that happens
     /// to share the spelling.
-    body_fn_names: HashSet<InternedString>,
+    body_fn_names: Arc<HashSet<InternedString>>,
     /// Types whose fields `convert_type` is part-way through expanding.
     ///
     /// A type that reaches itself through one of its own fields would
@@ -687,7 +687,7 @@ impl SsaBuilder {
         function: HirFunction,
         type_registry: Arc<zyntax_typed_ast::TypeRegistry>,
         arena: Arc<std::sync::Mutex<zyntax_typed_ast::AstArena>>,
-        function_symbols: IndexMap<InternedString, HirId>,
+        function_symbols: Arc<IndexMap<InternedString, HirId>>,
     ) -> Self {
         Self::with_builtin_registry(
             function,
@@ -707,7 +707,7 @@ impl SsaBuilder {
         function: HirFunction,
         type_registry: Arc<zyntax_typed_ast::TypeRegistry>,
         arena: Arc<std::sync::Mutex<zyntax_typed_ast::AstArena>>,
-        function_symbols: IndexMap<InternedString, HirId>,
+        function_symbols: Arc<IndexMap<InternedString, HirId>>,
         builtin_registry: Arc<crate::builtin_class::BuiltinRegistry>,
     ) -> Self {
         Self {
@@ -736,20 +736,20 @@ impl SsaBuilder {
             module_globals: IndexMap::new(),
             global_refs: IndexMap::new(),
             let_names: HashSet::new(),
-            extern_link_names: IndexMap::new(),
+            extern_link_names: Arc::default(),
             compute_yield_stack: Vec::new(),
             simd_continue_block: None,
-            function_default_params: IndexMap::new(),
-            function_return_types: IndexMap::new(),
-            function_param_types: IndexMap::new(),
+            function_default_params: Arc::default(),
+            function_return_types: Arc::default(),
+            function_param_types: Arc::default(),
             effect_op_map: IndexMap::new(),
             resume_param_names: HashSet::new(),
             preset_param_typed_ast_types: IndexMap::new(),
             intrinsic_alias_map: default_intrinsic_alias_map(),
             array_pool_placement: None,
             builtin_registry,
-            fiber_fn_names: HashSet::new(),
-            body_fn_names: HashSet::new(),
+            fiber_fn_names: Arc::default(),
+            body_fn_names: Arc::default(),
             converting: Default::default(),
         }
     }
@@ -775,7 +775,7 @@ impl SsaBuilder {
             type_registry,
             arena,
             closure_functions: Vec::new(),
-            function_symbols: IndexMap::new(),
+            function_symbols: Arc::default(),
             string_globals: Vec::new(),
             variable_writes: IndexMap::new(),
             idf_placement_done: false,
@@ -789,20 +789,20 @@ impl SsaBuilder {
             module_globals: IndexMap::new(),
             global_refs: IndexMap::new(),
             let_names: HashSet::new(),
-            extern_link_names: IndexMap::new(),
+            extern_link_names: Arc::default(),
             compute_yield_stack: Vec::new(),
             simd_continue_block: None,
-            function_default_params: IndexMap::new(),
-            function_return_types: IndexMap::new(),
-            function_param_types: IndexMap::new(),
+            function_default_params: Arc::default(),
+            function_return_types: Arc::default(),
+            function_param_types: Arc::default(),
             effect_op_map: IndexMap::new(),
             resume_param_names: HashSet::new(),
             preset_param_typed_ast_types: IndexMap::new(),
             intrinsic_alias_map: default_intrinsic_alias_map(),
             array_pool_placement: None,
             builtin_registry: Arc::new(crate::builtin_class::BuiltinRegistry::with_defaults()),
-            fiber_fn_names: HashSet::new(),
-            body_fn_names: HashSet::new(),
+            fiber_fn_names: Arc::default(),
+            body_fn_names: Arc::default(),
             converting: Default::default(),
             function,
         };
@@ -847,7 +847,10 @@ impl SsaBuilder {
 
     /// Set external function link names for alias resolution
     /// Maps alias names (e.g., "tensor_add") to ZRTL symbols (e.g., "$Tensor$add")
-    pub fn with_extern_link_names(mut self, link_names: IndexMap<InternedString, String>) -> Self {
+    pub fn with_extern_link_names(
+        mut self,
+        link_names: Arc<IndexMap<InternedString, String>>,
+    ) -> Self {
         self.extern_link_names = link_names;
         self
     }
@@ -857,7 +860,7 @@ impl SsaBuilder {
     /// uses this to detect when a call should lower to `FiberNew`
     /// instead of a regular `Call(Function)` — calling a fiber def
     /// constructs a paused fiber rather than running the body.
-    pub fn with_fiber_fn_names(mut self, names: HashSet<InternedString>) -> Self {
+    pub fn with_fiber_fn_names(mut self, names: Arc<HashSet<InternedString>>) -> Self {
         self.fiber_fn_names = names;
         self
     }
@@ -874,7 +877,7 @@ impl SsaBuilder {
         self
     }
 
-    pub fn with_body_fn_names(mut self, names: HashSet<InternedString>) -> Self {
+    pub fn with_body_fn_names(mut self, names: Arc<HashSet<InternedString>>) -> Self {
         self.body_fn_names = names;
         self
     }
@@ -893,7 +896,7 @@ impl SsaBuilder {
     /// Set default parameter info for functions with optional parameters
     pub fn with_function_default_params(
         mut self,
-        params: IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>,
+        params: Arc<IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>>,
     ) -> Self {
         self.function_default_params = params;
         self
@@ -902,7 +905,7 @@ impl SsaBuilder {
     /// Set return types for user-defined functions (for call-site type resolution)
     pub fn with_function_return_types(
         mut self,
-        return_types: IndexMap<InternedString, Type>,
+        return_types: Arc<IndexMap<InternedString, Type>>,
     ) -> Self {
         self.function_return_types = return_types;
         self
@@ -912,7 +915,7 @@ impl SsaBuilder {
     /// argument at a call site to the type the callee declared.
     pub fn with_function_param_types(
         mut self,
-        param_types: IndexMap<InternedString, Vec<Type>>,
+        param_types: Arc<IndexMap<InternedString, Vec<Type>>>,
     ) -> Self {
         self.function_param_types = param_types;
         self

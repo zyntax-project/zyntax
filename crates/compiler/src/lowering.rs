@@ -313,8 +313,10 @@ pub struct LoweringContext {
 /// Symbol table for name resolution
 #[derive(Debug, Default)]
 pub struct SymbolTable {
-    /// Functions by name
-    pub functions: indexmap::IndexMap<InternedString, crate::hir::HirId>,
+    /// Functions by name. This and the tables below are shared with
+    /// every function's SSA builder, which reads them, so they travel
+    /// as `Arc`s and a writer takes `Arc::make_mut`.
+    pub functions: Arc<indexmap::IndexMap<InternedString, crate::hir::HirId>>,
     /// Globals by name
     pub globals: indexmap::IndexMap<InternedString, crate::hir::HirId>,
     /// Types by name
@@ -325,30 +327,30 @@ pub struct SymbolTable {
     pub handlers: indexmap::IndexMap<InternedString, crate::hir::HirId>,
     /// External function link names (alias -> ZRTL symbol)
     /// e.g., "tensor_add" -> "$Tensor$add"
-    pub extern_link_names: indexmap::IndexMap<InternedString, String>,
+    pub extern_link_names: Arc<indexmap::IndexMap<InternedString, String>>,
     /// Default parameter info for functions with optional parameters
     /// Maps function name -> `Vec<TypedParameter>` (for filling in defaults at call sites)
     pub function_default_params:
-        indexmap::IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>,
+        Arc<indexmap::IndexMap<InternedString, Vec<zyntax_typed_ast::typed_ast::TypedParameter>>>,
     /// Return types for declared functions
     /// Maps function name -> return Type (for resolving call expression types in SSA)
-    pub function_return_types: indexmap::IndexMap<InternedString, zyntax_typed_ast::Type>,
+    pub function_return_types: Arc<indexmap::IndexMap<InternedString, zyntax_typed_ast::Type>>,
     /// Declared parameter types for every function, extern included.
     /// Maps function name -> parameter `Type`s, so a call site can
     /// coerce each argument to what the callee declared (boxing a
     /// concrete value passed into an `Any` parameter, for instance).
-    pub function_param_types: indexmap::IndexMap<InternedString, Vec<zyntax_typed_ast::Type>>,
+    pub function_param_types: Arc<indexmap::IndexMap<InternedString, Vec<zyntax_typed_ast::Type>>>,
     /// Names of `fiber def` functions (`signature.is_fiber == true`).
     /// SSA's Call handler consults this to detect when a call
     /// should construct a paused fiber (`FiberNew`) rather than
     /// running the body synchronously.
-    pub fiber_fn_names: std::collections::HashSet<InternedString>,
+    pub fiber_fn_names: Arc<std::collections::HashSet<InternedString>>,
     /// Names this program declares with a body of its own
     /// (`is_external == false` and `body.is_some()`). A name here is a
     /// real definition, so nothing keyed on the bare name — an
     /// intrinsic alias, a later `extern def` — may take the call site
     /// away from it.
-    pub body_fn_names: std::collections::HashSet<InternedString>,
+    pub body_fn_names: Arc<std::collections::HashSet<InternedString>>,
 }
 
 /// Import metadata for debugging and error messages
@@ -500,9 +502,7 @@ impl LoweringContext {
         }
         for (alias, target) in &config.builtins {
             let alias_interned = InternedString::new_global(alias);
-            symbols
-                .extern_link_names
-                .insert(alias_interned, target.clone());
+            Arc::make_mut(&mut symbols.extern_link_names).insert(alias_interned, target.clone());
             log::trace!("[LOWERING] Added builtin: '{}' -> '{}'", alias, target);
         }
 
@@ -529,8 +529,7 @@ impl LoweringContext {
                         let mangled = format!("{}${}${}", base_type_name, trait_name, method_name);
                         // ZRTL exports inherent name: $TypeName$method (no trait name)
                         let symbol = format!("${}${}", base_type_name, method_name);
-                        symbols
-                            .extern_link_names
+                        Arc::make_mut(&mut symbols.extern_link_names)
                             .insert(InternedString::new_global(&mangled), symbol);
                     }
                 }
@@ -2107,12 +2106,12 @@ impl LoweringContext {
                     // call reaches a stub instead of the definition.
                     let keeps_body = !has_body && self.symbols.body_fn_names.contains(&func.name);
                     if has_body {
-                        self.symbols.body_fn_names.insert(func.name);
+                        Arc::make_mut(&mut self.symbols.body_fn_names).insert(func.name);
                     }
                     let displaced = if keeps_body {
                         self.symbols.functions.get(&func.name).copied()
                     } else {
-                        self.symbols.functions.insert(func.name, func_id)
+                        Arc::make_mut(&mut self.symbols.functions).insert(func.name, func_id)
                     };
                     if displaced.is_some() {
                         let where_from = |module: Option<zyntax_typed_ast::InternedString>| {
@@ -2130,14 +2129,14 @@ impl LoweringContext {
                     }
                     self.declared_in.insert(func.name, func.module);
                     if func.is_fiber {
-                        self.symbols.fiber_fn_names.insert(func.name);
+                        Arc::make_mut(&mut self.symbols.fiber_fn_names).insert(func.name);
                     }
                     // An extern's link name is known before any body is
                     // lowered, so a call site earlier in the program than
                     // the declaration still knows it is calling a symbol.
                     if func.is_external && !keeps_body {
                         if let Some(link_name) = func.link_name {
-                            self.symbols.extern_link_names.insert(
+                            Arc::make_mut(&mut self.symbols.extern_link_names).insert(
                                 func.name,
                                 link_name
                                     .resolve_global()
@@ -2165,18 +2164,16 @@ impl LoweringContext {
                     // the name does not get to describe the signature the
                     // call site coerces its arguments to.
                     if !keeps_body {
-                        self.symbols
-                            .function_return_types
+                        Arc::make_mut(&mut self.symbols.function_return_types)
                             .insert(func.name, publicly_visible_return);
-                        self.symbols.function_param_types.insert(
+                        Arc::make_mut(&mut self.symbols.function_param_types).insert(
                             func.name,
                             func.params.iter().map(|p| p.ty.clone()).collect(),
                         );
                         // Record default parameter info for functions with
                         // optional params
                         if func.params.iter().any(|p| p.default_value.is_some()) {
-                            self.symbols
-                                .function_default_params
+                            Arc::make_mut(&mut self.symbols.function_default_params)
                                 .insert(func.name, func.params.clone());
                         }
                     }
@@ -2188,7 +2185,7 @@ impl LoweringContext {
                         // Methods become mangled names: ClassName_methodName
                         let mangled_name = self.mangle_method_name(class_decl.name, method.name);
                         let method_id = self.function_id_for(mangled_name);
-                        self.symbols.functions.insert(mangled_name, method_id);
+                        Arc::make_mut(&mut self.symbols.functions).insert(mangled_name, method_id);
                     }
 
                     // Pre-register constructors
@@ -2204,7 +2201,7 @@ impl LoweringContext {
                             arena.intern_string(&format!("{}_constructor_{}", class_name_str, i));
                         drop(arena);
                         let ctor_id = self.function_id_for(ctor_name);
-                        self.symbols.functions.insert(ctor_name, ctor_id);
+                        Arc::make_mut(&mut self.symbols.functions).insert(ctor_name, ctor_id);
                     }
                 }
 
@@ -2295,14 +2292,14 @@ impl LoweringContext {
                         };
 
                         let method_id = self.function_id_for(mangled_name);
-                        self.symbols.functions.insert(mangled_name, method_id);
+                        Arc::make_mut(&mut self.symbols.functions).insert(mangled_name, method_id);
                         // The declared parameter types, so a call site can
                         // know what it is passing into before it lowers the
                         // argument. Only free functions were recorded, which
                         // left a list literal at a method call laid out by
                         // what it infers about itself rather than by the
                         // parameter it is going into.
-                        self.symbols.function_param_types.insert(
+                        Arc::make_mut(&mut self.symbols.function_param_types).insert(
                             mangled_name,
                             method.params.iter().map(|p| p.ty.clone()).collect(),
                         );
@@ -2569,7 +2566,7 @@ impl LoweringContext {
                             func_name,
                             e,
                         );
-                        self.symbols.functions.remove(&func.name);
+                        Arc::make_mut(&mut self.symbols.functions).remove(&func.name);
                     }
                 } else if let Err(e) = self.lower_function(func) {
                     // Two error classes from lower_function:
@@ -2607,7 +2604,7 @@ impl LoweringContext {
                         if let Some(id) = self.symbols.functions.get(&func.name).copied() {
                             self.dropped_for.insert(id, (func.name, e.to_string()));
                         }
-                        self.symbols.functions.remove(&func.name);
+                        Arc::make_mut(&mut self.symbols.functions).remove(&func.name);
                     } else {
                         return Err(e);
                     }
@@ -2848,7 +2845,7 @@ impl LoweringContext {
 
         let mut name_of: std::collections::HashMap<crate::hir::HirId, InternedString> =
             std::collections::HashMap::new();
-        for (name, id) in &self.symbols.functions {
+        for (name, id) in self.symbols.functions.iter() {
             name_of.insert(*id, *name);
         }
 
@@ -2910,7 +2907,7 @@ impl LoweringContext {
         // has to come from what the declarations registered.
         let mut name_of: std::collections::HashMap<crate::hir::HirId, InternedString> =
             std::collections::HashMap::new();
-        for (name, id) in &self.symbols.functions {
+        for (name, id) in self.symbols.functions.iter() {
             name_of.insert(*id, *name);
         }
         // A dropped function is no longer in the table, and without
@@ -3063,9 +3060,7 @@ impl LoweringContext {
                 hir_func.link_name = Some(link_name_str.clone());
 
                 // Register the alias -> link_name mapping for SSA call resolution
-                self.symbols
-                    .extern_link_names
-                    .insert(func.name, link_name_str);
+                Arc::make_mut(&mut self.symbols.extern_link_names).insert(func.name, link_name_str);
             }
 
             // Extern functions have no body - clear the default entry block
@@ -3160,23 +3155,24 @@ impl LoweringContext {
         }
 
         // Convert to SSA form, processing TypedStatements to emit HIR instructions
+        // The tables are shared, not copied: the builder reads them.
         let ssa_builder = SsaBuilder::with_builtin_registry(
             hir_func,
             self.type_registry.clone(),
             self.arena.clone(),
-            self.symbols.functions.clone(),
+            Arc::clone(&self.symbols.functions),
             self.builtin_registry.clone(),
         )
         .with_return_type(func.return_type.clone())
-        .with_extern_link_names(self.symbols.extern_link_names.clone())
-        .with_function_default_params(self.symbols.function_default_params.clone())
-        .with_function_return_types(self.symbols.function_return_types.clone())
-        .with_function_param_types(self.symbols.function_param_types.clone())
+        .with_extern_link_names(Arc::clone(&self.symbols.extern_link_names))
+        .with_function_default_params(Arc::clone(&self.symbols.function_default_params))
+        .with_function_return_types(Arc::clone(&self.symbols.function_return_types))
+        .with_function_param_types(Arc::clone(&self.symbols.function_param_types))
         .with_effect_op_map(effect_op_map)
         .with_resume_param_names(resume_param_names)
         .with_param_typed_ast_types(param_typed_ast_types)
-        .with_fiber_fn_names(self.symbols.fiber_fn_names.clone())
-        .with_body_fn_names(self.symbols.body_fn_names.clone())
+        .with_fiber_fn_names(Arc::clone(&self.symbols.fiber_fn_names))
+        .with_body_fn_names(Arc::clone(&self.symbols.body_fn_names))
         .with_module_globals(self.module_globals());
         let ssa = ssa_builder.build_from_typed_cfg(&typed_cfg)?;
 
@@ -5591,7 +5587,7 @@ impl LoweringContext {
                 // Fallback: create new (shouldn't happen if collect_declarations ran first)
                 log::trace!("[LOWERING] WARNING: Creating new function_id for {:?} (should have been pre-registered)", mangled_name);
                 let new_id = self.function_id_for(mangled_name);
-                self.symbols.functions.insert(mangled_name, new_id);
+                Arc::make_mut(&mut self.symbols.functions).insert(mangled_name, new_id);
                 new_id
             };
 
@@ -5642,7 +5638,7 @@ impl LoweringContext {
                             method_name_str,
                             e
                         );
-                        self.symbols.functions.remove(&mangled_name);
+                        Arc::make_mut(&mut self.symbols.functions).remove(&mangled_name);
                         continue;
                     }
                     continue; // Skip regular function lowering
@@ -5683,7 +5679,7 @@ impl LoweringContext {
             // bound at every call to a function that returns nothing.
             // Cranelift absorbs that and LLVM refuses it, so one such
             // method took the whole LLVM tier down.
-            self.symbols.function_return_types.insert(
+            Arc::make_mut(&mut self.symbols.function_return_types).insert(
                 mangled_name,
                 crate::return_infer::effective_return_type(&func),
             );
@@ -5699,7 +5695,7 @@ impl LoweringContext {
                     e
                 );
                 // Remove the function from the symbols table so SSA doesn't try to process it
-                self.symbols.functions.remove(&mangled_name);
+                Arc::make_mut(&mut self.symbols.functions).remove(&mangled_name);
                 continue;
             }
         }
