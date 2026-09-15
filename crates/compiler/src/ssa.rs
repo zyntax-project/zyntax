@@ -13166,8 +13166,14 @@ impl SsaBuilder {
     ) -> CompilerResult<HirId> {
         use zyntax_typed_ast::typed_ast::TypedExpression;
 
-        // First evaluate the right-hand side (the value to assign)
-        let value = self.translate_expression(block_id, value_expr)?;
+        // First evaluate the right-hand side (the value to assign). A
+        // value built across blocks, a conditional or a short-circuit,
+        // is defined where its blocks join, so the store and whatever
+        // follows go there.
+        let started = block_id;
+        let mut block_id = block_id;
+        let value = self.translate_operand(&mut block_id, value_expr)?;
+        self.settle(started, block_id);
 
         // The slot being written has a declared type just as a binding
         // does, so a dynamically typed value assigned into a concrete
