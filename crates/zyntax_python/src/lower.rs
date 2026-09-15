@@ -606,6 +606,11 @@ pub(crate) struct Lowerer<'m> {
     /// body's flag and leaves the body; the flag is acted on after
     /// `finally`.
     try_ctls: Vec<TryCtl>,
+    /// The innermost loop's `else` flag, if it has an `else` suite.
+    loop_elses: Vec<Option<InternedString>>,
+    /// The `else` flag of the `for` about to be lowered, which its body
+    /// takes as it enters the loop.
+    for_else: Option<InternedString>,
     /// The `except` clauses being lowered that release their exception
     /// on the way out, innermost last.
     handler_ctls: Vec<HandlerCtl>,
@@ -713,6 +718,8 @@ impl<'m> Lowerer<'m> {
             raise_callees: BTreeSet::new(),
             caught: None,
             try_ctls: Vec::new(),
+            loop_elses: Vec::new(),
+            for_else: None,
             handler_ctls: Vec::new(),
             redirected: false,
             is_generator,
@@ -786,6 +793,25 @@ impl<'m> Lowerer<'m> {
                 return;
             }
         }
+        if code == 2 {
+            if let Some(Some(flag)) = self.loop_elses.last() {
+                out.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(binary(
+                        BinaryOp::Assign,
+                        var(*flag, Ty::Bool, span),
+                        node(
+                            TypedExpression::Literal(TypedLiteral::Bool(false)),
+                            Ty::Bool,
+                            span,
+                        ),
+                        Ty::None,
+                        span,
+                    ))),
+                    Type::Unknown,
+                    span,
+                ));
+            }
+        }
         let st = if code == 2 {
             TypedStatement::Break(None)
         } else {
@@ -823,6 +849,16 @@ impl<'m> Lowerer<'m> {
     /// Lower a loop body that sits inside a `try`, counting the loop so
     /// a `break` inside it is the loop's own.
     fn in_loop<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let flag = self.for_else.take();
+        self.in_loop_else(flag, f)
+    }
+
+    fn in_loop_else<T>(
+        &mut self,
+        else_flag: Option<InternedString>,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.loop_elses.push(else_flag);
         if let Some(ctl) = self.try_ctls.last_mut() {
             ctl.loop_depth += 1;
         }
@@ -830,6 +866,7 @@ impl<'m> Lowerer<'m> {
         if let Some(ctl) = self.try_ctls.last_mut() {
             ctl.loop_depth -= 1;
         }
+        self.loop_elses.pop();
         r
     }
 
@@ -2018,15 +2055,33 @@ impl<'m> Lowerer<'m> {
                 self.if_chain(&i.test, &i.body, &i.elif_else_clauses, span, out)?;
             }
             py::Stmt::While(w) => {
-                if !w.orelse.is_empty() {
-                    return unsupported("while/else", w);
-                }
                 let cond = self.expr(&w.test)?;
                 let condition = self.truthy(cond);
                 // A test that hoists work re-does it every pass: the loop
                 // becomes `while true { work; if not test: break; body }`.
                 let pre = std::mem::take(&mut self.hoisted);
-                let body = self.in_loop(|this| this.block(&w.body, span))?;
+                let else_flag = if w.orelse.is_empty() {
+                    None
+                } else {
+                    let flag = self.temp();
+                    out.push(TypedNode::new(
+                        TypedStatement::Let(TypedLet {
+                            name: flag,
+                            ty: ir(Ty::Bool),
+                            mutability: Mutability::Mutable,
+                            initializer: Some(Box::new(node(
+                                TypedExpression::Literal(TypedLiteral::Bool(true)),
+                                Ty::Bool,
+                                span,
+                            ))),
+                            span,
+                        }),
+                        Type::Unknown,
+                        span,
+                    ));
+                    Some(flag)
+                };
+                let body = self.in_loop_else(else_flag, |this| this.block(&w.body, span))?;
                 if pre.is_empty() {
                     push(
                         out,
@@ -2076,6 +2131,10 @@ impl<'m> Lowerer<'m> {
                             span,
                         }),
                     );
+                }
+                if let Some(flag) = else_flag {
+                    let suite = self.loop_else(flag, &w.orelse, span)?;
+                    out.push(suite);
                 }
             }
             py::Stmt::For(f) => {
@@ -2620,7 +2679,63 @@ impl<'m> Lowerer<'m> {
     }
 
     fn for_loop(&mut self, f: &py::StmtFor, span: Span) -> Result<TypedStatement> {
-        self.for_with_body(f, Vec::new(), span)
+        if f.orelse.is_empty() {
+            return self.for_with_body(f, Vec::new(), span);
+        }
+        // `for/else` as `while/else`: a flag every `break` clears, and
+        // the `else` suite after the loop when it still stands and no
+        // exception is pending.
+        let flag = self.temp();
+        let mut statements = vec![TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: flag,
+                ty: ir(Ty::Bool),
+                mutability: Mutability::Mutable,
+                initializer: Some(Box::new(node(
+                    TypedExpression::Literal(TypedLiteral::Bool(true)),
+                    Ty::Bool,
+                    span,
+                ))),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        )];
+        self.for_else = Some(flag);
+        let loop_stmt = self.for_with_body(f, Vec::new(), span)?;
+        statements.push(TypedNode::new(loop_stmt, Type::Unknown, span));
+        statements.push(self.loop_else(flag, &f.orelse, span)?);
+        Ok(TypedStatement::Block(TypedBlock { statements, span }))
+    }
+
+    /// The `else` suite of a loop: run when the loop's flag still stands
+    /// (no `break` cleared it) and no exception is leaving.
+    fn loop_else(&mut self, flag: InternedString, orelse: &[py::Stmt], span: Span) -> Result<Stmt> {
+        let not_pending = node(
+            TypedExpression::Unary(TypedUnary {
+                op: UnaryOp::Not,
+                operand: Box::new(self.pending(span)),
+            }),
+            Ty::Bool,
+            span,
+        );
+        let condition = binary(
+            BinaryOp::And,
+            var(flag, Ty::Bool, span),
+            not_pending,
+            Ty::Bool,
+            span,
+        );
+        Ok(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(condition),
+                then_block: self.block(orelse, span)?,
+                else_block: None,
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ))
     }
 
     /// `for x in range(...)` as a counted loop; anything else iterates
@@ -2631,8 +2746,8 @@ impl<'m> Lowerer<'m> {
         extra: Vec<Stmt>,
         span: Span,
     ) -> Result<TypedStatement> {
-        if f.is_async || !f.orelse.is_empty() {
-            return unsupported("async for / for-else", f);
+        if f.is_async {
+            return unsupported("async for", f);
         }
         let range = match &*f.iter {
             py::Expr::Call(c)
