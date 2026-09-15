@@ -1,0 +1,10 @@
+{'alpha': 3, 'beta': 2, 'gamma': 1}
+3 2 None -1
+True False
+40 17 17 17 True False
+170
+1700 1700
+False 39
+KeyError 'key17'
+string one one True True
+{1: 'one', '1': 'changed', 2.5: 'float'}

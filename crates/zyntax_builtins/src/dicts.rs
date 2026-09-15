@@ -322,6 +322,152 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
     ));
     let insert = |k: Expr, v: Expr| expr(call("zb_dict_insert", vec![d.e(), k, v], unit()));
     out_decls.push(define("zb_dict_len", &[&d], i64(), vec![ret(count(d.e()))]));
+
+    // Lookups by a string that is not boxed, for a key the frontend
+    // knows to be one: hashed and compared as a string, so a key
+    // already present costs no box, and one stored is boxed then.
+    let s = borrowed("text", string());
+    let stored_text = |x: Expr| call("zb_box_get_str", vec![x], string());
+    // The text is read only once the box is known to hold one.
+    let when_stored_is = |stored: &Local, found: Expr| {
+        when(
+            eq(
+                call("zb_any_category", vec![stored.e()], i64()),
+                int(crate::dynamic::STR),
+            ),
+            vec![when(
+                call("zb_str_eq", vec![stored_text(stored.e()), s.e()], boolean()),
+                vec![ret(found)],
+            )],
+        )
+    };
+    out_decls.push(define(
+        "zb_dict_str_hash",
+        &[&s],
+        i64(),
+        vec![
+            h.decl(call("zb_str_hash", vec![s.e()], i64())),
+            when(eq(h.e(), int(0)), vec![h.set(int(1))]),
+            h.set(bitxor(h.e(), shr(h.e(), int(32)))),
+            h.set(mul(h.e(), int(-7_046_029_254_386_353_131))),
+            h.set(bitxor(h.e(), shr(h.e(), int(29)))),
+            ret(h.e()),
+        ],
+    ));
+    out_decls.push(define(
+        "zb_dict_find_hashed_str",
+        &[&d, &s, &h],
+        i64(),
+        vec![
+            index.decl(index_of(d.e())),
+            mask.decl(sub(len(index.e()), int(1))),
+            slot.decl(bitand(h.e(), mask.e())),
+            i.decl(int(0)),
+            while_(
+                le(i.e(), mask.e()),
+                vec![
+                    entry.decl(slot_at(index.e(), slot.e())),
+                    when(lt(entry.e(), int(0)), vec![ret(int(-1))]),
+                    stored.decl(key_at(d.e(), entry.e())),
+                    when_stored_is(&stored, add(mul(entry.e(), int(2)), int(1))),
+                    slot.set(next_slot(slot.e(), mask.e())),
+                    i.add_assign(int(1)),
+                ],
+            ),
+            ret(int(-1)),
+        ],
+    ));
+    out_decls.push(define(
+        "zb_dict_find_str",
+        &[&d, &s],
+        i64(),
+        vec![
+            when(
+                unindexed(d.e()),
+                vec![
+                    n.decl(len(d.e())),
+                    i.decl(int(1)),
+                    while_(
+                        lt(i.e(), n.e()),
+                        vec![
+                            stored.decl(at(d.e(), i.e())),
+                            when_stored_is(&stored, i.e()),
+                            i.add_assign(int(2)),
+                        ],
+                    ),
+                    ret(int(-1)),
+                ],
+            ),
+            ret(call(
+                "zb_dict_find_hashed_str",
+                vec![d.e(), s.e(), call("zb_dict_str_hash", vec![s.e()], i64())],
+                i64(),
+            )),
+        ],
+    ));
+    let find_str = || call("zb_dict_find_str", vec![d.e(), s.e()], i64());
+    let boxed_key = || call("zb_str_to_dynamic", vec![s.e()], any());
+    out_decls.push(define(
+        "zb_dict_contains_str",
+        &[&d, &s],
+        boolean(),
+        vec![ret(ge(find_str(), int(0)))],
+    ));
+    out_decls.push(define(
+        "zb_dict_get_str",
+        &[&d, &s],
+        any(),
+        vec![
+            i.decl(find_str()),
+            when(lt(i.e(), int(0)), vec![fatal("KeyError", s.e())]),
+            ret(at(d.e(), add(i.e(), int(1)))),
+        ],
+    ));
+    out_decls.push(define(
+        "zb_dict_get_default_str",
+        &[&d, &s, &default],
+        any(),
+        vec![
+            i.decl(find_str()),
+            when(lt(i.e(), int(0)), vec![ret(default.e())]),
+            ret(at(d.e(), add(i.e(), int(1)))),
+        ],
+    ));
+    out_decls.push(define(
+        "zb_dict_set_str",
+        &[&d, &s, &v],
+        unit(),
+        vec![
+            when(
+                unindexed(d.e()),
+                vec![
+                    i.decl(find_str()),
+                    if_(
+                        lt(i.e(), int(0)),
+                        vec![insert(boxed_key(), v.e())],
+                        vec![set_idx(d.e(), add(i.e(), int(1)), v.e())],
+                    ),
+                    ret_void(),
+                ],
+            ),
+            h.decl(call("zb_dict_str_hash", vec![s.e()], i64())),
+            i.decl(call(
+                "zb_dict_find_hashed_str",
+                vec![d.e(), s.e(), h.e()],
+                i64(),
+            )),
+            if_(
+                lt(i.e(), int(0)),
+                vec![expr(call(
+                    "zb_dict_insert_hashed",
+                    vec![d.e(), boxed_key(), v.e(), h.e()],
+                    unit(),
+                ))],
+                vec![set_idx(d.e(), add(i.e(), int(1)), v.e())],
+            ),
+            ret_void(),
+        ],
+    ));
     out_decls.push(define(
         "zb_dict_contains",
         &[&d, &key],

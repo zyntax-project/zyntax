@@ -2467,9 +2467,14 @@ impl<'m> Lowerer<'m> {
                         call(&list_fn("set", e), vec![seq.node, i, v], Ty::None, span)
                     }
                     Ty::Dict => {
-                        let k = self.expr_as(&sub.slice, Ty::Object)?;
+                        let (k, by) = self.dict_key(&sub.slice)?;
                         let v = self.coerce(value, Ty::Object);
-                        call("zb_dict_set", vec![seq.node, k, v], Ty::None, span)
+                        call(
+                            &format!("zb_dict_set{by}"),
+                            vec![seq.node, k, v],
+                            Ty::None,
+                            span,
+                        )
                     }
                     Ty::Object => {
                         let i = self.expr_as(&sub.slice, Ty::Object)?;
@@ -3068,6 +3073,17 @@ impl<'m> Lowerer<'m> {
 
     /// A value as a `List<Any>` to iterate: a typed list boxed, a string
     /// its characters, a dynamic value whatever it iterates as.
+    /// A dict key as the lookup takes it: a string as itself, for the
+    /// lookups that hash and compare a string without boxing it, and
+    /// anything else as a dynamic value. The suffix names the lookup.
+    fn dict_key(&mut self, e: &py::Expr) -> Result<(Node, &'static str)> {
+        if self.ty_of(e) == Ty::Str {
+            Ok((self.expr_as(e, Ty::Str)?, "_str"))
+        } else {
+            Ok((self.expr_as(e, Ty::Object)?, ""))
+        }
+    }
+
     fn iterable(&mut self, v: Val, span: Span) -> Node {
         match v.ty {
             Ty::Str => {
@@ -4025,8 +4041,18 @@ impl<'m> Lowerer<'m> {
                         span,
                     )
                 } else if right.ty == Ty::Dict {
-                    let item = self.coerce(left, Ty::Object);
-                    call("zb_dict_contains", vec![right.node, item], Ty::Bool, span)
+                    let by = if left.ty == Ty::Str { "_str" } else { "" };
+                    let item = if left.ty == Ty::Str {
+                        left.node
+                    } else {
+                        self.coerce(left, Ty::Object)
+                    };
+                    call(
+                        &format!("zb_dict_contains{by}"),
+                        vec![right.node, item],
+                        Ty::Bool,
+                        span,
+                    )
                 } else {
                     let item = self.coerce(left, Ty::Object);
                     let container = self.coerce(right, Ty::Object);
@@ -4460,9 +4486,14 @@ impl<'m> Lowerer<'m> {
                 Ok(self.index_value(seq, index, ty, span))
             }
             Ty::Dict => {
-                let key = self.expr_as(&sub.slice, Ty::Object)?;
+                let (key, by) = self.dict_key(&sub.slice)?;
                 Ok(Val {
-                    node: call("zb_dict_get", vec![seq.node, key], Ty::Object, span),
+                    node: call(
+                        &format!("zb_dict_get{by}"),
+                        vec![seq.node, key],
+                        Ty::Object,
+                        span,
+                    ),
                     ty: Ty::Object,
                 })
             }
@@ -4699,7 +4730,7 @@ impl<'m> Lowerer<'m> {
                 let d = receiver.node;
                 let node = match (name, args.len()) {
                     ("get", 1) => {
-                        let k = self.expr_as(&args[0], Ty::Object)?;
+                        let (k, by) = self.dict_key(&args[0])?;
                         let none = self.coerce(
                             Val {
                                 node: node(
@@ -4711,12 +4742,22 @@ impl<'m> Lowerer<'m> {
                             },
                             Ty::Object,
                         );
-                        call("zb_dict_get_default", vec![d, k, none], Ty::Object, span)
+                        call(
+                            &format!("zb_dict_get_default{by}"),
+                            vec![d, k, none],
+                            Ty::Object,
+                            span,
+                        )
                     }
                     ("get", 2) => {
-                        let k = self.expr_as(&args[0], Ty::Object)?;
+                        let (k, by) = self.dict_key(&args[0])?;
                         let default = self.expr_as(&args[1], Ty::Object)?;
-                        call("zb_dict_get_default", vec![d, k, default], Ty::Object, span)
+                        call(
+                            &format!("zb_dict_get_default{by}"),
+                            vec![d, k, default],
+                            Ty::Object,
+                            span,
+                        )
                     }
                     ("setdefault", 2) => {
                         let k = self.expr_as(&args[0], Ty::Object)?;
