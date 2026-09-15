@@ -1330,42 +1330,49 @@ impl HirInstruction {
     /// Get all operand HirIds used by this instruction
     pub fn operands(&self) -> Vec<HirId> {
         let mut ops = Vec::new();
+        self.for_each_operand(|id| ops.push(id));
+        ops
+    }
+
+    /// Call `f` on every operand this instruction uses, in operand order,
+    /// without building a list.
+    pub fn for_each_operand(&self, mut f: impl FnMut(HirId)) {
         match self {
             HirInstruction::Binary { left, right, .. } => {
-                ops.push(*left);
-                ops.push(*right);
+                f(*left);
+                f(*right);
             }
             HirInstruction::Unary { operand, .. } => {
-                ops.push(*operand);
+                f(*operand);
             }
             HirInstruction::Alloca { count, .. } => {
                 if let Some(c) = count {
-                    ops.push(*c);
+                    f(*c);
                 }
             }
             HirInstruction::Load { ptr, .. } => {
-                ops.push(*ptr);
+                f(*ptr);
             }
             HirInstruction::Store { value, ptr, .. } => {
-                ops.push(*value);
-                ops.push(*ptr);
+                f(*value);
+                f(*ptr);
             }
             HirInstruction::GetElementPtr { ptr, indices, .. } => {
-                ops.push(*ptr);
-                ops.extend(indices.iter().copied());
+                f(*ptr);
+                indices.iter().copied().for_each(&mut f);
             }
             HirInstruction::Call { callee, args, .. } => {
                 if let HirCallable::Indirect(target) = callee {
-                    ops.push(*target);
+                    f(*target);
                 }
-                ops.extend(args.iter().copied());
+                args.iter().copied().for_each(&mut f);
             }
             HirInstruction::IndirectCall { func_ptr, args, .. } => {
-                ops.push(*func_ptr);
-                ops.extend(args.iter().copied());
+                f(*func_ptr);
+                args.iter().copied().for_each(&mut f);
             }
             HirInstruction::Cast { operand, .. } => {
-                ops.push(*operand);
+                f(*operand);
             }
             HirInstruction::Select {
                 condition,
@@ -1373,78 +1380,78 @@ impl HirInstruction {
                 false_val,
                 ..
             } => {
-                ops.push(*condition);
-                ops.push(*true_val);
-                ops.push(*false_val);
+                f(*condition);
+                f(*true_val);
+                f(*false_val);
             }
             HirInstruction::ExtractValue { aggregate, .. } => {
-                ops.push(*aggregate);
+                f(*aggregate);
             }
             HirInstruction::InsertValue {
                 aggregate, value, ..
             } => {
-                ops.push(*aggregate);
-                ops.push(*value);
+                f(*aggregate);
+                f(*value);
             }
             HirInstruction::Atomic { ptr, value, .. } => {
-                ops.push(*ptr);
+                f(*ptr);
                 if let Some(v) = value {
-                    ops.push(*v);
+                    f(*v);
                 }
             }
             HirInstruction::Fence { .. } => {}
             HirInstruction::CreateUnion { value, .. } => {
-                ops.push(*value);
+                f(*value);
             }
             HirInstruction::GetUnionDiscriminant { union_val, .. } => {
-                ops.push(*union_val);
+                f(*union_val);
             }
             HirInstruction::ExtractUnionValue { union_val, .. } => {
-                ops.push(*union_val);
+                f(*union_val);
             }
             HirInstruction::CreateTraitObject {
                 data_ptr,
                 vtable_id,
                 ..
             } => {
-                ops.push(*data_ptr);
-                ops.push(*vtable_id);
+                f(*data_ptr);
+                f(*vtable_id);
             }
             HirInstruction::UpcastTraitObject {
                 sub_trait_object,
                 super_vtable_id,
                 ..
             } => {
-                ops.push(*sub_trait_object);
-                ops.push(*super_vtable_id);
+                f(*sub_trait_object);
+                f(*super_vtable_id);
             }
             HirInstruction::TraitMethodCall {
                 trait_object, args, ..
             } => {
-                ops.push(*trait_object);
-                ops.extend(args.iter().copied());
+                f(*trait_object);
+                args.iter().copied().for_each(&mut f);
             }
             HirInstruction::CreateClosure {
                 function, captures, ..
             } => {
-                ops.push(*function);
-                ops.extend(captures.iter().copied());
+                f(*function);
+                captures.iter().copied().for_each(&mut f);
             }
             HirInstruction::CallClosure { closure, args, .. } => {
-                ops.push(*closure);
-                ops.extend(args.iter().copied());
+                f(*closure);
+                args.iter().copied().for_each(&mut f);
             }
             HirInstruction::CreateRef { value, .. } => {
-                ops.push(*value);
+                f(*value);
             }
             HirInstruction::Deref { reference, .. } => {
-                ops.push(*reference);
+                f(*reference);
             }
             HirInstruction::Move { source, .. } => {
-                ops.push(*source);
+                f(*source);
             }
             HirInstruction::Copy { source, .. } => {
-                ops.push(*source);
+                f(*source);
             }
             HirInstruction::BeginLifetime { .. }
             | HirInstruction::EndLifetime { .. }
@@ -1453,8 +1460,8 @@ impl HirInstruction {
             HirInstruction::PerformEffect {
                 effect_id, args, ..
             } => {
-                ops.push(*effect_id);
-                ops.extend(args.iter().copied());
+                f(*effect_id);
+                args.iter().copied().for_each(&mut f);
             }
             HirInstruction::HandleEffect {
                 handler_id,
@@ -1463,96 +1470,95 @@ impl HirInstruction {
                 continuation_block,
                 ..
             } => {
-                ops.push(*handler_id);
-                ops.extend(handler_state.iter().copied());
-                ops.push(*body_block);
-                ops.push(*continuation_block);
+                f(*handler_id);
+                handler_state.iter().copied().for_each(&mut f);
+                f(*body_block);
+                f(*continuation_block);
             }
             HirInstruction::Resume {
                 value,
                 continuation,
             } => {
-                ops.push(*value);
-                ops.push(*continuation);
+                f(*value);
+                f(*continuation);
             }
             HirInstruction::AbortEffect {
                 value,
                 handler_scope,
             } => {
-                ops.push(*value);
-                ops.push(*handler_scope);
+                f(*value);
+                f(*handler_scope);
             }
             HirInstruction::CaptureContinuation { .. } => {}
             // SIMD instructions
             HirInstruction::VectorSplat { scalar, .. } => {
-                ops.push(*scalar);
+                f(*scalar);
             }
             HirInstruction::VectorExtractLane { vector, .. } => {
-                ops.push(*vector);
+                f(*vector);
             }
             HirInstruction::VectorInsertLane { vector, scalar, .. } => {
-                ops.push(*vector);
-                ops.push(*scalar);
+                f(*vector);
+                f(*scalar);
             }
             HirInstruction::VectorHorizontalReduce { vector, .. } => {
-                ops.push(*vector);
+                f(*vector);
             }
             HirInstruction::VectorLoad { ptr, .. } => {
-                ops.push(*ptr);
+                f(*ptr);
             }
             HirInstruction::VectorStore { value, ptr, .. } => {
-                ops.push(*value);
-                ops.push(*ptr);
+                f(*value);
+                f(*ptr);
             }
             HirInstruction::VectorUnaryOp { operand, .. } => {
-                ops.push(*operand);
+                f(*operand);
             }
             HirInstruction::VectorMinMax { left, right, .. } => {
-                ops.push(*left);
-                ops.push(*right);
+                f(*left);
+                f(*right);
             }
             HirInstruction::VectorDot { acc, a, b, .. } => {
-                ops.push(*acc);
-                ops.push(*a);
-                ops.push(*b);
+                f(*acc);
+                f(*a);
+                f(*b);
             }
             HirInstruction::AsyncSaveSlot { frame, value, .. } => {
-                ops.push(*frame);
-                ops.push(*value);
+                f(*frame);
+                f(*value);
             }
             HirInstruction::AsyncLoadSlot { frame, .. } => {
-                ops.push(*frame);
+                f(*frame);
             }
             HirInstruction::FiberNew {
                 closure,
                 stack_size,
                 ..
             } => {
-                ops.push(*closure);
-                ops.push(*stack_size);
+                f(*closure);
+                f(*stack_size);
             }
             HirInstruction::FiberResume { fiber, .. } => {
-                ops.push(*fiber);
+                f(*fiber);
             }
             HirInstruction::FiberResumeWith { fiber, value, .. } => {
-                ops.push(*fiber);
-                ops.push(*value);
+                f(*fiber);
+                f(*value);
             }
             HirInstruction::FiberYield { value } => {
-                ops.push(*value);
+                f(*value);
             }
             HirInstruction::FiberTransfer { target, value, .. } => {
-                ops.push(*target);
-                ops.push(*value);
+                f(*target);
+                f(*value);
             }
             HirInstruction::FiberCancel { fiber } => {
-                ops.push(*fiber);
+                f(*fiber);
             }
             HirInstruction::FiberDrop { fiber } => {
-                ops.push(*fiber);
+                f(*fiber);
             }
         }
-        ops
     }
 }
 

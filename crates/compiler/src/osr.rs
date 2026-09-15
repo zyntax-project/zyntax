@@ -418,6 +418,16 @@ pub enum OsrReject {
 ///
 /// The combined live-in count must be ≤ [`OSR_MAX_LIVE_INS`].
 pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, OsrReject> {
+    osr_layout_with(function, header, &Dominators::compute(function))
+}
+
+/// [`osr_layout`] given the function's dominator tree, so a function
+/// with many headers computes it once.
+pub fn osr_layout_with(
+    function: &HirFunction,
+    header: HirId,
+    dominators: &Dominators,
+) -> Result<OsrLayout, OsrReject> {
     let block = function
         .blocks
         .get(&header)
@@ -441,13 +451,34 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
     // Non-phi live-ins. Walk reachable blocks, collect uses minus
     // locally-defined-or-rematerializable values.
     let reachable = reachable_from(function, header);
+    let in_region: IdSet = reachable.iter().copied().collect();
+    // A block other than the header that is also entered from outside the
+    // region would redefine, on entry, values the frame is supposed to
+    // supply: its phi takes an incoming edge the helper does not have.
+    // The enclosing loop's header is the usual case. Checked before the
+    // walk over the region's uses, which it makes unnecessary.
+    for &block_id in &reachable {
+        if block_id == header {
+            continue;
+        }
+        let Some(block) = function.blocks.get(&block_id) else {
+            continue;
+        };
+        if block
+            .predecessors
+            .iter()
+            .any(|p| !in_region.contains(p) && *p != header)
+        {
+            return Err(OsrReject::RegionHasExternalEntry);
+        }
+    }
     // Only values defined in blocks the header dominates are guaranteed to
     // have been computed by the time the resumed code reads them. Anything
-    // else — an enclosing loop's counter, say — must arrive in the frame.
-    let dominated: Vec<HirId> = blocks_dominated_by(function, header).into_iter().collect();
+    // else (an enclosing loop's counter, say) must arrive in the frame.
+    let dominated: Vec<HirId> = dominators.dominated_by(header).into_iter().collect();
     let local_defs = locally_defined_in(function, &dominated);
 
-    let mut seen_extra: std::collections::HashSet<HirId> = live_ins.iter().copied().collect();
+    let mut seen_extra: IdSet = live_ins.iter().copied().collect();
 
     for &block_id in &reachable {
         let block = match function.blocks.get(&block_id) {
@@ -455,13 +486,12 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
             None => continue,
         };
         for inst in &block.instructions {
-            let uses = match instruction_uses(inst) {
-                Ok(u) => u,
-                // Instruction outside the supported subset — reject
-                // the layout. The helper compile would mishandle it.
-                Err(()) => return Err(OsrReject::UnsupportedInstruction),
-            };
-            for used in uses {
+            // Instruction outside the supported subset: reject the
+            // layout. The helper compile would mishandle it.
+            if !layout_supports(inst) {
+                return Err(OsrReject::UnsupportedInstruction);
+            }
+            inst.for_each_operand(|used| {
                 consider_live_in(
                     function,
                     used,
@@ -470,7 +500,7 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
                     &mut live_ins,
                     &mut live_in_types,
                 );
-            }
+            });
         }
         for used in terminator_uses(&block.terminator) {
             consider_live_in(
@@ -513,26 +543,6 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
         return Err(OsrReject::LiveInDoesntFit);
     }
 
-    // A block other than the header that is also entered from outside the
-    // region would redefine, on entry, values the frame is supposed to
-    // supply — its phi takes an incoming edge the helper does not have.
-    // The enclosing loop's header is the usual case.
-    for &block_id in &reachable {
-        if block_id == header {
-            continue;
-        }
-        let Some(block) = function.blocks.get(&block_id) else {
-            continue;
-        };
-        if block
-            .predecessors
-            .iter()
-            .any(|p| !reachable.contains(p) && *p != header)
-        {
-            return Err(OsrReject::RegionHasExternalEntry);
-        }
-    }
-
     let loop_ordinal = loop_ordinal_of(function, header).unwrap_or(u64::MAX);
     let frame = OsrFrame::for_types(&live_in_types);
 
@@ -550,11 +560,15 @@ pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, Os
 /// Add `used` to the live-ins list iff it's used in the loop body but
 /// not locally defined and not a constant/undef/global (those are
 /// rematerialized in the helper's prologue, not passed as args).
+/// A set of ids hashed by the id itself: these sets are built and
+/// probed once per instruction of a function, per header.
+type IdSet = std::collections::HashSet<HirId, std::hash::BuildHasherDefault<fnv::FnvHasher>>;
+
 fn consider_live_in(
     function: &HirFunction,
     used: HirId,
-    local_defs: &std::collections::HashSet<HirId>,
-    seen: &mut std::collections::HashSet<HirId>,
+    local_defs: &IdSet,
+    seen: &mut IdSet,
     live_ins: &mut Vec<HirId>,
     live_in_types: &mut Vec<HirType>,
 ) {
@@ -600,11 +614,8 @@ fn reachable_from(function: &HirFunction, start: HirId) -> Vec<HirId> {
     order
 }
 
-fn locally_defined_in(
-    function: &HirFunction,
-    blocks: &[HirId],
-) -> std::collections::HashSet<HirId> {
-    let mut defs = std::collections::HashSet::new();
+fn locally_defined_in(function: &HirFunction, blocks: &[HirId]) -> IdSet {
+    let mut defs = IdSet::default();
     for &id in blocks {
         let block = match function.blocks.get(&id) {
             Some(b) => b,
@@ -650,27 +661,27 @@ fn instruction_result(inst: &crate::hir::HirInstruction) -> Option<HirId> {
 /// `Ok(uses)` — confidently enumerated uses.
 /// `Err(())` — the instruction is outside our supported subset; the
 /// caller should reject the layout.
-fn instruction_uses(inst: &crate::hir::HirInstruction) -> Result<Vec<HirId>, ()> {
+/// The kinds a helper body is known to lower; their operands are what
+/// the instruction itself reports, so a use is never missed by naming
+/// fields here. Anything else (effects, atomics, trait method calls,
+/// fences, ...) rejects the layout rather than risk a use going unseen.
+fn layout_supports(inst: &crate::hir::HirInstruction) -> bool {
     use crate::hir::HirInstruction as I;
-    // The kinds a helper body is known to lower; their operands are what
-    // the instruction itself reports, so a use is never missed by naming
-    // fields here. Anything else (effects, atomics, trait method calls,
-    // fences, ...) rejects the layout rather than risk a use going unseen.
-    match inst {
+    matches!(
+        inst,
         I::Binary { .. }
-        | I::Unary { .. }
-        | I::Alloca { .. }
-        | I::Load { .. }
-        | I::Store { .. }
-        | I::GetElementPtr { .. }
-        | I::Cast { .. }
-        | I::Select { .. }
-        | I::ExtractValue { .. }
-        | I::InsertValue { .. }
-        | I::Call { .. }
-        | I::CallClosure { .. } => Ok(inst.operands()),
-        _ => Err(()),
-    }
+            | I::Unary { .. }
+            | I::Alloca { .. }
+            | I::Load { .. }
+            | I::Store { .. }
+            | I::GetElementPtr { .. }
+            | I::Cast { .. }
+            | I::Select { .. }
+            | I::ExtractValue { .. }
+            | I::InsertValue { .. }
+            | I::Call { .. }
+            | I::CallClosure { .. }
+    )
 }
 
 fn terminator_uses(term: &HirTerminator) -> Vec<HirId> {

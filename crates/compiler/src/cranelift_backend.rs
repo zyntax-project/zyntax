@@ -495,7 +495,16 @@ impl CraneliftBackend {
                 &std::env::var("ZYNTAX_OPT_LEVEL").unwrap_or_else(|_| "speed".into()),
             )
             .unwrap();
-        flag_builder.set("enable_verifier", "true").unwrap();
+        flag_builder
+            .set(
+                "enable_verifier",
+                if std::env::var_os("ZYNTAX_CRANELIFT_VERIFIER").is_some_and(|v| v == "0") {
+                    "false"
+                } else {
+                    "true"
+                },
+            )
+            .unwrap();
 
         let isa_builder = cranelift_native::builder().unwrap();
         let isa = isa_builder
@@ -1919,6 +1928,7 @@ impl CraneliftBackend {
             // Additionally suppress when `emit_osr_probes` is false — the
             // embedder has declared no tier ≥ 1 backend will ever install
             // OSR helpers, so the probe stream is pure overhead.
+            let phase_started = std::time::Instant::now();
             let osr_loop_headers: std::collections::HashSet<HirId> =
                 if self.compile_tier == 0 && self.emit_osr_probes {
                     crate::osr::find_loop_headers(function)
@@ -1952,13 +1962,26 @@ impl CraneliftBackend {
             // costs speed on one shape; returning a dead frame is wrong.
             let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> =
                 if self.compile_tier == 0 && self.emit_osr_probes && destination_return.is_none() {
+                    let dominators = crate::osr::Dominators::compute(function);
                     osr_loop_headers
                         .iter()
-                        .filter_map(|h| crate::osr::osr_layout(function, *h).ok().map(|l| (*h, l)))
+                        .filter_map(|h| {
+                            crate::osr::osr_layout_with(function, *h, &dominators)
+                                .ok()
+                                .map(|l| (*h, l))
+                        })
                         .collect()
                 } else {
                     HashMap::new()
                 };
+            if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                eprintln!(
+                    "[clif]   osr prologue {:.2} ms ({} headers, {} layouts)",
+                    phase_started.elapsed().as_secs_f64() * 1e3,
+                    osr_loop_headers.len(),
+                    osr_layouts.len()
+                );
+            }
             // The width each live-in is stored at: its type's own, which
             // is what the helper loads it at. A value the body holds
             // narrower or wider than that is converted on the way in.
@@ -6449,7 +6472,16 @@ impl CraneliftBackend {
         );
 
         // Verify the generated IR (catches errors before they become cryptic panics)
-        if let Err(errors) = verify_function(&self.codegen_context.func, self.module.isa()) {
+        let verify_started = std::time::Instant::now();
+        let verified = verify_function(&self.codegen_context.func, self.module.isa());
+        if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+            eprintln!(
+                "[clif]   verify {:.2} ms ({} insts)",
+                verify_started.elapsed().as_secs_f64() * 1e3,
+                self.codegen_context.func.dfg.num_insts()
+            );
+        }
+        if let Err(errors) = verified {
             debug!(
                 "[Cranelift] IR verification failed for function '{}': {}",
                 function.name, errors
