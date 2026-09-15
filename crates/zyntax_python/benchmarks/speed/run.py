@@ -30,6 +30,11 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 KERNELS = os.path.join(HERE, "kernels")
 SHIMS = os.path.join(HERE, "shims")
+# A kernel prints times, not answers, so a kernel that runs on zypy is
+# only a number once checks/<name>.py, which imports the kernel and
+# prints what it computes for a small input, prints the same on zypy
+# as on CPython. A kernel without a check is reported as unchecked.
+CHECKS = os.path.join(HERE, "checks")
 
 # Name on the speed center's chart -> (script, extra arguments,
 # iteration scaling, files the script imports or reads). The trials
@@ -102,6 +107,26 @@ def stage(kernel, extra_files, with_optparse):
     if with_optparse:
         shutil.copy(os.path.join(SHIMS, "optparse.py"), d)
     return d
+
+
+def check(prefix, python, kernel, extra_files, name, timeout):
+    """Whether zypy computes what CPython computes: None when there is
+    no check for the kernel, else the two outputs."""
+    script = os.path.join(CHECKS, name + ".py")
+    if not os.path.exists(script):
+        return None
+    outputs = []
+    for argv, shim in ((prefix, True), ([python], False)):
+        d = stage(kernel, extra_files, shim)
+        try:
+            shutil.copy(script, os.path.join(d, "check.py"))
+            done = subprocess.run(argv + [os.path.join(d, "check.py")], cwd=d, capture_output=True, text=True, timeout=timeout)
+            outputs.append(done.stdout if done.returncode == 0 else "exit " + str(done.returncode) + ": " + reason(done.stderr))
+        except subprocess.TimeoutExpired:
+            outputs.append("timeout")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    return outputs
 
 
 def run_one(prefix, d, kernel, trials, extra, timeout):
@@ -180,6 +205,15 @@ def main():
                 r = run_one(prefix, d, kernel, trials, extra, args.timeout)
             finally:
                 shutil.rmtree(d, ignore_errors=True)
+            if interp == "zypy" and r["status"] == "ok":
+                python = [i for i in interps if i[0] == "cpython"][0][1][0]
+                outputs = check(prefix, python, kernel, files, name, args.timeout)
+                if outputs is None:
+                    r["status"] = "unchecked"
+                    r["error"] = "no checks/" + name + ".py to compare the answer with CPython's"
+                elif outputs[0] != outputs[1]:
+                    r["status"] = "wrong"
+                    r["error"] = "check prints " + outputs[0].strip()[:60] + " where CPython prints " + outputs[1].strip()[:60]
             results[name][interp] = r
             if r["status"] == "ok":
                 print(f"    {interp:<8} mean {r['mean_ms']:9.2f} ms  min {r['min_ms']:9.2f} ms  wall {r['wall_ms']:9.1f} ms", file=sys.stderr)
