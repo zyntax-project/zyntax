@@ -2200,6 +2200,29 @@ fn nonnegative_literal(e: &py::Expr) -> bool {
 }
 
 impl Typer<'_> {
+    /// The element type of `elt` under the loop variables of
+    /// `generators`: what a comprehension over them produces.
+    pub(crate) fn comprehension_elem(
+        &self,
+        generators: &[py::Comprehension],
+        elt: &py::Expr,
+    ) -> Elem {
+        let mut vars = self.vars.clone();
+        for g in generators {
+            bind_target(
+                &mut vars,
+                &g.target,
+                self.expr(&g.iter).element().unwrap_or(Ty::Object),
+            );
+        }
+        let inner = Typer {
+            module: self.module,
+            vars: &vars,
+            outer: self.outer,
+        };
+        Elem::of(inner.expr(elt))
+    }
+
     pub(crate) fn expr(&self, e: &py::Expr) -> Ty {
         match e {
             py::Expr::NumberLiteral(n) => match &n.value {
@@ -2288,22 +2311,7 @@ impl Typer<'_> {
                 }
             }
             py::Expr::List(l) => Ty::List(self.elem_of(l.elts.iter())),
-            py::Expr::ListComp(c) => {
-                let mut vars = self.vars.clone();
-                for g in &c.generators {
-                    bind_target(
-                        &mut vars,
-                        &g.target,
-                        self.expr(&g.iter).element().unwrap_or(Ty::Object),
-                    );
-                }
-                let inner = Typer {
-                    module: self.module,
-                    vars: &vars,
-                    outer: self.outer,
-                };
-                Ty::List(Elem::of(inner.expr(&c.elt)))
-            }
+            py::Expr::ListComp(c) => Ty::List(self.comprehension_elem(&c.generators, &c.elt)),
             py::Expr::Tuple(_) => Ty::Tuple,
             py::Expr::Dict(_) | py::Expr::DictComp(_) => Ty::Dict,
             py::Expr::Set(_) | py::Expr::SetComp(_) => Ty::Set,

@@ -1137,6 +1137,19 @@ impl<'m> Lowerer<'m> {
         self.typer().expr(e)
     }
 
+    /// An argument a builtin consumes whole. A generator expression
+    /// written there is never seen as a generator: it is built as the
+    /// list of its elements, typed by them, since a fiber and a box
+    /// per element buy nothing for a value read once and thrown away.
+    /// Anything else is lowered as it is.
+    fn consumed(&mut self, e: &py::Expr, span: Span) -> Result<Val> {
+        if let py::Expr::Generator(g) = e {
+            let elem = self.typer().comprehension_elem(&g.generators, &g.elt);
+            return self.comprehension(&g.generators, Produce::List(elem, &g.elt), span);
+        }
+        self.expr(e)
+    }
+
     fn var_ty(&self, name: &str) -> Ty {
         self.locals
             .vars
@@ -2999,7 +3012,7 @@ impl<'m> Lowerer<'m> {
                 }
             }
             ("any" | "all", 1) => {
-                let v = self.expr(&args[0])?;
+                let v = self.consumed(&args[0], span)?;
                 let xs = self.iterable(v, span);
                 let f = if name == "any" {
                     "zb_list_any"
@@ -4413,7 +4426,7 @@ impl<'m> Lowerer<'m> {
                 let s = receiver.node;
                 let mut lowered = Vec::with_capacity(args.len());
                 for a in args {
-                    lowered.push(self.expr(a)?);
+                    lowered.push(self.consumed(a, span)?);
                 }
                 let node = match (name, lowered.len()) {
                     (
@@ -4709,7 +4722,7 @@ impl<'m> Lowerer<'m> {
                     });
                 }
                 "sum" if args.len() == 1 || args.len() == 2 => {
-                    let v = self.expr(&args[0])?;
+                    let v = self.consumed(&args[0], span)?;
                     let (node, sum_ty) = match v.ty {
                         Ty::List(e @ (Elem::Int | Elem::Float | Elem::Object)) => {
                             (call(&list_fn("sum", e), vec![v.node], e.ty(), span), e.ty())
@@ -4742,7 +4755,7 @@ impl<'m> Lowerer<'m> {
                     // Several arguments are the one-argument form over a
                     // list of them.
                     let list = if args.len() == 1 {
-                        self.expr(&args[0])?
+                        self.consumed(&args[0], span)?
                     } else {
                         let mut items = Vec::with_capacity(args.len());
                         for a in args.iter() {
@@ -4781,7 +4794,7 @@ impl<'m> Lowerer<'m> {
                             span,
                         ),
                         Some(a) => {
-                            let v = self.expr(a)?;
+                            let v = self.consumed(a, span)?;
                             match v.ty {
                                 Ty::Dict => call("zb_dict_copy", vec![v.node], Ty::Dict, span),
                                 // Anything else is a sequence of pairs.
@@ -4798,7 +4811,7 @@ impl<'m> Lowerer<'m> {
                     let items = match args.first() {
                         None => self.list_of(Vec::new(), Elem::Object, span),
                         Some(a) => {
-                            let v = self.expr(a)?;
+                            let v = self.consumed(a, span)?;
                             match v.ty {
                                 Ty::List(_) | Ty::Tuple | Ty::Set | Ty::Dict => {
                                     self.coerce(v, Ty::List(Elem::Object))
@@ -4863,7 +4876,7 @@ impl<'m> Lowerer<'m> {
                             }
                         }
                         Some(a) => {
-                            let v = self.expr(a)?;
+                            let v = self.consumed(a, span)?;
                             match v.ty {
                                 Ty::List(_) => v,
                                 Ty::Tuple | Ty::Set | Ty::Dict | Ty::Gen => {
@@ -4896,6 +4909,17 @@ impl<'m> Lowerer<'m> {
                                 }
                             }
                         }
+                    };
+                    // A tuple holds dynamic values: a typed source is
+                    // boxed into a fresh list first.
+                    let source = if name == "tuple" && source.ty != Ty::List(Elem::Object) {
+                        let node = self.coerce(source, Ty::List(Elem::Object));
+                        Val {
+                            node,
+                            ty: Ty::List(Elem::Object),
+                        }
+                    } else {
+                        source
                     };
                     let Ty::List(e) = source.ty else {
                         unreachable!()
