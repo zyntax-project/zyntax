@@ -590,6 +590,9 @@ impl TieredRuntime {
             );
         }
 
+        // Boxes of booleans and small integers are the shared ones: the
+        // code runs in this process, where their addresses hold.
+        zyntax_compiler::boxes::set_interning(true);
         // String constants that are boxed are boxed once, at start.
         if let Some(names) = &entered {
             let names: Vec<&str> = names.iter().map(String::as_str).collect();

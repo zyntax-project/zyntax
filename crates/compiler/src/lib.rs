@@ -55,6 +55,7 @@ pub mod hir_builder; // HIR Builder API for direct HIR construction
 pub mod hir_dump; // CLIF-inspired HIR text dump for debugging
 pub mod hir_interp; // HIR bytecode interpreter (universal Tier 0; always available)
 pub mod inline;
+pub mod interned; // The boxes every program shares
 pub mod licm;
 pub mod load_cse;
 pub mod loop_vectorize;
@@ -2260,7 +2261,7 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
     stats.boxes.expanded += br.expanded;
     stats.boxes.made += br.made;
     stats.boxes.released += br.released;
-    if br.expanded + br.made + br.released > 0 {
+    if br.expanded + br.made + br.released + br.shared > 0 {
         let lc = licm::run_module(module);
         stats.licm.hoisted += lc.hoisted;
         stats.licm.loops_visited += lc.loops_visited;

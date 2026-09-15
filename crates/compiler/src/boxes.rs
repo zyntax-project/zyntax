@@ -24,13 +24,20 @@
 //! to learn that the payload is the box under another name; a load
 //! tells it nothing of the kind.
 //!
+//! A box of a boolean or a small integer is one every program shares
+//! (`crate::interned`): the pass hands out the shared box's address
+//! instead of allocating, through a select for a boolean and a branch
+//! on the value for an integer. Only when [`set_interning`] has said the
+//! module runs in this process, since the addresses are this process's.
+//!
 //! `ZYNTAX_DISABLE_BOX_READS=1` leaves the calls in place; safe.
+//! `ZYNTAX_DISABLE_INTERNED_BOXES=1` allocates every box; safe.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::hir::{
-    CastOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirType,
-    HirValue, HirValueKind,
+    CastOp, HirBlock, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
+    HirPhi, HirTerminator, HirType, HirValue, HirValueKind,
 };
 
 /// Byte offset of `tag` in the box header.
@@ -86,6 +93,19 @@ fn make_of(symbol: &str) -> Option<Make> {
 /// The release of a box.
 const FREE: &str = "zyntax_box_free";
 
+static INTERNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether boxes of booleans and small integers may be the shared ones:
+/// true only where the code runs in the process that compiles it.
+pub fn set_interning(on: bool) {
+    INTERNING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn interning() -> bool {
+    INTERNING.load(std::sync::atomic::Ordering::Relaxed)
+        && std::env::var_os("ZYNTAX_DISABLE_INTERNED_BOXES").is_none()
+}
+
 /// What a reader loads.
 #[derive(Clone, Copy)]
 enum Read {
@@ -117,6 +137,8 @@ pub struct BoxStats {
     pub made: usize,
     /// Releases of such boxes through the release intrinsic.
     pub released: usize,
+    /// Boxes that are, or may be, a shared one.
+    pub shared: usize,
 }
 
 pub fn run_module(module: &mut HirModule) -> BoxStats {
@@ -138,12 +160,13 @@ pub fn run_module(module: &mut HirModule) -> BoxStats {
         }
         let s = run_function(func, &externs);
         // The loads and stores are new to the passes that follow.
-        if s.expanded + s.made + s.released > 0 {
+        if s.expanded + s.made + s.released + s.shared > 0 {
             func.attributes.optimized = false;
         }
         stats.expanded += s.expanded;
         stats.made += s.made;
         stats.released += s.released;
+        stats.shared += s.shared;
     }
     stats
 }
@@ -161,6 +184,7 @@ pub fn externs_of(module: &HirModule) -> HashMap<HirId, String> {
 
 pub fn run_function(func: &mut HirFunction, externs: &HashMap<HirId, String>) -> BoxStats {
     let mut stats = BoxStats::default();
+    let intern = interning();
     // The symbol a call reaches, by name or through an extern declaration.
     let symbol_of = |callee: &HirCallable| -> Option<String> {
         match callee {
@@ -177,6 +201,10 @@ pub fn run_function(func: &mut HirFunction, externs: &HashMap<HirId, String>) ->
     for block_id in block_ids {
         let instructions =
             std::mem::take(&mut func.blocks.get_mut(&block_id).unwrap().instructions);
+        // The block receiving the rewritten instructions: the original,
+        // until a branch on a value splits it and the rest continues in
+        // a new block.
+        let mut current = block_id;
         let mut out = Vec::with_capacity(instructions.len());
         for inst in instructions {
             let HirInstruction::Call {
@@ -197,6 +225,21 @@ pub fn run_function(func: &mut HirFunction, externs: &HashMap<HirId, String>) ->
                 (Some(result), Some(read), _) if args.len() == 1 => {
                     expand(func, *result, args[0], read, &mut out);
                     stats.expanded += 1;
+                }
+                (Some(result), _, Some(Make::Scalar { payload, .. }))
+                    if intern && payload == HirType::U8 && args.len() == 1 =>
+                {
+                    shared_bool(func, *result, args[0], &mut out);
+                    made_here.insert(*result);
+                    stats.shared += 1;
+                }
+                (Some(result), _, Some(make @ Make::Scalar { .. }))
+                    if intern && make_payload_is_i64(&make) && args.len() == 1 =>
+                {
+                    let taken = std::mem::take(&mut out);
+                    current = shared_or_made_int(func, current, taken, *result, args[0], make);
+                    made_here.insert(*result);
+                    stats.shared += 1;
                 }
                 (Some(result), _, Some(make)) => {
                     make_box(func, *result, args, make, &mut out);
@@ -219,9 +262,243 @@ pub fn run_function(func: &mut HirFunction, externs: &HashMap<HirId, String>) ->
                 _ => out.push(inst),
             }
         }
-        func.blocks.get_mut(&block_id).unwrap().instructions = out;
+        func.blocks.get_mut(&current).unwrap().instructions = out;
     }
     stats
+}
+
+fn make_payload_is_i64(make: &Make) -> bool {
+    matches!(make, Make::Scalar { payload, .. } if *payload == HirType::I64)
+}
+
+/// The shared box of a boolean: one of two addresses, by the value.
+fn shared_bool(func: &mut HirFunction, result: HirId, arg: HirId, out: &mut Vec<HirInstruction>) {
+    let box_ty = func.values[&result].ty.clone();
+    let truth = value(func, HirType::Bool);
+    let zero = constant(
+        func,
+        func.values[&arg].ty.clone(),
+        zero_of(&func.values[&arg].ty),
+    );
+    out.push(HirInstruction::Binary {
+        op: crate::hir::BinaryOp::Ne,
+        result: truth,
+        ty: HirType::Bool,
+        left: arg,
+        right: zero,
+    });
+    let yes = address(func, crate::interned::bool_box(true), &box_ty, out);
+    let no = address(func, crate::interned::bool_box(false), &box_ty, out);
+    out.push(HirInstruction::Select {
+        result,
+        ty: box_ty,
+        condition: truth,
+        true_val: yes,
+        false_val: no,
+    });
+}
+
+fn zero_of(ty: &HirType) -> HirConstant {
+    match ty {
+        HirType::Bool => HirConstant::Bool(false),
+        HirType::U8 => HirConstant::U8(0),
+        HirType::I8 => HirConstant::I8(0),
+        HirType::I32 => HirConstant::I32(0),
+        HirType::U32 => HirConstant::U32(0),
+        _ => HirConstant::I64(0),
+    }
+}
+
+/// A constant address as a value of `ty`.
+fn address(
+    func: &mut HirFunction,
+    addr: usize,
+    ty: &HirType,
+    out: &mut Vec<HirInstruction>,
+) -> HirId {
+    let raw = constant(func, HirType::I64, HirConstant::I64(addr as i64));
+    let ptr = value(func, ty.clone());
+    out.push(HirInstruction::Cast {
+        result: ptr,
+        ty: ty.clone(),
+        op: CastOp::IntToPtr,
+        operand: raw,
+    });
+    ptr
+}
+
+/// An integer's box: the shared one when the value has one, made
+/// otherwise. `current` is closed with what came before the site and a
+/// branch on the value; the block returned holds `result` as a phi of
+/// the two and takes what follows the site. The blocks that followed
+/// `current` now follow it.
+fn shared_or_made_int(
+    func: &mut HirFunction,
+    current: HirId,
+    mut before: Vec<HirInstruction>,
+    result: HirId,
+    arg: HirId,
+    make: Make,
+) -> HirId {
+    use crate::hir::BinaryOp;
+    let box_ty = func.values[&result].ty.clone();
+    let small = HirId::new();
+    let big = HirId::new();
+    let rest = HirId::new();
+
+    // current: is the value one with a shared box?
+    let min = constant(
+        func,
+        HirType::I64,
+        HirConstant::I64(crate::interned::SMALL_INT_MIN),
+    );
+    let max = constant(
+        func,
+        HirType::I64,
+        HirConstant::I64(
+            crate::interned::SMALL_INT_MIN + crate::interned::SMALL_INT_COUNT as i64 - 1,
+        ),
+    );
+    let above = value(func, HirType::Bool);
+    let below = value(func, HirType::Bool);
+    let fits = value(func, HirType::Bool);
+    before.push(HirInstruction::Binary {
+        op: BinaryOp::Ge,
+        result: above,
+        ty: HirType::Bool,
+        left: arg,
+        right: min,
+    });
+    before.push(HirInstruction::Binary {
+        op: BinaryOp::Le,
+        result: below,
+        ty: HirType::Bool,
+        left: arg,
+        right: max,
+    });
+    before.push(HirInstruction::Binary {
+        op: BinaryOp::And,
+        result: fits,
+        ty: HirType::Bool,
+        left: above,
+        right: below,
+    });
+    let (terminator, successors) = {
+        let block = func.blocks.get_mut(&current).unwrap();
+        block.instructions = before;
+        let terminator = std::mem::replace(
+            &mut block.terminator,
+            HirTerminator::CondBranch {
+                condition: fits,
+                true_target: small,
+                false_target: big,
+            },
+        );
+        let successors = std::mem::replace(&mut block.successors, vec![small, big]);
+        (terminator, successors)
+    };
+
+    // small: base + (value - min) * stride.
+    let mut small_insts = Vec::new();
+    let offset = value(func, HirType::I64);
+    small_insts.push(HirInstruction::Binary {
+        op: BinaryOp::Sub,
+        result: offset,
+        ty: HirType::I64,
+        left: arg,
+        right: min,
+    });
+    let stride = constant(
+        func,
+        HirType::I64,
+        HirConstant::I64(crate::interned::STRIDE as i64),
+    );
+    let scaled = value(func, HirType::I64);
+    small_insts.push(HirInstruction::Binary {
+        op: BinaryOp::Mul,
+        result: scaled,
+        ty: HirType::I64,
+        left: offset,
+        right: stride,
+    });
+    let base = constant(
+        func,
+        HirType::I64,
+        HirConstant::I64(crate::interned::small_int_base() as i64),
+    );
+    let raw = value(func, HirType::I64);
+    small_insts.push(HirInstruction::Binary {
+        op: BinaryOp::Add,
+        result: raw,
+        ty: HirType::I64,
+        left: base,
+        right: scaled,
+    });
+    let shared = value(func, box_ty.clone());
+    small_insts.push(HirInstruction::Cast {
+        result: shared,
+        ty: box_ty.clone(),
+        op: CastOp::IntToPtr,
+        operand: raw,
+    });
+    func.blocks.insert(
+        small,
+        HirBlock {
+            instructions: small_insts,
+            terminator: HirTerminator::Branch { target: rest },
+            predecessors: vec![current],
+            successors: vec![rest],
+            ..HirBlock::new(small)
+        },
+    );
+
+    // big: the allocation, into a value of its own.
+    let made = value(func, box_ty.clone());
+    let mut big_insts = Vec::new();
+    make_box(func, made, &[arg], make, &mut big_insts);
+    func.blocks.insert(
+        big,
+        HirBlock {
+            instructions: big_insts,
+            terminator: HirTerminator::Branch { target: rest },
+            predecessors: vec![current],
+            successors: vec![rest],
+            ..HirBlock::new(big)
+        },
+    );
+
+    // rest: the result is whichever arrived, then what followed the site.
+    func.blocks.insert(
+        rest,
+        HirBlock {
+            phis: vec![HirPhi {
+                result,
+                ty: box_ty,
+                incoming: vec![(shared, small), (made, big)],
+            }],
+            terminator,
+            predecessors: vec![small, big],
+            successors: successors.clone(),
+            ..HirBlock::new(rest)
+        },
+    );
+    for succ in successors {
+        if let Some(block) = func.blocks.get_mut(&succ) {
+            for p in block.predecessors.iter_mut() {
+                if *p == current {
+                    *p = rest;
+                }
+            }
+            for phi in block.phis.iter_mut() {
+                for (_, from) in phi.incoming.iter_mut() {
+                    if *from == current {
+                        *from = rest;
+                    }
+                }
+            }
+        }
+    }
+    rest
 }
 
 /// The allocation and stores for one box, ending in the value `result`

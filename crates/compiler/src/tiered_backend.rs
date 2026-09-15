@@ -1903,7 +1903,7 @@ impl TieredBackend {
                         let mut f = f.clone();
                         f.attributes.deferred = false;
                         let boxed = crate::boxes::run_function(&mut f, &externs);
-                        if boxed.expanded + boxed.made + boxed.released > 0 {
+                        if boxed.expanded + boxed.made + boxed.released + boxed.shared > 0 {
                             crate::licm::run(&mut f);
                             crate::cse::eliminate_with(&mut f, &pure_fns);
                         }
