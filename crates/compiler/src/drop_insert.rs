@@ -278,13 +278,47 @@ impl ModuleFacts {
         let tprof = std::env::var_os("ZYNTAX_TRACE_DROP_TIME").is_some();
         let t = web_time::Instant::now();
         let mut rounds = 0;
+        let callees = callees_of(module);
+        // Which functions call each, for asking only the callers of
+        // whoever changed again.
+        let mut callers: std::collections::HashMap<HirId, Vec<HirId>> =
+            std::collections::HashMap::new();
+        for (key, called) in &callees {
+            for c in called {
+                callers.entry(*c).or_default().push(*key);
+            }
+        }
+        // Every function first, then the callers of whoever changed.
+        let mut dirty: Vec<HirId> = module
+            .functions
+            .iter()
+            .filter(|(_, f)| !f.is_external)
+            .map(|(key, _)| *key)
+            .collect();
         loop {
             rounds += 1;
-            let returned = functions_returning_params(module, &facts);
-            if returned == facts.returns_param {
+            let mut changed: Vec<HirId> = Vec::new();
+            for key in &dirty {
+                let Some(func) = module.functions.get(key) else {
+                    continue;
+                };
+                let flags = params_returned_by(func, &facts);
+                if facts.returns_param.get(key) != Some(&flags) {
+                    facts.returns_param.insert(*key, flags);
+                    changed.push(*key);
+                }
+            }
+            if changed.is_empty() {
                 break;
             }
-            facts.returns_param = returned;
+            dirty = changed
+                .iter()
+                .filter_map(|c| callers.get(c))
+                .flatten()
+                .copied()
+                .collect();
+            dirty.sort();
+            dirty.dedup();
         }
         if tprof {
             eprintln!(
@@ -298,7 +332,6 @@ impl ModuleFacts {
         // only the callers of whoever changed are asked again.
         let t = web_time::Instant::now();
         let mut rounds = 0;
-        let callees = callees_of(module);
         let mut dirty: Vec<HirId> = module
             .functions
             .iter()
@@ -921,15 +954,10 @@ fn last_use_index(
 /// Per function, which parameters may come back as its result, by
 /// position. A parameter that reaches a return through phis, casts, or a
 /// call to a function that returns its own parameter counts.
-fn functions_returning_params(
-    module: &HirModule,
-    facts: &ModuleFacts,
-) -> std::collections::HashMap<HirId, Vec<bool>> {
-    let mut out = std::collections::HashMap::new();
-    for (key, func) in module.functions.iter() {
-        if func.is_external {
-            continue;
-        }
+/// Which of `func`'s parameters it may hand back as its result. Reads
+/// only what the facts say of its callees.
+fn params_returned_by(func: &HirFunction, facts: &ModuleFacts) -> Vec<bool> {
+    {
         let returned: Vec<HirId> = func
             .blocks
             .values()
@@ -939,22 +967,35 @@ fn functions_returning_params(
             })
             .flatten()
             .collect();
+        let params = func.signature.params.len();
+        // A function returning nothing, or only scalars, returns no
+        // parameter's storage.
+        let returns_storage = returned
+            .iter()
+            .any(|r| func.values.get(r).is_some_and(|v| may_be_storage(&v.ty)));
+        if !returns_storage {
+            return vec![false; params];
+        }
         // A parameter's value is the one of `Parameter` kind at its
         // position; the signature's own ids name nothing in the body.
-        let flags: Vec<bool> = (0..func.signature.params.len())
-            .map(|i| {
-                func.values
-                    .values()
-                    .filter(|v| matches!(v.kind, crate::hir::HirValueKind::Parameter(n) if n as usize == i))
-                    .any(|v| {
-                        let names = derived_values_with(func, v.id, true, Some(facts));
-                        returned.iter().any(|r| names.contains(r))
-                    })
+        let mut by_position: Vec<Vec<HirId>> = vec![Vec::new(); params];
+        for v in func.values.values() {
+            if let crate::hir::HirValueKind::Parameter(n) = v.kind {
+                if let Some(slot) = by_position.get_mut(n as usize) {
+                    slot.push(v.id);
+                }
+            }
+        }
+        by_position
+            .iter()
+            .map(|ids| {
+                ids.iter().any(|id| {
+                    let names = derived_values_with(func, *id, true, Some(facts));
+                    returned.iter().any(|r| names.contains(r))
+                })
             })
-            .collect();
-        out.insert(*key, flags);
+            .collect()
     }
-    out
 }
 
 /// Whether `func`'s result is storage the caller owns.
