@@ -364,6 +364,14 @@ impl TieredBackend {
             cranelift.with_lock(|be| be.set_publish_osr_helpers(false));
         }
 
+        // Every call between compiled functions goes through the callee's
+        // cell, so a function compiled again at a higher tier, or on its
+        // first call, is what its callers reach from then on.
+        // `ZYNTAX_DIRECT_CALLS=1` emits direct calls instead; safe, and
+        // callers then keep the code they were compiled against.
+        if std::env::var_os("ZYNTAX_DIRECT_CALLS").is_none() {
+            cranelift.with_lock(|be| be.set_reloadable_calls(true));
+        }
         if config.enable_hot_reload {
             cranelift.with_lock(|be| {
                 be.set_reloadable_calls(true);
