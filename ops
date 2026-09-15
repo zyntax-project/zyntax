@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789504724,"nonce":"2K6+VXuazeCgTJDNHsTbmxoWmfg=","message":"Landed in 7cecb94: fannkuch 206 to 120 ms per iteration on the harness (0.41x CPython, PyPy 67). The bound-method half is d636409.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1789504724,"nonce":"1uMFYCdsVOQbRkda3WZ42LpMoK8=","status":2}]}
