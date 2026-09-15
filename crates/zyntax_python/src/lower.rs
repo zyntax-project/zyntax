@@ -1482,7 +1482,19 @@ impl<'m> Lowerer<'m> {
             (Ty::Tuple, Ty::Object) => call("zb_box_tuple", vec![v.node], Ty::Object, span),
             (Ty::Dict, Ty::Object) => call("zb_dict_box", vec![v.node], Ty::Object, span),
             (Ty::Set, Ty::Object) => call("zb_set_box", vec![v.node], Ty::Object, span),
-            (Ty::Object, Ty::List(e)) => call(&list_fn("unbox", e), vec![v.node], target, span),
+            // A list read out of a box is checked like a primitive: a box
+            // of anything else is a TypeError raised where it is used.
+            (Ty::Object, Ty::List(e)) => {
+                let checked = Val {
+                    node: call(&list_fn("unbox", e), vec![v.node], target, span),
+                    ty: target,
+                };
+                if self.guards {
+                    self.guard(checked, span).node
+                } else {
+                    checked.node
+                }
+            }
             (Ty::Object, Ty::Tuple) => call("zb_unbox_tuple", vec![v.node], Ty::Tuple, span),
             // A primitive read out of a box is checked: a box of another
             // type is a TypeError, raised where the value is used.

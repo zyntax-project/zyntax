@@ -1173,30 +1173,42 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         ))],
     ));
     let x = local("x", any());
+    // A list of dynamic values is read out of a box of any list kind:
+    // one of another kind comes out as a converted copy.
     let tag = local("tag", i64());
-    d.push(define(
-        &name("unbox"),
-        &[&x],
-        k.list.clone(),
-        vec![
-            tag.decl(cast(call("zb_box_tag", vec![x.e()], i32()), i64())),
-            when(
-                ne(tag.e(), int(k.kind.list_tag())),
-                vec![fatal(
-                    "TypeError",
-                    add(
-                        text("expected a list, got "),
-                        call("zb_any_type", vec![x.e()], string()),
-                    ),
-                )],
+    let mut unbox = vec![tag.decl(cast(call("zb_box_tag", vec![x.e()], i32()), i64()))];
+    if k.kind == Kind::Any {
+        for other in Kind::ALL.iter().filter(|o| **o != Kind::Any) {
+            unbox.push(when(
+                eq(tag.e(), int(other.list_tag())),
+                vec![ret(call(
+                    &format!("zb_list_to_any_{}", other.suffix()),
+                    vec![call(
+                        &format!("zb_unbox_list_raw_{}", other.suffix()),
+                        vec![x.e()],
+                        list_of(list_type_of(&k.list), other.ty()),
+                    )],
+                    k.list.clone(),
+                ))],
+            ));
+        }
+    }
+    unbox.push(when(
+        ne(tag.e(), int(k.kind.list_tag())),
+        vec![fatal(
+            "TypeError",
+            add(
+                text("expected a list, got "),
+                call("zb_any_type", vec![x.e()], string()),
             ),
-            ret(call(
-                &format!("zb_unbox_list_raw_{}", k.kind.suffix()),
-                vec![x.e()],
-                k.list.clone(),
-            )),
-        ],
+        )],
     ));
+    unbox.push(ret(call(
+        &format!("zb_unbox_list_raw_{}", k.kind.suffix()),
+        vec![x.e()],
+        k.list.clone(),
+    )));
+    d.push(define(&name("unbox"), &[&x], k.list.clone(), unbox));
     d
 }
 
