@@ -1374,6 +1374,10 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         &[&start, &stop, &step],
         ints.clone(),
         vec![
+            when(
+                eq(step.e(), int(0)),
+                vec![fatal("ValueError", text("range() arg 3 must not be zero"))],
+            ),
             out.decl(list(Vec::new(), ints.clone())),
             i.decl(start.e()),
             if_(
