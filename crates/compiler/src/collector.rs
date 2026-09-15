@@ -60,6 +60,7 @@
 //! the Python frontend's pressure test does.
 
 use std::cell::Cell;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -93,7 +94,8 @@ fn heap_floor() -> usize {
     })
 }
 
-/// Bits in a slab's mark and free maps: one per sixteen bytes.
+/// Bits in a slab's mark and free maps: one per block, at the most
+/// blocks a slab can hold.
 const SLAB_BITS: usize = pool_alloc::SLAB_BYTES / 16;
 const SLAB_WORDS: usize = SLAB_BITS / 64;
 
@@ -109,9 +111,9 @@ struct Registry {
     /// Bytes reached by the last collection.
     live: usize,
     collections: usize,
-    /// How many times the live set the next budget is: doubled, up to
-    /// [`MAX_GROWTH`], by a collection that found little to free, and
-    /// back to one by one that found plenty.
+    /// How many times the live set the next budget is: [`MAX_GROWTH`]
+    /// after a collection that found little to free in the slabs, one
+    /// after one that found plenty.
     growth: usize,
 }
 
@@ -380,6 +382,9 @@ pub fn stats() -> Stats {
 struct SlabBits {
     class: usize,
     slot: usize,
+    /// `2^32 / slot`, rounded up: a multiply and a shift divide an
+    /// offset within the slab by the slot size exactly.
+    recip: u64,
     /// Blocks carved so far.
     count: usize,
     marks: [u64; SLAB_WORDS],
@@ -401,6 +406,7 @@ impl SlabBits {
         Box::new(SlabBits {
             class,
             slot,
+            recip: ((1u64 << 32) + slot as u64 - 1) / slot as u64,
             count,
             marks: [0; SLAB_WORDS],
             free: [0; SLAB_WORDS],
@@ -414,7 +420,9 @@ impl SlabBits {
         if offset < pool_alloc::SLAB_HEADER {
             return None;
         }
-        let idx = (offset - pool_alloc::SLAB_HEADER) / self.slot;
+        // Exact while the offset and the slot both fit in sixteen bits,
+        // which a slab's size guarantees.
+        let idx = (((offset - pool_alloc::SLAB_HEADER) as u64 * self.recip) >> 32) as usize;
         (idx < self.count).then_some(idx)
     }
 
@@ -444,23 +452,102 @@ impl Hasher for SlabHasher {
 
 type SlabMap<V> = HashMap<usize, V, BuildHasherDefault<SlabHasher>>;
 
-#[inline]
-fn bit(offset: usize) -> (usize, u64) {
-    let i = offset / 16;
-    (i / 64, 1u64 << (i % 64))
+/// Slabs per page of the marker's table.
+const PAGE_SLABS: usize = 1024;
+const PAGE_SPAN: usize = PAGE_SLABS * pool_alloc::SLAB_BYTES;
+
+/// The bits of every slab touched by a collection, found by address:
+/// a page per span of [`PAGE_SLABS`] slabs, made on first touch, and
+/// a slot per slab in it. The page last used is kept to hand, so a
+/// heap that sits together costs a compare and a load per lookup.
+struct SlabTable {
+    pages: SlabMap<Box<[*mut SlabBits; PAGE_SLABS]>>,
+    last_page: usize,
+    last: *mut [*mut SlabBits; PAGE_SLABS],
+    /// Owns the bits; a page holds their addresses.
+    owned: Vec<Box<SlabBits>>,
 }
+
+impl SlabTable {
+    fn new(slabs: usize) -> Self {
+        SlabTable {
+            pages: SlabMap::with_capacity_and_hasher(slabs / PAGE_SLABS + 1, Default::default()),
+            last_page: usize::MAX,
+            last: std::ptr::null_mut(),
+            owned: Vec::with_capacity(slabs),
+        }
+    }
+
+    /// The slot of `slab` in its page, making the page if `make` and
+    /// there is none.
+    #[inline]
+    fn slot(&mut self, slab: usize, make: bool) -> Option<&mut *mut SlabBits> {
+        let page = slab / PAGE_SPAN;
+        if page != self.last_page {
+            let entry = match self.pages.entry(page) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(v) => {
+                    if !make {
+                        return None;
+                    }
+                    v.insert(Box::new([std::ptr::null_mut(); PAGE_SLABS]))
+                }
+            };
+            self.last_page = page;
+            self.last = &mut **entry;
+        }
+        // SAFETY: a page is never removed while the table lives, and
+        // is boxed, so it stays put while the map grows.
+        Some(unsafe { &mut (*self.last)[(slab % PAGE_SPAN) / pool_alloc::SLAB_BYTES] })
+    }
+
+    #[inline]
+    fn get(&mut self, slab: usize) -> Option<&mut SlabBits> {
+        let p = *self.slot(slab, false)?;
+        // SAFETY: a non-null slot holds the address of bits this table
+        // owns for as long as it lives.
+        (!p.is_null()).then(|| unsafe { &mut *p })
+    }
+
+    fn insert(&mut self, slab: usize, bits: Box<SlabBits>) -> &mut SlabBits {
+        let mut bits = bits;
+        let p: *mut SlabBits = &mut *bits;
+        self.owned.push(bits);
+        *self.slot(slab, true).expect("a page is made on demand") = p;
+        // SAFETY: as in `get`.
+        unsafe { &mut *p }
+    }
+}
+
+/// The word and mask of block `idx`'s bit.
+#[inline]
+fn bit(idx: usize) -> (usize, u64) {
+    (idx / 64, 1u64 << (idx % 64))
+}
+
+/// Pointers the marker remembers having marked through.
+const SEEN: usize = 4;
 
 /// One collection's working state.
 struct Marker<'a> {
     reg: &'a Registry,
-    /// The slabs touched so far, by base address: made on first touch,
-    /// so a slab nothing reaches costs nothing to mark and is set
-    /// aside whole by the sweep.
-    bits: SlabMap<Box<SlabBits>>,
+    /// The slabs touched so far: made on first touch, so a slab
+    /// nothing reaches costs nothing to mark and is set aside whole by
+    /// the sweep.
+    bits: SlabTable,
     /// The lowest and highest addresses any block may have, so most
     /// words are turned away without a lookup.
     lo: usize,
     hi: usize,
+    /// Every slab-sized span some large block covers, so a word that
+    /// lands in no slab is turned away without a search.
+    large_spans: HashSet<usize, BuildHasherDefault<SlabHasher>>,
+    /// The last few pointers found to be marked already, which many
+    /// blocks repeat: a shared constant, a class, a key every row
+    /// carries. A first pointer to a block is not kept, so a block
+    /// pointed to once does not push those out.
+    seen: [usize; SEEN],
+    seen_at: usize,
     large_marked: HashSet<usize>,
     /// Reached blocks whose words are still to be read: base and length.
     work: Vec<(usize, usize)>,
@@ -469,7 +556,15 @@ struct Marker<'a> {
 
 impl<'a> Marker<'a> {
     fn new(reg: &'a Registry) -> Self {
-        let bits = SlabMap::with_capacity_and_hasher(reg.slabs.len(), Default::default());
+        let bits = SlabTable::new(reg.slabs.len());
+        let mut large_spans = HashSet::with_hasher(Default::default());
+        for (&payload, &total) in &reg.large {
+            for span in
+                payload / pool_alloc::SLAB_BYTES..=(payload + total) / pool_alloc::SLAB_BYTES
+            {
+                large_spans.insert(span * pool_alloc::SLAB_BYTES);
+            }
+        }
         let mut lo = reg.slabs.iter().next().copied().unwrap_or(usize::MAX);
         let mut hi = reg
             .slabs
@@ -488,6 +583,9 @@ impl<'a> Marker<'a> {
             bits,
             lo,
             hi,
+            large_spans,
+            seen: [0; SEEN],
+            seen_at: 0,
             large_marked: HashSet::new(),
             work: Vec::new(),
             marked_bytes: 0,
@@ -498,45 +596,61 @@ impl<'a> Marker<'a> {
     /// an address outside every slab.
     #[inline]
     fn slab_bits(&mut self, slab: usize) -> Option<&mut SlabBits> {
-        if !self.bits.contains_key(&slab) {
-            if !pool_alloc::in_a_slab_at(slab) {
-                return None;
-            }
-            // SAFETY: a registered slab is live for the life of the process.
-            self.bits.insert(slab, unsafe { SlabBits::read(slab) });
+        if let Some(bits) = self.bits.get(slab) {
+            // Handed back through a fresh borrow: the one `get` made
+            // cannot be returned from a branch that also inserts.
+            let p: *mut SlabBits = bits;
+            // SAFETY: the table owns the bits for as long as it lives.
+            return Some(unsafe { &mut *p });
         }
-        self.bits.get_mut(&slab).map(|b| &mut **b)
+        if !pool_alloc::in_a_slab_at(slab) {
+            return None;
+        }
+        // SAFETY: a registered slab is live for the life of the process.
+        Some(self.bits.insert(slab, unsafe { SlabBits::read(slab) }))
     }
 
     /// Note a block on a free list, which is not storage to follow.
     fn note_free(&mut self, block: usize) {
         let slab = block & !(pool_alloc::SLAB_BYTES - 1);
         if let Some(bits) = self.slab_bits(slab) {
-            let (w, m) = bit(block - slab);
-            bits.free[w] |= m;
+            if let Some(idx) = bits.block_at(block - slab) {
+                let (w, m) = bit(idx);
+                bits.free[w] |= m;
+            }
         }
     }
 
     /// Take `a` for a pointer and mark what it lands in.
     #[inline]
     fn consider(&mut self, a: usize) {
-        if a < self.lo || a >= self.hi {
+        if a < self.lo || a >= self.hi || self.seen.contains(&a) {
+            return;
+        }
+        if crate::interned::is_interned(a) {
             return;
         }
         let slab = a & !(pool_alloc::SLAB_BYTES - 1);
+        let seen_at = self.seen_at;
         if let Some(bits) = self.slab_bits(slab) {
             let Some(idx) = bits.block_at(a - slab) else {
                 return;
             };
-            let base = bits.base(idx);
-            let (w, m) = bit(base);
-            if (bits.free[w] | bits.marks[w]) & m != 0 {
-                return;
-            }
+            let (w, m) = bit(idx);
+            let reached = (bits.free[w] | bits.marks[w]) & m != 0;
             bits.marks[w] |= m;
             let len = bits.slot;
-            self.marked_bytes += len;
-            self.work.push((slab + base, len));
+            let base = slab + bits.base(idx);
+            if reached {
+                self.seen[seen_at] = a;
+                self.seen_at = (seen_at + 1) % SEEN;
+            } else {
+                self.marked_bytes += len;
+                self.work.push((base, len));
+            }
+            return;
+        }
+        if !self.large_spans.contains(&slab) {
             return;
         }
         if let Some((&payload, &total)) = self.reg.large.range(..=a).next_back() {
@@ -567,14 +681,17 @@ impl<'a> Marker<'a> {
         self.scan(lo, hi);
     }
 
-    /// Read every aligned word in `[lo, hi)` as a possible pointer.
+    /// Read every aligned word in `[lo, hi)` as a possible pointer,
+    /// except one back into the range itself, which is reached already.
     fn scan(&mut self, lo: usize, hi: usize) {
         let mut p = (lo + 7) & !7;
         while p + 8 <= hi {
             // SAFETY: the caller hands over memory it owns and that is
             // mapped for the whole range.
             let w = unsafe { std::ptr::read_volatile(p as *const usize) };
-            self.consider(w);
+            if w < lo || w >= hi {
+                self.consider(w);
+            }
             p += 8;
         }
     }
@@ -591,7 +708,7 @@ impl<'a> Marker<'a> {
     /// Returns the blocks and bytes that were not free before.
     /// Returns the blocks and bytes that were not free before, and the
     /// bytes on the free lists afterwards.
-    fn sweep(&self) -> (usize, usize, usize) {
+    fn sweep(&mut self) -> (usize, usize, usize) {
         pool_alloc::clear_free_lists();
         let mut freed_blocks = 0usize;
         let mut freed_bytes = 0usize;
@@ -600,7 +717,7 @@ impl<'a> Marker<'a> {
         // first. A slab's blocks are chained here and joined to the
         // list in one go.
         for &slab in self.reg.slabs.iter().rev() {
-            let Some(bits) = self.bits.get(&slab) else {
+            let Some(bits) = self.bits.get(slab) else {
                 // Never touched: nothing in it is reached or on a list,
                 // so whatever it holds is garbage.
                 // SAFETY: a registered slab is live.
@@ -626,7 +743,7 @@ impl<'a> Marker<'a> {
             // than threaded block by block, and can serve any class.
             if bits.marks.iter().all(|w| *w == 0) {
                 for idx in 0..bits.count {
-                    let (w, m) = bit(bits.base(idx));
+                    let (w, m) = bit(idx);
                     if bits.free[w] & m == 0 {
                         freed_blocks += 1;
                         freed_bytes += bits.slot;
@@ -641,7 +758,7 @@ impl<'a> Marker<'a> {
             let mut tail = 0usize;
             for idx in (0..bits.count).rev() {
                 let base = bits.base(idx);
-                let (w, m) = bit(base);
+                let (w, m) = bit(idx);
                 if bits.marks[w] & m != 0 {
                     continue;
                 }
@@ -893,6 +1010,7 @@ fn collect_from(sp: usize) {
         )
     };
     let large_count = large_freed.len();
+    let pool_freed = freed_bytes;
     let mut freed_bytes = freed_bytes;
     for payload in large_freed {
         if let Some(total) = reg.large.remove(&payload) {
@@ -907,12 +1025,10 @@ fn collect_from(sp: usize) {
     // As much again as is live before the next one, or several times
     // as much while collections find little: a program building up a
     // table is marked at each doubling of its size otherwise, and the
-    // work of that is the sum of the sizes, twice the final one.
-    reg.growth = if freed_bytes * 8 < live {
-        (reg.growth * 2).min(MAX_GROWTH)
-    } else {
-        1
-    };
+    // work of that is the sum of the sizes, twice the final one. Only
+    // the slabs count: a large block is freed without being marked,
+    // and one dead buffer says nothing about the rest of the heap.
+    reg.growth = if pool_freed * 8 < live { MAX_GROWTH } else { 1 };
     update(|l| l.budget = (live * reg.growth).max(heap_floor()));
     if trace() {
         eprintln!(
