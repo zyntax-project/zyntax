@@ -2230,6 +2230,63 @@ impl<'m> Lowerer<'m> {
             }
             // `xs[i] = v`
             py::Expr::Subscript(sub) => {
+                if let py::Expr::Slice(sl) = &*sub.slice {
+                    let rhs_pre = std::mem::take(&mut self.hoisted);
+                    let seq = self.expr(&sub.value)?;
+                    let target_pre = std::mem::take(&mut self.hoisted);
+                    self.hoisted = rhs_pre;
+                    let Ty::List(e) = seq.ty else {
+                        return unsupported("slice assignment on a non-list", target);
+                    };
+                    let seq_node = if target_pre.is_empty() {
+                        seq.node
+                    } else {
+                        Self::block_value(target_pre, seq.node, seq.ty, span)
+                    };
+                    let source = if matches!(value.ty, Ty::List(_)) {
+                        value
+                    } else {
+                        Val {
+                            node: self.iterable(value, span),
+                            ty: Ty::List(Elem::Object),
+                        }
+                    };
+                    let typed = self.coerce(source, Ty::List(e));
+                    let mut mask = 0;
+                    let mut bound =
+                        |this: &mut Self, expr: &Option<Box<py::Expr>>, bit: i64| -> Result<Node> {
+                            match expr {
+                                Some(expr) => {
+                                    mask |= bit;
+                                    let outer = std::mem::take(&mut this.hoisted);
+                                    let value = this.expr_as(expr, Ty::Int)?;
+                                    let pre = std::mem::replace(&mut this.hoisted, outer);
+                                    Ok(if pre.is_empty() {
+                                        value
+                                    } else {
+                                        Self::block_value(pre, value, Ty::Int, span)
+                                    })
+                                }
+                                None => Ok(int_lit(0, span)),
+                            }
+                        };
+                    let start = bound(self, &sl.lower, 1)?;
+                    let stop = bound(self, &sl.upper, 2)?;
+                    let step = bound(self, &sl.step, 4)?;
+                    let call = call(
+                        &list_fn("assign_slice", e),
+                        vec![typed, seq_node, start, stop, step, int_lit(mask, span)],
+                        Ty::None,
+                        span,
+                    );
+                    out.push(TypedNode::new(
+                        TypedStatement::Expression(Box::new(call)),
+                        Type::Unknown,
+                        span,
+                    ));
+                    out.push(self.pending_check(span));
+                    return Ok(());
+                }
                 let seq = self.expr(&sub.value)?;
                 let stmt = match seq.ty {
                     Ty::List(e) => {

@@ -550,6 +550,128 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
             ret(out.e()),
         ],
     ));
+    // Replace selected elements in the same header, including when the source aliases it.
+    let replacement = local("replacement", k.list.clone());
+    let selected = local("selected", i64());
+    let width = local("width", i64());
+    let common = local("common", i64());
+    d.push(define(
+        &name("assign_slice"),
+        &[&ys, &xs, &start, &stop, &step, &mask],
+        unit(),
+        vec![
+            replacement.decl(call(&name("copy"), vec![ys.e()], k.list.clone())),
+            n.decl(len(xs.e())),
+            st.decl(int(1)),
+            when(ne(bitand(mask.e(), int(4)), int(0)), vec![st.set(step.e())]),
+            when(
+                eq(st.e(), int(0)),
+                vec![fatal("ValueError", text("slice step cannot be zero"))],
+            ),
+            lo.decl(int(0)),
+            hi.decl(n.e()),
+            when(
+                lt(st.e(), int(0)),
+                vec![lo.set(sub(n.e(), int(1))), hi.set(int(-1))],
+            ),
+            when(
+                ne(bitand(mask.e(), int(1)), int(0)),
+                vec![lo.set(call(
+                    "zb_slice_bound",
+                    vec![start.e(), n.e(), st.e()],
+                    i64(),
+                ))],
+            ),
+            when(
+                ne(bitand(mask.e(), int(2)), int(0)),
+                vec![hi.set(call("zb_slice_bound", vec![stop.e(), n.e(), st.e()], i64()))],
+            ),
+            selected.decl(len(replacement.e())),
+            if_(
+                ne(st.e(), int(1)),
+                vec![
+                    width.decl(int(0)),
+                    i.decl(lo.e()),
+                    if_(
+                        gt(st.e(), int(0)),
+                        vec![while_(
+                            lt(i.e(), hi.e()),
+                            vec![width.add_assign(int(1)), i.set(add(i.e(), st.e()))],
+                        )],
+                        vec![while_(
+                            gt(i.e(), hi.e()),
+                            vec![width.add_assign(int(1)), i.set(add(i.e(), st.e()))],
+                        )],
+                    ),
+                    when(
+                        ne(width.e(), selected.e()),
+                        vec![fatal(
+                            "ValueError",
+                            text("attempt to assign sequence of wrong size to extended slice"),
+                        )],
+                    ),
+                    i.decl(lo.e()),
+                    j.decl(int(0)),
+                    while_(
+                        lt(j.e(), selected.e()),
+                        vec![
+                            set_idx(xs.e(), i.e(), el(&replacement, j.e())),
+                            i.set(add(i.e(), st.e())),
+                            j.add_assign(int(1)),
+                        ],
+                    ),
+                    ret_void(),
+                ],
+                Vec::new(),
+            ),
+            when(lt(hi.e(), lo.e()), vec![hi.set(lo.e())]),
+            width.decl(sub(hi.e(), lo.e())),
+            common.decl(width.e()),
+            when(gt(common.e(), selected.e()), vec![common.set(selected.e())]),
+            i.decl(int(0)),
+            while_(
+                lt(i.e(), common.e()),
+                vec![
+                    set_idx(xs.e(), add(lo.e(), i.e()), el(&replacement, i.e())),
+                    i.add_assign(int(1)),
+                ],
+            ),
+            if_(
+                lt(selected.e(), width.e()),
+                vec![
+                    j.decl(selected.e()),
+                    while_(
+                        lt(j.e(), width.e()),
+                        vec![
+                            expr(mcall(
+                                xs.e(),
+                                "remove_at",
+                                vec![add(lo.e(), selected.e())],
+                                k.elem.clone(),
+                            )),
+                            j.add_assign(int(1)),
+                        ],
+                    ),
+                ],
+                vec![
+                    j.decl(width.e()),
+                    while_(
+                        lt(j.e(), selected.e()),
+                        vec![
+                            expr(mcall(
+                                xs.e(),
+                                "insert_at",
+                                vec![add(lo.e(), j.e()), el(&replacement, j.e())],
+                                unit(),
+                            )),
+                            j.add_assign(int(1)),
+                        ],
+                    ),
+                ],
+            ),
+            ret_void(),
+        ],
+    ));
     d.push(define(&name("eq"), &[&xs, &ys], boolean(), {
         let mut s = vec![
             n.decl(len(xs.e())),
