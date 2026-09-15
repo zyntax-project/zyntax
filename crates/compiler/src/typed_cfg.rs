@@ -1486,21 +1486,31 @@ impl TypedCfgBuilder {
             //   fn add(self, rhs: Tensor) -> Tensor { extern tensor_add(self, rhs) }
             // where the single expression should be returned.
             // Do NOT apply this to blocks inside control flow (if, match, etc.) - those should not implicitly return.
-            let (final_statements, terminator) =
-                if is_function_body && current_statements.len() == 1 {
-                    if let TypedStatement::Expression(expr) = &current_statements[0].node {
+            // A statement of no value (a call for its effect) is not a
+            // return: the block ends as any other, and the function's
+            // own return follows.
+            let (final_statements, terminator) = if is_function_body
+                && current_statements.len() == 1
+            {
+                match &current_statements[0].node {
+                    TypedStatement::Expression(expr)
+                        if !matches!(
+                            expr.ty,
+                            Type::Primitive(zyntax_typed_ast::type_registry::PrimitiveType::Unit)
+                        ) =>
+                    {
                         // Single expression in function body - implicitly return it
                         (
                             vec![],
                             TypedTerminator::Return(Some(Box::new((**expr).clone()))),
                         )
-                    } else {
-                        (current_statements, TypedTerminator::Unreachable)
                     }
-                } else {
-                    // Multiple statements, no statements, or not a function body - keep as unreachable
-                    (current_statements, TypedTerminator::Unreachable)
-                };
+                    _ => (current_statements, TypedTerminator::Unreachable),
+                }
+            } else {
+                // Multiple statements, no statements, or not a function body - keep as unreachable
+                (current_statements, TypedTerminator::Unreachable)
+            };
 
             all_blocks.push(TypedBasicBlock {
                 id: current_block_id,

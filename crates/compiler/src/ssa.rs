@@ -1420,6 +1420,15 @@ impl SsaBuilder {
                             values: vec![value_id],
                         }
                     }
+                } else if let Some(continuation) = self.continuation_block.take() {
+                    // The block's last statement left it for a continuation
+                    // block of its own; the return ends that one.
+                    let cont_block =
+                        self.function.blocks.get_mut(&continuation).ok_or_else(|| {
+                            crate::CompilerError::Analysis("Continuation block not found".into())
+                        })?;
+                    cont_block.terminator = HirTerminator::Return { values: vec![] };
+                    return Ok(());
                 } else {
                     HirTerminator::Return { values: vec![] }
                 }
@@ -1525,7 +1534,7 @@ impl SsaBuilder {
                 // nested-while main was the first kernel to hit it). Synthesise a
                 // Return with zero-valued operands so the JIT matches BC interp's
                 // observable behaviour for paths the program never executes.
-                if self.function.signature.returns.is_empty() {
+                let terminator = if self.function.signature.returns.is_empty() {
                     HirTerminator::Return { values: vec![] }
                 } else {
                     let zero_values: Vec<HirId> = self
@@ -1542,7 +1551,19 @@ impl SsaBuilder {
                     HirTerminator::Return {
                         values: zero_values,
                     }
+                };
+                // The block's last statement may have left it for a
+                // continuation block of its own, as an explicit return's
+                // value does; the return then ends the continuation.
+                if let Some(continuation) = self.continuation_block.take() {
+                    let cont_block =
+                        self.function.blocks.get_mut(&continuation).ok_or_else(|| {
+                            crate::CompilerError::Analysis("Continuation block not found".into())
+                        })?;
+                    cont_block.terminator = terminator;
+                    return Ok(());
                 }
+                terminator
             }
         };
 
