@@ -1,0 +1,4 @@
+https://foss.heptapod.net/pypy/benchmarks
+bfdfd6559603f1226816e7c0bb00a2dae648d751
+own/: chaos deltablue fannkuch float go hexiom2 meteor-contest nbody_modified nqueens pidigits pyflate-fast interpreter.tar.bz2 raytrace-simple scimark spectral-norm crypto_pyaes pyaes telco telco-bench.b json_bench
+unladen_swallow/performance/: bm_ai bm_richards richards
