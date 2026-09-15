@@ -1903,9 +1903,12 @@ impl TieredBackend {
         let lazy: HashSet<HirId> = lazy.difference(finished).copied().collect();
         let ready = finished.clone();
         let finished = finished.clone();
-        // Compiled once: a second call arriving while the first compiles
-        // waits on the lock and then finds the entry published.
-        let done: Mutex<HashMap<u64, usize>> = Mutex::new(HashMap::new());
+        // Compiled once: the entry once published, or the mark of a
+        // compile under way, which a second call waits out. Different
+        // functions compile side by side; the backend's own lock keeps
+        // them apart where it must.
+        let done: Arc<(Mutex<HashMap<u64, Option<usize>>>, std::sync::Condvar)> =
+            Arc::new((Mutex::new(HashMap::new()), std::sync::Condvar::new()));
         // What the per-function finishing passes read from the module.
         let (externs, pure_fns) = match self.functions.values().next() {
             Some(e) => (
@@ -1926,12 +1929,35 @@ impl TieredBackend {
         // What compiling a function on its first call does, once off the
         // caller's stack.
         let compile_lazy_function = move |bead_id: u64| -> *const u8 {
-            let mut done = done.lock().unwrap();
-            if let Some(entry) = done.get(&bead_id) {
-                return *entry as *const u8;
+            {
+                let (table, published) = &*done;
+                let mut table = table.lock().unwrap();
+                loop {
+                    match table.get(&bead_id) {
+                        Some(Some(entry)) => return *entry as *const u8,
+                        Some(None) => table = published.wait(table).unwrap(),
+                        None => {
+                            table.insert(bead_id, None);
+                            break;
+                        }
+                    }
+                }
             }
+            // Whatever this compile comes to, the mark is replaced and
+            // the waiters woken.
+            let publish = |entry: usize| {
+                let (table, published) = &*done;
+                let mut table = table.lock().unwrap();
+                if entry == 0 {
+                    table.remove(&bead_id);
+                } else {
+                    table.insert(bead_id, Some(entry));
+                }
+                published.notify_all();
+                entry as *const u8
+            };
             let Some((func_id, bound, module_arc)) = by_bead.get(&bead_id) else {
-                return ptr::null();
+                return publish(0);
             };
             let lazy_started = std::time::Instant::now();
             let body = if finished.contains(func_id) {
@@ -1949,7 +1975,7 @@ impl TieredBackend {
                         }
                         Arc::new(f)
                     }
-                    None => return ptr::null(),
+                    None => return publish(0),
                 }
             } else {
                 let mut optimized = optimized.lock().unwrap();
@@ -1971,7 +1997,7 @@ impl TieredBackend {
                 });
                 match bodies.get(func_id) {
                     Some(b) => Arc::clone(b),
-                    None => return ptr::null(),
+                    None => return publish(0),
                 }
             };
             let body_at = lazy_started.elapsed();
@@ -1990,11 +2016,11 @@ impl TieredBackend {
             );
             let compiled_at = lazy_started.elapsed();
             if entry.is_null() {
-                return ptr::null();
+                return publish(0);
             }
             crate::reload::set_call_target(reload_key, *func_id, entry as usize);
             bound.bead().eager_install(entry);
-            done.insert(bead_id, entry as usize);
+            publish(entry as usize);
             // `ZYNTAX_TRACE_LAZY=1` names each first-call compile with
             // the time it took, the wait for the backend included.
             if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
@@ -2009,6 +2035,10 @@ impl TieredBackend {
             entry as *const u8
         };
         let compile_lazy_function = Arc::new(compile_lazy_function);
+        // First calls waiting to compile. The warm-up thread stands
+        // aside while there is one, or it would take the lock back
+        // after every compile and the call would wait through them all.
+        let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         // The library functions the program reaches are compiled ahead
         // of their first call on a thread of their own, nearest the
@@ -2027,11 +2057,15 @@ impl TieredBackend {
             if !order.is_empty() {
                 let compile = Arc::clone(&compile_lazy_function);
                 let stop = Arc::clone(&self.warm_up_stop);
+                let waiting = Arc::clone(&waiting);
                 self.warm_up = std::thread::Builder::new()
                     .name("zyntax-warm-up".into())
                     .stack_size(16 << 20)
                     .spawn(move || {
                         for bead_id in order {
+                            while waiting.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                                std::thread::yield_now();
+                            }
                             if stop.load(std::sync::atomic::Ordering::Acquire) {
                                 break;
                             }
@@ -2046,14 +2080,17 @@ impl TieredBackend {
         // which may be a fiber's, far too small for a compile. The
         // compile runs on a thread with room and the caller waits.
         osr::set_lazy_compiler(move |bead_id| {
-            std::thread::scope(|scope| {
+            waiting.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let entry = std::thread::scope(|scope| {
                 std::thread::Builder::new()
                     .name("zyntax-first-call-compile".into())
                     .stack_size(16 << 20)
                     .spawn_scoped(scope, || compile_lazy_function(bead_id) as usize)
                     .map(|handle| handle.join().unwrap_or(0))
                     .unwrap_or(0) as *const u8
-            })
+            });
+            waiting.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            entry
         });
     }
 
