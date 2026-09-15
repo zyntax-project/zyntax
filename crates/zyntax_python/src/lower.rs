@@ -2009,6 +2009,11 @@ impl<'m> Lowerer<'m> {
                 push(out, TypedStatement::Expression(Box::new(v.node)));
             }
             py::Stmt::Assign(a) => {
+                if a.targets.len() == 1
+                    && self.reversed_slice_assign(&a.targets[0], &a.value, span, out)?
+                {
+                    return Ok(());
+                }
                 // `a = b = v` evaluates `v` once and binds each target
                 // to it, left to right.
                 let value = self.expr(&a.value)?;
@@ -2271,6 +2276,91 @@ impl<'m> Lowerer<'m> {
             other => return unsupported(types::stmt_kind(other), other),
         }
         Ok(())
+    }
+
+    /// `xs[a:b] = xs[c:d:-1]` over one list name, with bounds that
+    /// cannot rebind the name: lowered as one call that reverses the
+    /// elements in place when the two ranges name the same ones, so the
+    /// flip of a permutation copies nothing. Anything else is left to
+    /// the general slice assignment; says whether it was taken.
+    fn reversed_slice_assign(
+        &mut self,
+        target: &py::Expr,
+        value: &py::Expr,
+        span: Span,
+        out: &mut Vec<Stmt>,
+    ) -> Result<bool> {
+        let (py::Expr::Subscript(t), py::Expr::Subscript(v)) = (target, value) else {
+            return Ok(false);
+        };
+        let (py::Expr::Name(tn), py::Expr::Name(vn)) = (&*t.value, &*v.value) else {
+            return Ok(false);
+        };
+        let (py::Expr::Slice(ts), py::Expr::Slice(vs)) = (&*t.slice, &*v.slice) else {
+            return Ok(false);
+        };
+        let minus_one = |e: &Option<Box<py::Expr>>| {
+            matches!(e.as_deref(), Some(py::Expr::UnaryOp(u))
+                if u.op == py::UnaryOp::USub
+                    && matches!(&*u.operand, py::Expr::NumberLiteral(n)
+                        if matches!(&n.value, py::Number::Int(i) if i.as_u64() == Some(1))))
+        };
+        fn pure_bound(e: &Option<Box<py::Expr>>) -> bool {
+            fn pure(e: &py::Expr) -> bool {
+                match e {
+                    py::Expr::Name(_) | py::Expr::NumberLiteral(_) => true,
+                    py::Expr::BinOp(b) => pure(&b.left) && pure(&b.right),
+                    py::Expr::UnaryOp(u) => pure(&u.operand),
+                    _ => false,
+                }
+            }
+            e.as_deref().is_none_or(pure)
+        }
+        if tn.id != vn.id
+            || ts.step.is_some()
+            || !minus_one(&vs.step)
+            || !pure_bound(&ts.lower)
+            || !pure_bound(&ts.upper)
+            || !pure_bound(&vs.lower)
+            || !pure_bound(&vs.upper)
+        {
+            return Ok(false);
+        }
+        let seq = self.expr(&t.value)?;
+        let Ty::List(e) = seq.ty else {
+            return Ok(false);
+        };
+        let bounds = |this: &mut Self,
+                      lower: &Option<Box<py::Expr>>,
+                      upper: &Option<Box<py::Expr>>|
+         -> Result<(Node, Node, Node)> {
+            let mut mask = 0;
+            let mut bound = |this: &mut Self, e: &Option<Box<py::Expr>>, bit: i64| match e {
+                Some(e) => {
+                    mask |= bit;
+                    this.expr_as(e, Ty::Int)
+                }
+                None => Ok(int_lit(0, span)),
+            };
+            let lo = bound(this, lower, 1)?;
+            let hi = bound(this, upper, 2)?;
+            Ok((lo, hi, int_lit(mask, span)))
+        };
+        let (start, stop, mask) = bounds(self, &ts.lower, &ts.upper)?;
+        let (rstart, rstop, rmask) = bounds(self, &vs.lower, &vs.upper)?;
+        let call = call(
+            &list_fn("assign_reversed_slice", e),
+            vec![seq.node, start, stop, mask, rstart, rstop, rmask],
+            Ty::None,
+            span,
+        );
+        out.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(call)),
+            Type::Unknown,
+            span,
+        ));
+        out.push(self.pending_check(span));
+        Ok(true)
     }
 
     /// `target = value`: a `let` the first time a name is seen in this

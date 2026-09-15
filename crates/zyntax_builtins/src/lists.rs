@@ -552,17 +552,129 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
             ret(out.e()),
         ],
     ));
-    // Replace selected elements in the same header, including when the source aliases it.
-    let replacement = local("replacement", k.list.clone());
+    // Replace selected elements in the same header. The source is read
+    // as it is, unless it is the target's own storage, which is copied
+    // first so the elements moved are the ones the slice named.
+    let replacement = borrowed("replacement", k.list.clone());
     let selected = local("selected", i64());
     let width = local("width", i64());
     let common = local("common", i64());
+    let data = |xs: &Local| fld(xs.e(), "data", i64());
+    let assign_from = |source: Expr, step: Expr| {
+        expr(call(
+            &name("assign_slice_from"),
+            vec![source, xs.e(), start.e(), stop.e(), step, mask.e()],
+            unit(),
+        ))
+    };
     d.push(define(
         &name("assign_slice"),
         &[&ys, &xs, &start, &stop, &step, &mask],
         unit(),
         vec![
-            replacement.decl(call(&name("copy"), vec![ys.e()], k.list.clone())),
+            when(
+                eq(data(&ys), data(&xs)),
+                vec![
+                    replacement.decl(call(&name("copy"), vec![ys.e()], k.list.clone())),
+                    assign_from(replacement.e(), step.e()),
+                    ret_void(),
+                ],
+            ),
+            assign_from(ys.e(), step.e()),
+            ret_void(),
+        ],
+    ));
+    // xs[start:stop] = xs[rstart:rstop:-1]. The two ranges naming the
+    // same elements is a reversal in place; anything else is the slice
+    // taken first and assigned as any other source.
+    let rstart = local("rstart", i64());
+    let rstop = local("rstop", i64());
+    let rmask = local("rmask", i64());
+    let rlo = local("rlo", i64());
+    let rhi = local("rhi", i64());
+    let taken = local("taken", k.list.clone());
+    d.push(define(
+        &name("assign_reversed_slice"),
+        &[&xs, &start, &stop, &mask, &rstart, &rstop, &rmask],
+        unit(),
+        vec![
+            n.decl(len(xs.e())),
+            lo.decl(int(0)),
+            hi.decl(n.e()),
+            when(
+                ne(bitand(mask.e(), int(1)), int(0)),
+                vec![lo.set(call(
+                    "zb_slice_bound",
+                    vec![start.e(), n.e(), int(1)],
+                    i64(),
+                ))],
+            ),
+            when(
+                ne(bitand(mask.e(), int(2)), int(0)),
+                vec![hi.set(call("zb_slice_bound", vec![stop.e(), n.e(), int(1)], i64()))],
+            ),
+            when(lt(hi.e(), lo.e()), vec![hi.set(lo.e())]),
+            rlo.decl(sub(n.e(), int(1))),
+            rhi.decl(int(-1)),
+            when(
+                ne(bitand(rmask.e(), int(1)), int(0)),
+                vec![rlo.set(call(
+                    "zb_slice_bound",
+                    vec![rstart.e(), n.e(), int(-1)],
+                    i64(),
+                ))],
+            ),
+            when(
+                ne(bitand(rmask.e(), int(2)), int(0)),
+                vec![rhi.set(call(
+                    "zb_slice_bound",
+                    vec![rstop.e(), n.e(), int(-1)],
+                    i64(),
+                ))],
+            ),
+            if_(
+                and(
+                    eq(rlo.e(), sub(hi.e(), int(1))),
+                    eq(rhi.e(), sub(lo.e(), int(1))),
+                ),
+                vec![
+                    i.decl(lo.e()),
+                    j.decl(sub(hi.e(), int(1))),
+                    while_(
+                        lt(i.e(), j.e()),
+                        vec![
+                            a.decl(el(&xs, i.e())),
+                            b.decl(el(&xs, j.e())),
+                            set_idx(xs.e(), i.e(), b.e()),
+                            set_idx(xs.e(), j.e(), a.e()),
+                            i.add_assign(int(1)),
+                            j.set(sub(j.e(), int(1))),
+                        ],
+                    ),
+                ],
+                vec![
+                    taken.decl(call(
+                        &name("slice"),
+                        vec![
+                            xs.e(),
+                            rstart.e(),
+                            rstop.e(),
+                            int(-1),
+                            bitor(rmask.e(), int(4)),
+                        ],
+                        k.list.clone(),
+                    )),
+                    assign_from(taken.e(), int(0)),
+                ],
+            ),
+            ret_void(),
+        ],
+    ));
+    d.push(define(
+        &name("assign_slice_from"),
+        &[&replacement, &xs, &start, &stop, &step, &mask],
+        unit(),
+        vec![
             n.decl(len(xs.e())),
             st.decl(int(1)),
             when(ne(bitand(mask.e(), int(4)), int(0)), vec![st.set(step.e())]),
