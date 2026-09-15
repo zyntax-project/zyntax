@@ -317,7 +317,7 @@ pub struct TieredBackend {
     functions: HashMap<HirId, FunctionEntry>,
     /// The module the compiled code came from. A reload diffs the
     /// edited module against this and replaces it piecewise.
-    current_module: Option<HirModule>,
+    current_module: Option<Arc<HirModule>>,
     /// Every module loaded so far, in the order they arrived.
     ///
     /// A rebuild throws the JIT module away and with it the address of
@@ -571,8 +571,8 @@ impl TieredBackend {
         // all the same module name, so matching on that discarded every
         // earlier file and restored only the newest, which is the
         // behaviour this list exists to fix.
-        self.current_module = Some(module.clone());
         let module_context = Arc::new(module);
+        self.current_module = Some(Arc::clone(&module_context));
         self.loaded.push(Arc::clone(&module_context));
 
         // Hand the LLVM tier the whole module before anything promotes out
@@ -662,6 +662,7 @@ impl TieredBackend {
         let old_module = self.current_module.clone().ok_or_else(|| {
             CompilerError::Backend("reload before any module was compiled".into())
         })?;
+        let old_module: &HirModule = &old_module;
 
         let name_of = |f: &HirFunction| f.name.resolve_global();
 
@@ -1280,11 +1281,11 @@ impl TieredBackend {
         for (id, body) in updated_functions {
             merged.functions.insert(id, body);
         }
-        let module_context = Arc::new(merged.clone());
+        let module_context = Arc::new(merged);
         for entry in self.functions.values_mut() {
             entry.module = Arc::clone(&module_context);
         }
-        self.current_module = Some(merged);
+        self.current_module = Some(module_context);
 
         // The promotion requester captured each function's body when it
         // was installed; reinstall so a later promotion compiles the
@@ -1346,15 +1347,16 @@ impl TieredBackend {
                 }
             }
             if let Some(module) = &mut self.current_module {
-                module.functions.insert(swap.id, (*swap.old_body).clone());
+                Arc::make_mut(module)
+                    .functions
+                    .insert(swap.id, (*swap.old_body).clone());
             }
             restored.push(swap.name);
         }
 
         if let Some(module) = &self.current_module {
-            let module_context = Arc::new(module.clone());
             for entry in self.functions.values_mut() {
-                entry.module = Arc::clone(&module_context);
+                entry.module = Arc::clone(module);
             }
         }
 

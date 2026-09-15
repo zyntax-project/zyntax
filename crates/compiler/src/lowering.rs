@@ -240,6 +240,9 @@ pub struct LoweringContext {
     /// reaches had to be built. Stays set when a call through a value
     /// later forced every body to be built anyway.
     entered: bool,
+    /// What [`Self::entered_functions`] answers once the module has
+    /// been handed out of the context.
+    entered_names: Option<Vec<String>>,
     /// Functions an import brought in, by name. Everything else in the
     /// module is the program's own and a host may call it.
     imported: std::collections::HashSet<InternedString>,
@@ -545,6 +548,7 @@ impl LoweringContext {
             current_decl: 0,
             saw_indirect_call: false,
             entered: false,
+            entered_names: None,
             imported: std::collections::HashSet::new(),
             prelowered_functions: config
                 .prelowered
@@ -788,6 +792,9 @@ impl LoweringContext {
         if !self.entered {
             return None;
         }
+        if let Some(names) = &self.entered_names {
+            return Some(names.clone());
+        }
         Some(
             self.module
                 .functions
@@ -934,6 +941,7 @@ impl AstLowering for LoweringContext {
             self.current_decl = index;
             self.lower_declaration(decl)?;
         }
+        let declared_ms = phase.lap();
         self.lower_until_nothing_is_owed(program)?;
 
         // `with H { }` post-pass: now that every function (including
@@ -941,12 +949,12 @@ impl AstLowering for LoweringContext {
         // push_handler/pop_handler for each recorded scope. The
         // function is taken out of the module while mutated so
         // `build_op_table` can read the rest of the module freely.
-        let decls_ms = phase.lap();
+        let bodies_ms = phase.lap();
         if phase.on() {
             eprintln!(
                 "[LOWER-PROGRAM] copy_types = {copy_ms:.2}  typecheck = {typecheck_ms:.2}  \
                  method_types = {methods_ms:.2}  collect_decls = {collect_ms:.2}  \
-                 lower_decls = {decls_ms:.2} ms ({} declarations)",
+                 declarations = {declared_ms:.2} ms ({})  bodies = {bodies_ms:.2} ms",
                 program.declarations.len()
             );
         }
@@ -993,7 +1001,11 @@ impl AstLowering for LoweringContext {
         // present, and because every backend is downstream of it.
         self.report_calls_with_wrong_arity()?;
 
-        Ok(self.module.clone())
+        // The module leaves the context rather than being copied out;
+        // what is still asked of the context afterwards is kept.
+        self.entered_names = self.entered_functions();
+        let name = self.module.name;
+        Ok(std::mem::replace(&mut self.module, HirModule::new(name)))
     }
 }
 
