@@ -211,6 +211,9 @@ pub fn run_module(module: &mut HirModule) -> InlineStats {
         // Functions that reach each other through calls are one cycle;
         // inlining within a cycle copies the cycle into itself round
         // after round, so a callee in the caller's cycle stays a call.
+        // So does a callee whose cycle calls back into itself from
+        // outside that cycle: its body brings the call that re-enters
+        // it, and every round would inline one more level.
         let cycles = call_cycles(&callees);
 
         let mut this_pass = 0;
@@ -736,7 +739,28 @@ fn blocks_leading_to_cold(f: &HirFunction, callees: &Callees<'_>) -> HashSet<Hir
 /// The strongly connected component of each function in the graph of
 /// direct calls, so a caller and a callee in one component are known to
 /// reach each other.
-fn call_cycles(functions: &Callees<'_>) -> HashMap<HirId, usize> {
+/// The call graph's cycles: each function's component, and which
+/// components a call re-enters, a self-call included.
+struct Cycles {
+    component: HashMap<HirId, usize>,
+    recursive: HashSet<usize>,
+}
+
+impl Cycles {
+    /// Whether `callee` is in `caller`'s cycle.
+    fn shares(&self, caller: HirId, callee: HirId) -> bool {
+        self.component.get(&callee) == self.component.get(&caller)
+    }
+
+    /// Whether some call reaches `f` from within its own cycle.
+    fn recurs(&self, f: HirId) -> bool {
+        self.component
+            .get(&f)
+            .is_some_and(|c| self.recursive.contains(c))
+    }
+}
+
+fn call_cycles(functions: &Callees<'_>) -> Cycles {
     let mut callees_of: HashMap<HirId, Vec<HirId>> = HashMap::new();
     for (id, f) in functions.iter() {
         let mut out = Vec::new();
@@ -812,14 +836,22 @@ fn call_cycles(functions: &Callees<'_>) -> HashMap<HirId, usize> {
             }
         }
     }
-    component
+    let recursive = callees_of
+        .iter()
+        .filter(|(f, out)| out.iter().any(|c| component.get(c) == component.get(f)))
+        .map(|(f, _)| component[f])
+        .collect();
+    Cycles {
+        component,
+        recursive,
+    }
 }
 
 fn inline_in_function(
     caller: &mut HirFunction,
     caller_id: HirId,
     callees: &Callees<'_>,
-    cycles: &HashMap<HirId, usize>,
+    cycles: &Cycles,
 ) -> InlineStats {
     let mut stats = InlineStats::default();
 
@@ -877,9 +909,14 @@ fn inline_in_function(
                 _ => continue,
             };
 
-            if callee_id == caller_id || cycles.get(&callee_id) == cycles.get(&caller_id) {
-                // A call into the caller's own cycle: inlining it would
-                // copy the cycle into itself. The recursive inliner
+            if callee_id == caller_id
+                || cycles.shares(caller_id, callee_id)
+                || cycles.recurs(callee_id)
+            {
+                // A call into the caller's own cycle would copy the
+                // cycle into itself; a callee that re-enters its own
+                // cycle would come back as the call it carries and be
+                // inlined again next round. The recursive inliner
                 // handles the direct self-call on its own terms.
                 stats.skipped_unsupported += 1;
                 continue;
@@ -2194,6 +2231,46 @@ mod tests {
         let stats = run_module(&mut module);
         assert_eq!(stats.inlined, 0);
         assert_eq!(stats.skipped_unsupported, 1);
+    }
+
+    #[test]
+    fn skips_a_callee_that_calls_itself() {
+        // caller() { rec(7) + 1 }, rec(n) { rec(n) }: the callee's own
+        // call would be inlined again every round.
+        let rec_id = HirId::new();
+        let mut rec = HirFunction::new(
+            InternedString::new_global("rec"),
+            sig(vec![HirType::I64], HirType::I64),
+        );
+        rec.id = rec_id;
+        let entry = HirId::new();
+        rec.entry_block = entry;
+        rec.blocks.clear();
+        rec.blocks.insert(entry, HirBlock::new(entry));
+        let n = add_value_for_param(&mut rec, 0, HirType::I64);
+        let res = add_inst(&mut rec, HirType::I64);
+        let blk = rec.blocks.get_mut(&entry).unwrap();
+        blk.instructions.push(HirInstruction::Call {
+            result: Some(res),
+            callee: HirCallable::Function(rec_id),
+            args: vec![n],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        blk.terminator = HirTerminator::Return { values: vec![res] };
+
+        let caller_id = HirId::new();
+        let mut caller = build_caller(rec_id);
+        caller.id = caller_id;
+
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        module.functions.insert(rec_id, rec);
+        module.functions.insert(caller_id, caller);
+        let stats = run_module(&mut module);
+        assert_eq!(stats.inlined, 0);
+        let caller = &module.functions[&caller_id];
+        assert_eq!(count_insts(caller), 2);
     }
 
     /// Build `max(a: i64, b: i64): i64 { if a > b { return a } else { return b } }`
