@@ -45,6 +45,9 @@ ariadne = "0.5"
 
 [workspace.lints.rust]
 warnings = "allow"
+# `zrtl_plugin!` gates its dlopen exports on this feature of the crate
+# that expands it, whether or not that crate declares it.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("linked-into-host"))'] }
 
 [workspace.lints.clippy]
 all = "allow"
