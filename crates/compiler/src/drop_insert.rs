@@ -1229,8 +1229,125 @@ fn escapes_only_by_return(
     true
 }
 
+/// Whether `callee` copies a string into a fresh box.
+fn boxes_string(callee: &HirCallable, facts: &ModuleFacts) -> bool {
+    match callee {
+        HirCallable::Symbol(name) => name == STRING_TO_BOX,
+        HirCallable::Function(id) => facts
+            .extern_links
+            .get(id)
+            .is_some_and(|n| n == STRING_TO_BOX),
+        _ => false,
+    }
+}
+
+/// One string boxed twice on a path, the first box read only by calls
+/// that borrow it: the second boxing takes the first box instead of
+/// copying the string again. Whatever the second box was to, kept by a
+/// container or released, the first now is, and the analysis below
+/// decides that from the merged uses. A borrowed box is left as it was,
+/// so nothing that read it saw anything but the same string.
+fn merge_repeated_boxings(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
+    use crate::analysis::DominatorTree;
+    // (block, index, result, argument) of every boxing, in block order.
+    let mut boxings: Vec<(HirId, usize, HirId, HirId)> = Vec::new();
+    for (block_id, block) in &func.blocks {
+        for (idx, inst) in block.instructions.iter().enumerate() {
+            if let HirInstruction::Call {
+                result: Some(result),
+                callee,
+                args,
+                ..
+            } = inst
+            {
+                if boxes_string(callee, facts) {
+                    if let [arg] = args.as_slice() {
+                        boxings.push((*block_id, idx, *result, *arg));
+                    }
+                }
+            }
+        }
+    }
+    if boxings.len() < 2 {
+        return 0;
+    }
+    let dom = DominatorTree::new(func);
+    // A dominator comes before what it dominates in reverse postorder,
+    // so the earlier of a pair here is the one that can be kept.
+    boxings.sort_by_key(|(block, idx, _, _)| (dom.rpo_position(*block), *idx));
+    let mut replacements: indexmap::IndexMap<HirId, HirId> = indexmap::IndexMap::new();
+    let mut removed: Vec<(HirId, usize)> = Vec::new();
+    for (i, &(block_a, idx_a, box_a, arg)) in boxings.iter().enumerate() {
+        if replacements.contains_key(&box_a) {
+            continue;
+        }
+        let mut borrowed_only: Option<bool> = None;
+        for &(block_b, idx_b, box_b, arg_b) in boxings.iter().skip(i + 1) {
+            if arg_b != arg || replacements.contains_key(&box_b) {
+                continue;
+            }
+            let ahead = if block_a == block_b {
+                idx_a < idx_b
+            } else {
+                dom.strictly_dominates(block_a, block_b)
+            };
+            if !ahead {
+                continue;
+            }
+            let only_borrows = *borrowed_only.get_or_insert_with(|| {
+                let derived = derived_values_in(func, box_a, facts);
+                uses_are_all_borrows(func, &derived, facts)
+            });
+            if !only_borrows {
+                if trace_enabled() {
+                    eprintln!(
+                        "[drop] {}: boxing {box_a:?} is not only borrowed, so {box_b:?} stays",
+                        func.name.resolve_global().unwrap_or_default()
+                    );
+                }
+                break;
+            }
+            replacements.insert(box_b, box_a);
+            removed.push((block_b, idx_b));
+        }
+    }
+    if replacements.is_empty() {
+        return 0;
+    }
+    for block in func.blocks.values_mut() {
+        for inst in &mut block.instructions {
+            inst.replace_uses(&replacements);
+        }
+        block.terminator.replace_uses(&replacements);
+        for phi in block.phis.iter_mut() {
+            for (value, _) in phi.incoming.iter_mut() {
+                if let Some(&to) = replacements.get(value) {
+                    *value = to;
+                }
+            }
+        }
+    }
+    // Later indices first, so the earlier ones stay right.
+    removed.sort_by(|a, b| b.cmp(a));
+    for (block, idx) in removed {
+        if let Some(b) = func.blocks.get_mut(&block) {
+            b.instructions.remove(idx);
+        }
+    }
+    replacements.len()
+}
+
 fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
     let mut stats = DropStats::default();
+    if facts.automatic_release {
+        let merged = merge_repeated_boxings(func, facts);
+        if merged > 0 && trace_enabled() {
+            eprintln!(
+                "[drop] {}: {merged} repeated boxing(s) take the first box",
+                func.name.resolve_global().unwrap_or_default()
+            );
+        }
+    }
     let mallocs: Vec<MallocSite> = collect_owned_sites(func, facts);
     for site in mallocs {
         stats.mallocs_scanned += 1;
@@ -1464,15 +1581,7 @@ fn adopt_into_box(
     if args.as_slice() != [target] {
         return false;
     }
-    let copies = match callee {
-        HirCallable::Symbol(name) => name == STRING_TO_BOX,
-        HirCallable::Function(id) => facts
-            .extern_links
-            .get(id)
-            .is_some_and(|n| n == STRING_TO_BOX),
-        _ => false,
-    };
-    if !copies {
+    if !boxes_string(callee, facts) {
         return false;
     }
     *callee = HirCallable::Symbol(STRING_INTO_BOX.to_string());
@@ -3348,6 +3457,105 @@ mod tests {
         assert!(
             free > read,
             "releasing before the read would be a use after free"
+        );
+    }
+
+    /// A string boxed, read through, and boxed again on the same path:
+    /// `b1 = box(s); read(b1); b2 = box(s); return b2`.
+    fn build_string_boxed_twice(first_escapes: bool) -> (HirFunction, HirId, HirId) {
+        let mut f = HirFunction::new(
+            InternedString::new_global("boxed_twice"),
+            empty_sig(HirType::I64),
+        );
+        let entry = HirId::new();
+        f.entry_block = entry;
+        f.blocks.clear();
+        f.blocks.insert(entry, HirBlock::new(entry));
+        let s = add_const(&mut f, HirType::I64, HirConstant::I64(0));
+        let first = add_inst_val(&mut f, HirType::I64);
+        let read = add_inst_val(&mut f, HirType::F64);
+        let second = add_inst_val(&mut f, HirType::I64);
+        let boxing = |result| HirInstruction::Call {
+            result: Some(result),
+            callee: HirCallable::Symbol(STRING_TO_BOX.to_string()),
+            args: vec![s],
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            is_tail: false,
+        };
+        let block = f.blocks.get_mut(&entry).unwrap();
+        block.instructions.push(boxing(first));
+        block.instructions.push(HirInstruction::Call {
+            result: Some(read),
+            callee: HirCallable::Symbol(
+                if first_escapes {
+                    "zyntax_list_push"
+                } else {
+                    "zyntax_box_get_f64"
+                }
+                .to_string(),
+            ),
+            args: vec![first],
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            is_tail: false,
+        });
+        block.instructions.push(boxing(second));
+        block.terminator = HirTerminator::Return {
+            values: vec![second],
+        };
+        (f, first, second)
+    }
+
+    #[test]
+    fn a_second_boxing_of_a_borrowed_box_takes_the_first() {
+        let (mut f, first, second) = build_string_boxed_twice(false);
+        let facts = ModuleFacts {
+            automatic_release: true,
+            ..ModuleFacts::default()
+        };
+        let stats = run_function(&mut f, &facts);
+        let block = f.blocks.values().next().unwrap();
+        let boxings = block
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, HirInstruction::Call { callee: HirCallable::Symbol(n), .. } if n == STRING_TO_BOX))
+            .count();
+        assert_eq!(boxings, 1, "the second boxing is gone");
+        assert!(
+            matches!(&block.terminator, HirTerminator::Return { values } if values == &vec![first]),
+            "what was returned is the first box"
+        );
+        assert!(
+            !block
+                .instructions
+                .iter()
+                .any(|i| i.result_id() == Some(second)),
+            "the second box is not defined any more"
+        );
+        assert_eq!(
+            stats.frees_inserted, 0,
+            "the first box is returned now, so it is not released"
+        );
+    }
+
+    #[test]
+    fn a_second_boxing_stays_when_the_first_box_is_kept() {
+        let (mut f, _, second) = build_string_boxed_twice(true);
+        let facts = ModuleFacts {
+            automatic_release: true,
+            ..ModuleFacts::default()
+        };
+        run_function(&mut f, &facts);
+        let block = f.blocks.values().next().unwrap();
+        let boxings = block
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, HirInstruction::Call { callee: HirCallable::Symbol(n), .. } if n == STRING_TO_BOX))
+            .count();
+        assert_eq!(boxings, 2, "a kept box is not shared with a later one");
+        assert!(
+            matches!(&block.terminator, HirTerminator::Return { values } if values == &vec![second])
         );
     }
 
