@@ -12,6 +12,12 @@ use zyntax_typed_ast::TypeId;
 fn any_eq(a: Expr, b: Expr) -> Expr {
     call("zb_any_eq", vec![a, b], boolean())
 }
+/// Whether a stored key matches the one looked up: the same box, as a
+/// key read back from the dict or a shared constant is, before the
+/// values are compared.
+fn key_matches(stored: Expr, k: Expr) -> Expr {
+    or(eq(stored.clone(), k.clone()), any_eq(stored, k))
+}
 fn any_repr(x: Expr) -> Expr {
     call("zb_any_repr", vec![x], string())
 }
@@ -184,7 +190,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
                     entry.decl(slot_at(index.e(), slot.e())),
                     when(lt(entry.e(), int(0)), vec![ret(int(-1))]),
                     when(
-                        any_eq(key_at(d.e(), entry.e()), k.e()),
+                        key_matches(key_at(d.e(), entry.e()), k.e()),
                         vec![ret(add(mul(entry.e(), int(2)), int(1)))],
                     ),
                     slot.set(next_slot(slot.e(), mask.e())),
@@ -208,7 +214,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
                     while_(
                         lt(i.e(), n.e()),
                         vec![
-                            when(any_eq(at(d.e(), i.e()), k.e()), vec![ret(i.e())]),
+                            when(key_matches(at(d.e(), i.e()), k.e()), vec![ret(i.e())]),
                             i.add_assign(int(2)),
                         ],
                     ),
@@ -495,6 +501,29 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
             out.decl(call("zb_dict_new", vec![], anys.clone())),
             expr(call("zb_dict_add_pairs", vec![out.e(), pairs.e()], unit())),
             ret(out.e()),
+        ],
+    ));
+    // A dict over storage a literal laid out itself: the index slot,
+    // then pairs whose keys are known to be distinct. The storage is
+    // the dict; only a large one takes a table.
+    out_decls.push(define(
+        "zb_dict_from_distinct",
+        &[&d],
+        anys.clone(),
+        vec![
+            n.decl(count(d.e())),
+            when(
+                gt(n.e(), int(SMALL)),
+                vec![
+                    cap.decl(int(FIRST_TABLE)),
+                    while_(
+                        lt(cap.e(), mul(n.e(), int(2))),
+                        vec![cap.set(mul(cap.e(), int(2)))],
+                    ),
+                    expr(call("zb_dict_reindex", vec![d.e(), cap.e()], unit())),
+                ],
+            ),
+            ret(d.e()),
         ],
     ));
     out_decls.push(define(

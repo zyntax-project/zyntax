@@ -250,9 +250,16 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         ("zb_box_payload_i64", i64(), "zyntax_box_payload_i64"),
         ("zb_box_payload_f64", f64(), "zyntax_box_payload_f64"),
         ("zb_box_payload_bool", i32(), "zyntax_box_payload_bool"),
+        ("zb_box_hash", i64(), "zyntax_box_hash"),
     ] {
         d.push(extern_fn(name, &[("x", any())], ty, Some(link)));
     }
+    d.push(extern_fn(
+        "zb_box_set_hash",
+        &[("x", any()), ("h", i64())],
+        unit(),
+        Some("zyntax_box_set_hash"),
+    ));
     d.push(define(
         "zb_box_payload_truth",
         &[&x],
@@ -634,9 +641,18 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     ret(cast(mul(f.e(), float(1_048_576.0)), i64())),
                 ],
             ),
+            // A string box keeps its hash once computed, zero until
+            // then; a hash that comes out zero is recorded as one.
             when(
                 is(&cat, STR),
-                vec![ret(call("zb_str_hash", vec![get_str(x.e())], i64()))],
+                vec![
+                    h.decl(call("zb_box_hash", vec![x.e()], i64())),
+                    when(ne(h.e(), int(0)), vec![ret(h.e())]),
+                    h.set(call("zb_str_hash", vec![get_str(x.e())], i64())),
+                    when(eq(h.e(), int(0)), vec![h.set(int(1))]),
+                    expr(call("zb_box_set_hash", vec![x.e(), h.e()], unit())),
+                    ret(h.e()),
+                ],
             ),
             when(
                 is_instance(x.e()),
@@ -1071,6 +1087,72 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 quoted(type_name(b.e())),
             )),
             ret(null(any())),
+        ],
+    ));
+    // The same with an integer on one side, which is then never boxed:
+    // a number on the other side computes directly, anything else goes
+    // the general way.
+    let m = local("m", i64());
+    d.push(define(
+        "zb_any_arith_i64",
+        &[&code, &a, &m],
+        any(),
+        vec![
+            ca.decl(category(a.e())),
+            when(
+                is_number(ca.e()),
+                vec![
+                    when(
+                        is(&ca, FLOAT),
+                        vec![ret(call(
+                            "zb_arith_f64",
+                            vec![code.e(), get_f64(a.e()), cast(m.e(), f64())],
+                            any(),
+                        ))],
+                    ),
+                    ret(call(
+                        "zb_arith_i64",
+                        vec![code.e(), number_i64(a.e(), ca.e()), m.e()],
+                        any(),
+                    )),
+                ],
+            ),
+            ret(call(
+                "zb_any_arith",
+                vec![code.e(), a.e(), box_i64(m.e())],
+                any(),
+            )),
+        ],
+    ));
+    d.push(define(
+        "zb_i64_arith_any",
+        &[&code, &m, &b],
+        any(),
+        vec![
+            cb.decl(category(b.e())),
+            when(
+                is_number(cb.e()),
+                vec![
+                    when(
+                        is(&cb, FLOAT),
+                        vec![ret(call(
+                            "zb_arith_f64",
+                            vec![code.e(), cast(m.e(), f64()), get_f64(b.e())],
+                            any(),
+                        ))],
+                    ),
+                    ret(call(
+                        "zb_arith_i64",
+                        vec![code.e(), m.e(), number_i64(b.e(), cb.e())],
+                        any(),
+                    )),
+                ],
+            ),
+            ret(call(
+                "zb_any_arith",
+                vec![code.e(), box_i64(m.e()), b.e()],
+                any(),
+            )),
         ],
     ));
 

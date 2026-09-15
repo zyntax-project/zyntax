@@ -23,6 +23,9 @@ pub type DisplayFn = extern "C" fn(*const u8) -> *const u8;
 /// - data: Pointer to the actual data
 /// - dropper: Optional destructor function
 /// - display_fn: Optional display/formatting function
+/// Bytes after a string box's header for its hash.
+pub const STRING_HASH_SIZE: usize = 8;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DynamicBox {
@@ -394,6 +397,18 @@ impl DynamicBox {
         }
     }
 
+    /// Bytes a box on the heap takes: the header, and for a string a
+    /// word after it holding the string's hash once something has
+    /// computed it, zero until then. A string is immutable, so the
+    /// hash is good for as long as the box is.
+    pub const fn heap_size(tag: TypeTag) -> usize {
+        if tag.0 == TypeTag::STRING.0 {
+            std::mem::size_of::<Self>() + STRING_HASH_SIZE
+        } else {
+            std::mem::size_of::<Self>()
+        }
+    }
+
     /// Release a box made by [`Self::into_raw`], without running its
     /// dropper.
     ///
@@ -403,7 +418,7 @@ impl DynamicBox {
     pub unsafe fn free_raw(ptr: *mut Self) {
         crate::heap::free(
             ptr as *mut u8,
-            std::mem::size_of::<Self>(),
+            Self::heap_size((*ptr).tag),
             std::mem::align_of::<Self>(),
         );
     }
@@ -412,10 +427,15 @@ impl DynamicBox {
     /// host releases with its box release.
     pub fn into_raw(self) -> *mut Self {
         // SAFETY: the block is as large and as aligned as a box, and
-        // the write fills it.
+        // the writes fill it.
         unsafe {
-            let p = crate::heap::alloc(std::mem::size_of::<Self>(), std::mem::align_of::<Self>())
-                as *mut Self;
+            let size = Self::heap_size(self.tag);
+            let p = crate::heap::alloc(size, std::mem::align_of::<Self>()) as *mut Self;
+            if size > std::mem::size_of::<Self>() {
+                (p as *mut u8)
+                    .add(std::mem::size_of::<Self>())
+                    .write_bytes(0, size - std::mem::size_of::<Self>());
+            }
             p.write(self);
             p
         }

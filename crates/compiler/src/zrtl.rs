@@ -1625,10 +1625,42 @@ pub unsafe extern "C" fn zyntax_primitive_to_box(
 /// # Safety
 /// The pool serves any request this size.
 unsafe fn box_on_heap(repr: DynamicBoxRepr) -> *mut DynamicBoxRepr {
-    let p = crate::pool_alloc::zyntax_alloc(std::mem::size_of::<DynamicBoxRepr>())
-        as *mut DynamicBoxRepr;
+    // A string box carries a word after the header for its hash, zero
+    // until something computes it.
+    let size = if repr.tag == TypeTag::STRING.0 {
+        std::mem::size_of::<DynamicBoxRepr>() + STRING_HASH_SIZE
+    } else {
+        std::mem::size_of::<DynamicBoxRepr>()
+    };
+    let p = crate::pool_alloc::zyntax_alloc(size) as *mut DynamicBoxRepr;
     p.write(repr);
+    if size > std::mem::size_of::<DynamicBoxRepr>() {
+        (p as *mut u8)
+            .add(std::mem::size_of::<DynamicBoxRepr>())
+            .write_bytes(0, STRING_HASH_SIZE);
+    }
     p
+}
+
+/// Bytes after a string box's header for its hash.
+const STRING_HASH_SIZE: usize = 8;
+
+/// The hash a string box carries, zero while none has been computed.
+///
+/// # Safety
+/// `boxed` must be a live string box.
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_hash(boxed: *const DynamicBoxRepr) -> i64 {
+    *((boxed as *const u8).add(std::mem::size_of::<DynamicBoxRepr>()) as *const i64)
+}
+
+/// Record the hash of a string box.
+///
+/// # Safety
+/// As [`zyntax_box_hash`].
+#[no_mangle]
+pub unsafe extern "C" fn zyntax_box_set_hash(boxed: *mut DynamicBoxRepr, hash: i64) {
+    *((boxed as *mut u8).add(std::mem::size_of::<DynamicBoxRepr>()) as *mut i64) = hash;
 }
 
 /// A scalar payload on the program's heap.
@@ -2073,6 +2105,8 @@ pub fn box_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
             zyntax_box_payload_bool as *const u8,
             1,
         ),
+        ("zyntax_box_hash", zyntax_box_hash as *const u8, 1),
+        ("zyntax_box_set_hash", zyntax_box_set_hash as *const u8, 2),
     ]
 }
 

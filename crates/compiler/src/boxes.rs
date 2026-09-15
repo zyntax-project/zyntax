@@ -52,6 +52,8 @@ const DROPPER_OFFSET: i64 = 16;
 const DISPLAY_OFFSET: i64 = 24;
 /// Size of the header; a payload made here follows it.
 const HEADER_SIZE: i64 = 32;
+/// Byte offset of the hash a string box carries after its header.
+const HASH_OFFSET: i64 = HEADER_SIZE;
 
 /// A box the pass makes: the tag it carries and the payload's type.
 #[derive(Clone)]
@@ -117,6 +119,8 @@ enum Read {
     Payload,
     /// One byte behind `data`, widened to the type the call result has.
     PayloadByte,
+    /// The hash word a string box carries after its header.
+    Hash,
 }
 
 fn read_of(symbol: &str) -> Option<Read> {
@@ -125,9 +129,13 @@ fn read_of(symbol: &str) -> Option<Read> {
         "zyntax_box_data" | "zyntax_box_pointer" => Some(Read::Data),
         "zyntax_box_payload_i64" | "zyntax_box_payload_f64" => Some(Read::Payload),
         "zyntax_box_payload_bool" => Some(Read::PayloadByte),
+        "zyntax_box_hash" => Some(Read::Hash),
         _ => None,
     }
 }
+
+/// The one write into a box after it is made: its hash, on a string.
+const SET_HASH: &str = "zyntax_box_set_hash";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BoxStats {
@@ -245,6 +253,10 @@ pub fn run_function(func: &mut HirFunction, externs: &HashMap<HirId, String>) ->
                     make_box(func, *result, args, make, &mut out);
                     made_here.insert(*result);
                     stats.made += 1;
+                }
+                (None, _, _) if symbol == SET_HASH && args.len() == 2 => {
+                    store_field(func, args[0], HASH_OFFSET, args[1], HirType::I64, &mut out);
+                    stats.expanded += 1;
                 }
                 (None, _, _)
                     if symbol == FREE && args.len() == 1 && made_here.contains(&args[0]) =>
@@ -510,11 +522,19 @@ fn make_box(
     make: Make,
     out: &mut Vec<HirInstruction>,
 ) {
+    // A pointer box under the string tag carries the hash word.
+    let string_tagged = matches!(make, Make::Pointer)
+        && matches!(
+            func.values.get(&args[1]).map(|v| &v.kind),
+            Some(HirValueKind::Constant(HirConstant::U32(tag)))
+                if *tag == crate::zrtl::TypeTag::STRING.0
+        );
     let (total, tag, size, payload) = match make {
         Make::Scalar { tag, payload } => {
             let width = hir_ty_width(&payload);
             (HEADER_SIZE + 8, Some(tag), width, Some(payload))
         }
+        Make::Pointer if string_tagged => (HEADER_SIZE + 8, None, 8, None),
         Make::Pointer => (HEADER_SIZE, None, 8, None),
     };
     let size_const = constant(func, HirType::I64, HirConstant::I64(total));
@@ -537,6 +557,9 @@ fn make_box(
     let null = constant(func, HirType::I64, HirConstant::I64(0));
     store_field(func, result, DROPPER_OFFSET, null, HirType::I64, out);
     store_field(func, result, DISPLAY_OFFSET, null, HirType::I64, out);
+    if string_tagged {
+        store_field(func, result, HASH_OFFSET, null, HirType::I64, out);
+    }
     match payload {
         Some(payload) => {
             // `data` points at the payload, right after the header.
@@ -669,6 +692,10 @@ fn expand(
                 op: CastOp::ZExt,
                 operand: byte,
             });
+        }
+        Read::Hash => {
+            let ptr = field_ptr(func, boxed, HASH_OFFSET, result_ty.clone(), out);
+            out.push(load(result, result_ty, ptr));
         }
     }
 }

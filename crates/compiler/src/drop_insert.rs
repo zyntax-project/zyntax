@@ -1275,7 +1275,9 @@ pub(crate) fn symbol_role(name: &str) -> Option<SymbolRole> {
         | "zyntax_box_pointer"
         | "zyntax_box_payload_i64"
         | "zyntax_box_payload_f64"
-        | "zyntax_box_payload_bool" => Some(SymbolRole::BORROWS),
+        | "zyntax_box_payload_bool"
+        | "zyntax_box_hash"
+        | "zyntax_box_set_hash" => Some(SymbolRole::BORROWS),
         // A box holding its own copy of a string, released with the box.
         "$IO$string_to_dynamic" => Some(SymbolRole::COPIES_INTO_BOX),
         // The IO, string and math plugins read their arguments and hand

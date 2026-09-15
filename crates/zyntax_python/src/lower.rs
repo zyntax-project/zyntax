@@ -3307,7 +3307,21 @@ impl<'m> Lowerer<'m> {
                 self.comprehension(&c.generators, Produce::Dict(key, &c.value), span)?
             }
             py::Expr::Dict(d) => {
-                let mut items = Vec::with_capacity(d.items.len() * 2);
+                // Keys that are distinct literals need no search for
+                // an earlier equal key: the literal lays the dict's
+                // storage out itself, the index slot first.
+                let distinct = distinct_literal_keys(d);
+                let mut items = Vec::with_capacity(d.items.len() * 2 + 1);
+                if distinct {
+                    items.push(Val {
+                        node: node(
+                            TypedExpression::Literal(TypedLiteral::Null),
+                            Ty::Object,
+                            span,
+                        ),
+                        ty: Ty::Object,
+                    });
+                }
                 for item in &d.items {
                     let Some(key) = &item.key else {
                         return unsupported("`**` in a dict literal", d);
@@ -3316,8 +3330,13 @@ impl<'m> Lowerer<'m> {
                     items.push(self.expr(&item.value)?);
                 }
                 let pairs = self.list_of(items, Elem::Object, span);
+                let maker = if distinct {
+                    "zb_dict_from_distinct"
+                } else {
+                    "zb_dict_from_pairs"
+                };
                 Val {
-                    node: call("zb_dict_from_pairs", vec![pairs], Ty::Dict, span),
+                    node: call(maker, vec![pairs], Ty::Dict, span),
                     ty: Ty::Dict,
                 }
             }
@@ -3504,12 +3523,36 @@ impl<'m> Lowerer<'m> {
         }
         if ty == Ty::Object {
             // At least one side is dynamic: the runtime picks the
-            // operation from the tags.
-            let l = self.coerce(left, Ty::Object);
-            let r = self.coerce(right, Ty::Object);
+            // operation from the tags. An integer on the other side
+            // travels as itself.
             let code = int_lit(types::arith_code(op), span);
+            let node = match (left.ty, right.ty) {
+                (Ty::Object, Ty::Int | Ty::Bool) => {
+                    let r = self.coerce(right, Ty::Int);
+                    call(
+                        "zb_any_arith_i64",
+                        vec![code, left.node, r],
+                        Ty::Object,
+                        span,
+                    )
+                }
+                (Ty::Int | Ty::Bool, Ty::Object) => {
+                    let l = self.coerce(left, Ty::Int);
+                    call(
+                        "zb_i64_arith_any",
+                        vec![code, l, right.node],
+                        Ty::Object,
+                        span,
+                    )
+                }
+                _ => {
+                    let l = self.coerce(left, Ty::Object);
+                    let r = self.coerce(right, Ty::Object);
+                    call("zb_any_arith", vec![code, l, r], Ty::Object, span)
+                }
+            };
             return Ok(Val {
-                node: call("zb_any_arith", vec![code, l, r], Ty::Object, span),
+                node,
                 ty: Ty::Object,
             });
         }
@@ -7270,4 +7313,21 @@ impl<'m> Lowerer<'m> {
         };
         Ok(Val { node, ty: Ty::None })
     }
+}
+
+/// Whether every key of a dict literal is a string literal and no two
+/// are equal, so the pairs are the dict's pairs as written.
+fn distinct_literal_keys(d: &py::ExprDict) -> bool {
+    let mut seen: Vec<String> = Vec::with_capacity(d.items.len());
+    for item in &d.items {
+        let Some(py::Expr::StringLiteral(s)) = &item.key else {
+            return false;
+        };
+        let text = s.value.to_str().to_string();
+        if seen.contains(&text) {
+            return false;
+        }
+        seen.push(text);
+    }
+    true
 }
