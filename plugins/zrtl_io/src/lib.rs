@@ -968,6 +968,28 @@ pub unsafe extern "C" fn io_string_to_dynamic(s: StringConstPtr) -> *mut zrtl::D
     .into_raw()
 }
 
+/// Box a string the box then owns: no copy, released with the box.
+///
+/// # Safety
+/// `s` must be null or a string the caller gives up, allocated the way
+/// this plugin allocates strings.
+#[no_mangle]
+pub unsafe extern "C" fn io_string_adopt_dynamic(s: StringPtr) -> *mut zrtl::DynamicBox {
+    use zrtl::{DynamicBox, TypeTag};
+
+    if s.is_null() {
+        return DynamicBox::null().into_raw();
+    }
+    DynamicBox {
+        tag: TypeTag::STRING,
+        size: std::mem::size_of::<*const u8>() as u32,
+        data: s as *mut u8,
+        dropper: Some(drop_zrtl_string),
+        display_fn: None,
+    }
+    .into_raw()
+}
+
 /// Concatenate two ZRTL strings
 ///
 /// Returns a new ZRTL string, caller must free with `string_free`.
@@ -1124,6 +1146,7 @@ zrtl_plugin! {
 
         // String operations
         ("$IO$string_concat", io_string_concat, (i64, i64) -> i64),
+        ("$IO$string_adopt_dynamic", io_string_adopt_dynamic, (i64) -> i64),
         ("$IO$string_to_dynamic", io_string_to_dynamic, (i64) -> i64),
         ("$IO$concat_dynamic", io_concat_dynamic, dynamic(2) -> dynamic),
     ]

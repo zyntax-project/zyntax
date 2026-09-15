@@ -69,6 +69,10 @@ const STRING_FREE: &str = "$IO$string_free";
 const STRING_COPY: &str = "$IO$string_copy";
 /// Releases a dynamic box and whatever it owns.
 const BOX_FREE: &str = "zyntax_box_free";
+/// Boxes a copy of a string; the box owns the copy.
+const STRING_TO_BOX: &str = "$IO$string_to_dynamic";
+/// Boxes a string as it is; the box owns it from then on.
+const STRING_INTO_BOX: &str = "$IO$string_adopt_dynamic";
 
 /// Whether storage is released across blocks and through returned
 /// storage: asked for by the module (`HirModule::automatic_release`), or
@@ -1206,10 +1210,22 @@ fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
         }
         match outcome {
             SiteOutcome::SingleBlockDrop { block, after_idx } => {
-                insert_free_after(func, block, after_idx, site.result, site.release);
+                if !adopt_into_box(func, facts, block, after_idx, site.result, site.release) {
+                    insert_free_after(func, block, after_idx, site.result, site.release);
+                }
                 stats.frees_inserted += 1;
             }
             SiteOutcome::MultiBlockDrop { points } => {
+                let sole = match points.as_slice() {
+                    [Point::After(block, idx)] => Some((*block, *idx)),
+                    _ => None,
+                };
+                if let Some((block, idx)) = sole {
+                    if adopt_into_box(func, facts, block, idx, site.result, site.release) {
+                        stats.frees_inserted += 1;
+                        continue;
+                    }
+                }
                 stats.frees_inserted += apply_points(func, points, site.result, site.release);
             }
             SiteOutcome::Escaped => stats.escapes_skipped += 1,
@@ -1279,7 +1295,9 @@ pub(crate) fn symbol_role(name: &str) -> Option<SymbolRole> {
         | "zyntax_box_hash"
         | "zyntax_box_set_hash" => Some(SymbolRole::BORROWS),
         // A box holding its own copy of a string, released with the box.
-        "$IO$string_to_dynamic" => Some(SymbolRole::COPIES_INTO_BOX),
+        STRING_TO_BOX => Some(SymbolRole::COPIES_INTO_BOX),
+        // A box that took the string itself.
+        STRING_INTO_BOX => Some(SymbolRole::KEEPS_INTO_BOX),
         // The IO, string and math plugins read their arguments and hand
         // back fresh storage; none keeps a pointer it was given.
         _ if name.starts_with("$IO$")
@@ -1375,6 +1393,49 @@ fn apply_points(
         insert_free_on_edge(func, from, to, value, release);
     }
     count
+}
+
+/// A string released right after the call that boxes a copy of it is
+/// given to the box instead: the call becomes the one that takes the
+/// string as it is, and no release is placed. Only where that call is
+/// the string's one release point, so nothing reads it afterwards.
+fn adopt_into_box(
+    func: &mut HirFunction,
+    facts: &ModuleFacts,
+    block: HirId,
+    idx: usize,
+    target: HirId,
+    release: Release,
+) -> bool {
+    if release != Release::Symbol(STRING_FREE) {
+        return false;
+    }
+    let Some(inst) = func
+        .blocks
+        .get_mut(&block)
+        .and_then(|b| b.instructions.get_mut(idx))
+    else {
+        return false;
+    };
+    let HirInstruction::Call { callee, args, .. } = inst else {
+        return false;
+    };
+    if args.as_slice() != [target] {
+        return false;
+    }
+    let copies = match callee {
+        HirCallable::Symbol(name) => name == STRING_TO_BOX,
+        HirCallable::Function(id) => facts
+            .extern_links
+            .get(id)
+            .is_some_and(|n| n == STRING_TO_BOX),
+        _ => false,
+    };
+    if !copies {
+        return false;
+    }
+    *callee = HirCallable::Symbol(STRING_INTO_BOX.to_string());
+    true
 }
 
 /// Release `value` on the edge `from -> to`.
