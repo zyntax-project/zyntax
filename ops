@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789247156,"nonce":"52ApuCRRkAtkPDfUNmOnVcj3EXY=","message":"int is i64 by design (47a9c86): big_values.py stays a known failure until the opt-in bigint stdlib type exists. 49 of 50 conformance cases pass as of 6800c39.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1789503431,"nonce":"J65aFTs+BGGuW9E47si2jgyqaUg=","added":null,"removed":["conformance area:python"]}]}
