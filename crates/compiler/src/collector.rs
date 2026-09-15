@@ -675,7 +675,14 @@ impl<'a> Marker<'a> {
 /// with a hole in it.
 #[cfg(unix)]
 fn mapped(lo: usize, hi: usize) -> bool {
-    let page = 16384usize;
+    static PAGE: OnceLock<usize> = OnceLock::new();
+    // SAFETY: a query with no side effect.
+    let page = *PAGE.get_or_init(|| unsafe {
+        match libc::sysconf(libc::_SC_PAGESIZE) {
+            n if n > 0 => n as usize,
+            _ => 4096,
+        }
+    });
     let start = lo & !(page - 1);
     let end = (hi + page - 1) & !(page - 1);
     if end <= start {
