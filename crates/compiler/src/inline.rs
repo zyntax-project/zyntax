@@ -620,6 +620,29 @@ fn has_calls(callee: &HirFunction) -> bool {
     })
 }
 
+/// Whether a loop of `callee` calls a function or a symbol. Such a
+/// callee is its loop, and the call it saves by being inlined is
+/// nothing beside what the loop does; what it costs is a copy of the
+/// loop at every site.
+fn loops_with_calls(callee: &HirFunction) -> bool {
+    let in_loops = blocks_in_loops(callee);
+    in_loops.iter().any(|b| {
+        callee.blocks.get(b).is_some_and(|b| {
+            b.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    HirInstruction::Call {
+                        callee: HirCallable::Function(_)
+                            | HirCallable::Symbol(_)
+                            | HirCallable::FuncRef(_),
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
 /// The successors of a block, by its terminator.
 fn successors(f: &HirFunction, id: HirId) -> Vec<HirId> {
     match f.blocks.get(&id).map(|b| &b.terminator) {
@@ -880,6 +903,8 @@ fn inline_in_function(
     // result, and whether the block edges need rebuilding.
     let mut subs: HashMap<HirId, HirId> = HashMap::new();
     let mut spliced_blocks = false;
+    // Whether a callee is a loop that calls, asked once per callee.
+    let mut looping: HashMap<HirId, bool> = HashMap::new();
 
     // Walk every block; for each Call instruction, classify and
     // either inline or skip. We collect inline jobs first, then
@@ -953,6 +978,13 @@ fn inline_in_function(
             };
             if cold_blocks.contains(&block_id)
                 || (!hot_blocks.contains(&block_id) && has_calls(callee))
+            {
+                stats.skipped_cold += 1;
+                continue;
+            }
+            if *looping
+                .entry(callee_id)
+                .or_insert_with(|| loops_with_calls(callee))
             {
                 stats.skipped_cold += 1;
                 continue;
