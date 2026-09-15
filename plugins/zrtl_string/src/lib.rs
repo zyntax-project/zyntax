@@ -49,10 +49,10 @@ pub extern "C" fn string_len(s: StringPtr) -> i64 {
 /// Get string length in characters (Unicode-aware)
 #[no_mangle]
 pub extern "C" fn string_char_count(s: StringPtr) -> i64 {
-    match unsafe { string_as_str(s) } {
-        Some(s) => s.chars().count() as i64,
-        None => 0,
-    }
+    // A character starts at every byte that is not a continuation
+    // byte; the text is UTF-8 already, so no validation.
+    let bytes = unsafe { string_as_bytes(s) };
+    bytes.iter().filter(|b| (*b & 0xC0) != 0x80).count() as i64
 }
 
 /// Check if string is empty

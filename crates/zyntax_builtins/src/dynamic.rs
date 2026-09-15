@@ -13,7 +13,7 @@ const BOOL: i64 = 1;
 const INT: i64 = 2;
 const UINT: i64 = 3;
 const FLOAT: i64 = 4;
-const STR: i64 = 5;
+pub(crate) const STR: i64 = 5;
 const CUSTOM: i64 = 255;
 /// The whole tag of a box of the width its category's readers assume:
 /// the width in the byte above the category.

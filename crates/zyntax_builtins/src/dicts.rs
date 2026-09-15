@@ -18,6 +18,27 @@ fn any_eq(a: Expr, b: Expr) -> Expr {
 fn key_matches(stored: Expr, k: Expr) -> Expr {
     or(eq(stored.clone(), k.clone()), any_eq(stored, k))
 }
+/// The statements that return `found` when `stored` matches `k`, whose
+/// category is `kcat`: the same box, or two strings compared as
+/// strings, or anything else compared as dynamic values.
+fn when_key_matches(stored: &Local, k: &Local, kcat: &Local, found: Expr) -> Vec<Stmt> {
+    let category = |x: Expr| call("zb_any_category", vec![x], i64());
+    let text = |x: Expr| call("zb_box_get_str", vec![x], string());
+    vec![
+        when(eq(stored.e(), k.e()), vec![ret(found.clone())]),
+        if_(
+            and(
+                eq(kcat.e(), int(crate::dynamic::STR)),
+                eq(category(stored.e()), int(crate::dynamic::STR)),
+            ),
+            vec![when(
+                call("zb_str_eq", vec![text(stored.e()), text(k.e())], boolean()),
+                vec![ret(found.clone())],
+            )],
+            vec![when(any_eq(stored.e(), k.e()), vec![ret(found)])],
+        ),
+    ]
+}
 fn any_repr(x: Expr) -> Expr {
     call("zb_any_repr", vec![x], string())
 }
@@ -62,6 +83,8 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
     let entry = local("e", i64());
     let cap = local("cap", i64());
     let h = local("h", i64());
+    let kcat = local("kcat", i64());
+    let stored = local("stored", any());
     let mut out_decls = Vec::new();
 
     // The index is a power-of-two table of entry numbers, -1 where
@@ -173,61 +196,68 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
         ],
     ));
     // The position of `k`'s key in a dict with a table, given the
-    // key's hash, or -1. Bounded by the table's size, which a table
-    // under half full never reaches.
-    out_decls.push(define(
-        "zb_dict_find_hashed",
-        &[&d, &k, &h],
-        i64(),
-        vec![
-            index.decl(index_of(d.e())),
-            mask.decl(sub(len(index.e()), int(1))),
-            slot.decl(bitand(h.e(), mask.e())),
-            i.decl(int(0)),
-            while_(
-                le(i.e(), mask.e()),
-                vec![
-                    entry.decl(slot_at(index.e(), slot.e())),
-                    when(lt(entry.e(), int(0)), vec![ret(int(-1))]),
-                    when(
-                        key_matches(key_at(d.e(), entry.e()), k.e()),
-                        vec![ret(add(mul(entry.e(), int(2)), int(1)))],
-                    ),
-                    slot.set(next_slot(slot.e(), mask.e())),
-                    i.add_assign(int(1)),
-                ],
-            ),
-            ret(int(-1)),
-        ],
-    ));
-    // The position of `k`'s key, or -1.
-    out_decls.push(define(
-        "zb_dict_find",
-        &[&d, &k],
-        i64(),
-        vec![
-            when(
-                unindexed(d.e()),
-                vec![
-                    n.decl(len(d.e())),
-                    i.decl(int(1)),
-                    while_(
-                        lt(i.e(), n.e()),
-                        vec![
-                            when(key_matches(at(d.e(), i.e()), k.e()), vec![ret(i.e())]),
-                            i.add_assign(int(2)),
-                        ],
-                    ),
-                    ret(int(-1)),
-                ],
-            ),
-            ret(call(
-                "zb_dict_find_hashed",
-                vec![d.e(), k.e(), hash(k.e())],
-                i64(),
-            )),
-        ],
-    ));
+    // key's hash, or -1 (bounded by the table's size, which a table
+    // under half full never reaches); and the position of `k`'s key in
+    // any dict, or -1. Defined twice: comparing two dicts looks keys
+    // up and compares values, and comparing values can compare dicts,
+    // so the lookups equality uses are its own, and the ones
+    // everything else uses stay outside that cycle and inline into
+    // their callers.
+    for suffix in ["", "_eq"] {
+        let find_hashed = format!("zb_dict_find_hashed{suffix}");
+        out_decls.push(define(
+            &find_hashed,
+            &[&d, &k, &h],
+            i64(),
+            vec![
+                index.decl(index_of(d.e())),
+                mask.decl(sub(len(index.e()), int(1))),
+                slot.decl(bitand(h.e(), mask.e())),
+                kcat.decl(call("zb_any_category", vec![k.e()], i64())),
+                i.decl(int(0)),
+                while_(le(i.e(), mask.e()), {
+                    let mut body = vec![
+                        entry.decl(slot_at(index.e(), slot.e())),
+                        when(lt(entry.e(), int(0)), vec![ret(int(-1))]),
+                        stored.decl(key_at(d.e(), entry.e())),
+                    ];
+                    body.extend(when_key_matches(
+                        &stored,
+                        &k,
+                        &kcat,
+                        add(mul(entry.e(), int(2)), int(1)),
+                    ));
+                    body.push(slot.set(next_slot(slot.e(), mask.e())));
+                    body.push(i.add_assign(int(1)));
+                    body
+                }),
+                ret(int(-1)),
+            ],
+        ));
+        out_decls.push(define(
+            &format!("zb_dict_find{suffix}"),
+            &[&d, &k],
+            i64(),
+            vec![
+                when(
+                    unindexed(d.e()),
+                    vec![
+                        n.decl(len(d.e())),
+                        i.decl(int(1)),
+                        while_(
+                            lt(i.e(), n.e()),
+                            vec![
+                                when(key_matches(at(d.e(), i.e()), k.e()), vec![ret(i.e())]),
+                                i.add_assign(int(2)),
+                            ],
+                        ),
+                        ret(int(-1)),
+                    ],
+                ),
+                ret(call(&find_hashed, vec![d.e(), k.e(), hash(k.e())], i64())),
+            ],
+        ));
+    }
     let find = |k: Expr| call("zb_dict_find", vec![d.e(), k], i64());
     // Add a pair whose key is absent and hashes to `h`, growing the
     // table first when the pair would bring it to half full.
@@ -549,7 +579,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
                 lt(i.e(), n.e()),
                 vec![
                     j.decl(call(
-                        "zb_dict_find",
+                        "zb_dict_find_eq",
                         vec![other.e(), at(d.e(), i.e())],
                         i64(),
                     )),
