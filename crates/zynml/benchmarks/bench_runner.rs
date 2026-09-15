@@ -959,6 +959,7 @@ fn main() {
     let json = serde_json::to_string_pretty(&suite).expect("serialize results");
     fs::write(&out_path, json).unwrap_or_else(|e| panic!("write {out_path:?}: {e}"));
     eprintln!("\nwrote {}", out_path.display());
+    print_verdicts(&suite);
 
     // Fail the process AFTER writing results.json so the partial
     // (still-real) data lands on disk for forensics, but the CI
@@ -1540,6 +1541,44 @@ fn measure_interpreter(runtime: &PythonRuntime, path: &Path, runs: usize) -> Tar
         error: None,
         skipped: false,
     }
+}
+
+/// One line per kernel saying whether zypy is faster or slower than
+/// the fastest Python runtime that ran it, and by how much. The cost
+/// compared is what a program pays to run once: zypy's setup, compile
+/// and execute against the interpreter's whole process.
+fn print_verdicts(suite: &Suite) {
+    let interpreters: Vec<&str> = python_runtimes().iter().map(|r| r.key).collect();
+    let mut lines = Vec::new();
+    let (mut faster, mut slower) = (0, 0);
+    for (name, rows) in &suite.kernels {
+        let ran = |key: &str| rows.get(key).filter(|r| r.error.is_none() && !r.skipped);
+        let Some(z) = ran("zypy") else { continue };
+        let zypy_ms = z.setup_ms + z.compile_ms + z.exec_ms;
+        let best = interpreters
+            .iter()
+            .filter_map(|key| ran(key).map(|r| (*key, r.exec_ms)))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let Some((key, best_ms)) = best else { continue };
+        let verdict = if best_ms >= zypy_ms {
+            faster += 1;
+            format!("FASTER than {key} by {:.2}x", best_ms / zypy_ms)
+        } else {
+            slower += 1;
+            format!("slower than {key} by {:.2}x", zypy_ms / best_ms)
+        };
+        lines.push(format!(
+            "    {name:<32}{verdict:<30}{zypy_ms:>9.1} ms vs {best_ms:>9.1} ms"
+        ));
+    }
+    if lines.is_empty() {
+        return;
+    }
+    eprintln!("\nzypy against the best Python runtime on this machine (setup + compile + exec vs the interpreter's process):");
+    for line in lines {
+        eprintln!("{line}");
+    }
+    eprintln!("zypy faster than the best on {faster} kernel(s), slower on {slower}.");
 }
 
 fn median(samples: &mut [f64]) -> f64 {
