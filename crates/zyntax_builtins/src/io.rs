@@ -111,8 +111,9 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
 }
 
 /// What the program reads from the world around it: a line of input,
-/// and the arguments it was started with. The host supplies the
-/// arguments as `$Host$argc` and `$Host$argv`.
+/// the arguments it was started with, and the clocks. The host supplies
+/// the arguments as `$Host$argc` and `$Host$argv`, the clocks as
+/// `$Host$time` and `$Host$perf_counter`.
 fn host(list_type: TypeId) -> Vec<Decl> {
     let strs = list_of(list_type, string());
     let prompt = local("prompt", string());
@@ -134,6 +135,15 @@ fn host(list_type: TypeId) -> Vec<Decl> {
             &[("i", i64())],
             string(),
             Some("$Host$argv"),
+        ),
+        // The clocks: seconds since the epoch, and seconds on a clock
+        // that only goes forward, for timing.
+        extern_fn("zb_time_time", &[], f64(), Some("$Host$time")),
+        extern_fn(
+            "zb_time_perf_counter",
+            &[],
+            f64(),
+            Some("$Host$perf_counter"),
         ),
     ];
     // The end of input is an error to a program that asked for a line.

@@ -130,10 +130,31 @@ impl Linker<'_> {
                     }
                     *stmt = pass(stmt.range());
                 }
-                // Imports inside a function take effect when the program
-                // starts, like the ones at the top of the file.
+                // Imports inside a function, a branch or a loop take
+                // effect when the program starts, like the ones at the
+                // top of the file.
                 py::Stmt::FunctionDef(d) => {
                     let inner = self.link_imports(&mut d.body)?;
+                    imports.modules.extend(inner.modules);
+                    imports.names.extend(inner.names);
+                }
+                py::Stmt::If(i) => {
+                    let inner = self.link_imports(&mut i.body)?;
+                    imports.modules.extend(inner.modules);
+                    imports.names.extend(inner.names);
+                    for clause in i.elif_else_clauses.iter_mut() {
+                        let inner = self.link_imports(&mut clause.body)?;
+                        imports.modules.extend(inner.modules);
+                        imports.names.extend(inner.names);
+                    }
+                }
+                py::Stmt::For(f) => {
+                    let inner = self.link_imports(&mut f.body)?;
+                    imports.modules.extend(inner.modules);
+                    imports.names.extend(inner.names);
+                }
+                py::Stmt::While(w) => {
+                    let inner = self.link_imports(&mut w.body)?;
                     imports.modules.extend(inner.modules);
                     imports.names.extend(inner.names);
                 }

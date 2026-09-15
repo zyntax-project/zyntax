@@ -662,10 +662,20 @@ fn collect_imports(body: &[py::Stmt]) -> Result<(Imports, FromNames)> {
                                 &alias,
                             ));
                         }
-                        // typing's names are annotations, not values.
+                        // typing's names are annotations, not values;
+                        // __future__'s are the language as it is.
                         if module == "typing" {
                             if !stdlib::is_typing_name(name) {
                                 return Err(Error::unsupported(format!("`typing.{name}`"), &alias));
+                            }
+                            continue;
+                        }
+                        if module == "__future__" {
+                            if !stdlib::is_future_name(name) {
+                                return Err(Error::unsupported(
+                                    format!("`__future__.{name}`"),
+                                    &alias,
+                                ));
                             }
                             continue;
                         }

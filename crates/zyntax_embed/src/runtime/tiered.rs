@@ -605,6 +605,7 @@ impl TieredRuntime {
         // `run_interp_safe_opts` entry was the only place these fired,
         // leaving production code unoptimised. (Skippable via
         // `ZYNTAX_DISABLE_INTERP_OPTS=1`.)
+        zyntax_compiler::hir_dump::dump_module_to_dir(&module, "pre-opt-tiered-compile_module");
         let trace = std::env::var_os("ZYNTAX_TRACE_OPT_PHASES").is_some();
         let started = std::time::Instant::now();
         if self.run_interp_opts && std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {

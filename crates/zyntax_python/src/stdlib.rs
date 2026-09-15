@@ -24,8 +24,27 @@ pub(crate) enum Member {
 }
 
 /// Modules that may be imported, with nothing to resolve at run time.
+/// `__future__` is accepted whole: what it names is the language as
+/// it is.
 pub(crate) fn is_known(module: &str) -> bool {
-    matches!(module, "math" | "sys" | "typing")
+    matches!(module, "math" | "sys" | "typing" | "time" | "__future__")
+}
+
+/// The names `__future__` exports, every one of them already the case.
+pub(crate) fn is_future_name(name: &str) -> bool {
+    matches!(
+        name,
+        "division"
+            | "print_function"
+            | "absolute_import"
+            | "unicode_literals"
+            | "generators"
+            | "nested_scopes"
+            | "with_statement"
+            | "generator_stop"
+            | "annotations"
+            | "barry_as_FLUFL"
+    )
 }
 
 /// The names `typing` exports; all of them are annotations here.
@@ -107,6 +126,11 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         // `exit` takes its status as an int; the lowering fills in the
         // default and the two-argument `log`.
         ("sys", "exit") => func(&[I], Ty::None, "zb_exit"),
+        ("time", "time") => func(&[], F, "zb_time_time"),
+        // The monotonic clocks are one clock here.
+        ("time", "perf_counter" | "monotonic" | "process_time" | "clock") => {
+            func(&[], F, "zb_time_perf_counter")
+        }
         _ => return None,
     })
 }

@@ -6,8 +6,13 @@ functions written out, so every interpreter runs the same code."""
 import math
 
 
-def run_benchmark(options, num_runs, bench_func, *args):
-    data = bench_func(num_runs, *args)
+def run_benchmark(options, num_runs, bench_func, first=None, second=None):
+    # Two extra arguments at most: scimark passes its benchmark's name
+    # and its parameters, everything else nothing.
+    if first is None:
+        data = bench_func(num_runs)
+    else:
+        data = bench_func(num_runs, first, second)
     if options.take_geo_mean:
         product = 1.0
         for x in data:

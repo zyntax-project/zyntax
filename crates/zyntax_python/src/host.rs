@@ -1,5 +1,6 @@
 //! What the host hands a program: the arguments it was started with,
-//! reached from the library as `$Host$argc` and `$Host$argv`.
+//! reached from the library as `$Host$argc` and `$Host$argv`, and the
+//! clocks, `$Host$time` and `$Host$perf_counter`.
 
 use std::sync::OnceLock;
 
@@ -25,10 +26,32 @@ extern "C" fn host_argv(i: i64) -> zrtl::StringPtr {
     }
 }
 
+/// Seconds since the Unix epoch, as `time.time()` gives them.
+extern "C" fn host_time() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Seconds on a clock that only goes forward, from the first reading.
+extern "C" fn host_perf_counter() -> f64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
+}
+
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 2] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 4] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), host_argv as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$time".as_ptr(), host_time as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$perf_counter".as_ptr(),
+        host_perf_counter as *const u8,
+    ),
 ];
 
 /// The host's symbols as a plugin the runtime links like any other.
