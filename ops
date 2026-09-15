@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1789457500,"nonce":"1Ep2LH/Ld/8c6XbPoZTVRmSGF7A=","added":["debt","area:compiler"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789457511,"nonce":"gp/7uiiguw2xtreA5flKcMim5f0=","message":"The borrowed() marker landed in 2ffa79b.","files":null}]}
