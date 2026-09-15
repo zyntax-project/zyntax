@@ -339,6 +339,13 @@ pub struct TieredBackend {
     /// beadie's own counters).
     profile_data: ProfileData,
 
+    /// The thread compiling the library functions the program can reach
+    /// ahead of their first call, and the flag that stops it between
+    /// two compiles. Joined at shutdown, before anything it compiles
+    /// into goes away.
+    warm_up: Option<std::thread::JoinHandle<()>>,
+    warm_up_stop: Arc<std::sync::atomic::AtomicBool>,
+
     /// Runtime FFI symbols registered post-construction.
     runtime_symbols: Arc<RwLock<Vec<RuntimeSymbol>>>,
 
@@ -429,6 +436,8 @@ impl TieredBackend {
             last_undo: None,
             state_migration: crate::reload::StateMigration::default(),
             profile_data: ProfileData::new(config.profile_config.clone()),
+            warm_up: None,
+            warm_up_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_symbols: Arc::new(RwLock::new(Vec::new())),
             config,
         })
@@ -1878,7 +1887,7 @@ impl TieredBackend {
     /// went through the optimisers with the module and is compiled as
     /// it is; the rest were left as lowered and are optimised together
     /// on the first call to any of them.
-    fn install_lazy_compiler(&self, lazy: &HashSet<HirId>, finished: &HashSet<HirId>) {
+    fn install_lazy_compiler(&mut self, lazy: &HashSet<HirId>, finished: &HashSet<HirId>) {
         let cranelift = Arc::clone(&self.cranelift);
         let verbosity = self.config.verbosity;
         let tier2_backend = self.config.tier2_backend;
@@ -1892,6 +1901,7 @@ impl TieredBackend {
             .collect();
         let reload_key = self.cranelift.with_lock(|be| be.reload_key());
         let lazy: HashSet<HirId> = lazy.difference(finished).copied().collect();
+        let ready = finished.clone();
         let finished = finished.clone();
         // Compiled once: a second call arriving while the first compiles
         // waits on the lock and then finds the entry published.
@@ -1998,6 +2008,40 @@ impl TieredBackend {
             }
             entry as *const u8
         };
+        let compile_lazy_function = Arc::new(compile_lazy_function);
+
+        // The library functions the program reaches are compiled ahead
+        // of their first call on a thread of their own, nearest the
+        // program first; a call arriving first compiles its own and a
+        // call arriving during one waits for it. `ZYNTAX_DISABLE_WARM_UP=1`
+        // leaves every first call to compile its function; safe to run
+        // with.
+        if std::env::var_os("ZYNTAX_DISABLE_WARM_UP").is_none() {
+            let order: Vec<u64> = match self.functions.values().next() {
+                Some(e) => warm_up_order(&e.module, &ready)
+                    .into_iter()
+                    .filter_map(|id| self.functions.get(&id).map(|e| e.bead_id))
+                    .collect(),
+                None => Vec::new(),
+            };
+            if !order.is_empty() {
+                let compile = Arc::clone(&compile_lazy_function);
+                let stop = Arc::clone(&self.warm_up_stop);
+                self.warm_up = std::thread::Builder::new()
+                    .name("zyntax-warm-up".into())
+                    .stack_size(16 << 20)
+                    .spawn(move || {
+                        for bead_id in order {
+                            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                                break;
+                            }
+                            compile(bead_id);
+                        }
+                    })
+                    .ok();
+            }
+        }
+
         // The stub runs on whatever stack the first call was made from,
         // which may be a fiber's, far too small for a compile. The
         // compile runs on a thread with room and the caller waits.
@@ -2202,6 +2246,11 @@ impl TieredBackend {
     /// Releases bead registrations on shutdown so a long-lived process
     /// reusing `TieredBackend` instances doesn't leak entries.
     pub fn shutdown(&mut self) {
+        self.warm_up_stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = self.warm_up.take() {
+            let _ = handle.join();
+        }
         for entry in self.functions.values() {
             osr::unregister_bead(entry.bead_id);
         }
@@ -2298,6 +2347,54 @@ impl Drop for TieredBackend {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The functions of `ready` in the order the program is likely to call
+/// them: what its own functions call first, then what those call, and
+/// so on through `ready`.
+fn warm_up_order(module: &HirModule, ready: &HashSet<HirId>) -> Vec<HirId> {
+    let callees = |id: &HirId| -> Vec<HirId> {
+        let Some(f) = module.functions.get(id) else {
+            return Vec::new();
+        };
+        let mut out: Vec<HirId> = f
+            .blocks
+            .values()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|inst| match inst {
+                crate::hir::HirInstruction::Call {
+                    callee: crate::hir::HirCallable::Function(target),
+                    ..
+                } => Some(*target),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    };
+    let mut order: Vec<HirId> = Vec::new();
+    let mut seen: HashSet<HirId> = HashSet::new();
+    let mut frontier: Vec<HirId> = module
+        .functions
+        .keys()
+        .filter(|id| !ready.contains(id))
+        .copied()
+        .collect();
+    frontier.sort();
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for id in frontier {
+            for c in callees(&id) {
+                if ready.contains(&c) && seen.insert(c) {
+                    order.push(c);
+                    next.push(c);
+                }
+            }
+        }
+        frontier = next;
+    }
+    order
+}
 
 /// Build the per-tier hotness policies from a `TieredConfig`.
 ///
