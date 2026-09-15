@@ -1,0 +1,6 @@
+-n store int 100 num_runs
+--flag store None None flag
+--x store str time x
+a int None
+b None 2.5
+c None None

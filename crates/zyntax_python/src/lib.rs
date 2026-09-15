@@ -424,12 +424,24 @@ pub fn parse_program_with(
     for name in &global_names {
         inferred.globals.insert(name.clone(), types::Ty::Unknown);
     }
+    // Each round infers the module afresh from the declared layouts,
+    // against the globals and the list-parameter facts the last round
+    // settled; nothing else carries over, so what one round decided
+    // from less than it knows does not bind the next.
+    let declared_classes = inferred.classes.clone();
     for _ in 0..8 {
-        let before = inferred.globals.clone();
+        let before = (
+            inferred.globals.clone(),
+            inferred.list_params.clone(),
+            inferred.dynamic_methods.clone(),
+        );
+        inferred.classes = declared_classes.clone();
         let out = types::infer_module(&inferred, &items, &owned, &entry_files);
         inferred.funcs = out.funcs;
         inferred.classes = out.classes;
         inferred.closures = std::cell::RefCell::new(out.closures);
+        inferred.list_params = out.list_params;
+        inferred.dynamic_methods = out.dynamic_methods;
         let mut writes: Vec<(String, types::Ty)> = global_names
             .iter()
             .map(|name| {
@@ -459,7 +471,12 @@ pub fn parse_program_with(
                 .join(ty);
             inferred.globals.insert(name, joined);
         }
-        if inferred.globals == before {
+        if (
+            inferred.globals.clone(),
+            inferred.list_params.clone(),
+            inferred.dynamic_methods.clone(),
+        ) == before
+        {
             break;
         }
     }

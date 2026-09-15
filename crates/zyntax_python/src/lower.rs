@@ -110,7 +110,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Gen => Type::Fiber(Box::new(Type::Any)),
         // A known function value is still the record every function
         // value is.
-        Ty::Closure(_) | Ty::Bound(_) | Ty::Object | Ty::Unknown => Type::Any,
+        Ty::Closure(_) | Ty::Bound(_) | Ty::Builtin(_) | Ty::Object | Ty::Unknown => Type::Any,
     }
 }
 
@@ -448,7 +448,10 @@ fn parameter(name: &str, ty: Ty, span: Span) -> TypedParameter {
 /// unannotated parameter is dynamic by the language's rules, not by
 /// omission, and the lowering does not warn about it.
 pub(crate) fn dynamic_attribute(ty: Ty, span: Span) -> Vec<ParameterAttribute> {
-    if matches!(ty, Ty::Object | Ty::Closure(_) | Ty::Bound(_)) {
+    if matches!(
+        ty,
+        Ty::Object | Ty::Closure(_) | Ty::Bound(_) | Ty::Builtin(_)
+    ) {
         vec![ParameterAttribute {
             name: intern("dynamic"),
             args: Vec::new(),
@@ -956,7 +959,7 @@ impl<'m> Lowerer<'m> {
                 span,
             ),
             Ty::Str => str_lit("", span),
-            Ty::Object | Ty::Unknown | Ty::Closure(_) | Ty::Bound(_) => {
+            Ty::Object | Ty::Unknown | Ty::Closure(_) | Ty::Bound(_) | Ty::Builtin(_) => {
                 let none = Val {
                     node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
                     ty: Ty::None,
@@ -1473,6 +1476,7 @@ impl<'m> Lowerer<'m> {
             // A known function value is a dynamic value already.
             (Ty::Closure(_), Ty::Object | Ty::Closure(_)) | (Ty::Object, Ty::Closure(_)) => v.node,
             (Ty::Bound(_), Ty::Object | Ty::Bound(_)) | (Ty::Object, Ty::Bound(_)) => v.node,
+            (Ty::Builtin(_), Ty::Object | Ty::Builtin(_)) | (Ty::Object, Ty::Builtin(_)) => v.node,
             (Ty::Int | Ty::Bool, Ty::Float) => cast(v.node, Ty::Float, span),
             (Ty::Bool, Ty::Int) => cast(v.node, Ty::Int, span),
             (Ty::Int, Ty::Bool) => binary(BinaryOp::Ne, v.node, int_lit(0, span), Ty::Bool, span),
@@ -1711,7 +1715,7 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
                 span,
             ),
-            Ty::Gen | Ty::Closure(_) | Ty::Bound(_) => node(
+            Ty::Gen | Ty::Closure(_) | Ty::Bound(_) | Ty::Builtin(_) => node(
                 TypedExpression::Literal(TypedLiteral::Bool(true)),
                 Ty::Bool,
                 span,
@@ -1756,13 +1760,40 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
                 span,
             ),
-            Ty::None => node(
-                TypedExpression::Literal(TypedLiteral::Bool(false)),
+            Ty::None => Self::after_none(
+                v.node,
+                node(
+                    TypedExpression::Literal(TypedLiteral::Bool(false)),
+                    Ty::Bool,
+                    span,
+                ),
                 Ty::Bool,
-                span,
             ),
             Ty::Object | Ty::Unknown => call("zb_any_truthy", vec![v.node], Ty::Bool, span),
         }
+    }
+
+    /// `result`, after evaluating a None-typed expression whose value is
+    /// known but whose effects are not: a call of a method that returns
+    /// nothing still runs.
+    fn after_none(none: Node, result: Node, ty: Ty) -> Node {
+        if matches!(
+            none.node,
+            TypedExpression::Literal(_) | TypedExpression::Variable(_)
+        ) {
+            return result;
+        }
+        let span = none.span;
+        Self::block_value(
+            vec![TypedNode::new(
+                TypedStatement::Expression(Box::new(none)),
+                Type::Unknown,
+                span,
+            )],
+            result,
+            ty,
+            span,
+        )
     }
 
     /// `str(v)`.
@@ -1773,7 +1804,9 @@ impl<'m> Lowerer<'m> {
             Ty::Float => call("zb_float_repr", vec![v.node], Ty::Str, span),
             Ty::Bool => call("zb_bool_repr", vec![v.node], Ty::Str, span),
             Ty::Str => v.node,
-            Ty::None => call("zb_none_repr", vec![], Ty::Str, span),
+            Ty::None => {
+                Self::after_none(v.node, call("zb_none_repr", vec![], Ty::Str, span), Ty::Str)
+            }
             Ty::List(e) => call(&list_fn("repr", e), vec![v.node], Ty::Str, span),
             Ty::Tuple => call("zb_tuple_repr", vec![v.node], Ty::Str, span),
             Ty::Dict => call("zb_dict_repr", vec![v.node], Ty::Str, span),
@@ -1781,6 +1814,10 @@ impl<'m> Lowerer<'m> {
             Ty::Gen => str_lit("<generator object>", span),
             Ty::Closure(_) => str_lit("<function>", span),
             Ty::Bound(_) => str_lit("<bound method>", span),
+            Ty::Builtin(k) => str_lit(
+                &format!("<built-in function {}>", types::BUILTIN_VALUES[k as usize]),
+                span,
+            ),
             Ty::Class(k) => {
                 let k = k as usize;
                 let none = str_lit(crate::policy::POLICY.none_text, span);
@@ -2028,16 +2065,37 @@ impl<'m> Lowerer<'m> {
                 {
                     return Ok(());
                 }
-                // An empty literal is built as the list the name holds,
-                // which inference typed by what the body puts in it.
+                // A literal that says nothing of its elements is built
+                // as the list the name holds, which inference typed by
+                // what the body puts in it.
                 if let [py::Expr::Name(n)] = a.targets.as_slice() {
-                    if types::is_empty_list(&a.value) {
+                    if let Some(count) = types::unkinded_list(&a.value) {
                         if let Ty::List(e) = self.var_ty(n.id.as_str()) {
-                            let value = Val {
-                                node: self.list_of(Vec::new(), e, span),
-                                ty: Ty::List(e),
-                            };
-                            return self.bind(&a.targets[0], value, span, out);
+                            if e != Elem::Object {
+                                let items = if types::is_empty_list(&a.value) {
+                                    Vec::new()
+                                } else {
+                                    let none = node(
+                                        TypedExpression::Literal(TypedLiteral::Null),
+                                        Ty::None,
+                                        span,
+                                    );
+                                    vec![Val {
+                                        node: none,
+                                        ty: Ty::None,
+                                    }]
+                                };
+                                let mut value = Val {
+                                    node: self.list_of(items, e, span),
+                                    ty: Ty::List(e),
+                                };
+                                if let Some(n) = count {
+                                    let times = self.expr(n)?;
+                                    value =
+                                        self.arithmetic(py::Operator::Mult, value, times, n, span)?;
+                                }
+                                return self.bind(&a.targets[0], value, span, out);
+                            }
                         }
                     }
                 }
@@ -3086,6 +3144,36 @@ impl<'m> Lowerer<'m> {
 
     /// A value as a `List<Any>` to iterate: a typed list boxed, a string
     /// its characters, a dynamic value whatever it iterates as.
+    /// Whether a call of the builtin `name` with these arguments is one
+    /// the direct lowering handles: the arity the builtin has, no
+    /// keywords, and integer bounds for `range`.
+    fn builtin_takes(&self, name: &str, c: &py::ExprCall) -> bool {
+        let args = &c.arguments.args;
+        if !c.arguments.keywords.is_empty()
+            || args.iter().any(|a| matches!(a, py::Expr::Starred(_)))
+        {
+            return false;
+        }
+        match name {
+            "range" => {
+                (1..=3).contains(&args.len())
+                    && args.iter().all(|a| {
+                        matches!(self.ty_of(a), Ty::Int | Ty::Bool | Ty::Object | Ty::Unknown)
+                    })
+            }
+            "len" | "abs" | "repr" | "hash" | "ord" | "chr" | "id" | "iter" | "next" => {
+                args.len() == 1
+            }
+            "str" | "int" | "float" | "bool" | "list" | "tuple" | "set" | "dict" => args.len() <= 1,
+            "sorted" | "reversed" | "enumerate" | "sum" | "any" | "all" => {
+                (1..=2).contains(&args.len())
+            }
+            "min" | "max" | "zip" | "map" | "filter" | "print" => !args.is_empty(),
+            "round" | "divmod" | "pow" | "isinstance" => (1..=3).contains(&args.len()),
+            _ => false,
+        }
+    }
+
     /// A dict key as the lookup takes it: a string as itself, for the
     /// lookups that hash and compare a string without boxing it, and
     /// anything else as a dynamic value. The suffix names the lookup.
@@ -3455,7 +3543,7 @@ impl<'m> Lowerer<'m> {
         // A function value whose function is known is the record every
         // function value is; only a call reads the type, off the callee
         // expression itself.
-        if let Ty::Closure(_) | Ty::Bound(_) = v.ty {
+        if let Ty::Closure(_) | Ty::Bound(_) | Ty::Builtin(_) = v.ty {
             v.ty = Ty::Object;
         }
         // A library call that can raise is checked before its value is
@@ -3573,6 +3661,13 @@ impl<'m> Lowerer<'m> {
                     ),
                     ty: Ty::Object,
                 }
+            }
+            py::Expr::Name(n)
+                if !self.is_variable(n.id.as_str())
+                    && !self.module.class_index.contains_key(n.id.as_str())
+                    && types::builtin_index(n.id.as_str()).is_some() =>
+            {
+                return unsupported(format!("`{}` as a value", n.id.as_str()), e);
             }
             py::Expr::Name(n) => Val {
                 node: var(intern(n.id.as_str()), ty, span),
@@ -4930,6 +5025,21 @@ impl<'m> Lowerer<'m> {
                     }
                     // The method on the receiver as it is: the record
                     // the name holds is not read.
+                    // The builtin's own call, under its own name, where
+                    // the arguments are ones it takes; anything else goes
+                    // through the record and fails as it would.
+                    Ty::Builtin(k) if self.builtin_takes(types::BUILTIN_VALUES[k as usize], c) => {
+                        let builtin = py::ExprCall {
+                            func: Box::new(py::Expr::Name(py::ExprName {
+                                node_index: Default::default(),
+                                range: n.range,
+                                id: py::name::Name::new(types::BUILTIN_VALUES[k as usize]),
+                                ctx: py::ExprContext::Load,
+                            })),
+                            ..c.clone()
+                        };
+                        return self.call(&builtin, ty, span);
+                    }
                     Ty::Bound(k) => {
                         let info = self.module.bounds[k as usize].clone();
                         let receiver = self.expr(&py::Expr::Name(info.receiver))?;

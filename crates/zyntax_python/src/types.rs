@@ -56,6 +56,10 @@ pub(crate) enum Ty {
     /// so it is a dynamic value wherever one is needed; where it is
     /// called, the call is the method's on the receiver as it is.
     Bound(u16),
+    /// A builtin function named as a value, the one at this index of
+    /// [`BUILTIN_VALUES`]: `xrange = range`. A call through the name is
+    /// the builtin's call.
+    Builtin(u8),
     /// A dynamic value: a boxed `Any`.
     Object,
     #[default]
@@ -107,6 +111,51 @@ impl Elem {
             Elem::Object => "any",
         }
     }
+}
+
+/// The builtin functions a name can be bound to and called through.
+pub(crate) const BUILTIN_VALUES: &[&str] = &[
+    "range",
+    "len",
+    "zip",
+    "enumerate",
+    "sorted",
+    "reversed",
+    "list",
+    "tuple",
+    "dict",
+    "set",
+    "min",
+    "max",
+    "sum",
+    "abs",
+    "int",
+    "float",
+    "str",
+    "repr",
+    "bool",
+    "print",
+    "any",
+    "all",
+    "map",
+    "filter",
+    "hash",
+    "ord",
+    "chr",
+    "round",
+    "isinstance",
+    "next",
+    "iter",
+    "pow",
+    "divmod",
+    "id",
+];
+
+pub(crate) fn builtin_index(name: &str) -> Option<u8> {
+    BUILTIN_VALUES
+        .iter()
+        .position(|b| *b == name)
+        .map(|i| i as u8)
 }
 
 impl Ty {
@@ -211,6 +260,18 @@ pub(crate) struct Module {
     pub(crate) bounds: Vec<BoundInfo>,
     /// Bound method index by `(file, start of the attribute's range)`.
     pub(crate) bound_index: HashMap<(u32, u32), u16>,
+    /// For each function, by name, what its body does with each
+    /// list-typed parameter: `None` where the list may be kept or
+    /// written with anything, else the join of the element kinds
+    /// written into it (`Unknown` for a list only read). A caller
+    /// passing a list it is still typing reads this; see
+    /// [`decide_list`].
+    pub(crate) list_params: HashMap<String, Vec<ListFact>>,
+    /// Methods, by plain name, called somewhere on a receiver whose
+    /// class is not known: their parameters stay dynamic, so a call
+    /// from out of view passes what it has. The others are typed by
+    /// the calls in view, as module functions are.
+    pub(crate) dynamic_methods: std::collections::HashSet<String>,
     /// What lowering each function found about its raising, by the
     /// name it lowers to; see [`RaiseFact`].
     pub(crate) raise_facts: std::cell::RefCell<std::collections::BTreeMap<String, RaiseFact>>,
@@ -1209,6 +1270,8 @@ pub(crate) struct Inferred {
     pub(crate) closures: Vec<ClosureInfo>,
     /// The entry body's locals, against the signatures above.
     pub(crate) entry: Locals,
+    pub(crate) list_params: HashMap<String, Vec<ListFact>>,
+    pub(crate) dynamic_methods: std::collections::HashSet<String>,
 }
 
 /// The items every call of which is in view: module functions never
@@ -1229,6 +1292,8 @@ pub(crate) fn closed_items(
         /// `x.__init__` on anything but `super()`: a constructor
         /// reached without its class.
         init: bool,
+        /// Attribute names read as values rather than called.
+        valued_methods: std::collections::HashSet<String>,
     }
     impl<'a> Visitor<'a> for Mentions {
         fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
@@ -1245,6 +1310,10 @@ pub(crate) fn closed_items(
                 py::Expr::Call(c) => {
                     match &*c.func {
                         py::Expr::Name(_) => {}
+                        // A method called is not a method valued.
+                        py::Expr::Attribute(a) if a.attr.as_str() != "__init__" => {
+                            self.visit_expr(&a.value)
+                        }
                         other => self.visit_expr(other),
                     }
                     for a in &c.arguments.args {
@@ -1261,6 +1330,12 @@ pub(crate) fn closed_items(
                     if !is_super_call(&a.value) {
                         self.init = true;
                     }
+                    walk_expr(self, expr);
+                }
+                // An attribute read that is not a call: a method of
+                // that name is a value here.
+                py::Expr::Attribute(a) => {
+                    self.valued_methods.insert(a.attr.to_string());
                     walk_expr(self, expr);
                 }
                 _ => walk_expr(self, expr),
@@ -1286,6 +1361,9 @@ pub(crate) fn closed_items(
             // An operator method is reached from the operators on its
             // class, which are in view, and from dynamic arithmetic,
             // which reads the operand back as the type inferred here.
+            // Any other method is closed unless it is read as a value
+            // somewhere; a call on an unknown receiver is found during
+            // inference and opens it again.
             Some(_) => {
                 (item.def.name.as_str() == "__init__"
                     && !seen.init
@@ -1293,6 +1371,8 @@ pub(crate) fn closed_items(
                         .iter()
                         .any(|kind| item.name == method_fn(kind, "__init__")))
                     || is_operator_method(item.def.name.as_str())
+                    || (!item.def.name.starts_with("__")
+                        && !seen.valued_methods.contains(item.def.name.as_str()))
             }
         })
         .map(|item| item.name.clone())
@@ -1326,14 +1406,22 @@ pub(crate) fn infer_module(
         closure_index: known.closure_index.clone(),
         bounds: known.bounds.clone(),
         bound_index: known.bound_index.clone(),
+        list_params: known.list_params.clone(),
+        dynamic_methods: known.dynamic_methods.clone(),
         files: known.files.clone(),
+        imports: known.imports.clone(),
+        from_names: known.from_names.clone(),
         ..Default::default()
     };
-    // Which parameters of each function are inferred, by position.
+    // Which parameters of each function are inferred, by position. A
+    // method is, like a closed function, unless a call of a method of
+    // its name on an unknown receiver was seen last time round.
     let mut inferring: HashMap<String, Vec<bool>> = HashMap::new();
     for item in items {
         let mut sig = declared_sig_in(&module.class_index, item.def, item.class);
-        if known.closed.contains(&item.name) {
+        let closed = known.closed.contains(&item.name)
+            && !(item.class.is_some() && known.dynamic_methods.contains(item.def.name.as_str()));
+        if closed {
             let flags: Vec<bool> = item
                 .def
                 .parameters
@@ -1341,9 +1429,25 @@ pub(crate) fn infer_module(
                 .enumerate()
                 .map(|(i, p)| p.parameter.annotation.is_none() && !(i == 0 && item.class.is_some()))
                 .collect();
-            for (flag, (_, ty)) in flags.iter().zip(sig.params.iter_mut()) {
+            // A default is one of the values the parameter takes,
+            // whether or not a call leaves it out.
+            let defaults: Vec<Ty> = sig
+                .defaults
+                .iter()
+                .map(|d| match d {
+                    Some(d) => Typer {
+                        module: &module,
+                        vars: &HashMap::new(),
+                        outer: &HashMap::new(),
+                    }
+                    .expr(d),
+                    None => Ty::Unknown,
+                })
+                .collect();
+            for ((flag, (_, ty)), default) in flags.iter().zip(sig.params.iter_mut()).zip(defaults)
+            {
                 if *flag {
-                    *ty = Ty::Unknown;
+                    *ty = default;
                 }
             }
             inferring.insert(item.name.clone(), flags);
@@ -1356,10 +1460,12 @@ pub(crate) fn infer_module(
         defaults: Vec::new(),
     };
     let mut entry_locals = Locals::default();
+    let mut dynamic_methods = std::collections::HashSet::new();
     for _ in 0..32 {
         let mut changed = false;
         let mut passed: Vec<(Target, usize, Ty)> = Vec::new();
         let mut escaped: Vec<u16> = Vec::new();
+        dynamic_methods = std::collections::HashSet::new();
         for item in items {
             let sig = module.funcs[&item.name].clone();
             let file = module.file_of(item.module.as_deref());
@@ -1368,6 +1474,13 @@ pub(crate) fn infer_module(
                 changed |= infer_closures_in(&module, &item.def.body, &[], &locals.vars);
                 locals
             });
+            let facts = in_file(file, || {
+                list_param_facts(&module, &item.def.body, &locals.vars, &sig.params)
+            });
+            if module.list_params.get(&item.name) != Some(&facts) {
+                module.list_params.insert(item.name.clone(), facts);
+                changed = true;
+            }
             if item.def.returns.is_none() && sig.ret != Ty::Gen {
                 let ret = if locals.returns { locals.ret } else { Ty::None };
                 if ret != sig.ret {
@@ -1398,6 +1511,7 @@ pub(crate) fn infer_module(
                     passed: &mut passed,
                     allow_closure: false,
                     escaped: &mut escaped,
+                    dynamic_methods: &mut dynamic_methods,
                     files: &[],
                     no_outer: HashMap::new(),
                 }
@@ -1414,6 +1528,7 @@ pub(crate) fn infer_module(
             passed: &mut passed,
             allow_closure: false,
             escaped: &mut escaped,
+            dynamic_methods: &mut dynamic_methods,
             files: entry_files,
             no_outer: HashMap::new(),
         }
@@ -1513,6 +1628,8 @@ pub(crate) fn infer_module(
         classes: module.classes,
         closures,
         entry: entry_locals,
+        list_params: module.list_params,
+        dynamic_methods,
     }
 }
 
@@ -1533,6 +1650,8 @@ struct Calls<'a> {
     allow_closure: bool,
     /// Closures a value of which reached anywhere else.
     escaped: &'a mut Vec<u16>,
+    /// Methods called on a receiver whose class is not known.
+    dynamic_methods: &'a mut std::collections::HashSet<String>,
     /// The file of each top-level statement, where they span several.
     files: &'a [u32],
     /// A body typed here has no enclosing scope of its own.
@@ -1596,10 +1715,20 @@ impl Calls<'_> {
                 let (_, name) = self.module.method_sig(c as usize, &info.method)?;
                 Some((Target::Item(name), 1))
             }
-            py::Expr::Attribute(a) if a.attr.as_str() == "__init__" && is_super_call(&a.value) => {
+            py::Expr::Attribute(a) if is_super_call(&a.value) => {
                 let base = self.module.classes[self.class?].base?;
-                let (_, init) = self.module.method_sig(base, "__init__")?;
-                Some((Target::Item(init), 1))
+                let (_, name) = self.module.method_sig(base, a.attr.as_str())?;
+                Some((Target::Item(name), 1))
+            }
+            // A method on an instance of a known class: the class's
+            // own; each overriding one is recorded beside it, since
+            // the call reaches whichever the instance's class holds.
+            py::Expr::Attribute(a) if matches!(self.arg_ty(&a.value), Ty::Class(_)) => {
+                let Ty::Class(k) = self.arg_ty(&a.value) else {
+                    unreachable!()
+                };
+                let (_, name) = self.module.method_sig(k as usize, a.attr.as_str())?;
+                Some((Target::Item(name), 1))
             }
             other => self.closure_of(other).map(|k| (Target::Closure(k), 0)),
         }
@@ -1781,6 +1910,39 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
                 if let Some((target, first)) = self.callee(&c.func) {
                     self.record(target, first, &c.arguments.args, &c.arguments.keywords);
                 }
+                if let py::Expr::Attribute(a) = &*c.func {
+                    if !is_super_call(&a.value) && !self.opaque {
+                        match self.arg_ty(&a.value) {
+                            Ty::Class(k) => {
+                                for sub in self.module.overriders(k as usize, a.attr.as_str()) {
+                                    if let Some((_, name)) =
+                                        self.module.method_sig(sub, a.attr.as_str())
+                                    {
+                                        self.record(
+                                            Target::Item(name),
+                                            1,
+                                            &c.arguments.args,
+                                            &c.arguments.keywords,
+                                        );
+                                    }
+                                }
+                            }
+                            // Not an instance of a known class, or not
+                            // known yet: any method of the name may be
+                            // reached with whatever this passes.
+                            Ty::Object | Ty::Unknown
+                                if self
+                                    .module
+                                    .classes
+                                    .iter()
+                                    .any(|c| c.methods.iter().any(|m| m == a.attr.as_str())) =>
+                            {
+                                self.dynamic_methods.insert(a.attr.to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 self.allow_closure = true;
                 self.visit_expr(&c.func);
                 for a in &c.arguments.args {
@@ -1938,6 +2100,11 @@ fn infer_locals_with(
         locals.nonlocal_writes.insert(name.clone(), Ty::Unknown);
         locals.vars.remove(name);
     }
+    let fills = list_sites(
+        module,
+        body,
+        unkinded_locals(body, &sig.params, seeds, &scope),
+    );
     for _ in 0..8 {
         let before = locals.clone();
         let mut walker = Walker {
@@ -1945,6 +2112,7 @@ fn infer_locals_with(
             locals: &mut locals,
             params: &sig.params,
             seeds,
+            fills: &fills,
         };
         for (i, s) in body.iter().enumerate() {
             match files.get(i) {
@@ -1971,33 +2139,6 @@ fn infer_locals_with(
             break;
         }
     }
-    // A list bound to an empty literal and filled by the body's own
-    // writes of one kind is a list of that kind; everything typed off
-    // its elements is then typed again.
-    let filled = filled_kinds(module, body, &locals.vars, seeds, &sig.params, &scope);
-    if !filled.is_empty() {
-        for (name, e) in filled {
-            locals.vars.insert(name, Ty::List(e));
-        }
-        for _ in 0..8 {
-            let before = locals.clone();
-            let mut walker = Walker {
-                module,
-                locals: &mut locals,
-                params: &sig.params,
-                seeds,
-            };
-            for (i, s) in body.iter().enumerate() {
-                match files.get(i) {
-                    Some(&file) => in_file(file, || walker.stmt(s)),
-                    None => walker.stmt(s),
-                }
-            }
-            if locals.vars == before.vars && locals.ret == before.ret {
-                break;
-            }
-        }
-    }
     // A body control can fall off the end of returns None there too.
     if locals.returns && !terminates(body) {
         locals.ret = locals.ret.join(Ty::None);
@@ -2012,45 +2153,83 @@ pub(crate) fn is_empty_list(e: &py::Expr) -> bool {
     matches!(e, py::Expr::List(l) if l.elts.is_empty())
 }
 
-/// The element kind of each local of `body` that is bound only to empty
-/// list literals, is read only in ways that keep it a list of its own
-/// (indexed, iterated, measured, joined, its elements popped), and is
-/// written only by the body's own `append`, `insert`, `extend`,
-/// `+=` and element stores, all of one kind. Anything else that
-/// touches the name, in the body or a nested one, leaves it as it was.
-fn filled_kinds(
+/// `[]`, `[None]` or `[None] * n`: a list literal that says nothing
+/// about its elements' kind, which is then the kind of what the body
+/// puts in. `[None]` counts as one write of None, which any instance
+/// kind admits. Says the count of Nones to build.
+pub(crate) fn unkinded_list(e: &py::Expr) -> Option<Option<&py::Expr>> {
+    let nones = |l: &py::ExprList| l.elts.iter().all(|e| matches!(e, py::Expr::NoneLiteral(_)));
+    match e {
+        py::Expr::List(l) if l.elts.is_empty() => Some(None),
+        py::Expr::List(l) if l.elts.len() == 1 && nones(l) => Some(None),
+        py::Expr::BinOp(b) if b.op == py::Operator::Mult => match (&*b.left, &*b.right) {
+            (py::Expr::List(l), n) if l.elts.len() == 1 && nones(l) => Some(Some(n)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// How a body uses a list bound to one of its names, collected once
+/// from the syntax; what is written in is typed as inference goes.
+#[derive(Debug, Default)]
+pub(crate) struct ListSites<'ast> {
+    /// The list may be kept, aliased, passed to something with no facts,
+    /// or written with something not accounted for: its kind is not
+    /// this body's to decide.
+    pub(crate) kept: bool,
+    /// The expressions whose values are put in as elements.
+    pub(crate) elements: Vec<&'ast py::Expr>,
+    /// The expressions whose elements are put in.
+    pub(crate) sequences: Vec<&'ast py::Expr>,
+    /// Whether a literal `[None]` seeded it.
+    pub(crate) none: bool,
+    /// Functions of the module it is passed to, with the parameter's
+    /// position; what they write in is what their facts say.
+    pub(crate) passed_to: Vec<(String, usize)>,
+}
+
+/// What a function does with a parameter, for callers typing the list
+/// they pass; see [`Module::list_params`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListFact {
+    /// Kept, aliased, or written with what cannot be accounted for.
+    Kept,
+    /// Only read.
+    Reads,
+    /// Written with elements of this type; `Unknown` while the writes
+    /// are not yet typed.
+    Writes(Ty),
+}
+
+/// The uses of each of `names`, list-typed variables of `body`. A read
+/// is an index, a slice, an iteration, a measure, a join, a membership
+/// test, a truth test, or a call of one of the reading methods; a write
+/// is `append`, `insert`, `extend`, `+=`, an element or slice store, or
+/// a pass to a function of the module. Anything else, in the body or a
+/// nested one, keeps the list.
+pub(crate) fn list_sites<'ast>(
     module: &Module,
-    body: &[py::Stmt],
-    vars: &HashMap<String, Ty>,
-    seeds: &HashMap<String, Ty>,
-    params: &[(String, Ty)],
-    scope: &crate::scope::Scope,
-) -> Vec<(String, Elem)> {
+    body: &'ast [py::Stmt],
+    names: Vec<String>,
+) -> HashMap<String, ListSites<'ast>> {
     use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
-    struct Uses<'a, 'm> {
-        typer: Typer<'m>,
-        /// Names still in the running, with the join of what is written.
-        candidates: HashMap<String, Ty>,
-        /// Every name whose binding is not only empty literals, or that
-        /// is used some other way.
-        out: std::collections::HashSet<String>,
+    struct Uses<'a, 'm, 'ast> {
+        module: &'m Module,
+        sites: HashMap<String, ListSites<'ast>>,
         /// Whether the current expression is one of the allowed uses.
         allowed: &'a std::cell::Cell<bool>,
     }
-    impl Uses<'_, '_> {
-        fn write(&mut self, name: &str, ty: Ty) {
-            if let Some(joined) = self.candidates.get_mut(name) {
-                *joined = joined.join(ty);
-            }
+    impl<'ast> Uses<'_, '_, 'ast> {
+        fn site(&mut self, name: &str) -> &mut ListSites<'ast> {
+            self.sites.get_mut(name).expect("a name being followed")
         }
         fn drop_name(&mut self, name: &str) {
-            self.out.insert(name.to_string());
+            self.site(name).kept = true;
         }
         fn is_candidate<'e>(&self, e: &'e py::Expr) -> Option<&'e str> {
             match e {
-                py::Expr::Name(n) if self.candidates.contains_key(n.id.as_str()) => {
-                    Some(n.id.as_str())
-                }
+                py::Expr::Name(n) if self.sites.contains_key(n.id.as_str()) => Some(n.id.as_str()),
                 _ => None,
             }
         }
@@ -2076,14 +2255,23 @@ fn filled_kinds(
         "any",
         "all",
     ];
-    impl<'ast> Visitor<'ast> for Uses<'_, '_> {
+    impl<'ast> Visitor<'ast> for Uses<'_, '_, 'ast> {
         fn visit_stmt(&mut self, stmt: &'ast py::Stmt) {
             match stmt {
                 py::Stmt::Assign(a) => {
                     for t in &a.targets {
                         if let Some(name) = self.is_candidate(t) {
-                            if !is_empty_list(&a.value) {
-                                self.drop_name(name);
+                            let name = name.to_string();
+                            match unkinded_list(&a.value) {
+                                None => self.drop_name(&name),
+                                Some(count) => {
+                                    if !is_empty_list(&a.value) {
+                                        self.site(&name).none = true;
+                                    }
+                                    if let Some(n) = count {
+                                        self.visit_expr(n);
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -2091,14 +2279,12 @@ fn filled_kinds(
                         // writes ys's elements.
                         if let py::Expr::Subscript(sub) = t {
                             if let Some(name) = self.is_candidate(&sub.value) {
-                                let written = if matches!(&*sub.slice, py::Expr::Slice(_)) {
-                                    self.typer.expr(&a.value).element().unwrap_or(Ty::Object)
+                                let name = name.to_string();
+                                if matches!(&*sub.slice, py::Expr::Slice(_)) {
+                                    self.site(&name).sequences.push(&a.value);
                                 } else {
-                                    self.typer.expr(&a.value)
-                                };
-                                self.write(name, written);
-                                self.allowed.set(true);
-                                self.visit_expr(&sub.value);
+                                    self.site(&name).elements.push(&a.value);
+                                }
                                 self.visit_expr(&sub.slice);
                                 self.visit_expr(&a.value);
                                 return;
@@ -2117,8 +2303,7 @@ fn filled_kinds(
                     if let Some(name) = self.is_candidate(&a.target) {
                         let name = name.to_string();
                         if a.op == py::Operator::Add {
-                            let written = self.typer.expr(&a.value).element().unwrap_or(Ty::Object);
-                            self.write(&name, written);
+                            self.site(&name).sequences.push(&a.value);
                             self.visit_expr(&a.value);
                         } else {
                             self.drop_name(&name);
@@ -2128,8 +2313,8 @@ fn filled_kinds(
                     walk_stmt(self, stmt);
                 }
                 py::Stmt::For(f) => {
-                    if self.is_candidate(&f.target).is_some() {
-                        if let py::Expr::Name(n) = &*f.target {
+                    if let py::Expr::Name(n) = &*f.target {
+                        if self.sites.contains_key(n.id.as_str()) {
                             self.drop_name(n.id.as_str());
                         }
                     }
@@ -2166,7 +2351,7 @@ fn filled_kinds(
             let allowed = self.allowed.replace(false);
             match expr {
                 py::Expr::Name(n) => {
-                    if !allowed && self.candidates.contains_key(n.id.as_str()) {
+                    if !allowed && self.sites.contains_key(n.id.as_str()) {
                         self.drop_name(n.id.as_str());
                     }
                 }
@@ -2176,20 +2361,12 @@ fn filled_kinds(
                         py::Expr::Attribute(a) if self.is_candidate(&a.value).is_some() => {
                             let name = self.is_candidate(&a.value).unwrap().to_string();
                             let method = a.attr.as_str();
-                            let written = match (method, args.len()) {
-                                ("append", 1) => Some(self.typer.expr(&args[0])),
-                                ("insert", 2) => Some(self.typer.expr(&args[1])),
-                                ("extend", 1) => {
-                                    Some(self.typer.expr(&args[0]).element().unwrap_or(Ty::Object))
-                                }
-                                _ if READS.contains(&method) => None,
-                                _ => {
-                                    self.drop_name(&name);
-                                    None
-                                }
-                            };
-                            if let Some(ty) = written {
-                                self.write(&name, ty);
+                            match (method, args.len()) {
+                                ("append", 1) => self.site(&name).elements.push(&args[0]),
+                                ("insert", 2) => self.site(&name).elements.push(&args[1]),
+                                ("extend", 1) => self.site(&name).sequences.push(&args[0]),
+                                _ if READS.contains(&method) => {}
+                                _ => self.drop_name(&name),
                             }
                             for arg in args {
                                 self.visit_expr(arg);
@@ -2214,6 +2391,23 @@ fn filled_kinds(
                             }
                             for k in &c.arguments.keywords {
                                 self.visit_expr(&k.value);
+                            }
+                        }
+                        // A function of the module does with the list
+                        // what its facts say of that parameter.
+                        py::Expr::Name(f)
+                            if self.module.funcs.contains_key(f.id.as_str())
+                                && !self.sites.contains_key(f.id.as_str())
+                                && c.arguments.keywords.is_empty() =>
+                        {
+                            for (i, arg) in args.iter().enumerate() {
+                                match self.is_candidate(arg) {
+                                    Some(name) => {
+                                        let name = name.to_string();
+                                        self.site(&name).passed_to.push((f.id.to_string(), i));
+                                    }
+                                    None => self.visit_expr(arg),
+                                }
                             }
                         }
                         _ => walk_expr(self, expr),
@@ -2259,7 +2453,7 @@ fn filled_kinds(
                     let mut names = NamesIn::default();
                     names.visit_expr(expr);
                     for n in names.0 {
-                        if self.candidates.contains_key(&n) {
+                        if self.sites.contains_key(&n) {
                             self.drop_name(&n);
                         }
                     }
@@ -2279,37 +2473,13 @@ fn filled_kinds(
         }
     }
 
-    // Every local bound only by empty literals, at the top of the body
-    // or under its branches and loops, never in a nested body. A
-    // parameter is bound by the call.
-    let mut candidates: HashMap<String, Ty> = HashMap::new();
-    for (name, ty) in vars {
-        if matches!(ty, Ty::List(Elem::Object))
-            && scope.bound.contains(name)
-            && !params.iter().any(|(p, _)| p == name)
-            && !seeds.contains_key(name)
-            && !scope.globals.contains(name)
-            && !scope.nonlocals.contains(name)
-            && scope
-                .children
-                .iter()
-                .all(|(_, c)| !c.free.contains(name) && !c.bound.contains(name))
-        {
-            candidates.insert(name.clone(), Ty::Unknown);
-        }
-    }
-    if candidates.is_empty() {
-        return Vec::new();
-    }
     let allowed = std::cell::Cell::new(false);
     let mut uses = Uses {
-        typer: Typer {
-            module,
-            vars,
-            outer: seeds,
-        },
-        candidates,
-        out: std::collections::HashSet::new(),
+        module,
+        sites: names
+            .into_iter()
+            .map(|n| (n, ListSites::default()))
+            .collect(),
         allowed: &allowed,
     };
     for s in body {
@@ -2318,17 +2488,192 @@ fn filled_kinds(
         }
         uses.visit_stmt(s);
     }
-    let mut found: Vec<(String, Elem)> = uses
-        .candidates
+    uses.sites
+}
+
+/// The locals of `body` bound only by unkinded literals, never in a
+/// nested body: the ones whose kind the body's writes decide. A
+/// parameter is bound by the call.
+fn unkinded_locals(
+    body: &[py::Stmt],
+    params: &[(String, Ty)],
+    seeds: &HashMap<String, Ty>,
+    scope: &crate::scope::Scope,
+) -> Vec<String> {
+    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    /// Stores of each name, and how many of them bind an unkinded literal.
+    #[derive(Default)]
+    struct Stores(HashMap<String, (usize, usize)>);
+    impl<'a> Visitor<'a> for Stores {
+        fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
+            match stmt {
+                py::Stmt::Assign(a) if unkinded_list(&a.value).is_some() => {
+                    for t in &a.targets {
+                        if let py::Expr::Name(n) = t {
+                            let e = self.0.entry(n.id.to_string()).or_default();
+                            e.1 += 1;
+                        }
+                    }
+                }
+                py::Stmt::FunctionDef(f) => {
+                    self.0.entry(f.name.to_string()).or_default().0 += 1;
+                    return;
+                }
+                py::Stmt::ClassDef(c) => {
+                    self.0.entry(c.name.to_string()).or_default().0 += 1;
+                    return;
+                }
+                py::Stmt::Import(i) => {
+                    for a in &i.names {
+                        let bound = a.asname.as_ref().unwrap_or(&a.name);
+                        let first = bound.split('.').next().unwrap_or_default();
+                        self.0.entry(first.to_string()).or_default().0 += 1;
+                    }
+                }
+                py::Stmt::ImportFrom(i) => {
+                    for a in &i.names {
+                        let bound = a.asname.as_ref().unwrap_or(&a.name);
+                        self.0.entry(bound.to_string()).or_default().0 += 1;
+                    }
+                }
+                py::Stmt::Try(t) => {
+                    for h in &t.handlers {
+                        let py::ExceptHandler::ExceptHandler(h) = h;
+                        if let Some(n) = &h.name {
+                            self.0.entry(n.to_string()).or_default().0 += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'a py::Expr) {
+            if let py::Expr::Name(n) = expr {
+                if !matches!(n.ctx, py::ExprContext::Load) {
+                    self.0.entry(n.id.to_string()).or_default().0 += 1;
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut stores = Stores::default();
+    for s in body {
+        stores.visit_stmt(s);
+    }
+    let mut out: Vec<String> = stores
+        .0
         .iter()
-        .filter(|(name, _)| !uses.out.contains(*name))
-        .filter_map(|(name, written)| match Elem::of(*written) {
-            Elem::Object => None,
-            e => Some((name.clone(), e)),
+        .filter(|(name, (all, unkinded))| {
+            *unkinded > 0
+                && all == unkinded
+                && scope.bound.contains(*name)
+                && !params.iter().any(|(p, _)| p == *name)
+                && !seeds.contains_key(*name)
+                && !scope.globals.contains(*name)
+                && !scope.nonlocals.contains(*name)
+                && scope
+                    .children
+                    .iter()
+                    .all(|(_, c)| !c.free.contains(*name) && !c.bound.contains(*name))
         })
+        .map(|(name, _)| name.clone())
         .collect();
-    found.sort_by(|a, b| a.0.cmp(&b.0));
-    found
+    out.sort();
+    out
+}
+
+/// What a body puts into a list with these uses, against the types
+/// known so far: `None` when the list is kept; `Some(None)` when
+/// nothing is written in; `Some(Some(Unknown))` while something
+/// written in is not yet typed; else the join of what is written.
+fn written_into(module: &Module, sites: &ListSites<'_>, typer: &Typer<'_>) -> Option<Option<Ty>> {
+    if sites.kept {
+        return None;
+    }
+    let mut written = if sites.none { Some(Ty::None) } else { None };
+    let mut undecided = false;
+    let mut take = |ty: Ty| {
+        if ty == Ty::Unknown {
+            undecided = true;
+        } else {
+            written = Some(written.unwrap_or(Ty::Unknown).join(ty));
+        }
+    };
+    for e in &sites.elements {
+        take(typer.expr(e));
+    }
+    for e in &sites.sequences {
+        take(typer.expr(e).element().unwrap_or(Ty::Object));
+    }
+    for (callee, index) in &sites.passed_to {
+        match module
+            .list_params
+            .get(callee)
+            .and_then(|facts| facts.get(*index).copied())
+        {
+            Some(ListFact::Reads) => {}
+            Some(ListFact::Writes(ty)) => take(ty),
+            Some(ListFact::Kept) | None => return None,
+        }
+    }
+    if undecided {
+        return Some(Some(Ty::Unknown));
+    }
+    Some(written)
+}
+
+/// The kind a list bound to an unkinded literal has: `Unknown` while
+/// what goes in is not yet typed, a list of anything once it is kept,
+/// written with more than one kind, or never written at all.
+fn decide_list(module: &Module, sites: &ListSites<'_>, typer: &Typer<'_>) -> Ty {
+    match written_into(module, sites, typer) {
+        None | Some(None) => Ty::List(Elem::Object),
+        Some(Some(Ty::Unknown)) => Ty::Unknown,
+        Some(Some(ty)) => Ty::List(Elem::of(ty)),
+    }
+}
+
+/// What a body does with each of its parameters, in parameter order;
+/// see [`Module::list_params`].
+fn list_param_facts(
+    module: &Module,
+    body: &[py::Stmt],
+    vars: &HashMap<String, Ty>,
+    params: &[(String, Ty)],
+) -> Vec<ListFact> {
+    let scope = crate::scope::Scope::of_body(Vec::new(), body);
+    let followed: Vec<String> = params
+        .iter()
+        .filter(|(name, _)| {
+            !scope.bound.contains(name)
+                && !scope.globals.contains(name)
+                && !scope.nonlocals.contains(name)
+                && scope
+                    .children
+                    .iter()
+                    .all(|(_, c)| !c.free.contains(name) && !c.bound.contains(name))
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let sites = list_sites(module, body, followed);
+    let no_outer = HashMap::new();
+    let typer = Typer {
+        module,
+        vars,
+        outer: &no_outer,
+    };
+    params
+        .iter()
+        .map(|(name, _)| match sites.get(name) {
+            None => ListFact::Kept,
+            Some(site) => match written_into(module, site, &typer) {
+                None => ListFact::Kept,
+                Some(None) => ListFact::Reads,
+                Some(Some(ty)) => ListFact::Writes(ty),
+            },
+        })
+        .collect()
 }
 
 /// Whether control never reaches the end of `stmts`: some statement in
@@ -2417,9 +2762,20 @@ struct Walker<'a> {
     locals: &'a mut Locals,
     params: &'a [(String, Ty)],
     seeds: &'a HashMap<String, Ty>,
+    /// The uses of each local bound only to unkinded list literals,
+    /// whose kind is decided from them at each such binding.
+    fills: &'a HashMap<String, ListSites<'a>>,
 }
 
 impl Walker<'_> {
+    fn typer(&self) -> Typer<'_> {
+        Typer {
+            module: self.module,
+            vars: &self.locals.vars,
+            outer: self.seeds,
+        }
+    }
+
     fn assign(&mut self, name: &str, ty: Ty) {
         // A declared global or nonlocal is another scope's variable.
         if let Some(written) = self.locals.global_writes.get_mut(name) {
@@ -2509,17 +2865,16 @@ impl Walker<'_> {
             py::Stmt::Assign(a) => {
                 let ty = self.expr(&a.value);
                 for t in &a.targets {
-                    // An empty literal takes the kind the name already
-                    // has, which its writes decided; see [`filled_kinds`].
-                    let ty = match (t, ty) {
-                        (py::Expr::Name(n), Ty::List(Elem::Object)) if is_empty_list(&a.value) => {
-                            match self.locals.vars.get(n.id.as_str()) {
-                                Some(Ty::List(e)) => Ty::List(*e),
-                                _ => ty,
-                            }
+                    // An unkinded literal is the list its writes make
+                    // it, decided afresh from the types known now.
+                    if let py::Expr::Name(n) = t {
+                        if let Some(sites) = self.fills.get(n.id.as_str()) {
+                            let decided = decide_list(self.module, sites, &self.typer());
+                            self.locals.vars.remove(n.id.as_str());
+                            self.assign(n.id.as_str(), decided);
+                            continue;
                         }
-                        _ => ty,
-                    };
+                    }
                     self.target(t, ty);
                 }
             }
@@ -2820,10 +3175,17 @@ impl Typer<'_> {
                 if name == "__name__" {
                     return Ty::Str;
                 }
-                match self.module.imported_name(name) {
-                    Some(m) => member_ty(m),
-                    None => Ty::Object,
+                if let Some(m) = self.module.imported_name(name) {
+                    return member_ty(m);
                 }
+                if !self.module.funcs.contains_key(name)
+                    && !self.module.class_index.contains_key(name)
+                {
+                    if let Some(k) = builtin_index(name) {
+                        return Ty::Builtin(k);
+                    }
+                }
+                Ty::Object
             }
             py::Expr::BinOp(b) => {
                 let l = self.expr(&b.left);
@@ -2965,8 +3327,6 @@ impl Typer<'_> {
     }
 
     fn call(&self, c: &py::ExprCall) -> Ty {
-        let args = &c.arguments.args;
-        let arg = |i: usize| args.get(i).map(|a| self.expr(a)).unwrap_or(Ty::Unknown);
         if let py::Expr::Attribute(a) = &*c.func {
             if let Some(m) = self.module_member_of(&a.value, a.attr.as_str()) {
                 return member_ty(m);
@@ -2981,6 +3341,7 @@ impl Typer<'_> {
                 let receiver = self.expr(&py::Expr::Name(info.receiver.clone()));
                 return self.method_ret(receiver, &info.method);
             }
+            Ty::Builtin(k) => return self.builtin_call(BUILTIN_VALUES[k as usize], c),
             _ => {}
         }
         match &*c.func {
@@ -2997,83 +3358,7 @@ impl Typer<'_> {
                         return member_ty(m);
                     }
                 }
-                match name {
-                    "print" => Ty::None,
-                    // A range is iterated as ints.
-                    "range" => Ty::List(Elem::Int),
-                    "len" | "int" | "ord" | "hash" | "id" => Ty::Int,
-                    "next" => Ty::Object,
-                    "sorted" | "reversed" | "list" => match arg(0) {
-                        Ty::List(e) => Ty::List(e),
-                        Ty::Str => Ty::List(Elem::Str),
-                        Ty::Tuple | Ty::Dict | Ty::Set | Ty::Gen => Ty::List(Elem::Object),
-                        _ => match args.first() {
-                            Some(py::Expr::Call(c)) if is_name(&c.func, "range") => {
-                                Ty::List(Elem::Int)
-                            }
-                            _ => Ty::List(Elem::Object),
-                        },
-                    },
-                    "tuple" => Ty::Tuple,
-                    "dict" => Ty::Dict,
-                    "set" => Ty::Set,
-                    // Pairs and mapped values are dynamic; the lists are eager.
-                    "enumerate" | "zip" | "map" | "filter" => Ty::List(Elem::Object),
-                    "any" | "all" => Ty::Bool,
-                    "sum" => {
-                        let items = match arg(0) {
-                            Ty::List(Elem::Int) => Ty::Int,
-                            Ty::List(Elem::Float) => Ty::Float,
-                            _ => Ty::Object,
-                        };
-                        match args.get(1) {
-                            None => items,
-                            Some(start) => match (items, self.expr(start)) {
-                                (Ty::Int, Ty::Int | Ty::Bool) => Ty::Int,
-                                (Ty::Int | Ty::Float, Ty::Float)
-                                | (Ty::Float, Ty::Int | Ty::Bool) => Ty::Float,
-                                _ => Ty::Object,
-                            },
-                        }
-                    }
-                    "min" | "max" if args.len() == 1 => match arg(0) {
-                        Ty::List(e) => e.ty(),
-                        _ => Ty::Object,
-                    },
-                    "divmod" => Ty::Tuple,
-                    "type" => Ty::Str,
-                    "str" | "repr" | "input" | "chr" => Ty::Str,
-                    "float" => Ty::Float,
-                    "bool" | "isinstance" | "callable" | "hasattr" => Ty::Bool,
-                    "abs" => match arg(0) {
-                        Ty::Int | Ty::Bool => Ty::Int,
-                        Ty::Float => Ty::Float,
-                        Ty::Unknown => Ty::Unknown,
-                        _ => Ty::Object,
-                    },
-                    "round" if args.len() == 1 => match arg(0) {
-                        Ty::Int | Ty::Float | Ty::Bool => Ty::Int,
-                        Ty::Unknown => Ty::Unknown,
-                        _ => Ty::Object,
-                    },
-                    // With digits, the result keeps the argument's type.
-                    "round" if args.len() == 2 => match arg(0) {
-                        Ty::Int | Ty::Bool => Ty::Int,
-                        Ty::Float => Ty::Float,
-                        Ty::Unknown => Ty::Unknown,
-                        _ => Ty::Object,
-                    },
-                    "pow" if args.len() == 3 => Ty::Int,
-                    "min" | "max" if args.len() >= 2 => {
-                        let mut acc = Ty::Unknown;
-                        for a in args.iter() {
-                            acc = acc.join(self.expr(a));
-                        }
-                        acc
-                    }
-                    "pow" if args.len() == 2 => binop(py::Operator::Pow, arg(0), arg(1), &args[1]),
-                    _ => Ty::Object,
-                }
+                self.builtin_call(name, c)
             }
             // `super().m(...)`: the base's method.
             py::Expr::Attribute(a) if is_super_call(&a.value) => {
@@ -3090,6 +3375,88 @@ impl Typer<'_> {
             }
             // A method on a value whose type is known, or not yet.
             py::Expr::Attribute(a) => self.method_ret(self.expr(&a.value), a.attr.as_str()),
+            _ => Ty::Object,
+        }
+    }
+
+    /// What a call of the builtin `name` returns.
+    fn builtin_call(&self, name: &str, c: &py::ExprCall) -> Ty {
+        let args = &c.arguments.args;
+        let arg = |i: usize| args.get(i).map(|a| self.expr(a)).unwrap_or(Ty::Unknown);
+        match name {
+            "print" => Ty::None,
+            // A range is iterated as ints.
+            "range" => Ty::List(Elem::Int),
+            "len" | "int" | "ord" | "hash" | "id" => Ty::Int,
+            "next" => Ty::Object,
+            "sorted" | "reversed" | "list" => match arg(0) {
+                Ty::List(e) => Ty::List(e),
+                Ty::Str => Ty::List(Elem::Str),
+                Ty::Tuple | Ty::Dict | Ty::Set | Ty::Gen => Ty::List(Elem::Object),
+                _ => match args.first() {
+                    Some(py::Expr::Call(c)) if is_name(&c.func, "range") => Ty::List(Elem::Int),
+                    _ => Ty::List(Elem::Object),
+                },
+            },
+            "tuple" => Ty::Tuple,
+            "dict" => Ty::Dict,
+            "set" => Ty::Set,
+            // Pairs and mapped values are dynamic; the lists are eager.
+            "enumerate" | "zip" | "map" | "filter" => Ty::List(Elem::Object),
+            "any" | "all" => Ty::Bool,
+            "sum" => {
+                let items = match arg(0) {
+                    Ty::List(Elem::Int) => Ty::Int,
+                    Ty::List(Elem::Float) => Ty::Float,
+                    _ => Ty::Object,
+                };
+                match args.get(1) {
+                    None => items,
+                    Some(start) => match (items, self.expr(start)) {
+                        (Ty::Int, Ty::Int | Ty::Bool) => Ty::Int,
+                        (Ty::Int | Ty::Float, Ty::Float) | (Ty::Float, Ty::Int | Ty::Bool) => {
+                            Ty::Float
+                        }
+                        _ => Ty::Object,
+                    },
+                }
+            }
+            "min" | "max" if args.len() == 1 => match arg(0) {
+                Ty::List(e) => e.ty(),
+                _ => Ty::Object,
+            },
+            "divmod" => Ty::Tuple,
+            "type" => Ty::Str,
+            "str" | "repr" | "input" | "chr" => Ty::Str,
+            "float" => Ty::Float,
+            "bool" | "isinstance" | "callable" | "hasattr" => Ty::Bool,
+            "abs" => match arg(0) {
+                Ty::Int | Ty::Bool => Ty::Int,
+                Ty::Float => Ty::Float,
+                Ty::Unknown => Ty::Unknown,
+                _ => Ty::Object,
+            },
+            "round" if args.len() == 1 => match arg(0) {
+                Ty::Int | Ty::Float | Ty::Bool => Ty::Int,
+                Ty::Unknown => Ty::Unknown,
+                _ => Ty::Object,
+            },
+            // With digits, the result keeps the argument's type.
+            "round" if args.len() == 2 => match arg(0) {
+                Ty::Int | Ty::Bool => Ty::Int,
+                Ty::Float => Ty::Float,
+                Ty::Unknown => Ty::Unknown,
+                _ => Ty::Object,
+            },
+            "pow" if args.len() == 3 => Ty::Int,
+            "min" | "max" if args.len() >= 2 => {
+                let mut acc = Ty::Unknown;
+                for a in args.iter() {
+                    acc = acc.join(self.expr(a));
+                }
+                acc
+            }
+            "pow" if args.len() == 2 => binop(py::Operator::Pow, arg(0), arg(1), &args[1]),
             _ => Ty::Object,
         }
     }
