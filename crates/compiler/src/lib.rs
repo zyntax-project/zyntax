@@ -35,6 +35,7 @@ pub mod cast_classify; // Pure classification of source/target coercions → Cas
 pub mod cfg;
 pub mod cfg_simplify;
 pub mod collector; // Conservative mark-sweep over the pool's storage
+pub mod const_boxes; // One box per string constant, made at start
 pub mod const_eval;
 pub mod const_fold;
 pub mod cse;

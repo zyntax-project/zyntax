@@ -590,6 +590,12 @@ impl TieredRuntime {
             );
         }
 
+        // String constants that are boxed are boxed once, at start.
+        if let Some(names) = &entered {
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            zyntax_compiler::const_boxes::run_module(&mut module, &names);
+        }
+
         // Run interp-safe HIR opts before backend installation. Without this,
         // user programs run through `TieredRuntime::compile_module` never get
         // CSE / LICM / inline / const_fold / aggregate_split — the bench-only
