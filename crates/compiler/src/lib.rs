@@ -2023,10 +2023,42 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
         let cs_cfg = cfg_simplify::run_module(module);
         timed("cfg_simplify", &mut at);
 
-        let made_progress = cf.folded > 0
-            || sf.compares > 0
-            || sf.selects > 0
-            || cs.eliminated > 0
+        // The folders feed each other and nothing else: a compare
+        // sign_fold rewrites is what const_fold folds next round. When
+        // they are all that moved, they are run to their own fixed
+        // point here rather than paying a round of every pass for each
+        // step of it.
+        let restructured = fma.contracted > 0
+            || lcse.eliminated > 0
+            || ags.round_trips_removed > 0
+            || ags.field_reads_only > 0
+            || sra.mallocs_eliminated > 0
+            || il.inlined > 0
+            || lc.hoisted > 0
+            || lv.vectorized > 0
+            || rv.vectorized > 0
+            || cs_cfg.merged > 0
+            || cs_cfg.threaded > 0;
+        let mut folded = cf.folded > 0 || sf.compares > 0 || sf.selects > 0 || cs.eliminated > 0;
+        if folded && !restructured {
+            for _ in 0..8 {
+                let cf = const_fold::fold_module(module);
+                let sf = sign_fold::run_module(module);
+                stats.sign_fold.compares += sf.compares;
+                stats.sign_fold.selects += sf.selects;
+                let cs = cse::eliminate_module(module);
+                stats.const_fold.folded += cf.folded;
+                stats.cse.eliminated += cs.eliminated;
+                stats.cse.rewrites += cs.rewrites;
+                if cf.folded == 0 && sf.compares == 0 && sf.selects == 0 && cs.eliminated == 0 {
+                    break;
+                }
+            }
+            timed("fold to fixed point", &mut at);
+            folded = false;
+        }
+        let made_progress = folded
+            || restructured
             || fma.contracted > 0
             || lcse.eliminated > 0
             || ags.round_trips_removed > 0
@@ -2079,6 +2111,26 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
         stats.cfg_simplify.merged += cs_cfg.merged;
         stats.cfg_simplify.threaded += cs_cfg.threaded;
 
+        if trace {
+            eprintln!(
+                "[OPT] round {round} progress: fold {} sign {}/{} cse {} fma {} lcse {} ags {}/{} sra {} inline {} licm {} vec {}/{} cfg {}/{}",
+                cf.folded,
+                sf.compares,
+                sf.selects,
+                cs.eliminated,
+                fma.contracted,
+                lcse.eliminated,
+                ags.round_trips_removed,
+                ags.field_reads_only,
+                sra.mallocs_eliminated,
+                il.inlined,
+                lc.hoisted,
+                lv.vectorized,
+                rv.vectorized,
+                cs_cfg.merged,
+                cs_cfg.threaded
+            );
+        }
         if !made_progress {
             break;
         }

@@ -136,8 +136,10 @@ const MAX_RECURSIVE_INLINE_SITES: usize = 4;
 /// Per-pass-per-caller inlining cap. Resets each outer fixed-point
 /// round in `run_module` — intentional, so the next round can make a
 /// fresh decision under a fresh budget after any inlines from this
-/// round unlock further simplifications.
-const MAX_INLINES_PER_CALLER_PER_ROUND: usize = 8;
+/// round unlock further simplifications. Loose, since the caller's
+/// size budgets bound the work and every round the cap forces is a
+/// fresh loop and cold-path analysis of the caller.
+const MAX_INLINES_PER_CALLER_PER_ROUND: usize = 64;
 
 /// Stats surfaced for callers / tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -404,14 +406,18 @@ pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
             Some(f) => f,
             None => continue,
         };
+        let mut subs: HashMap<HirId, HirId> = HashMap::new();
         for job in jobs {
-            match job.kind {
+            let sub = match job.kind {
                 InlineKind::Leaf => apply_inline(live, &job, &snapshot),
                 InlineKind::MultiBlock => apply_inline_multi_block(live, &job, &snapshot),
+            };
+            if let Some((from, to)) = sub {
+                subs.insert(from, to);
             }
             stats.self_calls_inlined += 1;
         }
-        rebuild_cfg_edges(live);
+        finish_inlines(live, subs, true);
         // The LLVM backend processes blocks in `func.blocks.iter()`
         // order (IndexMap insertion order) and falls back to
         // `const_zero` placeholders in `value_map` for any HirValue
@@ -866,11 +872,14 @@ fn inline_in_function(
         .collect();
 
     // Per-pass-per-caller budget tracking. `caller_inline_count`
-    // increments per successful inline; `caller_inst_count` is
-    // refreshed after each successful inline because phis/branches
-    // can add insts beyond the raw callee count.
+    // increments per successful inline; `caller_inst_count` grows by
+    // what each splice brings, and is read exactly once at the end.
     let mut caller_inline_count: usize = 0;
     let mut caller_inst_count: usize = count_insts(caller);
+    // What every splice left to apply: the substitution of each call's
+    // result, and whether the block edges need rebuilding.
+    let mut subs: HashMap<HirId, HirId> = HashMap::new();
+    let mut spliced_blocks = false;
 
     // Walk every block; for each Call instruction, classify and
     // either inline or skip. We collect inline jobs first, then
@@ -1005,20 +1014,17 @@ fn inline_in_function(
             let callee_has_inlined_intrinsic = callee_contains_inline_safe_intrinsic(callee);
             let callee_has_alloca = callee_contains_alloca(callee);
 
-            match job.kind {
+            let sub = match job.kind {
                 InlineKind::Leaf => apply_inline(caller, &job, callee),
-                InlineKind::MultiBlock => apply_inline_multi_block(caller, &job, callee),
+                InlineKind::MultiBlock => {
+                    spliced_blocks = true;
+                    apply_inline_multi_block(caller, &job, callee)
+                }
+            };
+            if let Some((from, to)) = sub {
+                subs.insert(from, to);
             }
-
-            // Refresh — phis/branches added during multi-block
-            // inlining can put the caller over budget even when the
-            // prediction was below; if it did, count it but don't
-            // unwind (the inline is already applied).
-            caller_inst_count = count_insts(caller);
-            if caller_inst_count > MAX_POST_INLINE_INSTS {
-                stats.skipped_post_inline_overflow += 1;
-            }
-
+            caller_inst_count = predicted;
             caller_inline_count += 1;
             stats.inlined += 1;
             // `ZYNTAX_TRACE_INLINE=1` names every inline made.
@@ -1040,6 +1046,16 @@ fn inline_in_function(
                     stats.inlined_multiblock_intrinsic_call += 1;
                 }
             }
+        }
+    }
+
+    if stats.inlined > 0 {
+        finish_inlines(caller, subs, spliced_blocks);
+        // Phis and branches a body of several blocks brought can put
+        // the caller past the budget the prediction kept it under;
+        // counted, not unwound.
+        if count_insts(caller) > MAX_POST_INLINE_INSTS {
+            stats.skipped_post_inline_overflow += 1;
         }
     }
 
@@ -1304,10 +1320,18 @@ fn convert_args_to_params(
     (converted_args, casts)
 }
 
-fn apply_inline(caller: &mut HirFunction, job: &InlineJob, callee: &HirFunction) {
+/// Splice `callee`'s one block in place of the call. Returns the
+/// substitution of the call's result by the value the body returns,
+/// which the caller applies with [`finish_inlines`] once every job of
+/// a function is spliced.
+fn apply_inline(
+    caller: &mut HirFunction,
+    job: &InlineJob,
+    callee: &HirFunction,
+) -> Option<(HirId, HirId)> {
     let entry = match callee.blocks.get(&callee.entry_block) {
         Some(b) => b,
-        None => return,
+        None => return None,
     };
 
     // Build the substitution map. Param ids in the callee → the
@@ -1433,37 +1457,41 @@ fn apply_inline(caller: &mut HirFunction, job: &InlineJob, callee: &HirFunction)
         }
     }
 
-    // Splice into the caller's block.
-    let block = match caller.blocks.get_mut(&job.block_id) {
-        Some(b) => b,
-        None => return,
-    };
-    // Drop the original Call instruction; replace it with the
-    // cloned instructions in-place.
-    let mut new_inst_list: Vec<HirInstruction> =
-        Vec::with_capacity(block.instructions.len() + cloned.len());
-    for (i, inst) in block.instructions.iter().enumerate() {
-        if i == job.inst_idx {
-            // Splice the cloned body in place of the call.
-            for c in &cloned {
-                new_inst_list.push(c.clone());
-            }
-        } else {
-            new_inst_list.push(inst.clone());
-        }
-    }
-    block.instructions = new_inst_list;
+    // The cloned body in place of the call.
+    let block = caller.blocks.get_mut(&job.block_id)?;
+    block
+        .instructions
+        .splice(job.inst_idx..=job.inst_idx, cloned);
 
-    // If the call had a result and the callee returned a value,
-    // rewrite every subsequent reference to the call's result to
-    // point at the return value instead.
-    if let (Some(call_result), Some(ret)) = (job.call_result, return_value) {
-        let mut substitution: HashMap<HirId, HirId> = HashMap::new();
-        substitution.insert(call_result, ret);
-        replace_uses_across_function(caller, &substitution);
-        // Remove the now-orphaned call_result from the caller's
-        // values (its defining instruction is gone).
-        caller.values.shift_remove(&call_result);
+    // The call's result, if any, becomes the value the body returned.
+    match (job.call_result, return_value) {
+        (Some(call_result), Some(ret)) => Some((call_result, ret)),
+        _ => None,
+    }
+}
+
+/// Apply the substitutions the splices of one function left: every
+/// use of a call's result becomes the value its body returned, chased
+/// through a body that returned another call's result; the results
+/// themselves, defined by nothing now, leave the value table. Then the
+/// block edges are rebuilt if a body of several blocks went in.
+fn finish_inlines(caller: &mut HirFunction, subs: HashMap<HirId, HirId>, rebuild_edges: bool) {
+    if !subs.is_empty() {
+        let resolved: HashMap<HirId, HirId> = subs
+            .keys()
+            .map(|&from| {
+                let mut to = subs[&from];
+                while let Some(&next) = subs.get(&to) {
+                    to = next;
+                }
+                (from, to)
+            })
+            .collect();
+        replace_uses_across_function(caller, &resolved);
+        caller.values.retain(|id, _| !resolved.contains_key(id));
+    }
+    if rebuild_edges {
+        rebuild_cfg_edges(caller);
     }
 }
 
@@ -1488,7 +1516,15 @@ fn apply_inline(caller: &mut HirFunction, job: &InlineJob, callee: &HirFunction)
 ///   * Predecessors are rebuilt across the whole function at the end —
 ///     the cheapest way to keep `block.predecessors` consistent after
 ///     splicing in N blocks and splitting one.
-fn apply_inline_multi_block(caller: &mut HirFunction, job: &InlineJob, callee: &HirFunction) {
+/// Splice `callee`'s blocks in place of the call, splitting the call's
+/// block around them. Returns the substitution of the call's result as
+/// [`apply_inline`] does; the caller rebuilds the block edges after
+/// its last splice.
+fn apply_inline_multi_block(
+    caller: &mut HirFunction,
+    job: &InlineJob,
+    callee: &HirFunction,
+) -> Option<(HirId, HirId)> {
     // ─── 1. Mint fresh block ids for every callee block.
     let mut block_id_map: HashMap<HirId, HirId> = HashMap::new();
     for &cid in callee.blocks.keys() {
@@ -1548,7 +1584,7 @@ fn apply_inline_multi_block(caller: &mut HirFunction, job: &InlineJob, callee: &
                 let phis = blk.phis.clone();
                 (pre, post, term, phis)
             }
-            None => return,
+            None => return None,
         };
 
     // ─── 4. Rewrite the caller's pre-block in place: keep the
@@ -1740,13 +1776,8 @@ fn apply_inline_multi_block(caller: &mut HirFunction, job: &InlineJob, callee: &
 
     caller.blocks.insert(post_block_id, post_block);
 
-    // ─── 7. Substitute call_result → return-value across the function.
-    if let Some((from, to)) = final_call_substitution {
-        let mut s = HashMap::new();
-        s.insert(from, to);
-        replace_uses_across_function(caller, &s);
-        caller.values.shift_remove(&from);
-    }
+    // ─── 7. The call's result becomes the returned value; the caller
+    // applies it with `finish_inlines`.
 
     // ─── 7b. Rewrite every downstream phi-incoming that referenced
     // the *original* call block to instead reference `post_block_id`.
@@ -1776,10 +1807,9 @@ fn apply_inline_multi_block(caller: &mut HirFunction, job: &InlineJob, callee: &
         }
     }
 
-    // ─── 8. Rebuild predecessors + successors across the whole
-    //         function. After splicing in N blocks and splitting one,
-    //         the cheapest correct approach is a full sweep.
-    rebuild_cfg_edges(caller);
+    // ─── 8. Predecessors and successors are rebuilt across the whole
+    //         function by `finish_inlines`, once for every splice.
+    final_call_substitution
 }
 
 /// Rewalk every block's terminator + phi list and rebuild the
@@ -2439,14 +2469,14 @@ mod tests {
 
     #[test]
     fn per_pass_per_caller_cap() {
-        // Build a caller with 10 call sites to square. Expect:
-        // round 1 inlines 8 (the cap), round 2 inlines the remaining
-        // 2 — but the cap stat for round 1 should be 2 (the two
-        // candidates that hit the cap and were skipped that round).
+        // Build a caller with two more call sites to square than the
+        // cap. Expect: round 1 inlines the cap, round 2 inlines the
+        // remaining 2, and the cap stat for round 1 is 2.
         let mut callee = build_square_callee();
         let callee_id = HirId::new();
         callee.id = callee_id;
-        let caller = build_caller_with_n_callsites(callee_id, 10);
+        let sites = MAX_INLINES_PER_CALLER_PER_ROUND + 2;
+        let caller = build_caller_with_n_callsites(callee_id, sites);
 
         let mut module = HirModule::new(InternedString::new_global("m"));
         module.functions.insert(callee_id, callee);
@@ -2454,7 +2484,7 @@ mod tests {
 
         let stats = run_module(&mut module);
         // Across all rounds, every call site eventually inlines.
-        assert_eq!(stats.inlined, 10, "{stats:?}");
+        assert_eq!(stats.inlined, sites, "{stats:?}");
         // At least one round must have hit the per-caller cap.
         assert!(stats.skipped_per_pass_cap >= 1, "{stats:?}");
     }
