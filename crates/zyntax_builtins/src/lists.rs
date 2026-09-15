@@ -1173,25 +1173,43 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         ))],
     ));
     let x = local("x", any());
-    // A list of dynamic values is read out of a box of any list kind:
-    // one of another kind comes out as a converted copy.
+    // A list of dynamic values is read out of a box of any list kind,
+    // and a list of a primitive kind out of a box of dynamic values
+    // whose every element is one; either comes out as a converted copy.
     let tag = local("tag", i64());
     let mut unbox = vec![tag.decl(cast(call("zb_box_tag", vec![x.e()], i32()), i64()))];
-    if k.kind == Kind::Any {
-        for other in Kind::ALL.iter().filter(|o| **o != Kind::Any) {
+    match k.kind {
+        Kind::Any => {
+            for other in Kind::ALL.iter().filter(|o| **o != Kind::Any) {
+                unbox.push(when(
+                    eq(tag.e(), int(other.list_tag())),
+                    vec![ret(call(
+                        &format!("zb_list_to_any_{}", other.suffix()),
+                        vec![call(
+                            &format!("zb_unbox_list_raw_{}", other.suffix()),
+                            vec![x.e()],
+                            list_of(list_type_of(&k.list), other.ty()),
+                        )],
+                        k.list.clone(),
+                    ))],
+                ));
+            }
+        }
+        Kind::Int | Kind::Float | Kind::Str => {
             unbox.push(when(
-                eq(tag.e(), int(other.list_tag())),
+                eq(tag.e(), int(Kind::Any.list_tag())),
                 vec![ret(call(
-                    &format!("zb_list_to_any_{}", other.suffix()),
+                    &name("from_any"),
                     vec![call(
-                        &format!("zb_unbox_list_raw_{}", other.suffix()),
+                        "zb_unbox_list_raw_any",
                         vec![x.e()],
-                        list_of(list_type_of(&k.list), other.ty()),
+                        list_of(list_type_of(&k.list), any()),
                     )],
                     k.list.clone(),
                 ))],
             ));
         }
+        Kind::Ptr => {}
     }
     unbox.push(when(
         ne(tag.e(), int(k.kind.list_tag())),

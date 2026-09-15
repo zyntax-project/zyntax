@@ -2028,6 +2028,19 @@ impl<'m> Lowerer<'m> {
                 {
                     return Ok(());
                 }
+                // An empty literal is built as the list the name holds,
+                // which inference typed by what the body puts in it.
+                if let [py::Expr::Name(n)] = a.targets.as_slice() {
+                    if types::is_empty_list(&a.value) {
+                        if let Ty::List(e) = self.var_ty(n.id.as_str()) {
+                            let value = Val {
+                                node: self.list_of(Vec::new(), e, span),
+                                ty: Ty::List(e),
+                            };
+                            return self.bind(&a.targets[0], value, span, out);
+                        }
+                    }
+                }
                 // `a = b = v` evaluates `v` once and binds each target
                 // to it, left to right.
                 let value = self.expr(&a.value)?;

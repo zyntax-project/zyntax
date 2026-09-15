@@ -1,0 +1,10 @@
+start,one,p1,p2,p3,p4,x,y,z 9 start True z
+START ONE P1 P2 P3 P4 X Y 
+60 25 [0, 1, 9, 9, 16, 25] 2
+full
+[1, 'two']
+[2.5, 1] [2.5, 1]
+[1, 's']
+[1, 's']
+[2.5]
+['b']

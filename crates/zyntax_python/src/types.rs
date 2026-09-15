@@ -1971,6 +1971,33 @@ fn infer_locals_with(
             break;
         }
     }
+    // A list bound to an empty literal and filled by the body's own
+    // writes of one kind is a list of that kind; everything typed off
+    // its elements is then typed again.
+    let filled = filled_kinds(module, body, &locals.vars, seeds, &sig.params, &scope);
+    if !filled.is_empty() {
+        for (name, e) in filled {
+            locals.vars.insert(name, Ty::List(e));
+        }
+        for _ in 0..8 {
+            let before = locals.clone();
+            let mut walker = Walker {
+                module,
+                locals: &mut locals,
+                params: &sig.params,
+                seeds,
+            };
+            for (i, s) in body.iter().enumerate() {
+                match files.get(i) {
+                    Some(&file) => in_file(file, || walker.stmt(s)),
+                    None => walker.stmt(s),
+                }
+            }
+            if locals.vars == before.vars && locals.ret == before.ret {
+                break;
+            }
+        }
+    }
     // A body control can fall off the end of returns None there too.
     if locals.returns && !terminates(body) {
         locals.ret = locals.ret.join(Ty::None);
@@ -1979,6 +2006,329 @@ fn infer_locals_with(
         settle(&mut locals);
     }
     locals
+}
+
+pub(crate) fn is_empty_list(e: &py::Expr) -> bool {
+    matches!(e, py::Expr::List(l) if l.elts.is_empty())
+}
+
+/// The element kind of each local of `body` that is bound only to empty
+/// list literals, is read only in ways that keep it a list of its own
+/// (indexed, iterated, measured, joined, its elements popped), and is
+/// written only by the body's own `append`, `insert`, `extend`,
+/// `+=` and element stores, all of one kind. Anything else that
+/// touches the name, in the body or a nested one, leaves it as it was.
+fn filled_kinds(
+    module: &Module,
+    body: &[py::Stmt],
+    vars: &HashMap<String, Ty>,
+    seeds: &HashMap<String, Ty>,
+    params: &[(String, Ty)],
+    scope: &crate::scope::Scope,
+) -> Vec<(String, Elem)> {
+    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    struct Uses<'a, 'm> {
+        typer: Typer<'m>,
+        /// Names still in the running, with the join of what is written.
+        candidates: HashMap<String, Ty>,
+        /// Every name whose binding is not only empty literals, or that
+        /// is used some other way.
+        out: std::collections::HashSet<String>,
+        /// Whether the current expression is one of the allowed uses.
+        allowed: &'a std::cell::Cell<bool>,
+    }
+    impl Uses<'_, '_> {
+        fn write(&mut self, name: &str, ty: Ty) {
+            if let Some(joined) = self.candidates.get_mut(name) {
+                *joined = joined.join(ty);
+            }
+        }
+        fn drop_name(&mut self, name: &str) {
+            self.out.insert(name.to_string());
+        }
+        fn is_candidate<'e>(&self, e: &'e py::Expr) -> Option<&'e str> {
+            match e {
+                py::Expr::Name(n) if self.candidates.contains_key(n.id.as_str()) => {
+                    Some(n.id.as_str())
+                }
+                _ => None,
+            }
+        }
+    }
+    const READS: &[&str] = &[
+        "pop", "sort", "reverse", "clear", "copy", "index", "count", "remove",
+    ];
+    const READERS: &[&str] = &[
+        "len",
+        "sorted",
+        "reversed",
+        "enumerate",
+        "list",
+        "tuple",
+        "set",
+        "sum",
+        "min",
+        "max",
+        "str",
+        "repr",
+        "print",
+        "bool",
+        "any",
+        "all",
+    ];
+    impl<'ast> Visitor<'ast> for Uses<'_, '_> {
+        fn visit_stmt(&mut self, stmt: &'ast py::Stmt) {
+            match stmt {
+                py::Stmt::Assign(a) => {
+                    for t in &a.targets {
+                        if let Some(name) = self.is_candidate(t) {
+                            if !is_empty_list(&a.value) {
+                                self.drop_name(name);
+                            }
+                            continue;
+                        }
+                        // `xs[i] = v` writes an element; `xs[a:b] = ys`
+                        // writes ys's elements.
+                        if let py::Expr::Subscript(sub) = t {
+                            if let Some(name) = self.is_candidate(&sub.value) {
+                                let written = if matches!(&*sub.slice, py::Expr::Slice(_)) {
+                                    self.typer.expr(&a.value).element().unwrap_or(Ty::Object)
+                                } else {
+                                    self.typer.expr(&a.value)
+                                };
+                                self.write(name, written);
+                                self.allowed.set(true);
+                                self.visit_expr(&sub.value);
+                                self.visit_expr(&sub.slice);
+                                self.visit_expr(&a.value);
+                                return;
+                            }
+                        }
+                    }
+                    // The value is read whatever the targets are.
+                    for t in &a.targets {
+                        if self.is_candidate(t).is_none() {
+                            self.visit_expr(t);
+                        }
+                    }
+                    self.visit_expr(&a.value);
+                }
+                py::Stmt::AugAssign(a) => {
+                    if let Some(name) = self.is_candidate(&a.target) {
+                        let name = name.to_string();
+                        if a.op == py::Operator::Add {
+                            let written = self.typer.expr(&a.value).element().unwrap_or(Ty::Object);
+                            self.write(&name, written);
+                            self.visit_expr(&a.value);
+                        } else {
+                            self.drop_name(&name);
+                        }
+                        return;
+                    }
+                    walk_stmt(self, stmt);
+                }
+                py::Stmt::For(f) => {
+                    if self.is_candidate(&f.target).is_some() {
+                        if let py::Expr::Name(n) = &*f.target {
+                            self.drop_name(n.id.as_str());
+                        }
+                    }
+                    if self.is_candidate(&f.iter).is_some() {
+                        self.allowed.set(true);
+                    }
+                    walk_stmt(self, stmt);
+                }
+                py::Stmt::If(i) => {
+                    if self.is_candidate(&i.test).is_some() {
+                        self.allowed.set(true);
+                    }
+                    walk_stmt(self, stmt);
+                }
+                py::Stmt::While(w) => {
+                    if self.is_candidate(&w.test).is_some() {
+                        self.allowed.set(true);
+                    }
+                    walk_stmt(self, stmt);
+                }
+                py::Stmt::Delete(d) => {
+                    for t in &d.targets {
+                        if let Some(name) = self.is_candidate(t) {
+                            self.drop_name(name);
+                        }
+                    }
+                    walk_stmt(self, stmt);
+                }
+                _ => walk_stmt(self, stmt),
+            }
+        }
+
+        fn visit_expr(&mut self, expr: &'ast py::Expr) {
+            let allowed = self.allowed.replace(false);
+            match expr {
+                py::Expr::Name(n) => {
+                    if !allowed && self.candidates.contains_key(n.id.as_str()) {
+                        self.drop_name(n.id.as_str());
+                    }
+                }
+                py::Expr::Call(c) => {
+                    let args = &c.arguments.args;
+                    match &*c.func {
+                        py::Expr::Attribute(a) if self.is_candidate(&a.value).is_some() => {
+                            let name = self.is_candidate(&a.value).unwrap().to_string();
+                            let method = a.attr.as_str();
+                            let written = match (method, args.len()) {
+                                ("append", 1) => Some(self.typer.expr(&args[0])),
+                                ("insert", 2) => Some(self.typer.expr(&args[1])),
+                                ("extend", 1) => {
+                                    Some(self.typer.expr(&args[0]).element().unwrap_or(Ty::Object))
+                                }
+                                _ if READS.contains(&method) => None,
+                                _ => {
+                                    self.drop_name(&name);
+                                    None
+                                }
+                            };
+                            if let Some(ty) = written {
+                                self.write(&name, ty);
+                            }
+                            for arg in args {
+                                self.visit_expr(arg);
+                            }
+                            for k in &c.arguments.keywords {
+                                self.visit_expr(&k.value);
+                            }
+                        }
+                        // `sep.join(xs)`, `len(xs)` and the like read it.
+                        py::Expr::Attribute(a)
+                            if a.attr.as_str() == "join"
+                                && args.len() == 1
+                                && self.is_candidate(&args[0]).is_some() =>
+                        {
+                            self.visit_expr(&a.value);
+                        }
+                        py::Expr::Name(f) if READERS.contains(&f.id.as_str()) => {
+                            for arg in args {
+                                if self.is_candidate(arg).is_none() {
+                                    self.visit_expr(arg);
+                                }
+                            }
+                            for k in &c.arguments.keywords {
+                                self.visit_expr(&k.value);
+                            }
+                        }
+                        _ => walk_expr(self, expr),
+                    }
+                }
+                py::Expr::Subscript(sub) => {
+                    if self.is_candidate(&sub.value).is_some() {
+                        self.visit_expr(&sub.slice);
+                        return;
+                    }
+                    walk_expr(self, expr);
+                }
+                py::Expr::Compare(c) => {
+                    // `v in xs` reads it; comparing it is a use.
+                    if c.ops.len() == 1
+                        && matches!(c.ops[0], py::CmpOp::In | py::CmpOp::NotIn)
+                        && self.is_candidate(&c.comparators[0]).is_some()
+                    {
+                        self.visit_expr(&c.left);
+                        return;
+                    }
+                    walk_expr(self, expr);
+                }
+                py::Expr::UnaryOp(u) if u.op == py::UnaryOp::Not => {
+                    if self.is_candidate(&u.operand).is_some() {
+                        return;
+                    }
+                    walk_expr(self, expr);
+                }
+                py::Expr::BoolOp(b) => {
+                    for v in &b.values {
+                        if self.is_candidate(v).is_none() {
+                            self.visit_expr(v);
+                        }
+                    }
+                }
+                py::Expr::Lambda(_)
+                | py::Expr::ListComp(_)
+                | py::Expr::SetComp(_)
+                | py::Expr::DictComp(_)
+                | py::Expr::Generator(_) => {
+                    // A nested scope reads the name as a capture.
+                    let mut names = NamesIn::default();
+                    names.visit_expr(expr);
+                    for n in names.0 {
+                        if self.candidates.contains_key(&n) {
+                            self.drop_name(&n);
+                        }
+                    }
+                }
+                _ => walk_expr(self, expr),
+            }
+        }
+    }
+    #[derive(Default)]
+    struct NamesIn(Vec<String>);
+    impl<'ast> Visitor<'ast> for NamesIn {
+        fn visit_expr(&mut self, expr: &'ast py::Expr) {
+            if let py::Expr::Name(n) = expr {
+                self.0.push(n.id.to_string());
+            }
+            ruff_python_ast::visitor::walk_expr(self, expr);
+        }
+    }
+
+    // Every local bound only by empty literals, at the top of the body
+    // or under its branches and loops, never in a nested body. A
+    // parameter is bound by the call.
+    let mut candidates: HashMap<String, Ty> = HashMap::new();
+    for (name, ty) in vars {
+        if matches!(ty, Ty::List(Elem::Object))
+            && scope.bound.contains(name)
+            && !params.iter().any(|(p, _)| p == name)
+            && !seeds.contains_key(name)
+            && !scope.globals.contains(name)
+            && !scope.nonlocals.contains(name)
+            && scope
+                .children
+                .iter()
+                .all(|(_, c)| !c.free.contains(name) && !c.bound.contains(name))
+        {
+            candidates.insert(name.clone(), Ty::Unknown);
+        }
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let allowed = std::cell::Cell::new(false);
+    let mut uses = Uses {
+        typer: Typer {
+            module,
+            vars,
+            outer: seeds,
+        },
+        candidates,
+        out: std::collections::HashSet::new(),
+        allowed: &allowed,
+    };
+    for s in body {
+        if let py::Stmt::FunctionDef(_) | py::Stmt::ClassDef(_) = s {
+            continue;
+        }
+        uses.visit_stmt(s);
+    }
+    let mut found: Vec<(String, Elem)> = uses
+        .candidates
+        .iter()
+        .filter(|(name, _)| !uses.out.contains(*name))
+        .filter_map(|(name, written)| match Elem::of(*written) {
+            Elem::Object => None,
+            e => Some((name.clone(), e)),
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
 }
 
 /// Whether control never reaches the end of `stmts`: some statement in
@@ -2159,6 +2509,17 @@ impl Walker<'_> {
             py::Stmt::Assign(a) => {
                 let ty = self.expr(&a.value);
                 for t in &a.targets {
+                    // An empty literal takes the kind the name already
+                    // has, which its writes decided; see [`filled_kinds`].
+                    let ty = match (t, ty) {
+                        (py::Expr::Name(n), Ty::List(Elem::Object)) if is_empty_list(&a.value) => {
+                            match self.locals.vars.get(n.id.as_str()) {
+                                Some(Ty::List(e)) => Ty::List(*e),
+                                _ => ty,
+                            }
+                        }
+                        _ => ty,
+                    };
                     self.target(t, ty);
                 }
             }
