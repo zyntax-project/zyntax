@@ -411,7 +411,7 @@ impl TieredBackend {
         module: HirModule,
         reachable: Option<HashSet<HirId>>,
     ) -> CompilerResult<()> {
-        self.compile_module_lazily(module, reachable, HashSet::new())
+        self.compile_module_lazily(module, reachable, HashSet::new(), HashSet::new())
     }
 
     /// [`Self::compile_module_reaching`] with `lazy` naming functions to
@@ -423,6 +423,7 @@ impl TieredBackend {
         module: HirModule,
         reachable: Option<HashSet<HirId>>,
         lazy: HashSet<HirId>,
+        finished: HashSet<HirId>,
     ) -> CompilerResult<()> {
         if self.config.verbosity >= 1 {
             eprintln!(
@@ -572,7 +573,7 @@ impl TieredBackend {
         // Every bead now exists, so the handler can capture them.
         self.install_promotion_requester();
         if !lazy.is_empty() {
-            self.install_lazy_compiler(&lazy);
+            self.install_lazy_compiler(&lazy, &finished);
         }
         if trace {
             eprintln!(
@@ -1823,8 +1824,11 @@ impl TieredBackend {
     /// the handler captures their beads.
     /// How a function left uncompiled gets its body: compiled at tier 0
     /// on the thread that called its stub, then published into its cell
-    /// so the next call goes straight there.
-    fn install_lazy_compiler(&self, lazy: &HashSet<HirId>) {
+    /// so the next call goes straight there. A function in `finished`
+    /// went through the optimisers with the module and is compiled as
+    /// it is; the rest were left as lowered and are optimised together
+    /// on the first call to any of them.
+    fn install_lazy_compiler(&self, lazy: &HashSet<HirId>, finished: &HashSet<HirId>) {
         let cranelift = Arc::clone(&self.cranelift);
         let verbosity = self.config.verbosity;
         let tier2_backend = self.config.tier2_backend;
@@ -1837,7 +1841,8 @@ impl TieredBackend {
             .map(|(id, e)| (e.bead_id, (*id, e.bound.clone(), Arc::clone(&e.module))))
             .collect();
         let reload_key = self.cranelift.with_lock(|be| be.reload_key());
-        let lazy = lazy.clone();
+        let lazy: HashSet<HirId> = lazy.difference(finished).copied().collect();
+        let finished = finished.clone();
         // Compiled once: a second call arriving while the first compiles
         // waits on the lock and then finds the entry published.
         let done: Mutex<HashMap<u64, usize>> = Mutex::new(HashMap::new());
@@ -1853,7 +1858,13 @@ impl TieredBackend {
             let Some((func_id, bound, module_arc)) = by_bead.get(&bead_id) else {
                 return ptr::null();
             };
-            let body = {
+            let lazy_started = std::time::Instant::now();
+            let body = if finished.contains(func_id) {
+                match module_arc.functions.get(func_id) {
+                    Some(f) => Arc::new(f.clone()),
+                    None => return ptr::null(),
+                }
+            } else {
                 let mut optimized = optimized.lock().unwrap();
                 let bodies = optimized.get_or_insert_with(|| {
                     let mut scratch: HirModule = (**module_arc).clone();
@@ -1873,6 +1884,7 @@ impl TieredBackend {
                     None => return ptr::null(),
                 }
             };
+            let body_at = lazy_started.elapsed();
             let entry = compile_at_tier(
                 0,
                 bound.bead(),
@@ -1886,12 +1898,24 @@ impl TieredBackend {
                 tier2_backend,
                 verbosity,
             );
+            let compiled_at = lazy_started.elapsed();
             if entry.is_null() {
                 return ptr::null();
             }
             crate::reload::set_call_target(reload_key, *func_id, entry as usize);
             bound.bead().eager_install(entry);
             done.insert(bead_id, entry as usize);
+            // `ZYNTAX_TRACE_LAZY=1` names each first-call compile with
+            // the time it took, the wait for the backend included.
+            if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                eprintln!(
+                    "[lazy] compiled {} in {:.2} ms (body {:.2}, compile {:.2})",
+                    body.name.resolve_global().unwrap_or_default(),
+                    lazy_started.elapsed().as_secs_f64() * 1e3,
+                    body_at.as_secs_f64() * 1e3,
+                    (compiled_at - body_at).as_secs_f64() * 1e3
+                );
+            }
             entry as *const u8
         });
     }

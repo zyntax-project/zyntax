@@ -338,6 +338,10 @@ pub struct CraneliftBackend {
     /// observable, so a call to them can arrive through a pointer that
     /// says nothing about it. See [`crate::dce::address_taken_functions`].
     address_taken: HashSet<HirId>,
+    /// The module [`Self::note_address_taken`] last walked, by
+    /// identity: a function compiled on its first call arrives with the
+    /// module it came from, and one walk per module is enough.
+    address_taken_from: Option<Arc<HirModule>>,
     /// Pre-scanned call-site inferred signatures for extern functions with 0-param placeholders
     /// Maps HirId → (param_types, return_type) inferred from first call site
     inferred_extern_sigs: HashMap<HirId, (Vec<HirType>, Option<HirType>)>,
@@ -587,6 +591,7 @@ impl CraneliftBackend {
             external_link_names: HashMap::new(),
             destination_returns: HashMap::new(),
             address_taken: HashSet::new(),
+            address_taken_from: None,
             inferred_extern_sigs: HashMap::new(),
             effect_context: EffectCodegenContext::new(),
             compile_tier: 0,
@@ -1033,6 +1038,25 @@ impl CraneliftBackend {
             .extend(crate::dce::address_taken_functions(module));
     }
 
+    /// [`Self::compile_function_in_module`] for a module the backend
+    /// keeps seeing: the address-taken walk over it runs once.
+    pub fn compile_function_in_shared_module(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        module: &Arc<HirModule>,
+    ) -> CompilerResult<()> {
+        let noted = self
+            .address_taken_from
+            .as_ref()
+            .is_some_and(|m| Arc::ptr_eq(m, module));
+        if !noted {
+            self.note_address_taken(module);
+            self.address_taken_from = Some(Arc::clone(module));
+        }
+        self.compile_function_in_module_noted(id, function, module)
+    }
+
     /// Declare a function signature without compiling its body
     fn declare_function(
         &mut self,
@@ -1294,8 +1318,17 @@ impl CraneliftBackend {
         function: &HirFunction,
         module: &HirModule,
     ) -> CompilerResult<()> {
-        log::trace!("[Backend] compile_function called for {:?}", id);
         self.note_address_taken(module);
+        self.compile_function_in_module_noted(id, function, module)
+    }
+
+    fn compile_function_in_module_noted(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        module: &HirModule,
+    ) -> CompilerResult<()> {
+        log::trace!("[Backend] compile_function called for {:?}", id);
         self.declare_function(id, function, module)?;
         log::trace!(
             "[Backend] After declare_function, IR:\n{}",

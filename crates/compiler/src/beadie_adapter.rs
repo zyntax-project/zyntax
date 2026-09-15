@@ -89,7 +89,7 @@ impl JitBackend for ZyntaxCraneliftBackend {
             backend.set_compile_tier(tier);
             backend.set_compile_bead_id(bead_id);
             backend
-                .compile_function_in_module(def.id, &def.function, &def.module)
+                .compile_function_in_shared_module(def.id, &def.function, &def.module)
                 .map_err(|e| {
                     CompileError::new(format!("cranelift compile_function failed: {e}"))
                 })?;

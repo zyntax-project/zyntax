@@ -52,17 +52,10 @@ pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> HashS
     reachable_from_roots(module, roots)
 }
 
-/// Of `reachable`, the functions reached only through a cold function:
-/// a cold function itself, or one that only cold code calls. These may
-/// be compiled on first call. A function whose address is taken, or
-/// that is called by name or entered by the host, is excluded, since
-/// its code has to exist before anything runs.
-pub fn cold_only_function_ids(
-    module: &HirModule,
-    entry_names: &[&str],
-    reachable: &HashSet<HirId>,
-) -> HashSet<HirId> {
-    let mut hot: HashSet<HirId> = HashSet::new();
+/// The functions whose code has to exist before anything runs: the
+/// entry points, what the host enters, what is called by name or has
+/// its address taken, and the handler operations dispatch reaches.
+fn pinned_function_ids(module: &HirModule, entry_names: &[&str]) -> HashSet<HirId> {
     let mut worklist: Vec<HirId> = Vec::new();
     for (id, function) in &module.functions {
         if let Some(name) = function.name.resolve_global() {
@@ -131,6 +124,39 @@ pub fn cold_only_function_ids(
             }
         }
     }
+    pinned
+}
+
+/// Of `reachable`, every function that is only ever reached by a direct
+/// call: all of them may be compiled on first call, since a call site
+/// names a cell the stub fills in. What [`pinned_function_ids`] lists
+/// stays.
+pub fn callable_only_function_ids(
+    module: &HirModule,
+    entry_names: &[&str],
+    reachable: &HashSet<HirId>,
+) -> HashSet<HirId> {
+    let pinned = pinned_function_ids(module, entry_names);
+    reachable
+        .iter()
+        .copied()
+        .filter(|id| !pinned.contains(id))
+        .filter(|id| module.functions.get(id).is_some_and(|f| !f.is_external))
+        .collect()
+}
+
+/// Of `reachable`, the functions reached only through a cold function:
+/// a cold function itself, or one that only cold code calls. These may
+/// be compiled on first call. What [`pinned_function_ids`] lists is
+/// excluded, since its code has to exist before anything runs.
+pub fn cold_only_function_ids(
+    module: &HirModule,
+    entry_names: &[&str],
+    reachable: &HashSet<HirId>,
+) -> HashSet<HirId> {
+    let pinned = pinned_function_ids(module, entry_names);
+    let mut hot: HashSet<HirId> = HashSet::new();
+    let worklist: Vec<HirId> = pinned.iter().copied().collect();
     // Hot code is what a direct call from hot code reaches; a cold
     // function's body is not walked, so what only it calls stays cold.
     // `ZYNTAX_TRACE_LAZY=1` prints what is hot and what made it so.

@@ -531,6 +531,10 @@ impl TieredRuntime {
         // its stub. Not under hot reload, whose cells are spoken for.
         // `ZYNTAX_DISABLE_LAZY_COLD=1` compiles everything up front.
         let mut lazy: std::collections::HashSet<HirId> = std::collections::HashSet::new();
+        // Of the lazy functions, those that came in optimised already (a
+        // linked snapshot's): they need no pass of their own and are
+        // compiled as they are on first call.
+        let mut finished: std::collections::HashSet<HirId> = std::collections::HashSet::new();
         if let Some(names) = &entered {
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             let keep = zyntax_compiler::reachable_function_ids(&module, &names);
@@ -541,6 +545,24 @@ impl TieredRuntime {
                 let entries = self.entry_names();
                 let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
                 lazy = zyntax_compiler::dce::cold_only_function_ids(&module, &entries, &keep);
+                // A library function only a direct call reaches waits
+                // for that call too: most of what a program links is
+                // never called by it. `ZYNTAX_DISABLE_LAZY_LIBRARY=1`
+                // compiles the library up front.
+                if std::env::var_os("ZYNTAX_DISABLE_LAZY_LIBRARY").is_none() {
+                    let callable =
+                        zyntax_compiler::dce::callable_only_function_ids(&module, &entries, &keep);
+                    for id in callable {
+                        if module
+                            .functions
+                            .get(&id)
+                            .is_some_and(|f| f.attributes.optimized)
+                        {
+                            lazy.insert(id);
+                            finished.insert(id);
+                        }
+                    }
+                }
                 // The optimisers walk only what runs now; the rest is
                 // optimised with its first compile.
                 for id in &lazy {
@@ -551,11 +573,19 @@ impl TieredRuntime {
             }
         }
         if trace_phases {
+            let unoptimized: Vec<String> = module
+                .functions
+                .values()
+                .filter(|f| !f.attributes.optimized && !f.is_external)
+                .map(|f| f.name.resolve_global().unwrap_or_default())
+                .collect();
             eprintln!(
-                "[COMPILE] prune              {:8.2} ms ({} functions kept, {} left for their first call)",
+                "[COMPILE] prune              {:8.2} ms ({} functions kept, {} left for their first call, {} still to optimise: {})",
                 started.elapsed().as_secs_f64() * 1000.0,
                 module.functions.len(),
-                lazy.len()
+                lazy.len(),
+                unoptimized.len(),
+                unoptimized.join(" ")
             );
         }
 
@@ -610,7 +640,7 @@ impl TieredRuntime {
         // Compile the module (consumes it).
         let started = std::time::Instant::now();
         self.backend
-            .compile_module_lazily(module, reachable, lazy)?;
+            .compile_module_lazily(module, reachable, lazy, finished)?;
         if trace {
             eprintln!(
                 "[OPT] codegen               {:8.2} ms",
