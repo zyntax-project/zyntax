@@ -35,3 +35,4 @@ test/output/
 # Benchmark results — published by CI (.github/workflows/wiki.yml).
 # Local bench_runner output is for development inspection only.
 website/benchmark/results.json
+crates/zyntax_python/benchmarks/speed/speed.json
