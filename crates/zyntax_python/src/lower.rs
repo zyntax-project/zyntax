@@ -1962,11 +1962,21 @@ impl<'m> Lowerer<'m> {
                 push(out, TypedStatement::Expression(Box::new(v.node)));
             }
             py::Stmt::Assign(a) => {
-                if a.targets.len() != 1 {
-                    return unsupported("chained assignment", a);
-                }
+                // `a = b = v` evaluates `v` once and binds each target
+                // to it, left to right.
                 let value = self.expr(&a.value)?;
-                self.bind(&a.targets[0], value, span, out)?;
+                if a.targets.len() == 1 {
+                    self.bind(&a.targets[0], value, span, out)?;
+                } else {
+                    let held = self.hold(value, out, span);
+                    for target in &a.targets {
+                        let again = Val {
+                            node: held.node.clone(),
+                            ty: held.ty,
+                        };
+                        self.bind(target, again, span, out)?;
+                    }
+                }
             }
             py::Stmt::AnnAssign(a) => {
                 let Some(v) = &a.value else {
@@ -2250,6 +2260,18 @@ impl<'m> Lowerer<'m> {
                 return Ok(());
             }
             // `a, b = value`: the value once, then each name an element.
+            // `[a, b] = v` unpacks as `a, b = v` does.
+            py::Expr::List(l) => {
+                let elts: Vec<py::Expr> = l.elts.clone();
+                let as_tuple = py::Expr::Tuple(py::ExprTuple {
+                    elts,
+                    ctx: l.ctx,
+                    parenthesized: true,
+                    range: l.range,
+                    node_index: l.node_index.clone(),
+                });
+                return self.bind(&as_tuple, value, span, out);
+            }
             py::Expr::Tuple(t) => {
                 let elem_ty = value.ty.element().unwrap_or(Ty::Object);
                 let seq = self.hold(value, out, span);

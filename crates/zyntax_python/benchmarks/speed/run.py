@@ -48,7 +48,7 @@ SUITE = {
     "meteor-contest": ("meteor-contest.py", [], 1.0, []),
     "nbody_modified": ("nbody_modified.py", [], 1.0, []),
     "nqueens": ("nqueens.py", [], 0.1, []),
-    "pidigits": ("pidigits.py", [], 0.1, []),
+    "pidigits": ("pidigits.py", [], 0.1, []),  # needs an int wider than 64 bits
     "pyflate-fast": ("pyflate-fast.py", [], 1.0, ["interpreter.tar.bz2"]),
     "raytrace-simple": ("raytrace-simple.py", [], 1.0, []),
     "richards": ("bm_richards.py", [], 1.0, ["richards.py"]),
@@ -64,6 +64,14 @@ SUITE = {
     ),
     "spectral-norm": ("spectral-norm.py", [], 1.0, []),
     "telco": ("telco.py", [], 1.0, ["telco-bench.b"]),
+}
+
+
+# What a kernel computes with that zypy does not have: run on zypy it
+# would finish with the wrong answer, which the kernel does not print,
+# so the row says this instead of a time.
+UNMET = {
+    "pidigits": "int is 64 bits; the digits need arbitrary precision",
 }
 
 
@@ -163,6 +171,10 @@ def main():
         results[name] = {"trials": trials}
         print(f"==> {name} ({kernel} -n {trials} {' '.join(extra)})", file=sys.stderr)
         for interp, prefix, shim in interps:
+            if interp == "zypy" and name in UNMET:
+                results[name][interp] = {"status": "unsupported", "error": UNMET[name]}
+                print(f"    {interp:<8} unsupported: {UNMET[name]}", file=sys.stderr)
+                continue
             d = stage(kernel, files, shim)
             try:
                 r = run_one(prefix, d, kernel, trials, extra, args.timeout)

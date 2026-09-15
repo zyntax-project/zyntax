@@ -173,6 +173,49 @@ fn host(list_type: TypeId) -> Vec<Decl> {
             ret(line.e()),
         ],
     ));
+    // `sys.version_info`: the Python this frontend speaks, as the
+    // tuple `(major, minor, micro, releaselevel, serial)`.
+    let anys = list_of(list_type, any());
+    let info = local("info", anys.clone());
+    d.push(define(
+        "zb_sys_version_info",
+        &[],
+        anys.clone(),
+        vec![
+            info.decl(list(Vec::new(), anys.clone())),
+            expr(mcall(
+                info.e(),
+                "push",
+                vec![call("zb_box_i64", vec![int(3)], any())],
+                unit(),
+            )),
+            expr(mcall(
+                info.e(),
+                "push",
+                vec![call("zb_box_i64", vec![int(12)], any())],
+                unit(),
+            )),
+            expr(mcall(
+                info.e(),
+                "push",
+                vec![call("zb_box_i64", vec![int(0)], any())],
+                unit(),
+            )),
+            expr(mcall(
+                info.e(),
+                "push",
+                vec![call("zb_box_str", vec![text("final")], any())],
+                unit(),
+            )),
+            expr(mcall(
+                info.e(),
+                "push",
+                vec![call("zb_box_i64", vec![int(0)], any())],
+                unit(),
+            )),
+            ret(info.e()),
+        ],
+    ));
     d.push(define("zb_sys_argv", &[], strs.clone(), {
         let mut s = vec![
             out.decl(list(Vec::new(), strs.clone())),

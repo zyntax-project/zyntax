@@ -119,6 +119,10 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         ("math", "inf") => Member::Float(f64::INFINITY),
         ("math", "nan") => Member::Float(f64::NAN),
         ("sys", "maxsize") => Member::Int(i64::MAX),
+        ("sys", "version_info") => Member::Value {
+            ty: Ty::Tuple,
+            zb: "zb_sys_version_info",
+        },
         ("sys", "argv") => Member::Value {
             ty: Ty::List(Elem::Str),
             zb: "zb_sys_argv",
