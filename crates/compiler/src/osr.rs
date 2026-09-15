@@ -1023,77 +1023,159 @@ impl OsrFrame {
     }
 }
 
-/// Blocks that `header` dominates — every path to them from the function
+/// Blocks that `header` dominates: every path to them from the function
 /// entry passes through it.
 ///
 /// A helper resumes at `header`, so only these are guaranteed to have run
 /// by the time their values are used. A block that is merely *reachable*
-/// from the header may also be reached without it — an enclosing loop's
-/// header is the common case — and anything it defines has to arrive as a
+/// from the header may also be reached without it (an enclosing loop's
+/// header is the common case) and anything it defines has to arrive as a
 /// live-in instead.
 pub fn blocks_dominated_by(
     function: &HirFunction,
     header: HirId,
 ) -> std::collections::HashSet<HirId> {
-    let entry = match function.blocks.keys().next() {
-        Some(&id) => id,
-        None => return std::collections::HashSet::new(),
-    };
-    let all: Vec<HirId> = function.blocks.keys().copied().collect();
+    Dominators::compute(function).dominated_by(header)
+}
 
-    // Standard iterative dominators: everything dominates everything until
-    // the predecessors say otherwise.
-    let mut dom: HashMap<HirId, std::collections::HashSet<HirId>> = HashMap::new();
-    for &b in &all {
-        if b == entry {
-            dom.insert(b, std::collections::HashSet::from([entry]));
-        } else {
-            dom.insert(b, all.iter().copied().collect());
+/// The dominator tree of a function, over the blocks' predecessor
+/// lists: each reachable block's immediate dominator, found by the
+/// iterative algorithm over a reverse postorder, which is linear in
+/// the blocks for the CFGs here.
+///
+/// A block nothing reaches has no dominator of its own and counts as
+/// dominated by every block, so an edge from one never reads as a
+/// forward edge into a loop.
+pub struct Dominators {
+    /// Reachable blocks in reverse postorder.
+    order: Vec<HirId>,
+    /// Position in `order` of each reachable block.
+    index: HashMap<HirId, usize>,
+    /// Immediate dominator of each block in `order`, by position; the
+    /// entry is its own.
+    idom: Vec<usize>,
+    /// Every block of the function, for the unreachable ones.
+    all: Vec<HirId>,
+}
+
+impl Dominators {
+    pub fn compute(function: &HirFunction) -> Self {
+        let all: Vec<HirId> = function.blocks.keys().copied().collect();
+        let Some(&entry) = all.first() else {
+            return Dominators {
+                order: Vec::new(),
+                index: HashMap::new(),
+                idom: Vec::new(),
+                all,
+            };
+        };
+        let mut successors: HashMap<HirId, Vec<HirId>> = HashMap::new();
+        for (&b, block) in &function.blocks {
+            for &p in &block.predecessors {
+                successors.entry(p).or_default().push(b);
+            }
+        }
+        // Postorder from the entry, then reversed.
+        let mut order = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut stack: Vec<(HirId, usize)> = vec![(entry, 0)];
+        visited.insert(entry);
+        while let Some((b, next)) = stack.last_mut() {
+            let succ = successors.get(b).map(|s| s.as_slice()).unwrap_or(&[]);
+            if *next < succ.len() {
+                let s = succ[*next];
+                *next += 1;
+                if visited.insert(s) {
+                    stack.push((s, 0));
+                }
+            } else {
+                order.push(*b);
+                stack.pop();
+            }
+        }
+        order.reverse();
+        let index: HashMap<HirId, usize> = order.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+        let preds: Vec<Vec<usize>> = order
+            .iter()
+            .map(|b| {
+                function.blocks[b]
+                    .predecessors
+                    .iter()
+                    .filter_map(|p| index.get(p).copied())
+                    .collect()
+            })
+            .collect();
+        let mut idom = vec![usize::MAX; order.len()];
+        idom[0] = 0;
+        let intersect = |idom: &[usize], mut a: usize, mut b: usize| {
+            while a != b {
+                while a > b {
+                    a = idom[a];
+                }
+                while b > a {
+                    b = idom[b];
+                }
+            }
+            a
+        };
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in 1..order.len() {
+                let mut new = usize::MAX;
+                for &p in &preds[b] {
+                    if idom[p] == usize::MAX {
+                        continue;
+                    }
+                    new = if new == usize::MAX {
+                        p
+                    } else {
+                        intersect(&idom, p, new)
+                    };
+                }
+                if new != usize::MAX && idom[b] != new {
+                    idom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+        Dominators {
+            order,
+            index,
+            idom,
+            all,
         }
     }
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in &all {
-            if b == entry {
-                continue;
+    /// Whether `a` dominates `b`.
+    pub fn dominates(&self, a: HirId, b: HirId) -> bool {
+        let Some(&a) = self.index.get(&a) else {
+            return false;
+        };
+        let Some(&b) = self.index.get(&b) else {
+            // Unreachable: dominated by everything.
+            return true;
+        };
+        let mut b = b;
+        loop {
+            if b == a {
+                return true;
             }
-            let preds: Vec<HirId> = function
-                .blocks
-                .get(&b)
-                .map(|blk| blk.predecessors.clone())
-                .unwrap_or_default();
-            // A block with no predecessors is unreachable, and the
-            // iteration only ever refines, so leaving its set at "every
-            // block" keeps it the identity for the intersections below.
-            // Collapsing it to itself instead would make it constrain
-            // its successors: every block listing it as a predecessor
-            // would come out dominated by nothing but itself, which
-            // reads a loop's back edge as a forward edge.
-            if preds.is_empty() {
-                continue;
+            if b == 0 {
+                return false;
             }
-            let mut next: Option<std::collections::HashSet<HirId>> = None;
-            for p in preds {
-                let Some(dp) = dom.get(&p) else { continue };
-                next = Some(match next {
-                    None => dp.clone(),
-                    Some(acc) => acc.intersection(dp).copied().collect(),
-                });
-            }
-            let mut next = next.unwrap_or_default();
-            next.insert(b);
-            if dom.get(&b) != Some(&next) {
-                dom.insert(b, next);
-                changed = true;
-            }
+            b = self.idom[b];
         }
     }
 
-    all.into_iter()
-        .filter(|b| dom.get(b).is_some_and(|d| d.contains(&header)))
-        .collect()
+    /// Every block `header` dominates, itself included.
+    pub fn dominated_by(&self, header: HirId) -> std::collections::HashSet<HirId> {
+        self.all
+            .iter()
+            .copied()
+            .filter(|b| self.dominates(header, *b))
+            .collect()
+    }
 }
 
 /// Symbol the dispatch path calls once per transfer when tracing is on.
