@@ -1866,6 +1866,19 @@ impl TieredBackend {
         // Compiled once: a second call arriving while the first compiles
         // waits on the lock and then finds the entry published.
         let done: Mutex<HashMap<u64, usize>> = Mutex::new(HashMap::new());
+        // What the per-function finishing passes read from the module.
+        let (externs, pure_fns) = match self.functions.values().next() {
+            Some(e) => (
+                crate::boxes::externs_of(&e.module),
+                e.module
+                    .functions
+                    .iter()
+                    .filter(|(_, f)| f.signature.is_pure)
+                    .map(|(id, _)| *id)
+                    .collect::<HashSet<HirId>>(),
+            ),
+            None => (HashMap::new(), HashSet::new()),
+        };
         // The cold bodies were left as lowered; the first cold call
         // optimises them all together, once, and later calls take the
         // result from here.
@@ -1882,8 +1895,20 @@ impl TieredBackend {
             };
             let lazy_started = std::time::Instant::now();
             let body = if finished.contains(func_id) {
+                // Optimised with its snapshot; what the module's own pass
+                // would have done to it, done to it alone: box readers
+                // to loads, then what those loads let move.
                 match module_arc.functions.get(func_id) {
-                    Some(f) => Arc::new(f.clone()),
+                    Some(f) => {
+                        let mut f = f.clone();
+                        f.attributes.deferred = false;
+                        let boxed = crate::boxes::run_function(&mut f, &externs);
+                        if boxed.expanded + boxed.made + boxed.released > 0 {
+                            crate::licm::run(&mut f);
+                            crate::cse::eliminate_with(&mut f, &pure_fns);
+                        }
+                        Arc::new(f)
+                    }
                     None => return ptr::null(),
                 }
             } else {
@@ -1892,6 +1917,9 @@ impl TieredBackend {
                     let mut scratch: HirModule = (**module_arc).clone();
                     for (id, f) in scratch.functions.iter_mut() {
                         f.attributes.optimized = !lazy.contains(id);
+                        if lazy.contains(id) {
+                            f.attributes.deferred = false;
+                        }
                     }
                     crate::run_interp_safe_opts(&mut scratch);
                     scratch

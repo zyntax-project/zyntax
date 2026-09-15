@@ -2185,6 +2185,11 @@ pub struct FunctionAttributes {
     /// alone; one that does change it clears this.
     #[serde(default)]
     pub optimized: bool,
+    /// The body is compiled on its first call, not with the module, so
+    /// no module-wide pass spends time on it now; what it still needs
+    /// runs on it alone when the call comes.
+    #[serde(default)]
+    pub deferred: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

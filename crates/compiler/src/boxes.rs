@@ -133,7 +133,7 @@ pub fn run_module(module: &mut HirModule) -> BoxStats {
         .filter_map(|(id, f)| f.link_name.clone().map(|n| (*id, n)))
         .collect();
     for func in module.functions.values_mut() {
-        if func.is_external {
+        if func.is_external || func.attributes.deferred {
             continue;
         }
         let s = run_function(func, &externs);
@@ -148,7 +148,18 @@ pub fn run_module(module: &mut HirModule) -> BoxStats {
     stats
 }
 
-fn run_function(func: &mut HirFunction, externs: &HashMap<HirId, String>) -> BoxStats {
+/// The symbol each extern declaration of `module` stands for, as
+/// [`run_function`] wants it.
+pub fn externs_of(module: &HirModule) -> HashMap<HirId, String> {
+    module
+        .functions
+        .iter()
+        .filter(|(_, f)| f.is_external)
+        .filter_map(|(id, f)| f.link_name.clone().map(|n| (*id, n)))
+        .collect()
+}
+
+pub fn run_function(func: &mut HirFunction, externs: &HashMap<HirId, String>) -> BoxStats {
     let mut stats = BoxStats::default();
     // The symbol a call reaches, by name or through an extern declaration.
     let symbol_of = |callee: &HirCallable| -> Option<String> {

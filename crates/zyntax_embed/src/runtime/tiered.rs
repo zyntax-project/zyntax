@@ -568,6 +568,7 @@ impl TieredRuntime {
                 for id in &lazy {
                     if let Some(f) = module.functions.get_mut(id) {
                         f.attributes.optimized = true;
+                        f.attributes.deferred = true;
                     }
                 }
             }
