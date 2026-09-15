@@ -109,7 +109,14 @@ struct Registry {
     /// Bytes reached by the last collection.
     live: usize,
     collections: usize,
+    /// How many times the live set the next budget is: doubled, up to
+    /// [`MAX_GROWTH`], by a collection that found little to free, and
+    /// back to one by one that found plenty.
+    growth: usize,
 }
+
+/// The most the budget grows past the live set, in multiples of it.
+const MAX_GROWTH: usize = 4;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Bumped whenever the owner changes, so a thread's cached answer to
@@ -121,6 +128,7 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     roots: BTreeMap::new(),
     live: 0,
     collections: 0,
+    growth: 1,
 });
 /// The thread the collector was enabled on, which is the only one it
 /// runs on.
@@ -195,7 +203,11 @@ pub fn enable() {
         OWNER_GENERATION.fetch_add(1, Ordering::SeqCst);
     }
     drop(owner);
-    registry().roots.clear();
+    {
+        let mut reg = registry();
+        reg.roots.clear();
+        reg.growth = 1;
+    }
     update(|l| {
         l.spent = 0;
         l.budget = heap_floor();
@@ -885,11 +897,19 @@ fn collect_from(sp: usize) {
     }
     reg.live = live;
     reg.collections += 1;
-    // As much again as is live before the next one.
-    update(|l| l.budget = live.max(heap_floor()));
+    // As much again as is live before the next one, or several times
+    // as much while collections find little: a program building up a
+    // table is marked at each doubling of its size otherwise, and the
+    // work of that is the sum of the sizes, twice the final one.
+    reg.growth = if freed_bytes * 8 < live {
+        (reg.growth * 2).min(MAX_GROWTH)
+    } else {
+        1
+    };
+    update(|l| l.budget = (live * reg.growth).max(heap_floor()));
     if trace() {
         eprintln!(
-            "[gc] #{}: heap {} KB, {} KB carved since last, {} KB reached, {} blocks / {} KB and {} large freed, {} KB free, {:.2} ms",
+            "[gc] #{}: heap {} KB, {} KB carved since last, {} KB reached, {} blocks / {} KB and {} large freed, {} KB free, next after {} KB, {:.2} ms",
             reg.collections,
             local().heap >> 10,
             carved >> 10,
@@ -898,6 +918,7 @@ fn collect_from(sp: usize) {
             freed_bytes >> 10,
             large_count,
             free_bytes >> 10,
+            local().budget >> 10,
             started.elapsed().as_secs_f64() * 1e3
         );
     }
