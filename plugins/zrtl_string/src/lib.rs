@@ -30,6 +30,7 @@
 //! - `$String$parse_int`, `$String$parse_float` - Parse numbers
 //! - `$String$from_int`, `$String$from_float` - Convert to string
 
+use zrtl::string::{string_alloc_size, string_as_bytes, string_data_mut, string_from_bytes};
 use zrtl::{
     array_new, array_push, string_as_str, string_data, string_length, string_new, zrtl_plugin,
     ArrayPtr, StringPtr,
@@ -63,9 +64,21 @@ pub extern "C" fn string_is_empty(s: StringPtr) -> i32 {
 /// Concatenate two strings
 #[no_mangle]
 pub extern "C" fn string_concat(a: StringPtr, b: StringPtr) -> StringPtr {
-    let a_str = unsafe { string_as_str(a) }.unwrap_or("");
-    let b_str = unsafe { string_as_str(b) }.unwrap_or("");
-    string_new(&format!("{}{}", a_str, b_str))
+    // One allocation of the final length, the bytes copied straight in.
+    let a = unsafe { string_as_bytes(a) };
+    let b = unsafe { string_as_bytes(b) };
+    let total = a.len() + b.len();
+    unsafe {
+        let out = zrtl::heap::alloc(string_alloc_size(total), 4) as StringPtr;
+        if out.is_null() {
+            return out;
+        }
+        *out = total as i32;
+        let data = string_data_mut(out);
+        std::ptr::copy_nonoverlapping(a.as_ptr(), data, a.len());
+        std::ptr::copy_nonoverlapping(b.as_ptr(), data.add(a.len()), b.len());
+        out
+    }
 }
 
 /// Repeat string n times
@@ -109,27 +122,33 @@ pub extern "C" fn string_join(arr: ArrayPtr, sep: StringPtr) -> StringPtr {
 /// allocation for the whole result.
 #[no_mangle]
 pub extern "C" fn string_join_n(data: *const StringPtr, n: i64, sep: StringPtr) -> StringPtr {
-    let sep_str = unsafe { string_as_str(sep) }.unwrap_or("");
+    let sep = unsafe { string_as_bytes(sep) };
     if data.is_null() || n <= 0 {
         return string_new("");
     }
-    let mut total = 0usize;
-    for i in 0..n as usize {
-        let ptr = unsafe { *data.add(i) };
-        total += unsafe { string_length(ptr) } as usize;
+    let n = n as usize;
+    let mut total = sep.len() * (n - 1);
+    for i in 0..n {
+        total += unsafe { string_as_bytes(*data.add(i)) }.len();
     }
-    total += sep_str.len() * (n as usize - 1);
-    let mut out = String::with_capacity(total);
-    for i in 0..n as usize {
-        if i > 0 {
-            out.push_str(sep_str);
+    unsafe {
+        let out = zrtl::heap::alloc(string_alloc_size(total), 4) as StringPtr;
+        if out.is_null() {
+            return out;
         }
-        let ptr = unsafe { *data.add(i) };
-        if let Some(part) = unsafe { string_as_str(ptr) } {
-            out.push_str(part);
+        *out = total as i32;
+        let mut at = string_data_mut(out);
+        for i in 0..n {
+            if i > 0 {
+                std::ptr::copy_nonoverlapping(sep.as_ptr(), at, sep.len());
+                at = at.add(sep.len());
+            }
+            let part = string_as_bytes(*data.add(i));
+            std::ptr::copy_nonoverlapping(part.as_ptr(), at, part.len());
+            at = at.add(part.len());
         }
+        out
     }
-    string_new(&out)
 }
 
 // ============================================================================
@@ -430,10 +449,15 @@ pub extern "C" fn string_bytes(s: StringPtr, start: i64, end: i64) -> StringPtr 
     let data = unsafe { string_data(s) };
     let bytes =
         unsafe { std::slice::from_raw_parts(data.add(start as usize), (end - start) as usize) };
-    match std::str::from_utf8(bytes) {
-        Ok(text) => string_new(text),
-        Err(_) => string_new(""),
+    // A cut at a character boundary, as the callers make; a cut inside
+    // a character is the empty string rather than broken text.
+    let starts_inside = bytes.first().is_some_and(|b| b & 0xC0 == 0x80);
+    let ends_inside =
+        (end as usize) < len as usize && unsafe { *data.add(end as usize) } & 0xC0 == 0x80;
+    if starts_inside || ends_inside {
+        return string_new("");
     }
+    string_from_bytes(bytes)
 }
 
 /// The byte offset of the character after the one at `pos`; the string's
@@ -594,7 +618,24 @@ pub extern "C" fn string_parse_float(s: StringPtr) -> f64 {
 /// Convert integer to string
 #[no_mangle]
 pub extern "C" fn string_from_int(n: i64) -> StringPtr {
-    string_new(&n.to_string())
+    // Digits written into a stack buffer, then one allocation.
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let negative = n < 0;
+    let mut m = n.unsigned_abs();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        if m == 0 {
+            break;
+        }
+    }
+    if negative {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    string_from_bytes(&buf[i..])
 }
 
 /// Convert integer to string with radix
@@ -627,9 +668,10 @@ pub extern "C" fn string_from_float_precision(n: f64, precision: i32) -> StringP
 /// Compare two strings (returns -1, 0, or 1)
 #[no_mangle]
 pub extern "C" fn string_compare(a: StringPtr, b: StringPtr) -> i32 {
-    let a_str = unsafe { string_as_str(a) }.unwrap_or("");
-    let b_str = unsafe { string_as_str(b) }.unwrap_or("");
-    match a_str.cmp(b_str) {
+    // Byte order is code point order for UTF-8, so no decoding.
+    let a = unsafe { string_as_bytes(a) };
+    let b = unsafe { string_as_bytes(b) };
+    match a.cmp(b) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
@@ -651,9 +693,7 @@ pub extern "C" fn string_compare_ignore_case(a: StringPtr, b: StringPtr) -> i32 
 /// Check if two strings are equal
 #[no_mangle]
 pub extern "C" fn string_equals(a: StringPtr, b: StringPtr) -> i32 {
-    let a_str = unsafe { string_as_str(a) }.unwrap_or("");
-    let b_str = unsafe { string_as_str(b) }.unwrap_or("");
-    (a_str == b_str) as i32
+    unsafe { zrtl::string::string_equals(a, b) as i32 }
 }
 
 /// Check if two strings are equal ignoring case
