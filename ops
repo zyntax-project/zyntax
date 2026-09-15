@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1789495125,"nonce":"TXWgGPNo5Z3mjEl+8xVrlgQWHko=","added":["feature","area:python"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789495125,"nonce":"/moKLsRfOW19xDTZX51Lu55bDJU=","message":"Landed (the three features) in 81b9fa5; the rest of the list stays open here.","files":null}]}
