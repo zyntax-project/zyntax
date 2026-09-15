@@ -227,23 +227,45 @@ def main():
 
 
 def table(results, interps):
-    """Each interpreter's mean iteration time and wall time as a ratio
-    to CPython's, the speed center's own chart being the first."""
-    others = [i for i in interps if i != "cpython"]
-    head = f"{'kernel':<24}" + "".join(f"{i + ' iter':>14}{i + ' wall':>14}" for i in others)
+    """One line per kernel saying whether zypy is faster or slower than
+    the fastest of the other runtimes on it, by how much, and the
+    speed center's own figure (each runtime's iteration time relative
+    to CPython) beside it."""
+    others = [i for i in interps if i != "zypy"]
+    head = f"{'kernel':<24}{'zypy against the best':<36}time vs cpython (lower is faster)"
     lines = [head, "-" * len(head)]
+    faster = slower = 0
     for name, r in results.items():
+        z = r.get("zypy", {})
         c = r.get("cpython", {})
-        row = f"{name:<24}"
-        for i in others:
-            x = r.get(i, {})
-            if x.get("status") == "ok" and c.get("status") == "ok":
-                row += f"{x['mean_ms'] / c['mean_ms']:>13.3f}x{x['wall_ms'] / c['wall_ms']:>13.3f}x"
+        ran = [(i, r[i]["mean_ms"]) for i in others if r.get(i, {}).get("status") == "ok"]
+        verdict = z.get("status", "missing")
+        if z.get("status") == "ok" and ran:
+            best, best_ms = min(ran, key=lambda x: x[1])
+            ratio = best_ms / z["mean_ms"]
+            if ratio >= 1.0:
+                verdict = f"FASTER than {best} by {ratio:.2f}x"
+                faster += 1
             else:
-                row += f"{x.get('status', 'missing'):>14}{'':>14}"
-        lines.append(row)
+                verdict = f"slower than {best} by {1 / ratio:.2f}x"
+                slower += 1
+        elif z.get("error"):
+            verdict = f"{z['status']}: {z['error']}"
+        chart = []
+        if c.get("status") == "ok":
+            for i in interps:
+                x = r.get(i, {})
+                if x.get("status") == "ok":
+                    chart.append(f"{i} {x['mean_ms'] / c['mean_ms']:.3f}")
+        if len(verdict) > 35:
+            # A diagnostic gets its own line; the figures stay aligned.
+            lines.append(f"{name:<24}{'':<36}{' '.join(chart)}")
+            lines.append(f"{'':<24}{verdict}")
+        else:
+            lines.append(f"{name:<24}{verdict:<36}{' '.join(chart)}")
     lines.append("")
-    lines.append("iter: mean time of one iteration as the kernel measures it, relative to CPython (the speed center's number); wall: whole process, relative to CPython.")
+    lines.append(f"zypy faster than the best other runtime on {faster} kernel(s), slower on {slower}, not running on {len(results) - faster - slower}.")
+    lines.append("time vs cpython: each runtime's mean iteration time divided by CPython's, the speed center's own chart; 0.25 means four times as fast as CPython.")
     return "\n".join(lines)
 
 

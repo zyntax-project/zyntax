@@ -3,9 +3,12 @@
 The pure-Python kernels behind speed.pypy.org's "How fast is PyPy?"
 chart, as the PyPy benchmarks repository carries them (the revision and
 the files are in `kernels/REVISION`; `kernels/LICENSE` is theirs), run
-on zypy, PyPy and CPython the way the speed center runs them and
-reported the way it reports them: each interpreter's mean iteration
-time relative to CPython, beside the whole process's wall time.
+on zypy, PyPy and CPython the way the speed center runs them. Each row
+first says what matters: whether zypy is faster or slower than the
+fastest of the other runtimes on that kernel, and by how much. Beside
+it is the speed center's own figure, each runtime's mean iteration
+time relative to CPython (lower is faster); the whole process's wall
+time is in the JSON.
 
     python3 run.py            # 50 iterations times the speed center's scaling
     python3 run.py --fast     # 5 iterations, a quick look
