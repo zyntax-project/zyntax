@@ -117,81 +117,7 @@ fn cast_needs_scalar_lanes(
     ) && (operand_ty.is_vector() || target_ty.is_vector())
 }
 
-/// The field a single-field struct is carried as, when it is carried as
-/// its field rather than by address.
-///
-/// A struct wrapping one scalar has the same shape as that scalar, so it
-/// travels in a register. Anything else needs memory, and the rest of
-/// this backend represents it as a pointer to that memory.
-fn struct_carried_as_its_field(struct_ty: &crate::hir::HirStructType) -> Option<&HirType> {
-    if struct_ty.fields.len() != 1 {
-        return None;
-    }
-    let field = struct_ty.fields.first()?;
-    matches!(
-        field,
-        HirType::I8
-            | HirType::I16
-            | HirType::I32
-            | HirType::I64
-            | HirType::I128
-            | HirType::U8
-            | HirType::U16
-            | HirType::U32
-            | HirType::U64
-            | HirType::U128
-            | HirType::F32
-            | HirType::F64
-            | HirType::Bool
-    )
-    .then_some(field)
-}
-
-/// The struct a function hands back through a destination its caller
-/// provides, if it hands one back that way.
-///
-/// This backend represents a struct SSA value as the address of the
-/// bytes, and the only memory a function can put those bytes in on its
-/// own is its frame, which its caller outlives. So the caller supplies
-/// the memory instead and the function writes through it. Anything with
-/// a shape that fits in a register is returned in one and is not covered
-/// here.
-///
-/// Only structs. `Array` and `Union` translate to a pointer too, but an
-/// array-typed value is not reliably the frame memory a struct's is:
-/// copying one that already points at a buffer would hand back a copy
-/// where the buffer itself was meant. A growable list is excluded for
-/// the same reason: its header lives on the heap and is the list's
-/// identity, so its address is what a function hands back.
-fn destination_return_type(function: &HirFunction) -> Option<&HirType> {
-    if function.is_external {
-        return None;
-    }
-    if function.signature.returns.len() != 1 {
-        return None;
-    }
-    match function.signature.returns.first()? {
-        ret @ HirType::Struct(s)
-            if struct_carried_as_its_field(s).is_none() && !is_growable_list_header(s) =>
-        {
-            Some(ret)
-        }
-        _ => None,
-    }
-}
-
-/// The `{data, len, capacity}` header of a growable list, by its shape.
-fn is_growable_list_header(struct_ty: &crate::hir::HirStructType) -> bool {
-    struct_ty
-        .name
-        .and_then(|n| n.resolve_global())
-        .is_some_and(|n| n == "List" || n == "Array")
-        && struct_ty.fields.len() == 3
-        && struct_ty
-            .fields
-            .iter()
-            .all(|f| matches!(f, HirType::I64 | HirType::U64 | HirType::Ptr(_)))
-}
+use crate::abi::{destination_return_type, struct_carried_as_its_field};
 
 /// Function bodies this backend had no encoding for, across the process.
 ///
@@ -3467,9 +3393,14 @@ impl CraneliftBackend {
                                                 }
                                             }
 
-                                            let call = if self.reloadable_calls
-                                                || self.lazy_functions.contains(func_id)
-                                            {
+                                            // A call to itself stays direct: the body
+                                            // being compiled is the version it means,
+                                            // and a cell read per level of recursion is
+                                            // what a recursive function mostly does.
+                                            let through_cell = (self.reloadable_calls
+                                                || self.lazy_functions.contains(func_id))
+                                                && self.current_compile_id != Some(*func_id);
+                                            let call = if through_cell {
                                                 let sig_ref =
                                                     builder.import_signature(declared_sig);
                                                 let ptr_ty =

@@ -19,6 +19,7 @@
 //! - Type information preserved for optimization opportunities
 //! - Memory safety validated before code generation
 
+pub mod abi; // The calling convention every backend derives from a signature
 pub mod affine_loop; // Closed-form affine reduction loops (acc += invariant over a counted loop)
 pub mod aggregate_split; // Replace struct round-trips with direct field Load/Store (HIR-level SROA)
 pub mod alloca_promote; // Alloca → Malloc promotion for escaping allocations (pairs with drop_insert)
