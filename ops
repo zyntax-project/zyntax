@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789470802,"nonce":"xevoRIDll340kFXyq7OCEBkRVTU=","message":"Landed in a1ab4fa: the 9 to 11 ms waits on tiny first-call compiles are gone; only the two 700-instruction dict functions take their own 6.7 ms (1a793f8).","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1789470802,"nonce":"EsvD0lHkuq8meGCGf4O3CSx2fhU=","status":2}]}
