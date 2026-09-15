@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1789487778,"nonce":"K9ZGuqN9h1k8g2NheWDBOsQ+tjQ=","status":2}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789490618,"nonce":"V0GDxedOBNQMzN4+wE6fZsggCCo=","message":"The lookups leaving the cycle let them inline into every hot dict access of a program (bench_tokenize main 500 to 1800 lines, compile 29 to 43 ms, exec unchanged); 188b78a refuses a callee whose loop calls.","files":null}]}
