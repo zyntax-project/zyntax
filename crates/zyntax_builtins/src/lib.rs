@@ -129,6 +129,8 @@ pub const CODE_TAG: i64 = (10 << 8) | 255;
 /// Kinds from here up are instances of a frontend's classes, in the
 /// order the frontend numbers them.
 pub const INSTANCE_KIND_BASE: i64 = 16;
+/// The box category of None, the low byte of its tag.
+pub const NONE_CATEGORY: i64 = dynamic::NONE;
 
 /// The box tag of an instance of the frontend's class `index`.
 pub fn instance_tag(index: usize) -> i64 {

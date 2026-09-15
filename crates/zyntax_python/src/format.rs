@@ -46,6 +46,103 @@ impl Spec {
     }
 }
 
+/// One conversion of a `%` format: `%[flags][width][.precision]type`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PercentField {
+    pub left: bool,
+    pub zero: bool,
+    pub plus: bool,
+    pub space: bool,
+    pub alt: bool,
+    /// -1 when unset.
+    pub width: i64,
+    /// -1 when unset.
+    pub precision: i64,
+    pub conversion: char,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Percent {
+    Text(String),
+    Field(PercentField),
+}
+
+/// Split a `%` format into its literal text and its conversions. A
+/// `*` width, a mapping key `%(name)s` and a length modifier are not
+/// taken.
+pub(crate) fn parse_percent(text: &str) -> std::result::Result<Vec<Percent>, String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut literal = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            literal.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i < chars.len() && chars[i] == '%' {
+            literal.push('%');
+            i += 1;
+            continue;
+        }
+        if !literal.is_empty() {
+            out.push(Percent::Text(std::mem::take(&mut literal)));
+        }
+        let mut field = PercentField {
+            left: false,
+            zero: false,
+            plus: false,
+            space: false,
+            alt: false,
+            width: -1,
+            precision: -1,
+            conversion: ' ',
+        };
+        while i < chars.len() && matches!(chars[i], '-' | '0' | '+' | ' ' | '#') {
+            match chars[i] {
+                '-' => field.left = true,
+                '0' => field.zero = true,
+                '+' => field.plus = true,
+                ' ' => field.space = true,
+                _ => field.alt = true,
+            }
+            i += 1;
+        }
+        let number = |i: &mut usize| -> Option<i64> {
+            let start = *i;
+            while *i < chars.len() && chars[*i].is_ascii_digit() {
+                *i += 1;
+            }
+            chars[start..*i].iter().collect::<String>().parse().ok()
+        };
+        if i < chars.len() && chars[i] == '*' {
+            return Err("a `*` width".to_string());
+        }
+        if let Some(w) = number(&mut i) {
+            field.width = w;
+        }
+        if i < chars.len() && chars[i] == '.' {
+            i += 1;
+            field.precision = number(&mut i).unwrap_or(0);
+        }
+        if i < chars.len() && chars[i] == '(' {
+            return Err("a mapping key".to_string());
+        }
+        let Some(&conversion) = chars.get(i) else {
+            return Err("an incomplete conversion".to_string());
+        };
+        i += 1;
+        field.conversion = conversion;
+        out.push(Percent::Field(field));
+    }
+    if !literal.is_empty() {
+        out.push(Percent::Text(literal));
+    }
+    Ok(out)
+}
+
 /// Parse `[[fill]align][sign][z][#][0][width][grouping][.precision][type]`.
 pub(crate) fn parse_spec(text: &str) -> std::result::Result<Spec, String> {
     let chars: Vec<char> = text.chars().collect();
@@ -204,6 +301,136 @@ impl Lowerer<'_> {
                 Ok(self.format(value, &spec, span))
             }
         }
+    }
+
+    /// `"..." % values` with a literal format: each conversion is
+    /// mapped onto the format mini-language and the pieces concatenated.
+    /// The values are a tuple literal, one per conversion, or a single
+    /// value for a single conversion.
+    pub(crate) fn percent_format(
+        &mut self,
+        template: &str,
+        values: &py::Expr,
+        span: Span,
+    ) -> Result<Val> {
+        let conversions = parse_percent(template)
+            .map_err(|message| Error::unsupported_span(format!("`%` format ({message})"), span))?;
+        let wanted = conversions
+            .iter()
+            .filter(|p| matches!(p, Percent::Field(_)))
+            .count();
+        let args: Vec<&py::Expr> = match values {
+            py::Expr::Tuple(t) => t.elts.iter().collect(),
+            single => vec![single],
+        };
+        if args.len() != wanted {
+            return Err(Error::unsupported_span(
+                format!(
+                    "`%` format with {wanted} conversion(s) and {} value(s)",
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        let mut next = args.into_iter();
+        let mut pieces: Vec<Node> = Vec::new();
+        for piece in conversions {
+            match piece {
+                Percent::Text(t) => pieces.push(crate::lower::str_lit(&t, span)),
+                Percent::Field(field) => {
+                    let value = self.expr(next.next().expect("counted"))?;
+                    pieces.push(self.percent_field(value, &field, span)?);
+                }
+            }
+        }
+        let mut it = pieces.into_iter();
+        let first = it.next().unwrap_or_else(|| crate::lower::str_lit("", span));
+        let node = it.fold(first, |acc, piece| {
+            crate::lower::binary(BinaryOp::Add, acc, piece, Ty::Str, span)
+        });
+        Ok(Val { node, ty: Ty::Str })
+    }
+
+    fn percent_field(&mut self, value: Val, field: &PercentField, span: Span) -> Result<Node> {
+        let mut spec = Spec {
+            fill: if field.zero { "0" } else { " " }.to_string(),
+            align: if field.left {
+                1
+            } else if field.zero {
+                4
+            } else {
+                2
+            },
+            sign: if field.plus {
+                1
+            } else if field.space {
+                2
+            } else {
+                0
+            },
+            alt: field.alt,
+            zero: field.zero,
+            width: field.width,
+            grouping: 0,
+            precision: field.precision,
+            ty: 0,
+        };
+        let conversion = field.conversion;
+        let value = match conversion {
+            's' => Val {
+                node: self.str_of(value),
+                ty: Ty::Str,
+            },
+            'r' | 'a' => Val {
+                node: self.repr_of(value),
+                ty: Ty::Str,
+            },
+            'c' => {
+                let node = match value.ty {
+                    Ty::Str => value.node,
+                    _ => {
+                        let code = self.coerce(value, Ty::Int);
+                        crate::lower::call("zb_str_chr", vec![code], Ty::Str, span)
+                    }
+                };
+                Val { node, ty: Ty::Str }
+            }
+            'd' | 'i' | 'u' => {
+                spec.ty = 'd' as i64;
+                match value.ty {
+                    Ty::Float => Val {
+                        node: crate::lower::cast(value.node, Ty::Int, span),
+                        ty: Ty::Int,
+                    },
+                    _ => value,
+                }
+            }
+            'x' | 'X' | 'o' => {
+                spec.ty = conversion as i64;
+                value
+            }
+            'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
+                spec.ty = conversion as i64;
+                if spec.precision < 0 {
+                    spec.precision = 6;
+                }
+                value
+            }
+            other => {
+                return Err(Error::unsupported_span(
+                    format!("`%{other}` in a format"),
+                    span,
+                ))
+            }
+        };
+        // A string conversion with a precision is a truncation.
+        if matches!(conversion, 's' | 'r' | 'a' | 'c') {
+            spec.ty = 's' as i64;
+            if spec.width < 0 && spec.precision < 0 {
+                return Ok(value.node);
+            }
+        }
+        Ok(self.format(value, &spec, span))
     }
 
     /// The spec's text, which must be literal here.

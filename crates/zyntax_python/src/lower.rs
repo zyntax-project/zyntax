@@ -2056,6 +2056,16 @@ impl<'m> Lowerer<'m> {
                 push(out, TypedStatement::Yield(Box::new(value)));
             }
             py::Stmt::Expr(e) => {
+                // A bare name of a builtin as a statement does nothing.
+                if let py::Expr::Name(n) = &*e.value {
+                    if !self.is_variable(n.id.as_str())
+                        && !self.module.funcs.contains_key(n.id.as_str())
+                        && !self.module.class_index.contains_key(n.id.as_str())
+                        && types::builtin_index(n.id.as_str()).is_some()
+                    {
+                        return Ok(());
+                    }
+                }
                 let v = self.expr(&e.value)?;
                 push(out, TypedStatement::Expression(Box::new(v.node)));
             }
@@ -3144,6 +3154,18 @@ impl<'m> Lowerer<'m> {
 
     /// A value as a `List<Any>` to iterate: a typed list boxed, a string
     /// its characters, a dynamic value whatever it iterates as.
+    /// The class an expression names: a bare name of one of the
+    /// program's classes that no variable shadows.
+    fn class_named(&self, e: &py::Expr) -> Option<usize> {
+        let py::Expr::Name(n) = e else {
+            return None;
+        };
+        if self.is_variable(n.id.as_str()) {
+            return None;
+        }
+        self.module.class_index.get(n.id.as_str()).copied()
+    }
+
     /// Whether a call of the builtin `name` with these arguments is one
     /// the direct lowering handles: the arity the builtin has, no
     /// keywords, and integer bounds for `range`.
@@ -3681,6 +3703,16 @@ impl<'m> Lowerer<'m> {
                 }
                 let object = self.expr(&a.value)?;
                 self.attribute(object, a.attr.as_str(), span)?
+            }
+            // `"..." % values` with a literal format.
+            py::Expr::BinOp(b)
+                if b.op == py::Operator::Mod && matches!(&*b.left, py::Expr::StringLiteral(_)) =>
+            {
+                let py::Expr::StringLiteral(l) = &*b.left else {
+                    unreachable!()
+                };
+                let template = l.value.to_str().to_string();
+                self.percent_format(&template, &b.right, span)?
             }
             py::Expr::BinOp(b) => {
                 let l = self.expr(&b.left)?;
@@ -5095,6 +5127,30 @@ impl<'m> Lowerer<'m> {
             if types::is_super_call(&a.value) {
                 return self.super_call(a.attr.as_str(), args, keywords, c, span);
             }
+            // `Class.method(obj, ...)`: the method called with an explicit
+            // receiver, which must be an instance of the class.
+            if let Some(k) = self.class_named(&a.value) {
+                if args.is_empty() {
+                    return unsupported("a method called through its class without a receiver", c);
+                }
+                let receiver = self.expr(&args[0])?;
+                let receiver = match receiver.ty {
+                    Ty::Class(_) => receiver,
+                    _ => Val {
+                        node: self.coerce(receiver, Ty::Class(k as u16)),
+                        ty: Ty::Class(k as u16),
+                    },
+                };
+                return self.class_method_on(
+                    k,
+                    receiver,
+                    a.attr.as_str(),
+                    &args[1..],
+                    keywords,
+                    c,
+                    span,
+                );
+            }
             let receiver = self.expr(&a.value)?;
             let receiver = if receiver.ty == Ty::None {
                 Val {
@@ -5262,6 +5318,25 @@ impl<'m> Lowerer<'m> {
                         }
                     };
                     return Ok(Val { node, ty: Ty::Int });
+                }
+                // `ord` of a one-character string, `chr` of a code point.
+                "ord" if args.len() == 1 => {
+                    let v = self.expr(&args[0])?;
+                    let s = self.coerce(v, Ty::Str);
+                    let ok = Val {
+                        node: call("zb_str_ord", vec![s], Ty::Int, span),
+                        ty: Ty::Int,
+                    };
+                    return Ok(self.guard(ok, span));
+                }
+                "chr" if args.len() == 1 => {
+                    let v = self.expr(&args[0])?;
+                    let code = self.coerce(v, Ty::Int);
+                    let ok = Val {
+                        node: call("zb_str_chr", vec![code], Ty::Str, span),
+                        ty: Ty::Str,
+                    };
+                    return Ok(self.guard(ok, span));
                 }
                 // `range` as a value is the list of its numbers.
                 "range" if !args.is_empty() && args.len() <= 3 => {
@@ -7281,11 +7356,14 @@ impl<'m> Lowerer<'m> {
     fn invoke_target(&self, k: usize, method: &str) -> Option<String> {
         let owner = self.module.method_owner(k, method)?;
         let (_, fn_name) = self.module.method_sig(k, method)?;
-        Some(if self.module.overriders(owner, method).is_empty() {
-            fn_name
-        } else {
-            dispatch_name(&fn_name)
-        })
+        // A constructor is never dispatched: it is called by its class.
+        Some(
+            if method == "__init__" || self.module.overriders(owner, method).is_empty() {
+                fn_name
+            } else {
+                dispatch_name(&fn_name)
+            },
+        )
     }
 
     pub(crate) fn invoke(
@@ -7310,10 +7388,15 @@ impl<'m> Lowerer<'m> {
         span: Span,
     ) -> Option<(Val, String)> {
         let (sig, fn_name) = self.module.method_sig(k, method)?;
-        let ret = sig.ret;
         let params = without_self(sig).params;
         let owner = self.module.method_owner(k, method)?;
         let target = self.invoke_target(k, method)?;
+        // A dispatched call returns what any method it may reach does.
+        let ret = if target == fn_name {
+            sig.ret
+        } else {
+            self.module.dispatched_ret(k, method).unwrap_or(sig.ret)
+        };
         // A method nothing overrides may go to its trusted variant.
         let target = if target == fn_name {
             self.call_target(&fn_name, &params, &args)
@@ -7377,7 +7460,38 @@ impl<'m> Lowerer<'m> {
         c: &py::ExprCall,
         span: Span,
     ) -> Result<Val> {
-        let Some((sig, _)) = self.module.method_sig(k, method) else {
+        self.method_call(k, receiver, method, args, keywords, c, span, true)
+    }
+
+    /// `Class.m(obj, args)`: the class's own method, whatever `obj`'s
+    /// class overrides.
+    #[allow(clippy::too_many_arguments)]
+    fn class_method_on(
+        &mut self,
+        k: usize,
+        receiver: Val,
+        method: &str,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+        span: Span,
+    ) -> Result<Val> {
+        self.method_call(k, receiver, method, args, keywords, c, span, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn method_call(
+        &mut self,
+        k: usize,
+        receiver: Val,
+        method: &str,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+        span: Span,
+        dispatched: bool,
+    ) -> Result<Val> {
+        let Some((sig, fn_name)) = self.module.method_sig(k, method) else {
             return Err(Error::unsupported_span(
                 format!(
                     "method `{method}` of {}, which defines none",
@@ -7389,9 +7503,24 @@ impl<'m> Lowerer<'m> {
         let sig = without_self(sig);
         let receiver = self.checked_instance(receiver, method, span);
         let lowered = self.arguments(method, &sig, args, keywords, c)?;
-        let (v, target) = self
-            .invoke_targeted(k, method, receiver.node, lowered, span)
+        if dispatched {
+            let (v, target) = self
+                .invoke_targeted(k, method, receiver.node, lowered, span)
+                .expect("the method was just found");
+            return Ok(self.guard_named(v, &target, span));
+        }
+        let owner = self
+            .module
+            .method_owner(k, method)
             .expect("the method was just found");
+        let target = self.call_target(&fn_name, &sig.params, &lowered);
+        let receiver = self.coerce(receiver, Ty::Class(owner as u16));
+        let mut all = vec![receiver];
+        all.extend(lowered);
+        let v = Val {
+            node: call(&target, all, sig.ret, span),
+            ty: sig.ret,
+        };
         Ok(self.guard_named(v, &target, span))
     }
 

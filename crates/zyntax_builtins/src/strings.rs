@@ -66,6 +66,18 @@ const PRIMITIVES: &[(&str, &[(&str, &str)], &str, &str)] = &[
     ),
     ("zb_str_of_int", &[("n", "i64")], "str", "$String$from_int"),
     (
+        "zb_str_code_at",
+        &[("s", "str"), ("i", "i64")],
+        "i32",
+        "$String$char_code_at",
+    ),
+    (
+        "zb_str_of_code",
+        &[("code", "i32")],
+        "str",
+        "$String$from_char_code",
+    ),
+    (
         "zb_str_of_float_raw",
         &[("x", "f64")],
         "str",
@@ -210,6 +222,47 @@ pub(crate) fn declarations(policy: &Policy, list_type: zyntax_typed_ast::TypeId)
         vec![
             when(le(n.e(), int(0)), vec![ret(text(""))]),
             ret(call("zb_str_repeat_raw", vec![s.e(), n.e()], string())),
+        ],
+    ));
+    // ord: the code point of a string of one character.
+    out.push(define(
+        "zb_str_ord",
+        &[&s],
+        i64(),
+        vec![
+            when(
+                ne(chars_len(s.e()), int(1)),
+                vec![fatal(
+                    "TypeError",
+                    add(
+                        add(
+                            text("ord() expected a character, but string of length "),
+                            call("zb_str_of_int", vec![chars_len(s.e())], string()),
+                        ),
+                        text(" found"),
+                    ),
+                )],
+            ),
+            ret(cast(
+                call("zb_str_code_at", vec![s.e(), int(0)], i32()),
+                i64(),
+            )),
+        ],
+    ));
+    // chr: the character with a code point.
+    out.push(define(
+        "zb_str_chr",
+        &[&n],
+        string(),
+        vec![
+            when(
+                or(lt(n.e(), int(0)), gt(n.e(), int(0x10FFFF))),
+                vec![fatal(
+                    "ValueError",
+                    text("chr() arg not in range(0x110000)"),
+                )],
+            ),
+            ret(call("zb_str_of_code", vec![cast(n.e(), i32())], string())),
         ],
     ));
 

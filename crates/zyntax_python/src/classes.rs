@@ -399,7 +399,7 @@ pub(crate) fn raise_facts(
         for method in &class.methods {
             let fn_name = method_fn(&class.name, method);
             let overriders = module.overriders(k, method);
-            if overriders.is_empty() {
+            if overriders.is_empty() || method == "__init__" {
                 continue;
             }
             let mut dispatcher = crate::types::RaiseFact::default();
@@ -421,9 +421,11 @@ pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
     for (k, class) in module.classes.iter().enumerate() {
         out.push(constructor(module, k, span));
         out.push(unboxer(module, k, span));
+        // A constructor is called by its class's name, never through
+        // an instance of a base, so it has no dispatcher.
         for method in &class.methods {
             let fn_name = method_fn(&class.name, method);
-            if !module.overriders(k, method).is_empty() {
+            if method != "__init__" && !module.overriders(k, method).is_empty() {
                 out.push(dispatcher(module, k, method, &fn_name, span));
             }
         }
@@ -655,7 +657,14 @@ fn dispatcher(
     fn_name: &str,
     span: Span,
 ) -> TypedFunction {
-    let sig = &module.funcs[fn_name];
+    let base = &module.funcs[fn_name];
+    // The dispatcher returns what any of the methods it reaches may.
+    let sig = Sig {
+        params: base.params.clone(),
+        ret: module.dispatched_ret(owner, method).unwrap_or(base.ret),
+        defaults: base.defaults.clone(),
+    };
+    let sig = &sig;
     let mut lowerer = scratch(module);
     let self_ty = Ty::Class(owner as u16);
     let mut params = vec![param("self", self_ty, span)];
@@ -667,6 +676,47 @@ fn dispatcher(
     for sub in module.overriders(owner, method) {
         let sub_fn = method_fn(&module.classes[sub].name, method);
         let sub_sig = &module.funcs[&sub_fn];
+        // An override taking another number of arguments cannot be
+        // called with these; the call fails as it would in Python.
+        if sub_sig.params.len() != sig.params.len() {
+            let message = str_lit(
+                &format!(
+                    "{}() takes {} positional arguments but {} were given",
+                    method,
+                    sub_sig.params.len(),
+                    sig.params.len()
+                ),
+                span,
+            );
+            let fail = stmt(
+                call(
+                    "zb_fatal",
+                    vec![str_lit("TypeError", span), message],
+                    Ty::None,
+                    span,
+                ),
+                span,
+            );
+            let none = lowerer.coerce(
+                Val {
+                    node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+                    ty: Ty::None,
+                },
+                sig.ret,
+            );
+            statements.push(when(
+                binary(
+                    BinaryOp::Eq,
+                    var(intern("tag"), Ty::Int, span),
+                    int_lit(sub as i64, span),
+                    Ty::Bool,
+                    span,
+                ),
+                vec![fail, ret(none, span)],
+                span,
+            ));
+            continue;
+        }
         let mut args = vec![lowerer.coerce(
             Val {
                 node: var(intern("self"), self_ty, span),
@@ -708,7 +758,14 @@ fn dispatcher(
     for (name, ty) in sig.params.iter().skip(1) {
         args.push(var(intern(name), *ty, span));
     }
-    statements.push(ret(call(fn_name, args, sig.ret, span), span));
+    let own = lowerer.coerce(
+        Val {
+            node: call(fn_name, args, base.ret, span),
+            ty: base.ret,
+        },
+        sig.ret,
+    );
+    statements.push(ret(own, span));
     function(&dispatch_name(fn_name), params, sig.ret, statements, span)
 }
 
@@ -823,6 +880,44 @@ fn setattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
         |c| module.field(c, attr).is_some(),
         |lowerer, c, obj| {
             let (_, ty) = module.field(c, attr).expect("picked");
+            // A field only ever given None holds nothing else; a value
+            // arriving through a dynamic receiver is refused rather than
+            // stored as None.
+            let mut out = Vec::new();
+            if ty == Ty::None {
+                let not_none = binary(
+                    BinaryOp::Ne,
+                    call(
+                        "zb_any_category",
+                        vec![var(intern("v"), Ty::Object, span)],
+                        Ty::Int,
+                        span,
+                    ),
+                    int_lit(zyntax_builtins::NONE_CATEGORY, span),
+                    Ty::Bool,
+                    span,
+                );
+                let message = str_lit(
+                    &format!(
+                        "attribute '{attr}' of '{}' holds None only",
+                        module.classes[c].name
+                    ),
+                    span,
+                );
+                out.push(when(
+                    not_none,
+                    vec![stmt(
+                        call(
+                            "zb_fatal",
+                            vec![str_lit("TypeError", span), message],
+                            Ty::None,
+                            span,
+                        ),
+                        span,
+                    )],
+                    span,
+                ));
+            }
             let value = lowerer.coerce(
                 Val {
                     node: var(intern("v"), Ty::Object, span),
@@ -831,7 +926,7 @@ fn setattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
                 ty,
             );
             let stored = lowerer.coerce(Val { node: value, ty }, field_storage(ty));
-            vec![
+            out.extend([
                 stmt(
                     binary(
                         BinaryOp::Assign,
@@ -843,7 +938,8 @@ fn setattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
                     span,
                 ),
                 TypedNode::new(TypedStatement::Return(None), Type::Unknown, span),
-            ]
+            ]);
+            out
         },
         span,
     );

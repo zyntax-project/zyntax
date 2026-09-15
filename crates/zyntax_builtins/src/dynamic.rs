@@ -8,7 +8,7 @@ use crate::build::*;
 use crate::{list_of, Kind, Policy, DICT_TAG, FUNC_TAG, INSTANCE_KIND_BASE, SET_TAG, TUPLE_TAG};
 use zyntax_typed_ast::TypeId;
 
-const NONE: i64 = 0;
+pub(crate) const NONE: i64 = 0;
 const BOOL: i64 = 1;
 const INT: i64 = 2;
 const UINT: i64 = 3;

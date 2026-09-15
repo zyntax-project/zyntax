@@ -4,4 +4,3 @@
 # and its issue is closed; an unlisted case that fails is a regression.
 
 int/big_values.py                            dd86335
-exceptions/override_return_types.py           091ef56

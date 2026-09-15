@@ -1,0 +1,7 @@
+3 True True False
+idle task 3 over state
+False 3 True
+False 4 True
+hold False send 7 True wait
+1.5
+25.0

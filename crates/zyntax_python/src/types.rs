@@ -1062,6 +1062,36 @@ impl Module {
         self.funcs.get(&name).map(|sig| (sig, name))
     }
 
+    /// What a call of `method` on an instance of `k` returns: the join
+    /// over the method `k` sees and every override an instance of a
+    /// subclass of `k` would reach, since the call goes to whichever the
+    /// instance's class holds.
+    pub(crate) fn dispatched_ret(&self, k: usize, method: &str) -> Option<Ty> {
+        let (sig, _) = self.method_sig(k, method)?;
+        let mut ret = sig.ret;
+        for sub in self.overriders(k, method) {
+            if let Some((sub_sig, _)) = self.method_sig(sub, method) {
+                ret = self.join_classes(ret, sub_sig.ret);
+            }
+        }
+        Some(ret)
+    }
+
+    /// [`Ty::join`] knowing the hierarchy: two instance types join to
+    /// the nearest class both derive from, when there is one.
+    pub(crate) fn join_classes(&self, a: Ty, b: Ty) -> Ty {
+        if let (Ty::Class(x), Ty::Class(y)) = (a, b) {
+            let mut at = Some(x as usize);
+            while let Some(c) = at {
+                if self.is_subclass(y as usize, c) {
+                    return Ty::Class(c as u16);
+                }
+                at = self.classes[c].base;
+            }
+        }
+        a.join(b)
+    }
+
     /// Whether `k` is `base` or derives from it.
     pub(crate) fn is_subclass(&self, k: usize, base: usize) -> bool {
         k >= base && k < base + self.classes[base].descendants
@@ -1093,6 +1123,9 @@ pub(crate) struct Locals {
     /// Fields written through `self`, in the order first written, which
     /// is the order they are laid out in.
     pub(crate) field_writes: indexmap::IndexMap<String, Ty>,
+    /// Fields written through an instance of a known class other than
+    /// `self`: the class, the field, what is written.
+    pub(crate) other_field_writes: Vec<(usize, String, Ty)>,
     /// What the body assigns to its own parameters.
     pub(crate) param_writes: HashMap<String, Ty>,
     /// Whether the body has a `return`; without one it returns None.
@@ -1326,8 +1359,10 @@ pub(crate) fn closed_items(
                 py::Expr::Name(n) => {
                     self.names.insert(n.id.to_string());
                 }
+                // `x.__init__` on anything but `super()` or a class
+                // named outright, whose call is in view.
                 py::Expr::Attribute(a) if a.attr.as_str() == "__init__" => {
-                    if !is_super_call(&a.value) {
+                    if !is_super_call(&a.value) && !matches!(&*a.value, py::Expr::Name(_)) {
                         self.init = true;
                     }
                     walk_expr(self, expr);
@@ -1495,6 +1530,9 @@ pub(crate) fn infer_module(
                     changed |= widen_field(&mut module.classes, k, field, *ty);
                 }
             }
+            for (k, field, ty) in &locals.other_field_writes {
+                changed |= widen_field(&mut module.classes, *k, field, *ty);
+            }
             if let Some(flags) = inferring.get(&item.name) {
                 for (i, (name, _)) in sig.params.iter().enumerate() {
                     if let (true, Some(ty)) = (flags[i], locals.param_writes.get(name)) {
@@ -1519,6 +1557,9 @@ pub(crate) fn infer_module(
             });
         }
         entry_locals = infer_locals_open(&module, &entry_sig, entry, entry_files);
+        for (k, field, ty) in &entry_locals.other_field_writes {
+            changed |= widen_field(&mut module.classes, *k, field, *ty);
+        }
         changed |= infer_closures_in(&module, entry, entry_files, &entry_locals.vars);
         Calls {
             module: &module,
@@ -1719,6 +1760,12 @@ impl Calls<'_> {
                 let base = self.module.classes[self.class?].base?;
                 let (_, name) = self.module.method_sig(base, a.attr.as_str())?;
                 Some((Target::Item(name), 1))
+            }
+            // `Class.method(obj, ...)`: every argument, the receiver first.
+            py::Expr::Attribute(a) if self.typer().class_named(&a.value).is_some() => {
+                let k = self.typer().class_named(&a.value)?;
+                let (_, name) = self.module.method_sig(k, a.attr.as_str())?;
+                Some((Target::Item(name), 0))
             }
             // A method on an instance of a known class: the class's
             // own; each overriding one is recorded beside it, since
@@ -1997,6 +2044,18 @@ fn normalize_layouts(classes: &mut [ClassInfo]) {
 /// Join `ty` into field `name` of class `k` and of every subclass, adding
 /// the field where it is new. Returns whether anything changed.
 fn widen_field(classes: &mut [ClassInfo], k: usize, name: &str, ty: Ty) -> bool {
+    // A field an ancestor declares is the ancestor's: its layout, and
+    // every class deriving from it, must agree on the field's type, or
+    // the ancestor's methods read the wrong width through a subclass
+    // instance.
+    let mut k = k;
+    while let Some(base) = classes[k].base {
+        if classes[base].fields.iter().any(|(f, _)| f == name) {
+            k = base;
+        } else {
+            break;
+        }
+    }
     let mut changed = false;
     let targets: Vec<usize> = (0..classes.len())
         .filter(|&c| {
@@ -2821,10 +2880,36 @@ impl Walker<'_> {
         self.locals.vars.insert(name.to_string(), joined);
     }
 
+    /// `obj.x = v`: on an instance of a known class widens that class's
+    /// field; on a dynamic value, the field of every class that has one,
+    /// since any of them may be the receiver.
+    fn field_write(&mut self, a: &py::ExprAttribute, ty: Ty) {
+        match self.expr(&a.value) {
+            Ty::Class(k) => {
+                self.locals
+                    .other_field_writes
+                    .push((k as usize, a.attr.to_string(), ty));
+            }
+            Ty::Object => {
+                for (k, class) in self.module.classes.iter().enumerate() {
+                    if class.fields.iter().any(|(f, _)| f == a.attr.as_str()) {
+                        self.locals
+                            .other_field_writes
+                            .push((k, a.attr.to_string(), ty));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn target(&mut self, target: &py::Expr, ty: Ty) {
         match target {
             py::Expr::Name(n) => self.assign(n.id.as_str(), ty),
-            // `self.x = v` in a method declares the field.
+            // `self.x = v` in a method declares the field, in the order
+            // the fields are laid out; the first parameter of a module
+            // function is not `self`, so the write also goes the way any
+            // other instance's does.
             py::Expr::Attribute(a)
                 if matches!(&*a.value, py::Expr::Name(n)
                     if self.params.first().is_some_and(|(p, _)| p == n.id.as_str())) =>
@@ -2837,7 +2922,9 @@ impl Walker<'_> {
                     .unwrap_or(Ty::Unknown)
                     .join(ty);
                 self.locals.field_writes.insert(a.attr.to_string(), joined);
+                self.field_write(a, ty);
             }
+            py::Expr::Attribute(a) => self.field_write(a, ty),
             // Unpacking gives every name an element, whose type only the
             // runtime knows.
             py::Expr::Tuple(t) => {
@@ -3072,6 +3159,8 @@ pub(crate) fn dunder_name(op: py::Operator) -> &'static str {
 /// `**` with a negative literal exponent too.
 pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
     match op {
+        // A `%` format.
+        py::Operator::Mod if l == Ty::Str => Ty::Str,
         py::Operator::Div if l.is_numeric() && r.is_numeric() => Ty::Float,
         // `int ** int` is an int only when the exponent is visibly not
         // negative; otherwise Python's answer may be a float, and the
@@ -3306,6 +3395,21 @@ impl Typer<'_> {
         kind.unwrap_or(Elem::Object)
     }
 
+    /// The class a bare name is, when no variable shadows it.
+    pub(crate) fn class_named(&self, e: &py::Expr) -> Option<usize> {
+        let py::Expr::Name(n) = e else {
+            return None;
+        };
+        let name = n.id.as_str();
+        if self.vars.contains_key(name)
+            || self.outer.contains_key(name)
+            || self.module.globals.contains_key(name)
+        {
+            return None;
+        }
+        self.module.class_index.get(name).copied()
+    }
+
     /// The module member `value.attr` names, when `value` is an imported
     /// module's name and no variable shadows it.
     pub(crate) fn module_member_of(
@@ -3330,6 +3434,15 @@ impl Typer<'_> {
         if let py::Expr::Attribute(a) = &*c.func {
             if let Some(m) = self.module_member_of(&a.value, a.attr.as_str()) {
                 return member_ty(m);
+            }
+        }
+        // `Class.method(obj, ...)` is the method.
+        if let py::Expr::Attribute(a) = &*c.func {
+            if let Some(k) = self.class_named(&a.value) {
+                return match self.module.method_sig(k, a.attr.as_str()) {
+                    Some((sig, _)) => sig.ret,
+                    None => Ty::Object,
+                };
             }
         }
         // A call through a value whose function is known returns what
@@ -3471,11 +3584,12 @@ impl Typer<'_> {
                 "copy" => Ty::List(e),
                 _ => Ty::None,
             },
-            // What the defining class says.
-            Ty::Class(k) => match self.module.method_sig(k as usize, attr) {
-                Some((sig, _)) => sig.ret,
-                None => Ty::Object,
-            },
+            // What the defining class says, joined with every override
+            // an instance of a subclass would reach.
+            Ty::Class(k) => self
+                .module
+                .dispatched_ret(k as usize, attr)
+                .unwrap_or(Ty::Object),
             Ty::Dict => match attr {
                 "keys" | "values" | "items" => Ty::List(Elem::Object),
                 "copy" => Ty::Dict,
