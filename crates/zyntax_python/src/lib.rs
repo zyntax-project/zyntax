@@ -396,6 +396,13 @@ pub fn parse_program_with(
             &class_index,
             visible,
         );
+        let params: Vec<String> = item
+            .def
+            .parameters
+            .iter_non_variadic_params()
+            .map(|p| p.parameter.name.to_string())
+            .collect();
+        types::collect_bound_methods(&mut inferred, file, &item.def.body, &params);
     }
     let entry_scope = scope::Scope::of_body(Vec::new(), &owned);
     for (stmt, file) in owned.iter().zip(&entry_files) {

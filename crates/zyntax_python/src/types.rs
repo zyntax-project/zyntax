@@ -51,6 +51,11 @@ pub(crate) enum Ty {
     /// value is, so it is a dynamic value wherever one is needed; where
     /// it is called, the call is direct and typed.
     Closure(u16),
+    /// A method of a list or an instance bound to a local, at this
+    /// index of the module's table: the record every bound method is,
+    /// so it is a dynamic value wherever one is needed; where it is
+    /// called, the call is the method's on the receiver as it is.
+    Bound(u16),
     /// A dynamic value: a boxed `Any`.
     Object,
     #[default]
@@ -201,6 +206,11 @@ pub(crate) struct Module {
     pub(crate) closures: std::cell::RefCell<Vec<ClosureInfo>>,
     /// Closure index by `(file, start of range)`.
     pub(crate) closure_index: HashMap<(u32, u32), u16>,
+    /// Every `x = recv.method` a call through `x` can be lowered as a
+    /// call on `recv`; see [`BoundInfo`].
+    pub(crate) bounds: Vec<BoundInfo>,
+    /// Bound method index by `(file, start of the attribute's range)`.
+    pub(crate) bound_index: HashMap<(u32, u32), u16>,
     /// What lowering each function found about its raising, by the
     /// name it lowers to; see [`RaiseFact`].
     pub(crate) raise_facts: std::cell::RefCell<std::collections::BTreeMap<String, RaiseFact>>,
@@ -396,6 +406,166 @@ impl ClosureInfo {
             self.sig.ret = Ty::Unknown;
         }
         self.escapes = false;
+    }
+}
+
+/// `x = recv.method`: a method bound to a local, over a receiver that
+/// is a local of the same function. The record `x` holds serves every
+/// use of it; a call through `x` is a call of the method on `recv`,
+/// which is the object the binding saw because neither name is bound
+/// again in the function and the binding sits in no loop.
+#[derive(Debug, Clone)]
+pub(crate) struct BoundInfo {
+    /// The receiver, as written at the binding.
+    pub(crate) receiver: py::ExprName,
+    pub(crate) method: String,
+}
+
+/// The arity of a method a list or an instance value can be bound to,
+/// which is what the lowering makes a record for; `None` is any other
+/// attribute.
+pub(crate) fn bound_method_arity(module: &Module, receiver: Ty, attr: &str) -> Option<i64> {
+    match receiver {
+        Ty::List(_) => match attr {
+            "append" | "remove" | "index" | "count" | "extend" => Some(1),
+            "insert" => Some(2),
+            "sort" | "reverse" | "copy" | "clear" => Some(0),
+            "pop" => Some(zyntax_builtins::functions::VARIADIC_ARITY),
+            _ => None,
+        },
+        Ty::Class(k) => module
+            .method_sig(k as usize, attr)
+            .map(|(sig, _)| (sig.params.len() - 1) as i64),
+        _ => None,
+    }
+}
+
+/// Register every `x = recv.method` of `body` whose call sites can be
+/// lowered direct: `x` and `recv` are each bound once in the function
+/// (`recv` may be a parameter bound nowhere), neither is declared
+/// `global` or `nonlocal`, and the binding is under no loop. Nested
+/// bodies are walked for what they bind, not for bindings of their own.
+pub(crate) fn collect_bound_methods(
+    module: &mut Module,
+    file: u32,
+    body: &[py::Stmt],
+    params: &[String],
+) {
+    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    #[derive(Default)]
+    struct Stores(HashMap<String, usize>);
+    impl Stores {
+        fn note(&mut self, name: &str, times: usize) {
+            *self.0.entry(name.to_string()).or_insert(0) += times;
+        }
+    }
+    impl<'a> Visitor<'a> for Stores {
+        fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
+            match stmt {
+                py::Stmt::FunctionDef(f) => self.note(f.name.as_str(), 1),
+                py::Stmt::ClassDef(c) => self.note(c.name.as_str(), 1),
+                py::Stmt::Import(i) => {
+                    for a in &i.names {
+                        let bound = a.asname.as_ref().unwrap_or(&a.name);
+                        self.note(bound.split('.').next().unwrap_or_default(), 1);
+                    }
+                }
+                py::Stmt::ImportFrom(i) => {
+                    for a in &i.names {
+                        self.note(a.asname.as_ref().unwrap_or(&a.name).as_str(), 1);
+                    }
+                }
+                py::Stmt::Global(g) => {
+                    for n in &g.names {
+                        self.note(n.as_str(), 2);
+                    }
+                }
+                py::Stmt::Nonlocal(g) => {
+                    for n in &g.names {
+                        self.note(n.as_str(), 2);
+                    }
+                }
+                py::Stmt::Try(t) => {
+                    for h in &t.handlers {
+                        let py::ExceptHandler::ExceptHandler(h) = h;
+                        if let Some(n) = &h.name {
+                            self.note(n.as_str(), 1);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'a py::Expr) {
+            if let py::Expr::Name(n) = expr {
+                if !matches!(n.ctx, py::ExprContext::Load) {
+                    self.note(n.id.as_str(), 1);
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut stores = Stores::default();
+    for s in body {
+        stores.visit_stmt(s);
+    }
+    let bound_once = |name: &str| {
+        let times = stores.0.get(name).copied().unwrap_or(0);
+        if params.iter().any(|p| p == name) {
+            times == 0
+        } else {
+            times == 1
+        }
+    };
+    // The bindings themselves: statements of the body under any
+    // branch, never under a loop or in a nested body.
+    fn bindings<'a>(stmts: &'a [py::Stmt], out: &mut Vec<&'a py::StmtAssign>) {
+        for s in stmts {
+            match s {
+                py::Stmt::Assign(a) => out.push(a),
+                py::Stmt::If(i) => {
+                    bindings(&i.body, out);
+                    for c in &i.elif_else_clauses {
+                        bindings(&c.body, out);
+                    }
+                }
+                py::Stmt::Try(t) => {
+                    bindings(&t.body, out);
+                    for h in &t.handlers {
+                        let py::ExceptHandler::ExceptHandler(h) = h;
+                        bindings(&h.body, out);
+                    }
+                    bindings(&t.orelse, out);
+                    bindings(&t.finalbody, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut found = Vec::new();
+    bindings(body, &mut found);
+    for a in found {
+        let [py::Expr::Name(x)] = a.targets.as_slice() else {
+            continue;
+        };
+        let py::Expr::Attribute(attr) = &*a.value else {
+            continue;
+        };
+        let py::Expr::Name(recv) = &*attr.value else {
+            continue;
+        };
+        if x.id == recv.id || !bound_once(x.id.as_str()) || !bound_once(recv.id.as_str()) {
+            continue;
+        }
+        let index = module.bounds.len();
+        module.bounds.push(BoundInfo {
+            receiver: recv.clone(),
+            method: attr.attr.to_string(),
+        });
+        module
+            .bound_index
+            .insert((file, attr.range.start().to_u32()), index as u16);
     }
 }
 
@@ -732,6 +902,12 @@ impl Module {
     /// it and the start of its range.
     pub(crate) fn closure_at(&self, file: u32, start: u32) -> Option<u16> {
         self.closure_index.get(&(file, start)).copied()
+    }
+
+    /// The bound method an attribute read is, from the function holding
+    /// it and the start of its range.
+    pub(crate) fn bound_at(&self, file: u32, start: u32) -> Option<u16> {
+        self.bound_index.get(&(file, start)).copied()
     }
 
     /// What calling closure `k` returns.
@@ -1148,6 +1324,8 @@ pub(crate) fn infer_module(
         closed: known.closed.clone(),
         closures: std::cell::RefCell::new(closures),
         closure_index: known.closure_index.clone(),
+        bounds: known.bounds.clone(),
+        bound_index: known.bound_index.clone(),
         files: known.files.clone(),
         ..Default::default()
     };
@@ -1404,6 +1582,19 @@ impl Calls<'_> {
                     return Some((Target::Item(name.to_string()), 0));
                 }
                 self.closure_of(func).map(|k| (Target::Closure(k), 0))
+            }
+            // A call through a bound method of an instance reaches the
+            // class's method, with the receiver as its first argument.
+            py::Expr::Name(_) if matches!(self.typer().callee_ty(func), Ty::Bound(_)) => {
+                let Ty::Bound(k) = self.typer().callee_ty(func) else {
+                    unreachable!()
+                };
+                let info = &self.module.bounds[k as usize];
+                let Ty::Class(c) = self.typer().expr(&py::Expr::Name(info.receiver.clone())) else {
+                    return None;
+                };
+                let (_, name) = self.module.method_sig(c as usize, &info.method)?;
+                Some((Target::Item(name), 1))
             }
             py::Expr::Attribute(a) if a.attr.as_str() == "__init__" && is_super_call(&a.value) => {
                 let base = self.module.classes[self.class?].base?;
@@ -2311,6 +2502,15 @@ impl Typer<'_> {
                 if let Some(m) = self.module_member_of(&a.value, a.attr.as_str()) {
                     return member_ty(m);
                 }
+                if let Some(k) = self
+                    .module
+                    .bound_at(crate::lower::current_file(), a.range.start().to_u32())
+                {
+                    let receiver = self.expr(&a.value);
+                    if bound_method_arity(self.module, receiver, a.attr.as_str()).is_some() {
+                        return Ty::Bound(k);
+                    }
+                }
                 match self.expr(&a.value) {
                     Ty::Class(k) => self
                         .module
@@ -2413,8 +2613,14 @@ impl Typer<'_> {
         }
         // A call through a value whose function is known returns what
         // that function returns.
-        if let Ty::Closure(k) = self.callee_ty(&c.func) {
-            return self.module.closure_ret(k);
+        match self.callee_ty(&c.func) {
+            Ty::Closure(k) => return self.module.closure_ret(k),
+            Ty::Bound(k) => {
+                let info = &self.module.bounds[k as usize];
+                let receiver = self.expr(&py::Expr::Name(info.receiver.clone()));
+                return self.method_ret(receiver, &info.method);
+            }
+            _ => {}
         }
         match &*c.func {
             py::Expr::Name(n) => {
@@ -2508,30 +2714,6 @@ impl Typer<'_> {
                     _ => Ty::Object,
                 }
             }
-            // A method on a value not yet typed.
-            py::Expr::Attribute(a) if self.expr(&a.value) == Ty::Unknown => Ty::Unknown,
-            // A method on a list.
-            py::Expr::Attribute(a) if matches!(self.expr(&a.value), Ty::List(_)) => {
-                let Ty::List(e) = self.expr(&a.value) else {
-                    unreachable!()
-                };
-                match a.attr.as_str() {
-                    "pop" => e.ty(),
-                    "index" | "count" => Ty::Int,
-                    "copy" => Ty::List(e),
-                    _ => Ty::None,
-                }
-            }
-            // A method on an instance: what the defining class says.
-            py::Expr::Attribute(a) if matches!(self.expr(&a.value), Ty::Class(_)) => {
-                let Ty::Class(k) = self.expr(&a.value) else {
-                    unreachable!()
-                };
-                match self.module.method_sig(k as usize, a.attr.as_str()) {
-                    Some((sig, _)) => sig.ret,
-                    None => Ty::Object,
-                }
-            }
             // `super().m(...)`: the base's method.
             py::Expr::Attribute(a) if is_super_call(&a.value) => {
                 match self.vars.get("self").copied() {
@@ -2545,13 +2727,34 @@ impl Typer<'_> {
                     _ => Ty::Object,
                 }
             }
-            py::Expr::Attribute(a) if self.expr(&a.value) == Ty::Dict => match a.attr.as_str() {
+            // A method on a value whose type is known, or not yet.
+            py::Expr::Attribute(a) => self.method_ret(self.expr(&a.value), a.attr.as_str()),
+            _ => Ty::Object,
+        }
+    }
+
+    /// What a method call on a value of type `receiver` returns.
+    fn method_ret(&self, receiver: Ty, attr: &str) -> Ty {
+        match receiver {
+            Ty::Unknown => Ty::Unknown,
+            Ty::List(e) => match attr {
+                "pop" => e.ty(),
+                "index" | "count" => Ty::Int,
+                "copy" => Ty::List(e),
+                _ => Ty::None,
+            },
+            // What the defining class says.
+            Ty::Class(k) => match self.module.method_sig(k as usize, attr) {
+                Some((sig, _)) => sig.ret,
+                None => Ty::Object,
+            },
+            Ty::Dict => match attr {
                 "keys" | "values" | "items" => Ty::List(Elem::Object),
                 "copy" => Ty::Dict,
                 "clear" | "update" => Ty::None,
                 _ => Ty::Object,
             },
-            py::Expr::Attribute(a) if self.expr(&a.value) == Ty::Set => match a.attr.as_str() {
+            Ty::Set => match attr {
                 "add" | "remove" | "discard" | "clear" | "update" => Ty::None,
                 "union" | "intersection" | "difference" | "symmetric_difference" | "copy" => {
                     Ty::Set
@@ -2559,8 +2762,7 @@ impl Typer<'_> {
                 "issubset" | "issuperset" | "isdisjoint" => Ty::Bool,
                 _ => Ty::Object,
             },
-            // A method on a string, when the receiver is known to be one.
-            py::Expr::Attribute(a) if self.expr(&a.value) == Ty::Str => match a.attr.as_str() {
+            Ty::Str => match attr {
                 "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace" | "join"
                 | "capitalize" | "title" | "swapcase" | "format" | "zfill" | "center" | "ljust"
                 | "rjust" => Ty::Str,

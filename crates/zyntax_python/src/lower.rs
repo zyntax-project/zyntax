@@ -110,7 +110,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Gen => Type::Fiber(Box::new(Type::Any)),
         // A known function value is still the record every function
         // value is.
-        Ty::Closure(_) | Ty::Object | Ty::Unknown => Type::Any,
+        Ty::Closure(_) | Ty::Bound(_) | Ty::Object | Ty::Unknown => Type::Any,
     }
 }
 
@@ -448,7 +448,7 @@ fn parameter(name: &str, ty: Ty, span: Span) -> TypedParameter {
 /// unannotated parameter is dynamic by the language's rules, not by
 /// omission, and the lowering does not warn about it.
 pub(crate) fn dynamic_attribute(ty: Ty, span: Span) -> Vec<ParameterAttribute> {
-    if matches!(ty, Ty::Object | Ty::Closure(_)) {
+    if matches!(ty, Ty::Object | Ty::Closure(_) | Ty::Bound(_)) {
         vec![ParameterAttribute {
             name: intern("dynamic"),
             args: Vec::new(),
@@ -956,7 +956,7 @@ impl<'m> Lowerer<'m> {
                 span,
             ),
             Ty::Str => str_lit("", span),
-            Ty::Object | Ty::Unknown | Ty::Closure(_) => {
+            Ty::Object | Ty::Unknown | Ty::Closure(_) | Ty::Bound(_) => {
                 let none = Val {
                     node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
                     ty: Ty::None,
@@ -1472,6 +1472,7 @@ impl<'m> Lowerer<'m> {
             (_, Ty::Unknown) => v.node,
             // A known function value is a dynamic value already.
             (Ty::Closure(_), Ty::Object | Ty::Closure(_)) | (Ty::Object, Ty::Closure(_)) => v.node,
+            (Ty::Bound(_), Ty::Object | Ty::Bound(_)) | (Ty::Object, Ty::Bound(_)) => v.node,
             (Ty::Int | Ty::Bool, Ty::Float) => cast(v.node, Ty::Float, span),
             (Ty::Bool, Ty::Int) => cast(v.node, Ty::Int, span),
             (Ty::Int, Ty::Bool) => binary(BinaryOp::Ne, v.node, int_lit(0, span), Ty::Bool, span),
@@ -1698,7 +1699,7 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
                 span,
             ),
-            Ty::Gen | Ty::Closure(_) => node(
+            Ty::Gen | Ty::Closure(_) | Ty::Bound(_) => node(
                 TypedExpression::Literal(TypedLiteral::Bool(true)),
                 Ty::Bool,
                 span,
@@ -1767,6 +1768,7 @@ impl<'m> Lowerer<'m> {
             Ty::Set => call("zb_set_repr", vec![v.node], Ty::Str, span),
             Ty::Gen => str_lit("<generator object>", span),
             Ty::Closure(_) => str_lit("<function>", span),
+            Ty::Bound(_) => str_lit("<bound method>", span),
             Ty::Class(k) => {
                 let k = k as usize;
                 let none = str_lit(crate::policy::POLICY.none_text, span);
@@ -3412,7 +3414,7 @@ impl<'m> Lowerer<'m> {
         // A function value whose function is known is the record every
         // function value is; only a call reads the type, off the callee
         // expression itself.
-        if let Ty::Closure(_) = v.ty {
+        if let Ty::Closure(_) | Ty::Bound(_) = v.ty {
             v.ty = Ty::Object;
         }
         // A library call that can raise is checked before its value is
@@ -4855,10 +4857,37 @@ impl<'m> Lowerer<'m> {
         if let py::Expr::Name(n) = &*c.func {
             let name = n.id.as_str();
             if self.is_variable(name) {
-                let callee = self.expr(&c.func)?;
-                if let Ty::Closure(k) = self.typer().callee_ty(&c.func) {
-                    return self.call_closure(k, callee, args, keywords, c, span);
+                match self.typer().callee_ty(&c.func) {
+                    Ty::Closure(k) => {
+                        let callee = self.expr(&c.func)?;
+                        return self.call_closure(k, callee, args, keywords, c, span);
+                    }
+                    // The method on the receiver as it is: the record
+                    // the name holds is not read.
+                    Ty::Bound(k) => {
+                        let info = self.module.bounds[k as usize].clone();
+                        let receiver = self.expr(&py::Expr::Name(info.receiver))?;
+                        match receiver.ty {
+                            Ty::Class(class) => {
+                                return self.method_on(
+                                    class as usize,
+                                    receiver,
+                                    &info.method,
+                                    args,
+                                    keywords,
+                                    c,
+                                    span,
+                                );
+                            }
+                            Ty::List(_) if keywords.is_empty() => {
+                                return self.method(receiver, &info.method, args, ty, span);
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
+                let callee = self.expr(&c.func)?;
                 return self.call_value(callee, args, keywords, c, span);
             }
             if !self.module.funcs.contains_key(name) && !self.module.class_index.contains_key(name)
@@ -6749,21 +6778,7 @@ impl<'m> Lowerer<'m> {
         } else {
             object
         };
-        let bound_arity = match object.ty {
-            Ty::List(_) => match attr {
-                "append" | "remove" | "index" | "count" | "extend" => Some(1),
-                "insert" => Some(2),
-                "sort" | "reverse" | "copy" | "clear" => Some(0),
-                "pop" => Some(zyntax_builtins::functions::VARIADIC_ARITY),
-                _ => None,
-            },
-            Ty::Class(k) => self
-                .module
-                .method_sig(k as usize, attr)
-                .map(|(sig, _)| (sig.params.len() - 1) as i64),
-            _ => None,
-        };
-        if let Some(arity) = bound_arity {
+        if let Some(arity) = types::bound_method_arity(self.module, object.ty, attr) {
             return self.bound_method(object, attr, arity, span);
         }
         match object.ty {
