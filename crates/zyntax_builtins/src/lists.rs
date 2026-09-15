@@ -268,7 +268,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
 
 fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     let name = |op: &str| format!("zb_list_{op}_{}", k.kind.suffix());
-    let xs = local("xs", k.list.clone());
+    // The list every operation works on is read or edited in place and
+    // never kept, except by the box that carries it into a dynamic slot.
+    let xs = borrowed("xs", k.list.clone());
+    let carried = local("xs", k.list.clone());
     // The second list of a two-list operation is only read: extended
     // from, concatenated, compared, assigned from.
     let ys = borrowed("ys", k.list.clone());
@@ -1164,11 +1167,11 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     ));
     d.push(define(
         &name("box"),
-        &[&xs],
+        &[&carried],
         any(),
         vec![ret(call(
             &format!("zb_box_list_raw_{}", k.kind.suffix()),
-            vec![xs.e(), int32(k.kind.list_tag() as i32)],
+            vec![carried.e(), int32(k.kind.list_tag() as i32)],
             any(),
         ))],
     ));
@@ -1549,7 +1552,7 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     ));
     // One allocation for the whole result: the plugin reads the parts
     // straight out of the list's storage.
-    let parts = local("parts", strs.clone());
+    let parts = borrowed("parts", strs.clone());
     d.push(extern_fn(
         "zb_str_join_raw",
         &[("data", i64()), ("n", i64()), ("sep", string())],
