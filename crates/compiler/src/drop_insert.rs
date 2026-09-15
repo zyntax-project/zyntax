@@ -2203,6 +2203,13 @@ fn classify_derived_use(
         }
         _ => {}
     }
+    // Most instructions name none of the values: settled by one walk of
+    // the operands before any is classified against each.
+    let mut named = false;
+    inst.for_each_operand(|v| named |= derived.contains(&v));
+    if !named {
+        return UseKind::None;
+    }
     derived
         .iter()
         .map(|d| classify_inst_use(inst, *d, facts))

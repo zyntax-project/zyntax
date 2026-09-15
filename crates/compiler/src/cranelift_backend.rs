@@ -492,6 +492,10 @@ fn host_isa() -> Arc<dyn cranelift_codegen::isa::TargetIsa> {
             },
         )
         .unwrap();
+    // `ZYNTAX_REGALLOC=single_pass` measures the quick allocator.
+    if let Ok(algorithm) = std::env::var("ZYNTAX_REGALLOC") {
+        flag_builder.set("regalloc_algorithm", &algorithm).unwrap();
+    }
     cranelift_native::builder()
         .unwrap()
         .finish(settings::Flags::new(flag_builder))
