@@ -269,7 +269,9 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
 fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     let name = |op: &str| format!("zb_list_{op}_{}", k.kind.suffix());
     let xs = local("xs", k.list.clone());
-    let ys = local("ys", k.list.clone());
+    // The second list of a two-list operation is only read: extended
+    // from, concatenated, compared, assigned from.
+    let ys = borrowed("ys", k.list.clone());
     let out = local("out", k.list.clone());
     let i = local("i", i64());
     let j = local("j", i64());
