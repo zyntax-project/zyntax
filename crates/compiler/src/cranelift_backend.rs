@@ -119,6 +119,50 @@ fn cast_needs_scalar_lanes(
 
 use crate::abi::{destination_return_type, struct_carried_as_its_field};
 
+/// A function translated to Cranelift IR and not yet compiled: the
+/// middle of [`CraneliftBackend::compile_function_body`], which needs no
+/// module and so no lock. Compile it with [`Translated::compile`], then
+/// hand it back to [`CraneliftBackend::install_translated`].
+pub struct Translated {
+    id: HirId,
+    func_id: FuncId,
+    name: zyntax_typed_ast::InternedString,
+    sig: Signature,
+    osr_helper: bool,
+    probe_site_tags: Vec<(u64, u32)>,
+    clif_snapshot: Option<String>,
+    dump_vcode: bool,
+    ctx: codegen::Context,
+}
+
+impl Translated {
+    /// Run Cranelift's compiler over the IR.
+    pub fn compile(&mut self, isa: &dyn cranelift_codegen::isa::TargetIsa) -> CompilerResult<()> {
+        let name = self.name;
+        // The error borrows the context, so it is read before the context
+        // can be shown.
+        let failure = match self.ctx.compile(
+            isa,
+            &mut cranelift_codegen::control::ControlPlane::default(),
+        ) {
+            Ok(_) => return Ok(()),
+            Err(e) => format!("{}", e.inner),
+        };
+        error!("Function compilation failed for: {}", name);
+        error!("Error: {}", failure);
+        debug!("Function dump:\n{}", self.ctx.func.display());
+        Err(CompilerError::Backend(format!(
+            "Failed to compile function: {}",
+            failure
+        )))
+    }
+
+    /// The function this is.
+    pub fn id(&self) -> HirId {
+        self.id
+    }
+}
+
 /// Function bodies this backend had no encoding for, across the process.
 ///
 /// Separate from the skip count: a decline is a routing fact, and a skip
@@ -214,6 +258,9 @@ pub struct CraneliftBackend {
     declined_functions: std::collections::HashSet<HirId>,
     /// JIT module for code generation
     module: JITModule,
+    /// The target the module compiles for, held so a translated function
+    /// can be compiled without the module in hand.
+    isa: Arc<dyn cranelift_codegen::isa::TargetIsa>,
     /// Current function builder
     builder_context: FunctionBuilderContext,
     /// Codegen context
@@ -454,6 +501,7 @@ impl CraneliftBackend {
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .unwrap();
+        let isa_shared = Arc::clone(&isa);
 
         // Create JIT module and register runtime functions
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -495,6 +543,7 @@ impl CraneliftBackend {
         Ok(Self {
             declined_functions: std::collections::HashSet::new(),
             module,
+            isa: isa_shared,
             builder_context: FunctionBuilderContext::new(),
             codegen_context: codegen::Context::new(),
             capture_ir: false,
@@ -972,6 +1021,49 @@ impl CraneliftBackend {
         function: &HirFunction,
         module: &Arc<HirModule>,
     ) -> CompilerResult<()> {
+        self.note_shared_module(module);
+        self.compile_function_in_module_noted(id, function, module)
+    }
+
+    /// The first step of [`Self::compile_function_in_shared_module`]:
+    /// declare and translate, leaving Cranelift's compile to the caller,
+    /// which need not hold the backend for it. An external function has
+    /// no body and yields nothing to compile.
+    pub fn translate_function_in_shared_module(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        module: &Arc<HirModule>,
+    ) -> CompilerResult<Option<Translated>> {
+        self.note_shared_module(module);
+        self.declare_function(id, function, module)?;
+        if function.is_external {
+            return Ok(None);
+        }
+        self.translate_function_body(id, function, module).map(Some)
+    }
+
+    /// The last step: install what [`Translated::compile`] produced and,
+    /// at tier one and up, emit the function's OSR helpers.
+    pub fn install_function_in_shared_module(
+        &mut self,
+        translated: Translated,
+        function: &HirFunction,
+    ) -> CompilerResult<()> {
+        let id = translated.id();
+        self.install_translated(translated)?;
+        if self.compile_tier >= 1 {
+            self.compile_osr_helpers(id, function)?;
+        }
+        Ok(())
+    }
+
+    /// The target this backend compiles for.
+    pub fn isa(&self) -> Arc<dyn cranelift_codegen::isa::TargetIsa> {
+        Arc::clone(&self.isa)
+    }
+
+    fn note_shared_module(&mut self, module: &Arc<HirModule>) {
         let noted = self
             .address_taken_from
             .as_ref()
@@ -980,7 +1072,6 @@ impl CraneliftBackend {
             self.note_address_taken(module);
             self.address_taken_from = Some(Arc::clone(module));
         }
-        self.compile_function_in_module_noted(id, function, module)
     }
 
     /// Declare a function signature without compiling its body
@@ -1484,6 +1575,20 @@ impl CraneliftBackend {
         function: &HirFunction,
         hir_module: &HirModule,
     ) -> CompilerResult<()> {
+        let mut translated = self.translate_function_body(id, function, hir_module)?;
+        translated.compile(&*self.isa)?;
+        self.install_translated(translated)
+    }
+
+    /// The first step of [`Self::compile_function_body`]: `function` as
+    /// Cranelift IR, ready to compile, with what installing the result
+    /// needs. Needs the module, so it runs under the backend's lock.
+    pub fn translate_function_body(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        hir_module: &HirModule,
+    ) -> CompilerResult<Translated> {
         // Address-taking sites use this to spot self-references, which
         // pin to this generation instead of the reload cell.
         self.current_compile_id = Some(id);
@@ -6404,18 +6509,59 @@ impl CraneliftBackend {
             self.codegen_context.set_disasm(true);
         }
 
-        // Compile the function
-        log::debug!(
-            "[Cranelift] About to call define_function for {:?}",
-            function.name
-        );
-        let code = self
-            .module
-            .define_function(func_id, &mut self.codegen_context)
+        let ctx = std::mem::replace(&mut self.codegen_context, codegen::Context::new());
+        self.value_map.clear();
+        self.block_map.clear();
+        Ok(Translated {
+            id,
+            func_id,
+            name: function.name,
+            sig,
+            osr_helper: osr_helper.is_some(),
+            probe_site_tags,
+            clif_snapshot,
+            dump_vcode: dump_vcode.is_some(),
+            ctx,
+        })
+    }
+
+    /// The last step of [`Self::compile_function_body`]: define the
+    /// compiled code in the module and record what the runtime asks
+    /// about it. Under the backend's lock, like the first.
+    pub fn install_translated(&mut self, translated: Translated) -> CompilerResult<()> {
+        let Translated {
+            id,
+            func_id,
+            name,
+            sig,
+            osr_helper,
+            probe_site_tags,
+            clif_snapshot,
+            dump_vcode,
+            ctx,
+        } = translated;
+        let compiled = ctx.compiled_code().ok_or_else(|| {
+            CompilerError::Backend(format!(
+                "{} was installed before it was compiled",
+                name.resolve_global().unwrap_or_default()
+            ))
+        })?;
+        let relocs: Vec<cranelift_module::ModuleReloc> = compiled
+            .buffer
+            .relocs()
+            .iter()
+            .map(|r| cranelift_module::ModuleReloc::from_mach_reloc(r, &ctx.func, func_id))
+            .collect();
+        self.module
+            .define_function_bytes(
+                func_id,
+                u64::from(compiled.buffer.alignment),
+                compiled.code_buffer(),
+                &relocs,
+            )
             .map_err(|e| {
-                error!("Function compilation failed for: {}", function.name);
+                error!("Function compilation failed for: {}", name);
                 error!("Error: {}", e);
-                debug!("Function dump:\n{}", self.codegen_context.func.display());
                 CompilerError::Backend(format!("Failed to compile function: {}", e))
             })?;
 
@@ -6425,11 +6571,10 @@ impl CraneliftBackend {
         if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
             eprintln!(
                 "[reg] {id:?} helper_mode={} registered={}",
-                osr_helper.is_some(),
-                osr_helper.is_none()
+                osr_helper, !osr_helper
             );
         }
-        if osr_helper.is_none() {
+        if !osr_helper {
             let compiled_func = CompiledFunction {
                 function_id: func_id,
                 version: 1,
@@ -6444,17 +6589,12 @@ impl CraneliftBackend {
         // is relative to the start of the function, which is what a patcher
         // needs once the JIT hands back the function's address.
         self.probe_sites.clear();
-        self.last_code_len = None;
-        if let Some(cc) = self.codegen_context.compiled_code() {
-            self.last_code_len = Some(cc.buffer.data().len());
-            if !probe_site_tags.is_empty() {
-                for loc in cc.buffer.get_srclocs_sorted() {
-                    let bits = loc.loc.bits();
-                    if let Some((site_key, _)) =
-                        probe_site_tags.iter().find(|(_, tag)| *tag == bits)
-                    {
-                        self.probe_sites.push((*site_key, loc.start));
-                    }
+        self.last_code_len = Some(compiled.buffer.data().len());
+        if !probe_site_tags.is_empty() {
+            for loc in compiled.buffer.get_srclocs_sorted() {
+                let bits = loc.loc.bits();
+                if let Some((site_key, _)) = probe_site_tags.iter().find(|(_, tag)| *tag == bits) {
+                    self.probe_sites.push((*site_key, loc.start));
                 }
             }
         }
@@ -6462,21 +6602,13 @@ impl CraneliftBackend {
         // Verification capture: grab the native disassembly the just-completed
         // compile produced, pair it with the CLIF snapshot.
         if let Some(clif) = clif_snapshot {
-            let disasm = self
-                .codegen_context
-                .compiled_code()
-                .and_then(|c| c.vcode.clone());
-            self.captured_ir = Some((clif, disasm));
+            self.captured_ir = Some((clif, compiled.vcode.clone()));
         }
-        if dump_vcode.is_some() {
-            if let Some(vcode) = self
-                .codegen_context
-                .compiled_code()
-                .and_then(|c| c.vcode.as_ref())
-            {
+        if dump_vcode {
+            if let Some(vcode) = compiled.vcode.as_ref() {
                 eprintln!(
                     "===== ZYNTAX_DUMP_VCODE: {:?} =====\n{vcode}\n===== end =====",
-                    function.name.resolve_global()
+                    name.resolve_global()
                 );
             }
         }
@@ -9683,6 +9815,7 @@ impl CraneliftBackend {
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .unwrap();
+        self.isa = Arc::clone(&isa);
 
         // Create new JIT module with all symbols
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());

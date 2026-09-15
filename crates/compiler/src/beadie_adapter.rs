@@ -85,14 +85,38 @@ impl JitBackend for ZyntaxCraneliftBackend {
     ) -> Result<*mut (), Self::Error> {
         let tier = def.tier;
         let bead_id = def.bead_id;
-        self.with_lock(|backend| {
+        // Translation and installation need the module and run under the
+        // lock; Cranelift's own compile, the long part, does not, so
+        // another thread's compile is not held behind it.
+        let (translated, isa) = self.with_lock(|backend| {
             backend.set_compile_tier(tier);
             backend.set_compile_bead_id(bead_id);
-            backend
-                .compile_function_in_shared_module(def.id, &def.function, &def.module)
+            let translated = backend
+                .translate_function_in_shared_module(def.id, &def.function, &def.module)
                 .map_err(|e| {
                     CompileError::new(format!("cranelift compile_function failed: {e}"))
                 })?;
+            Ok::<_, CompileError>((translated, backend.isa()))
+        })?;
+        let translated = match translated {
+            Some(mut translated) => {
+                translated.compile(&*isa).map_err(|e| {
+                    CompileError::new(format!("cranelift compile_function failed: {e}"))
+                })?;
+                Some(translated)
+            }
+            None => None,
+        };
+        self.with_lock(|backend| {
+            backend.set_compile_tier(tier);
+            backend.set_compile_bead_id(bead_id);
+            if let Some(translated) = translated {
+                backend
+                    .install_function_in_shared_module(translated, &def.function)
+                    .map_err(|e| {
+                        CompileError::new(format!("cranelift compile_function failed: {e}"))
+                    })?;
+            }
             // Resolve the new definition before reading any pointer from
             // it: `get_function_ptr` would otherwise hand back the
             // *previous* generation's code, and resolving an OSR helper

@@ -1870,7 +1870,9 @@ impl TieredBackend {
         // optimises them all together, once, and later calls take the
         // result from here.
         let optimized: Mutex<Option<HashMap<HirId, Arc<HirFunction>>>> = Mutex::new(None);
-        osr::set_lazy_compiler(move |bead_id| {
+        // What compiling a function on its first call does, once off the
+        // caller's stack.
+        let compile_lazy_function = move |bead_id: u64| -> *const u8 {
             let mut done = done.lock().unwrap();
             if let Some(entry) = done.get(&bead_id) {
                 return *entry as *const u8;
@@ -1937,6 +1939,19 @@ impl TieredBackend {
                 );
             }
             entry as *const u8
+        };
+        // The stub runs on whatever stack the first call was made from,
+        // which may be a fiber's, far too small for a compile. The
+        // compile runs on a thread with room and the caller waits.
+        osr::set_lazy_compiler(move |bead_id| {
+            std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .name("zyntax-first-call-compile".into())
+                    .stack_size(16 << 20)
+                    .spawn_scoped(scope, || compile_lazy_function(bead_id) as usize)
+                    .map(|handle| handle.join().unwrap_or(0))
+                    .unwrap_or(0) as *const u8
+            })
         });
     }
 
