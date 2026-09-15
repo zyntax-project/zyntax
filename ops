@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1789253677,"nonce":"tY1YWdGHrHlKcDUsAZiVy7RNDfA=","added":["feature","area:python"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789515064,"nonce":"kSbua6Pw5adZRs0OJa7EfS3Ov3I=","message":"Item 1's % formatting with a literal format landed in 6c7961c (926e1ed); the mapping key, * width and non-literal formats are still open here. ord and chr (item 4) landed too.","files":null}]}
