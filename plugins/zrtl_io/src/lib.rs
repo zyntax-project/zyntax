@@ -973,31 +973,20 @@ pub unsafe extern "C" fn io_string_to_dynamic(s: StringConstPtr) -> *mut zrtl::D
 /// Returns a new ZRTL string, caller must free with `string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn io_string_concat(a: StringConstPtr, b: StringConstPtr) -> StringPtr {
-    let mut result = String::new();
-
-    if !a.is_null() {
-        let len_a = string_length(a) as usize;
-        let data_a = string_data(a);
-        if len_a > 0 && !data_a.is_null() {
-            let bytes = std::slice::from_raw_parts(data_a, len_a);
-            if let Ok(s) = std::str::from_utf8(bytes) {
-                result.push_str(s);
-            }
-        }
+    // One allocation of the final length, the bytes copied straight
+    // in: both are text already.
+    let a = zrtl::string_as_bytes(a);
+    let b = zrtl::string_as_bytes(b);
+    let total = a.len() + b.len();
+    let out = zrtl::heap::alloc(zrtl::string_alloc_size(total), 4) as StringPtr;
+    if out.is_null() {
+        return out;
     }
-
-    if !b.is_null() {
-        let len_b = string_length(b) as usize;
-        let data_b = string_data(b);
-        if len_b > 0 && !data_b.is_null() {
-            let bytes = std::slice::from_raw_parts(data_b, len_b);
-            if let Ok(s) = std::str::from_utf8(bytes) {
-                result.push_str(s);
-            }
-        }
-    }
-
-    string_new(&result)
+    *out = total as i32;
+    let data = zrtl::string::string_data_mut(out);
+    std::ptr::copy_nonoverlapping(a.as_ptr(), data, a.len());
+    std::ptr::copy_nonoverlapping(b.as_ptr(), data.add(a.len()), b.len());
+    out
 }
 
 /// Concatenate two values (DynamicBox) and return a DynamicBox containing the resulting string
