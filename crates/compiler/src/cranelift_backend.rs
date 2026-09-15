@@ -466,6 +466,38 @@ struct StructLayout {
     alignment: u32,
 }
 
+/// The ISA every JIT module of this process compiles for. Opt level is
+/// fixed on the ISA, so it is process-wide rather than per tier:
+/// `ZYNTAX_OPT_LEVEL=none|speed|speed_and_size` measures what
+/// Cranelift's own optimiser contributes; `ZYNTAX_CRANELIFT_VERIFIER=1`
+/// verifies the CLIF between Cranelift's own passes as well as before
+/// them. Both safe to run with.
+fn host_isa() -> Arc<dyn cranelift_codegen::isa::TargetIsa> {
+    let mut flag_builder = settings::builder();
+    flag_builder.set("use_colocated_libcalls", "false").unwrap();
+    flag_builder.set("is_pic", "false").unwrap();
+    flag_builder
+        .set(
+            "opt_level",
+            &std::env::var("ZYNTAX_OPT_LEVEL").unwrap_or_else(|_| "speed".into()),
+        )
+        .unwrap();
+    flag_builder
+        .set(
+            "enable_verifier",
+            if std::env::var_os("ZYNTAX_CRANELIFT_VERIFIER").is_some_and(|v| v == "1") {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .unwrap();
+    cranelift_native::builder()
+        .unwrap()
+        .finish(settings::Flags::new(flag_builder))
+        .unwrap()
+}
+
 impl CraneliftBackend {
     /// Create a new Cranelift backend with custom runtime symbols
     ///
@@ -482,34 +514,7 @@ impl CraneliftBackend {
     }
 
     fn new_internal(additional_symbols: Option<&[(&str, *const u8)]>) -> CompilerResult<Self> {
-        // Configure Cranelift for the current platform
-        let mut flag_builder = settings::builder();
-        flag_builder.set("use_colocated_libcalls", "false").unwrap();
-        flag_builder.set("is_pic", "false").unwrap();
-        // Opt level is fixed on the ISA, so it is process-wide rather than
-        // per-tier. `ZYNTAX_OPT_LEVEL` exists to measure what Cranelift's own
-        // optimizer contributes, which the tier ladder cannot currently vary.
-        flag_builder
-            .set(
-                "opt_level",
-                &std::env::var("ZYNTAX_OPT_LEVEL").unwrap_or_else(|_| "speed".into()),
-            )
-            .unwrap();
-        flag_builder
-            .set(
-                "enable_verifier",
-                if std::env::var_os("ZYNTAX_CRANELIFT_VERIFIER").is_some_and(|v| v == "0") {
-                    "false"
-                } else {
-                    "true"
-                },
-            )
-            .unwrap();
-
-        let isa_builder = cranelift_native::builder().unwrap();
-        let isa = isa_builder
-            .finish(settings::Flags::new(flag_builder))
-            .unwrap();
+        let isa = host_isa();
         let isa_shared = Arc::clone(&isa);
 
         // Create JIT module and register runtime functions
@@ -9836,17 +9841,7 @@ impl CraneliftBackend {
             }
         }
 
-        // Configure Cranelift for the current platform
-        let mut flag_builder = settings::builder();
-        flag_builder.set("use_colocated_libcalls", "false").unwrap();
-        flag_builder.set("is_pic", "false").unwrap();
-        flag_builder.set("opt_level", "speed").unwrap();
-        flag_builder.set("enable_verifier", "false").unwrap();
-
-        let isa_builder = cranelift_native::builder().unwrap();
-        let isa = isa_builder
-            .finish(settings::Flags::new(flag_builder))
-            .unwrap();
+        let isa = host_isa();
         self.isa = Arc::clone(&isa);
 
         // Create new JIT module with all symbols
