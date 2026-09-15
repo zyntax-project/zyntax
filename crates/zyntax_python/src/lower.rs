@@ -6062,6 +6062,47 @@ impl<'m> Lowerer<'m> {
         )]
     }
 
+    /// A paused fiber for `code` of a closure: the environment is the
+    /// record's list (its cells sit where the environment keeps them)
+    /// followed by the arguments (already coerced).
+    fn start_generator_from(
+        &mut self,
+        code: &str,
+        sig: &Sig,
+        record: Node,
+        args: Vec<Node>,
+        span: Span,
+    ) -> Val {
+        let items: Vec<Val> = args
+            .into_iter()
+            .zip(&sig.params)
+            .map(|(a, (_, ty))| Val { node: a, ty: *ty })
+            .collect();
+        let rest = self.list_of(items, Elem::Object, span);
+        let env = call(
+            "zb_list_concat_any",
+            vec![record, rest],
+            Ty::List(Elem::Object),
+            span,
+        );
+        let env = self.coerce(
+            Val {
+                node: env,
+                ty: Ty::List(Elem::Object),
+            },
+            Ty::Object,
+        );
+        Val {
+            node: call(
+                "zb_fiber_start",
+                vec![code_of(code, span), env],
+                Ty::Gen,
+                span,
+            ),
+            ty: Ty::Gen,
+        }
+    }
+
     /// A paused fiber for `code`, its environment holding the cells
     /// and the arguments (already coerced to the parameter types).
     fn start_generator(
@@ -7218,6 +7259,25 @@ impl<'m> Lowerer<'m> {
         if !keywords.is_empty() || args.len() != info.sig.params.len() {
             return self.call_value(callee, args, keywords, c, span);
         }
+        // A generator closure: the call starts its fiber, the record
+        // being the environment's head.
+        if info.sig.ret == Ty::Gen {
+            let record = self.coerce(callee, Ty::Object);
+            let record = call(
+                "zb_unbox_list_raw_any",
+                vec![record],
+                Ty::List(Elem::Object),
+                span,
+            );
+            let lowered = self.arguments(&info.name, &info.sig, args, keywords, c)?;
+            return Ok(self.start_generator_from(
+                &info.typed_name(),
+                &info.sig,
+                record,
+                lowered,
+                span,
+            ));
+        }
         let mut lowered = Vec::new();
         if info.captures {
             let record = self.coerce(callee, Ty::Object);
@@ -7287,6 +7347,25 @@ impl<'m> Lowerer<'m> {
             seeds,
         );
         let params: Vec<(String, Ty)> = child.sig.params.clone();
+        // A nested def that yields is a generator function as a module
+        // one is, its arguments and cells arriving in the fiber's
+        // environment; the record names a starter that builds that
+        // environment from a call's arguments and starts the fiber.
+        if child.is_generator {
+            // Known: the fiber under the typed name, which a direct call
+            // starts; the record names the starter. Unknown: the record
+            // is all there is.
+            let (fiber, starter) = match &known {
+                Some(info) => (info.typed_name(), info.name.clone()),
+                None => (lifted.clone(), format!("{lifted}$start")),
+            };
+            let function = child.function_named(f, &fiber)?;
+            self.module.lifted.borrow_mut().push(function);
+            let adapter = self.generator_starter(&starter, &fiber, &child.sig.clone(), span);
+            self.module.lifted.borrow_mut().push(adapter);
+            let cells = self.cells_of(&captured, span);
+            return Ok(self.record(&starter, params.len(), cells, span));
+        }
         let mut body = Vec::new();
         for s in &f.body {
             child.stmt(s, &mut body)?;
@@ -7294,6 +7373,64 @@ impl<'m> Lowerer<'m> {
         self.lift(&mut child, known.as_ref(), &lifted, &params, body, f)?;
         let cells = self.cells_of(&captured, span);
         Ok(self.record(&lifted, params.len(), cells, span))
+    }
+
+    /// The function a generator's record names: the shape every
+    /// function value has, starting the fiber for `code` with the
+    /// record's cells and the call's arguments in its environment.
+    fn generator_starter(
+        &mut self,
+        name: &str,
+        code: &str,
+        sig: &Sig,
+        span: Span,
+    ) -> TypedFunction {
+        // A check that fails leaves with a placeholder of this shape.
+        let ret = std::mem::replace(&mut self.sig.ret, Ty::Object);
+        let mut typed_params = vec![parameter("env", Ty::List(Elem::Object), span)];
+        let mut statements = Vec::new();
+        let mut args = Vec::new();
+        for (i, (_, declared)) in sig.params.iter().enumerate() {
+            let arg = format!("a{i}");
+            typed_params.push(parameter(&arg, Ty::Object, span));
+            let value = self.coerce(
+                Val {
+                    node: var(intern(&arg), Ty::Object, span),
+                    ty: Ty::Object,
+                },
+                *declared,
+            );
+            statements.append(&mut self.hoisted);
+            args.push(value);
+        }
+        let record = var(intern("env"), Ty::List(Elem::Object), span);
+        let started = self.start_generator_from(code, sig, record, args, span);
+        let boxed = self.coerce(started, Ty::Object);
+        statements.append(&mut self.hoisted);
+        statements.push(TypedNode::new(
+            TypedStatement::Return(Some(Box::new(boxed))),
+            Type::Unknown,
+            span,
+        ));
+        self.sig.ret = ret;
+        TypedFunction {
+            name: intern(name),
+            annotations: Vec::new(),
+            effects: Vec::new(),
+            with_handlers: Vec::new(),
+            type_params: Vec::new(),
+            params: typed_params,
+            return_type: ir(Ty::Object),
+            body: Some(TypedBlock { statements, span }),
+            visibility: Visibility::Public,
+            is_async: false,
+            is_fiber: false,
+            is_pure: false,
+            is_external: false,
+            calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
+            link_name: None,
+            module: None,
+        }
     }
 
     /// A lambda: a lifted function returning its one expression.
@@ -7648,7 +7785,8 @@ impl<'m> Lowerer<'m> {
             body: Some(TypedBlock { statements, span }),
             visibility: Visibility::Public,
             is_async: false,
-            is_fiber: false,
+            // A nested def that yields is a generator like any other.
+            is_fiber: self.is_generator,
             is_pure: false,
             is_external: false,
             calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,

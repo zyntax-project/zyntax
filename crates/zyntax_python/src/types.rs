@@ -474,13 +474,13 @@ pub(crate) fn collect_closures(
     impl<'a> Visitor<'a> for Finder<'_, '_> {
         fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
             match stmt {
-                // A nested def that yields is a generator, lowered on its
-                // own terms; one with variadics is not compiled at all.
-                // A default is evaluated where the def is, which a call
-                // from elsewhere cannot see.
+                // A nested def that yields is a generator: its result is
+                // the generator, whatever its body returns. One with
+                // variadics is not compiled at all. A default is
+                // evaluated where the def is, which a call from
+                // elsewhere cannot see.
                 py::Stmt::FunctionDef(f)
-                    if !is_generator(&f.body)
-                        && f.parameters.vararg.is_none()
+                    if f.parameters.vararg.is_none()
                         && f.parameters.kwarg.is_none()
                         && f.decorator_list.is_empty()
                         && f.parameters
@@ -498,7 +498,8 @@ pub(crate) fn collect_closures(
                             *ty = Ty::Unknown;
                         }
                     }
-                    if f.returns.is_none() {
+                    let generator = is_generator(&f.body);
+                    if f.returns.is_none() && !generator {
                         sig.ret = Ty::Unknown;
                     }
                     self.enter(
@@ -506,7 +507,7 @@ pub(crate) fn collect_closures(
                         f.name.as_str(),
                         sig,
                         inferred,
-                        f.returns.is_none(),
+                        f.returns.is_none() && !generator,
                         &crate::scope::Scope::of_function(f),
                     );
                     walk_stmt(self, stmt);
