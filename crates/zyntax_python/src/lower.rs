@@ -6437,6 +6437,23 @@ impl<'m> Lowerer<'m> {
         } else {
             object
         };
+        let bound_arity = match object.ty {
+            Ty::List(_) => match attr {
+                "append" | "remove" | "index" | "count" | "extend" => Some(1),
+                "insert" => Some(2),
+                "sort" | "reverse" | "copy" | "clear" => Some(0),
+                "pop" => Some(zyntax_builtins::functions::VARIADIC_ARITY),
+                _ => None,
+            },
+            Ty::Class(k) => self
+                .module
+                .method_sig(k as usize, attr)
+                .map(|(sig, _)| (sig.params.len() - 1) as i64),
+            _ => None,
+        };
+        if let Some(arity) = bound_arity {
+            return self.bound_method(object, attr, arity, span);
+        }
         match object.ty {
             Ty::Class(k) => {
                 let object = self.checked_instance(object, attr, span);
@@ -6480,6 +6497,219 @@ impl<'m> Lowerer<'m> {
                 span,
             )),
         }
+    }
+
+    /// A function record with the receiver held in its first cell.
+    fn bound_method(&mut self, receiver: Val, method: &str, arity: i64, span: Span) -> Result<Val> {
+        let receiver = if matches!(receiver.ty, Ty::Class(_)) {
+            self.checked_instance(receiver, method, span)
+        } else {
+            receiver
+        };
+        let code = self.lifted_name(&format!("bound${method}"));
+        let receiver_ty = receiver.ty;
+        let variadic = method == "pop" && matches!(receiver_ty, Ty::List(_));
+        let params: Vec<(String, Ty)> = (0..if variadic { 0 } else { arity as usize })
+            .map(|i| (format!("a{i}"), Ty::Object))
+            .collect();
+        let sig = Sig {
+            params: params.clone(),
+            ret: Ty::Object,
+            defaults: vec![None; params.len()],
+        };
+        let mut locals = Locals::default();
+        locals.vars.extend(params.iter().cloned());
+        let mut child = Lowerer::new(
+            self.module,
+            &code,
+            sig,
+            locals,
+            &Scope::default(),
+            Vec::new(),
+            HashMap::new(),
+        );
+        let env = var(intern("env"), Ty::List(Elem::Object), span);
+        let held = Val {
+            node: call(
+                "zb_list_get_any",
+                vec![env, int_lit(RECORD_CELLS_AT as i64, span)],
+                Ty::Object,
+                span,
+            ),
+            ty: Ty::Object,
+        };
+        let receiver_node = child.coerce(held, receiver_ty);
+        let held = Val {
+            node: receiver_node,
+            ty: receiver_ty,
+        };
+        let mut body = Vec::new();
+        let result = if variadic {
+            let packed = var(intern("a0"), Ty::Object, span);
+            let args = call(
+                "zb_list_unbox_any",
+                vec![packed],
+                Ty::List(Elem::Object),
+                span,
+            );
+            let count = method_call(args.clone(), "len", Vec::new(), Ty::Int, span);
+            let too_many = binary(
+                BinaryOp::Gt,
+                count.clone(),
+                int_lit(1, span),
+                Ty::Bool,
+                span,
+            );
+            let mut fail = Vec::new();
+            child.raise_named(
+                "TypeError",
+                str_lit("pop() takes at most one argument", span),
+                span,
+                &mut fail,
+            );
+            body.push(TypedNode::new(
+                TypedStatement::If(TypedIf {
+                    condition: Box::new(too_many),
+                    then_block: TypedBlock {
+                        statements: fail,
+                        span,
+                    },
+                    else_block: None,
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ));
+            let index = intern("index");
+            body.push(TypedNode::new(
+                TypedStatement::Let(TypedLet {
+                    name: index,
+                    ty: ir(Ty::Int),
+                    mutability: Mutability::Mutable,
+                    initializer: Some(Box::new(int_lit(-1, span))),
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ));
+            let read = Val {
+                node: call(
+                    "zb_list_get_any",
+                    vec![args, int_lit(0, span)],
+                    Ty::Object,
+                    span,
+                ),
+                ty: Ty::Object,
+            };
+            child.guards = false;
+            let read = child.coerce(read, Ty::Int);
+            child.guards = true;
+            let assign = TypedNode::new(
+                TypedStatement::Expression(Box::new(binary(
+                    BinaryOp::Assign,
+                    var(index, Ty::Int, span),
+                    read,
+                    Ty::None,
+                    span,
+                ))),
+                Type::Unknown,
+                span,
+            );
+            body.push(TypedNode::new(
+                TypedStatement::If(TypedIf {
+                    condition: Box::new(binary(
+                        BinaryOp::Eq,
+                        count,
+                        int_lit(1, span),
+                        Ty::Bool,
+                        span,
+                    )),
+                    then_block: TypedBlock {
+                        statements: vec![assign, child.pending_check(span)],
+                        span,
+                    },
+                    else_block: None,
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ));
+            let Ty::List(e) = receiver_ty else {
+                unreachable!()
+            };
+            Val {
+                node: elem_call("pop", e, vec![held.node, var(index, Ty::Int, span)], span),
+                ty: e.ty(),
+            }
+        } else {
+            let source = format!(
+                "f({})",
+                (0..arity as usize)
+                    .map(|i| format!("a{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let parsed = ruff_python_parser::parse_expression(&source)
+                .expect("bound method arguments parse");
+            let py::Expr::Call(c) = &*parsed.into_syntax().body else {
+                unreachable!()
+            };
+            match receiver_ty {
+                Ty::List(e) => {
+                    let ty = match method {
+                        "index" | "count" => Ty::Int,
+                        "copy" => Ty::List(e),
+                        _ => Ty::None,
+                    };
+                    child.method(held, method, &c.arguments.args, ty, span)?
+                }
+                Ty::Class(k) => {
+                    let (sig, _) = child
+                        .module
+                        .method_sig(k as usize, method)
+                        .expect("found at binding");
+                    let mut args = Vec::new();
+                    for (expr, (_, ty)) in c.arguments.args.iter().zip(sig.params.iter().skip(1)) {
+                        args.push(child.expr_as(expr, *ty)?);
+                    }
+                    child
+                        .invoke(k as usize, method, held.node, args, span)
+                        .expect("found at binding")
+                }
+                _ => unreachable!(),
+            }
+        };
+        let boxed = child.coerce(result, Ty::Object);
+        body.append(&mut child.hoisted);
+        body.push(TypedNode::new(
+            TypedStatement::Return(Some(Box::new(boxed))),
+            Type::Unknown,
+            span,
+        ));
+        let mut function = child.lifted_function(&code, &params, body, span);
+        if variadic {
+            function.params.push(parameter("a0", Ty::Object, span));
+        }
+        self.module.lifted.borrow_mut().push(function);
+        let record_arity = arity;
+        let cell = self.coerce(receiver, Ty::Object);
+        let cells = self.list_of(
+            vec![Val {
+                node: cell,
+                ty: Ty::Object,
+            }],
+            Elem::Object,
+            span,
+        );
+        Ok(Val {
+            node: call(
+                "zb_func_new",
+                vec![code_of(&code, span), int_lit(record_arity, span), cells],
+                Ty::Object,
+                span,
+            ),
+            ty: Ty::Object,
+        })
     }
 
     /// `obj.attr = value` as a statement expression.
