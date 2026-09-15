@@ -13,6 +13,9 @@ use zyntax_typed_ast::{Type, TypeId};
 /// The most arguments a call through a value passes.
 pub const MAX_CALL_ARITY: usize = 8;
 
+/// A record whose code takes the record and a boxed list of arguments.
+pub const VARIADIC_ARITY: i64 = -1;
+
 /// The type of a function value's code: the record, then `arity`
 /// dynamic arguments, to a dynamic result.
 pub fn code_type(list_type: TypeId, arity: usize) -> Type {
@@ -174,6 +177,31 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                     vec![idx(rec.e(), int(1), any())],
                     i64(),
                 )),
+                when(eq(arity.e(), int(VARIADIC_ARITY)), {
+                    let packed_fp = local("packed_fp", code_type(list_type, 1));
+                    vec![
+                        packed_fp.decl(call(
+                            &fp_name(1),
+                            vec![idx(rec.e(), int(0), any())],
+                            code_type(list_type, 1),
+                        )),
+                        ret(call(
+                            "packed_fp",
+                            vec![
+                                rec.e(),
+                                call(
+                                    "zb_list_box_any",
+                                    vec![list(
+                                        args[..n].iter().map(|a| a.e()).collect(),
+                                        anys.clone(),
+                                    )],
+                                    any(),
+                                ),
+                            ],
+                            any(),
+                        )),
+                    ]
+                }),
                 when(
                     ne(arity.e(), int(n as i64)),
                     vec![fatal(

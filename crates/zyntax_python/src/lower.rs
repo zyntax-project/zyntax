@@ -1467,8 +1467,24 @@ impl<'m> Lowerer<'m> {
             }
             (Ty::Object, Ty::Dict) => call("zb_dict_unbox", vec![v.node], Ty::Dict, span),
             (Ty::Object, Ty::Set) => call("zb_set_unbox", vec![v.node], Ty::Set, span),
-            // None is the null instance.
-            (Ty::None, Ty::Class(_)) => cast(int_lit(0, span), target, span),
+            // Evaluate a None-producing expression before representing its result.
+            (Ty::None, Ty::Class(_) | Ty::Object) => {
+                let result = if target == Ty::Object {
+                    node(TypedExpression::Literal(TypedLiteral::Null), target, span)
+                } else {
+                    cast(int_lit(0, span), target, span)
+                };
+                Self::block_value(
+                    vec![TypedNode::new(
+                        TypedStatement::Expression(Box::new(v.node)),
+                        Type::Unknown,
+                        span,
+                    )],
+                    result,
+                    target,
+                    span,
+                )
+            }
             // An instance is boxed as its address under the class tag, and
             // read back with a check; a subclass instance is its base. A
             // null instance boxes as None.
@@ -1556,12 +1572,6 @@ impl<'m> Lowerer<'m> {
                 ty: ir(target),
                 ..v.node
             },
-            // None is the null dynamic value.
-            (Ty::None, Ty::Object) => node(
-                TypedExpression::Literal(TypedLiteral::Null),
-                Ty::Object,
-                span,
-            ),
             // A string's box holds a copy of it, released with the box.
             (Ty::Str, Ty::Object) => call("zb_box_str", vec![v.node], Ty::Object, span),
             // Into the dynamic world: a box. Out of it: a checked read.
@@ -3230,6 +3240,25 @@ impl<'m> Lowerer<'m> {
                     && self.module.funcs.contains_key(n.id.as_str()) =>
             {
                 self.function_value(n.id.as_str(), span)
+            }
+            py::Expr::Name(n)
+                if n.id.as_str() == "range"
+                    && !self.is_variable("range")
+                    && !self.module.class_index.contains_key("range") =>
+            {
+                Val {
+                    node: call(
+                        "zb_func_new",
+                        vec![
+                            code_of("zb_range_call", span),
+                            int_lit(zyntax_builtins::functions::VARIADIC_ARITY, span),
+                            self.list_of(Vec::new(), Elem::Object, span),
+                        ],
+                        Ty::Object,
+                        span,
+                    ),
+                    ty: Ty::Object,
+                }
             }
             py::Expr::Name(n) => Val {
                 node: var(intern(n.id.as_str()), ty, span),

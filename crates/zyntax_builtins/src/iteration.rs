@@ -30,6 +30,56 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let at = |xs: &Local, i: Expr| idx(xs.e(), i, any());
     let mut d = Vec::new();
 
+    let env = local("env", anys.clone());
+    let packed = local("packed", any());
+    let stop = local("stop", i64());
+    let step = local("step", i64());
+    let bound = |at: i64| call("zb_any_as_i64", vec![idx(xs.e(), int(at), any())], i64());
+    d.push(define(
+        "zb_range_call",
+        &[&env, &packed],
+        any(),
+        vec![
+            xs.decl(call("zb_list_unbox_any", vec![packed.e()], anys.clone())),
+            n.decl(len(&xs)),
+            when(
+                lt(n.e(), int(1)),
+                vec![fatal(
+                    "TypeError",
+                    text("range expected at least 1 argument, got 0"),
+                )],
+            ),
+            when(
+                gt(n.e(), int(3)),
+                vec![fatal(
+                    "TypeError",
+                    text("range expected at most 3 arguments"),
+                )],
+            ),
+            start.decl(int(0)),
+            stop.decl(bound(0)),
+            step.decl(int(1)),
+            when(
+                gt(n.e(), int(1)),
+                vec![start.set(stop.e()), stop.set(bound(1))],
+            ),
+            when(eq(n.e(), int(3)), vec![step.set(bound(2))]),
+            when(
+                eq(step.e(), int(0)),
+                vec![fatal("ValueError", text("range() arg 3 must not be zero"))],
+            ),
+            ret(call(
+                "zb_list_box_i64",
+                vec![call(
+                    "zb_list_range",
+                    vec![start.e(), stop.e(), step.e()],
+                    list_of(list_type, i64()),
+                )],
+                any(),
+            )),
+        ],
+    ));
+
     d.push(define("zb_list_enumerate", &[&xs, &start], anys.clone(), {
         let mut s = vec![out.decl(empty()), n.decl(len(&xs))];
         s.extend(for_range(
