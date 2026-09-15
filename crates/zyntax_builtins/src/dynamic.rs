@@ -588,6 +588,21 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ret(bool(false)),
         ],
     ));
+    // The kind a sort key is compared as when every key shares it: 1
+    // for an int, 2 for a float, 3 for a string, 0 for anything else.
+    d.push(define(
+        "zb_any_key_kind",
+        &[&x],
+        i64(),
+        vec![
+            cat.decl(category(x.e())),
+            when(is_int(&cat), vec![ret(int(1))]),
+            when(is(&cat, FLOAT), vec![ret(int(2))]),
+            when(is(&cat, STR), vec![ret(int(3))]),
+            ret(int(0)),
+        ],
+    ));
+
     // What a dict keys a value by: equal values hash equal, so a
     // number hashes as its integral value when it has one, a string by
     // its bytes, a tuple by its elements, an instance through its

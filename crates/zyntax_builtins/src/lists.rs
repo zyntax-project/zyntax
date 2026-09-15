@@ -156,22 +156,27 @@ fn len(xs: Expr) -> Expr {
 /// element list's copy function.
 fn merge_sort(
     xs: &Local,
-    keys: Option<&Local>,
+    keys: Option<(&Local, &str)>,
     copy: &str,
     less: &dyn Fn(Expr, Expr) -> Expr,
 ) -> Vec<Stmt> {
-    let elem = match &xs.ty {
+    let elem_of = |ty: &Type| match ty {
         Type::Named { type_args, .. } if !type_args.is_empty() => type_args[0].clone(),
         other => other.clone(),
     };
+    let elem = elem_of(&xs.ty);
+    let key_elem = keys.map(|(ks, _)| elem_of(&ks.ty)).unwrap_or_else(any);
     // What `less` compares for the element at `i` of the source.
     let key_of = |i: Expr| match keys {
-        Some(ks) => idx(ks.e(), i, any()),
+        Some((ks, _)) => idx(ks.e(), i, key_elem.clone()),
         None => idx(xs.e(), i, elem.clone()),
     };
     let n = local("n", i64());
     let tmp = local("tmp", xs.ty.clone());
-    let ktmp = local("ktmp", keys.map(|ks| ks.ty.clone()).unwrap_or_else(any));
+    let ktmp = local(
+        "ktmp",
+        keys.map(|(ks, _)| ks.ty.clone()).unwrap_or_else(any),
+    );
     let width = local("width", i64());
     let lo = local("lo", i64());
     let mid = local("mid", i64());
@@ -184,8 +189,12 @@ fn merge_sort(
     // Move `src[from]` to `dst[o]`, keys alongside.
     let place = |from: &Local| {
         let mut s = vec![set_idx(tmp.e(), o.e(), idx(xs.e(), from.e(), elem.clone()))];
-        if let Some(ks) = keys {
-            s.push(set_idx(ktmp.e(), o.e(), idx(ks.e(), from.e(), any())));
+        if let Some((ks, _)) = keys {
+            s.push(set_idx(
+                ktmp.e(),
+                o.e(),
+                idx(ks.e(), from.e(), key_elem.clone()),
+            ));
         }
         s.push(from.add_assign(int(1)));
         s
@@ -217,14 +226,18 @@ fn merge_sort(
         ),
     ];
     let mut write_back = vec![set_idx(xs.e(), i.e(), idx(tmp.e(), i.e(), elem.clone()))];
-    if let Some(ks) = keys {
-        write_back.push(set_idx(ks.e(), i.e(), idx(ktmp.e(), i.e(), any())));
+    if let Some((ks, _)) = keys {
+        write_back.push(set_idx(
+            ks.e(),
+            i.e(),
+            idx(ktmp.e(), i.e(), key_elem.clone()),
+        ));
     }
     let mut body = vec![n.decl(len(xs.e()))];
     body.push(when(lt(n.e(), int(2)), vec![ret_void()]));
     body.push(tmp.decl(call(copy, vec![xs.e()], xs.ty.clone())));
-    if let Some(ks) = keys {
-        body.push(ktmp.decl(call("zb_list_copy_any", vec![ks.e()], ks.ty.clone())));
+    if let Some((ks, key_copy)) = keys {
+        body.push(ktmp.decl(call(key_copy, vec![ks.e()], ks.ty.clone())));
     }
     body.push(width.decl(int(1)));
     let mut pass = vec![lo.decl(int(0))];
@@ -654,20 +667,109 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     let descending = local("descending", boolean());
     let key = local("key", any());
     // One sort per direction, chosen once: a direction test inside
-    // the comparison would be paid at every step.
+    // the comparison would be paid at every step. Keys that are all
+    // ints, all floats or all strings are read out once and compared
+    // as such, since the dynamic comparison would settle the same
+    // question at every step.
+    let sort_with = |ks: &Local, key_copy: &str, less: &dyn Fn(Expr, Expr) -> Expr| {
+        vec![if_(
+            descending.e(),
+            merge_sort(&xs, Some((ks, key_copy)), &name("copy"), &|a, b| less(b, a)),
+            merge_sort(&xs, Some((ks, key_copy)), &name("copy"), less),
+        )]
+    };
+    let ikeys = local("ikeys", list_of(list_type_of(&k.list), i64()));
+    let fkeys = local("fkeys", list_of(list_type_of(&k.list), f64()));
+    let skeys = local("skeys", list_of(list_type_of(&k.list), string()));
+    d.push(define(
+        &name("sort_by_int_keys"),
+        &[&xs, &ikeys, &descending],
+        unit(),
+        sort_with(&ikeys, "zb_list_copy_i64", &|a, b| lt(a, b)),
+    ));
+    d.push(define(
+        &name("sort_by_float_keys"),
+        &[&xs, &fkeys, &descending],
+        unit(),
+        sort_with(&fkeys, "zb_list_copy_f64", &|a, b| lt(a, b)),
+    ));
+    d.push(define(
+        &name("sort_by_str_keys"),
+        &[&xs, &skeys, &descending],
+        unit(),
+        sort_with(&skeys, "zb_list_copy_str", &|a, b| {
+            call("zb_str_lt", vec![a, b], boolean())
+        }),
+    ));
+    d.push(define(
+        &name("sort_by_any_keys"),
+        &[&xs, &keys, &descending],
+        unit(),
+        sort_with(&keys, "zb_list_copy_any", &|a, b| {
+            call("zb_any_lt", vec![a, b], boolean())
+        }),
+    ));
+    let key_kind = local("kind", i64());
+    let typed_keys = |op: &str, from: &str, ks: &Local| {
+        vec![
+            ks.decl(call(from, vec![keys.e()], ks.ty.clone())),
+            expr(call(
+                &name(op),
+                vec![xs.e(), ks.e(), descending.e()],
+                unit(),
+            )),
+            ret_void(),
+        ]
+    };
     d.push(define(
         &name("sort_by"),
         &[&xs, &keys, &descending],
         unit(),
-        vec![if_(
-            descending.e(),
-            merge_sort(&xs, Some(&keys), &name("copy"), &|a, b| {
-                call("zb_any_lt", vec![b, a], boolean())
-            }),
-            merge_sort(&xs, Some(&keys), &name("copy"), &|a, b| {
-                call("zb_any_lt", vec![a, b], boolean())
-            }),
-        )],
+        {
+            let mut s = vec![
+                n.decl(len(keys.e())),
+                when(lt(n.e(), int(2)), vec![ret_void()]),
+                key_kind.decl(call(
+                    "zb_any_key_kind",
+                    vec![idx(keys.e(), int(0), any())],
+                    i64(),
+                )),
+                i.decl(int(1)),
+                while_(
+                    and(lt(i.e(), n.e()), ne(key_kind.e(), int(0))),
+                    vec![
+                        when(
+                            ne(
+                                call("zb_any_key_kind", vec![idx(keys.e(), i.e(), any())], i64()),
+                                key_kind.e(),
+                            ),
+                            vec![key_kind.set(int(0))],
+                        ),
+                        i.add_assign(int(1)),
+                    ],
+                ),
+                when(
+                    eq(key_kind.e(), int(1)),
+                    typed_keys("sort_by_int_keys", "zb_list_from_any_i64", &ikeys),
+                ),
+                when(
+                    eq(key_kind.e(), int(2)),
+                    typed_keys("sort_by_float_keys", "zb_list_from_any_f64", &fkeys),
+                ),
+                when(
+                    eq(key_kind.e(), int(3)),
+                    typed_keys("sort_by_str_keys", "zb_list_from_any_str", &skeys),
+                ),
+                expr(call(
+                    &name("sort_by_any_keys"),
+                    vec![xs.e(), keys.e(), descending.e()],
+                    unit(),
+                )),
+                ret_void(),
+            ];
+            s.shrink_to_fit();
+            s
+        },
     ));
     // Descending order of the elements themselves, stable like `sort`.
     d.push(define(
