@@ -620,26 +620,45 @@ fn has_calls(callee: &HirFunction) -> bool {
     })
 }
 
-/// Whether a loop of `callee` calls a function or a symbol. Such a
-/// callee is its loop, and the call it saves by being inlined is
-/// nothing beside what the loop does; what it costs is a copy of the
-/// loop at every site.
-fn loops_with_calls(callee: &HirFunction) -> bool {
+/// Calls of a function or a symbol a callee may carry and still be
+/// inlined, once it is more than a few instructions. Past this it is a
+/// dispatch: a switch over kinds with a call in each arm, of which a
+/// site takes one, and inlining it copies every arm to every site. A
+/// callee under [`DISPATCH_INSTS`] instructions is the switch alone
+/// and costs little to copy.
+const MAX_CALLS_INLINED: usize = 4;
+const DISPATCH_INSTS: usize = 16;
+
+/// Whether `callee` is a loop that calls, or a dispatch. Such a callee
+/// is its loop or its arms, and the call it saves by being inlined is
+/// nothing beside them; what it costs is a copy of them at every site.
+fn loops_or_dispatches(callee: &HirFunction) -> bool {
+    let is_call = |inst: &HirInstruction| {
+        matches!(
+            inst,
+            HirInstruction::Call {
+                callee: HirCallable::Function(_) | HirCallable::Symbol(_) | HirCallable::FuncRef(_),
+                ..
+            }
+        )
+    };
+    let calls: usize = callee
+        .blocks
+        .values()
+        .map(|b| b.instructions.iter().filter(|i| is_call(i)).count())
+        .sum();
+    if calls > MAX_CALLS_INLINED && count_insts(callee) > DISPATCH_INSTS {
+        return true;
+    }
+    if calls == 0 {
+        return false;
+    }
     let in_loops = blocks_in_loops(callee);
     in_loops.iter().any(|b| {
-        callee.blocks.get(b).is_some_and(|b| {
-            b.instructions.iter().any(|inst| {
-                matches!(
-                    inst,
-                    HirInstruction::Call {
-                        callee: HirCallable::Function(_)
-                            | HirCallable::Symbol(_)
-                            | HirCallable::FuncRef(_),
-                        ..
-                    }
-                )
-            })
-        })
+        callee
+            .blocks
+            .get(b)
+            .is_some_and(|b| b.instructions.iter().any(|i| is_call(i)))
     })
 }
 
@@ -903,7 +922,8 @@ fn inline_in_function(
     // result, and whether the block edges need rebuilding.
     let mut subs: HashMap<HirId, HirId> = HashMap::new();
     let mut spliced_blocks = false;
-    // Whether a callee is a loop that calls, asked once per callee.
+    // Whether a callee is a loop that calls or a dispatch, asked once
+    // per callee.
     let mut looping: HashMap<HirId, bool> = HashMap::new();
 
     // Walk every block; for each Call instruction, classify and
@@ -984,7 +1004,7 @@ fn inline_in_function(
             }
             if *looping
                 .entry(callee_id)
-                .or_insert_with(|| loops_with_calls(callee))
+                .or_insert_with(|| loops_or_dispatches(callee))
             {
                 stats.skipped_cold += 1;
                 continue;
