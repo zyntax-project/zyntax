@@ -1,0 +1,1 @@
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":1,"timestamp":1789513152,"nonce":"tUmC9b8t53Qi+32i9j3oUGYWoL4=","title":"Python: range() with a zero step returned an empty list","message":"`range(0, 2, 0)` gave `[]`; CPython raises ValueError. `zb_list_range` now raises \"range() arg 3 must not be zero\".","files":null}]}
