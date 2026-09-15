@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789469386,"nonce":"ddzGSTa2OonLkcHXbchb7K4zlfQ=","message":"LLVM half landed in 300beeb: calls to functions outside the promotion module load the cell and call indirect; LLVM promotions publish into the cell too.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1789469386,"nonce":"y8HtTjT0oRJ51UigiEHj7qXdGQA=","status":2}]}
