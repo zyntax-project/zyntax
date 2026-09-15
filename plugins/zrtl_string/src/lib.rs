@@ -296,6 +296,22 @@ pub extern "C" fn string_index_of_from(haystack: StringPtr, needle: StringPtr, f
     }
 }
 
+/// A hash of the bytes, the same for equal contents; FNV-1a.
+#[no_mangle]
+pub extern "C" fn string_hash(s: StringPtr) -> i64 {
+    if s.is_null() {
+        return 0;
+    }
+    let len = unsafe { string_length(s) }.max(0) as usize;
+    let bytes = unsafe { std::slice::from_raw_parts(string_data(s), len) };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h as i64
+}
+
 /// Find last index of substring, returns -1 if not found
 #[no_mangle]
 pub extern "C" fn string_last_index_of(haystack: StringPtr, needle: StringPtr) -> i64 {
@@ -694,6 +710,7 @@ zrtl_plugin! {
         ("$String$ends_with", string_ends_with),
         ("$String$index_of", string_index_of),
         ("$String$index_of_from", string_index_of_from),
+        ("$String$hash", string_hash),
         ("$String$last_index_of", string_last_index_of),
         ("$String$count", string_count),
 

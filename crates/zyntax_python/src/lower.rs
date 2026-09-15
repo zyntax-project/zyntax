@@ -4118,13 +4118,18 @@ impl<'m> Lowerer<'m> {
                 span,
             )]
         };
-        if let Produce::List(elem, _) = produce {
+        let initializer = match produce {
+            Produce::List(elem, _) => Some(self.list_of(Vec::new(), elem, span)),
+            Produce::Dict(..) => Some(call("zb_dict_new", vec![], Ty::Dict, span)),
+            _ => None,
+        };
+        if let Some(initializer) = initializer {
             statements[0] = TypedNode::new(
                 TypedStatement::Let(TypedLet {
                     name: out,
                     ty: ir(ty),
                     mutability: Mutability::Immutable,
-                    initializer: Some(Box::new(self.list_of(Vec::new(), elem, span))),
+                    initializer: Some(Box::new(initializer)),
                     span,
                 }),
                 Type::Unknown,

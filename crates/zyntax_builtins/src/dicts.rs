@@ -1,9 +1,9 @@
 //! Dictionaries and sets over lists of dynamic values.
 //!
-//! A dict is a list holding key, value, key, value in insertion order;
-//! a set is a list of distinct values. Lookup compares with the dynamic
-//! equality, so both are linear in their size, and both keep the order
-//! things were added in, which is what printing and iteration show.
+//! A dict is a list whose first element is its hash index and the rest
+//! key, value, key, value in insertion order, so iteration and printing
+//! show the order things were added in and a lookup is a hash and a
+//! probe. A set is a list of distinct values, searched linearly.
 
 use crate::build::*;
 use crate::{list_of, DICT_TAG, SET_TAG};
@@ -37,43 +37,252 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
 
 fn dict(list_type: TypeId) -> Vec<Decl> {
     let anys = list_of(list_type, any());
-    let d = local("d", anys.clone());
+    let ints = list_of(list_type, i64());
+    // Every function edits the dict in place; only boxing keeps it.
+    let d = borrowed("d", anys.clone());
     let k = kept("k", any());
     let v = kept("v", any());
     // Returned when the key is absent, so the caller cannot release it.
     let default = kept("default", any());
     let i = local("i", i64());
+    let j = local("j", i64());
     let n = local("n", i64());
     let out = local("out", anys.clone());
     let x = local("x", any());
     let tag = local("tag", i64());
+    let index = borrowed("index", ints.clone());
+    let mask = local("mask", i64());
+    let slot = local("s", i64());
+    let entry = local("e", i64());
+    let cap = local("cap", i64());
+    let h = local("h", i64());
     let mut out_decls = Vec::new();
 
-    // The position of `k`'s pair, or -1.
+    // The index is a power-of-two table of entry numbers, -1 where
+    // empty, probed linearly from the key's hash and kept under half
+    // full. Entry `e` is the pair at positions 1 + 2e and 2 + 2e. A
+    // dict of a few pairs has no table (its slot holds None) and is
+    // scanned, which costs less than hashing for so few.
+    let index_of = |d: Expr| call("zb_unbox_list_raw_i64", vec![at(d, int(0))], ints.clone());
+    let box_index = |index: Expr| call("zb_list_box_i64", vec![index], any());
+    let slot_at = |index: Expr, s: Expr| idx(index, s, i64());
+    let hash = |k: Expr| call("zb_dict_hash", vec![k], i64());
+    let count = |d: Expr| div(sub(len(d), int(1)), int(2));
+    let key_at = |d: Expr, e: Expr| at(d, add(mul(e, int(2)), int(1)));
+    let next_slot = |s: Expr, mask: Expr| bitand(add(s, int(1)), mask);
+    let unindexed = |d: Expr| eq(at(d, int(0)), null(any()));
+    /// Pairs a dict holds before it takes a table.
+    const SMALL: i64 = 8;
+    /// The first table's size, for a dict just past `SMALL`.
+    const FIRST_TABLE: i64 = 32;
+
+    // The hash a key lands by: the value's hash with its bits spread,
+    // since the table takes the low ones.
     out_decls.push(define(
-        "zb_dict_find",
-        &[&d, &k],
+        "zb_dict_hash",
+        &[&k],
         i64(),
         vec![
-            n.decl(len(d.e())),
+            h.decl(call("zb_any_hash", vec![k.e()], i64())),
+            h.set(bitxor(h.e(), shr(h.e(), int(32)))),
+            h.set(mul(h.e(), int(-7_046_029_254_386_353_131))),
+            h.set(bitxor(h.e(), shr(h.e(), int(29)))),
+            ret(h.e()),
+        ],
+    ));
+    // An empty table of `cap` slots.
+    out_decls.push(define("zb_dict_index_new", &[&cap], ints.clone(), {
+        let table = local("table", ints.clone());
+        let mut st = vec![
+            table.decl(list(Vec::new(), ints.clone())),
+            expr(mcall(table.e(), "reserve", vec![cap.e()], unit())),
+        ];
+        st.extend(for_range(
+            &i,
+            int(0),
+            cap.e(),
+            vec![expr(mcall(table.e(), "push", vec![int(-1)], unit()))],
+        ));
+        st.push(ret(table.e()));
+        st
+    }));
+    // Record entry `e`, whose key hashes to `h`, in `index`, which has
+    // room for it.
+    out_decls.push(define(
+        "zb_dict_place_hashed",
+        &[&index, &entry, &h],
+        unit(),
+        vec![
+            mask.decl(sub(len(index.e()), int(1))),
+            slot.decl(bitand(h.e(), mask.e())),
+            while_(
+                ge(slot_at(index.e(), slot.e()), int(0)),
+                vec![slot.set(next_slot(slot.e(), mask.e()))],
+            ),
+            set_idx(index.e(), slot.e(), entry.e()),
+            ret_void(),
+        ],
+    ));
+    out_decls.push(define(
+        "zb_dict_place",
+        &[&index, &d, &entry],
+        unit(),
+        vec![
+            expr(call(
+                "zb_dict_place_hashed",
+                vec![index.e(), entry.e(), hash(key_at(d.e(), entry.e()))],
+                unit(),
+            )),
+            ret_void(),
+        ],
+    ));
+    // A fresh table of `cap` slots over every entry of `d`.
+    out_decls.push(define("zb_dict_reindex", &[&d, &cap], unit(), {
+        let mut st = vec![
+            index.decl(call("zb_dict_index_new", vec![cap.e()], ints.clone())),
+            n.decl(count(d.e())),
+        ];
+        st.extend(for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![expr(call(
+                "zb_dict_place",
+                vec![index.e(), d.e(), i.e()],
+                unit(),
+            ))],
+        ));
+        st.push(set_idx(d.e(), int(0), box_index(index.e())));
+        st.push(ret_void());
+        st
+    }));
+    out_decls.push(define(
+        "zb_dict_new",
+        &[],
+        anys.clone(),
+        vec![
+            out.decl(list(Vec::new(), anys.clone())),
+            push(out.e(), null(any())),
+            ret(out.e()),
+        ],
+    ));
+    // The position of `k`'s key in a dict with a table, given the
+    // key's hash, or -1. Bounded by the table's size, which a table
+    // under half full never reaches.
+    out_decls.push(define(
+        "zb_dict_find_hashed",
+        &[&d, &k, &h],
+        i64(),
+        vec![
+            index.decl(index_of(d.e())),
+            mask.decl(sub(len(index.e()), int(1))),
+            slot.decl(bitand(h.e(), mask.e())),
             i.decl(int(0)),
             while_(
-                lt(i.e(), n.e()),
+                le(i.e(), mask.e()),
                 vec![
-                    when(any_eq(at(d.e(), i.e()), k.e()), vec![ret(i.e())]),
-                    i.add_assign(int(2)),
+                    entry.decl(slot_at(index.e(), slot.e())),
+                    when(lt(entry.e(), int(0)), vec![ret(int(-1))]),
+                    when(
+                        any_eq(key_at(d.e(), entry.e()), k.e()),
+                        vec![ret(add(mul(entry.e(), int(2)), int(1)))],
+                    ),
+                    slot.set(next_slot(slot.e(), mask.e())),
+                    i.add_assign(int(1)),
                 ],
             ),
             ret(int(-1)),
         ],
     ));
-    let find = |k: Expr| call("zb_dict_find", vec![d.e(), k], i64());
+    // The position of `k`'s key, or -1.
     out_decls.push(define(
-        "zb_dict_len",
-        &[&d],
+        "zb_dict_find",
+        &[&d, &k],
         i64(),
-        vec![ret(div(len(d.e()), int(2)))],
+        vec![
+            when(
+                unindexed(d.e()),
+                vec![
+                    n.decl(len(d.e())),
+                    i.decl(int(1)),
+                    while_(
+                        lt(i.e(), n.e()),
+                        vec![
+                            when(any_eq(at(d.e(), i.e()), k.e()), vec![ret(i.e())]),
+                            i.add_assign(int(2)),
+                        ],
+                    ),
+                    ret(int(-1)),
+                ],
+            ),
+            ret(call(
+                "zb_dict_find_hashed",
+                vec![d.e(), k.e(), hash(k.e())],
+                i64(),
+            )),
+        ],
     ));
+    let find = |k: Expr| call("zb_dict_find", vec![d.e(), k], i64());
+    // Add a pair whose key is absent and hashes to `h`, growing the
+    // table first when the pair would bring it to half full.
+    out_decls.push(define(
+        "zb_dict_insert_hashed",
+        &[&d, &k, &v, &h],
+        unit(),
+        vec![
+            entry.decl(count(d.e())),
+            cap.decl(len(index_of(d.e()))),
+            when(
+                gt(mul(add(entry.e(), int(1)), int(2)), cap.e()),
+                vec![expr(call(
+                    "zb_dict_reindex",
+                    vec![d.e(), mul(cap.e(), int(2))],
+                    unit(),
+                ))],
+            ),
+            push(d.e(), k.e()),
+            push(d.e(), v.e()),
+            expr(call(
+                "zb_dict_place_hashed",
+                vec![index_of(d.e()), entry.e(), h.e()],
+                unit(),
+            )),
+            ret_void(),
+        ],
+    ));
+    // Add a pair whose key is absent; a dict that has grown past a few
+    // pairs takes its first table.
+    out_decls.push(define(
+        "zb_dict_insert",
+        &[&d, &k, &v],
+        unit(),
+        vec![
+            when(
+                unindexed(d.e()),
+                vec![
+                    push(d.e(), k.e()),
+                    push(d.e(), v.e()),
+                    when(
+                        gt(count(d.e()), int(SMALL)),
+                        vec![expr(call(
+                            "zb_dict_reindex",
+                            vec![d.e(), int(FIRST_TABLE)],
+                            unit(),
+                        ))],
+                    ),
+                    ret_void(),
+                ],
+            ),
+            expr(call(
+                "zb_dict_insert_hashed",
+                vec![d.e(), k.e(), v.e(), hash(k.e())],
+                unit(),
+            )),
+            ret_void(),
+        ],
+    ));
+    let insert = |k: Expr, v: Expr| expr(call("zb_dict_insert", vec![d.e(), k, v], unit()));
+    out_decls.push(define("zb_dict_len", &[&d], i64(), vec![ret(count(d.e()))]));
     out_decls.push(define(
         "zb_dict_contains",
         &[&d, &k],
@@ -100,15 +309,37 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
             ret(at(d.e(), add(i.e(), int(1)))),
         ],
     ));
+    // Store `v` under `k`. The key is hashed once on the table path.
     out_decls.push(define(
         "zb_dict_set",
         &[&d, &k, &v],
         unit(),
         vec![
-            i.decl(find(k.e())),
+            when(
+                unindexed(d.e()),
+                vec![
+                    i.decl(find(k.e())),
+                    if_(
+                        lt(i.e(), int(0)),
+                        vec![insert(k.e(), v.e())],
+                        vec![set_idx(d.e(), add(i.e(), int(1)), v.e())],
+                    ),
+                    ret_void(),
+                ],
+            ),
+            h.decl(hash(k.e())),
+            i.decl(call(
+                "zb_dict_find_hashed",
+                vec![d.e(), k.e(), h.e()],
+                i64(),
+            )),
             if_(
                 lt(i.e(), int(0)),
-                vec![push(d.e(), k.e()), push(d.e(), v.e())],
+                vec![expr(call(
+                    "zb_dict_insert_hashed",
+                    vec![d.e(), k.e(), v.e(), h.e()],
+                    unit(),
+                ))],
                 vec![set_idx(d.e(), add(i.e(), int(1)), v.e())],
             ),
             ret_void(),
@@ -122,15 +353,23 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
         vec![
             i.decl(find(k.e())),
             when(ge(i.e(), int(0)), vec![ret(at(d.e(), add(i.e(), int(1))))]),
-            push(d.e(), k.e()),
-            push(d.e(), v.e()),
+            insert(k.e(), v.e()),
             ret(v.e()),
         ],
     ));
+    // Removal shifts the later pairs down, so the table is rebuilt.
     let remove_pair = |i: &Local| {
         vec![
             expr(mcall(d.e(), "remove_at", vec![add(i.e(), int(1))], any())),
             expr(mcall(d.e(), "remove_at", vec![i.e()], any())),
+            when(
+                not(unindexed(d.e())),
+                vec![expr(call(
+                    "zb_dict_reindex",
+                    vec![d.e(), len(index_of(d.e()))],
+                    unit(),
+                ))],
+            ),
         ]
     };
     out_decls.push(define("zb_dict_del", &[&d, &k], unit(), {
@@ -168,7 +407,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
             let mut s = vec![
                 out.decl(list(Vec::new(), anys.clone())),
                 n.decl(len(d.e())),
-                i.decl(int(0)),
+                i.decl(int(1)),
             ];
             s.push(while_(
                 lt(i.e(), n.e()),
@@ -186,7 +425,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
         vec![
             out.decl(list(Vec::new(), anys.clone())),
             n.decl(len(d.e())),
-            i.decl(int(0)),
+            i.decl(int(1)),
             while_(
                 lt(i.e(), n.e()),
                 vec![
@@ -201,11 +440,11 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
             ret(out.e()),
         ]
     }));
-    let other = local("other", anys.clone());
+    let other = borrowed("other", anys.clone());
     out_decls.push(define("zb_dict_update", &[&d, &other], unit(), {
         vec![
             n.decl(len(other.e())),
-            i.decl(int(0)),
+            i.decl(int(1)),
             while_(
                 lt(i.e(), n.e()),
                 vec![
@@ -225,22 +464,50 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
         ]
     }));
     // A dict from a literal's keys and values, later pairs winning.
-    let pairs = local("pairs", anys.clone());
-    out_decls.push(define("zb_dict_from_pairs", &[&pairs], anys.clone(), {
+    let pairs = borrowed("pairs", anys.clone());
+    out_decls.push(define("zb_dict_add_pairs", &[&d, &pairs], unit(), {
         vec![
-            out.decl(list(Vec::new(), anys.clone())),
-            expr(call("zb_dict_update", vec![out.e(), pairs.e()], unit())),
-            ret(out.e()),
+            n.decl(len(pairs.e())),
+            i.decl(int(0)),
+            while_(
+                lt(i.e(), n.e()),
+                vec![
+                    expr(call(
+                        "zb_dict_set",
+                        vec![
+                            d.e(),
+                            at(pairs.e(), i.e()),
+                            at(pairs.e(), add(i.e(), int(1))),
+                        ],
+                        unit(),
+                    )),
+                    i.add_assign(int(2)),
+                ],
+            ),
+            ret_void(),
         ]
     }));
+    out_decls.push(define(
+        "zb_dict_from_pairs",
+        &[&pairs],
+        anys.clone(),
+        vec![
+            out.decl(call("zb_dict_new", vec![], anys.clone())),
+            expr(call("zb_dict_add_pairs", vec![out.e(), pairs.e()], unit())),
+            ret(out.e()),
+        ],
+    ));
     out_decls.push(define(
         "zb_dict_copy",
         &[&d],
         anys.clone(),
-        vec![ret(call("zb_list_copy_any", vec![d.e()], anys.clone()))],
+        vec![
+            out.decl(call("zb_dict_new", vec![], anys.clone())),
+            expr(call("zb_dict_update", vec![out.e(), d.e()], unit())),
+            ret(out.e()),
+        ],
     ));
     // Equal when every pair of one is in the other and sizes match.
-    let j = local("j", i64());
     out_decls.push(define(
         "zb_dict_eq",
         &[&d, &other],
@@ -248,7 +515,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
         vec![
             n.decl(len(d.e())),
             when(ne(n.e(), len(other.e())), vec![ret(bool(false))]),
-            i.decl(int(0)),
+            i.decl(int(1)),
             while_(
                 lt(i.e(), n.e()),
                 vec![
@@ -279,11 +546,11 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
             pieces.decl(list(Vec::new(), list_of(list_type, string()))),
             piece(text("{")),
             n.decl(len(d.e())),
-            i.decl(int(0)),
+            i.decl(int(1)),
             while_(
                 lt(i.e(), n.e()),
                 vec![
-                    when(gt(i.e(), int(0)), vec![piece(text(", "))]),
+                    when(gt(i.e(), int(1)), vec![piece(text(", "))]),
                     piece(any_repr(at(d.e(), i.e()))),
                     piece(text(": ")),
                     piece(any_repr(at(d.e(), add(i.e(), int(1))))),
@@ -300,13 +567,14 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
         any(),
         Some("zyntax_box_ptr"),
     ));
+    let boxed = local("d", anys.clone());
     out_decls.push(define(
         "zb_dict_box",
-        &[&d],
+        &[&boxed],
         any(),
         vec![ret(call(
             "zb_box_dict_raw",
-            vec![d.e(), int32(DICT_TAG as i32)],
+            vec![boxed.e(), int32(DICT_TAG as i32)],
             any(),
         ))],
     ));

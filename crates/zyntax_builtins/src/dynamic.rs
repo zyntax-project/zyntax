@@ -102,6 +102,7 @@ pub(crate) fn extern_instance_hooks() -> Vec<Decl> {
             boolean(),
             None,
         ),
+        extern_fn("zb_hook_instance_hash", &[("x", any())], i64(), None),
         extern_fn(
             "zb_hook_instance_arith",
             &[("code", i64()), ("a", any()), ("b", any())],
@@ -136,6 +137,12 @@ pub(crate) fn default_instance_hooks(policy: &Policy) -> Vec<Decl> {
             &[&a, &b],
             boolean(),
             vec![ret(bool(false))],
+        ),
+        define(
+            "zb_hook_instance_hash",
+            &[&x],
+            i64(),
+            vec![ret(call("zb_unbox_instance_raw", vec![x.e()], i64()))],
         ),
         define(
             "zb_hook_instance_arith",
@@ -579,6 +586,73 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 ],
             ),
             ret(bool(false)),
+        ],
+    ));
+    // What a dict keys a value by: equal values hash equal, so a
+    // number hashes as its integral value when it has one, a string by
+    // its bytes, a tuple by its elements, an instance through its
+    // class, and None as itself. A list, dict or set cannot be a key.
+    let h = local("h", i64());
+    let items = local("items", anys.clone());
+    let n = local("n", i64());
+    let i = local("i", i64());
+    let f = local("f", f64());
+    d.push(define(
+        "zb_any_hash",
+        &[&x],
+        i64(),
+        vec![
+            cat.decl(category(x.e())),
+            when(is(&cat, NONE), vec![ret(int(0x5A6E_6F6E_6521))]),
+            when(is_integral(&cat), vec![ret(number_i64(x.e(), cat.e()))]),
+            when(
+                is(&cat, FLOAT),
+                vec![
+                    f.decl(get_f64(x.e())),
+                    when(
+                        and(
+                            eq(f.e(), cast(cast(f.e(), i64()), f64())),
+                            and(gt(f.e(), float(-9.2e18)), lt(f.e(), float(9.2e18))),
+                        ),
+                        vec![ret(cast(f.e(), i64()))],
+                    ),
+                    ret(cast(mul(f.e(), float(1_048_576.0)), i64())),
+                ],
+            ),
+            when(
+                is(&cat, STR),
+                vec![ret(call("zb_str_hash", vec![get_str(x.e())], i64()))],
+            ),
+            when(
+                is_instance(x.e()),
+                vec![ret(call("zb_hook_instance_hash", vec![x.e()], i64()))],
+            ),
+            when(
+                is_tuple(x.e()),
+                vec![
+                    items.decl(call("zb_unbox_tuple", vec![x.e()], anys.clone())),
+                    n.decl(mcall(items.e(), "len", vec![], i64())),
+                    h.decl(int(0x2545_F491_4F6C_DD1D)),
+                    i.decl(int(0)),
+                    while_(
+                        lt(i.e(), n.e()),
+                        vec![
+                            h.set(add(
+                                mul(h.e(), int(1_000_003)),
+                                call("zb_any_hash", vec![idx(items.e(), i.e(), any())], i64()),
+                            )),
+                            i.add_assign(int(1)),
+                        ],
+                    ),
+                    ret(h.e()),
+                ],
+            ),
+            when(
+                eq(kind(x.e()), int(FUNC_TAG >> 8)),
+                vec![ret(call("zb_unbox_instance_raw", vec![x.e()], i64()))],
+            ),
+            type_error(add(text("unhashable type: "), quoted(type_name(x.e())))),
+            ret(int(0)),
         ],
     ));
     d.push(define(

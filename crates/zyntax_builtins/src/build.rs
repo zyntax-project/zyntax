@@ -100,6 +100,9 @@ pub struct Local {
     /// As a parameter: whether the function keeps what it is passed, so
     /// the caller must not release it afterwards.
     pub kept: bool,
+    /// As a parameter: the function only reads or edits the storage
+    /// for the length of the call, so the caller may release it after.
+    pub borrowed: bool,
 }
 
 pub fn local(name: &'static str, ty: Type) -> Local {
@@ -107,6 +110,7 @@ pub fn local(name: &'static str, ty: Type) -> Local {
         name,
         ty,
         kept: false,
+        borrowed: false,
     }
 }
 
@@ -117,6 +121,22 @@ pub fn kept(name: &'static str, ty: Type) -> Local {
         name,
         ty,
         kept: true,
+        borrowed: false,
+    }
+}
+
+/// A parameter the function reads or edits in place and never stores
+/// or returns: a list it looks up in or appends to. What the caller
+/// passed stays the caller's to release, so a temporary handed in is
+/// released after the call rather than left to the collector. A list
+/// travels as its header by value, which the release analysis would
+/// otherwise take for a copy it cannot follow.
+pub fn borrowed(name: &'static str, ty: Type) -> Local {
+    Local {
+        name,
+        ty,
+        kept: false,
+        borrowed: true,
     }
 }
 
@@ -171,6 +191,8 @@ impl Local {
         );
         if self.kept {
             p.ownership = ParamOwnership::Shared;
+        } else if self.borrowed {
+            p.ownership = ParamOwnership::Borrowed;
         }
         p
     }

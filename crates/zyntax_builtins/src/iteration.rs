@@ -170,7 +170,10 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let items = local("items", anys.clone());
     let kv = local("kv", anys.clone());
     d.push(define("zb_dict_from_tuples", &[&items], anys.clone(), {
-        let mut s = vec![out.decl(empty()), n.decl(len(&items))];
+        let mut s = vec![
+            out.decl(call("zb_dict_new", vec![], anys.clone())),
+            n.decl(len(&items)),
+        ];
         s.extend(for_range(
             &i,
             int(0),

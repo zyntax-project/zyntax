@@ -1087,10 +1087,61 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         str_hook,
         type_hook,
         eq_hook,
+        hash_hook(module, span),
         arith_hook(module, span),
         box_hook(module, span),
         unbox_hook(module, span),
     ]
+}
+
+/// `zb_hook_instance_hash(x)`: what a dict keys an instance by. A class
+/// with `__hash__` answers through it; one with `__eq__` and no
+/// `__hash__` is unhashable, as in Python, since equal instances would
+/// land in different places; any other class hashes by identity.
+fn hash_hook(module: &Module, span: Span) -> TypedFunction {
+    let x = var(intern("x"), Ty::Object, span);
+    let mut statements = per_class(
+        module,
+        x.clone(),
+        |c| module.method_sig(c, "__hash__").is_some() || module.method_sig(c, "__eq__").is_some(),
+        |lowerer, c, obj| {
+            if module.method_sig(c, "__hash__").is_none() {
+                let message = str_lit(
+                    &format!("unhashable type: '{}'", module.classes[c].name),
+                    span,
+                );
+                return vec![
+                    stmt(
+                        call(
+                            "zb_fatal",
+                            vec![str_lit("TypeError", span), message],
+                            Ty::None,
+                            span,
+                        ),
+                        span,
+                    ),
+                    ret(int_lit(0, span), span),
+                ];
+            }
+            let result = lowerer
+                .invoke(c, "__hash__", obj, vec![], span)
+                .expect("picked");
+            let value = lowerer.coerce(result, Ty::Int);
+            vec![ret(value, span)]
+        },
+        span,
+    );
+    statements.push(ret(
+        lower::addr_call("zb_unbox_instance_raw", vec![x], span),
+        span,
+    ));
+    function(
+        "zb_hook_instance_hash",
+        vec![param("x", Ty::Object, span)],
+        Ty::Int,
+        statements,
+        span,
+    )
 }
 
 /// `zb_hook_instance_arith(code, a, b)`: `a op b` where `a` is an
