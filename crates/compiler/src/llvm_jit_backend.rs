@@ -93,6 +93,22 @@ pub struct LLVMJitBackend<'ctx> {
     /// the call has nothing to bind to. Set once when the module is first
     /// compiled; promotions read it back.
     module_context: Option<std::sync::Arc<HirModule>>,
+    /// Functions of the module context whose address is observable,
+    /// which changes how they return an aggregate; read with the
+    /// context.
+    address_taken: std::collections::HashSet<HirId>,
+
+    /// How a promotion reaches the rest of the program without
+    /// compiling it: the cell registry key of the tier that holds the
+    /// callees, and where that tier keeps each module global. Set by the
+    /// runtime; without it a promotion compiles its callee closure. See
+    /// [`Self::set_cross_tier_links`].
+    cross_tier_key: Option<u64>,
+    global_resolver: Option<std::sync::Arc<dyn Fn(HirId) -> Option<usize> + Send + Sync>>,
+    /// What the module being compiled reaches across tiers, handed to
+    /// the lowering.
+    pending_cross_tier: HashMap<HirId, crate::llvm_backend::CrossTierCallee>,
+    pending_shared_globals: HashMap<HirId, usize>,
 
     /// Loaded shared object. Holding this `Library` keeps the mapped
     /// code pages alive — dropping it would munmap them and any held
@@ -172,6 +188,11 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         let mut backend = Self {
             context,
             module_context: None,
+            address_taken: std::collections::HashSet::new(),
+            cross_tier_key: None,
+            global_resolver: None,
+            pending_cross_tier: HashMap::new(),
+            pending_shared_globals: HashMap::new(),
             loaded_lib: None,
             function_pointers: IndexMap::new(),
             opt_level,
@@ -369,6 +390,13 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 if f.count_basic_blocks() == 0 {
                     engine.add_global_mapping(&f, *addr);
                 }
+            }
+        }
+        // And the globals whose storage another tier owns, those the
+        // middle end kept.
+        for (name, addr) in backend.shared_global_bindings() {
+            if let Some(global) = backend.module().get_global(name) {
+                engine.add_global_mapping(&global, *addr);
             }
         }
 
@@ -598,6 +626,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         let mut backend = LLVMBackend::new(self.context, "zyntax_jit");
         backend.register_symbol_signatures(&self.symbol_signatures);
         backend.set_only_compile_reachable(self.only_compile_reachable.clone());
+        backend.set_cross_tier_callees(self.pending_cross_tier.clone());
+        backend.set_shared_globals(self.pending_shared_globals.clone());
         // The name a function is declared under and the name its address
         // is looked up by have to be decided the same way, and they are
         // decided in two places. Without this the entry is declared
@@ -910,7 +940,27 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// Call this with the whole module before promoting any function from
     /// it; see [`Self::module_context`].
     pub fn set_module_context(&mut self, module: std::sync::Arc<HirModule>) {
+        let same = self
+            .module_context
+            .as_ref()
+            .is_some_and(|m| std::sync::Arc::ptr_eq(m, &module));
+        if !same {
+            self.address_taken = crate::dce::address_taken_functions(&module);
+        }
         self.module_context = Some(module);
+    }
+
+    /// How a promoted function reaches functions and globals another
+    /// tier compiled: callees through their cells under `key`, globals
+    /// at the addresses `globals` answers. With these a promotion
+    /// compiles the one function.
+    pub fn set_cross_tier_links(
+        &mut self,
+        key: u64,
+        globals: std::sync::Arc<dyn Fn(HirId) -> Option<usize> + Send + Sync>,
+    ) {
+        self.cross_tier_key = Some(key);
+        self.global_resolver = Some(globals);
     }
 
     /// Compile a single function, together with everything it calls.
@@ -928,13 +978,61 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         let mut types = IndexMap::new();
         let mut effects = IndexMap::new();
         let mut handlers = IndexMap::new();
+        self.pending_cross_tier.clear();
+        self.pending_shared_globals.clear();
         if let Some(ctx) = self.module_context.clone() {
-            for callee in crate::dce::reachable_from_roots(&ctx, vec![id]) {
-                if callee == id {
-                    continue;
+            let own_module = self.cross_tier_key.is_some() && self.use_mcjit;
+            if own_module {
+                // The function alone. Its entry is published where callers
+                // of the tier below reach it, so its own convention has
+                // to be one both tiers read the same way.
+                let abi = crate::abi::function_abi(function, self.address_taken.contains(&id));
+                if !abi.is_scalar() {
+                    return Err(CompilerError::Backend(format!(
+                        "{} passes or returns an aggregate; promoted alone its entry would \
+                         not match its callers",
+                        function.name.resolve_global().unwrap_or_default()
+                    )));
                 }
-                if let Some(f) = ctx.functions.get(&callee) {
-                    functions.insert(callee, f.clone());
+                let key = self.cross_tier_key.unwrap_or_default();
+                for callee in direct_callees(function) {
+                    if callee == id {
+                        continue;
+                    }
+                    let Some(f) = ctx.functions.get(&callee) else {
+                        continue;
+                    };
+                    if f.is_external {
+                        functions.insert(callee, f.clone());
+                        continue;
+                    }
+                    let abi = crate::abi::function_abi(f, self.address_taken.contains(&callee));
+                    self.pending_cross_tier.insert(
+                        callee,
+                        crate::llvm_backend::CrossTierCallee {
+                            name: f.name.resolve_global().unwrap_or_default(),
+                            params: f.signature.params.iter().map(|p| p.ty.clone()).collect(),
+                            returns: f.signature.returns.clone(),
+                            abi,
+                            cell: crate::reload::call_cell_addr(key, callee),
+                        },
+                    );
+                }
+                if let Some(resolve) = &self.global_resolver {
+                    for gid in ctx.globals.keys() {
+                        if let Some(addr) = resolve(*gid) {
+                            self.pending_shared_globals.insert(*gid, addr);
+                        }
+                    }
+                }
+            } else {
+                for callee in crate::dce::reachable_from_roots(&ctx, vec![id]) {
+                    if callee == id {
+                        continue;
+                    }
+                    if let Some(f) = ctx.functions.get(&callee) {
+                        functions.insert(callee, f.clone());
+                    }
                 }
             }
             // Globals and type/effect tables are shared by whatever came
@@ -984,6 +1082,32 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     pub fn optimization_level(&self) -> OptimizationLevel {
         self.opt_level
     }
+}
+
+/// The module functions `function` calls or takes the address of, once
+/// each.
+fn direct_callees(function: &HirFunction) -> Vec<HirId> {
+    use crate::hir::{HirCallable, HirInstruction};
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for block in function.blocks.values() {
+        for inst in &block.instructions {
+            let target = match inst {
+                HirInstruction::Call {
+                    callee: HirCallable::Function(id) | HirCallable::FuncRef(id),
+                    ..
+                } => Some(*id),
+                HirInstruction::CreateClosure { function, .. } => Some(*function),
+                _ => None,
+            };
+            if let Some(id) = target {
+                if seen.insert(id) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 64-bit FNV-1a — fast, allocation-free, good enough for cache keys

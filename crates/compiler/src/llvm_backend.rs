@@ -35,6 +35,17 @@ use inkwell::{
     IntPredicate,
 };
 
+/// A function another tier compiled, as a call site here needs it.
+#[derive(Clone, Debug)]
+pub struct CrossTierCallee {
+    pub name: String,
+    pub params: Vec<HirType>,
+    pub returns: Vec<HirType>,
+    pub abi: crate::abi::FunctionAbi,
+    /// Address of the cell holding the callee's current entry.
+    pub cell: usize,
+}
+
 // Helper macro to convert inkwell errors to CompilerError
 macro_rules! llvm_try {
     ($expr:expr) => {
@@ -134,6 +145,20 @@ pub struct LLVMBackend<'ctx> {
     /// has.
     only_compile_reachable: Option<std::collections::HashSet<HirId>>,
 
+    /// Functions this module calls but does not hold: compiled by
+    /// another tier and reached through their cells. See
+    /// [`Self::set_cross_tier_callees`].
+    cross_tier: std::collections::HashMap<HirId, CrossTierCallee>,
+
+    /// Module globals whose storage another tier owns, by address. Such
+    /// a global is declared here and bound to that address by whoever
+    /// loads the module; see [`Self::shared_global_bindings`].
+    shared_globals: std::collections::HashMap<HirId, usize>,
+    /// The declared globals by name with the addresses they stand for.
+    /// By name: the middle end drops a declaration nothing uses, and a
+    /// value handle to one would dangle.
+    shared_global_bindings: Vec<(String, usize)>,
+
     /// The functions a host enters through. These keep the name they
     /// were written with; every other local function is mangled to its
     /// id so two of them cannot share a symbol. Configured, because
@@ -224,7 +249,33 @@ impl<'ctx> LLVMBackend<'ctx> {
             only_compile_reachable: None,
             entry_names: Default::default(),
             x86_target_vnni: false,
+            cross_tier: std::collections::HashMap::new(),
+            shared_globals: std::collections::HashMap::new(),
+            shared_global_bindings: Vec::new(),
         }
+    }
+
+    /// Functions a body may call that this module does not define. A
+    /// call to one loads its cell and calls what the cell holds, with
+    /// the arguments and result shaped by the callee's [`FunctionAbi`],
+    /// which is how the tier that compiled it expects to be entered.
+    pub fn set_cross_tier_callees(
+        &mut self,
+        callees: std::collections::HashMap<HirId, CrossTierCallee>,
+    ) {
+        self.cross_tier = callees;
+    }
+
+    /// Module globals to declare rather than define, with the address
+    /// of their storage in the tier that owns them.
+    pub fn set_shared_globals(&mut self, globals: std::collections::HashMap<HirId, usize>) {
+        self.shared_globals = globals;
+    }
+
+    /// The declared globals, by name, and the addresses they stand for,
+    /// to bind once the module has an execution engine.
+    pub fn shared_global_bindings(&self) -> &[(String, usize)] {
+        &self.shared_global_bindings
     }
 
     /// Register symbol signatures for auto-boxing support
@@ -1088,6 +1139,28 @@ impl<'ctx> LLVMBackend<'ctx> {
     fn compile_global(&mut self, id: HirId, global: &HirGlobal) -> CompilerResult<()> {
         // Create unique name for the global
         let global_name = format!("global__{:?}", id);
+
+        // Storage another tier owns: a declaration here, bound to that
+        // storage when the module is loaded, so both tiers read and
+        // write the one global. Only its address is used through the
+        // declaration; a string's bytes and a table's slots are read
+        // through pointers derived from it.
+        if let Some(&addr) = self.shared_globals.get(&id) {
+            let llvm_ty: BasicTypeEnum = match &global.initializer {
+                Some(HirConstant::String(_)) => self.context.i32_type().into(),
+                _ => self
+                    .translate_type(&global.ty)
+                    .unwrap_or_else(|_| self.context.i64_type().into()),
+            };
+            let global_value =
+                self.module
+                    .add_global(llvm_ty, Some(AddressSpace::default()), &global_name);
+            global_value.set_linkage(inkwell::module::Linkage::External);
+            self.shared_global_bindings.push((global_name, addr));
+            self.globals_map
+                .insert(id, global_value.as_pointer_value().into());
+            return Ok(());
+        }
 
         // Handle string constants specially - emit in Haxe String format: [length: i32][utf8_bytes...]
         // This matches the Cranelift backend format so runtime functions work correctly
@@ -2377,7 +2450,35 @@ impl<'ctx> LLVMBackend<'ctx> {
 
                 // Store function pointer at offset 0
                 // Try to get function from functions map first
-                if let Some(&llvm_func) = self.functions.get(function) {
+                let cross_tier_entry = if self.functions.contains_key(function) {
+                    None
+                } else {
+                    self.cross_tier.get(function).map(|c| c.cell)
+                };
+                if let Some(cell) = cross_tier_entry {
+                    // The callee's current entry, read from its cell.
+                    let cell_ptr = self.builder.build_int_to_ptr(
+                        i64_type.const_int(cell as u64, false),
+                        ptr_type,
+                        "cell",
+                    )?;
+                    let entry = self
+                        .builder
+                        .build_load(i64_type, cell_ptr, "entry")?
+                        .into_int_value();
+                    let fn_slot_ptr = unsafe {
+                        self.builder.build_in_bounds_gep(
+                            closure_type,
+                            closure_alloca,
+                            &[
+                                self.context.i32_type().const_zero(),
+                                self.context.i32_type().const_zero(),
+                            ],
+                            "fn_slot",
+                        )?
+                    };
+                    self.builder.build_store(fn_slot_ptr, entry)?;
+                } else if let Some(&llvm_func) = self.functions.get(function) {
                     // Get function pointer
                     let func_ptr = llvm_func.as_global_value().as_pointer_value();
                     let func_ptr_as_i64 =
@@ -4003,6 +4104,121 @@ impl<'ctx> LLVMBackend<'ctx> {
             .into())
     }
 
+    /// A call to a function another tier compiled: through its cell, in
+    /// the shape its convention gives it. An aggregate argument the body
+    /// holds as a value is spilled to the frame and passed by address,
+    /// one it holds as an address is passed as it is; a struct the callee
+    /// returns through a destination is read back from the storage
+    /// passed for it.
+    fn compile_cross_tier_call(
+        &mut self,
+        callee: &CrossTierCallee,
+        args: &[HirId],
+        expects_value: bool,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        use crate::abi::Pass;
+        if args.len() != callee.params.len() || callee.abi.params.len() != callee.params.len() {
+            return Err(CompilerError::CodeGen(format!(
+                "call to {} passes {} arguments for {} parameters",
+                callee.name,
+                args.len(),
+                callee.params.len()
+            )));
+        }
+        let ptr_ty = self.context.i8_type().ptr_type(AddressSpace::default());
+        let i64t = self.context.i64_type();
+        let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::new();
+        let mut arg_values: Vec<BasicMetadataValueEnum> = Vec::new();
+        let destination = match &callee.abi.destination {
+            Some(ty) => {
+                let llvm_ty = self.translate_type(ty)?;
+                let slot = self.builder.build_alloca(llvm_ty, "ret_dest")?;
+                param_types.push(ptr_ty.into());
+                arg_values.push(slot.into());
+                Some((slot, llvm_ty))
+            }
+            None => None,
+        };
+        for ((arg, ty), pass) in args.iter().zip(&callee.params).zip(&callee.abi.params) {
+            let value = self.get_value(*arg)?;
+            match pass {
+                Pass::Pointer => {
+                    param_types.push(ptr_ty.into());
+                    let address = if value.is_pointer_value() {
+                        value.into_pointer_value()
+                    } else if value.is_int_value() {
+                        self.builder
+                            .build_int_to_ptr(value.into_int_value(), ptr_ty, "arg_addr")?
+                    } else {
+                        let slot = self.builder.build_alloca(value.get_type(), "arg")?;
+                        self.builder.build_store(slot, value)?;
+                        slot
+                    };
+                    arg_values.push(address.into());
+                }
+                Pass::Direct => {
+                    let llvm_ty = self.translate_type(ty)?;
+                    param_types.push(llvm_ty.into());
+                    let coerced: BasicValueEnum = match (llvm_ty, value) {
+                        (BasicTypeEnum::IntType(it), BasicValueEnum::PointerValue(pv)) => {
+                            self.builder.build_ptr_to_int(pv, it, "arg_p2i")?.into()
+                        }
+                        (BasicTypeEnum::PointerType(pt), BasicValueEnum::IntValue(iv)) => {
+                            self.builder.build_int_to_ptr(iv, pt, "arg_i2p")?.into()
+                        }
+                        (BasicTypeEnum::IntType(it), BasicValueEnum::IntValue(iv))
+                            if iv.get_type().get_bit_width() != it.get_bit_width() =>
+                        {
+                            if iv.get_type().get_bit_width() < it.get_bit_width() {
+                                self.builder.build_int_z_extend(iv, it, "arg_ext")?.into()
+                            } else {
+                                self.builder.build_int_truncate(iv, it, "arg_trunc")?.into()
+                            }
+                        }
+                        (_, other) => other,
+                    };
+                    arg_values.push(coerced.into());
+                }
+            }
+        }
+        let fn_type = match (callee.returns.as_slice(), callee.abi.returns.as_slice()) {
+            ([], _) => self.context.void_type().fn_type(&param_types, false),
+            ([_], [Pass::Pointer]) => ptr_ty.fn_type(&param_types, false),
+            ([ret], [Pass::Direct]) => self.translate_type(ret)?.fn_type(&param_types, false),
+            _ => {
+                return Err(CompilerError::CodeGen(format!(
+                    "call to {} across tiers: several return values",
+                    callee.name
+                )))
+            }
+        };
+        let cell = self.builder.build_int_to_ptr(
+            i64t.const_int(callee.cell as u64, false),
+            ptr_ty,
+            "cell",
+        )?;
+        let target = self
+            .builder
+            .build_load(ptr_ty, cell, "entry")?
+            .into_pointer_value();
+        let call_site =
+            self.builder
+                .build_indirect_call(fn_type, target, &arg_values, "cross_tier_call")?;
+        if let Some((slot, llvm_ty)) = destination {
+            return Ok(self.builder.build_load(llvm_ty, slot, "ret")?);
+        }
+        match call_site.try_as_basic_value() {
+            ValueKind::Basic(val) => Ok(val),
+            ValueKind::Instruction(_) if !expects_value => {
+                Ok(self.context.i32_type().get_undef().into())
+            }
+            ValueKind::Instruction(_) => Err(CompilerError::CodeGen(format!(
+                "call to {} returns void but its result is bound",
+                callee.name
+            ))),
+        }
+    }
+
     /// `expects_value` is whether the HIR call binds a result. A void
     /// callee still has to yield something for the return type; when no
     /// result was asked for that stand-in is dropped, and when one was it
@@ -4015,6 +4231,13 @@ impl<'ctx> LLVMBackend<'ctx> {
         expects_value: bool,
     ) -> CompilerResult<BasicValueEnum<'ctx>> {
         match callee {
+            HirCallable::Function(func_id)
+                if !self.functions.contains_key(func_id)
+                    && self.cross_tier.contains_key(func_id) =>
+            {
+                let callee = self.cross_tier[func_id].clone();
+                self.compile_cross_tier_call(&callee, args, expects_value)
+            }
             HirCallable::Function(func_id) => {
                 // Direct function call
                 let function = self.functions.get(func_id).ok_or_else(|| {
