@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use zyntax_typed_ast::{InternedString, TypedProgram};
 
 const MAGIC: &[u8; 4] = b"ZAST";
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const HEADER_LEN: usize = MAGIC.len() + std::mem::size_of::<u32>();
 
 /// A parsed import packaged by the application at build time.
@@ -104,8 +104,9 @@ impl CompiledImport {
             program: self.program.clone(),
             type_registry: self.program.type_registry.clone(),
         };
-        let mut encoded = Vec::new();
-        ciborium::into_writer(&payload, &mut encoded)
+        // Postcard: a fixed field order and no field names, decoded in
+        // a fraction of the time a self-describing format takes.
+        let encoded = postcard::to_allocvec(&payload)
             .map_err(|e| CompiledArtifactError::Encode(e.to_string()))?;
         let mut bytes = Vec::with_capacity(HEADER_LEN + encoded.len());
         bytes.extend_from_slice(MAGIC);
@@ -130,7 +131,7 @@ impl CompiledImport {
                 expected: SCHEMA_VERSION,
             });
         }
-        let payload: CompiledImportPayload = ciborium::from_reader(&bytes[HEADER_LEN..])
+        let payload: CompiledImportPayload = postcard::from_bytes(&bytes[HEADER_LEN..])
             .map_err(|e| CompiledArtifactError::Decode(e.to_string()))?;
         let mut program = payload.program;
         program.type_registry = payload.type_registry;
