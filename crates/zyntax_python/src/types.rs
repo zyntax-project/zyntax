@@ -925,6 +925,23 @@ pub(crate) fn annotated_value(
     }
 }
 
+/// The element kind an empty list literal takes from the annotation
+/// on its binding, `xs: list[str] = []`, when the annotation names
+/// one: the literal has no element to say otherwise.
+pub(crate) fn annotated_empty_list(
+    classes: &HashMap<String, usize>,
+    annotation: &py::Expr,
+    value: &py::Expr,
+) -> Option<Elem> {
+    match value {
+        py::Expr::List(l) if l.elts.is_empty() => match annotation_in(classes, annotation) {
+            Ty::List(e) if e != Elem::Object => Some(e),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Signature from the annotations alone; an unannotated return is
 /// `Unknown` until the body says.
 pub(crate) fn declared_sig(f: &py::StmtFunctionDef) -> Sig {
@@ -1960,6 +1977,10 @@ impl Walker<'_> {
                     // unannotated parameter is one.
                     let ty = if is_dynamic_annotation(&a.annotation) {
                         Ty::Object
+                    } else if let Some(e) =
+                        annotated_empty_list(&self.module.class_index, &a.annotation, v)
+                    {
+                        Ty::List(e)
                     } else {
                         annotated_value(&self.module.class_index, &a.annotation, self.expr(v))
                     };

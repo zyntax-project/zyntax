@@ -2032,6 +2032,15 @@ impl<'m> Lowerer<'m> {
                 // An annotation converts nothing: `x: float = 3` binds the
                 // int 3. A dynamic value is read back as the annotation
                 // says, with the check a parameter's annotation gets.
+                if let Some(e) =
+                    types::annotated_empty_list(&self.module.class_index, &a.annotation, v)
+                {
+                    let value = Val {
+                        node: self.list_of(Vec::new(), e, span),
+                        ty: Ty::List(e),
+                    };
+                    return self.bind(&a.target, value, span, out);
+                }
                 let value = self.expr(v)?;
                 let declared =
                     types::annotated_value(&self.module.class_index, &a.annotation, value.ty);
