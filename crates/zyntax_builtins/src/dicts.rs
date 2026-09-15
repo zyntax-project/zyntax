@@ -68,6 +68,9 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
     // Every function edits the dict in place; only boxing keeps it.
     let d = borrowed("d", anys.clone());
     let k = kept("k", any());
+    // The lookups read the key and keep nothing, so a box made for one
+    // is the caller's to release straight after the call.
+    let key = borrowed("k", any());
     let v = kept("v", any());
     // Returned when the key is absent, so the caller cannot release it.
     let default = kept("default", any());
@@ -207,7 +210,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
         let find_hashed = format!("zb_dict_find_hashed{suffix}");
         out_decls.push(define(
             &find_hashed,
-            &[&d, &k, &h],
+            &[&d, &key, &h],
             i64(),
             vec![
                 index.decl(index_of(d.e())),
@@ -236,7 +239,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
         ));
         out_decls.push(define(
             &format!("zb_dict_find{suffix}"),
-            &[&d, &k],
+            &[&d, &key],
             i64(),
             vec![
                 when(
@@ -321,13 +324,13 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
     out_decls.push(define("zb_dict_len", &[&d], i64(), vec![ret(count(d.e()))]));
     out_decls.push(define(
         "zb_dict_contains",
-        &[&d, &k],
+        &[&d, &key],
         boolean(),
         vec![ret(ge(find(k.e()), int(0)))],
     ));
     out_decls.push(define(
         "zb_dict_get",
-        &[&d, &k],
+        &[&d, &key],
         any(),
         vec![
             i.decl(find(k.e())),
@@ -337,7 +340,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
     ));
     out_decls.push(define(
         "zb_dict_get_default",
-        &[&d, &k, &default],
+        &[&d, &key, &default],
         any(),
         vec![
             i.decl(find(k.e())),
@@ -408,7 +411,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
             ),
         ]
     };
-    out_decls.push(define("zb_dict_del", &[&d, &k], unit(), {
+    out_decls.push(define("zb_dict_del", &[&d, &key], unit(), {
         let mut s = vec![
             i.decl(find(k.e())),
             when(lt(i.e(), int(0)), vec![fatal("KeyError", any_str(k.e()))]),
@@ -417,7 +420,7 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
         s.push(ret_void());
         s
     }));
-    out_decls.push(define("zb_dict_pop", &[&d, &k], any(), {
+    out_decls.push(define("zb_dict_pop", &[&d, &key], any(), {
         let mut s = vec![
             i.decl(find(k.e())),
             when(lt(i.e(), int(0)), vec![fatal("KeyError", any_str(k.e()))]),
@@ -427,16 +430,21 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
         s.push(ret(v.e()));
         s
     }));
-    out_decls.push(define("zb_dict_pop_default", &[&d, &k, &default], any(), {
-        let mut s = vec![
-            i.decl(find(k.e())),
-            when(lt(i.e(), int(0)), vec![ret(default.e())]),
-            v.decl(at(d.e(), add(i.e(), int(1)))),
-        ];
-        s.extend(remove_pair(&i));
-        s.push(ret(v.e()));
-        s
-    }));
+    out_decls.push(define(
+        "zb_dict_pop_default",
+        &[&d, &key, &default],
+        any(),
+        {
+            let mut s = vec![
+                i.decl(find(k.e())),
+                when(lt(i.e(), int(0)), vec![ret(default.e())]),
+                v.decl(at(d.e(), add(i.e(), int(1)))),
+            ];
+            s.extend(remove_pair(&i));
+            s.push(ret(v.e()));
+            s
+        },
+    ));
     // Every key, every value, every (key, value) tuple, in order.
     for (name, offset) in [("zb_dict_keys", 0), ("zb_dict_values", 1)] {
         out_decls.push(define(name, &[&d], anys.clone(), {
@@ -664,6 +672,8 @@ fn set(list_type: TypeId) -> Vec<Decl> {
     let s = local("s", anys.clone());
     let other = local("other", anys.clone());
     let v = kept("v", any());
+    // Discarding reads the value and keeps nothing.
+    let value = borrowed("v", any());
     let i = local("i", i64());
     let n = local("n", i64());
     let out = local("out", anys.clone());
@@ -684,7 +694,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
     ));
     d.push(define(
         "zb_set_discard",
-        &[&s, &v],
+        &[&s, &value],
         unit(),
         vec![
             i.decl(call("zb_list_index_or_neg_any", vec![s.e(), v.e()], i64())),
@@ -697,7 +707,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
     ));
     d.push(define(
         "zb_set_remove",
-        &[&s, &v],
+        &[&s, &value],
         unit(),
         vec![
             i.decl(call("zb_list_index_or_neg_any", vec![s.e(), v.e()], i64())),
