@@ -4257,6 +4257,70 @@ impl<'m> Lowerer<'m> {
                         span,
                     )
                 }
+                (Ty::Object, Ty::Object)
+                    if matches!(
+                        op,
+                        py::Operator::Add
+                            | py::Operator::Sub
+                            | py::Operator::Mult
+                            | py::Operator::Div
+                    ) =>
+                {
+                    // Numeric containers lose their element type when boxed.
+                    // Keep the common float operation in the caller and use
+                    // the full dispatcher for every other pair of values.
+                    const FLOAT_CATEGORY: i64 = 4;
+                    let bin = match op {
+                        py::Operator::Add => BinaryOp::Add,
+                        py::Operator::Sub => BinaryOp::Sub,
+                        py::Operator::Mult => BinaryOp::Mul,
+                        py::Operator::Div => BinaryOp::Div,
+                        _ => unreachable!(),
+                    };
+                    let mut pre = Vec::new();
+                    let l = self.hold(left, &mut pre, span);
+                    let r = self.hold(right, &mut pre, span);
+                    let is_float = |v: &Val| {
+                        binary(
+                            BinaryOp::Eq,
+                            call("zb_any_category", vec![v.node.clone()], Ty::Int, span),
+                            int_lit(FLOAT_CATEGORY, span),
+                            Ty::Bool,
+                            span,
+                        )
+                    };
+                    let both_float =
+                        binary(BinaryOp::And, is_float(&l), is_float(&r), Ty::Bool, span);
+                    let lf = call("zb_box_get_f64", vec![l.node.clone()], Ty::Float, span);
+                    let rf = call("zb_box_get_f64", vec![r.node.clone()], Ty::Float, span);
+                    let fast = call(
+                        "zb_box_f64",
+                        vec![binary(bin, lf, rf, Ty::Float, span)],
+                        Ty::Object,
+                        span,
+                    );
+                    let slow = call("zb_any_arith", vec![code, l.node, r.node], Ty::Object, span);
+                    let mut slow_pre = Vec::new();
+                    let slow = self.hold(
+                        Val {
+                            node: slow,
+                            ty: Ty::Object,
+                        },
+                        &mut slow_pre,
+                        span,
+                    );
+                    slow_pre.push(self.pending_check(span));
+                    let chosen = self.conditional_value(
+                        both_float,
+                        (Vec::new(), fast),
+                        (slow_pre, slow.node),
+                        Ty::Object,
+                        span,
+                        &mut pre,
+                    );
+                    self.hoisted.extend(pre);
+                    chosen
+                }
                 _ => {
                     let l = self.coerce(left, Ty::Object);
                     let r = self.coerce(right, Ty::Object);
