@@ -28,7 +28,22 @@ impl Scope {
             .iter_non_variadic_params()
             .map(|p| p.parameter.name.to_string())
             .collect();
-        Self::of_body(params, &f.body)
+        let mut collector = Collector::default();
+        for s in &f.body {
+            collector.visit_stmt(s);
+        }
+        // A default is evaluated where the function is defined, and a
+        // call leaving the argument out evaluates it there too, so the
+        // names it reads are the function's to reach.
+        let mut defaults = Collector::default();
+        for p in f.parameters.iter_non_variadic_params() {
+            if let Some(d) = &p.default {
+                defaults.visit_expr(d);
+            }
+        }
+        let mut scope = collector.finish(params);
+        scope.free.extend(defaults.loads);
+        scope
     }
 
     pub(crate) fn of_lambda(l: &py::ExprLambda) -> Scope {

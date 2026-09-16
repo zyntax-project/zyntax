@@ -16,6 +16,19 @@ pub const MAX_CALL_ARITY: usize = 8;
 /// A record whose code takes the record and a boxed list of arguments.
 pub const VARIADIC_ARITY: i64 = -1;
 
+/// The arity word of a record whose function takes `min` to `max`
+/// arguments: the code takes `max`, and a call passing fewer fills the
+/// rest with the missing-argument marker for the code to replace by
+/// the defaults kept in the record. A word without the high half is a
+/// function taking exactly `max`.
+pub fn arity_word(min: usize, max: usize) -> i64 {
+    if min == max {
+        max as i64
+    } else {
+        (max as i64) | (((min as i64) + 1) << 16)
+    }
+}
+
 /// The type of a function value's code: the record, then `arity`
 /// dynamic arguments, to a dynamic result.
 pub fn code_type(list_type: TypeId, arity: usize) -> Type {
@@ -51,12 +64,17 @@ pub fn fiber_type() -> Type {
 
 pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let anys = list_of(list_type, any());
-    let mut d = vec![extern_fn(
-        "zb_box_fnptr_raw",
-        &[("f", usize()), ("tag", i32())],
-        any(),
-        Some("zyntax_box_ptr"),
-    )];
+    let mut d = vec![
+        extern_fn(
+            "zb_box_fnptr_raw",
+            &[("f", usize()), ("tag", i32())],
+            any(),
+            Some("zyntax_box_ptr"),
+        ),
+        // The marker a call through a value passes for an argument it
+        // leaves out: one address, compared by identity.
+        extern_fn("zb_missing_arg", &[], any(), Some("$Host$missing_arg")),
+    ];
 
     // A fiber body takes nothing; what it needs travels as an
     // environment it reads back when it starts.
@@ -95,6 +113,8 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     // A record from a code address, an arity and the shared cells.
     let code = local("code", usize());
     let arity = local("arity", i64());
+    let most = local("most", i64());
+    let least = local("least", i64());
     let cells = local("cells", anys.clone());
     let rec = local("rec", anys.clone());
     d.push(define(
@@ -202,26 +222,61 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                         )),
                     ]
                 }),
+                // The word is `max`, with `min + 1` above bit 16 when
+                // the function has defaults.
+                most.decl(bitand(arity.e(), int(0xFFFF))),
+                least.decl(shr(arity.e(), int(16))),
+                if_(
+                    eq(least.e(), int(0)),
+                    vec![least.set(most.e())],
+                    vec![least.set(sub(least.e(), int(1)))],
+                ),
                 when(
-                    ne(arity.e(), int(n as i64)),
+                    or(lt(int(n as i64), least.e()), gt(int(n as i64), most.e())),
                     vec![fatal(
                         "TypeError",
                         add(
                             add(
                                 text("function takes "),
-                                call("zb_str_of_int", vec![arity.e()], string()),
+                                call("zb_str_of_int", vec![most.e()], string()),
                             ),
                             text(&format!(" positional arguments but {n} were given")),
                         ),
                     )],
                 ),
+            ]
+            .into_iter()
+            .chain((n + 1..=MAX_CALL_ARITY).map(|m| {
+                // A function taking more than was passed gets the marker
+                // for the rest.
+                let wide_ty = code_type(list_type, m);
+                let wide = local("wide", wide_ty.clone());
+                let mut wide_args = vec![rec.e()];
+                wide_args.extend(args[..n].iter().map(|a| a.e()));
+                for _ in n..m {
+                    wide_args.push(call("zb_missing_arg", vec![], any()));
+                }
+                when(
+                    eq(most.e(), int(m as i64)),
+                    vec![
+                        wide.decl(call(
+                            &fp_name(m),
+                            vec![idx(rec.e(), int(0), any())],
+                            wide_ty,
+                        )),
+                        ret(call("wide", wide_args, any())),
+                    ],
+                )
+            }))
+            .chain([
                 fp.decl(call(
                     &fp_name(n),
                     vec![idx(rec.e(), int(0), any())],
                     code_ty,
                 )),
                 ret(call("fp", call_args, any())),
-            ],
+            ])
+            .collect(),
         ));
     }
     d

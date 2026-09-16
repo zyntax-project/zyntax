@@ -480,12 +480,20 @@ pub(crate) fn adapter(module: &Module, name: &str, sig: &Sig) -> TypedFunction {
     lowerer.guards = false;
     let mut params = vec![parameter("env", Ty::List(Elem::Object), span)];
     let mut args = Vec::new();
+    let first_default = sig.params.len() - sig.defaults.iter().flatten().count();
     for (i, (_, ty)) in sig.params.iter().enumerate() {
         let arg = format!("a{i}");
         params.push(parameter(&arg, Ty::Object, span));
+        let given = var(intern(&arg), Ty::Object, span);
+        // An argument left out takes the default kept in the record.
+        let given = if i >= first_default {
+            lowerer.or_default(given, RECORD_CELLS_AT + (i - first_default), span)
+        } else {
+            given
+        };
         args.push(lowerer.coerce(
             Val {
-                node: var(intern(&arg), Ty::Object, span),
+                node: given,
                 ty: Ty::Object,
             },
             *ty,
@@ -578,6 +586,9 @@ pub(crate) struct Lowerer<'m> {
     /// instance-typed parameters to be instances; see
     /// [`types::trusted_name`].
     pub(crate) trusted: bool,
+    /// How many cells the record of this lifted function holds before
+    /// the defaults of its parameters.
+    defaults_after_cells: usize,
     /// Variables shared with nested functions. Each lives in a
     /// one-element list, the cell, that every function using it holds.
     cells: HashMap<String, InternedString>,
@@ -704,6 +715,7 @@ impl<'m> Lowerer<'m> {
             always_instance: std::collections::HashSet::new(),
             nonnull_fields: std::collections::HashSet::new(),
             trusted: false,
+            defaults_after_cells: 0,
             guards: true,
             cells: cells
                 .into_iter()
@@ -3750,7 +3762,7 @@ impl<'m> Lowerer<'m> {
                 if !self.is_variable(n.id.as_str())
                     && self.module.funcs.contains_key(n.id.as_str()) =>
             {
-                self.function_value(n.id.as_str(), span)
+                self.function_value(n.id.as_str(), span)?
             }
             py::Expr::Name(n)
                 if n.id.as_str() == "range"
@@ -7804,12 +7816,25 @@ impl<'m> Lowerer<'m> {
     }
 
     /// A function record: the code address, the arity and the cells.
-    fn record(&mut self, code: &str, arity: usize, cells: Vec<Val>, span: Span) -> Val {
+    /// A function record: the code, the arity word, the cells, then the
+    /// values of the parameters with defaults, evaluated here once, as
+    /// Python evaluates them where the function is defined.
+    fn record(
+        &mut self,
+        code: &str,
+        arity: usize,
+        mut cells: Vec<Val>,
+        defaults: Vec<Val>,
+        span: Span,
+    ) -> Val {
+        let least = arity - defaults.len();
+        cells.extend(defaults);
         let cells = self.list_of(cells, Elem::Object, span);
+        let word = zyntax_builtins::functions::arity_word(least, arity);
         Val {
             node: call(
                 "zb_func_new",
-                vec![code_of(code, span), int_lit(arity as i64, span), cells],
+                vec![code_of(code, span), int_lit(word, span), cells],
                 Ty::Object,
                 span,
             ),
@@ -7817,12 +7842,32 @@ impl<'m> Lowerer<'m> {
         }
     }
 
+    /// The defaults of a signature, evaluated and boxed, in parameter
+    /// order; Python allows them only at the end of the parameters.
+    fn default_values(&mut self, sig: &Sig) -> Result<Vec<Val>> {
+        let mut out = Vec::new();
+        for d in sig.defaults.iter().flatten() {
+            out.push(self.expr_as(d, Ty::Object).map(|node| Val {
+                node,
+                ty: Ty::Object,
+            })?);
+        }
+        Ok(out)
+    }
+
     /// A module function as a value, through an adapter that unboxes
     /// the arguments and boxes the result.
-    fn function_value(&mut self, name: &str, span: Span) -> Val {
+    fn function_value(&mut self, name: &str, span: Span) -> Result<Val> {
         let sig = self.module.funcs[name].clone();
         self.module.adapters.borrow_mut().insert(name.to_string());
-        self.record(&adapter_name(name), sig.params.len(), Vec::new(), span)
+        let defaults = self.default_values(&sig)?;
+        Ok(self.record(
+            &adapter_name(name),
+            sig.params.len(),
+            Vec::new(),
+            defaults,
+            span,
+        ))
     }
 
     /// A `def` inside this function: lifted to a function of its own
@@ -7867,18 +7912,24 @@ impl<'m> Lowerer<'m> {
             };
             let function = child.function_named(f, &fiber)?;
             self.module.lifted.borrow_mut().push(function);
+            if child.sig.defaults.iter().any(Option::is_some) {
+                return unsupported("a default on a nested generator", &*f.parameters);
+            }
             let adapter = self.generator_starter(&starter, &fiber, &child.sig.clone(), span);
             self.module.lifted.borrow_mut().push(adapter);
             let cells = self.cells_of(&captured, span);
-            return Ok(self.record(&starter, params.len(), cells, span));
+            return Ok(self.record(&starter, params.len(), cells, Vec::new(), span));
         }
         let mut body = Vec::new();
         for s in &f.body {
             child.stmt(s, &mut body)?;
         }
+        child.defaults_after_cells = captured.len();
         self.lift(&mut child, known.as_ref(), &lifted, &params, body, f)?;
         let cells = self.cells_of(&captured, span);
-        Ok(self.record(&lifted, params.len(), cells, span))
+        let sig = child.sig.clone();
+        let defaults = self.default_values(&sig)?;
+        Ok(self.record(&lifted, params.len(), cells, defaults, span))
     }
 
     /// The function a generator's record names: the shape every
@@ -7949,9 +8000,6 @@ impl<'m> Lowerer<'m> {
                 return unsupported("*args / **kwargs", &**ps);
             }
             for p in ps.iter_non_variadic_params() {
-                if p.default.is_some() {
-                    return unsupported("a default in a lambda", p);
-                }
                 params.push((p.parameter.name.to_string(), Ty::Object));
             }
         }
@@ -7960,7 +8008,15 @@ impl<'m> Lowerer<'m> {
             None => Sig {
                 params: params.clone(),
                 ret: Ty::Object,
-                defaults: vec![None; params.len()],
+                defaults: l
+                    .parameters
+                    .as_ref()
+                    .map(|ps| {
+                        ps.iter_non_variadic_params()
+                            .map(|p| p.default.as_deref().cloned())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             },
         };
         let params = sig.params.clone();
@@ -7990,9 +8046,12 @@ impl<'m> Lowerer<'m> {
             Type::Unknown,
             span,
         ));
+        child.defaults_after_cells = captured.len();
         self.lift(&mut child, known.as_ref(), &lifted, &params, body, l)?;
         let cells = self.cells_of(&captured, span);
-        Ok(self.record(&lifted, params.len(), cells, span))
+        let sig = child.sig.clone();
+        let defaults = self.default_values(&sig)?;
+        Ok(self.record(&lifted, params.len(), cells, defaults, span))
     }
 
     /// What inference knows of the closure defined at `start` of the
@@ -8226,6 +8285,38 @@ impl<'m> Lowerer<'m> {
     /// This function in the shape every function value has: the record
     /// first, each argument a dynamic value unboxed to its declared type
     /// in a prologue, the result boxed.
+    /// `given` unless it is the missing-argument marker, then the record's
+    /// element at `slot`.
+    fn or_default(&mut self, given: Node, slot: usize, span: Span) -> Node {
+        let missing = call(
+            "zb_any_same",
+            vec![
+                given.clone(),
+                call("zb_missing_arg", vec![], Ty::Object, span),
+            ],
+            Ty::Bool,
+            span,
+        );
+        let kept = call(
+            "zb_list_get_any",
+            vec![
+                var(intern("env"), Ty::List(Elem::Object), span),
+                int_lit(slot as i64, span),
+            ],
+            Ty::Object,
+            span,
+        );
+        node(
+            TypedExpression::If(TypedIfExpr {
+                condition: Box::new(missing),
+                then_branch: Box::new(kept),
+                else_branch: Box::new(given),
+            }),
+            Ty::Object,
+            span,
+        )
+    }
+
     fn lifted_function(
         &mut self,
         name: &str,
@@ -8235,13 +8326,26 @@ impl<'m> Lowerer<'m> {
     ) -> TypedFunction {
         let mut typed_params = vec![parameter("env", Ty::List(Elem::Object), span)];
         let mut statements = Vec::new();
+        let first_default = params.len() - self.sig.defaults.iter().flatten().count();
         for (i, (pname, declared)) in params.iter().enumerate() {
             let arg = format!("a{i}");
             typed_params.push(parameter(&arg, Ty::Object, span));
             let local = self.var_ty(pname);
+            let given = var(intern(&arg), Ty::Object, span);
+            // An argument left out arrives as the marker and takes the
+            // default the record keeps after the cells.
+            let given = if i >= first_default {
+                self.or_default(
+                    given,
+                    RECORD_CELLS_AT + self.defaults_after_cells + (i - first_default),
+                    span,
+                )
+            } else {
+                given
+            };
             let value = self.coerce(
                 Val {
-                    node: var(intern(&arg), Ty::Object, span),
+                    node: given,
                     ty: Ty::Object,
                 },
                 *declared,

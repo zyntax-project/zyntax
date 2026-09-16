@@ -43,8 +43,18 @@ extern "C" fn host_perf_counter() -> f64 {
         .as_secs_f64()
 }
 
+/// The one address a call through a function value passes for an
+/// argument it leaves out; the function's code replaces it by the
+/// default it keeps. Shaped like a box so that reading it by mistake
+/// finds None rather than garbage.
+static MISSING_ARG: [u64; 6] = [0; 6];
+
+extern "C" fn host_missing_arg() -> *const u8 {
+    MISSING_ARG.as_ptr() as *const u8
+}
+
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 4] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 5] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$time".as_ptr(), host_time as *const u8),
@@ -52,6 +62,7 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 4] = [
         c"$Host$perf_counter".as_ptr(),
         host_perf_counter as *const u8,
     ),
+    zrtl::ZrtlSymbol::new(c"$Host$missing_arg".as_ptr(), host_missing_arg as *const u8),
 ];
 
 /// The host's symbols as a plugin the runtime links like any other.
