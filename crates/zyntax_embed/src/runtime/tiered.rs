@@ -518,7 +518,7 @@ impl TieredRuntime {
     fn compile_module_entered(
         &mut self,
         mut module: HirModule,
-        entered: Option<Vec<String>>,
+        mut entered: Option<Vec<String>>,
     ) -> RuntimeResult<()> {
         // What the entry points cannot reach is dropped before the
         // optimisers run, so they walk the program rather than the
@@ -593,11 +593,18 @@ impl TieredRuntime {
         // Boxes of booleans and small integers are the shared ones: the
         // code runs in this process, where their addresses hold.
         zyntax_compiler::boxes::set_interning(true);
-        // String constants that are boxed are boxed once, at start.
-        if let Some(names) = &entered {
-            let names: Vec<&str> = names.iter().map(String::as_str).collect();
-            zyntax_compiler::const_boxes::run_module(&mut module, &names);
-        }
+        // Keep the initializer reachable for codegen, then run it once
+        // after the module's globals and functions have been installed.
+        let init_boxed_constants = if let Some(names) = &mut entered {
+            if zyntax_compiler::const_boxes::run_module(&mut module) > 0 {
+                names.push(zyntax_compiler::const_boxes::INIT_FUNCTION.to_owned());
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         // Run interp-safe HIR opts before backend installation. Without this,
         // user programs run through `TieredRuntime::compile_module` never get
@@ -652,6 +659,9 @@ impl TieredRuntime {
         let started = std::time::Instant::now();
         self.backend
             .compile_module_lazily(module, reachable, lazy, finished)?;
+        if init_boxed_constants {
+            self.call::<()>(zyntax_compiler::const_boxes::INIT_FUNCTION, &[])?;
+        }
         if trace {
             eprintln!(
                 "[OPT] codegen               {:8.2} ms",

@@ -5,8 +5,8 @@
 //! dict key inside a loop is once a row. The bytes are immutable and no
 //! box of them is distinguishable from another, so one box serves every
 //! use. Each boxed constant gets a global holding its box, a function
-//! makes the boxes once, each entry point calls that function first,
-//! and the use loads the global.
+//! makes the boxes once when the module is installed, and each use
+//! loads the global.
 //!
 //! Runs before the release analysis: a load is not an allocation, so
 //! no use releases a box it did not make. The globals are writable, so
@@ -28,9 +28,9 @@ pub const INIT_FUNCTION: &str = "__zyntax_box_constants";
 /// name, taking the string as their only argument.
 const BOXERS: &[&str] = &["$IO$string_to_dynamic", "zyntax_box_str", "zb_box_str"];
 
-/// Box every string constant once. `entries` names the functions a host
-/// enters through; each gets the call that makes the boxes.
-pub fn run_module(module: &mut HirModule, entries: &[&str]) -> usize {
+/// Prepare one box per string constant for the host to initialize after
+/// installing the module. Returns the number of replaced boxing sites.
+pub fn run_module(module: &mut HirModule) -> usize {
     // Which callees box a string.
     let mut boxers: HashSet<HirId> = HashSet::new();
     for (id, f) in &module.functions {
@@ -150,9 +150,9 @@ pub fn run_module(module: &mut HirModule, entries: &[&str]) -> usize {
         };
     }
 
-    // The function that makes them, called first by every entry. A
-    // program may have several entries and enter one many times, so
-    // the function keeps a flag and makes the boxes once.
+    // The function that makes them is called by the host after codegen.
+    // Keep the flag so a repeated initialization cannot replace boxes
+    // already reachable from compiled code.
     let flag = HirId::new();
     module.globals.insert(
         flag,
@@ -170,29 +170,6 @@ pub fn run_module(module: &mut HirModule, entries: &[&str]) -> usize {
     let init = make_init(&made, &box_ty, flag, module);
     let init_id = init.id;
     module.functions.insert(init_id, init);
-    for f in module.functions.values_mut() {
-        let is_entry = f
-            .name
-            .resolve_global()
-            .is_some_and(|n| entries.contains(&n.as_str()));
-        if !is_entry || f.is_external {
-            continue;
-        }
-        let entry = f.entry_block;
-        if let Some(block) = f.blocks.get_mut(&entry) {
-            block.instructions.insert(
-                0,
-                HirInstruction::Call {
-                    result: None,
-                    callee: HirCallable::Function(init_id),
-                    args: Vec::new(),
-                    type_args: Vec::new(),
-                    const_args: Vec::new(),
-                    is_tail: false,
-                },
-            );
-        }
-    }
     sites.len()
 }
 
