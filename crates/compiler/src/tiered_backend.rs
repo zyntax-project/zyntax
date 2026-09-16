@@ -2133,16 +2133,6 @@ impl TieredBackend {
                 })
                 .collect();
 
-        // The bead of each function, for queueing a promoted function's
-        // callees after it.
-        let bead_of: Arc<HashMap<HirId, u64>> = Arc::new(
-            self.functions
-                .iter()
-                .map(|(id, e)| (*id, e.bead_id))
-                .collect(),
-        );
-        let top_tier = tier_idx == OptimizationTier::Optimized.index();
-
         osr::set_promotion_requester(move |bead_id| {
             let Some((func_id, bound, swapped, module_arc)) = by_bead.get(&bead_id) else {
                 if osr::osr_trace_enabled() {
@@ -2187,7 +2177,6 @@ impl TieredBackend {
             #[cfg(feature = "llvm-backend")]
             let llvm = llvm.clone();
             let func_id = *func_id;
-            let bead_of = Arc::clone(&bead_of);
             // The compile itself runs on a broker thread, so raising the
             // request costs the running loop only the submission.
             let submitted = adapter.force_promote(bound, tier_idx, move |bead| {
@@ -2208,18 +2197,6 @@ impl TieredBackend {
                 if !entry.is_null() {
                     let key = cranelift.with_lock(|be| be.reload_key());
                     crate::reload::set_call_target(key, func_id, entry as usize);
-                }
-                // The top tier compiles one function and reaches its
-                // callees through their cells, so a callee is promoted
-                // on its own, after its caller, when the top tier has
-                // something to gain on it. Nothing else ever asks:
-                // compiled code counts no calls.
-                if top_tier && !entry.is_null() {
-                    for callee in promotable_callees(&func_arc, &module_arc) {
-                        if let Some(&callee_bead) = bead_of.get(&callee) {
-                            osr::osr_request_promotion(callee_bead);
-                        }
-                    }
                 }
                 entry
             });
@@ -2323,6 +2300,8 @@ impl TieredBackend {
             let _ = handle.join();
         }
         for entry in self.functions.values() {
+            // Queued broker jobs are obsolete once the runtime stops.
+            entry.bound.bead().invalidate();
             osr::unregister_bead(entry.bead_id);
         }
         self.functions.clear();
@@ -2507,83 +2486,6 @@ fn clamp_to_u32(v: u64) -> u32 {
     } else {
         v as u32
     }
-}
-
-/// The module functions `function` calls that the top tier could
-/// improve: not an extern, not the function itself, reachable by a call
-/// both tiers read the same way (a scalar signature), and holding a
-/// loop, a recursion, or enough straight-line work to be worth a
-/// compile. A refusal is remembered: the same function is proposed
-/// again on every promotion of any caller.
-fn promotable_callees(function: &HirFunction, module: &HirModule) -> Vec<HirId> {
-    use crate::hir::{HirCallable, HirInstruction};
-    static REFUSED: std::sync::OnceLock<Mutex<HashSet<HirId>>> = std::sync::OnceLock::new();
-    let refused = REFUSED.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for block in function.blocks.values() {
-        for inst in &block.instructions {
-            let HirInstruction::Call {
-                callee: HirCallable::Function(callee),
-                ..
-            } = inst
-            else {
-                continue;
-            };
-            let callee = *callee;
-            if callee == function.id || !seen.insert(callee) {
-                continue;
-            }
-            if refused
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&callee)
-            {
-                continue;
-            }
-            let Some(f) = module.functions.get(&callee) else {
-                continue;
-            };
-            if f.is_external || !has_headroom(f) {
-                refused
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(callee);
-                continue;
-            }
-            out.push(callee);
-        }
-    }
-    out
-}
-
-/// Whether the top tier has something to work with: a loop, a call to
-/// itself, or a body long enough that scheduling and register choice
-/// pay. A leaf of a few instructions has no headroom at any tier.
-fn has_headroom(f: &HirFunction) -> bool {
-    use crate::hir::{HirCallable, HirInstruction};
-    if !crate::abi::llvm_entry_abi_supported(f, false) || !llvm_list_entry_has_headroom(f) {
-        return false;
-    }
-    if !osr::find_loop_headers(f).is_empty() {
-        return true;
-    }
-    let mut instructions = 0usize;
-    for block in f.blocks.values() {
-        instructions += block.instructions.len();
-        for inst in &block.instructions {
-            if let HirInstruction::Call {
-                callee: HirCallable::Function(callee),
-                ..
-            } = inst
-            {
-                if *callee == f.id {
-                    return true;
-                }
-            }
-        }
-    }
-    instructions >= 32
 }
 
 /// Calls across the LLVM/Cranelift boundary stay indirect. Large list-entry
