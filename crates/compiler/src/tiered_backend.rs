@@ -2148,16 +2148,28 @@ impl TieredBackend {
                 if osr::osr_trace_enabled() {
                     eprintln!("[osr] request for unknown bead={bead_id}");
                 }
-                return;
+                return false;
             };
             // The body: the one a reload swapped in, else the module's.
             let func_arc = match swapped {
                 Some(f) => Arc::clone(f),
                 None => match module_arc.functions.get(func_id) {
                     Some(f) => Arc::new(f.clone()),
-                    None => return,
+                    None => return false,
                 },
             };
+            #[cfg(feature = "llvm-backend")]
+            if matches!(tier2_backend, Tier2Backend::LLVM)
+                && !crate::abi::function_abi(&func_arc, false).is_scalar()
+            {
+                if osr::osr_trace_enabled() {
+                    eprintln!(
+                        "[osr] LLVM promotion unavailable for {}: aggregate ABI",
+                        func_arc.name.resolve_global().unwrap_or_default()
+                    );
+                }
+                return true;
+            }
             let module_arc = Arc::clone(module_arc);
             let cranelift = Arc::clone(&cranelift);
             #[cfg(feature = "llvm-backend")]
@@ -2200,8 +2212,12 @@ impl TieredBackend {
                 entry
             });
             if osr::osr_trace_enabled() {
-                eprintln!("[osr] force_promote(bead={bead_id}, tier={tier_idx}) -> {submitted}");
+                eprintln!(
+                    "[osr] force_promote({:?}, bead={bead_id}, tier={tier_idx}) -> {submitted}",
+                    func_id
+                );
             }
+            submitted
         });
     }
 
@@ -2285,6 +2301,9 @@ impl TieredBackend {
     /// Releases bead registrations on shutdown so a long-lived process
     /// reusing `TieredBackend` instances doesn't leak entries.
     pub fn shutdown(&mut self) {
+        // The global requester owns backend and LLVM handles. Release it
+        // before the LLVM context; the adapter then joins promotion workers.
+        osr::set_promotion_requester(|_| false);
         self.warm_up_stop
             .store(true, std::sync::atomic::Ordering::Release);
         if let Some(handle) = self.warm_up.take() {

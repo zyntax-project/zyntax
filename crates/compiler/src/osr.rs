@@ -824,6 +824,25 @@ mod tests {
     }
 
     #[test]
+    fn rejected_promotion_can_be_requested_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let id = u64::MAX - 43;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        set_promotion_requester(move |bead| {
+            assert_eq!(bead, id);
+            seen.fetch_add(1, Ordering::Relaxed) > 0
+        });
+        osr_request_promotion(id);
+        osr_request_promotion(id);
+        osr_request_promotion(id);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        requested().write().unwrap().remove(&id);
+        set_promotion_requester(|_| false);
+    }
+
+    #[test]
     fn registry_get_and_remove() {
         // Registry is process-global — use a unique id to avoid clashes
         // between tests run in parallel.
@@ -1283,7 +1302,7 @@ pub extern "C" fn lazy_compile(bead_id: u64) -> *const u8 {
 pub const OSR_REQUEST_SYMBOL: &str = "__zyntax_osr_request";
 
 /// Installed by the runtime to queue a top-tier compile for a bead.
-type PromotionRequester = Box<dyn Fn(u64) + Send + Sync>;
+type PromotionRequester = Box<dyn Fn(u64) -> bool + Send + Sync>;
 
 fn promotion_requester() -> &'static RwLock<Option<PromotionRequester>> {
     static R: OnceLock<RwLock<Option<PromotionRequester>>> = OnceLock::new();
@@ -1292,7 +1311,7 @@ fn promotion_requester() -> &'static RwLock<Option<PromotionRequester>> {
 
 /// Register how a promotion request is fulfilled. The runtime owns the
 /// policy — whether to queue, and to which tier.
-pub fn set_promotion_requester(f: impl Fn(u64) + Send + Sync + 'static) {
+pub fn set_promotion_requester(f: impl Fn(u64) -> bool + Send + Sync + 'static) {
     *promotion_requester().write().unwrap() = Some(Box::new(f));
 }
 
@@ -1322,7 +1341,9 @@ pub extern "C" fn osr_request_promotion(bead_id: u64) {
         eprintln!("[osr] promotion requested for bead={bead_id}");
     }
     let guard = promotion_requester().read().unwrap();
-    if let Some(f) = guard.as_ref() {
-        f(bead_id);
+    let submitted = guard.as_ref().is_some_and(|f| f(bead_id));
+    drop(guard);
+    if !submitted {
+        requested().write().unwrap().remove(&bead_id);
     }
 }
