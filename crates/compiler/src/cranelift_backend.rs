@@ -54,6 +54,10 @@ static CRANELIFT_SKIPPED_FUNCTIONS: AtomicUsize = AtomicUsize::new(0);
 /// without spilling code-cache.
 const INLINE_COPY_MAX_BYTES: u32 = 64;
 
+/// A frame must revisit its loop headers this many times before asking for
+/// background promotion. The count is local to the invocation.
+const OSR_REQUEST_BACKEDGES: i64 = 1024;
+
 /// Emit an inline byte-by-byte aggregate copy using straight-line
 /// scalar loads/stores. Used in place of `call_memcpy` for small
 /// aggregates (`size <= INLINE_COPY_MAX_BYTES`) where the libc thunk's
@@ -2169,24 +2173,14 @@ impl CraneliftBackend {
                 builder.seal_block(entry_block);
             }
 
-            // A tier-0 function with a resumable loop says so on entry, so a
-            // frame that never returns can still reach the tier worth
-            // transferring into. Promotion is otherwise driven by
-            // invocation count, which advances one tier per call. One call
-            // per invocation, not per iteration; the runtime dedups.
-            if osr_helper.is_none() && !osr_layouts.is_empty() {
-                let mut sig = self.module.make_signature();
-                sig.params.push(AbiParam::new(types::I64));
-                if let Ok(fid) = self.module.declare_function(
-                    crate::osr::OSR_REQUEST_SYMBOL,
-                    Linkage::Import,
-                    &sig,
-                ) {
-                    let f = self.module.declare_func_in_func(fid, builder.func);
-                    let bead_v = builder.ins().iconst(types::I64, osr_bead_id as i64);
-                    builder.ins().call(f, &[bead_v]);
-                }
-            }
+            let osr_backedges = if osr_helper.is_none() && !osr_layouts.is_empty() {
+                let counter = builder.declare_var(types::I64);
+                let zero = builder.ins().iconst(types::I64, 0);
+                builder.def_var(counter, zero);
+                Some(counter)
+            } else {
+                None
+            };
 
             // Store block map for use in helper methods
             self.block_map = block_map.clone();
@@ -2448,12 +2442,10 @@ impl CraneliftBackend {
                     }
                 }
 
-                // Tier-0 OSR back-edge probe: at every loop header, emit a
-                // sample-and-call sequence that asks the runtime whether
-                // a tier-1 OSR helper is available. When a layout is
-                // representable, also emit the dispatch path: marshal
-                // phi results into i64 args, call_indirect the helper,
-                // return its result.
+                // Tier-0 OSR probe: count visits to resumable loop headers
+                // and request promotion only when this invocation stays
+                // hot. Each header reads its helper slot and dispatches
+                // when promoted code becomes available.
                 // A header with no representable layout can never have a
                 // helper, so a probe there would load a slot that stays null
                 // for the life of the program. Skip it rather than pay a
@@ -2461,6 +2453,14 @@ impl CraneliftBackend {
                 // happen.
                 if osr_loop_headers.contains(hir_block_id) && osr_layouts.contains_key(hir_block_id)
                 {
+                    if let Some(counter) = osr_backedges {
+                        emit_osr_request_after_backedges(
+                            &mut builder,
+                            &mut self.module,
+                            osr_bead_id,
+                            counter,
+                        );
+                    }
                     let block_index = osr_block_index.get(hir_block_id).copied().unwrap_or(0);
 
                     let empty_frame = crate::osr::OsrFrame::for_types(&[]);
@@ -9923,35 +9923,45 @@ fn get_successors(terminator: &HirTerminator) -> Vec<HirId> {
     }
 }
 
-/// Emit a tier-0 OSR back-edge probe at the start of a loop header block.
-///
-/// Layout — control flow through the header becomes:
-///
-/// ```text
-///   <existing header content above>
-///   v_armed = load.i8 [arm_slot]                  ;; per-bead byte
-///   brif v_armed, b_call_probe, b_post_probe      ;; zero ⇒ skip the probe
-///
-/// b_call_probe:
-///   v_helper = call __zyntax_osr_probe(bead_id, site_key)
-///   brif v_helper, b_dispatch, b_post_probe       ;; helper non-null ⇒ dispatch
-///
-/// b_dispatch:                                     (only when live_ins is Some)
-///   ;; marshal live-ins → 4 i64 args (pad with zero), call_indirect helper,
-///   ;; return its result
-///
-/// b_post_probe:
-///   <continues with the original header instructions, terminator, etc>
-/// ```
-///
-/// When `live_ins` is empty (layout rejected, or zero phi results), the
-/// dispatch block is skipped — the probe call is still emitted (cheap)
-/// but the result is unconditionally discarded. This keeps the probe
-/// instruction shape stable across loops with different layouts and
-/// makes the symbol-resolution path uniform.
-///
-/// On exit the builder is positioned in `b_post_probe` so subsequent
-/// instruction/terminator emission lands there.
+/// Count visits in SSA so a short-lived loop does not start an LLVM compile.
+/// Only the threshold visit calls into the runtime; all other visits stay
+/// in generated code.
+fn emit_osr_request_after_backedges(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut JITModule,
+    bead_id: u64,
+    counter: cranelift_frontend::Variable,
+) {
+    let count = builder.use_var(counter);
+    let next = builder.ins().iadd_imm(count, 1);
+    builder.def_var(counter, next);
+    let request = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, next, OSR_REQUEST_BACKEDGES);
+    let request_block = builder.create_block();
+    let continue_block = builder.create_block();
+    builder
+        .ins()
+        .brif(request, request_block, &[], continue_block, &[]);
+
+    builder.switch_to_block(request_block);
+    builder.seal_block(request_block);
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::I64));
+    if let Ok(fid) = module.declare_function(crate::osr::OSR_REQUEST_SYMBOL, Linkage::Import, &sig)
+    {
+        let f = module.declare_func_in_func(fid, builder.func);
+        let bead = builder.ins().iconst(types::I64, bead_id as i64);
+        builder.ins().call(f, &[bead]);
+    }
+    builder.ins().jump(continue_block, &[]);
+
+    builder.switch_to_block(continue_block);
+    builder.seal_block(continue_block);
+}
+
+/// Read the helper slot at a loop header. A null slot continues in baseline
+/// code; an installed helper receives the live frame and finishes the call.
 #[allow(clippy::too_many_arguments)]
 fn emit_osr_back_edge_probe(
     builder: &mut FunctionBuilder<'_>,
@@ -9978,10 +9988,6 @@ fn emit_osr_back_edge_probe(
         None
     };
 
-    // Arm check: load the bead's arm byte and branch on it. The byte flips
-    // only when a tier ≥ 1 compile installs helpers for this bead. The load
-    // must observe a store from a broker thread, so it cannot be hoisted
-    // out of the loop, and it splits the header into extra blocks.
     // Load the helper pointer for this site. Null means no tier >= 1 code
     // exists yet, which is the steady state, so an unarmed loop pays one
     // load and a not-taken branch.

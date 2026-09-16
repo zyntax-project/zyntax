@@ -6,21 +6,17 @@
 //!
 //! ## Architecture (3 layers)
 //!
-//! 1. **Runtime probe** (this module). A globally-registered C ABI function
-//!    `osr_probe(bead_id, site) -> *mut ()` that JIT'd code calls at
-//!    back-edges. It looks up the corresponding [`beadie::Bead`] and asks
-//!    for an `OsrEntry` matching the encoded site key.
+//! 1. **Runtime registry** (this module). Each bead/site pair owns a stable
+//!    helper slot. Baseline code reads it at a loop header; promotion fills
+//!    it when the matching helper is ready.
 //!
-//! 2. **Tier-0 codegen** (cranelift_backend, increment 3). At each HIR loop
-//!    header, emit a sampling counter + probe call + indirect call to the
-//!    helper if non-null. Cap the per-site cost at ~one cache-line worth of
-//!    instructions amortized over 64 iterations.
+//! 2. **Tier-0 codegen** (cranelift_backend). Count loop-header visits in the
+//!    running frame and request promotion after the hot threshold. Each
+//!    header also loads its helper slot and transfers if one is installed.
 //!
-//! 3. **Tier-1 codegen** (cranelift_backend, increment 5). For each
-//!    eligible loop header, emit a separate Cranelift function with
-//!    signature `(i64, i64, i64, i64) -> i64`. Args are bit-cast as
-//!    needed and used as the loop's live-in values; the helper jumps to
-//!    the loop header in tier-1 code.
+//! 3. **Promoted codegen** (cranelift_backend or llvm_jit_backend). Each
+//!    eligible header gets a helper that reads live-ins from a frame and
+//!    resumes the loop in promoted code.
 //!
 //! ## Site key encoding
 //!
@@ -30,7 +26,7 @@
 //!
 //! ```text
 //!   bits 63..16: loop header block index (per-function, ≤ 2^48)
-//!   bits 15..0 : live-in count (≤ 4 — codegen rejects larger layouts)
+//!   bits 15..0 : live-in count (bounded by [`OSR_MAX_LIVE_INS`])
 //! ```
 //!
 //! Both tier-0 (probe emitter) and tier-1 (helper emitter) walk
@@ -1298,7 +1294,7 @@ pub extern "C" fn lazy_compile(bead_id: u64) -> *const u8 {
 // Promotion requests
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Symbol a tier-0 function with a resumable loop calls on entry.
+/// Symbol a tier-0 function calls once its loop has stayed hot.
 pub const OSR_REQUEST_SYMBOL: &str = "__zyntax_osr_request";
 
 /// Installed by the runtime to queue a top-tier compile for a bead.
@@ -1322,13 +1318,9 @@ fn requested() -> &'static RwLock<std::collections::HashSet<u64>> {
     S.get_or_init(|| RwLock::new(std::collections::HashSet::new()))
 }
 
-/// Called on entry to a tier-0 function that has a resumable loop.
-///
-/// Promotion is otherwise driven by invocation count, which advances one
-/// tier per call — so a function entered once and left running can never
-/// climb to the tier worth transferring into. A loop is the evidence that
-/// the function may run long, and entry is where saying so costs one call
-/// rather than one per iteration.
+/// Called when a tier-0 frame has revisited a resumable loop enough times
+/// to justify a background compile. Invocation counts alone cannot promote
+/// a function that remains in one long-running call.
 ///
 /// # Safety
 /// Called from generated code with C ABI.

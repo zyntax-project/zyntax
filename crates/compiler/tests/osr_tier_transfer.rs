@@ -145,11 +145,8 @@ block4:
     assert_eq!(direct_calls(""), 0);
 }
 
-/// The probe's steady-state cost is what decides whether it can stay on.
-/// An unarmed back-edge must be a load of the helper slot and a branch —
-/// no call into the runtime, because a call that returns into the loop
-/// forces caller-saved registers to be treated as clobbered across the
-/// whole body.
+/// An unarmed back-edge should load the helper slot without calling the
+/// runtime, except for the one visit that requests promotion.
 #[test]
 fn an_unarmed_probe_site_costs_a_load_not_a_call() {
     use zyntax_compiler::cranelift_backend::CraneliftBackend;
@@ -176,22 +173,65 @@ fn an_unarmed_probe_site_costs_a_load_not_a_call() {
         !clif.contains("osr_sample_tick"),
         "the per-iteration tick call should be gone:\n{clif}"
     );
-    // Exactly one direct call, and it is the promotion request in the entry
-    // block — a function holding a resumable loop says so once per
-    // invocation. Anything else would mean a call inside the loop, which is
-    // what forces caller-saved registers to be treated as clobbered across
-    // the body.
+    // The request is behind the back-edge threshold, never at entry.
     let entry_end = clif.find("block1").unwrap_or(clif.len());
     let calls_before_loop = direct_calls(&clif[..entry_end]);
     let calls_total = direct_calls(&clif);
     assert_eq!(
         (calls_before_loop, calls_total),
-        (1, 1),
-        "the only direct call should be the entry-block promotion request:\n{clif}"
+        (0, 1),
+        "the only direct call should be the gated promotion request:\n{clif}"
+    );
+    assert!(
+        clif.contains("iconst.i64 1024"),
+        "missing hot-loop gate:\n{clif}"
     );
     assert!(
         clif.matches("call_indirect").count() >= 1,
         "an armed site should still dispatch to the helper:\n{clif}"
+    );
+}
+
+static PROMOTION_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn count_promotion_request(_bead_id: u64) {
+    PROMOTION_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[test]
+fn only_a_running_hot_loop_requests_promotion() {
+    use zyntax_compiler::cranelift_backend::CraneliftBackend;
+
+    let (function, _) = counted_loop();
+    let id = function.id;
+    let symbol = [(
+        osr::OSR_REQUEST_SYMBOL,
+        count_promotion_request as *const u8,
+    )];
+    let mut backend = CraneliftBackend::with_runtime_symbols(&symbol).expect("backend");
+    backend.set_compile_tier(0);
+    backend
+        .compile_function(id, &function)
+        .expect("tier-0 compile");
+    backend.finalize_definitions().expect("finalize");
+    let entry = backend.get_function_ptr(id).expect("entry");
+    let run: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(entry) };
+
+    PROMOTION_REQUESTS.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(run(100), 4950);
+    assert_eq!(
+        PROMOTION_REQUESTS.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(run(2000), 1_999_000);
+    assert_eq!(
+        PROMOTION_REQUESTS.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(run(100), 4950);
+    assert_eq!(
+        PROMOTION_REQUESTS.load(std::sync::atomic::Ordering::Relaxed),
+        1
     );
 }
 
