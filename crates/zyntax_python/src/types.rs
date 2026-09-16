@@ -3705,7 +3705,11 @@ impl Typer<'_> {
                     return Ty::Str;
                 }
                 if let Some(m) = self.module.imported_name(name) {
-                    return member_ty(m);
+                    return if matches!(m, crate::stdlib::Member::Func { .. }) {
+                        Ty::Object
+                    } else {
+                        member_ty(m)
+                    };
                 }
                 if !self.module.funcs.contains_key(name)
                     && !self.module.class_index.contains_key(name)
@@ -3752,7 +3756,11 @@ impl Typer<'_> {
             py::Expr::Call(c) => self.call(c),
             py::Expr::Attribute(a) => {
                 if let Some(m) = self.module_member_of(&a.value, a.attr.as_str()) {
-                    return member_ty(m);
+                    return if matches!(m, crate::stdlib::Member::Func { .. }) {
+                        Ty::Object
+                    } else {
+                        member_ty(m)
+                    };
                 }
                 if let Some(k) = self
                     .module

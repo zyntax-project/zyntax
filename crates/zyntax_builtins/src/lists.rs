@@ -501,6 +501,55 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         s.push(ret(out.e()));
         s
     }));
+    let low = local("low", i64());
+    let high = local("high", i64());
+    let middle = local("middle", i64());
+    for right in [false, true] {
+        let search = if right { "bisect_right" } else { "bisect_left" };
+        let goes_right = if right {
+            not((k.lt)(v.e(), idx(xs.e(), middle.e(), k.elem.clone())))
+        } else {
+            (k.lt)(idx(xs.e(), middle.e(), k.elem.clone()), v.e())
+        };
+        d.push(define(
+            &name(search),
+            &[&xs, &v, &low, &high],
+            i64(),
+            vec![
+                when(
+                    lt(low.e(), int(0)),
+                    vec![fatal("ValueError", text("lo must be non-negative"))],
+                ),
+                while_(
+                    lt(low.e(), high.e()),
+                    vec![
+                        middle.decl(add(low.e(), div(sub(high.e(), low.e()), int(2)))),
+                        if_(
+                            goes_right,
+                            vec![low.set(add(middle.e(), int(1)))],
+                            vec![high.set(middle.e())],
+                        ),
+                    ],
+                ),
+                ret(low.e()),
+            ],
+        ));
+        let insert = if right { "insort_right" } else { "insort_left" };
+        d.push(define(
+            &name(insert),
+            &[&xs, &v, &low, &high],
+            unit(),
+            vec![
+                i.decl(call(
+                    &name(search),
+                    vec![xs.e(), v.e(), low.e(), high.e()],
+                    i64(),
+                )),
+                expr(mcall(xs.e(), "insert_at", vec![i.e(), v.e()], unit())),
+                ret_void(),
+            ],
+        ));
+    }
     // xs[start:stop:step]; `mask` bits 1, 2, 4 say which bounds were given.
     let start = local("start", i64());
     let stop = local("stop", i64());

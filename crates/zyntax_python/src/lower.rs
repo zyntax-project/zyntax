@@ -3183,6 +3183,19 @@ impl<'m> Lowerer<'m> {
                 node: call(zb, Vec::new(), ty, span),
                 ty,
             },
+            stdlib::Member::Func { zb, .. } if zb.starts_with("zb_bisect_") => Val {
+                node: call(
+                    "zb_func_new",
+                    vec![
+                        code_of(&format!("{zb}_call"), span),
+                        int_lit(zyntax_builtins::functions::VARIADIC_ARITY, span),
+                        self.list_of(Vec::new(), Elem::Object, span),
+                    ],
+                    Ty::Object,
+                    span,
+                ),
+                ty: Ty::Object,
+            },
             stdlib::Member::Func { .. } => {
                 return unsupported(format!("`{name}` of a module as a value"), e)
             }
@@ -3205,6 +3218,49 @@ impl<'m> Lowerer<'m> {
         };
         if !keywords.is_empty() {
             return unsupported(format!("keyword arguments to `{name}`"), c);
+        }
+        if let Some(op) = zb
+            .strip_prefix("zb_bisect_")
+            .map(|side| format!("bisect_{side}"))
+            .or_else(|| {
+                zb.strip_prefix("zb_insort_")
+                    .map(|side| format!("insort_{side}"))
+            })
+        {
+            if !(2..=4).contains(&args.len()) {
+                return unsupported(
+                    format!("calling `{name}` with {} argument(s)", args.len()),
+                    c,
+                );
+            }
+            let source = self.expr(&args[0])?;
+            let Ty::List(elem) = source.ty else {
+                return unsupported("bisect on a non-list", &args[0]);
+            };
+            let mut pre = std::mem::take(&mut self.hoisted);
+            let source = self.hold(source, &mut pre, span);
+            self.hoisted.extend(pre);
+            let value = self.expr_as(&args[1], elem.ty())?;
+            let low = if let Some(arg) = args.get(2) {
+                self.expr_as(arg, Ty::Int)?
+            } else {
+                int_lit(0, span)
+            };
+            let high = if let Some(arg) = args.get(3) {
+                self.expr_as(arg, Ty::Int)?
+            } else {
+                method_call(source.node.clone(), "len", vec![], Ty::Int, span)
+            };
+            let result = Val {
+                node: call(
+                    &list_fn(&op, elem),
+                    vec![source.node, value, low, high],
+                    ret,
+                    span,
+                ),
+                ty: ret,
+            };
+            return Ok(self.guard(result, span));
         }
         // Forms with a default or a second signature.
         let (params, zb): (Vec<Ty>, &str) = match (zb, args.len()) {

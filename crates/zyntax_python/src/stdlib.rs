@@ -27,7 +27,10 @@ pub(crate) enum Member {
 /// `__future__` is accepted whole: what it names is the language as
 /// it is.
 pub(crate) fn is_known(module: &str) -> bool {
-    matches!(module, "math" | "sys" | "typing" | "time" | "__future__")
+    matches!(
+        module,
+        "math" | "sys" | "typing" | "time" | "bisect" | "__future__"
+    )
 }
 
 /// The names `__future__` exports, every one of them already the case.
@@ -83,6 +86,22 @@ const B: Ty = Ty::Bool;
 pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
     let func = |params: &'static [Ty], ret: Ty, zb: &'static str| Member::Func { params, ret, zb };
     Some(match (module, name) {
+        ("bisect", "bisect" | "bisect_right") => {
+            func(&[Ty::List(Elem::Object), Ty::Object], I, "zb_bisect_right")
+        }
+        ("bisect", "bisect_left") => {
+            func(&[Ty::List(Elem::Object), Ty::Object], I, "zb_bisect_left")
+        }
+        ("bisect", "insort" | "insort_right") => func(
+            &[Ty::List(Elem::Object), Ty::Object],
+            Ty::None,
+            "zb_insort_right",
+        ),
+        ("bisect", "insort_left") => func(
+            &[Ty::List(Elem::Object), Ty::Object],
+            Ty::None,
+            "zb_insort_left",
+        ),
         ("math", "sqrt") => func(&[F], F, "zb_math_sqrt"),
         ("math", "pow") => func(&[F, F], F, "zb_math_pow"),
         ("math", "fabs") => func(&[F], F, "zb_math_fabs"),

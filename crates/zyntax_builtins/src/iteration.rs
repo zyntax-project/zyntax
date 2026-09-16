@@ -80,6 +80,49 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         ],
     ));
 
+    // A `bisect` imported as a value (for example, a function default)
+    // searches the iterable's dynamic elements without changing it.
+    for side in ["left", "right"] {
+        let name = format!("zb_bisect_{side}_call");
+        let args = local("args", anys.clone());
+        let items = local("items", anys.clone());
+        let lo = local("lo", i64());
+        let hi = local("hi", i64());
+        d.push(define(
+            &name,
+            &[&env, &packed],
+            any(),
+            vec![
+                args.decl(call("zb_list_unbox_any", vec![packed.e()], anys.clone())),
+                n.decl(len(&args)),
+                when(
+                    or(lt(n.e(), int(2)), gt(n.e(), int(4))),
+                    vec![fatal("TypeError", text("bisect expected 2 to 4 arguments"))],
+                ),
+                items.decl(call("zb_any_iter", vec![at(&args, int(0))], anys.clone())),
+                lo.decl(int(0)),
+                hi.decl(len(&items)),
+                when(
+                    gt(n.e(), int(2)),
+                    vec![lo.set(call("zb_any_as_i64", vec![at(&args, int(2))], i64()))],
+                ),
+                when(
+                    gt(n.e(), int(3)),
+                    vec![hi.set(call("zb_any_as_i64", vec![at(&args, int(3))], i64()))],
+                ),
+                ret(call(
+                    "zb_box_i64",
+                    vec![call(
+                        &format!("zb_list_bisect_{side}_any"),
+                        vec![items.e(), at(&args, int(1)), lo.e(), hi.e()],
+                        i64(),
+                    )],
+                    any(),
+                )),
+            ],
+        ));
+    }
+
     d.push(define("zb_list_enumerate", &[&xs, &start], anys.clone(), {
         let mut s = vec![out.decl(empty()), n.decl(len(&xs))];
         s.extend(for_range(
