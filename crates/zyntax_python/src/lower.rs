@@ -1282,9 +1282,11 @@ impl<'m> Lowerer<'m> {
 
     /// A global holds its own scalar type; anything else is stored boxed,
     /// so a list global is one heap header shared by every reader.
-    fn storage(ty: Ty) -> Ty {
+    /// How a module variable of type `ty` is stored: primitives,
+    /// strings and instances as themselves, the rest boxed.
+    pub(crate) fn storage(ty: Ty) -> Ty {
         match ty {
-            Ty::Int | Ty::Float | Ty::Bool | Ty::Str => ty,
+            Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Class(_) => ty,
             _ => Ty::Object,
         }
     }

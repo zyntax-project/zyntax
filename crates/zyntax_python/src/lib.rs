@@ -582,10 +582,7 @@ pub fn parse_program_with(
         Span::new(0, 0),
     ));
     for (name, ty) in &inferred.globals {
-        let stored = match ty {
-            types::Ty::Int | types::Ty::Float | types::Ty::Bool | types::Ty::Str => *ty,
-            _ => types::Ty::Object,
-        };
+        let stored = lower::Lowerer::storage(*ty);
         declarations.push(TypedNode::new(
             TypedDeclaration::Variable(TypedVariable {
                 name: intern(name),
