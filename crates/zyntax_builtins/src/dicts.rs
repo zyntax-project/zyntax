@@ -6,7 +6,7 @@
 //! probe. A set is a list of distinct values, searched linearly.
 
 use crate::build::*;
-use crate::{list_of, DICT_TAG, SET_TAG};
+use crate::{list_of, DICT_TAG, SET_TAG, TUPLE_TAG};
 use zyntax_typed_ast::TypeId;
 
 fn any_eq(a: Expr, b: Expr) -> Expr {
@@ -826,8 +826,91 @@ fn set(list_type: TypeId) -> Vec<Decl> {
     let text_out = local("text", string());
     let x = local("x", any());
     let tag = local("tag", i64());
+    let mask = local("mask", i64());
+    let left_mask = local("left_mask", i64());
+    let right_mask = local("right_mask", i64());
+    let member = local("member", any());
+    let bit = local("bit", i64());
+    let wanted = local("wanted", i64());
     let contains = |s: Expr, v: Expr| call("zb_list_contains_any", vec![s, v], boolean());
     let mut d = Vec::new();
+
+    // Integer board positions fit in a word. -1 means the set also
+    // holds a value that needs the general equality path.
+    d.push(define("zb_set_mask63", &[&s], i64(), {
+        let mut st = vec![mask.decl(int(0)), n.decl(len(s.e()))];
+        st.extend(for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![
+                member.decl(at(s.e(), i.e())),
+                when(
+                    ne(
+                        cast(call("zb_box_tag", vec![member.e()], i32()), i64()),
+                        int(crate::dynamic::I64_TAG),
+                    ),
+                    vec![ret(int(-1))],
+                ),
+                bit.decl(call("zb_box_get_i64", vec![member.e()], i64())),
+                when(
+                    or(lt(bit.e(), int(0)), ge(bit.e(), int(63))),
+                    vec![ret(int(-1))],
+                ),
+                mask.set(bitor(mask.e(), shl(int(1), bit.e()))),
+            ],
+        ));
+        st.push(ret(mask.e()));
+        st
+    }));
+    d.push(define("zb_set_all_kind", &[&s, &wanted], boolean(), {
+        let mut st = vec![
+            n.decl(len(s.e())),
+            when(eq(n.e(), int(0)), vec![ret(bool(false))]),
+        ];
+        st.extend(for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![when(
+                ne(
+                    call("zb_any_kind", vec![at(s.e(), i.e())], i64()),
+                    wanted.e(),
+                ),
+                vec![ret(bool(false))],
+            )],
+        ));
+        st.push(ret(bool(true)));
+        st
+    }));
+    d.push(define(
+        "zb_set_disjoint_kinds",
+        &[&s, &other],
+        boolean(),
+        vec![
+            when(
+                call("zb_set_all_kind", vec![s.e(), int(SET_TAG >> 8)], boolean()),
+                vec![ret(call(
+                    "zb_set_all_kind",
+                    vec![other.e(), int(TUPLE_TAG >> 8)],
+                    boolean(),
+                ))],
+            ),
+            when(
+                call(
+                    "zb_set_all_kind",
+                    vec![s.e(), int(TUPLE_TAG >> 8)],
+                    boolean(),
+                ),
+                vec![ret(call(
+                    "zb_set_all_kind",
+                    vec![other.e(), int(SET_TAG >> 8)],
+                    boolean(),
+                ))],
+            ),
+            ret(bool(false)),
+        ],
+    ));
 
     d.push(define(
         "zb_set_add",
@@ -884,7 +967,34 @@ fn set(list_type: TypeId) -> Vec<Decl> {
     }));
     // Intersection, union, difference, symmetric difference.
     d.push(define("zb_set_and", &[&s, &other], anys.clone(), {
-        let mut st = vec![out.decl(list(Vec::new(), anys.clone())), n.decl(len(s.e()))];
+        let mut st = vec![
+            out.decl(list(Vec::new(), anys.clone())),
+            n.decl(len(s.e())),
+            left_mask.decl(call("zb_set_mask63", vec![s.e()], i64())),
+            when(ge(left_mask.e(), int(0)), {
+                let mut fast = vec![right_mask.decl(call("zb_set_mask63", vec![other.e()], i64()))];
+                let mut matched = for_range(
+                    &i,
+                    int(0),
+                    n.e(),
+                    vec![
+                        member.decl(at(s.e(), i.e())),
+                        bit.decl(call("zb_box_get_i64", vec![member.e()], i64())),
+                        when(
+                            ne(bitand(right_mask.e(), shl(int(1), bit.e())), int(0)),
+                            vec![push(out.e(), member.e())],
+                        ),
+                    ],
+                );
+                matched.push(ret(out.e()));
+                fast.push(when(ge(right_mask.e(), int(0)), matched));
+                fast
+            }),
+            when(
+                call("zb_set_disjoint_kinds", vec![s.e(), other.e()], boolean()),
+                vec![ret(out.e())],
+            ),
+        ];
         st.extend(for_range(
             &i,
             int(0),
@@ -916,7 +1026,39 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         st
     }));
     d.push(define("zb_set_sub", &[&s, &other], anys.clone(), {
-        let mut st = vec![out.decl(list(Vec::new(), anys.clone())), n.decl(len(s.e()))];
+        let mut st = vec![
+            out.decl(list(Vec::new(), anys.clone())),
+            n.decl(len(s.e())),
+            left_mask.decl(call("zb_set_mask63", vec![s.e()], i64())),
+            when(ge(left_mask.e(), int(0)), {
+                let mut fast = vec![right_mask.decl(call("zb_set_mask63", vec![other.e()], i64()))];
+                let mut unmatched = for_range(
+                    &i,
+                    int(0),
+                    n.e(),
+                    vec![
+                        member.decl(at(s.e(), i.e())),
+                        bit.decl(call("zb_box_get_i64", vec![member.e()], i64())),
+                        when(
+                            eq(bitand(right_mask.e(), shl(int(1), bit.e())), int(0)),
+                            vec![push(out.e(), member.e())],
+                        ),
+                    ],
+                );
+                unmatched.push(ret(out.e()));
+                fast.push(when(ge(right_mask.e(), int(0)), unmatched));
+                fast
+            }),
+            when(
+                call("zb_set_disjoint_kinds", vec![s.e(), other.e()], boolean()),
+                {
+                    let mut copy =
+                        for_range(&i, int(0), n.e(), vec![push(out.e(), at(s.e(), i.e()))]);
+                    copy.push(ret(out.e()));
+                    copy
+                },
+            ),
+        ];
         st.extend(for_range(
             &i,
             int(0),
@@ -942,15 +1084,41 @@ fn set(list_type: TypeId) -> Vec<Decl> {
             anys.clone(),
         ))],
     ));
-    d.push(define(
-        "zb_set_issubset",
-        &[&s, &other],
-        boolean(),
-        vec![ret(eq(
-            len(call("zb_set_sub", vec![s.e(), other.e()], anys.clone())),
+    d.push(define("zb_set_issubset", &[&s, &other], boolean(), {
+        let mut st = vec![
+            when(gt(len(s.e()), len(other.e())), vec![ret(bool(false))]),
+            left_mask.decl(call("zb_set_mask63", vec![s.e()], i64())),
+            when(
+                ge(left_mask.e(), int(0)),
+                vec![
+                    right_mask.decl(call("zb_set_mask63", vec![other.e()], i64())),
+                    when(
+                        ge(right_mask.e(), int(0)),
+                        vec![ret(eq(
+                            bitand(left_mask.e(), right_mask.e()),
+                            left_mask.e(),
+                        ))],
+                    ),
+                ],
+            ),
+            when(
+                call("zb_set_disjoint_kinds", vec![s.e(), other.e()], boolean()),
+                vec![ret(bool(false))],
+            ),
+            n.decl(len(s.e())),
+        ];
+        st.extend(for_range(
+            &i,
             int(0),
-        ))],
-    ));
+            n.e(),
+            vec![when(
+                not(contains(other.e(), at(s.e(), i.e()))),
+                vec![ret(bool(false))],
+            )],
+        ));
+        st.push(ret(bool(true)));
+        st
+    }));
     d.push(define(
         "zb_set_eq",
         &[&s, &other],

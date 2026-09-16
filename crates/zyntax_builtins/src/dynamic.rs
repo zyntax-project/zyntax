@@ -17,7 +17,7 @@ pub(crate) const STR: i64 = 5;
 const CUSTOM: i64 = 255;
 /// The whole tag of a box of the width its category's readers assume:
 /// the width in the byte above the category.
-const I64_TAG: i64 = (4 << 8) | INT;
+pub(crate) const I64_TAG: i64 = (4 << 8) | INT;
 const F64_TAG: i64 = (4 << 8) | FLOAT;
 
 fn tag(x: Expr) -> Expr {
