@@ -1599,6 +1599,123 @@ fn test_tuple_construction_lowering() {
 }
 
 #[test]
+fn test_growable_list_of_tuple_values_lowering() {
+    let mut arena = test_arena();
+    let tuple_ty = Type::Tuple(vec![
+        Type::Primitive(PrimitiveType::I64),
+        Type::Primitive(PrimitiveType::F64),
+    ]);
+    let list_ty = Type::Array {
+        element_type: Box::new(tuple_ty.clone()),
+        size: None,
+        nullability: zyntax_typed_ast::NullabilityKind::NonNull,
+    };
+    let tuple = typed_node(
+        TypedExpression::Tuple(vec![
+            typed_node(
+                TypedExpression::Literal(TypedLiteral::Integer(7)),
+                Type::Primitive(PrimitiveType::I64),
+                test_span(),
+            ),
+            typed_node(
+                TypedExpression::Literal(TypedLiteral::Float(2.5)),
+                Type::Primitive(PrimitiveType::F64),
+                test_span(),
+            ),
+        ]),
+        tuple_ty.clone(),
+        test_span(),
+    );
+    let list = typed_node(TypedExpression::Array(vec![]), list_ty.clone(), test_span());
+    let list_name = arena.intern_string("tuples");
+    let list_value_ty = list_ty.clone();
+    let body = TypedBlock {
+        statements: vec![
+            typed_node(
+                TypedStatement::Let(TypedLet {
+                    name: list_name,
+                    ty: list_ty.clone(),
+                    mutability: Mutability::Mutable,
+                    initializer: Some(Box::new(list)),
+                    span: test_span(),
+                }),
+                Type::Primitive(PrimitiveType::Unit),
+                test_span(),
+            ),
+            typed_node(
+                TypedStatement::Expression(Box::new(typed_node(
+                    TypedExpression::MethodCall(zyntax_typed_ast::typed_ast::TypedMethodCall {
+                        receiver: Box::new(typed_node(
+                            TypedExpression::Variable(list_name),
+                            list_ty,
+                            test_span(),
+                        )),
+                        method: arena.intern_string("push"),
+                        type_args: vec![],
+                        positional_args: vec![tuple],
+                        named_args: vec![],
+                    }),
+                    Type::Primitive(PrimitiveType::Unit),
+                    test_span(),
+                ))),
+                Type::Primitive(PrimitiveType::Unit),
+                test_span(),
+            ),
+            typed_node(
+                TypedStatement::Expression(Box::new(typed_node(
+                    TypedExpression::Index(zyntax_typed_ast::typed_ast::TypedIndex {
+                        object: Box::new(typed_node(
+                            TypedExpression::Variable(list_name),
+                            list_value_ty,
+                            test_span(),
+                        )),
+                        index: Box::new(typed_node(
+                            TypedExpression::Literal(TypedLiteral::Integer(0)),
+                            Type::Primitive(PrimitiveType::I64),
+                            test_span(),
+                        )),
+                    }),
+                    tuple_ty,
+                    test_span(),
+                ))),
+                Type::Primitive(PrimitiveType::Unit),
+                test_span(),
+            ),
+        ],
+        span: test_span(),
+    };
+    let mut program = create_test_program(&mut arena, "list_of_tuples", body);
+    let registry = Arc::new(TypeRegistry::new());
+    let name = arena.intern_string("test_module");
+    let arena = Arc::new(Mutex::new(arena));
+    let mut ctx = LoweringContext::new(name, registry, arena, LoweringConfig::default());
+    let module = ctx.lower_program(&mut program).expect("lower tuple list");
+    let function = module.functions.values().next().expect("function");
+    assert!(function.values.values().any(|value| {
+        matches!(&value.ty, zyntax_compiler::hir::HirType::Struct(s)
+            if s.fields == vec![zyntax_compiler::hir::HirType::I64, zyntax_compiler::hir::HirType::F64])
+    }));
+    assert!(function.blocks.values().flat_map(|block| &block.instructions).any(|instruction| {
+        matches!(instruction, HirInstruction::GetElementPtr {
+            ty: zyntax_compiler::hir::HirType::Ptr(inner), ..
+        } if matches!(&**inner, zyntax_compiler::hir::HirType::Struct(s)
+            if s.fields == vec![zyntax_compiler::hir::HirType::I64, zyntax_compiler::hir::HirType::F64]))
+    }));
+    #[cfg(feature = "cranelift-backend")]
+    zyntax_compiler::cranelift_backend::CraneliftBackend::new()
+        .expect("Cranelift backend")
+        .compile_module(&module)
+        .expect("Cranelift tuple list");
+    #[cfg(feature = "llvm-backend")]
+    {
+        let context = inkwell::context::Context::create();
+        zyntax_compiler::llvm_backend::LLVMBackend::new(&context, "tuple_list")
+            .compile_module(&module)
+            .expect("LLVM tuple list");
+    }
+}
+
+#[test]
 fn test_array_construction_lowering() {
     let mut arena = test_arena();
 

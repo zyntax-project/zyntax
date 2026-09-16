@@ -11867,6 +11867,11 @@ impl SsaBuilder {
                 _ => HirType::I64, // Default
             },
             Type::Tuple(types) if types.is_empty() => HirType::Void,
+            Type::Tuple(types) => HirType::Struct(crate::hir::HirStructType {
+                name: None,
+                fields: types.iter().map(|ty| self.convert_type(ty)).collect(),
+                packed: false,
+            }),
             Type::Reference { ty, .. } => HirType::Ptr(Box::new(self.convert_type(ty))),
             Type::Array {
                 element_type,
