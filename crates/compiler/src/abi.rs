@@ -84,6 +84,34 @@ pub fn function_abi(function: &HirFunction, address_taken: bool) -> FunctionAbi 
     }
 }
 
+/// The entry shapes LLVM can currently publish into a Cranelift call cell.
+/// Growable list headers stay at their caller-owned address so changes to
+/// their data pointer, length, or capacity remain visible to aliases.
+pub fn llvm_entry_abi_supported(function: &HirFunction, address_taken: bool) -> bool {
+    let abi = function_abi(function, address_taken);
+    let direct_shape = |ty: &HirType| {
+        !matches!(
+            ty,
+            HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_)
+        )
+    };
+    abi.destination.is_none()
+        && abi.returns.iter().all(|p| *p == Pass::Direct)
+        && function.signature.returns.iter().all(direct_shape)
+        && function
+            .signature
+            .params
+            .iter()
+            .zip(&abi.params)
+            .all(|(param, pass)| match pass {
+                Pass::Direct => direct_shape(&param.ty),
+                Pass::Pointer => matches!(
+                    &param.ty,
+                    HirType::Struct(s) if is_growable_list_header(s)
+                ),
+            })
+}
+
 /// How a value of `ty` travels.
 pub fn pass_of(ty: &HirType) -> Pass {
     match ty {
@@ -232,6 +260,22 @@ mod tests {
         assert_eq!(abi.params, vec![Pass::Pointer]);
         assert_eq!(abi.returns, vec![Pass::Pointer]);
         assert_eq!(abi.destination, None);
+        assert!(!llvm_entry_abi_supported(&f, false));
+    }
+
+    #[test]
+    fn llvm_entry_keeps_mutable_list_parameters_by_address() {
+        let f = function(vec![list(), HirType::I64], vec![HirType::I64]);
+        assert!(llvm_entry_abi_supported(&f, false));
+        let f = function(vec![vec3()], vec![HirType::I64]);
+        assert!(!llvm_entry_abi_supported(&f, false));
+        let wrapped = HirType::Struct(HirStructType {
+            name: None,
+            fields: vec![HirType::I64],
+            packed: false,
+        });
+        let f = function(vec![wrapped], vec![HirType::I64]);
+        assert!(!llvm_entry_abi_supported(&f, false));
     }
 
     #[test]

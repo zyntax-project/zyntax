@@ -120,14 +120,15 @@ fn peak_memory_does_not_grow_with_the_step_count() {
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        // Tree's LLVM callees promote after the short run; compare two
-        // executions that have both reached the same tier.
-        let (small_steps, large_steps) =
-            if name == "tree.py" && std::env::var_os("ZYPY_LLVM").is_some() {
-                (200_000, 2_000_000)
-            } else {
-                (SMALL, LARGE)
-            };
+        // LLVM promotes the dict and tree helpers after the short run;
+        // compare executions that have both reached the same tier.
+        let (small_steps, large_steps) = if matches!(name.as_str(), "dicts.py" | "tree.py")
+            && std::env::var_os("ZYPY_LLVM").is_some()
+        {
+            (200_000, 2_000_000)
+        } else {
+            (SMALL, LARGE)
+        };
         let (small_status, small) = run(program, small_steps);
         let (large_status, large) = run(program, large_steps);
         if small_status != 0 || large_status != 0 {

@@ -109,6 +109,7 @@ pub struct LLVMJitBackend<'ctx> {
     /// the lowering.
     pending_cross_tier: HashMap<HirId, crate::llvm_backend::CrossTierCallee>,
     pending_shared_globals: HashMap<HirId, usize>,
+    pending_entry_abi: Option<(HirId, crate::abi::FunctionAbi)>,
 
     /// Loaded shared object. Holding this `Library` keeps the mapped
     /// code pages alive — dropping it would munmap them and any held
@@ -193,6 +194,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             global_resolver: None,
             pending_cross_tier: HashMap::new(),
             pending_shared_globals: HashMap::new(),
+            pending_entry_abi: None,
             loaded_lib: None,
             function_pointers: IndexMap::new(),
             opt_level,
@@ -668,6 +670,9 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         backend.set_only_compile_reachable(self.only_compile_reachable.clone());
         backend.set_cross_tier_callees(self.pending_cross_tier.clone());
         backend.set_shared_globals(self.pending_shared_globals.clone());
+        if let Some((id, abi)) = &self.pending_entry_abi {
+            backend.set_entry_abi(*id, abi.clone());
+        }
         // The name a function is declared under and the name its address
         // is looked up by have to be decided the same way, and they are
         // decided in two places. Without this the entry is declared
@@ -1020,6 +1025,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         let mut handlers = IndexMap::new();
         self.pending_cross_tier.clear();
         self.pending_shared_globals.clear();
+        self.pending_entry_abi = None;
         if let Some(ctx) = self.module_context.clone() {
             let own_module = self.cross_tier_key.is_some() && self.use_mcjit;
             if own_module {
@@ -1027,13 +1033,14 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 // of the tier below reach it, so its own convention has
                 // to be one both tiers read the same way.
                 let abi = crate::abi::function_abi(function, self.address_taken.contains(&id));
-                if !abi.is_scalar() {
+                if !crate::abi::llvm_entry_abi_supported(function, self.address_taken.contains(&id))
+                {
                     return Err(CompilerError::Backend(format!(
-                        "{} passes or returns an aggregate; promoted alone its entry would \
-                         not match its callers",
+                        "{} has an unsupported LLVM entry ABI",
                         function.name.resolve_global().unwrap_or_default()
                     )));
                 }
+                self.pending_entry_abi = Some((id, abi));
                 let key = self.cross_tier_key.unwrap_or_default();
                 for callee in direct_callees(function) {
                     if callee == id {

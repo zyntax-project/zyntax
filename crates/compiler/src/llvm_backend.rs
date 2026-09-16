@@ -149,6 +149,13 @@ pub struct LLVMBackend<'ctx> {
     /// another tier and reached through their cells. See
     /// [`Self::set_cross_tier_callees`].
     cross_tier: std::collections::HashMap<HirId, CrossTierCallee>,
+    /// A promoted entry whose signature must match its Cranelift callers.
+    entry_abi: Option<(HirId, crate::abi::FunctionAbi)>,
+    /// External declarations in a promoted module use the native ABI.
+    native_external_abi: bool,
+    /// HIR aliases of one native symbol may view its pointer-sized result
+    /// as an address or an integer handle.
+    native_return_types: std::collections::HashMap<HirId, BasicTypeEnum<'ctx>>,
 
     /// Module globals whose storage another tier owns, by address. Such
     /// a global is declared here and bound to that address by whoever
@@ -250,6 +257,9 @@ impl<'ctx> LLVMBackend<'ctx> {
             entry_names: Default::default(),
             x86_target_vnni: false,
             cross_tier: std::collections::HashMap::new(),
+            entry_abi: None,
+            native_external_abi: false,
+            native_return_types: std::collections::HashMap::new(),
             shared_globals: std::collections::HashMap::new(),
             shared_global_bindings: Vec::new(),
         }
@@ -264,6 +274,13 @@ impl<'ctx> LLVMBackend<'ctx> {
         callees: std::collections::HashMap<HirId, CrossTierCallee>,
     ) {
         self.cross_tier = callees;
+    }
+
+    /// Use the shared ABI for a function published into another tier's
+    /// call cell. Aggregate list parameters arrive as their live address.
+    pub fn set_entry_abi(&mut self, id: HirId, abi: crate::abi::FunctionAbi) {
+        self.entry_abi = Some((id, abi));
+        self.native_external_abi = true;
     }
 
     /// Module globals to declare rather than define, with the address
@@ -569,11 +586,30 @@ impl<'ctx> LLVMBackend<'ctx> {
         func: &HirFunction,
     ) -> CompilerResult<FunctionValue<'ctx>> {
         // Translate parameter types
+        let native_abi = if func.is_external && self.native_external_abi {
+            Some(crate::abi::function_abi(func, true))
+        } else {
+            self.entry_abi
+                .as_ref()
+                .and_then(|(entry, abi)| (*entry == id).then_some(abi.clone()))
+        };
+        let entry_passes = native_abi.as_ref().map(|abi| &abi.params);
         let param_types: Vec<BasicMetadataTypeEnum> = func
             .signature
             .params
             .iter()
-            .map(|param| self.translate_type(&param.ty).map(|t| t.into()))
+            .enumerate()
+            .map(|(i, param)| {
+                if entry_passes.is_some_and(|passes| passes[i] == crate::abi::Pass::Pointer) {
+                    Ok(self
+                        .context
+                        .i8_type()
+                        .ptr_type(AddressSpace::default())
+                        .into())
+                } else {
+                    self.translate_type(&param.ty).map(|t| t.into())
+                }
+            })
             .collect::<CompilerResult<Vec<_>>>()?;
 
         // Translate return type
@@ -582,7 +618,17 @@ impl<'ctx> LLVMBackend<'ctx> {
             self.context.void_type().fn_type(&param_types, false)
         } else if func.signature.returns.len() == 1 {
             // Function returning a single value
-            let return_type = self.translate_type(&func.signature.returns[0])?;
+            let return_type = if native_abi
+                .as_ref()
+                .is_some_and(|abi| abi.returns.first() == Some(&crate::abi::Pass::Pointer))
+            {
+                self.context
+                    .i8_type()
+                    .ptr_type(AddressSpace::default())
+                    .into()
+            } else {
+                self.translate_type(&func.signature.returns[0])?
+            };
             return_type.fn_type(&param_types, false)
         } else {
             // Multiple return values - represent as struct (tuple)
@@ -617,7 +663,32 @@ impl<'ctx> LLVMBackend<'ctx> {
             // Regular functions use mangled name with HirId
             format!("func_{:?}", id)
         };
-        let fn_value = self.module.add_function(&fn_name, fn_type, None);
+        let fn_value = if func.is_external && self.native_external_abi {
+            match self.module.get_function(&fn_name) {
+                Some(existing) if existing.get_type() == fn_type => existing,
+                Some(existing)
+                    if existing.get_type().get_param_types() == fn_type.get_param_types()
+                        && matches!(
+                            (existing.get_type().get_return_type(), fn_type.get_return_type()),
+                            (Some(BasicTypeEnum::PointerType(_)), Some(BasicTypeEnum::IntType(i)))
+                                | (Some(BasicTypeEnum::IntType(i)), Some(BasicTypeEnum::PointerType(_)))
+                                if i.get_bit_width() == 64
+                        ) =>
+                {
+                    self.native_return_types
+                        .insert(id, fn_type.get_return_type().unwrap());
+                    existing
+                }
+                Some(_) => {
+                    return Err(CompilerError::CodeGen(format!(
+                        "incompatible native declarations for {fn_name}"
+                    )))
+                }
+                None => self.module.add_function(&fn_name, fn_type, None),
+            }
+        } else {
+            self.module.add_function(&fn_name, fn_type, None)
+        };
 
         // Set parameter names (helps with debugging IR)
         for (i, param) in func.signature.params.iter().enumerate() {
@@ -4291,6 +4362,22 @@ impl<'ctx> LLVMBackend<'ctx> {
                             .builder
                             .build_int_to_ptr(iv, *pt, "call_arg_i2p")?
                             .into(),
+                        (
+                            Some(BasicMetadataTypeEnum::PointerType(_)),
+                            BasicMetadataValueEnum::StructValue(sv),
+                        ) => {
+                            let slot = self.builder.build_alloca(sv.get_type(), "call_arg")?;
+                            self.builder.build_store(slot, sv)?;
+                            slot.into()
+                        }
+                        (
+                            Some(BasicMetadataTypeEnum::PointerType(_)),
+                            BasicMetadataValueEnum::ArrayValue(av),
+                        ) => {
+                            let slot = self.builder.build_alloca(av.get_type(), "call_arg")?;
+                            self.builder.build_store(slot, av)?;
+                            slot.into()
+                        }
                         (_, other) => other,
                     };
                     arg_values.push(coerced);
@@ -4332,7 +4419,25 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // `Void` entry. Tolerating it here would have hidden
                 // the mismatch rather than removed it.
                 match call_site.try_as_basic_value() {
-                    ValueKind::Basic(val) => Ok(val),
+                    ValueKind::Basic(val) => {
+                        match (self.native_return_types.get(func_id).copied(), val) {
+                            (
+                                Some(BasicTypeEnum::PointerType(pt)),
+                                BasicValueEnum::IntValue(iv),
+                            ) => Ok(self
+                                .builder
+                                .build_int_to_ptr(iv, pt, "native_ret_ptr")?
+                                .into()),
+                            (
+                                Some(BasicTypeEnum::IntType(it)),
+                                BasicValueEnum::PointerValue(pv),
+                            ) => Ok(self
+                                .builder
+                                .build_ptr_to_int(pv, it, "native_ret_int")?
+                                .into()),
+                            (_, value) => Ok(value),
+                        }
+                    }
                     ValueKind::Instruction(_) if !expects_value => {
                         Ok(self.context.i32_type().get_undef().into())
                     }

@@ -2160,11 +2160,23 @@ impl TieredBackend {
             };
             #[cfg(feature = "llvm-backend")]
             if matches!(tier2_backend, Tier2Backend::LLVM)
-                && !crate::abi::function_abi(&func_arc, false).is_scalar()
+                && !crate::abi::llvm_entry_abi_supported(&func_arc, false)
             {
                 if osr::osr_trace_enabled() {
                     eprintln!(
                         "[osr] LLVM promotion unavailable for {}: aggregate ABI",
+                        func_arc.name.resolve_global().unwrap_or_default()
+                    );
+                }
+                return true;
+            }
+            #[cfg(feature = "llvm-backend")]
+            if matches!(tier2_backend, Tier2Backend::LLVM)
+                && !llvm_list_entry_has_headroom(&func_arc)
+            {
+                if osr::osr_trace_enabled() {
+                    eprintln!(
+                        "[osr] LLVM promotion skipped for {}: call-heavy list entry",
                         func_arc.name.resolve_global().unwrap_or_default()
                     );
                 }
@@ -2550,7 +2562,7 @@ fn promotable_callees(function: &HirFunction, module: &HirModule) -> Vec<HirId> 
 /// pay. A leaf of a few instructions has no headroom at any tier.
 fn has_headroom(f: &HirFunction) -> bool {
     use crate::hir::{HirCallable, HirInstruction};
-    if !crate::abi::function_abi(f, false).is_scalar() {
+    if !crate::abi::llvm_entry_abi_supported(f, false) || !llvm_list_entry_has_headroom(f) {
         return false;
     }
     if !osr::find_loop_headers(f).is_empty() {
@@ -2572,6 +2584,27 @@ fn has_headroom(f: &HirFunction) -> bool {
         }
     }
     instructions >= 32
+}
+
+/// Calls across the LLVM/Cranelift boundary stay indirect. Large list-entry
+/// bodies with many such calls offer little LLVM optimization headroom.
+fn llvm_list_entry_has_headroom(f: &HirFunction) -> bool {
+    use crate::abi::{function_abi, Pass};
+    use crate::hir::HirInstruction;
+    if function_abi(f, false)
+        .params
+        .iter()
+        .all(|p| *p == Pass::Direct)
+    {
+        return true;
+    }
+    f.blocks
+        .values()
+        .flat_map(|block| &block.instructions)
+        .filter(|inst| matches!(inst, HirInstruction::Call { .. }))
+        .take(65)
+        .count()
+        <= 64
 }
 
 /// Dispatch the correct JIT backend for a tier index.
