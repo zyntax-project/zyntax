@@ -63,15 +63,21 @@ impl Scope {
 
     /// A generator expression: its loop variables are its own.
     pub(crate) fn of_generator(g: &py::ExprGenerator) -> Scope {
+        Self::of_comprehension(&g.generators, &[&g.elt])
+    }
+
+    fn of_comprehension(generators: &[py::Comprehension], values: &[&py::Expr]) -> Scope {
         let mut collector = Collector::default();
-        for comp in &g.generators {
+        for comp in generators {
             collector.visit_expr(&comp.target);
             collector.visit_expr(&comp.iter);
             for cond in &comp.ifs {
                 collector.visit_expr(cond);
             }
         }
-        collector.visit_expr(&g.elt);
+        for value in values {
+            collector.visit_expr(value);
+        }
         collector.finish(Vec::new())
     }
 
@@ -184,6 +190,21 @@ impl<'a> Visitor<'a> for Collector {
             }
             py::Expr::Generator(g) => {
                 self.children.push((String::new(), Scope::of_generator(g)));
+            }
+            py::Expr::ListComp(c) => self
+                .loads
+                .extend(Scope::of_comprehension(&c.generators, &[&c.elt]).free),
+            py::Expr::SetComp(c) => self
+                .loads
+                .extend(Scope::of_comprehension(&c.generators, &[&c.elt]).free),
+            py::Expr::DictComp(c) => {
+                let mut values = Vec::new();
+                if let Some(key) = c.key.as_deref() {
+                    values.push(key);
+                }
+                values.push(c.value.as_ref());
+                self.loads
+                    .extend(Scope::of_comprehension(&c.generators, &values).free);
             }
             _ => walk_expr(self, expr),
         }
@@ -324,6 +345,13 @@ mod tests {
         assert!(f.free.contains("m"));
         assert!(s.free.contains("m"));
         assert!(s.declared_globals().contains("total"));
+    }
+
+    #[test]
+    fn a_comprehension_target_does_not_bind_the_enclosing_body() {
+        let s = scope_of("result = [p for p in pieces]");
+        assert!(!s.bound.contains("p"));
+        assert!(s.free.contains("pieces"));
     }
 
     fn keeps(handler_body: &str, name: Option<&str>) -> bool {

@@ -570,6 +570,8 @@ pub(crate) struct Lowerer<'m> {
     /// name is its `let` and later ones are assignments.
     bound: Vec<InternedString>,
     temps: usize,
+    /// Compiler names for comprehension targets, scoped to their expression.
+    comp_symbols: HashMap<String, InternedString>,
     /// Statements an expression needs run before the statement it is
     /// part of: a comprehension's loop, which the IR cannot hold inside
     /// an expression. Drained in front of each statement.
@@ -716,6 +718,7 @@ impl<'m> Lowerer<'m> {
             locals,
             bound,
             temps: 0,
+            comp_symbols: HashMap::new(),
             hoisted: Vec::new(),
             nonnull: std::collections::HashSet::new(),
             always_instance: std::collections::HashSet::new(),
@@ -1220,7 +1223,8 @@ impl<'m> Lowerer<'m> {
 
     /// Whether `name` here is the module's variable rather than a local.
     fn is_global(&self, name: &str) -> bool {
-        !self.locals.vars.contains_key(name)
+        !self.comp_symbols.contains_key(name)
+            && !self.locals.vars.contains_key(name)
             && !self.cells.contains_key(name)
             && self.module.globals.contains_key(name)
     }
@@ -1228,7 +1232,8 @@ impl<'m> Lowerer<'m> {
     /// Whether `name` is a variable of some kind here, as opposed to a
     /// module function or a builtin.
     fn is_variable(&self, name: &str) -> bool {
-        self.cells.contains_key(name)
+        self.comp_symbols.contains_key(name)
+            || self.cells.contains_key(name)
             || self.locals.vars.contains_key(name)
             || self.module.globals.contains_key(name)
     }
@@ -1327,6 +1332,13 @@ impl<'m> Lowerer<'m> {
     fn temp(&mut self) -> InternedString {
         self.temps += 1;
         intern(&format!("__tmp{}", self.temps))
+    }
+
+    fn local_symbol(&self, name: &str) -> InternedString {
+        self.comp_symbols
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| intern(name))
     }
 
     // ─── Functions ──────────────────────────────────────────────────
@@ -2767,7 +2779,7 @@ impl<'m> Lowerer<'m> {
             }
         };
         let ty = self.var_ty(n.id.as_str());
-        let name = intern(n.id.as_str());
+        let name = self.local_symbol(n.id.as_str());
         // An instance assigned from its constructor is known to be one
         // until the block ends or the variable is assigned again.
         if let Ty::Class(_) = ty {
@@ -2777,22 +2789,24 @@ impl<'m> Lowerer<'m> {
                 self.nonnull.remove(&name);
             }
         }
-        if let Some(cell) = self.cells.get(n.id.as_str()).copied() {
-            let value = self.coerce(value, ty);
-            let boxed = self.coerce(Val { node: value, ty }, Ty::Object);
-            let set = binary(
-                BinaryOp::Assign,
-                slot(var(cell, Ty::List(Elem::Object), span), 0, Ty::Object, span),
-                boxed,
-                Ty::None,
-                span,
-            );
-            out.push(TypedNode::new(
-                TypedStatement::Expression(Box::new(set)),
-                Type::Unknown,
-                span,
-            ));
-            return Ok(());
+        if !self.comp_symbols.contains_key(n.id.as_str()) {
+            if let Some(cell) = self.cells.get(n.id.as_str()).copied() {
+                let value = self.coerce(value, ty);
+                let boxed = self.coerce(Val { node: value, ty }, Ty::Object);
+                let set = binary(
+                    BinaryOp::Assign,
+                    slot(var(cell, Ty::List(Elem::Object), span), 0, Ty::Object, span),
+                    boxed,
+                    Ty::None,
+                    span,
+                );
+                out.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(set)),
+                    Type::Unknown,
+                    span,
+                ));
+                return Ok(());
+            }
         }
         if self.is_global(n.id.as_str()) {
             let stored = Self::storage(ty);
@@ -3107,7 +3121,7 @@ impl<'m> Lowerer<'m> {
             && !self.is_global(target.id.as_str())
             && self.var_ty(target.id.as_str()) == Ty::Int;
         let name = if direct {
-            let name = intern(target.id.as_str());
+            let name = self.local_symbol(target.id.as_str());
             if !self.bound.contains(&name) {
                 self.bound.push(name);
             }
@@ -3835,6 +3849,10 @@ impl<'m> Lowerer<'m> {
                 let member = self.module.imported_name(n.id.as_str()).expect("checked");
                 self.member_value(member, n.id.as_str(), e, span)?
             }
+            py::Expr::Name(n) if self.comp_symbols.contains_key(n.id.as_str()) => Val {
+                node: var(self.local_symbol(n.id.as_str()), ty, span),
+                ty,
+            },
             py::Expr::Name(n) if self.cells.contains_key(n.id.as_str()) => {
                 self.cell_read(n.id.as_str(), span)
             }
@@ -3894,7 +3912,7 @@ impl<'m> Lowerer<'m> {
                 return unsupported(format!("`{}` as a value", n.id.as_str()), e);
             }
             py::Expr::Name(n) => Val {
-                node: var(intern(n.id.as_str()), ty, span),
+                node: var(self.local_symbol(n.id.as_str()), ty, span),
                 ty,
             },
             py::Expr::Lambda(l) => self.lambda(l, span)?,
@@ -4868,6 +4886,17 @@ impl<'m> Lowerer<'m> {
         // Loop variables are the comprehension's own; they shadow the
         // function's for the body and are forgotten after.
         let saved_vars = self.locals.vars.clone();
+        let saved_symbols = self.comp_symbols.clone();
+        let mut target_names = BTreeSet::new();
+        for g in generators {
+            let mut names = HashMap::new();
+            bind_names(&mut names, &g.target, Ty::Object);
+            target_names.extend(names.into_keys());
+        }
+        for name in target_names {
+            let symbol = self.temp();
+            self.comp_symbols.insert(name, symbol);
+        }
         let mut statements = if matches!(produce, Produce::Yield(_)) {
             Vec::new()
         } else {
@@ -4985,6 +5014,7 @@ impl<'m> Lowerer<'m> {
             )];
         }
         self.locals.vars = saved_vars;
+        self.comp_symbols = saved_symbols;
         statements.extend(inner);
         self.hoisted = outer_hoisted;
         self.hoisted.extend(statements);
