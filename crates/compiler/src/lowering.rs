@@ -3961,6 +3961,7 @@ impl LoweringContext {
             hir_func.attributes.no_inline = true;
             hir_func.attributes.inline = crate::hir::InlineHint::Never;
         }
+        hir_func.attributes.strict_fp = annotated("strict_fp");
         // `@cooperative` (short alias `@coop`) marks an async function whose
         // fiber steps may interleave at the executor's yield points. Recorded
         // here so both spellings are recognized; the interleaving lowering

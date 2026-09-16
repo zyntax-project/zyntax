@@ -32,6 +32,7 @@ mod lower;
 mod modules;
 mod prelude;
 mod scope;
+mod shape;
 mod stdlib;
 mod types;
 
@@ -612,7 +613,8 @@ pub fn parse_program_with(
     // The functions are lowered twice. The first time teaches which of
     // them can raise; the second time, a call to one that never does is
     // not followed by a check. Only the second lowering is kept.
-    lower_items(&inferred, &items)?;
+    let unpack_shapes = shape::infer(&inferred, &items, &owned);
+    lower_items(&inferred, &items, &unpack_shapes)?;
     let mut facts = inferred.raise_facts.take();
     classes::raise_facts(&inferred, &mut facts);
     inferred.non_raising = types::non_raising(&facts);
@@ -622,7 +624,7 @@ pub fn parse_program_with(
     inferred.attr_writes.take();
     inferred.dyn_methods.take();
     inferred.counter.set(inferred.closures.borrow().len());
-    declarations.extend(lower_items(&inferred, &items)?);
+    declarations.extend(lower_items(&inferred, &items, &unpack_shapes)?);
     if !top_level.is_empty() {
         let mut locals = types::infer_locals_entry(&inferred, &entry_sig, &owned, &entry_files);
         for name in inferred.globals.keys() {
@@ -646,7 +648,7 @@ pub fn parse_program_with(
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(TypedFunction {
                 name: intern(ENTRY),
-                annotations: Vec::new(),
+                annotations: vec![lower::strict_fp_annotation(span)],
                 effects: Vec::new(),
                 with_handlers: Vec::new(),
                 type_params: Vec::new(),
@@ -675,7 +677,15 @@ pub fn parse_program_with(
             Span::new(0, 0),
         ));
     }
-    for func in inferred.lifted.take() {
+    for mut func in inferred.lifted.take() {
+        if !func
+            .annotations
+            .iter()
+            .any(|a| a.name.resolve_global().as_deref() == Some("strict_fp"))
+        {
+            func.annotations
+                .push(lower::strict_fp_annotation(Span::new(0, 0)));
+        }
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(func),
             Type::Unknown,
@@ -862,6 +872,7 @@ pub(crate) fn intern(s: &str) -> InternedString {
 fn lower_items(
     inferred: &types::Module,
     items: &[types::Item<'_>],
+    unpack_shapes: &std::collections::HashMap<String, std::collections::HashMap<String, types::Ty>>,
 ) -> Result<Vec<TypedNode<TypedDeclaration>>> {
     let mut declarations = Vec::with_capacity(items.len());
     for item in items {
@@ -874,7 +885,16 @@ fn lower_items(
         for (name, trusted) in variants {
             let sig = inferred.funcs[&item.name].clone();
             lower::set_current_file(inferred.file_of(item.module.as_deref()));
-            let locals = types::infer_locals(inferred, &sig, &item.def.body);
+            let mut locals = types::infer_locals(inferred, &sig, &item.def.body);
+            if let Some(shapes) = unpack_shapes.get(&item.name) {
+                for (name, ty) in shapes {
+                    if !sig.params.iter().any(|(param, _)| param == name)
+                        && locals.vars.get(name) == Some(&types::Ty::Object)
+                    {
+                        locals.vars.insert(name.clone(), *ty);
+                    }
+                }
+            }
             let scope = scope::Scope::of_function(item.def);
             let mut lowerer = lower::Lowerer::new(
                 inferred,

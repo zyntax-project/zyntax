@@ -70,6 +70,9 @@ pub fn run_module(module: &mut HirModule) -> FmaStats {
         return stats;
     }
     for func in module.functions_to_optimize() {
+        if func.attributes.strict_fp {
+            continue;
+        }
         stats.contracted += run_function(func);
     }
     stats

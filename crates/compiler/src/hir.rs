@@ -2172,6 +2172,9 @@ pub struct FunctionAttributes {
     pub hot: bool,
     pub pure: bool,
     pub const_fn: bool,
+    /// Preserve separate IEEE-754 rounding steps in source arithmetic.
+    #[serde(default)]
+    pub strict_fp: bool,
     /// Set by the `@cooperative` (alias `@coop`) function annotation. Marks
     /// an async function whose fiber steps may interleave with other tasks
     /// at the cooperative executor's yield points. Currently only recorded

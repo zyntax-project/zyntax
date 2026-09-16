@@ -17,10 +17,10 @@ use ruff_text_size::Ranged;
 use std::collections::{BTreeSet, HashMap};
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
-    ParameterAttribute, TypedBinary, TypedBlock, TypedCall, TypedCast, TypedExpression,
-    TypedFieldAccess, TypedFor, TypedFunction, TypedIf, TypedIfExpr, TypedIndex, TypedLet,
-    TypedLiteral, TypedMatch, TypedMatchArm, TypedMethodCall, TypedParameter, TypedPattern,
-    TypedRange, TypedStatement, TypedUnary, TypedWhile,
+    ParameterAttribute, TypedAnnotation, TypedBinary, TypedBlock, TypedCall, TypedCast,
+    TypedExpression, TypedFieldAccess, TypedFor, TypedFunction, TypedIf, TypedIfExpr, TypedIndex,
+    TypedLet, TypedLiteral, TypedMatch, TypedMatchArm, TypedMethodCall, TypedParameter,
+    TypedPattern, TypedRange, TypedStatement, TypedUnary, TypedWhile,
 };
 use zyntax_typed_ast::{
     BinaryOp, InternedString, Mutability, ParamOwnership, ParameterKind, PrimitiveType, Type,
@@ -29,6 +29,14 @@ use zyntax_typed_ast::{
 
 pub(crate) type Node = TypedNode<TypedExpression>;
 type Stmt = TypedNode<TypedStatement>;
+
+pub(crate) fn strict_fp_annotation(span: Span) -> TypedAnnotation {
+    TypedAnnotation {
+        name: intern("strict_fp"),
+        args: Vec::new(),
+        span,
+    }
+}
 
 /// Keep Python module variables separate from the built-in library's
 /// constants and globals, which share the compiler's symbol table.
@@ -1479,7 +1487,7 @@ impl<'m> Lowerer<'m> {
         };
         Ok(TypedFunction {
             name: intern(name),
-            annotations: Vec::new(),
+            annotations: vec![strict_fp_annotation(span)],
             effects: Vec::new(),
             with_handlers: Vec::new(),
             type_params: Vec::new(),
@@ -2818,6 +2826,15 @@ impl<'m> Lowerer<'m> {
         };
         let ty = self.var_ty(n.id.as_str());
         let name = self.local_symbol(n.id.as_str());
+        // A checked read here depends on the preceding unpack statements.
+        // Emit its pending-exception check after the store, not in the
+        // statement-wide hoist that runs before those statements.
+        let check_after = self.guards
+            && value.ty == Ty::Object
+            && matches!(
+                ty,
+                Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::List(_) | Ty::Class(_)
+            );
         // An instance assigned from its constructor is known to be one
         // until the block ends or the variable is assigned again.
         if let Ty::Class(_) = ty {
@@ -2829,7 +2846,13 @@ impl<'m> Lowerer<'m> {
         }
         if !self.comp_symbols.contains_key(n.id.as_str()) {
             if let Some(cell) = self.cells.get(n.id.as_str()).copied() {
+                if check_after {
+                    self.guards = false;
+                }
                 let value = self.coerce(value, ty);
+                if check_after {
+                    self.guards = true;
+                }
                 let boxed = self.coerce(Val { node: value, ty }, Ty::Object);
                 let set = binary(
                     BinaryOp::Assign,
@@ -2843,12 +2866,21 @@ impl<'m> Lowerer<'m> {
                     Type::Unknown,
                     span,
                 ));
+                if check_after {
+                    out.push(self.pending_check(span));
+                }
                 return Ok(());
             }
         }
         if self.is_global(n.id.as_str()) {
             let stored = Self::storage(ty);
+            if check_after {
+                self.guards = false;
+            }
             let value = self.coerce(value, ty);
+            if check_after {
+                self.guards = true;
+            }
             let value = self.coerce(Val { node: value, ty }, stored);
             let assign = binary(
                 BinaryOp::Assign,
@@ -2862,9 +2894,18 @@ impl<'m> Lowerer<'m> {
                 Type::Unknown,
                 span,
             ));
+            if check_after {
+                out.push(self.pending_check(span));
+            }
             return Ok(());
         }
+        if check_after {
+            self.guards = false;
+        }
         let value = self.coerce(value, ty);
+        if check_after {
+            self.guards = true;
+        }
         if !self.bound.contains(&name) {
             self.bound.push(name);
             out.push(TypedNode::new(
@@ -2878,6 +2919,9 @@ impl<'m> Lowerer<'m> {
                 Type::Unknown,
                 span,
             ));
+            if check_after {
+                out.push(self.pending_check(span));
+            }
             return Ok(());
         }
         let assign = binary(BinaryOp::Assign, var(name, ty, span), value, Ty::None, span);
@@ -2886,6 +2930,9 @@ impl<'m> Lowerer<'m> {
             Type::Unknown,
             span,
         ));
+        if check_after {
+            out.push(self.pending_check(span));
+        }
         Ok(())
     }
 
