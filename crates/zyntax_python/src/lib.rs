@@ -585,7 +585,7 @@ pub fn parse_program_with(
         let stored = lower::Lowerer::storage(*ty);
         declarations.push(TypedNode::new(
             TypedDeclaration::Variable(TypedVariable {
-                name: intern(name),
+                name: lower::global_symbol(name),
                 ty: lower::ir(stored),
                 mutability: Mutability::Mutable,
                 initializer: None,

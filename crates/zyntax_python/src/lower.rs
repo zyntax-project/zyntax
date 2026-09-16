@@ -30,6 +30,12 @@ use zyntax_typed_ast::{
 pub(crate) type Node = TypedNode<TypedExpression>;
 type Stmt = TypedNode<TypedStatement>;
 
+/// Keep Python module variables separate from the built-in library's
+/// constants and globals, which share the compiler's symbol table.
+pub(crate) fn global_symbol(name: &str) -> InternedString {
+    intern(&format!("py$global${name}"))
+}
+
 thread_local! {
     /// The built-in library's `List<T>`, for spelling list types. Set
     /// once per program before any lowering.
@@ -1309,7 +1315,7 @@ impl<'m> Lowerer<'m> {
         let stored = Self::storage(ty);
         let node = self.trusted(
             Val {
-                node: var(intern(name), stored, span),
+                node: var(global_symbol(name), stored, span),
                 ty: stored,
             },
             ty,
@@ -2794,7 +2800,7 @@ impl<'m> Lowerer<'m> {
             let value = self.coerce(Val { node: value, ty }, stored);
             let assign = binary(
                 BinaryOp::Assign,
-                var(name, stored, span),
+                var(global_symbol(n.id.as_str()), stored, span),
                 value,
                 Ty::None,
                 span,
