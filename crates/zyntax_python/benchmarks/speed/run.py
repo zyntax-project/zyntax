@@ -119,6 +119,9 @@ def check(prefix, python, kernel, extra_files, name, timeout):
     for argv, shim in ((prefix, True), ([python], False)):
         d = stage(kernel, extra_files, shim)
         try:
+            importable = kernel.replace("-", "_")
+            if importable != kernel:
+                shutil.copy(os.path.join(d, kernel), os.path.join(d, importable))
             shutil.copy(script, os.path.join(d, "check.py"))
             done = subprocess.run(argv + [os.path.join(d, "check.py")], cwd=d, capture_output=True, text=True, timeout=timeout)
             outputs.append(done.stdout if done.returncode == 0 else "exit " + str(done.returncode) + ": " + reason(done.stderr))

@@ -715,6 +715,21 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 ],
             ),
             when(
+                and(is_set(a.e()), is_set(b.e())),
+                vec![ret(and(
+                    call(
+                        "zb_set_issubset",
+                        vec![raw_any(a.e()), raw_any(b.e())],
+                        boolean(),
+                    ),
+                    not(call(
+                        "zb_set_eq",
+                        vec![raw_any(a.e()), raw_any(b.e())],
+                        boolean(),
+                    )),
+                ))],
+            ),
+            when(
                 and(is(&ca, CUSTOM), is(&cb, CUSTOM)),
                 vec![ret(call(
                     "zb_list_lt_any",
@@ -733,6 +748,22 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 quoted(type_name(b.e())),
             )),
             ret(bool(false)),
+        ],
+    ));
+    d.push(define(
+        "zb_any_le",
+        &[&a, &b],
+        boolean(),
+        vec![
+            when(
+                and(is_set(a.e()), is_set(b.e())),
+                vec![ret(call(
+                    "zb_set_issubset",
+                    vec![raw_any(a.e()), raw_any(b.e())],
+                    boolean(),
+                ))],
+            ),
+            ret(not(call("zb_any_lt", vec![b.e(), a.e()], boolean()))),
         ],
     ));
     // Two boxed heap objects are the same when they hold the same

@@ -4587,8 +4587,8 @@ impl<'m> Lowerer<'m> {
             py::CmpOp::NotEq => negate(call("zb_any_eq", vec![l, r], Ty::Bool, span)),
             py::CmpOp::Lt => call("zb_any_lt", vec![l, r], Ty::Bool, span),
             py::CmpOp::Gt => call("zb_any_lt", vec![r, l], Ty::Bool, span),
-            py::CmpOp::LtE => negate(call("zb_any_lt", vec![r, l], Ty::Bool, span)),
-            py::CmpOp::GtE => negate(call("zb_any_lt", vec![l, r], Ty::Bool, span)),
+            py::CmpOp::LtE => call("zb_any_le", vec![l, r], Ty::Bool, span),
+            py::CmpOp::GtE => call("zb_any_le", vec![r, l], Ty::Bool, span),
             _ => unreachable!(),
         })
     }
@@ -5670,7 +5670,7 @@ impl<'m> Lowerer<'m> {
                         _ => {
                             let e = Elem::Object;
                             Val {
-                                node: self.coerce(list, Ty::List(e)),
+                                node: self.iterable(list, span),
                                 ty: Ty::List(e),
                             }
                         }
