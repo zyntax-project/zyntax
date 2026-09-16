@@ -361,8 +361,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                         }
                         continue;
                     }
-                    // Calls that allocate or cross tiers need a root and
-                    // ownership map the LLVM resume frame cannot provide.
+                    // Resume helpers are not yet safe across allocation and
+                    // cross-tier calls; keep these loops in their current tier.
                     let has_effectful_call = crate::osr::blocks_reachable_from(func, header)
                         .iter()
                         .filter_map(|id| func.blocks.get(id))
