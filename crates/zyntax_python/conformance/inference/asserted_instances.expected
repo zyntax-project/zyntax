@@ -1,0 +1,3 @@
+hold send 5 wait
+hold send 7
+AssertionError

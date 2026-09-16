@@ -428,12 +428,19 @@ pub fn parse_program_with(
     // against the globals and the list-parameter facts the last round
     // settled; nothing else carries over, so what one round decided
     // from less than it knows does not bind the next.
+    // Methods called on unknown receivers are found only once the
+    // globals and the list facts have settled with every method typed
+    // by its calls: opening a method makes more receivers unknown,
+    // never fewer, so the set only grows from there, and a set taken
+    // earlier would open methods on account of what was not yet known.
     let declared_classes = inferred.classes.clone();
-    for _ in 0..8 {
+    let mut methods_settling = false;
+    for _ in 0..12 {
         let before = (
             inferred.globals.clone(),
             inferred.list_params.clone(),
             inferred.dynamic_methods.clone(),
+            inferred.field_lists.clone(),
         );
         inferred.classes = declared_classes.clone();
         let out = types::infer_module(&inferred, &items, &owned, &entry_files);
@@ -441,7 +448,38 @@ pub fn parse_program_with(
         inferred.classes = out.classes;
         inferred.closures = std::cell::RefCell::new(out.closures);
         inferred.list_params = out.list_params;
-        inferred.dynamic_methods = out.dynamic_methods;
+        let found_dynamic = out.dynamic_methods.clone();
+        if methods_settling {
+            inferred
+                .dynamic_methods
+                .extend(found_dynamic.iter().cloned());
+        }
+        inferred.list_fields = out.list_fields;
+        inferred.field_lists = out.field_lists;
+        if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
+            let mut dynamic: Vec<&String> = inferred.dynamic_methods.iter().collect();
+            dynamic.sort();
+            eprintln!(
+                "[types] round: dynamic methods {}",
+                dynamic
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            if let Ok(watch) = std::env::var("ZYNTAX_TRACE_TYPES_WATCH") {
+                for name in watch.split(',') {
+                    if let Some(sig) = inferred.funcs.get(name) {
+                        eprintln!("[types] round: {name} {:?} -> {:?}", sig.params, sig.ret);
+                    }
+                    for class in &inferred.classes {
+                        if class.name == name {
+                            eprintln!("[types] round: class {name} {:?}", class.fields);
+                        }
+                    }
+                }
+            }
+        }
         let mut writes: Vec<(String, types::Ty)> = global_names
             .iter()
             .map(|name| {
@@ -471,18 +509,63 @@ pub fn parse_program_with(
                 .join(ty);
             inferred.globals.insert(name, joined);
         }
-        if (
+        let settled = (
             inferred.globals.clone(),
             inferred.list_params.clone(),
             inferred.dynamic_methods.clone(),
-        ) == before
-        {
+            inferred.field_lists.clone(),
+        ) == before;
+        if settled && methods_settling {
             break;
+        }
+        if settled {
+            methods_settling = true;
+            inferred.dynamic_methods = found_dynamic;
         }
     }
     for ty in inferred.globals.values_mut() {
         if *ty == types::Ty::Unknown {
             *ty = types::Ty::Object;
+        }
+    }
+    // `ZYNTAX_TRACE_TYPES=1` prints what inference decided: each
+    // function's signature, each class's fields, the globals.
+    if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
+        let mut names: Vec<&String> = inferred.funcs.keys().collect();
+        names.sort();
+        for name in names {
+            let sig = &inferred.funcs[name];
+            let params: Vec<String> = sig
+                .params
+                .iter()
+                .map(|(n, t)| format!("{n}: {t:?}"))
+                .collect();
+            eprintln!("[types] {name}({}) -> {:?}", params.join(", "), sig.ret);
+        }
+        for class in &inferred.classes {
+            let fields: Vec<String> = class
+                .fields
+                .iter()
+                .map(|(n, t)| format!("{n}: {t:?}"))
+                .collect();
+            eprintln!("[types] class {} {{ {} }}", class.name, fields.join(", "));
+        }
+        let mut globals: Vec<(&String, &types::Ty)> = inferred.globals.iter().collect();
+        globals.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, ty) in globals {
+            eprintln!("[types] global {name}: {ty:?}");
+        }
+        if !inferred.dynamic_methods.is_empty() {
+            let mut dynamic: Vec<&String> = inferred.dynamic_methods.iter().collect();
+            dynamic.sort();
+            eprintln!(
+                "[types] dynamic methods: {}",
+                dynamic
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
         }
     }
     let mut declarations = classes::register(&mut inferred, &mut library.type_registry);

@@ -2076,36 +2076,50 @@ impl<'m> Lowerer<'m> {
                     return Ok(());
                 }
                 // A literal that says nothing of its elements is built
-                // as the list the name holds, which inference typed by
-                // what the body puts in it.
-                if let [py::Expr::Name(n)] = a.targets.as_slice() {
+                // as the list its name or field holds, which inference
+                // typed by what the program puts in it.
+                if let [target] = a.targets.as_slice() {
                     if let Some(count) = types::unkinded_list(&a.value) {
-                        if let Ty::List(e) = self.var_ty(n.id.as_str()) {
-                            if e != Elem::Object {
-                                let items = if types::is_empty_list(&a.value) {
-                                    Vec::new()
-                                } else {
-                                    let none = node(
-                                        TypedExpression::Literal(TypedLiteral::Null),
-                                        Ty::None,
-                                        span,
-                                    );
-                                    vec![Val {
-                                        node: none,
-                                        ty: Ty::None,
-                                    }]
-                                };
-                                let mut value = Val {
-                                    node: self.list_of(items, e, span),
-                                    ty: Ty::List(e),
-                                };
-                                if let Some(n) = count {
-                                    let times = self.expr(n)?;
-                                    value =
-                                        self.arithmetic(py::Operator::Mult, value, times, n, span)?;
+                        let kind = match target {
+                            py::Expr::Name(n) => match self.var_ty(n.id.as_str()) {
+                                Ty::List(e) if e != Elem::Object => Some(e),
+                                _ => None,
+                            },
+                            py::Expr::Attribute(attr) => match self.ty_of(&attr.value) {
+                                Ty::Class(k) => {
+                                    match self.module.field(k as usize, attr.attr.as_str()) {
+                                        Some((_, Ty::List(e))) if e != Elem::Object => Some(e),
+                                        _ => None,
+                                    }
                                 }
-                                return self.bind(&a.targets[0], value, span, out);
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(e) = kind {
+                            let items = if types::is_empty_list(&a.value) {
+                                Vec::new()
+                            } else {
+                                let none = node(
+                                    TypedExpression::Literal(TypedLiteral::Null),
+                                    Ty::None,
+                                    span,
+                                );
+                                vec![Val {
+                                    node: none,
+                                    ty: Ty::None,
+                                }]
+                            };
+                            let mut value = Val {
+                                node: self.list_of(items, e, span),
+                                ty: Ty::List(e),
+                            };
+                            if let Some(n) = count {
+                                let times = self.expr(n)?;
+                                value =
+                                    self.arithmetic(py::Operator::Mult, value, times, n, span)?;
                             }
+                            return self.bind(target, value, span, out);
                         }
                     }
                 }
@@ -2315,6 +2329,17 @@ impl<'m> Lowerer<'m> {
                 self.escape_into(span, out);
             }
             py::Stmt::Assert(a) => {
+                // `assert isinstance(x, C)` right after `x = v`: the
+                // binding checked already.
+                if let py::Expr::Call(c) = &*a.test {
+                    if types::is_name(&c.func, "isinstance") && c.arguments.args.len() == 2 {
+                        if let py::Expr::Name(x) = &c.arguments.args[0] {
+                            if self.locals.narrowed.contains_key(x.id.as_str()) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 let test = self.expr(&a.test)?;
                 let cond = self.truthy(test);
                 let message = match &a.msg {
@@ -2469,6 +2494,66 @@ impl<'m> Lowerer<'m> {
         out: &mut Vec<Stmt>,
     ) -> Result<()> {
         let n = match target {
+            // A name the next statement asserts to be an instance of a
+            // class: the assert's check happens here, on the value, and
+            // the name holds the instance.
+            py::Expr::Name(n)
+                if self
+                    .locals
+                    .narrowed
+                    .get(n.id.as_str())
+                    .is_some_and(|&k| value.ty != Ty::Class(k)) =>
+            {
+                let k = self.locals.narrowed[n.id.as_str()];
+                // The check and the value it reads run ahead of the
+                // statement, with whatever the checked read hoists after
+                // them.
+                let mut pre = Vec::new();
+                let held = self.hold(value, &mut pre, span);
+                self.hoisted.append(&mut pre);
+                let class = py::Expr::Name(py::ExprName {
+                    node_index: Default::default(),
+                    range: target.range(),
+                    id: py::name::Name::new(self.module.classes[k as usize].name.clone()),
+                    ctx: py::ExprContext::Load,
+                });
+                let test = self.isinstance(
+                    Val {
+                        node: held.node.clone(),
+                        ty: held.ty,
+                    },
+                    &class,
+                    span,
+                )?;
+                let mut raise = Vec::new();
+                self.raise_named("AssertionError", str_lit("", span), span, &mut raise);
+                let failed = node(
+                    TypedExpression::Unary(TypedUnary {
+                        op: UnaryOp::Not,
+                        operand: Box::new(self.truthy(test)),
+                    }),
+                    Ty::Bool,
+                    span,
+                );
+                self.hoisted.push(TypedNode::new(
+                    TypedStatement::If(TypedIf {
+                        condition: Box::new(failed),
+                        then_block: TypedBlock {
+                            statements: raise,
+                            span,
+                        },
+                        else_block: None,
+                        span,
+                    }),
+                    Type::Unknown,
+                    span,
+                ));
+                let instance = Val {
+                    node: self.coerce(held, Ty::Class(k)),
+                    ty: Ty::Class(k),
+                };
+                return self.bind(target, instance, span, out);
+            }
             py::Expr::Name(n) => n,
             // `obj.attr = v`
             py::Expr::Attribute(a) => {

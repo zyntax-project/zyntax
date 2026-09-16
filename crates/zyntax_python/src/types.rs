@@ -272,6 +272,11 @@ pub(crate) struct Module {
     /// from out of view passes what it has. The others are typed by
     /// the calls in view, as module functions are.
     pub(crate) dynamic_methods: std::collections::HashSet<String>,
+    /// Fields a constructor binds to an unkinded list literal, by class
+    /// and name, and the kind the program's writes into them decided
+    /// last round (`Unknown` while undecided); see [`decide_list`].
+    pub(crate) list_fields: std::collections::HashSet<(usize, String)>,
+    pub(crate) field_lists: HashMap<(usize, String), Ty>,
     /// What lowering each function found about its raising, by the
     /// name it lowers to; see [`RaiseFact`].
     pub(crate) raise_facts: std::cell::RefCell<std::collections::BTreeMap<String, RaiseFact>>,
@@ -1126,6 +1131,9 @@ pub(crate) struct Locals {
     /// Fields written through an instance of a known class other than
     /// `self`: the class, the field, what is written.
     pub(crate) other_field_writes: Vec<(usize, String, Ty)>,
+    /// Locals bound once and then asserted to be an instance of a class
+    /// on the next line: they have that class, and the binding checks.
+    pub(crate) narrowed: HashMap<String, u16>,
     /// What the body assigns to its own parameters.
     pub(crate) param_writes: HashMap<String, Ty>,
     /// Whether the body has a `return`; without one it returns None.
@@ -1305,6 +1313,8 @@ pub(crate) struct Inferred {
     pub(crate) entry: Locals,
     pub(crate) list_params: HashMap<String, Vec<ListFact>>,
     pub(crate) dynamic_methods: std::collections::HashSet<String>,
+    pub(crate) list_fields: std::collections::HashSet<(usize, String)>,
+    pub(crate) field_lists: HashMap<(usize, String), Ty>,
 }
 
 /// The items every call of which is in view: module functions never
@@ -1443,11 +1453,38 @@ pub(crate) fn infer_module(
         bound_index: known.bound_index.clone(),
         list_params: known.list_params.clone(),
         dynamic_methods: known.dynamic_methods.clone(),
+        list_fields: known.list_fields.clone(),
+        field_lists: known.field_lists.clone(),
         files: known.files.clone(),
         imports: known.imports.clone(),
         from_names: known.from_names.clone(),
         ..Default::default()
     };
+    // The fields a constructor binds to an unkinded literal.
+    for item in items {
+        let Some(k) = item.class else {
+            continue;
+        };
+        let Some(first) = item.def.parameters.iter_non_variadic_params().next() else {
+            continue;
+        };
+        let this = first.parameter.name.as_str();
+        for stmt in &item.def.body {
+            let py::Stmt::Assign(a) = stmt else {
+                continue;
+            };
+            if unkinded_list(&a.value).is_none() {
+                continue;
+            }
+            for t in &a.targets {
+                if let py::Expr::Attribute(attr) = t {
+                    if is_name(&attr.value, this) {
+                        module.list_fields.insert((k, attr.attr.to_string()));
+                    }
+                }
+            }
+        }
+    }
     // Which parameters of each function are inferred, by position. A
     // method is, like a closed function, unless a call of a method of
     // its name on an unknown receiver was seen last time round.
@@ -1495,12 +1532,17 @@ pub(crate) fn infer_module(
         defaults: Vec::new(),
     };
     let mut entry_locals = Locals::default();
-    let mut dynamic_methods = std::collections::HashSet::new();
+    let field_keys: Vec<String> = module
+        .list_fields
+        .iter()
+        .map(|(k, f)| field_key(*k, f))
+        .collect();
     for _ in 0..32 {
         let mut changed = false;
         let mut passed: Vec<(Target, usize, Ty)> = Vec::new();
         let mut escaped: Vec<u16> = Vec::new();
-        dynamic_methods = std::collections::HashSet::new();
+        let mut dynamic_methods = std::collections::HashSet::new();
+        let mut field_rounds: HashMap<String, FieldRound> = HashMap::new();
         for item in items {
             let sig = module.funcs[&item.name].clone();
             let file = module.file_of(item.module.as_deref());
@@ -1512,6 +1554,17 @@ pub(crate) fn infer_module(
             let facts = in_file(file, || {
                 list_param_facts(&module, &item.def.body, &locals.vars, &sig.params)
             });
+            if !field_keys.is_empty() {
+                in_file(file, || {
+                    field_sites_into(
+                        &module,
+                        &item.def.body,
+                        &locals.vars,
+                        &field_keys,
+                        &mut field_rounds,
+                    )
+                });
+            }
             if module.list_params.get(&item.name) != Some(&facts) {
                 module.list_params.insert(item.name.clone(), facts);
                 changed = true;
@@ -1527,10 +1580,20 @@ pub(crate) fn infer_module(
             // class, and on every class deriving from it.
             if let Some(k) = item.class {
                 for (field, ty) in &locals.field_writes {
+                    if std::env::var_os("ZYNTAX_TRACE_TYPES_ROUNDS").is_some() && *ty == Ty::Object
+                    {
+                        eprintln!("[types] inner: {} writes self.{field} as Object", item.name);
+                    }
                     changed |= widen_field(&mut module.classes, k, field, *ty);
                 }
             }
             for (k, field, ty) in &locals.other_field_writes {
+                if std::env::var_os("ZYNTAX_TRACE_TYPES_ROUNDS").is_some() {
+                    eprintln!(
+                        "[types] inner: {} writes {}.{field} as {ty:?}",
+                        item.name, module.classes[*k].name
+                    );
+                }
                 changed |= widen_field(&mut module.classes, *k, field, *ty);
             }
             if let Some(flags) = inferring.get(&item.name) {
@@ -1550,6 +1613,7 @@ pub(crate) fn infer_module(
                     allow_closure: false,
                     escaped: &mut escaped,
                     dynamic_methods: &mut dynamic_methods,
+                    settled: false,
                     files: &[],
                     no_outer: HashMap::new(),
                 }
@@ -1559,6 +1623,25 @@ pub(crate) fn infer_module(
         entry_locals = infer_locals_open(&module, &entry_sig, entry, entry_files);
         for (k, field, ty) in &entry_locals.other_field_writes {
             changed |= widen_field(&mut module.classes, *k, field, *ty);
+        }
+        if !field_keys.is_empty() {
+            field_sites_into(
+                &module,
+                entry,
+                &entry_locals.vars,
+                &field_keys,
+                &mut field_rounds,
+            );
+            for (k, f) in module.list_fields.clone() {
+                let decided = field_rounds
+                    .get(&field_key(k, &f))
+                    .map(FieldRound::decide)
+                    .unwrap_or(Ty::List(Elem::Object));
+                if module.field_lists.get(&(k, f.clone())) != Some(&decided) {
+                    module.field_lists.insert((k, f), decided);
+                    changed = true;
+                }
+            }
         }
         changed |= infer_closures_in(&module, entry, entry_files, &entry_locals.vars);
         Calls {
@@ -1570,6 +1653,7 @@ pub(crate) fn infer_module(
             allow_closure: false,
             escaped: &mut escaped,
             dynamic_methods: &mut dynamic_methods,
+            settled: false,
             files: entry_files,
             no_outer: HashMap::new(),
         }
@@ -1583,10 +1667,10 @@ pub(crate) fn infer_module(
                     if !flags[index] {
                         continue;
                     }
-                    let slot = &mut module.funcs.get_mut(name).unwrap().params[index].1;
-                    let joined = slot.join(ty);
-                    if joined != *slot {
-                        *slot = joined;
+                    let current = module.funcs[name].params[index].1;
+                    let joined = module.join_classes(current, ty);
+                    if joined != current {
+                        module.funcs.get_mut(name).unwrap().params[index].1 = joined;
                         changed = true;
                     }
                     continue;
@@ -1626,9 +1710,65 @@ pub(crate) fn infer_module(
                 }
             }
         }
+        if let Ok(watch) = std::env::var("ZYNTAX_TRACE_TYPES_ROUNDS") {
+            for name in watch.split(',') {
+                if let Some(sig) = module.funcs.get(name) {
+                    eprintln!("[types] inner: {name} {:?} -> {:?}", sig.params, sig.ret);
+                }
+                for class in &module.classes {
+                    if class.name == name {
+                        eprintln!("[types] inner: class {name} {:?}", class.fields);
+                    }
+                }
+            }
+        }
         if !changed {
             break;
         }
+    }
+    // The methods called on receivers that never got a type, now that
+    // nothing more will be reached.
+    let mut dynamic_methods = std::collections::HashSet::new();
+    {
+        let mut passed: Vec<(Target, usize, Ty)> = Vec::new();
+        let mut escaped: Vec<u16> = Vec::new();
+        for item in items {
+            let sig = module.funcs[&item.name].clone();
+            let file = module.file_of(item.module.as_deref());
+            let locals = in_file(file, || {
+                infer_locals_open(&module, &sig, &item.def.body, &[])
+            });
+            in_file(file, || {
+                Calls {
+                    module: &module,
+                    vars: &locals.vars,
+                    class: item.class,
+                    opaque: false,
+                    passed: &mut passed,
+                    allow_closure: false,
+                    escaped: &mut escaped,
+                    dynamic_methods: &mut dynamic_methods,
+                    settled: true,
+                    files: &[],
+                    no_outer: HashMap::new(),
+                }
+                .stmts(&item.def.body)
+            });
+        }
+        Calls {
+            module: &module,
+            vars: &entry_locals.vars,
+            class: None,
+            opaque: false,
+            passed: &mut passed,
+            allow_closure: false,
+            escaped: &mut escaped,
+            dynamic_methods: &mut dynamic_methods,
+            settled: true,
+            files: entry_files,
+            no_outer: HashMap::new(),
+        }
+        .stmts(entry);
     }
     // Whatever recursion left undecided is dynamic. So is a parameter
     // only ever passed None: the IR has no value of that type to pass.
@@ -1671,6 +1811,8 @@ pub(crate) fn infer_module(
         entry: entry_locals,
         list_params: module.list_params,
         dynamic_methods,
+        list_fields: module.list_fields,
+        field_lists: module.field_lists,
     }
 }
 
@@ -1693,6 +1835,10 @@ struct Calls<'a> {
     escaped: &'a mut Vec<u16>,
     /// Methods called on a receiver whose class is not known.
     dynamic_methods: &'a mut std::collections::HashSet<String>,
+    /// Whether a receiver still untyped counts as unknown: only once the
+    /// rounds are over, since a type not yet reached is not a dynamic
+    /// value, and treating it as one would keep it from being reached.
+    settled: bool,
     /// The file of each top-level statement, where they span several.
     files: &'a [u32],
     /// A body typed here has no enclosing scope of its own.
@@ -1958,7 +2104,10 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
                     self.record(target, first, &c.arguments.args, &c.arguments.keywords);
                 }
                 if let py::Expr::Attribute(a) = &*c.func {
-                    if !is_super_call(&a.value) && !self.opaque {
+                    if !is_super_call(&a.value)
+                        && !self.opaque
+                        && self.typer().class_named(&a.value).is_none()
+                    {
                         match self.arg_ty(&a.value) {
                             Ty::Class(k) => {
                                 for sub in self.module.overriders(k as usize, a.attr.as_str()) {
@@ -1974,11 +2123,11 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
                                     }
                                 }
                             }
-                            // Not an instance of a known class, or not
-                            // known yet: any method of the name may be
-                            // reached with whatever this passes.
-                            Ty::Object | Ty::Unknown
-                                if self
+                            // Not an instance of a known class: any
+                            // method of the name may be reached with
+                            // whatever this passes.
+                            ty if (ty == Ty::Object || (ty == Ty::Unknown && self.settled))
+                                && self
                                     .module
                                     .classes
                                     .iter()
@@ -2069,10 +2218,28 @@ fn widen_field(classes: &mut [ClassInfo], k: usize, name: &str, ty: Ty) -> bool 
             false
         })
         .collect();
+    // Two instance types join to the nearest class both derive from.
+    let bases: Vec<Option<usize>> = classes.iter().map(|c| c.base).collect();
+    let join = |a: Ty, b: Ty| -> Ty {
+        if let (Ty::Class(x), Ty::Class(y)) = (a, b) {
+            let mut at = Some(x as usize);
+            while let Some(c) = at {
+                let mut y_at = Some(y as usize);
+                while let Some(yc) = y_at {
+                    if yc == c {
+                        return Ty::Class(c as u16);
+                    }
+                    y_at = bases[yc];
+                }
+                at = bases[c];
+            }
+        }
+        a.join(b)
+    };
     for c in targets {
         match classes[c].fields.iter().position(|(f, _)| f == name) {
             Some(i) => {
-                let joined = classes[c].fields[i].1.join(ty);
+                let joined = join(classes[c].fields[i].1, ty);
                 if joined != classes[c].fields[i].1 {
                     classes[c].fields[i].1 = joined;
                     changed = true;
@@ -2162,8 +2329,10 @@ fn infer_locals_with(
     let fills = list_sites(
         module,
         body,
+        &locals.vars,
         unkinded_locals(body, &sig.params, seeds, &scope),
     );
+    locals.narrowed = asserted_classes(body, &module.class_index);
     for _ in 0..8 {
         let before = locals.clone();
         let mut walker = Walker {
@@ -2246,6 +2415,9 @@ pub(crate) struct ListSites<'ast> {
     /// Functions of the module it is passed to, with the parameter's
     /// position; what they write in is what their facts say.
     pub(crate) passed_to: Vec<(String, usize)>,
+    /// Written through a receiver not yet typed: nothing can be decided
+    /// this round.
+    pub(crate) undecided: bool,
 }
 
 /// What a function does with a parameter, for callers typing the list
@@ -2267,14 +2439,21 @@ pub(crate) enum ListFact {
 /// is `append`, `insert`, `extend`, `+=`, an element or slice store, or
 /// a pass to a function of the module. Anything else, in the body or a
 /// nested one, keeps the list.
+/// The key a class's field goes by among list sites.
+pub(crate) fn field_key(class: usize, field: &str) -> String {
+    format!("{class}#{field}")
+}
+
 pub(crate) fn list_sites<'ast>(
     module: &Module,
     body: &'ast [py::Stmt],
+    vars: &HashMap<String, Ty>,
     names: Vec<String>,
 ) -> HashMap<String, ListSites<'ast>> {
     use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
     struct Uses<'a, 'm, 'ast> {
         module: &'m Module,
+        typer: Typer<'m>,
         sites: HashMap<String, ListSites<'ast>>,
         /// Whether the current expression is one of the allowed uses.
         allowed: &'a std::cell::Cell<bool>,
@@ -2286,9 +2465,39 @@ pub(crate) fn list_sites<'ast>(
         fn drop_name(&mut self, name: &str) {
             self.site(name).kept = true;
         }
-        fn is_candidate<'e>(&self, e: &'e py::Expr) -> Option<&'e str> {
+        /// The followed fields of this name, when an attribute store
+        /// goes through a receiver whose class is not known: every one
+        /// of them may be the receiver's.
+        fn fields_named(&self, e: &py::Expr) -> Vec<(String, bool)> {
+            let py::Expr::Attribute(a) = e else {
+                return Vec::new();
+            };
+            let receiver = self.typer.expr(&a.value);
+            if !matches!(receiver, Ty::Unknown | Ty::Object) {
+                return Vec::new();
+            }
+            let suffix = format!("#{}", a.attr.as_str());
+            self.sites
+                .keys()
+                .filter(|k| k.ends_with(&suffix))
+                .map(|k| (k.clone(), receiver == Ty::Unknown))
+                .collect()
+        }
+
+        /// The key of a followed list: a name, or a field of an
+        /// instance whose class is known.
+        fn is_candidate(&self, e: &py::Expr) -> Option<String> {
             match e {
-                py::Expr::Name(n) if self.sites.contains_key(n.id.as_str()) => Some(n.id.as_str()),
+                py::Expr::Name(n) if self.sites.contains_key(n.id.as_str()) => {
+                    Some(n.id.to_string())
+                }
+                py::Expr::Attribute(a) => {
+                    let Ty::Class(k) = self.typer.expr(&a.value) else {
+                        return None;
+                    };
+                    let key = field_key(k as usize, a.attr.as_str());
+                    self.sites.contains_key(&key).then_some(key)
+                }
                 _ => None,
             }
         }
@@ -2320,7 +2529,6 @@ pub(crate) fn list_sites<'ast>(
                 py::Stmt::Assign(a) => {
                     for t in &a.targets {
                         if let Some(name) = self.is_candidate(t) {
-                            let name = name.to_string();
                             match unkinded_list(&a.value) {
                                 None => self.drop_name(&name),
                                 Some(count) => {
@@ -2337,8 +2545,17 @@ pub(crate) fn list_sites<'ast>(
                         // `xs[i] = v` writes an element; `xs[a:b] = ys`
                         // writes ys's elements.
                         if let py::Expr::Subscript(sub) = t {
+                            for (key, unknown) in self.fields_named(&sub.value) {
+                                let site = self.site(&key);
+                                if unknown {
+                                    site.undecided = true;
+                                } else if matches!(&*sub.slice, py::Expr::Slice(_)) {
+                                    site.sequences.push(&a.value);
+                                } else {
+                                    site.elements.push(&a.value);
+                                }
+                            }
                             if let Some(name) = self.is_candidate(&sub.value) {
-                                let name = name.to_string();
                                 if matches!(&*sub.slice, py::Expr::Slice(_)) {
                                     self.site(&name).sequences.push(&a.value);
                                 } else {
@@ -2360,7 +2577,6 @@ pub(crate) fn list_sites<'ast>(
                 }
                 py::Stmt::AugAssign(a) => {
                     if let Some(name) = self.is_candidate(&a.target) {
-                        let name = name.to_string();
                         if a.op == py::Operator::Add {
                             self.site(&name).sequences.push(&a.value);
                             self.visit_expr(&a.value);
@@ -2397,7 +2613,7 @@ pub(crate) fn list_sites<'ast>(
                 py::Stmt::Delete(d) => {
                     for t in &d.targets {
                         if let Some(name) = self.is_candidate(t) {
-                            self.drop_name(name);
+                            self.drop_name(&name);
                         }
                     }
                     walk_stmt(self, stmt);
@@ -2414,11 +2630,37 @@ pub(crate) fn list_sites<'ast>(
                         self.drop_name(n.id.as_str());
                     }
                 }
+                // A followed field read whole is kept; any other
+                // attribute read reads its object.
+                py::Expr::Attribute(a) if self.is_candidate(expr).is_some() => {
+                    if !allowed {
+                        let key = self.is_candidate(expr).unwrap();
+                        self.drop_name(&key);
+                    }
+                    self.visit_expr(&a.value);
+                }
                 py::Expr::Call(c) => {
                     let args = &c.arguments.args;
                     match &*c.func {
+                        py::Expr::Attribute(a) if !self.fields_named(&a.value).is_empty() => {
+                            let method = a.attr.as_str();
+                            for (key, unknown) in self.fields_named(&a.value) {
+                                let site = self.site(&key);
+                                match (method, args.len()) {
+                                    _ if unknown => site.undecided = true,
+                                    ("append", 1) => site.elements.push(&args[0]),
+                                    ("insert", 2) => site.elements.push(&args[1]),
+                                    ("extend", 1) => site.sequences.push(&args[0]),
+                                    _ if READS.contains(&method) => {}
+                                    _ => site.kept = true,
+                                }
+                            }
+                            for arg in args {
+                                self.visit_expr(arg);
+                            }
+                        }
                         py::Expr::Attribute(a) if self.is_candidate(&a.value).is_some() => {
-                            let name = self.is_candidate(&a.value).unwrap().to_string();
+                            let name = self.is_candidate(&a.value).unwrap();
                             let method = a.attr.as_str();
                             match (method, args.len()) {
                                 ("append", 1) => self.site(&name).elements.push(&args[0]),
@@ -2462,7 +2704,6 @@ pub(crate) fn list_sites<'ast>(
                             for (i, arg) in args.iter().enumerate() {
                                 match self.is_candidate(arg) {
                                     Some(name) => {
-                                        let name = name.to_string();
                                         self.site(&name).passed_to.push((f.id.to_string(), i));
                                     }
                                     None => self.visit_expr(arg),
@@ -2533,8 +2774,14 @@ pub(crate) fn list_sites<'ast>(
     }
 
     let allowed = std::cell::Cell::new(false);
+    let no_outer = HashMap::new();
     let mut uses = Uses {
         module,
+        typer: Typer {
+            module,
+            vars,
+            outer: &no_outer,
+        },
         sites: names
             .into_iter()
             .map(|n| (n, ListSites::default()))
@@ -2548,6 +2795,113 @@ pub(crate) fn list_sites<'ast>(
         uses.visit_stmt(s);
     }
     uses.sites
+}
+
+/// `x = v` followed by `assert isinstance(x, C)`, for a local `x` bound
+/// nowhere else in the body: `x` is a `C`, and the binding does the
+/// checking the assert asked for.
+pub(crate) fn asserted_classes(
+    body: &[py::Stmt],
+    classes: &HashMap<String, usize>,
+) -> HashMap<String, u16> {
+    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    fn pairs(stmts: &[py::Stmt], classes: &HashMap<String, usize>, out: &mut Vec<(String, u16)>) {
+        for (i, s) in stmts.iter().enumerate() {
+            match s {
+                py::Stmt::Assign(a) => {
+                    let [py::Expr::Name(x)] = a.targets.as_slice() else {
+                        continue;
+                    };
+                    let Some(py::Stmt::Assert(t)) = stmts.get(i + 1) else {
+                        continue;
+                    };
+                    let py::Expr::Call(c) = &*t.test else {
+                        continue;
+                    };
+                    if !is_name(&c.func, "isinstance") || c.arguments.args.len() != 2 {
+                        continue;
+                    }
+                    let (py::Expr::Name(checked), py::Expr::Name(class)) =
+                        (&c.arguments.args[0], &c.arguments.args[1])
+                    else {
+                        continue;
+                    };
+                    if checked.id != x.id {
+                        continue;
+                    }
+                    if let Some(&k) = classes.get(class.id.as_str()) {
+                        out.push((x.id.to_string(), k as u16));
+                    }
+                }
+                py::Stmt::If(i) => {
+                    pairs(&i.body, classes, out);
+                    for c in &i.elif_else_clauses {
+                        pairs(&c.body, classes, out);
+                    }
+                }
+                py::Stmt::While(w) => pairs(&w.body, classes, out),
+                py::Stmt::For(f) => pairs(&f.body, classes, out),
+                py::Stmt::Try(t) => {
+                    pairs(&t.body, classes, out);
+                    for h in &t.handlers {
+                        let py::ExceptHandler::ExceptHandler(h) = h;
+                        pairs(&h.body, classes, out);
+                    }
+                    pairs(&t.orelse, classes, out);
+                    pairs(&t.finalbody, classes, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut found = Vec::new();
+    pairs(body, classes, &mut found);
+    if found.is_empty() {
+        return HashMap::new();
+    }
+    // Only a name stored once, by that assignment.
+    #[derive(Default)]
+    struct Stores(HashMap<String, usize>);
+    impl<'a> Visitor<'a> for Stores {
+        fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
+            match stmt {
+                py::Stmt::FunctionDef(f) => {
+                    *self.0.entry(f.name.to_string()).or_default() += 1;
+                }
+                py::Stmt::ClassDef(c) => {
+                    *self.0.entry(c.name.to_string()).or_default() += 1;
+                }
+                py::Stmt::Global(g) => {
+                    for n in &g.names {
+                        *self.0.entry(n.to_string()).or_default() += 2;
+                    }
+                }
+                py::Stmt::Nonlocal(g) => {
+                    for n in &g.names {
+                        *self.0.entry(n.to_string()).or_default() += 2;
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'a py::Expr) {
+            if let py::Expr::Name(n) = expr {
+                if !matches!(n.ctx, py::ExprContext::Load) {
+                    *self.0.entry(n.id.to_string()).or_default() += 1;
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut stores = Stores::default();
+    for s in body {
+        stores.visit_stmt(s);
+    }
+    found
+        .into_iter()
+        .filter(|(name, _)| stores.0.get(name).copied() == Some(1))
+        .collect()
 }
 
 /// The locals of `body` bound only by unkinded literals, never in a
@@ -2651,7 +3005,7 @@ fn written_into(module: &Module, sites: &ListSites<'_>, typer: &Typer<'_>) -> Op
         return None;
     }
     let mut written = if sites.none { Some(Ty::None) } else { None };
-    let mut undecided = false;
+    let mut undecided = sites.undecided;
     let mut take = |ty: Ty| {
         if ty == Ty::Unknown {
             undecided = true;
@@ -2693,6 +3047,71 @@ fn decide_list(module: &Module, sites: &ListSites<'_>, typer: &Typer<'_>) -> Ty 
     }
 }
 
+/// What the program's bodies do with a field bound to an unkinded
+/// list, gathered over one round of inference.
+#[derive(Default, Debug)]
+struct FieldRound {
+    kept: bool,
+    none: bool,
+    /// What is written in, typed where it is written; `Unknown` for a
+    /// write not yet typed.
+    written: Vec<Ty>,
+}
+
+impl FieldRound {
+    /// The list's kind: as [`decide_list`] decides a local's.
+    fn decide(&self) -> Ty {
+        if self.kept {
+            return Ty::List(Elem::Object);
+        }
+        let mut joined = if self.none { Some(Ty::None) } else { None };
+        for ty in &self.written {
+            if *ty == Ty::Unknown {
+                return Ty::Unknown;
+            }
+            joined = Some(joined.unwrap_or(Ty::Unknown).join(*ty));
+        }
+        match joined {
+            None => Ty::List(Elem::Object),
+            Some(ty) => Ty::List(Elem::of(ty)),
+        }
+    }
+}
+
+/// Add what `body` does with each field in `keys` to `rounds`.
+fn field_sites_into(
+    module: &Module,
+    body: &[py::Stmt],
+    vars: &HashMap<String, Ty>,
+    keys: &[String],
+    rounds: &mut HashMap<String, FieldRound>,
+) {
+    let sites = list_sites(module, body, vars, keys.to_vec());
+    let no_outer = HashMap::new();
+    let typer = Typer {
+        module,
+        vars,
+        outer: &no_outer,
+    };
+    for (key, site) in sites {
+        let round = rounds.entry(key).or_default();
+        // A field handed to a function is out of sight.
+        round.kept |= site.kept || !site.passed_to.is_empty();
+        round.none |= site.none;
+        if site.undecided {
+            round.written.push(Ty::Unknown);
+        }
+        for e in &site.elements {
+            round.written.push(typer.expr(e));
+        }
+        for e in &site.sequences {
+            round
+                .written
+                .push(typer.expr(e).element().unwrap_or(Ty::Object));
+        }
+    }
+}
+
 /// What a body does with each of its parameters, in parameter order;
 /// see [`Module::list_params`].
 fn list_param_facts(
@@ -2715,7 +3134,7 @@ fn list_param_facts(
         })
         .map(|(name, _)| name.clone())
         .collect();
-    let sites = list_sites(module, body, followed);
+    let sites = list_sites(module, body, vars, followed);
     let no_outer = HashMap::new();
     let typer = Typer {
         module,
@@ -2862,21 +3281,18 @@ impl Walker<'_> {
                 .unwrap_or(Ty::Unknown)
                 .join(ty);
             self.locals.param_writes.insert(name.to_string(), written);
+            // A value the declared type admits, None into an instance,
+            // a subclass instance into a base, changes nothing.
             if !matches!(*declared, Ty::Object | Ty::Unknown)
-                && ty != *declared
                 && ty != Ty::Unknown
+                && self.module.join_classes(*declared, ty) != *declared
             {
                 self.locals.vars.insert(name.to_string(), Ty::Object);
             }
             return;
         }
-        let joined = self
-            .locals
-            .vars
-            .get(name)
-            .copied()
-            .unwrap_or(Ty::Unknown)
-            .join(ty);
+        let current = self.locals.vars.get(name).copied().unwrap_or(Ty::Unknown);
+        let joined = self.module.join_classes(current, ty);
         self.locals.vars.insert(name.to_string(), joined);
     }
 
@@ -2914,13 +3330,13 @@ impl Walker<'_> {
                 if matches!(&*a.value, py::Expr::Name(n)
                     if self.params.first().is_some_and(|(p, _)| p == n.id.as_str())) =>
             {
-                let joined = self
+                let current = self
                     .locals
                     .field_writes
                     .get(a.attr.as_str())
                     .copied()
-                    .unwrap_or(Ty::Unknown)
-                    .join(ty);
+                    .unwrap_or(Ty::Unknown);
+                let joined = self.module.join_classes(current, ty);
                 self.locals.field_writes.insert(a.attr.to_string(), joined);
                 self.field_write(a, ty);
             }
@@ -2960,6 +3376,30 @@ impl Walker<'_> {
                             self.locals.vars.remove(n.id.as_str());
                             self.assign(n.id.as_str(), decided);
                             continue;
+                        }
+                        // The assert on the next line says what it is.
+                        if let Some(&k) = self.locals.narrowed.get(n.id.as_str()) {
+                            self.assign(n.id.as_str(), Ty::Class(k));
+                            continue;
+                        }
+                    }
+                    // `self.f = []` takes the kind the program's writes
+                    // into the field decided, nothing until they have.
+                    if let py::Expr::Attribute(attr) = t {
+                        if unkinded_list(&a.value).is_some() {
+                            if let Ty::Class(k) = self.expr(&attr.value) {
+                                let key = (k as usize, attr.attr.to_string());
+                                if self.module.list_fields.contains(&key) {
+                                    let decided = self
+                                        .module
+                                        .field_lists
+                                        .get(&key)
+                                        .copied()
+                                        .unwrap_or(Ty::Unknown);
+                                    self.target(t, decided);
+                                    continue;
+                                }
+                            }
                         }
                     }
                     self.target(t, ty);
@@ -3329,7 +3769,9 @@ impl Typer<'_> {
                         .field(k as usize, a.attr.as_str())
                         .map(|(_, ty)| ty)
                         .unwrap_or(Ty::Object),
-                    Ty::Unknown => Ty::Unknown,
+                    // An attribute of None raises; its type is what the
+                    // other paths to the name decide.
+                    Ty::Unknown | Ty::None => Ty::Unknown,
                     _ => Ty::Object,
                 }
             }
@@ -3577,7 +4019,7 @@ impl Typer<'_> {
     /// What a method call on a value of type `receiver` returns.
     fn method_ret(&self, receiver: Ty, attr: &str) -> Ty {
         match receiver {
-            Ty::Unknown => Ty::Unknown,
+            Ty::Unknown | Ty::None => Ty::Unknown,
             Ty::List(e) => match attr {
                 "pop" => e.ty(),
                 "index" | "count" => Ty::Int,
