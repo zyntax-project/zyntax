@@ -1419,13 +1419,24 @@ impl TypedCfgBuilder {
                             None,
                         );
 
-                        all_blocks.push(TypedBasicBlock {
-                            id: body_id,
-                            label: None,
+                        // An arm can contain nested loops and branches. Split
+                        // them into CFG blocks before attaching the arm's
+                        // pattern binding to its entry block.
+                        let body_block = TypedBlock {
                             statements: body_stmts,
-                            terminator: body_terminator,
-                            pattern_check: body_pattern_info,
-                        });
+                            span: arm.body.span,
+                        };
+                        let (mut body_blocks, _, body_exit) =
+                            self.split_at_control_flow(&body_block, body_id, false)?;
+                        if let Some(entry) = body_blocks.iter_mut().find(|b| b.id == body_id) {
+                            entry.pattern_check = body_pattern_info;
+                        }
+                        if let Some(exit) = body_blocks.iter_mut().find(|b| b.id == body_exit) {
+                            if matches!(exit.terminator, TypedTerminator::Unreachable) {
+                                exit.terminator = body_terminator;
+                            }
+                        }
+                        all_blocks.extend(body_blocks);
 
                         prev_pattern_id = next_pattern_id;
                     }
