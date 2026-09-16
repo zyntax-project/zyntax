@@ -1261,6 +1261,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         &[&x],
         anys.clone(),
         vec![
+            when(
+                eq(tag(x.e()), int(TUPLE_TAG)),
+                vec![ret(call("zb_unbox_tuple_raw", vec![x.e()], anys.clone()))],
+            ),
             cat.decl(category(x.e())),
             when(
                 is(&cat, STR),

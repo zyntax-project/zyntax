@@ -2781,8 +2781,26 @@ impl<'m> Lowerer<'m> {
                 return self.bind(&as_tuple, value, span, out);
             }
             py::Expr::Tuple(t) => {
+                // Resolve a dynamic iterable once before reading its fields.
+                let dynamic = value.ty == Ty::Object;
+                let value = if dynamic {
+                    Val {
+                        node: call(
+                            "zb_any_iter",
+                            vec![value.node],
+                            Ty::List(Elem::Object),
+                            span,
+                        ),
+                        ty: Ty::List(Elem::Object),
+                    }
+                } else {
+                    value
+                };
                 let elem_ty = value.ty.element().unwrap_or(Ty::Object);
                 let seq = self.hold(value, out, span);
+                if dynamic {
+                    out.push(self.pending_check(span));
+                }
                 let n = t.elts.len() as i64;
                 let check = match seq.ty {
                     Ty::List(e) => Some(call(
@@ -2805,6 +2823,7 @@ impl<'m> Lowerer<'m> {
                         Type::Unknown,
                         span,
                     ));
+                    out.push(self.pending_check(span));
                 }
                 for (i, elt) in t.elts.iter().enumerate() {
                     let item = self.index_value(
