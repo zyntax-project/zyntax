@@ -125,6 +125,7 @@ pub(crate) const BUILTIN_VALUES: &[&str] = &[
     "tuple",
     "dict",
     "set",
+    "frozenset",
     "min",
     "max",
     "sum",
@@ -3882,6 +3883,11 @@ impl Typer<'_> {
 
     fn call(&self, c: &py::ExprCall) -> Ty {
         if let py::Expr::Attribute(a) = &*c.func {
+            if is_name(&a.value, "frozenset") && a.attr.as_str() == "union" {
+                return Ty::Set;
+            }
+        }
+        if let py::Expr::Attribute(a) = &*c.func {
             if let Some(m) = self.module_member_of(&a.value, a.attr.as_str()) {
                 return member_ty(m);
             }
@@ -3963,7 +3969,7 @@ impl Typer<'_> {
             },
             "tuple" => Ty::Tuple,
             "dict" => Ty::Dict,
-            "set" => Ty::Set,
+            "set" | "frozenset" => Ty::Set,
             // Pairs and mapped values are dynamic; the lists are eager.
             "enumerate" | "zip" | "map" | "filter" => Ty::List(Elem::Object),
             "any" | "all" => Ty::Bool,

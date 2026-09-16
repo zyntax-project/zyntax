@@ -2283,6 +2283,26 @@ impl<'m> Lowerer<'m> {
                     let py::Expr::Subscript(sub) = target else {
                         return unsupported("del of anything but an item", target);
                     };
+                    if let py::Expr::Slice(slice) = &*sub.slice {
+                        if slice.lower.is_some() || slice.upper.is_some() || slice.step.is_some() {
+                            return unsupported("del of a bounded slice", target);
+                        }
+                        let seq = self.expr(&sub.value)?;
+                        if !matches!(seq.ty, Ty::List(_)) {
+                            return unsupported("del of a non-list slice", target);
+                        }
+                        push(
+                            out,
+                            TypedStatement::Expression(Box::new(method_call(
+                                seq.node,
+                                "clear",
+                                vec![],
+                                Ty::None,
+                                span,
+                            ))),
+                        );
+                        continue;
+                    }
                     let seq = self.expr(&sub.value)?;
                     let stmt = match seq.ty {
                         Ty::List(e) => {
@@ -3341,7 +3361,9 @@ impl<'m> Lowerer<'m> {
             "len" | "abs" | "repr" | "hash" | "ord" | "chr" | "id" | "iter" | "next" => {
                 args.len() == 1
             }
-            "str" | "int" | "float" | "bool" | "list" | "tuple" | "set" | "dict" => args.len() <= 1,
+            "str" | "int" | "float" | "bool" | "list" | "tuple" | "set" | "frozenset" | "dict" => {
+                args.len() <= 1
+            }
             "sorted" | "reversed" | "enumerate" | "sum" | "any" | "all" => {
                 (1..=2).contains(&args.len())
             }
@@ -3830,6 +3852,25 @@ impl<'m> Lowerer<'m> {
                         "zb_func_new",
                         vec![
                             code_of("zb_range_call", span),
+                            int_lit(zyntax_builtins::functions::VARIADIC_ARITY, span),
+                            self.list_of(Vec::new(), Elem::Object, span),
+                        ],
+                        Ty::Object,
+                        span,
+                    ),
+                    ty: Ty::Object,
+                }
+            }
+            py::Expr::Name(n)
+                if n.id.as_str() == "frozenset"
+                    && !self.is_variable("frozenset")
+                    && !self.module.class_index.contains_key("frozenset") =>
+            {
+                Val {
+                    node: call(
+                        "zb_func_new",
+                        vec![
+                            code_of("zb_frozenset_call", span),
                             int_lit(zyntax_builtins::functions::VARIADIC_ARITY, span),
                             self.list_of(Vec::new(), Elem::Object, span),
                         ],
@@ -5195,6 +5236,27 @@ impl<'m> Lowerer<'m> {
     fn call(&mut self, c: &py::ExprCall, ty: Ty, span: Span) -> Result<Val> {
         let args = &c.arguments.args;
         let keywords = &c.arguments.keywords;
+        if let py::Expr::Attribute(a) = &*c.func {
+            if types::is_name(&a.value, "frozenset")
+                && a.attr.as_str() == "union"
+                && !self.is_variable("frozenset")
+                && keywords.is_empty()
+                && !args.is_empty()
+            {
+                let mut result = self.expr_as(&args[0], Ty::Set)?;
+                for arg in &args[1..] {
+                    let other = self.expr_as(arg, Ty::Set)?;
+                    result = call("zb_set_or", vec![result, other], Ty::Set, span);
+                }
+                if args.len() == 1 {
+                    result = call("zb_list_copy_any", vec![result], Ty::Set, span);
+                }
+                return Ok(Val {
+                    node: result,
+                    ty: Ty::Set,
+                });
+            }
+        }
         // A function of an imported module, named through the module or
         // brought in by name.
         if let py::Expr::Attribute(a) = &*c.func {
@@ -5607,7 +5669,7 @@ impl<'m> Lowerer<'m> {
                     };
                     return Ok(Val { node, ty: Ty::Dict });
                 }
-                "set" => {
+                "set" | "frozenset" => {
                     let items = match args.first() {
                         None => self.list_of(Vec::new(), Elem::Object, span),
                         Some(a) => {

@@ -1009,6 +1009,59 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     string(),
                 )))],
             ),
+            when(
+                and(is_set(a.e()), is_set(b.e())),
+                vec![
+                    when(
+                        eq(code.e(), int(1)),
+                        vec![ret(call(
+                            "zb_set_box",
+                            vec![call(
+                                "zb_set_sub",
+                                vec![raw_any(a.e()), raw_any(b.e())],
+                                anys.clone(),
+                            )],
+                            any(),
+                        ))],
+                    ),
+                    when(
+                        eq(code.e(), int(7)),
+                        vec![ret(call(
+                            "zb_set_box",
+                            vec![call(
+                                "zb_set_and",
+                                vec![raw_any(a.e()), raw_any(b.e())],
+                                anys.clone(),
+                            )],
+                            any(),
+                        ))],
+                    ),
+                    when(
+                        eq(code.e(), int(8)),
+                        vec![ret(call(
+                            "zb_set_box",
+                            vec![call(
+                                "zb_set_or",
+                                vec![raw_any(a.e()), raw_any(b.e())],
+                                anys.clone(),
+                            )],
+                            any(),
+                        ))],
+                    ),
+                    when(
+                        eq(code.e(), int(9)),
+                        vec![ret(call(
+                            "zb_set_box",
+                            vec![call(
+                                "zb_set_xor",
+                                vec![raw_any(a.e()), raw_any(b.e())],
+                                anys.clone(),
+                            )],
+                            any(),
+                        ))],
+                    ),
+                ],
+            ),
             // An instance on either side takes part through its class.
             when(
                 or(

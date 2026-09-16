@@ -80,6 +80,39 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         ],
     ));
 
+    let frozen_args = local("frozen_args", anys.clone());
+    let frozen_items = local("frozen_items", anys.clone());
+    d.push(define(
+        "zb_frozenset_call",
+        &[&env, &packed],
+        any(),
+        vec![
+            frozen_args.decl(call("zb_list_unbox_any", vec![packed.e()], anys.clone())),
+            n.decl(len(&frozen_args)),
+            when(
+                gt(n.e(), int(1)),
+                vec![fatal(
+                    "TypeError",
+                    text("frozenset expected at most 1 argument"),
+                )],
+            ),
+            frozen_items.decl(empty()),
+            when(
+                eq(n.e(), int(1)),
+                vec![frozen_items.set(call(
+                    "zb_any_iter",
+                    vec![at(&frozen_args, int(0))],
+                    anys.clone(),
+                ))],
+            ),
+            ret(call(
+                "zb_set_box",
+                vec![call("zb_set_from", vec![frozen_items.e()], anys.clone())],
+                any(),
+            )),
+        ],
+    ));
+
     // A `bisect` imported as a value (for example, a function default)
     // searches the iterable's dynamic elements without changing it.
     for side in ["left", "right"] {
