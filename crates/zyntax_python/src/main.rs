@@ -10,7 +10,14 @@ use zyntax_embed::{TieredConfig, TieredRuntime};
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
-    let path = match (args.next().as_deref(), args.next()) {
+    let command = args.next();
+    // ZYPY_LLVM=1 selects LLVM tier-up; use it for checked benchmark runs.
+    let llvm = cfg!(feature = "llvm-backend") && std::env::var_os("ZYPY_LLVM").is_some();
+    if command.as_deref() == Some("backend") {
+        println!("{}", if llvm { "llvm" } else { "cranelift" });
+        return ExitCode::SUCCESS;
+    }
+    let path = match (command.as_deref(), args.next()) {
         (Some("run"), Some(p)) => PathBuf::from(p),
         _ => {
             eprintln!("usage: zypy run <file.py> [args...]");
@@ -70,7 +77,12 @@ fn main() -> ExitCode {
         }
     };
     lap("parse");
-    let mut rt = match TieredRuntime::new(TieredConfig::default()) {
+    let mut config = TieredConfig::default();
+    #[cfg(feature = "llvm-backend")]
+    if llvm {
+        config.tier2_backend = zyntax_compiler::tiered_backend::Tier2Backend::LLVM;
+    }
+    let mut rt = match TieredRuntime::new(config) {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("zypy: runtime: {e}");

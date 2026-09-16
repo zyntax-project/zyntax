@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "A Python frontend for Zyntax: ruff's AST to a TypedProgram"
 
+[features]
+llvm-backend = ["zyntax_embed/llvm-backend"]
+
 [[bin]]
 name = "zypy"
 path = "src/main.rs"

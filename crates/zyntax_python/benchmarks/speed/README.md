@@ -14,6 +14,10 @@ time is in the JSON.
     python3 run.py --fast     # 5 iterations, a quick look
     python3 run.py --only richards,nbody_modified
 
+Build the `zypy` used by this harness with
+`cargo build --release -p zyntax_python --features llvm-backend`.
+The harness selects LLVM for `zypy` and checks that the binary provides it.
+
 `run.py` looks for `target/release/zypy`, `pypy3` and `python3`;
 `--zypy`, `--pypy` and `--python` name them. Results go to `speed.json`.
 

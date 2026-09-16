@@ -86,9 +86,19 @@ def interpreters(args):
     found = []
     zypy = args.zypy or os.path.join(HERE, "..", "..", "..", "..", "target", "release", "zypy")
     if os.path.exists(zypy):
+        os.environ["ZYPY_LLVM"] = "1"
+        backend = subprocess.run([os.path.abspath(zypy), "backend"], capture_output=True, text=True)
+        if backend.returncode != 0 or backend.stdout.strip() != "llvm":
+            raise SystemExit(
+                f"speed benchmarks require an LLVM-enabled zypy at {zypy}; "
+                "build it with cargo build --release -p zyntax_python --features llvm-backend"
+            )
         found.append(("zypy", [os.path.abspath(zypy), "run"], True))
     else:
-        print(f"zypy not found at {zypy}; build it with cargo build --release -p zyntax_python", file=sys.stderr)
+        raise SystemExit(
+            f"zypy not found at {zypy}; build it with "
+            "cargo build --release -p zyntax_python --features llvm-backend"
+        )
     pypy = args.pypy or shutil.which("pypy3")
     if pypy:
         found.append(("pypy", [pypy], False))
