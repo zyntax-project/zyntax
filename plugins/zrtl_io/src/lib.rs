@@ -1145,7 +1145,7 @@ zrtl_plugin! {
         ("$IO$println_array_f64", io_println_array_f64),
 
         // String operations
-        ("$IO$string_concat", io_string_concat, (i64, i64) -> i64),
+        ("$IO$string_concat", io_string_concat, (i64, i64) -> opaque),
         ("$IO$string_adopt_dynamic", io_string_adopt_dynamic, (i64) -> i64),
         ("$IO$string_to_dynamic", io_string_to_dynamic, (i64) -> i64),
         ("$IO$concat_dynamic", io_concat_dynamic, dynamic(2) -> dynamic),
