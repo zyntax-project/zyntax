@@ -39,7 +39,7 @@
 //!
 //! Both share the HIR → LLVM IR translation logic.
 
-use crate::hir::{HirFunction, HirId, HirModule};
+use crate::hir::{HirFunction, HirId, HirModule, HirType};
 use crate::llvm_backend::LLVMBackend;
 use crate::{CompilerError, CompilerResult};
 use indexmap::IndexMap;
@@ -351,6 +351,46 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                             continue;
                         }
                     };
+                    // Structured pointer live-ins cannot yet be reconstructed by
+                    // LLVM's resume helper; keep the existing frame in its tier.
+                    if layout.live_in_types.iter().any(|ty| {
+                        matches!(ty, HirType::Ptr(inner) if matches!(inner.as_ref(), HirType::Opaque(_) | HirType::Struct(_)))
+                    }) {
+                        if crate::osr::osr_trace_enabled() {
+                            eprintln!("[osr] no LLVM helper for {header:?}: structured pointer live-in");
+                        }
+                        continue;
+                    }
+                    // Calls that allocate or cross tiers need a root and
+                    // ownership map the LLVM resume frame cannot provide.
+                    let has_effectful_call = crate::osr::blocks_reachable_from(func, header)
+                        .iter()
+                        .filter_map(|id| func.blocks.get(id))
+                        .flat_map(|block| &block.instructions)
+                        .any(|inst| {
+                            use crate::hir::{HirCallable, HirInstruction, Intrinsic};
+                            match inst {
+                                HirInstruction::Call { callee, .. } => matches!(
+                                    callee,
+                                    HirCallable::Function(_)
+                                        | HirCallable::Symbol(_)
+                                        | HirCallable::Indirect(_)
+                                        | HirCallable::Intrinsic(
+                                            Intrinsic::Malloc
+                                                | Intrinsic::Realloc
+                                                | Intrinsic::Free
+                                        )
+                                ),
+                                HirInstruction::CreateClosure { .. } => true,
+                                _ => false,
+                            }
+                        });
+                    if has_effectful_call {
+                        if crate::osr::osr_trace_enabled() {
+                            eprintln!("[osr] no LLVM helper for {header:?}: effectful call");
+                        }
+                        continue;
+                    }
                     match backend.compile_osr_helper(func, &layout) {
                         Ok(name) => {
                             if crate::osr::osr_trace_enabled() {

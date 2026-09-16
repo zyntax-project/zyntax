@@ -2301,9 +2301,10 @@ impl TieredBackend {
     /// Releases bead registrations on shutdown so a long-lived process
     /// reusing `TieredBackend` instances doesn't leak entries.
     pub fn shutdown(&mut self) {
-        // The global requester owns backend and LLVM handles. Release it
+        // The global callbacks own backend and LLVM handles. Release them
         // before the LLVM context; the adapter then joins promotion workers.
         osr::set_promotion_requester(|_| false);
+        osr::set_lazy_compiler(|_| ptr::null());
         self.warm_up_stop
             .store(true, std::sync::atomic::Ordering::Release);
         if let Some(handle) = self.warm_up.take() {
@@ -2604,8 +2605,9 @@ pub fn compile_at_tier(
 
     if verbosity >= 1 || crate::osr::osr_trace_enabled() {
         eprintln!(
-            "[TieredBackend] Recompiling {:?} at tier {} ({:?})",
+            "[TieredBackend] Recompiling {:?} ({}) at tier {} ({:?})",
             func_id,
+            func_arc.name.resolve_global().unwrap_or_default(),
             tier_idx,
             OptimizationTier::from_index(tier_idx)
         );
@@ -2614,12 +2616,28 @@ pub fn compile_at_tier(
     #[cfg(feature = "llvm-backend")]
     if tier_idx == 2 && matches!(tier2_backend, Tier2Backend::LLVM) {
         if let Some(llvm) = llvm {
+            // The LLVM tier cannot yet preserve GC ownership across calls
+            // made with structured pointer arguments or results.
+            let structured = |ty: &crate::hir::HirType| matches!(ty, crate::hir::HirType::Ptr(inner) if matches!(inner.as_ref(), crate::hir::HirType::Opaque(_) | crate::hir::HirType::Struct(_)));
+            if def
+                .function
+                .signature
+                .params
+                .iter()
+                .any(|p| structured(&p.ty))
+                || def.function.signature.returns.iter().any(structured)
+            {
+                if verbosity >= 1 || crate::osr::osr_trace_enabled() {
+                    eprintln!(
+                        "[TieredBackend] LLVM promotion unavailable for {}: structured pointer signature",
+                        def.function.name.resolve_global().unwrap_or_default()
+                    );
+                }
+                return ptr::null_mut();
+            }
             return match llvm.compile(bead, def) {
                 Ok(p) => p,
                 Err(e) => {
-                    // A failure here means the function silently stays in
-                    // the tier below, which looks identical from the outside
-                    // to a tier that simply never fired. Say so.
                     log::warn!("[TieredBackend] LLVM compile failed: {e}");
                     if verbosity >= 1 || crate::osr::osr_trace_enabled() {
                         eprintln!("[TieredBackend] LLVM compile failed: {e}");
