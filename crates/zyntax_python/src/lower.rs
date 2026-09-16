@@ -2825,16 +2825,41 @@ impl<'m> Lowerer<'m> {
                     ));
                     out.push(self.pending_check(span));
                 }
-                for (i, elt) in t.elts.iter().enumerate() {
-                    let item = self.index_value(
-                        Val {
-                            node: seq.node.clone(),
-                            ty: seq.ty,
+                let mut items = Vec::with_capacity(t.elts.len());
+                for i in 0..t.elts.len() {
+                    let index = int_lit(i as i64, span);
+                    let item = match seq.ty {
+                        Ty::List(e) => Val {
+                            node: elem_call(
+                                "get_unchecked",
+                                e,
+                                vec![seq.node.clone(), index],
+                                span,
+                            ),
+                            ty: elem_ty,
                         },
-                        int_lit(i as i64, span),
-                        elem_ty,
-                        span,
-                    );
+                        Ty::Tuple => Val {
+                            node: call(
+                                "zb_list_get_unchecked_any",
+                                vec![seq.node.clone(), index],
+                                Ty::Object,
+                                span,
+                            ),
+                            ty: elem_ty,
+                        },
+                        _ => self.index_value(
+                            Val {
+                                node: seq.node.clone(),
+                                ty: seq.ty,
+                            },
+                            index,
+                            elem_ty,
+                            span,
+                        ),
+                    };
+                    items.push(self.hold(item, out, span));
+                }
+                for (elt, item) in t.elts.iter().zip(items) {
                     self.bind(elt, item, span, out)?;
                 }
                 return Ok(());

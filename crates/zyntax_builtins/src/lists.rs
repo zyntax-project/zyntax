@@ -314,6 +314,13 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
             ret(el(&xs, j.e())),
         ],
     ));
+    // Used only after unpacking checked the sequence's exact length.
+    d.push(define(
+        &name("get_unchecked"),
+        &[&xs, &i],
+        k.elem.clone(),
+        vec![ret(el(&xs, i.e()))],
+    ));
     d.push(define(
         &name("set"),
         &[&xs, &i, &v],

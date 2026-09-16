@@ -21,3 +21,7 @@ for value in ([], [1], [1, 2, 3]):
         unpack(value)
     except ValueError:
         print("value error")
+
+alias = [[], 2]
+(alias[:], last) = alias
+print(alias, last)
