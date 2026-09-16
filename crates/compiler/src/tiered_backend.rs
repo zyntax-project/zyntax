@@ -2616,25 +2616,6 @@ pub fn compile_at_tier(
     #[cfg(feature = "llvm-backend")]
     if tier_idx == 2 && matches!(tier2_backend, Tier2Backend::LLVM) {
         if let Some(llvm) = llvm {
-            // The LLVM tier cannot yet preserve GC ownership across calls
-            // made with structured pointer arguments or results.
-            let structured = |ty: &crate::hir::HirType| matches!(ty, crate::hir::HirType::Ptr(inner) if matches!(inner.as_ref(), crate::hir::HirType::Opaque(_) | crate::hir::HirType::Struct(_)));
-            if def
-                .function
-                .signature
-                .params
-                .iter()
-                .any(|p| structured(&p.ty))
-                || def.function.signature.returns.iter().any(structured)
-            {
-                if verbosity >= 1 || crate::osr::osr_trace_enabled() {
-                    eprintln!(
-                        "[TieredBackend] LLVM promotion unavailable for {}: structured pointer signature",
-                        def.function.name.resolve_global().unwrap_or_default()
-                    );
-                }
-                return ptr::null_mut();
-            }
             return match llvm.compile(bead, def) {
                 Ok(p) => p,
                 Err(e) => {

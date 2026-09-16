@@ -120,17 +120,25 @@ fn peak_memory_does_not_grow_with_the_step_count() {
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        let (small_status, small) = run(program, SMALL);
-        let (large_status, large) = run(program, LARGE);
+        // Tree's LLVM callees promote after the short run; compare two
+        // executions that have both reached the same tier.
+        let (small_steps, large_steps) =
+            if name == "tree.py" && std::env::var_os("ZYPY_LLVM").is_some() {
+                (200_000, 2_000_000)
+            } else {
+                (SMALL, LARGE)
+            };
+        let (small_status, small) = run(program, small_steps);
+        let (large_status, large) = run(program, large_steps);
         if small_status != 0 || large_status != 0 {
             failures.push(format!(
-                "{name}: exited {small_status} at {SMALL} steps and {large_status} at {LARGE}"
+                "{name}: exited {small_status} at {small_steps} steps and {large_status} at {large_steps}"
             ));
             continue;
         }
         let growth = large.saturating_sub(small);
         let leaks = growth > ALLOWED_GROWTH;
-        let per_step = growth / (LARGE - SMALL);
+        let per_step = growth / (large_steps - small_steps);
         match (leaks, known.get(&name)) {
             (true, Some(issue)) => {
                 known_count += 1;
@@ -141,7 +149,7 @@ fn peak_memory_does_not_grow_with_the_step_count() {
                 );
             }
             (true, None) => failures.push(format!(
-                "{name}: peak memory grew from {} MB to {} MB between {SMALL} and {LARGE} steps, about {per_step} bytes a step",
+                "{name}: peak memory grew from {} MB to {} MB between {small_steps} and {large_steps} steps, about {per_step} bytes a step",
                 small >> 20,
                 large >> 20
             )),
