@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1789554345,"nonce":"0poZTb0vIP/Dn7zgLse4kZMB2Ws=","added":["perf","area:llvm","priority:high"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":2,"timestamp":1789555643,"nonce":"tUJyjrI59sPIp5lLHSd74XngAt8=","title":"LLVM OSR cannot resume Python loops with pointer state or effectful calls","was":"LLVM OSR cannot resume loops with structured pointer live-ins"}]}
