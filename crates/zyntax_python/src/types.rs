@@ -3358,6 +3358,34 @@ impl Walker<'_> {
         }
     }
 
+    /// A tuple literal gives each unpacked name the type of its own
+    /// expression. No tuple escapes this assignment, so the lowering can
+    /// bind those values directly without putting them through `Any`.
+    fn target_tuple_literal(&mut self, target: &py::Expr, value: &py::Expr) -> bool {
+        let py::Expr::Tuple(source) = value else {
+            return false;
+        };
+        let targets = match target {
+            py::Expr::Tuple(t) => &t.elts,
+            py::Expr::List(l) => &l.elts,
+            _ => return false,
+        };
+        if targets.len() != source.elts.len() {
+            return false;
+        }
+        if targets
+            .iter()
+            .any(|target| matches!(target, py::Expr::Tuple(_) | py::Expr::List(_)))
+        {
+            return false;
+        }
+        for (target, value) in targets.iter().zip(&source.elts) {
+            let ty = self.expr(value);
+            self.target(target, ty);
+        }
+        true
+    }
+
     fn stmts(&mut self, stmts: &[py::Stmt]) {
         for s in stmts {
             self.stmt(s);
@@ -3369,6 +3397,9 @@ impl Walker<'_> {
             py::Stmt::Assign(a) => {
                 let ty = self.expr(&a.value);
                 for t in &a.targets {
+                    if a.targets.len() == 1 && self.target_tuple_literal(t, &a.value) {
+                        continue;
+                    }
                     // An unkinded literal is the list its writes make
                     // it, decided afresh from the types known now.
                     if let py::Expr::Name(n) = t {

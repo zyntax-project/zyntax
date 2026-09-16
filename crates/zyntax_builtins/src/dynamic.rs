@@ -1456,6 +1456,83 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             )),
         ],
     ));
+    // Positional indexing already has an unboxed integer in the Python
+    // frontend (notably while unpacking nested tuples). Keep that integer
+    // through the dispatch instead of allocating a box only to read it
+    // back in every list branch. Dicts still need a boxed key.
+    let position = local("position", i64());
+    d.push(define(
+        "zb_any_getitem_i64",
+        &[&x, &position],
+        any(),
+        vec![
+            cat.decl(category(x.e())),
+            when(
+                is(&cat, STR),
+                vec![ret(box_str(call(
+                    "zb_str_get",
+                    vec![get_str(x.e()), position.e()],
+                    string(),
+                )))],
+            ),
+            when(
+                ne(cat.e(), int(CUSTOM)),
+                vec![type_error(add(
+                    quoted(type_name(x.e())),
+                    text(" object is not subscriptable"),
+                ))],
+            ),
+            when(
+                is_dict(x.e()),
+                vec![ret(call(
+                    "zb_dict_get",
+                    vec![raw_any(x.e()), box_i64(position.e())],
+                    any(),
+                ))],
+            ),
+            when(
+                kind_is(Kind::Int, x.e()),
+                vec![ret(box_i64(call(
+                    "zb_list_get_i64",
+                    vec![unbox(Kind::Int, x.e()), position.e()],
+                    i64(),
+                )))],
+            ),
+            when(
+                kind_is(Kind::Float, x.e()),
+                vec![ret(box_f64(call(
+                    "zb_list_get_f64",
+                    vec![unbox(Kind::Float, x.e()), position.e()],
+                    f64(),
+                )))],
+            ),
+            when(
+                kind_is(Kind::Str, x.e()),
+                vec![ret(box_str(call(
+                    "zb_list_get_str",
+                    vec![unbox(Kind::Str, x.e()), position.e()],
+                    string(),
+                )))],
+            ),
+            when(
+                kind_is(Kind::Ptr, x.e()),
+                vec![ret(call(
+                    "zb_hook_box_instance",
+                    vec![call(
+                        "zb_list_get_ptr",
+                        vec![unbox(Kind::Ptr, x.e()), position.e()],
+                        Kind::Ptr.ty(),
+                    )],
+                    any(),
+                ))],
+            ),
+            ret(call(
+                "zb_list_get_any",
+                vec![iter(x.e()), position.e()],
+                any(),
+            )),
+        ],
+    ));
     let mutable_list = |x: Expr| {
         and(
             eq(category(x.clone()), int(CUSTOM)),
@@ -1562,6 +1639,99 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             expr(call(
                 "zb_list_set_any",
                 vec![unbox(Kind::Any, x.e()), index(i.e()), v.e()],
+                unit(),
+            )),
+            ret_void(),
+        ],
+    ));
+    let list_set_i64 = |k: Kind, x: Expr, i: Expr, v: Expr| {
+        expr(call(
+            &format!("zb_list_set_{}", k.suffix()),
+            vec![unbox(k, x), i, v],
+            unit(),
+        ))
+    };
+    d.push(define(
+        "zb_any_setitem_i64",
+        &[&x, &position, &v],
+        unit(),
+        vec![
+            when(
+                boxed_dict(x.e()),
+                vec![
+                    expr(call(
+                        "zb_dict_set",
+                        vec![raw_any(x.e()), box_i64(position.e()), v.e()],
+                        unit(),
+                    )),
+                    ret_void(),
+                ],
+            ),
+            when(
+                not(mutable_list(x.e())),
+                vec![type_error(add(
+                    quoted(type_name(x.e())),
+                    text(" object does not support item assignment"),
+                ))],
+            ),
+            when(
+                kind_is(Kind::Int, x.e()),
+                vec![
+                    list_set_i64(
+                        Kind::Int,
+                        x.e(),
+                        position.e(),
+                        call("zb_any_as_i64", vec![v.e()], i64()),
+                    ),
+                    ret_void(),
+                ],
+            ),
+            when(
+                kind_is(Kind::Float, x.e()),
+                vec![
+                    list_set_i64(
+                        Kind::Float,
+                        x.e(),
+                        position.e(),
+                        call("zb_any_as_f64", vec![v.e()], f64()),
+                    ),
+                    ret_void(),
+                ],
+            ),
+            when(
+                kind_is(Kind::Str, x.e()),
+                vec![
+                    list_set_i64(
+                        Kind::Str,
+                        x.e(),
+                        position.e(),
+                        call("zb_any_as_str", vec![v.e()], string()),
+                    ),
+                    ret_void(),
+                ],
+            ),
+            when(
+                kind_is(Kind::Ptr, x.e()),
+                vec![
+                    when(
+                        not(is_instance(v.e())),
+                        vec![type_error(add(
+                            text("expected an instance, got "),
+                            quoted(type_name(v.e())),
+                        ))],
+                    ),
+                    list_set_i64(
+                        Kind::Ptr,
+                        x.e(),
+                        position.e(),
+                        cast(call("zb_unbox_instance_raw", vec![v.e()], i64()), usize()),
+                    ),
+                    ret_void(),
+                ],
+            ),
+            expr(call(
+                "zb_list_set_any",
+                vec![unbox(Kind::Any, x.e()), position.e(), v.e()],
                 unit(),
             )),
             ret_void(),

@@ -2107,6 +2107,34 @@ impl<'m> Lowerer<'m> {
                 {
                     return Ok(());
                 }
+                // A tuple literal consumed immediately by an unpacking
+                // assignment has no observable tuple identity. Evaluate
+                // every RHS expression first, then bind the targets in
+                // order, retaining each element's inferred type.
+                if let ([target], py::Expr::Tuple(source)) = (a.targets.as_slice(), &*a.value) {
+                    let targets = match target {
+                        py::Expr::Tuple(t) => Some(&t.elts),
+                        py::Expr::List(l) => Some(&l.elts),
+                        _ => None,
+                    };
+                    if let Some(targets) = targets.filter(|t| {
+                        t.len() == source.elts.len()
+                            && t.iter().all(|target| {
+                                !matches!(target, py::Expr::Tuple(_) | py::Expr::List(_))
+                            })
+                    }) {
+                        let mut values = Vec::with_capacity(source.elts.len());
+                        for expr in &source.elts {
+                            let value = self.expr(expr)?;
+                            out.append(&mut self.hoisted);
+                            values.push(self.hold(value, out, span));
+                        }
+                        for (target, value) in targets.iter().zip(values) {
+                            self.bind(target, value, span, out)?;
+                        }
+                        return Ok(());
+                    }
+                }
                 // A literal that says nothing of its elements is built
                 // as the list its name or field holds, which inference
                 // typed by what the program puts in it.
@@ -2695,9 +2723,19 @@ impl<'m> Lowerer<'m> {
                         )
                     }
                     Ty::Object => {
-                        let i = self.expr_as(&sub.slice, Ty::Object)?;
+                        let i = self.expr(&sub.slice)?;
                         let v = self.coerce(value, Ty::Object);
-                        call("zb_any_setitem", vec![seq.node, i, v], Ty::None, span)
+                        if i.ty == Ty::Int {
+                            call(
+                                "zb_any_setitem_i64",
+                                vec![seq.node, i.node, v],
+                                Ty::None,
+                                span,
+                            )
+                        } else {
+                            let i = self.coerce(i, Ty::Object);
+                            call("zb_any_setitem", vec![seq.node, i, v], Ty::None, span)
+                        }
                     }
                     _ => {
                         return unsupported(
@@ -2915,16 +2953,12 @@ impl<'m> Lowerer<'m> {
             Ty::List(e) => elem_call("get", e, vec![seq.node, index], span),
             Ty::Tuple => call("zb_list_get_any", vec![seq.node, index], Ty::Object, span),
             Ty::Str => call("zb_str_get", vec![seq.node, index], Ty::Str, span),
-            _ => {
-                let i = self.coerce(
-                    Val {
-                        node: index,
-                        ty: Ty::Int,
-                    },
-                    Ty::Object,
-                );
-                call("zb_any_getitem", vec![seq.node, i], Ty::Object, span)
-            }
+            _ => call(
+                "zb_any_getitem_i64",
+                vec![seq.node, index],
+                Ty::Object,
+                span,
+            ),
         };
         Val { node, ty: elem_ty }
     }
@@ -4922,10 +4956,16 @@ impl<'m> Lowerer<'m> {
                 })
             }
             _ => {
-                let key = self.expr_as(&sub.slice, Ty::Object)?;
+                let key = self.expr(&sub.slice)?;
                 let o = self.coerce(seq, Ty::Object);
+                let node = if key.ty == Ty::Int {
+                    call("zb_any_getitem_i64", vec![o, key.node], Ty::Object, span)
+                } else {
+                    let key = self.coerce(key, Ty::Object);
+                    call("zb_any_getitem", vec![o, key], Ty::Object, span)
+                };
                 Ok(Val {
-                    node: call("zb_any_getitem", vec![o, key], Ty::Object, span),
+                    node,
                     ty: Ty::Object,
                 })
             }
