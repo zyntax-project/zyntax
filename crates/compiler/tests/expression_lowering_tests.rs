@@ -1681,12 +1681,12 @@ fn test_growable_list_of_tuple_values_lowering() {
                             test_span(),
                         )),
                         index: Box::new(typed_node(
-                            TypedExpression::Literal(TypedLiteral::Integer(0)),
+                            TypedExpression::Literal(TypedLiteral::Integer(-1)),
                             Type::Primitive(PrimitiveType::I64),
                             test_span(),
                         )),
                     }),
-                    Type::Primitive(PrimitiveType::I64),
+                    Type::Primitive(PrimitiveType::F64),
                     test_span(),
                 ))),
                 Type::Primitive(PrimitiveType::Unit),
@@ -1712,12 +1712,16 @@ fn test_growable_list_of_tuple_values_lowering() {
         } if matches!(&**inner, zyntax_compiler::hir::HirType::Struct(s)
             if s.fields == vec![zyntax_compiler::hir::HirType::I64, zyntax_compiler::hir::HirType::F64]))
     }));
-    assert!(function.blocks.values().flat_map(|block| &block.instructions).any(|instruction| {
-        matches!(instruction, HirInstruction::ExtractValue {
-            ty: zyntax_compiler::hir::HirType::I64,
+    assert!(function
+        .blocks
+        .values()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| {
+            matches!(instruction, HirInstruction::ExtractValue {
+            ty: zyntax_compiler::hir::HirType::F64,
             indices, ..
-        } if indices == &[0])
-    }));
+        } if indices == &[1])
+        }));
     #[cfg(feature = "cranelift-backend")]
     zyntax_compiler::cranelift_backend::CraneliftBackend::new()
         .expect("Cranelift backend")

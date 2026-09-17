@@ -5708,14 +5708,24 @@ impl SsaBuilder {
                 // A tuple is an aggregate value. Its fields must be extracted
                 // from that value, rather than addressed as array elements.
                 if let Type::Tuple(fields) = self.resolve_expr_type(object) {
-                    let index = self.const_lane_index(index_val).ok_or_else(|| {
+                    let raw_index = self.const_integer_index(index_val).ok_or_else(|| {
                         crate::CompilerError::Lowering(
                             "tuple value index must be a constant".to_string(),
                         )
-                    })? as usize;
+                    })?;
+                    let index = if raw_index < 0 {
+                        raw_index + fields.len() as i128
+                    } else {
+                        raw_index
+                    };
+                    let index = usize::try_from(index).map_err(|_| {
+                        crate::CompilerError::Lowering(format!(
+                            "tuple value index {raw_index} out of bounds"
+                        ))
+                    })?;
                     let field = fields.get(index).ok_or_else(|| {
                         crate::CompilerError::Lowering(format!(
-                            "tuple value index {index} out of bounds"
+                            "tuple value index {raw_index} out of bounds"
                         ))
                     })?;
                     let field_ty = self.convert_type(field);
@@ -10351,6 +10361,23 @@ impl SsaBuilder {
                 HirConstant::U64(n) => u8::try_from(*n).ok(),
                 _ => None,
             },
+            _ => None,
+        }
+    }
+
+    fn const_integer_index(&self, value: HirId) -> Option<i128> {
+        match self.function.values.get(&value).map(|v| &v.kind) {
+            Some(HirValueKind::Constant(c)) => Some(match c {
+                HirConstant::I8(n) => *n as i128,
+                HirConstant::I16(n) => *n as i128,
+                HirConstant::I32(n) => *n as i128,
+                HirConstant::I64(n) => *n as i128,
+                HirConstant::U8(n) => *n as i128,
+                HirConstant::U16(n) => *n as i128,
+                HirConstant::U32(n) => *n as i128,
+                HirConstant::U64(n) => *n as i128,
+                _ => return None,
+            }),
             _ => None,
         }
     }
