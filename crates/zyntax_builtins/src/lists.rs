@@ -305,15 +305,23 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         ],
     ));
     let norm = |i: Expr, msg: &str| call(&name("norm"), vec![xs.e(), i, text(msg)], i64());
-    d.push(define(
-        &name("get"),
-        &[&xs, &i],
-        k.elem.clone(),
+    let checked_index = |msg: &str| {
+        if k.kind != Kind::Float {
+            return vec![j.decl(norm(i.e(), msg))];
+        }
         vec![
-            j.decl(norm(i.e(), "list index out of range")),
-            ret(el(&xs, j.e())),
-        ],
-    ));
+            n.decl(len(xs.e())),
+            j.decl(i.e()),
+            when(lt(j.e(), int(0)), vec![j.set(add(j.e(), n.e()))]),
+            when(
+                or(lt(j.e(), int(0)), ge(j.e(), n.e())),
+                vec![fatal("IndexError", text(msg))],
+            ),
+        ]
+    };
+    let mut get_body = checked_index("list index out of range");
+    get_body.push(ret(el(&xs, j.e())));
+    d.push(define(&name("get"), &[&xs, &i], k.elem.clone(), get_body));
     // Used only after unpacking checked the sequence's exact length.
     d.push(define(
         &name("get_unchecked"),
@@ -321,16 +329,10 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         k.elem.clone(),
         vec![ret(el(&xs, i.e()))],
     ));
-    d.push(define(
-        &name("set"),
-        &[&xs, &i, &v],
-        unit(),
-        vec![
-            j.decl(norm(i.e(), "list assignment index out of range")),
-            set_idx(xs.e(), j.e(), v.e()),
-            ret_void(),
-        ],
-    ));
+    let mut set_body = checked_index("list assignment index out of range");
+    set_body.push(set_idx(xs.e(), j.e(), v.e()));
+    set_body.push(ret_void());
+    d.push(define(&name("set"), &[&xs, &i, &v], unit(), set_body));
     d.push(define(
         &name("pop"),
         &[&xs, &i],
