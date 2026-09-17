@@ -5705,6 +5705,34 @@ impl SsaBuilder {
                     return self.emit_vector_extract_lane(block_id, object_val, lane);
                 }
 
+                // A tuple is an aggregate value. Its fields must be extracted
+                // from that value, rather than addressed as array elements.
+                if let Type::Tuple(fields) = self.resolve_expr_type(object) {
+                    let index = self.const_lane_index(index_val).ok_or_else(|| {
+                        crate::CompilerError::Lowering(
+                            "tuple value index must be a constant".to_string(),
+                        )
+                    })? as usize;
+                    let field = fields.get(index).ok_or_else(|| {
+                        crate::CompilerError::Lowering(format!(
+                            "tuple value index {index} out of bounds"
+                        ))
+                    })?;
+                    let field_ty = self.convert_type(field);
+                    let result = self.create_value(field_ty.clone(), HirValueKind::Instruction);
+                    self.add_instruction(
+                        block_id,
+                        HirInstruction::ExtractValue {
+                            result,
+                            ty: field_ty,
+                            aggregate: object_val,
+                            indices: vec![index as u32],
+                        },
+                    );
+                    self.add_use(object_val, result);
+                    return Ok(result);
+                }
+
                 // The grammar layer assigns `Type::Unknown` to every
                 // Index expression (see
                 // `runtime2/interpreter.rs::construct_expression`),

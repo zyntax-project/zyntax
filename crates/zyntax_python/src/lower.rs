@@ -3062,6 +3062,9 @@ impl<'m> Lowerer<'m> {
         extra: Vec<Stmt>,
         span: Span,
     ) -> Result<TypedStatement> {
+        if let Some(specialized) = self.for_value_tuples(f, &extra, span)? {
+            return Ok(specialized);
+        }
         let seq = self.expr(&f.iter)?;
         if seq.ty == Ty::Gen {
             return self.for_generator(f, seq, extra, span);
@@ -3139,6 +3142,178 @@ impl<'m> Lowerer<'m> {
             statements: prologue,
             span,
         }))
+    }
+
+    /// A directly iterated list literal need not materialize Python tuple
+    /// objects when every tuple is immediately destructured into scalars.
+    fn for_value_tuples(
+        &mut self,
+        f: &py::StmtFor,
+        extra: &[Stmt],
+        span: Span,
+    ) -> Result<Option<TypedStatement>> {
+        let py::Expr::List(source) = &*f.iter else {
+            return Ok(None);
+        };
+        let targets = match &*f.target {
+            py::Expr::Tuple(t) => &t.elts,
+            py::Expr::List(l) => &l.elts,
+            _ => return Ok(None),
+        };
+        if targets.is_empty() || !targets.iter().all(|e| matches!(e, py::Expr::Name(_))) {
+            return Ok(None);
+        }
+        let mut field_types = Vec::new();
+        for (row_index, row) in source.elts.iter().enumerate() {
+            let py::Expr::Tuple(tuple) = row else {
+                return Ok(None);
+            };
+            if tuple.elts.len() != targets.len() {
+                return Ok(None);
+            }
+            for (index, field) in tuple.elts.iter().enumerate() {
+                let ty = self.ty_of(field);
+                if !matches!(ty, Ty::Int | Ty::Float | Ty::Bool)
+                    || (row_index != 0 && field_types[index] != ty)
+                {
+                    return Ok(None);
+                }
+                if row_index == 0 {
+                    field_types.push(ty);
+                }
+            }
+        }
+        if source.elts.is_empty() {
+            return Ok(None);
+        }
+
+        let tuple_ty = Type::Tuple(field_types.iter().copied().map(ir).collect());
+        let list_ty = Type::Array {
+            element_type: Box::new(tuple_ty.clone()),
+            size: None,
+            nullability: zyntax_typed_ast::NullabilityKind::NonNull,
+        };
+        let mut prologue = std::mem::take(&mut self.hoisted);
+        let mut rows = Vec::with_capacity(source.elts.len());
+        for row in &source.elts {
+            let py::Expr::Tuple(tuple) = row else {
+                unreachable!()
+            };
+            let mut fields = Vec::with_capacity(targets.len());
+            for field in &tuple.elts {
+                let value = self.expr(field)?;
+                prologue.append(&mut self.hoisted);
+                fields.push(self.hold(value, &mut prologue, span).node);
+            }
+            rows.push(TypedNode::new(
+                TypedExpression::Tuple(fields),
+                tuple_ty.clone(),
+                span,
+            ));
+        }
+        let seq_name = self.temp();
+        prologue.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: seq_name,
+                ty: list_ty.clone(),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(TypedNode::new(
+                    TypedExpression::Array(rows),
+                    list_ty.clone(),
+                    span,
+                ))),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        let seq = TypedNode::new(TypedExpression::Variable(seq_name), list_ty.clone(), span);
+        let len = TypedNode::new(
+            TypedExpression::MethodCall(TypedMethodCall {
+                receiver: Box::new(seq.clone()),
+                method: intern("len"),
+                type_args: vec![],
+                positional_args: vec![],
+                named_args: vec![],
+            }),
+            ir(Ty::Int),
+            span,
+        );
+        let counter = self.temp();
+        let item = TypedNode::new(
+            TypedExpression::Index(TypedIndex {
+                object: Box::new(seq),
+                index: Box::new(var(counter, Ty::Int, span)),
+            }),
+            tuple_ty.clone(),
+            span,
+        );
+        let mut body = Vec::new();
+        let item_name = self.temp();
+        body.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: item_name,
+                ty: tuple_ty.clone(),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(item)),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        for (index, (target, ty)) in targets.iter().zip(field_types).enumerate() {
+            let field = TypedNode::new(
+                TypedExpression::Index(TypedIndex {
+                    object: Box::new(TypedNode::new(
+                        TypedExpression::Variable(item_name),
+                        tuple_ty.clone(),
+                        span,
+                    )),
+                    index: Box::new(int_lit(index as i64, span)),
+                }),
+                ir(ty),
+                span,
+            );
+            self.bind(target, Val { node: field, ty }, span, &mut body)?;
+        }
+        self.in_loop(|this| -> Result<()> {
+            for stmt in &f.body {
+                this.stmt(stmt, &mut body)?;
+            }
+            Ok(())
+        })?;
+        body.extend_from_slice(extra);
+        prologue.push(TypedNode::new(
+            TypedStatement::For(TypedFor {
+                pattern: Box::new(TypedNode::new(
+                    TypedPattern::Identifier {
+                        name: counter,
+                        mutability: Mutability::Mutable,
+                    },
+                    prim(PrimitiveType::I64),
+                    span,
+                )),
+                iterator: Box::new(TypedNode::new(
+                    TypedExpression::Range(TypedRange {
+                        start: Some(Box::new(int_lit(0, span))),
+                        end: Some(Box::new(len)),
+                        inclusive: false,
+                    }),
+                    Type::Unknown,
+                    span,
+                )),
+                body: TypedBlock {
+                    statements: body,
+                    span,
+                },
+            }),
+            Type::Unknown,
+            span,
+        ));
+        Ok(Some(TypedStatement::Block(TypedBlock {
+            statements: prologue,
+            span,
+        })))
     }
 
     fn for_loop(&mut self, f: &py::StmtFor, span: Span) -> Result<TypedStatement> {

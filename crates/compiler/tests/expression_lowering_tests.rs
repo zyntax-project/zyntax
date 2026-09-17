@@ -1665,8 +1665,19 @@ fn test_growable_list_of_tuple_values_lowering() {
                 TypedStatement::Expression(Box::new(typed_node(
                     TypedExpression::Index(zyntax_typed_ast::typed_ast::TypedIndex {
                         object: Box::new(typed_node(
-                            TypedExpression::Variable(list_name),
-                            list_value_ty,
+                            TypedExpression::Index(zyntax_typed_ast::typed_ast::TypedIndex {
+                                object: Box::new(typed_node(
+                                    TypedExpression::Variable(list_name),
+                                    list_value_ty,
+                                    test_span(),
+                                )),
+                                index: Box::new(typed_node(
+                                    TypedExpression::Literal(TypedLiteral::Integer(0)),
+                                    Type::Primitive(PrimitiveType::I64),
+                                    test_span(),
+                                )),
+                            }),
+                            tuple_ty,
                             test_span(),
                         )),
                         index: Box::new(typed_node(
@@ -1675,7 +1686,7 @@ fn test_growable_list_of_tuple_values_lowering() {
                             test_span(),
                         )),
                     }),
-                    tuple_ty,
+                    Type::Primitive(PrimitiveType::I64),
                     test_span(),
                 ))),
                 Type::Primitive(PrimitiveType::Unit),
@@ -1700,6 +1711,12 @@ fn test_growable_list_of_tuple_values_lowering() {
             ty: zyntax_compiler::hir::HirType::Ptr(inner), ..
         } if matches!(&**inner, zyntax_compiler::hir::HirType::Struct(s)
             if s.fields == vec![zyntax_compiler::hir::HirType::I64, zyntax_compiler::hir::HirType::F64]))
+    }));
+    assert!(function.blocks.values().flat_map(|block| &block.instructions).any(|instruction| {
+        matches!(instruction, HirInstruction::ExtractValue {
+            ty: zyntax_compiler::hir::HirType::I64,
+            indices, ..
+        } if indices == &[0])
     }));
     #[cfg(feature = "cranelift-backend")]
     zyntax_compiler::cranelift_backend::CraneliftBackend::new()
