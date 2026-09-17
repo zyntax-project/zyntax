@@ -2324,6 +2324,9 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
         timed("licm+cse", &mut at);
     }
 
+    stats.cfg_simplify.unreachable_removed += cfg_simplify::prune_unreachable_module(module);
+    timed("prune_unreachable", &mut at);
+
     stats
 }
 

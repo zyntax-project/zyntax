@@ -37,6 +37,40 @@ pub struct CfgSimplifyStats {
     /// Empty blocks whose predecessors now branch straight to their
     /// target.
     pub threaded: usize,
+    /// Blocks with no path from the function entry.
+    pub unreachable_removed: usize,
+}
+
+/// Drop blocks left disconnected by CFG rewrites, and their stale phi edges.
+/// Reachability follows terminators, which are the edges codegen executes.
+pub fn prune_unreachable(func: &mut HirFunction) -> usize {
+    let mut reachable = HashSet::new();
+    let mut pending = vec![func.entry_block];
+    while let Some(id) = pending.pop() {
+        if !reachable.insert(id) {
+            continue;
+        }
+        if let Some(block) = func.blocks.get(&id) {
+            pending.extend(block.terminator.targets());
+        }
+    }
+    let before = func.blocks.len();
+    if before == reachable.len() {
+        return 0;
+    }
+    func.blocks.retain(|id, _| reachable.contains(id));
+    for block in func.blocks.values_mut() {
+        block.predecessors.retain(|id| reachable.contains(id));
+        block.successors.retain(|id| reachable.contains(id));
+        for phi in &mut block.phis {
+            phi.incoming.retain(|(_, pred)| reachable.contains(pred));
+        }
+    }
+    before - func.blocks.len()
+}
+
+pub fn prune_unreachable_module(module: &mut HirModule) -> usize {
+    module.functions_to_optimize().map(prune_unreachable).sum()
 }
 
 /// Run on one function. Iterates until no merge fires (covers chains
@@ -409,5 +443,38 @@ mod tests {
         f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Branch { target: entry };
         let stats = run(&mut f);
         assert_eq!(stats.merged, 0);
+    }
+
+    #[test]
+    fn prune_unreachable_removes_orphan_phi_edges() {
+        let mut f = mk_func();
+        let entry = f.entry_block;
+        let join = HirId::new();
+        let orphan = HirId::new();
+        let live_value = add_const(&mut f, HirType::I64, HirConstant::I64(7));
+        let dead_value = add_const(&mut f, HirType::I64, HirConstant::I64(8));
+        let result = HirId::new();
+        f.blocks.insert(entry, HirBlock::new(entry));
+        f.blocks.insert(join, HirBlock::new(join));
+        f.blocks.insert(orphan, HirBlock::new(orphan));
+        f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Branch { target: join };
+        f.blocks.get_mut(&entry).unwrap().successors = vec![join];
+        f.blocks.get_mut(&orphan).unwrap().terminator = HirTerminator::Branch { target: join };
+        f.blocks.get_mut(&orphan).unwrap().successors = vec![join];
+        let join_block = f.blocks.get_mut(&join).unwrap();
+        join_block.predecessors = vec![entry, orphan];
+        join_block.phis.push(crate::hir::HirPhi {
+            result,
+            ty: HirType::I64,
+            incoming: vec![(live_value, entry), (dead_value, orphan)],
+        });
+        join_block.terminator = HirTerminator::Return {
+            values: vec![result],
+        };
+
+        assert_eq!(prune_unreachable(&mut f), 1);
+        assert!(!f.blocks.contains_key(&orphan));
+        assert_eq!(f.blocks[&join].predecessors, vec![entry]);
+        assert_eq!(f.blocks[&join].phis[0].incoming, vec![(live_value, entry)]);
     }
 }
