@@ -821,6 +821,16 @@ impl InterpRuntime {
             Ok(())
         })?;
 
+        // Bytecode and native code must read and write the same globals
+        // when a function crosses tiers.
+        cranelift.with_lock(|be| {
+            for id in module.globals.keys() {
+                if let Some((ptr, _)) = be.global_data_addr(*id) {
+                    self.interp.bind_global_slot(*id, ptr as *mut u8);
+                }
+            }
+        });
+
         // LLVM eager module compile (mirrors the Cranelift pre-compile
         // above). The per-function tier-up callback for LLVM previously
         // called `LLVMJitBackend::compile_function`, which builds a
@@ -1251,6 +1261,150 @@ mod tests {
             },
         );
         id
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn interpreted_write_is_visible_after_cranelift_promotion() {
+        use zyntax_compiler::hir::{HirConstant, HirGlobal, Linkage, Visibility};
+        use zyntax_compiler::value::ZyntaxValue;
+
+        let signature = |params: Vec<HirParam>, returns: Vec<HirType>| HirFunctionSignature {
+            params,
+            returns,
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let gid = HirId::new();
+        let global_ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let input = HirId::new();
+        let param = HirParam {
+            id: input,
+            name: InternedString::new_global("value"),
+            ty: HirType::I64,
+            attributes: ParamAttributes::default(),
+            ownership: ParamOwnership::default(),
+        };
+        let mut writer = HirFunction::new(
+            InternedString::new_global("write_global"),
+            signature(vec![param], vec![]),
+        );
+        writer.values.insert(
+            input,
+            HirValue {
+                id: input,
+                ty: HirType::I64,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        let writer_ptr = add_value(
+            &mut writer,
+            global_ptr_ty.clone(),
+            HirValueKind::Global(gid),
+        );
+        writer
+            .blocks
+            .get_mut(&writer.entry_block)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Store {
+                value: input,
+                ptr: writer_ptr,
+                align: 8,
+                volatile: false,
+            });
+        writer
+            .blocks
+            .get_mut(&writer.entry_block)
+            .unwrap()
+            .terminator = HirTerminator::Return { values: vec![] };
+
+        let mut reader = HirFunction::new(
+            InternedString::new_global("read_global"),
+            signature(vec![], vec![HirType::I64]),
+        );
+        let reader_ptr = add_value(&mut reader, global_ptr_ty, HirValueKind::Global(gid));
+        let value = add_value(&mut reader, HirType::I64, HirValueKind::Instruction);
+        reader
+            .blocks
+            .get_mut(&reader.entry_block)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Load {
+                result: value,
+                ty: HirType::I64,
+                ptr: reader_ptr,
+                align: 8,
+                volatile: false,
+            });
+        reader
+            .blocks
+            .get_mut(&reader.entry_block)
+            .unwrap()
+            .terminator = HirTerminator::Return {
+            values: vec![value],
+        };
+
+        let writer_id = writer.id;
+        let reader_id = reader.id;
+        let mut module = HirModule::new(InternedString::new_global("shared_global"));
+        module.globals.insert(
+            gid,
+            HirGlobal {
+                id: gid,
+                name: InternedString::new_global("shared"),
+                ty: HirType::I64,
+                initializer: Some(HirConstant::I64(0)),
+                is_const: false,
+                is_thread_local: false,
+                linkage: Linkage::Internal,
+                visibility: Visibility::Default,
+            },
+        );
+        module.functions.insert(writer.id, writer);
+        module.functions.insert(reader.id, reader);
+
+        let mut runtime = InterpRuntime::new();
+        runtime.compile_module(module);
+        let mut config = TieredConfig::default();
+        config.profile_config.warm_threshold = 2;
+        config.profile_config.hot_threshold = u64::MAX;
+        runtime.install_jit_with(config).unwrap();
+
+        assert!(runtime.bead_for(writer_id).unwrap().compiled().is_none());
+        runtime
+            .call_function("write_global", vec![ZyntaxValue::Int(17)])
+            .unwrap();
+        assert_eq!(
+            runtime.call_function("read_global", vec![]).unwrap(),
+            ZyntaxValue::Int(17)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while runtime
+            .bead_for(reader_id)
+            .and_then(|bead| bead.compiled())
+            .is_none()
+            && std::time::Instant::now() < deadline
+        {
+            runtime.call_function("read_global", vec![]).unwrap();
+            std::thread::yield_now();
+        }
+        assert!(runtime.bead_for(reader_id).unwrap().compiled().is_some());
+        runtime
+            .call_function("write_global", vec![ZyntaxValue::Int(29)])
+            .unwrap();
+        assert_eq!(
+            runtime.call_function("read_global", vec![]).unwrap(),
+            ZyntaxValue::Int(29)
+        );
     }
 
     #[test]

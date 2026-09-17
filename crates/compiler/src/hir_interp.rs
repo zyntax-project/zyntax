@@ -621,6 +621,8 @@ pub enum Op {
 pub struct CompiledFunction {
     pub code: Vec<Op>,
     pub const_pool: Vec<ZyntaxValue>,
+    /// Constant-pool slots whose pointer names a module global.
+    pub global_consts: Vec<(HirId, u32)>,
     pub type_pool: Vec<HirType>,
     pub args_pool: Vec<Vec<Reg>>,
     /// Each entry is a switch table: list of `(case_i64, target_pc)`.
@@ -737,7 +739,12 @@ pub fn compile_function(
             // ZRTL string pointer and reads it the same way as a
             // runtime-allocated one.
             if let Some(global) = module.globals.get(global_id) {
-                if let Some(HirConstant::String(interned)) = &global.initializer {
+                if let Some(&ptr) = memory.globals.get(global_id) {
+                    let idx = cf.const_pool.len() as u32;
+                    cf.const_pool.push(ZyntaxValue::Pointer(ptr));
+                    const_idx_for.insert(*val_id, idx);
+                    cf.global_consts.push((*global_id, idx));
+                } else if let Some(HirConstant::String(interned)) = &global.initializer {
                     let s = interned.resolve_global().unwrap_or_default();
                     let bytes = s.as_bytes();
                     let total = 4 + bytes.len();
@@ -750,12 +757,14 @@ pub fn compile_function(
                     let idx = cf.const_pool.len() as u32;
                     cf.const_pool.push(ZyntaxValue::Pointer(ptr));
                     const_idx_for.insert(*val_id, idx);
+                    cf.global_consts.push((*global_id, idx));
                 } else {
                     // A variable: one zeroed slot for the whole module.
                     let ptr = memory.global_slot(*global_id, size_of_hir_ty(&global.ty));
                     let idx = cf.const_pool.len() as u32;
                     cf.const_pool.push(ZyntaxValue::Pointer(ptr));
                     const_idx_for.insert(*val_id, idx);
+                    cf.global_consts.push((*global_id, idx));
                 }
             }
         }
@@ -1818,6 +1827,12 @@ impl Memory {
         self.globals.insert(id, ptr);
         ptr
     }
+
+    /// Bind a module global to storage owned by another execution tier.
+    /// The caller keeps `ptr` alive while bytecode using this global runs.
+    pub fn bind_global_slot(&mut self, id: HirId, ptr: *mut u8) {
+        self.globals.insert(id, ptr);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2016,6 +2031,20 @@ impl HirInterpreter {
             wasm_jit_threshold: 1,
             indirect_call_dispatcher: None,
             symbol_call_dispatcher: None,
+        }
+    }
+
+    /// Use the native tier's storage for a module global. Existing bytecode
+    /// constants are rebound as well, so a later native module rebuild can
+    /// replace the backing address without keeping stale pointers in code.
+    pub fn bind_global_slot(&mut self, id: HirId, ptr: *mut u8) {
+        self.memory.bind_global_slot(id, ptr);
+        for function in self.cache.values_mut() {
+            for &(global_id, idx) in &function.global_consts {
+                if global_id == id {
+                    function.const_pool[idx as usize] = ZyntaxValue::Pointer(ptr);
+                }
+            }
         }
     }
 
@@ -3937,6 +3966,65 @@ mod tests {
             },
         );
         id
+    }
+
+    #[test]
+    fn bytecode_reads_native_global_storage() {
+        let global_id = HirId::new();
+        let mut func = mk_fn("read_global", vec![], vec![HirType::I64]);
+        let global_ptr = add_value(
+            &mut func,
+            HirType::Ptr(Box::new(HirType::I64)),
+            HirValueKind::Global(global_id),
+        );
+        let loaded = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Load {
+            result: loaded,
+            ty: HirType::I64,
+            ptr: global_ptr,
+            align: 8,
+            volatile: false,
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![loaded],
+        };
+
+        let mut module = HirModule::new(InternedString::new_global("test"));
+        module.globals.insert(
+            global_id,
+            crate::hir::HirGlobal {
+                id: global_id,
+                name: InternedString::new_global("shared"),
+                ty: HirType::I64,
+                initializer: Some(HirConstant::I64(0)),
+                is_const: false,
+                is_thread_local: false,
+                linkage: crate::hir::Linkage::Internal,
+                visibility: crate::hir::Visibility::Default,
+            },
+        );
+        module.functions.insert(func.id, func);
+
+        let mut backing = 17i64;
+        let mut interp = HirInterpreter::new();
+        interp.bind_global_slot(global_id, (&mut backing as *mut i64).cast());
+        assert_eq!(
+            interp.call(&module, "read_global", vec![]).unwrap(),
+            ZyntaxValue::Int(17)
+        );
+        backing = 29;
+        assert_eq!(
+            interp.call(&module, "read_global", vec![]).unwrap(),
+            ZyntaxValue::Int(29)
+        );
+        let mut replacement = 41i64;
+        interp.bind_global_slot(global_id, (&mut replacement as *mut i64).cast());
+        assert_eq!(
+            interp.call(&module, "read_global", vec![]).unwrap(),
+            ZyntaxValue::Int(41)
+        );
+        assert_eq!(backing, 29);
     }
 
     /// `def add(a: i64, b: i64): i64 { return a + b }`
