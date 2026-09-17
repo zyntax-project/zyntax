@@ -392,9 +392,8 @@ pub enum OsrReject {
     /// conservative analysis can't enumerate (effects, atomics, trait
     /// method calls, etc.). Helper compile would mishandle it.
     UnsupportedInstruction,
-    /// A block in the resumed region can also be entered from outside it,
-    /// so a value it defines would be recomputed rather than taken from
-    /// the frame. Resuming there needs more than one entry point.
+    /// A nonterminal block in the resumed region can also be entered from
+    /// outside it. Resuming there needs more than one entry point.
     RegionHasExternalEntry,
 }
 
@@ -448,11 +447,10 @@ pub fn osr_layout_with(
     // locally-defined-or-rematerializable values.
     let reachable = reachable_from(function, header);
     let in_region: IdSet = reachable.iter().copied().collect();
-    // A block other than the header that is also entered from outside the
-    // region would redefine, on entry, values the frame is supposed to
-    // supply: its phi takes an incoming edge the helper does not have.
-    // The enclosing loop's header is the usual case. Checked before the
-    // walk over the region's uses, which it makes unnecessary.
+    // A shared return block is safe: the helper reaches it only through its
+    // own edges, and incoming phi values from other entries are omitted.
+    // Other shared blocks can lead back into the loop through paths whose
+    // values the helper cannot reconstruct from one entry frame.
     for &block_id in &reachable {
         if block_id == header {
             continue;
@@ -460,10 +458,11 @@ pub fn osr_layout_with(
         let Some(block) = function.blocks.get(&block_id) else {
             continue;
         };
-        if block
-            .predecessors
-            .iter()
-            .any(|p| !in_region.contains(p) && *p != header)
+        if !matches!(block.terminator, HirTerminator::Return { .. })
+            && block
+                .predecessors
+                .iter()
+                .any(|p| !in_region.contains(p) && *p != header)
         {
             return Err(OsrReject::RegionHasExternalEntry);
         }
@@ -514,7 +513,10 @@ pub fn osr_layout_with(
         // the frame for the entry values it exists to supersede.
         if block_id != header {
             for phi in &block.phis {
-                for (value_id, _) in &phi.incoming {
+                for (value_id, predecessor) in &phi.incoming {
+                    if !in_region.contains(predecessor) {
+                        continue;
+                    }
                     consider_live_in(
                         function,
                         *value_id,

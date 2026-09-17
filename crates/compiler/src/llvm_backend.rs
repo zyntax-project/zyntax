@@ -911,24 +911,9 @@ impl<'ctx> LLVMBackend<'ctx> {
         func: &HirFunction,
         layout: &crate::osr::OsrLayout,
     ) -> CompilerResult<String> {
-        // Reject shapes the helper cannot express before creating anything.
-        // An LLVM function or block cannot be safely removed once other
-        // values reference it — deleting one leaves dangling uses that crash
-        // the pass pipeline rather than failing cleanly.
+        // The helper enters only at this header. Predecessors outside its
+        // reachable graph are omitted when wiring the copied blocks' phis.
         let in_loop = crate::osr::blocks_reachable_from(func, layout.header);
-        for block_id in &in_loop {
-            if *block_id == layout.header {
-                continue;
-            }
-            if let Some(block) = func.blocks.get(block_id) {
-                if block.predecessors.iter().any(|p| !in_loop.contains(p)) {
-                    return Err(CompilerError::CodeGen(format!(
-                        "OSR helper for {:?}: block {block_id:?} is also reached from outside the loop",
-                        layout.header
-                    )));
-                }
-            }
-        }
 
         // One pointer to the frame carrying the live-ins.
         let params: Vec<BasicMetadataTypeEnum> = vec![self

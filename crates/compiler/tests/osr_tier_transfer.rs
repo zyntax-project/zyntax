@@ -11,7 +11,10 @@
 mod common;
 
 use common::{counted_loop, flagged_counted_loop};
-use zyntax_compiler::hir::HirModule;
+use zyntax_compiler::hir::{
+    BinaryOp, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirPhi, HirTerminator,
+    HirType, HirValue, HirValueKind,
+};
 use zyntax_compiler::osr;
 use zyntax_compiler::tiered_backend::{OptimizationTier, TieredBackend, TieredConfig};
 use zyntax_typed_ast::InternedString;
@@ -44,6 +47,141 @@ fn any_bead_has_entry(site: u64) -> bool {
         .unwrap()
         .values()
         .any(|bead| bead.osr_entry(site).is_some_and(|p| !p.is_null()))
+}
+
+/// The loop exit can also be reached before the loop. A helper entered at
+/// the loop header only needs the exit phi's incoming value from that header.
+fn loop_with_external_exit_entry() -> (HirFunction, HirId, HirId) {
+    let (mut function, header) = counted_loop();
+    let entry = function.entry_block;
+    let exit = function.blocks[&header].successors[1];
+    let sum = function.blocks[&header].phis[1].result;
+    let zero = function.blocks[&header].phis[1]
+        .incoming
+        .iter()
+        .find(|(_, pred)| *pred == entry)
+        .unwrap()
+        .0;
+    let one = function
+        .values
+        .iter()
+        .find_map(|(id, value)| {
+            matches!(value.kind, HirValueKind::Constant(HirConstant::I32(1))).then_some(*id)
+        })
+        .unwrap();
+    let before_loop = HirId::new();
+    let exit_result = HirId::new();
+    let condition = HirId::new();
+    for (id, ty, kind) in [
+        (before_loop, HirType::I32, HirValueKind::Instruction),
+        (exit_result, HirType::I32, HirValueKind::Instruction),
+        (
+            condition,
+            HirType::Bool,
+            HirValueKind::Constant(HirConstant::Bool(true)),
+        ),
+    ] {
+        function.values.insert(
+            id,
+            HirValue {
+                id,
+                ty,
+                kind,
+                uses: Default::default(),
+                span: None,
+            },
+        );
+    }
+    let entry_block = function.blocks.get_mut(&entry).unwrap();
+    entry_block.instructions.push(HirInstruction::Binary {
+        op: BinaryOp::Add,
+        result: before_loop,
+        ty: HirType::I32,
+        left: zero,
+        right: one,
+    });
+    entry_block.terminator = HirTerminator::CondBranch {
+        condition,
+        true_target: header,
+        false_target: exit,
+    };
+    entry_block.successors.push(exit);
+    let exit_block = function.blocks.get_mut(&exit).unwrap();
+    exit_block.predecessors.push(entry);
+    exit_block.phis.push(HirPhi {
+        result: exit_result,
+        ty: HirType::I32,
+        incoming: vec![(before_loop, entry), (sum, header)],
+    });
+    exit_block.terminator = HirTerminator::Return {
+        values: vec![exit_result],
+    };
+    (function, header, before_loop)
+}
+
+#[test]
+fn a_shared_block_that_reenters_the_loop_is_not_an_osr_exit() {
+    let (mut function, header, _) = loop_with_external_exit_entry();
+    let exit = function.blocks[&header].successors[1];
+    function.blocks.get_mut(&exit).unwrap().terminator = HirTerminator::Branch { target: header };
+    assert!(matches!(
+        osr::osr_layout(&function, header),
+        Err(osr::OsrReject::RegionHasExternalEntry)
+    ));
+}
+
+#[test]
+fn a_helper_ignores_an_exit_edge_outside_its_reachable_graph() {
+    use zyntax_compiler::cranelift_backend::CraneliftBackend;
+
+    const BEAD: u64 = 0xB0AC;
+    let (function, header, before_loop) = loop_with_external_exit_entry();
+    let id = function.id;
+    let layout = osr::osr_layout(&function, header).expect("loop should have an OSR layout");
+    assert!(!layout.live_ins.contains(&before_loop));
+    let site = layout.site_key();
+    let osr_syms = osr::osr_runtime_symbols();
+    let mut backend = CraneliftBackend::with_runtime_symbols(&osr_syms).expect("backend");
+    backend.set_compile_tier(0);
+    backend.set_compile_bead_id(BEAD);
+    backend
+        .compile_function(id, &function)
+        .expect("tier-0 compile");
+    backend.finalize_definitions().expect("finalize tier 0");
+    let tier0 = backend.get_function_ptr(id).expect("tier-0 pointer");
+    backend.set_compile_tier(1);
+    backend
+        .compile_function(id, &function)
+        .expect("tier-1 compile");
+    backend.finalize_definitions().expect("finalize tier 1");
+    let (_, helper) = backend
+        .take_pending_osr_helpers()
+        .into_iter()
+        .find(|(s, _)| *s == site)
+        .expect("helper for the loop header");
+    osr::publish_helper(BEAD, site, helper);
+    let run: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(tier0) };
+    assert_eq!(run(10), 45);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn an_llvm_helper_ignores_an_exit_edge_outside_its_reachable_graph() {
+    use inkwell::context::Context;
+    use zyntax_compiler::llvm_backend::LLVMBackend;
+
+    let (function, header, before_loop) = loop_with_external_exit_entry();
+    let layout = osr::osr_layout(&function, header).expect("loop should have an OSR layout");
+    assert!(!layout.live_ins.contains(&before_loop));
+    let context = Context::create();
+    let mut backend = LLVMBackend::new(&context, "osr_external_exit");
+    backend
+        .compile_osr_helper(&function, &layout)
+        .expect("LLVM helper should compile");
+    backend
+        .module()
+        .verify()
+        .expect("LLVM helper should verify");
 }
 
 /// Promoting to tier 1 through `TieredBackend` should leave an OSR entry

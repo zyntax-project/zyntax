@@ -1979,9 +1979,20 @@ impl CraneliftBackend {
                     osr_loop_headers
                         .iter()
                         .filter_map(|h| {
-                            crate::osr::osr_layout_with(function, *h, &dominators)
-                                .ok()
-                                .map(|l| (*h, l))
+                            match crate::osr::osr_layout_with(function, *h, &dominators) {
+                                Ok(layout) => Some((*h, layout)),
+                                Err(reason) => {
+                                    if crate::osr::osr_trace_enabled() {
+                                        eprintln!(
+                                            "[osr] reject tier-0 {} header_idx={}: {:?}",
+                                            function.name.resolve_global().unwrap_or_default(),
+                                            osr_block_index.get(h).copied().unwrap_or(u64::MAX),
+                                            reason
+                                        );
+                                    }
+                                    None
+                                }
+                            }
                         })
                         .collect()
                 } else {
