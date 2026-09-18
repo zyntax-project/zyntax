@@ -1019,7 +1019,7 @@ fn eval_input(
         LoweringConfig::default(),
     );
 
-    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    unsafe { std::env::set_var("SKIP_TYPE_CHECK", "1") };
 
     let mut hir_module = lowering_ctx
         .lower_program(&mut typed_program)

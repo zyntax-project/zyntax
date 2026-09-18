@@ -31,7 +31,7 @@ fn build(src: &str, dump: &str) -> (f64, usize) {
     std::fs::create_dir_all(&dir).unwrap();
     // Process-global, and these tests share a process, so each one
     // points it at its own directory immediately before compiling.
-    std::env::set_var("ZYNTAX_DUMP_HIR_DIR", &dir);
+    unsafe { std::env::set_var("ZYNTAX_DUMP_HIR_DIR", &dir) };
 
     let plugins = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/target/zrtl");
     let cfg = ZynMLConfig {
