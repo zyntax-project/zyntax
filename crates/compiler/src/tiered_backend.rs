@@ -41,6 +41,7 @@ use beadie::{Bead, HotnessPolicy, JitBackend, ThresholdPolicy, TieredAdapter, Ti
 use crate::beadie_adapter::{ZyntaxCraneliftBackend, ZyntaxFunctionDef};
 use crate::cranelift_backend::CraneliftBackend;
 use crate::hir::{HirFunction, HirId, HirModule};
+use crate::hir_interp::{jit_dispatch_supported, jit_float_mask, JitDispatch, JitRet};
 use crate::osr;
 use crate::profiling::{ProfileConfig, ProfileData};
 use crate::{CompilerError, CompilerResult};
@@ -598,11 +599,11 @@ impl TieredBackend {
         for (func_id, function) in module_context.functions.iter() {
             let bound = self.adapter.register(ptr::null_mut(), None);
 
-            // Eagerly install the tier-0 code pointer so the bead reports
-            // `Compiled(gen=0)` from the very first invocation.
-            if let Some(p) = self.cranelift.with_lock(|be| be.get_function_ptr(*func_id)) {
-                bound.bead().eager_install(p as *mut ());
-            } else if osr::osr_trace_enabled() {
+            // The bead starts without code: interpreter calls tick it and
+            // beadie publishes the already generated baseline at tier-up.
+            if self.cranelift.with_lock(|be| be.get_function_ptr(*func_id)).is_none()
+                && osr::osr_trace_enabled()
+            {
                 eprintln!(
                     "[reload] no entry pointer for {:?} ({:?}) after module compile",
                     function.name.resolve_global().unwrap_or_default(),
@@ -1812,10 +1813,80 @@ impl TieredBackend {
 
     /// Current native-code pointer for `func_id`, or `None` if unknown.
     pub fn get_function_pointer(&self, func_id: HirId) -> Option<*const u8> {
+        self.promoted_function_pointer(func_id).or_else(|| {
+            // Explicit native-pointer consumers (fibers, effects, host
+            // exports) still need an address before a bead is hot.
+            self.cranelift.with_lock(|be| be.get_function_ptr(func_id))
+        })
+    }
+
+    /// A pointer installed by beadie, excluding the unpromoted baseline.
+    pub fn promoted_function_pointer(&self, func_id: HirId) -> Option<*const u8> {
         self.functions
             .get(&func_id)
             .and_then(|e| e.bound.bead().compiled())
             .map(|p| p as *const u8)
+    }
+
+    /// HIR context for an interpreter entry, including direct callees.
+    pub fn interpreter_module(&self, func_id: HirId) -> Option<Arc<HirModule>> {
+        self.functions.get(&func_id).map(|e| Arc::clone(&e.module))
+    }
+
+    /// Runtime symbols and native global slots used by interpreted code.
+    pub fn interpreter_bindings(&self) -> (Vec<(String, *const u8)>, Vec<(HirId, *mut u8)>) {
+        let symbols = self.runtime_symbols.read().unwrap().iter()
+            .map(|s| (s.name.clone(), s.ptr as *const u8)).collect();
+        let globals = self.loaded_modules().into_iter().flat_map(|m| m.globals.keys().copied())
+            .filter_map(|id| self.cranelift.with_lock(|be| be.global_data_addr(id))
+                .map(|(ptr, _)| (id, ptr as *mut u8))).collect();
+        (symbols, globals)
+    }
+
+    /// Entry callback for the bytecode interpreter. It ticks the same
+    /// bead and submits the same compile closure as native call profiling.
+    pub fn interpreter_tick_callback(
+        &self,
+        func_id: HirId,
+    ) -> Option<Box<dyn FnMut() -> Option<JitDispatch> + Send>> {
+        let entry = self.functions.get(&func_id)?;
+        let func = entry.body(func_id);
+        let params: Vec<_> = func.signature.params.iter().map(|p| p.ty.clone()).collect();
+        let ret = func.signature.returns.first().cloned().unwrap_or(crate::hir::HirType::Void);
+        let supported = jit_dispatch_supported(&params, &ret);
+        let dispatch = JitDispatch {
+            ptr: ptr::null(),
+            n_params: params.len().min(255) as u8,
+            float_mask: jit_float_mask(&params),
+            ret: match ret {
+                crate::hir::HirType::F32 => JitRet::F32,
+                crate::hir::HirType::F64 => JitRet::F64,
+                _ => JitRet::Int,
+            },
+        };
+        let bound = entry.bound.clone();
+        let adapter = Arc::clone(&self.adapter);
+        let module = Arc::clone(&entry.module);
+        let bead_id = entry.bead_id;
+        let cranelift = Arc::clone(&self.cranelift);
+        #[cfg(feature = "llvm-backend")]
+        let llvm = self.llvm.as_ref().map(Arc::clone);
+        let tier2_backend = self.config.tier2_backend;
+        let verbosity = self.config.verbosity;
+        Some(Box::new(move || {
+            let func = Arc::clone(&func);
+            let module = Arc::clone(&module);
+            let cranelift = Arc::clone(&cranelift);
+            #[cfg(feature = "llvm-backend")]
+            let llvm = llvm.as_ref().map(Arc::clone);
+            let code = adapter.on_invoke(&bound, move |tier, bead| {
+                compile_at_tier(tier, bead, func_id, bead_id, &func, &module, &cranelift,
+                    #[cfg(feature = "llvm-backend")]
+                    llvm.as_ref(),
+                    tier2_backend, verbosity)
+            })?;
+            supported.then_some(JitDispatch { ptr: code as *const u8, ..dispatch })
+        }))
     }
 
     /// Record an invocation. Drives tier promotion via beadie.

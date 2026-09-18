@@ -13,13 +13,13 @@ fn fiber_dropped_at_scope_exit() {
     let mut rt = ZynML::new().expect("rt");
     rt.load_source(
         r#"
-        fiber def gen(): i64 {
+        fiber def r#gen(): i64 {
             yield 1
             yield 2
             yield 3
         }
         def main(): i64 {
-            let f = gen()
+            let f = r#gen()
             let mut sum: i64 = 0
             while let Some(x) = f.next() {
                 sum = sum + x
@@ -44,12 +44,12 @@ fn returned_fiber_not_double_freed() {
     let mut rt = ZynML::new().expect("rt");
     rt.load_source(
         r#"
-        fiber def gen(): i64 {
+        fiber def r#gen(): i64 {
             yield 10
             yield 20
         }
         def make(): Fiber<i64> {
-            let f = gen()
+            let f = r#gen()
             return f
         }
         def main(): i64 {

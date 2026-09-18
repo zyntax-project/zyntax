@@ -20,7 +20,7 @@ fn test_span() -> Span {
 #[test]
 fn test_vtable_generation_simple() {
     // Set environment variable to skip type checking
-    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    unsafe { std::env::set_var("SKIP_TYPE_CHECK", "1") };
 
     let mut arena = AstArena::new();
     let mut type_registry = TypeRegistry::new();
@@ -148,7 +148,7 @@ fn test_vtable_generation_simple() {
     let result = ctx.lower_program(&mut program);
 
     // Clean up env var
-    std::env::remove_var("SKIP_TYPE_CHECK");
+    unsafe { std::env::remove_var("SKIP_TYPE_CHECK") };
 
     assert!(
         result.is_ok(),

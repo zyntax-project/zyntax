@@ -382,7 +382,7 @@ fn slot_bytes(class: usize) -> usize {
 /// # Safety
 /// The returned pointer is valid for `size` bytes and must be released
 /// with [`zyntax_free`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_alloc(size: usize) -> *mut u8 {
     let Some(class) = class_of(size) else {
         return large_alloc(size);
@@ -628,7 +628,7 @@ fn could_be_ours(ptr: *mut u8) -> bool {
 /// # Safety
 /// `ptr` must have come from [`zyntax_alloc`] and must not be used
 /// afterwards. A null pointer is ignored, as `free`'s is.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
     if ptr.is_null() {
         return;
@@ -754,7 +754,7 @@ unsafe fn usable_size(ptr: *mut u8) -> Option<usize> {
 /// # Safety
 /// `ptr` must be null or have come from [`zyntax_alloc`], and must not
 /// be used afterwards except through the returned pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
     if ptr.is_null() {
         return zyntax_alloc(new_size);
@@ -777,7 +777,7 @@ pub unsafe extern "C" fn zyntax_realloc(ptr: *mut u8, new_size: usize) -> *mut u
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn libc_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
-    extern "C" {
+    unsafe extern "C" {
         fn realloc(p: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;
     }
     realloc(ptr as *mut core::ffi::c_void, new_size) as *mut u8
@@ -794,7 +794,7 @@ unsafe fn libc_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn libc_free(ptr: *mut u8) {
-    extern "C" {
+    unsafe extern "C" {
         fn free(p: *mut core::ffi::c_void);
     }
     free(ptr as *mut core::ffi::c_void);

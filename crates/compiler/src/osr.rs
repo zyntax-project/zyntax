@@ -167,7 +167,7 @@ pub fn next_bead_id() -> u64 {
 /// Called from generated code with C ABI. The runtime guarantees `bead_id`
 /// values it ever passes correspond to either a live registry entry or a
 /// stale one (the latter returns null cleanly).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn osr_probe(bead_id: u64, site: u64) -> *mut () {
     // `std::env::var_os` calls `getenv`, which on macOS takes a
     // global lock per call (`os_unfair_lock` around the env
@@ -1212,7 +1212,7 @@ pub const OSR_TRANSFER_SYMBOL: &str = "__zyntax_osr_transfer";
 /// Counts transfers per site. Generated code calls this from the dispatch
 /// path, which runs exactly when a frame moves into a helper — the one
 /// place a transfer can be observed from outside a test.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn osr_transfer(site: u64, helper: u64) {
     static COUNTS: OnceLock<RwLock<HashMap<u64, u64>>> = OnceLock::new();
     let counts = COUNTS.get_or_init(|| RwLock::new(HashMap::new()));
@@ -1277,7 +1277,7 @@ pub fn set_lazy_compiler(f: impl Fn(u64) -> *const u8 + Send + Sync + 'static) {
 ///
 /// # Safety
 /// Called from generated code with C ABI.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lazy_compile(bead_id: u64) -> *const u8 {
     let guard = lazy_compiler().read().unwrap();
     let Some(f) = guard.as_ref() else {
@@ -1326,7 +1326,7 @@ fn requested() -> &'static RwLock<std::collections::HashSet<u64>> {
 ///
 /// # Safety
 /// Called from generated code with C ABI.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn osr_request_promotion(bead_id: u64) {
     if !requested().write().unwrap().insert(bead_id) {
         return;

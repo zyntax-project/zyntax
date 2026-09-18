@@ -18,7 +18,7 @@ fn perform_in_fiber_sees_enclosing_handler() {
         handler H for Log { def emit(): i64 { return 7 } }
 
         @effect(Log)
-        fiber def gen(): i64 {
+        fiber def r#gen(): i64 {
             yield emit()
             yield emit()
         }
@@ -26,7 +26,7 @@ fn perform_in_fiber_sees_enclosing_handler() {
         def main(): i64 {
             let mut total: i64 = 0
             with H {
-                let f = gen()
+                let f = r#gen()
                 while let Some(x) = f.next() {
                     total = total + x
                 }
@@ -52,7 +52,7 @@ fn innermost_with_around_resume_wins() {
         handler H2 for Log { def emit(): i64 { return 2 } }
 
         @effect(Log)
-        fiber def gen(): i64 {
+        fiber def r#gen(): i64 {
             yield emit()
         }
 
@@ -62,7 +62,7 @@ fn innermost_with_around_resume_wins() {
         def main(): i64 {
             let mut inside: i64 = 0
             with H1 {
-                let f = gen()
+                let f = r#gen()
                 with H2 {
                     while let Some(x) = f.next() {
                         inside = x
@@ -92,7 +92,7 @@ fn fiber_handler_does_not_leak_on_partial_drain() {
         handler HIn for Log { def emit(): i64 { return 9 } }
 
         @effect(Log)
-        fiber def gen(): i64 {
+        fiber def r#gen(): i64 {
             with HIn {
                 yield emit()
                 yield emit()
@@ -104,7 +104,7 @@ fn fiber_handler_does_not_leak_on_partial_drain() {
 
         def main(): i64 {
             with HOut {
-                let f = gen()
+                let f = r#gen()
                 let mut first: i64 = 0
                 while let Some(v) = f.next() {
                     first = v

@@ -182,7 +182,7 @@ impl SourceMap {
     pub fn get_file_by_id(&self, id: usize) -> Option<&SourceFile> {
         self.file_ids
             .iter()
-            .find(|(_, &file_id)| file_id == id)
+            .find(|(_, file_id)| **file_id == id)
             .and_then(|(name, _)| self.files.get(name))
     }
 

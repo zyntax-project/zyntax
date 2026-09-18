@@ -200,6 +200,13 @@ pub enum Op {
         dst: Reg,
         src: Reg,
     },
+    /// Choose one SSA value without branching.
+    Select {
+        dst: Reg,
+        cond: Reg,
+        yes: Reg,
+        no: Reg,
+    },
 
     // ── integer arithmetic (operands flow through i64 on the bus) ──
     IAdd {
@@ -485,6 +492,11 @@ pub enum Op {
     Malloc {
         dst: Reg,
         has_dst: bool,
+        size_reg: Reg,
+    },
+    Realloc {
+        dst: Reg,
+        old_reg: Reg,
         size_reg: Reg,
     },
     /// `Intrinsic::Free` no-op. The interpreter's bump-style
@@ -935,6 +947,7 @@ fn inst_result(inst: &HirInstruction) -> Option<HirId> {
         HirInstruction::Binary { result, .. }
         | HirInstruction::Unary { result, .. }
         | HirInstruction::Cast { result, .. }
+        | HirInstruction::Select { result, .. }
         | HirInstruction::Alloca { result, .. }
         | HirInstruction::Load { result, .. }
         | HirInstruction::ExtractValue { result, .. }
@@ -949,6 +962,7 @@ fn inst_result_ty(inst: &HirInstruction) -> Option<HirType> {
         HirInstruction::Binary { ty, .. }
         | HirInstruction::Unary { ty, .. }
         | HirInstruction::Cast { ty, .. }
+        | HirInstruction::Select { ty, .. }
         | HirInstruction::Alloca { ty, .. }
         | HirInstruction::Load { ty, .. } => Some(ty.clone()),
         // Calls return whatever the signature says — left as I64 for
@@ -1090,6 +1104,14 @@ fn lower_inst(
                 src,
                 op: *op,
                 ty: ty_idx,
+            });
+        }
+        HirInstruction::Select { result, condition, true_val, false_val, .. } => {
+            cf.code.push(Op::Select {
+                dst: reg(*result)?,
+                cond: reg(*condition)?,
+                yes: reg(*true_val)?,
+                no: reg(*false_val)?,
             });
         }
         HirInstruction::Alloca {
@@ -1281,6 +1303,15 @@ fn lower_inst(
                         has_dst,
                         size_reg,
                     });
+                }
+                HirCallable::Intrinsic(crate::hir::Intrinsic::Realloc) => {
+                    let regs = &cf.args_pool[args_idx as usize];
+                    if regs.len() != 2 || !has_dst {
+                        return Err(InterpError::UnsupportedInstruction(
+                            "realloc expects pointer and size".to_string(),
+                        ));
+                    }
+                    cf.code.push(Op::Realloc { dst, old_reg: regs[0], size_reg: regs[1] });
                 }
                 HirCallable::Intrinsic(crate::hir::Intrinsic::Free)
                 | HirCallable::Intrinsic(crate::hir::Intrinsic::IncRef)
@@ -1803,6 +1834,7 @@ pub struct ProfileSample {
 #[derive(Default)]
 pub struct Memory {
     allocations: Vec<Box<[u8]>>,
+    native_allocator: bool,
     /// One storage slot per module global, shared by every function
     /// that names it.
     globals: HashMap<HirId, *mut u8>,
@@ -1812,10 +1844,39 @@ impl Memory {
     pub fn new() -> Self {
         Self::default()
     }
+    pub fn use_native_allocator(&mut self) {
+        self.native_allocator = true;
+    }
     pub fn alloc_zeroed(&mut self, n_bytes: usize) -> *mut u8 {
+        if self.native_allocator {
+            // The compiled tier uses this same allocator. In particular,
+            // a native realloc may receive a pointer created here.
+            let ptr = unsafe { crate::pool_alloc::zyntax_alloc(n_bytes.max(1)) };
+            if !ptr.is_null() {
+                unsafe { std::ptr::write_bytes(ptr, 0, n_bytes.max(1)) };
+            }
+            return ptr;
+        }
         let mut bytes: Box<[u8]> = vec![0u8; n_bytes].into_boxed_slice();
         let ptr = bytes.as_mut_ptr();
         self.allocations.push(bytes);
+        ptr
+    }
+    pub fn realloc(&mut self, old: *mut u8, size: usize) -> *mut u8 {
+        if self.native_allocator {
+            return unsafe { crate::pool_alloc::zyntax_realloc(old, size.max(1)) };
+        }
+        if old.is_null() {
+            return self.alloc_zeroed(size.max(1));
+        }
+        let Some(index) = self.allocations.iter().position(|a| a.as_ptr() == old) else {
+            return std::ptr::null_mut();
+        };
+        let mut replacement = vec![0u8; size.max(1)].into_boxed_slice();
+        let n = replacement.len().min(self.allocations[index].len());
+        replacement[..n].copy_from_slice(&self.allocations[index][..n]);
+        let ptr = replacement.as_mut_ptr();
+        self.allocations[index] = replacement;
         ptr
     }
     /// The slot of global `id`, allocated zeroed on first use.
@@ -2034,6 +2095,11 @@ impl HirInterpreter {
         }
     }
 
+    /// Share allocations with Cranelift/LLVM when execution can tier up.
+    pub fn use_native_allocator(&mut self) {
+        self.memory.use_native_allocator();
+    }
+
     /// Use the native tier's storage for a module global. Existing bytecode
     /// constants are rebound as well, so a later native module rebuild can
     /// replace the backing address without keeping stale pointers in code.
@@ -2200,6 +2266,9 @@ impl HirInterpreter {
                     .get(&name)
                     .copied()
                     .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?;
+                if let Some(sig) = entry.sig {
+                    return call_extern_symbol_typed(entry.ptr, &args, &sig);
+                }
                 let raw = call_extern_symbol(entry.ptr, &args);
                 let ret_ty = func.signature.returns.first().unwrap_or(&HirType::Void);
                 return Ok(value_from_i64_as(ret_ty, raw));
@@ -2329,6 +2398,15 @@ impl HirInterpreter {
                 }
                 Op::Move { dst, src } => {
                     regs[*dst as usize] = regs[*src as usize].clone();
+                    pc += 1;
+                }
+                Op::Select { dst, cond, yes, no } => {
+                    let src = if value_to_i64(&regs[*cond as usize]).unwrap_or(0) != 0 {
+                        *yes
+                    } else {
+                        *no
+                    };
+                    regs[*dst as usize] = regs[src as usize].clone();
                     pc += 1;
                 }
                 Op::IAdd { dst, lhs, rhs } => {
@@ -2587,6 +2665,25 @@ impl HirInterpreter {
                     if *has_dst {
                         regs[*dst as usize] = ZyntaxValue::Pointer(ptr);
                     }
+                    pc += 1;
+                }
+                Op::Realloc { dst, old_reg, size_reg } => {
+                    let old = match &regs[*old_reg as usize] {
+                        ZyntaxValue::Pointer(p) => *p,
+                        ZyntaxValue::Int(0) | ZyntaxValue::UInt(0) => std::ptr::null_mut(),
+                        other => return Err(InterpError::TypeMismatch {
+                            expected: "pointer (Realloc old allocation)".to_string(),
+                            got: format!("{:?}", other),
+                        }),
+                    };
+                    let size = value_to_i64(&regs[*size_reg as usize])
+                        .ok_or_else(|| InterpError::TypeMismatch {
+                            expected: "integer (Realloc size)".to_string(),
+                            got: format!("{:?}", regs[*size_reg as usize]),
+                        })?.max(1) as usize;
+                    let ptr = self.memory.realloc(old, size);
+                    if ptr.is_null() { return Err(InterpError::OutOfMemory); }
+                    regs[*dst as usize] = ZyntaxValue::Pointer(ptr);
                     pc += 1;
                 }
                 Op::FreeNoop { dst, has_dst } => {

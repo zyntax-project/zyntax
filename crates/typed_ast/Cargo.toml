@@ -1,7 +1,7 @@
 [package]
 name = "zyntax_typed_ast"
 version = "0.3.0"
-edition = "2021"
+edition = "2024"
 authors = ["Damilare Akinlaja"]
 description = "TypedAST - Common typed intermediate representation for multiple languages"
 

@@ -11,7 +11,7 @@ use wide::*;
 
 /// Dot product of two f32 vectors
 /// Returns a.dot(b) = sum(a[i] * b[i])
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vec_dot_product_f32(a: *const f32, b: *const f32, len: u64) -> f32 {
     if a.is_null() || b.is_null() || len == 0 {
         return 0.0;
@@ -66,7 +66,7 @@ pub extern "C" fn vec_dot_product_f32(a: *const f32, b: *const f32, len: u64) ->
 }
 
 /// Sum all elements of an f32 vector
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vec_sum_f32(data: *const f32, len: u64) -> f32 {
     if data.is_null() || len == 0 {
         return 0.0;
@@ -108,7 +108,7 @@ pub extern "C" fn vec_sum_f32(data: *const f32, len: u64) -> f32 {
 }
 
 /// Scale all elements by a scalar: data[i] *= scalar
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vec_scale_f32(data: *mut f32, scalar: f32, len: u64) {
     if data.is_null() || len == 0 {
         return;
@@ -148,7 +148,7 @@ pub extern "C" fn vec_scale_f32(data: *mut f32, scalar: f32, len: u64) {
 }
 
 /// Find minimum value in vector
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vec_min_f32(data: *const f32, len: u64) -> f32 {
     if data.is_null() || len == 0 {
         return f32::INFINITY;
@@ -197,7 +197,7 @@ pub extern "C" fn vec_min_f32(data: *const f32, len: u64) -> f32 {
 }
 
 /// Find maximum value in vector
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vec_max_f32(data: *const f32, len: u64) -> f32 {
     if data.is_null() || len == 0 {
         return f32::NEG_INFINITY;
@@ -246,7 +246,7 @@ pub extern "C" fn vec_max_f32(data: *const f32, len: u64) -> f32 {
 }
 
 /// Fill array with constant value: data[i] = value
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vec_fill_f32(data: *mut f32, value: f32, len: u64) {
     if data.is_null() || len == 0 {
         return;
@@ -275,7 +275,7 @@ pub extern "C" fn vec_fill_f32(data: *mut f32, value: f32, len: u64) {
 }
 
 /// Euclidean distance: sqrt(sum((a[i] - b[i])^2))
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vec_euclidean_f32(a: *const f32, b: *const f32, len: u64) -> f32 {
     if a.is_null() || b.is_null() || len == 0 {
         return 0.0;
@@ -329,7 +329,7 @@ pub extern "C" fn vec_euclidean_f32(a: *const f32, b: *const f32, len: u64) -> f
 }
 
 /// Squared Euclidean distance: sum((a[i] - b[i])^2) - avoids sqrt
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vec_euclidean_sq_f32(a: *const f32, b: *const f32, len: u64) -> f32 {
     if a.is_null() || b.is_null() || len == 0 {
         return 0.0;
@@ -383,7 +383,7 @@ pub extern "C" fn vec_euclidean_sq_f32(a: *const f32, b: *const f32, len: u64) -
 }
 
 /// Manhattan (L1) distance: sum(|a[i] - b[i]|)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vec_manhattan_f32(a: *const f32, b: *const f32, len: u64) -> f32 {
     if a.is_null() || b.is_null() || len == 0 {
         return 0.0;
@@ -436,7 +436,7 @@ pub extern "C" fn vec_manhattan_f32(a: *const f32, b: *const f32, len: u64) -> f
 }
 
 /// Cosine similarity: dot(a,b) / (norm(a) * norm(b))
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vec_cosine_similarity_f32(a: *const f32, b: *const f32, len: u64) -> f32 {
     if a.is_null() || b.is_null() || len == 0 {
         return 0.0;
@@ -455,7 +455,7 @@ pub extern "C" fn vec_cosine_similarity_f32(a: *const f32, b: *const f32, len: u
 }
 
 /// L2 normalize in place: data[i] /= norm(data)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vec_l2_normalize_f32(data: *mut f32, len: u64) {
     if data.is_null() || len == 0 {
         return;
@@ -470,7 +470,7 @@ pub extern "C" fn vec_l2_normalize_f32(data: *mut f32, len: u64) {
 }
 
 /// Find max value and its index
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vec_argmax_with_val_f32(
     data: *const f32,
     len: u64,

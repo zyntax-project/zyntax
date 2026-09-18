@@ -40,7 +40,7 @@ fn lower(src: &str) -> zyntax_compiler::hir::HirModule {
 fn diagnostic_fiber_def_return_type() {
     let program = parse_program(
         r#"
-        fiber def gen(): i64 {
+        fiber def r#gen(): i64 {
             yield 1
         }
         "#,
@@ -49,19 +49,19 @@ fn diagnostic_fiber_def_return_type() {
     let mut found = None;
     for decl in &program.declarations {
         if let TypedDeclaration::Function(f) = &decl.node {
-            if f.name.resolve_global().as_deref() == Some("gen") {
+            if f.name.resolve_global().as_deref() == Some("r#gen") {
                 found = Some(f);
                 break;
             }
         }
     }
-    let f = found.expect("gen function should be in program");
+    let f = found.expect("r#gen function should be in program");
 
     eprintln!(
-        "[DIAG] fiber def gen():i64 -> return_type = {:?}",
+        "[DIAG] fiber def r#gen():i64 -> return_type = {:?}",
         f.return_type
     );
-    eprintln!("[DIAG] fiber def gen():i64 -> is_fiber = {}", f.is_fiber);
+    eprintln!("[DIAG] fiber def r#gen():i64 -> is_fiber = {}", f.is_fiber);
 
     // is_fiber must be true (the grammar fix from step 3a).
     assert!(f.is_fiber, "fiber def must have is_fiber=true");
@@ -96,26 +96,26 @@ fn diagnostic_fiber_def_return_type() {
 }
 
 /// Diagnostic 1b: at the CALL SITE — when source spells
-/// `let f = gen()` where `gen` is `fiber def`, does the SSA-lowered
+/// `let f = r#gen()` where `r#gen` is `fiber def`, does the SSA-lowered
 /// HIR produce a `Fiber<T>` value via `FiberNew`, or does it fall
 /// through to a regular `Call` that runs the body synchronously?
 #[test]
 fn diagnostic_fiber_call_site() {
     let module = lower(
         r#"
-        fiber def gen(): i64 {
+        fiber def r#gen(): i64 {
             yield 1
         }
 
         def main(): i64 {
-            let f = gen()
+            let f = r#gen()
             return 0
         }
         "#,
     );
 
     // Search `main` for either a FiberNew (new behavior) or a
-    // regular Call to `gen` (current behavior).
+    // regular Call to `r#gen` (current behavior).
     let mut fiber_new_count = 0usize;
     let mut call_gen_count = 0usize;
     for func in module.functions.values() {
@@ -137,7 +137,7 @@ fn diagnostic_fiber_call_site() {
     }
 
     eprintln!(
-        "[DIAG] let f = gen() in main -> FiberNew ops = {}, Call(Function) ops = {}",
+        "[DIAG] let f = r#gen() in main -> FiberNew ops = {}, Call(Function) ops = {}",
         fiber_new_count, call_gen_count
     );
 

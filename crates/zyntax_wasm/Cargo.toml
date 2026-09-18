@@ -1,7 +1,7 @@
 [package]
 name = "zyntax_wasm"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "wasm-bindgen entry shim for the Zyntax/ZynML runtime — parse + interpret ZynML in browser / wasi hosts."
 license = "Apache-2.0"
 publish = false

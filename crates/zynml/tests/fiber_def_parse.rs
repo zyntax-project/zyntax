@@ -35,14 +35,14 @@ fn find_function<'a>(
 fn fiber_def_block_with_return_type_sets_is_fiber() {
     let program = parse(
         r#"
-        fiber def gen(): i32 {
+        fiber def r#gen(): i32 {
             yield 1
             yield 2
         }
         "#,
     );
-    let func = find_function(&program, "gen");
-    assert!(func.is_fiber, "expected is_fiber=true for `fiber def gen`");
+    let func = find_function(&program, "r#gen");
+    assert!(func.is_fiber, "expected is_fiber=true for `fiber def r#gen`");
     assert!(
         !func.is_async,
         "fiber and async should be mutually exclusive"

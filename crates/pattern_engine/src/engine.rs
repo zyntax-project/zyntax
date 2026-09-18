@@ -156,7 +156,7 @@ impl PatternEngine {
 
         let mut queue: std::collections::VecDeque<&'static str> = in_degree
             .iter()
-            .filter(|(_, &deg)| deg == 0)
+            .filter(|(_, deg)| **deg == 0)
             .map(|(&name, _)| name)
             .collect();
 

@@ -403,19 +403,19 @@ fn ownership_of(ty: Ty) -> ParamOwnership {
 /// Whether a generator expression is the start of a fresh generator,
 /// which whoever drains it owns, rather than a name for one held
 /// elsewhere.
-fn is_generator_start(gen: &Node) -> bool {
+fn is_generator_start(r#gen: &Node) -> bool {
     matches!(
-        &gen.node,
+        &r#gen.node,
         TypedExpression::Call(c)
             if matches!(&c.callee.node, TypedExpression::Variable(v)
                 if v.resolve_global().as_deref() == Some("zb_fiber_start"))
     )
 }
 
-/// `zb_fiber_free(gen)`: a drained generator's fiber released.
-fn free_generator(gen: Node, span: Span) -> Stmt {
+/// `zb_fiber_free(r#gen)`: a drained generator's fiber released.
+fn free_generator(r#gen: Node, span: Span) -> Stmt {
     TypedNode::new(
-        TypedStatement::Expression(Box::new(call("zb_fiber_free", vec![gen], Ty::None, span))),
+        TypedStatement::Expression(Box::new(call("zb_fiber_free", vec![r#gen], Ty::None, span))),
         Type::Unknown,
         span,
     )
@@ -6785,17 +6785,17 @@ impl<'m> Lowerer<'m> {
         ])
     }
 
-    /// `match gen.next() { Some(x) => { ... }, _ => { ... } }` as a
+    /// `match r#gen.next() { Some(x) => { ... }, _ => { ... } }` as a
     /// statement, with `x` bound as `item` in the first arm.
     fn next_match(
         &mut self,
-        gen: Node,
+        r#gen: Node,
         item: InternedString,
         some: Vec<Stmt>,
         none: Vec<Stmt>,
         span: Span,
     ) -> Stmt {
-        let next = method_call(gen, "next", vec![], Ty::Object, span);
+        let next = method_call(r#gen, "next", vec![], Ty::Object, span);
         let next = Node {
             ty: Type::Optional(Box::new(Type::Any)),
             ..next
@@ -6844,13 +6844,13 @@ impl<'m> Lowerer<'m> {
     fn for_generator(
         &mut self,
         f: &py::StmtFor,
-        gen: Val,
+        r#gen: Val,
         extra: Vec<Stmt>,
         span: Span,
     ) -> Result<TypedStatement> {
         let mut prologue = std::mem::take(&mut self.hoisted);
-        let held_from = gen.node.clone();
-        let held = self.hold(gen, &mut prologue, span);
+        let held_from = r#gen.node.clone();
+        let held = self.hold(r#gen, &mut prologue, span);
         let item = self.temp();
         let mut body = Vec::new();
         self.bind(
@@ -6887,12 +6887,12 @@ impl<'m> Lowerer<'m> {
     }
 
     /// Every value a generator yields, as a list.
-    fn generator_to_list(&mut self, gen: Node, span: Span) -> Node {
+    fn generator_to_list(&mut self, r#gen: Node, span: Span) -> Node {
         let mut pre = Vec::new();
-        let fresh = is_generator_start(&gen);
+        let fresh = is_generator_start(&r#gen);
         let held = self.hold(
             Val {
-                node: gen,
+                node: r#gen,
                 ty: Ty::Gen,
             },
             &mut pre,
@@ -6936,8 +6936,8 @@ impl<'m> Lowerer<'m> {
         var(out, Ty::List(Elem::Object), span)
     }
 
-    /// `next(gen)`: the next value, or the default, or StopIteration.
-    fn next_of(&mut self, gen: Node, default: Option<Node>, span: Span) -> Val {
+    /// `next(r#gen)`: the next value, or the default, or StopIteration.
+    fn next_of(&mut self, r#gen: Node, default: Option<Node>, span: Span) -> Val {
         let mut pre = Vec::new();
         let result = self.temp();
         let initial = match &default {
@@ -6977,7 +6977,7 @@ impl<'m> Lowerer<'m> {
         if default.is_none() {
             self.raise_named("StopIteration", str_lit("", span), span, &mut exhausted);
         }
-        let pull = self.next_match(gen, item, take, exhausted, span);
+        let pull = self.next_match(r#gen, item, take, exhausted, span);
         pre.push(pull);
         self.hoisted.extend(pre);
         Val {

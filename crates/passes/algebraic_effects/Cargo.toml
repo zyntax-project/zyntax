@@ -1,7 +1,7 @@
 [package]
 name = "algebraic_effects_pass"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Algebraic effects pass — CPS-transforms effect operations and generates handler dispatch"
 
 [dependencies]

@@ -7,7 +7,7 @@ members = [
     "crates/runtime",
     "crates/zyntax_plugin_macros",
     "crates/zyn_peg",
-    "crates/haxe_zyntax_runtime",
+    # "crates/haxe_zyntax_runtime",
     "crates/zyntax_embed",
     "crates/zyntax_wasm",
     "crates/zynml",

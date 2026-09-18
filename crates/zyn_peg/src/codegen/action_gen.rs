@@ -261,8 +261,8 @@ mod tests {
             ],
         };
 
-        let mut gen = ActionGenerator::new();
-        let code = gen.generate(&action);
+        let mut r#gen = ActionGenerator::new();
+        let code = r#gen.generate(&action);
 
         assert!(code.contains("TypedExpression::Binary"));
         assert!(code.contains("left: left"));
@@ -277,8 +277,8 @@ mod tests {
             args: vec![ExprIR::Binding("items".to_string())],
         };
 
-        let mut gen = ActionGenerator::new();
-        let code = gen.generate(&action);
+        let mut r#gen = ActionGenerator::new();
+        let code = r#gen.generate(&action);
 
         assert!(code.contains("fold_binary_left(items)"));
     }
@@ -289,21 +289,21 @@ mod tests {
             binding: "inner".to_string(),
         };
 
-        let mut gen = ActionGenerator::new();
-        let code = gen.generate(&action);
+        let mut r#gen = ActionGenerator::new();
+        let code = r#gen.generate(&action);
 
         assert!(code.contains("inner"));
     }
 
     #[test]
     fn test_generate_expr_unwrap_or() {
-        let gen = ActionGenerator::new();
+        let r#gen = ActionGenerator::new();
         let expr = ExprIR::UnwrapOr {
             optional: Box::new(ExprIR::Binding("params".to_string())),
             default: Box::new(ExprIR::List(vec![])),
         };
 
-        let code = gen.generate_expr(&expr);
+        let code = r#gen.generate_expr(&expr);
         assert!(code.contains("params.unwrap_or(vec![])"));
     }
 }

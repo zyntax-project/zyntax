@@ -25,14 +25,14 @@ fn async_drives_fiber_no_await() {
     let program = grammar
         .parse_with_filename(
             r#"
-            fiber def gen(): i64 {
+            fiber def r#gen(): i64 {
                 yield 1
                 yield 2
                 yield 3
             }
 
             async def main(): i64 {
-                let f = gen()
+                let f = r#gen()
                 let mut sum: i64 = 0
                 while let Some(x) = f.next() {
                     sum = sum + x
@@ -66,14 +66,14 @@ fn async_drives_fiber_with_await_in_loop() {
     let program = grammar
         .parse_with_filename(
             r#"
-            fiber def gen(): i64 {
+            fiber def r#gen(): i64 {
                 yield 10
                 yield 20
                 yield 30
             }
 
             async def main(): i64 {
-                let f = gen()
+                let f = r#gen()
                 let mut sum: i64 = 0
                 while let Some(x) = f.next() {
                     await sleep(20)

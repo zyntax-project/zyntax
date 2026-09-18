@@ -214,16 +214,16 @@ mod tests {
 
     #[test]
     fn test_rule_id_generator() {
-        let mut gen = RuleIdGenerator::new();
+        let mut r#gen = RuleIdGenerator::new();
 
-        let id1 = gen.get_id("expr");
-        let id2 = gen.get_id("stmt");
-        let id3 = gen.get_id("expr"); // Same as id1
+        let id1 = r#gen.get_id("expr");
+        let id2 = r#gen.get_id("stmt");
+        let id3 = r#gen.get_id("expr"); // Same as id1
 
         assert_eq!(id1, id3);
         assert_ne!(id1, id2);
 
-        assert_eq!(gen.lookup("expr"), Some(id1));
-        assert_eq!(gen.lookup("unknown"), None);
+        assert_eq!(r#gen.lookup("expr"), Some(id1));
+        assert_eq!(r#gen.lookup("unknown"), None);
     }
 }

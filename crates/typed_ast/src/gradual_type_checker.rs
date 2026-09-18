@@ -753,12 +753,12 @@ impl GradualTypeChecker {
     /// Combine existing type information with new evidence
     fn combine_type_with_evidence(&self, current_type: &Type, evidence: &Evidence) -> Type {
         match &evidence.kind {
-            EvidenceKind::Assignment(ref new_type) => {
+            EvidenceKind::Assignment(new_type) => {
                 // Assignment evidence overrides previous type
                 new_type.clone()
             }
 
-            EvidenceKind::TypeGuard(ref guarded_type) => {
+            EvidenceKind::TypeGuard(guarded_type) => {
                 // Type guard narrows the type
                 self.intersect_types(current_type, guarded_type)
             }

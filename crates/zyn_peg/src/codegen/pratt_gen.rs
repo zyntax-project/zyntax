@@ -441,8 +441,8 @@ mod tests {
     #[test]
     fn test_generate_pratt_parser() {
         let config = standard_expr_config();
-        let mut gen = PrattGenerator::new();
-        let code = gen.generate(&config);
+        let mut r#gen = PrattGenerator::new();
+        let code = r#gen.generate(&config);
 
         assert!(code.contains("fn parse_expr"));
         assert!(code.contains("fn parse_expr_bp"));

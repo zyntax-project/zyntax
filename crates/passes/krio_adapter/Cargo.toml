@@ -1,7 +1,7 @@
 [package]
 name = "krio_adapter"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Damilare Akinlaja"]
 description = "Adapter wiring zyntax HIR into krio-async's CFG-shaped CoroCfg / AsyncHooks / SuspendingFns traits"
 

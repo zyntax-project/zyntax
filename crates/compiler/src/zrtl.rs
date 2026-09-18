@@ -1475,7 +1475,7 @@ pub struct DynamicBoxRepr {
 ///
 /// # Returns
 /// Pointer to heap-allocated ZrtlClosure. Caller must free with `zrtl_closure_free`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_closure_to_zrtl(
     fn_ptr: RawClosureFn,
     env_ptr: *const u8,
@@ -1578,7 +1578,7 @@ extern "C" fn raw_closure_clone(ptr: *const ()) -> *const () {
 }
 
 /// Free a ZrtlClosure created by zyntax_closure_to_zrtl
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_closure_free(closure: *mut ZrtlClosureRepr) {
     if !closure.is_null() {
         let c = Box::from_raw(closure);
@@ -1595,7 +1595,7 @@ pub unsafe extern "C" fn zyntax_closure_free(closure: *mut ZrtlClosureRepr) {
 ///
 /// # Returns
 /// Pointer to heap-allocated DynamicBox. Caller must free with `zyntax_box_free`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_primitive_to_box(
     value_ptr: *const u8,
     type_tag: u32,
@@ -1649,7 +1649,7 @@ const STRING_HASH_SIZE: usize = 8;
 ///
 /// # Safety
 /// `boxed` must be a live string box.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_hash(boxed: *const DynamicBoxRepr) -> i64 {
     *((boxed as *const u8).add(std::mem::size_of::<DynamicBoxRepr>()) as *const i64)
 }
@@ -1658,7 +1658,7 @@ pub unsafe extern "C" fn zyntax_box_hash(boxed: *const DynamicBoxRepr) -> i64 {
 ///
 /// # Safety
 /// As [`zyntax_box_hash`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_set_hash(boxed: *mut DynamicBoxRepr, hash: i64) {
     *((boxed as *mut u8).add(std::mem::size_of::<DynamicBoxRepr>()) as *mut i64) = hash;
 }
@@ -1674,7 +1674,7 @@ unsafe fn scalar_on_heap<T: Copy>(value: T) -> *mut u8 {
 }
 
 /// Create a DynamicBox for an i32 value
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_i32(value: i32) -> *mut DynamicBoxRepr {
     box_on_heap(DynamicBoxRepr {
         tag: TypeTag::I32.0,
@@ -1686,7 +1686,7 @@ pub unsafe extern "C" fn zyntax_box_i32(value: i32) -> *mut DynamicBoxRepr {
 }
 
 /// Create a DynamicBox for an i64 value
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_i64(value: i64) -> *mut DynamicBoxRepr {
     box_on_heap(DynamicBoxRepr {
         tag: TypeTag::I64.0,
@@ -1698,7 +1698,7 @@ pub unsafe extern "C" fn zyntax_box_i64(value: i64) -> *mut DynamicBoxRepr {
 }
 
 /// Create a DynamicBox for an f32 value
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_f32(value: f32) -> *mut DynamicBoxRepr {
     box_on_heap(DynamicBoxRepr {
         tag: TypeTag::F32.0,
@@ -1710,7 +1710,7 @@ pub unsafe extern "C" fn zyntax_box_f32(value: f32) -> *mut DynamicBoxRepr {
 }
 
 /// Create a DynamicBox for an f64 value
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_f64(value: f64) -> *mut DynamicBoxRepr {
     box_on_heap(DynamicBoxRepr {
         tag: TypeTag::F64.0,
@@ -1722,7 +1722,7 @@ pub unsafe extern "C" fn zyntax_box_f64(value: f64) -> *mut DynamicBoxRepr {
 }
 
 /// Create a DynamicBox for a bool value
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_bool(value: i32) -> *mut DynamicBoxRepr {
     box_on_heap(DynamicBoxRepr {
         tag: TypeTag::BOOL.0,
@@ -1747,7 +1747,7 @@ const OPAQUE_BOX_HEADER: usize = 8;
 ///
 /// # Safety
 /// `data` must point to at least `size` readable bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_opaque(
     data: *const u8,
     size: u32,
@@ -1781,7 +1781,7 @@ pub unsafe extern "C" fn zyntax_box_opaque(
 ///
 /// # Safety
 /// `s` must be null or a live ZRTL string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_str(s: *mut u8) -> *mut DynamicBoxRepr {
     box_on_heap(DynamicBoxRepr {
         tag: TypeTag::STRING.0,
@@ -1798,7 +1798,7 @@ pub unsafe extern "C" fn zyntax_box_str(s: *mut u8) -> *mut DynamicBoxRepr {
 ///
 /// # Safety
 /// `p` must stay valid for as long as the box is read.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_ptr(p: *mut u8, tag: u32) -> *mut DynamicBoxRepr {
     box_on_heap(DynamicBoxRepr {
         tag,
@@ -1817,7 +1817,7 @@ pub unsafe extern "C" fn zyntax_box_ptr(p: *mut u8, tag: u32) -> *mut DynamicBox
 ///
 /// # Safety
 /// `boxed` must be null or a live box.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_get_opaque(boxed: *const DynamicBoxRepr) -> *mut u8 {
     if boxed.is_null() {
         return std::ptr::null_mut();
@@ -1832,7 +1832,7 @@ pub unsafe extern "C" fn zyntax_box_get_opaque(boxed: *const DynamicBoxRepr) -> 
 /// the runtime here (the system allocator), by a plugin through the SDK
 /// (the same), or by compiled code through the allocation intrinsic
 /// (the pool), and this is the one release all three reach.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_free(boxed: *mut DynamicBoxRepr) {
     if boxed.is_null() {
         return;
@@ -1846,7 +1846,7 @@ pub unsafe extern "C" fn zyntax_box_free(boxed: *mut DynamicBoxRepr) {
 }
 
 /// Get the value from a DynamicBox as i64
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_get_i64(boxed: *const DynamicBoxRepr) -> i64 {
     if boxed.is_null() || (*boxed).data.is_null() {
         return 0;
@@ -1863,7 +1863,7 @@ pub unsafe extern "C" fn zyntax_box_get_i64(boxed: *const DynamicBoxRepr) -> i64
 /// Get the value from a DynamicBox as i32. Reads through the box's
 /// `data` pointer using the recorded `size` so source values stored
 /// as i8/i16 widen losslessly. Returns 0 on null box.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_get_i32(boxed: *const DynamicBoxRepr) -> i32 {
     if boxed.is_null() || (*boxed).data.is_null() {
         return 0;
@@ -1877,7 +1877,7 @@ pub unsafe extern "C" fn zyntax_box_get_i32(boxed: *const DynamicBoxRepr) -> i32
 }
 
 /// Get the value from a DynamicBox as f32. Source f64 narrows.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_get_f32(boxed: *const DynamicBoxRepr) -> f32 {
     if boxed.is_null() || (*boxed).data.is_null() {
         return 0.0;
@@ -1890,7 +1890,7 @@ pub unsafe extern "C" fn zyntax_box_get_f32(boxed: *const DynamicBoxRepr) -> f32
 }
 
 /// Get the value from a DynamicBox as f64. Source f32 widens.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_get_f64(boxed: *const DynamicBoxRepr) -> f64 {
     if boxed.is_null() || (*boxed).data.is_null() {
         return 0.0;
@@ -1911,7 +1911,7 @@ pub unsafe extern "C" fn zyntax_box_get_f64(boxed: *const DynamicBoxRepr) -> f64
 /// # Safety
 /// `boxed` must be a live box whose payload is at least as wide as the
 /// value read.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_data(boxed: *const DynamicBoxRepr) -> *mut u8 {
     (*boxed).data
 }
@@ -1919,37 +1919,37 @@ pub unsafe extern "C" fn zyntax_box_data(boxed: *const DynamicBoxRepr) -> *mut u
 /// See [`zyntax_box_data`]. The pointer a `zyntax_box_ptr` box holds:
 /// the box does not own what it points at, so the result is not the
 /// box's storage under another name and outlives the box.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_pointer(boxed: *const DynamicBoxRepr) -> *mut u8 {
     (*boxed).data
 }
 
 /// See [`zyntax_box_data`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_header_tag(boxed: *const DynamicBoxRepr) -> u32 {
     (*boxed).tag
 }
 
 /// See [`zyntax_box_data`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_payload_i64(boxed: *const DynamicBoxRepr) -> i64 {
     *((*boxed).data as *const i64)
 }
 
 /// See [`zyntax_box_data`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_payload_f64(boxed: *const DynamicBoxRepr) -> f64 {
     *((*boxed).data as *const f64)
 }
 
 /// See [`zyntax_box_data`]. A bool payload is one byte.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_payload_bool(boxed: *const DynamicBoxRepr) -> i32 {
     (*((*boxed).data as *const u8) != 0) as i32
 }
 
 /// Get the value from a DynamicBox as bool (returned as i32 for FFI).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_get_bool(boxed: *const DynamicBoxRepr) -> i32 {
     if boxed.is_null() || (*boxed).data.is_null() {
         return 0;
@@ -1965,7 +1965,7 @@ pub unsafe extern "C" fn zyntax_box_get_bool(boxed: *const DynamicBoxRepr) -> i3
 }
 
 /// Get the TypeTag from a DynamicBox
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_get_tag(boxed: *const DynamicBoxRepr) -> u32 {
     if boxed.is_null() {
         return TypeTag::VOID.0;
@@ -2168,7 +2168,7 @@ fn fiber_backend() -> &'static dyn crate::fiber_backend::FiberCfg {
 /// # Safety
 /// `closure` must be a pointer the installed backend can interpret
 /// (today: an `extern "C" fn()` pointer with no captured environment).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_new(closure: *mut u8, stack_size: i64) -> *mut FiberRepr {
     fiber_backend().fiber_new(closure, stack_size)
 }
@@ -2181,7 +2181,7 @@ pub unsafe extern "C" fn krio_fiber_new(closure: *mut u8, stack_size: i64) -> *m
 /// `fiber` must be a handle returned by `krio_fiber_new` (or a
 /// previous `krio_fiber_resume*`) that hasn't been moved between
 /// threads.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_resume(fiber: *mut FiberRepr) -> i64 {
     fiber_backend().fiber_resume(fiber)
 }
@@ -2193,7 +2193,7 @@ pub unsafe extern "C" fn krio_fiber_resume(fiber: *mut FiberRepr) -> i64 {
 ///
 /// # Safety
 /// Same as [`krio_fiber_resume`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_resume_with(fiber: *mut FiberRepr, value: i64) -> i64 {
     fiber_backend().fiber_resume_with(fiber, value)
 }
@@ -2202,7 +2202,7 @@ pub unsafe extern "C" fn krio_fiber_resume_with(fiber: *mut FiberRepr, value: i6
 /// `value` to whoever called the matching resume. Only valid from
 /// inside a fiber body — the backend looks up the current fiber via
 /// a thread-local.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_yield(value: i64) {
     fiber_backend().fiber_yield(value)
 }
@@ -2212,7 +2212,7 @@ pub unsafe extern "C" fn krio_fiber_yield(value: i64) {
 ///
 /// # Safety
 /// As [`krio_fiber_new`]; `env` is stored as an address only.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_new_with_env(
     closure: *mut u8,
     env: *mut u8,
@@ -2223,7 +2223,7 @@ pub unsafe extern "C" fn krio_fiber_new_with_env(
 
 /// `krio_fiber_env` — the environment of the fiber running now, null
 /// outside any fiber or for one made without an environment.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn krio_fiber_env() -> *mut u8 {
     fiber_backend().fiber_env()
 }
@@ -2233,7 +2233,7 @@ pub extern "C" fn krio_fiber_env() -> *mut u8 {
 ///
 /// This must be called from inside a fiber body after that body has previously
 /// yielded and was resumed with [`krio_fiber_resume_with`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_take_input() -> i64 {
     fiber_backend().fiber_take_input()
 }
@@ -2244,7 +2244,7 @@ pub unsafe extern "C" fn krio_fiber_take_input() -> i64 {
 ///
 /// # Safety
 /// `target` must be a valid fiber handle on the calling thread.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_transfer(target: *mut FiberRepr, value: i64) -> i64 {
     fiber_backend().fiber_transfer(target, value)
 }
@@ -2255,7 +2255,7 @@ pub unsafe extern "C" fn krio_fiber_transfer(target: *mut FiberRepr, value: i64)
 ///
 /// # Safety
 /// `fiber` must be a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_cancel(fiber: *mut FiberRepr) {
     fiber_backend().fiber_cancel(fiber)
 }
@@ -2268,7 +2268,7 @@ pub unsafe extern "C" fn krio_fiber_cancel(fiber: *mut FiberRepr) {
 /// # Safety
 /// `fiber` must be a valid handle returned by `krio_fiber_new` that
 /// hasn't already been freed; it must not be used after this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_free(fiber: *mut FiberRepr) {
     fiber_backend().fiber_free(fiber)
 }
@@ -2286,7 +2286,7 @@ pub unsafe extern "C" fn krio_fiber_free(fiber: *mut FiberRepr) {
 ///
 /// SSA-side dispatch picks the variant based on the argument
 /// type at the call site.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn krio_fiber_abort_with(variant: i64, payload: i64) {
     fiber_backend().fiber_abort_with(variant, payload)
 }
@@ -2303,7 +2303,7 @@ pub extern "C" fn krio_fiber_abort_with(variant: i64, payload: i64) {
 ///
 /// # Safety
 /// `fiber` must be a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn krio_fiber_take_error(fiber: *mut FiberRepr) -> i64 {
     fiber_backend().fiber_take_error(fiber)
 }
@@ -2645,7 +2645,7 @@ fn run_bands(job: &Job) {
 /// # Safety
 /// `band` must be a valid function pointer and `env` must remain valid
 /// for the call, which it does because this blocks.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_parallel_for(
     lo: i64,
     hi: i64,

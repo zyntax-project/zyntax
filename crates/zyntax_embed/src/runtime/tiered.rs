@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use zyntax_compiler::{
     hir::{HirId, HirModule},
+    hir_interp::HirInterpreter,
     lowering::AstLowering,
     tiered_backend::{OptimizationTier, TieredBackend, TieredConfig, TieredStatistics},
     zrtl::DynamicValue,
@@ -60,6 +61,8 @@ use zyntax_compiler::{
 pub struct TieredRuntime {
     /// The tiered JIT backend
     backend: TieredBackend,
+    /// Cold calls execute here until beadie installs a native entry.
+    interpreter: Mutex<HirInterpreter>,
     /// Mapping from function names to HIR IDs
     function_ids: HashMap<String, HirId>,
     /// Function signatures for native calling
@@ -409,8 +412,11 @@ impl TieredRuntime {
             backend.register_runtime_symbol(name, ptr);
         }
 
+        let mut interpreter = HirInterpreter::new();
+        interpreter.use_native_allocator();
         let mut runtime = Self {
             backend,
+            interpreter: Mutex::new(interpreter),
             function_ids: HashMap::new(),
             function_signatures: HashMap::new(),
             config,
@@ -659,6 +665,26 @@ impl TieredRuntime {
         let started = std::time::Instant::now();
         self.backend
             .compile_module_lazily(module, reachable, lazy, finished)?;
+        // The backend owns the optimized HIR and native global slots. Bind
+        // both into the interpreter before the initializer can run.
+        let (symbols, globals) = self.backend.interpreter_bindings();
+        let mut interp = self.interpreter.lock().unwrap();
+        for (name, ptr) in symbols {
+            if let Some(sig) = self.plugin_signatures.get(&name) {
+                interp.register_symbol_typed(name, ptr, *sig);
+            } else {
+                interp.register_symbol(name, ptr, 0);
+            }
+        }
+        for (id, ptr) in globals {
+            interp.bind_global_slot(id, ptr);
+        }
+        for id in self.function_ids.values().copied() {
+            if let Some(tick) = self.backend.interpreter_tick_callback(id) {
+                interp.register_tick_callback(id, tick);
+            }
+        }
+        drop(interp);
         if init_boxed_constants {
             self.call::<()>(zyntax_compiler::const_boxes::INIT_FUNCTION, &[])?;
         }
@@ -739,12 +765,19 @@ impl TieredRuntime {
             )));
         }
 
-        // Record the call for profiling
-        self.backend.record_call(*func_id);
+        // A cold entry starts in the HIR interpreter. Its tick callback
+        // drives beadie for every interpreted function, including callees.
+        // A promoted entry uses the current native pointer directly.
+        if self.backend.promoted_function_pointer(*func_id).is_none() {
+            let module = self.backend.interpreter_module(*func_id)
+                .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
+            return self.interpreter.lock().unwrap()
+                .call(&module, name, args.to_vec())
+                .map_err(|e| RuntimeError::Execution(e.to_string()));
+        }
 
-        let ptr = self
-            .backend
-            .get_function_pointer(*func_id)
+        self.backend.record_call(*func_id);
+        let ptr = self.backend.get_function_pointer(*func_id)
             .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
 
         // If we have a recorded HIR-derived signature, the function uses

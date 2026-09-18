@@ -45,20 +45,20 @@ fn count_fiber_yields(func: &zyntax_compiler::hir::HirFunction) -> usize {
 fn yield_in_fiber_def_emits_fiber_yield_op() {
     let module = lower(
         r#"
-        fiber def gen() {
+        fiber def r#gen() {
             yield 1
             yield 2
             yield 3
         }
         "#,
     );
-    let gen = function_by_name(&module, "gen");
+    let r#gen = function_by_name(&module, "r#gen");
     assert!(
-        gen.signature.is_fiber,
+        r#gen.signature.is_fiber,
         "is_fiber flag must propagate to HIR signature"
     );
     assert_eq!(
-        count_fiber_yields(gen),
+        count_fiber_yields(r#gen),
         3,
         "expected three FiberYield ops, one per `yield` in the body"
     );

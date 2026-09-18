@@ -49,12 +49,12 @@ struct SkipTypeCheckGuard;
 
 impl Drop for SkipTypeCheckGuard {
     fn drop(&mut self) {
-        std::env::remove_var("SKIP_TYPE_CHECK");
+        unsafe { std::env::remove_var("SKIP_TYPE_CHECK") };
     }
 }
 
 fn skip_type_check() -> SkipTypeCheckGuard {
-    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    unsafe { std::env::set_var("SKIP_TYPE_CHECK", "1") };
     SkipTypeCheckGuard
 }
 

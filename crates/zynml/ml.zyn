@@ -1783,7 +1783,7 @@ fn_def = {
 }
 
 // ========== Fiber function definitions ==========
-// fiber def gen(): i32 { yield 1; yield 2 }
+// fiber def r#gen(): i32 { yield 1; yield 2 }
 //
 // Stackful coroutines — body runs on a per-fiber stack allocated at
 // `FiberNew` time. `yield expr` inside the body suspends until the

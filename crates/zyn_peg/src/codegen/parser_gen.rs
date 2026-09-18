@@ -601,8 +601,8 @@ mod tests {
         "#;
 
         let grammar = parse_grammar(input).unwrap();
-        let mut gen = ParserGenerator::new();
-        let code = gen.generate(&grammar);
+        let mut r#gen = ParserGenerator::new();
+        let code = r#gen.generate(&grammar);
 
         assert!(code.contains("fn parse_identifier"));
         assert!(code.contains("ascii_alpha"));
@@ -617,8 +617,8 @@ mod tests {
         "#;
 
         let grammar = parse_grammar(input).unwrap();
-        let mut gen = ParserGenerator::new();
-        let code = gen.generate(&grammar);
+        let mut r#gen = ParserGenerator::new();
+        let code = r#gen.generate(&grammar);
 
         assert!(code.contains("fn parse_fn_def"));
         assert!(code.contains("let name ="));

@@ -218,10 +218,10 @@ fn fiber_handle_survives_a_resumable_perform() {
             r#"
             effect E { def op(): i64 }
             handler H for E { def op(k: Resume<i64>): i64 { return k(1) } }
-            fiber def gen() { yield 10 yield 20 }
+            fiber def r#gen() { yield 10 yield 20 }
             @effect(E)
             async def work(): i64 {
-                let f = gen()
+                let f = r#gen()
                 let x = op()
                 var s: i64 = 0
                 while let Some(y) = f.next() { s = s + y }
@@ -280,10 +280,10 @@ fn perform_resume_await_then_fiber_next() {
             r#"
             effect E { def op(): i64 }
             handler H for E { def op(k: Resume<i64>): i64 { return k(1) } }
-            fiber def gen() { yield 10 yield 20 }
+            fiber def r#gen() { yield 10 yield 20 }
             @effect(E)
             async def work(): i64 {
-                let f = gen()
+                let f = r#gen()
                 let x = op()
                 await sleep(10)
                 var s: i64 = 0

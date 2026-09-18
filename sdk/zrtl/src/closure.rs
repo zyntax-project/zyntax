@@ -510,7 +510,7 @@ impl DynamicBox {
 ///
 /// # Safety
 /// The function pointer must be valid for the lifetime of the closure.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn zrtl_closure_from_fn(func: extern "C" fn(i64) -> i64) -> *mut ZrtlClosure {
     let closure = ZrtlClosure::new(move |arg| func(arg));
     Box::into_raw(Box::new(closure))
@@ -520,7 +520,7 @@ pub extern "C" fn zrtl_closure_from_fn(func: extern "C" fn(i64) -> i64) -> *mut 
 ///
 /// # Safety
 /// The pointer must be a valid ZrtlClosure pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zrtl_closure_call(closure: *const ZrtlClosure, arg: i64) -> ClosureResult {
     if closure.is_null() {
         return ClosureResult::err(error::NULL_CLOSURE);
@@ -532,7 +532,7 @@ pub unsafe extern "C" fn zrtl_closure_call(closure: *const ZrtlClosure, arg: i64
 ///
 /// # Safety
 /// The pointer must be a valid ZrtlClosure pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zrtl_closure_clone(closure: *const ZrtlClosure) -> *mut ZrtlClosure {
     if closure.is_null() {
         return std::ptr::null_mut();
@@ -545,7 +545,7 @@ pub unsafe extern "C" fn zrtl_closure_clone(closure: *const ZrtlClosure) -> *mut
 ///
 /// # Safety
 /// The pointer must be a valid ZrtlClosure pointer that was created by zrtl_closure_* functions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zrtl_closure_free(closure: *mut ZrtlClosure) {
     if !closure.is_null() {
         let _ = Box::from_raw(closure);
@@ -556,7 +556,7 @@ pub unsafe extern "C" fn zrtl_closure_free(closure: *mut ZrtlClosure) {
 ///
 /// # Safety
 /// The pointer must be a valid ZrtlClosure pointer or null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zrtl_closure_is_null(closure: *const ZrtlClosure) -> i32 {
     if closure.is_null() || (*closure).is_null() {
         1
@@ -584,7 +584,7 @@ pub unsafe extern "C" fn zrtl_closure_is_null(closure: *const ZrtlClosure) -> i3
 /// # Safety
 /// * `func` must be a valid function pointer
 /// * If `env_size > 0`, `env` must point to valid memory of at least `env_size` bytes
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zrtl_closure_from_raw(
     func: RawClosureFn,
     env: *const u8,
@@ -607,7 +607,7 @@ pub unsafe extern "C" fn zrtl_closure_from_raw(
 ///
 /// # Safety
 /// * `func` must be a valid function pointer
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn zrtl_closure_from_raw_noenv(func: RawClosureFn) -> *mut ZrtlClosure {
     let closure = ZrtlClosure::from_raw(func, std::ptr::null(), 0);
     Box::into_raw(Box::new(closure))

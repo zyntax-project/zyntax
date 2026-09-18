@@ -159,7 +159,7 @@ fn build_program(closure_body: TypedLambdaBody, arena: &mut AstArena) -> TypedPr
 /// disabled for the synthetic input — the test exercises SSA
 /// lowering, not the type checker.
 fn lower(mut program: TypedProgram, mut arena: AstArena) -> zyntax_compiler::hir::HirModule {
-    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    unsafe { std::env::set_var("SKIP_TYPE_CHECK", "1") };
     let type_registry = Arc::new(TypeRegistry::new());
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("closure_test");
@@ -168,7 +168,7 @@ fn lower(mut program: TypedProgram, mut arena: AstArena) -> zyntax_compiler::hir
     let module = ctx
         .lower_program(&mut program)
         .expect("lower program containing closure");
-    std::env::remove_var("SKIP_TYPE_CHECK");
+    unsafe { std::env::remove_var("SKIP_TYPE_CHECK") };
     module
 }
 
@@ -263,7 +263,7 @@ fn sibling_top_level_fns_survive_closure_lowering() {
         type_registry: TypeRegistry::new(),
     };
 
-    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    unsafe { std::env::set_var("SKIP_TYPE_CHECK", "1") };
     let type_registry = Arc::new(TypeRegistry::new());
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("closure_test");
@@ -272,7 +272,7 @@ fn sibling_top_level_fns_survive_closure_lowering() {
     let module = ctx
         .lower_program(&mut program)
         .expect("lower three-decl program");
-    std::env::remove_var("SKIP_TYPE_CHECK");
+    unsafe { std::env::remove_var("SKIP_TYPE_CHECK") };
 
     let names: Vec<String> = module
         .functions
@@ -430,7 +430,7 @@ fn lambda_as_call_arg_with_capture_survives() {
         type_registry: TypeRegistry::new(),
     };
 
-    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    unsafe { std::env::set_var("SKIP_TYPE_CHECK", "1") };
     let type_registry = Arc::new(TypeRegistry::new());
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("frontend_shape");
@@ -439,7 +439,7 @@ fn lambda_as_call_arg_with_capture_survives() {
     let module = ctx
         .lower_program(&mut program)
         .expect("lower frontend-shape program");
-    std::env::remove_var("SKIP_TYPE_CHECK");
+    unsafe { std::env::remove_var("SKIP_TYPE_CHECK") };
 
     let names: Vec<String> = module
         .functions
@@ -557,7 +557,7 @@ fn lambda_body_extern_call_resolves_same_as_outer() {
         type_registry: TypeRegistry::new(),
     };
 
-    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    unsafe { std::env::set_var("SKIP_TYPE_CHECK", "1") };
     let type_registry = Arc::new(TypeRegistry::new());
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("layer4_repro");
@@ -566,7 +566,7 @@ fn lambda_body_extern_call_resolves_same_as_outer() {
     let module = ctx
         .lower_program(&mut program)
         .expect("lower outer + inner extern-call program");
-    std::env::remove_var("SKIP_TYPE_CHECK");
+    unsafe { std::env::remove_var("SKIP_TYPE_CHECK") };
 
     // Find both main and the lambda; check the callee variant in
     // each. If the outer resolves Symbol but inner resolves
@@ -713,7 +713,7 @@ fn many_externs_dont_drop_non_extern_render_view() {
         type_registry: TypeRegistry::new(),
     };
 
-    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    unsafe { std::env::set_var("SKIP_TYPE_CHECK", "1") };
     let type_registry = Arc::new(TypeRegistry::new());
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("frontend_repro");
@@ -722,7 +722,7 @@ fn many_externs_dont_drop_non_extern_render_view() {
     let module = ctx
         .lower_program(&mut program)
         .expect("lower 20-decl frontend-shape program");
-    std::env::remove_var("SKIP_TYPE_CHECK");
+    unsafe { std::env::remove_var("SKIP_TYPE_CHECK") };
 
     let non_extern_names: Vec<String> = module
         .functions
@@ -893,7 +893,7 @@ fn undefined_callee_in_lambda_body_surfaces_lowering_error() {
 
     // Run lowering manually (not via the `lower()` helper, which panics
     // on Err) so we can assert on the error shape.
-    std::env::set_var("SKIP_TYPE_CHECK", "1");
+    unsafe { std::env::set_var("SKIP_TYPE_CHECK", "1") };
     let type_registry = Arc::new(TypeRegistry::new());
     let config = LoweringConfig::default();
     let module_name = arena.intern_string("undefined_callee_test");
@@ -903,7 +903,7 @@ fn undefined_callee_in_lambda_body_surfaces_lowering_error() {
         let mut prog = program;
         ctx.lower_program(&mut prog)
     };
-    std::env::remove_var("SKIP_TYPE_CHECK");
+    unsafe { std::env::remove_var("SKIP_TYPE_CHECK") };
 
     let err = result.expect_err(
         "Lowering a lambda body that calls an undeclared function must \
