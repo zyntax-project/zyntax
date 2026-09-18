@@ -7,6 +7,11 @@
 //! for every field reads or writes the wrong bytes the moment a field
 //! is wider than a register.
 //!
+//! A struct of one scalar is the other case: it is carried as that
+//! scalar, in a register, so storing it, loading it and holding it in a
+//! field of another struct move the scalar and never look for bytes at
+//! an address.
+//!
 //! The same module runs on every backend that can execute it.
 
 #![cfg(feature = "cranelift-backend")]
@@ -37,6 +42,23 @@ fn outer_ty() -> HirType {
     HirType::Struct(HirStructType {
         name: Some(InternedString::new_global("Outer")),
         fields: vec![HirType::I64, pair_ty()],
+        packed: false,
+    })
+}
+
+/// A struct carried as its single field.
+fn one_ty() -> HirType {
+    HirType::Struct(HirStructType {
+        name: Some(InternedString::new_global("One")),
+        fields: vec![HirType::F64],
+        packed: false,
+    })
+}
+
+fn tagged_ty() -> HirType {
+    HirType::Struct(HirStructType {
+        name: Some(InternedString::new_global("Tagged")),
+        fields: vec![HirType::I64, one_ty()],
         packed: false,
     })
 }
@@ -212,6 +234,95 @@ fn build_module() -> (HirModule, HirId) {
     (module, main_id)
 }
 
+/// `w` = One { 2.5 } goes through a stack cell and into a field of
+/// Tagged; both reads give 2.5, so the sum is 5.0.
+const ONE_EXPECTED: f64 = 5.0;
+
+/// ```text
+/// def scalar_struct(): f64 {
+///     let w = One { x: 2.5 }
+///     let cell = alloca One
+///     *cell = w
+///     let r = *cell
+///     let t = Tagged { tag: 7, one: r }
+///     return r.x + t.one.x
+/// }
+/// ```
+fn build_scalar_struct() -> HirFunction {
+    let mut f = HirFunction::new(
+        InternedString::new_global("scalar_struct"),
+        sig(vec![], vec![HirType::F64]),
+    );
+
+    let half = add_value(
+        &mut f,
+        HirType::F64,
+        HirValueKind::Constant(HirConstant::F64(2.5)),
+    );
+    let seven = konst(&mut f, 7);
+    let w_undef = add_value(&mut f, one_ty(), HirValueKind::Undef);
+    let w = add_value(&mut f, one_ty(), HirValueKind::Instruction);
+    let cell = add_value(
+        &mut f,
+        HirType::Ptr(Box::new(one_ty())),
+        HirValueKind::Instruction,
+    );
+    let r = add_value(&mut f, one_ty(), HirValueKind::Instruction);
+    let t_undef = add_value(&mut f, tagged_ty(), HirValueKind::Undef);
+    let t_tag = add_value(&mut f, tagged_ty(), HirValueKind::Instruction);
+    let t = add_value(&mut f, tagged_ty(), HirValueKind::Instruction);
+    let rx = add_value(&mut f, HirType::F64, HirValueKind::Instruction);
+    let tx = add_value(&mut f, HirType::F64, HirValueKind::Instruction);
+    let sum = add_value(&mut f, HirType::F64, HirValueKind::Instruction);
+
+    let blk = body(&mut f);
+    blk.instructions
+        .push(insert(w, one_ty(), w_undef, half, vec![0]));
+    blk.instructions.push(HirInstruction::Alloca {
+        result: cell,
+        ty: one_ty(),
+        count: None,
+        align: 8,
+    });
+    blk.instructions.push(HirInstruction::Store {
+        value: w,
+        ptr: cell,
+        align: 8,
+        volatile: false,
+    });
+    blk.instructions.push(HirInstruction::Load {
+        result: r,
+        ty: one_ty(),
+        ptr: cell,
+        align: 8,
+        volatile: false,
+    });
+    blk.instructions
+        .push(insert(t_tag, tagged_ty(), t_undef, seven, vec![0]));
+    blk.instructions
+        .push(insert(t, tagged_ty(), t_tag, r, vec![1]));
+    blk.instructions.push(extract(rx, HirType::F64, r, vec![0]));
+    blk.instructions
+        .push(extract(tx, HirType::F64, t, vec![1, 0]));
+    blk.instructions.push(HirInstruction::Binary {
+        op: BinaryOp::Add,
+        result: sum,
+        ty: HirType::F64,
+        left: rx,
+        right: tx,
+    });
+    blk.terminator = HirTerminator::Return { values: vec![sum] };
+    f
+}
+
+fn build_scalar_module() -> (HirModule, HirId) {
+    let f = build_scalar_struct();
+    let id = f.id;
+    let mut module = HirModule::new(InternedString::new_global("scalar_struct"));
+    module.functions.insert(id, f);
+    (module, id)
+}
+
 #[test]
 fn cranelift_copies_a_struct_into_a_field_and_reads_it_back() {
     use zyntax_compiler::cranelift_backend::CraneliftBackend;
@@ -239,6 +350,31 @@ fn the_interpreter_copies_a_struct_into_a_field_and_reads_it_back() {
     let mut interp = HirInterpreter::new();
     let result = interp.call(&module, "main", vec![]).expect("run");
     assert_eq!(value_to_i64(&result), Some(EXPECTED));
+}
+
+#[test]
+fn cranelift_moves_a_single_scalar_struct_as_its_scalar() {
+    use zyntax_compiler::cranelift_backend::CraneliftBackend;
+
+    let (module, id) = build_scalar_module();
+    let mut backend = CraneliftBackend::new().expect("backend");
+    backend.compile_module(&module).expect("compile");
+    backend.finalize_definitions().expect("finalize");
+    let ptr = backend.get_function_ptr(id).expect("compiled");
+    let f: unsafe extern "C" fn() -> f64 = unsafe { std::mem::transmute(ptr) };
+    let got = unsafe { f() };
+
+    assert_eq!(got, ONE_EXPECTED);
+}
+
+#[test]
+fn the_interpreter_moves_a_single_scalar_struct_as_its_scalar() {
+    use zyntax_compiler::hir_interp::{HirInterpreter, value_to_f64};
+
+    let (module, _) = build_scalar_module();
+    let mut interp = HirInterpreter::new();
+    let result = interp.call(&module, "scalar_struct", vec![]).expect("run");
+    assert_eq!(value_to_f64(&result), Some(ONE_EXPECTED));
 }
 
 #[cfg(feature = "llvm-backend")]

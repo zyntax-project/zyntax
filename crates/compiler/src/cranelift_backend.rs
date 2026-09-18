@@ -4352,24 +4352,12 @@ impl CraneliftBackend {
                                 ),
                             };
 
-                            // Aggregate-typed Load: the loaded "value"
-                            // in Cranelift IR is a pointer to a fresh
-                            // copy of the struct's bytes (matching the
-                            // by-value SSA semantics where the load
-                            // result is consumed by ExtractValue /
-                            // InsertValue / Store as a struct, all of
-                            // which treat the aggregate as a pointer).
-                            // We allocate a stack slot, memcpy the
-                            // struct's bytes into it, and route the
-                            // result HirId at that slot's address.
-                            // Otherwise the scalar Load below would
-                            // only read the first 8 bytes — the bug
-                            // that surfaces as nbody's bodies[i] reads
-                            // returning a half-initialised Body.
-                            let is_aggregate = matches!(
-                                ty,
-                                HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_)
-                            );
+                            // An aggregate held by address is loaded as
+                            // a fresh stack copy of its bytes, since the
+                            // consumers of the value read it by address;
+                            // a struct carried as its single field loads
+                            // as that scalar.
+                            let is_aggregate = held(ty) == Held::ByReference;
                             if is_aggregate {
                                 let size = size_cache.get(ty).copied().unwrap_or(0);
                                 if size > 0 {
@@ -4433,23 +4421,13 @@ impl CraneliftBackend {
                             // TODO: Properly handle volatile flag
                             let flags = cranelift_codegen::ir::MemFlagsData::new();
 
-                            // Aggregate-typed Stores need a memcpy, not a
-                            // scalar store. The InsertValue chain at line
-                            // 3795 represents the aggregate's "value" as
-                            // a pointer to a stack slot (`value_map[v]`
-                            // = stack_addr), so `val` here is a pointer
-                            // to source bytes. A plain `builder.store`
-                            // would copy just the pointer (8 bytes)
-                            // instead of the struct's contents — that's
-                            // the bug that surfaces as nbody's
-                            // `bodies[i]` reading null and segfaulting.
+                            // An aggregate held by address arrives as the
+                            // address of its bytes, which are copied to
+                            // the destination; a struct carried as its
+                            // single field is stored as that scalar.
                             let value_ty = value_type_cache.get(value);
-                            let is_aggregate = matches!(
-                                value_ty,
-                                Some(HirType::Struct(_))
-                                    | Some(HirType::Array(_, _))
-                                    | Some(HirType::Union(_))
-                            );
+                            let is_aggregate =
+                                value_ty.is_some_and(|t| held(t) == Held::ByReference);
                             if is_aggregate {
                                 let size = size_cache.get(value_ty.unwrap()).copied().unwrap_or(0);
                                 if size > 0 {
