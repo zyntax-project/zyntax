@@ -1906,6 +1906,177 @@ impl<'m> Lowerer<'m> {
 
     /// Bind a value to a hidden local and hand back the name, so it is
     /// evaluated once.
+    /// The primitive every target of an unpacking is a plain local of,
+    /// when they all are: `x, y, z = p` with `x`, `y`, `z` floats.
+    fn unpacks_primitive_names(&self, elts: &[py::Expr]) -> Option<Ty> {
+        let mut kind = None;
+        for elt in elts {
+            let py::Expr::Name(n) = elt else { return None };
+            let name = n.id.as_str();
+            if self.is_global(name)
+                || self.cells.contains_key(name)
+                || self.comp_symbols.contains_key(name)
+            {
+                return None;
+            }
+            let ty = self.var_ty(name);
+            if !matches!(ty, Ty::Int | Ty::Float) {
+                return None;
+            }
+            if kind.is_some_and(|k| k != ty) {
+                return None;
+            }
+            kind = Some(ty);
+        }
+        kind
+    }
+
+    /// `x, y, z = p` where `p` is a dynamic value and the targets are
+    /// locals of one primitive: when the box holds a list of that kind
+    /// the elements are read from it directly, with no boxes made for
+    /// them; any other value goes the general way, unpacked through a
+    /// list of dynamic values and converted one by one.
+    fn bind_unpacked_primitives(
+        &mut self,
+        t: &py::ExprTuple,
+        value: Val,
+        kind: Ty,
+        span: Span,
+        out: &mut Vec<Stmt>,
+    ) -> Result<()> {
+        let elem = Elem::of(kind);
+        let list_kind = match kind {
+            Ty::Int => zyntax_builtins::Kind::Int,
+            _ => zyntax_builtins::Kind::Float,
+        };
+        // Every target is declared before the branch, so both arms
+        // assign it.
+        for elt in &t.elts {
+            let py::Expr::Name(n) = elt else { continue };
+            let name = self.local_symbol(n.id.as_str());
+            if !self.bound.contains(&name) {
+                self.bound.push(name);
+                let initial = self.zero_of(kind, span);
+                out.push(TypedNode::new(
+                    TypedStatement::Let(TypedLet {
+                        name,
+                        ty: ir(kind),
+                        mutability: Mutability::Mutable,
+                        initializer: Some(Box::new(initial)),
+                        span,
+                    }),
+                    Type::Unknown,
+                    span,
+                ));
+            }
+        }
+        let source = self.hold(value, out, span);
+        // The kind above the category byte of the box's tag.
+        let is_kind = binary(
+            BinaryOp::Eq,
+            call("zb_any_kind", vec![source.node.clone()], Ty::Int, span),
+            int_lit(list_kind.list_tag() >> 8, span),
+            Ty::Bool,
+            span,
+        );
+        let n = t.elts.len() as i64;
+
+        // The direct arm: the list read as itself.
+        let mut direct = Vec::new();
+        let xs = self.hold(
+            Val {
+                node: call(
+                    &format!("zb_unbox_list_raw_{}", list_kind.suffix()),
+                    vec![source.node.clone()],
+                    Ty::List(elem),
+                    span,
+                ),
+                ty: Ty::List(elem),
+            },
+            &mut direct,
+            span,
+        );
+        direct.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(call(
+                &list_fn("expect_len", elem),
+                vec![xs.node.clone(), int_lit(n, span)],
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        ));
+        direct.push(self.pending_check(span));
+        for (i, elt) in t.elts.iter().enumerate() {
+            let item = Val {
+                node: elem_call(
+                    "get_unchecked",
+                    elem,
+                    vec![xs.node.clone(), int_lit(i as i64, span)],
+                    span,
+                ),
+                ty: kind,
+            };
+            self.bind(elt, item, span, &mut direct)?;
+        }
+
+        // The general arm: what any other dynamic value goes through.
+        let mut general = Vec::new();
+        let items = Val {
+            node: call(
+                "zb_any_iter",
+                vec![source.node.clone()],
+                Ty::List(Elem::Object),
+                span,
+            ),
+            ty: Ty::List(Elem::Object),
+        };
+        let seq = self.hold(items, &mut general, span);
+        general.push(self.pending_check(span));
+        general.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(call(
+                "zb_list_expect_len_any",
+                vec![seq.node.clone(), int_lit(n, span)],
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        ));
+        general.push(self.pending_check(span));
+        for (i, elt) in t.elts.iter().enumerate() {
+            let item = Val {
+                node: call(
+                    "zb_list_get_unchecked_any",
+                    vec![seq.node.clone(), int_lit(i as i64, span)],
+                    Ty::Object,
+                    span,
+                ),
+                ty: Ty::Object,
+            };
+            let item = self.hold(item, &mut general, span);
+            self.bind(elt, item, span, &mut general)?;
+        }
+
+        out.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(is_kind),
+                then_block: TypedBlock {
+                    statements: direct,
+                    span,
+                },
+                else_block: Some(TypedBlock {
+                    statements: general,
+                    span,
+                }),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        Ok(())
+    }
+
     fn hold(&mut self, v: Val, out: &mut Vec<Stmt>, span: Span) -> Val {
         let name = self.temp();
         let ty = v.ty;
@@ -2778,6 +2949,9 @@ impl<'m> Lowerer<'m> {
             py::Expr::Tuple(t) => {
                 // Resolve a dynamic iterable once before reading its fields.
                 let dynamic = value.ty == Ty::Object;
+                if dynamic && let Some(kind) = self.unpacks_primitive_names(&t.elts) {
+                    return self.bind_unpacked_primitives(t, value, kind, span, out);
+                }
                 let value = if dynamic {
                     Val {
                         node: call(
