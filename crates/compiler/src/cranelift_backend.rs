@@ -123,6 +123,7 @@ fn cast_needs_scalar_lanes(
 }
 
 use crate::abi::{destination_return_type, struct_carried_as_its_field};
+use crate::hir_interp::{Held, held};
 
 /// A function translated to Cranelift IR and not yet compiled: the
 /// middle of [`CraneliftBackend::compile_function_body`], which needs no
@@ -5029,19 +5030,23 @@ impl CraneliftBackend {
                                                 let elem_ptr =
                                                     builder.ins().iadd(current_ptr, offset_val);
 
-                                                let cranelift_ty = type_cache
-                                                    .get(ty)
-                                                    .copied()
-                                                    .unwrap_or(types::I64);
-                                                let flags =
-                                                    cranelift_codegen::ir::MemFlagsData::new();
-                                                let loaded = builder.ins().load(
-                                                    cranelift_ty,
-                                                    flags,
-                                                    elem_ptr,
-                                                    0,
-                                                );
-                                                self.value_map.insert(*result, loaded);
+                                                if held(elem_ty) == Held::ByReference {
+                                                    self.value_map.insert(*result, elem_ptr);
+                                                } else {
+                                                    let cranelift_ty = type_cache
+                                                        .get(ty)
+                                                        .copied()
+                                                        .unwrap_or(types::I64);
+                                                    let flags =
+                                                        cranelift_codegen::ir::MemFlagsData::new();
+                                                    let loaded = builder.ins().load(
+                                                        cranelift_ty,
+                                                        flags,
+                                                        elem_ptr,
+                                                        0,
+                                                    );
+                                                    self.value_map.insert(*result, loaded);
+                                                }
                                             }
                                         }
                                         HirType::Struct(struct_ty) => {
@@ -5077,19 +5082,33 @@ impl CraneliftBackend {
                                                             .ins()
                                                             .iadd(current_ptr, offset_val);
 
-                                                        let cranelift_ty = type_cache
-                                                            .get(ty)
-                                                            .copied()
-                                                            .unwrap_or(types::I64);
-                                                        let flags =
-                                                            cranelift_codegen::ir::MemFlagsData::new();
-                                                        let loaded = builder.ins().load(
-                                                            cranelift_ty,
-                                                            flags,
-                                                            field_ptr,
-                                                            0,
-                                                        );
-                                                        self.value_map.insert(*result, loaded);
+                                                        // A field that is itself an aggregate
+                                                        // is held as the address of its
+                                                        // bytes, inside the parent's storage.
+                                                        let by_address = struct_ty
+                                                            .fields
+                                                            .get(field_index)
+                                                            .is_some_and(|f| {
+                                                                held(f) == Held::ByReference
+                                                            });
+                                                        if by_address {
+                                                            self.value_map
+                                                                .insert(*result, field_ptr);
+                                                        } else {
+                                                            let cranelift_ty = type_cache
+                                                                .get(ty)
+                                                                .copied()
+                                                                .unwrap_or(types::I64);
+                                                            let flags =
+                                                                cranelift_codegen::ir::MemFlagsData::new();
+                                                            let loaded = builder.ins().load(
+                                                                cranelift_ty,
+                                                                flags,
+                                                                field_ptr,
+                                                                0,
+                                                            );
+                                                            self.value_map.insert(*result, loaded);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -5267,9 +5286,25 @@ impl CraneliftBackend {
                                                 let elem_ptr =
                                                     builder.ins().iadd(current_ptr, offset_val);
 
-                                                let flags =
-                                                    cranelift_codegen::ir::MemFlagsData::new();
-                                                builder.ins().store(flags, val, elem_ptr, 0);
+                                                if held(elem_ty) == Held::ByReference {
+                                                    let size = size_cache
+                                                        .get(&**elem_ty)
+                                                        .copied()
+                                                        .unwrap_or(0)
+                                                        as u32;
+                                                    if size > 0 {
+                                                        emit_inline_aggregate_copy(
+                                                            &mut builder,
+                                                            elem_ptr,
+                                                            val,
+                                                            size,
+                                                        );
+                                                    }
+                                                } else {
+                                                    let flags =
+                                                        cranelift_codegen::ir::MemFlagsData::new();
+                                                    builder.ins().store(flags, val, elem_ptr, 0);
+                                                }
                                                 self.value_map.insert(*result, base_ptr);
                                             }
                                         }
@@ -5306,11 +5341,37 @@ impl CraneliftBackend {
                                                             .ins()
                                                             .iadd(current_ptr, offset_val);
 
-                                                        let flags =
-                                                            cranelift_codegen::ir::MemFlagsData::new();
-                                                        builder
-                                                            .ins()
-                                                            .store(flags, val, field_ptr, 0);
+                                                        // An aggregate field arrives as the
+                                                        // address of its bytes, which are
+                                                        // copied into the parent's storage.
+                                                        let field_ty =
+                                                            struct_ty.fields.get(field_index);
+                                                        let by_address =
+                                                            field_ty.is_some_and(|f| {
+                                                                held(f) == Held::ByReference
+                                                            });
+                                                        if by_address {
+                                                            let size = field_ty
+                                                                .and_then(|f| {
+                                                                    size_cache.get(f).copied()
+                                                                })
+                                                                .unwrap_or(0)
+                                                                as u32;
+                                                            if size > 0 {
+                                                                emit_inline_aggregate_copy(
+                                                                    &mut builder,
+                                                                    field_ptr,
+                                                                    val,
+                                                                    size,
+                                                                );
+                                                            }
+                                                        } else {
+                                                            let flags =
+                                                                cranelift_codegen::ir::MemFlagsData::new();
+                                                            builder
+                                                                .ins()
+                                                                .store(flags, val, field_ptr, 0);
+                                                        }
                                                         self.value_map.insert(*result, base_ptr);
                                                     }
                                                 }
