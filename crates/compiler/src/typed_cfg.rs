@@ -7,16 +7,16 @@
 //!
 //! This is the solution to Gap #4 (CFG Construction) described in INTEGRATION_GAPS_ANALYSIS.md
 
-use crate::hir::HirId;
 use crate::CompilerResult;
+use crate::hir::HirId;
 use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::HashMap;
 use zyntax_typed_ast::{
-    typed_ast::{
-        typed_node, TypedBlock, TypedExpression, TypedMatchArm, TypedNode, TypedPattern,
-        TypedStatement,
-    },
     InternedString, Span, Type,
+    typed_ast::{
+        TypedBlock, TypedExpression, TypedMatchArm, TypedNode, TypedPattern, TypedStatement,
+        typed_node,
+    },
 };
 
 /// A `with H { body }` scope discovered during CFG construction.
@@ -183,11 +183,7 @@ impl TypedCfgBuilder {
                         if let Some(&false_node) = block_map.get(false_target) {
                             edges.push((node, false_node));
                         }
-                        if edges.is_empty() {
-                            None
-                        } else {
-                            Some(edges)
-                        }
+                        if edges.is_empty() { None } else { Some(edges) }
                     }
                     _ => None,
                 }
@@ -368,8 +364,8 @@ impl TypedCfgBuilder {
                         // Both branches have definite terminators - no merge block needed
                         // The if statement itself terminates the function/loop
                         exit_id = current_block_id; // Exit at the if block
-                                                    // Don't update current_block_id - we're done
-                                                    // Early return to avoid creating unreachable merge block
+                        // Don't update current_block_id - we're done
+                        // Early return to avoid creating unreachable merge block
                         return Ok((all_blocks, entry_id, exit_id));
                     } else {
                         // Start new block after If (merge point)

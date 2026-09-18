@@ -3,9 +3,9 @@
 //! Provides optimization passes that work on the HIR representation.
 //! These optimizations are shared between Cranelift and LLVM backends.
 
+use crate::CompilerResult;
 use crate::analysis::ModuleAnalysis;
 use crate::hir::{HirBlock, HirFunction, HirId, HirInstruction, HirModule};
-use crate::CompilerResult;
 use indexmap::IndexMap;
 use std::collections::HashSet;
 

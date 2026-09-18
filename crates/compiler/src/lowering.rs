@@ -17,6 +17,7 @@ fn hash_string(s: &str) -> u64 {
     s.hash(&mut hasher);
     hasher.finish()
 }
+use crate::CompilerResult;
 use crate::cfg::{CfgBuilder, ControlFlowGraph};
 use crate::hir::{
     HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirEffectOp, HirFunction,
@@ -24,7 +25,6 @@ use crate::hir::{
     HirTypeParam, OwnershipMode, ParamAttributes,
 };
 use crate::ssa::{SsaBuilder, SsaForm};
-use crate::CompilerResult;
 use std::collections::HashMap;
 
 static LOWERING_SKIPPED_FUNCTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -1114,9 +1114,9 @@ impl LoweringContext {
     /// This updates MethodCall expressions with Type::Any to have the correct return type
     fn resolve_method_call_types(&mut self, program: &mut TypedProgram) -> CompilerResult<()> {
         use std::collections::HashMap;
-        use zyntax_typed_ast::typed_ast::TypedDeclaration;
         use zyntax_typed_ast::Type;
         use zyntax_typed_ast::TypedExpression;
+        use zyntax_typed_ast::typed_ast::TypedDeclaration;
 
         let function_param_specs = self.collect_declared_function_param_specs(program);
 
@@ -2352,8 +2352,8 @@ impl LoweringContext {
         program: &mut TypedProgram,
         fiber_fn_names: &std::collections::HashSet<InternedString>,
     ) {
-        use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedExpression, TypedStatement};
         use zyntax_typed_ast::Type;
+        use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedExpression, TypedStatement};
 
         fn rewrite_expr(
             node: &mut zyntax_typed_ast::TypedNode<TypedExpression>,
@@ -3048,7 +3048,7 @@ impl LoweringContext {
                     "function `{}` reached lowering without a collected symbol; \
                      it was added to the program after declaration collection ran",
                     func.name.resolve_global().unwrap_or_default()
-                )))
+                )));
             }
         };
 
@@ -5598,7 +5598,10 @@ impl LoweringContext {
                 existing_id
             } else {
                 // Fallback: create new (shouldn't happen if collect_declarations ran first)
-                log::trace!("[LOWERING] WARNING: Creating new function_id for {:?} (should have been pre-registered)", mangled_name);
+                log::trace!(
+                    "[LOWERING] WARNING: Creating new function_id for {:?} (should have been pre-registered)",
+                    mangled_name
+                );
                 let new_id = self.function_id_for(mangled_name);
                 Arc::make_mut(&mut self.symbols.functions).insert(mangled_name, new_id);
                 new_id
@@ -5777,7 +5780,7 @@ impl LoweringContext {
                     _ => {
                         return Err(crate::CompilerError::Analysis(
                             "Array initializer for non-array type".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -5796,7 +5799,7 @@ impl LoweringContext {
                     _ => {
                         return Err(crate::CompilerError::Analysis(
                             "Struct initializer for non-struct type".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -6370,7 +6373,7 @@ impl LoweringContext {
     ) -> CompilerResult<()> {
         use zyntax_typed_ast::type_registry::{NullabilityKind, Type, TypeId};
         use zyntax_typed_ast::typed_ast::{
-            typed_node, ParameterKind, TypedFunction, TypedParameter,
+            ParameterKind, TypedFunction, TypedParameter, typed_node,
         };
 
         // Create mangled function name
@@ -6760,7 +6763,7 @@ impl LoweringContext {
         expr: zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedExpression>,
         expected_type: &Type,
     ) -> Option<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedExpression>> {
-        use zyntax_typed_ast::{typed_ast::typed_node, TypedCast, TypedExpression};
+        use zyntax_typed_ast::{TypedCast, TypedExpression, typed_ast::typed_node};
 
         let source_prim = match expr.ty {
             Type::Primitive(p) if p.is_numeric() => p,
@@ -6795,7 +6798,7 @@ impl LoweringContext {
         expr: zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedExpression>,
         expected_type: &Type,
     ) -> Option<zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedExpression>> {
-        use zyntax_typed_ast::{typed_ast::typed_node, TypedCall, TypedExpression};
+        use zyntax_typed_ast::{TypedCall, TypedExpression, typed_ast::typed_node};
 
         // Don't convert if types already match
         if &expr.ty == expected_type {
@@ -7015,8 +7018,10 @@ impl LoweringContext {
             zyntax_typed_ast::Type::Unresolved(name) => {
                 // Unresolved types are generic type parameters (like I, T, etc.)
                 // Skip trait impl lowering for these as they require monomorphization
-                log::trace!("[LOWERING WARN] Skipping trait impl for unresolved type '{}' - requires monomorphization",
-                    name.resolve_global().unwrap_or_default());
+                log::trace!(
+                    "[LOWERING WARN] Skipping trait impl for unresolved type '{}' - requires monomorphization",
+                    name.resolve_global().unwrap_or_default()
+                );
                 return Ok(());
             }
             _ => {

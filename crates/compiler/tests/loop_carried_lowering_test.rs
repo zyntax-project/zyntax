@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
-use zyntax_compiler::{compile_to_hir, CompilationConfig};
+use zyntax_compiler::{CompilationConfig, compile_to_hir};
 use zyntax_typed_ast::arena::AstArena;
 use zyntax_typed_ast::type_registry::Mutability;
 use zyntax_typed_ast::typed_ast::{TypedBinary, TypedBlock, TypedLet, TypedWhile};

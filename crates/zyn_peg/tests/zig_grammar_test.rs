@@ -26,10 +26,12 @@ fn test_parse_zig_zyn_grammar() {
             // Verify language info
             assert_eq!(grammar.language.name, "Zig");
             assert_eq!(grammar.language.version, "0.11");
-            assert!(grammar
-                .language
-                .file_extensions
-                .contains(&".zig".to_string()));
+            assert!(
+                grammar
+                    .language
+                    .file_extensions
+                    .contains(&".zig".to_string())
+            );
             println!(
                 "✓ Language info: {} v{}",
                 grammar.language.name, grammar.language.version

@@ -798,11 +798,7 @@ impl GradualTypeChecker {
             let consistent = evidence_chain.iter().all(|e| {
                 self.evidence_supports_type(&e.resulting_type, &new_evidence.resulting_type)
             });
-            if consistent {
-                10
-            } else {
-                -20
-            }
+            if consistent { 10 } else { -20 }
         } else {
             0
         };

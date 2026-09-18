@@ -15,7 +15,7 @@
 #![cfg(feature = "krio-async-backend")]
 
 use zynml::{Grammar2, ZYNML_GRAMMAR};
-use zyntax_embed::{drive_tasks, ZyntaxRuntime, ZyntaxValue};
+use zyntax_embed::{ZyntaxRuntime, ZyntaxValue, drive_tasks};
 
 /// Compile `src`, drive async `run` to completion, return its i64 result.
 fn run_program(src: &str) -> Option<i64> {

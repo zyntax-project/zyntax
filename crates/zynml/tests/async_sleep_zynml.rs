@@ -27,7 +27,7 @@ use std::time::Instant;
 use zynml::{Grammar2, ZYNML_GRAMMAR};
 #[cfg(feature = "krio-async-backend")]
 use zyntax_embed::ZyntaxRuntime;
-use zyntax_embed::{compile_to_hir, CompilationConfig};
+use zyntax_embed::{CompilationConfig, compile_to_hir};
 
 #[cfg(feature = "krio-async-backend")]
 #[test]

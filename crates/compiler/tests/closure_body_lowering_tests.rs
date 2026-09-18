@@ -25,10 +25,11 @@ use zyntax_compiler::{
     lowering::{AstLowering, LoweringConfig, LoweringContext},
 };
 use zyntax_typed_ast::{
+    PrimitiveType, Span, Type, TypeRegistry, TypedCall, TypedDeclaration, TypedExpression,
+    TypedFunction, TypedLiteral, TypedProgram, TypedStatement,
     arena::AstArena,
     typed_ast::{TypedBlock, TypedLambda, TypedLambdaBody, TypedLet, TypedParameter},
-    typed_node, PrimitiveType, Span, Type, TypeRegistry, TypedCall, TypedDeclaration,
-    TypedExpression, TypedFunction, TypedLiteral, TypedProgram, TypedStatement,
+    typed_node,
 };
 
 fn span() -> Span {

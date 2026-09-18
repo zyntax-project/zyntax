@@ -2,7 +2,7 @@
 //! global or nonlocal, and which it reads from an enclosing scope.
 
 use ruff_python_ast as py;
-use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use std::collections::HashSet;
 
 /// What one body does with names.
@@ -310,10 +310,10 @@ impl<'a> Visitor<'a> for Keeps<'_> {
 
     fn visit_interpolated_string_element(&mut self, element: &'a py::InterpolatedStringElement) {
         // An interpolation is a conversion to text.
-        if let py::InterpolatedStringElement::Interpolation(e) = element {
-            if self.is_it(&e.expression) {
-                return;
-            }
+        if let py::InterpolatedStringElement::Interpolation(e) = element
+            && self.is_it(&e.expression)
+        {
+            return;
         }
         ruff_python_ast::visitor::walk_interpolated_string_element(self, element);
     }
@@ -321,7 +321,7 @@ impl<'a> Visitor<'a> for Keeps<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{handler_keeps_exception, Scope};
+    use super::{Scope, handler_keeps_exception};
 
     fn scope_of(src: &str) -> Scope {
         let module = ruff_python_parser::parse_module(src).unwrap().into_syntax();

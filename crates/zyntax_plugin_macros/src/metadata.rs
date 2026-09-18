@@ -144,7 +144,7 @@ pub fn runtime_method(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         #(#attrs)*
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         #vis #sig #block
 
         // Register the runtime symbol

@@ -20,8 +20,8 @@
 
 use zyn_peg::runtime2::{GrammarInterpreter, ParseResult, ParsedValue, ParserState};
 use zynml::{Grammar2, ZYNML_GRAMMAR};
-use zyntax_typed_ast::type_registry::TypeRegistry;
 use zyntax_typed_ast::TypedASTBuilder;
+use zyntax_typed_ast::type_registry::TypeRegistry;
 
 fn parse(interp: &GrammarInterpreter<'_>, source: &str) -> String {
     let mut builder = TypedASTBuilder::new();

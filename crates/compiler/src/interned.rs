@@ -10,8 +10,8 @@
 //! out exactly as a box it would make: the header and the payload
 //! right after it, `data` pointing at the payload.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::zrtl::TypeTag;
 

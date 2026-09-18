@@ -1756,10 +1756,11 @@ mod tests {
                     .any(|i| matches!(i, HirInstruction::VectorStore { .. }))
             })
             .expect("vector body present");
-        assert!(body
-            .instructions
-            .iter()
-            .any(|i| matches!(i, HirInstruction::VectorLoad { .. })));
+        assert!(
+            body.instructions
+                .iter()
+                .any(|i| matches!(i, HirInstruction::VectorLoad { .. }))
+        );
     }
 
     #[test]

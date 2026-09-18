@@ -24,8 +24,8 @@ use zyntax_compiler::hir::{
 };
 
 use common::{
-    live_out_for_entry_only, make_effectful_function_with_one_perform, module_of,
-    EffectfulFnFixture,
+    EffectfulFnFixture, live_out_for_entry_only, make_effectful_function_with_one_perform,
+    module_of,
 };
 
 #[test]

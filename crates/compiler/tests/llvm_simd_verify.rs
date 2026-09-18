@@ -104,10 +104,10 @@ fn llvm_vector_dot_emits_sdot_intrinsic() {
     // Final proof: emit native assembly via a host TargetMachine and confirm
     // the intrinsic actually became an `sdot` (+ `addv`) machine instruction —
     // not just a promise in the IR.
+    use inkwell::OptimizationLevel;
     use inkwell::targets::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
     };
-    use inkwell::OptimizationLevel;
     Target::initialize_native(&InitializationConfig::default()).expect("init native target");
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple).expect("target from triple");
@@ -205,10 +205,10 @@ fn llvm_vector_dot_emits_vpdpbusd_on_vnni() {
         "LLVM IR missing the x86 vpdpbusd intrinsic:\n{ir}"
     );
 
+    use inkwell::OptimizationLevel;
     use inkwell::targets::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
     };
-    use inkwell::OptimizationLevel;
     Target::initialize_native(&InitializationConfig::default()).expect("init native target");
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple).expect("target from triple");
@@ -355,10 +355,10 @@ fn llvm_vector_fma_emits_fma_intrinsic() {
         "LLVM IR missing the vector fma intrinsic:\n{ir}"
     );
 
+    use inkwell::OptimizationLevel;
     use inkwell::targets::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
     };
-    use inkwell::OptimizationLevel;
     Target::initialize_native(&InitializationConfig::default()).expect("init native target");
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple).expect("target from triple");

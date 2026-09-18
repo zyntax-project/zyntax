@@ -19,6 +19,10 @@
 //! - Type information preserved for optimization opportunities
 //! - Memory safety validated before code generation
 
+// The backends and runtime glue work on raw memory throughout their
+// unsafe functions; the caller's obligation is stated at the function.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 pub mod abi; // The calling convention every backend derives from a signature
 pub mod affine_loop; // Closed-form affine reduction loops (acc += invariant over a counted loop)
 pub mod aggregate_split; // Replace struct round-trips with direct field Load/Store (HIR-level SROA)
@@ -120,8 +124,8 @@ pub use async_support::{
     AsyncStateMachine, AsyncTerminator,
 };
 pub use borrow_check::{
-    run_borrow_check, validate_borrow_check, BorrowCheckResult, BorrowError, BorrowWarning,
-    HirBorrowChecker,
+    BorrowCheckResult, BorrowError, BorrowWarning, HirBorrowChecker, run_borrow_check,
+    validate_borrow_check,
 };
 pub use cfg::{BasicBlock, CfgEdge, ControlFlowGraph};
 pub use const_eval::{ConstEvalContext, ConstEvaluator};
@@ -132,28 +136,27 @@ pub use cranelift_backend::{
 };
 pub use dce::reachable_function_ids;
 pub use effect_analysis::{
-    analyze_effects, analyze_effects_with_call_graph, get_function_effect_summary,
-    has_effect_errors, EffectAnalyzer, EffectCallGraph, EffectError, EffectErrorKind,
-    EffectOccurrence, EffectSite, EffectSummary, EffectWarning, EffectWarningKind,
-    FunctionEffectAnalysis, HandlerScope, ModuleEffectAnalysis,
+    EffectAnalyzer, EffectCallGraph, EffectError, EffectErrorKind, EffectOccurrence, EffectSite,
+    EffectSummary, EffectWarning, EffectWarningKind, FunctionEffectAnalysis, HandlerScope,
+    ModuleEffectAnalysis, analyze_effects, analyze_effects_with_call_graph,
+    get_function_effect_summary, has_effect_errors,
 };
 pub use effect_codegen::{
-    analyze_handle_effect, analyze_perform_effect, get_handler_ops_info, mangle_handler_op_name,
-    mangle_handler_state_name, EffectCodegenContext, HandleEffectCodegen, HandlerOpInfo,
-    HandlerStackEntry, HandlerStateInfo, PerformEffectCodegen, PerformStrategy, StateVarInfo,
+    EffectCodegenContext, HandleEffectCodegen, HandlerOpInfo, HandlerStackEntry, HandlerStateInfo,
+    PerformEffectCodegen, PerformStrategy, StateVarInfo, analyze_handle_effect,
+    analyze_perform_effect, get_handler_ops_info, mangle_handler_op_name,
+    mangle_handler_state_name,
 };
 pub use effect_handler_resolution::{
-    can_inline_handler, get_optimization_level, resolve_handlers, resolve_handlers_with_analysis,
     FunctionHandlerResolution, HandlerOptimization, HandlerResolution, HandlerResolver,
     HandlerScopeNode, HandlerScopeTree, ModuleHandlerResolution, PerformSite, ResolutionStats,
-    ResolvedHandler,
+    ResolvedHandler, can_inline_handler, get_optimization_level, resolve_handlers,
+    resolve_handlers_with_analysis,
 };
 pub use hir::{HirBlock, HirFunction, HirId, HirInstruction, HirModule, HirValue};
 pub use hir_builder::HirBuilder; // HIR Builder API
 use log::debug;
 pub use lowering::{
-    lowering_skipped_function_count,
-    reset_lowering_skipped_function_count,
     AstLowering,
     BuiltinResolver,
     ChainedResolver,
@@ -169,9 +172,10 @@ pub use lowering::{
     ModuleArchitecture,
     ResolvedImport,
     SymbolKind,
+    lowering_skipped_function_count,
+    reset_lowering_skipped_function_count,
 };
 pub use memory_management::{
-    convert_linearity_kind,
     ARCManager,
     AllocationInfo,
     CleanupAction,
@@ -188,11 +192,12 @@ pub use memory_management::{
     // Unified cleanup types
     UnifiedCleanupBehavior,
     UnifiedCleanupManager,
+    convert_linearity_kind,
 };
 pub use memory_optimization::MemoryOptimizationPass;
 pub use memory_pass::MemoryManagementPass;
-pub use monomorphize::{monomorphize_module, MonomorphizationContext};
-pub use pattern_matching::{check_exhaustiveness, DecisionNode, PatternMatchCompiler};
+pub use monomorphize::{MonomorphizationContext, monomorphize_module};
+pub use pattern_matching::{DecisionNode, PatternMatchCompiler, check_exhaustiveness};
 pub use ssa::{PhiNode, SsaBuilder, SsaForm};
 pub use typed_cfg::{TypedBasicBlock, TypedCfgBuilder, TypedControlFlowGraph, TypedTerminator};
 
@@ -350,9 +355,9 @@ impl Default for CompilationConfig {
 pub fn register_impl_blocks(
     program: &mut zyntax_typed_ast::TypedProgram,
 ) -> Result<(), CompilerError> {
+    use zyntax_typed_ast::Type;
     use zyntax_typed_ast::type_registry::{ImplDef, MethodImpl, MethodSig, ParamDef};
     use zyntax_typed_ast::typed_ast::TypedDeclaration;
-    use zyntax_typed_ast::Type;
 
     // First pass: Register all traits
     for decl in program.declarations.iter() {

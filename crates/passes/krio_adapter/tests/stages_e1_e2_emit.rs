@@ -9,11 +9,11 @@ mod common;
 
 use std::collections::HashSet;
 
-use krio_adapter::{emit, HirAsyncHooks, HirCoroCfg, HirLiveness, HirSuspendingFns};
+use krio_adapter::{HirAsyncHooks, HirCoroCfg, HirLiveness, HirSuspendingFns, emit};
 use zyntax_compiler::hir::{HirId, HirInstruction, HirTerminator, HirType, HirValue, HirValueKind};
 
 use common::{
-    live_out_for_entry_only, make_async_function_with_one_await, module_of, AsyncFnFixture,
+    AsyncFnFixture, live_out_for_entry_only, make_async_function_with_one_await, module_of,
 };
 
 /// Test driver that runs Phases A–E2 against the canonical fixture

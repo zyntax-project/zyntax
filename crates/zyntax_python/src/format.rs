@@ -6,11 +6,11 @@
 
 use crate::lower::{Lowerer, Node, Val};
 use crate::types::Ty;
-use crate::{span_of, Error, Result};
+use crate::{Error, Result, span_of};
 use ruff_python_ast as py;
+use zyntax_typed_ast::BinaryOp;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{TypedExpression, TypedLiteral};
-use zyntax_typed_ast::BinaryOp;
 
 /// The fields of a format spec, with the library's encodings.
 #[derive(Clone, Debug, PartialEq)]
@@ -229,11 +229,11 @@ pub(crate) fn parse_spec(text: &str) -> std::result::Result<Spec, String> {
             .parse()
             .map_err(|_| "precision too large".to_string())?;
     }
-    if let Some(c) = chars.get(i) {
-        if "bcdeEfFgGnosxX%".contains(*c) {
-            spec.ty = *c as i64;
-            i += 1;
-        }
+    if let Some(c) = chars.get(i)
+        && "bcdeEfFgGnosxX%".contains(*c)
+    {
+        spec.ty = *c as i64;
+        i += 1;
     }
     if i != chars.len() {
         return Err(format!("Invalid format specifier '{text}'"));
@@ -420,7 +420,7 @@ impl Lowerer<'_> {
                 return Err(Error::unsupported_span(
                     format!("`%{other}` in a format"),
                     span,
-                ))
+                ));
             }
         };
         // A string conversion with a precision is a truncation.
@@ -443,7 +443,7 @@ impl Lowerer<'_> {
                     return Err(Error::unsupported(
                         "a nested expression in a format spec".to_string(),
                         &e,
-                    ))
+                    ));
                 }
             }
         }

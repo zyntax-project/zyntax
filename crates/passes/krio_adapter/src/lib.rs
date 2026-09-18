@@ -994,11 +994,7 @@ impl HirLiveness {
                             ..
                         }
                     ) || matches!(inst, HirInstruction::PerformEffect { .. });
-                    if is_suspension {
-                        Some(i)
-                    } else {
-                        None
-                    }
+                    if is_suspension { Some(i) } else { None }
                 })
                 .collect();
             if suspension_indices.is_empty() {

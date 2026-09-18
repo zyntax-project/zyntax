@@ -1,10 +1,10 @@
 use crate::metadata::MetadataTable;
 use crate::trace::FiredSet;
+use zyntax_typed_ast::InternedString;
+use zyntax_typed_ast::TypeRegistry;
 use zyntax_typed_ast::advanced_analysis::AnalysisContext;
 use zyntax_typed_ast::effect_system::EffectSystem;
 use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedProgram};
-use zyntax_typed_ast::InternedString;
-use zyntax_typed_ast::TypeRegistry;
 
 /// Snapshot of effect operation names, built before the walk.
 /// Maps operation name → effect name.

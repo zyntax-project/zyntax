@@ -746,13 +746,13 @@ macro_rules! zrtl_plugin {
         // enforces it. A host that links plugins reaches them through
         // `static_plugin()` and never looks these up.
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "linked-into-host")))]
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub static _zrtl_info: $crate::ZrtlInfo = $crate::ZrtlInfo::new(
             concat!($name, "\0").as_ptr() as *const ::std::ffi::c_char
         );
 
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "linked-into-host")))]
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub static _zrtl_symbols: [$crate::ZrtlSymbol; _ZRTL_PLUGIN_SYMBOLS_LEN] = [
             $(
                 $crate::__zrtl_symbol_entry!($($entry)*),
@@ -764,7 +764,7 @@ macro_rules! zrtl_plugin {
         /// SDK, so the plugin's strings and boxes come from the heap
         /// the program's own values live on.
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "linked-into-host")))]
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn _zrtl_set_allocator(
             alloc: $crate::heap::AllocFn,
             free: $crate::heap::FreeFn,

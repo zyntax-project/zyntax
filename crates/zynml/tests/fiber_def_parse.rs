@@ -42,7 +42,10 @@ fn fiber_def_block_with_return_type_sets_is_fiber() {
         "#,
     );
     let func = find_function(&program, "r#gen");
-    assert!(func.is_fiber, "expected is_fiber=true for `fiber def r#gen`");
+    assert!(
+        func.is_fiber,
+        "expected is_fiber=true for `fiber def r#gen`"
+    );
     assert!(
         !func.is_async,
         "fiber and async should be mutually exclusive"

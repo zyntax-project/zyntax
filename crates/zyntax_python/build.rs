@@ -9,7 +9,7 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 
-use zyntax_embed::{lower_for_snapshot_releasing, SnapshotBuilder};
+use zyntax_embed::{SnapshotBuilder, lower_for_snapshot_releasing};
 use zyntax_typed_ast::{InternedString, Span, TypedProgram};
 
 #[path = "src/policy.rs"]

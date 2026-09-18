@@ -12,8 +12,8 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use zynml::{
-    Grammar2, LanguageGrammar, RuntimeEvent, ZynML, ZynMLConfig, ZynMLRuntimeProfile,
-    ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_TENSOR,
+    Grammar2, LanguageGrammar, RuntimeEvent, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE,
+    ZYNML_STDLIB_TENSOR, ZynML, ZynMLConfig, ZynMLRuntimeProfile,
 };
 
 // ============================================================================

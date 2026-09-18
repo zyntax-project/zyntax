@@ -23,11 +23,11 @@
 
 use std::sync::Arc;
 
-use crate::hir::HirId;
 use crate::CompilerResult;
+use crate::hir::HirId;
+use zyntax_typed_ast::TypedNode;
 use zyntax_typed_ast::type_registry::Type;
 use zyntax_typed_ast::typed_ast::TypedExpression;
-use zyntax_typed_ast::TypedNode;
 
 /// Contract every built-in wrapper class implements. The class owns
 /// two pieces of behaviour: a type predicate that says "I handle

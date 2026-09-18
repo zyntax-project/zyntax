@@ -4597,7 +4597,7 @@ enum ConstraintResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{type_registry::PrimitiveType, ConstValue};
+    use crate::{ConstValue, type_registry::PrimitiveType};
 
     #[test]
     fn test_simple_unification() {
@@ -5201,9 +5201,11 @@ mod tests {
 
         // Check that we get the right error type
         if let Err(errors) = result {
-            assert!(errors
-                .iter()
-                .any(|e| matches!(e, SolverError::UnknownTrait { .. })));
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, SolverError::UnknownTrait { .. }))
+            );
         }
     }
 

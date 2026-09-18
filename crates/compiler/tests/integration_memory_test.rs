@@ -5,7 +5,7 @@ use zyntax_compiler::hir::{
     CallingConvention, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction,
     HirParam, HirTerminator, HirType, HirValueKind, ParamAttributes,
 };
-use zyntax_typed_ast::{arena::AstArena, InternedString};
+use zyntax_typed_ast::{InternedString, arena::AstArena};
 
 /// Helper to create an interned string for tests
 fn create_test_string(s: &str) -> InternedString {

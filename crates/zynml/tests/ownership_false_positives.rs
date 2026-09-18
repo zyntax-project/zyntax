@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use zynml::{Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD};
-use zyntax_compiler::{borrow_check, BorrowError};
+use zyntax_compiler::{BorrowError, borrow_check};
 use zyntax_embed::ZyntaxRuntime;
 
 fn benchmarks() -> Vec<PathBuf> {

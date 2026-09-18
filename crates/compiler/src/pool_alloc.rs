@@ -63,7 +63,7 @@
 //! block would have leaked exactly the cross-thread case this
 //! paragraph promises works.
 
-use std::alloc::{alloc as sys_alloc, dealloc as sys_dealloc, Layout};
+use std::alloc::{Layout, alloc as sys_alloc, dealloc as sys_dealloc};
 use std::cell::Cell;
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicIsize, AtomicUsize};

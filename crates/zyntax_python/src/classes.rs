@@ -6,15 +6,16 @@
 //! class that has it.
 
 use crate::lower::{
-    self, binary, call, callm_name, cast, dispatch_name, field_storage, getattr_name, int_lit, ir,
-    new_name, node, setattr_name, str_lit, var, without_self, Lowerer, Node, Val,
+    self, Lowerer, Node, Val, binary, call, callm_name, cast, dispatch_name, field_storage,
+    getattr_name, int_lit, ir, new_name, node, setattr_name, str_lit, var, without_self,
 };
 use crate::scope::Scope;
-use crate::types::{method_fn, ClassInfo, Locals, Module, Sig, Ty};
-use crate::{intern, Error, Result};
+use crate::types::{ClassInfo, Locals, Module, Sig, Ty, method_fn};
+use crate::{Error, Result, intern};
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
 use std::collections::HashMap;
+use zyntax_typed_ast::TypeId;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{FieldDef, TypeDefinition, TypeKind, TypeMetadata};
 use zyntax_typed_ast::typed_ast::{
@@ -22,7 +23,6 @@ use zyntax_typed_ast::typed_ast::{
     TypedFieldInit, TypedFunction, TypedIf, TypedLet, TypedLiteral, TypedParameter, TypedStatement,
     TypedStructLiteral,
 };
-use zyntax_typed_ast::TypeId;
 use zyntax_typed_ast::{
     Mutability, ParamOwnership, ParameterKind, Type, TypeRegistry, TypedNode, Visibility,
 };
@@ -87,7 +87,7 @@ pub(crate) fn collect<'a>(
                     return Err(located(Error::unsupported(
                         "a class body statement other than a method",
                         other,
-                    )))
+                    )));
                 }
             }
         }

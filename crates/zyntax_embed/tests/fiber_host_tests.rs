@@ -2,8 +2,8 @@
 
 use zyntax_embed::{ZyntaxFiberStep, ZyntaxRuntime, ZyntaxValue};
 use zyntax_typed_ast::{
-    typed_ast::typed_node, PrimitiveType, Span, Type, TypedASTBuilder, TypedDeclaration,
-    TypedStatement, Visibility,
+    PrimitiveType, Span, Type, TypedASTBuilder, TypedDeclaration, TypedStatement, Visibility,
+    typed_ast::typed_node,
 };
 
 fn yielding_fiber_program() -> zyntax_typed_ast::TypedProgram {

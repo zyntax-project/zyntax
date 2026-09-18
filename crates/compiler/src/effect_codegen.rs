@@ -240,6 +240,8 @@
 //! - Generate runtime dispatch for dynamic handlers
 //! - (Future) Generate CPS-transformed code for resumable handlers
 
+use crate::CompilerError;
+use crate::CompilerResult;
 use crate::effect_handler_resolution::{
     FunctionHandlerResolution, HandlerOptimization, HandlerResolution, ModuleHandlerResolution,
     ResolvedHandler,
@@ -248,8 +250,6 @@ use crate::hir::{
     HirBlock, HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirFunction, HirId,
     HirInstruction, HirModule, HirType,
 };
-use crate::CompilerError;
-use crate::CompilerResult;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use zyntax_typed_ast::InternedString;

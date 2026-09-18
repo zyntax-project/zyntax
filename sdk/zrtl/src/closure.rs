@@ -68,11 +68,7 @@ impl ClosureResult {
     /// Get the value if successful
     #[inline]
     pub fn value(&self) -> Option<i64> {
-        if self.is_ok() {
-            Some(self.value)
-        } else {
-            None
-        }
+        if self.is_ok() { Some(self.value) } else { None }
     }
 }
 

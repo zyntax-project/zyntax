@@ -502,9 +502,9 @@ impl SmtSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AstArena;
     use crate::dependent_types::*;
     use crate::type_registry::*;
-    use crate::AstArena;
 
     #[test]
     fn test_smt_solver_creation() {

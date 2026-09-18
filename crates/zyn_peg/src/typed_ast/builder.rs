@@ -4,15 +4,15 @@
 //! These functions bridge the gap between parser output and TypedAST construction.
 
 use zyntax_typed_ast::{
+    BinaryOp, InternedString, Span, TypedASTBuilder, TypedBlock, TypedClass, TypedDeclaration,
+    TypedEnum, TypedExpression, TypedField, TypedFunction, TypedNode, TypedProgram, TypedStatement,
+    TypedVariable, UnaryOp,
     type_registry::{CallingConvention, Mutability, PrimitiveType, Type, TypeRegistry, Visibility},
     typed_ast::{
         ParameterKind, TypedBinary, TypedCall, TypedFieldAccess, TypedFieldInit, TypedFor, TypedIf,
         TypedLambda, TypedLambdaBody, TypedLambdaParam, TypedLet, TypedLiteral, TypedMethodCall,
         TypedParameter, TypedPattern, TypedStructLiteral, TypedTypeParam, TypedUnary, TypedWhile,
     },
-    BinaryOp, InternedString, Span, TypedASTBuilder, TypedBlock, TypedClass, TypedDeclaration,
-    TypedEnum, TypedExpression, TypedField, TypedFunction, TypedNode, TypedProgram, TypedStatement,
-    TypedVariable, UnaryOp,
 };
 
 use crate::runtime2::state::{NodeHandle, ParsedValue};

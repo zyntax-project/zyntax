@@ -8,8 +8,8 @@
 // (IndexMap fields, link_name, effects, is_pure)
 #[cfg(all(feature = "llvm-backend", not(feature = "llvm-backend")))]
 mod llvm_tests {
-    use inkwell::context::Context;
     use inkwell::OptimizationLevel;
+    use inkwell::context::Context;
     use std::collections::{HashMap, HashSet};
     use zyntax_compiler::hir::*;
     use zyntax_compiler::llvm_backend::LLVMBackend;

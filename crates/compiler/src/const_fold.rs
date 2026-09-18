@@ -274,28 +274,28 @@ fn fold_binary(
                     li < ri
                 } else {
                     (li as u128) < (ri as u128)
-                }))
+                }));
             }
             Le => {
                 return Some(HirConstant::Bool(if is_signed_ty(ty) {
                     li <= ri
                 } else {
                     (li as u128) <= (ri as u128)
-                }))
+                }));
             }
             Gt => {
                 return Some(HirConstant::Bool(if is_signed_ty(ty) {
                     li > ri
                 } else {
                     (li as u128) > (ri as u128)
-                }))
+                }));
             }
             Ge => {
                 return Some(HirConstant::Bool(if is_signed_ty(ty) {
                     li >= ri
                 } else {
                     (li as u128) >= (ri as u128)
-                }))
+                }));
             }
             // Float ops on int operands — shouldn't happen in
             // well-typed HIR, but be defensive.

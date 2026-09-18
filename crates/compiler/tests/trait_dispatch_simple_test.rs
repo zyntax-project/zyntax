@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use zyntax_compiler::lowering::{AstLowering, LoweringConfig, LoweringContext};
 use zyntax_typed_ast::{
-    arena::AstArena, ImplDef, MethodImpl, MethodSig, Span, Type, TypeId, TypeRegistry,
-    TypedProgram, Visibility,
+    ImplDef, MethodImpl, MethodSig, Span, Type, TypeId, TypeRegistry, TypedProgram, Visibility,
+    arena::AstArena,
 };
 
 fn test_span() -> Span {
@@ -125,7 +125,7 @@ fn test_vtable_generation_simple() {
     };
 
     // 5. Create program with the method function
-    use zyntax_typed_ast::{typed_node, TypedDeclaration};
+    use zyntax_typed_ast::{TypedDeclaration, typed_node};
     let mut program = TypedProgram {
         language: None,
         declarations: vec![typed_node(

@@ -18,12 +18,12 @@
 
 use std::sync::Arc;
 use zyn_peg::grammar::{
-    parse_grammar, BuiltinMappings, GrammarIR, GrammarMetadata, TypeDeclarations,
+    BuiltinMappings, GrammarIR, GrammarMetadata, TypeDeclarations, parse_grammar,
 };
 use zyn_peg::runtime2::{GrammarInterpreter, ParseResult, ParsedValue, ParserState};
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type, TypeRegistry};
 use zyntax_typed_ast::{
-    typed_node, CallingConvention, InternedString, Mutability, Span, Visibility,
+    CallingConvention, InternedString, Mutability, Span, Visibility, typed_node,
 };
 use zyntax_typed_ast::{
     TypedASTBuilder, TypedDeclaration, TypedFunction, TypedParameter, TypedProgram,

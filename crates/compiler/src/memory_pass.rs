@@ -7,8 +7,8 @@
 //! - Optimizes memory operations
 
 use crate::{
-    analysis::ModuleAnalysis, hir::*, memory_management::*, optimization::OptimizationPass,
-    CompilerResult,
+    CompilerResult, analysis::ModuleAnalysis, hir::*, memory_management::*,
+    optimization::OptimizationPass,
 };
 use std::collections::HashMap;
 

@@ -1,8 +1,8 @@
 //! Strings: the primitives from the string plugin, and what every
 //! language builds on them.
 
-use crate::build::*;
 use crate::Policy;
+use crate::build::*;
 
 /// The primitives, bound to the string plugin's symbols.
 const PRIMITIVES: &[(&str, &[(&str, &str)], &str, &str)] = &[

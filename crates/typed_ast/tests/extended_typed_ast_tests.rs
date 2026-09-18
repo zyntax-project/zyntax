@@ -2,8 +2,8 @@
 //! Tests for the extended TypedAST features
 
 use zyntax_typed_ast::{
-    ast_convert::*, typed_ast::*, AstArena, InternedString, Mutability, PrimitiveType, Span, Type,
-    TypeId, TypeRegistry, Visibility,
+    AstArena, InternedString, Mutability, PrimitiveType, Span, Type, TypeId, TypeRegistry,
+    Visibility, ast_convert::*, typed_ast::*,
 };
 use zyntax_typed_ast::{AsyncKind, CallingConvention, NullabilityKind, ParamOwnership};
 

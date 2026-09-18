@@ -5,7 +5,7 @@
 
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::*;
-use zyntax_typed_ast::{arena::AstArena, InternedString};
+use zyntax_typed_ast::{InternedString, arena::AstArena};
 
 fn create_test_string(s: &str) -> InternedString {
     let mut arena = AstArena::new();

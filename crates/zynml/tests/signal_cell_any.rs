@@ -200,15 +200,21 @@ fn which_construct_actually_boxes_into_an_any_parameter() {
     let rows: [(&str, String); 3] = [
         (
             "direct argument",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, 41)\n    return 0\n}}\n"),
+            format!(
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, 41)\n    return 0\n}}\n"
+            ),
         ),
         (
             "via `let b: Any = v`",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let v: i64 = 41\n    let b: Any = v\n    host_signal_cell_set(c, b)\n    return 0\n}}\n"),
+            format!(
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let v: i64 = 41\n    let b: Any = v\n    host_signal_cell_set(c, b)\n    return 0\n}}\n"
+            ),
         ),
         (
             "explicit zyntax_box_i64",
-            format!("{CELL}\nextern def zyntax_box_i64(v: i64): Any\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, zyntax_box_i64(41))\n    return 0\n}}\n"),
+            format!(
+                "{CELL}\nextern def zyntax_box_i64(v: i64): Any\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, zyntax_box_i64(41))\n    return 0\n}}\n"
+            ),
         ),
     ];
 
@@ -261,21 +267,24 @@ fn which_construct_actually_boxes_into_an_any_parameter() {
 fn where_any_is_accepted_and_whether_it_coerces() {
     let _guard = exclusive();
     let rows: [(&str, String); 4] = [
-        (
-            "declarations only",
-            CELL.to_string(),
-        ),
+        ("declarations only", CELL.to_string()),
         (
             "T -> Any (autobox)",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, 41)\n    return 0\n}}\n"),
+            format!(
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, 41)\n    return 0\n}}\n"
+            ),
         ),
         (
             "Any -> T (autounbox)",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, 41)\n    return host_signal_cell_get(c)\n}}\n"),
+            format!(
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, 41)\n    return host_signal_cell_get(c)\n}}\n"
+            ),
         ),
         (
             "Any held as Any",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, 41)\n    let v: Any = host_signal_cell_get(c)\n    return 0\n}}\n"),
+            format!(
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    host_signal_cell_set(c, 41)\n    let v: Any = host_signal_cell_get(c)\n    return 0\n}}\n"
+            ),
         ),
     ];
     for (label, src) in rows {
@@ -492,32 +501,44 @@ fn where_an_any_return_is_unboxed_and_whether_it_is_freed() {
     let rows: [(&str, String, i64); 6] = [
         (
             "return position",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    return host_signal_cell_get(c)\n}}\n"),
+            format!(
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    return host_signal_cell_get(c)\n}}\n"
+            ),
             7,
         ),
         (
             "let binding, no loop",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let v: i64 = host_signal_cell_get(c)\n    return v\n}}\n"),
+            format!(
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let v: i64 = host_signal_cell_get(c)\n    return v\n}}\n"
+            ),
             7,
         ),
         (
             "let binding + `as i64`",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let v: i64 = host_signal_cell_get(c) as i64\n    return v\n}}\n"),
+            format!(
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let v: i64 = host_signal_cell_get(c) as i64\n    return v\n}}\n"
+            ),
             7,
         ),
         (
             "assignment + `as i64`",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let mut v: i64 = 0\n    v = host_signal_cell_get(c) as i64\n    return v\n}}\n"),
+            format!(
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let mut v: i64 = 0\n    v = host_signal_cell_get(c) as i64\n    return v\n}}\n"
+            ),
             7,
         ),
         (
             "plain assignment, no cast",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let mut v: i64 = 0\n    v = host_signal_cell_get(c)\n    return v\n}}\n"),
+            format!(
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let mut v: i64 = 0\n    v = host_signal_cell_get(c)\n    return v\n}}\n"
+            ),
             7,
         ),
         (
             "let binding, 8x loop",
-            format!("{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let mut total: i64 = 0\n    let mut i: i64 = 0\n    while i < 8 {{\n        let v: i64 = host_signal_cell_get(c)\n        total = total + v\n        i = i + 1\n    }}\n    return total\n}}\n"),
+            format!(
+                "{CELL}\ndef main(): i64 {{\n    let c: SignalCell = host_signal_cell_new()\n    let mut total: i64 = 0\n    let mut i: i64 = 0\n    while i < 8 {{\n        let v: i64 = host_signal_cell_get(c)\n        total = total + v\n        i = i + 1\n    }}\n    return total\n}}\n"
+            ),
             56,
         ),
     ];

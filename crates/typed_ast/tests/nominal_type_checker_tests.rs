@@ -8,8 +8,8 @@
 use zyntax_typed_ast::arena::InternedString;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::{
-    nominal_type_checker::*, MethodSig, NullabilityKind, PrimitiveType, Type, TypeId, TypeParam,
-    Variance, Visibility,
+    MethodSig, NullabilityKind, PrimitiveType, Type, TypeId, TypeParam, Variance, Visibility,
+    nominal_type_checker::*,
 };
 // use zyntax_typed_ast::type_registry::{Type, PrimitiveType, NullabilityKind, TypeVarKind, Variance};
 use std::collections::HashMap;

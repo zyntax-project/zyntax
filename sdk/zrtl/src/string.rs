@@ -24,11 +24,7 @@ pub const STRING_HEADER_SIZE: usize = std::mem::size_of::<i32>();
 /// The pointer must be valid and point to a valid string header.
 #[inline]
 pub unsafe fn string_length(ptr: StringConstPtr) -> i32 {
-    if ptr.is_null() {
-        0
-    } else {
-        *ptr
-    }
+    if ptr.is_null() { 0 } else { *ptr }
 }
 
 /// Get pointer to UTF-8 bytes from a string pointer

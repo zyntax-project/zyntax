@@ -4,19 +4,19 @@
 //! Uses the efficient algorithm from "Simple and Efficient Construction of SSA Form"
 //! by Braun et al.
 
+use crate::CompilerResult;
 use crate::cfg::{BasicBlock, ControlFlowGraph};
 use crate::hir::{
     CastOp, HirBlock, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction,
     HirParam, HirPhi, HirTerminator, HirType, HirValueKind,
 };
-use crate::CompilerResult;
 use indexmap::IndexMap;
 use petgraph::visit::EdgeRef; // For .source() method on edges
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use zyntax_typed_ast::{
-    typed_ast::{TypedExpression, TypedNode},
     ConstValue, InternedString, Type,
+    typed_ast::{TypedExpression, TypedNode},
 };
 
 /// Kernel types recognised in `compute()` body statements (M2).
@@ -471,8 +471,8 @@ struct DominanceInfo {
 impl DominanceInfo {
     /// Compute dominance information from TypedCFG
     fn compute(cfg: &crate::typed_cfg::TypedControlFlowGraph) -> Self {
-        use petgraph::visit::Dfs;
         use petgraph::Direction;
+        use petgraph::visit::Dfs;
 
         // Step 1: Compute reverse postorder (RPO)
         let mut rpo = Vec::new();
@@ -3506,8 +3506,8 @@ impl SsaBuilder {
     /// Determine an element type hint from a scalar expression's declared or inferred type.
     /// Defaults to `F32` (most common for ML kernels).
     fn hint_elem_ty_from_expr(expr: &zyntax_typed_ast::TypedNode<TypedExpression>) -> HirType {
-        use zyntax_typed_ast::typed_ast::{TypedExpression as TE, TypedLiteral};
         use zyntax_typed_ast::PrimitiveType;
+        use zyntax_typed_ast::typed_ast::{TypedExpression as TE, TypedLiteral};
 
         // Try the declared type annotation first.
         // Note: We map F64 → F32 because the SIMD path uses 128-bit vectors which
@@ -3838,7 +3838,9 @@ impl SsaBuilder {
                             return Ok(addr);
                         }
                         // Not a function — reading as undefined variable
-                        log::debug!("[SSA] Not an enum constructor or function, reading as undefined variable");
+                        log::debug!(
+                            "[SSA] Not an enum constructor or function, reading as undefined variable"
+                        );
                         Ok(self.read_variable(*name, block_id))
                     }
                 }
@@ -8979,7 +8981,8 @@ impl SsaBuilder {
 
                                     log::trace!(
                                         "[METHOD DISPATCH] Found trait method for extern type '{}' (trait: {:?})",
-                                        base_type_name, impl_def.trait_id
+                                        base_type_name,
+                                        impl_def.trait_id
                                     );
                                     return Ok(InternedString::new_global(&trait_mangled));
                                 }
@@ -8999,15 +9002,16 @@ impl SsaBuilder {
                     .resolve_string(method_name)
                     .unwrap_or_default()
                     .to_string();
-                return Err(crate::CompilerError::Analysis(
-                    format!("Cannot resolve method '{}' on unknown type - add a type annotation to the variable", method_name_str)
-                ));
+                return Err(crate::CompilerError::Analysis(format!(
+                    "Cannot resolve method '{}' on unknown type - add a type annotation to the variable",
+                    method_name_str
+                )));
             }
             _ => {
                 return Err(crate::CompilerError::Analysis(format!(
                     "Cannot call methods on non-nominal type: {:?}",
                     receiver_type
-                )))
+                )));
             }
         };
 
@@ -9208,7 +9212,7 @@ impl SsaBuilder {
         source_ty: &Type,
         target_ty: &Type,
     ) -> HirId {
-        use crate::cast_classify::{classify_cast, CastKind};
+        use crate::cast_classify::{CastKind, classify_cast};
         match classify_cast(source_ty, target_ty, &self.type_registry) {
             CastKind::UpcastBox => self
                 .emit_box_to_any(block_id, value, source_ty)
@@ -9336,7 +9340,7 @@ impl SsaBuilder {
         expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
         target_ty: &Type,
     ) -> HirId {
-        use crate::cast_classify::{classify_cast, CastKind};
+        use crate::cast_classify::{CastKind, classify_cast};
         let source = self.resolve_expr_type(expr);
         if matches!(
             classify_cast(&source, target_ty, &self.type_registry),
@@ -10705,10 +10709,10 @@ impl SsaBuilder {
         if !float {
             match self.constant_sign(divisor) {
                 Some(std::cmp::Ordering::Greater) => {
-                    return self.emit_bin(block, B::Lt, ty, rem, zero)
+                    return self.emit_bin(block, B::Lt, ty, rem, zero);
                 }
                 Some(std::cmp::Ordering::Less) => {
-                    return self.emit_bin(block, B::Gt, ty, rem, zero)
+                    return self.emit_bin(block, B::Gt, ty, rem, zero);
                 }
                 _ => {}
             }
@@ -12288,8 +12292,8 @@ impl SsaBuilder {
     /// Convert HIR type back to TypedAST Type (reverse of convert_type)
     /// This is used when we need to look up type information that was stored in HIR format
     fn hir_type_to_typed_ast_type(&self, hir_ty: &HirType) -> Type {
-        use zyntax_typed_ast::type_registry::NullabilityKind;
         use zyntax_typed_ast::PrimitiveType;
+        use zyntax_typed_ast::type_registry::NullabilityKind;
 
         match hir_ty {
             HirType::Bool => Type::Primitive(PrimitiveType::Bool),
@@ -13559,7 +13563,7 @@ impl SsaBuilder {
                             return Err(crate::CompilerError::Analysis(format!(
                                 "Cannot index into non-array type: {:?}",
                                 resolved_array_ty
-                            )))
+                            )));
                         }
                     },
                 };
@@ -14355,24 +14359,20 @@ impl SsaBuilder {
                     .collect();
                 Ok((u32::try_from(index).unwrap_or(u32::MAX), payload_types))
             }
-            Type::Optional(inner) => {
-                match variant_name.resolve_global().as_deref() {
-                    Some("Some") => Ok((1, vec![inner.as_ref().clone()])),
-                    Some("None") => Ok((0, vec![])),
-                    _ => Err(crate::CompilerError::Analysis(format!(
-                        "unknown variant `{variant_name}` for Option"
-                    ))),
-                }
-            }
-            Type::Result { ok_type, err_type } => {
-                match variant_name.resolve_global().as_deref() {
-                    Some("Ok") => Ok((0, vec![ok_type.as_ref().clone()])),
-                    Some("Err") => Ok((1, vec![err_type.as_ref().clone()])),
-                    _ => Err(crate::CompilerError::Analysis(format!(
-                        "unknown variant `{variant_name}` for Result"
-                    ))),
-                }
-            }
+            Type::Optional(inner) => match variant_name.resolve_global().as_deref() {
+                Some("Some") => Ok((1, vec![inner.as_ref().clone()])),
+                Some("None") => Ok((0, vec![])),
+                _ => Err(crate::CompilerError::Analysis(format!(
+                    "unknown variant `{variant_name}` for Option"
+                ))),
+            },
+            Type::Result { ok_type, err_type } => match variant_name.resolve_global().as_deref() {
+                Some("Ok") => Ok((0, vec![ok_type.as_ref().clone()])),
+                Some("Err") => Ok((1, vec![err_type.as_ref().clone()])),
+                _ => Err(crate::CompilerError::Analysis(format!(
+                    "unknown variant `{variant_name}` for Result"
+                ))),
+            },
             _ => Err(crate::CompilerError::Analysis(format!(
                 "enum variant pattern `{variant_name}` requires an enum scrutinee, found {scrutinee_ty:?}"
             ))),
@@ -14579,7 +14579,7 @@ impl SsaBuilder {
                         return Err(crate::CompilerError::Analysis(format!(
                             "Expected array type for array pattern, got {:?}",
                             scrutinee_ty
-                        )))
+                        )));
                     }
                 };
 
@@ -14901,7 +14901,7 @@ impl SsaBuilder {
                 return Err(crate::CompilerError::Analysis(format!(
                     "Expected tuple type for tuple pattern, got {:?}",
                     scrutinee_ty
-                )))
+                )));
             }
         };
 
@@ -14996,7 +14996,7 @@ impl SsaBuilder {
                 return Err(crate::CompilerError::Analysis(format!(
                     "Expected struct type for struct pattern, got {:?}",
                     scrutinee_ty
-                )))
+                )));
             }
         };
 

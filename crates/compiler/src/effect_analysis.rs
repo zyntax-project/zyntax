@@ -8,13 +8,13 @@
 //! - Effect checking: Validates effect annotations and purity constraints
 //! - Handler scope analysis: Ensures effect operations are within valid handler scopes
 
+use crate::CompilerError;
+use crate::CompilerResult;
 use crate::analysis::{CallGraph, ModuleAnalysis};
 use crate::hir::{
     HirBlock, HirEffect, HirEffectHandler, HirFunction, HirId, HirInstruction, HirModule,
     HirTerminator,
 };
-use crate::CompilerError;
-use crate::CompilerResult;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use zyntax_typed_ast::InternedString;

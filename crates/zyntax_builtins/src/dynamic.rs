@@ -5,7 +5,7 @@
 //! category and then does what the typed code does.
 
 use crate::build::*;
-use crate::{list_of, Kind, Policy, DICT_TAG, FUNC_TAG, INSTANCE_KIND_BASE, SET_TAG, TUPLE_TAG};
+use crate::{DICT_TAG, FUNC_TAG, INSTANCE_KIND_BASE, Kind, Policy, SET_TAG, TUPLE_TAG, list_of};
 use zyntax_typed_ast::TypeId;
 
 pub(crate) const NONE: i64 = 0;

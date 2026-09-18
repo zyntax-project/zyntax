@@ -166,11 +166,13 @@ mod tests {
                 .as_deref(),
             Some("prelude")
         );
-        assert!(decoded
-            .program()
-            .type_registry
-            .get_type_by_name(marker)
-            .is_some());
+        assert!(
+            decoded
+                .program()
+                .type_registry
+                .get_type_by_name(marker)
+                .is_some()
+        );
     }
 
     #[test]

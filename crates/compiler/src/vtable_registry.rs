@@ -25,8 +25,8 @@
 //! let super_vtable = registry.get_super_trait_vtable(sub_trait_id, super_trait_id, type_id)?;
 //! ```
 
-use crate::hir::{HirGlobal, HirId, HirType, HirVTable};
 use crate::CompilerResult;
+use crate::hir::{HirGlobal, HirId, HirType, HirVTable};
 use std::collections::HashMap;
 use zyntax_typed_ast::{InternedString, TypeId};
 

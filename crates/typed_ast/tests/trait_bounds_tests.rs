@@ -344,9 +344,11 @@ fn test_insufficient_trait_implementation_error() {
         assert!(!errors.is_empty());
         println!("{:?}", errors);
         // Should have trait not implemented error
-        assert!(errors
-            .iter()
-            .any(|e| matches!(e, SolverError::TraitNotImplemented { .. })));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, SolverError::TraitNotImplemented { .. }))
+        );
     }
 }
 

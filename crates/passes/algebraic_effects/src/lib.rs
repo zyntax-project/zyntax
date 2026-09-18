@@ -54,10 +54,10 @@ impl PatternPass for Pass {
 mod tests {
     use super::*;
     use pattern_engine::{EngineConfig, PatternEngine};
+    use zyntax_typed_ast::InternedString;
     use zyntax_typed_ast::source::Span;
     use zyntax_typed_ast::type_registry::{PrimitiveType, Type};
     use zyntax_typed_ast::typed_ast::*;
-    use zyntax_typed_ast::InternedString;
 
     #[test]
     fn test_pass_registers_with_dependency() {

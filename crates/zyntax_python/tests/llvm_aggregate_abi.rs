@@ -18,7 +18,12 @@ fn promoted_list_parameter_keeps_caller_header_and_aliases() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert_eq!(stdout.trim(), "5000 10000 10000 10000 4999");
-    let grow = stderr.find("(grow) at tier 2").expect("grow promotes to LLVM");
-    assert!(stderr[grow..].contains("[osr] llvm install tier=2"), "{stderr}");
+    let grow = stderr
+        .find("(grow) at tier 2")
+        .expect("grow promotes to LLVM");
+    assert!(
+        stderr[grow..].contains("[osr] llvm install tier=2"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("LLVM compile failed"), "{stderr}");
 }

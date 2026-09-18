@@ -21,8 +21,8 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_test::*;
 use zyntax_wasm::{
-    _zyntax_reject_future, _zyntax_resolve_future, _zyntax_run_async, run, version, ErrorKind,
-    RunResult,
+    _zyntax_reject_future, _zyntax_resolve_future, _zyntax_run_async, ErrorKind, RunResult, run,
+    version,
 };
 
 // JS-side host shims are normally installed by `web/zynml.mjs::

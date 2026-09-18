@@ -7,8 +7,8 @@
 //! load/store to `VectorLoad` / `VectorStore` — no ZRTL `List<T>`, no FFI.
 
 use zynml::{Grammar2, ZYNML_GRAMMAR};
-use zyntax_compiler::hir::{HirCallable, HirFunction, HirInstruction, HirType, Intrinsic};
 use zyntax_compiler::HirModule;
+use zyntax_compiler::hir::{HirCallable, HirFunction, HirInstruction, HirType, Intrinsic};
 use zyntax_embed::ZyntaxRuntime;
 
 fn lower(source: &str) -> HirModule {

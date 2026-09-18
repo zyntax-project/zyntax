@@ -88,9 +88,11 @@ fn test_lifetime_cycle_detection() {
     assert!(result2.is_err(), "Lifetime cycle should be detected");
 
     if let Err(errors) = result2 {
-        assert!(errors
-            .iter()
-            .any(|e| matches!(e, SolverError::LifetimeCycle { .. })));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, SolverError::LifetimeCycle { .. }))
+        );
         println!("✅ Lifetime cycle correctly detected");
     }
 }

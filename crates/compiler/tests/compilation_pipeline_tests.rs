@@ -8,15 +8,15 @@
 
 use std::sync::Arc;
 use zyntax_compiler::{
-    async_support::AsyncRuntimeType, compile_to_hir, hir::*, monomorphize_module,
-    CompilationConfig, CompilerResult, MonomorphizationContext,
+    CompilationConfig, CompilerResult, MonomorphizationContext, async_support::AsyncRuntimeType,
+    compile_to_hir, hir::*, monomorphize_module,
 };
 use zyntax_typed_ast::{
+    BinaryOp, CallingConvention, PrimitiveType, Span, Type, TypeRegistry, TypedDeclaration,
+    TypedExpression, TypedFunction, TypedLiteral, TypedProgram, TypedStatement, Visibility,
     arena::AstArena,
     typed_ast::{TypedBinary, TypedBlock, TypedWhile},
-    typed_node, BinaryOp, CallingConvention, PrimitiveType, Span, Type, TypeRegistry,
-    TypedDeclaration, TypedExpression, TypedFunction, TypedLiteral, TypedProgram, TypedStatement,
-    Visibility,
+    typed_node,
 };
 
 fn test_span() -> Span {

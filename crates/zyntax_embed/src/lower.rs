@@ -49,8 +49,8 @@ pub(crate) fn lower_typed_program(
     mut program: TypedProgram,
     inputs: Inputs<'_>,
 ) -> RuntimeResult<Lowered> {
-    use zyntax_typed_ast::type_registry::*;
     use zyntax_typed_ast::TypedDeclaration;
+    use zyntax_typed_ast::type_registry::*;
 
     let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
     let mut at = std::time::Instant::now();

@@ -3,7 +3,7 @@
 //! rolled back — beads, reload cells and dispatch tables swing back to
 //! the previous generation, with state untouched either way.
 
-use zynml::{Grammar2, ZynML, ZynMLConfig, ZynMLRuntimeProfile, ZYNML_GRAMMAR};
+use zynml::{Grammar2, ZYNML_GRAMMAR, ZynML, ZynMLConfig, ZynMLRuntimeProfile};
 use zyntax_embed::{TieredConfig, TieredRuntime, ZyntaxValue};
 
 fn runtime() -> ZynML {

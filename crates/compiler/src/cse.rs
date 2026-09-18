@@ -465,11 +465,7 @@ fn canonical_operand_order(
     if is_commutative(op) {
         let lk = format!("{l:?}");
         let rk = format!("{r:?}");
-        if lk <= rk {
-            (l, r)
-        } else {
-            (r, l)
-        }
+        if lk <= rk { (l, r) } else { (r, l) }
     } else {
         (l, r)
     }

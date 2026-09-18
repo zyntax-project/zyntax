@@ -6,8 +6,8 @@
 //! not a call into a stdlib function.
 
 use zynml::{Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE};
-use zyntax_compiler::hir::{HirCallable, HirFunction, HirInstruction, Intrinsic};
 use zyntax_compiler::HirModule;
+use zyntax_compiler::hir::{HirCallable, HirFunction, HirInstruction, Intrinsic};
 use zyntax_embed::ZyntaxRuntime;
 
 fn lower(source: &str) -> HirModule {

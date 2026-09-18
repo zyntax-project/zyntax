@@ -15,11 +15,11 @@ mod common;
 
 use std::collections::HashSet;
 
-use krio_adapter::{orchestrator, HirSuspendingFns};
+use krio_adapter::{HirSuspendingFns, orchestrator};
 use zyntax_compiler::analysis::AnalysisRunner;
 use zyntax_compiler::hir::{HirId, HirInstruction, HirType, HirValue, HirValueKind};
 
-use common::{make_async_function_with_one_await, AsyncFnFixture};
+use common::{AsyncFnFixture, make_async_function_with_one_await};
 
 /// End-to-end: run AnalysisRunner against the canonical fixture,
 /// hand its live_out output to the orchestrator, and verify krio's

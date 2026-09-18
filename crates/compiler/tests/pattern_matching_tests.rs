@@ -1,7 +1,7 @@
 //! Pattern matching tests for Phase 4 implementation
 
-use zyntax_compiler::{check_exhaustiveness, hir::*, DecisionNode, PatternMatchCompiler};
-use zyntax_typed_ast::{arena::AstArena, Type};
+use zyntax_compiler::{DecisionNode, PatternMatchCompiler, check_exhaustiveness, hir::*};
+use zyntax_typed_ast::{Type, arena::AstArena};
 
 fn create_test_arena() -> AstArena {
     AstArena::new()

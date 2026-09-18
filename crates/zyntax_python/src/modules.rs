@@ -8,7 +8,7 @@ use crate::scope::Scope;
 use crate::stdlib;
 use crate::{Error, Result};
 use ruff_python_ast as py;
-use ruff_python_ast::visitor::transformer::{walk_expr, walk_stmt, Transformer};
+use ruff_python_ast::visitor::transformer::{Transformer, walk_expr, walk_stmt};
 use ruff_text_size::Ranged;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -283,10 +283,10 @@ impl Qualifier {
         if let Some(target) = self.imports.names.get(name) {
             return Some(target.clone());
         }
-        if let Some(prefix) = &self.prefix {
-            if self.module_names.contains(name) {
-                return Some(qualified(prefix, name));
-            }
+        if let Some(prefix) = &self.prefix
+            && self.module_names.contains(name)
+        {
+            return Some(qualified(prefix, name));
         }
         None
     }
@@ -346,11 +346,11 @@ impl Transformer for Qualifier {
             }
             py::Stmt::Global(g) => {
                 for name in &mut g.names {
-                    if let Some(prefix) = &self.prefix {
-                        if self.module_names.contains(name.id.as_str()) {
-                            let to = qualified(prefix, name.id.as_str());
-                            Self::set_name(name, &to);
-                        }
+                    if let Some(prefix) = &self.prefix
+                        && self.module_names.contains(name.id.as_str())
+                    {
+                        let to = qualified(prefix, name.id.as_str());
+                        Self::set_name(name, &to);
                     }
                 }
             }
@@ -365,17 +365,17 @@ impl Transformer for Qualifier {
             py::Expr::Attribute(a) => {
                 if let Some(path) = dotted_path(&a.value) {
                     let head = path.split('.').next().unwrap_or(&path);
-                    if !self.is_local(head) {
-                        if let Some(module) = self.imports.modules.get(&path) {
-                            let to = qualified(module, a.attr.id.as_str());
-                            *expr = py::Expr::Name(py::ExprName {
-                                node_index: Default::default(),
-                                range: a.range,
-                                id: py::name::Name::new(to),
-                                ctx: a.ctx,
-                            });
-                            return;
-                        }
+                    if !self.is_local(head)
+                        && let Some(module) = self.imports.modules.get(&path)
+                    {
+                        let to = qualified(module, a.attr.id.as_str());
+                        *expr = py::Expr::Name(py::ExprName {
+                            node_index: Default::default(),
+                            range: a.range,
+                            id: py::name::Name::new(to),
+                            ctx: a.ctx,
+                        });
+                        return;
                     }
                 }
                 walk_expr(self, expr);

@@ -10,11 +10,11 @@ use std::rc::Rc;
 use std::thread::{self, ThreadId};
 
 use zyntax_compiler::fiber_backend::{
-    unpack_fiber_step, FIBER_STEP_DONE, FIBER_STEP_ERRORED, FIBER_STEP_YIELDED,
+    FIBER_STEP_DONE, FIBER_STEP_ERRORED, FIBER_STEP_YIELDED, unpack_fiber_step,
 };
 use zyntax_compiler::zrtl::{
-    krio_fiber_cancel, krio_fiber_free, krio_fiber_new, krio_fiber_resume, krio_fiber_resume_with,
-    FiberRepr,
+    FiberRepr, krio_fiber_cancel, krio_fiber_free, krio_fiber_new, krio_fiber_resume,
+    krio_fiber_resume_with,
 };
 
 use crate::runtime::{RuntimeError, RuntimeResult};

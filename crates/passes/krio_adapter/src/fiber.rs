@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 
 use krio_fiber::{Fiber, FiberStep};
 use zyntax_compiler::fiber_backend::{
-    self, FiberCfg, FIBER_STEP_DONE, FIBER_STEP_ERRORED, FIBER_STEP_YIELDED,
+    self, FIBER_STEP_DONE, FIBER_STEP_ERRORED, FIBER_STEP_YIELDED, FiberCfg,
 };
 use zyntax_compiler::zrtl::FiberRepr;
 
@@ -458,7 +458,7 @@ pub fn install() -> bool {
 mod tests {
     use super::*;
     use std::sync::Once;
-    use zyntax_compiler::fiber_backend::{unpack_fiber_step, FIBER_STEP_DONE, FIBER_STEP_YIELDED};
+    use zyntax_compiler::fiber_backend::{FIBER_STEP_DONE, FIBER_STEP_YIELDED, unpack_fiber_step};
     use zyntax_compiler::zrtl;
 
     /// Install the backend exactly once per test binary. Multiple

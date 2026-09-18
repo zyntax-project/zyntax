@@ -4,7 +4,7 @@
 //! This analysis demonstrates how Go language features map to our Zyntax TypedAST,
 //! identifying supported features and potential gaps for a Go compiler.
 
-use zyntax_typed_ast::{type_registry::*, typed_ast::*, AstArena, Span};
+use zyntax_typed_ast::{AstArena, Span, type_registry::*, typed_ast::*};
 
 /// Analysis of Go language features and TypedAST compatibility
 fn golang_features_analysis() {
@@ -235,7 +235,9 @@ fn golang_features_analysis() {
     println!("   ✅ Built-in functions (make, new, len, cap) - Will be registered extensions");
     println!("   ✅ Type switches - RTTI support as opt-in feature (Go, Haxe, etc.)");
     println!("   ❌ Method sets and automatic pointer/value method calling");
-    println!("   ✅ Package initialization order and init() functions - opt-in feature (Go, Python, etc.)");
+    println!(
+        "   ✅ Package initialization order and init() functions - opt-in feature (Go, Python, etc.)"
+    );
     println!("   ✅ Blank identifier (_) - supported via Wildcard patterns (Rust, Go, etc.)");
     println!("   ✅ Multiple assignment (a, b = c, d) - supported via tuple assignment");
 
@@ -267,7 +269,9 @@ fn golang_features_analysis() {
 
     println!("\n📊 UPDATED COMPATIBILITY SUMMARY:");
     println!("   ✅ Core Language: 95% compatible (improved!)");
-    println!("   ✅ Type System: 95% compatible (generics fully supported, only missing type assertions)");
+    println!(
+        "   ✅ Type System: 95% compatible (generics fully supported, only missing type assertions)"
+    );
     println!("   ✅ Concurrency: 85% compatible (goroutines, select, defer now supported!)");
     println!(
         "   ✅ Runtime Features: 95% compatible (defer supported, panic/recover via extensions)"

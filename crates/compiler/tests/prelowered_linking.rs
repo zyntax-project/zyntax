@@ -3,14 +3,14 @@
 //! for them, and a call reaches the body the module brought.
 
 use std::sync::{Arc, Mutex};
-use zyntax_compiler::bytecode::{deserialize_module, serialize_module, Format};
+use zyntax_compiler::bytecode::{Format, deserialize_module, serialize_module};
 use zyntax_compiler::hir::{HirCallable, HirInstruction, HirModule};
 use zyntax_compiler::lowering::{AstLowering, LoweringConfig, LoweringContext};
 use zyntax_typed_ast::{
-    typed_node, AstArena, BinaryOp, CallingConvention, InternedString, Mutability, PrimitiveType,
-    Span, Type, TypeRegistry, TypedBinary, TypedBlock, TypedCall, TypedDeclaration,
-    TypedExpression, TypedFunction, TypedLiteral, TypedParameter, TypedProgram, TypedStatement,
-    Visibility,
+    AstArena, BinaryOp, CallingConvention, InternedString, Mutability, PrimitiveType, Span, Type,
+    TypeRegistry, TypedBinary, TypedBlock, TypedCall, TypedDeclaration, TypedExpression,
+    TypedFunction, TypedLiteral, TypedParameter, TypedProgram, TypedStatement, Visibility,
+    typed_node,
 };
 
 const SPAN: Span = Span::new(0, 0);

@@ -230,13 +230,13 @@ impl Analyzer<'_> {
                                         | "float"
                                 ) {
                                     for arg in &c.arguments.args {
-                                        if let py::Expr::Name(n) = arg {
-                                            if matches!(
+                                        if let py::Expr::Name(n) = arg
+                                            && matches!(
                                                 self.name(n.id.as_str()),
                                                 Shape::List(_) | Shape::Dict(_)
-                                            ) {
-                                                self.env.insert(n.id.to_string(), Shape::Dynamic);
-                                            }
+                                            )
+                                        {
+                                            self.env.insert(n.id.to_string(), Shape::Dynamic);
                                         }
                                     }
                                 }
@@ -251,13 +251,13 @@ impl Analyzer<'_> {
                             (Shape::List(inner), "copy") => Shape::List(inner),
                             (_, "len" | "count" | "index" | "copy") => Shape::Dynamic,
                             (_, _) => {
-                                if let py::Expr::Name(n) = &*a.value {
-                                    if matches!(
+                                if let py::Expr::Name(n) = &*a.value
+                                    && matches!(
                                         self.name(n.id.as_str()),
                                         Shape::List(_) | Shape::Dict(_)
-                                    ) {
-                                        self.env.insert(n.id.to_string(), Shape::Dynamic);
-                                    }
+                                    )
+                                {
+                                    self.env.insert(n.id.to_string(), Shape::Dynamic);
                                 }
                                 Shape::Dynamic
                             }
@@ -308,15 +308,14 @@ impl Analyzer<'_> {
             match stmt {
                 py::Stmt::Assign(a) => {
                     let mut shape = self.expr(&a.value);
-                    if let py::Expr::Name(source) = &*a.value {
-                        if a.targets
+                    if let py::Expr::Name(source) = &*a.value
+                        && a.targets
                             .iter()
                             .any(|target| matches!(target, py::Expr::Name(n) if n.id != source.id))
-                            && matches!(shape, Shape::List(_) | Shape::Dict(_))
-                        {
-                            self.env.insert(source.id.to_string(), Shape::Dynamic);
-                            shape = Shape::Dynamic;
-                        }
+                        && matches!(shape, Shape::List(_) | Shape::Dict(_))
+                    {
+                        self.env.insert(source.id.to_string(), Shape::Dynamic);
+                        shape = Shape::Dynamic;
                     }
                     for target in &a.targets {
                         self.bind(target, shape.clone());
@@ -367,23 +366,20 @@ impl Analyzer<'_> {
                     }
                 }
                 py::Stmt::Expr(e) => {
-                    if let py::Expr::Call(c) = &*e.value {
-                        if let py::Expr::Attribute(a) = &*c.func {
-                            if a.attr.as_str() == "append" {
-                                if let py::Expr::Name(n) = &*a.value {
-                                    if let Some(arg) = c.arguments.args.first() {
-                                        let added = self.expr(arg);
-                                        let old = self.name(n.id.as_str());
-                                        if let Shape::List(inner) = old {
-                                            self.env.insert(
-                                                n.id.to_string(),
-                                                Shape::List(Box::new(inner.join(&added))),
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                }
-                            }
+                    if let py::Expr::Call(c) = &*e.value
+                        && let py::Expr::Attribute(a) = &*c.func
+                        && a.attr.as_str() == "append"
+                        && let py::Expr::Name(n) = &*a.value
+                        && let Some(arg) = c.arguments.args.first()
+                    {
+                        let added = self.expr(arg);
+                        let old = self.name(n.id.as_str());
+                        if let Shape::List(inner) = old {
+                            self.env.insert(
+                                n.id.to_string(),
+                                Shape::List(Box::new(inner.join(&added))),
+                            );
+                            continue;
                         }
                     }
                     self.expr(&e.value);

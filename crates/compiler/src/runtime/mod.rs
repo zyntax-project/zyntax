@@ -32,6 +32,6 @@ pub mod executor;
 pub mod task;
 pub mod waker;
 
-pub use executor::{block_on, Executor};
+pub use executor::{Executor, block_on};
 pub use task::Task;
 pub use waker::{Context, Waker};

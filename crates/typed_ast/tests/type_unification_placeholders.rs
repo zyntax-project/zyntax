@@ -113,12 +113,13 @@ fn fibers_unify_through_their_yield_type() {
         .expect("Fiber<i64> and Fiber<_> should unify");
     assert_eq!(unified, Type::Fiber(Box::new(i64_ty())));
 
-    assert!(ctx
-        .unify(
+    assert!(
+        ctx.unify(
             Type::Fiber(Box::new(i64_ty())),
             Type::Fiber(Box::new(f64_ty()))
         )
-        .is_err());
+        .is_err()
+    );
 }
 
 /// Lane count is part of the type — `f32x4` and `f32x8` are distinct even
@@ -136,12 +137,13 @@ fn vectors_unify_only_at_the_same_lane_count() {
         .expect("f32x4 should unify with itself");
     assert_eq!(unified, Type::Vector(Box::new(f32_ty.clone()), 4));
 
-    assert!(ctx
-        .unify(
+    assert!(
+        ctx.unify(
             Type::Vector(Box::new(f32_ty.clone()), 4),
             Type::Vector(Box::new(f32_ty), 8),
         )
-        .is_err());
+        .is_err()
+    );
 }
 
 #[test]
@@ -206,9 +208,10 @@ fn substitutions_reach_inside_a_fiber() {
 #[test]
 fn unit_does_not_unify_with_a_value_type() {
     let mut ctx = ctx();
-    assert!(ctx
-        .unify(Type::Primitive(PrimitiveType::Unit), i64_ty())
-        .is_err());
+    assert!(
+        ctx.unify(Type::Primitive(PrimitiveType::Unit), i64_ty())
+            .is_err()
+    );
 }
 
 /// Primitives are not registered types, so a name that spells one has to

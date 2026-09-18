@@ -333,7 +333,7 @@ use std::ffi::c_char;
 use zyntax_compiler::zrtl::{ZrtlInfo, ZrtlSymbol, ZRTL_VERSION};
 
 /// Plugin info - required for ZRTL dynamic loading
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static _zrtl_info: ZrtlInfo = ZrtlInfo {
     version: ZRTL_VERSION,
     name: b"haxe\0".as_ptr() as *const c_char,
@@ -341,7 +341,7 @@ pub static _zrtl_info: ZrtlInfo = ZrtlInfo {
 
 /// Symbol table - required for ZRTL dynamic loading
 /// Each symbol is { name, function_ptr } with null sentinel at end
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static _zrtl_symbols: [ZrtlSymbol; 8] = [
     ZrtlSymbol {
         name: b"$haxe$trace\0".as_ptr() as *const c_char,

@@ -9,8 +9,8 @@ pub mod loops;
 pub use dominators::DominatorTree;
 pub use loops::{LoopForest, NaturalLoop};
 
-use crate::hir::{HirBlock, HirFunction, HirId, HirInstruction, HirModule, HirValue};
 use crate::CompilerResult;
+use crate::hir::{HirBlock, HirFunction, HirId, HirInstruction, HirModule, HirValue};
 use std::collections::{HashMap, HashSet};
 
 /// Successor block ids of a terminator, derived directly from its targets.

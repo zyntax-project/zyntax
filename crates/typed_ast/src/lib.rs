@@ -88,9 +88,9 @@ pub mod test_dsl;
 pub use arena::{ArenaStatistics, AstArena, InternedString, MemoryUsage};
 
 pub use diagnostics::{
-    codes, Annotation, AnnotationStyle, ConsoleDiagnosticDisplay, Diagnostic, DiagnosticBuilder,
+    Annotation, AnnotationStyle, ConsoleDiagnosticDisplay, Diagnostic, DiagnosticBuilder,
     DiagnosticCode, DiagnosticCollector, DiagnosticDisplay, DiagnosticLevel, Suggestion,
-    SuggestionApplicability,
+    SuggestionApplicability, codes,
 };
 pub use error::{AstError, ErrorReporter, ValidationError};
 pub use source::{Location, SourceFile, SourceMap, Span};
@@ -144,8 +144,6 @@ pub use type_registry::{
 pub use type_registry::BuiltinTraitIds;
 
 pub use typed_ast::{
-    effect_annotation_lists,
-    typed_node,
     BinaryOp,
     ParamOwnership,
     ParameterKind,
@@ -242,6 +240,8 @@ pub use typed_ast::{
     TypedVariantFields,
     TypedWhile,
     UnaryOp,
+    effect_annotation_lists,
+    typed_node,
 };
 
 pub use type_inference::{Constraint, InferenceContext, InferenceError, InferenceOptions};

@@ -4,7 +4,7 @@
 //! with the memory management system, eliminating redundant operations
 //! and improving performance.
 
-use crate::{analysis::ModuleAnalysis, hir::*, optimization::OptimizationPass, CompilerResult};
+use crate::{CompilerResult, analysis::ModuleAnalysis, hir::*, optimization::OptimizationPass};
 use std::collections::{HashMap, HashSet};
 
 /// Memory optimization pass

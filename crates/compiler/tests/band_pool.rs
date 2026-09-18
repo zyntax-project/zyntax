@@ -16,9 +16,10 @@
 //! whole point is to make handing work over cheap, a number is the only
 //! thing that says whether it was.
 
+#![allow(unsafe_op_in_unsafe_fn)]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
-use zyntax_compiler::zrtl::{zyntax_parallel_for, BandPool};
+use zyntax_compiler::zrtl::{BandPool, zyntax_parallel_for};
 
 unsafe extern "C" fn tiny(lo: i64, hi: i64, env: *mut u8) {
     let acc = &*(env as *const AtomicI64);

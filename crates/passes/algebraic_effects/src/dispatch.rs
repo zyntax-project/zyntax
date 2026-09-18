@@ -3,9 +3,9 @@
 use pattern_engine::{Bindings, DeclRewrite, Pattern, Priority, RewriteOutput};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use zyntax_typed_ast::InternedString;
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type, Visibility};
 use zyntax_typed_ast::typed_ast::*;
-use zyntax_typed_ast::InternedString;
 
 pub fn handler_decl_to_impl() -> DeclRewrite {
     // The rewrite keeps the handler declaration it matched, so the

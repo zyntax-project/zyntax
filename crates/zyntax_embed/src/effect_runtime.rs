@@ -45,7 +45,7 @@
 use std::cell::RefCell;
 
 use zyntax_compiler::zrtl::{
-    PrimitiveSize, TypeCategory, TypeFlags, TypeTag, ZrtlSigFlags, ZrtlSymbolSig, MAX_PARAMS,
+    MAX_PARAMS, PrimitiveSize, TypeCategory, TypeFlags, TypeTag, ZrtlSigFlags, ZrtlSymbolSig,
 };
 
 // C `free` for releasing state-machine allocations. The JIT-side
@@ -138,7 +138,7 @@ thread_local! {
 /// `__zyntax_effect_pop_handler` call can verify it's popping the
 /// expected frame. Stack depths in well-formed code are tiny (handlers
 /// rarely nest beyond 2–3), so we don't worry about overflow.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_push_handler(
     effect_id: u64,
     handler_state: *mut u8,
@@ -163,7 +163,7 @@ pub extern "C" fn __zyntax_effect_push_handler(
 /// perform site then falls back to its compile-time static default). The
 /// perform site uses this to pick the drive-vs-call convention at runtime
 /// for an operation with mixed async/sync handlers.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_lookup_op_is_async(effect_id: u64, op_index: u64) -> i64 {
     HANDLER_STACK.with(|stack| {
         let s = stack.borrow();
@@ -183,7 +183,7 @@ pub extern "C" fn __zyntax_effect_lookup_op_is_async(effect_id: u64, op_index: u
 /// the op result directly. `is_async` (0/1) selects. This keeps the perform
 /// site a single straight-line block even for mixed async/sync operations.
 #[cfg(not(target_arch = "wasm32"))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_finish_op(raw: i64, is_async: i64, resume_ptr: *mut u8) -> i64 {
     if is_async != 0 {
         __zyntax_effect_launch_handler(raw as *mut u8, resume_ptr)
@@ -202,7 +202,7 @@ pub extern "C" fn __zyntax_effect_finish_op(raw: i64, is_async: i64, resume_ptr:
 ///
 /// Returns `0` on success, non-zero on detected stack corruption (for
 /// future diagnostics; current callers ignore the value).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_pop_handler(frame_id: u64) -> u64 {
     HANDLER_STACK.with(|stack| {
         let mut s = stack.borrow_mut();
@@ -236,7 +236,7 @@ pub extern "C" fn __zyntax_effect_pop_handler(frame_id: u64) -> u64 {
 ///
 /// All three steps happen in the same call frame; the stack isn't
 /// mutated in between. Safe.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_lookup_handler(effect_id: u64) -> *mut u8 {
     HANDLER_STACK.with(|stack| {
         let s = stack.borrow();
@@ -264,7 +264,7 @@ pub extern "C" fn __zyntax_effect_lookup_handler(effect_id: u64) -> *mut u8 {
 /// The returned pointer is a code address into JIT-compiled memory
 /// held live by the runtime for the program's duration; the caller
 /// invokes it as the handler op's function type.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_lookup_op(effect_id: u64, op_index: u64) -> *mut u8 {
     HANDLER_STACK.with(|stack| {
         let s = stack.borrow();
@@ -292,7 +292,7 @@ pub extern "C" fn __zyntax_effect_lookup_op(effect_id: u64, op_index: u64) -> *m
 /// # Safety
 /// The returned pointer aliases a heap region owned by the enclosing
 /// `with` scope; it stays valid until that scope's `pop_handler`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_lookup_state(effect_id: u64) -> *mut u8 {
     HANDLER_STACK.with(|stack| {
         let s = stack.borrow();
@@ -324,7 +324,7 @@ thread_local! {
 /// current stack depth as the fiber's baseline, then re-pushes any frames
 /// the fiber had open when it last yielded (empty on the first resume).
 /// Returns the baseline so the matching `leave` can restore it.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_fiber_enter(fiber: *mut u8) -> i64 {
     let baseline = HANDLER_STACK.with(|stack| stack.borrow().len());
     let saved = HANDLER_SEGMENTS.with(|segs| segs.borrow_mut().remove(&(fiber as usize)));
@@ -338,7 +338,7 @@ pub extern "C" fn __zyntax_effect_fiber_enter(fiber: *mut u8) -> i64 {
 /// frames the fiber left open (everything above `baseline`) back into its
 /// saved segment and truncates the shared stack to `baseline`, so the
 /// caller sees exactly the stack it had before the resume.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_fiber_leave(fiber: *mut u8, baseline: i64) {
     let base = baseline.max(0) as usize;
     HANDLER_STACK.with(|stack| {
@@ -406,7 +406,7 @@ pub fn leave_handler_frames(baseline: usize) {
 
 /// Drop a fiber's saved handler segment. Called when the fiber is freed so
 /// a later fiber that reuses the same address can't inherit stale frames.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_fiber_forget(fiber: *mut u8) {
     HANDLER_SEGMENTS.with(|segs| {
         segs.borrow_mut().remove(&(fiber as usize));
@@ -618,7 +618,7 @@ struct Resume {
 ///
 /// Returns whatever the recursive poll produces — for single-shot
 /// synchronous resume this is the caller's full computation result.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_resume(resume_struct: *mut u8, value: i64) -> i64 {
     if resume_struct.is_null() {
         // Defensive: null resume struct means placeholder-ABI Tier 1
@@ -803,7 +803,7 @@ pub extern "C" fn __zyntax_effect_resume(resume_struct: *mut u8, value: i64) -> 
 /// `state_machine_ptr`/`poll_fn_ptr` must stay live until the handler
 /// completes (the entry mallocs them; nothing frees them before Ready).
 #[cfg(not(target_arch = "wasm32"))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_launch_handler(promise_ptr: *mut u8, resume_ptr: *mut u8) -> i64 {
     if promise_ptr.is_null() {
         return 0;
@@ -857,7 +857,7 @@ pub extern "C" fn __zyntax_effect_launch_handler(promise_ptr: *mut u8, resume_pt
 /// Same caveat as `__zyntax_effect_resume` — in the placeholder
 /// implementation we just return `value`. Future Tier 3 versions will
 /// unwind the caller's state machine into a terminal "aborted" state.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_effect_abort(value: i64) -> i64 {
     value
 }
@@ -875,7 +875,7 @@ pub extern "C" fn __zyntax_effect_abort(value: i64) -> i64 {
 /// `upgrade_resume_struct_at_perform_sites`) carries `state_machine_ptr`
 /// at offset 8 and `refcount_offset` at offset 32, so this helper can
 /// navigate without needing to know the SM's full layout.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __zyntax_runtime_retain_sm(resume_struct: *mut u8) {
     if resume_struct.is_null() {
         return;
@@ -896,7 +896,7 @@ pub unsafe extern "C" fn __zyntax_runtime_retain_sm(resume_struct: *mut u8) {
 ///
 /// Safe to call multiple times only if matched by retains — a release
 /// past zero would corrupt the refcount and lead to use-after-free.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __zyntax_runtime_release_sm(resume_struct: *mut u8) {
     if resume_struct.is_null() {
         return;
@@ -922,7 +922,7 @@ pub unsafe extern "C" fn __zyntax_runtime_release_sm(resume_struct: *mut u8) {
 /// through a `Resume<T>` struct. Used by `generate_sync_entry`'s
 /// return path where there's no Resume pointer in scope but the
 /// JIT has both pieces of info as constants.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __zyntax_runtime_release_sm_by_offset(
     sm_ptr: *mut u8,
     refcount_offset: i64,
@@ -966,7 +966,7 @@ pub unsafe extern "C" fn __zyntax_runtime_release_sm_by_offset(
 // directly without ZynML-level integration.
 
 #[cfg(not(target_arch = "wasm32"))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_async_set_timeout(handle: i64, ms: i64) {
     // Cooperative native path: record a timer for `handle` and return
     // immediately. The state machine's poll then returns Pending (parks)
@@ -993,7 +993,7 @@ pub extern "C" fn __zyntax_async_set_timeout(handle: i64, ms: i64) {
 // leak into the wasm-bindgen-test runner (which tries to
 // `require()` every import module name at test setup time).
 #[cfg(target_arch = "wasm32")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_async_set_timeout(_handle: i64, _ms: i64) {
     // Intentional no-op. The wasm-target call path goes through
     // JIT-emitted `(import "host" "async_set_timeout@2" ...)` —

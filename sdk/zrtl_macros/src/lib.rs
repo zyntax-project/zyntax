@@ -60,7 +60,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse::Parse, parse::ParseStream, parse_macro_input, DeriveInput, ItemFn, LitStr};
+use syn::{DeriveInput, ItemFn, LitStr, parse::Parse, parse::ParseStream, parse_macro_input};
 
 /// Defines the ZRTL plugin metadata and symbol table infrastructure
 ///

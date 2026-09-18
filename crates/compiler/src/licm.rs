@@ -436,8 +436,8 @@ fn hoist_loop(
                 };
                 if invariant.contains(&res) {
                     continue; // already invariant — was hoisted on
-                              // a prior iteration or wasn't a body
-                              // instruction.
+                    // a prior iteration or wasn't a body
+                    // instruction.
                 }
                 if !is_safe_to_hoist(inst) {
                     continue;

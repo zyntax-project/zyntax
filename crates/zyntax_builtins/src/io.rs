@@ -2,7 +2,7 @@
 //! an error nothing can catch.
 
 use crate::build::*;
-use crate::{list_of, Policy};
+use crate::{Policy, list_of};
 use zyntax_typed_ast::TypeId;
 
 pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {

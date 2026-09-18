@@ -27,12 +27,13 @@ use zyntax_compiler::{
     lowering::{AstLowering, LoweringConfig, LoweringContext},
 };
 use zyntax_typed_ast::{
-    arena::AstArena,
-    typed_ast::{ParameterKind, TypedBinary, TypedBlock, TypedIfExpr, TypedLet, TypedUnary},
-    typed_node, BinaryOp, CallingConvention, ImplDef, MethodImpl, MethodSig, Mutability, ParamDef,
+    BinaryOp, CallingConvention, ImplDef, MethodImpl, MethodSig, Mutability, ParamDef,
     PrimitiveType, Span, TraitDef, Type, TypeId, TypeRegistry, TypedCall, TypedDeclaration,
     TypedExpression, TypedFunction, TypedLiteral, TypedParameter, TypedProgram, TypedStatement,
     UnaryOp, Visibility,
+    arena::AstArena,
+    typed_ast::{ParameterKind, TypedBinary, TypedBlock, TypedIfExpr, TypedLet, TypedUnary},
+    typed_node,
 };
 
 /// Helper to create a test arena
@@ -1712,16 +1713,18 @@ fn test_growable_list_of_tuple_values_lowering() {
         } if matches!(&**inner, zyntax_compiler::hir::HirType::Struct(s)
             if s.fields == vec![zyntax_compiler::hir::HirType::I64, zyntax_compiler::hir::HirType::F64]))
     }));
-    assert!(function
-        .blocks
-        .values()
-        .flat_map(|block| &block.instructions)
-        .any(|instruction| {
-            matches!(instruction, HirInstruction::ExtractValue {
+    assert!(
+        function
+            .blocks
+            .values()
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| {
+                matches!(instruction, HirInstruction::ExtractValue {
             ty: zyntax_compiler::hir::HirType::F64,
             indices, ..
         } if indices == &[1])
-        }));
+            })
+    );
     #[cfg(feature = "cranelift-backend")]
     zyntax_compiler::cranelift_backend::CraneliftBackend::new()
         .expect("Cranelift backend")

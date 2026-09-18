@@ -11,14 +11,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use zyntax_compiler::{
+    CompilationConfig,
+    CompilerError,
     cranelift_backend::CraneliftBackend,
     hir::{HirId, HirModule},
     lowering::AstLowering, // For lower_program trait method
     runtime::{Executor, Waker as RuntimeWaker},
     tiered_backend::{OptimizationTier, TieredBackend, TieredConfig, TieredStatistics},
     zrtl::DynamicValue,
-    CompilationConfig,
-    CompilerError,
 };
 
 /// Route the SDK's strings and boxes through the program's heap, so
@@ -53,8 +53,8 @@ use native_call::{
     call_dynamic_function, call_native_with_signature, call_with_signature, dynamic_to_i64,
 };
 pub use promise::{
-    drive_tasks, AsyncPollResult, PromiseAll, PromiseAllSettled, PromiseAllState, PromiseRace,
-    PromiseRaceState, PromiseState, SettledResult, ZyntaxPromise,
+    AsyncPollResult, PromiseAll, PromiseAllSettled, PromiseAllState, PromiseRace, PromiseRaceState,
+    PromiseState, SettledResult, ZyntaxPromise, drive_tasks,
 };
 pub use tiered::{
     EffectHandlerToken, FiberToken, HandlerContext, HandlerContextScope, HandlerFrame,

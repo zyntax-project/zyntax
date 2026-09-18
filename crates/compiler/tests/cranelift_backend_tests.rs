@@ -10,7 +10,7 @@ use cranelift_codegen::isa::CallConv;
 use std::collections::HashSet;
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::*;
-use zyntax_typed_ast::{arena::AstArena, InternedString};
+use zyntax_typed_ast::{InternedString, arena::AstArena};
 
 /// Test basic function compilation
 #[test]
@@ -3098,10 +3098,7 @@ unsafe fn jit_f32_to_f32(
     backend.compile_function(id, &func).ok()?;
     backend.finalize_definitions().ok()?;
     let raw = backend.get_function_ptr(id)?;
-    Some(std::mem::transmute::<
-        *const u8,
-        unsafe extern "C" fn(f32) -> f32,
-    >(raw))
+    Some(unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn(f32) -> f32>(raw) })
 }
 
 /// Helper: compile, finalize, and return a `fn(i32) -> i32` function pointer.
@@ -3113,10 +3110,7 @@ unsafe fn jit_i32_to_i32(
     backend.compile_function(id, &func).ok()?;
     backend.finalize_definitions().ok()?;
     let raw = backend.get_function_ptr(id)?;
-    Some(std::mem::transmute::<
-        *const u8,
-        unsafe extern "C" fn(i32) -> i32,
-    >(raw))
+    Some(unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn(i32) -> i32>(raw) })
 }
 
 /// Execution: VectorSplat f32 → extract lane 0 → should return the original scalar.
@@ -3315,10 +3309,7 @@ unsafe fn jit_ptr_to_f32(
     backend.compile_function(id, &func).ok()?;
     backend.finalize_definitions().ok()?;
     let raw = backend.get_function_ptr(id)?;
-    Some(std::mem::transmute::<
-        *const u8,
-        unsafe extern "C" fn(*const f32) -> f32,
-    >(raw)) // safe: ABI matches
+    Some(unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn(*const f32) -> f32>(raw) }) // safe: ABI matches
 }
 
 /// Contract: VectorLoad compiles for F32X4 without error.

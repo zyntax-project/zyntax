@@ -578,7 +578,7 @@ pub(super) unsafe fn call_native_with_signature(
             return Err(RuntimeError::Execution(format!(
                 "Unsupported argument count: {}. Maximum is 8.",
                 n
-            )))
+            )));
         }
     };
 
@@ -710,9 +710,10 @@ pub(super) unsafe fn call_dynamic_function(
             )
         }
         n => {
-            return Err(RuntimeError::Execution(
-                format!("Functions with {} arguments not supported (max 8). Consider using a struct-based calling convention.", n)
-            ));
+            return Err(RuntimeError::Execution(format!(
+                "Functions with {} arguments not supported (max 8). Consider using a struct-based calling convention.",
+                n
+            )));
         }
     };
     Ok(result)

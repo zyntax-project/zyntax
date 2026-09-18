@@ -15,8 +15,8 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use zyntax_typed_ast::{InternedString, Span, Type, TypeId};
 
 // ============================================================================

@@ -7,14 +7,14 @@
 
 use crate::arena::InternedString;
 use crate::constraint_solver::{Constraint as SolverConstraint, ConstraintSolver};
-use crate::diagnostics::{codes, DiagnosticCollector};
+use crate::diagnostics::{DiagnosticCollector, codes};
 use crate::multi_paradigm_checker::Paradigm;
 use crate::source::Span;
 use crate::type_inference::{InferenceContext, InferenceError};
 use crate::type_registry::{
     CallingConvention, MethodSig, Mutability, ParamInfo, PrimitiveType, Type, TypeBound, Visibility,
 };
-use crate::{typed_ast::*, AsyncKind};
+use crate::{AsyncKind, typed_ast::*};
 use std::collections::HashMap;
 
 /// Type checking context

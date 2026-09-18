@@ -10,10 +10,10 @@ use indexmap::IndexMap;
 use std::collections::HashSet;
 use zyntax_compiler::{
     // Effect analysis
-    effect_analysis::{analyze_effects, EffectErrorKind},
+    effect_analysis::{EffectErrorKind, analyze_effects},
     // Codegen
     effect_codegen::{
-        analyze_handle_effect, get_handler_ops_info, mangle_handler_op_name, EffectCodegenContext,
+        EffectCodegenContext, analyze_handle_effect, get_handler_ops_info, mangle_handler_op_name,
     },
     // Handler resolution
     effect_handler_resolution::resolve_handlers,
@@ -265,10 +265,12 @@ fn test_effect_analysis_pure_violation() {
 
     // Should have a pure violation error
     assert!(!result.errors.is_empty());
-    assert!(result
-        .errors
-        .iter()
-        .any(|e| matches!(e.kind, EffectErrorKind::PureViolation)));
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, EffectErrorKind::PureViolation))
+    );
 }
 
 #[test]

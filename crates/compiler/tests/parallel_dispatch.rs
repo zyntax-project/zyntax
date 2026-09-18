@@ -7,6 +7,7 @@
 //! finished when the call returns, and that a range too small to be
 //! worth splitting is not split.
 
+#![allow(unsafe_op_in_unsafe_fn)]
 use std::sync::atomic::{AtomicI64, Ordering};
 use zyntax_compiler::zrtl::zyntax_parallel_for;
 

@@ -10,7 +10,7 @@
 //! reruns under a real browser to verify wasm-bindgen's binding
 //! generation hasn't drifted from the Rust signatures.
 
-use zyntax_wasm::{_zyntax_run_async, run, version, ErrorKind};
+use zyntax_wasm::{_zyntax_run_async, ErrorKind, run, version};
 
 #[test]
 fn version_is_self_describing() {

@@ -1,7 +1,7 @@
 use crate::bindings::Bindings;
 use crate::context::{LoweringTarget, MatchContext};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use zyntax_typed_ast::typed_ast::TypedNode;
 
 /// Unique pattern identifier.
@@ -76,11 +76,7 @@ impl<T: 'static> Pattern<T> {
             name: self.name,
             predicate: Arc::new(
                 move |node, ctx| {
-                    if guard(ctx) {
-                        inner(node, ctx)
-                    } else {
-                        None
-                    }
+                    if guard(ctx) { inner(node, ctx) } else { None }
                 },
             ),
         }

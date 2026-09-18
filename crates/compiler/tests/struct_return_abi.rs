@@ -368,7 +368,7 @@ fn cranelift_keeps_a_returned_argument_separate_from_the_argument() {
 
 #[test]
 fn the_interpreter_keeps_a_returned_argument_separate_from_the_argument() {
-    use zyntax_compiler::hir_interp::{value_to_i64, HirInterpreter};
+    use zyntax_compiler::hir_interp::{HirInterpreter, value_to_i64};
 
     let (module, _) = build_echo_module();
     let mut interp = HirInterpreter::new();
@@ -378,7 +378,7 @@ fn the_interpreter_keeps_a_returned_argument_separate_from_the_argument() {
 
 #[test]
 fn the_interpreter_gives_two_calls_two_values() {
-    use zyntax_compiler::hir_interp::{value_to_i64, HirInterpreter};
+    use zyntax_compiler::hir_interp::{HirInterpreter, value_to_i64};
 
     let (module, _) = build_module();
     let mut interp = HirInterpreter::new();

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use zynml::{Grammar2, ZYNML_GRAMMAR};
-use zyntax_embed::{compile_to_hir, CompilationConfig};
+use zyntax_embed::{CompilationConfig, compile_to_hir};
 
 fn lower(src: &str) -> zyntax_compiler::hir::HirModule {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("ZynML grammar should compile");

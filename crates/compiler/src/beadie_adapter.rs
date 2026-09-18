@@ -166,7 +166,7 @@ impl JitBackend for ZyntaxCraneliftBackend {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "llvm-backend")]
-pub use llvm_impl::{build_llvm_backend, LlvmContextKeepAlive, ZyntaxLlvmBackend};
+pub use llvm_impl::{LlvmContextKeepAlive, ZyntaxLlvmBackend, build_llvm_backend};
 
 #[cfg(feature = "llvm-backend")]
 mod llvm_impl {

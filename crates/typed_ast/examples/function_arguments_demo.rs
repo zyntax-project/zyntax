@@ -5,8 +5,8 @@
 //! demonstrating how it handles various parameter passing conventions from different languages.
 
 use zyntax_typed_ast::{
-    typed_ast::*, AstArena, AsyncKind, CallingConvention, Mutability, NullabilityKind, ParamInfo,
-    PrimitiveType, Span, Type, TypeId, Visibility,
+    AstArena, AsyncKind, CallingConvention, Mutability, NullabilityKind, ParamInfo, PrimitiveType,
+    Span, Type, TypeId, Visibility, typed_ast::*,
 };
 
 /// Demonstrates basic positional arguments (C, Go, Java style)

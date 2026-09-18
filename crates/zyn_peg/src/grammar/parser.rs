@@ -844,7 +844,7 @@ impl<'a> GrammarParser<'a> {
                             type_name: "Option".to_string(),
                             variant: "None".to_string(),
                             value: None,
-                        })
+                        });
                     }
                     _ => {}
                 }

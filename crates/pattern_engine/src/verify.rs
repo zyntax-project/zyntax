@@ -1,6 +1,6 @@
+use zyntax_typed_ast::TypeRegistry;
 use zyntax_typed_ast::type_checker::{TypeCheckOptions, TypeChecker};
 use zyntax_typed_ast::typed_ast::TypedProgram;
-use zyntax_typed_ast::TypeRegistry;
 
 /// Run the type checker on the program to verify soundness after a rewrite iteration.
 /// Returns any type errors found.

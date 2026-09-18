@@ -45,11 +45,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use zynml::{ZynML, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD, ZYNML_STDLIB_TENSOR};
-use zyntax_compiler::bytecode::{deserialize_module, serialize_module, Format};
+use zynml::{ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD, ZYNML_STDLIB_TENSOR, ZynML};
+use zyntax_compiler::HirModule;
+use zyntax_compiler::bytecode::{Format, deserialize_module, serialize_module};
 use zyntax_compiler::profiling::ProfileConfig;
 use zyntax_compiler::tiered_backend::TieredConfig;
-use zyntax_compiler::HirModule;
 use zyntax_embed::ZyntaxValue;
 
 /// Bumped manually when the compiler's HIR schema changes (new variants,
@@ -1574,7 +1574,9 @@ fn print_verdicts(suite: &Suite) {
     if lines.is_empty() {
         return;
     }
-    eprintln!("\nzypy against the best Python runtime on this machine (setup + compile + exec vs the interpreter's process):");
+    eprintln!(
+        "\nzypy against the best Python runtime on this machine (setup + compile + exec vs the interpreter's process):"
+    );
     for line in lines {
         eprintln!("{line}");
     }

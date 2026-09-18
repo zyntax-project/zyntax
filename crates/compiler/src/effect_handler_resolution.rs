@@ -18,13 +18,13 @@
 //! - Convert to direct function calls when handler is known at compile time
 //! - Eliminate handler overhead for pure handlers
 
+use crate::CompilerError;
+use crate::CompilerResult;
 use crate::effect_analysis::{HandlerScope, ModuleEffectAnalysis};
 use crate::hir::{
     HirBlock, HirEffect, HirEffectHandler, HirEffectHandlerImpl, HirFunction, HirId,
     HirInstruction, HirModule, HirTerminator, HirType,
 };
-use crate::CompilerError;
-use crate::CompilerResult;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use zyntax_typed_ast::InternedString;

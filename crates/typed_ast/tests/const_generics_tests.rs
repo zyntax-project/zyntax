@@ -4,12 +4,12 @@
 //! compile-time constant evaluation in type parameters.
 
 use std::collections::HashMap;
+use zyntax_typed_ast::AstArena;
 use zyntax_typed_ast::const_evaluator::{ConstConstraint, ConstEvalContext, ConstEvaluator};
 use zyntax_typed_ast::multi_paradigm_checker::Paradigm;
 use zyntax_typed_ast::type_registry::{
     ConstBinaryOp, ConstValue, NullabilityKind, PrimitiveType, Type, TypeId,
 };
-use zyntax_typed_ast::AstArena;
 
 /// Test basic const generics type creation and validation
 #[test]

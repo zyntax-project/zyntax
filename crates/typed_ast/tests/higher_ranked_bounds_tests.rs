@@ -2,6 +2,7 @@
 // Tests for higher-ranked trait bounds (for<'a>)
 
 use std::collections::HashMap;
+use zyntax_typed_ast::InternedString;
 use zyntax_typed_ast::arena::AstArena;
 use zyntax_typed_ast::constraint_solver::{Constraint, ConstraintSolver, SolverError};
 use zyntax_typed_ast::source::Span;
@@ -9,7 +10,6 @@ use zyntax_typed_ast::type_registry::{
     ImplDef, Lifetime, MethodImpl, MethodSig, ParamDef, PrimitiveType, TraitDef, Type, TypeBound,
     TypeConstraint, TypeId, TypeParam, TypeRegistry, Visibility,
 };
-use zyntax_typed_ast::InternedString;
 use zyntax_typed_ast::{AsyncKind, CallingConvention, NullabilityKind};
 
 #[test]

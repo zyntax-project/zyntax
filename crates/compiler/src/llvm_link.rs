@@ -315,7 +315,7 @@ pub fn load_dylib(
     symbols: &[String],
 ) -> Result<(libloading::Library, HashMap<String, usize>), LinkError> {
     use std::fs::OpenOptions;
-    use std::sync::atomic::{fence, Ordering};
+    use std::sync::atomic::{Ordering, fence};
 
     // Force the dylib's contents to disk and ensure metadata visibility.
     // Overlay-FS / tmpfs / NFS can leave a window where `close()` has

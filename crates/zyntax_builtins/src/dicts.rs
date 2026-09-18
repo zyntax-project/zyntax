@@ -6,7 +6,7 @@
 //! probe. A set is a list of distinct values, searched linearly.
 
 use crate::build::*;
-use crate::{list_of, DICT_TAG, SET_TAG, TUPLE_TAG};
+use crate::{DICT_TAG, SET_TAG, TUPLE_TAG, list_of};
 use zyntax_typed_ast::TypeId;
 
 fn any_eq(a: Expr, b: Expr) -> Expr {

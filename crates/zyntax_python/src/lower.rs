@@ -11,7 +11,7 @@
 use crate::scope::Scope;
 use crate::stdlib;
 use crate::types::{self, Elem, Locals, Module, Sig, Ty, Typer};
-use crate::{intern, prim, span_of, Error, Result};
+use crate::{Error, Result, intern, prim, span_of};
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
 use std::collections::{BTreeSet, HashMap};
@@ -818,31 +818,31 @@ impl<'m> Lowerer<'m> {
     /// recording one when the loop it means is outside the body.
     fn emit_loop_exit(&mut self, code: i64, span: Span, out: &mut Vec<Stmt>) {
         self.release_left_handlers(false, span, out);
-        if let Some(ctl) = self.try_ctls.last() {
-            if ctl.loop_depth == 0 {
-                let flag = ctl.flag;
-                self.set_flag_and_leave(flag, code, span, out);
-                return;
-            }
+        if let Some(ctl) = self.try_ctls.last()
+            && ctl.loop_depth == 0
+        {
+            let flag = ctl.flag;
+            self.set_flag_and_leave(flag, code, span, out);
+            return;
         }
-        if code == 2 {
-            if let Some(Some(flag)) = self.loop_elses.last() {
-                out.push(TypedNode::new(
-                    TypedStatement::Expression(Box::new(binary(
-                        BinaryOp::Assign,
-                        var(*flag, Ty::Bool, span),
-                        node(
-                            TypedExpression::Literal(TypedLiteral::Bool(false)),
-                            Ty::Bool,
-                            span,
-                        ),
-                        Ty::None,
+        if code == 2
+            && let Some(Some(flag)) = self.loop_elses.last()
+        {
+            out.push(TypedNode::new(
+                TypedStatement::Expression(Box::new(binary(
+                    BinaryOp::Assign,
+                    var(*flag, Ty::Bool, span),
+                    node(
+                        TypedExpression::Literal(TypedLiteral::Bool(false)),
+                        Ty::Bool,
                         span,
-                    ))),
-                    Type::Unknown,
+                    ),
+                    Ty::None,
                     span,
-                ));
-            }
+                ))),
+                Type::Unknown,
+                span,
+            ));
         }
         let st = if code == 2 {
             TypedStatement::Break(None)
@@ -2007,34 +2007,35 @@ impl<'m> Lowerer<'m> {
         }
         // Likewise a `return`, `break` or `continue` recorded inside a
         // loop: leave this level too.
-        if self.redirected && matches!(s, py::Stmt::For(_) | py::Stmt::While(_)) {
-            if let Some(ctl) = self.try_ctls.last() {
-                let flag = ctl.flag;
-                let sp = span_of(s);
-                out.push(TypedNode::new(
-                    TypedStatement::If(TypedIf {
-                        condition: Box::new(binary(
-                            BinaryOp::Ne,
-                            var(flag, Ty::Int, sp),
-                            int_lit(0, sp),
-                            Ty::Bool,
+        if self.redirected
+            && matches!(s, py::Stmt::For(_) | py::Stmt::While(_))
+            && let Some(ctl) = self.try_ctls.last()
+        {
+            let flag = ctl.flag;
+            let sp = span_of(s);
+            out.push(TypedNode::new(
+                TypedStatement::If(TypedIf {
+                    condition: Box::new(binary(
+                        BinaryOp::Ne,
+                        var(flag, Ty::Int, sp),
+                        int_lit(0, sp),
+                        Ty::Bool,
+                        sp,
+                    )),
+                    then_block: TypedBlock {
+                        statements: vec![TypedNode::new(
+                            TypedStatement::Break(None),
+                            Type::Unknown,
                             sp,
-                        )),
-                        then_block: TypedBlock {
-                            statements: vec![TypedNode::new(
-                                TypedStatement::Break(None),
-                                Type::Unknown,
-                                sp,
-                            )],
-                            span: sp,
-                        },
-                        else_block: None,
+                        )],
                         span: sp,
-                    }),
-                    Type::Unknown,
-                    sp,
-                ));
-            }
+                    },
+                    else_block: None,
+                    span: sp,
+                }),
+                Type::Unknown,
+                sp,
+            ));
         }
         self.raised |= raised_before;
         Ok(())
@@ -2097,14 +2098,13 @@ impl<'m> Lowerer<'m> {
             }
             py::Stmt::Expr(e) => {
                 // A bare name of a builtin as a statement does nothing.
-                if let py::Expr::Name(n) = &*e.value {
-                    if !self.is_variable(n.id.as_str())
-                        && !self.module.funcs.contains_key(n.id.as_str())
-                        && !self.module.class_index.contains_key(n.id.as_str())
-                        && types::builtin_index(n.id.as_str()).is_some()
-                    {
-                        return Ok(());
-                    }
+                if let py::Expr::Name(n) = &*e.value
+                    && !self.is_variable(n.id.as_str())
+                    && !self.module.funcs.contains_key(n.id.as_str())
+                    && !self.module.class_index.contains_key(n.id.as_str())
+                    && types::builtin_index(n.id.as_str()).is_some()
+                {
+                    return Ok(());
                 }
                 let v = self.expr(&e.value)?;
                 push(out, TypedStatement::Expression(Box::new(v.node)));
@@ -2146,49 +2146,45 @@ impl<'m> Lowerer<'m> {
                 // A literal that says nothing of its elements is built
                 // as the list its name or field holds, which inference
                 // typed by what the program puts in it.
-                if let [target] = a.targets.as_slice() {
-                    if let Some(count) = types::unkinded_list(&a.value) {
-                        let kind = match target {
-                            py::Expr::Name(n) => match self.var_ty(n.id.as_str()) {
-                                Ty::List(e) if e != Elem::Object => Some(e),
-                                _ => None,
-                            },
-                            py::Expr::Attribute(attr) => match self.ty_of(&attr.value) {
-                                Ty::Class(k) => {
-                                    match self.module.field(k as usize, attr.attr.as_str()) {
-                                        Some((_, Ty::List(e))) if e != Elem::Object => Some(e),
-                                        _ => None,
-                                    }
-                                }
-                                _ => None,
-                            },
+                if let [target] = a.targets.as_slice()
+                    && let Some(count) = types::unkinded_list(&a.value)
+                {
+                    let kind = match target {
+                        py::Expr::Name(n) => match self.var_ty(n.id.as_str()) {
+                            Ty::List(e) if e != Elem::Object => Some(e),
                             _ => None,
-                        };
-                        if let Some(e) = kind {
-                            let items = if types::is_empty_list(&a.value) {
-                                Vec::new()
-                            } else {
-                                let none = node(
-                                    TypedExpression::Literal(TypedLiteral::Null),
-                                    Ty::None,
-                                    span,
-                                );
-                                vec![Val {
-                                    node: none,
-                                    ty: Ty::None,
-                                }]
-                            };
-                            let mut value = Val {
-                                node: self.list_of(items, e, span),
-                                ty: Ty::List(e),
-                            };
-                            if let Some(n) = count {
-                                let times = self.expr(n)?;
-                                value =
-                                    self.arithmetic(py::Operator::Mult, value, times, n, span)?;
+                        },
+                        py::Expr::Attribute(attr) => match self.ty_of(&attr.value) {
+                            Ty::Class(k) => {
+                                match self.module.field(k as usize, attr.attr.as_str()) {
+                                    Some((_, Ty::List(e))) if e != Elem::Object => Some(e),
+                                    _ => None,
+                                }
                             }
-                            return self.bind(target, value, span, out);
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(e) = kind {
+                        let items = if types::is_empty_list(&a.value) {
+                            Vec::new()
+                        } else {
+                            let none =
+                                node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span);
+                            vec![Val {
+                                node: none,
+                                ty: Ty::None,
+                            }]
+                        };
+                        let mut value = Val {
+                            node: self.list_of(items, e, span),
+                            ty: Ty::List(e),
+                        };
+                        if let Some(n) = count {
+                            let times = self.expr(n)?;
+                            value = self.arithmetic(py::Operator::Mult, value, times, n, span)?;
                         }
+                        return self.bind(target, value, span, out);
                     }
                 }
                 // `a = b = v` evaluates `v` once and binds each target
@@ -2419,14 +2415,13 @@ impl<'m> Lowerer<'m> {
             py::Stmt::Assert(a) => {
                 // `assert isinstance(x, C)` right after `x = v`: the
                 // binding checked already.
-                if let py::Expr::Call(c) = &*a.test {
-                    if types::is_name(&c.func, "isinstance") && c.arguments.args.len() == 2 {
-                        if let py::Expr::Name(x) = &c.arguments.args[0] {
-                            if self.locals.narrowed.contains_key(x.id.as_str()) {
-                                return Ok(());
-                            }
-                        }
-                    }
+                if let py::Expr::Call(c) = &*a.test
+                    && types::is_name(&c.func, "isinstance")
+                    && c.arguments.args.len() == 2
+                    && let py::Expr::Name(x) = &c.arguments.args[0]
+                    && self.locals.narrowed.contains_key(x.id.as_str())
+                {
+                    return Ok(());
                 }
                 let test = self.expr(&a.test)?;
                 let cond = self.truthy(test);
@@ -2749,7 +2744,7 @@ impl<'m> Lowerer<'m> {
                         return unsupported(
                             format!("item assignment on {}", types::expr_kind(&sub.value)),
                             target,
-                        )
+                        );
                     }
                 };
                 let fallible = match &stmt.node {
@@ -2865,7 +2860,7 @@ impl<'m> Lowerer<'m> {
                 return Ok(());
             }
             other => {
-                return unsupported(format!("assignment to {}", types::expr_kind(other)), other)
+                return unsupported(format!("assignment to {}", types::expr_kind(other)), other);
             }
         };
         let ty = self.var_ty(n.id.as_str());
@@ -2888,33 +2883,33 @@ impl<'m> Lowerer<'m> {
                 self.nonnull.remove(&name);
             }
         }
-        if !self.comp_symbols.contains_key(n.id.as_str()) {
-            if let Some(cell) = self.cells.get(n.id.as_str()).copied() {
-                if check_after {
-                    self.guards = false;
-                }
-                let value = self.coerce(value, ty);
-                if check_after {
-                    self.guards = true;
-                }
-                let boxed = self.coerce(Val { node: value, ty }, Ty::Object);
-                let set = binary(
-                    BinaryOp::Assign,
-                    slot(var(cell, Ty::List(Elem::Object), span), 0, Ty::Object, span),
-                    boxed,
-                    Ty::None,
-                    span,
-                );
-                out.push(TypedNode::new(
-                    TypedStatement::Expression(Box::new(set)),
-                    Type::Unknown,
-                    span,
-                ));
-                if check_after {
-                    out.push(self.pending_check(span));
-                }
-                return Ok(());
+        if !self.comp_symbols.contains_key(n.id.as_str())
+            && let Some(cell) = self.cells.get(n.id.as_str()).copied()
+        {
+            if check_after {
+                self.guards = false;
             }
+            let value = self.coerce(value, ty);
+            if check_after {
+                self.guards = true;
+            }
+            let boxed = self.coerce(Val { node: value, ty }, Ty::Object);
+            let set = binary(
+                BinaryOp::Assign,
+                slot(var(cell, Ty::List(Elem::Object), span), 0, Ty::Object, span),
+                boxed,
+                Ty::None,
+                span,
+            );
+            out.push(TypedNode::new(
+                TypedStatement::Expression(Box::new(set)),
+                Type::Unknown,
+                span,
+            ));
+            if check_after {
+                out.push(self.pending_check(span));
+            }
+            return Ok(());
         }
         if self.is_global(n.id.as_str()) {
             let stored = Self::storage(ty);
@@ -3537,7 +3532,7 @@ impl<'m> Lowerer<'m> {
                 ty: Ty::Object,
             },
             stdlib::Member::Func { .. } => {
-                return unsupported(format!("`{name}` of a module as a value"), e)
+                return unsupported(format!("`{name}` of a module as a value"), e);
             }
         })
     }
@@ -3608,13 +3603,13 @@ impl<'m> Lowerer<'m> {
                 return Ok(Val {
                     node: call("zb_exit", vec![int_lit(0, span)], Ty::None, span),
                     ty: Ty::None,
-                })
+                });
             }
             ("zb_exit", 1) if matches!(&args[0], py::Expr::NoneLiteral(_)) => {
                 return Ok(Val {
                     node: call("zb_exit", vec![int_lit(0, span)], Ty::None, span),
                     ty: Ty::None,
-                })
+                });
             }
             ("zb_math_log", 2) => (vec![Ty::Float, Ty::Float], "zb_math_log_base"),
             _ => (params.to_vec(), zb),
@@ -3723,35 +3718,36 @@ impl<'m> Lowerer<'m> {
     /// The typed list an iterable argument stands for: a `range(...)` is
     /// its ints, a string its characters, anything else what it holds.
     fn sequence(&mut self, e: &py::Expr, span: Span) -> Result<Val> {
-        if let py::Expr::Call(rc) = e {
-            if types::is_name(&rc.func, "range") && rc.arguments.keywords.is_empty() {
-                let mut bounds = Vec::new();
-                for a in rc.arguments.args.iter() {
-                    bounds.push(self.expr_as(a, Ty::Int)?);
-                }
-                let (start, stop, step) = match bounds.len() {
-                    1 => (int_lit(0, span), bounds.remove(0), int_lit(1, span)),
-                    2 => {
-                        let stop = bounds.remove(1);
-                        (bounds.remove(0), stop, int_lit(1, span))
-                    }
-                    3 => {
-                        let step = bounds.remove(2);
-                        let stop = bounds.remove(1);
-                        (bounds.remove(0), stop, step)
-                    }
-                    _ => return unsupported("range() with more than three arguments", rc),
-                };
-                return Ok(Val {
-                    node: call(
-                        "zb_list_range",
-                        vec![start, stop, step],
-                        Ty::List(Elem::Int),
-                        span,
-                    ),
-                    ty: Ty::List(Elem::Int),
-                });
+        if let py::Expr::Call(rc) = e
+            && types::is_name(&rc.func, "range")
+            && rc.arguments.keywords.is_empty()
+        {
+            let mut bounds = Vec::new();
+            for a in rc.arguments.args.iter() {
+                bounds.push(self.expr_as(a, Ty::Int)?);
             }
+            let (start, stop, step) = match bounds.len() {
+                1 => (int_lit(0, span), bounds.remove(0), int_lit(1, span)),
+                2 => {
+                    let stop = bounds.remove(1);
+                    (bounds.remove(0), stop, int_lit(1, span))
+                }
+                3 => {
+                    let step = bounds.remove(2);
+                    let stop = bounds.remove(1);
+                    (bounds.remove(0), stop, step)
+                }
+                _ => return unsupported("range() with more than three arguments", rc),
+            };
+            return Ok(Val {
+                node: call(
+                    "zb_list_range",
+                    vec![start, stop, step],
+                    Ty::List(Elem::Int),
+                    span,
+                ),
+                ty: Ty::List(Elem::Int),
+            });
         }
         let v = self.expr(e)?;
         Ok(match v.ty {
@@ -3838,7 +3834,7 @@ impl<'m> Lowerer<'m> {
                 Some("key") => key = Some(self.callable_value(&kw.value)?),
                 Some("reverse") => reverse = Some(self.expr_as(&kw.value, Ty::Bool)?),
                 Some(other) => {
-                    return unsupported(format!("the keyword argument `{other}` here"), c)
+                    return unsupported(format!("the keyword argument `{other}` here"), c);
                 }
                 None => return unsupported("** in a call", c),
             }
@@ -4459,7 +4455,7 @@ impl<'m> Lowerer<'m> {
                     return Ok(Val {
                         node: binary(BinaryOp::Add, left.node, right.node, Ty::Str, span),
                         ty: Ty::Str,
-                    })
+                    });
                 }
                 (py::Operator::Mult, Ty::Str, Ty::Int | Ty::Bool) => {
                     let n = self.coerce(right, Ty::Int);
@@ -4707,17 +4703,17 @@ impl<'m> Lowerer<'m> {
                 ) {
                     return Ok(self.truthy(r));
                 }
-                if name == "__ne__" {
-                    if let Some(r) = self.dunder(
+                if name == "__ne__"
+                    && let Some(r) = self.dunder(
                         k as usize,
                         "__eq__",
                         left.node.clone(),
                         vec![right.clone()],
                         span,
-                    ) {
-                        let t = self.truthy(r);
-                        return Ok(negate(t));
-                    }
+                    )
+                {
+                    let t = self.truthy(r);
+                    return Ok(negate(t));
                 }
                 if matches!(op, py::CmpOp::Eq | py::CmpOp::NotEq) {
                     // No `__eq__`: identity.
@@ -4864,7 +4860,7 @@ impl<'m> Lowerer<'m> {
                     return Err(Error::unsupported_span(
                         "this comparison of sets".to_string(),
                         span,
-                    ))
+                    ));
                 }
             });
         }
@@ -5463,7 +5459,7 @@ impl<'m> Lowerer<'m> {
                                     span.start as u32,
                                 )),
                             ),
-                        )
+                        );
                     }
                 };
                 Ok(Val { node, ty })
@@ -5528,7 +5524,7 @@ impl<'m> Lowerer<'m> {
                         return Err(Error::unsupported_span(
                             format!("dict.{name} with {} argument(s)", args.len()),
                             span,
-                        ))
+                        ));
                     }
                 };
                 Ok(Val { node, ty })
@@ -5579,7 +5575,7 @@ impl<'m> Lowerer<'m> {
                         return Err(Error::unsupported_span(
                             format!("set.{name} with {} argument(s)", args.len()),
                             span,
-                        ))
+                        ));
                     }
                 };
                 Ok(Val { node, ty })
@@ -5625,7 +5621,7 @@ impl<'m> Lowerer<'m> {
                         return Err(Error::unsupported_span(
                             format!("str.{name} with {} argument(s)", args.len()),
                             span,
-                        ))
+                        ));
                     }
                 };
                 Ok(Val { node, ty })
@@ -5642,33 +5638,32 @@ impl<'m> Lowerer<'m> {
     fn call(&mut self, c: &py::ExprCall, ty: Ty, span: Span) -> Result<Val> {
         let args = &c.arguments.args;
         let keywords = &c.arguments.keywords;
-        if let py::Expr::Attribute(a) = &*c.func {
-            if types::is_name(&a.value, "frozenset")
-                && a.attr.as_str() == "union"
-                && !self.is_variable("frozenset")
-                && keywords.is_empty()
-                && !args.is_empty()
-            {
-                let mut result = self.expr_as(&args[0], Ty::Set)?;
-                for arg in &args[1..] {
-                    let other = self.expr_as(arg, Ty::Set)?;
-                    result = call("zb_set_or", vec![result, other], Ty::Set, span);
-                }
-                if args.len() == 1 {
-                    result = call("zb_list_copy_any", vec![result], Ty::Set, span);
-                }
-                return Ok(Val {
-                    node: result,
-                    ty: Ty::Set,
-                });
+        if let py::Expr::Attribute(a) = &*c.func
+            && types::is_name(&a.value, "frozenset")
+            && a.attr.as_str() == "union"
+            && !self.is_variable("frozenset")
+            && keywords.is_empty()
+            && !args.is_empty()
+        {
+            let mut result = self.expr_as(&args[0], Ty::Set)?;
+            for arg in &args[1..] {
+                let other = self.expr_as(arg, Ty::Set)?;
+                result = call("zb_set_or", vec![result, other], Ty::Set, span);
             }
+            if args.len() == 1 {
+                result = call("zb_list_copy_any", vec![result], Ty::Set, span);
+            }
+            return Ok(Val {
+                node: result,
+                ty: Ty::Set,
+            });
         }
         // A function of an imported module, named through the module or
         // brought in by name.
-        if let py::Expr::Attribute(a) = &*c.func {
-            if let Some(member) = self.module_member_of(&a.value, a.attr.as_str()) {
-                return self.stdlib_call(member, a.attr.as_str(), args, keywords, c, span);
-            }
+        if let py::Expr::Attribute(a) = &*c.func
+            && let Some(member) = self.module_member_of(&a.value, a.attr.as_str())
+        {
+            return self.stdlib_call(member, a.attr.as_str(), args, keywords, c, span);
         }
         if let py::Expr::Name(n) = &*c.func {
             let name = n.id.as_str();
@@ -5721,11 +5716,11 @@ impl<'m> Lowerer<'m> {
                 let callee = self.expr(&c.func)?;
                 return self.call_value(callee, args, keywords, c, span);
             }
-            if !self.module.funcs.contains_key(name) && !self.module.class_index.contains_key(name)
+            if !self.module.funcs.contains_key(name)
+                && !self.module.class_index.contains_key(name)
+                && let Some(member) = self.module.imported_name(name)
             {
-                if let Some(member) = self.module.imported_name(name) {
-                    return self.stdlib_call(member, name, args, keywords, c, span);
-                }
+                return self.stdlib_call(member, name, args, keywords, c, span);
             }
             if let Some(&k) = self.module.class_index.get(name) {
                 return self.construct(k, args, keywords, c, span);
@@ -5802,27 +5797,28 @@ impl<'m> Lowerer<'m> {
             }
         }
         // `xs.sort(key=..., reverse=...)` on a list.
-        if let py::Expr::Attribute(a) = &*c.func {
-            if a.attr.as_str() == "sort" && !keywords.is_empty() {
-                let receiver = self.expr(&a.value)?;
-                if let Ty::List(e) = receiver.ty {
-                    let (key, reverse) = self.ordering_keywords(keywords, c)?;
-                    let mut statements = Vec::new();
-                    let held = self.hold(receiver, &mut statements, span);
-                    self.sort_in_place(held.node, e, key, reverse, &mut statements, span)?;
-                    let none = node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span);
-                    return Ok(Val {
-                        node: Self::block_value(statements, none, Ty::None, span),
-                        ty: Ty::None,
-                    });
-                }
-                return unsupported("sort() with keyword arguments on a non-list", c);
+        if let py::Expr::Attribute(a) = &*c.func
+            && a.attr.as_str() == "sort"
+            && !keywords.is_empty()
+        {
+            let receiver = self.expr(&a.value)?;
+            if let Ty::List(e) = receiver.ty {
+                let (key, reverse) = self.ordering_keywords(keywords, c)?;
+                let mut statements = Vec::new();
+                let held = self.hold(receiver, &mut statements, span);
+                self.sort_in_place(held.node, e, key, reverse, &mut statements, span)?;
+                let none = node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span);
+                return Ok(Val {
+                    node: Self::block_value(statements, none, Ty::None, span),
+                    ty: Ty::None,
+                });
             }
+            return unsupported("sort() with keyword arguments on a non-list", c);
         }
-        if let py::Expr::Name(n) = &*c.func {
-            if let Some(v) = self.iteration_builtin(n.id.as_str(), args, keywords, ty, c, span)? {
-                return Ok(v);
-            }
+        if let py::Expr::Name(n) = &*c.func
+            && let Some(v) = self.iteration_builtin(n.id.as_str(), args, keywords, ty, c, span)?
+        {
+            return Ok(v);
         }
         if !keywords.is_empty() {
             return unsupported("keyword arguments", c);
@@ -5931,7 +5927,7 @@ impl<'m> Lowerer<'m> {
                                             self.module.classes[k as usize].name
                                         ),
                                         span,
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -6130,7 +6126,7 @@ impl<'m> Lowerer<'m> {
                                     return unsupported(
                                         "range() with more than three arguments",
                                         rc,
-                                    )
+                                    );
                                 }
                             };
                             Val {
@@ -7417,7 +7413,7 @@ impl<'m> Lowerer<'m> {
     /// assignment to it, anywhere in the body, is another constructor
     /// call at the top level.
     fn always_instances(&self, body: &[py::Stmt]) -> std::collections::HashSet<InternedString> {
-        use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+        use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
         struct Names {
             mentioned: std::collections::HashSet<String>,
             stored: std::collections::HashSet<String>,
@@ -8977,7 +8973,7 @@ impl<'m> Lowerer<'m> {
                     return unsupported(
                         format!("calling `{name}` without its argument `{pname}`"),
                         &at.range(),
-                    )
+                    );
                 }
             };
             lowered.push(self.expr_as(e, *pty)?);

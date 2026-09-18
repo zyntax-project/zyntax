@@ -70,7 +70,7 @@ fn function_has_resumable_effect(func: &HirFunction, module: &HirModule) -> bool
 }
 
 use crate::{
-    emit, HirAsyncHooks, HirBlockId, HirCoroCfg, HirFnId, HirLiveness, HirLocalId, HirSuspendingFns,
+    HirAsyncHooks, HirBlockId, HirCoroCfg, HirFnId, HirLiveness, HirLocalId, HirSuspendingFns, emit,
 };
 
 /// Result of orchestrating the krio pipeline for a single async fn.

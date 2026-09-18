@@ -102,11 +102,7 @@ impl VectorProfile {
             _ => return None,
         };
         let lanes = (self.bits / elem_bits) as usize;
-        if lanes < 2 {
-            None
-        } else {
-            Some(lanes)
-        }
+        if lanes < 2 { None } else { Some(lanes) }
     }
 }
 

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use zyntax_compiler::{
-    hir::*, monomorphize_module, ConstEvalContext, ConstEvaluator, MonomorphizationContext,
+    ConstEvalContext, ConstEvaluator, MonomorphizationContext, hir::*, monomorphize_module,
 };
 use zyntax_typed_ast::arena::AstArena;
 

@@ -25,11 +25,7 @@ pub const ARRAY_HEADER_BYTES: usize = ARRAY_HEADER_SIZE * std::mem::size_of::<i3
 /// The pointer must be valid.
 #[inline]
 pub unsafe fn array_capacity(ptr: ArrayConstPtr) -> i32 {
-    if ptr.is_null() {
-        0
-    } else {
-        *ptr
-    }
+    if ptr.is_null() { 0 } else { *ptr }
 }
 
 /// Get array length from pointer
@@ -38,11 +34,7 @@ pub unsafe fn array_capacity(ptr: ArrayConstPtr) -> i32 {
 /// The pointer must be valid.
 #[inline]
 pub unsafe fn array_length(ptr: ArrayConstPtr) -> i32 {
-    if ptr.is_null() {
-        0
-    } else {
-        *ptr.add(1)
-    }
+    if ptr.is_null() { 0 } else { *ptr.add(1) }
 }
 
 /// Set array length

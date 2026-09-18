@@ -600,7 +600,10 @@ fn float_format() -> Vec<Decl> {
         vec![
             negative.decl(call(
                 "zb_str_startswith",
-                vec![call("zb_str_of_float_raw", vec![v.e()], string()), text("-")],
+                vec![
+                    call("zb_str_of_float_raw", vec![v.e()], string()),
+                    text("-"),
+                ],
                 boolean(),
             )),
             mag.decl(v.e()),
@@ -622,10 +625,9 @@ fn float_format() -> Vec<Decl> {
                         vec![body.set(fixed(mag.e(), p.e()))],
                         vec![if_(
                             is_ty(&ty, '%'),
-                            vec![body.set(add(
-                                fixed(mul(mag.e(), float(100.0)), p.e()),
-                                text("%"),
-                            ))],
+                            vec![
+                                body.set(add(fixed(mul(mag.e(), float(100.0)), p.e()), text("%"))),
+                            ],
                             vec![if_(
                                 is_ty(&ty, 'e'),
                                 vec![body.set(call(

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::backends::{self, Backend};
-use crate::cli::{default_cache_dir, CacheAction, ModuleArch, PackAction};
+use crate::cli::{CacheAction, ModuleArch, PackAction, default_cache_dir};
 use crate::formats::{self, InputFormat};
 
 use zyntax_typed_ast::{ImportContext, ModuleArchitecture};
@@ -511,8 +511,8 @@ pub fn repl(
     lib_paths: Vec<PathBuf>,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use rustyline::error::ReadlineError;
     use rustyline::DefaultEditor;
+    use rustyline::error::ReadlineError;
 
     // Verify grammar file exists
     if !grammar_path.exists() {
@@ -924,7 +924,7 @@ fn eval_input(
     // Rebuild type registry from declarations (TypeRegistry is not serializable)
     // Scan for struct definitions (TypedDeclaration::Class) and register them
     // IMPORTANT: Only register types that don't already exist (abstract types are pre-registered by parser)
-    use zyntax_typed_ast::{type_registry::*, TypedDeclaration};
+    use zyntax_typed_ast::{TypedDeclaration, type_registry::*};
     for decl_node in &typed_program.declarations {
         eprintln!("[DEBUG] Checking declaration, type: {:?}", decl_node.ty);
         if let TypedDeclaration::Class(class) = &decl_node.node {
@@ -935,9 +935,11 @@ fn eval_input(
 
             // Check if type is already registered (e.g., abstract types from parser)
             if let Some(existing_type) = typed_program.type_registry.get_type_by_name(class.name) {
-                eprintln!("[DEBUG] Type '{}' already registered with kind: {:?}, skipping re-registration",
+                eprintln!(
+                    "[DEBUG] Type '{}' already registered with kind: {:?}, skipping re-registration",
                     class.name.resolve_global().unwrap_or("Unknown".to_string()),
-                    std::mem::discriminant(&existing_type.kind));
+                    std::mem::discriminant(&existing_type.kind)
+                );
                 continue;
             }
 
@@ -1143,7 +1145,7 @@ fn pack_create(
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::fs::File;
-    use zyntax_compiler::zpack::{ZPackManifest, ZPackWriter, ZPACK_VERSION};
+    use zyntax_compiler::zpack::{ZPACK_VERSION, ZPackManifest, ZPackWriter};
 
     println!("{}", "Creating ZPack archive...".green().bold());
 

@@ -27,9 +27,9 @@
 
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use zynml::{Grammar2, ZYNML_GRAMMAR};
-use zyntax_compiler::{run_interp_safe_opts, HirModule};
+use zyntax_compiler::{HirModule, run_interp_safe_opts};
 use zyntax_embed::{ZyntaxRuntime, ZyntaxValue};
 
 const MANDELBROT_SRC: &str = include_str!("../benchmarks/bench_mandelbrot.zynml");

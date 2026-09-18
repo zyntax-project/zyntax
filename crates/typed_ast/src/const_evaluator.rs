@@ -3,10 +3,10 @@
 //! Evaluates compile-time constant expressions for const generics and dependent types.
 //! Supports Rust-style const generics, C++ template value parameters, and value-dependent types.
 
+use crate::PrimitiveType;
 use crate::arena::{AstArena, InternedString};
 use crate::source::Span;
 use crate::type_registry::{ConstBinaryOp, ConstUnaryOp, ConstValue, Type, TypeId};
-use crate::PrimitiveType;
 use std::collections::HashMap;
 
 /// Const evaluation context
@@ -291,7 +291,7 @@ impl ConstEvaluator {
                     _ => {
                         return Err(ConstEvalError::UnsupportedOperation(
                             "sizeof for this type".to_string(),
-                        ))
+                        ));
                     }
                 };
                 Ok(ConstValue::UInt(size))
@@ -320,7 +320,7 @@ impl ConstEvaluator {
                                 expected: Type::Primitive(PrimitiveType::USize),
                                 found: Type::Error,
                                 operation: "array size".to_string(),
-                            })
+                            });
                         }
                     };
 
@@ -366,7 +366,7 @@ impl ConstEvaluator {
                     _ => {
                         return Err(ConstEvalError::UnsupportedOperation(
                             "alignof for this type".to_string(),
-                        ))
+                        ));
                     }
                 };
                 Ok(ConstValue::UInt(align))

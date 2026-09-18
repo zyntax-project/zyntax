@@ -12,7 +12,7 @@
 //! 3. Action structure (Construct, not LegacyJson)
 //! 4. Using GrammarInterpreter to parse actual ImagePipe source files
 
-use zyn_peg::grammar::{parse_grammar, ActionIR, PatternIR, RuleModifier};
+use zyn_peg::grammar::{ActionIR, PatternIR, RuleModifier, parse_grammar};
 use zyn_peg::runtime2::{GrammarInterpreter, ParseResult, ParsedValue, ParserState};
 use zyntax_typed_ast::type_registry::TypeRegistry;
 use zyntax_typed_ast::{TypedASTBuilder, TypedDeclaration};
@@ -814,7 +814,11 @@ fn test_interpreter_parse_vintage_imgpipe_program() {
             };
             panic!(
                 "Failed to parse vintage.imgpipe as program at line {} col {} (pos {}): expected {:?}\nRemaining input: {:?}",
-                e.line, e.column, state.pos(), e.expected, remaining
+                e.line,
+                e.column,
+                state.pos(),
+                e.expected,
+                remaining
             );
         }
     }

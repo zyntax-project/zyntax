@@ -4,7 +4,7 @@
 //!
 //! Tests the full pipeline: Generic HIR → Monomorphization → Cranelift Compilation → JIT Execution
 
-use zyntax_compiler::{cranelift_backend::CraneliftBackend, hir::*, MonomorphizationContext};
+use zyntax_compiler::{MonomorphizationContext, cranelift_backend::CraneliftBackend, hir::*};
 use zyntax_typed_ast::arena::AstArena;
 
 fn create_test_arena() -> AstArena {

@@ -42,8 +42,8 @@
 //! in the `DynamicBox` header is used by `zyntax_box_get_X` to widen
 //! / narrow losslessly.
 
-use zyntax_typed_ast::type_registry::{Type, TypeRegistry};
 use zyntax_typed_ast::PrimitiveType;
+use zyntax_typed_ast::type_registry::{Type, TypeRegistry};
 
 /// Classification of a coercion from a source type to a target type.
 ///

@@ -6,7 +6,7 @@
 //! one, so a call through a value has one shape whatever it reaches.
 
 use crate::build::*;
-use crate::{list_of, CODE_TAG, FUNC_TAG};
+use crate::{CODE_TAG, FUNC_TAG, list_of};
 use zyntax_typed_ast::type_registry::{AsyncKind, CallingConvention, NullabilityKind, ParamInfo};
 use zyntax_typed_ast::{Type, TypeId};
 

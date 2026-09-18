@@ -14,7 +14,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use zyntax_embed::__zyntax_effect_resume;
-use zyntax_embed::host_futures::{register_future, schedule_timer, ParkedFuture};
+use zyntax_embed::host_futures::{ParkedFuture, register_future, schedule_timer};
 
 /// A dummy parked SM whose poll fn is immediately Ready — stands in for
 /// whatever future the driven timer resolves. `resolve_future` writes into

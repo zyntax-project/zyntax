@@ -69,6 +69,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use zynml::{Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD};
+use zyntax_compiler::HirModule;
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
 use zyntax_compiler::hir::{
     BinaryOp, CallingConvention, HirConstant, HirFunction, HirFunctionSignature, HirId,
@@ -77,7 +78,6 @@ use zyntax_compiler::hir::{
 use zyntax_compiler::hir_interp::value_to_i64;
 use zyntax_compiler::profiling::ProfileConfig;
 use zyntax_compiler::tiered_backend::TieredConfig;
-use zyntax_compiler::HirModule;
 use zyntax_embed::{ZyntaxRuntime, ZyntaxValue};
 use zyntax_typed_ast::InternedString;
 

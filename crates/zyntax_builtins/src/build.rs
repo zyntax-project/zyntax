@@ -8,9 +8,9 @@
 
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
-    typed_node, TypedBinary, TypedBlock, TypedCall, TypedCast, TypedDeclaration, TypedExpression,
+    TypedBinary, TypedBlock, TypedCall, TypedCast, TypedDeclaration, TypedExpression,
     TypedFieldAccess, TypedFunction, TypedIf, TypedIfExpr, TypedIndex, TypedLet, TypedLiteral,
-    TypedMethodCall, TypedParameter, TypedStatement, TypedUnary, TypedWhile,
+    TypedMethodCall, TypedParameter, TypedStatement, TypedUnary, TypedWhile, typed_node,
 };
 use zyntax_typed_ast::{
     BinaryOp, InternedString, Mutability, ParamOwnership, PrimitiveType, Type, TypedNode, UnaryOp,

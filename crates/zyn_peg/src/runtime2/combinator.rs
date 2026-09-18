@@ -426,8 +426,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zyntax_typed_ast::type_registry::TypeRegistry;
     use zyntax_typed_ast::TypedASTBuilder;
+    use zyntax_typed_ast::type_registry::TypeRegistry;
 
     fn make_state<'a>(
         input: &'a str,

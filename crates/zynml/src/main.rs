@@ -23,7 +23,7 @@ use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use zynml::{ZynML, ZynMLConfig, OPTIONAL_PLUGINS, REQUIRED_PLUGINS, ZYNML_GRAMMAR};
+use zynml::{OPTIONAL_PLUGINS, REQUIRED_PLUGINS, ZYNML_GRAMMAR, ZynML, ZynMLConfig};
 
 /// ZynML - Machine Learning DSL for Zyntax
 #[derive(Parser)]

@@ -5,8 +5,8 @@
 //! with various type constraint types from different programming languages.
 
 use zyntax_typed_ast::{
-    typed_ast::*, AstArena, AsyncKind, CallingConvention, Lifetime, Mutability, NullabilityKind,
-    PrimitiveType, Span, Type, TypeId, TypeVar, Visibility,
+    AstArena, AsyncKind, CallingConvention, Lifetime, Mutability, NullabilityKind, PrimitiveType,
+    Span, Type, TypeId, TypeVar, Visibility, typed_ast::*,
 };
 
 /// Demonstrates Rust-style generic constraints

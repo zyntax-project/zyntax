@@ -10,9 +10,8 @@ use std::path::PathBuf;
 use zyntax_compiler::hir::{CallingConvention, HirId, HirModule, HirType};
 use zyntax_compiler::hir_builder::HirBuilder;
 use zyntax_typed_ast::{
-    typed_ast::TypedBlock, AstArena, BinaryOp, ParamOwnership, PrimitiveType, Type,
-    TypedDeclaration, TypedExpression, TypedFunction, TypedLiteral, TypedNode, TypedProgram,
-    TypedStatement,
+    AstArena, BinaryOp, ParamOwnership, PrimitiveType, Type, TypedDeclaration, TypedExpression,
+    TypedFunction, TypedLiteral, TypedNode, TypedProgram, TypedStatement, typed_ast::TypedBlock,
 };
 
 /// Load TypedAST from JSON file(s) and convert to HIR
@@ -409,8 +408,8 @@ fn add_runtime_function_declarations(program: &mut TypedProgram, arena: &mut Ast
 
 fn typed_ast_to_hir(program: &TypedProgram) -> Result<HirModule, Box<dyn std::error::Error>> {
     use std::sync::{Arc, Mutex};
-    use zyntax_compiler::lowering::{LoweringConfig, LoweringContext};
     use zyntax_compiler::AstLowering;
+    use zyntax_compiler::lowering::{LoweringConfig, LoweringContext};
     use zyntax_typed_ast::TypeRegistry;
 
     // Use the lowering pass which properly uses TypedCFG + SSA

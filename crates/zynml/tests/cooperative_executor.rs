@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 use zynml::{Grammar2, ZYNML_GRAMMAR};
 use zyntax_embed::host_futures::has_pending_timers;
-use zyntax_embed::{drive_tasks, PromiseRace, ZyntaxRuntime, ZyntaxValue};
+use zyntax_embed::{PromiseRace, ZyntaxRuntime, ZyntaxValue, drive_tasks};
 
 fn compile(rt: &mut ZyntaxRuntime, src: &str) {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");

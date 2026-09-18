@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 fn scalar_add(dst: &mut [f32], a: &[f32], b: &[f32]) {
     for i in 0..dst.len() {

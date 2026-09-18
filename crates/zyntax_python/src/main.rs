@@ -77,7 +77,7 @@ fn main() -> ExitCode {
         }
     };
     lap("parse");
-    let mut config = TieredConfig::default();
+    let config = TieredConfig::default();
     #[cfg(feature = "llvm-backend")]
     if llvm {
         config.tier2_backend = zyntax_compiler::tiered_backend::Tier2Backend::LLVM;

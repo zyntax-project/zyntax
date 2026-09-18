@@ -10,7 +10,7 @@
 //! be used instead as it produces more efficient compiled code.
 
 use super::machine;
-use super::state::{own, ParseFailure, ParseResult, ParsedValue, ParserState};
+use super::state::{ParseFailure, ParseResult, ParsedValue, ParserState, own};
 use crate::grammar::{ActionIR, CharClass, ExprIR, GrammarIR, PatternIR, RuleIR, RuleModifier};
 use log::{debug, trace};
 use std::collections::HashMap;
@@ -20,18 +20,19 @@ use zyntax_typed_ast::typed_ast::{
     TypedTry,
 };
 use zyntax_typed_ast::{
-    type_registry::{
-        CallingConvention, ConstValue, Mutability, NullabilityKind, PrimitiveType, Type,
-        TypeMetadata, Visibility,
-    },
-    typed_node, ParameterKind, Span, TypedAnnotation, TypedAnnotationArg, TypedAnnotationValue,
-    TypedBlock, TypedCall, TypedDeclaration, TypedExpression, TypedExtern, TypedExternStruct,
-    TypedFieldAccess, TypedFieldInit, TypedFieldPattern, TypedFor, TypedFunction, TypedIf,
-    TypedImportItem, TypedImportModifier, TypedIndex, TypedInterface, TypedLambda, TypedLambdaBody,
+    ParameterKind, Span, TypedAnnotation, TypedAnnotationArg, TypedAnnotationValue, TypedBlock,
+    TypedCall, TypedDeclaration, TypedExpression, TypedExtern, TypedExternStruct, TypedFieldAccess,
+    TypedFieldInit, TypedFieldPattern, TypedFor, TypedFunction, TypedIf, TypedImportItem,
+    TypedImportModifier, TypedIndex, TypedInterface, TypedLambda, TypedLambdaBody,
     TypedLambdaParam, TypedLet, TypedLetPattern, TypedLiteral, TypedLiteralPattern, TypedMatch,
     TypedMatchArm, TypedMethodCall, TypedNode, TypedParameter, TypedPath, TypedPattern,
     TypedProgram, TypedRange, TypedStatement, TypedStructLiteral, TypedTypeAlias, TypedTypeParam,
     TypedUnary, TypedVariable, TypedVariant, TypedVariantFields, TypedWhile, UnaryOp,
+    type_registry::{
+        CallingConvention, ConstValue, Mutability, NullabilityKind, PrimitiveType, Type,
+        TypeMetadata, Visibility,
+    },
+    typed_node,
 };
 
 /// Runtime interpreter for GrammarIR
@@ -1064,7 +1065,7 @@ impl<'g> GrammarInterpreter<'g> {
                         return Err(format!(
                             "Literal value must be a literal type, got: {:?}",
                             value
-                        ))
+                        ));
                     }
                 }
             }
@@ -1559,7 +1560,7 @@ impl<'g> GrammarInterpreter<'g> {
                         TypedDeclaration::Function(func)
                     }
                     _ => {
-                        return Err("AnnotatedFunction requires a Function declaration".to_string())
+                        return Err("AnnotatedFunction requires a Function declaration".to_string());
                     }
                 }
             }
@@ -1945,7 +1946,7 @@ impl<'g> GrammarInterpreter<'g> {
                             return Err(format!(
                                 "Bool value must be bool or text, got: {:?}",
                                 other
-                            ))
+                            ));
                         }
                     }
                 } else {
@@ -2812,13 +2813,13 @@ impl<'g> GrammarInterpreter<'g> {
                                     return Err(format!(
                                         "fold_cast: expected Type in target_type, got {:?}",
                                         other
-                                    ))
+                                    ));
                                 }
                             },
                             None => {
                                 return Err(
                                     "fold_cast: CastTarget missing target_type field".to_string()
-                                )
+                                );
                             }
                         },
                         ParsedValue::Type(t) => t,
@@ -2826,7 +2827,7 @@ impl<'g> GrammarInterpreter<'g> {
                             return Err(format!(
                                 "fold_cast: unexpected cast target value: {:?}",
                                 other
-                            ))
+                            ));
                         }
                     };
                     let cast_node = typed_node(
@@ -2972,7 +2973,7 @@ impl<'g> GrammarInterpreter<'g> {
                         _ => {
                             return Err(
                                 "pipe operator expects a call on the right-hand side".to_string()
-                            )
+                            );
                         }
                     }
                 }
@@ -3140,7 +3141,7 @@ impl<'g> GrammarInterpreter<'g> {
                                 return Err(format!(
                                     "SuffixField field must be interned, got {:?}",
                                     other
-                                ))
+                                ));
                             }
                         };
 
@@ -3171,7 +3172,7 @@ impl<'g> GrammarInterpreter<'g> {
                                 return Err(format!(
                                     "SuffixMethod method must be interned, got {:?}",
                                     other
-                                ))
+                                ));
                             }
                         };
 
@@ -3958,7 +3959,7 @@ impl<'g> GrammarInterpreter<'g> {
                     return Err(format!(
                         "expected FieldInit in struct pattern, got {:?}",
                         item
-                    ))
+                    ));
                 }
             }
         }
@@ -5603,8 +5604,8 @@ impl<'g> GrammarInterpreter<'g> {
 mod tests {
     use super::*;
     use crate::grammar::parser::parse_grammar;
-    use zyntax_typed_ast::type_registry::TypeRegistry;
     use zyntax_typed_ast::TypedASTBuilder;
+    use zyntax_typed_ast::type_registry::TypeRegistry;
 
     #[test]
     fn test_interpret_literal() {

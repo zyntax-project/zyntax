@@ -5,7 +5,7 @@
 //! of that: all, race, and all-settled.
 
 use super::types::{NativeSignature, RuntimeError, RuntimeResult};
-use super::{native_call::call_with_signature, ZyntaxRuntime};
+use super::{ZyntaxRuntime, native_call::call_with_signature};
 use crate::convert::FromZyntax;
 use crate::value::ZyntaxValue;
 use std::sync::{Arc, Mutex};
@@ -580,24 +580,26 @@ impl ZyntaxPromise {
         let target = new_promise.state.clone();
 
         // Spawn a thread to wait for completion and run the callback
-        std::thread::spawn(move || loop {
-            let source_state = source.lock().unwrap().state.clone();
-            match source_state {
-                PromiseState::Ready(value) => {
-                    let result = f(value);
-                    target.lock().unwrap().state = PromiseState::Ready(result);
-                    break;
-                }
-                PromiseState::Failed(err) => {
-                    target.lock().unwrap().state = PromiseState::Failed(err);
-                    break;
-                }
-                PromiseState::Cancelled => {
-                    target.lock().unwrap().state = PromiseState::Cancelled;
-                    break;
-                }
-                PromiseState::Pending => {
-                    std::thread::yield_now();
+        std::thread::spawn(move || {
+            loop {
+                let source_state = source.lock().unwrap().state.clone();
+                match source_state {
+                    PromiseState::Ready(value) => {
+                        let result = f(value);
+                        target.lock().unwrap().state = PromiseState::Ready(result);
+                        break;
+                    }
+                    PromiseState::Failed(err) => {
+                        target.lock().unwrap().state = PromiseState::Failed(err);
+                        break;
+                    }
+                    PromiseState::Cancelled => {
+                        target.lock().unwrap().state = PromiseState::Cancelled;
+                        break;
+                    }
+                    PromiseState::Pending => {
+                        std::thread::yield_now();
+                    }
                 }
             }
         });
@@ -684,8 +686,8 @@ pub(crate) fn drive_until(
     mut done: impl FnMut(&[ZyntaxPromise]) -> bool,
 ) -> bool {
     use crate::host_futures::{
-        deregister_task, drive_next_timer_with_task, next_timer_deadline, set_current_task_id,
-        ResolveOutcome,
+        ResolveOutcome, deregister_task, drive_next_timer_with_task, next_timer_deadline,
+        set_current_task_id,
     };
 
     // Drive one task's poll, stamped with its id and bracketed by its
@@ -798,10 +800,10 @@ fn collect_all(ps: &[ZyntaxPromise]) -> RuntimeResult<Vec<ZyntaxValue>> {
             PromiseState::Ready(v) => values.push(v),
             PromiseState::Failed(e) => return Err(RuntimeError::Promise(e)),
             PromiseState::Cancelled => {
-                return Err(RuntimeError::Promise("Promise was cancelled".to_string()))
+                return Err(RuntimeError::Promise("Promise was cancelled".to_string()));
             }
             PromiseState::Pending => {
-                return Err(RuntimeError::Promise("Task did not complete".to_string()))
+                return Err(RuntimeError::Promise("Task did not complete".to_string()));
             }
         }
     }
@@ -1108,7 +1110,7 @@ impl PromiseRace {
                     PromiseState::Failed(err) => {
                         return Err(RuntimeError::Promise(format!(
                             "Promise {index} failed: {err}"
-                        )))
+                        )));
                     }
                     _ => {}
                 }
@@ -1123,7 +1125,7 @@ impl PromiseRace {
                 PromiseRaceState::Failed(index, err) => {
                     return Err(RuntimeError::Promise(format!(
                         "Promise {index} failed: {err}"
-                    )))
+                    )));
                 }
             }
         }
@@ -1250,11 +1252,7 @@ impl PromiseAllSettled {
             }
         }
 
-        if all_settled {
-            Some(results)
-        } else {
-            None
-        }
+        if all_settled { Some(results) } else { None }
     }
 
     /// Block until all promises settle (complete or fail)

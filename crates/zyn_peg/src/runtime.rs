@@ -47,6 +47,9 @@ use crate::{BuiltinMappings, TypeDeclarations, ZynGrammar};
 
 // Re-export types from typed_ast for host function implementations
 pub use zyntax_typed_ast::{
+    BinaryOp, InternedString, Span, TypedASTBuilder, TypedBlock, TypedClass, TypedDeclaration,
+    TypedEnum, TypedExpression, TypedField, TypedNode, TypedProgram, TypedStatement, TypedVariant,
+    UnaryOp,
     type_registry::{ConstValue, Mutability, PrimitiveType, Type, Visibility},
     typed_ast::{
         ParameterAttribute, ParameterKind, TypedExtern, TypedExternStruct, TypedFieldPattern,
@@ -54,9 +57,6 @@ pub use zyntax_typed_ast::{
         TypedMethodParam, TypedPattern, TypedRange, TypedTypeAlias, TypedTypeParam,
         TypedVariantFields,
     },
-    BinaryOp, InternedString, Span, TypedASTBuilder, TypedBlock, TypedClass, TypedDeclaration,
-    TypedEnum, TypedExpression, TypedField, TypedNode, TypedProgram, TypedStatement, TypedVariant,
-    UnaryOp,
 };
 
 // ============================================================================
@@ -2203,7 +2203,10 @@ impl AstHostFunctions for TypedAstBuilder {
                 )
             );
             if !is_numeric {
-                debug!("[WARNING] Abstract type '{}' uses Suffixes with non-numeric underlying type. This will be reported as an error during type checking.", name);
+                debug!(
+                    "[WARNING] Abstract type '{}' uses Suffixes with non-numeric underlying type. This will be reported as an error during type checking.",
+                    name
+                );
             }
 
             // 2. Enforce 'value' field convention
@@ -2231,7 +2234,10 @@ impl AstHostFunctions for TypedAstBuilder {
                 );
                 debug!("       The 'value' field represents the canonical IR representation.");
             } else if typed_fields.len() > 1 {
-                debug!("[WARNING] Abstract type '{}' with Suffixes has multiple fields. Only the 'value' field will be used in IR.", name);
+                debug!(
+                    "[WARNING] Abstract type '{}' with Suffixes has multiple fields. Only the 'value' field will be used in IR.",
+                    name
+                );
             }
         }
 
@@ -4630,8 +4636,13 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                                             let callee =
                                                 self.host.create_identifier(&resolved_name);
                                             let new_node = self.host.create_call(callee, all_args);
-                                            log::trace!("[FoldPostfix] Method mapping: {}.{}() -> {}() [resolved: {}]",
-                                                base_h.0, field_name, builtin_name, resolved_name);
+                                            log::trace!(
+                                                "[FoldPostfix] Method mapping: {}.{}() -> {}() [resolved: {}]",
+                                                base_h.0,
+                                                field_name,
+                                                builtin_name,
+                                                resolved_name
+                                            );
                                             result = RuntimeValue::Node(new_node);
 
                                             // Skip the next postfix op (the call) since we consumed it
@@ -4831,7 +4842,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
 
                         if let (RuntimeValue::Node(left_h), Some(right_h)) = (&result, right_node) {
                             let left_h = *left_h; // Copy to avoid borrow
-                                                  // Check if this operator has a builtin overload
+                            // Check if this operator has a builtin overload
                             if let Some(builtin_names) =
                                 self.module.metadata.builtins.operators.get(&op_str)
                             {
@@ -4850,8 +4861,16 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                                 let callee = self.host.create_identifier(resolved_name);
                                 let new_node = self.host.create_call(callee, vec![left_h, right_h]);
                                 result = RuntimeValue::Node(new_node);
-                                log::trace!("[FoldLeftOps] Operator overload: {} {} {} -> {}({}, {}) [resolved: {}]",
-                                    left_h.0, op_str, right_h.0, builtin_name, left_h.0, right_h.0, resolved_name);
+                                log::trace!(
+                                    "[FoldLeftOps] Operator overload: {} {} {} -> {}({}, {}) [resolved: {}]",
+                                    left_h.0,
+                                    op_str,
+                                    right_h.0,
+                                    builtin_name,
+                                    left_h.0,
+                                    right_h.0,
+                                    resolved_name
+                                );
                             } else {
                                 // No overload, use standard binary op
                                 let new_node = self.host.create_binary_op(&op_str, left_h, right_h);
@@ -5177,7 +5196,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "suffixed_literal: missing text".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -5218,14 +5237,12 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     Some(name) => name,
                     None => {
                         // Suffix not registered - provide helpful error message
-                        return Err(crate::error::ZynPegError::CodeGenError(
-                            format!(
-                                "Unknown suffix '{}' in literal '{}'. \
+                        return Err(crate::error::ZynPegError::CodeGenError(format!(
+                            "Unknown suffix '{}' in literal '{}'. \
                                 No abstract type has been declared with this suffix. \
                                 \nHint: Declare an abstract type like: abstract Duration(i64) with Suffixes(\"ms, s\") to use '{}' suffix literals.",
-                                suffix, text, suffix
-                            )
-                        ));
+                            suffix, text, suffix
+                        )));
                     }
                 };
 
@@ -5287,8 +5304,10 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     vec![num_literal],
                 );
 
-                debug!("[SUFFIX LITERAL] Successfully parsed suffix literal '{}' as constructor call {}::{}({})",
-                    text, type_name, constructor_name, num);
+                debug!(
+                    "[SUFFIX LITERAL] Successfully parsed suffix literal '{}' as constructor call {}::{}({})",
+                    text, type_name, constructor_name, num
+                );
                 Ok(RuntimeValue::Node(handle))
             }
 
@@ -5299,7 +5318,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "duration_literal: missing value".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -5356,7 +5375,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "binary_op: missing left operand".into(),
-                        ))
+                        ));
                     }
                 };
                 let right = match args.get("right") {
@@ -5364,7 +5383,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "binary_op: missing right operand".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_binary_op(&op, left, right);
@@ -5381,7 +5400,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "unary_op: missing operand".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_unary_op(&op, operand);
@@ -5642,7 +5661,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "expr_block: missing expr".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -5741,7 +5760,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "path: missing segments".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -5769,7 +5788,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "call: missing callee".into(),
-                        ))
+                        ));
                     }
                 };
                 let call_args: Vec<NodeHandle> = match args.get("args") {
@@ -5804,7 +5823,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "call_or_primary: missing callee".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -5840,7 +5859,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "method_call: missing receiver".into(),
-                        ))
+                        ));
                     }
                 };
                 let method = match args.get("method") {
@@ -5867,7 +5886,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "field_access: missing object".into(),
-                        ))
+                        ));
                     }
                 };
                 let field = match args.get("field") {
@@ -5884,7 +5903,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "index: missing object".into(),
-                        ))
+                        ));
                     }
                 };
                 let index = match args.get("index") {
@@ -5892,7 +5911,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "index: missing index".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_index(object, index);
@@ -5921,9 +5940,9 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                 // Create a marker handle - we need to downcast to TypedAstBuilder
                 // For now, create a placeholder node and store postfix info
                 let handle = self.host.create_int_literal(0); // Marker placeholder
-                                                              // Store postfix info in a special way - use the handle as key
-                                                              // Note: This requires TypedAstBuilder to have postfix_ops accessible
-                                                              // For the generic case, we'll store this info as a variable
+                // Store postfix info in a special way - use the handle as key
+                // Note: This requires TypedAstBuilder to have postfix_ops accessible
+                // For the generic case, we'll store this info as a variable
                 self.variables.insert(
                     format!("$postfix_{}", handle.0),
                     RuntimeValue::String(format!("call:{}", call_args.len())),
@@ -5968,7 +5987,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "index_postfix/index: missing index".into(),
-                        ))
+                        ));
                     }
                 };
                 log::trace!("[define_node] index_postfix with index={:?}", index);
@@ -6081,7 +6100,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "struct_field_init: missing value".into(),
-                        ))
+                        ));
                     }
                 };
                 // Store field init and return a handle for later lookup
@@ -6095,7 +6114,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "cast: missing expr".into(),
-                        ))
+                        ));
                     }
                 };
                 let target_type = match args.get("target_type").or(args.get("type")) {
@@ -6122,7 +6141,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "lambda: missing body".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_lambda(params, body);
@@ -6181,7 +6200,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "assignment: missing target".into(),
-                        ))
+                        ));
                     }
                 };
                 let value = match args.get("value") {
@@ -6189,7 +6208,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "assignment: missing value".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_assignment(target, value);
@@ -6204,7 +6223,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "field_assignment: missing object".into(),
-                        ))
+                        ));
                     }
                 };
                 let field_name = match args.get("field") {
@@ -6212,7 +6231,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "field_assignment: missing field".into(),
-                        ))
+                        ));
                     }
                 };
                 let value = match args.get("value") {
@@ -6220,7 +6239,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "field_assignment: missing value".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -6237,7 +6256,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "if: missing condition".into(),
-                        ))
+                        ));
                     }
                 };
                 let then_block = match args
@@ -6249,7 +6268,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "if: missing then block".into(),
-                        ))
+                        ));
                     }
                 };
                 let else_block = match args
@@ -6271,7 +6290,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "while: missing condition".into(),
-                        ))
+                        ));
                     }
                 };
                 let body = match args.get("body") {
@@ -6279,7 +6298,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "while: missing body".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_while(condition, body);
@@ -6306,7 +6325,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "for: missing iterable".into(),
-                        ))
+                        ));
                     }
                 };
                 let body = match args.get("body") {
@@ -6314,7 +6333,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "for: missing body".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_for(&variable, iterable, body);
@@ -6342,7 +6361,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "expression_stmt: missing expr".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_expression_stmt(expr);
@@ -6451,7 +6470,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "try: missing expr".into(),
-                        ))
+                        ));
                     }
                 };
                 // For now, represent as unary with special op
@@ -6466,7 +6485,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "await: missing expr".into(),
-                        ))
+                        ));
                     }
                 };
                 // Create await expression node
@@ -6481,7 +6500,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "defer: missing body".into(),
-                        ))
+                        ));
                     }
                 };
                 // Represent as expression statement for now
@@ -6496,7 +6515,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "errdefer: missing body".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_expr_stmt(body);
@@ -6562,7 +6581,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "orelse: missing lhs".into(),
-                        ))
+                        ));
                     }
                 };
                 let rhs = match args.get("rhs").or(args.get("right")) {
@@ -6570,7 +6589,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "orelse: missing rhs".into(),
-                        ))
+                        ));
                     }
                 };
                 // Represent as binary op with special operator
@@ -6585,7 +6604,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "catch: missing lhs".into(),
-                        ))
+                        ));
                     }
                 };
                 let rhs = match args.get("rhs").or(args.get("right")) {
@@ -6593,7 +6612,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "catch: missing rhs".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_binary_op("catch", lhs, rhs);
@@ -6611,7 +6630,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "match_expr: missing scrutinee".into(),
-                        ))
+                        ));
                     }
                 };
                 let arms: Vec<NodeHandle> = match args.get("arms").or(args.get("cases")) {
@@ -6638,7 +6657,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "match_arm: missing body".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_match_arm(pattern, body);
@@ -6909,7 +6928,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "method: missing body".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_method(
@@ -6964,7 +6983,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "trait: missing name".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -6985,7 +7004,10 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                         s.clone()
                     }
                     Some(other) => {
-                        debug!("[GRAMMAR impl_abstract_inherent] ERROR: type_name is not a string, it's: {:?}", other);
+                        debug!(
+                            "[GRAMMAR impl_abstract_inherent] ERROR: type_name is not a string, it's: {:?}",
+                            other
+                        );
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "impl_abstract_inherent: type_name is not a string".into(),
                         ));
@@ -7007,7 +7029,10 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                         *h
                     }
                     Some(other) => {
-                        debug!("[GRAMMAR impl_abstract_inherent] ERROR: underlying_type is not a node, it's: {:?}", other);
+                        debug!(
+                            "[GRAMMAR impl_abstract_inherent] ERROR: underlying_type is not a node, it's: {:?}",
+                            other
+                        );
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "impl_abstract_inherent: underlying_type is not a node".into(),
                         ));
@@ -7052,7 +7077,10 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                 let handle =
                     self.host
                         .create_abstract_inherent_impl(&type_name, underlying_type, items);
-                debug!("[GRAMMAR impl_abstract_inherent] Created inherent impl block with handle: {:?}", handle);
+                debug!(
+                    "[GRAMMAR impl_abstract_inherent] Created inherent impl block with handle: {:?}",
+                    handle
+                );
                 Ok(RuntimeValue::Node(handle))
             }
 
@@ -7093,7 +7121,10 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                             debug!("[GRAMMAR impl_block] type_name from node: {}", name);
                             name
                         } else {
-                            debug!("[GRAMMAR impl_block] ERROR: could not extract type name from node {:?}", h);
+                            debug!(
+                                "[GRAMMAR impl_block] ERROR: could not extract type name from node {:?}",
+                                h
+                            );
                             return Err(crate::error::ZynPegError::CodeGenError(
                                 "impl_block: could not extract type name from node".into(),
                             ));
@@ -7210,7 +7241,10 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                                 debug!("[GRAMMAR impl_inherent] type_name from node: {}", name);
                                 name
                             } else {
-                                debug!("[GRAMMAR impl_inherent] Could not get type name from node {:?}", h);
+                                debug!(
+                                    "[GRAMMAR impl_inherent] Could not get type name from node {:?}",
+                                    h
+                                );
                                 return Err(crate::error::ZynPegError::CodeGenError(
                                     "impl_inherent: could not resolve type_name".into(),
                                 ));
@@ -7231,7 +7265,10 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                             );
                             name
                         } else {
-                            debug!("[GRAMMAR impl_inherent] Could not get type name from direct node {:?}", h);
+                            debug!(
+                                "[GRAMMAR impl_inherent] Could not get type name from direct node {:?}",
+                                h
+                            );
                             return Err(crate::error::ZynPegError::CodeGenError(
                                 "impl_inherent: could not resolve type_name from node".into(),
                             ));
@@ -7475,7 +7512,12 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     }
                 };
 
-                debug!("[DEBUG abstract_type] Creating abstract type: name='{}', {} fields, suffixes={:?}", name, fields.len(), suffixes);
+                debug!(
+                    "[DEBUG abstract_type] Creating abstract type: name='{}', {} fields, suffixes={:?}",
+                    name,
+                    fields.len(),
+                    suffixes
+                );
                 log::debug!(
                     "[abstract_type] Creating abstract type: name='{}', {} fields, suffixes={:?}",
                     name,
@@ -7503,7 +7545,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "abstract_with_single_suffix: missing name".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -7512,7 +7554,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "abstract_with_single_suffix: missing underlying_type".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -7551,7 +7593,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "abstract_with_single_suffix: missing or invalid suffix_literal".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -7575,7 +7617,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "abstract_with_multiple_suffixes: missing name".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -7584,7 +7626,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "abstract_with_multiple_suffixes: missing underlying_type".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -7628,7 +7670,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "abstract_with_multiple_suffixes: missing or invalid suffixes_literal"
                                 .into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -7651,7 +7693,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "ternary: missing condition".into(),
-                        ))
+                        ));
                     }
                 };
                 let then_expr = match args.get("then_expr") {
@@ -7659,7 +7701,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "ternary: missing then_expr".into(),
-                        ))
+                        ));
                     }
                 };
                 let else_expr = match args.get("else_expr") {
@@ -7667,7 +7709,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "ternary: missing else_expr".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_ternary(condition, then_expr, else_expr);
@@ -7772,7 +7814,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "binary_op: missing left operand".into(),
-                        ))
+                        ));
                     }
                 };
                 let right = match args.get(2) {
@@ -7780,7 +7822,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "binary_op: missing right operand".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_binary_op(&op, left, right);
@@ -7797,7 +7839,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     _ => {
                         return Err(crate::error::ZynPegError::CodeGenError(
                             "unary_op: missing operand".into(),
-                        ))
+                        ));
                     }
                 };
                 let handle = self.host.create_unary_op(&op, operand);

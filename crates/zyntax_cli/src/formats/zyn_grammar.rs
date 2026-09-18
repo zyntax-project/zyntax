@@ -462,7 +462,7 @@ fn lower_to_hir(
     mut program: TypedProgram,
     verbose: bool,
 ) -> Result<HirModule, Box<dyn std::error::Error>> {
-    use zyntax_typed_ast::{type_registry::*, TypedDeclaration};
+    use zyntax_typed_ast::{TypedDeclaration, type_registry::*};
 
     // Register struct/class types in the type registry before lowering
     // This is needed because the Grammar2 parser creates TypedDeclaration::Class

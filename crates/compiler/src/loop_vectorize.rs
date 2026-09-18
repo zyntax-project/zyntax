@@ -1254,14 +1254,16 @@ mod tests {
             .map(|b| b.id)
             .expect("vector body present");
         let body = &f.blocks[&body_id];
-        assert!(body
-            .instructions
-            .iter()
-            .any(|i| matches!(i, HirInstruction::VectorLoad { .. })));
-        assert!(body
-            .instructions
-            .iter()
-            .any(|i| matches!(i, HirInstruction::VectorStore { .. })));
+        assert!(
+            body.instructions
+                .iter()
+                .any(|i| matches!(i, HirInstruction::VectorLoad { .. }))
+        );
+        assert!(
+            body.instructions
+                .iter()
+                .any(|i| matches!(i, HirInstruction::VectorStore { .. }))
+        );
     }
 
     #[test]

@@ -1104,7 +1104,7 @@ const STASH_SENTINEL: i64 = -1;
 /// before compilation. Returns `STASH_SENTINEL` (non-zero) so the
 /// poll loop breaks on Ready — the entry wrapper treats 0 as
 /// Pending and would otherwise spin forever.
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn test_stash_resume(k: *mut u8) -> i64 {
     // Retain the state machine before stashing. `generate_sync_entry`
     // auto-releases the SM on its return path; without an explicit
@@ -1311,7 +1311,7 @@ fn build_async_out_of_line_program() -> TypedProgram {
 #[test]
 fn phase_j3_async_out_of_line_resume() {
     use zyntax_compiler::zrtl::{
-        PrimitiveSize, TypeCategory, TypeFlags, TypeTag, ZrtlSigFlags, ZrtlSymbolSig, MAX_PARAMS,
+        MAX_PARAMS, PrimitiveSize, TypeCategory, TypeFlags, TypeTag, ZrtlSigFlags, ZrtlSymbolSig,
     };
 
     // Clear any leftover stash from a previous test invocation.

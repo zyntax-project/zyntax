@@ -5,11 +5,11 @@
 //! to register built-in complex types while keeping primitive types simple.
 
 use zyntax_typed_ast::{
+    AstArena, PrimitiveType, Span, Type,
     type_registry::{
         FieldDef, MethodSig, Mutability, TypeBound, TypeDefinition, TypeId, TypeKind, TypeMetadata,
         TypeParam, TypeRegistry, Variance, Visibility,
     },
-    AstArena, PrimitiveType, Span, Type,
 };
 use zyntax_typed_ast::{AsyncKind, CallingConvention, ConstValue, NullabilityKind};
 

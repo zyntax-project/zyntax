@@ -6,7 +6,7 @@
 use crate::*;
 // use crate::universal_type_system::*;
 use crate::source::Span;
-use crate::{arena::InternedString, TypeId};
+use crate::{TypeId, arena::InternedString};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Nominal type checker for inheritance-based type systems
@@ -1420,11 +1420,15 @@ mod tests {
             nullability: NullabilityKind::NonNull,
         };
 
-        assert!(checker
-            .is_subtype(&string_instance, &object_instance)
-            .unwrap());
-        assert!(!checker
-            .is_subtype(&object_instance, &string_instance)
-            .unwrap());
+        assert!(
+            checker
+                .is_subtype(&string_instance, &object_instance)
+                .unwrap()
+        );
+        assert!(
+            !checker
+                .is_subtype(&object_instance, &string_instance)
+                .unwrap()
+        );
     }
 }

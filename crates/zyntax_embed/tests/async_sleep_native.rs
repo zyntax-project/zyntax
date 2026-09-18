@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use zyntax_embed::__zyntax_async_set_timeout;
 use zyntax_embed::host_futures::{
-    clear_for_tests, parked_count, register_future, set_complete_task_callback, ParkedFuture,
+    ParkedFuture, clear_for_tests, parked_count, register_future, set_complete_task_callback,
 };
 
 // Two-state SM modeling an `await __builtin_sleep(...)` shape:

@@ -691,7 +691,7 @@ pub fn clear_for_tests() {
 /// `ParkedFuture` struct on the wasm side — every arg comes through
 /// as an i64 (or pointer-sized) value compatible with the krio_adapter
 /// emit shape.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_register_future(
     poll_fn_ptr: *const u8,
     state_machine_ptr: *mut u8,
@@ -722,7 +722,7 @@ pub extern "C" fn __zyntax_register_future(
 /// code so callers that re-enter through the C boundary (e.g. the
 /// wasm-bindgen export, or a native test harness) can branch
 /// without re-parsing the enum.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __zyntax_resolve_future(handle: i64, value: i64) -> i32 {
     resolve_future(handle, value).as_i32()
 }
@@ -736,7 +736,7 @@ pub extern "C" fn __zyntax_resolve_future(handle: i64, value: i64) -> i32 {
 ///
 /// `msg_ptr` + `msg_len` must describe a valid UTF-8 byte slice
 /// owned by the caller for the duration of this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __zyntax_reject_future(
     handle: i64,
     msg_ptr: *const u8,

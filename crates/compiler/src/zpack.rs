@@ -76,13 +76,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 use std::path::Path;
+use zip::CompressionMethod;
 use zip::read::ZipArchive;
 use zip::write::{FileOptions, SimpleFileOptions, ZipWriter};
-use zip::CompressionMethod;
 
-use crate::bytecode::{deserialize_module, serialize_module, Format};
-use crate::zrtl::{ZrtlError, ZrtlPlugin};
 use crate::HirModule;
+use crate::bytecode::{Format, deserialize_module, serialize_module};
+use crate::zrtl::{ZrtlError, ZrtlPlugin};
 
 /// File extension for ZPack archives
 pub const ZPACK_EXTENSION: &str = "zpack";

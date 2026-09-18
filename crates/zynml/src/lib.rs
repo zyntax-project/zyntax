@@ -700,12 +700,14 @@ mod tests {
         assert_eq!(prelude.language(), "zynml");
         assert_eq!(prelude.module_name(), "prelude");
         assert!(!prelude.program().declarations.is_empty());
-        assert!(prelude
-            .program()
-            .type_registry
-            .get_all_types()
-            .next()
-            .is_some());
+        assert!(
+            prelude
+                .program()
+                .type_registry
+                .get_all_types()
+                .next()
+                .is_some()
+        );
 
         // The source travels with it, for a host that would rather
         // parse than trust the artifact.

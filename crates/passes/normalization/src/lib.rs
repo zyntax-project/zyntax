@@ -9,9 +9,9 @@ use pattern_engine::{
     Bindings, DeclRewrite, ExprRewrite, Pattern, PatternEngine, PatternPass, Priority,
     RewriteOutput, StmtRewrite,
 };
+use zyntax_typed_ast::InternedString;
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type};
 use zyntax_typed_ast::typed_ast::*;
-use zyntax_typed_ast::InternedString;
 
 pub struct Pass;
 
@@ -236,8 +236,8 @@ fn fstring_to_concat() -> ExprRewrite {
 mod tests {
     use super::*;
     use pattern_engine::{EngineConfig, PatternEngine};
-    use zyntax_typed_ast::source::Span;
     use zyntax_typed_ast::InternedString;
+    use zyntax_typed_ast::source::Span;
 
     fn span() -> Span {
         Span::new(0, 0)

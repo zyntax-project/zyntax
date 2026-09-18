@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use zyntax_compiler::{
-    compile_to_hir, effect_analysis::analyze_effects, effect_handler_resolution::resolve_handlers,
-    hir::HirInstruction, CompilationConfig,
+    CompilationConfig, compile_to_hir, effect_analysis::analyze_effects,
+    effect_handler_resolution::resolve_handlers, hir::HirInstruction,
 };
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{PrimitiveType, Type, Visibility};
@@ -258,8 +258,8 @@ fn handler_body_calling_resume_param_emits_runtime_symbol_call() {
     // Without this rewrite, `k(value)` would lower to a regular
     // `HirCallable::Indirect(k)` — which would crash at JIT link time
     // because k is a struct value, not a function pointer.
-    use zyntax_typed_ast::type_registry::TypeMetadata;
     use zyntax_typed_ast::TypeRegistry;
+    use zyntax_typed_ast::type_registry::TypeMetadata;
 
     let mut registry = TypeRegistry::new();
     // Pre-register a "Resume" type so the lookup at

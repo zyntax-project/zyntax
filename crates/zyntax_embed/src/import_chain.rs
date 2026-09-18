@@ -398,9 +398,9 @@ pub(crate) fn resolve_unresolved_types(
     program: &mut zyntax_typed_ast::TypedProgram,
     type_registry: &zyntax_typed_ast::TypeRegistry,
 ) {
+    use zyntax_typed_ast::InternedString;
     use zyntax_typed_ast::type_registry::Type;
     use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedNode};
-    use zyntax_typed_ast::InternedString;
 
     log::debug!(
         "Resolving unresolved types in program with {} declarations",
@@ -960,8 +960,8 @@ pub(crate) fn resolve_in_expr(
             let mut positional_args = method_call.positional_args;
             if type_name_str == "Fiber" && method_name_str == "abort" && positional_args.len() == 1
             {
-                use zyntax_typed_ast::typed_ast::TypedLiteral;
                 use zyntax_typed_ast::PrimitiveType;
+                use zyntax_typed_ast::typed_ast::TypedLiteral;
                 let user_arg = &positional_args[0];
                 let is_string = matches!(user_arg.ty, Type::Primitive(PrimitiveType::String));
                 let variant_tag: i128 = if is_string { 1 } else { 2 };
@@ -1104,9 +1104,9 @@ pub(crate) fn process_extern_declarations_mut(
     program: &zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
 ) -> RuntimeResult<()> {
+    use zyntax_typed_ast::TypeId;
     use zyntax_typed_ast::type_registry::{Type, TypeDefinition, TypeKind, TypeMetadata};
     use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedExtern};
-    use zyntax_typed_ast::TypeId;
 
     // Collect all extern struct declarations
     for decl in &program.declarations {
@@ -1153,11 +1153,11 @@ pub(crate) fn register_struct_declarations(
     program: &zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
 ) -> RuntimeResult<()> {
+    use zyntax_typed_ast::TypeId;
     use zyntax_typed_ast::type_registry::{
         FieldDef, TypeDefinition, TypeKind, TypeMetadata, TypeParam, Variance, Visibility,
     };
     use zyntax_typed_ast::typed_ast::TypedDeclaration;
-    use zyntax_typed_ast::TypeId;
 
     // Process all Class declarations (structs are represented as Class)
     for decl in &program.declarations {
@@ -1268,12 +1268,12 @@ pub(crate) fn register_enum_declarations(
     program: &zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
 ) -> RuntimeResult<()> {
+    use zyntax_typed_ast::TypeId;
     use zyntax_typed_ast::type_registry::{
         FieldDef, TypeDefinition, TypeKind, TypeMetadata, TypeParam, Variance, VariantDef,
         VariantFields, Visibility,
     };
     use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedVariantFields};
-    use zyntax_typed_ast::TypeId;
 
     for decl in &program.declarations {
         if let TypedDeclaration::Enum(enum_decl) = &decl.node {
@@ -1436,8 +1436,10 @@ mod tests {
         // every host today, and its imports go to the flat resolvers
         // exactly as they did before.
         let modules = two_languages();
-        assert!(resolve_snapshot_module(&modules, None, None, "prelude")
-            .expect("resolve")
-            .is_none());
+        assert!(
+            resolve_snapshot_module(&modules, None, None, "prelude")
+                .expect("resolve")
+                .is_none()
+        );
     }
 }

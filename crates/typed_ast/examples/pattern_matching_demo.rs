@@ -4,7 +4,7 @@
 //! This example showcases the comprehensive pattern matching capabilities
 //! of the Zyntax TypedAST, inspired by Rust and Haxe pattern matching systems.
 
-use zyntax_typed_ast::{type_registry::*, typed_ast::*, AstArena, Span};
+use zyntax_typed_ast::{AstArena, Span, type_registry::*, typed_ast::*};
 use zyntax_typed_ast::{AsyncKind, CallingConvention, ConstValue, NullabilityKind};
 
 /// Demonstrates basic pattern matching constructs

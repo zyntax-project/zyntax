@@ -447,11 +447,7 @@ pub extern "C" fn vec_cosine_similarity_f32(a: *const f32, b: *const f32, len: u
     let norm_b_sq = vec_dot_product_f32(b, b, len);
 
     let denom = (norm_a_sq * norm_b_sq).sqrt();
-    if denom < 1e-10 {
-        0.0
-    } else {
-        dot / denom
-    }
+    if denom < 1e-10 { 0.0 } else { dot / denom }
 }
 
 /// L2 normalize in place: data[i] /= norm(data)

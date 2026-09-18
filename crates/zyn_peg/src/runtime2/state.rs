@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use zyntax_typed_ast::typed_ast::TypedCatch;
 use zyntax_typed_ast::{
-    type_registry::{PrimitiveType, Type, TypeRegistry},
     InternedString, Span, TypedASTBuilder,
+    type_registry::{PrimitiveType, Type, TypeRegistry},
 };
 
 /// Result of a parse attempt
@@ -661,8 +661,8 @@ impl<'a> ParserState<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zyntax_typed_ast::type_registry::TypeRegistry;
     use zyntax_typed_ast::TypedASTBuilder;
+    use zyntax_typed_ast::type_registry::TypeRegistry;
 
     #[test]
     fn test_position_tracking() {

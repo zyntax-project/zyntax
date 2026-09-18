@@ -8,8 +8,8 @@
 use std::sync::{Arc, Mutex};
 
 use zyntax_embed::host_futures::{
-    clear_for_tests, parked_count, register_future, reject_future, resolve_future,
-    set_complete_task_callback, ParkedFuture, ResolveOutcome,
+    ParkedFuture, ResolveOutcome, clear_for_tests, parked_count, register_future, reject_future,
+    resolve_future, set_complete_task_callback,
 };
 
 // SM layout used by these tests:

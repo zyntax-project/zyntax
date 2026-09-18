@@ -467,11 +467,7 @@ fn step_of(func: &HirFunction, defs: &Defs<'_>, lp: &NaturalLoop, counter: HirId
             entered_from_outside = true;
         }
     }
-    if entered_from_outside {
-        step
-    } else {
-        None
-    }
+    if entered_from_outside { step } else { None }
 }
 
 /// The value as a signed integer constant, where it is one.

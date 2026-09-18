@@ -9,9 +9,9 @@ use zyntax_compiler::{
     lowering::{AstLowering, LoweringConfig, LoweringContext},
 };
 use zyntax_typed_ast::{
-    arena::AstArena, typed_ast::TypedBlock, typed_node, CallingConvention, FieldDef, Mutability,
-    PrimitiveType, Span, Type, TypeDefinition, TypeId, TypeKind, TypeMetadata, TypeRegistry,
-    TypedDeclaration, TypedFunction, TypedProgram, VariantDef, VariantFields, Visibility,
+    CallingConvention, FieldDef, Mutability, PrimitiveType, Span, Type, TypeDefinition, TypeId,
+    TypeKind, TypeMetadata, TypeRegistry, TypedDeclaration, TypedFunction, TypedProgram,
+    VariantDef, VariantFields, Visibility, arena::AstArena, typed_ast::TypedBlock, typed_node,
 };
 
 fn test_span() -> Span {

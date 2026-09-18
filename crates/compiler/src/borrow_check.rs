@@ -10,16 +10,16 @@
 //! - References do not outlive their referents
 //! - Drop order is correct for RAII resources
 
+use crate::CompilerError;
+use crate::CompilerResult;
 use crate::analysis::{AliasAnalysis, FunctionAnalysis, LivenessAnalysis, ModuleAnalysis};
 use crate::hir::{
     BorrowCheckContext, BorrowInfo, HirBlock, HirFunction, HirId, HirInstruction, HirLifetime,
     HirModule, HirType, HirValue, HirValueKind, LifetimeConstraint, MoveInfo,
 };
-use crate::CompilerError;
-use crate::CompilerResult;
 use std::collections::{HashMap, HashSet};
-use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::InternedString;
+use zyntax_typed_ast::source::Span;
 
 /// Result of borrow checking
 #[derive(Debug)]
@@ -259,7 +259,7 @@ impl<'a> HirBorrowChecker<'a> {
     /// takes that responsibility, so this reports only the ones that
     /// have not.
     fn check_releases_of_borrowed_params(&mut self, func: &HirFunction) {
-        use crate::drop_insert::{derived_values, symbol_role, SymbolRole};
+        use crate::drop_insert::{SymbolRole, derived_values, symbol_role};
         use crate::hir::{HirCallable, Intrinsic, ParamOwnership};
 
         for (index, param) in func.signature.params.iter().enumerate() {

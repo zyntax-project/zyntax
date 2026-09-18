@@ -4,7 +4,7 @@
 //! printing, slicing. Built once per element kind.
 
 use crate::build::*;
-use crate::{list_of, Kind, Policy, TUPLE_TAG};
+use crate::{Kind, Policy, TUPLE_TAG, list_of};
 use zyntax_typed_ast::type_registry::{FieldDef, TypeMetadata, TypeParam, Variance};
 use zyntax_typed_ast::typed_ast::{TypedClass, TypedDeclaration, TypedField, TypedTypeParam};
 use zyntax_typed_ast::typed_builder::TypedASTBuilder;

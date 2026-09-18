@@ -23,12 +23,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use zyntax_compiler::{
+    CompilationConfig, CompilerError,
     cranelift_backend::CraneliftBackend,
     hir::{HirId, HirModule},
     lowering::AstLowering,
     runtime::{Executor, Waker as RuntimeWaker},
     zrtl::DynamicValue,
-    CompilationConfig, CompilerError,
 };
 
 pub struct ZyntaxRuntime {
@@ -393,7 +393,7 @@ impl ZyntaxRuntime {
     ) -> RuntimeResult<HirModule> {
         use zyntax_compiler::lowering::{LoweringConfig, LoweringContext};
         use zyntax_typed_ast::{
-            type_registry::*, AstArena, InternedString, TypeRegistry, TypedDeclaration,
+            AstArena, InternedString, TypeRegistry, TypedDeclaration, type_registry::*,
         };
         let fn_start = std::time::Instant::now();
 
@@ -1473,7 +1473,7 @@ impl ZyntaxRuntime {
     fn register_static_plugin_deferred(&mut self, plugin: zrtl::StaticPlugin) -> RuntimeResult<()> {
         use std::ffi::CStr;
         use zyntax_compiler::zrtl::{
-            RuntimeSymbolInfo, TypeTag, ZrtlSigFlags, ZrtlSymbolSig, MAX_PARAMS,
+            MAX_PARAMS, RuntimeSymbolInfo, TypeTag, ZrtlSigFlags, ZrtlSymbolSig,
         };
 
         // Walk the SDK-side `ZrtlSymbol` array and build compiler-side

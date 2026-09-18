@@ -26,8 +26,8 @@
 
 #![cfg(feature = "llvm-backend")]
 
-use inkwell::context::Context;
 use inkwell::OptimizationLevel;
+use inkwell::context::Context;
 
 type AddFn = unsafe extern "C" fn(i64, i64) -> i64;
 

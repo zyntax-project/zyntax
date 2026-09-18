@@ -14,7 +14,7 @@ use krio_stackless::CoroCfg;
 use zyntax_compiler::hir::{HirCallable, HirInstruction, Intrinsic};
 
 use common::{
-    live_out_for_entry_only, make_async_function_with_one_await, module_of, AsyncFnFixture,
+    AsyncFnFixture, live_out_for_entry_only, make_async_function_with_one_await, module_of,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

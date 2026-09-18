@@ -2711,9 +2711,11 @@ async fn compute(x: i32) i32 {
 
         match result {
             Ok(Ok(_functions)) => {
-                let promises = vec![runtime
-                    .call_async("compute", &[ZyntaxValue::Int(7)])
-                    .unwrap()];
+                let promises = vec![
+                    runtime
+                        .call_async("compute", &[ZyntaxValue::Int(7)])
+                        .unwrap(),
+                ];
 
                 let mut all = PromiseAll::new(promises);
                 let results = all.await_all().expect("Single PromiseAll should succeed");

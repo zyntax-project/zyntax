@@ -5,8 +5,8 @@
 //! demonstrating all the patterns and constructs that are now supported.
 
 use zyntax_typed_ast::{
-    typed_ast::*, AsyncKind, CallingConvention, Mutability, NullabilityKind, PrimitiveType, Span,
-    Type, TypeId, TypedASTBuilder, Variance, Visibility,
+    AsyncKind, CallingConvention, Mutability, NullabilityKind, PrimitiveType, Span, Type, TypeId,
+    TypedASTBuilder, Variance, Visibility, typed_ast::*,
 };
 
 fn main() {

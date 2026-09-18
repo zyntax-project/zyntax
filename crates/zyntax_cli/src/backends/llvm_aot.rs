@@ -109,11 +109,11 @@ pub fn compile_llvm(
     static_libs: &[PathBuf],
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use inkwell::OptimizationLevel;
     use inkwell::context::Context;
     use inkwell::targets::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
     };
-    use inkwell::OptimizationLevel;
     use zyntax_compiler::llvm_backend::LLVMBackend;
 
     let output_path = output.unwrap_or_else(|| PathBuf::from("a.out"));
@@ -306,8 +306,8 @@ pub fn compile_and_run_llvm(
     pack_symbols: &[(&'static str, *const u8)],
     verbose: bool,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    use inkwell::context::Context;
     use inkwell::OptimizationLevel;
+    use inkwell::context::Context;
     use zyntax_compiler::llvm_jit_backend::LLVMJitBackend;
 
     if verbose {

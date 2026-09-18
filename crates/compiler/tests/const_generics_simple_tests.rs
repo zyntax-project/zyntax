@@ -1,6 +1,6 @@
 //! Simplified tests for const generics and monomorphization
 
-use zyntax_compiler::{hir::*, monomorphize_module, ConstEvalContext, MonomorphizationContext};
+use zyntax_compiler::{ConstEvalContext, MonomorphizationContext, hir::*, monomorphize_module};
 use zyntax_typed_ast::arena::AstArena;
 
 fn create_test_arena() -> AstArena {

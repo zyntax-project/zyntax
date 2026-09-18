@@ -1503,8 +1503,8 @@ fn run_counted(
 mod tests {
     use super::*;
     use crate::grammar::{GrammarIR, RuleIR};
-    use zyntax_typed_ast::type_registry::TypeRegistry;
     use zyntax_typed_ast::TypedASTBuilder;
+    use zyntax_typed_ast::type_registry::TypeRegistry;
 
     fn grammar_with(rules: Vec<(&str, PatternIR)>) -> GrammarIR {
         let mut g = GrammarIR::default();

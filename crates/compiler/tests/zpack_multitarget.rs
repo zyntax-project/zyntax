@@ -13,7 +13,7 @@
 
 use std::io::Cursor;
 
-use zyntax_compiler::zpack::{ZPack, ZPackManifest, ZPackWriter, ZPACK_VERSION};
+use zyntax_compiler::zpack::{ZPACK_VERSION, ZPack, ZPackManifest, ZPackWriter};
 
 const NATIVE_RUNTIME_BYTES: &[u8] = b"FAKE-NATIVE-DYLIB-PLACEHOLDER";
 const WASM_RUNTIME_BYTES: &[u8] = b"\0asm\x01\x00\x00\x00FAKE-WASM-MODULE-PLACEHOLDER";
@@ -75,8 +75,10 @@ fn manifest_records_each_target_added() {
     }
     let manifest: ZPackManifest = serde_json::from_str(&manifest_json).expect("parse manifest");
     assert!(manifest.targets.iter().any(|t| t == "aarch64-apple-darwin"));
-    assert!(manifest
-        .targets
-        .iter()
-        .any(|t| t == "wasm32-unknown-unknown"));
+    assert!(
+        manifest
+            .targets
+            .iter()
+            .any(|t| t == "wasm32-unknown-unknown")
+    );
 }

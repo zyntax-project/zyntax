@@ -26,8 +26,8 @@
 //! - data_ptr: Pointer to actual object
 //! - vtable_ptr: Pointer to trait's vtable for this type
 
-use crate::hir::{HirMethodSignature, HirType};
 use crate::CompilerResult;
+use crate::hir::{HirMethodSignature, HirType};
 use std::collections::{HashMap, HashSet};
 use zyntax_typed_ast::{InternedString, TypeId, TypeRegistry};
 

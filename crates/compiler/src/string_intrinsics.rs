@@ -42,11 +42,7 @@ pub unsafe extern "C" fn zrtl_string_equals(a: *const i32, b: *const i32) -> i32
     let data_b = unsafe { (b as *const u8).add(std::mem::size_of::<i32>()) };
     let slice_a = unsafe { std::slice::from_raw_parts(data_a, len_a as usize) };
     let slice_b = unsafe { std::slice::from_raw_parts(data_b, len_b as usize) };
-    if slice_a == slice_b {
-        1
-    } else {
-        0
-    }
+    if slice_a == slice_b { 1 } else { 0 }
 }
 
 /// `(name, function_pointer)` pairs to feed

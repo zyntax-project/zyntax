@@ -8,8 +8,8 @@
 //! argument (`N` → 4 / 8) into the struct's field types at `convert_type`.
 
 use zynml::{Grammar2, ZYNML_GRAMMAR};
-use zyntax_compiler::hir::HirType;
 use zyntax_compiler::HirModule;
+use zyntax_compiler::hir::HirType;
 use zyntax_embed::ZyntaxRuntime;
 
 fn lower(source: &str) -> HirModule {

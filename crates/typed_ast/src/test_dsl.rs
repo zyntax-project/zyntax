@@ -7,7 +7,7 @@ use crate::arena::{AstArena, InternedString};
 use crate::source::Span;
 use crate::type_registry::{Mutability, ParamInfo, PrimitiveType, Type, Visibility};
 use crate::typed_builder::TypedASTBuilder;
-use crate::{typed_ast::*, ConstValue};
+use crate::{ConstValue, typed_ast::*};
 use std::collections::HashMap;
 
 /// A test context that tracks declarations and provides fluent building

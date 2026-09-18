@@ -5,8 +5,9 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
+    ItemFn, LitBool, Token,
     parse::{Parse, ParseStream},
-    parse_macro_input, ItemFn, LitBool, Token,
+    parse_macro_input,
 };
 
 /// Attribute macro to export a runtime function with automatic plugin registration

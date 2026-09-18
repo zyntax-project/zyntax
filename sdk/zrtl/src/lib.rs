@@ -94,6 +94,10 @@
 //! let custom_tag = zrtl_tag!(Struct, 42);
 //! ```
 
+// The SDK's unsafe functions are unsafe throughout: their bodies work
+// on raw pointers the caller vouched for when it entered them.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 pub mod array;
 pub mod async_support;
 pub mod closure;
@@ -109,44 +113,44 @@ pub use array::{ArrayConstPtr, ArrayIterator, ArrayPtr, OwnedArray};
 pub use dynamic_box::{DropFn, DynamicBox};
 pub use generic_box::{GenericBox, GenericTypeArgs, MAX_TYPE_ARGS};
 pub use plugin::{
-    StaticPlugin, TypeInfo, ZrtlInfo, ZrtlSigFlags, ZrtlSymbol, ZrtlSymbolEntry, ZrtlSymbolSig,
-    ZrtlTyped, MAX_PARAMS, ZRTL_VERSION,
+    MAX_PARAMS, StaticPlugin, TypeInfo, ZRTL_VERSION, ZrtlInfo, ZrtlSigFlags, ZrtlSymbol,
+    ZrtlSymbolEntry, ZrtlSymbolSig, ZrtlTyped,
 };
 pub use string::{OwnedString, StringConstPtr, StringPtr, StringView};
 pub use type_system::{PrimitiveSize, TypeCategory, TypeFlags, TypeTag};
 
 // Re-export async types
 pub use async_support::{
-    next_task_id, noop_context, noop_waker, sleep, yield_once, AsyncState, FutureAdapter,
-    PollResult, PromiseAll, PromiseAllSettled, PromiseError, PromiseRace, SettledResult,
-    StateMachineHeader, Timer, YieldOnce, ZrtlPromise,
+    AsyncState, FutureAdapter, PollResult, PromiseAll, PromiseAllSettled, PromiseError,
+    PromiseRace, SettledResult, StateMachineHeader, Timer, YieldOnce, ZrtlPromise, next_task_id,
+    noop_context, noop_waker, sleep, yield_once,
 };
 
 // Re-export closure types
 pub use closure::{
-    zrtl_closure_call, zrtl_closure_clone, zrtl_closure_free, zrtl_closure_from_fn,
-    zrtl_closure_from_raw, zrtl_closure_from_raw_noenv, zrtl_closure_is_null, ClosureResult,
-    RawClosureFn, ThreadEntry, ZrtlClosure, ZrtlOnceClosure,
+    ClosureResult, RawClosureFn, ThreadEntry, ZrtlClosure, ZrtlOnceClosure, zrtl_closure_call,
+    zrtl_closure_clone, zrtl_closure_free, zrtl_closure_from_fn, zrtl_closure_from_raw,
+    zrtl_closure_from_raw_noenv, zrtl_closure_is_null,
 };
 
 // Re-export string functions
 pub use string::{
-    string_alloc_size, string_as_bytes, string_as_str, string_copy, string_data, string_empty,
-    string_equals, string_free, string_length, string_new, STRING_HEADER_SIZE,
+    STRING_HEADER_SIZE, string_alloc_size, string_as_bytes, string_as_str, string_copy,
+    string_data, string_empty, string_equals, string_free, string_length, string_new,
 };
 
 // Re-export array functions
 pub use array::{
-    array_alloc_size, array_as_slice, array_capacity, array_data, array_free, array_get,
-    array_length, array_new, array_push, array_set, ARRAY_HEADER_BYTES, ARRAY_HEADER_SIZE,
+    ARRAY_HEADER_BYTES, ARRAY_HEADER_SIZE, array_alloc_size, array_as_slice, array_capacity,
+    array_data, array_free, array_get, array_length, array_new, array_push, array_set,
 };
 
 /// Prelude module for convenient imports
 pub mod prelude {
     pub use crate::array::OwnedArray;
     pub use crate::async_support::{
-        sleep, yield_once, AsyncState, PollResult, PromiseAll, PromiseAllSettled, PromiseError,
-        PromiseRace, SettledResult, StateMachineHeader, ZrtlPromise,
+        AsyncState, PollResult, PromiseAll, PromiseAllSettled, PromiseError, PromiseRace,
+        SettledResult, StateMachineHeader, ZrtlPromise, sleep, yield_once,
     };
     pub use crate::closure::{ClosureResult, ThreadEntry, ZrtlClosure, ZrtlOnceClosure};
     pub use crate::dynamic_box::DynamicBox;

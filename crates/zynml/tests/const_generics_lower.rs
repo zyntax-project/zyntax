@@ -9,8 +9,8 @@
 //! const args (Milestone A wired the use-site `const_args`).
 
 use zynml::{Grammar2, ZYNML_GRAMMAR};
-use zyntax_compiler::hir::HirType;
 use zyntax_compiler::HirModule;
+use zyntax_compiler::hir::HirType;
 use zyntax_embed::ZyntaxRuntime;
 
 fn lower(source: &str) -> HirModule {

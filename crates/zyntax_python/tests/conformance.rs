@@ -69,7 +69,7 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
             return Outcome {
                 stdout: format!("<could not start: {e}>"),
                 status: -1,
-            }
+            };
         }
     };
     // Drained as it is written, so a program that prints more than a
@@ -107,7 +107,7 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
                 return Outcome {
                     stdout: format!("<wait failed: {e}>"),
                     status: -1,
-                }
+                };
             }
         }
     }

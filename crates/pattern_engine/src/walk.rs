@@ -6,8 +6,8 @@
 use crate::context::MatchContext;
 use crate::rewrite::{DeclRewrite, ExprRewrite, RewriteOutput, StmtRewrite};
 use crate::trace::{FiredRewrite, FiredSet};
-use zyntax_typed_ast::typed_ast::*;
 use zyntax_typed_ast::TypedASTBuilder;
+use zyntax_typed_ast::typed_ast::*;
 
 /// Result of walking the program in one iteration.
 pub struct WalkResult {

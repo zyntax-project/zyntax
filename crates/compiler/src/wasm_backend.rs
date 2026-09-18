@@ -1007,7 +1007,7 @@ impl<'a> FunctionEmitter<'a> {
                 return Err(WasmEmitError::Unsupported(format!(
                     "constant {:?} (ty {:?})",
                     other, ty
-                )))
+                )));
             }
         }
         Ok(())
@@ -1224,7 +1224,7 @@ impl<'a> FunctionEmitter<'a> {
                                     ref other => {
                                         return Err(WasmEmitError::Unsupported(format!(
                                             "fma on vector lane {other:?}"
-                                        )))
+                                        )));
                                     }
                                 });
                             }
@@ -1292,7 +1292,7 @@ impl<'a> FunctionEmitter<'a> {
                         return Err(WasmEmitError::Unsupported(format!(
                             "unsupported callee in emit_instruction: {:?}",
                             std::mem::discriminant(callee)
-                        )))
+                        )));
                     }
                 };
                 let import_idx = *self.import_indices.get(&import_name).ok_or_else(|| {
@@ -1645,7 +1645,7 @@ impl<'a> FunctionEmitter<'a> {
                     }
                     HirType::F64 => out.push(WasmInst::F64x2Splat),
                     other => {
-                        return Err(WasmEmitError::Unsupported(format!("splat lane {other:?}")))
+                        return Err(WasmEmitError::Unsupported(format!("splat lane {other:?}")));
                     }
                 }
                 out.push(self.local_set(*result)?);
@@ -1739,7 +1739,7 @@ impl<'a> FunctionEmitter<'a> {
                     other => {
                         return Err(WasmEmitError::Unsupported(format!(
                             "extract lane {other:?}"
-                        )))
+                        )));
                     }
                 }
                 out.push(self.local_set(*result)?);
@@ -1779,7 +1779,7 @@ impl<'a> FunctionEmitter<'a> {
                     }
                     HirType::F64 => out.push(WasmInst::F64x2ReplaceLane(l)),
                     other => {
-                        return Err(WasmEmitError::Unsupported(format!("insert lane {other:?}")))
+                        return Err(WasmEmitError::Unsupported(format!("insert lane {other:?}")));
                     }
                 }
                 out.push(self.local_set(*result)?);
@@ -2155,7 +2155,7 @@ fn case_constant_to_i64(c: &HirConstant) -> Result<i64> {
             return Err(WasmEmitError::Unsupported(format!(
                 "Switch case constant {:?} (only integer/bool case discriminators supported)",
                 other
-            )))
+            )));
         }
     })
 }
@@ -2215,7 +2215,7 @@ fn emit_binary_op(out: &mut Vec<WasmInst<'static>>, op: BinaryOp, ty: &HirType) 
             return Err(WasmEmitError::Unsupported(format!(
                 "binary op {:?} on {:?}",
                 op, ty
-            )))
+            )));
         }
     };
     out.push(inst);
@@ -2254,7 +2254,7 @@ fn emit_vector_binary(
         _ => {
             return Err(WasmEmitError::Unsupported(format!(
                 "vector binary {op:?} on lane {elem:?}"
-            )))
+            )));
         }
     };
     out.push(inst);

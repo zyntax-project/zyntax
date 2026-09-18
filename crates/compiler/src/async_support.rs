@@ -4,8 +4,8 @@
 //! async runtime integration for the HIR. This module provides the foundation
 //! for async/await syntax and coroutine-based programming models.
 
-use crate::hir::*;
 use crate::CompilerResult;
+use crate::hir::*;
 use indexmap::IndexMap;
 use std::collections::{HashSet, VecDeque};
 use zyntax_typed_ast::InternedString;
@@ -387,8 +387,10 @@ impl AsyncCompiler {
                 // (in which case it flows between blocks)
                 if all_defs.contains(used_id) || func.values.get(used_id).is_some() {
                     needs_capture.insert(*used_id);
-                    eprintln!("[DEBUG] analyze_captures: need to capture {:?} (used in block {:?}, not local)",
-                        used_id, block_id);
+                    eprintln!(
+                        "[DEBUG] analyze_captures: need to capture {:?} (used in block {:?}, not local)",
+                        used_id, block_id
+                    );
                 }
             }
         }
@@ -802,8 +804,12 @@ impl AsyncCompiler {
                                 state_machine.initial_state
                             }
                         };
-                        log::trace!("[ASYNC] build_states: segment {} has Branch, resolved_targets={:?}, next_state = {:?}",
-                            i, segment.resolved_targets, next_state);
+                        log::trace!(
+                            "[ASYNC] build_states: segment {} has Branch, resolved_targets={:?}, next_state = {:?}",
+                            i,
+                            segment.resolved_targets,
+                            next_state
+                        );
                         AsyncTerminator::Continue { next_state }
                     }
                     HirTerminator::CondBranch { condition, .. } => {
@@ -831,8 +837,14 @@ impl AsyncCompiler {
                                 (next, next)
                             };
 
-                        log::trace!("[ASYNC] build_states: segment {} has CondBranch, resolved_targets={:?}, condition={:?}, true_state={:?}, false_state={:?}",
-                            i, segment.resolved_targets, condition, true_state, false_state);
+                        log::trace!(
+                            "[ASYNC] build_states: segment {} has CondBranch, resolved_targets={:?}, condition={:?}, true_state={:?}, false_state={:?}",
+                            i,
+                            segment.resolved_targets,
+                            condition,
+                            true_state,
+                            false_state
+                        );
                         AsyncTerminator::CondContinue {
                             condition: *condition,
                             true_state,
@@ -973,8 +985,11 @@ impl AsyncCompiler {
                 if is_await_point {
                     // Push segment before await with a Branch terminator
                     // The Branch terminator signals to build_states that this segment has an await
-                    eprintln!("[DEBUG] split_single_block: instruction {} is await point, creating segment with {} instructions",
-                        i, current_instructions.len());
+                    eprintln!(
+                        "[DEBUG] split_single_block: instruction {} is await point, creating segment with {} instructions",
+                        i,
+                        current_instructions.len()
+                    );
                     segments.push(CodeSegment {
                         instructions: current_instructions,
                         terminator: HirTerminator::Branch {
@@ -990,8 +1005,10 @@ impl AsyncCompiler {
             }
 
             // Add final segment with the original terminator (usually Return)
-            eprintln!("[DEBUG] split_single_block: final segment has {} instructions with original terminator",
-                current_instructions.len());
+            eprintln!(
+                "[DEBUG] split_single_block: final segment has {} instructions with original terminator",
+                current_instructions.len()
+            );
             segments.push(CodeSegment {
                 instructions: current_instructions,
                 terminator: entry_block.terminator.clone(),
@@ -1357,8 +1374,10 @@ impl AsyncCompiler {
                     op,
                     ..
                 } => {
-                    eprintln!("[DEBUG] store_updated_captures_back: checking Binary left={:?} right={:?} result={:?}",
-                        left, right, result);
+                    eprintln!(
+                        "[DEBUG] store_updated_captures_back: checking Binary left={:?} right={:?} result={:?}",
+                        left, right, result
+                    );
                     // Pattern: `x = x + something` or `x = x - something` etc.
                     // Only the LEFT operand of an Add/Sub/etc. is considered the "updated" variable,
                     // assuming the pattern follows `var = var + expr`.
@@ -1407,8 +1426,10 @@ impl AsyncCompiler {
 
             // Check if this capture was updated
             if let Some(updated_value) = capture_updates.get(&capture.id) {
-                eprintln!("[DEBUG] store_updated_captures_back: storing capture {:?} -> updated value {:?} at offset {}",
-                    capture.id, updated_value, current_offset);
+                eprintln!(
+                    "[DEBUG] store_updated_captures_back: storing capture {:?} -> updated value {:?} at offset {}",
+                    capture.id, updated_value, current_offset
+                );
 
                 // Calculate capture slot pointer
                 let offset_const = wrapper.create_value(
@@ -1744,8 +1765,10 @@ impl AsyncCompiler {
                                         entry_block_id.map(|e| *block_id == e).unwrap_or(false);
                                     if let Some(val) = original_func.values.get(value_id) {
                                         if let HirValueKind::Constant(c) = &val.kind {
-                                            eprintln!("[DEBUG] Phi incoming {:?} from block {:?} is constant {:?} (from_entry={})",
-                                                value_id, block_id, c, is_from_entry);
+                                            eprintln!(
+                                                "[DEBUG] Phi incoming {:?} from block {:?} is constant {:?} (from_entry={})",
+                                                value_id, block_id, c, is_from_entry
+                                            );
                                             if is_from_entry {
                                                 // This is definitely the initial value
                                                 found_constant = Some(c.clone());
@@ -1794,7 +1817,10 @@ impl AsyncCompiler {
                                             _ => continue,
                                         };
                                         if const_ty == capture.ty && found_constant.is_none() {
-                                            eprintln!("[DEBUG] Found matching constant {:?} for capture {:?}", c, capture.id);
+                                            eprintln!(
+                                                "[DEBUG] Found matching constant {:?} for capture {:?}",
+                                                c, capture.id
+                                            );
                                             found_constant = Some(c.clone());
                                             break;
                                         }
@@ -1806,8 +1832,10 @@ impl AsyncCompiler {
                 }
 
                 if let Some(constant) = found_constant {
-                    eprintln!("[DEBUG] generate_async_entry: storing initial constant {:?} at offset {} for capture {:?} (name={})",
-                        constant, current_offset, capture.id, capture.name);
+                    eprintln!(
+                        "[DEBUG] generate_async_entry: storing initial constant {:?} at offset {} for capture {:?} (name={})",
+                        constant, current_offset, capture.id, capture.name
+                    );
 
                     // Create the constant value
                     let const_value_id = HirId::new();
@@ -1857,8 +1885,10 @@ impl AsyncCompiler {
                     });
 
                     // Store the constant value
-                    eprintln!("[DEBUG] generate_async_entry: HIR Store ptr={:?} value={:?} (constant={:?}, offset={})",
-                        field_ptr, const_value_id, constant, current_offset);
+                    eprintln!(
+                        "[DEBUG] generate_async_entry: HIR Store ptr={:?} value={:?} (constant={:?}, offset={})",
+                        field_ptr, const_value_id, constant, current_offset
+                    );
                     instructions.push(HirInstruction::Store {
                         ptr: field_ptr,
                         value: const_value_id,
@@ -2190,12 +2220,18 @@ impl AsyncCompiler {
                                 );
                                 wrapper.values.insert(*v, orig_value.clone());
                             } else {
-                                eprintln!("[DEBUG] WARNING: Return value {:?} not found in original_func.values either!", v);
+                                eprintln!(
+                                    "[DEBUG] WARNING: Return value {:?} not found in original_func.values either!",
+                                    v
+                                );
                                 // Check if it's a phi result
                                 for (blk_id, blk) in &original_func.blocks {
                                     for phi in &blk.phis {
                                         if phi.result == *v {
-                                            eprintln!("[DEBUG] Found phi producing return value in block {:?}", blk_id);
+                                            eprintln!(
+                                                "[DEBUG] Found phi producing return value in block {:?}",
+                                                blk_id
+                                            );
                                             // Add the phi result as a value
                                             let phi_ty = original_func
                                                 .values
@@ -3265,9 +3301,11 @@ mod tests {
 
         let state_machine = result.unwrap();
         assert_eq!(state_machine.original_function, func.id);
-        assert!(state_machine
-            .states
-            .contains_key(&state_machine.initial_state));
+        assert!(
+            state_machine
+                .states
+                .contains_key(&state_machine.initial_state)
+        );
     }
 
     #[test]

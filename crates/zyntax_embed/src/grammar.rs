@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use pest_meta::{optimizer, parser};
 use pest_vm::Vm;
 use serde::{Deserialize, Serialize};
-use zyn_peg::grammar::{parse_grammar, GrammarIR};
+use zyn_peg::grammar::{GrammarIR, parse_grammar};
 use zyn_peg::runtime::{
     AstHostFunctions, CommandInterpreter, RuntimeValue, TypedAstBuilder, ZpegModule,
 };
@@ -525,9 +525,9 @@ impl LanguageGrammar {
     /// This preserves the TypeRegistry which is not serializable
     fn parse_to_typed_program(&self, source: &str, filename: &str) -> GrammarResult<TypedProgram> {
         use zyn_peg::runtime2::{GrammarInterpreter, ParseResult, ParsedValue, ParserState};
+        use zyntax_typed_ast::TypedASTBuilder;
         use zyntax_typed_ast::source::SourceFile;
         use zyntax_typed_ast::type_registry::TypeRegistry;
-        use zyntax_typed_ast::TypedASTBuilder;
 
         // Use Grammar2 if available (preferred path - handles new action format correctly)
         if let Some(grammar2) = &self.grammar2 {
@@ -701,7 +701,7 @@ impl LanguageGrammar {
         use zyntax_typed_ast::type_registry::{PrimitiveType, Type};
         use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedFunction, TypedParameter};
         use zyntax_typed_ast::{
-            typed_node, CallingConvention, InternedString, Mutability, Span, Visibility,
+            CallingConvention, InternedString, Mutability, Span, Visibility, typed_node,
         };
 
         let span = Span::new(0, 0); // Synthetic span for injected declarations
@@ -877,8 +877,8 @@ impl LanguageGrammar {
         symbol: &str,
     ) -> zyntax_typed_ast::type_registry::Type {
         use zyntax_compiler::zrtl::TypeCategory;
-        use zyntax_typed_ast::type_registry::Type;
         use zyntax_typed_ast::InternedString;
+        use zyntax_typed_ast::type_registry::Type;
 
         // For opaque types, infer the type name from the symbol
         // e.g., "$Tensor$add" -> type is "$Tensor"

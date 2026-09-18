@@ -6,9 +6,9 @@
 //! The vtable field name is derived from the effect and operation names.
 
 use pattern_engine::{Bindings, ExprRewrite, Pattern, Priority, RewriteOutput};
+use zyntax_typed_ast::InternedString;
 use zyntax_typed_ast::type_registry::Type;
 use zyntax_typed_ast::typed_ast::*;
-use zyntax_typed_ast::InternedString;
 
 // M1.3 superseded this rewrite — the SSA builder now emits
 // `HirInstruction::PerformEffect` directly via `effect_op_map`, so

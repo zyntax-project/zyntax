@@ -2,9 +2,9 @@
 //!
 //! This module tests compile-time constant evaluation and constraint solving.
 
+use zyntax_typed_ast::PrimitiveType;
 use zyntax_typed_ast::const_evaluator::*;
 use zyntax_typed_ast::type_registry::{ConstBinaryOp, ConstValue, Type};
-use zyntax_typed_ast::PrimitiveType;
 
 #[test]
 fn test_eval_simple_literals() {

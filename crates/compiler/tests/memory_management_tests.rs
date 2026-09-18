@@ -1,8 +1,8 @@
 //! Tests for memory management infrastructure
 
 use zyntax_compiler::{
-    hir::*, ARCManager, AllocationInfo, DropManager, EscapeAnalysis, EscapeInfo, MemoryContext,
-    MemoryStrategy,
+    ARCManager, AllocationInfo, DropManager, EscapeAnalysis, EscapeInfo, MemoryContext,
+    MemoryStrategy, hir::*,
 };
 use zyntax_typed_ast::arena::AstArena;
 

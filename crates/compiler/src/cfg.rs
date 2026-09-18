@@ -3,8 +3,8 @@
 //! Builds CFG from TypedAST, preparing for SSA conversion.
 //! The CFG is designed to be compatible with both Cranelift and LLVM backends.
 
-use crate::hir::{HirBlock, HirFunction, HirId, HirInstruction, HirTerminator, HirType, HirValue};
 use crate::CompilerResult;
+use crate::hir::{HirBlock, HirFunction, HirId, HirInstruction, HirTerminator, HirType, HirValue};
 use petgraph::algo::{all_simple_paths, dominators};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::{DfsPostOrder, Walker};

@@ -6,7 +6,7 @@
 //! reported nothing at all on a program that released a buffer twice.
 
 use zynml::{Grammar2, ZYNML_GRAMMAR, ZYNML_STDLIB_PRELUDE, ZYNML_STDLIB_SIMD};
-use zyntax_compiler::{analysis, borrow_check, move_insert, BorrowError};
+use zyntax_compiler::{BorrowError, analysis, borrow_check, move_insert};
 use zyntax_embed::ZyntaxRuntime;
 
 /// Borrow-check one program, with the move insertion the check depends on.

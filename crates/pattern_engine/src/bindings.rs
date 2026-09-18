@@ -1,7 +1,7 @@
 use std::collections::HashMap;
+use zyntax_typed_ast::Type;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedExpression, TypedNode, TypedStatement};
-use zyntax_typed_ast::Type;
 
 /// The result of a successful pattern match — a typed map from names to matched AST fragments.
 #[derive(Debug, Clone, Default)]

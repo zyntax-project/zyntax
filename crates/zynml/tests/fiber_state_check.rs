@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use zynml::{Grammar2, ZYNML_GRAMMAR};
 use zyntax_compiler::hir::HirInstruction;
-use zyntax_embed::{compile_to_hir, CompilationConfig};
+use zyntax_embed::{CompilationConfig, compile_to_hir};
 use zyntax_typed_ast::type_registry::Type;
 use zyntax_typed_ast::typed_ast::TypedDeclaration;
 

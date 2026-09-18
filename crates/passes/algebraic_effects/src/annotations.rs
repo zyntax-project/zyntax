@@ -64,9 +64,9 @@ pub fn extract_effect_annotations() -> DeclRewrite {
 mod tests {
     use super::*;
     use pattern_engine::{EngineConfig, PatternEngine};
+    use zyntax_typed_ast::InternedString;
     use zyntax_typed_ast::source::Span;
     use zyntax_typed_ast::type_registry::{PrimitiveType, Type};
-    use zyntax_typed_ast::InternedString;
 
     fn ident_arg(name: &str) -> TypedAnnotationArg {
         TypedAnnotationArg::Positional(TypedAnnotationValue::Identifier(

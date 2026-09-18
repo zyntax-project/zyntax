@@ -55,6 +55,10 @@
 //! let program = grammar.parse("fn main() { 42 }")?;
 //! ```
 
+// The runtime's unsafe functions work on raw memory throughout; the
+// caller's obligation is stated at the function.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 mod array;
 mod compiled_artifact;
 mod convert;
@@ -131,8 +135,8 @@ pub use host_futures::{__zyntax_register_future, __zyntax_reject_future, __zynta
 pub use array::ZyntaxArray;
 pub use compiled_artifact::{CompiledArtifactError, CompiledImport};
 pub use snapshot::{
-    lower_for_snapshot, lower_for_snapshot_releasing, snapshot_file_name, Snapshot,
-    SnapshotBuilder, SnapshotError, SNAPSHOT_EXTENSION,
+    SNAPSHOT_EXTENSION, Snapshot, SnapshotBuilder, SnapshotError, lower_for_snapshot,
+    lower_for_snapshot_releasing, snapshot_file_name,
 };
 // Re-export the BC interpreter so embedders that want a bare
 // HirInterpreter without the beadie wrapper can grab it directly.
@@ -225,6 +229,7 @@ pub use zyntax_compiler::zrtl::{
     TypeMeta,
     TypeRegistry,
     TypeTag,
+    ZRTL_VERSION,
     ZrtlError,
     ZrtlInfo,
     // ZRTL plugin loading
@@ -233,12 +238,11 @@ pub use zyntax_compiler::zrtl::{
     ZrtlSigFlags,
     ZrtlSymbol,
     ZrtlSymbolSig,
-    ZRTL_VERSION,
 };
 
 // Re-export compiler types needed for module compilation
 pub use zyntax_compiler::{
-    compile_to_hir, CompilationConfig, CompilerError, CompilerResult, HirModule,
+    CompilationConfig, CompilerError, CompilerResult, HirModule, compile_to_hir,
 };
 #[cfg(feature = "native")]
-pub use zyntax_compiler::{compile_to_jit, HirFunction};
+pub use zyntax_compiler::{HirFunction, compile_to_jit};

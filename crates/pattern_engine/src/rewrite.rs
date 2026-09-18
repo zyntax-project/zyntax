@@ -1,9 +1,9 @@
 use crate::bindings::Bindings;
 use crate::pattern::Pattern;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedExpression, TypedNode, TypedStatement};
+use std::sync::atomic::{AtomicU32, Ordering};
 use zyntax_typed_ast::TypedASTBuilder;
+use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedExpression, TypedNode, TypedStatement};
 
 /// Unique rewrite identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -122,9 +122,9 @@ impl ExprRewrite {
         priority: Priority,
         pattern: Pattern<TypedExpression>,
         apply: impl Fn(&TypedNode<TypedExpression>, Bindings, &mut TypedASTBuilder) -> RewriteOutput
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             id: RewriteId::fresh(),
@@ -148,9 +148,9 @@ impl StmtRewrite {
         priority: Priority,
         pattern: Pattern<TypedStatement>,
         apply: impl Fn(&TypedNode<TypedStatement>, Bindings, &mut TypedASTBuilder) -> RewriteOutput
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             id: RewriteId::fresh(),
@@ -174,9 +174,9 @@ impl DeclRewrite {
         priority: Priority,
         pattern: Pattern<TypedDeclaration>,
         apply: impl Fn(&TypedNode<TypedDeclaration>, Bindings, &mut TypedASTBuilder) -> RewriteOutput
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             id: RewriteId::fresh(),
