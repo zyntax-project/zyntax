@@ -249,6 +249,10 @@ pub(crate) struct Module {
     /// Functions every call of which is in view, so an unannotated
     /// parameter can be typed by what is passed; see [`closed_items`].
     pub(crate) closed: std::collections::HashSet<String>,
+    /// Whether inference is over: while it runs, a field a class does
+    /// not yet declare may still be declared this round, and reads of
+    /// it are undecided rather than dynamic.
+    pub(crate) settled: std::cell::Cell<bool>,
     /// Every lambda and nested `def` in the program, by the function
     /// holding it and its position in the source, with what inference
     /// knows of each. Filled once before inference; the signatures are
@@ -327,7 +331,7 @@ pub(crate) fn returning_instances(
     items: &[Item<'_>],
 ) -> std::collections::HashSet<String> {
     fn returns_of<'a>(body: &'a [py::Stmt], out: &mut Vec<Option<&'a py::Expr>>) {
-        use ruff_python_ast::visitor::{walk_stmt, Visitor};
+        use ruff_python_ast::visitor::{Visitor, walk_stmt};
         struct Returns<'a, 'b> {
             out: &'b mut Vec<Option<&'a py::Expr>>,
         }
@@ -518,7 +522,7 @@ pub(crate) fn collect_bound_methods(
     body: &[py::Stmt],
     params: &[String],
 ) {
-    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     #[derive(Default)]
     struct Stores(HashMap<String, usize>);
     impl Stores {
@@ -565,10 +569,10 @@ pub(crate) fn collect_bound_methods(
             walk_stmt(self, stmt);
         }
         fn visit_expr(&mut self, expr: &'a py::Expr) {
-            if let py::Expr::Name(n) = expr {
-                if !matches!(n.ctx, py::ExprContext::Load) {
-                    self.note(n.id.as_str(), 1);
-                }
+            if let py::Expr::Name(n) = expr
+                && !matches!(n.ctx, py::ExprContext::Load)
+            {
+                self.note(n.id.as_str(), 1);
             }
             walk_expr(self, expr);
         }
@@ -658,7 +662,7 @@ pub(crate) fn collect_closures(
     classes: &HashMap<String, usize>,
     visible: std::collections::HashSet<String>,
 ) {
-    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     struct Finder<'m, 'c> {
         module: &'m mut Module,
         classes: &'c HashMap<String, usize>,
@@ -1270,7 +1274,7 @@ pub(crate) fn declared_sig_in(
 /// Whether a body yields, making its function a generator. Nested
 /// functions yield for themselves.
 pub(crate) fn is_generator(body: &[py::Stmt]) -> bool {
-    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     #[derive(Default)]
     struct Finder(bool);
     impl<'a> Visitor<'a> for Finder {
@@ -1327,7 +1331,7 @@ pub(crate) fn closed_items(
     body: &[py::Stmt],
     items: &[Item<'_>],
 ) -> std::collections::HashSet<String> {
-    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     #[derive(Default)]
     struct Mentions {
         /// Names used as anything but a callee: values, assignment
@@ -1478,10 +1482,10 @@ pub(crate) fn infer_module(
                 continue;
             }
             for t in &a.targets {
-                if let py::Expr::Attribute(attr) = t {
-                    if is_name(&attr.value, this) {
-                        module.list_fields.insert((k, attr.attr.to_string()));
-                    }
+                if let py::Expr::Attribute(attr) = t
+                    && is_name(&attr.value, this)
+                {
+                    module.list_fields.insert((k, attr.attr.to_string()));
                 }
             }
         }
@@ -2050,12 +2054,11 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
             py::Stmt::ClassDef(c) => self.nested(|v| v.visit_body(&c.body)),
             // `raise C`: the class is called with nothing.
             py::Stmt::Raise(r) => {
-                if let Some(py::Expr::Name(n)) = r.exc.as_deref() {
-                    if let Some(&k) = self.module.class_index.get(n.id.as_str()) {
-                        if let Some((_, name)) = self.module.method_sig(k, "__init__") {
-                            self.record(Target::Item(name), 1, &[], &[]);
-                        }
-                    }
+                if let Some(py::Expr::Name(n)) = r.exc.as_deref()
+                    && let Some(&k) = self.module.class_index.get(n.id.as_str())
+                    && let Some((_, name)) = self.module.method_sig(k, "__init__")
+                {
+                    self.record(Target::Item(name), 1, &[], &[]);
                 }
                 walk_stmt(self, stmt);
             }
@@ -2089,10 +2092,8 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
         // A closure value anywhere but a callee, a binding or a return
         // has left the inference's sight.
         let allowed = std::mem::take(&mut self.allow_closure);
-        if !allowed {
-            if let Some(k) = self.closure_of(expr) {
-                self.escape(k);
-            }
+        if !allowed && let Some(k) = self.closure_of(expr) {
+            self.escape(k);
         }
         // An operator on an instance passes the right operand to the
         // class's method for it.
@@ -2104,40 +2105,39 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
                 if let Some((target, first)) = self.callee(&c.func) {
                     self.record(target, first, &c.arguments.args, &c.arguments.keywords);
                 }
-                if let py::Expr::Attribute(a) = &*c.func {
-                    if !is_super_call(&a.value)
-                        && !self.opaque
-                        && self.typer().class_named(&a.value).is_none()
-                    {
-                        match self.arg_ty(&a.value) {
-                            Ty::Class(k) => {
-                                for sub in self.module.overriders(k as usize, a.attr.as_str()) {
-                                    if let Some((_, name)) =
-                                        self.module.method_sig(sub, a.attr.as_str())
-                                    {
-                                        self.record(
-                                            Target::Item(name),
-                                            1,
-                                            &c.arguments.args,
-                                            &c.arguments.keywords,
-                                        );
-                                    }
+                if let py::Expr::Attribute(a) = &*c.func
+                    && !is_super_call(&a.value)
+                    && !self.opaque
+                    && self.typer().class_named(&a.value).is_none()
+                {
+                    match self.arg_ty(&a.value) {
+                        Ty::Class(k) => {
+                            for sub in self.module.overriders(k as usize, a.attr.as_str()) {
+                                if let Some((_, name)) =
+                                    self.module.method_sig(sub, a.attr.as_str())
+                                {
+                                    self.record(
+                                        Target::Item(name),
+                                        1,
+                                        &c.arguments.args,
+                                        &c.arguments.keywords,
+                                    );
                                 }
                             }
-                            // Not an instance of a known class: any
-                            // method of the name may be reached with
-                            // whatever this passes.
-                            ty if (ty == Ty::Object || (ty == Ty::Unknown && self.settled))
-                                && self
-                                    .module
-                                    .classes
-                                    .iter()
-                                    .any(|c| c.methods.iter().any(|m| m == a.attr.as_str())) =>
-                            {
-                                self.dynamic_methods.insert(a.attr.to_string());
-                            }
-                            _ => {}
                         }
+                        // Not an instance of a known class: any
+                        // method of the name may be reached with
+                        // whatever this passes.
+                        ty if (ty == Ty::Object || (ty == Ty::Unknown && self.settled))
+                            && self
+                                .module
+                                .classes
+                                .iter()
+                                .any(|c| c.methods.iter().any(|m| m == a.attr.as_str())) =>
+                        {
+                            self.dynamic_methods.insert(a.attr.to_string());
+                        }
+                        _ => {}
                     }
                 }
                 self.allow_closure = true;
@@ -2451,7 +2451,7 @@ pub(crate) fn list_sites<'ast>(
     vars: &HashMap<String, Ty>,
     names: Vec<String>,
 ) -> HashMap<String, ListSites<'ast>> {
-    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     struct Uses<'a, 'm, 'ast> {
         module: &'m Module,
         typer: Typer<'m>,
@@ -2589,10 +2589,10 @@ pub(crate) fn list_sites<'ast>(
                     walk_stmt(self, stmt);
                 }
                 py::Stmt::For(f) => {
-                    if let py::Expr::Name(n) = &*f.target {
-                        if self.sites.contains_key(n.id.as_str()) {
-                            self.drop_name(n.id.as_str());
-                        }
+                    if let py::Expr::Name(n) = &*f.target
+                        && self.sites.contains_key(n.id.as_str())
+                    {
+                        self.drop_name(n.id.as_str());
                     }
                     if self.is_candidate(&f.iter).is_some() {
                         self.allowed.set(true);
@@ -2805,7 +2805,7 @@ pub(crate) fn asserted_classes(
     body: &[py::Stmt],
     classes: &HashMap<String, usize>,
 ) -> HashMap<String, u16> {
-    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     fn pairs(stmts: &[py::Stmt], classes: &HashMap<String, usize>, out: &mut Vec<(String, u16)>) {
         for (i, s) in stmts.iter().enumerate() {
             match s {
@@ -2887,10 +2887,10 @@ pub(crate) fn asserted_classes(
             walk_stmt(self, stmt);
         }
         fn visit_expr(&mut self, expr: &'a py::Expr) {
-            if let py::Expr::Name(n) = expr {
-                if !matches!(n.ctx, py::ExprContext::Load) {
-                    *self.0.entry(n.id.to_string()).or_default() += 1;
-                }
+            if let py::Expr::Name(n) = expr
+                && !matches!(n.ctx, py::ExprContext::Load)
+            {
+                *self.0.entry(n.id.to_string()).or_default() += 1;
             }
             walk_expr(self, expr);
         }
@@ -2914,7 +2914,7 @@ fn unkinded_locals(
     seeds: &HashMap<String, Ty>,
     scope: &crate::scope::Scope,
 ) -> Vec<String> {
-    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     /// Stores of each name, and how many of them bind an unkinded literal.
     #[derive(Default)]
     struct Stores(HashMap<String, (usize, usize)>);
@@ -2963,10 +2963,10 @@ fn unkinded_locals(
             walk_stmt(self, stmt);
         }
         fn visit_expr(&mut self, expr: &'a py::Expr) {
-            if let py::Expr::Name(n) = expr {
-                if !matches!(n.ctx, py::ExprContext::Load) {
-                    self.0.entry(n.id.to_string()).or_default().0 += 1;
-                }
+            if let py::Expr::Name(n) = expr
+                && !matches!(n.ctx, py::ExprContext::Load)
+            {
+                self.0.entry(n.id.to_string()).or_default().0 += 1;
             }
             walk_expr(self, expr);
         }
@@ -3417,21 +3417,20 @@ impl Walker<'_> {
                     }
                     // `self.f = []` takes the kind the program's writes
                     // into the field decided, nothing until they have.
-                    if let py::Expr::Attribute(attr) = t {
-                        if unkinded_list(&a.value).is_some() {
-                            if let Ty::Class(k) = self.expr(&attr.value) {
-                                let key = (k as usize, attr.attr.to_string());
-                                if self.module.list_fields.contains(&key) {
-                                    let decided = self
-                                        .module
-                                        .field_lists
-                                        .get(&key)
-                                        .copied()
-                                        .unwrap_or(Ty::Unknown);
-                                    self.target(t, decided);
-                                    continue;
-                                }
-                            }
+                    if let py::Expr::Attribute(attr) = t
+                        && unkinded_list(&a.value).is_some()
+                        && let Ty::Class(k) = self.expr(&attr.value)
+                    {
+                        let key = (k as usize, attr.attr.to_string());
+                        if self.module.list_fields.contains(&key) {
+                            let decided = self
+                                .module
+                                .field_lists
+                                .get(&key)
+                                .copied()
+                                .unwrap_or(Ty::Unknown);
+                            self.target(t, decided);
+                            continue;
                         }
                     }
                     self.target(t, ty);
@@ -3745,10 +3744,9 @@ impl Typer<'_> {
                 }
                 if !self.module.funcs.contains_key(name)
                     && !self.module.class_index.contains_key(name)
+                    && let Some(k) = builtin_index(name)
                 {
-                    if let Some(k) = builtin_index(name) {
-                        return Ty::Builtin(k);
-                    }
+                    return Ty::Builtin(k);
                 }
                 Ty::Object
             }
@@ -3757,10 +3755,10 @@ impl Typer<'_> {
                 let r = self.expr(&b.right);
                 // An instance takes part through its class's method, and
                 // the result is what that method returns.
-                if let Ty::Class(k) = l {
-                    if let Some((sig, _)) = self.module.method_sig(k as usize, dunder_name(b.op)) {
-                        return sig.ret;
-                    }
+                if let Ty::Class(k) = l
+                    && let Some((sig, _)) = self.module.method_sig(k as usize, dunder_name(b.op))
+                {
+                    return sig.ret;
                 }
                 binop(b.op, l, r, &b.right)
             }
@@ -3808,7 +3806,11 @@ impl Typer<'_> {
                         .module
                         .field(k as usize, a.attr.as_str())
                         .map(|(_, ty)| ty)
-                        .unwrap_or(Ty::Object),
+                        .unwrap_or(if self.module.settled.get() {
+                            Ty::Object
+                        } else {
+                            Ty::Unknown
+                        }),
                     // An attribute of None raises; its type is what the
                     // other paths to the name decide.
                     Ty::Unknown | Ty::None => Ty::Unknown,
@@ -3913,24 +3915,25 @@ impl Typer<'_> {
     }
 
     fn call(&self, c: &py::ExprCall) -> Ty {
-        if let py::Expr::Attribute(a) = &*c.func {
-            if is_name(&a.value, "frozenset") && a.attr.as_str() == "union" {
-                return Ty::Set;
-            }
+        if let py::Expr::Attribute(a) = &*c.func
+            && is_name(&a.value, "frozenset")
+            && a.attr.as_str() == "union"
+        {
+            return Ty::Set;
         }
-        if let py::Expr::Attribute(a) = &*c.func {
-            if let Some(m) = self.module_member_of(&a.value, a.attr.as_str()) {
-                return member_ty(m);
-            }
+        if let py::Expr::Attribute(a) = &*c.func
+            && let Some(m) = self.module_member_of(&a.value, a.attr.as_str())
+        {
+            return member_ty(m);
         }
         // `Class.method(obj, ...)` is the method.
-        if let py::Expr::Attribute(a) = &*c.func {
-            if let Some(k) = self.class_named(&a.value) {
-                return match self.module.method_sig(k, a.attr.as_str()) {
-                    Some((sig, _)) => sig.ret,
-                    None => Ty::Object,
-                };
-            }
+        if let py::Expr::Attribute(a) = &*c.func
+            && let Some(k) = self.class_named(&a.value)
+        {
+            return match self.module.method_sig(k, a.attr.as_str()) {
+                Some((sig, _)) => sig.ret,
+                None => Ty::Object,
+            };
         }
         // A call through a value whose function is known returns what
         // that function returns.
@@ -3953,10 +3956,11 @@ impl Typer<'_> {
                 if let Some(sig) = self.module.funcs.get(name) {
                     return sig.ret;
                 }
-                if !self.vars.contains_key(name) && !self.outer.contains_key(name) {
-                    if let Some(m) = self.module.imported_name(name) {
-                        return member_ty(m);
-                    }
+                if !self.vars.contains_key(name)
+                    && !self.outer.contains_key(name)
+                    && let Some(m) = self.module.imported_name(name)
+                {
+                    return member_ty(m);
                 }
                 self.builtin_call(name, c)
             }

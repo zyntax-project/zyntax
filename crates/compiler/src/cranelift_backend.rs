@@ -29,8 +29,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::effect_codegen::{
-    analyze_handle_effect, analyze_perform_effect, get_handler_ops_info, mangle_handler_op_name,
-    runtime as effect_runtime, EffectCodegenContext, HandlerStackEntry, PerformStrategy,
+    EffectCodegenContext, HandlerStackEntry, PerformStrategy, analyze_handle_effect,
+    analyze_perform_effect, get_handler_ops_info, mangle_handler_op_name,
+    runtime as effect_runtime,
 };
 use crate::hir::{
     BinaryOp, HirCallable, HirConstant, HirFunction, HirGlobal, HirId, HirInstruction, HirModule,
@@ -425,6 +426,8 @@ pub struct CraneliftBackend {
     /// Stubs emitted for lazy functions in the module being compiled,
     /// published into the functions' cells once finalised.
     lazy_stubs: Vec<(HirId, FuncId)>,
+    /// The interpreter's callers into native code, one per call shape.
+    interp_thunks: HashMap<crate::hir_interp::NativeSig, usize>,
     /// Code offsets of tier-0 probe sites from the most recent compile,
     /// as `(site_key, offset_from_function_start)`. Recovered from the
     /// source-location table, which is the only post-codegen mapping from
@@ -480,6 +483,11 @@ fn host_isa() -> Arc<dyn cranelift_codegen::isa::TargetIsa> {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
     flag_builder.set("is_pic", "false").unwrap();
+    // `ZYNTAX_FRAME_POINTERS=1` keeps frame pointers in generated code so
+    // a sampling profiler can walk through it; safe, costs a register.
+    if std::env::var_os("ZYNTAX_FRAME_POINTERS").is_some() {
+        flag_builder.set("preserve_frame_pointers", "true").unwrap();
+    }
     flag_builder
         .set(
             "opt_level",
@@ -606,6 +614,7 @@ impl CraneliftBackend {
             only_compile_reachable: None,
             lazy_functions: HashSet::new(),
             lazy_stubs: Vec::new(),
+            interp_thunks: HashMap::new(),
             compile_generation: HashMap::new(),
             bead_ids: HashMap::new(),
             probe_sites: Vec::new(),
@@ -1393,6 +1402,105 @@ impl CraneliftBackend {
     /// The stub standing in for `function` until its first call: it asks
     /// the runtime to compile the body, then calls the entry it gets
     /// with its own arguments and returns what that returns.
+    /// The interpreter's caller for native code of one shape:
+    /// `fn(target, words, out)` loads each argument word into the
+    /// callee's register class, calls `target`, and stores the result
+    /// word at `out`, or passes `out` as the destination the callee
+    /// fills. Made once per shape.
+    pub fn interp_thunk(
+        &mut self,
+        sig: &crate::hir_interp::NativeSig,
+    ) -> CompilerResult<*const u8> {
+        if let Some(&p) = self.interp_thunks.get(sig) {
+            return Ok(p as *const u8);
+        }
+        let ptr_ty = self.module.target_config().pointer_type();
+        let mut callee = self.module.make_signature();
+        if sig.fast {
+            callee.call_conv = CallConv::Fast;
+        }
+        if sig.destination {
+            callee.params.push(AbiParam::new(ptr_ty));
+        }
+        let mut param_tys = Vec::with_capacity(sig.params.len());
+        for p in &sig.params {
+            let t = self.translate_type(p)?;
+            if t.is_vector() {
+                return Err(CompilerError::Backend(
+                    "a vector cannot travel through the interpreter's call words".into(),
+                ));
+            }
+            callee.params.push(AbiParam::new(t));
+            param_tys.push(t);
+        }
+        let ret_ty = if sig.ret == HirType::Void {
+            None
+        } else {
+            let t = self.translate_type(&sig.ret)?;
+            if t.is_vector() {
+                return Err(CompilerError::Backend(
+                    "a vector cannot travel through the interpreter's call words".into(),
+                ));
+            }
+            callee.returns.push(AbiParam::new(t));
+            Some(t)
+        };
+
+        let mut thunk_sig = self.module.make_signature();
+        thunk_sig.params.push(AbiParam::new(ptr_ty));
+        thunk_sig.params.push(AbiParam::new(ptr_ty));
+        thunk_sig.params.push(AbiParam::new(ptr_ty));
+        let name = format!("__zyntax_interp_thunk_{}", self.interp_thunks.len());
+        let thunk_id = self
+            .module
+            .declare_function(&name, Linkage::Local, &thunk_sig)
+            .map_err(|e| CompilerError::Backend(format!("Failed to declare thunk: {e}")))?;
+
+        let frontend_config = self.module.target_config();
+        self.codegen_context.clear();
+        self.codegen_context.func.signature = thunk_sig;
+        let mut builder =
+            FunctionBuilder::new(&mut self.codegen_context.func, &mut self.builder_context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let params = builder.block_params(entry).to_vec();
+        let (target, words, out) = (params[0], params[1], params[2]);
+        let mut args = Vec::with_capacity(param_tys.len() + 1);
+        if sig.destination {
+            args.push(out);
+        }
+        for (i, t) in param_tys.iter().enumerate() {
+            let word = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), words, (i * 8) as i32);
+            args.push(bitcast_from_i64(&mut builder, word, *t));
+        }
+        let sig_ref = builder.import_signature(callee);
+        let call = builder.ins().call_indirect(sig_ref, target, &args);
+        let results = builder.inst_results(call).to_vec();
+        if !sig.destination {
+            if let (Some(&r), Some(_)) = (results.first(), ret_ty) {
+                let word = marshal_to_i64(&mut builder, r);
+                builder.ins().store(MemFlags::trusted(), word, out, 0);
+            }
+        }
+        builder.ins().return_(&[]);
+        builder.finalize(frontend_config);
+
+        self.module
+            .define_function(thunk_id, &mut self.codegen_context)
+            .map_err(|e| CompilerError::Backend(format!("Failed to define thunk: {e}")))?;
+        self.codegen_context.clear();
+        self.module
+            .finalize_definitions()
+            .map_err(|e| CompilerError::Backend(format!("Failed to finalize definitions: {e}")))?;
+        let p = self.module.get_finalized_function(thunk_id);
+        self.interp_thunks.insert(sig.clone(), p as usize);
+        Ok(p)
+    }
+
     fn compile_lazy_stub(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
         let Some(&declared) = self.function_map.get(&id) else {
             return Err(CompilerError::Backend(format!(
@@ -1498,7 +1606,10 @@ impl CraneliftBackend {
             // doesn't yet handle in helper mode), log and skip this layout
             // — the main function still works, we just don't OSR for this
             // header.
-            if let Err(e) = self.emit_osr_helper_via_body(id, function, &layout) {
+            // The region as resumed: live-ins the region redefines read
+            // a phi at the header.
+            let resumed = crate::osr::resumable(function, &layout);
+            if let Err(e) = self.emit_osr_helper_via_body(id, &resumed, &layout) {
                 if trace {
                     eprintln!(
                         "[osr] helper emission failed for bead={} header_idx={}: {}",
@@ -2139,11 +2250,13 @@ impl CraneliftBackend {
                 let cranelift_block = builder.create_block();
                 block_map.insert(*hir_block_id, cranelift_block);
 
-                // Add block parameters for phi nodes
+                // Add block parameters for phi nodes. Each phi's value is
+                // known now, so a use laid out ahead of its block finds it.
                 if let Some(hir_block) = function.blocks.get(hir_block_id) {
                     for phi in &hir_block.phis {
                         let phi_type = type_cache.get(&phi.ty).copied().unwrap_or(types::I64);
-                        builder.append_block_param(cranelift_block, phi_type);
+                        let param = builder.append_block_param(cranelift_block, phi_type);
+                        self.value_map.insert(phi.result, param);
                     }
                 }
             }
@@ -2224,7 +2337,9 @@ impl CraneliftBackend {
                         builder
                             .ins()
                             .load(target, MemFlags::new(), frame_ptr, offset as i32);
-                    if i < layout.phi_count {
+                    if i < layout.phi_count || layout.enters_as_phi(*hir_id) {
+                        // Header phis, in the header's order: its own,
+                        // then the repaired live-ins in live-in order.
                         osr_phi_jump_args.push(recovered);
                     } else {
                         // Non-phi live-in — value_map for body consumption.
@@ -3658,12 +3773,14 @@ impl CraneliftBackend {
                                     // callers get a `CompilerError::Backend`
                                     // pointing at the offending HirId; we can then
                                     // chase the missing definition.
-                                    let func_ptr_val =
-                                        match self.value_map.get(func_ptr_id).copied() {
-                                            Some(v) => v,
-                                            None => {
-                                                return Err(crate::CompilerError::Backend(
-                                                    format!(
+                                    let func_ptr_val = match self
+                                        .value_map
+                                        .get(func_ptr_id)
+                                        .copied()
+                                    {
+                                        Some(v) => v,
+                                        None => {
+                                            return Err(crate::CompilerError::Backend(format!(
                                                 "indirect call: function-pointer value {:?} \
                                                  is referenced but never defined in this \
                                                  function's value_map. SSA lowering produced \
@@ -3671,10 +3788,9 @@ impl CraneliftBackend {
                                                  earlier instruction (CreateClosure / FuncRef \
                                                  / Load / Parameter).",
                                                 func_ptr_id
-                                            ),
-                                                ));
-                                            }
-                                        };
+                                            )));
+                                        }
+                                    };
 
                                     // Create signature for the indirect call
                                     let mut sig = self.module.make_signature();
@@ -4423,12 +4539,17 @@ impl CraneliftBackend {
                                             {
                                                 const_val as usize
                                             } else {
-                                                warn!(" GEP struct field index {} out of bounds (struct has {} fields)",
-                                                    const_val, struct_ty.fields.len());
+                                                warn!(
+                                                    " GEP struct field index {} out of bounds (struct has {} fields)",
+                                                    const_val,
+                                                    struct_ty.fields.len()
+                                                );
                                                 0 // Fallback to first field
                                             }
                                         } else {
-                                            warn!(" GEP for struct requires constant index, got non-constant value");
+                                            warn!(
+                                                " GEP for struct requires constant index, got non-constant value"
+                                            );
                                             0 // Fallback to first field
                                         };
 
@@ -5319,46 +5440,33 @@ impl CraneliftBackend {
                                 .filter(|h| h.effect_id == *effect_id)
                                 .flat_map(|h| h.implementations.iter())
                                 .any(|i| i.op_name == *op_name && i.is_resumable);
-                            let (handler_func_name, is_resumable, has_state) =
-                                if let Some(handler) = hir_module
-                                    .handlers
-                                    .values()
-                                    .find(|h| h.effect_id == *effect_id)
+                            let (handler_func_name, is_resumable, has_state) = if let Some(
+                                handler,
+                            ) = hir_module
+                                .handlers
+                                .values()
+                                .find(|h| h.effect_id == *effect_id)
+                            {
+                                if let Some(impl_) = handler
+                                    .implementations
+                                    .iter()
+                                    .find(|i| i.op_name == *op_name)
                                 {
-                                    if let Some(impl_) = handler
-                                        .implementations
-                                        .iter()
-                                        .find(|i| i.op_name == *op_name)
-                                    {
-                                        (
-                                            mangle_handler_op_name(handler.name, impl_.op_name),
-                                            op_is_resumable,
-                                            // A resumable op takes its
-                                            // continuation, not an implicit
-                                            // `self` — the synthesis that
-                                            // adds `self` skips those.
-                                            effect_has_state && !op_is_resumable,
-                                        )
-                                    } else {
-                                        warn!(
+                                    (
+                                        mangle_handler_op_name(handler.name, impl_.op_name),
+                                        op_is_resumable,
+                                        // A resumable op takes its
+                                        // continuation, not an implicit
+                                        // `self` — the synthesis that
+                                        // adds `self` skips those.
+                                        effect_has_state && !op_is_resumable,
+                                    )
+                                } else {
+                                    warn!(
                                         "[Effect] No implementation for operation {:?} in handler",
                                         op_name
                                     );
-                                        // Fall through to trap
-                                        if let Some(result_id) = result {
-                                            self.value_map.insert(
-                                                *result_id,
-                                                builder.ins().iconst(types::I64, 0),
-                                            );
-                                        }
-                                        continue;
-                                    }
-                                } else {
-                                    warn!("[Effect] No handler found for effect {:?}", effect_id);
-                                    // Unhandled effect - trap at runtime
-                                    builder
-                                        .ins()
-                                        .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                                    // Fall through to trap
                                     if let Some(result_id) = result {
                                         self.value_map.insert(
                                             *result_id,
@@ -5366,7 +5474,19 @@ impl CraneliftBackend {
                                         );
                                     }
                                     continue;
-                                };
+                                }
+                            } else {
+                                warn!("[Effect] No handler found for effect {:?}", effect_id);
+                                // Unhandled effect - trap at runtime
+                                builder
+                                    .ins()
+                                    .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+                                if let Some(result_id) = result {
+                                    self.value_map
+                                        .insert(*result_id, builder.ins().iconst(types::I64, 0));
+                                }
+                                continue;
+                            };
 
                             // Try to find the handler function in the module
                             // Look up by name in hir_module.functions, then get FuncId from function_map
@@ -5699,7 +5819,9 @@ impl CraneliftBackend {
                             //
                             // Tier 3 will need actual continuation invocation.
 
-                            log::debug!("[Effect] Resume instruction (Tier 1: no-op, value flows via return)");
+                            log::debug!(
+                                "[Effect] Resume instruction (Tier 1: no-op, value flows via return)"
+                            );
 
                             // The value should be returned from the handler
                             // In Tier 1, this is handled by the handler function's return
@@ -5846,7 +5968,10 @@ impl CraneliftBackend {
                                     types::F32X4 | types::I32X4 => 4,
                                     types::F64X2 | types::I64X2 => 2,
                                     _ => {
-                                        warn!("[Cranelift] VectorHorizontalReduce: unsupported type {:?}", vec_clif_ty);
+                                        warn!(
+                                            "[Cranelift] VectorHorizontalReduce: unsupported type {:?}",
+                                            vec_clif_ty
+                                        );
                                         0
                                     }
                                 };
@@ -5884,7 +6009,10 @@ impl CraneliftBackend {
                                             BinaryOp::Mul => builder.ins().imul(acc, lane_val),
                                             BinaryOp::FMul => builder.ins().fmul(acc, lane_val),
                                             _ => {
-                                                warn!("[Cranelift] VectorHorizontalReduce: unsupported op {:?}", op);
+                                                warn!(
+                                                    "[Cranelift] VectorHorizontalReduce: unsupported op {:?}",
+                                                    op
+                                                );
                                                 acc
                                             }
                                         };
@@ -9232,7 +9360,7 @@ impl CraneliftBackend {
                             return Err(CompilerError::Backend(format!(
                                 "VectorHorizontalReduce: unsupported vector type {:?}",
                                 clif_ty
-                            )))
+                            )));
                         }
                     };
 
@@ -9251,7 +9379,7 @@ impl CraneliftBackend {
                             return Err(CompilerError::Backend(format!(
                                 "VectorHorizontalReduce: unsupported op {:?}",
                                 op
-                            )))
+                            )));
                         }
                     };
                 }

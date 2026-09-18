@@ -361,6 +361,15 @@ pub fn add_root_range(ptr: *const u8, len: usize) {
     registry().roots.insert(ptr as usize, len);
 }
 
+/// Forget a range [`add_root_range`] registered, once what it held is
+/// gone: an interpreter frame's registers, for one.
+pub fn remove_root_range(ptr: *const u8) {
+    if !is_enabled() {
+        return;
+    }
+    registry().roots.remove(&(ptr as usize));
+}
+
 /// What a collection found and did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {

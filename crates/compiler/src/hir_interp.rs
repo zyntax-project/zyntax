@@ -99,6 +99,56 @@ use crate::value::ZyntaxValue;
 // each HIR instruction); the interpreter masks integer arithmetic
 // results to fit that width on output.
 
+/// `ZYNTAX_TRACE_INTERP=1` prints every call the interpreter makes and
+/// every extern it reaches; safe to run with.
+pub fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZYNTAX_TRACE_INTERP").is_some())
+}
+
+/// The address of `name` in the running process, if the dynamic linker
+/// knows it.
+#[cfg(not(target_arch = "wasm32"))]
+fn process_symbol(name: &str) -> Option<*const u8> {
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `dlsym` with the default handle reads the process's own
+    // symbol tables; a null result is a miss.
+    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
+    (!p.is_null()).then_some(p as *const u8)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn process_symbol(_name: &str) -> Option<*const u8> {
+    None
+}
+
+/// The machine word a value travels as into native code: an integer or
+/// pointer as itself, a float as its bits, an aggregate as its address.
+fn word_of(v: &ZyntaxValue) -> u64 {
+    match v {
+        ZyntaxValue::Float(x) => x.to_bits(),
+        ZyntaxValue::F32(x) => x.to_bits() as u64,
+        other => value_to_i64(other).unwrap_or(0) as u64,
+    }
+}
+
+/// The value of type `ty` a native call handed back as the word `w`.
+fn value_from_word(ty: &HirType, w: u64) -> ZyntaxValue {
+    match ty {
+        HirType::Void => ZyntaxValue::Void,
+        HirType::F32 => ZyntaxValue::F32(f32::from_bits(w as u32)),
+        HirType::F64 => ZyntaxValue::Float(f64::from_bits(w)),
+        HirType::Struct(st) => match crate::abi::struct_carried_as_its_field(st) {
+            Some(field) => value_from_word(field, w),
+            None => ZyntaxValue::Pointer(w as usize as *mut u8),
+        },
+        HirType::Array(_, _) | HirType::Union(_) | HirType::Ptr(_) | HirType::Opaque(_) => {
+            ZyntaxValue::Pointer(w as usize as *mut u8)
+        }
+        other => value_from_i64_as(other, w as i64),
+    }
+}
+
 /// Coerce a `ZyntaxValue` to `i64` for the interpreter's i64-funneled
 /// integer bus. Accepts every integer-shaped variant (generic +
 /// width-precise siblings).
@@ -150,6 +200,56 @@ pub fn value_from_i64_as(ty: &HirType, raw: i64) -> ZyntaxValue {
         HirType::F64 => ZyntaxValue::Float(f64::from_bits(raw as u64)),
         HirType::Ptr(_) => ZyntaxValue::Pointer(raw as *mut u8),
         _ => ZyntaxValue::Int(raw),
+    }
+}
+
+/// The value of an integer constant, whatever width it was written at.
+fn constant_int(c: &HirConstant) -> Option<i64> {
+    match c {
+        HirConstant::Bool(b) => Some(*b as i64),
+        HirConstant::I8(x) => Some(*x as i64),
+        HirConstant::I16(x) => Some(*x as i64),
+        HirConstant::I32(x) => Some(*x as i64),
+        HirConstant::I64(x) => Some(*x),
+        HirConstant::U8(x) => Some(*x as i64),
+        HirConstant::U16(x) => Some(*x as i64),
+        HirConstant::U32(x) => Some(*x as i64),
+        HirConstant::U64(x) => Some(*x as i64),
+        HirConstant::USize(x) => Some(*x as i64),
+        HirConstant::ISize(x) => Some(*x),
+        _ => None,
+    }
+}
+
+/// Write constant `c` of type `ty` into `out` at the native layout.
+fn write_constant(c: &HirConstant, ty: &HirType, out: &mut [u8]) {
+    match (c, ty) {
+        (HirConstant::Struct(fields), HirType::Struct(s)) => {
+            let layout = struct_layout(s);
+            for ((field, field_ty), offset) in fields.iter().zip(&s.fields).zip(&layout.offsets) {
+                let end = (offset + size_of_hir_ty(field_ty)).min(out.len());
+                if *offset < end {
+                    write_constant(field, field_ty, &mut out[*offset..end]);
+                }
+            }
+        }
+        (HirConstant::Array(items), HirType::Array(elem, _)) => {
+            let stride = size_of_hir_ty(elem);
+            for (i, item) in items.iter().enumerate() {
+                let start = i * stride;
+                let end = (start + stride).min(out.len());
+                if start < end {
+                    write_constant(item, elem, &mut out[start..end]);
+                }
+            }
+        }
+        (c, ty) => {
+            let v = const_to_zyntax(c);
+            if size_of_hir_ty(ty) <= out.len() {
+                // SAFETY: `out` holds at least the type's size.
+                unsafe { write_typed(out.as_mut_ptr(), &v, ty) };
+            }
+        }
     }
 }
 
@@ -426,24 +526,31 @@ pub enum Op {
         ty: u32,
     },
 
-    // ── aggregates ──
-    /// Walk into `regs[src]` using `indices_pool[idx]`, write the leaf
-    /// to `dst`.
+    // ── aggregates (held as the address of their storage) ──
+    /// `dst` = the field of the aggregate at `src` named by the index
+    /// path `indices_pool[idx]`; `ty` is the aggregate's type.
     ExtractValue {
         dst: Reg,
         src: Reg,
         idx: u32,
+        ty: u32,
     },
-    /// Clone `regs[agg]`, walk to `indices_pool[idx]`, install
-    /// `regs[val]` there, write the new aggregate to `dst`.
+    /// Write `val` into the aggregate at `agg` in place; `dst` is that
+    /// same address.
     InsertValue {
         dst: Reg,
         agg: Reg,
         val: Reg,
         idx: u32,
+        ty: u32,
     },
 
     // ── control flow ──
+    /// The entry of a loop header that promoted code can resume at:
+    /// `osr_sites[site]` says what the frame hands over.
+    LoopHeader {
+        site: u32,
+    },
     Jump {
         target: Pc,
     },
@@ -474,15 +581,13 @@ pub enum Op {
         fn_id: HirId,
         args: u32,
     },
-    /// FFI call by symbol name (resolved through the interpreter's
-    /// symbol table). `ret_ty` indexes the type pool — used to retag
-    /// the i64 return into a width-correct `InterpValue`.
+    /// Call the symbol `symbol_pool[sym]` with the shape `sig_pool[sig]`.
     CallSym {
         dst: Reg,
         has_dst: bool,
         sym: u32,
         args: u32,
-        ret_ty: u32,
+        sig: u32,
     },
     /// `Intrinsic::Malloc` lowered to a runtime-sized allocation via
     /// the interpreter's `Memory` arena. `size_reg` carries the
@@ -499,27 +604,27 @@ pub enum Op {
         old_reg: Reg,
         size_reg: Reg,
     },
-    /// `Intrinsic::Free` no-op. The interpreter's bump-style
-    /// `Memory` doesn't expose per-allocation free; everything is
-    /// reclaimed when the runtime drops. Compiled so Free-emitting
-    /// HIR (krio's promise-entry release path) doesn't blow up.
-    FreeNoop {
-        dst: Reg,
-        has_dst: bool,
+    /// `Intrinsic::Free`: returns the block to the allocator the
+    /// program's other tiers use; nothing to do while the interpreter
+    /// keeps its own memory.
+    Free {
+        ptr: Reg,
     },
-    /// Indirect call through a function-pointer register. On wasm32
-    /// the pointer is a 32-bit-truncated closure handle (Phase I.3);
-    /// dispatch routes through `indirect_call_dispatcher` (installed
-    /// by `zyntax_wasm`) which resolves the handle through
-    /// `ACTIVE_CLOSURE_FNS` and re-enters `call_function`. Returns
-    /// `InterpError::UnsupportedInstruction` if no dispatcher is
-    /// installed.
+    /// `dst` = the current entry of function `fn_id`, read from its
+    /// call cell, as compiled code takes a function's address.
+    FuncAddr {
+        dst: Reg,
+        fn_id: HirId,
+    },
+    /// Call the code at `fn_ptr_reg` with the shape `sig_pool[sig]`. A
+    /// host dispatcher, when one is installed, resolves the handle
+    /// itself; otherwise the handle is native code.
     CallIndirect {
         dst: Reg,
         has_dst: bool,
         fn_ptr_reg: Reg,
         args: u32,
-        ret_ty: u32,
+        sig: u32,
     },
     /// `HirInstruction::AsyncSaveSlot { frame, slot, value }` — store
     /// `value` (as i64) at `frame + slot * 8`. Krio's SM layout uses
@@ -645,9 +750,22 @@ pub struct CompiledFunction {
     /// at compile time because symbols are registered at the
     /// interpreter level, not the compiler level.
     pub symbol_pool: Vec<String>,
-    /// Per-`Op::Gep` byte-stride list (one entry per index). At runtime
-    /// `Gep` computes `ptr + Σ stride[i] * regs[index_regs[i]]`.
-    pub gep_stride_pool: Vec<Vec<i64>>,
+    /// Per-`Op::Gep` steps, one per index: `(stride, offset)`. At
+    /// runtime `Gep` computes `ptr + sum(stride[i] * regs[index[i]] +
+    /// offset[i])`; a struct field is a fixed offset with stride 0.
+    pub gep_stride_pool: Vec<Vec<(i64, i64)>>,
+    /// The shape of each native call the function makes.
+    pub sig_pool: Vec<NativeSig>,
+    /// Aggregate values the function needs storage for at entry: undef
+    /// values and struct constants, with the bytes to start from.
+    pub entry_storage: Vec<(Reg, Vec<u8>)>,
+    /// Whether the function writes its returned struct into storage the
+    /// caller provides.
+    pub returns_through_destination: bool,
+    /// Size in bytes of what the function returns through a destination.
+    pub destination_size: usize,
+    /// Loop headers a promoted helper can resume at.
+    pub osr_sites: Vec<OsrSite>,
     /// Per-register hint of the SSA value's HirType. Used to size
     /// extern-call returns and width-correct integer ops.
     pub reg_types: Vec<HirType>,
@@ -656,13 +774,95 @@ pub struct CompiledFunction {
     /// Number of parameters in the original signature; arg-binding
     /// fills regs[0..n_params].
     pub n_params: u16,
-    /// Which function each `FuncRef` result names.
-    ///
-    /// There is no address to put in a register here, and nothing asks
-    /// for one: a function pointer taken in this interpreter is only
-    /// ever handed straight to a call. Remembering the name at compile
-    /// time is enough to turn that call back into a direct one.
+    /// Which function each `FuncRef` result names, so a call that
+    /// hands one straight to a runtime entry can name the callee.
     pub func_refs: HashMap<HirId, HirId>,
+}
+
+/// A frame's register file registered with the collector as a root
+/// range for the frame's lifetime.
+struct FrameRoots(*const u8);
+
+impl FrameRoots {
+    fn new(regs: &[ZyntaxValue]) -> Self {
+        let ptr = regs.as_ptr() as *const u8;
+        if crate::collector::is_enabled() {
+            crate::collector::add_root_range(ptr, std::mem::size_of_val(regs));
+        }
+        Self(ptr)
+    }
+}
+
+impl Drop for FrameRoots {
+    fn drop(&mut self) {
+        crate::collector::remove_root_range(self.0);
+    }
+}
+
+/// A loop header the interpreter can leave for promoted code: the
+/// registers holding the live-ins, laid out in the frame the helper
+/// reads.
+#[derive(Debug, Clone)]
+pub struct OsrSite {
+    pub site_key: u64,
+    pub live_ins: Vec<Reg>,
+    pub types: Vec<HirType>,
+    pub frame: crate::osr::OsrFrame,
+    pub ret: HirType,
+}
+
+/// Header visits before an interpreted frame asks for promoted code.
+const OSR_REQUEST_VISITS: u32 = 256;
+
+/// The shape of a call into native code: what travels in, what comes
+/// back, and whether the callee writes its result through a destination
+/// the caller passes first. One Cranelift thunk is compiled per shape.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NativeSig {
+    pub params: Vec<HirType>,
+    pub ret: HirType,
+    pub destination: bool,
+    /// The callee uses the backend's internal convention rather than
+    /// the platform's.
+    pub fast: bool,
+}
+
+impl NativeSig {
+    /// The shape of calling `function` directly. `address_taken` says
+    /// whether callers can be made to pass a destination.
+    pub fn of_function(function: &HirFunction, address_taken: bool) -> Self {
+        let abi = crate::abi::function_abi(function, address_taken);
+        Self {
+            params: function
+                .signature
+                .params
+                .iter()
+                .map(|p| p.ty.clone())
+                .collect(),
+            ret: function
+                .signature
+                .returns
+                .first()
+                .cloned()
+                .unwrap_or(HirType::Void),
+            destination: abi.destination.is_some(),
+            fast: matches!(
+                function.calling_convention,
+                crate::hir::CallingConvention::Fast | crate::hir::CallingConvention::WebKit
+            ),
+        }
+    }
+
+    /// The shape of a call site that only knows its operand types: a
+    /// symbol or a function pointer. Neither takes a destination.
+    pub fn of_site(params: Vec<HirType>, ret: HirType) -> Self {
+        Self {
+            params,
+            ret,
+            destination: false,
+            fast: false,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -683,8 +883,32 @@ pub fn compile_function(
     memory: &mut Memory,
     func: &HirFunction,
 ) -> Result<CompiledFunction, InterpError> {
+    compile_function_with(module, memory, func, false)
+}
+
+/// [`compile_function`] for a function whose address may be taken,
+/// which rules out returning a struct through a destination.
+pub fn compile_function_with(
+    module: &HirModule,
+    memory: &mut Memory,
+    func: &HirFunction,
+    address_taken: bool,
+) -> Result<CompiledFunction, InterpError> {
     let mut cf = CompiledFunction::default();
     let mut reg_of: HashMap<HirId, Reg> = HashMap::new();
+    let abi = crate::abi::function_abi(func, address_taken);
+    cf.returns_through_destination = abi.destination.is_some();
+    cf.destination_size = abi.destination.as_ref().map(size_of_hir_ty).unwrap_or(0);
+    // Struct field indices in a GEP are constants; the walk needs their
+    // values.
+    let const_ints: HashMap<HirId, i64> = func
+        .values
+        .iter()
+        .filter_map(|(id, v)| match &v.kind {
+            HirValueKind::Constant(c) => constant_int(c).map(|n| (*id, n)),
+            _ => None,
+        })
+        .collect();
 
     // Assign a register to every SSA value. Parameters first so
     // `regs[0..n_params]` lines up with the call ABI.
@@ -738,9 +962,23 @@ pub fn compile_function(
             &mut next_reg,
         );
         if let HirValueKind::Constant(c) = &val_def.kind {
+            if held(&val_def.ty) == Held::ByReference {
+                // An aggregate constant gets storage of its own each
+                // time the function runs, as a stack slot would.
+                let mut bytes = vec![0u8; size_of_hir_ty(&val_def.ty).max(8)];
+                write_constant(c, &val_def.ty, &mut bytes);
+                cf.entry_storage.push((reg_of[val_id], bytes));
+                continue;
+            }
             let idx = cf.const_pool.len() as u32;
             cf.const_pool.push(const_to_zyntax(c));
             const_idx_for.insert(*val_id, idx);
+        } else if matches!(val_def.kind, HirValueKind::Undef)
+            && held(&val_def.ty) == Held::ByReference
+        {
+            // An undef aggregate is storage the function fills in.
+            let size = size_of_hir_ty(&val_def.ty).max(8);
+            cf.entry_storage.push((reg_of[val_id], vec![0u8; size]));
         } else if let HirValueKind::Global(global_id) = &val_def.kind {
             // Resolve the global to a ZRTL-formatted string buffer
             // ([i32 length][utf8 bytes]) in `memory`, then pre-load
@@ -804,6 +1042,34 @@ pub fn compile_function(
     }
     cf.n_regs = next_reg as u32;
 
+    // Loop headers promoted code can resume at, keyed by block.
+    let mut header_sites: HashMap<HirId, u32> = HashMap::new();
+    if !address_taken && !cf.returns_through_destination {
+        let headers = crate::osr::find_loop_headers(func);
+        if !headers.is_empty() {
+            let dominators = crate::osr::Dominators::compute(func);
+            for header in headers {
+                let Ok(layout) = crate::osr::osr_layout_with(func, header, &dominators) else {
+                    continue;
+                };
+                let live_ins: Option<Vec<Reg>> = layout
+                    .live_ins
+                    .iter()
+                    .map(|id| reg_of.get(id).copied())
+                    .collect();
+                let Some(live_ins) = live_ins else { continue };
+                header_sites.insert(header, cf.osr_sites.len() as u32);
+                cf.osr_sites.push(OsrSite {
+                    site_key: layout.site_key(),
+                    live_ins,
+                    types: layout.live_in_types.clone(),
+                    frame: layout.frame.clone(),
+                    ret: layout.return_type.clone(),
+                });
+            }
+        }
+    }
+
     // ── Code emission ──
     // First pass: emit ops; record block-id → start PC; track every
     // jump-target site so we can backpatch after pass 1.
@@ -838,9 +1104,13 @@ pub fn compile_function(
         // single load at the block prefix is fine since each block
         // dominates its uses for constants.)
 
+        if let Some(&site) = header_sites.get(bid) {
+            cf.code.push(Op::LoopHeader { site });
+        }
+
         // Lower each instruction.
         for inst in &block.instructions {
-            lower_inst(inst, &mut cf, &reg_of, &const_idx_for, &mut patches)?;
+            lower_inst(inst, &mut cf, &reg_of, &const_ints)?;
         }
 
         // Lower terminator (phi-copy preamble for branch targets is
@@ -968,9 +1238,8 @@ fn inst_result_ty(inst: &HirInstruction) -> Option<HirType> {
         // Calls return whatever the signature says — left as I64 for
         // now and re-tagged in the dispatcher on the way back.
         HirInstruction::Call { .. } => Some(HirType::I64),
-        // ExtractValue/InsertValue: caller's responsibility to type.
-        HirInstruction::ExtractValue { .. } | HirInstruction::InsertValue { .. } => {
-            Some(HirType::I64)
+        HirInstruction::ExtractValue { ty, .. } | HirInstruction::InsertValue { ty, .. } => {
+            Some(ty.clone())
         }
         _ => None,
     }
@@ -980,8 +1249,7 @@ fn lower_inst(
     inst: &HirInstruction,
     cf: &mut CompiledFunction,
     reg_of: &HashMap<HirId, Reg>,
-    _const_idx_for: &HashMap<HirId, u32>,
-    _patches: &mut Vec<(usize, u8, HirId)>,
+    const_ints: &HashMap<HirId, i64>,
 ) -> Result<(), InterpError> {
     let reg = |id: HirId| -> Result<Reg, InterpError> {
         reg_of
@@ -1037,7 +1305,7 @@ fn lower_inst(
                         return Err(InterpError::UnsupportedInstruction(format!(
                             "float binary op {:?}",
                             other
-                        )))
+                        )));
                     }
                 }
             } else {
@@ -1106,7 +1374,13 @@ fn lower_inst(
                 ty: ty_idx,
             });
         }
-        HirInstruction::Select { result, condition, true_val, false_val, .. } => {
+        HirInstruction::Select {
+            result,
+            condition,
+            true_val,
+            false_val,
+            ..
+        } => {
             cf.code.push(Op::Select {
                 dst: reg(*result)?,
                 cond: reg(*condition)?,
@@ -1170,7 +1444,9 @@ fn lower_inst(
             let src = reg(*aggregate)?;
             let idx = cf.indices_pool.len() as u32;
             cf.indices_pool.push(indices.clone());
-            cf.code.push(Op::ExtractValue { dst, src, idx });
+            let agg_ty = cf.reg_types[src as usize].clone();
+            let ty = type_idx(cf, &agg_ty);
+            cf.code.push(Op::ExtractValue { dst, src, idx, ty });
         }
         HirInstruction::GetElementPtr {
             result,
@@ -1178,33 +1454,47 @@ fn lower_inst(
             ptr,
             indices,
         } => {
-            // `ty` is the *result* pointer type — `Ptr(elem_ty)`. Strides
-            // are derived from `size_of_hir_ty(elem_ty)`. For multi-index
-            // GEP we fall back to a uniform stride of the element type,
-            // which is correct for the single-index array-indexing case
-            // the ZynML front-end emits today (see
-            // `crates/compiler/src/ssa.rs::TypedExpression::Index`).
-            // Multi-index struct-field GEP would need per-level strides;
-            // not emitted by ZynML's lowering yet, so a `todo!` would
-            // never fire — we just treat extra indices uniformly.
-            let elem_ty = match ty {
-                HirType::Ptr(inner) => (**inner).clone(),
-                other => other.clone(),
-            };
-            let stride = size_of_hir_ty(&elem_ty) as i64;
+            // The same walk Cranelift makes: `ty` names what `ptr`
+            // points at; a pointer or array index scales by the element
+            // size, a struct index is a constant naming a field, and a
+            // byte type adds the index as it is.
+            let mut steps: Vec<(i64, i64)> = Vec::with_capacity(indices.len());
+            let mut current = ty.clone();
+            for index in indices {
+                match current.clone() {
+                    HirType::Ptr(inner) => {
+                        steps.push((size_of_hir_ty(&inner).max(1) as i64, 0));
+                        current = *inner;
+                    }
+                    HirType::Array(elem, _) => {
+                        steps.push((size_of_hir_ty(&elem).max(1) as i64, 0));
+                        current = *elem;
+                    }
+                    HirType::Struct(st) => {
+                        let field = const_ints.get(index).copied().unwrap_or(0).max(0) as usize;
+                        let field = field.min(st.fields.len().saturating_sub(1));
+                        let layout = struct_layout(&st);
+                        steps.push((0, layout.offsets.get(field).copied().unwrap_or(0) as i64));
+                        current = st.fields.get(field).cloned().unwrap_or(HirType::U8);
+                    }
+                    HirType::U8 | HirType::I8 => steps.push((1, 0)),
+                    _ => {
+                        steps.push((size_of_hir_ty(&current).max(1) as i64, 0));
+                    }
+                }
+            }
             let dst = reg(*result)?;
             let p = reg(*ptr)?;
             let idx_regs: Result<Vec<Reg>, InterpError> = indices.iter().map(|i| reg(*i)).collect();
-            let idx_regs = idx_regs?;
             let args = cf.args_pool.len() as u32;
-            cf.args_pool.push(idx_regs);
-            let stride_idx = cf.gep_stride_pool.len() as u32;
-            cf.gep_stride_pool.push(vec![stride; indices.len().max(1)]);
+            cf.args_pool.push(idx_regs?);
+            let stride = cf.gep_stride_pool.len() as u32;
+            cf.gep_stride_pool.push(steps);
             cf.code.push(Op::Gep {
                 dst,
                 ptr: p,
                 args,
-                stride: stride_idx,
+                stride,
             });
         }
         HirInstruction::InsertValue {
@@ -1219,7 +1509,15 @@ fn lower_inst(
             let val = reg(*value)?;
             let idx = cf.indices_pool.len() as u32;
             cf.indices_pool.push(indices.clone());
-            cf.code.push(Op::InsertValue { dst, agg, val, idx });
+            let agg_ty = cf.reg_types[agg as usize].clone();
+            let ty = type_idx(cf, &agg_ty);
+            cf.code.push(Op::InsertValue {
+                dst,
+                agg,
+                val,
+                idx,
+                ty,
+            });
         }
         HirInstruction::Call {
             result,
@@ -1267,29 +1565,30 @@ fn lower_inst(
                 HirCallable::Symbol(name) => {
                     let sym_idx = cf.symbol_pool.len() as u32;
                     cf.symbol_pool.push(name.clone());
-                    // Return type defaults to I64 unless we have a
-                    // result HirId whose type lives in cf.reg_types.
-                    let ret_ty_idx = {
-                        let ty = result
-                            .and_then(|r| reg_of.get(&r).copied())
-                            .and_then(|r| cf.reg_types.get(r as usize).cloned())
-                            .unwrap_or(HirType::I64);
-                        let idx = cf.type_pool.len() as u32;
-                        cf.type_pool.push(ty);
-                        idx
-                    };
+                    // The call's shape is its operand types: a symbol
+                    // has no declaration here.
+                    let ret = result
+                        .and_then(|r| reg_of.get(&r).copied())
+                        .and_then(|r| cf.reg_types.get(r as usize).cloned())
+                        .unwrap_or(HirType::Void);
+                    let params: Vec<HirType> = cf.args_pool[args_idx as usize]
+                        .iter()
+                        .map(|r| cf.reg_types[*r as usize].clone())
+                        .collect();
+                    let sig = cf.sig_pool.len() as u32;
+                    cf.sig_pool.push(NativeSig::of_site(params, ret));
                     cf.code.push(Op::CallSym {
                         dst,
                         has_dst,
                         sym: sym_idx,
                         args: args_idx,
-                        ret_ty: ret_ty_idx,
+                        sig,
                     });
                 }
                 HirCallable::Indirect(_) => {
                     return Err(InterpError::UnsupportedInstruction(
                         "indirect call".to_string(),
-                    ))
+                    ));
                 }
                 HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc) => {
                     // First arg carries the size in bytes.
@@ -1311,17 +1610,23 @@ fn lower_inst(
                             "realloc expects pointer and size".to_string(),
                         ));
                     }
-                    cf.code.push(Op::Realloc { dst, old_reg: regs[0], size_reg: regs[1] });
+                    cf.code.push(Op::Realloc {
+                        dst,
+                        old_reg: regs[0],
+                        size_reg: regs[1],
+                    });
                 }
-                HirCallable::Intrinsic(crate::hir::Intrinsic::Free)
-                | HirCallable::Intrinsic(crate::hir::Intrinsic::IncRef)
+                HirCallable::Intrinsic(crate::hir::Intrinsic::Free) => {
+                    let regs = &cf.args_pool[args_idx as usize];
+                    if let Some(&ptr) = regs.first() {
+                        cf.code.push(Op::Free { ptr });
+                    }
+                }
+                HirCallable::Intrinsic(crate::hir::Intrinsic::IncRef)
                 | HirCallable::Intrinsic(crate::hir::Intrinsic::DecRef)
                 | HirCallable::Intrinsic(crate::hir::Intrinsic::Drop) => {
-                    // No-op for the bump-allocator interpreter:
-                    // memory lives until the runtime drops, so
-                    // refcount/drop bookkeeping has no observable
-                    // effect during a single task's lifetime.
-                    cf.code.push(Op::FreeNoop { dst, has_dst });
+                    // Reference counts are not kept here; the storage
+                    // outlives the run or the collector takes it.
                 }
                 HirCallable::Intrinsic(crate::hir::Intrinsic::Sqrt) => {
                     // Single-arg math intrinsic — mirror Cranelift's
@@ -1383,18 +1688,13 @@ fn lower_inst(
                 HirCallable::Intrinsic(_) => {
                     return Err(InterpError::UnsupportedInstruction(
                         "intrinsic call".to_string(),
-                    ))
+                    ));
                 }
                 HirCallable::FuncRef(fn_id) => {
-                    // Taking a function's address. The register holds
-                    // nothing meaningful; what matters is the note, and
-                    // the call that reads it is rewritten below.
                     if let Some(r) = result {
                         cf.func_refs.insert(*r, *fn_id);
                     }
-                    let idx = cf.const_pool.len() as u32;
-                    cf.const_pool.push(ZyntaxValue::Int(0));
-                    cf.code.push(Op::LoadConst { dst, c: idx });
+                    cf.code.push(Op::FuncAddr { dst, fn_id: *fn_id });
                 }
             }
         }
@@ -1412,14 +1712,19 @@ fn lower_inst(
                 Some(r) => (reg(*r)?, true),
                 None => (0, false),
             };
-            let ret_ty_idx = cf.type_pool.len() as u32;
-            cf.type_pool.push(return_ty.clone());
+            let params: Vec<HirType> = cf.args_pool[args_idx as usize]
+                .iter()
+                .map(|r| cf.reg_types[*r as usize].clone())
+                .collect();
+            let sig = cf.sig_pool.len() as u32;
+            cf.sig_pool
+                .push(NativeSig::of_site(params, return_ty.clone()));
             cf.code.push(Op::CallIndirect {
                 dst,
                 has_dst,
                 fn_ptr_reg,
                 args: args_idx,
-                ret_ty: ret_ty_idx,
+                sig,
             });
         }
         HirInstruction::AsyncSaveSlot { frame, slot, value } => {
@@ -1471,11 +1776,10 @@ fn lower_inst(
                 ));
             }
             let dst = reg(*result)?;
-            let handle = function.to_handle_hash();
-            let const_idx = cf.const_pool.len() as u32;
-            cf.const_pool
-                .push(ZyntaxValue::Pointer(handle as usize as *mut u8));
-            cf.code.push(Op::LoadConst { dst, c: const_idx });
+            cf.code.push(Op::FuncAddr {
+                dst,
+                fn_id: *function,
+            });
         }
         // ── SIMD / vector (scalarized) ──
         HirInstruction::VectorSplat { result, ty, scalar } => {
@@ -1486,7 +1790,7 @@ fn lower_inst(
                 _ => {
                     return Err(InterpError::UnsupportedInstruction(
                         "VectorSplat with non-vector type".to_string(),
-                    ))
+                    ));
                 }
             };
             cf.code.push(Op::VSplat {
@@ -1505,7 +1809,7 @@ fn lower_inst(
                 _ => {
                     return Err(InterpError::UnsupportedInstruction(
                         "VectorLoad with non-vector type".to_string(),
-                    ))
+                    ));
                 }
             };
             let elem_ty = type_idx(cf, &elem);
@@ -1526,7 +1830,7 @@ fn lower_inst(
                 _ => {
                     return Err(InterpError::UnsupportedInstruction(
                         "VectorStore of non-vector value".to_string(),
-                    ))
+                    ));
                 }
             };
             let elem_ty = type_idx(cf, &elem);
@@ -1646,7 +1950,7 @@ fn instruction_name(inst: &HirInstruction) -> String {
                 "performing effect operation `{}`: the bytecode interpreter cannot run \
                  algebraic effects, so this function needs a JIT tier",
                 op_name.resolve_global().unwrap_or_default()
-            )
+            );
         }
         HirInstruction::FiberNew { .. } => "creating a fiber",
         HirInstruction::FiberResume { .. } | HirInstruction::FiberResumeWith { .. } => {
@@ -1659,7 +1963,7 @@ fn instruction_name(inst: &HirInstruction) -> String {
             return format!(
                 "an instruction the bytecode interpreter does not implement ({:?})",
                 std::mem::discriminant(other)
-            )
+            );
         }
     };
     format!("{what}: the bytecode interpreter cannot run fibers, so this function needs a JIT tier")
@@ -1682,9 +1986,12 @@ fn lower_terminator(
     };
 
     // Helper: emit phi-copy preamble for any phis in `target` whose
-    // incoming edge originates at `src_block`. Standard out-of-SSA.
+    // incoming edge originates at `src_block`. Standard out-of-SSA. The
+    // copies are parallel: when one phi's result feeds another's on the
+    // same edge, every source is read into a temporary first.
     let mut emit_phi_copies =
         |cf: &mut CompiledFunction, target: HirId| -> Result<(), InterpError> {
+            let mut copies: Vec<(Reg, Reg)> = Vec::new();
             if let Some(blk) = func.blocks.get(&target) {
                 for phi in &blk.phis {
                     let dst = reg(phi.result)?;
@@ -1692,12 +1999,41 @@ fn lower_terminator(
                         if *pred == src_block {
                             let src = reg(*val_id)?;
                             if dst != src {
-                                cf.code.push(Op::Move { dst, src });
+                                copies.push((dst, src));
                             }
                             break;
                         }
                     }
                 }
+            }
+            let conflict = copies
+                .iter()
+                .any(|(dst, _)| copies.iter().any(|(_, src)| src == dst));
+            if !conflict {
+                for (dst, src) in copies {
+                    cf.code.push(Op::Move { dst, src });
+                }
+                return Ok(());
+            }
+            let mut temps = Vec::with_capacity(copies.len());
+            for (_, src) in &copies {
+                let tmp = Reg::try_from(cf.n_regs).map_err(|_| {
+                    InterpError::UnsupportedInstruction("register overflow".to_string())
+                })?;
+                cf.n_regs += 1;
+                let ty = cf.reg_types[*src as usize].clone();
+                cf.reg_types.push(ty);
+                cf.code.push(Op::Move {
+                    dst: tmp,
+                    src: *src,
+                });
+                temps.push(tmp);
+            }
+            for ((dst, _), tmp) in copies.iter().zip(temps) {
+                cf.code.push(Op::Move {
+                    dst: *dst,
+                    src: tmp,
+                });
             }
             Ok(())
         };
@@ -1772,7 +2108,7 @@ fn lower_terminator(
                         return Err(InterpError::UnsupportedInstruction(format!(
                             "switch case const {:?}",
                             other
-                        )))
+                        )));
                     }
                 };
                 table.push((k, 0));
@@ -1806,18 +2142,89 @@ fn lower_terminator(
     Ok(())
 }
 
-fn size_of_hir_ty(ty: &HirType) -> usize {
+/// Byte size of a value of `ty` in memory, laid out as the native
+/// backends lay it out: fields at their natural alignment, the total
+/// rounded up to the struct's alignment.
+pub fn size_of_hir_ty(ty: &HirType) -> usize {
     match ty {
+        HirType::Void => 0,
         HirType::Bool | HirType::I8 | HirType::U8 => 1,
         HirType::I16 | HirType::U16 => 2,
         HirType::I32 | HirType::U32 | HirType::F32 => 4,
         HirType::I64 | HirType::U64 | HirType::F64 => 8,
-        HirType::Ptr(_) | HirType::USize | HirType::ISize => std::mem::size_of::<usize>(),
+        HirType::Ptr(_) | HirType::USize | HirType::ISize => 8,
         HirType::I128 | HirType::U128 => 16,
-        HirType::Struct(s) => s.fields.iter().map(size_of_hir_ty).sum::<usize>().max(1),
+        HirType::Struct(s) => struct_layout(s).size,
         HirType::Array(elem, n) => size_of_hir_ty(elem).saturating_mul((*n) as usize),
         HirType::Vector(elem, n) => size_of_hir_ty(elem).saturating_mul((*n) as usize),
         _ => 8,
+    }
+}
+
+/// Alignment of a value of `ty` in memory.
+pub fn align_of_hir_ty(ty: &HirType) -> usize {
+    match ty {
+        HirType::Void => 1,
+        HirType::Bool | HirType::I8 | HirType::U8 => 1,
+        HirType::I16 | HirType::U16 => 2,
+        HirType::I32 | HirType::U32 | HirType::F32 => 4,
+        HirType::I64 | HirType::U64 | HirType::F64 => 8,
+        HirType::Ptr(_) | HirType::USize | HirType::ISize => 8,
+        HirType::I128 | HirType::U128 => 16,
+        HirType::Struct(s) => struct_layout(s).align,
+        HirType::Array(elem, _) | HirType::Vector(elem, _) => align_of_hir_ty(elem),
+        _ => 8,
+    }
+}
+
+/// Where a struct's fields sit.
+pub struct StructLayout {
+    pub offsets: Vec<usize>,
+    pub size: usize,
+    pub align: usize,
+}
+
+/// The layout of `s`: each field at its natural alignment unless the
+/// struct is packed, the size rounded up to the struct's alignment.
+pub fn struct_layout(s: &crate::hir::HirStructType) -> StructLayout {
+    let mut offset = 0usize;
+    let mut offsets = Vec::with_capacity(s.fields.len());
+    let mut align = 1usize;
+    for field in &s.fields {
+        let a = if s.packed { 1 } else { align_of_hir_ty(field) };
+        align = align.max(a);
+        offset = offset.div_ceil(a) * a;
+        offsets.push(offset);
+        offset += size_of_hir_ty(field);
+    }
+    let size = offset.div_ceil(align) * align;
+    StructLayout {
+        offsets,
+        size,
+        align,
+    }
+}
+
+/// How the interpreter holds a value of `ty` in a register.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Held {
+    /// As the value itself.
+    Scalar,
+    /// As the address of its storage: a multi-field struct, an array,
+    /// a union.
+    ByReference,
+    /// A struct of one scalar field, held as that field.
+    Flattened,
+}
+
+/// How a value of `ty` is held, as the native backends hold it.
+pub fn held(ty: &HirType) -> Held {
+    match ty {
+        HirType::Struct(s) if crate::abi::struct_carried_as_its_field(s).is_some() => {
+            Held::Flattened
+        }
+        HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_) => Held::ByReference,
+        _ => Held::Scalar,
     }
 }
 
@@ -1861,6 +2268,19 @@ impl Memory {
         let ptr = bytes.as_mut_ptr();
         self.allocations.push(bytes);
         ptr
+    }
+    /// Return a block the program frees. Only the shared allocator can
+    /// take one back; the interpreter's own memory lives until it drops.
+    pub fn free(&mut self, ptr: *mut u8) {
+        if self.native_allocator && !ptr.is_null() {
+            // SAFETY: the program frees what it allocated through the
+            // same allocator.
+            unsafe { crate::pool_alloc::zyntax_free(ptr) };
+        }
+    }
+    /// Return storage a frame took for itself.
+    pub fn release_scratch(&mut self, ptr: *mut u8) {
+        self.free(ptr);
     }
     pub fn realloc(&mut self, old: *mut u8, size: usize) -> *mut u8 {
         if self.native_allocator {
@@ -1963,12 +2383,32 @@ pub struct HirInterpreter {
     /// re-compiles the whole body just to fail the same way, and the
     /// host takes its fallback path afterwards regardless.
     uncompilable: HashMap<HirId, String>,
-    /// Per-function tick callbacks. Invoked once per call entry — the
-    /// callback returns `Some(ptr)` to dispatch to JIT'd code instead
-    /// of running the bytecode (the host-side beadie integration uses
-    /// this to short-circuit hot functions). `None` falls through.
+    /// Per-function tick callbacks. Invoked once per call entry; the
+    /// callback returns the function's native entry once one exists,
+    /// and the call goes there instead of into the bytecode.
     #[allow(clippy::type_complexity)]
-    tick_callbacks: HashMap<HirId, Box<dyn FnMut() -> Option<JitDispatch> + Send>>,
+    tick_callbacks: HashMap<HirId, Box<dyn FnMut() -> Option<*const u8> + Send>>,
+    /// Compiles, or finds, the thunk that calls native code of a given
+    /// shape: `fn(target, words, out)`. Installed by a runtime with a
+    /// native tier; without one, calls into native code use the fixed
+    /// set of shapes `call_jit_dispatch` knows.
+    #[allow(clippy::type_complexity)]
+    thunk_source: Option<Box<dyn FnMut(&NativeSig) -> Option<*const u8> + Send>>,
+    /// The current native entry of a function, as compiled callers
+    /// reach it: what a `FuncRef` evaluates to, and where a call to a
+    /// function the interpreter cannot run goes.
+    #[allow(clippy::type_complexity)]
+    entry_source: Option<Box<dyn Fn(HirId) -> Option<*const u8> + Send + Sync>>,
+    /// The bead a function is promoted under, for a loop that asks.
+    #[allow(clippy::type_complexity)]
+    bead_source: Option<Box<dyn Fn(HirId) -> Option<u64> + Send + Sync>>,
+    /// Thunks already made, by shape.
+    thunks: HashMap<NativeSig, usize>,
+    /// The call shape of each function called so far.
+    shapes: HashMap<HirId, NativeSig>,
+    /// Functions whose address the module takes, per module (by
+    /// address; modules are shared and stay put).
+    address_taken: HashMap<usize, std::collections::HashSet<HirId>>,
     /// Wasm-JIT compile hook (Phase E.6 — wasm32 only path).
     ///
     /// Called the first time a function crosses
@@ -2086,6 +2526,12 @@ impl HirInterpreter {
             cache: HashMap::new(),
             uncompilable: HashMap::new(),
             tick_callbacks: HashMap::new(),
+            thunk_source: None,
+            entry_source: None,
+            bead_source: None,
+            thunks: HashMap::new(),
+            shapes: HashMap::new(),
+            address_taken: HashMap::new(),
             wasm_compile_hook: None,
             wasm_dispatch_hook: None,
             wasm_jit_handles: HashMap::new(),
@@ -2185,14 +2631,270 @@ impl HirInterpreter {
     }
 
     /// Register a per-function tick callback. Invoked on every entry to
-    /// the function; returning `Some` short-circuits to JIT dispatch.
-    /// The host-side beadie wrapper plugs `Beadie::on_invoke` in here.
+    /// the function; returning `Some(entry)` sends the call to that
+    /// native code. The host-side beadie wrapper plugs `on_invoke` in
+    /// here.
     pub fn register_tick_callback(
         &mut self,
         func_id: HirId,
-        cb: Box<dyn FnMut() -> Option<JitDispatch> + Send>,
+        cb: Box<dyn FnMut() -> Option<*const u8> + Send>,
     ) {
         self.tick_callbacks.insert(func_id, cb);
+    }
+
+    /// Install the bridge to a native tier: `thunk` compiles the caller
+    /// for a call shape, `entry` reads a function's current native entry.
+    #[allow(clippy::type_complexity)]
+    pub fn set_native_bridge(
+        &mut self,
+        thunk: Box<dyn FnMut(&NativeSig) -> Option<*const u8> + Send>,
+        entry: Box<dyn Fn(HirId) -> Option<*const u8> + Send + Sync>,
+        bead: Box<dyn Fn(HirId) -> Option<u64> + Send + Sync>,
+    ) {
+        self.thunk_source = Some(thunk);
+        self.entry_source = Some(entry);
+        self.bead_source = Some(bead);
+    }
+
+    /// Leave an interpreted frame at a loop header for `helper`: the
+    /// live-ins go into a frame laid out as the helper expects, and its
+    /// result is the frame's result.
+    fn transfer(
+        &mut self,
+        helper: *const u8,
+        site: &OsrSite,
+        regs: &[ZyntaxValue],
+        scratch: &mut Vec<*mut u8>,
+    ) -> Result<ZyntaxValue, InterpError> {
+        let frame = self.frame_alloc(scratch, site.frame.size.max(8) as usize);
+        if frame.is_null() {
+            return Err(InterpError::OutOfMemory);
+        }
+        for ((reg, ty), offset) in site
+            .live_ins
+            .iter()
+            .zip(&site.types)
+            .zip(&site.frame.offsets)
+        {
+            let value = &regs[*reg as usize];
+            // SAFETY: the frame has `site.frame.size` bytes and the
+            // offsets lie within it.
+            unsafe {
+                let at = frame.add(*offset as usize);
+                if crate::osr::is_held_by_reference(ty) {
+                    *(at as *mut i64) = value_to_i64(value).unwrap_or(0);
+                } else {
+                    write_typed(at, value, ty);
+                }
+            }
+        }
+        let sig = NativeSig::of_site(vec![HirType::Ptr(Box::new(HirType::U8))], site.ret.clone());
+        if trace_enabled() {
+            eprintln!("[interp] transfer site=0x{:x} -> {helper:?}", site.site_key);
+        }
+        self.call_native(
+            helper,
+            &sig,
+            &[ZyntaxValue::Pointer(frame)],
+            core::ptr::null_mut(),
+        )
+    }
+
+    /// Box the arguments an extern declares as dynamic, as a compiled call
+    /// site does: a pointer-shaped value is the box's payload itself, a
+    /// scalar is copied into a slot the box points at. Returns the boxes
+    /// made, to free after the call; a value already boxed goes through.
+    fn box_dynamic_args(
+        &mut self,
+        sig: &crate::zrtl::ZrtlSymbolSig,
+        arg_types: &[HirType],
+        args: &mut [ZyntaxValue],
+    ) -> Vec<*mut u8> {
+        let mut made = Vec::new();
+        for (i, arg) in args.iter_mut().enumerate() {
+            if !sig.param_is_dynamic(i) {
+                continue;
+            }
+            let ty = match arg_types.get(i) {
+                Some(t) => t,
+                None => continue,
+            };
+            if crate::zrtl::is_dynamic_box_pointer(ty) {
+                continue;
+            }
+            let (tag, size) = crate::zrtl::dynamic_box_tag_and_size_for_hir_type(ty);
+            // Box, then the payload slot behind it for a scalar.
+            let block = self.memory.alloc_zeroed(40);
+            if block.is_null() {
+                continue;
+            }
+            let payload = if crate::zrtl::dynamic_box_uses_direct_pointer(ty) {
+                value_to_i64(arg).unwrap_or(0)
+            } else {
+                // SAFETY: the block has 40 bytes; the slot is at 32.
+                unsafe {
+                    let slot = block.add(32);
+                    let bits = match &*arg {
+                        ZyntaxValue::Float(f) => f.to_bits() as i64,
+                        ZyntaxValue::F32(f) => f.to_bits() as i64,
+                        other => value_to_i64(other).unwrap_or(0),
+                    };
+                    *(slot as *mut i64) = bits;
+                    slot as i64
+                }
+            };
+            let display = match ty {
+                HirType::Opaque(name) => Some(name),
+                HirType::Ptr(inner) => match inner.as_ref() {
+                    HirType::Opaque(name) => Some(name),
+                    _ => None,
+                },
+                _ => None,
+            }
+            .and_then(|name| {
+                let name = name.resolve_global().unwrap_or_default();
+                let name = name.strip_prefix('$').unwrap_or(&name).to_string();
+                (!name.is_empty())
+                    .then(|| {
+                        self.symbols
+                            .get(&format!("${name}$to_string"))
+                            .map(|e| e.ptr as i64)
+                    })
+                    .flatten()
+            })
+            .unwrap_or(0);
+            // SAFETY: the block has 40 bytes.
+            unsafe {
+                *(block as *mut u32) = tag;
+                *(block.add(4) as *mut u32) = size;
+                *(block.add(8) as *mut i64) = payload;
+                *(block.add(16) as *mut i64) = 0;
+                *(block.add(24) as *mut i64) = display;
+            }
+            *arg = ZyntaxValue::Pointer(block);
+            made.push(block);
+        }
+        made
+    }
+
+    /// The thunk for calls of shape `sig`, made on first use.
+    fn thunk_for(&mut self, sig: &NativeSig) -> Result<*const u8, InterpError> {
+        if let Some(&t) = self.thunks.get(sig) {
+            return Ok(t as *const u8);
+        }
+        let source = self.thunk_source.as_mut().ok_or_else(|| {
+            InterpError::UnsupportedInstruction(
+                "a call into native code with no native tier to make the call".to_string(),
+            )
+        })?;
+        let t = source(sig).ok_or_else(|| {
+            InterpError::UnsupportedInstruction(format!(
+                "a call into native code of a shape the native tier cannot make: {sig:?}"
+            ))
+        })?;
+        self.thunks.insert(sig.clone(), t as usize);
+        Ok(t)
+    }
+
+    /// The native entry of `func`, if a native tier holds one.
+    fn native_entry(&self, func: HirId) -> Option<*const u8> {
+        self.entry_source
+            .as_ref()
+            .and_then(|f| f(func))
+            .filter(|p| !p.is_null())
+    }
+
+    /// Whether `module` takes the address of `func`, which fixes the
+    /// convention its callers use.
+    fn is_address_taken(&mut self, module: &HirModule, func: HirId) -> bool {
+        let key = module as *const HirModule as usize;
+        let set = self
+            .address_taken
+            .entry(key)
+            .or_insert_with(|| crate::dce::address_taken_functions(module));
+        set.contains(&func)
+    }
+
+    /// The shape of a direct call to `func`.
+    fn shape_of(&mut self, module: &HirModule, func: HirId) -> Option<NativeSig> {
+        if let Some(sig) = self.shapes.get(&func) {
+            return Some(sig.clone());
+        }
+        let taken = self.is_address_taken(module, func);
+        let function = module.functions.get(&func)?;
+        let sig = NativeSig::of_function(function, taken);
+        self.shapes.insert(func, sig.clone());
+        Some(sig)
+    }
+
+    /// Call native code at `entry` with the shape `sig`. Aggregates go as
+    /// the addresses they are held at; `dest` is the storage a
+    /// destination-returning callee fills.
+    fn call_native(
+        &mut self,
+        entry: *const u8,
+        sig: &NativeSig,
+        args: &[ZyntaxValue],
+        dest: *mut u8,
+    ) -> Result<ZyntaxValue, InterpError> {
+        if self.thunk_source.is_none() {
+            // No native tier to make a thunk: the fixed set of shapes.
+            if !jit_dispatch_supported(&sig.params, &sig.ret) {
+                return Err(InterpError::UnsupportedInstruction(format!(
+                    "a call into native code of a shape the interpreter cannot make: {sig:?}"
+                )));
+            }
+            let dispatch = JitDispatch {
+                ptr: entry,
+                n_params: sig.params.len().min(255) as u8,
+                float_mask: jit_float_mask(&sig.params),
+                ret: match sig.ret {
+                    HirType::F32 => JitRet::F32,
+                    HirType::F64 => JitRet::F64,
+                    _ => JitRet::Int,
+                },
+            };
+            let raw = call_jit_dispatch(dispatch, args);
+            return Ok(match raw {
+                ZyntaxValue::Int(i) => value_from_i64_as(&sig.ret, i),
+                other => other,
+            });
+        }
+        let thunk = self.thunk_for(sig)?;
+        if args.len() != sig.params.len() {
+            return Err(InterpError::Host(format!(
+                "a native call with {} arguments for {} parameters",
+                args.len(),
+                sig.params.len()
+            )));
+        }
+        let words: Vec<u64> = args.iter().map(word_of).collect();
+        let mut out = [0u8; 16];
+        let out_ptr = if sig.destination {
+            if dest.is_null() {
+                return Err(InterpError::Host(
+                    "a destination-returning native call with no destination".to_string(),
+                ));
+            }
+            dest
+        } else {
+            out.as_mut_ptr()
+        };
+        // SAFETY: the thunk was compiled for exactly this shape, `words`
+        // holds one word per parameter, and `out_ptr` has room for the
+        // result the shape describes.
+        unsafe {
+            let f: extern "C" fn(*const u8, *const u64, *mut u8) = core::mem::transmute(thunk);
+            f(entry, words.as_ptr(), out_ptr);
+        }
+        if trace_enabled() {
+            eprintln!("[interp] native {entry:?} {sig:?} {args:?}");
+        }
+        if sig.destination {
+            return Ok(ZyntaxValue::Pointer(dest));
+        }
+        let word = u64::from_ne_bytes(out[..8].try_into().unwrap());
+        Ok(value_from_word(&sig.ret, word))
     }
 
     /// Install the wasm-JIT compile hook. See `Self::wasm_compile_hook`
@@ -2245,14 +2947,26 @@ impl HirInterpreter {
             .find(|f| f.name.resolve_global().as_deref() == Some(name))
             .ok_or_else(|| InterpError::UnknownFunction(name.to_string()))?;
         let func_id = func.id;
-        self.call_by_id(module, func_id, args)
+        // A struct handed back through a destination needs storage that
+        // outlives the callee's frame.
+        let dest = match crate::abi::destination_return_type(func) {
+            Some(ty) if !self.is_address_taken(module, func_id) => {
+                self.memory.alloc_zeroed(size_of_hir_ty(ty).max(8))
+            }
+            _ => core::ptr::null_mut(),
+        };
+        self.call_by_id(module, func_id, args, dest)
     }
 
+    /// Call `func_id` from the host or from bytecode. `dest` is where a
+    /// callee that returns a struct through a destination writes it;
+    /// null when it returns nothing that way.
     fn call_by_id(
         &mut self,
         module: &HirModule,
         func_id: HirId,
         args: Vec<ZyntaxValue>,
+        dest: *mut u8,
     ) -> Result<ZyntaxValue, InterpError> {
         if let Some(func) = module.functions.get(&func_id) {
             if func.is_external {
@@ -2261,18 +2975,48 @@ impl HirInterpreter {
                     .clone()
                     .or_else(|| func.name.resolve_global())
                     .ok_or_else(|| InterpError::UnknownFunction(format!("{:?}", func_id)))?;
-                let entry = self
-                    .symbols
-                    .get(&name)
-                    .copied()
-                    .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?;
-                if let Some(sig) = entry.sig {
-                    return call_extern_symbol_typed(entry.ptr, &args, &sig);
+                let entry = match self.symbols.get(&name).copied() {
+                    Some(e) => e,
+                    None => {
+                        // A symbol nothing registered is the process's own,
+                        // as the native tiers resolve one: libc's `exit`.
+                        let ptr = process_symbol(&name)
+                            .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?;
+                        let e = SymbolEntry {
+                            ptr,
+                            param_count: func.signature.params.len().min(255) as u8,
+                            sig: None,
+                        };
+                        self.symbols.insert(name.clone(), e);
+                        e
+                    }
+                };
+                let result = if self.thunk_source.is_some() {
+                    let sig = NativeSig::of_function(func, true);
+                    self.call_native(entry.ptr, &sig, &args, dest)
+                } else {
+                    match entry.sig {
+                        Some(sig) => call_extern_symbol_typed(entry.ptr, &args, &sig),
+                        None => {
+                            let raw = call_extern_symbol(entry.ptr, &args);
+                            let ret_ty = func.signature.returns.first().unwrap_or(&HirType::Void);
+                            Ok(value_from_i64_as(ret_ty, raw))
+                        }
+                    }
+                };
+                if trace_enabled() {
+                    eprintln!("[interp] extern {name}({args:?}) -> {result:?}");
                 }
-                let raw = call_extern_symbol(entry.ptr, &args);
-                let ret_ty = func.signature.returns.first().unwrap_or(&HirType::Void);
-                return Ok(value_from_i64_as(ret_ty, raw));
+                return result;
             }
+        }
+        if trace_enabled() {
+            let name = module
+                .functions
+                .get(&func_id)
+                .and_then(|f| f.name.resolve_global())
+                .unwrap_or_default();
+            eprintln!("[interp] call {name}({args:?})");
         }
 
         // Profile.
@@ -2296,13 +3040,17 @@ impl HirInterpreter {
             self.wasm_jit_handles.remove(&func_id);
         }
 
-        // Tier-1 shortcut: if a JIT dispatch is ready for this fn,
-        // call it instead of interpreting (native Cranelift / LLVM
-        // path).
-        if let Some(cb) = self.tick_callbacks.get_mut(&func_id) {
-            if let Some(dispatch) = cb() {
-                return Ok(call_jit_dispatch(dispatch, &args));
-            }
+        // A native entry, once the tiers above have made one, takes the
+        // call instead of the bytecode.
+        let native = match self.tick_callbacks.get_mut(&func_id) {
+            Some(cb) => cb(),
+            None => None,
+        };
+        if let Some(entry) = native {
+            let sig = self
+                .shape_of(module, func_id)
+                .ok_or(InterpError::UndefinedSsaValue(func_id))?;
+            return self.call_native(entry, &sig, &args, dest);
         }
 
         // Wasm-JIT hot detection. Once `call_count` crosses the
@@ -2324,22 +3072,24 @@ impl HirInterpreter {
             }
         }
 
-        // Compile-on-first-use, and refuse-once.
-        if let Some(why) = self.uncompilable.get(&func_id) {
-            return Err(InterpError::UnsupportedInstruction(why.clone()));
-        }
+        // Compile-on-first-use, and refuse-once. What the interpreter
+        // cannot run, native code runs, when there is native code.
         if !self.cache.contains_key(&func_id) {
+            if let Some(why) = self.uncompilable.get(&func_id).cloned() {
+                return self.run_natively_or(module, func_id, args, dest, why);
+            }
             let func = module
                 .functions
                 .get(&func_id)
                 .ok_or(InterpError::UndefinedSsaValue(func_id))?;
-            match compile_function(module, &mut self.memory, func) {
+            let taken = self.is_address_taken(module, func_id);
+            match compile_function_with(module, &mut self.memory, func, taken) {
                 Ok(cf) => {
                     self.cache.insert(func_id, cf);
                 }
                 Err(InterpError::UnsupportedInstruction(why)) => {
                     self.uncompilable.insert(func_id, why.clone());
-                    return Err(InterpError::UnsupportedInstruction(why));
+                    return self.run_natively_or(module, func_id, args, dest, why);
                 }
                 Err(e) => return Err(e),
             }
@@ -2349,26 +3099,99 @@ impl HirInterpreter {
         // `self.memory` / `self.symbols` / `self.cache` during nested
         // calls. The map ownership returns at the end.
         let cf = self.cache.remove(&func_id).unwrap();
-        let result = self.run(module, &cf, args, func_id);
+        let result = self.run(module, &cf, args, func_id, dest);
         // Put the (immutable) compiled function back.
         self.cache.insert(func_id, cf);
         result
     }
 
+    /// Run `func_id` natively because the interpreter refused it for
+    /// `why`, or report the refusal when nothing native exists.
+    fn run_natively_or(
+        &mut self,
+        module: &HirModule,
+        func_id: HirId,
+        args: Vec<ZyntaxValue>,
+        dest: *mut u8,
+        why: String,
+    ) -> Result<ZyntaxValue, InterpError> {
+        match self.native_entry(func_id) {
+            Some(entry) => {
+                let sig = self
+                    .shape_of(module, func_id)
+                    .ok_or(InterpError::UndefinedSsaValue(func_id))?;
+                self.call_native(entry, &sig, &args, dest)
+            }
+            None => Err(InterpError::UnsupportedInstruction(why)),
+        }
+    }
+
+    /// Run one frame of `cf`. Storage the frame takes for itself (its
+    /// allocas, aggregate copies, undef aggregates) is returned when it
+    /// finishes, as a stack frame's would be.
     fn run(
         &mut self,
         module: &HirModule,
         cf: &CompiledFunction,
         args: Vec<ZyntaxValue>,
         func_id: HirId,
+        dest: *mut u8,
+    ) -> Result<ZyntaxValue, InterpError> {
+        let mut scratch: Vec<*mut u8> = Vec::new();
+        let result = self.run_frame(module, cf, args, func_id, dest, &mut scratch);
+        for block in scratch {
+            self.memory.release_scratch(block);
+        }
+        result
+    }
+
+    /// Storage for this frame: zeroed, released with the frame.
+    fn frame_alloc(&mut self, scratch: &mut Vec<*mut u8>, size: usize) -> *mut u8 {
+        let p = self.memory.alloc_zeroed(size.max(1));
+        if !p.is_null() {
+            scratch.push(p);
+        }
+        p
+    }
+
+    fn run_frame(
+        &mut self,
+        module: &HirModule,
+        cf: &CompiledFunction,
+        args: Vec<ZyntaxValue>,
+        func_id: HirId,
+        dest: *mut u8,
+        scratch: &mut Vec<*mut u8>,
     ) -> Result<ZyntaxValue, InterpError> {
         let mut regs: Vec<ZyntaxValue> = vec![ZyntaxValue::Undef; cf.n_regs as usize];
+        // The registers hold pointers the collector cannot see on any
+        // stack; they are a root for as long as the frame runs.
+        let _roots = FrameRoots::new(&regs);
 
         // Bind params into regs[0..n_params].
         for (i, a) in args.into_iter().enumerate() {
             if i < cf.n_params as usize {
                 regs[i] = a;
             }
+        }
+        // Loop headers: visits so far, and the helper slot each reads.
+        let bead = if cf.osr_sites.is_empty() {
+            None
+        } else {
+            self.bead_source.as_ref().and_then(|f| f(func_id))
+        };
+        let mut visits: Vec<u32> = vec![0; cf.osr_sites.len()];
+        let mut slots: Vec<*const std::sync::atomic::AtomicU64> =
+            vec![core::ptr::null(); cf.osr_sites.len()];
+        // Aggregates the function owns from the start.
+        for (reg, bytes) in &cf.entry_storage {
+            let p = self.frame_alloc(scratch, bytes.len());
+            if p.is_null() {
+                return Err(InterpError::OutOfMemory);
+            }
+            // SAFETY: `p` has `bytes.len()` writable bytes.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
+            regs[*reg as usize] = ZyntaxValue::Pointer(p);
         }
 
         // Pre-resolve `cf.symbol_pool` (Vec<String>) into a parallel
@@ -2642,7 +3465,10 @@ impl HirInterpreter {
                     pc += 1;
                 }
                 Op::Alloca { dst, size_bytes } => {
-                    let ptr = self.memory.alloc_zeroed((*size_bytes).max(1) as usize);
+                    let ptr = self.frame_alloc(scratch, (*size_bytes).max(1) as usize);
+                    if ptr.is_null() {
+                        return Err(InterpError::OutOfMemory);
+                    }
                     regs[*dst as usize] = ZyntaxValue::Pointer(ptr);
                     pc += 1;
                 }
@@ -2658,7 +3484,7 @@ impl HirInterpreter {
                             return Err(InterpError::TypeMismatch {
                                 expected: "integer (Malloc size)".to_string(),
                                 got: format!("{:?}", other),
-                            })
+                            });
                         }
                     };
                     let ptr = self.memory.alloc_zeroed(size);
@@ -2667,34 +3493,54 @@ impl HirInterpreter {
                     }
                     pc += 1;
                 }
-                Op::Realloc { dst, old_reg, size_reg } => {
+                Op::Realloc {
+                    dst,
+                    old_reg,
+                    size_reg,
+                } => {
                     let old = match &regs[*old_reg as usize] {
                         ZyntaxValue::Pointer(p) => *p,
                         ZyntaxValue::Int(0) | ZyntaxValue::UInt(0) => std::ptr::null_mut(),
-                        other => return Err(InterpError::TypeMismatch {
-                            expected: "pointer (Realloc old allocation)".to_string(),
-                            got: format!("{:?}", other),
-                        }),
+                        other => {
+                            return Err(InterpError::TypeMismatch {
+                                expected: "pointer (Realloc old allocation)".to_string(),
+                                got: format!("{:?}", other),
+                            });
+                        }
                     };
                     let size = value_to_i64(&regs[*size_reg as usize])
                         .ok_or_else(|| InterpError::TypeMismatch {
                             expected: "integer (Realloc size)".to_string(),
                             got: format!("{:?}", regs[*size_reg as usize]),
-                        })?.max(1) as usize;
+                        })?
+                        .max(1) as usize;
                     let ptr = self.memory.realloc(old, size);
-                    if ptr.is_null() { return Err(InterpError::OutOfMemory); }
+                    if ptr.is_null() {
+                        return Err(InterpError::OutOfMemory);
+                    }
                     regs[*dst as usize] = ZyntaxValue::Pointer(ptr);
                     pc += 1;
                 }
-                Op::FreeNoop { dst, has_dst } => {
-                    // No-op — bump-allocator interpreter doesn't
-                    // expose per-allocation free. Zero the result
-                    // register so any consumer of Free's return
-                    // sees a defined value (Free is void in HIR but
-                    // we keep `has_dst` for shape uniformity).
-                    if *has_dst {
-                        regs[*dst as usize] = ZyntaxValue::Int(0);
+                Op::Free { ptr } => {
+                    if let Some(p) = value_to_i64(&regs[*ptr as usize]) {
+                        self.memory.free(p as usize as *mut u8);
                     }
+                    pc += 1;
+                }
+                Op::FuncAddr { dst, fn_id } => {
+                    // With a native tier the address is the function's
+                    // entry; without one it is the handle a host
+                    // dispatcher resolves (the wasm shim's closure table).
+                    let addr = match self.native_entry(*fn_id) {
+                        Some(entry) => entry as usize,
+                        None if self.entry_source.is_none() => fn_id.to_handle_hash() as usize,
+                        None => {
+                            return Err(InterpError::UnsupportedInstruction(
+                                "taking the address of a function no tier holds".to_string(),
+                            ));
+                        }
+                    };
+                    regs[*dst as usize] = ZyntaxValue::Pointer(addr as *mut u8);
                     pc += 1;
                 }
                 Op::Load { dst, ptr, ty } => {
@@ -2710,10 +3556,27 @@ impl HirInterpreter {
                             return Err(InterpError::TypeMismatch {
                                 expected: "pointer".to_string(),
                                 got: format!("{:?}", other),
-                            })
+                            });
                         }
                     };
-                    regs[*dst as usize] = unsafe { read_typed(p, target) };
+                    if p.is_null() {
+                        return Err(InterpError::Host(
+                            "a load through a null pointer".to_string(),
+                        ));
+                    }
+                    regs[*dst as usize] = if held(target) == Held::ByReference {
+                        // The loaded aggregate is a copy of its own.
+                        let size = size_of_hir_ty(target);
+                        let copy = self.frame_alloc(scratch, size.max(8));
+                        if copy.is_null() {
+                            return Err(InterpError::OutOfMemory);
+                        }
+                        // SAFETY: both point at `size` bytes.
+                        unsafe { core::ptr::copy_nonoverlapping(p, copy, size) };
+                        ZyntaxValue::Pointer(copy)
+                    } else {
+                        unsafe { read_typed(p, target) }
+                    };
                     pc += 1;
                 }
                 Op::Store { ptr, val, ty } => {
@@ -2730,30 +3593,49 @@ impl HirInterpreter {
                             return Err(InterpError::TypeMismatch {
                                 expected: "pointer".to_string(),
                                 got: format!("{:?}", other),
-                            })
+                            });
                         }
                     };
                     let v = regs[*val as usize].clone();
                     unsafe { write_typed(p, &v, target) };
                     pc += 1;
                 }
-                Op::ExtractValue { dst, src, idx } => {
+                Op::ExtractValue { dst, src, idx, ty } => {
                     let indices = &cf.indices_pool[*idx as usize];
-                    let mut cur = regs[*src as usize].clone();
-                    for i in indices {
-                        cur = match cur {
-                            ZyntaxValue::Tuple(mut fields) => fields.swap_remove(*i as usize),
-                            scalar => scalar,
-                        };
-                    }
-                    regs[*dst as usize] = cur;
+                    let agg_ty = &cf.type_pool[*ty as usize];
+                    regs[*dst as usize] = match held(agg_ty) {
+                        // The struct is its field.
+                        Held::Flattened | Held::Scalar => regs[*src as usize].clone(),
+                        Held::ByReference => {
+                            let base = ptr_of(&regs[*src as usize])?;
+                            let (offset, leaf) = field_path(agg_ty, indices);
+                            // SAFETY: `base` holds a value of `agg_ty`.
+                            unsafe { read_typed(base.add(offset), &leaf) }
+                        }
+                    };
                     pc += 1;
                 }
-                Op::InsertValue { dst, agg, val, idx } => {
+                Op::InsertValue {
+                    dst,
+                    agg,
+                    val,
+                    idx,
+                    ty,
+                } => {
                     let indices = &cf.indices_pool[*idx as usize];
-                    let mut new_agg = regs[*agg as usize].clone();
-                    insert_value_recursive(&mut new_agg, indices, regs[*val as usize].clone());
-                    regs[*dst as usize] = new_agg;
+                    let agg_ty = &cf.type_pool[*ty as usize];
+                    regs[*dst as usize] = match held(agg_ty) {
+                        Held::Flattened | Held::Scalar => regs[*val as usize].clone(),
+                        Held::ByReference => {
+                            // Written in place: the aggregate's storage
+                            // is the value, as it is in compiled code.
+                            let base = ptr_of(&regs[*agg as usize])?;
+                            let (offset, leaf) = field_path(agg_ty, indices);
+                            // SAFETY: `base` holds a value of `agg_ty`.
+                            unsafe { write_typed(base.add(offset), &regs[*val as usize], &leaf) };
+                            ZyntaxValue::Pointer(base)
+                        }
+                    };
                     pc += 1;
                 }
                 Op::Gep {
@@ -2774,7 +3656,7 @@ impl HirInterpreter {
                             return Err(InterpError::TypeMismatch {
                                 expected: "pointer".to_string(),
                                 got: format!("{:?}", other),
-                            })
+                            });
                         }
                     };
                     let idx_regs = &cf.args_pool[*args as usize];
@@ -2787,8 +3669,10 @@ impl HirInterpreter {
                                 got: format!("{:?}", regs[*r as usize]),
                             }
                         })?;
-                        let s = strides.get(i).copied().unwrap_or(0);
-                        addr = addr.wrapping_add(idx_val.wrapping_mul(s));
+                        let (s, fixed) = strides.get(i).copied().unwrap_or((0, 0));
+                        addr = addr
+                            .wrapping_add(idx_val.wrapping_mul(s))
+                            .wrapping_add(fixed);
                     }
                     regs[*dst as usize] = ZyntaxValue::Pointer(addr as usize as *mut u8);
                     pc += 1;
@@ -2960,7 +3844,42 @@ impl HirInterpreter {
                     pc = taken as usize;
                 }
                 Op::Ret { src } => {
-                    return Ok(regs[*src as usize].clone());
+                    let value = regs[*src as usize].clone();
+                    if cf.returns_through_destination && !dest.is_null() {
+                        // The caller's storage receives the struct; the
+                        // frame's own copy goes with the frame.
+                        if let Some(from) = value_to_i64(&value) {
+                            let from = from as usize as *const u8;
+                            if !from.is_null() && from != dest as *const u8 {
+                                // SAFETY: both hold `destination_size` bytes.
+                                unsafe {
+                                    core::ptr::copy(from, dest, cf.destination_size);
+                                }
+                            }
+                        }
+                        return Ok(ZyntaxValue::Pointer(dest));
+                    }
+                    return Ok(value);
+                }
+                Op::LoopHeader { site } => {
+                    pc += 1;
+                    let Some(bead) = bead else { continue };
+                    let i = *site as usize;
+                    visits[i] = visits[i].saturating_add(1);
+                    if visits[i] < OSR_REQUEST_VISITS {
+                        continue;
+                    }
+                    let osr_site = &cf.osr_sites[i];
+                    if visits[i] == OSR_REQUEST_VISITS {
+                        crate::osr::osr_request_promotion(bead);
+                        slots[i] = crate::osr::helper_slot_addr(bead, osr_site.site_key)
+                            as *const std::sync::atomic::AtomicU64;
+                    }
+                    // SAFETY: the slot lives for the process.
+                    let helper = unsafe { &*slots[i] }.load(std::sync::atomic::Ordering::Acquire);
+                    if helper != 0 {
+                        return self.transfer(helper as *const u8, osr_site, &regs, scratch);
+                    }
                 }
                 Op::RetVoid => {
                     return Ok(ZyntaxValue::Void);
@@ -2977,9 +3896,37 @@ impl HirInterpreter {
                     args,
                 } => {
                     let arg_regs = &cf.args_pool[*args as usize];
-                    let arg_vals: Vec<ZyntaxValue> =
+                    let mut arg_vals: Vec<ZyntaxValue> =
                         arg_regs.iter().map(|r| regs[*r as usize].clone()).collect();
-                    let ret = self.call_by_id(module, *fn_id, arg_vals)?;
+                    let callee = module.functions.get(fn_id);
+                    // An extern declared over dynamic boxes receives its
+                    // arguments boxed, as compiled call sites box them.
+                    let mut boxes: Vec<*mut u8> = Vec::new();
+                    if let Some(f) = callee.filter(|f| f.is_external) {
+                        let link = f.link_name.clone().or_else(|| f.name.resolve_global());
+                        if let Some(sig) =
+                            link.and_then(|n| self.symbols.get(&n)).and_then(|e| e.sig)
+                        {
+                            let arg_types: Vec<HirType> = arg_regs
+                                .iter()
+                                .map(|r| cf.reg_types[*r as usize].clone())
+                                .collect();
+                            boxes = self.box_dynamic_args(&sig, &arg_types, &mut arg_vals);
+                        }
+                    }
+                    // Storage for a struct the callee hands back through
+                    // a destination.
+                    let callee_dest = match self.shape_of(module, *fn_id) {
+                        Some(sig) if sig.destination => {
+                            self.frame_alloc(scratch, size_of_hir_ty(&sig.ret).max(8))
+                        }
+                        _ => core::ptr::null_mut(),
+                    };
+                    let ret = self.call_by_id(module, *fn_id, arg_vals, callee_dest);
+                    for b in boxes {
+                        self.memory.free(b);
+                    }
+                    let ret = ret?;
                     if *has_dst {
                         regs[*dst as usize] = ret;
                     }
@@ -2990,12 +3937,13 @@ impl HirInterpreter {
                     has_dst,
                     sym,
                     args,
-                    ret_ty,
+                    sig,
                 } => {
                     let arg_regs = &cf.args_pool[*args as usize];
-                    let arg_vals: Vec<ZyntaxValue> =
+                    let mut arg_vals: Vec<ZyntaxValue> =
                         arg_regs.iter().map(|r| regs[*r as usize].clone()).collect();
                     let sym_idx = *sym as usize;
+                    let shape = &cf.sig_pool[*sig as usize];
 
                     // Phase J.5 wasm32 escape hatch: route through the
                     // installed symbol-call dispatcher first. A `Some(v)`
@@ -3019,37 +3967,56 @@ impl HirInterpreter {
                             Some(e) => e,
                             None => {
                                 let name = &cf.symbol_pool[sym_idx];
-                                self.symbols
-                                    .get(name)
-                                    .copied()
-                                    .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?
+                                match self.symbols.get(name).copied() {
+                                    Some(e) => e,
+                                    None => {
+                                        let ptr = process_symbol(name).ok_or_else(|| {
+                                            InterpError::UnknownFunction(name.clone())
+                                        })?;
+                                        let e = SymbolEntry {
+                                            ptr,
+                                            param_count: arg_vals.len().min(255) as u8,
+                                            sig: None,
+                                        };
+                                        self.symbols.insert(name.clone(), e);
+                                        e
+                                    }
+                                }
                             }
                         };
-                        // Typed marshalling path. When the symbol was
-                        // registered with a ZRTL signature
-                        // (e.g. via `register_zrtl_symbols` for the
-                        // `zyntax_box_*` family) the dispatch routes
-                        // float args through the platform float ABI
-                        // and reads the return register matching the
-                        // declared return TypeTag. Without this, f64
-                        // args bit-truncate through `value_to_i64` —
-                        // `zyntax_box_f64(2.5)` would arrive at the
-                        // callee with `xmm0 == 0.0`, silently
-                        // poisoning every Any cast on the BC interp
-                        // tier.
-                        if let Some(sig) = entry.sig {
-                            call_extern_symbol_typed(entry.ptr, &arg_vals, &sig)?
+                        if self.thunk_source.is_some() {
+                            // A symbol declared over dynamic boxes gets
+                            // its arguments boxed, as compiled call
+                            // sites box them.
+                            let boxes = match entry.sig {
+                                Some(zsig) => {
+                                    self.box_dynamic_args(&zsig, &shape.params, &mut arg_vals)
+                                }
+                                None => Vec::new(),
+                            };
+                            let result = self.call_native(
+                                entry.ptr,
+                                shape,
+                                &arg_vals,
+                                core::ptr::null_mut(),
+                            );
+                            for b in boxes {
+                                self.memory.free(b);
+                            }
+                            result?
+                        } else if let Some(zsig) = entry.sig {
+                            // Typed marshalling path: the ZRTL signature
+                            // supplies the register classes.
+                            call_extern_symbol_typed(entry.ptr, &arg_vals, &zsig)?
                         } else {
                             let raw = call_extern_symbol(entry.ptr, &arg_vals);
-                            let ty = &cf.type_pool[*ret_ty as usize];
-                            value_from_i64_as(ty, raw)
+                            value_from_i64_as(&shape.ret, raw)
                         }
                     };
 
                     if *has_dst {
-                        let ty = &cf.type_pool[*ret_ty as usize];
                         let v = match result_val {
-                            ZyntaxValue::Int(i) => value_from_i64_as(ty, i),
+                            ZyntaxValue::Int(i) => value_from_i64_as(&shape.ret, i),
                             other => other,
                         };
                         regs[*dst as usize] = v;
@@ -3069,7 +4036,7 @@ impl HirInterpreter {
                             return Err(InterpError::TypeMismatch {
                                 expected: "pointer (AsyncSaveSlot frame)".to_string(),
                                 got: format!("{:?}", other),
-                            })
+                            });
                         }
                     };
                     let val_i64 = value_to_i64(&regs[*val_reg as usize]).ok_or_else(|| {
@@ -3098,7 +4065,7 @@ impl HirInterpreter {
                             return Err(InterpError::TypeMismatch {
                                 expected: "pointer (AsyncLoadSlot frame)".to_string(),
                                 got: format!("{:?}", other),
-                            })
+                            });
                         }
                     };
                     let target_ty = &cf.type_pool[*ty as usize];
@@ -3112,7 +4079,7 @@ impl HirInterpreter {
                     has_dst,
                     fn_ptr_reg,
                     args,
-                    ret_ty,
+                    sig,
                 } => {
                     let handle = match &regs[*fn_ptr_reg as usize] {
                         ZyntaxValue::Pointer(p) => *p as usize as i64,
@@ -3122,22 +4089,38 @@ impl HirInterpreter {
                             return Err(InterpError::TypeMismatch {
                                 expected: "function-pointer / handle".to_string(),
                                 got: format!("{:?}", other),
-                            })
+                            });
                         }
                     };
                     let arg_regs = &cf.args_pool[*args as usize];
                     let arg_vals: Vec<ZyntaxValue> =
                         arg_regs.iter().map(|r| regs[*r as usize].clone()).collect();
-                    let dispatcher = self.indirect_call_dispatcher.as_mut().ok_or_else(|| {
-                        InterpError::UnsupportedInstruction(
-                            "indirect call without dispatcher".to_string(),
-                        )
-                    })?;
-                    let result = dispatcher(handle, arg_vals)?;
+                    let shape = &cf.sig_pool[*sig as usize];
+                    // A host dispatcher (wasm) resolves the handle itself;
+                    // otherwise the handle is native code.
+                    let result = if let Some(dispatcher) = self.indirect_call_dispatcher.as_mut() {
+                        dispatcher(handle, arg_vals)?
+                    } else {
+                        if self.thunk_source.is_none() {
+                            return Err(InterpError::UnsupportedInstruction(
+                                "indirect call without dispatcher".to_string(),
+                            ));
+                        }
+                        if handle == 0 {
+                            return Err(InterpError::Host(
+                                "a call through a null function pointer".to_string(),
+                            ));
+                        }
+                        self.call_native(
+                            handle as usize as *const u8,
+                            shape,
+                            &arg_vals,
+                            core::ptr::null_mut(),
+                        )?
+                    };
                     if *has_dst {
-                        let ty = &cf.type_pool[*ret_ty as usize];
                         let v = match result {
-                            ZyntaxValue::Int(i) => value_from_i64_as(ty, i),
+                            ZyntaxValue::Int(i) => value_from_i64_as(&shape.ret, i),
                             other => other,
                         };
                         regs[*dst as usize] = v;
@@ -3286,7 +4269,7 @@ fn apply_lane_binop(
                 return Err(InterpError::UnsupportedInstruction(format!(
                     "vector float lane op {:?}",
                     other
-                )))
+                )));
             }
         };
         Ok(match a {
@@ -3314,7 +4297,7 @@ fn apply_lane_binop(
                 return Err(InterpError::UnsupportedInstruction(format!(
                     "vector int lane op {:?}",
                     other
-                )))
+                )));
             }
         };
         Ok(value_from_i64_as(&hir_ty_of_value(a), r))
@@ -3411,26 +4394,30 @@ fn eval_cast(op: CastOp, o: ZyntaxValue, ty: &HirType) -> Result<ZyntaxValue, In
     }
 }
 
-fn insert_value_recursive(agg: &mut ZyntaxValue, indices: &[u32], v: ZyntaxValue) {
-    if indices.is_empty() {
-        *agg = v;
-        return;
-    }
-    // The SSA builder lowers `Foo { x: 10, y: 20 }` as a chain of
-    // `InsertValue` ops starting from an `Undef` aggregate. Materialise
-    // `Undef` into an empty `Struct` so successive inserts can grow it.
-    if matches!(agg, ZyntaxValue::Undef) {
-        *agg = ZyntaxValue::Tuple(Vec::new());
-    }
-    let head = indices[0] as usize;
-    let tail = &indices[1..];
-    if let ZyntaxValue::Tuple(fields) = agg {
-        // Pad with `Undef` so the index we're writing to exists.
-        while fields.len() <= head {
-            fields.push(ZyntaxValue::Undef);
+/// The byte offset and type of the field `indices` names inside a value
+/// of `ty`, at the native layout.
+fn field_path(ty: &HirType, indices: &[u32]) -> (usize, HirType) {
+    let mut offset = 0usize;
+    let mut current = ty.clone();
+    for &i in indices {
+        match current {
+            HirType::Struct(s) => {
+                let layout = struct_layout(&s);
+                let i = (i as usize).min(s.fields.len().saturating_sub(1));
+                offset += layout.offsets.get(i).copied().unwrap_or(0);
+                current = s.fields.get(i).cloned().unwrap_or(HirType::I64);
+            }
+            HirType::Array(elem, _) => {
+                offset += size_of_hir_ty(&elem) * i as usize;
+                current = *elem;
+            }
+            other => {
+                current = other;
+                break;
+            }
         }
-        insert_value_recursive(&mut fields[head], tail, v);
     }
+    (offset, current)
 }
 
 unsafe fn read_typed(ptr: *mut u8, ty: &HirType) -> ZyntaxValue {
@@ -3447,40 +4434,21 @@ unsafe fn read_typed(ptr: *mut u8, ty: &HirType) -> ZyntaxValue {
         HirType::U64 => ZyntaxValue::UInt(*(ptr as *const u64)),
         HirType::F64 => ZyntaxValue::Float(*(ptr as *const f64)),
         HirType::Ptr(_) => ZyntaxValue::Pointer(*(ptr as *const *mut u8)),
-        HirType::Struct(s) => {
-            // Read every field at its in-memory offset and assemble a
-            // tuple. The runtime treats a struct value as a tuple of
-            // its field values (see `ExtractValue` / `InsertValue`
-            // op handlers), so this is the natural read shape.
-            //
-            // Field offsets are computed as a running sum of field
-            // sizes — ZynML's structs are unpadded today (no explicit
-            // alignment requests beyond natural i64/f64 alignment),
-            // and `size_of_hir_ty` already returns the byte size
-            // each field occupies. If ZynML grows padded layouts the
-            // offset calculation here needs to track explicit
-            // alignment per field.
-            let mut fields = Vec::with_capacity(s.fields.len());
-            let mut offset = 0usize;
-            for field_ty in &s.fields {
-                let field_ptr = ptr.add(offset);
-                fields.push(read_typed(field_ptr, field_ty));
-                offset += size_of_hir_ty(field_ty);
-            }
-            ZyntaxValue::Tuple(fields)
+        HirType::Struct(s) if crate::abi::struct_carried_as_its_field(s).is_some() => {
+            // A struct of one scalar field is that field.
+            read_typed(ptr, &s.fields[0])
         }
-        HirType::Array(elem, n) => {
-            // Same shape as Struct: read each element into a tuple
-            // slot. Used when an array-of-T is loaded as a value
-            // (rare — most array accesses go through GEP + load of
-            // a single element), but covers the case cleanly.
-            let mut fields = Vec::with_capacity(*n as usize);
-            let elem_size = size_of_hir_ty(elem);
-            for i in 0..*n as usize {
-                let elem_ptr = ptr.add(i * elem_size);
-                fields.push(read_typed(elem_ptr, elem));
-            }
-            ZyntaxValue::Tuple(fields)
+        // An aggregate is held as the address of its storage; a reader
+        // that wants its own copy makes one (see `Op::Load`).
+        HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_) => ZyntaxValue::Pointer(ptr),
+        // A vector is its lanes.
+        HirType::Vector(elem, n) => {
+            let stride = size_of_hir_ty(elem);
+            ZyntaxValue::Array(
+                (0..*n as usize)
+                    .map(|i| read_typed(ptr.add(i * stride), elem))
+                    .collect(),
+            )
         }
         _ => ZyntaxValue::Int(*(ptr as *const i64)),
     }
@@ -3552,33 +4520,23 @@ unsafe fn write_typed(ptr: *mut u8, v: &ZyntaxValue, ty: &HirType) {
                 *(ptr as *mut *mut u8) = *p;
             }
         }
-        HirType::Struct(s) => {
-            // Symmetric to the Struct arm in `read_typed`: walk the
-            // tuple's fields and write each at its in-memory offset.
-            // Tolerant of i64/Int fall-back values too — if a caller
-            // hands us a scalar where we expected a tuple (e.g. from
-            // ExtractValue's pass-through path), write it into the
-            // first slot and zero-skip the rest rather than corrupting
-            // the layout silently.
-            if let ZyntaxValue::Tuple(fields) = v {
-                let mut offset = 0usize;
-                for (i, field_ty) in s.fields.iter().enumerate() {
-                    let field_ptr = ptr.add(offset);
-                    if let Some(field_val) = fields.get(i) {
-                        write_typed(field_ptr, field_val, field_ty);
-                    }
-                    offset += size_of_hir_ty(field_ty);
+        HirType::Struct(s) if crate::abi::struct_carried_as_its_field(s).is_some() => {
+            write_typed(ptr, v, &s.fields[0]);
+        }
+        HirType::Vector(elem, _) => {
+            if let ZyntaxValue::Array(lanes) = v {
+                let stride = size_of_hir_ty(elem);
+                for (i, lane) in lanes.iter().enumerate() {
+                    write_typed(ptr.add(i * stride), lane, elem);
                 }
             }
         }
-        HirType::Array(elem, n) => {
-            if let ZyntaxValue::Tuple(items) = v {
-                let elem_size = size_of_hir_ty(elem);
-                for i in 0..*n as usize {
-                    if let Some(item) = items.get(i) {
-                        let elem_ptr = ptr.add(i * elem_size);
-                        write_typed(elem_ptr, item, elem);
-                    }
+        // The value is the address of the bytes to copy.
+        HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_) => {
+            if let Some(src) = value_to_i64(v) {
+                let src = src as usize as *const u8;
+                if !src.is_null() && src != ptr as *const u8 {
+                    core::ptr::copy(src, ptr, size_of_hir_ty(ty));
                 }
             }
         }
@@ -3883,7 +4841,7 @@ fn call_extern_symbol_typed(
     sig: &crate::zrtl::ZrtlSymbolSig,
 ) -> Result<ZyntaxValue, InterpError> {
     use crate::hir::HirType;
-    use crate::zrtl::{TypeCategory, TypeTag, ZrtlSigFlags, MAX_PARAMS};
+    use crate::zrtl::{MAX_PARAMS, TypeCategory, TypeTag, ZrtlSigFlags};
 
     let pcount = sig.param_count as usize;
     if pcount != args.len() || pcount > MAX_PARAMS || pcount > 8 {
@@ -4121,7 +5079,7 @@ mod tests {
 
     #[test]
     fn typed_extern_uses_float_registers_for_mixed_arguments_and_return() {
-        use crate::zrtl::{TypeTag, ZrtlSigFlags, ZrtlSymbolSig, MAX_PARAMS};
+        use crate::zrtl::{MAX_PARAMS, TypeTag, ZrtlSigFlags, ZrtlSymbolSig};
 
         extern "C" fn mixed(a: i64, b: f64, c: f64) -> f64 {
             a as f64 + b * 2.0 + c
@@ -4149,7 +5107,7 @@ mod tests {
 
     #[test]
     fn typed_extern_rejects_unrepresentable_float_argument() {
-        use crate::zrtl::{TypeTag, ZrtlSigFlags, ZrtlSymbolSig, MAX_PARAMS};
+        use crate::zrtl::{MAX_PARAMS, TypeTag, ZrtlSigFlags, ZrtlSymbolSig};
 
         extern "C" fn narrow(_: f32) -> i64 {
             panic!("unsupported ABI must not enter the function")

@@ -6,22 +6,21 @@
 //! infrastructure.
 //!
 //! ## Optimization tiers
-//! - **Tier 0 (Interpreter)** — HIR bytecode interpreter, the cold-start
-//!   path before any JIT touches a function. Lives in `hir_interp`; not
-//!   driven by beadie. Promotes to Baseline on the first hotness sample.
-//! - **Tier 1 (Baseline)** — Cranelift, eagerly compiled at module load
-//!   on native or wasm-emitted on wasm targets. Beadie generation 0.
-//! - **Tier 2 (Standard)** — Cranelift recompile, promoted at the warm
-//!   threshold from `ProfileConfig`. Beadie generation 1.
-//! - **Tier 3 (Optimized)** — Cranelift or LLVM recompile, promoted at
-//!   the hot threshold. Beadie generation 2.
+//! - **Interpreter** (`hir_interp`): where every call starts. Not a
+//!   rung of beadie's ladder; its tick callback ticks the bead as a
+//!   native call would, and the baseline takes over once installed.
+//! - **Tier 0 (Baseline)**: Cranelift. Declarations, globals and stubs
+//!   are emitted at module load; a body is compiled when its bead
+//!   crosses `TieredConfig::baseline_threshold` calls, when a stub is
+//!   called, or when an interpreted loop asks for promotion.
+//! - **Tier 1 (Standard)**: Cranelift recompile with OSR helpers, at the
+//!   warm threshold from `ProfileConfig`. Beadie generation 1.
+//! - **Tier 2 (Optimized)**: Cranelift or LLVM recompile, at the hot
+//!   threshold. Beadie generation 2.
 //!
-//! Note: the variants below are the JIT-tier ladder only — they're
-//! what beadie's broker schedules. The `Interpreter` tier is OUTSIDE
-//! this enum because the JIT broker never schedules into it (it's the
-//! starting point). Callers ask `function_tier()` and get back one of
-//! the JIT tiers once a function has been baselined; before that, the
-//! function is implicitly in the `Interpreter` tier.
+//! The variants below are the JIT-tier ladder only; a function that has
+//! not been baselined is in the interpreter, which `function_tier()`
+//! reports as no tier.
 //!
 //! ## Public API
 //! Mirrors the previous hand-rolled implementation 1:1 so embedders
@@ -41,7 +40,6 @@ use beadie::{Bead, HotnessPolicy, JitBackend, ThresholdPolicy, TieredAdapter, Ti
 use crate::beadie_adapter::{ZyntaxCraneliftBackend, ZyntaxFunctionDef};
 use crate::cranelift_backend::CraneliftBackend;
 use crate::hir::{HirFunction, HirId, HirModule};
-use crate::hir_interp::{jit_dispatch_supported, jit_float_mask, JitDispatch, JitRet};
 use crate::osr;
 use crate::profiling::{ProfileConfig, ProfileData};
 use crate::{CompilerError, CompilerResult};
@@ -148,6 +146,9 @@ pub struct TieredConfig {
     /// Route calls between compiled functions through reload cells so
     /// `reload_module` can replace a function under running code.
     pub enable_hot_reload: bool,
+    /// Calls a function takes in the interpreter before its baseline is
+    /// compiled. A loop that stays interpreted asks sooner, on its own.
+    pub baseline_threshold: u32,
 }
 
 impl Default for TieredConfig {
@@ -165,6 +166,12 @@ impl Default for TieredConfig {
             // misbehaves.
             enable_osr: std::env::var_os("ZYNTAX_DISABLE_OSR").is_none(),
             enable_hot_reload: false,
+            // `ZYNTAX_BASELINE_THRESHOLD=n` overrides the calls before the
+            // baseline compiles; 1 compiles on the first call. Safe.
+            baseline_threshold: std::env::var("ZYNTAX_BASELINE_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20),
         }
     }
 }
@@ -181,6 +188,7 @@ impl TieredConfig {
             llvm_cache_key: None,
             enable_osr: true,
             enable_hot_reload: false,
+            baseline_threshold: 20,
         }
     }
 
@@ -195,6 +203,7 @@ impl TieredConfig {
             llvm_cache_key: None,
             enable_osr: true,
             enable_hot_reload: false,
+            baseline_threshold: 20,
         }
     }
 
@@ -210,6 +219,7 @@ impl TieredConfig {
             llvm_cache_key: None,
             enable_osr: true,
             enable_hot_reload: false,
+            baseline_threshold: 20,
         }
     }
 }
@@ -601,7 +611,10 @@ impl TieredBackend {
 
             // The bead starts without code: interpreter calls tick it and
             // beadie publishes the already generated baseline at tier-up.
-            if self.cranelift.with_lock(|be| be.get_function_ptr(*func_id)).is_none()
+            if self
+                .cranelift
+                .with_lock(|be| be.get_function_ptr(*func_id))
+                .is_none()
                 && osr::osr_trace_enabled()
             {
                 eprintln!(
@@ -1835,35 +1848,35 @@ impl TieredBackend {
 
     /// Runtime symbols and native global slots used by interpreted code.
     pub fn interpreter_bindings(&self) -> (Vec<(String, *const u8)>, Vec<(HirId, *mut u8)>) {
-        let symbols = self.runtime_symbols.read().unwrap().iter()
-            .map(|s| (s.name.clone(), s.ptr as *const u8)).collect();
-        let globals = self.loaded_modules().into_iter().flat_map(|m| m.globals.keys().copied())
-            .filter_map(|id| self.cranelift.with_lock(|be| be.global_data_addr(id))
-                .map(|(ptr, _)| (id, ptr as *mut u8))).collect();
+        let symbols = self
+            .runtime_symbols
+            .read()
+            .unwrap()
+            .iter()
+            .map(|s| (s.name.clone(), s.ptr as *const u8))
+            .collect();
+        let globals = self
+            .loaded_modules()
+            .into_iter()
+            .flat_map(|m| m.globals.keys().copied())
+            .filter_map(|id| {
+                self.cranelift
+                    .with_lock(|be| be.global_data_addr(id))
+                    .map(|(ptr, _)| (id, ptr as *mut u8))
+            })
+            .collect();
         (symbols, globals)
     }
 
-    /// Entry callback for the bytecode interpreter. It ticks the same
-    /// bead and submits the same compile closure as native call profiling.
+    /// Entry callback for the bytecode interpreter: ticks the function's
+    /// bead as a native call would and hands back the native entry once
+    /// beadie has installed one.
     pub fn interpreter_tick_callback(
         &self,
         func_id: HirId,
-    ) -> Option<Box<dyn FnMut() -> Option<JitDispatch> + Send>> {
+    ) -> Option<Box<dyn FnMut() -> Option<*const u8> + Send>> {
         let entry = self.functions.get(&func_id)?;
         let func = entry.body(func_id);
-        let params: Vec<_> = func.signature.params.iter().map(|p| p.ty.clone()).collect();
-        let ret = func.signature.returns.first().cloned().unwrap_or(crate::hir::HirType::Void);
-        let supported = jit_dispatch_supported(&params, &ret);
-        let dispatch = JitDispatch {
-            ptr: ptr::null(),
-            n_params: params.len().min(255) as u8,
-            float_mask: jit_float_mask(&params),
-            ret: match ret {
-                crate::hir::HirType::F32 => JitRet::F32,
-                crate::hir::HirType::F64 => JitRet::F64,
-                _ => JitRet::Int,
-            },
-        };
         let bound = entry.bound.clone();
         let adapter = Arc::clone(&self.adapter);
         let module = Arc::clone(&entry.module);
@@ -1880,13 +1893,61 @@ impl TieredBackend {
             #[cfg(feature = "llvm-backend")]
             let llvm = llvm.as_ref().map(Arc::clone);
             let code = adapter.on_invoke(&bound, move |tier, bead| {
-                compile_at_tier(tier, bead, func_id, bead_id, &func, &module, &cranelift,
+                let entry = compile_at_tier(
+                    tier,
+                    bead,
+                    func_id,
+                    bead_id,
+                    &func,
+                    &module,
+                    &cranelift,
                     #[cfg(feature = "llvm-backend")]
                     llvm.as_ref(),
-                    tier2_backend, verbosity)
+                    tier2_backend,
+                    verbosity,
+                );
+                // Compiled callers reach the code through the cell.
+                if !entry.is_null() {
+                    let key = cranelift.with_lock(|be| be.reload_key());
+                    crate::reload::set_call_target(key, func_id, entry as usize);
+                }
+                entry
             })?;
-            supported.then_some(JitDispatch { ptr: code as *const u8, ..dispatch })
+            Some(code as *const u8)
         }))
+    }
+
+    /// The interpreter's bridge into native code: a thunk maker for
+    /// call shapes, and the current entry of a function as compiled
+    /// callers reach it (its cell, else the code compiled at load).
+    #[allow(clippy::type_complexity)]
+    pub fn interpreter_bridge(
+        &self,
+    ) -> (
+        Box<dyn FnMut(&crate::hir_interp::NativeSig) -> Option<*const u8> + Send>,
+        Box<dyn Fn(HirId) -> Option<*const u8> + Send + Sync>,
+        Box<dyn Fn(HirId) -> Option<u64> + Send + Sync>,
+    ) {
+        let cranelift = Arc::clone(&self.cranelift);
+        let thunk = Box::new(move |sig: &crate::hir_interp::NativeSig| {
+            cranelift.with_lock(|be| be.interp_thunk(sig).ok())
+        });
+        let cranelift = Arc::clone(&self.cranelift);
+        let key = self.cranelift.with_lock(|be| be.reload_key());
+        let entry = Box::new(move |id: HirId| {
+            let cell = crate::reload::call_target(key, id);
+            if cell != 0 {
+                return Some(cell as *const u8);
+            }
+            cranelift.with_lock(|be| be.get_function_ptr(id))
+        });
+        let beads: HashMap<HirId, u64> = self
+            .functions
+            .iter()
+            .map(|(id, e)| (*id, e.bead_id))
+            .collect();
+        let bead = Box::new(move |id: HirId| beads.get(&id).copied());
+        (thunk, entry, bead)
     }
 
     /// Record an invocation. Drives tier promotion via beadie.
@@ -2248,6 +2309,23 @@ impl TieredBackend {
             #[cfg(feature = "llvm-backend")]
             let llvm = llvm.clone();
             let func_id = *func_id;
+            // An interpreted frame asks before its function has any
+            // native code; the baseline comes first so the promotion has
+            // something to promote.
+            if !ensure_baseline(
+                bound,
+                func_id,
+                bead_id,
+                &func_arc,
+                &module_arc,
+                &cranelift,
+                #[cfg(feature = "llvm-backend")]
+                llvm.as_ref(),
+                tier2_backend,
+                verbosity,
+            ) {
+                return false;
+            }
             // The compile itself runs on a broker thread, so raising the
             // request costs the running loop only the submission.
             let submitted = adapter.force_promote(bound, tier_idx, move |bead| {
@@ -2300,6 +2378,23 @@ impl TieredBackend {
         let tier2_backend = self.config.tier2_backend;
         let verbosity = self.config.verbosity;
         let tier_idx = target_tier.index();
+        if !ensure_baseline(
+            &entry.bound,
+            func_id,
+            bead_id,
+            &func_arc,
+            &module_arc,
+            &cranelift,
+            #[cfg(feature = "llvm-backend")]
+            llvm.as_ref(),
+            tier2_backend,
+            verbosity,
+        ) {
+            return Err(CompilerError::Backend(format!(
+                "no baseline could be compiled for {:?}",
+                func_arc.name.resolve_global().unwrap_or_default()
+            )));
+        }
 
         let promoted = self
             .adapter
@@ -2525,10 +2620,8 @@ pub fn make_policies(config: &TieredConfig) -> Vec<Box<dyn HotnessPolicy>> {
     let warm = clamp_to_u32(config.profile_config.warm_threshold);
     let hot = clamp_to_u32(config.profile_config.hot_threshold);
 
-    // Tier 0 is always eager-installed by `compile_module`, so its policy
-    // never fires. Use a tiny threshold so any code path that registers a
-    // bead without eager-installing still gets a baseline compile quickly.
-    let tier0 = ThresholdPolicy::new(1);
+    // Tier 0 is the baseline the interpreter promotes into.
+    let tier0 = ThresholdPolicy::new(config.baseline_threshold.max(1));
 
     // Tier 1 (Standard) — promote at warm threshold.
     let queue_ahead_1 = (warm / 5).max(1);
@@ -2562,7 +2655,7 @@ fn clamp_to_u32(v: u64) -> u32 {
 /// Calls across the LLVM/Cranelift boundary stay indirect. Large list-entry
 /// bodies with many such calls offer little LLVM optimization headroom.
 fn llvm_list_entry_has_headroom(f: &HirFunction) -> bool {
-    use crate::abi::{function_abi, Pass};
+    use crate::abi::{Pass, function_abi};
     use crate::hir::HirInstruction;
     if function_abi(f, false)
         .params
@@ -2589,6 +2682,55 @@ fn llvm_list_entry_has_headroom(f: &HirFunction) -> bool {
 /// dispatch as the native `TieredBackend`. Returns `*mut ()` (the
 /// compiled fn ptr) or `ptr::null_mut()` on failure.
 #[allow(clippy::too_many_arguments)]
+/// Give `bound` its baseline code if it has none yet: compiled off this
+/// stack, since the caller may be running on a fiber's, and published to
+/// the bead and the call cell. Whether the bead has code afterwards.
+#[allow(clippy::too_many_arguments)]
+fn ensure_baseline(
+    bound: &TieredBound,
+    func_id: HirId,
+    bead_id: u64,
+    func_arc: &Arc<HirFunction>,
+    module_arc: &Arc<HirModule>,
+    cranelift: &Arc<ZyntaxCraneliftBackend>,
+    #[cfg(feature = "llvm-backend")] llvm: Option<&Arc<ZyntaxLlvmBackend>>,
+    tier2_backend: Tier2Backend,
+    verbosity: u8,
+) -> bool {
+    if bound.bead().compiled().is_some() {
+        return true;
+    }
+    let bead = Arc::clone(bound.bead());
+    let entry = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("zyntax-baseline-compile".into())
+            .stack_size(16 << 20)
+            .spawn_scoped(scope, || {
+                compile_at_tier(
+                    0,
+                    &bead,
+                    func_id,
+                    bead_id,
+                    func_arc,
+                    module_arc,
+                    cranelift,
+                    #[cfg(feature = "llvm-backend")]
+                    llvm,
+                    tier2_backend,
+                    verbosity,
+                ) as usize
+            })
+            .map(|h| h.join().unwrap_or(0))
+            .unwrap_or(0)
+    });
+    if entry == 0 {
+        return false;
+    }
+    let key = cranelift.with_lock(|be| be.reload_key());
+    crate::reload::set_call_target(key, func_id, entry);
+    bound.bead().eager_install(entry as *mut ()) || bound.bead().compiled().is_some()
+}
+
 pub fn compile_at_tier(
     tier_idx: usize,
     bead: &Arc<Bead>,

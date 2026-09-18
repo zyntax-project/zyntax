@@ -7,9 +7,9 @@ use super::native_call::{call_dynamic_function, call_native_with_signature, dyna
 use super::promise::ZyntaxPromise;
 use super::types::{NativeSignature, NativeType, RuntimeError, RuntimeEvent, RuntimeResult};
 use super::{
-    apply_krio_async_lowering, apply_krio_effect_lowering, apply_krio_fiber_lowering,
-    capture_runtime_events_from_program, synthesize_handler_state, CompiledImportResolverCallback,
-    ImportResolverCallback,
+    CompiledImportResolverCallback, ImportResolverCallback, apply_krio_async_lowering,
+    apply_krio_effect_lowering, apply_krio_fiber_lowering, capture_runtime_events_from_program,
+    synthesize_handler_state,
 };
 use crate::convert::FromZyntax;
 use crate::error::ZyntaxError;
@@ -19,30 +19,23 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use zyntax_compiler::{
+    CompilationConfig, CompilerError,
     hir::{HirId, HirModule},
     hir_interp::HirInterpreter,
     lowering::AstLowering,
     tiered_backend::{OptimizationTier, TieredBackend, TieredConfig, TieredStatistics},
     zrtl::DynamicValue,
-    CompilationConfig, CompilerError,
 };
 
-/// A multi-tier JIT runtime with automatic optimization
+/// A multi-tier runtime: interpreted first, compiled as it runs.
 ///
-/// `TieredRuntime` provides adaptive compilation where frequently-called
-/// functions are automatically optimized to higher tiers:
-///
-/// - **Tier 0 (Baseline)**: Fast compilation, minimal optimization (cold code)
-/// - **Tier 1 (Standard)**: Moderate optimization (warm code)
-/// - **Tier 2 (Optimized)**: Aggressive optimization (hot code)
-///
-/// ## How It Works
-///
-/// 1. All functions start at Tier 0 (baseline JIT with Cranelift)
-/// 2. Execution counters track how often functions are called
-/// 3. When a function crosses the "warm" threshold, it's recompiled at Tier 1
-/// 4. When it crosses the "hot" threshold, it's recompiled at Tier 2
-/// 5. Function pointers are atomically swapped after recompilation
+/// - Every call starts in the HIR interpreter.
+/// - A function called `TieredConfig::baseline_threshold` times gets
+///   Cranelift baseline code; a loop that stays interpreted asks for it
+///   itself and transfers into the compiled code at its header.
+/// - **Tier 1 (Standard)** and **Tier 2 (Optimized)** recompile warm
+///   and hot functions in the background; entries are swapped
+///   atomically through the functions' call cells.
 ///
 /// ## Example
 ///
@@ -684,6 +677,8 @@ impl TieredRuntime {
                 interp.register_tick_callback(id, tick);
             }
         }
+        let (thunk, entry, bead) = self.backend.interpreter_bridge();
+        interp.set_native_bridge(thunk, entry, bead);
         drop(interp);
         if init_boxed_constants {
             self.call::<()>(zyntax_compiler::const_boxes::INIT_FUNCTION, &[])?;
@@ -769,15 +764,22 @@ impl TieredRuntime {
         // drives beadie for every interpreted function, including callees.
         // A promoted entry uses the current native pointer directly.
         if self.backend.promoted_function_pointer(*func_id).is_none() {
-            let module = self.backend.interpreter_module(*func_id)
+            let module = self
+                .backend
+                .interpreter_module(*func_id)
                 .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
-            return self.interpreter.lock().unwrap()
+            return self
+                .interpreter
+                .lock()
+                .unwrap()
                 .call(&module, name, args.to_vec())
                 .map_err(|e| RuntimeError::Execution(e.to_string()));
         }
 
         self.backend.record_call(*func_id);
-        let ptr = self.backend.get_function_pointer(*func_id)
+        let ptr = self
+            .backend
+            .get_function_pointer(*func_id)
             .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;
 
         // If we have a recorded HIR-derived signature, the function uses
@@ -883,7 +885,8 @@ impl TieredRuntime {
         }
 
         Err(RuntimeError::FunctionNotFound(format!(
-            "Async function '{}' not found (tried both Promise-returning and legacy _new/_poll APIs)", name
+            "Async function '{}' not found (tried both Promise-returning and legacy _new/_poll APIs)",
+            name
         )))
     }
 
@@ -1021,7 +1024,7 @@ impl TieredRuntime {
     fn register_static_plugin_deferred(&mut self, plugin: zrtl::StaticPlugin) -> RuntimeResult<()> {
         use std::ffi::CStr;
         use zyntax_compiler::zrtl::{
-            RuntimeSymbolInfo, TypeTag, ZrtlSigFlags, ZrtlSymbolSig, MAX_PARAMS,
+            MAX_PARAMS, RuntimeSymbolInfo, TypeTag, ZrtlSigFlags, ZrtlSymbolSig,
         };
 
         // Walk the SDK-side `ZrtlSymbol` array and build compiler-side
@@ -1452,6 +1455,23 @@ impl TieredRuntime {
         Ok(function_names)
     }
 
+    /// Lower `program` to the HIR this runtime would compile, in this
+    /// runtime's context (its grammars, plugins and snapshots) and with
+    /// the krio passes applied: what a host reads before handing the
+    /// module to [`Self::compile_module`], to publish it from its HIR.
+    pub fn lower_to_hir(
+        &self,
+        program: zyntax_typed_ast::TypedProgram,
+    ) -> RuntimeResult<HirModule> {
+        let (mut hir_module, _) =
+            self.lower_typed_program(program, self.builtin_aliases.clone())?;
+        hir_module.automatic_release = self.automatic_release;
+        apply_krio_async_lowering(&mut hir_module)?;
+        apply_krio_effect_lowering(&mut hir_module)?;
+        apply_krio_fiber_lowering(&mut hir_module);
+        Ok(hir_module)
+    }
+
     /// Reload a pre-parsed typed program against the running module —
     /// the typed-program twin of [`Self::reload_module_source`].
     pub fn reload_typed_program(
@@ -1743,7 +1763,7 @@ impl TieredRuntime {
         }
 
         use zyntax_compiler::fiber_backend::{
-            unpack_fiber_step, FIBER_STEP_DONE, FIBER_STEP_YIELDED,
+            FIBER_STEP_DONE, FIBER_STEP_YIELDED, unpack_fiber_step,
         };
         let (tag, payload) = unpack_fiber_step(raw);
         let step = if tag == FIBER_STEP_YIELDED {

@@ -123,7 +123,7 @@ impl Error {
     /// its own diagnostics. `file` names the source the error's span
     /// refers to: the main file, or the module [`Error::module`] names.
     pub fn render(&self, file: &str, source: &str, use_colors: bool) -> String {
-        use zyntax_typed_ast::diagnostics::{render_diagnostic, Diagnostic};
+        use zyntax_typed_ast::diagnostics::{Diagnostic, render_diagnostic};
         let (message, label, span) = match self {
             Error::Syntax { message, span, .. } => {
                 (format!("syntax error: {message}"), "here", *span)
@@ -134,7 +134,7 @@ impl Error {
                 *span,
             ),
             Error::Library(message) => {
-                return format!("error: the built-in library is unreadable: {message}\n")
+                return format!("error: the built-in library is unreadable: {message}\n");
             }
         };
         // A span has to cover something to be shown; an empty one at the
@@ -524,6 +524,7 @@ pub fn parse_program_with(
             inferred.dynamic_methods = found_dynamic;
         }
     }
+    inferred.settled.set(true);
     for ty in inferred.globals.values_mut() {
         if *ty == types::Ty::Unknown {
             *ty = types::Ty::Object;

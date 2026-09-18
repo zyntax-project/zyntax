@@ -119,15 +119,18 @@ fn loop_with_external_exit_entry() -> (HirFunction, HirId, HirId) {
     (function, header, before_loop)
 }
 
+/// A block the loop reaches that is also entered from before the loop
+/// resumes with only its in-loop edge: the value the entry edge would
+/// have brought is never read by the resumed code, so it is not a
+/// live-in.
 #[test]
-fn a_shared_block_that_reenters_the_loop_is_not_an_osr_exit() {
-    let (mut function, header, _) = loop_with_external_exit_entry();
+fn a_shared_block_that_reenters_the_loop_resumes_without_the_entry_value() {
+    let (mut function, header, before_loop) = loop_with_external_exit_entry();
     let exit = function.blocks[&header].successors[1];
     function.blocks.get_mut(&exit).unwrap().terminator = HirTerminator::Branch { target: header };
-    assert!(matches!(
-        osr::osr_layout(&function, header),
-        Err(osr::OsrReject::RegionHasExternalEntry)
-    ));
+    let layout = osr::osr_layout(&function, header).expect("the loop resumes at its header");
+    assert!(!layout.live_ins.contains(&before_loop));
+    assert!(layout.repairs.is_empty());
 }
 
 #[test]
@@ -762,8 +765,21 @@ fn a_transfer_keeps_writing_into_the_header_it_was_handed() {
     let ptr_i64 = HirType::Ptr(Box::new(HirType::I64));
 
     let [entry_id, head_id, body_id, exit_id] = [(); 4].map(|_| HirId::new());
-    let [list, n, c0, c1, c8, len_addr, phi_i, cmp, data, bumped, len, len1, next_i] =
-        [(); 13].map(|_| HirId::new());
+    let [
+        list,
+        n,
+        c0,
+        c1,
+        c8,
+        len_addr,
+        phi_i,
+        cmp,
+        data,
+        bumped,
+        len,
+        len1,
+        next_i,
+    ] = [(); 13].map(|_| HirId::new());
 
     let mut values: IndexMap<HirId, HirValue> = IndexMap::new();
     let mut value = |id: HirId, ty: HirType, kind: HirValueKind| {

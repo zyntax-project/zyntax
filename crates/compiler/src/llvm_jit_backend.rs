@@ -44,11 +44,11 @@ use crate::llvm_backend::LLVMBackend;
 use crate::{CompilerError, CompilerResult};
 use indexmap::IndexMap;
 use inkwell::{
+    OptimizationLevel,
     context::Context,
     execution_engine::ExecutionEngine,
     passes::PassBuilderOptions,
     targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine},
-    OptimizationLevel,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -393,7 +393,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                         }
                         continue;
                     }
-                    match backend.compile_osr_helper(func, &layout) {
+                    let resumed = crate::osr::resumable(func, &layout);
+                    match backend.compile_osr_helper(&resumed, &layout) {
                         Ok(name) => {
                             if crate::osr::osr_trace_enabled() {
                                 eprintln!(
@@ -859,7 +860,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     ///   as `CompilerError::Backend` too. The runtime's calling code
     ///   treats any error as a soft-fail and stays on Cranelift.
     pub fn compile_module(&mut self, hir_module: &HirModule) -> CompilerResult<()> {
-        use crate::llvm_link::{link_to_dylib, load_dylib, Triple};
+        use crate::llvm_link::{Triple, link_to_dylib, load_dylib};
 
         // Reset state from any previous compile.
         self.function_pointers.clear();

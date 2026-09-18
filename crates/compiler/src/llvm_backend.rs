@@ -22,6 +22,8 @@ use crate::hir::{
 use crate::{CompilerError, CompilerResult};
 use indexmap::IndexMap;
 use inkwell::{
+    AddressSpace, AtomicOrdering as LLVMAtomicOrdering, AtomicRMWBinOp, FloatPredicate,
+    IntPredicate,
     basic_block::BasicBlock,
     builder::Builder,
     context::Context,
@@ -31,8 +33,6 @@ use inkwell::{
         BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, PhiValue, PointerValue,
         ValueKind,
     },
-    AddressSpace, AtomicOrdering as LLVMAtomicOrdering, AtomicRMWBinOp, FloatPredicate,
-    IntPredicate,
 };
 
 /// A function another tier compiled, as a call site here needs it.
@@ -682,7 +682,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 Some(_) => {
                     return Err(CompilerError::CodeGen(format!(
                         "incompatible native declarations for {fn_name}"
-                    )))
+                    )));
                 }
                 None => self.module.add_function(&fn_name, fn_type, None),
             }
@@ -916,10 +916,11 @@ impl<'ctx> LLVMBackend<'ctx> {
         let in_loop = crate::osr::blocks_reachable_from(func, layout.header);
 
         // One pointer to the frame carrying the live-ins.
-        let params: Vec<BasicMetadataTypeEnum> = vec![self
-            .context
-            .ptr_type(inkwell::AddressSpace::default())
-            .into()];
+        let params: Vec<BasicMetadataTypeEnum> = vec![
+            self.context
+                .ptr_type(inkwell::AddressSpace::default())
+                .into(),
+        ];
         let fn_ty = match &layout.return_type {
             HirType::Void => self.context.void_type().fn_type(&params, false),
             ty => self.translate_type(ty)?.fn_type(&params, false),
@@ -1008,10 +1009,15 @@ impl<'ctx> LLVMBackend<'ctx> {
                     )
                     .map_err(|e| CompilerError::CodeGen(format!("OSR frame gep: {e}")))?
             };
+            let repaired = layout.repairs.iter().find(|r| r.value == *hir_id);
             if i < layout.phi_count {
                 // Deferred: the phi this seeds does not exist yet, and its
                 // type is what the load has to match.
                 phi_seed_slots.push((*hir_id, slot, hir_ty.clone()));
+            } else if let Some(r) = repaired {
+                // A live-in the region redefines seeds the phi standing
+                // for it at the header.
+                phi_seed_slots.push((r.phi, slot, hir_ty.clone()));
             } else {
                 // A value held by reference travels as the pointer to its
                 // storage, which is what the body expects for one.
@@ -1183,7 +1189,7 @@ impl<'ctx> LLVMBackend<'ctx> {
             other => {
                 return Err(CompilerError::CodeGen(format!(
                     "OSR live-in type {other:?} does not fit an i64 slot"
-                )))
+                )));
             }
         })
     }
@@ -1416,11 +1422,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                     }
                 }
             }
-            if agree {
-                consensus.cloned()
-            } else {
-                None
-            }
+            if agree { consensus.cloned() } else { None }
         } else {
             None
         };
@@ -3378,7 +3380,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 other => {
                     return Err(CompilerError::CodeGen(format!(
                         "vector float binop {other:?}"
-                    )))
+                    )));
                 }
             }
         } else {
@@ -3392,7 +3394,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 other => {
                     return Err(CompilerError::CodeGen(format!(
                         "vector int binop {other:?}"
-                    )))
+                    )));
                 }
             }
         };
@@ -4245,7 +4247,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 return Err(CompilerError::CodeGen(format!(
                     "call to {} across tiers: several return values",
                     callee.name
-                )))
+                )));
             }
         };
         let cell = self.builder.build_int_to_ptr(
@@ -4454,7 +4456,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                         return Err(CompilerError::CodeGen(format!(
                             "Expected function type for indirect call, got: {:?}",
                             hir_type
-                        )))
+                        )));
                     }
                 };
 
