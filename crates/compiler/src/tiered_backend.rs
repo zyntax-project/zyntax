@@ -326,6 +326,10 @@ pub struct TieredBackend {
 
     /// Per-function entries keyed by HIR function id.
     functions: HashMap<HirId, FunctionEntry>,
+    /// Functions compiled on their first native call, through the stub
+    /// in their cell; the interpreter reaches their baseline the same
+    /// way, so one compile is made of each.
+    lazy: HashSet<HirId>,
     /// The module the compiled code came from. A reload diffs the
     /// edited module against this and replaces it piecewise.
     current_module: Option<Arc<HirModule>>,
@@ -442,6 +446,7 @@ impl TieredBackend {
             #[cfg(feature = "llvm-backend")]
             _llvm_context,
             functions: HashMap::new(),
+            lazy: HashSet::new(),
             current_module: None,
             loaded: Vec::new(),
             last_undo: None,
@@ -644,6 +649,7 @@ impl TieredBackend {
         }
 
         // Every bead now exists, so the handler can capture them.
+        self.lazy.extend(lazy.iter().copied());
         self.install_promotion_requester();
         if !lazy.is_empty() {
             self.install_lazy_compiler(&lazy, &finished);
@@ -1870,7 +1876,10 @@ impl TieredBackend {
 
     /// Entry callback for the bytecode interpreter: ticks the function's
     /// bead as a native call would and hands back the native entry once
-    /// beadie has installed one.
+    /// there is one. The baseline of a function compiled at load is the
+    /// code already in its cell; that of a function left for its first
+    /// call is made by the same first-call compiler its stub uses, so
+    /// the two never compile one function twice.
     pub fn interpreter_tick_callback(
         &self,
         func_id: HirId,
@@ -1902,10 +1911,32 @@ impl TieredBackend {
         });
         let bound = entry.bound.clone();
         let adapter = Arc::clone(&self.adapter);
+        let lazy = self.lazy.contains(&func_id);
+        let threshold = self.config.baseline_threshold.max(1);
         Some(Box::new(move || {
+            if lazy && bound.bead().compiled().is_none() {
+                // Counted here until the first-call compiler has made
+                // the baseline and installed it in the bead; beadie's
+                // own ladder takes over from there.
+                let (count, _) = bound.bead().tick();
+                if count >= threshold {
+                    let code = osr::lazy_compile(ctx.bead_id);
+                    if !code.is_null() {
+                        return Some(code);
+                    }
+                }
+                return None;
+            }
             let ctx = Arc::clone(&ctx);
             let code = adapter.on_invoke(&bound, move |tier, bead| {
                 let c = &*ctx;
+                // The baseline was compiled at load; the ladder above it
+                // compiles anew.
+                if tier == 0 {
+                    if let Some(p) = c.cranelift.with_lock(|be| be.get_function_ptr(c.func_id)) {
+                        return p as *mut ();
+                    }
+                }
                 let entry = compile_at_tier(
                     tier,
                     bead,
@@ -2267,24 +2298,35 @@ impl TieredBackend {
 
         // bead id -> everything a compile needs, so the handler can run on
         // the thread that raised the request without reaching for `self`.
-        let by_bead: HashMap<u64, (HirId, TieredBound, Option<Arc<HirFunction>>, Arc<HirModule>)> =
-            self.functions
-                .iter()
-                .map(|(id, e)| {
+        #[allow(clippy::type_complexity)]
+        let by_bead: HashMap<
+            u64,
+            (
+                HirId,
+                TieredBound,
+                Option<Arc<HirFunction>>,
+                Arc<HirModule>,
+                bool,
+            ),
+        > = self
+            .functions
+            .iter()
+            .map(|(id, e)| {
+                (
+                    e.bead_id,
                     (
-                        e.bead_id,
-                        (
-                            *id,
-                            e.bound.clone(),
-                            e.function.clone(),
-                            Arc::clone(&e.module),
-                        ),
-                    )
-                })
-                .collect();
+                        *id,
+                        e.bound.clone(),
+                        e.function.clone(),
+                        Arc::clone(&e.module),
+                        self.lazy.contains(id),
+                    ),
+                )
+            })
+            .collect();
 
         osr::set_promotion_requester(move |bead_id| {
-            let Some((func_id, bound, swapped, module_arc)) = by_bead.get(&bead_id) else {
+            let Some((func_id, bound, swapped, module_arc, lazy)) = by_bead.get(&bead_id) else {
                 if osr::osr_trace_enabled() {
                     eprintln!("[osr] request for unknown bead={bead_id}");
                 }
@@ -2334,6 +2376,7 @@ impl TieredBackend {
                 bound,
                 func_id,
                 bead_id,
+                *lazy,
                 &func_arc,
                 &module_arc,
                 &cranelift,
@@ -2396,10 +2439,12 @@ impl TieredBackend {
         let tier2_backend = self.config.tier2_backend;
         let verbosity = self.config.verbosity;
         let tier_idx = target_tier.index();
+        let lazy = self.lazy.contains(&func_id);
         if !ensure_baseline(
             &entry.bound,
             func_id,
             bead_id,
+            lazy,
             &func_arc,
             &module_arc,
             &cranelift,
@@ -2700,14 +2745,17 @@ fn llvm_list_entry_has_headroom(f: &HirFunction) -> bool {
 /// dispatch as the native `TieredBackend`. Returns `*mut ()` (the
 /// compiled fn ptr) or `ptr::null_mut()` on failure.
 #[allow(clippy::too_many_arguments)]
-/// Give `bound` its baseline code if it has none yet: compiled off this
-/// stack, since the caller may be running on a fiber's, and published to
-/// the bead and the call cell. Whether the bead has code afterwards.
+/// Give `bound` its baseline code if it has none yet: the code compiled
+/// at load, or for a function left for its first call the code its
+/// first-call compiler makes (which installs it itself), or else a
+/// compile off this stack, since the caller may be running on a
+/// fiber's. Whether the bead has code afterwards.
 #[allow(clippy::too_many_arguments)]
 fn ensure_baseline(
     bound: &TieredBound,
     func_id: HirId,
     bead_id: u64,
+    lazy: bool,
     func_arc: &Arc<HirFunction>,
     module_arc: &Arc<HirModule>,
     cranelift: &Arc<ZyntaxCraneliftBackend>,
@@ -2718,29 +2766,38 @@ fn ensure_baseline(
     if bound.bead().compiled().is_some() {
         return true;
     }
-    let bead = Arc::clone(bound.bead());
-    let entry = std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name("zyntax-baseline-compile".into())
-            .stack_size(16 << 20)
-            .spawn_scoped(scope, || {
-                compile_at_tier(
-                    0,
-                    &bead,
-                    func_id,
-                    bead_id,
-                    func_arc,
-                    module_arc,
-                    cranelift,
-                    #[cfg(feature = "llvm-backend")]
-                    llvm,
-                    tier2_backend,
-                    verbosity,
-                ) as usize
+    if lazy {
+        return !osr::lazy_compile(bead_id).is_null() || bound.bead().compiled().is_some();
+    }
+    let existing = cranelift.with_lock(|be| be.get_function_ptr(func_id));
+    let entry = match existing {
+        Some(p) => p as usize,
+        None => {
+            let bead = Arc::clone(bound.bead());
+            std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .name("zyntax-baseline-compile".into())
+                    .stack_size(16 << 20)
+                    .spawn_scoped(scope, || {
+                        compile_at_tier(
+                            0,
+                            &bead,
+                            func_id,
+                            bead_id,
+                            func_arc,
+                            module_arc,
+                            cranelift,
+                            #[cfg(feature = "llvm-backend")]
+                            llvm,
+                            tier2_backend,
+                            verbosity,
+                        ) as usize
+                    })
+                    .map(|h| h.join().unwrap_or(0))
+                    .unwrap_or(0)
             })
-            .map(|h| h.join().unwrap_or(0))
-            .unwrap_or(0)
-    });
+        }
+    };
     if entry == 0 {
         return false;
     }
