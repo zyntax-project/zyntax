@@ -1876,40 +1876,53 @@ impl TieredBackend {
         func_id: HirId,
     ) -> Option<Box<dyn FnMut() -> Option<*const u8> + Send>> {
         let entry = self.functions.get(&func_id)?;
-        let func = entry.body(func_id);
+        // Everything a compile needs, behind one count the closure
+        // handed to beadie clones per call.
+        struct Compile {
+            func: Arc<HirFunction>,
+            module: Arc<HirModule>,
+            cranelift: Arc<ZyntaxCraneliftBackend>,
+            #[cfg(feature = "llvm-backend")]
+            llvm: Option<Arc<ZyntaxLlvmBackend>>,
+            tier2_backend: Tier2Backend,
+            verbosity: u8,
+            func_id: HirId,
+            bead_id: u64,
+        }
+        let ctx = Arc::new(Compile {
+            func: entry.body(func_id),
+            module: Arc::clone(&entry.module),
+            cranelift: Arc::clone(&self.cranelift),
+            #[cfg(feature = "llvm-backend")]
+            llvm: self.llvm.as_ref().map(Arc::clone),
+            tier2_backend: self.config.tier2_backend,
+            verbosity: self.config.verbosity,
+            func_id,
+            bead_id: entry.bead_id,
+        });
         let bound = entry.bound.clone();
         let adapter = Arc::clone(&self.adapter);
-        let module = Arc::clone(&entry.module);
-        let bead_id = entry.bead_id;
-        let cranelift = Arc::clone(&self.cranelift);
-        #[cfg(feature = "llvm-backend")]
-        let llvm = self.llvm.as_ref().map(Arc::clone);
-        let tier2_backend = self.config.tier2_backend;
-        let verbosity = self.config.verbosity;
         Some(Box::new(move || {
-            let func = Arc::clone(&func);
-            let module = Arc::clone(&module);
-            let cranelift = Arc::clone(&cranelift);
-            #[cfg(feature = "llvm-backend")]
-            let llvm = llvm.as_ref().map(Arc::clone);
+            let ctx = Arc::clone(&ctx);
             let code = adapter.on_invoke(&bound, move |tier, bead| {
+                let c = &*ctx;
                 let entry = compile_at_tier(
                     tier,
                     bead,
-                    func_id,
-                    bead_id,
-                    &func,
-                    &module,
-                    &cranelift,
+                    c.func_id,
+                    c.bead_id,
+                    &c.func,
+                    &c.module,
+                    &c.cranelift,
                     #[cfg(feature = "llvm-backend")]
-                    llvm.as_ref(),
-                    tier2_backend,
-                    verbosity,
+                    c.llvm.as_ref(),
+                    c.tier2_backend,
+                    c.verbosity,
                 );
                 // Compiled callers reach the code through the cell.
                 if !entry.is_null() {
-                    let key = cranelift.with_lock(|be| be.reload_key());
-                    crate::reload::set_call_target(key, func_id, entry as usize);
+                    let key = c.cranelift.with_lock(|be| be.reload_key());
+                    crate::reload::set_call_target(key, c.func_id, entry as usize);
                 }
                 entry
             })?;
@@ -1941,11 +1954,16 @@ impl TieredBackend {
             }
             cranelift.with_lock(|be| be.get_function_ptr(id))
         });
-        let beads: HashMap<HirId, u64> = self
-            .functions
-            .iter()
-            .map(|(id, e)| (*id, e.bead_id))
-            .collect();
+        // With OSR off an interpreted loop stays where it is, as a
+        // native one does.
+        let beads: HashMap<HirId, u64> = if self.config.enable_osr {
+            self.functions
+                .iter()
+                .map(|(id, e)| (*id, e.bead_id))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let bead = Box::new(move |id: HirId| beads.get(&id).copied());
         (thunk, entry, bead)
     }

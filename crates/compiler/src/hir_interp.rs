@@ -40,6 +40,10 @@
 
 use std::collections::HashMap;
 
+/// A map keyed by `HirId`, hashed cheaply: these are probed on every
+/// call the interpreter makes.
+type IdMap<V> = HashMap<HirId, V, std::hash::BuildHasherDefault<fnv::FnvHasher>>;
+
 /// What a function uses that the bytecode interpreter cannot execute.
 ///
 /// The interpreter rejects these when it compiles a function to
@@ -756,6 +760,8 @@ pub struct CompiledFunction {
     pub gep_stride_pool: Vec<Vec<(i64, i64)>>,
     /// The shape of each native call the function makes.
     pub sig_pool: Vec<NativeSig>,
+    /// The thunk made for each entry of `sig_pool`, 0 until one is.
+    pub sig_thunks: Vec<std::cell::Cell<usize>>,
     /// Aggregate values the function needs storage for at entry: undef
     /// values and struct constants, with the bytes to start from.
     pub entry_storage: Vec<(Reg, Vec<u8>)>,
@@ -1577,6 +1583,7 @@ fn lower_inst(
                         .collect();
                     let sig = cf.sig_pool.len() as u32;
                     cf.sig_pool.push(NativeSig::of_site(params, ret));
+                    cf.sig_thunks.push(Default::default());
                     cf.code.push(Op::CallSym {
                         dst,
                         has_dst,
@@ -1719,6 +1726,7 @@ fn lower_inst(
             let sig = cf.sig_pool.len() as u32;
             cf.sig_pool
                 .push(NativeSig::of_site(params, return_ty.clone()));
+            cf.sig_thunks.push(Default::default());
             cf.code.push(Op::CallIndirect {
                 dst,
                 has_dst,
@@ -2370,24 +2378,24 @@ impl std::error::Error for InterpError {}
 
 pub struct HirInterpreter {
     symbols: HashMap<String, SymbolEntry>,
-    pub profile: HashMap<HirId, ProfileSample>,
+    pub profile: IdMap<ProfileSample>,
     memory: Memory,
     /// Per-HIR-function compiled bytecode cache. First call to a fn
     /// triggers compilation; subsequent calls reuse the same
     /// `CompiledFunction`. Keyed by `HirFunction::id`.
-    cache: HashMap<HirId, CompiledFunction>,
+    cache: IdMap<CompiledFunction>,
     /// Functions this interpreter has already refused, and why.
     ///
     /// A refusal is as stable as a success: a function that performs an
     /// effect will never become interpretable. Without this, every call
     /// re-compiles the whole body just to fail the same way, and the
     /// host takes its fallback path afterwards regardless.
-    uncompilable: HashMap<HirId, String>,
+    uncompilable: IdMap<String>,
     /// Per-function tick callbacks. Invoked once per call entry; the
     /// callback returns the function's native entry once one exists,
     /// and the call goes there instead of into the bytecode.
     #[allow(clippy::type_complexity)]
-    tick_callbacks: HashMap<HirId, Box<dyn FnMut() -> Option<*const u8> + Send>>,
+    tick_callbacks: IdMap<Box<dyn FnMut() -> Option<*const u8> + Send>>,
     /// Compiles, or finds, the thunk that calls native code of a given
     /// shape: `fn(target, words, out)`. Installed by a runtime with a
     /// native tier; without one, calls into native code use the fixed
@@ -2404,8 +2412,9 @@ pub struct HirInterpreter {
     bead_source: Option<Box<dyn Fn(HirId) -> Option<u64> + Send + Sync>>,
     /// Thunks already made, by shape.
     thunks: HashMap<NativeSig, usize>,
-    /// The call shape of each function called so far.
-    shapes: HashMap<HirId, NativeSig>,
+    /// The call shape of each function called so far, with the thunk
+    /// that makes calls of that shape once one has been made.
+    shapes: IdMap<(std::sync::Arc<NativeSig>, usize)>,
     /// Functions whose address the module takes, per module (by
     /// address; modules are shared and stay put).
     address_taken: HashMap<usize, std::collections::HashSet<HirId>>,
@@ -2521,16 +2530,16 @@ impl HirInterpreter {
     pub fn new() -> Self {
         Self {
             symbols: HashMap::new(),
-            profile: HashMap::new(),
+            profile: IdMap::default(),
             memory: Memory::new(),
-            cache: HashMap::new(),
-            uncompilable: HashMap::new(),
-            tick_callbacks: HashMap::new(),
+            cache: IdMap::default(),
+            uncompilable: IdMap::default(),
+            tick_callbacks: IdMap::default(),
             thunk_source: None,
             entry_source: None,
             bead_source: None,
             thunks: HashMap::new(),
-            shapes: HashMap::new(),
+            shapes: IdMap::default(),
             address_taken: HashMap::new(),
             wasm_compile_hook: None,
             wasm_dispatch_hook: None,
@@ -2777,6 +2786,21 @@ impl HirInterpreter {
         made
     }
 
+    /// The thunk for the call site `sig` of `cf`, made on first use and
+    /// kept with the site; 0 when there is no native tier.
+    fn site_thunk(&mut self, cf: &CompiledFunction, sig: u32) -> Result<usize, InterpError> {
+        if self.thunk_source.is_none() {
+            return Ok(0);
+        }
+        let slot = &cf.sig_thunks[sig as usize];
+        if slot.get() != 0 {
+            return Ok(slot.get());
+        }
+        let made = self.thunk_for(&cf.sig_pool[sig as usize])? as usize;
+        slot.set(made);
+        Ok(made)
+    }
+
     /// The thunk for calls of shape `sig`, made on first use.
     fn thunk_for(&mut self, sig: &NativeSig) -> Result<*const u8, InterpError> {
         if let Some(&t) = self.thunks.get(sig) {
@@ -2815,16 +2839,42 @@ impl HirInterpreter {
         set.contains(&func)
     }
 
-    /// The shape of a direct call to `func`.
-    fn shape_of(&mut self, module: &HirModule, func: HirId) -> Option<NativeSig> {
-        if let Some(sig) = self.shapes.get(&func) {
-            return Some(sig.clone());
+    /// The shape of a direct call to `func`, and its thunk once made.
+    fn shape_of(
+        &mut self,
+        module: &HirModule,
+        func: HirId,
+    ) -> Option<(std::sync::Arc<NativeSig>, usize)> {
+        if let Some(entry) = self.shapes.get(&func) {
+            return Some(entry.clone());
         }
         let taken = self.is_address_taken(module, func);
         let function = module.functions.get(&func)?;
-        let sig = NativeSig::of_function(function, taken);
-        self.shapes.insert(func, sig.clone());
-        Some(sig)
+        let sig = std::sync::Arc::new(NativeSig::of_function(function, taken));
+        self.shapes.insert(func, (std::sync::Arc::clone(&sig), 0));
+        Some((sig, 0))
+    }
+
+    /// Call `func`'s native code at `entry`, through the thunk cached for
+    /// its shape.
+    fn call_function_natively(
+        &mut self,
+        module: &HirModule,
+        func: HirId,
+        entry: *const u8,
+        args: &[ZyntaxValue],
+        dest: *mut u8,
+    ) -> Result<ZyntaxValue, InterpError> {
+        let (sig, mut thunk) = self
+            .shape_of(module, func)
+            .ok_or(InterpError::UndefinedSsaValue(func))?;
+        if thunk == 0 && self.thunk_source.is_some() {
+            thunk = self.thunk_for(&sig)? as usize;
+            if let Some(cached) = self.shapes.get_mut(&func) {
+                cached.1 = thunk;
+            }
+        }
+        self.call_native_through(entry, &sig, thunk, args, dest)
     }
 
     /// Call native code at `entry` with the shape `sig`. Aggregates go as
@@ -2837,7 +2887,25 @@ impl HirInterpreter {
         args: &[ZyntaxValue],
         dest: *mut u8,
     ) -> Result<ZyntaxValue, InterpError> {
-        if self.thunk_source.is_none() {
+        let thunk = if self.thunk_source.is_some() {
+            self.thunk_for(sig)? as usize
+        } else {
+            0
+        };
+        self.call_native_through(entry, sig, thunk, args, dest)
+    }
+
+    /// [`Self::call_native`] with the shape's thunk already in hand; 0
+    /// when there is no native tier to make one.
+    fn call_native_through(
+        &mut self,
+        entry: *const u8,
+        sig: &NativeSig,
+        thunk: usize,
+        args: &[ZyntaxValue],
+        dest: *mut u8,
+    ) -> Result<ZyntaxValue, InterpError> {
+        if thunk == 0 {
             // No native tier to make a thunk: the fixed set of shapes.
             if !jit_dispatch_supported(&sig.params, &sig.ret) {
                 return Err(InterpError::UnsupportedInstruction(format!(
@@ -2860,7 +2928,6 @@ impl HirInterpreter {
                 other => other,
             });
         }
-        let thunk = self.thunk_for(sig)?;
         if args.len() != sig.params.len() {
             return Err(InterpError::Host(format!(
                 "a native call with {} arguments for {} parameters",
@@ -2868,7 +2935,18 @@ impl HirInterpreter {
                 sig.params.len()
             )));
         }
-        let words: Vec<u64> = args.iter().map(word_of).collect();
+        // The words stay on the stack for the shapes that fit.
+        let mut small = [0u64; 16];
+        let mut large: Vec<u64> = Vec::new();
+        let words: &[u64] = if args.len() <= small.len() {
+            for (w, a) in small.iter_mut().zip(args) {
+                *w = word_of(a);
+            }
+            &small[..args.len()]
+        } else {
+            large.extend(args.iter().map(word_of));
+            &large
+        };
         let mut out = [0u8; 16];
         let out_ptr = if sig.destination {
             if dest.is_null() {
@@ -2884,7 +2962,8 @@ impl HirInterpreter {
         // holds one word per parameter, and `out_ptr` has room for the
         // result the shape describes.
         unsafe {
-            let f: extern "C" fn(*const u8, *const u64, *mut u8) = core::mem::transmute(thunk);
+            let f: extern "C" fn(*const u8, *const u64, *mut u8) =
+                core::mem::transmute(thunk as *const u8);
             f(entry, words.as_ptr(), out_ptr);
         }
         if trace_enabled() {
@@ -3047,10 +3126,7 @@ impl HirInterpreter {
             None => None,
         };
         if let Some(entry) = native {
-            let sig = self
-                .shape_of(module, func_id)
-                .ok_or(InterpError::UndefinedSsaValue(func_id))?;
-            return self.call_native(entry, &sig, &args, dest);
+            return self.call_function_natively(module, func_id, entry, &args, dest);
         }
 
         // Wasm-JIT hot detection. Once `call_count` crosses the
@@ -3116,12 +3192,7 @@ impl HirInterpreter {
         why: String,
     ) -> Result<ZyntaxValue, InterpError> {
         match self.native_entry(func_id) {
-            Some(entry) => {
-                let sig = self
-                    .shape_of(module, func_id)
-                    .ok_or(InterpError::UndefinedSsaValue(func_id))?;
-                self.call_native(entry, &sig, &args, dest)
-            }
+            Some(entry) => self.call_function_natively(module, func_id, entry, &args, dest),
             None => Err(InterpError::UnsupportedInstruction(why)),
         }
     }
@@ -3917,7 +3988,7 @@ impl HirInterpreter {
                     // Storage for a struct the callee hands back through
                     // a destination.
                     let callee_dest = match self.shape_of(module, *fn_id) {
-                        Some(sig) if sig.destination => {
+                        Some((sig, _)) if sig.destination => {
                             self.frame_alloc(scratch, size_of_hir_ty(&sig.ret).max(8))
                         }
                         _ => core::ptr::null_mut(),
@@ -3994,9 +4065,11 @@ impl HirInterpreter {
                                 }
                                 None => Vec::new(),
                             };
-                            let result = self.call_native(
+                            let thunk = self.site_thunk(cf, *sig)?;
+                            let result = self.call_native_through(
                                 entry.ptr,
                                 shape,
+                                thunk,
                                 &arg_vals,
                                 core::ptr::null_mut(),
                             );
@@ -4111,9 +4184,11 @@ impl HirInterpreter {
                                 "a call through a null function pointer".to_string(),
                             ));
                         }
-                        self.call_native(
+                        let thunk = self.site_thunk(cf, *sig)?;
+                        self.call_native_through(
                             handle as usize as *const u8,
                             shape,
+                            thunk,
                             &arg_vals,
                             core::ptr::null_mut(),
                         )?
