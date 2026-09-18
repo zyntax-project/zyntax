@@ -1623,10 +1623,7 @@ impl<'m> Lowerer<'m> {
             // a generator is run to exhaustion.
             (Ty::Dict, Ty::List(Elem::Object)) => call("zb_dict_keys", vec![v.node], target, span),
             (Ty::Gen, Ty::List(Elem::Object)) => self.generator_to_list(v.node, span),
-            (Ty::Set, Ty::List(Elem::Object)) => Node {
-                ty: ir(target),
-                ..v.node
-            },
+            (Ty::Set, Ty::List(Elem::Object)) => call("zb_set_items", vec![v.node], target, span),
             // Lists of one kind into lists of dynamic values.
             (Ty::List(e), Ty::List(Elem::Object)) => {
                 call(&list_fn("to_any", e), vec![v.node], target, span)
@@ -1793,9 +1790,16 @@ impl<'m> Lowerer<'m> {
                     }
                 })
             }
-            Ty::List(_) | Ty::Tuple | Ty::Set => binary(
+            Ty::List(_) | Ty::Tuple => binary(
                 BinaryOp::Ne,
                 method_call(v.node, "len", vec![], Ty::Int, span),
+                int_lit(0, span),
+                Ty::Bool,
+                span,
+            ),
+            Ty::Set => binary(
+                BinaryOp::Ne,
+                call("zb_set_len", vec![v.node], Ty::Int, span),
                 int_lit(0, span),
                 Ty::Bool,
                 span,
@@ -2947,6 +2951,15 @@ impl<'m> Lowerer<'m> {
                 return self.bind(&as_tuple, value, span, out);
             }
             py::Expr::Tuple(t) => {
+                // A set unpacks as the list of its values.
+                let value = if value.ty == Ty::Set {
+                    Val {
+                        node: self.coerce(value, Ty::List(Elem::Object)),
+                        ty: Ty::List(Elem::Object),
+                    }
+                } else {
+                    value
+                };
                 // Resolve a dynamic iterable once before reading its fields.
                 let dynamic = value.ty == Ty::Object;
                 if dynamic && let Some(kind) = self.unpacks_primitive_names(&t.elts) {
@@ -4926,7 +4939,10 @@ impl<'m> Lowerer<'m> {
                         Ty::Bool,
                         span,
                     )
-                } else if right.ty == Ty::Tuple || right.ty == Ty::Set {
+                } else if right.ty == Ty::Set {
+                    let item = self.coerce(left, Ty::Object);
+                    call("zb_set_contains", vec![right.node, item], Ty::Bool, span)
+                } else if right.ty == Ty::Tuple {
                     let item = self.coerce(left, Ty::Object);
                     call(
                         "zb_list_contains_any",
@@ -5015,8 +5031,8 @@ impl<'m> Lowerer<'m> {
                 let sub = subset(this, a.clone(), b.clone());
                 let same_size = binary(
                     BinaryOp::Eq,
-                    method_call(a, "len", vec![], Ty::Int, span),
-                    method_call(b, "len", vec![], Ty::Int, span),
+                    call("zb_set_len", vec![a], Ty::Int, span),
+                    call("zb_set_len", vec![b], Ty::Int, span),
                     Ty::Bool,
                     span,
                 );
@@ -5454,6 +5470,7 @@ impl<'m> Lowerer<'m> {
         };
         let initializer = match produce {
             Produce::List(elem, _) => Some(self.list_of(Vec::new(), elem, span)),
+            Produce::Set(_) => Some(call("zb_set_new", vec![], Ty::Set, span)),
             Produce::Dict(..) => Some(call("zb_dict_new", vec![], Ty::Dict, span)),
             _ => None,
         };
@@ -5718,8 +5735,8 @@ impl<'m> Lowerer<'m> {
                         let v = self.expr_as(&args[0], Ty::Object)?;
                         call("zb_set_discard", vec![st, v], Ty::None, span)
                     }
-                    ("clear", 0) => method_call(st, "clear", vec![], Ty::None, span),
-                    ("copy", 0) => call("zb_list_copy_any", vec![st], Ty::Set, span),
+                    ("clear", 0) => call("zb_set_clear", vec![st], Ty::None, span),
+                    ("copy", 0) => call("zb_set_copy", vec![st], Ty::Set, span),
                     (
                         "union"
                         | "intersection"
@@ -5819,14 +5836,32 @@ impl<'m> Lowerer<'m> {
             && keywords.is_empty()
             && !args.is_empty()
         {
-            let mut result = self.expr_as(&args[0], Ty::Set)?;
+            // One copy of the first set, the rest added into it.
+            let first = self.expr_as(&args[0], Ty::Set)?;
+            let result = call("zb_set_copy", vec![first], Ty::Set, span);
+            let mut pre = Vec::new();
+            let held = self.hold(
+                Val {
+                    node: result,
+                    ty: Ty::Set,
+                },
+                &mut pre,
+                span,
+            );
             for arg in &args[1..] {
                 let other = self.expr_as(arg, Ty::Set)?;
-                result = call("zb_set_or", vec![result, other], Ty::Set, span);
+                pre.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(call(
+                        "zb_set_update",
+                        vec![held.node.clone(), other],
+                        Ty::None,
+                        span,
+                    ))),
+                    Type::Unknown,
+                    span,
+                ));
             }
-            if args.len() == 1 {
-                result = call("zb_list_copy_any", vec![result], Ty::Set, span);
-            }
+            let result = Self::block_value(pre, held.node, Ty::Set, span);
             return Ok(Val {
                 node: result,
                 ty: Ty::Set,
@@ -6087,9 +6122,10 @@ impl<'m> Lowerer<'m> {
                     let v = self.expr(&args[0])?;
                     let node = match v.ty {
                         Ty::Str => call("zb_str_chars_len", vec![v.node], Ty::Int, span),
-                        Ty::List(_) | Ty::Tuple | Ty::Set => {
+                        Ty::List(_) | Ty::Tuple => {
                             method_call(v.node, "len", vec![], Ty::Int, span)
                         }
+                        Ty::Set => call("zb_set_len", vec![v.node], Ty::Int, span),
                         Ty::Dict => call("zb_dict_len", vec![v.node], Ty::Int, span),
                         Ty::Class(k) => {
                             match self.dunder(k as usize, "__len__", v.node, vec![], span) {

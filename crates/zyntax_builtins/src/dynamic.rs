@@ -585,6 +585,19 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                             boolean(),
                         ))],
                     ),
+                    // Two tuples, or two lists of dynamic values, are
+                    // their storage already.
+                    when(
+                        or(
+                            is_tuple(a.e()),
+                            eq(kind(a.e()), int(Kind::Any.list_tag() >> 8)),
+                        ),
+                        vec![ret(call(
+                            "zb_list_eq_any",
+                            vec![raw_any(a.e()), raw_any(b.e())],
+                            boolean(),
+                        ))],
+                    ),
                     ret(call(
                         "zb_list_eq_any",
                         vec![iter(a.e()), iter(b.e())],
@@ -616,6 +629,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     // class, and None as itself. A list, dict or set cannot be a key.
     let h = local("h", i64());
     let items = local("items", anys.clone());
+    let elem = local("elem", any());
     let n = local("n", i64());
     let i = local("i", i64());
     let f = local("f", f64());
@@ -668,10 +682,17 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     while_(
                         lt(i.e(), n.e()),
                         vec![
-                            h.set(add(
-                                mul(h.e(), int(1_000_003)),
-                                call("zb_any_hash", vec![idx(items.e(), i.e(), any())], i64()),
-                            )),
+                            elem.decl(idx(items.e(), i.e(), any())),
+                            // An integer element hashes to itself, read
+                            // without the dispatch.
+                            if_(
+                                eq(tag(elem.e()), int(I64_TAG)),
+                                vec![h.set(add(mul(h.e(), int(1_000_003)), payload_i64(elem.e())))],
+                                vec![h.set(add(
+                                    mul(h.e(), int(1_000_003)),
+                                    call("zb_any_hash", vec![elem.e()], i64()),
+                                ))],
+                            ),
                             i.add_assign(int(1)),
                         ],
                     ),
@@ -681,6 +702,12 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 eq(kind(x.e()), int(FUNC_TAG >> 8)),
                 vec![ret(call("zb_unbox_instance_raw", vec![x.e()], i64()))],
+            ),
+            // A frozenset hashes by its contents; a set is not told
+            // apart from one.
+            when(
+                is_set(x.e()),
+                vec![ret(call("zb_set_hash", vec![raw_any(x.e())], i64()))],
             ),
             type_error(add(text("unhashable type: "), quoted(type_name(x.e())))),
             ret(int(0)),
@@ -826,6 +853,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![ret(call(
                     "zb_str_contains",
                     vec![get_str(container.e()), get_str(item.e())],
+                    boolean(),
+                ))],
+            ),
+            when(
+                is_set(container.e()),
+                vec![ret(call(
+                    "zb_set_contains",
+                    vec![raw_any(container.e()), item.e()],
                     boolean(),
                 ))],
             ),
@@ -1296,6 +1331,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 ))],
             ),
             when(
+                is_set(x.e()),
+                vec![ret(call(
+                    "zb_set_items",
+                    vec![raw_any(x.e())],
+                    anys.clone(),
+                ))],
+            ),
+            when(
                 kind_is(Kind::Int, x.e()),
                 vec![ret(to_any(Kind::Int, unbox(Kind::Int, x.e())))],
             ),
@@ -1394,6 +1437,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 is_dict(x.e()),
                 vec![ret(call("zb_dict_len", vec![raw_any(x.e())], i64()))],
+            ),
+            when(
+                is_set(x.e()),
+                vec![ret(call("zb_set_len", vec![raw_any(x.e())], i64()))],
             ),
             ret(len_of(Kind::Any, x.e())),
         ],

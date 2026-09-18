@@ -3,7 +3,7 @@
 //! A dict is a list whose first element is its hash index and the rest
 //! key, value, key, value in insertion order, so iteration and printing
 //! show the order things were added in and a lookup is a hash and a
-//! probe. A set is a list of distinct values, searched linearly.
+//! probe. A set is laid out the same way over its values.
 
 use crate::build::*;
 use crate::{DICT_TAG, SET_TAG, TUPLE_TAG, list_of};
@@ -815,10 +815,12 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
 
 fn set(list_type: TypeId) -> Vec<Decl> {
     let anys = list_of(list_type, any());
-    let s = local("s", anys.clone());
-    let other = local("other", anys.clone());
+    let ints = list_of(list_type, i64());
+    // Every function edits the set in place; only boxing keeps it.
+    let s = borrowed("s", anys.clone());
+    let other = borrowed("other", anys.clone());
     let v = kept("v", any());
-    // Discarding reads the value and keeps nothing.
+    // Lookups and removals read the value and keep nothing.
     let value = borrowed("v", any());
     let i = local("i", i64());
     let n = local("n", i64());
@@ -832,8 +834,397 @@ fn set(list_type: TypeId) -> Vec<Decl> {
     let member = local("member", any());
     let bit = local("bit", i64());
     let wanted = local("wanted", i64());
-    let contains = |s: Expr, v: Expr| call("zb_list_contains_any", vec![s, v], boolean());
+    let index = borrowed("index", ints.clone());
+    let slot = local("slot", i64());
+    let entry = local("e", i64());
+    let cap = local("cap", i64());
+    let h = local("h", i64());
+    let kcat = local("kcat", i64());
+    let stored = local("stored", any());
     let mut d = Vec::new();
+
+    // A set is laid out as a dict is: position 0 holds the hash index
+    // (None while the set is small), the values follow in insertion
+    // order, so value `e` is at position 1 + e. The table holds two
+    // words per slot, the entry number (-1 when empty) and the entry's
+    // hash, so growing it and copying it hash nothing again and a probe
+    // reads a value only when its hash agrees.
+    let count = |s: Expr| sub(len(s), int(1));
+    let value_at = |s: Expr, e: Expr| at(s, add(e, int(1)));
+    let index_of = |s: Expr| call("zb_unbox_list_raw_i64", vec![at(s, int(0))], ints.clone());
+    let box_index = |index: Expr| call("zb_list_box_i64", vec![index], any());
+    let entry_at = |index: Expr, slot: Expr| idx(index, mul(slot, int(2)), i64());
+    let hash_at = |index: Expr, slot: Expr| idx(index, add(mul(slot, int(2)), int(1)), i64());
+    let slots_of = |index: Expr| div(len(index), int(2));
+    let hash = |k: Expr| call("zb_dict_hash", vec![k], i64());
+    let next_slot = |s: Expr, mask: Expr| bitand(add(s, int(1)), mask);
+    let unindexed = |s: Expr| eq(at(s, int(0)), null(any()));
+    let reuse = local("reuse", boolean());
+    let old = local("old", ints.clone());
+    let j = local("j", i64());
+    let contains = |s: Expr, v: Expr| call("zb_set_contains", vec![s, v], boolean());
+    let find = |s: Expr, v: Expr| call("zb_set_find", vec![s, v], i64());
+    /// Values a set holds before it takes a table.
+    const SMALL: i64 = 8;
+    /// The first table's size, for a set just past `SMALL`.
+    const FIRST_TABLE: i64 = 32;
+
+    d.push(define(
+        "zb_set_new",
+        &[],
+        anys.clone(),
+        vec![
+            out.decl(list(Vec::new(), anys.clone())),
+            push(out.e(), null(any())),
+            ret(out.e()),
+        ],
+    ));
+    d.push(define("zb_set_len", &[&s], i64(), vec![ret(count(s.e()))]));
+    // An empty table of `cap` slots.
+    d.push(define("zb_set_index_new", &[&cap], ints.clone(), {
+        let table = local("table", ints.clone());
+        let mut st = vec![
+            table.decl(list(Vec::new(), ints.clone())),
+            expr(mcall(
+                table.e(),
+                "reserve",
+                vec![mul(cap.e(), int(2))],
+                unit(),
+            )),
+        ];
+        st.extend(for_range(
+            &i,
+            int(0),
+            cap.e(),
+            vec![
+                expr(mcall(table.e(), "push", vec![int(-1)], unit())),
+                expr(mcall(table.e(), "push", vec![int(0)], unit())),
+            ],
+        ));
+        st.push(ret(table.e()));
+        st
+    }));
+    // Record entry `e`, whose hash is `h`, in `index`, which has room.
+    d.push(define(
+        "zb_set_place_hashed",
+        &[&index, &entry, &h],
+        unit(),
+        vec![
+            mask.decl(sub(slots_of(index.e()), int(1))),
+            slot.decl(bitand(h.e(), mask.e())),
+            while_(
+                ge(entry_at(index.e(), slot.e()), int(0)),
+                vec![slot.set(next_slot(slot.e(), mask.e()))],
+            ),
+            set_idx(index.e(), mul(slot.e(), int(2)), entry.e()),
+            set_idx(index.e(), add(mul(slot.e(), int(2)), int(1)), h.e()),
+            ret_void(),
+        ],
+    ));
+    // A fresh table of `cap` slots over every value of `s`: from the
+    // hashes the old table holds when the entries kept their positions
+    // (`reuse`), else from the values.
+    d.push(define("zb_set_reindex", &[&s, &cap, &reuse], unit(), {
+        let mut from_values = vec![n.decl(count(s.e()))];
+        from_values.extend(for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![expr(call(
+                "zb_set_place_hashed",
+                vec![index.e(), i.e(), hash(value_at(s.e(), i.e()))],
+                unit(),
+            ))],
+        ));
+        let mut from_table = vec![old.decl(index_of(s.e())), n.decl(slots_of(old.e()))];
+        from_table.extend(for_range(
+            &j,
+            int(0),
+            n.e(),
+            vec![
+                entry.decl(entry_at(old.e(), j.e())),
+                when(
+                    ge(entry.e(), int(0)),
+                    vec![expr(call(
+                        "zb_set_place_hashed",
+                        vec![index.e(), entry.e(), hash_at(old.e(), j.e())],
+                        unit(),
+                    ))],
+                ),
+            ],
+        ));
+        vec![
+            index.decl(call("zb_set_index_new", vec![cap.e()], ints.clone())),
+            if_(
+                and(reuse.e(), not(unindexed(s.e()))),
+                from_table,
+                from_values,
+            ),
+            set_idx(s.e(), int(0), box_index(index.e())),
+            ret_void(),
+        ]
+    }));
+    // A set built by appending distinct values takes its table once it
+    // is past a few of them.
+    d.push(define(
+        "zb_set_settle",
+        &[&s],
+        unit(),
+        vec![
+            when(
+                and(unindexed(s.e()), gt(count(s.e()), int(SMALL))),
+                vec![
+                    cap.decl(int(FIRST_TABLE)),
+                    while_(
+                        lt(cap.e(), mul(count(s.e()), int(2))),
+                        vec![cap.set(mul(cap.e(), int(2)))],
+                    ),
+                    expr(call(
+                        "zb_set_reindex",
+                        vec![s.e(), cap.e(), bool(false)],
+                        unit(),
+                    )),
+                ],
+            ),
+            ret_void(),
+        ],
+    ));
+    // The position of `v` in a set with a table, given its hash, or -1;
+    // and its position in any set, or -1.
+    d.push(define(
+        "zb_set_find_hashed",
+        &[&s, &value, &h],
+        i64(),
+        vec![
+            index.decl(index_of(s.e())),
+            mask.decl(sub(slots_of(index.e()), int(1))),
+            slot.decl(bitand(h.e(), mask.e())),
+            kcat.decl(call("zb_any_category", vec![v.e()], i64())),
+            i.decl(int(0)),
+            while_(le(i.e(), mask.e()), {
+                let mut matched = vec![stored.decl(value_at(s.e(), entry.e()))];
+                matched.extend(when_key_matches(&stored, &v, &kcat, add(entry.e(), int(1))));
+                vec![
+                    entry.decl(entry_at(index.e(), slot.e())),
+                    when(lt(entry.e(), int(0)), vec![ret(int(-1))]),
+                    when(eq(hash_at(index.e(), slot.e()), h.e()), matched),
+                    slot.set(next_slot(slot.e(), mask.e())),
+                    i.add_assign(int(1)),
+                ]
+            }),
+            ret(int(-1)),
+        ],
+    ));
+    d.push(define(
+        "zb_set_find",
+        &[&s, &value],
+        i64(),
+        vec![
+            when(
+                unindexed(s.e()),
+                vec![
+                    n.decl(len(s.e())),
+                    i.decl(int(1)),
+                    while_(
+                        lt(i.e(), n.e()),
+                        vec![
+                            when(key_matches(at(s.e(), i.e()), v.e()), vec![ret(i.e())]),
+                            i.add_assign(int(1)),
+                        ],
+                    ),
+                    ret(int(-1)),
+                ],
+            ),
+            ret(call(
+                "zb_set_find_hashed",
+                vec![s.e(), v.e(), hash(v.e())],
+                i64(),
+            )),
+        ],
+    ));
+    d.push(define(
+        "zb_set_contains",
+        &[&s, &value],
+        boolean(),
+        vec![ret(ge(find(s.e(), v.e()), int(0)))],
+    ));
+    // Add a value known to be absent whose hash is `h`, growing the
+    // table first when the value would bring it to half full.
+    d.push(define(
+        "zb_set_insert_hashed",
+        &[&s, &v, &h],
+        unit(),
+        vec![
+            entry.decl(count(s.e())),
+            cap.decl(slots_of(index_of(s.e()))),
+            when(
+                gt(mul(add(entry.e(), int(1)), int(2)), cap.e()),
+                vec![expr(call(
+                    "zb_set_reindex",
+                    vec![s.e(), mul(cap.e(), int(2)), bool(true)],
+                    unit(),
+                ))],
+            ),
+            push(s.e(), v.e()),
+            expr(call(
+                "zb_set_place_hashed",
+                vec![index_of(s.e()), entry.e(), h.e()],
+                unit(),
+            )),
+            ret_void(),
+        ],
+    ));
+    d.push(define(
+        "zb_set_add",
+        &[&s, &v],
+        unit(),
+        vec![
+            when(
+                unindexed(s.e()),
+                vec![
+                    when(
+                        lt(find(s.e(), v.e()), int(0)),
+                        vec![
+                            push(s.e(), v.e()),
+                            when(
+                                gt(count(s.e()), int(SMALL)),
+                                vec![expr(call(
+                                    "zb_set_reindex",
+                                    vec![s.e(), int(FIRST_TABLE), bool(false)],
+                                    unit(),
+                                ))],
+                            ),
+                        ],
+                    ),
+                    ret_void(),
+                ],
+            ),
+            h.decl(hash(v.e())),
+            when(
+                lt(
+                    call("zb_set_find_hashed", vec![s.e(), v.e(), h.e()], i64()),
+                    int(0),
+                ),
+                vec![expr(call(
+                    "zb_set_insert_hashed",
+                    vec![s.e(), v.e(), h.e()],
+                    unit(),
+                ))],
+            ),
+            ret_void(),
+        ],
+    ));
+    // Removal shifts the later values down, so the table is rebuilt.
+    let remove_at = |i: &Local| {
+        vec![
+            expr(mcall(s.e(), "remove_at", vec![i.e()], any())),
+            when(
+                not(unindexed(s.e())),
+                vec![expr(call(
+                    "zb_set_reindex",
+                    vec![s.e(), slots_of(index_of(s.e())), bool(false)],
+                    unit(),
+                ))],
+            ),
+        ]
+    };
+    d.push(define("zb_set_discard", &[&s, &value], unit(), {
+        let mut st = vec![i.decl(find(s.e(), v.e()))];
+        st.push(when(ge(i.e(), int(0)), remove_at(&i)));
+        st.push(ret_void());
+        st
+    }));
+    d.push(define("zb_set_remove", &[&s, &value], unit(), {
+        let mut st = vec![
+            i.decl(find(s.e(), v.e())),
+            when(lt(i.e(), int(0)), vec![fatal("KeyError", any_str(v.e()))]),
+        ];
+        st.extend(remove_at(&i));
+        st.push(ret_void());
+        st
+    }));
+    d.push(define(
+        "zb_set_clear",
+        &[&s],
+        unit(),
+        vec![
+            expr(mcall(s.e(), "clear", vec![], unit())),
+            push(s.e(), null(any())),
+            ret_void(),
+        ],
+    ));
+    // The values, in order, as a list of their own.
+    d.push(define("zb_set_items", &[&s], anys.clone(), {
+        vec![
+            out.decl(list(Vec::new(), anys.clone())),
+            n.decl(len(s.e())),
+            i.decl(int(1)),
+            while_(
+                lt(i.e(), n.e()),
+                vec![push(out.e(), at(s.e(), i.e())), i.add_assign(int(1))],
+            ),
+            ret(out.e()),
+        ]
+    }));
+    // A copy with a table of its own: the values keep their positions,
+    // so the table is copied rather than built again.
+    d.push(define(
+        "zb_set_copy",
+        &[&s],
+        anys.clone(),
+        vec![
+            out.decl(call("zb_list_copy_any", vec![s.e()], anys.clone())),
+            when(
+                not(unindexed(out.e())),
+                vec![set_idx(
+                    out.e(),
+                    int(0),
+                    box_index(call(
+                        "zb_list_copy_i64",
+                        vec![index_of(s.e())],
+                        ints.clone(),
+                    )),
+                )],
+            ),
+            ret(out.e()),
+        ],
+    ));
+    // A set from any list, keeping first occurrences.
+    let xs = local("xs", anys.clone());
+    d.push(define("zb_set_from", &[&xs], anys.clone(), {
+        let mut st = vec![
+            out.decl(call("zb_set_new", vec![], anys.clone())),
+            n.decl(len(xs.e())),
+        ];
+        st.extend(for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![expr(call(
+                "zb_set_add",
+                vec![out.e(), at(xs.e(), i.e())],
+                unit(),
+            ))],
+        ));
+        st.push(ret(out.e()));
+        st
+    }));
+    // The hash of a set is the same whatever order it was filled in.
+    d.push(define("zb_set_hash", &[&s], i64(), {
+        vec![
+            h.decl(int(0x2545_F491_4F6C_DD1D)),
+            n.decl(len(s.e())),
+            i.decl(int(1)),
+            while_(
+                lt(i.e(), n.e()),
+                vec![
+                    h.set(bitxor(h.e(), hash(at(s.e(), i.e())))),
+                    i.add_assign(int(1)),
+                ],
+            ),
+            ret(add(mul(h.e(), int(1_000_003)), count(s.e()))),
+        ]
+    }));
 
     // Integer board positions fit in a word. -1 means the set also
     // holds a value that needs the general equality path.
@@ -841,7 +1232,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         let mut st = vec![mask.decl(int(0)), n.decl(len(s.e()))];
         st.extend(for_range(
             &i,
-            int(0),
+            int(1),
             n.e(),
             vec![
                 member.decl(at(s.e(), i.e())),
@@ -866,11 +1257,11 @@ fn set(list_type: TypeId) -> Vec<Decl> {
     d.push(define("zb_set_all_kind", &[&s, &wanted], boolean(), {
         let mut st = vec![
             n.decl(len(s.e())),
-            when(eq(n.e(), int(0)), vec![ret(bool(false))]),
+            when(eq(n.e(), int(1)), vec![ret(bool(false))]),
         ];
         st.extend(for_range(
             &i,
-            int(0),
+            int(1),
             n.e(),
             vec![when(
                 ne(
@@ -912,70 +1303,25 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         ],
     ));
 
-    d.push(define(
-        "zb_set_add",
-        &[&s, &v],
-        unit(),
+    // Intersection, union, difference, symmetric difference. A result
+    // built from values known to be distinct is appended to and takes
+    // its table at the end.
+    let settled = |out: &Local| {
         vec![
-            when(not(contains(s.e(), v.e())), vec![push(s.e(), v.e())]),
-            ret_void(),
-        ],
-    ));
-    d.push(define(
-        "zb_set_discard",
-        &[&s, &value],
-        unit(),
-        vec![
-            i.decl(call("zb_list_index_or_neg_any", vec![s.e(), v.e()], i64())),
-            when(
-                ge(i.e(), int(0)),
-                vec![expr(mcall(s.e(), "remove_at", vec![i.e()], any()))],
-            ),
-            ret_void(),
-        ],
-    ));
-    d.push(define(
-        "zb_set_remove",
-        &[&s, &value],
-        unit(),
-        vec![
-            i.decl(call("zb_list_index_or_neg_any", vec![s.e(), v.e()], i64())),
-            when(lt(i.e(), int(0)), vec![fatal("KeyError", any_str(v.e()))]),
-            expr(mcall(s.e(), "remove_at", vec![i.e()], any())),
-            ret_void(),
-        ],
-    ));
-    // A set from any list, keeping first occurrences.
-    let xs = local("xs", anys.clone());
-    d.push(define("zb_set_from", &[&xs], anys.clone(), {
-        let mut st = vec![
-            out.decl(list(Vec::new(), anys.clone())),
-            n.decl(len(xs.e())),
-        ];
-        st.extend(for_range(
-            &i,
-            int(0),
-            n.e(),
-            vec![expr(call(
-                "zb_set_add",
-                vec![out.e(), at(xs.e(), i.e())],
-                unit(),
-            ))],
-        ));
-        st.push(ret(out.e()));
-        st
-    }));
-    // Intersection, union, difference, symmetric difference.
+            expr(call("zb_set_settle", vec![out.e()], unit())),
+            ret(out.e()),
+        ]
+    };
     d.push(define("zb_set_and", &[&s, &other], anys.clone(), {
         let mut st = vec![
-            out.decl(list(Vec::new(), anys.clone())),
+            out.decl(call("zb_set_new", vec![], anys.clone())),
             n.decl(len(s.e())),
             left_mask.decl(call("zb_set_mask63", vec![s.e()], i64())),
             when(ge(left_mask.e(), int(0)), {
                 let mut fast = vec![right_mask.decl(call("zb_set_mask63", vec![other.e()], i64()))];
                 let mut matched = for_range(
                     &i,
-                    int(0),
+                    int(1),
                     n.e(),
                     vec![
                         member.decl(at(s.e(), i.e())),
@@ -986,7 +1332,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
                         ),
                     ],
                 );
-                matched.push(ret(out.e()));
+                matched.extend(settled(&out));
                 fast.push(when(ge(right_mask.e(), int(0)), matched));
                 fast
             }),
@@ -997,44 +1343,102 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         ];
         st.extend(for_range(
             &i,
-            int(0),
+            int(1),
             n.e(),
             vec![when(
                 contains(other.e(), at(s.e(), i.e())),
                 vec![push(out.e(), at(s.e(), i.e()))],
             )],
         ));
-        st.push(ret(out.e()));
+        st.extend(settled(&out));
         st
     }));
-    d.push(define("zb_set_or", &[&s, &other], anys.clone(), {
+    // Room for `extra` more values without the table growing as they
+    // come: a table sized once for what a union adds.
+    let extra = local("extra", i64());
+    let need = local("need", i64());
+    d.push(define(
+        "zb_set_reserve",
+        &[&s, &extra],
+        unit(),
+        vec![
+            need.decl(mul(add(count(s.e()), extra.e()), int(2))),
+            when(
+                unindexed(s.e()),
+                vec![
+                    when(
+                        gt(add(count(s.e()), extra.e()), int(SMALL)),
+                        vec![
+                            cap.decl(int(FIRST_TABLE)),
+                            while_(lt(cap.e(), need.e()), vec![cap.set(mul(cap.e(), int(2)))]),
+                            expr(call(
+                                "zb_set_reindex",
+                                vec![s.e(), cap.e(), bool(false)],
+                                unit(),
+                            )),
+                        ],
+                    ),
+                    ret_void(),
+                ],
+            ),
+            cap.decl(slots_of(index_of(s.e()))),
+            when(
+                lt(cap.e(), need.e()),
+                vec![
+                    while_(lt(cap.e(), need.e()), vec![cap.set(mul(cap.e(), int(2)))]),
+                    expr(call(
+                        "zb_set_reindex",
+                        vec![s.e(), cap.e(), bool(true)],
+                        unit(),
+                    )),
+                ],
+            ),
+            ret_void(),
+        ],
+    ));
+    // Every value of `other` added to `s`.
+    d.push(define("zb_set_update", &[&s, &other], unit(), {
         let mut st = vec![
-            out.decl(call("zb_list_copy_any", vec![s.e()], anys.clone())),
+            expr(call(
+                "zb_set_reserve",
+                vec![s.e(), count(other.e())],
+                unit(),
+            )),
             n.decl(len(other.e())),
         ];
         st.extend(for_range(
             &i,
-            int(0),
+            int(1),
             n.e(),
             vec![expr(call(
                 "zb_set_add",
-                vec![out.e(), at(other.e(), i.e())],
+                vec![s.e(), at(other.e(), i.e())],
                 unit(),
             ))],
         ));
-        st.push(ret(out.e()));
+        st.push(ret_void());
         st
     }));
+    d.push(define(
+        "zb_set_or",
+        &[&s, &other],
+        anys.clone(),
+        vec![
+            out.decl(call("zb_set_copy", vec![s.e()], anys.clone())),
+            expr(call("zb_set_update", vec![out.e(), other.e()], unit())),
+            ret(out.e()),
+        ],
+    ));
     d.push(define("zb_set_sub", &[&s, &other], anys.clone(), {
         let mut st = vec![
-            out.decl(list(Vec::new(), anys.clone())),
+            out.decl(call("zb_set_new", vec![], anys.clone())),
             n.decl(len(s.e())),
             left_mask.decl(call("zb_set_mask63", vec![s.e()], i64())),
             when(ge(left_mask.e(), int(0)), {
                 let mut fast = vec![right_mask.decl(call("zb_set_mask63", vec![other.e()], i64()))];
                 let mut unmatched = for_range(
                     &i,
-                    int(0),
+                    int(1),
                     n.e(),
                     vec![
                         member.decl(at(s.e(), i.e())),
@@ -1045,30 +1449,25 @@ fn set(list_type: TypeId) -> Vec<Decl> {
                         ),
                     ],
                 );
-                unmatched.push(ret(out.e()));
+                unmatched.extend(settled(&out));
                 fast.push(when(ge(right_mask.e(), int(0)), unmatched));
                 fast
             }),
             when(
                 call("zb_set_disjoint_kinds", vec![s.e(), other.e()], boolean()),
-                {
-                    let mut copy =
-                        for_range(&i, int(0), n.e(), vec![push(out.e(), at(s.e(), i.e()))]);
-                    copy.push(ret(out.e()));
-                    copy
-                },
+                vec![ret(call("zb_set_copy", vec![s.e()], anys.clone()))],
             ),
         ];
         st.extend(for_range(
             &i,
-            int(0),
+            int(1),
             n.e(),
             vec![when(
                 not(contains(other.e(), at(s.e(), i.e()))),
                 vec![push(out.e(), at(s.e(), i.e()))],
             )],
         ));
-        st.push(ret(out.e()));
+        st.extend(settled(&out));
         st
     }));
     d.push(define(
@@ -1086,7 +1485,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
     ));
     d.push(define("zb_set_issubset", &[&s, &other], boolean(), {
         let mut st = vec![
-            when(gt(len(s.e()), len(other.e())), vec![ret(bool(false))]),
+            when(gt(count(s.e()), count(other.e())), vec![ret(bool(false))]),
             left_mask.decl(call("zb_set_mask63", vec![s.e()], i64())),
             when(
                 ge(left_mask.e(), int(0)),
@@ -1109,7 +1508,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         ];
         st.extend(for_range(
             &i,
-            int(0),
+            int(1),
             n.e(),
             vec![when(
                 not(contains(other.e(), at(s.e(), i.e()))),
@@ -1124,7 +1523,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         &[&s, &other],
         boolean(),
         vec![ret(and(
-            eq(len(s.e()), len(other.e())),
+            eq(count(s.e()), count(other.e())),
             call("zb_set_issubset", vec![s.e(), other.e()], boolean()),
         ))],
     ));
@@ -1133,10 +1532,14 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         &[&s],
         string(),
         vec![
-            when(eq(len(s.e()), int(0)), vec![ret(text("set()"))]),
+            when(eq(count(s.e()), int(0)), vec![ret(text("set()"))]),
             text_out.decl(call(
                 "zb_list_items_any",
-                vec![s.e(), text("{"), text("}")],
+                vec![
+                    call("zb_set_items", vec![s.e()], anys.clone()),
+                    text("{"),
+                    text("}"),
+                ],
                 string(),
             )),
             ret(text_out.e()),
@@ -1148,13 +1551,14 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         any(),
         Some("zyntax_box_ptr"),
     ));
+    let boxed = local("s", anys.clone());
     d.push(define(
         "zb_set_box",
-        &[&s],
+        &[&boxed],
         any(),
         vec![ret(call(
             "zb_box_set_raw",
-            vec![s.e(), int32(SET_TAG as i32)],
+            vec![boxed.e(), int32(SET_TAG as i32)],
             any(),
         ))],
     ));

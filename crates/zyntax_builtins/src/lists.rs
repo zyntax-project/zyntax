@@ -114,8 +114,17 @@ fn ops(kind: Kind, list_type: TypeId) -> KindOps {
             |a, b| call("zb_str_lt", vec![a, b], boolean()),
             |x| call("zb_str_repr", vec![x], string()),
         ),
+        // The same box is equal to itself before its value is looked
+        // at, which is how a membership test or an element comparison
+        // treats identity; shared boxes of small integers make that the
+        // common case.
         Kind::Any => (
-            |a, b| call("zb_any_eq", vec![a, b], boolean()),
+            |a, b| {
+                or(
+                    eq(a.clone(), b.clone()),
+                    call("zb_any_eq", vec![a, b], boolean()),
+                )
+            },
             |a, b| call("zb_any_lt", vec![a, b], boolean()),
             |x| call("zb_any_repr", vec![x], string()),
         ),
