@@ -83,6 +83,23 @@ pub enum Collector {
 /// enough that a collection sweeps a worthwhile amount.
 const MIN_HEAP: usize = 16 << 20;
 
+/// How many times the live set a productive collection grants before
+/// the next. Every collection marks the whole live set again, so a
+/// program that keeps a large structure while it churns through small
+/// ones pays that mark once per budget: twice the live set halves the
+/// number of marks for a heap that peaks at three times what it holds.
+/// `ZYNTAX_GC_GROWTH=n` overrides it; safe, trades memory for time.
+fn growth_default() -> usize {
+    static G: OnceLock<usize> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("ZYNTAX_GC_GROWTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|g| *g >= 1)
+            .unwrap_or(2)
+    })
+}
+
 fn heap_floor() -> usize {
     static FLOOR: OnceLock<usize> = OnceLock::new();
     *FLOOR.get_or_init(|| {
@@ -112,8 +129,8 @@ struct Registry {
     live: usize,
     collections: usize,
     /// How many times the live set the next budget is: [`MAX_GROWTH`]
-    /// after a collection that found little to free in the slabs, one
-    /// after one that found plenty.
+    /// after a collection that found little to free in the slabs,
+    /// [`growth_default`] after one that found plenty.
     growth: usize,
 }
 
@@ -1031,13 +1048,17 @@ fn collect_from(sp: usize) {
     }
     reg.live = live;
     reg.collections += 1;
-    // As much again as is live before the next one, or several times
-    // as much while collections find little: a program building up a
-    // table is marked at each doubling of its size otherwise, and the
-    // work of that is the sum of the sizes, twice the final one. Only
-    // the slabs count: a large block is freed without being marked,
-    // and one dead buffer says nothing about the rest of the heap.
-    reg.growth = if pool_freed * 8 < live { MAX_GROWTH } else { 1 };
+    // A multiple of what is live before the next one, more while
+    // collections find little: a program building up a table is marked
+    // at each doubling of its size otherwise, and the work of that is
+    // the sum of the sizes, twice the final one. Only the slabs count:
+    // a large block is freed without being marked, and one dead buffer
+    // says nothing about the rest of the heap.
+    reg.growth = if pool_freed * 8 < live {
+        MAX_GROWTH
+    } else {
+        growth_default()
+    };
     update(|l| l.budget = (live * reg.growth).max(heap_floor()));
     if trace() {
         eprintln!(
