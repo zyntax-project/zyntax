@@ -77,7 +77,9 @@ fn main() -> ExitCode {
         }
     };
     lap("parse");
-    let config = TieredConfig::default();
+    // Only the LLVM build changes the default.
+    #[allow(unused_mut)]
+    let mut config = TieredConfig::default();
     #[cfg(feature = "llvm-backend")]
     if llvm {
         config.tier2_backend = zyntax_compiler::tiered_backend::Tier2Backend::LLVM;
