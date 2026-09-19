@@ -265,6 +265,21 @@ pub struct SsaBuilder {
     variable_writes: IndexMap<HirId, HashSet<InternedString>>,
     /// Flag: after IDF placement, don't create new phis
     idf_placement_done: bool,
+    /// Values replaced by another while phis are filled, applied to
+    /// the instruction stream in one pass by
+    /// [`Self::apply_substitutions`]; a read resolves through it
+    /// meanwhile. Walking the function per replaced value cost the
+    /// square of a loop-heavy body.
+    pending_subst: HashMap<HirId, HirId>,
+    /// `ZYNTAX_SSA_TRACE=1` traces variable reads; read once.
+    ssa_trace: bool,
+    /// Set once the predecessor lists were recomputed from the
+    /// terminators and no block has been wired since: they are then
+    /// the truth, and a read need not consult every terminator.
+    edges_exact: bool,
+    /// The dominator tree while the CFG stands still, for the back-edge
+    /// test each self-referencing phi incoming asks.
+    dominators: Option<crate::osr::Dominators>,
     /// Current match context (scrutinee and discriminant for pattern matching)
     match_context: Option<MatchContext>,
     /// Element type a list/array literal is being assigned INTO.
@@ -728,6 +743,10 @@ impl SsaBuilder {
             string_globals: Vec::new(),
             variable_writes: IndexMap::new(),
             idf_placement_done: false,
+            pending_subst: HashMap::new(),
+            ssa_trace: std::env::var_os("ZYNTAX_SSA_TRACE").is_some(),
+            edges_exact: false,
+            dominators: None,
             match_context: None,
             expected_elem_ty: None,
             expected_growable: false,
@@ -782,6 +801,10 @@ impl SsaBuilder {
             string_globals: Vec::new(),
             variable_writes: IndexMap::new(),
             idf_placement_done: false,
+            pending_subst: HashMap::new(),
+            ssa_trace: std::env::var_os("ZYNTAX_SSA_TRACE").is_some(),
+            edges_exact: false,
+            dominators: None,
             match_context: None,
             expected_elem_ty: None,
             expected_growable: false,
@@ -7433,7 +7456,7 @@ impl SsaBuilder {
     /// Write a variable in SSA form
     fn write_variable(&mut self, var: InternedString, block: HirId, value: HirId) {
         log::debug!("[SSA] write_variable({:?}, {:?}, {:?})", var, block, value);
-        if std::env::var_os("ZYNTAX_SSA_TRACE").is_some() {
+        if self.ssa_trace {
             eprintln!(
                 "[ssa] write {} at {:?} = {:?}",
                 var.resolve_global().unwrap_or_default(),
@@ -7463,7 +7486,12 @@ impl SsaBuilder {
     }
 
     fn read_variable(&mut self, var: InternedString, block: HirId) -> HirId {
-        if std::env::var_os("ZYNTAX_SSA_TRACE").is_some() {
+        let value = self.read_variable_unresolved(var, block);
+        self.resolve_subst(value)
+    }
+
+    fn read_variable_unresolved(&mut self, var: InternedString, block: HirId) -> HirId {
+        if self.ssa_trace {
             let preds = self
                 .function
                 .blocks
@@ -7483,7 +7511,7 @@ impl SsaBuilder {
             );
         }
         if let Some(&value) = self.definitions.get(&block).and_then(|defs| defs.get(&var)) {
-            if std::env::var_os("ZYNTAX_SSA_TRACE").is_some() {
+            if self.ssa_trace {
                 eprintln!("[ssa]   -> {value:?} (defs)");
             }
             return value;
@@ -7503,7 +7531,7 @@ impl SsaBuilder {
     fn read_variable_recursive(&mut self, var: InternedString, block: HirId) -> HirId {
         let predecessors = self.current_preds_of(block);
         let is_sealed = self.sealed_blocks.contains(&block);
-        if std::env::var_os("ZYNTAX_SSA_TRACE").is_some() {
+        if self.ssa_trace {
             eprintln!(
                 "[ssa]   recursive {} at {:?}: live_preds={:?} sealed={}",
                 var.resolve_global().unwrap_or_default(),
@@ -7757,11 +7785,43 @@ impl SsaBuilder {
     /// before resolution finished (typically the loop header → body
     /// → header back-edge case).
     fn substitute_value(&mut self, from: HirId, to: HirId) {
+        let to = self.resolve_subst(to);
         if from == to {
             return;
         }
+        self.pending_subst.insert(from, to);
+    }
+
+    /// What `value` stands for once the pending substitutions apply.
+    fn resolve_subst(&self, mut value: HirId) -> HirId {
+        let mut steps = 0;
+        while let Some(&next) = self.pending_subst.get(&value) {
+            value = next;
+            steps += 1;
+            if steps > self.pending_subst.len() {
+                break;
+            }
+        }
+        value
+    }
+
+    /// Rewrite every use of a replaced value to what it stands for:
+    /// the instructions, terminators and phi incomings, the per-block
+    /// definitions a later read would return, and the recorded uses,
+    /// which follow the value so the def-use chains read off them
+    /// name definitions that exist.
+    fn apply_substitutions(&mut self) {
+        if self.pending_subst.is_empty() {
+            return;
+        }
         let mut map: IndexMap<HirId, HirId> = IndexMap::new();
-        map.insert(from, to);
+        for from in self.pending_subst.keys().copied().collect::<Vec<_>>() {
+            let to = self.resolve_subst(from);
+            if to != from {
+                map.insert(from, to);
+            }
+        }
+        self.pending_subst.clear();
         for block in self.function.blocks.values_mut() {
             for inst in &mut block.instructions {
                 inst.replace_uses(&map);
@@ -7769,35 +7829,28 @@ impl SsaBuilder {
             block.terminator.replace_uses(&map);
             for phi in &mut block.phis {
                 for (incoming, _) in &mut phi.incoming {
-                    if *incoming == from {
+                    if let Some(&to) = map.get(incoming) {
                         *incoming = to;
                     }
                 }
             }
         }
-        // The per-block `definitions` map records what value each
-        // variable currently maps to. If `from` is sitting in that
-        // map as the current binding for some variable in some
-        // block, a future `read_variable` on that block returns
-        // the stale orphan instead of the resolved value. Patch
-        // those entries here too.
         for block_defs in self.definitions.values_mut() {
             for (_var, val) in block_defs.iter_mut() {
-                if *val == from {
+                if let Some(&to) = map.get(val) {
                     *val = to;
                 }
             }
         }
-        // The recorded uses follow the value: the def-use chains are
-        // read off them after construction, and a user left on `from`
-        // would name a definition that no longer exists.
-        let moved = self
-            .function
-            .values
-            .get_mut(&from)
-            .map(|v| std::mem::take(&mut v.uses));
-        if let (Some(moved), Some(target)) = (moved, self.function.values.get_mut(&to)) {
-            target.uses.extend(moved);
+        for (from, to) in &map {
+            let moved = self
+                .function
+                .values
+                .get_mut(from)
+                .map(|v| std::mem::take(&mut v.uses));
+            if let (Some(moved), Some(target)) = (moved, self.function.values.get_mut(to)) {
+                target.uses.extend(moved);
+            }
         }
     }
 
@@ -7900,6 +7953,9 @@ impl SsaBuilder {
             .get(&block)
             .map(|b| b.predecessors.clone())
             .unwrap_or_default();
+        if self.edges_exact {
+            return preds;
+        }
         preds.retain(|p| {
             self.function.blocks.get(p).is_none_or(|b| {
                 matches!(b.terminator, crate::hir::HirTerminator::Unreachable)
@@ -7932,8 +7988,14 @@ impl SsaBuilder {
     /// on any other edge it means no definition reaches, and the
     /// incoming is undef. Reachability is not enough here — inside an
     /// enclosing loop every block reaches every other.
-    fn edge_is_back(&self, block: HirId, pred: HirId) -> bool {
-        crate::osr::blocks_dominated_by(&self.function, block).contains(&pred)
+    fn edge_is_back(&mut self, block: HirId, pred: HirId) -> bool {
+        if !self.edges_exact {
+            return crate::osr::blocks_dominated_by(&self.function, block).contains(&pred);
+        }
+        let dominators = self
+            .dominators
+            .get_or_insert_with(|| crate::osr::Dominators::compute(&self.function));
+        dominators.dominates(block, pred)
     }
 
     /// Recompute every block's predecessor and successor lists from its
@@ -7974,6 +8036,8 @@ impl SsaBuilder {
             block.predecessors = preds.remove(id).unwrap_or_default();
             block.successors = succs.remove(id).unwrap_or_default();
         }
+        self.edges_exact = true;
+        self.dominators = None;
     }
 
     /// Drop every block no path from the entry reaches. The typed CFG
@@ -8023,6 +8087,7 @@ impl SsaBuilder {
         self.definitions
             .retain(|block, _| reachable.contains(block));
         self.sealed_blocks.retain(|block| reachable.contains(block));
+        self.dominators = None;
     }
 
     /// Replace every phi that can only be one value with that value: a
@@ -8056,6 +8121,7 @@ impl SsaBuilder {
             // resolves to what that one resolves to; a ring of them
             // names nothing and is undefined.
             let map: HashMap<HirId, HirId> = trivial.iter().map(|(p, v, _)| (*p, *v)).collect();
+            let removed: HashSet<HirId> = map.keys().copied().collect();
             for (phi, mut value, ty) in trivial {
                 let mut steps = 0;
                 while let Some(next) = map.get(&value).copied() {
@@ -8066,11 +8132,12 @@ impl SsaBuilder {
                     }
                     value = next;
                 }
-                for block in self.function.blocks.values_mut() {
-                    block.phis.retain(|p| p.result != phi);
-                }
                 self.substitute_value(phi, value);
             }
+            for block in self.function.blocks.values_mut() {
+                block.phis.retain(|p| !removed.contains(&p.result));
+            }
+            self.apply_substitutions();
         }
     }
 
@@ -8084,6 +8151,7 @@ impl SsaBuilder {
                 self.fill_incomplete_phi(block, var);
             }
         }
+        self.apply_substitutions();
         // Conservative phi-type fix-up: when a phi result is typed
         // I64 (the `var_types[var].unwrap_or(I64)` fallback hit
         // because the let-binding lived inside the loop body and
@@ -14666,7 +14734,7 @@ impl SsaBuilder {
     }
 
     fn propagate_pattern_definitions(&mut self, source: HirId, target: HirId) {
-        if std::env::var_os("ZYNTAX_SSA_TRACE").is_some() {
+        if self.ssa_trace {
             eprintln!("[ssa] propagate defs {source:?} -> {target:?}");
         }
         let definitions = self.definitions.get(&source).cloned().unwrap_or_default();
