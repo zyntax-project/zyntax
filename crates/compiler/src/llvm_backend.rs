@@ -1511,6 +1511,17 @@ impl<'ctx> LLVMBackend<'ctx> {
                     };
                     if needs_fixup {
                         if let Some(et) = expected {
+                            // An aggregate returned as its address must be
+                            // one already; a copy of the header would be
+                            // the address of nothing the caller can keep.
+                            if et.is_pointer_type()
+                                && (val.is_struct_value() || val.is_array_value())
+                            {
+                                return Err(CompilerError::CodeGen(format!(
+                                    "return of {:?} as an address, but the value is a copy",
+                                    values[0]
+                                )));
+                            }
                             let synth = self.zero_of_basic_type(et);
                             self.builder.build_return(Some(&synth))?;
                         } else {
@@ -4518,11 +4529,22 @@ impl<'ctx> LLVMBackend<'ctx> {
                 }
             }
             HirCallable::Indirect(func_ptr_id) => {
-                // Indirect call through function pointer
+                // Indirect call through function pointer, which a record
+                // may hold as an integer.
                 let func_ptr_val = self.get_value(*func_ptr_id)?;
-
-                // The function pointer should be a pointer value
-                let func_ptr = func_ptr_val.into_pointer_value();
+                let func_ptr = if func_ptr_val.is_int_value() {
+                    self.builder.build_int_to_ptr(
+                        func_ptr_val.into_int_value(),
+                        self.context.ptr_type(AddressSpace::default()),
+                        "callee_addr",
+                    )?
+                } else if func_ptr_val.is_pointer_value() {
+                    func_ptr_val.into_pointer_value()
+                } else {
+                    return Err(CompilerError::CodeGen(format!(
+                        "indirect call through {func_ptr_id:?}, which is not an address"
+                    )));
+                };
 
                 // Get the HIR type for this function pointer to extract the signature
                 let hir_type = self.type_map.get(func_ptr_id).ok_or_else(|| {

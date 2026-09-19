@@ -287,7 +287,8 @@ block4:
 }
 
 /// An unarmed back-edge should load the helper slot without calling the
-/// runtime, except for the one visit that requests promotion.
+/// runtime, except for the one visit that requests promotion; the entry
+/// likewise counts in a memory cell and calls only at its threshold.
 #[test]
 fn an_unarmed_probe_site_costs_a_load_not_a_call() {
     use zyntax_compiler::cranelift_backend::CraneliftBackend;
@@ -314,18 +315,20 @@ fn an_unarmed_probe_site_costs_a_load_not_a_call() {
         !clif.contains("osr_sample_tick"),
         "the per-iteration tick call should be gone:\n{clif}"
     );
-    // The request is behind the back-edge threshold, never at entry.
-    let entry_end = clif.find("block1").unwrap_or(clif.len());
-    let calls_before_loop = direct_calls(&clif[..entry_end]);
+    // Two gated requests: the entry's, behind its call count, and the
+    // loop's, behind its back-edge count.
     let calls_total = direct_calls(&clif);
     assert_eq!(
-        (calls_before_loop, calls_total),
-        (0, 1),
-        "the only direct call should be the gated promotion request:\n{clif}"
+        calls_total, 2,
+        "the only direct calls should be the gated promotion requests:\n{clif}"
     );
     assert!(
         clif.contains("iconst.i64 1024"),
         "missing hot-loop gate:\n{clif}"
+    );
+    assert!(
+        clif.contains("iconst.i64 2048"),
+        "missing hot-entry gate:\n{clif}"
     );
     assert!(
         clif.matches("call_indirect").count() >= 1,

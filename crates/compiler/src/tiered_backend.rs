@@ -330,6 +330,10 @@ pub struct TieredBackend {
     /// in their cell; the interpreter reaches their baseline the same
     /// way, so one compile is made of each.
     lazy: HashSet<HirId>,
+    /// The body the first-call compile optimised for each function it
+    /// compiled, which a later tier compiles again rather than the
+    /// module's unoptimised one.
+    optimized_bodies: Arc<Mutex<HashMap<HirId, Arc<HirFunction>>>>,
     /// The module the compiled code came from. A reload diffs the
     /// edited module against this and replaces it piecewise.
     current_module: Option<Arc<HirModule>>,
@@ -447,6 +451,7 @@ impl TieredBackend {
             _llvm_context,
             functions: HashMap::new(),
             lazy: HashSet::new(),
+            optimized_bodies: Arc::new(Mutex::new(HashMap::new())),
             current_module: None,
             loaded: Vec::new(),
             last_undo: None,
@@ -1913,6 +1918,7 @@ impl TieredBackend {
         let adapter = Arc::clone(&self.adapter);
         let lazy = self.lazy.contains(&func_id);
         let threshold = self.config.baseline_threshold.max(1);
+        let optimized_bodies = Arc::clone(&self.optimized_bodies);
         Some(Box::new(move || {
             if lazy && bound.bead().compiled().is_none() {
                 // Counted here until the first-call compiler has made
@@ -1928,21 +1934,29 @@ impl TieredBackend {
                 return None;
             }
             let ctx = Arc::clone(&ctx);
+            let optimized_bodies = Arc::clone(&optimized_bodies);
             let code = adapter.on_invoke(&bound, move |tier, bead| {
                 let c = &*ctx;
                 // The baseline was compiled at load; the ladder above it
-                // compiles anew.
+                // compiles anew, from the body the first-call compile
+                // optimised when there is one.
                 if tier == 0 {
                     if let Some(p) = c.cranelift.with_lock(|be| be.get_function_ptr(c.func_id)) {
                         return p as *mut ();
                     }
                 }
+                let body = optimized_bodies
+                    .lock()
+                    .unwrap()
+                    .get(&c.func_id)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::clone(&c.func));
                 let entry = compile_at_tier(
                     tier,
                     bead,
                     c.func_id,
                     c.bead_id,
-                    &c.func,
+                    &body,
                     &c.module,
                     &c.cranelift,
                     #[cfg(feature = "llvm-backend")]
@@ -2072,6 +2086,7 @@ impl TieredBackend {
     /// on the first call to any of them.
     fn install_lazy_compiler(&mut self, lazy: &HashSet<HirId>, finished: &HashSet<HirId>) {
         let cranelift = Arc::clone(&self.cranelift);
+        let optimized_bodies = Arc::clone(&self.optimized_bodies);
         let verbosity = self.config.verbosity;
         let tier2_backend = self.config.tier2_backend;
         #[cfg(feature = "llvm-backend")]
@@ -2184,6 +2199,10 @@ impl TieredBackend {
                 }
             };
             let body_at = lazy_started.elapsed();
+            optimized_bodies
+                .lock()
+                .unwrap()
+                .insert(*func_id, Arc::clone(&body));
             let entry = compile_at_tier(
                 0,
                 bound.bead(),
@@ -2325,6 +2344,7 @@ impl TieredBackend {
             })
             .collect();
 
+        let optimized_bodies = Arc::clone(&self.optimized_bodies);
         osr::set_promotion_requester(move |bead_id| {
             let Some((func_id, bound, swapped, module_arc, lazy)) = by_bead.get(&bead_id) else {
                 if osr::osr_trace_enabled() {
@@ -2332,10 +2352,13 @@ impl TieredBackend {
                 }
                 return false;
             };
-            // The body: the one a reload swapped in, else the module's.
-            let func_arc = match swapped {
-                Some(f) => Arc::clone(f),
-                None => match module_arc.functions.get(func_id) {
+            // The body: the one a reload swapped in, else the one the
+            // first-call compile optimised, else the module's.
+            let optimized = optimized_bodies.lock().unwrap().get(func_id).cloned();
+            let func_arc = match (swapped, optimized) {
+                (Some(f), _) => Arc::clone(f),
+                (None, Some(f)) => f,
+                (None, None) => match module_arc.functions.get(func_id) {
                     Some(f) => Arc::new(f.clone()),
                     None => return false,
                 },
@@ -2848,7 +2871,16 @@ pub fn compile_at_tier(
     if tier_idx == 2 && matches!(tier2_backend, Tier2Backend::LLVM) {
         if let Some(llvm) = llvm {
             let resume = def.clone();
-            return match llvm.compile(bead, def) {
+            // A compile that panics is a compile that failed: the
+            // promoter thread carries every later promotion.
+            let compiled =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| llvm.compile(bead, def)))
+                    .unwrap_or_else(|_| {
+                        Err(beadie::CompileError::new(
+                            "the LLVM compile panicked".to_string(),
+                        ))
+                    });
+            return match compiled {
                 Ok(p) => {
                     // A loop the LLVM tier made no resume point for
                     // would keep its running frame where it is; the

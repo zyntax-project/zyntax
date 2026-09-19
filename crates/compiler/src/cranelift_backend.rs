@@ -59,6 +59,10 @@ const INLINE_COPY_MAX_BYTES: u32 = 64;
 /// background promotion. The count is local to the invocation.
 const OSR_REQUEST_BACKEDGES: i64 = 1024;
 
+/// A function's baseline code asks for background promotion once it has
+/// been entered this many times, over all its invocations.
+const OSR_REQUEST_CALLS: i64 = 2048;
+
 /// Emit an inline byte-by-byte aggregate copy using straight-line
 /// scalar loads/stores. Used in place of `call_memcpy` for small
 /// aggregates (`size <= INLINE_COPY_MAX_BYTES`) where the libc thunk's
@@ -2306,6 +2310,17 @@ impl CraneliftBackend {
             } else {
                 None
             };
+            // Tier-0 entry probe: a callee that compiled code reaches
+            // through its cell is counted here, and asks for promotion
+            // once it is hot.
+            if self.compile_tier == 0 && self.emit_osr_probes && osr_helper.is_none() {
+                emit_osr_request_after_calls(
+                    &mut builder,
+                    &mut self.module,
+                    osr_bead_id,
+                    pointer_type,
+                );
+            }
 
             // Store block map for use in helper methods
             self.block_map = block_map.clone();
@@ -10145,6 +10160,46 @@ fn emit_osr_request_after_backedges(
     let request = builder
         .ins()
         .icmp_imm(IntCC::Equal, next, OSR_REQUEST_BACKEDGES);
+    let request_block = builder.create_block();
+    let continue_block = builder.create_block();
+    builder
+        .ins()
+        .brif(request, request_block, &[], continue_block, &[]);
+
+    builder.switch_to_block(request_block);
+    builder.seal_block(request_block);
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::I64));
+    if let Ok(fid) = module.declare_function(crate::osr::OSR_REQUEST_SYMBOL, Linkage::Import, &sig)
+    {
+        let f = module.declare_func_in_func(fid, builder.func);
+        let bead = builder.ins().iconst(types::I64, bead_id as i64);
+        builder.ins().call(f, &[bead]);
+    }
+    builder.ins().jump(continue_block, &[]);
+
+    builder.switch_to_block(continue_block);
+    builder.seal_block(continue_block);
+}
+
+/// Count entries in the bead's counter so a function every compiled caller
+/// reaches through its cell is promoted once hot. Only the threshold entry
+/// calls into the runtime.
+fn emit_osr_request_after_calls(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut JITModule,
+    bead_id: u64,
+    pointer_type: types::Type,
+) {
+    let addr = crate::osr::entry_counter_addr(bead_id);
+    let addr = builder.ins().iconst(pointer_type, addr as i64);
+    let flags = MemFlags::trusted();
+    let count = builder.ins().load(types::I64, flags, addr, 0);
+    let next = builder.ins().iadd_imm(count, 1);
+    builder.ins().store(flags, next, addr, 0);
+    let request = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, next, OSR_REQUEST_CALLS);
     let request_block = builder.create_block();
     let continue_block = builder.create_block();
     builder

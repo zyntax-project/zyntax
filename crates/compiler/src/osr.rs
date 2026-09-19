@@ -1184,6 +1184,25 @@ pub fn helper_slot_addr(bead_id: u64, site_key: u64) -> *const u8 {
     (&**slot) as *const AtomicU64 as *const u8
 }
 
+/// The calls made into a bead's baseline code, counted by that code at
+/// its entry; the interpreter counts the calls it makes itself, but a
+/// caller already compiled reaches the callee through its cell and is
+/// counted nowhere else. Stable for as long as the bead is registered.
+fn entry_counters() -> &'static RwLock<HashMap<u64, Box<AtomicU64>>> {
+    static COUNTERS: OnceLock<RwLock<HashMap<u64, Box<AtomicU64>>>> = OnceLock::new();
+    COUNTERS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Address of the entry counter for `bead_id`, allocating it on first
+/// call.
+pub fn entry_counter_addr(bead_id: u64) -> *const u8 {
+    let mut counters = entry_counters().write().unwrap();
+    let counter = counters
+        .entry(bead_id)
+        .or_insert_with(|| Box::new(AtomicU64::new(0)));
+    counter.as_ptr() as *const u8
+}
+
 /// Publish `helper` for `(bead_id, site_key)`, so back-edges start
 /// transferring into it.
 pub fn publish_helper(bead_id: u64, site_key: u64, helper: *mut ()) {

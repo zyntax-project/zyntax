@@ -86,7 +86,8 @@ pub fn function_abi(function: &HirFunction, address_taken: bool) -> FunctionAbi 
 
 /// The entry shapes LLVM can currently publish into a Cranelift call cell.
 /// Growable list headers stay at their caller-owned address so changes to
-/// their data pointer, length, or capacity remain visible to aliases.
+/// their data pointer, length, or capacity remain visible to aliases;
+/// they arrive and return as that address.
 pub fn llvm_entry_abi_supported(function: &HirFunction, address_taken: bool) -> bool {
     let abi = function_abi(function, address_taken);
     let direct_shape = |ty: &HirType| {
@@ -95,21 +96,24 @@ pub fn llvm_entry_abi_supported(function: &HirFunction, address_taken: bool) -> 
             HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_)
         )
     };
+    let travels = |ty: &HirType, pass: &Pass| match pass {
+        Pass::Direct => direct_shape(ty),
+        Pass::Pointer => matches!(ty, HirType::Struct(s) if is_growable_list_header(s)),
+    };
     abi.destination.is_none()
-        && abi.returns.iter().all(|p| *p == Pass::Direct)
-        && function.signature.returns.iter().all(direct_shape)
+        && function
+            .signature
+            .returns
+            .iter()
+            .filter(|t| **t != HirType::Void)
+            .zip(&abi.returns)
+            .all(|(ret, pass)| travels(ret, pass))
         && function
             .signature
             .params
             .iter()
             .zip(&abi.params)
-            .all(|(param, pass)| match pass {
-                Pass::Direct => direct_shape(&param.ty),
-                Pass::Pointer => matches!(
-                    &param.ty,
-                    HirType::Struct(s) if is_growable_list_header(s)
-                ),
-            })
+            .all(|(param, pass)| travels(&param.ty, pass))
 }
 
 /// How a value of `ty` travels.
@@ -260,6 +264,11 @@ mod tests {
         assert_eq!(abi.params, vec![Pass::Pointer]);
         assert_eq!(abi.returns, vec![Pass::Pointer]);
         assert_eq!(abi.destination, None);
+        // An address in, an address out: the LLVM entry can take it.
+        assert!(llvm_entry_abi_supported(&f, false));
+        // A struct returned as a value needs a destination the entry
+        // cannot pass.
+        let f = function(vec![list()], vec![vec3()]);
         assert!(!llvm_entry_abi_supported(&f, false));
     }
 
