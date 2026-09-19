@@ -1805,6 +1805,60 @@ pub fn osr_request_promotion_interpreted(bead_id: u64, body_tag: u16) {
     request(bead_id, Requester::Interpreted { body_tag });
 }
 
+/// The compile worker's busy flag, raised while it is in a job.
+fn compile_worker_busy() -> &'static RwLock<Option<Arc<std::sync::atomic::AtomicBool>>> {
+    static B: OnceLock<RwLock<Option<Arc<std::sync::atomic::AtomicBool>>>> = OnceLock::new();
+    B.get_or_init(|| RwLock::new(None))
+}
+
+/// Register the flag the compile worker raises while it is in a job.
+pub fn set_compile_worker_busy(flag: Option<Arc<std::sync::atomic::AtomicBool>>) {
+    *compile_worker_busy().write().unwrap() = flag;
+}
+
+/// Whether there is a compile worker at all.
+pub fn compile_worker_present() -> bool {
+    compile_worker_busy().read().unwrap().is_some()
+}
+
+/// Interpreted frames that asked for resume points and are still
+/// running, by bead. A resume point is compiled for a bead only while
+/// one of them could take it.
+fn waiting_frames() -> &'static RwLock<HashMap<u64, u32>> {
+    static W: OnceLock<RwLock<HashMap<u64, u32>>> = OnceLock::new();
+    W.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// An interpreted frame of `bead_id` asks; it says so before the request.
+pub fn frame_waits(bead_id: u64) {
+    *waiting_frames()
+        .write()
+        .unwrap()
+        .entry(bead_id)
+        .or_insert(0) += 1;
+}
+
+/// The frame returned or left through a resume point.
+pub fn frame_left(bead_id: u64) {
+    let mut frames = waiting_frames().write().unwrap();
+    if let Some(n) = frames.get_mut(&bead_id) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            frames.remove(&bead_id);
+        }
+    }
+}
+
+/// Whether some interpreted frame of `bead_id` still waits for a resume
+/// point.
+pub fn frame_waiting(bead_id: u64) -> bool {
+    waiting_frames()
+        .read()
+        .unwrap()
+        .get(&bead_id)
+        .is_some_and(|n| *n > 0)
+}
+
 /// Run the registered requester for `bead_id` now, on this thread: what
 /// a worker does with a request another thread queued. Returns whether
 /// it was fulfilled.

@@ -249,20 +249,29 @@ struct FunctionEntry {
 /// itself; the planned order of everything else fills the gaps.
 struct CompileQueue {
     promote: Mutex<std::collections::VecDeque<(u64, u16)>>,
-    compile: Mutex<std::collections::VecDeque<u64>>,
+    /// Compile requests with the function's call count and the time
+    /// when made: a request the function has not been called since is
+    /// stale by the time the worker reaches it. A request made for the
+    /// callee of a function being compiled carries no count: its calls
+    /// will come from native code, which the counter does not see.
+    compile: Mutex<std::collections::VecDeque<(u64, Option<u32>, std::time::Instant)>>,
     /// Beads already queued, once each.
     queued: Mutex<HashSet<u64>>,
+    /// Each lazy function's call count as the interpreter ticks it.
+    counts: Mutex<HashMap<u64, Arc<std::sync::atomic::AtomicU32>>>,
     ready: std::sync::Condvar,
     stop: Arc<std::sync::atomic::AtomicBool>,
     /// Whether the worker is in a job. A request made while it is
     /// would wait behind that job; the asking thread does the work
-    /// itself then, as it did before there was a worker.
-    busy: std::sync::atomic::AtomicBool,
+    /// itself then, as it did before there was a worker. Shared with
+    /// the interpreter, which asks early for a warm loop while the
+    /// worker is quiescent.
+    busy: Arc<std::sync::atomic::AtomicBool>,
 }
 
 enum Job {
     Promote(u64, u16),
-    Compile(u64),
+    Compile(u64, Option<u32>, std::time::Instant),
 }
 
 impl CompileQueue {
@@ -271,9 +280,10 @@ impl CompileQueue {
             promote: Mutex::new(std::collections::VecDeque::new()),
             compile: Mutex::new(std::collections::VecDeque::new()),
             queued: Mutex::new(HashSet::new()),
+            counts: Mutex::new(HashMap::new()),
             ready: std::sync::Condvar::new(),
             stop,
-            busy: std::sync::atomic::AtomicBool::new(false),
+            busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -282,11 +292,55 @@ impl CompileQueue {
         !self.busy.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn request_compile(&self, bead_id: u64) {
+    /// Whether a compile of `bead_id` was asked for already.
+    fn is_queued(&self, bead_id: u64) -> bool {
+        self.queued.lock().unwrap().contains(&bead_id)
+    }
+
+    fn request_compile(&self, bead_id: u64, count: Option<u32>) {
         if self.queued.lock().unwrap().insert(bead_id) {
-            self.compile.lock().unwrap().push_back(bead_id);
+            self.compile
+                .lock()
+                .unwrap()
+                .push_back((bead_id, count, std::time::Instant::now()));
             self.ready.notify_one();
         }
+    }
+
+    /// The counter the interpreter keeps for `bead_id`'s calls.
+    fn count_of(&self, bead_id: u64) -> Arc<std::sync::atomic::AtomicU32> {
+        Arc::clone(
+            self.counts
+                .lock()
+                .unwrap()
+                .entry(bead_id)
+                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU32::new(0))),
+        )
+    }
+
+    /// Whether a compile request is still wanted: the function has been
+    /// called since it was made, or it was made just now. One that sat
+    /// while the function went quiet is dropped, and asked again should
+    /// the function come back.
+    fn still_wanted(&self, bead_id: u64, count: Option<u32>, at: std::time::Instant) -> bool {
+        let Some(count) = count else {
+            return true;
+        };
+        if at.elapsed() < std::time::Duration::from_millis(2) {
+            return true;
+        }
+        let now = self
+            .counts
+            .lock()
+            .unwrap()
+            .get(&bead_id)
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(count);
+        if now != count {
+            return true;
+        }
+        self.queued.lock().unwrap().remove(&bead_id);
+        false
     }
 
     /// A promotion request is queued even for a bead whose compile was:
@@ -302,7 +356,11 @@ impl CompileQueue {
         if let Some((b, tag)) = self.promote.lock().unwrap().pop_front() {
             return Some(Job::Promote(b, tag));
         }
-        self.compile.lock().unwrap().pop_front().map(Job::Compile)
+        self.compile
+            .lock()
+            .unwrap()
+            .pop_front()
+            .map(|(b, count, at)| Job::Compile(b, count, at))
     }
 
     /// Wait until a request arrives or the runtime stops.
@@ -2012,19 +2070,32 @@ impl TieredBackend {
         let adapter = Arc::clone(&self.adapter);
         let lazy = self.lazy.contains(&func_id);
         let threshold = self.config.baseline_threshold.max(1);
+        // Calls at which a function counts as warm: it will cross the
+        // threshold if the program goes on as it has, so its compile is
+        // asked of the worker then, and is done by the time the
+        // threshold comes.
+        let warm = (threshold / 4).max(2);
         let optimized_bodies = Arc::clone(&self.optimized_bodies);
         let queue = self.compile_queue.clone();
+        let counter = queue.as_ref().map(|q| q.count_of(entry.bead_id));
         Some(Box::new(move || {
             if lazy && bound.bead().compiled().is_none() {
                 // Counted here until the first-call compiler has made
                 // the baseline and installed it in the bead; beadie's
-                // own ladder takes over from there. The compile is asked
-                // of the warm-up thread and the call runs interpreted
-                // meanwhile; without that thread it compiles here.
+                // own ladder takes over from there.
                 let (count, _) = bound.bead().tick();
+                if let Some(counter) = &counter {
+                    counter.store(count, std::sync::atomic::Ordering::Relaxed);
+                }
                 if count >= threshold {
+                    // Hot: queued already, so its code is on the way and
+                    // the call runs interpreted meanwhile; else asked of
+                    // the worker if it is free, else compiled here.
                     match &queue {
-                        Some(queue) if queue.idle() => queue.request_compile(ctx.bead_id),
+                        Some(queue) if queue.is_queued(ctx.bead_id) => {}
+                        Some(queue) if queue.idle() => {
+                            queue.request_compile(ctx.bead_id, Some(count))
+                        }
                         _ => {
                             let code = osr::lazy_compile(ctx.bead_id);
                             if !code.is_null() {
@@ -2032,6 +2103,13 @@ impl TieredBackend {
                             }
                         }
                     }
+                } else if count >= warm
+                    && let Some(queue) = &queue
+                {
+                    // Warm: asked of the worker now, whatever it is doing,
+                    // so the code is there by the time the threshold
+                    // comes; nobody waits on this one.
+                    queue.request_compile(ctx.bead_id, Some(count));
                 }
                 return None;
             }
@@ -2261,9 +2339,7 @@ impl TieredBackend {
             .map(|(id, e)| (e.bead_id, (*id, e.bound.clone(), Arc::clone(&e.module))))
             .collect();
         let reload_key = self.cranelift.with_lock(|be| be.reload_key());
-        let all_lazy: HashSet<HirId> = lazy.clone();
         let lazy: HashSet<HirId> = lazy.difference(finished).copied().collect();
-        let ready = finished.clone();
         let finished = finished.clone();
         // Compiled once: the entry once published, or the mark of a
         // compile under way, which a second call waits out. Different
@@ -2382,6 +2458,12 @@ impl TieredBackend {
         });
         // What compiling a function on its first call does, once off the
         // caller's stack.
+        // The queue is made after this closure, which reads it through
+        // this cell once it exists.
+        let queue_for_callees: Arc<Mutex<Option<Arc<CompileQueue>>>> = Arc::new(Mutex::new(None));
+        let queue_cell = Arc::clone(&queue_for_callees);
+        let bead_of: HashMap<HirId, u64> =
+            by_bead.iter().map(|(b, (id, _, _))| (*id, *b)).collect();
         let compile_lazy_function = move |bead_id: u64| -> *const u8 {
             let trace = std::env::var_os("ZYNTAX_TRACE_LAZY").is_some();
             {
@@ -2428,6 +2510,21 @@ impl TieredBackend {
             let Some((func_id, bound, module_arc)) = by_bead.get(&bead_id) else {
                 return publish(0);
             };
+            // What this function calls will be called from its native code
+            // as soon as it runs, through stubs that compile on the spot:
+            // asked of the worker now, so they are compiled first.
+            if let Some(queue) = queue_for_callees.lock().unwrap().as_ref()
+                && let Some(f) = module_arc.functions.get(func_id)
+            {
+                for callee in direct_lazy_callees(f, &bead_of) {
+                    if !by_bead
+                        .get(&callee)
+                        .is_some_and(|(_, b, _)| b.bead().compiled().is_some())
+                    {
+                        queue.request_compile(callee, None);
+                    }
+                }
+            }
             let lazy_started = std::time::Instant::now();
             let Some(body) = optimize_body(bead_id) else {
                 return publish(0);
@@ -2476,84 +2573,65 @@ impl TieredBackend {
         };
         let compile_lazy_function = Arc::new(compile_lazy_function);
 
-        // The functions left for their call are compiled ahead of it on
-        // a thread of their own, in the order the program is likely to
-        // call them; a call arriving first compiles its own and a call
-        // arriving during one waits for it. The thread does not stand
-        // aside for a first call: what it is compiling is what the
-        // program calls next, and the backend is held only to translate
-        // and install, not through Cranelift's own compile.
-        // `ZYNTAX_DISABLE_WARM_UP=1` leaves every first call to compile
-        // its function; safe to run with.
+        // The compile worker: what the program's own profile asks for,
+        // a loop or a function that is warm or hot, nothing else. It
+        // stands idle otherwise, so a request is taken at once, and the
+        // program is never made to wait behind a compile it did not
+        // ask for. `ZYNTAX_DISABLE_WARM_UP=1` leaves every compile to the
+        // asking thread; safe to run with.
         if std::env::var_os("ZYNTAX_DISABLE_WARM_UP").is_none() {
-            let order: Vec<u64> = match self.functions.values().next() {
-                Some(e) => {
-                    let ids = warm_up_order(&e.module, &all_lazy, &ready);
-                    if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
-                        let names: Vec<String> = ids
-                            .iter()
-                            .filter_map(|id| e.module.functions.get(id))
-                            .map(|f| f.name.resolve_global().unwrap_or_default())
-                            .collect();
-                        eprintln!("[lazy] warm-up order: {}", names.join(" "));
-                    }
-                    ids.into_iter()
-                        .filter_map(|id| self.functions.get(&id).map(|e| e.bead_id))
-                        .collect()
-                }
-                None => Vec::new(),
-            };
-            if !order.is_empty() {
-                let compile = Arc::clone(&compile_lazy_function);
-                let stop = Arc::clone(&self.warm_up_stop);
-                let queue = Arc::new(CompileQueue::new(Arc::clone(&stop)));
-                self.compile_queue = Some(Arc::clone(&queue));
-                self.warm_up = std::thread::Builder::new()
-                    .name("zyntax-warm-up".into())
-                    .stack_size(16 << 20)
-                    .spawn(move || {
-                        ON_WARM_UP.with(|on| on.set(true));
-                        let mut order = order.into_iter();
-                        let mut scratch_dropped = false;
-                        loop {
-                            if stop.load(std::sync::atomic::Ordering::Acquire) {
-                                return;
+            let compile = Arc::clone(&compile_lazy_function);
+            let stop = Arc::clone(&self.warm_up_stop);
+            let queue = Arc::new(CompileQueue::new(Arc::clone(&stop)));
+            osr::set_compile_worker_busy(Some(Arc::clone(&queue.busy)));
+            self.compile_queue = Some(Arc::clone(&queue));
+            *queue_cell.lock().unwrap() = Some(Arc::clone(&queue));
+            self.warm_up = std::thread::Builder::new()
+                .name("zyntax-warm-up".into())
+                .stack_size(16 << 20)
+                .spawn(move || {
+                    ON_WARM_UP.with(|on| on.set(true));
+                    let mut idle_since: Option<std::time::Instant> = None;
+                    loop {
+                        if stop.load(std::sync::atomic::Ordering::Acquire) {
+                            return;
+                        }
+                        queue.busy.store(true, std::sync::atomic::Ordering::Release);
+                        match queue.take() {
+                            Some(Job::Promote(bead_id, body_tag)) => {
+                                idle_since = None;
+                                osr::run_promotion(
+                                    bead_id,
+                                    osr::Requester::Interpreted { body_tag },
+                                );
                             }
-                            queue.busy.store(true, std::sync::atomic::Ordering::Release);
-                            match queue.take() {
-                                Some(Job::Promote(bead_id, body_tag)) => {
-                                    osr::run_promotion(
-                                        bead_id,
-                                        osr::Requester::Interpreted { body_tag },
+                            Some(Job::Compile(bead_id, count, at)) => {
+                                idle_since = None;
+                                if queue.still_wanted(bead_id, count, at) {
+                                    compile(bead_id);
+                                } else if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                                    eprintln!(
+                                        "[lazy] dropped compile of bead {bead_id}: no calls since"
                                     );
                                 }
-                                Some(Job::Compile(bead_id)) => {
-                                    compile(bead_id);
+                            }
+                            None => {
+                                // A quiet spell: the scratch module the
+                                // program's functions are optimised in is
+                                // let go, and made again if asked.
+                                let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                                if since.elapsed() > std::time::Duration::from_millis(250) {
+                                    scratch_shared.lock().unwrap().take();
                                 }
-                                None => match order.next() {
-                                    Some(bead_id) => {
-                                        compile(bead_id);
-                                    }
-                                    None => {
-                                        // Every lazy function has its code:
-                                        // the scratch module the program's
-                                        // own were optimised in is done with,
-                                        // and only requests remain.
-                                        if !scratch_dropped {
-                                            scratch_dropped = true;
-                                            scratch_shared.lock().unwrap().take();
-                                        }
-                                        queue
-                                            .busy
-                                            .store(false, std::sync::atomic::Ordering::Release);
-                                        queue.wait();
-                                    }
-                                },
+                                queue
+                                    .busy
+                                    .store(false, std::sync::atomic::Ordering::Release);
+                                queue.wait();
                             }
                         }
-                    })
-                    .ok();
-            }
+                    }
+                })
+                .ok();
         }
 
         // The stub runs on whatever stack the first call was made from,
@@ -2868,6 +2946,7 @@ impl TieredBackend {
         osr::set_promotion_requester(|_, _| false);
         osr::set_lazy_compiler(|_| ptr::null());
         osr::set_lazy_optimizer(|_| None);
+        osr::set_compile_worker_busy(None);
         self.warm_up_stop
             .store(true, std::sync::atomic::Ordering::Release);
         if let Some(queue) = &self.compile_queue {
@@ -2975,23 +3054,11 @@ impl Drop for TieredBackend {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The functions of `lazy` in the order to compile them ahead of the
-/// program: from the program's own functions nothing calls (its entry
-/// points, the one reaching most first), every function after the
-/// functions it calls, so that a compiled caller finds its callees
-/// compiled and no call from native code waits for a compile. The
-/// program's own functions come before the library's it calls; those
-/// compile in a fraction of the time and the interpreter runs them
-/// well meanwhile. Whatever no root reaches follows.
-fn warm_up_order(module: &HirModule, lazy: &HashSet<HirId>, ready: &HashSet<HirId>) -> Vec<HirId> {
-    // A function whose address a body takes is called from it too, by
-    // whatever the address is handed to.
-    let callees = |id: &HirId| -> Vec<HirId> {
-        let Some(f) = module.functions.get(id) else {
-            return Vec::new();
-        };
-        let mut out: Vec<HirId> = f
-            .blocks
+/// The beads of the functions `f` calls directly, or takes the address
+/// of, among those with a bead in `bead_of`.
+fn direct_lazy_callees(f: &HirFunction, bead_of: &HashMap<HirId, u64>) -> Vec<u64> {
+    let mut out: Vec<u64> =
+        f.blocks
             .values()
             .flat_map(|b| b.instructions.iter())
             .filter_map(|inst| match inst {
@@ -3004,61 +3071,11 @@ fn warm_up_order(module: &HirModule, lazy: &HashSet<HirId>, ready: &HashSet<HirI
                 crate::hir::HirInstruction::CreateClosure { function, .. } => Some(*function),
                 _ => None,
             })
-            .filter(|c| lazy.contains(c))
+            .filter_map(|id| bead_of.get(&id).copied())
             .collect();
-        out.sort();
-        out.dedup();
-        out
-    };
-    let mut called: HashSet<HirId> = HashSet::new();
-    for id in module.functions.keys() {
-        called.extend(callees(id));
-    }
-    let mut roots: Vec<HirId> = module
-        .functions
-        .keys()
-        .filter(|id| lazy.contains(id) && !ready.contains(id) && !called.contains(id))
-        .copied()
-        .collect();
-    roots.sort_by_key(|id| (std::cmp::Reverse(callees(id).len()), *id));
-    let mut order: Vec<HirId> = Vec::new();
-    let mut library: Vec<HirId> = Vec::new();
-    let mut seen: HashSet<HirId> = HashSet::new();
-    for root in roots {
-        if seen.contains(&root) {
-            continue;
-        }
-        // Post-order over direct calls, iteratively.
-        let mut stack: Vec<(HirId, Vec<HirId>, usize)> = vec![(root, callees(&root), 0)];
-        seen.insert(root);
-        while let Some((id, cs, next)) = stack.last_mut() {
-            if *next < cs.len() {
-                let c = cs[*next];
-                *next += 1;
-                if seen.insert(c) {
-                    stack.push((c, callees(&c), 0));
-                }
-            } else {
-                let id = *id;
-                stack.pop();
-                if ready.contains(&id) {
-                    library.push(id);
-                } else {
-                    order.push(id);
-                }
-            }
-        }
-    }
-    order.extend(library);
-    let mut rest: Vec<HirId> = module
-        .functions
-        .keys()
-        .filter(|id| lazy.contains(id) && !seen.contains(id))
-        .copied()
-        .collect();
-    rest.sort_by_key(|id| (ready.contains(id), *id));
-    order.extend(rest);
-    order
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Build the per-tier hotness policies from a `TieredConfig`.
@@ -3206,10 +3223,21 @@ fn publish_baseline_resume_points(
     };
     // One header at a time, the innermost first, each published as
     // soon as it exists: the waiting frame is at the header it visits
-    // most, and leaves at the first one that has a resume point.
+    // most, and leaves at the first one that has a resume point. Once
+    // no frame waits, whether it left through one or returned, the
+    // rest are not made.
     let mut headers = osr::find_loop_headers(&def.function);
     headers.reverse();
     for header in headers {
+        if !osr::frame_waiting(bead_id) {
+            if osr::osr_trace_enabled() {
+                eprintln!(
+                    "[osr] {}: no frame waits, resume points not made",
+                    func_arc.name.resolve_global().unwrap_or_default()
+                );
+            }
+            break;
+        }
         let points: Vec<(u64, usize)> = std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .name("zyntax-resume-points".into())

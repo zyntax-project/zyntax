@@ -891,6 +891,10 @@ pub struct OsrSite {
 
 /// Header visits before an interpreted frame asks for promoted code.
 const OSR_REQUEST_VISITS: u32 = 64;
+/// Header visits at which a loop counts as warm: the frame asks for
+/// its promoted code then, when there is a worker to take the request,
+/// so the code is there by the time the loop is hot.
+const OSR_WARM_VISITS: u32 = 16;
 
 /// Which memory intrinsic an [`Op::MemOp`] performs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2580,6 +2584,9 @@ pub struct HirInterpreter {
     /// has no code yet is interpreted rather than compiled on the spot.
     #[allow(clippy::type_complexity)]
     address_source: Option<Box<dyn Fn(usize) -> Option<HirId> + Send + Sync>>,
+    /// The beads of the running frames that asked for resume points,
+    /// innermost last; `run` reports each frame gone as it returns.
+    waiting_marks: Vec<u64>,
     /// Thunks already made, by shape.
     thunks: HashMap<NativeSig, usize>,
     /// The call shape of each function called so far, with the thunk
@@ -2710,6 +2717,7 @@ impl HirInterpreter {
             entry_source: None,
             bead_source: None,
             address_source: None,
+            waiting_marks: Vec::new(),
             thunks: HashMap::new(),
             shapes: IdMap::default(),
             address_taken: HashMap::new(),
@@ -3434,7 +3442,15 @@ impl HirInterpreter {
         dest: *mut u8,
     ) -> Result<ZyntaxValue, InterpError> {
         let mut scratch = Scratch::new();
+        let marks = self.waiting_marks.len();
         let result = self.run_frame(module, cf, args, func_id, dest, &mut scratch);
+        // The frame is gone, whether it returned or left through a
+        // resume point: no resume point is owed to it any more.
+        while self.waiting_marks.len() > marks {
+            if let Some(bead) = self.waiting_marks.pop() {
+                crate::osr::frame_left(bead);
+            }
+        }
         for block in scratch.blocks.drain(..) {
             self.memory.release_scratch(block);
         }
@@ -3479,6 +3495,9 @@ impl HirInterpreter {
         let mut visits: Vec<u32> = vec![0; cf.osr_sites.len()];
         let mut slots: Vec<*const std::sync::atomic::AtomicU64> =
             vec![core::ptr::null(); cf.osr_sites.len()];
+        // Whether this frame has asked for resume points; it is counted
+        // as waiting until `run` sees it leave.
+        let mut waits = false;
         // Aggregates the function owns from the start.
         for (reg, bytes) in &cf.entry_storage {
             let p = self.frame_alloc(scratch, bytes.len());
@@ -4208,15 +4227,30 @@ impl HirInterpreter {
                     let Some(bead) = bead else { continue };
                     let i = *site as usize;
                     visits[i] = visits[i].saturating_add(1);
-                    if visits[i] < OSR_REQUEST_VISITS {
-                        continue;
-                    }
                     let osr_site = &cf.osr_sites[i];
-                    if visits[i] == OSR_REQUEST_VISITS {
+                    // Ask once: early while the loop is warm when a worker
+                    // will take it, else when it is hot. From then on the
+                    // slot is watched.
+                    let asks = if slots[i].is_null() {
+                        visits[i] == OSR_REQUEST_VISITS
+                            || (visits[i] == OSR_WARM_VISITS
+                                && crate::osr::compile_worker_present())
+                    } else {
+                        false
+                    };
+                    if asks {
                         let (body_tag, _, _) = crate::osr::decode_osr_site(osr_site.site_key);
+                        // Waiting from here until this frame leaves `run`.
+                        if !waits {
+                            waits = true;
+                            self.waiting_marks.push(bead);
+                            crate::osr::frame_waits(bead);
+                        }
                         crate::osr::osr_request_promotion_interpreted(bead, body_tag);
                         slots[i] = crate::osr::helper_slot_addr(bead, osr_site.site_key)
                             as *const std::sync::atomic::AtomicU64;
+                    } else if slots[i].is_null() {
+                        continue;
                     }
                     // SAFETY: the slot lives for the process.
                     let helper = unsafe { &*slots[i] }.load(std::sync::atomic::Ordering::Acquire);
