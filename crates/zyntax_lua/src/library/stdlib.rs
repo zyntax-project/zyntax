@@ -267,6 +267,27 @@ pub const BUILTINS: &[Builtin] = &[
         params: &[Str, Str, OptInt(1), Any],
         ret: Ret::Multi,
     },
+    Builtin {
+        lib: "string",
+        name: "match",
+        func: "zl_string_match",
+        params: &[Str, Str, OptInt(1)],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "string",
+        name: "gmatch",
+        func: "zl_string_gmatch",
+        params: &[Str, Str, OptInt(1)],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "string",
+        name: "gsub",
+        func: "zl_string_gsub",
+        params: &[Str, Str, Value, OptInt(i64::MAX)],
+        ret: Ret::Multi,
+    },
     // ─── math ───
     Builtin {
         lib: "math",
@@ -1166,6 +1187,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             i64(),
             "$Lua$find_plain",
         ),
+        ("zl_bytes", vec![("hex", string())], string(), "$Lua$bytes"),
         (
             "zl_string_upper",
             vec![("s", string())],
@@ -1293,81 +1315,6 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ret(acc.e()),
         ],
     ));
-    // `string.find(s, pattern, init, plain)`: plain text only; the
-    // start and end, or nil.
-    let pat = kept("pat", string());
-    let plain = kept("plain", any());
-    d.push(define(
-        "zl_string_find",
-        &[&s, &pat, &i, &plain],
-        any(),
-        vec![
-            when(
-                and(
-                    not(call("zl_truthy", vec![plain.e()], boolean())),
-                    call("zl_has_pattern_chars", vec![pat.e()], boolean()),
-                ),
-                vec![lua_error(text(
-                    "string.find with a pattern is not supported yet",
-                ))],
-            ),
-            k.decl(call("zl_find_plain", vec![s.e(), pat.e(), i.e()], i64())),
-            when(eq(k.e(), int(0)), vec![ret(nil())]),
-            ret(call(
-                "zb_box_tuple",
-                vec![list(
-                    vec![
-                        box_i64(k.e()),
-                        box_i64(sub(
-                            add(k.e(), call("zb_str_len", vec![pat.e()], i64())),
-                            int(1),
-                        )),
-                    ],
-                    anys.clone(),
-                )],
-                any(),
-            )),
-        ],
-    ));
-    // Whether a pattern uses anything beyond plain text.
-    d.push(define(
-        "zl_has_pattern_chars",
-        &[&pat],
-        boolean(),
-        vec![
-            n.decl(call("zb_str_len", vec![pat.e()], i64())),
-            i.decl(int(1)),
-            while_(
-                le(i.e(), n.e()),
-                vec![
-                    k.decl(call("zl_byte_at", vec![pat.e(), i.e()], i64())),
-                    // ^ $ * + ? . ( ) [ ] % -
-                    when(
-                        or(
-                            or(
-                                or(eq(k.e(), int(94)), eq(k.e(), int(36))),
-                                or(eq(k.e(), int(42)), eq(k.e(), int(43))),
-                            ),
-                            or(
-                                or(
-                                    or(eq(k.e(), int(63)), eq(k.e(), int(46))),
-                                    or(eq(k.e(), int(40)), eq(k.e(), int(41))),
-                                ),
-                                or(
-                                    or(eq(k.e(), int(91)), eq(k.e(), int(93))),
-                                    or(eq(k.e(), int(37)), eq(k.e(), int(45))),
-                                ),
-                            ),
-                        ),
-                        vec![ret(bool(true))],
-                    ),
-                    i.add_assign(int(1)),
-                ],
-            ),
-            ret(bool(false)),
-        ],
-    ));
-
     // ─── math ───────────────────────────────────────────────────
     let number_arg = |x: &Local, what: &str| {
         vec![

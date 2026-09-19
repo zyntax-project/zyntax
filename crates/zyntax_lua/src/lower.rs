@@ -526,8 +526,8 @@ fn typed_function(
     }
 }
 
-/// The text of a string literal token, escapes decoded.
-fn string_text(token: &TokenReference) -> std::result::Result<String, String> {
+/// The bytes of a string literal token, escapes decoded.
+fn string_bytes(token: &TokenReference) -> std::result::Result<Vec<u8>, String> {
     use full_moon::tokenizer::{StringLiteralQuoteType, TokenType};
     let TokenType::StringLiteral {
         literal,
@@ -535,7 +535,7 @@ fn string_text(token: &TokenReference) -> std::result::Result<String, String> {
         ..
     } = token.token().token_type()
     else {
-        return Ok(token.token().to_string());
+        return Ok(token.token().to_string().into_bytes());
     };
     match quote_type {
         StringLiteralQuoteType::Brackets => {
@@ -546,15 +546,33 @@ fn string_text(token: &TokenReference) -> std::result::Result<String, String> {
                 .or_else(|| s.strip_prefix('\n'))
                 .or_else(|| s.strip_prefix('\r'))
                 .unwrap_or(s);
-            Ok(s.to_string())
+            Ok(s.as_bytes().to_vec())
         }
         _ => decode_escapes(literal.as_str()),
     }
 }
 
+/// A string literal as a node: text when it is UTF-8, otherwise built
+/// at run time from its bytes spelled in hex, since a literal in the
+/// typed AST is text.
+fn string_literal(bytes: Vec<u8>, span: Span) -> Node {
+    match String::from_utf8(bytes) {
+        Ok(text) => str_lit(&text, span),
+        Err(e) => {
+            let hex: String = e.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            call(
+                "zl_bytes",
+                vec![str_lit(&hex, span)],
+                prim(PrimitiveType::String),
+                span,
+            )
+        }
+    }
+}
+
 /// Lua's escapes: `\n` and the others, `\ddd`, `\xXX`, `\u{XXX}`, `\z`,
 /// and a backslash before a line break.
-fn decode_escapes(s: &str) -> std::result::Result<String, String> {
+fn decode_escapes(s: &str) -> std::result::Result<Vec<u8>, String> {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -632,10 +650,7 @@ fn decode_escapes(s: &str) -> std::result::Result<String, String> {
             other => return Err(format!("invalid escape sequence '\\{}'", other as char)),
         }
     }
-    // Strings are bytes in Lua; a sequence that is not UTF-8 is kept
-    // byte for byte where it can be.
-    Ok(String::from_utf8(out)
-        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+    Ok(out)
 }
 
 impl<'m, 'a> Lowerer<'m, 'a> {
@@ -1281,12 +1296,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 })
             }
             Expression::String(t) => {
-                let text = string_text(t).map_err(|message| Error::Syntax {
+                let bytes = string_bytes(t).map_err(|message| Error::Syntax {
                     message,
                     span: (span.start, span.end),
                 })?;
                 Ok(Val {
-                    node: str_lit(&text, span),
+                    node: string_literal(bytes, span),
                     ty: Ty::Str,
                 })
             }
@@ -2176,12 +2191,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     fn literal_arg(&mut self, args: &ast::FunctionArgs, span: Span) -> Result<Option<Val>> {
         Ok(match args {
             ast::FunctionArgs::String(t) => {
-                let text = string_text(t).map_err(|message| Error::Syntax {
+                let bytes = string_bytes(t).map_err(|message| Error::Syntax {
                     message,
                     span: (span.start, span.end),
                 })?;
                 Some(Val {
-                    node: str_lit(&text, span),
+                    node: string_literal(bytes, span),
                     ty: Ty::Str,
                 })
             }

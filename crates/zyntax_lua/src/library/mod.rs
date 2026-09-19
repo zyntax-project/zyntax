@@ -10,6 +10,7 @@
 
 pub mod calls;
 pub mod coroutines;
+pub mod patterns;
 pub mod stdlib;
 pub mod tables;
 pub mod values;
@@ -637,6 +638,7 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     lib.declarations.extend(values::declarations(policy, &t));
     lib.declarations.extend(calls::declarations(&t));
     lib.declarations.extend(coroutines::declarations(&t));
+    lib.declarations.extend(patterns::declarations(&t));
     lib.declarations.extend(stdlib::declarations(policy, &t));
     lib.fallible = fallible_functions(&lib.declarations);
     (lib, t)

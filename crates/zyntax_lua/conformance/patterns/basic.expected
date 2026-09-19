@@ -1,0 +1,44 @@
+5	7
+8	8
+3	4
+nil
+2	2
+4	3
+nil
+1	9	key	value
+key	value
+123
+3	5
+trim me
+2024	01	15
+nil
+(a(b)c)
+THE
+one|two|three|
+a:1 b:2 c:3 
+[][][][]
+hell0 w0rld	2
+<hello> <world>	2
+hello hello world	1
+-a-b-c-	4
+heLLo	2
+HELLO WORLD	2
+X world	2
+Bob is 42	2
+%%%	3
+1 = x, 2 = y	2
+!anchored	1
+baa	1
+true	xaxbxcx	4
+false	malformed pattern (missing ']')
+false	invalid capture index %2
+false	invalid use of '%' in replacement string
+true	
+104 101 108 108 111 	5
+heLLo	1
+ 3.14|42   |x
+2
+test	lua
+x  	1
+2	2
+e	l

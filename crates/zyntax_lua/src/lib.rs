@@ -21,6 +21,7 @@ use zyntax_typed_ast::{InternedString, PrimitiveType, Type, TypedProgram};
 mod host;
 pub mod library;
 mod lower;
+pub mod pattern;
 mod policy;
 mod scope;
 mod types;

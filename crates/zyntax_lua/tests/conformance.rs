@@ -305,5 +305,6 @@ categories! {
     coroutines,
     stdlib,
     errors,
+    patterns,
     official,
 }
