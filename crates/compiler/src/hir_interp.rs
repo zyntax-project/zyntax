@@ -614,6 +614,14 @@ pub enum Op {
     Free {
         ptr: Reg,
     },
+    /// `memcpy`/`memmove`/`memset` over `len` bytes: `src` is the source
+    /// pointer, or the byte value for a fill.
+    MemOp {
+        kind: MemOpKind,
+        dst_ptr: Reg,
+        src: Reg,
+        len: Reg,
+    },
     /// `dst` = the current entry of function `fn_id`, read from its
     /// call cell, as compiled code takes a function's address.
     FuncAddr {
@@ -822,6 +830,14 @@ pub struct OsrSite {
 
 /// Header visits before an interpreted frame asks for promoted code.
 const OSR_REQUEST_VISITS: u32 = 256;
+
+/// Which memory intrinsic an [`Op::MemOp`] performs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemOpKind {
+    Copy,
+    Move,
+    Set,
+}
 
 /// The shape of a call into native code: what travels in, what comes
 /// back, and whether the callee writes its result through a destination
@@ -1695,6 +1711,29 @@ fn lower_inst(
                     let b = arg_regs.get(1).copied().unwrap_or(0);
                     let c = arg_regs.get(2).copied().unwrap_or(0);
                     cf.code.push(Op::FMulAdd { dst, a, b, c });
+                }
+                HirCallable::Intrinsic(
+                    intrinsic @ (crate::hir::Intrinsic::Memcpy
+                    | crate::hir::Intrinsic::Memmove
+                    | crate::hir::Intrinsic::Memset),
+                ) => {
+                    let regs = &cf.args_pool[args_idx as usize];
+                    if regs.len() != 3 {
+                        return Err(InterpError::UnsupportedInstruction(
+                            "memory intrinsic expects destination, source and length".to_string(),
+                        ));
+                    }
+                    let kind = match intrinsic {
+                        crate::hir::Intrinsic::Memcpy => MemOpKind::Copy,
+                        crate::hir::Intrinsic::Memmove => MemOpKind::Move,
+                        _ => MemOpKind::Set,
+                    };
+                    cf.code.push(Op::MemOp {
+                        kind,
+                        dst_ptr: regs[0],
+                        src: regs[1],
+                        len: regs[2],
+                    });
                 }
                 HirCallable::Intrinsic(_) => {
                     return Err(InterpError::UnsupportedInstruction(
@@ -3617,6 +3656,35 @@ impl HirInterpreter {
                 Op::Free { ptr } => {
                     if let Some(p) = value_to_i64(&regs[*ptr as usize]) {
                         self.memory.free(p as usize as *mut u8);
+                    }
+                    pc += 1;
+                }
+                Op::MemOp {
+                    kind,
+                    dst_ptr,
+                    src,
+                    len,
+                } => {
+                    let dst =
+                        value_to_i64(&regs[*dst_ptr as usize]).unwrap_or(0) as usize as *mut u8;
+                    let src_v = value_to_i64(&regs[*src as usize]).unwrap_or(0);
+                    let n = value_to_i64(&regs[*len as usize]).unwrap_or(0).max(0) as usize;
+                    if n > 0 && !dst.is_null() {
+                        // SAFETY: the program computed these ranges, as
+                        // the compiled tiers trust them.
+                        unsafe {
+                            match kind {
+                                MemOpKind::Copy => core::ptr::copy_nonoverlapping(
+                                    src_v as usize as *const u8,
+                                    dst,
+                                    n,
+                                ),
+                                MemOpKind::Move => {
+                                    core::ptr::copy(src_v as usize as *const u8, dst, n)
+                                }
+                                MemOpKind::Set => core::ptr::write_bytes(dst, src_v as u8, n),
+                            }
+                        }
                     }
                     pc += 1;
                 }
