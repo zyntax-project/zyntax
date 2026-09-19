@@ -3,7 +3,17 @@
 
 use ruff_python_ast as py;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
+
+thread_local! {
+    static BODY_SCOPES: std::cell::RefCell<rustc_hash::FxHashMap<(usize, usize), Scope>> =
+        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+/// Forget the scopes cached for the previous program.
+pub(crate) fn reset_cache() {
+    BODY_SCOPES.with(|c| c.borrow_mut().clear());
+}
 
 /// What one body does with names.
 #[derive(Debug, Default, Clone)]
@@ -81,7 +91,24 @@ impl Scope {
         collector.finish(Vec::new())
     }
 
+    /// Cached by the body's address for the run of one program: the
+    /// scope of a body is a property of its syntax, and inference reads
+    /// it again every round. `reset_cache` clears it between programs,
+    /// whose syntax trees may reuse addresses.
     pub(crate) fn of_body(params: Vec<String>, body: &[py::Stmt]) -> Scope {
+        if params.is_empty() {
+            let key = (body.as_ptr() as usize, body.len());
+            if let Some(scope) = BODY_SCOPES.with(|c| c.borrow().get(&key).cloned()) {
+                return scope;
+            }
+            let scope = Self::of_body_uncached(Vec::new(), body);
+            BODY_SCOPES.with(|c| c.borrow_mut().insert(key, scope.clone()));
+            return scope;
+        }
+        Self::of_body_uncached(params, body)
+    }
+
+    fn of_body_uncached(params: Vec<String>, body: &[py::Stmt]) -> Scope {
         let mut collector = Collector::default();
         for s in body {
             collector.visit_stmt(s);

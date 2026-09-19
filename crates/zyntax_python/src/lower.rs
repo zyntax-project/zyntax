@@ -14,7 +14,9 @@ use crate::types::{self, Elem, Locals, Module, Sig, Ty, Typer};
 use crate::{Error, Result, intern, prim, span_of};
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
-use std::collections::{BTreeSet, HashMap};
+use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
+use std::collections::BTreeSet;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
     ParameterAttribute, TypedAnnotation, TypedBinary, TypedBlock, TypedCall, TypedCast,
@@ -303,7 +305,7 @@ pub(crate) fn method_call(
     )
 }
 
-fn bind_names(vars: &mut std::collections::HashMap<String, Ty>, target: &py::Expr, ty: Ty) {
+fn bind_names(vars: &mut HashMap<String, Ty>, target: &py::Expr, ty: Ty) {
     types::bind_target(vars, target, ty)
 }
 
@@ -657,7 +659,7 @@ pub(crate) fn adapter(module: &Module, name: &str, sig: &Sig) -> TypedFunction {
         Locals::default(),
         &scope,
         Vec::new(),
-        HashMap::new(),
+        HashMap::default(),
     );
     lowerer.guards = false;
     let mut params = vec![parameter("env", Ty::List(Elem::Object), span)];
@@ -756,16 +758,16 @@ pub(crate) struct Lowerer<'m> {
     /// stands: assigned from a constructor, or checked since. Cleared
     /// at every compound statement, so it never crosses a branch or a
     /// loop back edge.
-    nonnull: std::collections::HashSet<InternedString>,
+    nonnull: HashSet<InternedString>,
     /// Variables that hold an instance for the whole function: assigned
     /// a constructor's result before anything reads them, and assigned
     /// nothing else anywhere; see [`Self::always_instances`].
-    always_instance: std::collections::HashSet<InternedString>,
+    always_instance: HashSet<InternedString>,
     /// Fields `v.f` of a known instance `v` known not to be None where
     /// the lowering stands, from a test the control flow has settled.
     /// Cleared with `nonnull`, at any call (which may store to the
     /// field), and at a store to a field of that name.
-    nonnull_fields: std::collections::HashSet<(InternedString, String)>,
+    nonnull_fields: HashSet<(InternedString, String)>,
     /// Whether this is the variant of the function that takes its
     /// instance-typed parameters to be instances; see
     /// [`types::trusted_name`].
@@ -894,11 +896,11 @@ impl<'m> Lowerer<'m> {
             locals,
             bound,
             temps: 0,
-            comp_symbols: HashMap::new(),
+            comp_symbols: HashMap::default(),
             hoisted: Vec::new(),
-            nonnull: std::collections::HashSet::new(),
-            always_instance: std::collections::HashSet::new(),
-            nonnull_fields: std::collections::HashSet::new(),
+            nonnull: HashSet::default(),
+            always_instance: HashSet::default(),
+            nonnull_fields: HashSet::default(),
             trusted: false,
             defaults_after_cells: 0,
             guards: true,
@@ -6451,7 +6453,7 @@ impl<'m> Lowerer<'m> {
         let saved_symbols = self.comp_symbols.clone();
         let mut target_names = BTreeSet::new();
         for g in generators {
-            let mut names = HashMap::new();
+            let mut names = HashMap::default();
             bind_names(&mut names, &g.target, Ty::Object);
             target_names.extend(names.into_keys());
         }
@@ -8833,11 +8835,11 @@ impl<'m> Lowerer<'m> {
     /// first mentioned by a top-level `x = C(...)` and every other
     /// assignment to it, anywhere in the body, is another constructor
     /// call at the top level.
-    fn always_instances(&self, body: &[py::Stmt]) -> std::collections::HashSet<InternedString> {
+    fn always_instances(&self, body: &[py::Stmt]) -> HashSet<InternedString> {
         use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
         struct Names {
-            mentioned: std::collections::HashSet<String>,
-            stored: std::collections::HashSet<String>,
+            mentioned: HashSet<String>,
+            stored: HashSet<String>,
         }
         impl<'a> Visitor<'a> for Names {
             fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
@@ -8899,9 +8901,9 @@ impl<'m> Lowerer<'m> {
                 _ => false,
             }
         };
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut disqualified: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::default();
+        let mut candidates: HashSet<String> = HashSet::default();
+        let mut disqualified: HashSet<String> = HashSet::default();
         for s in body {
             let mut names = Names {
                 mentioned: Default::default(),
@@ -9161,7 +9163,7 @@ impl<'m> Lowerer<'m> {
             locals,
             &Scope::default(),
             Vec::new(),
-            HashMap::new(),
+            HashMap::default(),
         );
         let env = var(intern("env"), Ty::List(Elem::Object), span);
         let held = Val {

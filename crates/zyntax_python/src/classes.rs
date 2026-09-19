@@ -15,7 +15,7 @@ use crate::types::{ClassInfo, Locals, Module, Sig, Ty, method_fn};
 use crate::{Error, Result, intern};
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use zyntax_typed_ast::TypeId;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{FieldDef, TypeDefinition, TypeKind, TypeMetadata};
@@ -107,7 +107,7 @@ pub(crate) fn collect<'a>(
 /// and the class tag as the only field.
 pub(crate) fn skeletons(defs: &[ClassDef<'_>]) -> Result<(Vec<ClassInfo>, HashMap<String, usize>)> {
     // A base is declared before what derives from it.
-    let mut declared: HashMap<&str, usize> = HashMap::new();
+    let mut declared: HashMap<&str, usize> = HashMap::default();
     let mut base_of: Vec<Option<usize>> = Vec::with_capacity(defs.len());
     for (i, def) in defs.iter().enumerate() {
         let base = match &def.base {
@@ -165,7 +165,7 @@ pub(crate) fn skeletons(defs: &[ClassDef<'_>]) -> Result<(Vec<ClassInfo>, HashMa
         position[i] = k;
     }
     let mut classes = Vec::with_capacity(defs.len());
-    let mut index = HashMap::new();
+    let mut index = HashMap::default();
     for &i in &order {
         let def = &defs[i];
         index.insert(def.name.clone(), classes.len());
@@ -379,7 +379,7 @@ fn scratch(module: &Module) -> Lowerer<'_> {
         Locals::default(),
         &Scope::default(),
         Vec::new(),
-        HashMap::new(),
+        HashMap::default(),
     );
     lowerer.guards = false;
     lowerer
@@ -1141,7 +1141,7 @@ fn scratch_with<'m>(module: &'m Module, vars: &[(&str, Ty)]) -> Lowerer<'m> {
         locals,
         &Scope::default(),
         Vec::new(),
-        HashMap::new(),
+        HashMap::default(),
     )
 }
 

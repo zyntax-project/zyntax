@@ -18,7 +18,7 @@
 //! program is consistent and dynamic where it is not.
 
 use ruff_python_ast as py;
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use zyntax_typed_ast::typed_ast::TypedFunction;
 
 /// A static type. `Unknown` is the bottom of the join and never
@@ -597,7 +597,7 @@ pub(crate) struct Module {
     pub(crate) files: HashMap<String, u32>,
     /// Functions every call of which is in view, so an unannotated
     /// parameter can be typed by what is passed; see [`closed_items`].
-    pub(crate) closed: std::collections::HashSet<String>,
+    pub(crate) closed: HashSet<String>,
     /// Whether inference is over: while it runs, a field a class does
     /// not yet declare may still be declared this round, and reads of
     /// it are undecided rather than dynamic.
@@ -625,26 +625,26 @@ pub(crate) struct Module {
     /// class is not known: their parameters stay dynamic, so a call
     /// from out of view passes what it has. The others are typed by
     /// the calls in view, as module functions are.
-    pub(crate) dynamic_methods: std::collections::HashSet<String>,
+    pub(crate) dynamic_methods: HashSet<String>,
     /// Fields a constructor binds to an unkinded list literal, by class
     /// and name, and the kind the program's writes into them decided
     /// last round (`Unknown` while undecided); see [`decide_list`].
-    pub(crate) list_fields: std::collections::HashSet<(usize, String)>,
+    pub(crate) list_fields: HashSet<(usize, String)>,
     pub(crate) field_lists: HashMap<(usize, String), Ty>,
     /// What lowering each function found about its raising, by the
     /// name it lowers to; see [`RaiseFact`].
     pub(crate) raise_facts: std::cell::RefCell<std::collections::BTreeMap<String, RaiseFact>>,
     /// Functions of the program that never leave with an exception
     /// pending, so a call to one needs no check after it.
-    pub(crate) non_raising: std::collections::HashSet<String>,
+    pub(crate) non_raising: HashSet<String>,
     /// Items with a parameter typed as an instance, which are lowered a
     /// second time under [`trusted_name`] with those parameters taken
     /// to be instances; a call whose every such argument is known to be
     /// one goes there.
-    pub(crate) trusted: std::collections::HashSet<String>,
+    pub(crate) trusted: HashSet<String>,
     /// Functions whose result is an instance and never None; see
     /// [`returning_instances`].
-    pub(crate) returns_instance: std::collections::HashSet<String>,
+    pub(crate) returns_instance: HashSet<String>,
     /// Exception classes the lowering raises by name, each getting a
     /// cold `py$raise$Class(message)` that builds the instance and
     /// leaves it pending; see `classes::raisers`.
@@ -675,10 +675,7 @@ pub(crate) fn has_instance_params(sig: &Sig, is_method: bool) -> bool {
 /// hands back a constructor call, `self`, or the result of another such
 /// item, and the body cannot fall off its end. Decided together, as the
 /// greatest set consistent with itself.
-pub(crate) fn returning_instances(
-    module: &Module,
-    items: &[Item<'_>],
-) -> std::collections::HashSet<String> {
+pub(crate) fn returning_instances(module: &Module, items: &[Item<'_>]) -> HashSet<String> {
     fn returns_of<'a>(body: &'a [py::Stmt], out: &mut Vec<Option<&'a py::Expr>>) {
         use ruff_python_ast::visitor::{Visitor, walk_stmt};
         struct Returns<'a, 'b> {
@@ -698,7 +695,7 @@ pub(crate) fn returning_instances(
             Returns { out }.visit_stmt(s);
         }
     }
-    let mut quiet: std::collections::HashSet<String> = items
+    let mut quiet: HashSet<String> = items
         .iter()
         .filter(|item| {
             matches!(
@@ -760,8 +757,8 @@ pub(crate) struct RaiseFact {
 /// raises on its own or calls a function not (or no longer) in the set.
 pub(crate) fn non_raising(
     facts: &std::collections::BTreeMap<String, RaiseFact>,
-) -> std::collections::HashSet<String> {
-    let mut quiet: std::collections::HashSet<String> = facts
+) -> HashSet<String> {
+    let mut quiet: HashSet<String> = facts
         .iter()
         .filter(|(_, f)| !f.own)
         .map(|(n, _)| n.clone())
@@ -1009,7 +1006,7 @@ pub(crate) fn collect_closures(
     file: u32,
     body: &[py::Stmt],
     classes: &HashMap<String, usize>,
-    visible: std::collections::HashSet<String>,
+    visible: HashSet<String>,
 ) {
     use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     struct Finder<'m, 'c> {
@@ -1017,7 +1014,7 @@ pub(crate) fn collect_closures(
         classes: &'c HashMap<String, usize>,
         owner: Vec<String>,
         /// The variables of the enclosing functions, innermost last.
-        visible: Vec<std::collections::HashSet<String>>,
+        visible: Vec<HashSet<String>>,
         file: u32,
     }
     impl Finder<'_, '_> {
@@ -1280,7 +1277,7 @@ fn infer_closure(module: &Module, k: u16, def: &ClosureDef, vars: &HashMap<Strin
             for (j, nested) in closures_directly_in_expr(module, &l.body) {
                 changed |= infer_closure(module, j, &nested, &inner);
             }
-            (ret, HashMap::new())
+            (ret, HashMap::default())
         }
         ClosureDef::Def(f) => {
             let seeds = seeds_for(&crate::scope::Scope::of_function(f));
@@ -1612,7 +1609,7 @@ pub(crate) fn annotated_empty_list(
 /// Signature from the annotations alone; an unannotated return is
 /// `Unknown` until the body says.
 pub(crate) fn declared_sig(f: &py::StmtFunctionDef) -> Sig {
-    declared_sig_in(&HashMap::new(), f, None)
+    declared_sig_in(&HashMap::default(), f, None)
 }
 
 /// [`declared_sig`] with class names resolved, and `self` typed as the
@@ -1701,8 +1698,8 @@ pub(crate) struct Inferred {
     /// The entry body's locals, against the signatures above.
     pub(crate) entry: Locals,
     pub(crate) list_params: HashMap<String, Vec<ListFact>>,
-    pub(crate) dynamic_methods: std::collections::HashSet<String>,
-    pub(crate) list_fields: std::collections::HashSet<(usize, String)>,
+    pub(crate) dynamic_methods: HashSet<String>,
+    pub(crate) list_fields: HashSet<(usize, String)>,
     pub(crate) field_lists: HashMap<(usize, String), Ty>,
 }
 
@@ -1711,21 +1708,18 @@ pub(crate) struct Inferred {
 /// through their class. An unannotated parameter of one is typed by
 /// what is passed to it, everywhere it is passed; any other stays
 /// dynamic, as Python has it.
-pub(crate) fn closed_items(
-    body: &[py::Stmt],
-    items: &[Item<'_>],
-) -> std::collections::HashSet<String> {
+pub(crate) fn closed_items(body: &[py::Stmt], items: &[Item<'_>]) -> HashSet<String> {
     use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     #[derive(Default)]
     struct Mentions {
         /// Names used as anything but a callee: values, assignment
         /// targets, deletions.
-        names: std::collections::HashSet<String>,
+        names: HashSet<String>,
         /// `x.__init__` on anything but `super()`: a constructor
         /// reached without its class.
         init: bool,
         /// Attribute names read as values rather than called.
-        valued_methods: std::collections::HashSet<String>,
+        valued_methods: HashSet<String>,
     }
     impl<'a> Visitor<'a> for Mentions {
         fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
@@ -1780,7 +1774,7 @@ pub(crate) fn closed_items(
     for s in body {
         seen.visit_stmt(s);
     }
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut counts: HashMap<&str, usize> = HashMap::default();
     for item in items {
         *counts.entry(item.name.as_str()).or_default() += 1;
     }
@@ -1830,7 +1824,7 @@ pub(crate) fn infer_module(
         c.reset();
     }
     let mut module = Module {
-        funcs: HashMap::new(),
+        funcs: HashMap::default(),
         globals: known.globals.clone(),
         list_type: known.list_type,
         classes: known.classes.clone(),
@@ -1877,7 +1871,7 @@ pub(crate) fn infer_module(
     // Which parameters of each function are inferred, by position. A
     // method is, like a closed function, unless a call of a method of
     // its name on an unknown receiver was seen last time round.
-    let mut inferring: HashMap<String, Vec<bool>> = HashMap::new();
+    let mut inferring: HashMap<String, Vec<bool>> = HashMap::default();
     for item in items {
         let mut sig = declared_sig_in(&module.class_index, item.def, item.class);
         let closed = known.closed.contains(&item.name)
@@ -1898,8 +1892,8 @@ pub(crate) fn infer_module(
                 .map(|d| match d {
                     Some(d) => Typer {
                         module: &module,
-                        vars: &HashMap::new(),
-                        outer: &HashMap::new(),
+                        vars: &HashMap::default(),
+                        outer: &HashMap::default(),
                     }
                     .expr(d),
                     None => Ty::Unknown,
@@ -1926,101 +1920,204 @@ pub(crate) fn infer_module(
         .iter()
         .map(|(k, f)| field_key(*k, f))
         .collect();
+    let trace_rounds = std::env::var_os("ZYNTAX_TRACE_TYPES_ROUNDS").is_some();
+    let mut inner_rounds = 0;
+    let index_of: HashMap<&str, usize> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| (item.name.as_str(), i))
+        .collect();
     for _ in 0..32 {
+        inner_rounds += 1;
         let mut changed = false;
-        let mut passed: Vec<(Target, usize, Ty)> = Vec::new();
         let mut escaped: Vec<u16> = Vec::new();
-        let mut dynamic_methods = std::collections::HashSet::new();
-        let mut field_rounds: HashMap<String, FieldRound> = HashMap::new();
-        for item in items {
-            let sig = module.funcs[&item.name].clone();
-            let file = module.file_of(item.module.as_deref());
-            let locals = in_file(file, || {
-                let locals = infer_locals_open(&module, &sig, &item.def.body, &[]);
-                changed |= infer_closures_in(&module, &item.def.body, &[], &locals.vars);
-                locals
-            });
-            let facts = in_file(file, || {
-                list_param_facts(&module, &item.def.body, &locals.vars, &sig.params)
-            });
-            if !field_keys.is_empty() {
+        let mut dynamic_methods = HashSet::default();
+        // Field writes per item, so an item inferred again this round
+        // replaces its earlier reading rather than adding to it.
+        let mut item_field_rounds: Vec<HashMap<String, FieldRound>> =
+            vec![HashMap::default(); items.len()];
+        let mut entry_field_rounds: HashMap<String, FieldRound> = HashMap::default();
+        // Every item once, the module body, then whichever items a call
+        // typed a parameter of since they were inferred, until none is
+        // left: a parameter type that reaches its callee mid-round saves
+        // the round the callee would otherwise wait for.
+        let mut queue: std::collections::VecDeque<usize> = (0..items.len()).collect();
+        let mut queued: Vec<bool> = vec![true; items.len()];
+        let mut entry_done = false;
+        loop {
+            let mut passed: Vec<(Target, usize, Ty)> = Vec::new();
+            if let Some(i) = queue.pop_front() {
+                queued[i] = false;
+                let item = &items[i];
+                let sig = module.funcs[&item.name].clone();
+                let file = module.file_of(item.module.as_deref());
+                let locals = in_file(file, || {
+                    let locals = infer_locals_open(&module, &sig, &item.def.body, &[]);
+                    changed |= infer_closures_in(&module, &item.def.body, &[], &locals.vars);
+                    locals
+                });
+                let facts = in_file(file, || {
+                    list_param_facts(&module, &item.def.body, &locals.vars, &sig.params)
+                });
+                if !field_keys.is_empty() {
+                    let rounds = &mut item_field_rounds[i];
+                    rounds.clear();
+                    in_file(file, || {
+                        field_sites_into(&module, &item.def.body, &locals.vars, &field_keys, rounds)
+                    });
+                }
+                if module.list_params.get(&item.name) != Some(&facts) {
+                    module.list_params.insert(item.name.clone(), facts);
+                    changed = true;
+                    if trace_rounds {
+                        eprintln!("[types] inner {inner_rounds}: list params of {}", item.name);
+                    }
+                }
+                if item.def.returns.is_none() && sig.ret != Ty::Gen {
+                    let ret = if locals.returns { locals.ret } else { Ty::None };
+                    if ret != sig.ret {
+                        if trace_rounds {
+                            eprintln!(
+                                "[types] inner {inner_rounds}: {} returns {ret:?} (was {:?})",
+                                item.name, sig.ret
+                            );
+                        }
+                        module.funcs.get_mut(&item.name).unwrap().ret = ret;
+                        changed = true;
+                    }
+                }
+                // What a method assigns to `self.x` types the field on its
+                // class, and on every class deriving from it.
+                if let Some(k) = item.class {
+                    for (field, ty) in &locals.field_writes {
+                        if trace_rounds && *ty == Ty::Object {
+                            eprintln!("[types] inner: {} writes self.{field} as Object", item.name);
+                        }
+                        changed |= widen_field(&mut module.classes, k, field, *ty);
+                    }
+                }
+                for (k, field, ty) in &locals.other_field_writes {
+                    if trace_rounds {
+                        eprintln!(
+                            "[types] inner: {} writes {}.{field} as {ty:?}",
+                            item.name, module.classes[*k].name
+                        );
+                    }
+                    changed |= widen_field(&mut module.classes, *k, field, *ty);
+                }
+                if let Some(flags) = inferring.get(&item.name) {
+                    for (i, (name, _)) in sig.params.iter().enumerate() {
+                        if let (true, Some(ty)) = (flags[i], locals.param_writes.get(name)) {
+                            passed.push((Target::Item(item.name.clone()), i, *ty));
+                        }
+                    }
+                }
                 in_file(file, || {
+                    Calls {
+                        module: &module,
+                        vars: &locals.vars,
+                        class: item.class,
+                        opaque: false,
+                        passed: &mut passed,
+                        allow_closure: false,
+                        escaped: &mut escaped,
+                        dynamic_methods: &mut dynamic_methods,
+                        settled: false,
+                        files: &[],
+                        no_outer: HashMap::default(),
+                    }
+                    .stmts(&item.def.body)
+                });
+            } else if !entry_done {
+                entry_done = true;
+                entry_locals = infer_locals_open(&module, &entry_sig, entry, entry_files);
+                for (k, field, ty) in &entry_locals.other_field_writes {
+                    changed |= widen_field(&mut module.classes, *k, field, *ty);
+                }
+                if !field_keys.is_empty() {
                     field_sites_into(
                         &module,
-                        &item.def.body,
-                        &locals.vars,
+                        entry,
+                        &entry_locals.vars,
                         &field_keys,
-                        &mut field_rounds,
-                    )
-                });
-            }
-            if module.list_params.get(&item.name) != Some(&facts) {
-                module.list_params.insert(item.name.clone(), facts);
-                changed = true;
-            }
-            if item.def.returns.is_none() && sig.ret != Ty::Gen {
-                let ret = if locals.returns { locals.ret } else { Ty::None };
-                if ret != sig.ret {
-                    module.funcs.get_mut(&item.name).unwrap().ret = ret;
-                    changed = true;
-                }
-            }
-            // What a method assigns to `self.x` types the field on its
-            // class, and on every class deriving from it.
-            if let Some(k) = item.class {
-                for (field, ty) in &locals.field_writes {
-                    if std::env::var_os("ZYNTAX_TRACE_TYPES_ROUNDS").is_some() && *ty == Ty::Object
-                    {
-                        eprintln!("[types] inner: {} writes self.{field} as Object", item.name);
-                    }
-                    changed |= widen_field(&mut module.classes, k, field, *ty);
-                }
-            }
-            for (k, field, ty) in &locals.other_field_writes {
-                if std::env::var_os("ZYNTAX_TRACE_TYPES_ROUNDS").is_some() {
-                    eprintln!(
-                        "[types] inner: {} writes {}.{field} as {ty:?}",
-                        item.name, module.classes[*k].name
+                        &mut entry_field_rounds,
                     );
                 }
-                changed |= widen_field(&mut module.classes, *k, field, *ty);
-            }
-            if let Some(flags) = inferring.get(&item.name) {
-                for (i, (name, _)) in sig.params.iter().enumerate() {
-                    if let (true, Some(ty)) = (flags[i], locals.param_writes.get(name)) {
-                        passed.push((Target::Item(item.name.clone()), i, *ty));
-                    }
-                }
-            }
-            in_file(file, || {
+                changed |= infer_closures_in(&module, entry, entry_files, &entry_locals.vars);
                 Calls {
                     module: &module,
-                    vars: &locals.vars,
-                    class: item.class,
+                    vars: &entry_locals.vars,
+                    class: None,
                     opaque: false,
                     passed: &mut passed,
                     allow_closure: false,
                     escaped: &mut escaped,
                     dynamic_methods: &mut dynamic_methods,
                     settled: false,
-                    files: &[],
-                    no_outer: HashMap::new(),
+                    files: entry_files,
+                    no_outer: HashMap::default(),
                 }
-                .stmts(&item.def.body)
-            });
-        }
-        entry_locals = infer_locals_open(&module, &entry_sig, entry, entry_files);
-        for (k, field, ty) in &entry_locals.other_field_writes {
-            changed |= widen_field(&mut module.classes, *k, field, *ty);
+                .stmts(entry);
+            } else {
+                break;
+            }
+            for (callee, index, ty) in passed {
+                let slot = match &callee {
+                    Target::Item(name) => {
+                        let Some(flags) = inferring.get(name) else {
+                            continue;
+                        };
+                        if !flags[index] {
+                            continue;
+                        }
+                        let current = module.funcs[name].params[index].1;
+                        let joined = module.join_classes(current, ty);
+                        if joined != current {
+                            if trace_rounds {
+                                eprintln!(
+                                    "[types] inner {inner_rounds}: {name} param {index} {joined:?} (was {current:?})"
+                                );
+                            }
+                            module.funcs.get_mut(name).unwrap().params[index].1 = joined;
+                            changed = true;
+                            if let Some(&j) = index_of.get(name.as_str())
+                                && !queued[j]
+                            {
+                                queued[j] = true;
+                                queue.push_back(j);
+                            }
+                        }
+                        continue;
+                    }
+                    Target::Closure(k) => *k,
+                };
+                let mut closures = module.closures.borrow_mut();
+                let c = &mut closures[slot as usize];
+                if !c.inferred[index] {
+                    continue;
+                }
+                // A parameter only ever passed None is dynamic: the IR has no
+                // value of that type to pass.
+                let joined = match c.sig.params[index].1.join(ty) {
+                    Ty::None => Ty::Object,
+                    t => t,
+                };
+                if joined != c.sig.params[index].1 {
+                    c.sig.params[index].1 = joined;
+                    changed = true;
+                }
+            }
         }
         if !field_keys.is_empty() {
-            field_sites_into(
-                &module,
-                entry,
-                &entry_locals.vars,
-                &field_keys,
-                &mut field_rounds,
-            );
+            let mut field_rounds: HashMap<String, FieldRound> = entry_field_rounds;
+            for rounds in item_field_rounds {
+                for (key, round) in rounds {
+                    let into = field_rounds.entry(key).or_default();
+                    into.kept |= round.kept;
+                    into.none |= round.none;
+                    into.written.extend(round.written);
+                }
+            }
             for (k, f) in module.list_fields.clone() {
                 let decided = field_rounds
                     .get(&field_key(k, &f))
@@ -2030,56 +2127,6 @@ pub(crate) fn infer_module(
                     module.field_lists.insert((k, f), decided);
                     changed = true;
                 }
-            }
-        }
-        changed |= infer_closures_in(&module, entry, entry_files, &entry_locals.vars);
-        Calls {
-            module: &module,
-            vars: &entry_locals.vars,
-            class: None,
-            opaque: false,
-            passed: &mut passed,
-            allow_closure: false,
-            escaped: &mut escaped,
-            dynamic_methods: &mut dynamic_methods,
-            settled: false,
-            files: entry_files,
-            no_outer: HashMap::new(),
-        }
-        .stmts(entry);
-        for (callee, index, ty) in passed {
-            let slot = match &callee {
-                Target::Item(name) => {
-                    let Some(flags) = inferring.get(name) else {
-                        continue;
-                    };
-                    if !flags[index] {
-                        continue;
-                    }
-                    let current = module.funcs[name].params[index].1;
-                    let joined = module.join_classes(current, ty);
-                    if joined != current {
-                        module.funcs.get_mut(name).unwrap().params[index].1 = joined;
-                        changed = true;
-                    }
-                    continue;
-                }
-                Target::Closure(k) => *k,
-            };
-            let mut closures = module.closures.borrow_mut();
-            let c = &mut closures[slot as usize];
-            if !c.inferred[index] {
-                continue;
-            }
-            // A parameter only ever passed None is dynamic: the IR has no
-            // value of that type to pass.
-            let joined = match c.sig.params[index].1.join(ty) {
-                Ty::None => Ty::Object,
-                t => t,
-            };
-            if joined != c.sig.params[index].1 {
-                c.sig.params[index].1 = joined;
-                changed = true;
             }
         }
         // An escaped closure may be called from code out of view, so
@@ -2115,9 +2162,15 @@ pub(crate) fn infer_module(
             break;
         }
     }
+    if trace_rounds {
+        eprintln!(
+            "[types] infer_module: {inner_rounds} inner rounds over {} items",
+            items.len()
+        );
+    }
     // The methods called on receivers that never got a type, now that
     // nothing more will be reached.
-    let mut dynamic_methods = std::collections::HashSet::new();
+    let mut dynamic_methods = HashSet::default();
     {
         let mut passed: Vec<(Target, usize, Ty)> = Vec::new();
         let mut escaped: Vec<u16> = Vec::new();
@@ -2139,7 +2192,7 @@ pub(crate) fn infer_module(
                     dynamic_methods: &mut dynamic_methods,
                     settled: true,
                     files: &[],
-                    no_outer: HashMap::new(),
+                    no_outer: HashMap::default(),
                 }
                 .stmts(&item.def.body)
             });
@@ -2155,7 +2208,7 @@ pub(crate) fn infer_module(
             dynamic_methods: &mut dynamic_methods,
             settled: true,
             files: entry_files,
-            no_outer: HashMap::new(),
+            no_outer: HashMap::default(),
         }
         .stmts(entry);
     }
@@ -2220,7 +2273,7 @@ struct Calls<'a> {
     /// Closures a value of which reached anywhere else.
     escaped: &'a mut Vec<u16>,
     /// Methods called on a receiver whose class is not known.
-    dynamic_methods: &'a mut std::collections::HashSet<String>,
+    dynamic_methods: &'a mut HashSet<String>,
     /// Whether a receiver still untyped counts as unknown: only once the
     /// rounds are over, since a type not yet reached is not a dynamic
     /// value, and treating it as one would keep it from being reached.
@@ -2405,8 +2458,8 @@ impl Calls<'_> {
                     (Some(t), _) => t,
                     (None, Some(d)) => Typer {
                         module: self.module,
-                        vars: &HashMap::new(),
-                        outer: &HashMap::new(),
+                        vars: &HashMap::default(),
+                        outer: &HashMap::default(),
                     }
                     .expr(d),
                     // Missing with no default: the call fails before the
@@ -2640,7 +2693,7 @@ fn widen_field(classes: &mut [ClassInfo], k: usize, name: &str, ty: Ty) -> bool 
 /// the join of what is assigned to it, iterated until stable. A name
 /// nothing decides is dynamic.
 pub(crate) fn infer_locals(module: &Module, sig: &Sig, body: &[py::Stmt]) -> Locals {
-    infer_locals_seeded(module, sig, body, &HashMap::new())
+    infer_locals_seeded(module, sig, body, &HashMap::default())
 }
 
 /// [`infer_locals`] for the entry body, whose statements come from
@@ -2651,14 +2704,14 @@ pub(crate) fn infer_locals_entry(
     body: &[py::Stmt],
     files: &[u32],
 ) -> Locals {
-    infer_locals_with(module, sig, body, &HashMap::new(), files, true)
+    infer_locals_with(module, sig, body, &HashMap::default(), files, true)
 }
 
 /// [`infer_locals`] leaving what is undecided undecided, for the
 /// module-wide fixed point: a value another function has yet to type
 /// must not settle as dynamic here and poison every join it reaches.
 fn infer_locals_open(module: &Module, sig: &Sig, body: &[py::Stmt], files: &[u32]) -> Locals {
-    infer_locals_with(module, sig, body, &HashMap::new(), files, false)
+    infer_locals_with(module, sig, body, &HashMap::default(), files, false)
 }
 
 /// Whatever inference left undecided is dynamic.
@@ -3168,7 +3221,7 @@ pub(crate) fn list_sites<'ast>(
     }
 
     let allowed = std::cell::Cell::new(false);
-    let no_outer = HashMap::new();
+    let no_outer = HashMap::default();
     let mut uses = Uses {
         module,
         typer: Typer {
@@ -3252,7 +3305,7 @@ pub(crate) fn asserted_classes(
     let mut found = Vec::new();
     pairs(body, classes, &mut found);
     if found.is_empty() {
-        return HashMap::new();
+        return HashMap::default();
     }
     // Only a name stored once, by that assignment.
     #[derive(Default)]
@@ -3444,7 +3497,7 @@ fn decide_list(module: &Module, sites: &ListSites<'_>, typer: &Typer<'_>) -> Ty 
 
 /// What the program's bodies do with a field bound to an unkinded
 /// list, gathered over one round of inference.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 struct FieldRound {
     kept: bool,
     none: bool,
@@ -3482,7 +3535,7 @@ fn field_sites_into(
     rounds: &mut HashMap<String, FieldRound>,
 ) {
     let sites = list_sites(module, body, vars, keys.to_vec(), false);
-    let no_outer = HashMap::new();
+    let no_outer = HashMap::default();
     let typer = Typer {
         module,
         vars,
@@ -3530,7 +3583,7 @@ fn list_param_facts(
         .map(|(name, _)| name.clone())
         .collect();
     let sites = list_sites(module, body, vars, followed, false);
-    let no_outer = HashMap::new();
+    let no_outer = HashMap::default();
     let typer = Typer {
         module,
         vars,

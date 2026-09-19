@@ -10,8 +10,8 @@ use crate::{Error, Result};
 use ruff_python_ast as py;
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr, walk_stmt};
 use ruff_text_size::Ranged;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 
 /// Finds a module's source by its dotted name, when it exists.
 pub type Resolver<'a> = dyn Fn(&str) -> Option<String> + 'a;
@@ -44,7 +44,7 @@ pub(crate) struct Linked {
 pub(crate) fn link(main: Vec<py::Stmt>, resolve: &Resolver<'_>) -> Result<Linked> {
     let mut linker = Linker {
         resolve,
-        done: HashSet::new(),
+        done: HashSet::default(),
         in_progress: Vec::new(),
         out: Vec::new(),
         sources: Vec::new(),
@@ -435,9 +435,9 @@ fn comprehension_targets(expr: &py::Expr) -> HashSet<String> {
         py::Expr::SetComp(c) => &c.generators,
         py::Expr::DictComp(c) => &c.generators,
         py::Expr::Generator(g) => &g.generators,
-        _ => return HashSet::new(),
+        _ => return HashSet::default(),
     };
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for g in generators {
         collect_target_names(&g.target, &mut out);
     }

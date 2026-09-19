@@ -62,6 +62,27 @@ fn main() -> ExitCode {
         phase = std::time::Instant::now();
     };
     let file = path.display().to_string();
+    // `ZYPY_PROFILE_STARTUP=N` parses and compiles the program N more
+    // times before the run, so a sampling profiler sees the start-up
+    // path rather than the program; a measurement switch only.
+    if let Some(n) = std::env::var("ZYPY_PROFILE_STARTUP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        for _ in 0..n {
+            let Ok(program) = zyntax_python::parse_program_with(&source, &file, &resolve) else {
+                break;
+            };
+            let Ok(mut rt) = TieredRuntime::new(TieredConfig::default()) else {
+                break;
+            };
+            if zyntax_python::register_runtime(&mut rt).is_err()
+                || rt.compile_typed_program(program).is_err()
+            {
+                break;
+            }
+        }
+    }
     let program = match zyntax_python::parse_program_with(&source, &file, &resolve) {
         Ok(p) => p,
         Err(e) => {
@@ -104,6 +125,9 @@ fn main() -> ExitCode {
     lap("compile");
     let outcome = rt.call_raw(zyntax_python::ENTRY, &[]);
     lap("run");
+    // The runtime waits for a compile still in flight; count that too.
+    drop(rt);
+    lap("shutdown");
     match outcome {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
