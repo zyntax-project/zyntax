@@ -5875,13 +5875,19 @@ impl<'m> Lowerer<'m> {
             return Ok(Val { node, ty });
         }
         match seq.ty {
-            // A literal index into a shape is that field.
+            // A literal index into a shape is that field, read as the
+            // shape stores it.
             Ty::Tuple(k)
                 if let Some(i) = types::constant_index(&sub.slice, types::tuple_shape(k).len()) =>
             {
                 let field = types::tuple_shape(k)[i].settled();
+                let stored = tuple_field_storage(field);
+                let read = Val {
+                    node: slot(seq.node, i, stored, span),
+                    ty: stored,
+                };
                 Ok(Val {
-                    node: slot(seq.node, i, field, span),
+                    node: self.trusted(read, field),
                     ty: field,
                 })
             }
