@@ -628,20 +628,23 @@ fn classify_recursive(callee: &HirFunction, self_id: HirId) -> CalleeClass {
     CalleeClass::OkMultiBlock
 }
 
-/// Whether `inst` calls something that stays a call once compiled: a
-/// box reader, by symbol or through the extern declared for it, becomes
-/// loads in the boxes pass and is leaf work here.
+/// Whether `inst` calls something that stays a call once compiled and
+/// runs: a box reader, by symbol or through the extern declared for it,
+/// becomes loads in the boxes pass and is leaf work here; a cold callee
+/// is an error path, which is what an accessor's bounds check ends in,
+/// and does not make the accessor a call-bearing callee.
 fn is_real_call(inst: &HirInstruction, callees: &Callees<'_>) -> bool {
     match inst {
         HirInstruction::Call {
             callee: HirCallable::Function(fid),
             ..
         } => !callees.get(fid).is_some_and(|f| {
-            f.is_external
-                && f.link_name
-                    .clone()
-                    .or_else(|| f.name.resolve_global())
-                    .is_some_and(|n| crate::boxes::is_reader(&n))
+            f.attributes.cold
+                || f.is_external
+                    && f.link_name
+                        .clone()
+                        .or_else(|| f.name.resolve_global())
+                        .is_some_and(|n| crate::boxes::is_reader(&n))
         }),
         HirInstruction::Call {
             callee: HirCallable::FuncRef(_),
