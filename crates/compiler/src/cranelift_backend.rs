@@ -292,6 +292,10 @@ pub struct CraneliftBackend {
     block_map: HashMap<HirId, Block>,
     /// Compiled function metadata
     compiled_functions: HashMap<HirId, CompiledFunction>,
+    /// Functions compiled since the last finalization: the ones whose
+    /// call cells that finalization publishes. A cell another tier has
+    /// since taken over keeps that tier's code.
+    unpublished: Vec<HirId>,
     /// Hot-reload state
     hot_reload: HotReloadState,
     /// Exported symbols from compiled functions (name → pointer)
@@ -586,6 +590,7 @@ impl CraneliftBackend {
             value_map: HashMap::new(),
             block_map: HashMap::new(),
             compiled_functions: HashMap::new(),
+            unpublished: Vec::new(),
             hot_reload: HotReloadState {
                 versions: Arc::new(RwLock::new(HashMap::new())),
                 previous_versions: Arc::new(RwLock::new(HashMap::new())),
@@ -6802,6 +6807,7 @@ impl CraneliftBackend {
                 signature: sig,
             };
             self.compiled_functions.insert(id, compiled_func);
+            self.unpublished.push(id);
         }
 
         // Resolve the tagged probe sites to code offsets. `MachSrcLoc.start`
@@ -9458,7 +9464,11 @@ impl CraneliftBackend {
         })?;
         self.register_root_globals();
 
-        // Update function pointers after finalization
+        // Update function pointers after finalization. Only what this
+        // finalization compiled goes into a call cell: republishing every
+        // function would hand a cell a higher tier had taken over back
+        // to this tier's code.
+        let fresh: std::collections::HashSet<HirId> = self.unpublished.drain(..).collect();
         for (hir_id, compiled_func) in &self.compiled_functions {
             let code_ptr = self
                 .module
@@ -9471,6 +9481,9 @@ impl CraneliftBackend {
                 .write()
                 .unwrap()
                 .insert(*hir_id, code_ptr);
+            if !fresh.contains(hir_id) {
+                continue;
+            }
             if self.defer_cell_publish {
                 self.deferred_cells.push((*hir_id, code_ptr as usize));
             } else {
@@ -10063,6 +10076,7 @@ impl CraneliftBackend {
         self.global_map.clear();
         self.root_globals.clear();
         self.compiled_functions.clear();
+        self.unpublished.clear();
         // Note: hot_reload.function_pointers still has the old pointers
         // They remain valid but won't be part of the new module
 
