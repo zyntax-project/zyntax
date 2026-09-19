@@ -80,6 +80,15 @@ pub fn encode_osr_site(body_tag: u16, loop_ordinal: u64, live_in_count: u16) -> 
     ((body_tag as u64) << 48) | ((loop_ordinal & 0xFFFF_FFFF) << 16) | (live_in_count as u64)
 }
 
+/// A site key without its body tag: the loop's ordinal and live-in
+/// count, which an edited body shares with the one running. A reload
+/// matches the two bodies' sites on this and publishes the edited
+/// body's helper under the running code's key, whose probes carry it.
+#[inline]
+pub fn site_loop(site: u64) -> u64 {
+    site & 0x0000_FFFF_FFFF_FFFF
+}
+
 /// Unpack a site key. Returns `(body_tag, loop_ordinal, live_in_count)`.
 #[inline]
 pub fn decode_osr_site(site: u64) -> (u16, u64, u16) {

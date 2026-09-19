@@ -1344,17 +1344,20 @@ impl TieredBackend {
 
             // A resume point is only sound where the old code's probe
             // writes the frame the edited body's helper reads: same
-            // site, same live-ins. Anything else completes on the old
-            // code and picks up the edit next call.
+            // loop, same live-ins. Anything else completes on the old
+            // code and picks up the edit next call. The two bodies' site
+            // keys differ in their tags; the helper is published under
+            // the running code's, which its probes carry.
             let mut helper_sites: Vec<(u64, u64)> = Vec::new();
             if !pending_resume.is_empty() {
                 let old_sites = site_layouts(old_fn);
                 let new_sites = site_layouts(&body);
                 for (site, code) in pending_resume {
-                    match (old_sites.get(&site), new_sites.get(&site)) {
-                        (Some(old_l), Some(new_l)) if old_l == new_l => {
-                            osr::publish_helper(bead_id, site, code);
-                            helper_sites.push((bead_id, site));
+                    let loop_key = osr::site_loop(site);
+                    match (old_sites.get(&loop_key), new_sites.get(&loop_key)) {
+                        (Some((old_site, old_l)), Some((_, new_l))) if old_l == new_l => {
+                            osr::publish_helper(bead_id, *old_site, code);
+                            helper_sites.push((bead_id, *old_site));
                         }
                         (Some(_), Some(_)) => report.resume_fell_back.push((
                             name.clone(),
@@ -3491,15 +3494,19 @@ impl TieredStatistics {
 /// `(phi_count, live-in types)`. Two functions agree at a site exactly
 /// when the frame one's probe writes is the frame the other's helper
 /// reads.
+/// Each resumable loop of `func` by its tag-less site (`osr::site_loop`):
+/// the full site key and the layout a helper for it must share.
+#[allow(clippy::type_complexity)]
 fn site_layouts(
     func: &HirFunction,
-) -> std::collections::HashMap<u64, (usize, Vec<crate::hir::HirType>)> {
+) -> std::collections::HashMap<u64, (u64, (usize, Vec<crate::hir::HirType>))> {
     let mut map = std::collections::HashMap::new();
     for header in osr::find_loop_headers(func) {
         if let Ok(layout) = osr::osr_layout(func, header) {
+            let site = layout.site_key();
             map.insert(
-                layout.site_key(),
-                (layout.phi_count, layout.live_in_types.clone()),
+                osr::site_loop(site),
+                (site, (layout.phi_count, layout.live_in_types.clone())),
             );
         }
     }
