@@ -1784,15 +1784,13 @@ impl CraneliftBackend {
         };
 
         // Whether this body writes its result through a destination its
-        // caller passed. An OSR helper takes only the frame pointer and
-        // is never on that convention, which is also why a function that
-        // is gets no probes (see `osr_layouts` below). Read from what was
-        // recorded at declaration rather than derived again, so the body
-        // cannot disagree with the signature callers were emitted against.
-        let destination_return = if osr_helper.is_some() {
-            None
-        } else {
-            self.destination_returns.get(&id).copied()
+        // caller passed. Read from what was recorded at declaration rather
+        // than derived again, so the body cannot disagree with the
+        // signature callers were emitted against. An OSR helper takes
+        // only the frame pointer; the destination comes in the frame.
+        let destination_return = match &osr_helper {
+            Some(layout) if layout.destination.is_none() => None,
+            _ => self.destination_returns.get(&id).copied(),
         };
 
         // Pre-calculate parameter types before creating builder
@@ -2084,14 +2082,11 @@ impl CraneliftBackend {
             // created avoids re-borrowing `self` during emission.
             //
             // A function that returns through a caller-provided
-            // destination is left without probes. A probe finishes the
-            // frame inside the helper and returns whatever the helper
-            // returned, and the helper has no destination to write
-            // through — it would hand back its own frame, which is the
-            // thing the destination exists to avoid. Losing the transfer
-            // costs speed on one shape; returning a dead frame is wrong.
+            // destination hands the destination over in the frame, and
+            // the helper writes through it and returns it as this body
+            // would.
             let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> =
-                if self.compile_tier == 0 && self.emit_osr_probes && destination_return.is_none() {
+                if self.compile_tier == 0 && self.emit_osr_probes {
                     let dominators = crate::osr::Dominators::compute(function);
                     osr_loop_headers
                         .iter()
@@ -2329,6 +2324,14 @@ impl CraneliftBackend {
                 // as the pointer to its storage, which is how this backend
                 // holds one anyway.
                 let frame_ptr = builder.block_params(entry_block)[0];
+                if let Some(offset) = layout.destination {
+                    destination_ptr = Some(builder.ins().load(
+                        pointer_type,
+                        MemFlags::new(),
+                        frame_ptr,
+                        offset as i32,
+                    ));
+                }
                 for (i, hir_id) in layout.live_ins.iter().enumerate() {
                     let Some(&offset) = layout.frame.offsets.get(i) else {
                         break;
@@ -2596,7 +2599,7 @@ impl CraneliftBackend {
                     let block_index = osr_block_index.get(hir_block_id).copied().unwrap_or(0);
 
                     let empty_frame = crate::osr::OsrFrame::for_types(&[]);
-                    let (site_key, live_in_clir, slot_types, frame, return_clir) =
+                    let (site_key, live_in_clir, slot_types, frame, return_clir, destination) =
                         if let Some(layout) = osr_layouts.get(hir_block_id) {
                             // Collect the Cranelift value backing each live-in.
                             let mut clir_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
@@ -2605,7 +2608,13 @@ impl CraneliftBackend {
                                     clir_vals.push(v);
                                 }
                             }
-                            if clir_vals.len() == layout.live_ins.len() {
+                            let destination = match (layout.destination, destination_ptr) {
+                                (Some(offset), Some(ptr)) => Some((ptr, offset)),
+                                _ => None,
+                            };
+                            if clir_vals.len() == layout.live_ins.len()
+                                && layout.destination.is_some() == destination.is_some()
+                            {
                                 (
                                     layout.site_key(),
                                     clir_vals,
@@ -2615,6 +2624,7 @@ impl CraneliftBackend {
                                         .unwrap_or_default(),
                                     layout.frame.clone(),
                                     osr_return_clir,
+                                    destination,
                                 )
                             } else {
                                 (
@@ -2622,6 +2632,7 @@ impl CraneliftBackend {
                                     Vec::new(),
                                     Vec::new(),
                                     empty_frame.clone(),
+                                    None,
                                     None,
                                 )
                             }
@@ -2632,6 +2643,7 @@ impl CraneliftBackend {
                                 Vec::new(),
                                 Vec::new(),
                                 empty_frame.clone(),
+                                None,
                                 None,
                             )
                         };
@@ -2653,6 +2665,7 @@ impl CraneliftBackend {
                         &live_in_clir,
                         &slot_types,
                         return_clir,
+                        destination,
                     );
                     builder.set_srcloc(cranelift_codegen::ir::SourceLoc::default());
                     probe_site_tags.push((site_key, tag));
@@ -10155,6 +10168,7 @@ fn emit_osr_request_after_backedges(
 /// Read the helper slot at a loop header. A null slot continues in baseline
 /// code; an installed helper receives the live frame and finishes the call.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_osr_back_edge_probe(
     builder: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
@@ -10164,6 +10178,7 @@ fn emit_osr_back_edge_probe(
     live_ins: &[cranelift_codegen::ir::Value],
     slot_types: &[cranelift_codegen::ir::Type],
     return_clir: Option<cranelift_codegen::ir::Type>,
+    destination: Option<(cranelift_codegen::ir::Value, u32)>,
 ) {
     // Helper signature: one pointer to the frame carrying the live-ins.
     // Passing them as arguments would force each to fit a register, which
@@ -10222,6 +10237,13 @@ fn emit_osr_back_edge_probe(
                 }
             }
             let frame_addr = emit_osr_frame_store(builder, frame, live_ins, slot_types);
+            // The destination this body writes through, for the helper
+            // to write through and return in turn.
+            if let Some((dest, offset)) = destination {
+                builder
+                    .ins()
+                    .store(MemFlags::new(), dest, frame_addr, offset as i32);
+            }
             let call = builder
                 .ins()
                 .call_indirect(sig_ref, helper_ptr, &[frame_addr]);

@@ -350,7 +350,11 @@ fn successors_of(term: &HirTerminator) -> smallvec::SmallVec<[HirId; 4]> {
 ///
 /// `return_type` is the function's return type — the helper returns it
 /// directly (no bit-cast at the dispatch site since both sides share the
-/// same Cranelift signature for the return).
+/// same Cranelift signature for the return). A function that hands its
+/// result back through a destination its caller provides returns that
+/// pointer, and the helper does the same: the frame carries the
+/// destination at `destination`, the helper writes through it and
+/// returns it.
 #[derive(Debug, Clone)]
 pub struct OsrLayout {
     pub header: HirId,
@@ -367,6 +371,9 @@ pub struct OsrLayout {
     pub return_type: HirType,
     /// Where each live-in sits in the frame the back-edge hands over.
     pub frame: OsrFrame,
+    /// Byte offset in the frame of the destination pointer, for a
+    /// function returning through one.
+    pub destination: Option<u32>,
     /// Live-ins the region defines again on its way back to the header
     /// (an enclosing loop's counter, say): the resumed code reads each
     /// as a phi at the header, made by [`resumable`], that merges the
@@ -459,9 +466,13 @@ pub fn osr_layout_with(
         .get(&header)
         .ok_or(OsrReject::NoSuchHeader)?;
 
-    // Multi-value return functions can't go through the helper ABI.
+    // Multi-value return functions can't go through the helper ABI. A
+    // struct returned through a caller-provided destination comes back
+    // as the pointer to it, which fits.
+    let returns_through_destination = crate::abi::destination_return_type(function).is_some();
     let return_type = match function.signature.returns.as_slice() {
         [] => HirType::Void,
+        [_] if returns_through_destination => HirType::Ptr(Box::new(HirType::U8)),
         [ty] => ty.clone(),
         _ => return Err(OsrReject::ReturnDoesntFit),
     };
@@ -687,7 +698,8 @@ pub fn osr_layout_with(
     }
 
     let loop_ordinal = loop_ordinal_of(function, header).unwrap_or(u64::MAX);
-    let frame = OsrFrame::for_types(&live_in_types);
+    let mut frame = OsrFrame::for_types(&live_in_types);
+    let destination = returns_through_destination.then(|| frame.push_pointer());
 
     Ok(OsrLayout {
         header,
@@ -697,6 +709,7 @@ pub fn osr_layout_with(
         phi_count,
         return_type,
         frame,
+        destination,
         repairs,
     })
 }
@@ -1311,6 +1324,14 @@ impl OsrFrame {
             size: size as u32,
             align: align as u32,
         }
+    }
+
+    /// Add a pointer-sized slot after the live-ins; its offset.
+    pub fn push_pointer(&mut self) -> u32 {
+        let at = (self.size as usize).div_ceil(8) * 8;
+        self.align = self.align.max(8);
+        self.size = ((at + 8).div_ceil(self.align as usize) * self.align as usize) as u32;
+        at as u32
     }
 }
 

@@ -815,6 +815,9 @@ pub struct OsrSite {
     pub types: Vec<HirType>,
     pub frame: crate::osr::OsrFrame,
     pub ret: HirType,
+    /// Frame offset of the destination pointer, for a function that
+    /// returns through one.
+    pub destination: Option<u32>,
 }
 
 /// Header visits before an interpreted frame asks for promoted code.
@@ -1050,7 +1053,7 @@ pub fn compile_function_with(
 
     // Loop headers promoted code can resume at, keyed by block.
     let mut header_sites: HashMap<HirId, u32> = HashMap::new();
-    if !address_taken && !cf.returns_through_destination {
+    if !address_taken {
         let headers = crate::osr::find_loop_headers(func);
         if !headers.is_empty() {
             let dominators = crate::osr::Dominators::compute(func);
@@ -1071,6 +1074,7 @@ pub fn compile_function_with(
                     types: layout.live_in_types.clone(),
                     frame: layout.frame.clone(),
                     ret: layout.return_type.clone(),
+                    destination: layout.destination,
                 });
             }
         }
@@ -2676,17 +2680,26 @@ impl HirInterpreter {
 
     /// Leave an interpreted frame at a loop header for `helper`: the
     /// live-ins go into a frame laid out as the helper expects, and its
-    /// result is the frame's result.
+    /// result is the frame's result. A function returning through a
+    /// destination hands `dest` over in the frame, and gets it back as
+    /// the result, the way its own return would.
     fn transfer(
         &mut self,
         helper: *const u8,
         site: &OsrSite,
         regs: &[ZyntaxValue],
         scratch: &mut Vec<*mut u8>,
+        dest: *mut u8,
     ) -> Result<ZyntaxValue, InterpError> {
         let frame = self.frame_alloc(scratch, site.frame.size.max(8) as usize);
         if frame.is_null() {
             return Err(InterpError::OutOfMemory);
+        }
+        if let Some(offset) = site.destination {
+            // SAFETY: the slot lies within the frame.
+            unsafe {
+                *(frame.add(offset as usize) as *mut *mut u8) = dest;
+            }
         }
         for ((reg, ty), offset) in site
             .live_ins
@@ -3957,8 +3970,9 @@ impl HirInterpreter {
                     }
                     // SAFETY: the slot lives for the process.
                     let helper = unsafe { &*slots[i] }.load(std::sync::atomic::Ordering::Acquire);
-                    if helper != 0 {
-                        return self.transfer(helper as *const u8, osr_site, &regs, scratch);
+                    // A frame with nowhere to write its result stays here.
+                    if helper != 0 && (osr_site.destination.is_none() || !dest.is_null()) {
+                        return self.transfer(helper as *const u8, osr_site, &regs, scratch, dest);
                     }
                 }
                 Op::RetVoid => {

@@ -911,6 +911,13 @@ impl<'ctx> LLVMBackend<'ctx> {
         func: &HirFunction,
         layout: &crate::osr::OsrLayout,
     ) -> CompilerResult<String> {
+        // A function returning through a destination keeps the Cranelift
+        // convention this tier does not enter.
+        if layout.destination.is_some() {
+            return Err(CompilerError::CodeGen(
+                "OSR helper for a destination return".into(),
+            ));
+        }
         // The helper enters only at this header. Predecessors outside its
         // reachable graph are omitted when wiring the copied blocks' phis.
         let in_loop = crate::osr::blocks_reachable_from(func, layout.header);
