@@ -308,5 +308,6 @@ categories! {
     patterns,
     globals,
     utf8,
+    modules,
     official,
 }

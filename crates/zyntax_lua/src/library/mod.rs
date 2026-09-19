@@ -431,6 +431,12 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
 /// here; every function that may raise leaves with a placeholder once
 /// it sees the value set, until a `pcall` takes it.
 pub const PENDING: &str = "zl_pending";
+/// The names of the chunks a program is made of besides the main one,
+/// which `zl_chunk` names: a line stored in `zl_line` carries its
+/// chunk's number in the bits above `LINE_BITS`, 0 for the main chunk
+/// and `k` for the `k`th entry here.
+pub const CHUNKS: &str = "zl_chunks";
+pub const LINE_BITS: i64 = 32;
 /// The globals table, set before the chunk runs when the program
 /// reaches its globals through one.
 pub const GLOBALS: &str = "zl_G";
@@ -481,31 +487,94 @@ pub fn pending() -> Expr {
 
 /// Raising: the first error stands until it is taken; a message gets
 /// the running statement's position, an error value is kept as it is.
-fn raising() -> Vec<Decl> {
+fn raising(t: &Types) -> Vec<Decl> {
     let kind = local("kind", string());
     let message = local("message", string());
     let v = kept("v", any());
     let level = local("level", i64());
+    let line = local("line", i64());
     let mut d = vec![
         global_var(PENDING, any()),
         global_var(LINE, i64()),
         global_var(CHUNK, string()),
+        global_var(CHUNKS, any()),
     ];
+    // The name of the chunk a stored line belongs to.
+    d.push(define(
+        "zl_chunk_of",
+        &[&line],
+        string(),
+        vec![
+            when(
+                eq(shr(line.e(), int(LINE_BITS)), int(0)),
+                vec![ret(read_global(CHUNK, string()))],
+            ),
+            ret(get_str(call(
+                "zl_value_at",
+                vec![
+                    call("zl_values", vec![read_global(CHUNKS, any())], t.anys()),
+                    shr(line.e(), int(LINE_BITS)),
+                ],
+                any(),
+            ))),
+        ],
+    ));
+    // A chunk a program loads besides its main one; its number is the
+    // count so far.
+    let name = kept("name", string());
+    d.push(define(
+        "zl_chunk_add",
+        &[&name],
+        unit(),
+        vec![
+            when(
+                is_nil(read_global(CHUNKS, any())),
+                vec![set_global(
+                    CHUNKS,
+                    call("zb_box_tuple", vec![list(vec![], t.anys())], any()),
+                )],
+            ),
+            expr(call(
+                "zl_append_values",
+                vec![
+                    call("zl_values", vec![read_global(CHUNKS, any())], t.anys()),
+                    box_str(name.e()),
+                ],
+                unit(),
+            )),
+            ret_void(),
+        ],
+    ));
+    // `message` positioned at a stored line: its chunk and line.
+    d.push(define(
+        "zl_position_at",
+        &[&line, &message],
+        string(),
+        vec![
+            when(le(line.e(), int(0)), vec![ret(message.e())]),
+            ret(concat(vec![
+                call("zl_chunk_of", vec![line.e()], string()),
+                text(":"),
+                call(
+                    "zb_str_of_int",
+                    vec![bitand(line.e(), int((1i64 << LINE_BITS) - 1))],
+                    string(),
+                ),
+                text(": "),
+                message.e(),
+            ])),
+        ],
+    ));
     // The message with the position of the statement running.
     d.push(define(
         "zl_position",
         &[&message],
         string(),
-        vec![
-            when(le(read_global(LINE, i64()), int(0)), vec![ret(message.e())]),
-            ret(concat(vec![
-                read_global(CHUNK, string()),
-                text(":"),
-                call("zb_str_of_int", vec![read_global(LINE, i64())], string()),
-                text(": "),
-                message.e(),
-            ])),
-        ],
+        vec![ret(call(
+            "zl_position_at",
+            vec![read_global(LINE, i64()), message.e()],
+            string(),
+        ))],
     ));
     d.push(define_cold(
         "zl_raise_value",
@@ -559,7 +628,6 @@ fn raising() -> Vec<Decl> {
     ));
     // `error(v, 2)`: the position is the caller's, the line the
     // function was entered at.
-    let line = local("line", i64());
     d.push(define_cold(
         "zl_error_at",
         &[&v, &line],
@@ -572,13 +640,11 @@ fn raising() -> Vec<Decl> {
                 ),
                 vec![expr(call(
                     "zl_raise_value",
-                    vec![box_str(concat(vec![
-                        read_global(CHUNK, string()),
-                        text(":"),
-                        call("zb_str_of_int", vec![line.e()], string()),
-                        text(": "),
-                        get_str(v.e()),
-                    ]))],
+                    vec![box_str(call(
+                        "zl_position_at",
+                        vec![line.e(), get_str(v.e())],
+                        string(),
+                    ))],
                     unit(),
                 ))],
                 vec![expr(call("zl_raise_value", vec![v.e()], unit()))],
@@ -637,7 +703,7 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     };
     lib.declarations.push(table_class(table_type));
     lib.declarations.extend(instance_hooks(&t));
-    lib.declarations.extend(raising());
+    lib.declarations.extend(raising(&t));
     lib.declarations.extend(tables::declarations(&t));
     lib.declarations.extend(values::declarations(policy, &t));
     lib.declarations.extend(calls::declarations(&t));

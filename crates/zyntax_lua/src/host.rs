@@ -1000,6 +1000,15 @@ extern "C" fn host_buf_expand(s: zrtl::StringConstPtr, repl: zrtl::StringConstPt
     }
 }
 
+/// A module name as a path: dots become directory separators.
+extern "C" fn host_replace_dots(s: zrtl::StringConstPtr) -> StringPtr {
+    let bytes: Vec<u8> = unsafe { bytes_of(s) }
+        .iter()
+        .map(|&b| if b == b'.' { b'/' } else { b })
+        .collect();
+    zrtl::string::string_from_bytes(&bytes)
+}
+
 extern "C" fn host_buf_close() -> StringPtr {
     let bytes = BUFFERS.with(|b| b.borrow_mut().pop().unwrap_or_default());
     zrtl::string::string_from_bytes(&bytes)
@@ -1242,7 +1251,7 @@ extern "C" fn host_gc(op: i64) -> i64 {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 45] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 46] = [
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$clock".as_ptr(), host_clock as *const u8),
@@ -1312,6 +1321,10 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 45] = [
     ),
     zrtl::ZrtlSymbol::new(c"$Lua$utf8_next".as_ptr(), host_utf8_next as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$gc".as_ptr(), host_gc as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$replace_dots".as_ptr(),
+        host_replace_dots as *const u8,
+    ),
 ];
 
 /// The host's symbols as a plugin the runtime links like any other.

@@ -1,0 +1,7 @@
+loading mod	lib.mod	./lib/mod.lua
+3	7	2	lib.mod
+true	true
+10	util.deep	3
+no return module
+true	42	set by mod
+true

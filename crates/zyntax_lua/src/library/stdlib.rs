@@ -2286,6 +2286,15 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ],
                 unit(),
             )));
+            st.push(expr(call(
+                "zl_rawset_str",
+                vec![
+                    tb.e(),
+                    text("preload"),
+                    call("zl_package_preload", vec![], any()),
+                ],
+                unit(),
+            )));
         }
         st.push(ret(cached()));
         d.push(define(&lib_table_fn(lib), &[], any(), st));
@@ -2557,6 +2566,49 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 any(),
             )),
             when(not(is_nil(y.e())), vec![ret(y.e())]),
+            // A loader in `package.preload`: what it returns is the
+            // module, or true when it returns nothing.
+            handler.decl(call(
+                "zl_index",
+                vec![call("zl_package_preload", vec![], any()), box_str(name.e())],
+                any(),
+            )),
+            when(
+                not(is_nil(handler.e())),
+                vec![
+                    // The loader sees the name and the file it was found
+                    // as, `./name.lua` under the program's own directory.
+                    y.set(call(
+                        "zl_first",
+                        vec![call(
+                            "zl_call_2",
+                            vec![
+                                handler.e(),
+                                box_str(name.e()),
+                                box_str(concat(vec![
+                                    text("./"),
+                                    call("zl_module_path", vec![name.e()], string()),
+                                    text(".lua"),
+                                ])),
+                            ],
+                            any(),
+                        )],
+                        any(),
+                    )),
+                    when(not(is_nil(pending())), vec![ret(nil())]),
+                    when(is_nil(y.e()), vec![y.set(box_bool(bool(true)))]),
+                    expr(call(
+                        "zl_rawset_str",
+                        vec![
+                            unbox_table(call("zl_package_loaded", vec![], any()), t),
+                            name.e(),
+                            y.e(),
+                        ],
+                        unit(),
+                    )),
+                    ret(y.e()),
+                ],
+            ),
             lua_error(concat(vec![
                 text("module '"),
                 name.e(),
@@ -2567,6 +2619,48 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 text(".lua'"),
             ])),
             ret(nil()),
+        ],
+    ));
+    // `package.preload`: loaders by module name; the program's own
+    // files are entered here before it runs.
+    d.push(global_var("zl_preload", any()));
+    d.push(define(
+        "zl_package_preload",
+        &[],
+        any(),
+        vec![
+            when(
+                is_nil(cached("zl_preload")),
+                vec![assign_global(
+                    "zl_preload",
+                    box_table(call("zl_table_new", vec![], table.clone())),
+                )],
+            ),
+            ret(cached("zl_preload")),
+        ],
+    ));
+    // A module name's path: its dots as directory separators.
+    d.push(define(
+        "zl_module_path",
+        &[&name],
+        string(),
+        vec![ret(call("zl_buf_replace_dots", vec![name.e()], string()))],
+    ));
+    d.push(define(
+        "zl_preload_module",
+        &[&name, &x],
+        unit(),
+        vec![
+            expr(call(
+                "zl_rawset_str",
+                vec![
+                    unbox_table(call("zl_package_preload", vec![], any()), t),
+                    name.e(),
+                    x.e(),
+                ],
+                unit(),
+            )),
+            ret_void(),
         ],
     ));
     // `package.loaded`: every library under its name, and `_G`.
@@ -2632,7 +2726,10 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 vec![
                     tb.e(),
                     text("currentline"),
-                    box_i64(read_global(LINE, i64())),
+                    box_i64(bitand(
+                        read_global(LINE, i64()),
+                        int((1i64 << LINE_BITS) - 1),
+                    )),
                 ],
                 unit(),
             )),
@@ -2641,7 +2738,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 vec![
                     tb.e(),
                     text("short_src"),
-                    box_str(read_global(CHUNK, string())),
+                    box_str(call(
+                        "zl_chunk_of",
+                        vec![read_global(LINE, i64())],
+                        string(),
+                    )),
                 ],
                 unit(),
             )),
@@ -2650,7 +2751,10 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 vec![
                     tb.e(),
                     text("source"),
-                    box_str(add(text("@"), read_global(CHUNK, string()))),
+                    box_str(add(
+                        text("@"),
+                        call("zl_chunk_of", vec![read_global(LINE, i64())], string()),
+                    )),
                 ],
                 unit(),
             )),

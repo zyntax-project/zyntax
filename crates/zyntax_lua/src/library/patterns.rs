@@ -103,6 +103,12 @@ pub fn declarations(t: &Types) -> Vec<Decl> {
             "$Lua$buf_expand",
         ),
         ("zl_buf_close", vec![], string(), "$Lua$buf_close"),
+        (
+            "zl_buf_replace_dots",
+            vec![("s", string())],
+            string(),
+            "$Lua$replace_dots",
+        ),
     ] {
         let params: Vec<(&str, Type)> = params.into_iter().collect();
         d.push(extern_fn(name, &params, ret_ty, Some(symbol)));

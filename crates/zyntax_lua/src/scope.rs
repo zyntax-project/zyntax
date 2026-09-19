@@ -126,6 +126,10 @@ pub struct Scopes {
     /// Whether `_G` or `_ENV` is used as a value anywhere: then the
     /// globals live in a real table and every global is dynamic.
     pub dynamic_globals: bool,
+    /// The names `require` is called with as string literals, in order
+    /// of appearance: the files the program is made of besides its
+    /// main one.
+    pub requires: Vec<String>,
     /// Whether the chunk's outermost block is lowered as several
     /// functions run in sequence, so no one function is as long as a
     /// whole test file: every outermost local is then a module
@@ -225,6 +229,10 @@ pub fn literal_string(e: &Expression) -> Option<String> {
     let Expression::String(token) = e else {
         return None;
     };
+    literal_string_token(token)
+}
+
+pub fn literal_string_token(token: &TokenReference) -> Option<String> {
     match token.token().token_type() {
         full_moon::tokenizer::TokenType::StringLiteral { literal, .. } => Some(literal.to_string()),
         _ => None,
@@ -684,6 +692,25 @@ impl Walker {
     fn call(&mut self, c: &ast::FunctionCall) {
         let suffixes: Vec<&Suffix> = c.suffixes().collect();
         let callee_first = matches!(suffixes.first(), Some(Suffix::Call(_)));
+        // `require "name"`: a file the program is made of.
+        if let (Prefix::Name(callee), [Suffix::Call(ast::Call::AnonymousCall(args))]) =
+            (c.prefix(), suffixes.as_slice())
+            && name_of(callee) == "require"
+            && !self.shadowed("require")
+        {
+            let name = match args {
+                ast::FunctionArgs::String(s) => literal_string_token(s),
+                ast::FunctionArgs::Parentheses { arguments, .. } => {
+                    arguments.iter().next().and_then(literal_string)
+                }
+                _ => None,
+            };
+            if let Some(name) = name
+                && !self.out.requires.contains(&name)
+            {
+                self.out.requires.push(name);
+            }
+        }
         // `rawget(_G, "name")` and `rawset(_G, "name", v)` name the
         // global; `_G` there is not the table as a value.
         if let (Prefix::Name(callee), [Suffix::Call(ast::Call::AnonymousCall(args))]) =
