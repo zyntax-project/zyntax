@@ -656,8 +656,11 @@ impl Walker {
             }
             Expression::Parentheses { expression, .. } => self.expr(expression),
             Expression::UnaryOperator { expression, .. } => self.expr(expression),
+            // A function expression is a value from the start: its
+            // calls are never known.
             Expression::Function(f) => {
-                self.function(f.body(), false, String::new());
+                let id = self.function(f.body(), false, String::new());
+                self.out.funcs[id.0 as usize].escapes = true;
             }
             Expression::FunctionCall(c) => self.call(c),
             Expression::TableConstructor(t) => self.table(t),
