@@ -150,13 +150,28 @@ fn ops(kind: Kind, list_type: TypeId) -> KindOps {
                 )
             }),
         ),
+        // Array storage prints as the number it reads as.
+        Kind::F32 => (
+            Box::new(|a, b| eq(a, b)),
+            Box::new(|a, b| lt(a, b)),
+            Box::new(|x| call("zb_float_repr", vec![cast(x, f64())], string())),
+        ),
+        _ => (
+            Box::new(|a, b| eq(a, b)),
+            Box::new(|a, b| lt(a, b)),
+            Box::new(|x| call("zb_str_of_int", vec![cast(x, i64())], string())),
+        ),
     };
     // A primitive boxes as itself on the push; an instance address
-    // boxes as the instance. Reading back checks the kind; an instance
-    // list takes the class tag its elements must carry, which the
-    // generated function reads from its own parameter.
+    // boxes as the instance; array storage boxes as the number it
+    // reads as. Reading back checks the kind; an instance list takes
+    // the class tag its elements must carry, which the generated
+    // function reads from its own parameter; array storage takes the
+    // number through its range check.
     let boxed: Unary = match kind {
         Kind::Ptr => Box::new(|e| call("zb_hook_box_instance", vec![e], any())),
+        Kind::F32 => Box::new(|e| cast(e, f64())),
+        k if k.is_narrow_int() => Box::new(|e| cast(e, i64())),
         _ => Box::new(|e| e),
     };
     let read: Unary = match kind {
@@ -171,6 +186,14 @@ fn ops(kind: Kind, list_type: TypeId) -> KindOps {
             )
         }),
         Kind::Any => Box::new(|e| e),
+        Kind::F32 => Box::new(|e| cast(call("zb_any_as_f64", vec![e], f64()), Kind::F32.ty())),
+        k => Box::new(move |e| {
+            call(
+                &format!("zb_list_narrow_{}", k.suffix()),
+                vec![call("zb_any_as_i64", vec![e], i64())],
+                k.ty(),
+            )
+        }),
     };
     KindOps {
         kind: Some(kind),
@@ -218,6 +241,14 @@ pub enum Field {
         suffix: String,
         ty: Type,
     },
+    /// A typed array stored as the kind whose functions carry `suffix`,
+    /// boxed under `tag`, which carries its typecode `letter`.
+    Array {
+        suffix: String,
+        ty: Type,
+        tag: i64,
+        letter: String,
+    },
     /// A tuple of the shape whose functions carry `suffix`.
     Tuple {
         suffix: String,
@@ -232,7 +263,11 @@ impl Field {
             Field::Float => f64(),
             Field::Bool => boolean(),
             Field::Str => string(),
-            Field::Any | Field::Dict { .. } | Field::Set { .. } | Field::List { .. } => any(),
+            Field::Any
+            | Field::Dict { .. }
+            | Field::Set { .. }
+            | Field::List { .. }
+            | Field::Array { .. } => any(),
             Field::Instance { ty, .. } | Field::Tuple { ty, .. } => ty.clone(),
         }
     }
@@ -244,7 +279,7 @@ impl Field {
             Field::Dict { ty } | Field::Set { ty } => {
                 call("zb_unbox_list_raw_any", vec![x], ty.clone())
             }
-            Field::List { suffix, ty } => {
+            Field::List { suffix, ty } | Field::Array { suffix, ty, .. } => {
                 call(&format!("zb_unbox_list_raw_{suffix}"), vec![x], ty.clone())
             }
             _ => x,
@@ -262,7 +297,7 @@ impl Field {
             Field::Dict { .. } => call("zb_dict_eq", vec![self.raw(a), self.raw(b)], boolean()),
             Field::Set { .. } => call("zb_set_eq", vec![self.raw(a), self.raw(b)], boolean()),
             Field::Instance { .. } => eq(cast(a, usize()), cast(b, usize())),
-            Field::List { suffix, .. } => call(
+            Field::List { suffix, .. } | Field::Array { suffix, .. } => call(
                 &format!("zb_list_eq_{suffix}"),
                 vec![self.raw(a), self.raw(b)],
                 boolean(),
@@ -286,7 +321,7 @@ impl Field {
                 vec![cast(a, usize()), cast(b, usize())],
                 boolean(),
             ),
-            Field::List { suffix, .. } => call(
+            Field::List { suffix, .. } | Field::Array { suffix, .. } => call(
                 &format!("zb_list_lt_{suffix}"),
                 vec![self.raw(a), self.raw(b)],
                 boolean(),
@@ -312,6 +347,20 @@ impl Field {
                 vec![self.raw(x)],
                 string(),
             ),
+            // `array('i', [1, 2])`, and `array('i')` when empty.
+            Field::Array { suffix, letter, .. } => if_expr(
+                eq(mcall(self.raw(x.clone()), "len", vec![], i64()), int(0)),
+                text(&format!("array('{letter}')")),
+                call(
+                    &format!("zb_list_items_{suffix}"),
+                    vec![
+                        self.raw(x),
+                        text(&format!("array('{letter}', [")),
+                        text("])"),
+                    ],
+                    string(),
+                ),
+            ),
             Field::Tuple { suffix, .. } => {
                 call(&format!("zb_tuple_repr_{suffix}"), vec![x], string())
             }
@@ -324,7 +373,11 @@ impl Field {
             Field::Float => call("zb_box_f64", vec![x], any()),
             Field::Bool => call("zb_box_bool", vec![x], any()),
             Field::Str => call("zb_box_str", vec![x], any()),
-            Field::Any | Field::Dict { .. } | Field::Set { .. } | Field::List { .. } => x,
+            Field::Any
+            | Field::Dict { .. }
+            | Field::Set { .. }
+            | Field::List { .. }
+            | Field::Array { .. } => x,
             Field::Instance { tag, .. } => call(
                 "zb_box_instance",
                 vec![cast(x, usize()), int32(*tag)],
@@ -343,9 +396,11 @@ impl Field {
             Field::Float => call("zb_hash_of_f64", vec![x], i64()),
             Field::Str => call("zb_hash_of_str", vec![x], i64()),
             Field::Tuple { suffix, .. } => call(&format!("zb_tuple_hash_{suffix}"), vec![x], i64()),
-            Field::Any | Field::Dict { .. } | Field::Set { .. } | Field::List { .. } => {
-                call("zb_any_hash", vec![x], i64())
-            }
+            Field::Any
+            | Field::Dict { .. }
+            | Field::Set { .. }
+            | Field::List { .. }
+            | Field::Array { .. } => call("zb_any_hash", vec![x], i64()),
             Field::Instance { .. } => call("zb_any_hash", vec![self.boxed(x)], i64()),
         }
     }
@@ -391,9 +446,11 @@ impl Field {
                 vec![stored, v],
                 boolean(),
             ),
-            Field::Any | Field::Dict { .. } | Field::Set { .. } | Field::List { .. } => {
-                any_eq(stored, v)
-            }
+            Field::Any
+            | Field::Dict { .. }
+            | Field::Set { .. }
+            | Field::List { .. }
+            | Field::Array { .. } => any_eq(stored, v),
             Field::Instance { .. } => any_eq(stored, self.boxed(v)),
         }
     }
@@ -415,6 +472,33 @@ impl Field {
                 ty.clone(),
             ),
             Field::List { suffix, .. } => call(&format!("zb_list_as_box_{suffix}"), vec![x], any()),
+            // The box itself once its tag is the array's; anything else
+            // is the TypeError the check raises, and the value after it
+            // is never read.
+            Field::Array {
+                suffix,
+                ty,
+                tag,
+                letter,
+            } => if_expr(
+                eq(
+                    cast(call("zb_box_tag", vec![x.clone()], i32()), i64()),
+                    int(*tag),
+                ),
+                x.clone(),
+                call(
+                    &format!("zb_list_box_tagged_{suffix}"),
+                    vec![
+                        call(
+                            &format!("zb_list_unbox_tagged_{suffix}"),
+                            vec![x, int(*tag), text(letter)],
+                            ty.clone(),
+                        ),
+                        int(*tag),
+                    ],
+                    any(),
+                ),
+            ),
             Field::Tuple { suffix, ty } => {
                 call(&format!("zb_tuple_read_{suffix}"), vec![x], ty.clone())
             }
@@ -746,11 +830,18 @@ fn merge_sort(
 
 pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     let mut out = vec![list_class()];
-    for kind in Kind::ALL {
+    for kind in Kind::LIBRARY {
         out.extend(kind_declarations(&ops(kind, list_type)));
     }
     out.extend(shared(policy, list_type));
     out
+}
+
+/// The list functions of an array storage kind, for a frontend to
+/// generate into the program that uses arrays of it: the library holds
+/// only its own kinds.
+pub fn array_kind_declarations(kind: Kind, list_type: TypeId) -> Vec<Decl> {
+    kind_declarations(&ops(kind, list_type))
 }
 
 fn kind_declarations(k: &KindOps) -> Vec<Decl> {
@@ -773,6 +864,9 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     let el = |xs: &Local, i: Expr| idx(xs.e(), i, k.elem.clone());
     let empty = || list(Vec::new(), k.list.clone());
     let mut d = Vec::new();
+    if let Some(kind) = k.kind.filter(|kind| kind.wide() != *kind) {
+        d.extend(narrow_declarations(k, kind));
+    }
 
     // Index normalisation: negative counts from the end, out of range is
     // an IndexError.
@@ -792,8 +886,13 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         ],
     ));
     let norm = |i: Expr, msg: &str| call(&name("norm"), vec![xs.e(), i, text(msg)], i64());
+    // Numeric storage checks its index inline: the check is what a hot
+    // loop pays per element.
+    let inline_check = k
+        .kind
+        .is_some_and(|kind| matches!(kind, Kind::Float | Kind::F32) || kind.is_narrow_int());
     let checked_index = |msg: &str| {
-        if k.kind != Some(Kind::Float) {
+        if !inline_check {
             return vec![j.decl(norm(i.e(), msg))];
         }
         vec![
@@ -1709,6 +1808,19 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
             any(),
         ))],
     ));
+    // The same box under a tag the caller chooses: an array's, which
+    // carries its typecode.
+    let chosen = local("tag", i64());
+    d.push(define(
+        &name("box_tagged"),
+        &[&carried, &chosen],
+        any(),
+        vec![ret(call(
+            &format!("zb_box_list_raw_{}", k.suffix),
+            vec![carried.e(), cast(chosen.e(), i32())],
+            any(),
+        ))],
+    ));
     let x = local("x", any());
     // A list of dynamic values is read out of a box of any list kind,
     // and a list of a primitive kind out of a box of dynamic values
@@ -1717,7 +1829,7 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     let mut unbox = vec![tag.decl(cast(call("zb_box_tag", vec![x.e()], i32()), i64()))];
     match k.kind {
         Some(Kind::Any) => {
-            for other in Kind::ALL.iter().filter(|o| **o != Kind::Any) {
+            for other in Kind::LIBRARY.iter().filter(|o| **o != Kind::Any) {
                 unbox.push(when(
                     eq(tag.e(), int(other.list_tag())),
                     vec![ret(call(
@@ -1742,7 +1854,8 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
                 ))],
             ));
         }
-        Some(Kind::Int) | Some(Kind::Float) | Some(Kind::Str) | None => {
+        Some(Kind::Ptr) => {}
+        _ => {
             unbox.push(when(
                 eq(tag.e(), int(Kind::Any.list_tag())),
                 vec![ret(call(
@@ -1756,7 +1869,6 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
                 ))],
             ));
         }
-        Some(Kind::Ptr) => {}
     }
     unbox.push(when(
         ne(tag.e(), int(k.tag)),
@@ -1774,6 +1886,35 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         k.list.clone(),
     )));
     d.push(define(&name("unbox"), &[&x], k.list.clone(), unbox));
+    // A box read back as the array whose tag is `tag`: a list stored
+    // the same way, or an array of another typecode, is a TypeError.
+    let wanted = local("tag", i64());
+    let letter = local("letter", string());
+    d.push(define(
+        &name("unbox_tagged"),
+        &[&x, &wanted, &letter],
+        k.list.clone(),
+        vec![
+            when(
+                ne(
+                    cast(call("zb_box_tag", vec![x.e()], i32()), i64()),
+                    wanted.e(),
+                ),
+                vec![fatal(
+                    "TypeError",
+                    add(
+                        add(add(text("expected array('"), letter.e()), text("'), got ")),
+                        call("zb_any_type", vec![x.e()], string()),
+                    ),
+                )],
+            ),
+            ret(call(
+                &format!("zb_unbox_list_raw_{}", k.suffix),
+                vec![x.e()],
+                k.list.clone(),
+            )),
+        ],
+    ));
     // A box holding a list of this kind, from a dynamic value: the box
     // itself when its tag is the kind's, else the checked conversion
     // boxed anew.
@@ -1796,6 +1937,196 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
             )),
         ],
     ));
+    d
+}
+
+/// What array storage adds to a kind: the number an element reads as
+/// is wider than the element, so a value is checked on the way in and
+/// widened on the way out.
+///
+/// `zb_list_narrow_<k>(v)` is the element a number becomes, or an
+/// OverflowError worded as CPython words it (a `b` value beyond a short
+/// is reported as a short, an `H` value beyond an int as an int, since
+/// CPython converts in those steps). `zb_list_in_range_<k>(v)` is
+/// whether a number could be an element at all, which a search asks
+/// before narrowing. `zb_list_from_wide_<k>` and `zb_list_to_wide_<k>`
+/// convert whole lists, and `zb_list_sum_<k>` adds up in the wide type.
+fn narrow_declarations(k: &KindOps, kind: Kind) -> Vec<Decl> {
+    let name = |op: &str| format!("zb_list_{op}_{}", k.suffix);
+    let wide = kind.wide().ty();
+    let wide_list = list_of(list_type_of(&k.list), wide.clone());
+    let v = local("v", wide.clone());
+    let i = local("i", i64());
+    let n = local("n", i64());
+    let mut d = Vec::new();
+
+    // (below, message) and (above, message) bounds, checked in order.
+    let bounds: Vec<(Expr, &str)> = match kind {
+        Kind::I8 => vec![
+            (
+                lt(v.e(), int(-32768)),
+                "signed short integer is less than minimum",
+            ),
+            (
+                gt(v.e(), int(32767)),
+                "signed short integer is greater than maximum",
+            ),
+            (lt(v.e(), int(-128)), "signed char is less than minimum"),
+            (gt(v.e(), int(127)), "signed char is greater than maximum"),
+        ],
+        Kind::U8 => vec![
+            (
+                lt(v.e(), int(0)),
+                "unsigned byte integer is less than minimum",
+            ),
+            (
+                gt(v.e(), int(255)),
+                "unsigned byte integer is greater than maximum",
+            ),
+        ],
+        Kind::I16 => vec![
+            (
+                lt(v.e(), int(-32768)),
+                "signed short integer is less than minimum",
+            ),
+            (
+                gt(v.e(), int(32767)),
+                "signed short integer is greater than maximum",
+            ),
+        ],
+        Kind::U16 => vec![
+            (
+                lt(v.e(), int(-2147483648)),
+                "signed integer is less than minimum",
+            ),
+            (
+                gt(v.e(), int(2147483647)),
+                "signed integer is greater than maximum",
+            ),
+            (lt(v.e(), int(0)), "unsigned short is less than minimum"),
+            (
+                gt(v.e(), int(65535)),
+                "unsigned short is greater than maximum",
+            ),
+        ],
+        Kind::I32 => vec![
+            (
+                lt(v.e(), int(-2147483648)),
+                "signed integer is less than minimum",
+            ),
+            (
+                gt(v.e(), int(2147483647)),
+                "signed integer is greater than maximum",
+            ),
+        ],
+        Kind::U32 => vec![
+            (
+                lt(v.e(), int(0)),
+                "can't convert negative value to unsigned int",
+            ),
+            (
+                gt(v.e(), int(4294967295)),
+                "unsigned int is greater than maximum",
+            ),
+        ],
+        Kind::U64 => vec![(
+            lt(v.e(), int(0)),
+            "can't convert negative value to unsigned int",
+        )],
+        // A float narrows by rounding.
+        _ => Vec::new(),
+    };
+    let checks: Vec<Stmt> = bounds
+        .iter()
+        .map(|(out_of_range, message)| {
+            when(
+                out_of_range.clone(),
+                vec![fatal("OverflowError", text(message))],
+            )
+        })
+        .collect();
+    let mut narrow = checks.clone();
+    narrow.push(ret(cast(v.e(), k.elem.clone())));
+    d.push(define(&name("narrow"), &[&v], k.elem.clone(), narrow));
+    // A number no element can equal: out of range, or a float the
+    // storage cannot hold exactly.
+    let fits: Expr = match kind {
+        Kind::F32 => eq(cast(cast(v.e(), k.elem.clone()), wide.clone()), v.e()),
+        _ => bounds
+            .iter()
+            .map(|(out_of_range, _)| not(out_of_range.clone()))
+            .reduce(and)
+            .unwrap_or_else(|| bool(true)),
+    };
+    d.push(define(&name("in_range"), &[&v], boolean(), vec![ret(fits)]));
+
+    let ws = borrowed("ws", wide_list.clone());
+    let out = local("out", k.list.clone());
+    d.push(define(&name("from_wide"), &[&ws], k.list.clone(), {
+        let mut s = vec![
+            n.decl(len(ws.e())),
+            out.decl(list(Vec::new(), k.list.clone())),
+            expr(mcall(out.e(), "reserve", vec![n.e()], unit())),
+        ];
+        s.extend(for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![expr(mcall(
+                out.e(),
+                "push",
+                vec![call(
+                    &name("narrow"),
+                    vec![idx(ws.e(), i.e(), wide.clone())],
+                    k.elem.clone(),
+                )],
+                unit(),
+            ))],
+        ));
+        s.push(ret(out.e()));
+        s
+    }));
+    let xs = borrowed("xs", k.list.clone());
+    let wout = local("out", wide_list.clone());
+    d.push(define(&name("to_wide"), &[&xs], wide_list.clone(), {
+        let mut s = vec![
+            n.decl(len(xs.e())),
+            wout.decl(list(Vec::new(), wide_list.clone())),
+            expr(mcall(wout.e(), "reserve", vec![n.e()], unit())),
+        ];
+        s.extend(for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![expr(mcall(
+                wout.e(),
+                "push",
+                vec![cast(idx(xs.e(), i.e(), k.elem.clone()), wide.clone())],
+                unit(),
+            ))],
+        ));
+        s.push(ret(wout.e()));
+        s
+    }));
+    let total = local("s", wide.clone());
+    let zero = match kind {
+        Kind::F32 => float(0.0),
+        _ => int(0),
+    };
+    d.push(define(&name("sum"), &[&xs], wide.clone(), {
+        let mut s = vec![total.decl(zero), n.decl(len(xs.e()))];
+        s.extend(for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![total.set(add(
+                total.e(),
+                cast(idx(xs.e(), i.e(), k.elem.clone()), wide.clone()),
+            ))],
+        ));
+        s.push(ret(total.e()));
+        s
+    }));
     d
 }
 
@@ -1910,6 +2241,12 @@ pub(crate) fn shape_hook_declarations(policy: &Policy, list_type: TypeId) -> Vec
             unit(),
             None,
         ));
+        d.push(extern_fn(
+            "zb_hook_shaped_repr",
+            &[("x", any())],
+            string(),
+            None,
+        ));
         return d;
     }
     let unknown = || fatal("TypeError", text("a list of an unknown kind"));
@@ -1936,6 +2273,12 @@ pub(crate) fn shape_hook_declarations(policy: &Policy, list_type: TypeId) -> Vec
         &[&x, &v],
         unit(),
         vec![unknown(), ret_void()],
+    ));
+    d.push(define(
+        "zb_hook_shaped_repr",
+        &[&x],
+        string(),
+        vec![unknown(), ret(text(""))],
     ));
     d
 }

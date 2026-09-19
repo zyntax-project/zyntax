@@ -1,0 +1,55 @@
+array('d', [1.5]) 1
+array('d', [0.0]) 0.0
+array('i', [1, 2, 3]) 6 3
+array('d', [0.0, 1.0, 2.0, 3.0])
+array('q', [0, 1, 4, 9, 16])
+[1, 2, 3] array('l', [1, 2, 3, 4])
+0.0 9.0
+array('i') array('B', [65, 66]) array('h', [-1, 2])
+array('d', [0.0, 0.0, 0.0, 0.0, 0.0]) 5
+array('d', [0.0, 2.5, 0.0]) array('d', [0.0, 0.0, 2.5, 0.0, 0.0, 7.0])
+array('d', [1.0, 1.0, 1.0, 1.0, 1.0])
+True False
+True False True
+True True
+array('B', [1, 2, 1, 2, 1, 2]) array('f', [0.5, 0.5])
+array('i', [7, 5, 3, 8, 1, 9]) 3 1 4 6
+array('i', [9, 1, 8, 5, 7, 2, 2]) 2 [9, 1, 8, 5, 7, 2, 2]
+1 9 [1, 2, 2, 5, 7, 8, 9] [9, 1, 8, 5, 7, 2, 2] (7, 8)
+i 4 8 1 2
+4.5 True False
+135.0 1.5 7.5
+0 9
+1 8
+array('b', [-128, 127]) -129 128 False 0
+array('B', [254, 255]) 509
+array('h', [-32768, 32767]) -1
+array('H', [65535]) 131070
+array('i', [-2147483648, 2147483647]) 2147483648
+array('I', [4294967295]) 4294967296
+array('l', [-9223372036854775808, 9223372036854775807]) 9223372036854775807
+9223372036854775807
+b 128 OverflowError: signed char is greater than maximum
+b -129 OverflowError: signed char is less than minimum
+b 40000 OverflowError: signed short integer is greater than maximum
+B -1 OverflowError: unsigned byte integer is less than minimum
+B 256 OverflowError: unsigned byte integer is greater than maximum
+h 32768 OverflowError: signed short integer is greater than maximum
+H 70000 OverflowError: unsigned short is greater than maximum
+H -1 OverflowError: unsigned short is less than minimum
+i 2147483648 OverflowError: signed integer is greater than maximum
+I -1 OverflowError: can't convert negative value to unsigned int
+I 4294967296 OverflowError: unsigned int is greater than maximum
+L -1 OverflowError: can't convert negative value to unsigned int
+bBuwhHiIlLqQfd
+array('d', [1.0, 2.0, 3.0, 4.0]) 0.5
+0.10000000149011612 1.5 array('f', [0.10000000149011612, 1.5]) [0.10000000149011612, 1.5] False True 1.6000000014901161
+array('f', [2.0, 1.5, 1.0]) True array('d', [2.0, 1.5, 1.0])
+TypeError: can only append array (not "list") to array
+TypeError: can only extend with array of same kind
+TypeError: '<' not supported between instances of 'array.array' and 'list'
+ValueError: array.index(x): x not in array
+ValueError: array.remove(x): x not in array
+6.5 array('d', [0.0, 0.0, 0.0, 0.0, 6.5, 0.0])
+(array('B', [1, 2]), 'x') array('B', [1, 2])
+[array('i', [1]), 'text']

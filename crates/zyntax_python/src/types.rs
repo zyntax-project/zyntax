@@ -83,7 +83,115 @@ pub(crate) enum Elem {
     /// Tuples of one shape, held as the struct itself; the list's
     /// functions are generated for the shape.
     Tuple(u16),
+    /// The storage of an `array.array` of this typecode: a list whose
+    /// elements are stored at the typecode's width and read as the
+    /// number the typecode stands for. The list is the array.
+    Array(Code),
     Object,
+}
+
+/// A typecode of the `array` module, `u` and `w` aside: those hold
+/// characters, which are strings here.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Code {
+    B,
+    UB,
+    H,
+    UH,
+    I,
+    UI,
+    L,
+    UL,
+    Q,
+    UQ,
+    F,
+    D,
+}
+
+impl Code {
+    pub(crate) const ALL: [Code; 12] = [
+        Code::B,
+        Code::UB,
+        Code::H,
+        Code::UH,
+        Code::I,
+        Code::UI,
+        Code::L,
+        Code::UL,
+        Code::Q,
+        Code::UQ,
+        Code::F,
+        Code::D,
+    ];
+
+    /// The typecode spelled `letter`, if it is one an array can hold.
+    pub(crate) fn of(letter: &str) -> Option<Code> {
+        Code::ALL.iter().copied().find(|c| c.letter() == letter)
+    }
+
+    pub(crate) fn letter(self) -> &'static str {
+        match self {
+            Code::B => "b",
+            Code::UB => "B",
+            Code::H => "h",
+            Code::UH => "H",
+            Code::I => "i",
+            Code::UI => "I",
+            Code::L => "l",
+            Code::UL => "L",
+            Code::Q => "q",
+            Code::UQ => "Q",
+            Code::F => "f",
+            Code::D => "d",
+        }
+    }
+
+    /// The kind an element is stored as. `l` and `L` are the 8 bytes
+    /// they are on every platform this runs on.
+    pub(crate) fn storage(self) -> zyntax_builtins::Kind {
+        use zyntax_builtins::Kind;
+        match self {
+            Code::B => Kind::I8,
+            Code::UB => Kind::U8,
+            Code::H => Kind::I16,
+            Code::UH => Kind::U16,
+            Code::I => Kind::I32,
+            Code::UI => Kind::U32,
+            Code::L | Code::Q => Kind::Int,
+            Code::UL | Code::UQ => Kind::U64,
+            Code::F => Kind::F32,
+            Code::D => Kind::Float,
+        }
+    }
+
+    /// What an element reads as.
+    pub(crate) fn item(self) -> Ty {
+        match self {
+            Code::F | Code::D => Ty::Float,
+            _ => Ty::Int,
+        }
+    }
+
+    /// Whether storing an element narrows the number it reads as: a
+    /// range check on an integer, a rounding on a float.
+    pub(crate) fn narrows(self) -> bool {
+        self.storage().wide() != self.storage()
+    }
+
+    /// Bytes per element, `a.itemsize`.
+    pub(crate) fn itemsize(self) -> i64 {
+        match self {
+            Code::B | Code::UB => 1,
+            Code::H | Code::UH => 2,
+            Code::I | Code::UI | Code::F => 4,
+            _ => 8,
+        }
+    }
+
+    /// The tag a boxed array of this typecode carries.
+    pub(crate) fn tag(self) -> i64 {
+        zyntax_builtins::array_tag(self.storage(), self.letter().as_bytes()[0])
+    }
 }
 
 impl Elem {
@@ -99,6 +207,7 @@ impl Elem {
         }
     }
 
+    /// What an element reads as.
     pub(crate) fn ty(self) -> Ty {
         match self {
             Elem::Int => Ty::Int,
@@ -106,7 +215,16 @@ impl Elem {
             Elem::Str => Ty::Str,
             Elem::Class(k) => Ty::Class(k),
             Elem::Tuple(k) => Ty::Tuple(k),
+            Elem::Array(c) => c.item(),
             Elem::Object => Ty::Object,
+        }
+    }
+
+    /// The typecode, for the storage of an array.
+    pub(crate) fn code(self) -> Option<Code> {
+        match self {
+            Elem::Array(c) => Some(c),
+            _ => None,
         }
     }
 
@@ -118,6 +236,7 @@ impl Elem {
             Elem::Str => "str".to_string(),
             Elem::Class(_) => "ptr".to_string(),
             Elem::Tuple(k) => tuple_suffix(k),
+            Elem::Array(c) => c.storage().suffix().to_string(),
             Elem::Object => "any".to_string(),
         }
     }
@@ -130,6 +249,7 @@ impl Elem {
             Elem::Str => zyntax_builtins::Kind::Str.list_tag(),
             Elem::Class(_) => zyntax_builtins::Kind::Ptr.list_tag(),
             Elem::Tuple(k) => zyntax_builtins::lists::shape_list_tag(k),
+            Elem::Array(c) => c.tag(),
             Elem::Object => zyntax_builtins::Kind::Any.list_tag(),
         }
     }
@@ -199,6 +319,12 @@ thread_local! {
     /// The dict shapes of the program being compiled: key and value
     /// types, by index, interned like tuple shapes.
     static DICT_SHAPES: std::cell::RefCell<Vec<(Ty, Ty)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The storage kinds of the arrays the lowering used, as positions
+    /// in `Kind::ALL`. A kind the library does not carry gets its list
+    /// functions generated with the program; every kind gets its arms
+    /// in the hooks the dynamic layer reaches a boxed array through.
+    static ARRAY_KINDS: std::cell::RefCell<std::collections::BTreeSet<usize>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
 }
 
 /// Forget every shape: the start of a program.
@@ -206,6 +332,34 @@ pub(crate) fn reset_tuple_shapes() {
     TUPLE_SHAPES.with(|t| t.borrow_mut().clear());
     TUPLE_LISTS.with(|t| t.borrow_mut().clear());
     DICT_SHAPES.with(|t| t.borrow_mut().clear());
+    ARRAY_KINDS.with(|t| t.borrow_mut().clear());
+}
+
+/// Record that arrays stored as `kind` are used.
+pub(crate) fn note_array_kind(kind: zyntax_builtins::Kind) {
+    let index = zyntax_builtins::Kind::ALL
+        .iter()
+        .position(|k| *k == kind)
+        .expect("an array storage kind");
+    ARRAY_KINDS.with(|t| t.borrow_mut().insert(index));
+}
+
+/// The storage kinds noted so far, and those of arrays held in tuple
+/// shapes, in tag order.
+pub(crate) fn array_kinds() -> Vec<zyntax_builtins::Kind> {
+    for shape in TUPLE_SHAPES.with(|t| t.borrow().clone()) {
+        for field in shape {
+            if let Ty::List(Elem::Array(c)) = field {
+                note_array_kind(c.storage());
+            }
+        }
+    }
+    ARRAY_KINDS.with(|t| {
+        t.borrow()
+            .iter()
+            .map(|&i| zyntax_builtins::Kind::ALL[i])
+            .collect()
+    })
 }
 
 /// The dict type with these key and value types.
@@ -1212,7 +1366,28 @@ pub(crate) fn member_ty(member: crate::stdlib::Member) -> Ty {
         crate::stdlib::Member::Func { ret, .. } => ret,
         crate::stdlib::Member::Float(_) => Ty::Float,
         crate::stdlib::Member::Int(_) => Ty::Int,
+        crate::stdlib::Member::Str(_) => Ty::Str,
         crate::stdlib::Member::Value { ty, .. } => ty,
+        // The type as a value; a call of it is typed by its typecode.
+        crate::stdlib::Member::ArrayType => Ty::Object,
+    }
+}
+
+/// What a call of `array.array` with these arguments builds: the array
+/// of the typecode named, when the typecode is a literal. Anything
+/// else has no static element type and the lowering refuses it.
+pub(crate) fn array_call_ty(args: &[py::Expr]) -> Ty {
+    match array_call_code(args) {
+        Some(code) => Ty::List(Elem::Array(code)),
+        None => Ty::Object,
+    }
+}
+
+/// The typecode an `array.array` call spells as its first argument.
+pub(crate) fn array_call_code(args: &[py::Expr]) -> Option<Code> {
+    match args.first() {
+        Some(py::Expr::StringLiteral(s)) => crate::stdlib::array_code(s.value.to_str()).ok(),
+        _ => None,
     }
 }
 
@@ -4199,6 +4374,9 @@ impl Typer<'_> {
                     // An attribute of None raises; its type is what the
                     // other paths to the name decide.
                     Ty::Unknown | Ty::None => Ty::Unknown,
+                    // An array's typecode and element size.
+                    Ty::List(Elem::Array(_)) if a.attr.as_str() == "typecode" => Ty::Str,
+                    Ty::List(Elem::Array(_)) if a.attr.as_str() == "itemsize" => Ty::Int,
                     _ => Ty::Object,
                 }
             }
@@ -4369,7 +4547,10 @@ impl Typer<'_> {
         if let py::Expr::Attribute(a) = &*c.func
             && let Some(m) = self.module_member_of(&a.value, a.attr.as_str())
         {
-            return member_ty(m);
+            return match m {
+                crate::stdlib::Member::ArrayType => array_call_ty(&c.arguments.args),
+                other => member_ty(other),
+            };
         }
         // `Class.method(obj, ...)` is the method.
         if let py::Expr::Attribute(a) = &*c.func
@@ -4405,7 +4586,10 @@ impl Typer<'_> {
                     && !self.outer.contains_key(name)
                     && let Some(m) = self.module.imported_name(name)
                 {
-                    return member_ty(m);
+                    return match m {
+                        crate::stdlib::Member::ArrayType => array_call_ty(&c.arguments.args),
+                        other => member_ty(other),
+                    };
                 }
                 self.builtin_call(name, c)
             }
@@ -4451,6 +4635,8 @@ impl Typer<'_> {
             "len" | "int" | "ord" | "hash" | "id" => Ty::Int,
             "next" => Ty::Object,
             "sorted" | "reversed" | "list" => match arg(0) {
+                // An array's elements make a list of what they read as.
+                Ty::List(Elem::Array(c)) => Ty::List(Elem::of(c.item())),
                 Ty::List(e) => Ty::List(e),
                 Ty::Str => Ty::List(Elem::Str),
                 Ty::Tuple(_) => Ty::List(Elem::of(arg(0).element().unwrap_or(Ty::Object))),
@@ -4551,6 +4737,8 @@ impl Typer<'_> {
                 "pop" => e.ty(),
                 "index" | "count" => Ty::Int,
                 "copy" => Ty::List(e),
+                // An array's elements as the list of what they read as.
+                "tolist" => Ty::List(Elem::of(e.ty())),
                 _ => Ty::None,
             },
             Ty::Tuple(_) => match attr {

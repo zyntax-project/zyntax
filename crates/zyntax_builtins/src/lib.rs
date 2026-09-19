@@ -69,7 +69,9 @@ pub struct TypeNames {
 }
 
 /// The element kinds a list is instantiated for. Anything else in a
-/// list is a dynamic value.
+/// list is a dynamic value. The kinds after `Any` are the storage of
+/// typed arrays: their elements read as an `Int` or a `Float`, and are
+/// stored at the width the kind names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Int,
@@ -80,10 +82,38 @@ pub enum Kind {
     /// boxes one through `zb_hook_box_instance` when it becomes dynamic.
     Ptr,
     Any,
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    U64,
+    F32,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 5] = [Kind::Int, Kind::Float, Kind::Str, Kind::Ptr, Kind::Any];
+    /// The kinds the library itself instantiates. The array storage
+    /// kinds are generated into a program by the frontend that uses
+    /// them, since most programs use none.
+    pub const LIBRARY: [Kind; 5] = [Kind::Int, Kind::Float, Kind::Str, Kind::Ptr, Kind::Any];
+
+    /// Every kind, in the order their tags are numbered.
+    pub const ALL: [Kind; 13] = [
+        Kind::Int,
+        Kind::Float,
+        Kind::Str,
+        Kind::Ptr,
+        Kind::Any,
+        Kind::I8,
+        Kind::U8,
+        Kind::I16,
+        Kind::U16,
+        Kind::I32,
+        Kind::U32,
+        Kind::U64,
+        Kind::F32,
+    ];
 
     /// The suffix on this kind's functions: `zb_list_get_i64`.
     pub fn suffix(self) -> &'static str {
@@ -93,16 +123,52 @@ impl Kind {
             Kind::Str => "str",
             Kind::Ptr => "ptr",
             Kind::Any => "any",
+            Kind::I8 => "i8",
+            Kind::U8 => "u8",
+            Kind::I16 => "i16",
+            Kind::U16 => "u16",
+            Kind::I32 => "i32",
+            Kind::U32 => "u32",
+            Kind::U64 => "u64",
+            Kind::F32 => "f32",
         }
     }
 
     pub fn ty(self) -> zyntax_typed_ast::Type {
+        use zyntax_typed_ast::type_registry::PrimitiveType as P;
         match self {
             Kind::Int => build::i64(),
             Kind::Float => build::f64(),
             Kind::Str => build::string(),
             Kind::Ptr => build::usize(),
             Kind::Any => build::any(),
+            Kind::I8 => zyntax_typed_ast::Type::Primitive(P::I8),
+            Kind::U8 => zyntax_typed_ast::Type::Primitive(P::U8),
+            Kind::I16 => zyntax_typed_ast::Type::Primitive(P::I16),
+            Kind::U16 => zyntax_typed_ast::Type::Primitive(P::U16),
+            Kind::I32 => zyntax_typed_ast::Type::Primitive(P::I32),
+            Kind::U32 => zyntax_typed_ast::Type::Primitive(P::U32),
+            Kind::U64 => zyntax_typed_ast::Type::Primitive(P::U64),
+            Kind::F32 => zyntax_typed_ast::Type::Primitive(P::F32),
+        }
+    }
+
+    /// The kinds whose elements are integers stored narrower than, or
+    /// unsigned at, the word an `Int` is.
+    pub fn is_narrow_int(self) -> bool {
+        matches!(
+            self,
+            Kind::I8 | Kind::U8 | Kind::I16 | Kind::U16 | Kind::I32 | Kind::U32 | Kind::U64
+        )
+    }
+
+    /// The kind an element of this kind reads as: `Int` or `Float` for
+    /// the array storage kinds, the kind itself otherwise.
+    pub fn wide(self) -> Kind {
+        match self {
+            Kind::F32 => Kind::Float,
+            k if k.is_narrow_int() => Kind::Int,
+            k => k,
         }
     }
 
@@ -114,21 +180,37 @@ impl Kind {
     }
 }
 
+/// The kinds above the list kinds, in the order they are numbered.
+const LIST_KINDS: i64 = Kind::ALL.len() as i64;
 /// The box tag of a tuple: a list of dynamic values that prints and
 /// compares as a tuple.
-pub const TUPLE_TAG: i64 = (6 << 8) | 255;
+pub const TUPLE_TAG: i64 = ((LIST_KINDS + 1) << 8) | 255;
 /// The box tag of a dict: keys and values alternating in one list.
-pub const DICT_TAG: i64 = (7 << 8) | 255;
+pub const DICT_TAG: i64 = ((LIST_KINDS + 2) << 8) | 255;
 /// The box tag of a set: a list of distinct values.
-pub const SET_TAG: i64 = (8 << 8) | 255;
+pub const SET_TAG: i64 = ((LIST_KINDS + 3) << 8) | 255;
 /// The box tag of a function value: a record of dynamic values, see
 /// [`functions`].
-pub const FUNC_TAG: i64 = (9 << 8) | 255;
+pub const FUNC_TAG: i64 = ((LIST_KINDS + 4) << 8) | 255;
 /// The box tag of a bare code address inside a function record.
-pub const CODE_TAG: i64 = (10 << 8) | 255;
+pub const CODE_TAG: i64 = ((LIST_KINDS + 5) << 8) | 255;
 /// Kinds from here up are instances of a frontend's classes, in the
 /// order the frontend numbers them.
-pub const INSTANCE_KIND_BASE: i64 = 16;
+pub const INSTANCE_KIND_BASE: i64 = 32;
+/// Typed arrays are kinds a frontend registers, numbered from here
+/// within the frontend's range (`lists::SHAPE_KIND_BASE` and up), so the
+/// dynamic layer reaches them through the same hooks as a list of a
+/// registered tuple shape. A kind holds the storage's list kind number
+/// in its low byte and the typecode letter above; see [`array_tag`].
+pub const ARRAY_KIND_BASE: i64 = lists::SHAPE_KIND_BASE + (1 << 19);
+
+/// The box tag of an array stored as a list of `storage` under
+/// typecode `letter`, distinct from a list stored the same way and from
+/// an array of another typecode.
+pub fn array_tag(storage: Kind, letter: u8) -> i64 {
+    let kind = ARRAY_KIND_BASE + ((letter as i64) << 8) + (storage.list_tag() >> 8);
+    (kind << 8) | 255
+}
 /// The box category of None, the low byte of its tag.
 pub const NONE_CATEGORY: i64 = dynamic::NONE;
 
