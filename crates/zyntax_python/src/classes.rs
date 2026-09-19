@@ -1039,24 +1039,42 @@ fn builtin_arms(
         )
     };
     let list_kind = |k: zyntax_builtins::Kind| kind(k.list_tag() >> 8);
-    let receivers: [(Node, Ty); 8] = [
-        (category(5), Ty::Str),
-        (list_kind(zyntax_builtins::Kind::Int), Ty::List(Elem::Int)),
+    let mut receivers: Vec<(Node, Ty, bool)> = vec![
+        (category(5), Ty::Str, false),
+        (
+            list_kind(zyntax_builtins::Kind::Int),
+            Ty::List(Elem::Int),
+            false,
+        ),
         (
             list_kind(zyntax_builtins::Kind::Float),
             Ty::List(Elem::Float),
+            false,
         ),
-        (list_kind(zyntax_builtins::Kind::Str), Ty::List(Elem::Str)),
+        (
+            list_kind(zyntax_builtins::Kind::Str),
+            Ty::List(Elem::Str),
+            false,
+        ),
         (
             list_kind(zyntax_builtins::Kind::Any),
             Ty::List(Elem::Object),
+            false,
         ),
-        (kind(zyntax_builtins::TUPLE_TAG >> 8), Ty::Tuple),
-        (kind(zyntax_builtins::DICT_TAG >> 8), Ty::Dict),
-        (kind(zyntax_builtins::SET_TAG >> 8), Ty::Set),
+        (kind(zyntax_builtins::DICT_TAG >> 8), Ty::Dict, false),
+        (kind(zyntax_builtins::SET_TAG >> 8), Ty::Set, false),
     ];
+    // A boxed tuple is a list of dynamic values under its own tag, and
+    // answers the two methods a tuple has as that list.
+    if matches!(method, "count" | "index") {
+        receivers.push((
+            kind(zyntax_builtins::TUPLE_TAG >> 8),
+            Ty::List(Elem::Object),
+            true,
+        ));
+    }
     let mut arms = Vec::new();
-    for (test, ty) in receivers {
+    for (test, ty, tuple) in receivers {
         let mut vars: Vec<(&str, Ty)> = vec![("s", ty)];
         for a in &args {
             vars.push((a.as_str(), Ty::Object));
@@ -1064,13 +1082,17 @@ fn builtin_arms(
         let mut lowerer = scratch_with(module, &vars);
         // The receiver is what the arm's test says it is; the method
         // then runs on it, and may leave statements to run ahead of it.
-        let receiver = lowerer.trusted(
-            Val {
-                node: x.clone(),
-                ty: Ty::Object,
-            },
-            ty,
-        );
+        let receiver = if tuple {
+            call("zb_unbox_tuple_raw", vec![x.clone()], ty, span)
+        } else {
+            lowerer.trusted(
+                Val {
+                    node: x.clone(),
+                    ty: Ty::Object,
+                },
+                ty,
+            )
+        };
         let mut then = std::mem::take(&mut lowerer.hoisted);
         then.push(let_("s", ty, receiver, span));
         let Ok(value) = lowerer.expr(&expr) else {

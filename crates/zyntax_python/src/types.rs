@@ -33,8 +33,10 @@ pub(crate) enum Ty {
     None,
     /// A list whose elements are all of one kind.
     List(Elem),
-    /// A tuple: an immutable list of dynamic values.
-    Tuple,
+    /// A tuple of the shape at this index of the shape table: the
+    /// number of elements and the type of each, a value struct. A tuple
+    /// no shape is settled for is a dynamic value.
+    Tuple(u16),
     /// A dict: keys and values, dynamic, in insertion order.
     Dict,
     /// A set of dynamic values.
@@ -159,6 +161,50 @@ pub(crate) fn builtin_index(name: &str) -> Option<u8> {
         .map(|i| i as u8)
 }
 
+thread_local! {
+    /// The tuple shapes of the program being compiled, by index. A
+    /// shape is interned once and its index never changes, so a
+    /// `Ty::Tuple` decided in one inference round names the same shape
+    /// in the next and in the lowering.
+    static TUPLE_SHAPES: std::cell::RefCell<Vec<Vec<Ty>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Forget every shape: the start of a program.
+pub(crate) fn reset_tuple_shapes() {
+    TUPLE_SHAPES.with(|t| t.borrow_mut().clear());
+}
+
+/// The tuple type of these element types. The empty tuple is a dynamic
+/// value: a struct of no fields has no value to hold. An element with
+/// no value of its own to store (None) or none a field can hold (a
+/// generator) is stored boxed.
+pub(crate) fn tuple_of(elems: Vec<Ty>) -> Ty {
+    if elems.is_empty() {
+        return Ty::Object;
+    }
+    let elems: Vec<Ty> = elems
+        .into_iter()
+        .map(|t| match t {
+            Ty::None | Ty::Gen => Ty::Object,
+            other => other,
+        })
+        .collect();
+    TUPLE_SHAPES.with(|t| {
+        let mut table = t.borrow_mut();
+        if let Some(k) = table.iter().position(|shape| *shape == elems) {
+            return Ty::Tuple(k as u16);
+        }
+        let k = u16::try_from(table.len()).expect("fewer than 65536 tuple shapes in a program");
+        table.push(elems);
+        Ty::Tuple(k)
+    })
+}
+
+/// The element types of the tuple shape `k`.
+pub(crate) fn tuple_shape(k: u16) -> Vec<Ty> {
+    TUPLE_SHAPES.with(|t| t.borrow()[k as usize].clone())
+}
+
 impl Ty {
     /// The join of two assignments to one name.
     pub(crate) fn join(self, other: Ty) -> Ty {
@@ -167,7 +213,33 @@ impl Ty {
             (a, b) if a == b => a,
             // An instance is a pointer, and None is the null one.
             (Ty::None, Ty::Class(k)) | (Ty::Class(k), Ty::None) => Ty::Class(k),
+            // Two shapes of one arity join element by element.
+            (Ty::Tuple(a), Ty::Tuple(b)) => {
+                let (a, b) = (tuple_shape(a), tuple_shape(b));
+                if a.len() != b.len() {
+                    return Ty::Object;
+                }
+                tuple_of(a.into_iter().zip(b).map(|(x, y)| x.join(y)).collect())
+            }
             _ => Ty::Object,
+        }
+    }
+
+    /// The shape of a tuple type.
+    pub(crate) fn tuple_elems(self) -> Option<Vec<Ty>> {
+        match self {
+            Ty::Tuple(k) => Some(tuple_shape(k)),
+            _ => None,
+        }
+    }
+
+    /// This type once inference is over: whatever it left undecided is
+    /// dynamic, inside a tuple's shape as well.
+    pub(crate) fn settled(self) -> Ty {
+        match self {
+            Ty::Unknown => Ty::Object,
+            Ty::Tuple(k) => tuple_of(tuple_shape(k).into_iter().map(Ty::settled).collect()),
+            other => other,
         }
     }
 
@@ -175,11 +247,21 @@ impl Ty {
         matches!(self, Ty::Int | Ty::Float | Ty::Bool)
     }
 
-    /// The element type of a sequence, when it is one.
+    /// The element type of a sequence, when it is one: for a tuple,
+    /// the kind its elements are read as when they are read by a
+    /// position only the runtime knows, which is the list kind the join
+    /// of its elements is stored as.
     pub(crate) fn element(self) -> Option<Ty> {
         match self {
             Ty::List(e) => Some(e.ty()),
-            Ty::Tuple | Ty::Dict | Ty::Set | Ty::Gen => Some(Ty::Object),
+            Ty::Tuple(k) => {
+                let joined = tuple_shape(k).into_iter().fold(Ty::Unknown, Ty::join);
+                Some(match joined {
+                    Ty::Unknown => Ty::Unknown,
+                    other => Elem::of(other).ty(),
+                })
+            }
+            Ty::Dict | Ty::Set | Ty::Gen => Some(Ty::Object),
             Ty::Str => Some(Ty::Str),
             Ty::Unknown => Some(Ty::Unknown),
             _ => None,
@@ -1167,7 +1249,7 @@ pub(crate) fn annotation_in(classes: &HashMap<String, usize>, e: &py::Expr) -> T
             "list" | "List" | "Sequence" | "Iterable" => Ty::List(Elem::Object),
             "dict" | "Dict" | "Mapping" => Ty::Dict,
             "set" | "Set" => Ty::Set,
-            "tuple" | "Tuple" => Ty::Tuple,
+            "tuple" | "Tuple" => Ty::Object,
             other => classes
                 .get(other)
                 .map(|k| Ty::Class(*k as u16))
@@ -1175,6 +1257,7 @@ pub(crate) fn annotation_in(classes: &HashMap<String, usize>, e: &py::Expr) -> T
         },
         py::Expr::NoneLiteral(_) => Ty::None,
         // `list[int]` and friends: the outer name decides.
+        // `tuple[int, str]` is that shape.
         py::Expr::Subscript(sub) => match annotation_in(classes, &sub.value) {
             Ty::List(_) => match annotation_in(classes, &sub.slice) {
                 Ty::Int => Ty::List(Elem::Int),
@@ -1183,6 +1266,19 @@ pub(crate) fn annotation_in(classes: &HashMap<String, usize>, e: &py::Expr) -> T
                 Ty::Class(k) => Ty::List(Elem::Class(k)),
                 _ => Ty::List(Elem::Object),
             },
+            Ty::Object if matches!(&*sub.value, py::Expr::Name(n) if matches!(n.id.as_str(), "tuple" | "Tuple")) => {
+                match &*sub.slice {
+                    py::Expr::Tuple(t)
+                        if !t
+                            .elts
+                            .iter()
+                            .any(|e| matches!(e, py::Expr::EllipsisLiteral(_))) =>
+                    {
+                        tuple_of(t.elts.iter().map(|e| annotation_in(classes, e)).collect())
+                    }
+                    _ => Ty::Object,
+                }
+            }
             other => other,
         },
         _ => Ty::Object,
@@ -1778,32 +1874,29 @@ pub(crate) fn infer_module(
     // Whatever recursion left undecided is dynamic. So is a parameter
     // only ever passed None: the IR has no value of that type to pass.
     for (name, sig) in module.funcs.iter_mut() {
-        if sig.ret == Ty::Unknown {
-            sig.ret = Ty::Object;
-        }
+        sig.ret = sig.ret.settled();
         if let Some(flags) = inferring.get(name) {
             for (flag, (_, ty)) in flags.iter().zip(sig.params.iter_mut()) {
-                if *flag && matches!(ty, Ty::Unknown | Ty::None) {
-                    *ty = Ty::Object;
+                if *flag {
+                    *ty = match *ty {
+                        Ty::None => Ty::Object,
+                        t => t.settled(),
+                    };
                 }
             }
         }
     }
     for class in &mut module.classes {
         for (_, ty) in &mut class.fields {
-            if *ty == Ty::Unknown {
-                *ty = Ty::Object;
-            }
+            *ty = ty.settled();
         }
     }
     let mut closures = module.closures.take();
     for c in &mut closures {
-        if c.sig.ret == Ty::Unknown {
-            c.sig.ret = Ty::Object;
-        }
+        c.sig.ret = c.sig.ret.settled();
         for (flag, (_, ty)) in c.inferred.iter().zip(c.sig.params.iter_mut()) {
-            if *flag && *ty == Ty::Unknown {
-                *ty = Ty::Object;
+            if *flag {
+                *ty = ty.settled();
             }
         }
     }
@@ -2283,9 +2376,7 @@ fn infer_locals_open(module: &Module, sig: &Sig, body: &[py::Stmt], files: &[u32
 /// Whatever inference left undecided is dynamic.
 fn settle(locals: &mut Locals) {
     for ty in locals.vars.values_mut() {
-        if *ty == Ty::Unknown {
-            *ty = Ty::Object;
-        }
+        *ty = ty.settled();
     }
 }
 
@@ -3342,16 +3433,17 @@ impl Walker<'_> {
                 self.field_write(a, ty);
             }
             py::Expr::Attribute(a) => self.field_write(a, ty),
-            // Unpacking gives every name an element, whose type only the
-            // runtime knows.
+            // Unpacking gives every name an element: its own from a
+            // tuple of that arity, the element type from a list, and
+            // otherwise whatever the runtime finds.
             py::Expr::Tuple(t) => {
-                for e in &t.elts {
-                    self.target(e, Ty::Object);
+                for (e, ty) in t.elts.iter().zip(unpacked(ty, &t.elts)) {
+                    self.target(e, ty);
                 }
             }
             py::Expr::List(l) => {
-                for e in &l.elts {
-                    self.target(e, Ty::Object);
+                for (e, ty) in l.elts.iter().zip(unpacked(ty, &l.elts)) {
+                    self.target(e, ty);
                 }
             }
             _ => {}
@@ -3550,12 +3642,38 @@ pub(crate) fn bind_target(vars: &mut HashMap<String, Ty>, target: &py::Expr, ty:
             vars.insert(n.id.to_string(), ty);
         }
         py::Expr::Tuple(t) => {
-            for e in &t.elts {
-                bind_target(vars, e, Ty::Object);
+            for (e, ty) in t.elts.iter().zip(unpacked(ty, &t.elts)) {
+                bind_target(vars, e, ty);
+            }
+        }
+        py::Expr::List(l) => {
+            for (e, ty) in l.elts.iter().zip(unpacked(ty, &l.elts)) {
+                bind_target(vars, e, ty);
             }
         }
         _ => {}
     }
+}
+
+/// What each of `targets` receives when a value of type `ty` is
+/// unpacked into them: the shape's own elements from a tuple of that
+/// arity, the element type of a list or string, and a dynamic value
+/// otherwise or wherever a starred target takes a slice.
+pub(crate) fn unpacked(ty: Ty, targets: &[py::Expr]) -> Vec<Ty> {
+    let starred = targets.iter().any(|t| matches!(t, py::Expr::Starred(_)));
+    let each = match ty {
+        Ty::Tuple(k) if !starred => {
+            let shape = tuple_shape(k);
+            if shape.len() == targets.len() {
+                return shape;
+            }
+            Ty::Object
+        }
+        Ty::List(e) if !starred => e.ty(),
+        Ty::Str if !starred => Ty::Str,
+        _ => Ty::Object,
+    };
+    vec![each; targets.len()]
 }
 
 pub(crate) fn is_name(e: &py::Expr, name: &str) -> bool {
@@ -3654,16 +3772,20 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
             Ty::Set
         }
         py::Operator::Add if matches!(l, Ty::List(_)) && l == r => l,
-        py::Operator::Add if l == Ty::Tuple && r == Ty::Tuple => Ty::Tuple,
-        py::Operator::Mult
-            if matches!(l, Ty::List(_) | Ty::Tuple) && matches!(r, Ty::Int | Ty::Bool) =>
-        {
-            l
+        // Two shapes concatenate into one.
+        py::Operator::Add if let (Ty::Tuple(a), Ty::Tuple(b)) = (l, r) => {
+            let mut elems = tuple_shape(a);
+            elems.extend(tuple_shape(b));
+            tuple_of(elems)
         }
+        py::Operator::Mult if matches!(l, Ty::List(_)) && matches!(r, Ty::Int | Ty::Bool) => l,
+        py::Operator::Mult if matches!(r, Ty::List(_)) && matches!(l, Ty::Int | Ty::Bool) => r,
+        // A repeated tuple has no shape the count does not decide.
         py::Operator::Mult
-            if matches!(r, Ty::List(_) | Ty::Tuple) && matches!(l, Ty::Int | Ty::Bool) =>
+            if (matches!(l, Ty::Tuple(_)) && matches!(r, Ty::Int | Ty::Bool))
+                || (matches!(r, Ty::Tuple(_)) && matches!(l, Ty::Int | Ty::Bool)) =>
         {
-            r
+            Ty::Object
         }
         py::Operator::Mult
             if (l == Ty::Str && matches!(r, Ty::Int | Ty::Bool))
@@ -3680,6 +3802,68 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
         }
         _ => l.arith(r),
     }
+}
+
+/// The value of an integer literal, possibly negated.
+pub(crate) fn int_literal(e: &py::Expr) -> Option<i64> {
+    match e {
+        py::Expr::NumberLiteral(n) => match &n.value {
+            py::Number::Int(i) => i.as_i64(),
+            _ => None,
+        },
+        py::Expr::UnaryOp(u) if u.op == py::UnaryOp::USub => int_literal(&u.operand)?.checked_neg(),
+        py::Expr::UnaryOp(u) if u.op == py::UnaryOp::UAdd => int_literal(&u.operand),
+        _ => None,
+    }
+}
+
+/// The element a literal subscript names in a tuple of `len` elements,
+/// counting from the end when negative; None when it is not a literal
+/// or is out of range.
+pub(crate) fn constant_index(e: &py::Expr, len: usize) -> Option<usize> {
+    let i = int_literal(e)?;
+    let i = if i < 0 { i + len as i64 } else { i };
+    (0..len as i64).contains(&i).then_some(i as usize)
+}
+
+/// The indexes a slice with literal bounds selects from a sequence of
+/// `len` elements, by Python's rules.
+pub(crate) fn tuple_slice(len: usize, slice: &py::ExprSlice) -> Option<Vec<usize>> {
+    let n = len as i64;
+    let literal = |e: &Option<Box<py::Expr>>| -> Option<Option<i64>> {
+        match e {
+            None => Some(None),
+            Some(e) => int_literal(e).map(Some),
+        }
+    };
+    let step = literal(&slice.step)?.unwrap_or(1);
+    if step == 0 {
+        return None;
+    }
+    let (lo, hi) = if step > 0 { (0, n) } else { (-1, n - 1) };
+    let bound = |v: Option<i64>, default: i64| match v {
+        None => default,
+        Some(v) if v < 0 => (v + n).clamp(lo, hi),
+        Some(v) => v.clamp(lo, hi),
+    };
+    let (start, stop) = if step > 0 {
+        (
+            bound(literal(&slice.lower)?, 0),
+            bound(literal(&slice.upper)?, n),
+        )
+    } else {
+        (
+            bound(literal(&slice.lower)?, n - 1),
+            bound(literal(&slice.upper)?, -1),
+        )
+    };
+    let mut out = Vec::new();
+    let mut i = start;
+    while (step > 0 && i < stop) || (step < 0 && i > stop) {
+        out.push(i as usize);
+        i += step;
+    }
+    Some(out)
 }
 
 fn nonnegative_literal(e: &py::Expr) -> bool {
@@ -3819,10 +4003,24 @@ impl Typer<'_> {
             }
             py::Expr::Subscript(s) => {
                 let seq = self.expr(&s.value);
-                if matches!(&*s.slice, py::Expr::Slice(_)) {
+                if let py::Expr::Slice(slice) = &*s.slice {
                     match seq {
-                        Ty::Str | Ty::List(_) | Ty::Tuple => seq,
+                        Ty::Str | Ty::List(_) => seq,
+                        // A slice of a tuple with literal bounds is the
+                        // shape those bounds cut out.
+                        Ty::Tuple(k) => {
+                            let shape = tuple_shape(k);
+                            tuple_slice(shape.len(), slice)
+                                .map(|picked| tuple_of(picked.iter().map(|&i| shape[i]).collect()))
+                                .unwrap_or(Ty::Object)
+                        }
                         _ => Ty::Object,
+                    }
+                } else if let Ty::Tuple(k) = seq {
+                    let shape = tuple_shape(k);
+                    match constant_index(&s.slice, shape.len()) {
+                        Some(i) => shape[i],
+                        None => seq.element().unwrap_or(Ty::Object),
                     }
                 } else {
                     seq.element().unwrap_or(Ty::Object)
@@ -3830,7 +4028,15 @@ impl Typer<'_> {
             }
             py::Expr::List(l) => Ty::List(self.elem_of(l.elts.iter())),
             py::Expr::ListComp(c) => Ty::List(self.comprehension_elem(&c.generators, &c.elt)),
-            py::Expr::Tuple(_) => Ty::Tuple,
+            // A starred element spreads a sequence of a length only the
+            // runtime knows.
+            py::Expr::Tuple(t) => {
+                if t.elts.iter().any(|e| matches!(e, py::Expr::Starred(_))) {
+                    Ty::Object
+                } else {
+                    tuple_of(t.elts.iter().map(|e| self.expr(e)).collect())
+                }
+            }
             py::Expr::Dict(_) | py::Expr::DictComp(_) => Ty::Dict,
             py::Expr::Set(_) | py::Expr::SetComp(_) => Ty::Set,
             py::Expr::Generator(_) => Ty::Gen,
@@ -3996,13 +4202,19 @@ impl Typer<'_> {
             "sorted" | "reversed" | "list" => match arg(0) {
                 Ty::List(e) => Ty::List(e),
                 Ty::Str => Ty::List(Elem::Str),
-                Ty::Tuple | Ty::Dict | Ty::Set | Ty::Gen => Ty::List(Elem::Object),
+                Ty::Tuple(_) => Ty::List(Elem::of(arg(0).element().unwrap_or(Ty::Object))),
+                Ty::Dict | Ty::Set | Ty::Gen => Ty::List(Elem::Object),
                 _ => match args.first() {
                     Some(py::Expr::Call(c)) if is_name(&c.func, "range") => Ty::List(Elem::Int),
                     _ => Ty::List(Elem::Object),
                 },
             },
-            "tuple" => Ty::Tuple,
+            // A tuple built from a sequence has the length of that
+            // sequence, which is not a shape.
+            "tuple" => match arg(0) {
+                Ty::Tuple(k) => Ty::Tuple(k),
+                _ => Ty::Object,
+            },
             "dict" => Ty::Dict,
             "set" | "frozenset" => Ty::Set,
             // Pairs and mapped values are dynamic; the lists are eager.
@@ -4012,6 +4224,11 @@ impl Typer<'_> {
                 let items = match arg(0) {
                     Ty::List(Elem::Int) => Ty::Int,
                     Ty::List(Elem::Float) => Ty::Float,
+                    t @ Ty::Tuple(_) => match t.element() {
+                        Some(Ty::Int | Ty::Bool) => Ty::Int,
+                        Some(Ty::Float) => Ty::Float,
+                        _ => Ty::Object,
+                    },
                     _ => Ty::Object,
                 };
                 match args.get(1) {
@@ -4027,9 +4244,13 @@ impl Typer<'_> {
             }
             "min" | "max" if args.len() == 1 => match arg(0) {
                 Ty::List(e) => e.ty(),
+                t @ Ty::Tuple(_) => Elem::of(t.element().unwrap_or(Ty::Object)).ty(),
                 _ => Ty::Object,
             },
-            "divmod" => Ty::Tuple,
+            "divmod" => {
+                let q = arg(0).arith(arg(1));
+                tuple_of(vec![q, q])
+            }
             "type" => Ty::Str,
             "str" | "repr" | "input" | "chr" => Ty::Str,
             "float" => Ty::Float,
@@ -4074,6 +4295,10 @@ impl Typer<'_> {
                 "index" | "count" => Ty::Int,
                 "copy" => Ty::List(e),
                 _ => Ty::None,
+            },
+            Ty::Tuple(_) => match attr {
+                "index" | "count" => Ty::Int,
+                _ => Ty::Object,
             },
             // What the defining class says, joined with every override
             // an instance of a subclass would reach.

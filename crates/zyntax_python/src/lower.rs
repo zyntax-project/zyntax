@@ -119,7 +119,9 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Str => prim(PrimitiveType::String),
         Ty::None => prim(PrimitiveType::Unit),
         Ty::List(e) => list_type(elem_ir(e)),
-        Ty::Tuple | Ty::Dict | Ty::Set => list_type(Type::Any),
+        // A shape is a value struct with one field per element.
+        Ty::Tuple(k) => Type::Tuple(types::tuple_shape(k).into_iter().map(ir).collect()),
+        Ty::Dict | Ty::Set => list_type(Type::Any),
         Ty::Class(k) => class_type(k as usize),
         Ty::Gen => Type::Fiber(Box::new(Type::Any)),
         // A known function value is still the record every function
@@ -170,7 +172,8 @@ fn list_fn(op: &str, elem: Elem) -> String {
 }
 
 /// Element `i` of a list the lowering built itself and so knows the
-/// length of: a cell, a record. Nothing checks the index.
+/// length of: a cell, a record. Nothing checks the index. On a tuple
+/// value the same expression is the field at `i`.
 fn slot(list: Node, i: usize, ty: Ty, span: Span) -> Node {
     node(
         TypedExpression::Index(TypedIndex {
@@ -180,6 +183,25 @@ fn slot(list: Node, i: usize, ty: Ty, span: Span) -> Node {
         ty,
         span,
     )
+}
+
+/// A tuple value of shape `ty` from its elements, each already of the
+/// shape's element type.
+fn tuple_value(items: Vec<Node>, ty: Ty, span: Span) -> Node {
+    node(TypedExpression::Tuple(items), ty, span)
+}
+
+/// Where the hold of a value read more than once goes.
+enum Hold<'a> {
+    /// Into this statement list, which the reads follow.
+    Into(&'a mut Vec<Stmt>),
+    /// Ahead of the statement, where reads of the parts may hoist
+    /// checks of their own that must come after it; or, where nothing
+    /// hoists, back to the caller.
+    Ahead,
+    /// Back to the caller, to wrap around the reads: for reads that
+    /// never hoist.
+    Around,
 }
 
 /// What a comprehension builds.
@@ -1523,7 +1545,41 @@ impl<'m> Lowerer<'m> {
             // A list is boxed by reference under a tag of its kind, and
             // read back by checking that tag.
             (Ty::List(e), Ty::Object) => call(&list_fn("box", e), vec![v.node], Ty::Object, span),
-            (Ty::Tuple, Ty::Object) => call("zb_box_tuple", vec![v.node], Ty::Object, span),
+            // A tuple is boxed as the tagged list of its boxed elements,
+            // and read back field by field once the tag and the length
+            // are checked.
+            (Ty::Tuple(_), Ty::Object) => self.box_tuple(v, span),
+            (Ty::Object, Ty::Tuple(k)) => self.unbox_tuple(v, k, false, span),
+            // Between two shapes of one arity, element by element; of
+            // different arities, through the box, whose length check
+            // is the ValueError.
+            (Ty::Tuple(a), Ty::Tuple(k)) => {
+                let to = types::tuple_shape(k);
+                if types::tuple_shape(a).len() != to.len() {
+                    let boxed = self.box_tuple(v, span);
+                    return self.unbox_tuple(
+                        Val {
+                            node: boxed,
+                            ty: Ty::Object,
+                        },
+                        k,
+                        false,
+                        span,
+                    );
+                }
+                let (fields, pre) = self.tuple_fields(v, span, Hold::Ahead);
+                let items = fields
+                    .into_iter()
+                    .zip(to)
+                    .map(|(f, t)| self.coerce(f, t.settled()))
+                    .collect();
+                let value = tuple_value(items, target, span);
+                if pre.is_empty() {
+                    value
+                } else {
+                    Self::block_value(pre, value, target, span)
+                }
+            }
             (Ty::Dict, Ty::Object) => call("zb_dict_box", vec![v.node], Ty::Object, span),
             (Ty::Set, Ty::Object) => call("zb_set_box", vec![v.node], Ty::Object, span),
             // A list read out of a box is checked like a primitive: a box
@@ -1539,7 +1595,6 @@ impl<'m> Lowerer<'m> {
                     checked.node
                 }
             }
-            (Ty::Object, Ty::Tuple) => call("zb_unbox_tuple", vec![v.node], Ty::Tuple, span),
             // A primitive read out of a box is checked: a box of another
             // type is a TypeError, raised where the value is used.
             (Ty::Object, Ty::Int | Ty::Float | Ty::Str | Ty::Bool) => {
@@ -1659,10 +1714,16 @@ impl<'m> Lowerer<'m> {
                     converted.node
                 }
             }
-            (Ty::Tuple, Ty::List(Elem::Object)) => Node {
-                ty: ir(target),
-                ..v.node
-            },
+            // A tuple's elements as a list of the kind wanted.
+            (Ty::Tuple(_), Ty::List(e)) => {
+                let (fields, pre) = self.tuple_fields(v, span, Hold::Around);
+                let list = self.list_of(fields, e, span);
+                if pre.is_empty() {
+                    list
+                } else {
+                    Self::block_value(pre, list, target, span)
+                }
+            }
             // A string's box holds a copy of it, released with the box.
             (Ty::Str, Ty::Object) => call("zb_box_str", vec![v.node], Ty::Object, span),
             // Into the dynamic world: a box. Out of it: a checked read.
@@ -1701,6 +1762,7 @@ impl<'m> Lowerer<'m> {
                 let address = addr_call("zb_unbox_instance_raw", vec![v.node], span);
                 return cast(address, target, span);
             }
+            (Ty::Object, Ty::Tuple(k)) => return self.unbox_tuple(v, k, true, span),
             _ => return self.coerce(v, target),
         };
         call(read, vec![v.node], target, span)
@@ -1709,6 +1771,131 @@ impl<'m> Lowerer<'m> {
     fn expr_as(&mut self, e: &py::Expr, target: Ty) -> Result<Node> {
         let v = self.expr(e)?;
         Ok(self.coerce(v, target))
+    }
+
+    /// A tuple as the list of its elements, of the one kind they all
+    /// are when they are; anything else as it is.
+    fn tuple_as_list(&mut self, v: Val) -> Val {
+        match v.ty {
+            Ty::Tuple(_) => {
+                let list = Ty::List(Elem::of(v.ty.element().unwrap_or(Ty::Object)));
+                Val {
+                    node: self.coerce(v, list),
+                    ty: list,
+                }
+            }
+            _ => v,
+        }
+    }
+
+    /// The fields of a tuple value, each as its own type. A tuple read
+    /// more than once is held first, where `place` says; a hold that
+    /// comes back is for the caller to put in front of the fields' use.
+    fn tuple_fields(&mut self, v: Val, span: Span, place: Hold<'_>) -> (Vec<Val>, Vec<Stmt>) {
+        let shape = v.ty.tuple_elems().expect("a tuple value");
+        let mut pre = Vec::new();
+        let held = if shape.len() > 1 {
+            self.hold(v, &mut pre, span)
+        } else {
+            v
+        };
+        match place {
+            Hold::Into(out) => out.append(&mut pre),
+            Hold::Ahead if self.guards => self.hoisted.append(&mut pre),
+            Hold::Ahead | Hold::Around => {}
+        }
+        let fields = shape
+            .into_iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                let ty = ty.settled();
+                Val {
+                    node: slot(held.node.clone(), i, ty, span),
+                    ty,
+                }
+            })
+            .collect();
+        (fields, pre)
+    }
+
+    /// A tuple value as a dynamic value: the tagged list of its boxed
+    /// elements.
+    fn box_tuple(&mut self, v: Val, span: Span) -> Node {
+        let (fields, pre) = self.tuple_fields(v, span, Hold::Around);
+        let list = self.list_of(fields, Elem::Object, span);
+        let boxed = call("zb_box_tuple", vec![list], Ty::Object, span);
+        if pre.is_empty() {
+            boxed
+        } else {
+            Self::block_value(pre, boxed, Ty::Object, span)
+        }
+    }
+
+    /// A dynamic value as a tuple of shape `k`: the box is checked to
+    /// hold a tuple of that length, and each element is read back as
+    /// the shape says. A `trusted` value is one the lowering boxed
+    /// itself, so nothing is checked.
+    fn unbox_tuple(&mut self, v: Val, k: u16, trusted: bool, span: Span) -> Node {
+        let shape = types::tuple_shape(k);
+        let target = Ty::Tuple(k);
+        let anys = Ty::List(Elem::Object);
+        let read = if trusted {
+            "zb_unbox_tuple_raw"
+        } else {
+            "zb_unbox_tuple"
+        };
+        let mut pre = Vec::new();
+        let held = self.hold(
+            Val {
+                node: call(read, vec![v.node], anys, span),
+                ty: anys,
+            },
+            &mut pre,
+            span,
+        );
+        if !trusted && self.guards {
+            pre.push(self.pending_check(span));
+            pre.push(TypedNode::new(
+                TypedStatement::Expression(Box::new(call(
+                    "zb_list_expect_len_any",
+                    vec![held.node.clone(), int_lit(shape.len() as i64, span)],
+                    Ty::None,
+                    span,
+                ))),
+                Type::Unknown,
+                span,
+            ));
+            pre.push(self.pending_check(span));
+        }
+        if self.guards {
+            self.hoisted.append(&mut pre);
+        }
+        let items = shape
+            .into_iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                let item = Val {
+                    node: call(
+                        "zb_list_get_unchecked_any",
+                        vec![held.node.clone(), int_lit(i as i64, span)],
+                        Ty::Object,
+                        span,
+                    ),
+                    ty: Ty::Object,
+                };
+                if trusted {
+                    self.trusted(item, ty.settled())
+                } else {
+                    self.coerce(item, ty.settled())
+                }
+            })
+            .collect();
+        let value = tuple_value(items, target, span);
+        if pre.is_empty() {
+            value
+        } else {
+            Self::block_value(pre, value, target, span)
+        }
     }
 
     /// A value as an element of a list of kind `e`: an instance goes in
@@ -1790,12 +1977,22 @@ impl<'m> Lowerer<'m> {
                     }
                 })
             }
-            Ty::List(_) | Ty::Tuple => binary(
+            Ty::List(_) => binary(
                 BinaryOp::Ne,
                 method_call(v.node, "len", vec![], Ty::Int, span),
                 int_lit(0, span),
                 Ty::Bool,
                 span,
+            ),
+            // A shape has at least one element.
+            Ty::Tuple(_) => Self::after_none(
+                v.node,
+                node(
+                    TypedExpression::Literal(TypedLiteral::Bool(true)),
+                    Ty::Bool,
+                    span,
+                ),
+                Ty::Bool,
             ),
             Ty::Set => binary(
                 BinaryOp::Ne,
@@ -1852,7 +2049,10 @@ impl<'m> Lowerer<'m> {
                 Self::after_none(v.node, call("zb_none_repr", vec![], Ty::Str, span), Ty::Str)
             }
             Ty::List(e) => call(&list_fn("repr", e), vec![v.node], Ty::Str, span),
-            Ty::Tuple => call("zb_tuple_repr", vec![v.node], Ty::Str, span),
+            Ty::Tuple(_) => {
+                let items = self.coerce(v, Ty::List(Elem::Object));
+                call("zb_tuple_repr", vec![items], Ty::Str, span)
+            }
             Ty::Dict => call("zb_dict_repr", vec![v.node], Ty::Str, span),
             Ty::Set => call("zb_set_repr", vec![v.node], Ty::Str, span),
             Ty::Gen => str_lit("<generator object>", span),
@@ -2951,8 +3151,27 @@ impl<'m> Lowerer<'m> {
                 return self.bind(&as_tuple, value, span, out);
             }
             py::Expr::Tuple(t) => {
+                let starred = t.elts.iter().any(|e| matches!(e, py::Expr::Starred(_)));
+                // A tuple of the targets' own arity is taken apart field
+                // by field, each held before any target is bound; one of
+                // another arity is unpacked as the list of its elements,
+                // whose length check raises.
+                if let Some(shape) = value.ty.tuple_elems()
+                    && shape.len() == t.elts.len()
+                    && !starred
+                {
+                    let (fields, _) = self.tuple_fields(value, span, Hold::Into(out));
+                    let mut items = Vec::with_capacity(fields.len());
+                    for field in fields {
+                        items.push(self.hold(field, out, span));
+                    }
+                    for (elt, item) in t.elts.iter().zip(items) {
+                        self.bind(elt, item, span, out)?;
+                    }
+                    return Ok(());
+                }
                 // A set unpacks as the list of its values.
-                let value = if value.ty == Ty::Set {
+                let value = if value.ty == Ty::Set || matches!(value.ty, Ty::Tuple(_)) {
                     Val {
                         node: self.coerce(value, Ty::List(Elem::Object)),
                         ty: Ty::List(Elem::Object),
@@ -2991,12 +3210,6 @@ impl<'m> Lowerer<'m> {
                         Ty::None,
                         span,
                     )),
-                    Ty::Tuple => Some(call(
-                        "zb_list_expect_len_any",
-                        vec![seq.node.clone(), int_lit(n, span)],
-                        Ty::None,
-                        span,
-                    )),
                     _ => None,
                 };
                 if let Some(check) = check {
@@ -3016,15 +3229,6 @@ impl<'m> Lowerer<'m> {
                                 "get_unchecked",
                                 e,
                                 vec![seq.node.clone(), index],
-                                span,
-                            ),
-                            ty: elem_ty,
-                        },
-                        Ty::Tuple => Val {
-                            node: call(
-                                "zb_list_get_unchecked_any",
-                                vec![seq.node.clone(), index],
-                                Ty::Object,
                                 span,
                             ),
                             ty: elem_ty,
@@ -3224,7 +3428,16 @@ impl<'m> Lowerer<'m> {
     fn index_value(&mut self, seq: Val, index: Node, elem_ty: Ty, span: Span) -> Val {
         let node = match seq.ty {
             Ty::List(e) => elem_call("get", e, vec![seq.node, index], span),
-            Ty::Tuple => call("zb_list_get_any", vec![seq.node, index], Ty::Object, span),
+            // An index only the runtime knows reads the tuple as the
+            // list of its elements.
+            Ty::Tuple(_) => {
+                let e = Elem::of(elem_ty);
+                let items = Val {
+                    node: self.coerce(seq, Ty::List(e)),
+                    ty: Ty::List(e),
+                };
+                return self.index_value(items, index, elem_ty, span);
+            }
             Ty::Str => call("zb_str_get", vec![seq.node, index], Ty::Str, span),
             _ => call(
                 "zb_any_getitem_i64",
@@ -3251,6 +3464,9 @@ impl<'m> Lowerer<'m> {
         if seq.ty == Ty::Gen {
             return self.for_generator(f, seq, extra, span);
         }
+        // A tuple iterates as the list of its elements, whose kind is
+        // the element the loop variable takes.
+        let seq = self.tuple_as_list(seq);
         let elem_ty = seq.ty.element().unwrap_or(Ty::Object);
         // The iterator is evaluated once, before the loop.
         let mut prologue = std::mem::take(&mut self.hoisted);
@@ -4473,18 +4689,32 @@ impl<'m> Lowerer<'m> {
                     ty,
                 }
             }
+            // A literal of a shape is the value struct; one of no shape
+            // (empty, or spreading a sequence) is a boxed tuple.
             py::Expr::Tuple(t) => {
                 let mut items = Vec::with_capacity(t.elts.len());
                 for e in &t.elts {
                     items.push(self.expr(e)?);
                 }
-                let node = self.list_of(items, Elem::Object, span);
-                Val {
-                    node: Node {
-                        ty: ir(Ty::Tuple),
-                        ..node
-                    },
-                    ty: Ty::Tuple,
+                match ty.tuple_elems() {
+                    Some(shape) if shape.len() == items.len() => {
+                        let items = items
+                            .into_iter()
+                            .zip(shape)
+                            .map(|(item, elem)| self.coerce(item, elem.settled()))
+                            .collect();
+                        Val {
+                            node: tuple_value(items, ty, span),
+                            ty,
+                        }
+                    }
+                    _ => {
+                        let list = self.list_of(items, Elem::Object, span);
+                        Val {
+                            node: call("zb_box_tuple", vec![list], Ty::Object, span),
+                            ty: Ty::Object,
+                        }
+                    }
                 }
             }
             py::Expr::Subscript(sub) => self.subscript(sub, ty, span)?,
@@ -4685,27 +4915,58 @@ impl<'m> Lowerer<'m> {
                     ty,
                 });
             }
-            (py::Operator::Add, Ty::Tuple, Ty::Tuple) => {
+            // Two shapes concatenate into the wider one.
+            (py::Operator::Add, Ty::Tuple(_), Ty::Tuple(_)) if matches!(ty, Ty::Tuple(_)) => {
+                let (mut fields, mut pre) = self.tuple_fields(left, span, Hold::Ahead);
+                let (more, mut pre_right) = self.tuple_fields(right, span, Hold::Ahead);
+                fields.extend(more);
+                pre.append(&mut pre_right);
+                let shape = ty.tuple_elems().expect("a shape");
+                let items = fields
+                    .into_iter()
+                    .zip(shape)
+                    .map(|(f, t)| self.coerce(f, t.settled()))
+                    .collect();
+                let value = tuple_value(items, ty, span);
                 return Ok(Val {
-                    node: call(
-                        "zb_list_concat_any",
-                        vec![left.node, right.node],
-                        Ty::Tuple,
-                        span,
-                    ),
-                    ty: Ty::Tuple,
+                    node: if pre.is_empty() {
+                        value
+                    } else {
+                        Self::block_value(pre, value, ty, span)
+                    },
+                    ty,
                 });
             }
-            (py::Operator::Mult, Ty::List(_) | Ty::Tuple, Ty::Int | Ty::Bool)
-            | (py::Operator::Mult, Ty::Int | Ty::Bool, Ty::List(_) | Ty::Tuple) => {
-                let (seq, times) = if matches!(left.ty, Ty::List(_) | Ty::Tuple) {
+            // A repeated tuple is a boxed tuple of the repeated elements.
+            (py::Operator::Mult, Ty::Tuple(_), Ty::Int | Ty::Bool)
+            | (py::Operator::Mult, Ty::Int | Ty::Bool, Ty::Tuple(_)) => {
+                let (seq, times) = if matches!(left.ty, Ty::Tuple(_)) {
                     (left, right)
                 } else {
                     (right, left)
                 };
-                let elem = match seq.ty {
-                    Ty::List(e) => e,
-                    _ => Elem::Object,
+                let items = self.coerce(seq, Ty::List(Elem::Object));
+                let n = self.coerce(times, Ty::Int);
+                let repeated = call(
+                    &list_fn("repeat", Elem::Object),
+                    vec![items, n],
+                    Ty::List(Elem::Object),
+                    span,
+                );
+                return Ok(Val {
+                    node: call("zb_box_tuple", vec![repeated], Ty::Object, span),
+                    ty: Ty::Object,
+                });
+            }
+            (py::Operator::Mult, Ty::List(_), Ty::Int | Ty::Bool)
+            | (py::Operator::Mult, Ty::Int | Ty::Bool, Ty::List(_)) => {
+                let (seq, times) = if matches!(left.ty, Ty::List(_)) {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                let Ty::List(elem) = seq.ty else {
+                    unreachable!()
                 };
                 let n = self.coerce(times, Ty::Int);
                 let seq_ty = seq.ty;
@@ -4942,14 +5203,14 @@ impl<'m> Lowerer<'m> {
                 } else if right.ty == Ty::Set {
                     let item = self.coerce(left, Ty::Object);
                     call("zb_set_contains", vec![right.node, item], Ty::Bool, span)
-                } else if right.ty == Ty::Tuple {
-                    let item = self.coerce(left, Ty::Object);
-                    call(
-                        "zb_list_contains_any",
-                        vec![right.node, item],
-                        Ty::Bool,
-                        span,
-                    )
+                } else if matches!(right.ty, Ty::Tuple(_)) {
+                    // Through the list of the elements, of the one kind
+                    // they all are when they are.
+                    let e = Elem::of(right.ty.element().unwrap_or(Ty::Object));
+                    let e = if left.ty == e.ty() { e } else { Elem::Object };
+                    let items = self.coerce(right, Ty::List(e));
+                    let item = self.elem_arg(left, e);
+                    call(&list_fn("contains", e), vec![items, item], Ty::Bool, span)
                 } else if right.ty == Ty::Dict {
                     let by = if left.ty == Ty::Str { "_str" } else { "" };
                     let item = if left.ty == Ty::Str {
@@ -5005,8 +5266,8 @@ impl<'m> Lowerer<'m> {
                         span,
                     ),
                     // Containers are identical when they are the same heap object.
-                    (Ty::List(_) | Ty::Tuple | Ty::Dict | Ty::Set, _)
-                    | (_, Ty::List(_) | Ty::Tuple | Ty::Dict | Ty::Set) => {
+                    (Ty::List(_) | Ty::Tuple(_) | Ty::Dict | Ty::Set, _)
+                    | (_, Ty::List(_) | Ty::Tuple(_) | Ty::Dict | Ty::Set) => {
                         let l = self.coerce(left, Ty::Object);
                         let r = self.coerce(right, Ty::Object);
                         call("zb_any_same", vec![l, r], Ty::Bool, span)
@@ -5054,10 +5315,47 @@ impl<'m> Lowerer<'m> {
                 }
             });
         }
-        // Two sequences compare element by element.
+        // A tuple and a list are never equal and have no order.
+        let tuple_sides = (
+            matches!(left.ty, Ty::Tuple(_)),
+            matches!(right.ty, Ty::Tuple(_)),
+        );
+        if matches!(
+            (tuple_sides, left.ty, right.ty),
+            ((true, false), _, Ty::List(_)) | ((false, true), Ty::List(_), _)
+        ) {
+            let lit = |b: bool| {
+                node(
+                    TypedExpression::Literal(TypedLiteral::Bool(b)),
+                    Ty::Bool,
+                    span,
+                )
+            };
+            return Ok(match op {
+                py::CmpOp::Eq => Self::after_none(
+                    left.node,
+                    Self::after_none(right.node, lit(false), Ty::Bool),
+                    Ty::Bool,
+                ),
+                py::CmpOp::NotEq => Self::after_none(
+                    left.node,
+                    Self::after_none(right.node, lit(true), Ty::Bool),
+                    Ty::Bool,
+                ),
+                _ => {
+                    return Err(Error::unsupported_span(
+                        "ordering a tuple against a list".to_string(),
+                        span,
+                    ));
+                }
+            });
+        }
+        // Two sequences compare element by element; tuples as the lists
+        // of their elements.
+        let left = self.tuple_as_list(left);
+        let right = self.tuple_as_list(right);
         let seq_kind = |t: Ty| match t {
             Ty::List(e) => Some(e),
-            Ty::Tuple => Some(Elem::Object),
             _ => None,
         };
         if let (Some(e), Some(f)) = (seq_kind(left.ty), seq_kind(right.ty)) {
@@ -5360,17 +5658,33 @@ impl<'m> Lowerer<'m> {
                     ty,
                     span,
                 ),
-                Ty::Tuple => {
+                // Literal bounds cut a shape out of a shape; any other
+                // slice is a tuple of a length only the runtime knows.
+                Ty::Tuple(k) => {
+                    let shape = types::tuple_shape(k);
+                    if let Some(picked) = types::tuple_slice(shape.len(), sl)
+                        && ty == types::tuple_of(picked.iter().map(|&i| shape[i]).collect())
+                    {
+                        let (fields, pre) = self.tuple_fields(seq, span, Hold::Ahead);
+                        let items = picked.iter().map(|&i| fields[i].node.clone()).collect();
+                        let value = tuple_value(items, ty, span);
+                        return Ok(Val {
+                            node: if pre.is_empty() {
+                                value
+                            } else {
+                                Self::block_value(pre, value, ty, span)
+                            },
+                            ty,
+                        });
+                    }
+                    let items = self.coerce(seq, Ty::List(Elem::Object));
                     let sliced = call(
                         "zb_list_slice_any",
-                        vec![seq.node, start, stop, step, mask],
-                        Ty::Tuple,
+                        vec![items, start, stop, step, mask],
+                        Ty::List(Elem::Object),
                         span,
                     );
-                    Node {
-                        ty: ir(Ty::Tuple),
-                        ..sliced
-                    }
+                    call("zb_box_tuple", vec![sliced], Ty::Object, span)
                 }
                 Ty::Str => call(
                     "zb_str_slice",
@@ -5391,7 +5705,17 @@ impl<'m> Lowerer<'m> {
             return Ok(Val { node, ty });
         }
         match seq.ty {
-            Ty::List(_) | Ty::Tuple | Ty::Str => {
+            // A literal index into a shape is that field.
+            Ty::Tuple(k)
+                if let Some(i) = types::constant_index(&sub.slice, types::tuple_shape(k).len()) =>
+            {
+                let field = types::tuple_shape(k)[i].settled();
+                Ok(Val {
+                    node: slot(seq.node, i, field, span),
+                    ty: field,
+                })
+            }
+            Ty::List(_) | Ty::Tuple(_) | Ty::Str => {
                 let index = self.expr_as(&sub.slice, Ty::Int)?;
                 Ok(self.index_value(seq, index, ty, span))
             }
@@ -5817,6 +6141,19 @@ impl<'m> Lowerer<'m> {
                 };
                 Ok(Val { node, ty })
             }
+            // A tuple answers its two methods as the list of its elements.
+            Ty::Tuple(_) if matches!(name, "count" | "index") => {
+                expect(1, self)?;
+                let v = self.expr(&args[0])?;
+                let e = Elem::of(receiver.ty.element().unwrap_or(Ty::Object));
+                let e = if v.ty == e.ty() { e } else { Elem::Object };
+                let items = self.coerce(receiver, Ty::List(e));
+                let v = self.elem_arg(v, e);
+                Ok(Val {
+                    node: call(&list_fn(name, e), vec![items, v], ty, span),
+                    ty,
+                })
+            }
             _ => Err(Error::unsupported_span(
                 format!("method `{name}` on a dynamic value"),
                 span,
@@ -6122,9 +6459,13 @@ impl<'m> Lowerer<'m> {
                     let v = self.expr(&args[0])?;
                     let node = match v.ty {
                         Ty::Str => call("zb_str_chars_len", vec![v.node], Ty::Int, span),
-                        Ty::List(_) | Ty::Tuple => {
-                            method_call(v.node, "len", vec![], Ty::Int, span)
-                        }
+                        Ty::List(_) => method_call(v.node, "len", vec![], Ty::Int, span),
+                        // A shape's length is its arity.
+                        Ty::Tuple(k) => Self::after_none(
+                            v.node,
+                            int_lit(types::tuple_shape(k).len() as i64, span),
+                            Ty::Int,
+                        ),
                         Ty::Set => call("zb_set_len", vec![v.node], Ty::Int, span),
                         Ty::Dict => call("zb_dict_len", vec![v.node], Ty::Int, span),
                         Ty::Class(k) => {
@@ -6197,6 +6538,7 @@ impl<'m> Lowerer<'m> {
                 }
                 "sum" if args.len() == 1 || args.len() == 2 => {
                     let v = self.consumed(&args[0], span)?;
+                    let v = self.tuple_as_list(v);
                     let (node, sum_ty) = match v.ty {
                         Ty::List(e @ (Elem::Int | Elem::Float | Elem::Object)) => {
                             (call(&list_fn("sum", e), vec![v.node], e.ty(), span), e.ty())
@@ -6229,7 +6571,8 @@ impl<'m> Lowerer<'m> {
                     // Several arguments are the one-argument form over a
                     // list of them.
                     let list = if args.len() == 1 {
-                        self.consumed(&args[0], span)?
+                        let v = self.consumed(&args[0], span)?;
+                        self.tuple_as_list(v)
                     } else {
                         let mut items = Vec::with_capacity(args.len());
                         for a in args.iter() {
@@ -6287,7 +6630,7 @@ impl<'m> Lowerer<'m> {
                         Some(a) => {
                             let v = self.consumed(a, span)?;
                             match v.ty {
-                                Ty::List(_) | Ty::Tuple | Ty::Set | Ty::Dict => {
+                                Ty::List(_) | Ty::Tuple(_) | Ty::Set | Ty::Dict => {
                                     self.coerce(v, Ty::List(Elem::Object))
                                 }
                                 _ => {
@@ -6300,6 +6643,13 @@ impl<'m> Lowerer<'m> {
                     return Ok(Val {
                         node: call("zb_set_from", vec![items], Ty::Set, span),
                         ty: Ty::Set,
+                    });
+                }
+                "tuple" if matches!(ty, Ty::Tuple(_)) => {
+                    let v = self.expr(&args[0])?;
+                    return Ok(Val {
+                        node: self.coerce(v, ty),
+                        ty,
                     });
                 }
                 "sorted" | "reversed" | "list" | "tuple" => {
@@ -6353,7 +6703,16 @@ impl<'m> Lowerer<'m> {
                             let v = self.consumed(a, span)?;
                             match v.ty {
                                 Ty::List(_) => v,
-                                Ty::Tuple | Ty::Set | Ty::Dict | Ty::Gen => {
+                                // A tuple's elements as the list the
+                                // result is typed as.
+                                Ty::Tuple(_) => {
+                                    let node = self.coerce(v, Ty::List(target_elem));
+                                    Val {
+                                        node,
+                                        ty: Ty::List(target_elem),
+                                    }
+                                }
+                                Ty::Set | Ty::Dict | Ty::Gen => {
                                     let node = self.coerce(v, Ty::List(Elem::Object));
                                     Val {
                                         node,
@@ -6426,14 +6785,15 @@ impl<'m> Lowerer<'m> {
                             span,
                         ));
                     }
-                    let result_ty = if name == "tuple" {
-                        Ty::Tuple
+                    // A tuple of a length only the runtime knows is a
+                    // boxed tuple.
+                    let (value, result_ty) = if name == "tuple" {
+                        (
+                            call("zb_box_tuple", vec![held.node], Ty::Object, span),
+                            Ty::Object,
+                        )
                     } else {
-                        Ty::List(e)
-                    };
-                    let value = Node {
-                        ty: ir(result_ty),
-                        ..held.node
+                        (held.node, Ty::List(e))
                     };
                     return Ok(Val {
                         node: Self::block_value(statements, value, result_ty, span),
@@ -6463,14 +6823,25 @@ impl<'m> Lowerer<'m> {
                         span,
                     )?;
                     let r = self.arithmetic(py::Operator::Mod, a, b, &args[1], span)?;
-                    let pair = self.list_of(vec![q, r], Elem::Object, span);
-                    return Ok(Val {
-                        node: Node {
-                            ty: ir(Ty::Tuple),
-                            ..pair
-                        },
-                        ty: Ty::Tuple,
-                    });
+                    // The pair, of the shape inference gave it.
+                    let pair = match ty.tuple_elems() {
+                        Some(shape) if shape.len() == 2 => {
+                            let q = self.coerce(q, shape[0].settled());
+                            let r = self.coerce(r, shape[1].settled());
+                            Val {
+                                node: tuple_value(vec![q, r], ty, span),
+                                ty,
+                            }
+                        }
+                        _ => {
+                            let list = self.list_of(vec![q, r], Elem::Object, span);
+                            Val {
+                                node: call("zb_box_tuple", vec![list], Ty::Object, span),
+                                ty: Ty::Object,
+                            }
+                        }
+                    };
+                    return Ok(pair);
                 }
                 "pow" if args.len() == 3 => {
                     let a = self.expr_as(&args[0], Ty::Int)?;
@@ -6551,7 +6922,7 @@ impl<'m> Lowerer<'m> {
                         Ty::Str => str_lit("str", span),
                         Ty::None => str_lit("NoneType", span),
                         Ty::List(_) => str_lit("list", span),
-                        Ty::Tuple => str_lit("tuple", span),
+                        Ty::Tuple(_) => str_lit("tuple", span),
                         Ty::Dict => str_lit("dict", span),
                         Ty::Set => str_lit("set", span),
                         Ty::Class(k) => str_lit(&self.module.classes[k as usize].name, span),
@@ -7428,7 +7799,7 @@ impl<'m> Lowerer<'m> {
                 ("float", Ty::Float) => true,
                 ("str", Ty::Str) => true,
                 ("list", Ty::List(_)) => true,
-                ("tuple", Ty::Tuple) => true,
+                ("tuple", Ty::Tuple(_)) => true,
                 ("dict", Ty::Dict) => true,
                 ("set", Ty::Set) => true,
                 (_, Ty::Object | Ty::Unknown) => return None,

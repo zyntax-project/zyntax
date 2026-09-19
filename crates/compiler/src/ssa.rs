@@ -2002,10 +2002,9 @@ impl SsaBuilder {
                     }
                     let elem_hir_ty = element_types[i].clone();
 
-                    // Single-element tuples are flattened by Cranelift's ABI
-                    let elem_val = if num_elements == 1 && i == 0 {
-                        aggregate
-                    } else {
+                    // Every backend reads a struct carried as its single
+                    // field through the same extractvalue.
+                    let elem_val = {
                         let extracted_id = self.create_value(
                             elem_hir_ty.clone(),
                             crate::hir::HirValueKind::Instruction,
@@ -6648,13 +6647,22 @@ impl SsaBuilder {
             }
 
             TypedExpression::Tuple(elements) => {
-                // Convert tuple to struct
-                let field_types: Vec<_> =
-                    elements.iter().map(|e| self.convert_type(&e.ty)).collect();
+                // The struct has the fields the tuple's own type names,
+                // and each element is brought to its field's type; an
+                // expression typed as something else takes its fields
+                // from the elements.
+                let declared: Option<Vec<Type>> = match &expr.ty {
+                    Type::Tuple(fields) if fields.len() == elements.len() => Some(fields.clone()),
+                    _ => None,
+                };
+                let field_types: Vec<Type> =
+                    declared.unwrap_or_else(|| elements.iter().map(|e| e.ty.clone()).collect());
+                let field_hir: Vec<HirType> =
+                    field_types.iter().map(|t| self.convert_type(t)).collect();
 
                 let tuple_ty = HirType::Struct(crate::hir::HirStructType {
                     name: None,
-                    fields: field_types,
+                    fields: field_hir.clone(),
                     packed: false,
                 });
 
@@ -6670,25 +6678,36 @@ impl SsaBuilder {
                     },
                 );
 
-                // Initialize each element
+                // Elements may branch (a checked read, a conditional), so
+                // each is translated where the previous one left off.
+                // The value is the last insertion's: the storage for an
+                // aggregate held by address, and for a struct carried as
+                // its single field that field.
+                let started = block_id;
+                let mut cur = block_id;
+                let mut value = alloc_result;
                 for (i, elem_expr) in elements.iter().enumerate() {
-                    let elem_val = self.translate_expression(block_id, elem_expr)?;
+                    let raw = self.translate_operand(&mut cur, elem_expr)?;
+                    let raw = self.coerce_for_transfer(cur, raw, elem_expr, &field_types[i]);
+                    let elem_val = self.coerce_scalar_to(cur, raw, &field_hir[i]);
 
                     let insert_result =
                         self.create_value(tuple_ty.clone(), HirValueKind::Instruction);
                     self.add_instruction(
-                        block_id,
+                        cur,
                         HirInstruction::InsertValue {
                             result: insert_result,
                             ty: tuple_ty.clone(),
-                            aggregate: alloc_result,
+                            aggregate: value,
                             value: elem_val,
                             indices: vec![i as u32],
                         },
                     );
+                    value = insert_result;
                 }
+                self.settle(started, cur);
 
-                Ok(alloc_result)
+                Ok(value)
             }
 
             TypedExpression::Cast(cast) => {

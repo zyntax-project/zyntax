@@ -266,6 +266,7 @@ pub fn parse_program_with(
     if let Some(first) = parsed.errors().first() {
         return Err(Error::syntax(first.error.to_string(), first.location));
     }
+    types::reset_tuple_shapes();
     let mut module = parsed.into_syntax();
     let main: Vec<py::Stmt> = std::mem::take(&mut module.body).into_iter().collect();
     let linked = modules::link(main, modules)?;
@@ -526,9 +527,7 @@ pub fn parse_program_with(
     }
     inferred.settled.set(true);
     for ty in inferred.globals.values_mut() {
-        if *ty == types::Ty::Unknown {
-            *ty = types::Ty::Object;
-        }
+        *ty = ty.settled();
     }
     // `ZYNTAX_TRACE_TYPES=1` prints what inference decided: each
     // function's signature, each class's fields, the globals.

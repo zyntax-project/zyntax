@@ -138,8 +138,9 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         ("math", "inf") => Member::Float(f64::INFINITY),
         ("math", "nan") => Member::Float(f64::NAN),
         ("sys", "maxsize") => Member::Int(i64::MAX),
+        // The library builds the tuple as a list of dynamic values.
         ("sys", "version_info") => Member::Value {
-            ty: Ty::Tuple,
+            ty: Ty::List(Elem::Object),
             zb: "zb_sys_version_info",
         },
         ("sys", "argv") => Member::Value {
