@@ -491,7 +491,7 @@ pub fn osr_layout_with(
     let in_region: IdSet = reachable.iter().copied().collect();
     // Dominance inside the region, entered at the header alone: the
     // helper's view of the control flow.
-    let region_dom = region_dominators(function, header, &in_region);
+    let region_dom = RegionDominators::compute(function, header, &in_region);
     // Only values defined in blocks the header dominates are guaranteed to
     // have been computed by the time the resumed code reads them. Anything
     // else (an enclosing loop's counter, say) must arrive in the frame.
@@ -574,6 +574,36 @@ pub fn osr_layout_with(
                 .is_some_and(|block| successors_of(&block.terminator).contains(&header))
         })
         .collect();
+    // Where each value is read inside the region: the blocks whose
+    // instructions or terminator use it, and the predecessors its phi
+    // incomings come in on. Built once; the repairs below look up rather
+    // than rescan.
+    let mut readers: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut phi_readers: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    for &b in &reachable {
+        let Some(rb) = function.blocks.get(&b) else {
+            continue;
+        };
+        let mut note = |used: HirId| {
+            let list = readers.entry(used).or_default();
+            if list.last() != Some(&b) {
+                list.push(b);
+            }
+        };
+        for inst in &rb.instructions {
+            inst.for_each_operand(&mut note);
+        }
+        for used in terminator_uses(&rb.terminator) {
+            note(used);
+        }
+        for p in &rb.phis {
+            for (v, pred) in &p.incoming {
+                if in_region.contains(pred) {
+                    phi_readers.entry(*v).or_default().push(*pred);
+                }
+            }
+        }
+    }
     let mut repairs = Vec::new();
     for &def_block in &reachable {
         // Entered from outside the region: not on every path to the
@@ -593,16 +623,15 @@ pub fn osr_layout_with(
                     .and_then(|r| function.values.get(&r).map(|v| (r, v.ty.clone())))
             }))
             .collect();
-        for (value, ty) in defs {
-            let reached_by_def =
-                |b: &HirId| region_dom.get(b).is_some_and(|d| d.contains(&def_block));
-            // A block the definition does not dominate reads the header's
-            // phi. That is the value there only if every path from the
-            // definition to the block passes the header, where the phi
-            // merges again; a block the definition reaches around the
-            // header would need a phi of its own.
-            let mut around: IdSet = IdSet::default();
-            {
+        let reached_by_def = |b: &HirId| region_dom.dominates(def_block, *b);
+        // The region blocks the definition reaches without passing the
+        // header. Shared by every value the block defines, and needed
+        // only once one of them is read where the definition does not
+        // dominate.
+        let mut around: Option<IdSet> = None;
+        let mut mixed = |b: &HirId| {
+            let around = around.get_or_insert_with(|| {
+                let mut around: IdSet = IdSet::default();
                 let mut stack: Vec<HirId> = vec![def_block];
                 while let Some(b) = stack.pop() {
                     let Some(bb) = function.blocks.get(&b) else {
@@ -614,33 +643,31 @@ pub fn osr_layout_with(
                         }
                     }
                 }
-            }
-            let mixed = |b: &HirId| !reached_by_def(b) && around.contains(b);
+                around
+            });
+            !reached_by_def(b) && around.contains(b)
+        };
+        for (value, ty) in defs {
+            // A block the definition does not dominate reads the header's
+            // phi. That is the value there only if every path from the
+            // definition to the block passes the header, where the phi
+            // merges again; a block the definition reaches around the
+            // header would need a phi of its own.
             let mut escapes = false;
-            for &b in &reachable {
-                let Some(rb) = function.blocks.get(&b) else {
-                    continue;
-                };
-                let mut read = false;
-                for inst in &rb.instructions {
-                    inst.for_each_operand(|u| read |= u == value);
-                }
-                read |= terminator_uses(&rb.terminator).contains(&value);
-                if read && !reached_by_def(&b) {
-                    if mixed(&b) {
+            for b in readers.get(&value).map(Vec::as_slice).unwrap_or(&[]) {
+                if !reached_by_def(b) {
+                    if mixed(b) {
                         return Err(OsrReject::RegionHasExternalEntry);
                     }
                     escapes = true;
                 }
-                for p in &rb.phis {
-                    for (v, pred) in &p.incoming {
-                        if *v == value && in_region.contains(pred) && !reached_by_def(pred) {
-                            if mixed(pred) {
-                                return Err(OsrReject::RegionHasExternalEntry);
-                            }
-                            escapes = true;
-                        }
+            }
+            for pred in phi_readers.get(&value).map(Vec::as_slice).unwrap_or(&[]) {
+                if !reached_by_def(pred) {
+                    if mixed(pred) {
+                        return Err(OsrReject::RegionHasExternalEntry);
                     }
+                    escapes = true;
                 }
             }
             if !escapes {
@@ -714,58 +741,112 @@ pub fn osr_layout_with(
     })
 }
 
-/// The dominators of each block of `region`, with `header` as the only
-/// entry: edges from outside the region do not count.
-fn region_dominators(
-    function: &HirFunction,
-    header: HirId,
-    region: &IdSet,
-) -> HashMap<HirId, IdSet> {
-    let mut preds: HashMap<HirId, Vec<HirId>> = HashMap::new();
-    for &b in region {
-        if let Some(block) = function.blocks.get(&b) {
-            for succ in successors_of(&block.terminator) {
-                if region.contains(&succ) && succ != header {
-                    preds.entry(succ).or_default().push(b);
+/// Dominance over the blocks of a region entered at its header alone:
+/// edges into the header and edges from outside the region do not
+/// count. Immediate dominators over the region's reverse postorder,
+/// the same iteration as [`Dominators`].
+struct RegionDominators {
+    index: HashMap<HirId, usize>,
+    idom: Vec<usize>,
+}
+
+impl RegionDominators {
+    fn compute(function: &HirFunction, header: HirId, region: &IdSet) -> Self {
+        let succs = |b: HirId| -> smallvec::SmallVec<[HirId; 4]> {
+            function
+                .blocks
+                .get(&b)
+                .map(|block| {
+                    successors_of(&block.terminator)
+                        .into_iter()
+                        .filter(|s| *s != header && region.contains(s))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut order = Vec::with_capacity(region.len());
+        let mut visited: IdSet = IdSet::default();
+        let mut stack: Vec<(HirId, smallvec::SmallVec<[HirId; 4]>, usize)> =
+            vec![(header, succs(header), 0)];
+        visited.insert(header);
+        while let Some((b, ss, next)) = stack.last_mut() {
+            if *next < ss.len() {
+                let s = ss[*next];
+                *next += 1;
+                if visited.insert(s) {
+                    stack.push((s, succs(s), 0));
+                }
+            } else {
+                order.push(*b);
+                stack.pop();
+            }
+        }
+        order.reverse();
+        let index: HashMap<HirId, usize> = order.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); order.len()];
+        for (i, &b) in order.iter().enumerate() {
+            for s in succs(b) {
+                if let Some(&j) = index.get(&s) {
+                    preds[j].push(i);
                 }
             }
         }
-    }
-    let all: IdSet = region.iter().copied().collect();
-    let mut dom: HashMap<HirId, IdSet> = region
-        .iter()
-        .map(|&b| {
-            if b == header {
-                (b, std::iter::once(b).collect())
-            } else {
-                (b, all.clone())
+        let mut idom = vec![usize::MAX; order.len()];
+        if !idom.is_empty() {
+            idom[0] = 0;
+        }
+        let intersect = |idom: &[usize], mut a: usize, mut b: usize| {
+            while a != b {
+                while a > b {
+                    a = idom[a];
+                }
+                while b > a {
+                    b = idom[b];
+                }
             }
-        })
-        .collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in region {
-            if b == header {
-                continue;
-            }
-            let mut next: Option<IdSet> = None;
-            for p in preds.get(&b).map(|v| v.as_slice()).unwrap_or(&[]) {
-                let pd = &dom[p];
-                next = Some(match next {
-                    None => pd.clone(),
-                    Some(acc) => acc.intersection(pd).copied().collect(),
-                });
-            }
-            let mut next = next.unwrap_or_default();
-            next.insert(b);
-            if next != dom[&b] {
-                dom.insert(b, next);
-                changed = true;
+            a
+        };
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in 1..order.len() {
+                let mut new = usize::MAX;
+                for &p in &preds[b] {
+                    if idom[p] == usize::MAX {
+                        continue;
+                    }
+                    new = if new == usize::MAX {
+                        p
+                    } else {
+                        intersect(&idom, p, new)
+                    };
+                }
+                if new != usize::MAX && idom[b] != new {
+                    idom[b] = new;
+                    changed = true;
+                }
             }
         }
+        RegionDominators { index, idom }
     }
-    dom
+
+    /// Whether `a` dominates `b` within the region; false for a block
+    /// outside it.
+    fn dominates(&self, a: HirId, b: HirId) -> bool {
+        let (Some(&a), Some(&b)) = (self.index.get(&a), self.index.get(&b)) else {
+            return false;
+        };
+        let mut b = b;
+        loop {
+            if b == a {
+                return true;
+            }
+            if b == 0 {
+                return false;
+            }
+            b = self.idom[b];
+        }
+    }
 }
 
 /// `function` as a helper resumes it at `layout.header`: each repaired
