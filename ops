@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1789836537,"nonce":"Lkdn/u/ZQ4AVf+OGmSqmJikA3qU=","status":2}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789839451,"nonce":"0nmyZuCDTT+F+ed/DP9VyYX3ivQ=","message":"Follow-up in 864d728e1fbe251ff50301b86deb49bc8712250c: a function held by a table (effect op table, vtable) is its own stub; found by zynml effect_on_impl_method under the tiered profile.","files":null}]}
