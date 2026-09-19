@@ -1981,15 +1981,25 @@ impl TieredBackend {
     pub fn interpreter_body_source(
         &self,
     ) -> Box<dyn FnMut(HirId) -> Option<Arc<HirFunction>> + Send> {
-        let beads: HashMap<HirId, u64> = self
+        let beads: HashMap<HirId, (u64, Arc<HirModule>)> = self
             .functions
             .iter()
             .filter(|(id, _)| self.lazy.contains(id))
-            .map(|(id, e)| (*id, e.bead_id))
+            .map(|(id, e)| (*id, (e.bead_id, Arc::clone(&e.module))))
             .collect();
         Box::new(move |id: HirId| {
-            let bead = *beads.get(&id)?;
-            osr::lazy_optimized_body(bead)
+            let (bead, module) = beads.get(&id)?;
+            // Only a frame in a loop can move to another tier mid-run; a
+            // body without one is run as lowered rather than waiting on
+            // the optimiser, which the warm-up thread may be holding.
+            let has_loop = module
+                .functions
+                .get(&id)
+                .is_some_and(|f| !osr::find_loop_headers(f).is_empty());
+            if !has_loop {
+                return None;
+            }
+            osr::lazy_optimized_body(*bead)
         })
     }
 
