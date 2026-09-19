@@ -123,6 +123,12 @@ enum Read {
     Hash,
 }
 
+/// Whether `symbol` is a box reader this pass replaces with loads: for
+/// the inliner, a callee made of these is leaf work, not a call.
+pub fn is_reader(symbol: &str) -> bool {
+    read_of(symbol).is_some()
+}
+
 fn read_of(symbol: &str) -> Option<Read> {
     match symbol {
         "zyntax_box_header_tag" => Some(Read::Tag),

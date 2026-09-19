@@ -1555,7 +1555,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
                     ),
                     vec![ret(int(-1))],
                 ),
-                bit.decl(call("zb_box_get_i64", vec![member.e()], i64())),
+                bit.decl(call("zb_box_payload_i64", vec![member.e()], i64())),
                 when(
                     or(lt(bit.e(), int(0)), ge(bit.e(), int(63))),
                     vec![ret(int(-1))],
@@ -1649,7 +1649,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
                     n.e(),
                     vec![
                         member.decl(at(s.e(), i.e())),
-                        bit.decl(call("zb_box_get_i64", vec![member.e()], i64())),
+                        bit.decl(call("zb_box_payload_i64", vec![member.e()], i64())),
                         when(
                             ne(bitand(right_mask.e(), shl(int(1), bit.e())), int(0)),
                             vec![push(out.e(), member.e())],
@@ -1810,7 +1810,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
                     n.e(),
                     vec![
                         member.decl(at(s.e(), i.e())),
-                        bit.decl(call("zb_box_get_i64", vec![member.e()], i64())),
+                        bit.decl(call("zb_box_payload_i64", vec![member.e()], i64())),
                         when(
                             eq(bitand(right_mask.e(), shl(int(1), bit.e())), int(0)),
                             vec![push(out.e(), member.e())],

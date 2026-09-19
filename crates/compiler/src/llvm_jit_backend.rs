@@ -472,6 +472,9 @@ impl<'ctx> LLVMJitBackend<'ctx> {
 
         for (hir_id, name) in self.get_function_symbols(hir_module) {
             if let Ok(addr) = engine.get_function_address(&name) {
+                if crate::osr::osr_trace_enabled() {
+                    eprintln!("[ptrs] llvm {hir_id:?} {name} -> {:#x}", addr as usize);
+                }
                 self.function_pointers.insert(hir_id, addr as usize);
             }
         }

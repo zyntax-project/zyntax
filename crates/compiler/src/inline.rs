@@ -603,20 +603,44 @@ fn classify_recursive(callee: &HirFunction, self_id: HirId) -> CalleeClass {
     CalleeClass::OkMultiBlock
 }
 
-/// Whether a callee calls anything but an inline-safe intrinsic.
-fn has_calls(callee: &HirFunction) -> bool {
+/// Whether `inst` calls something that stays a call once compiled: a
+/// box reader, by symbol or through the extern declared for it, becomes
+/// loads in the boxes pass and is leaf work here.
+fn is_real_call(inst: &HirInstruction, callees: &Callees<'_>) -> bool {
+    match inst {
+        HirInstruction::Call {
+            callee: HirCallable::Function(fid),
+            ..
+        } => !callees.get(fid).is_some_and(|f| {
+            f.is_external
+                && f.link_name
+                    .clone()
+                    .or_else(|| f.name.resolve_global())
+                    .is_some_and(|n| crate::boxes::is_reader(&n))
+        }),
+        HirInstruction::Call {
+            callee: HirCallable::FuncRef(_),
+            ..
+        } => true,
+        HirInstruction::Call {
+            callee: HirCallable::Symbol(name),
+            ..
+        } => !crate::boxes::is_reader(name),
+        HirInstruction::Call {
+            callee: HirCallable::Intrinsic(i),
+            ..
+        } => is_plain_call_intrinsic(*i),
+        _ => false,
+    }
+}
+
+/// Whether a callee calls anything but an inline-safe intrinsic or a
+/// box reader.
+fn has_calls(callee: &HirFunction, callees: &Callees<'_>) -> bool {
     callee.blocks.values().any(|b| {
-        b.instructions.iter().any(|inst| match inst {
-            HirInstruction::Call {
-                callee: HirCallable::Function(_) | HirCallable::Symbol(_) | HirCallable::FuncRef(_),
-                ..
-            } => true,
-            HirInstruction::Call {
-                callee: HirCallable::Intrinsic(i),
-                ..
-            } => is_plain_call_intrinsic(*i),
-            _ => false,
-        })
+        b.instructions
+            .iter()
+            .any(|inst| is_real_call(inst, callees))
     })
 }
 
@@ -632,16 +656,8 @@ const DISPATCH_INSTS: usize = 16;
 /// Whether `callee` is a loop that calls, or a dispatch. Such a callee
 /// is its loop or its arms, and the call it saves by being inlined is
 /// nothing beside them; what it costs is a copy of them at every site.
-fn loops_or_dispatches(callee: &HirFunction) -> bool {
-    let is_call = |inst: &HirInstruction| {
-        matches!(
-            inst,
-            HirInstruction::Call {
-                callee: HirCallable::Function(_) | HirCallable::Symbol(_) | HirCallable::FuncRef(_),
-                ..
-            }
-        )
-    };
+fn loops_or_dispatches(callee: &HirFunction, callees: &Callees<'_>) -> bool {
+    let is_call = |inst: &HirInstruction| is_real_call(inst, callees);
     let calls: usize = callee
         .blocks
         .values()
@@ -997,14 +1013,14 @@ fn inline_in_function(
                 }
             };
             if cold_blocks.contains(&block_id)
-                || (!hot_blocks.contains(&block_id) && has_calls(callee))
+                || (!hot_blocks.contains(&block_id) && has_calls(callee, callees))
             {
                 stats.skipped_cold += 1;
                 continue;
             }
             if *looping
                 .entry(callee_id)
-                .or_insert_with(|| loops_or_dispatches(callee))
+                .or_insert_with(|| loops_or_dispatches(callee, callees))
             {
                 stats.skipped_cold += 1;
                 continue;
@@ -1050,7 +1066,7 @@ fn inline_in_function(
             let predicted = caller_inst_count
                 .saturating_add(callee_inst_count)
                 .saturating_sub(1);
-            let budget = if has_calls(callee) {
+            let budget = if has_calls(callee, callees) {
                 MAX_POST_INLINE_INSTS_WITH_CALLS
             } else {
                 MAX_POST_INLINE_INSTS
@@ -1086,7 +1102,7 @@ fn inline_in_function(
                     caller.name.resolve_global().unwrap_or_default(),
                     callee.name.resolve_global().unwrap_or_default(),
                     hot_blocks.contains(&job.block_id),
-                    has_calls(callee),
+                    has_calls(callee, callees),
                     callee_inst_count
                 );
             }
