@@ -2871,7 +2871,7 @@ impl TieredBackend {
                 return true;
             }
             #[cfg(feature = "llvm-backend")]
-            if !llvm_list_entry_has_headroom(&func_arc) {
+            if !llvm_list_entry_has_headroom(&func_arc, &module_arc) {
                 if osr::osr_trace_enabled() {
                     eprintln!(
                         "[osr] LLVM promotion skipped for {}: call-heavy list entry",
@@ -3183,11 +3183,13 @@ fn clamp_to_u32(v: u64) -> u32 {
     }
 }
 
-/// Calls across the LLVM/Cranelift boundary stay indirect. Large list-entry
-/// bodies with many such calls offer little LLVM optimization headroom.
-fn llvm_list_entry_has_headroom(f: &HirFunction) -> bool {
+/// Calls across the LLVM/Cranelift boundary stay indirect. A large
+/// list-entry body made of such calls offers LLVM little headroom. An
+/// intrinsic lowers in place and a cold callee is off the hot path, so
+/// neither is a boundary call.
+fn llvm_list_entry_has_headroom(f: &HirFunction, module: &HirModule) -> bool {
     use crate::abi::{Pass, function_abi};
-    use crate::hir::HirInstruction;
+    use crate::hir::{HirCallable, HirInstruction};
     if function_abi(f, false)
         .params
         .iter()
@@ -3195,10 +3197,22 @@ fn llvm_list_entry_has_headroom(f: &HirFunction) -> bool {
     {
         return true;
     }
+    let crosses = |inst: &&HirInstruction| match inst {
+        HirInstruction::Call {
+            callee: HirCallable::Intrinsic(_),
+            ..
+        } => false,
+        HirInstruction::Call {
+            callee: HirCallable::Function(id),
+            ..
+        } => !module.functions.get(id).is_some_and(|c| c.attributes.cold),
+        HirInstruction::Call { .. } => true,
+        _ => false,
+    };
     f.blocks
         .values()
         .flat_map(|block| &block.instructions)
-        .filter(|inst| matches!(inst, HirInstruction::Call { .. }))
+        .filter(crosses)
         .take(65)
         .count()
         <= 64
