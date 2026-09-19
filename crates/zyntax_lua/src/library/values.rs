@@ -572,7 +572,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![
             when(
                 eq(ib.e(), int(0)),
-                vec![lua_error(text("attempt to perform 'n//0'"))],
+                vec![lua_error(text("attempt to divide by zero"))],
             ),
             when(eq(ib.e(), int(-1)), vec![ret(sub(int(0), ia.e()))]),
             ret(call("zb_floordiv_i64", vec![ia.e(), ib.e()], i64())),
@@ -1004,14 +1004,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         &[&a, &b],
         boolean(),
         vec![
-            when(eq(a.e(), b.e()), vec![ret(bool(true))]),
+            when(and(is_nil(a.e()), is_nil(b.e())), vec![ret(bool(true))]),
             when(or(is_nil(a.e()), is_nil(b.e())), vec![ret(bool(false))]),
             ca.decl(category(a.e())),
             cb.decl(category(b.e())),
+            // Numbers compare by value first: a NaN is not itself,
+            // whichever box holds it.
             when(
                 and(is_number_cat(&ca), is_number_cat(&cb)),
                 vec![ret(num_eq(a.e(), b.e()))],
             ),
+            when(eq(a.e(), b.e()), vec![ret(bool(true))]),
             when(
                 and(is_cat(&ca, STR), is_cat(&cb, STR)),
                 vec![ret(str_eq(get_str(a.e()), get_str(b.e())))],

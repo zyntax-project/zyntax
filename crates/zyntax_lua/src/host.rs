@@ -227,27 +227,60 @@ fn parse_hex(s: &str) -> Numeral {
         }
         return Numeral::Int(v as i64);
     }
-    let mut value = 0f64;
+    // The digits go into the mantissa while they are significant and
+    // fit; past that they only move the binary exponent, as the
+    // reference reads them, so any number of digits is read exactly.
+    const MAX_SIGNIFICANT: u32 = 30;
+    if frac_part.is_some_and(|f| !f.bytes().all(|b| hex_digit(b).is_some())) {
+        return Numeral::None;
+    }
+    let mut r = 0f64;
+    let mut e: i64 = 0;
+    let mut significant = 0u32;
+    let mut take = |b: u8, after_point: bool| {
+        let digit = hex_digit(b).unwrap();
+        if significant == 0 && digit == 0 {
+            // A leading zero is not significant.
+        } else {
+            significant += 1;
+            if significant <= MAX_SIGNIFICANT {
+                r = r * 16.0 + digit as f64;
+            } else {
+                e += 1;
+            }
+        }
+        if after_point {
+            e -= 1;
+        }
+    };
     for b in int_part.bytes() {
-        value = value * 16.0 + hex_digit(b).unwrap() as f64;
+        take(b, false);
     }
-    if let Some(frac) = frac_part {
-        if !frac.bytes().all(|b| hex_digit(b).is_some()) {
-            return Numeral::None;
-        }
-        let mut scale = 1.0 / 16.0;
-        for b in frac.bytes() {
-            value += hex_digit(b).unwrap() as f64 * scale;
-            scale /= 16.0;
-        }
+    for b in frac_part.unwrap_or("").bytes() {
+        take(b, true);
     }
+    e *= 4;
     if let Some(exp) = exp {
-        let Ok(e) = exp.parse::<i32>() else {
+        let Ok(p) = exp.parse::<i64>() else {
             return Numeral::None;
         };
-        value *= 2f64.powi(e);
+        e += p;
     }
-    Numeral::Float(value)
+    Numeral::Float(ldexp(r, e))
+}
+
+/// `r * 2^e`, scaled in steps so a large exponent on a mantissa that
+/// brings it back into range does not overflow on the way.
+fn ldexp(mut r: f64, mut e: i64) -> f64 {
+    while e > 1000 {
+        r *= 2f64.powi(1000);
+        e -= 1000;
+    }
+    while e < -1000 {
+        r *= 2f64.powi(-1000);
+        e += 1000;
+    }
+    r * 2f64.powi(e as i32)
 }
 
 unsafe fn text_of(s: zrtl::StringConstPtr) -> &'static str {
@@ -957,13 +990,16 @@ struct Xoshiro([u64; 4]);
 
 impl Xoshiro {
     fn seeded(n: u64) -> Self {
-        let mut s = [n, 0xff, 0, 0];
-        let mut r = Xoshiro(s);
+        Self::seeded_with(n, 0)
+    }
+    /// The reference's seeding: the two numbers and a constant in the
+    /// state, then sixteen draws discarded.
+    fn seeded_with(n1: u64, n2: u64) -> Self {
+        let mut r = Xoshiro([n1, 0xff, n2, 0]);
         for _ in 0..16 {
             r.next();
         }
-        s = r.0;
-        Xoshiro(s)
+        r
     }
     fn next(&mut self) -> u64 {
         let s = &mut self.0;
@@ -988,34 +1024,65 @@ thread_local! {
     ));
 }
 
-extern "C" fn host_random_seed(n: i64) {
-    RANDOM.with(|r| *r.borrow_mut() = Xoshiro::seeded(n as u64));
+extern "C" fn host_random_seed(n1: i64, n2: i64) {
+    RANDOM.with(|r| *r.borrow_mut() = Xoshiro::seeded_with(n1 as u64, n2 as u64));
 }
 
-/// A float in `[0, 1)`.
+/// Seeded from the clock and the process, as `math.randomseed()`
+/// with nothing given; the first number, the second being the
+/// process id.
+extern "C" fn host_random_seed_now() -> i64 {
+    let n1 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(7);
+    let n2 = u64::from(std::process::id());
+    RANDOM.with(|r| *r.borrow_mut() = Xoshiro::seeded_with(n1, n2));
+    n1 as i64
+}
+
+/// The second number `math.randomseed()` seeds with.
+extern "C" fn host_random_seed_pid() -> i64 {
+    i64::from(std::process::id())
+}
+
+/// The next draw, all 64 bits.
+extern "C" fn host_random_next() -> i64 {
+    RANDOM.with(|r| r.borrow_mut().next()) as i64
+}
+
+/// A float in `[0, 1)`, from the high 53 bits.
 extern "C" fn host_random_float() -> f64 {
     let bits = RANDOM.with(|r| r.borrow_mut().next());
     (bits >> 11) as f64 * (1.0 / 9007199254740992.0)
 }
 
-/// An integer in `[lo, hi]`.
+/// An integer in `[lo, hi]`, projected as the reference projects a
+/// draw: masked to the smallest all-ones bound and drawn again while
+/// out of range.
 extern "C" fn host_random_int(lo: i64, hi: i64) -> i64 {
     if lo > hi {
         return lo;
     }
-    let span = (hi as u64).wrapping_sub(lo as u64);
-    let bits = RANDOM.with(|r| r.borrow_mut().next());
-    let pick = if span == u64::MAX {
-        bits
+    let n = (hi as u64).wrapping_sub(lo as u64);
+    let mut ran = RANDOM.with(|r| r.borrow_mut().next());
+    let pick = if n & n.wrapping_add(1) == 0 {
+        ran & n
     } else {
-        // Rejection keeps the draw uniform over a span that does not
-        // divide 2^64.
-        let limit = span + 1;
-        let mut v = bits;
-        while v >= u64::MAX - (u64::MAX % limit) {
-            v = RANDOM.with(|r| r.borrow_mut().next());
+        let mut lim = n;
+        lim |= lim >> 1;
+        lim |= lim >> 2;
+        lim |= lim >> 4;
+        lim |= lim >> 8;
+        lim |= lim >> 16;
+        lim |= lim >> 32;
+        loop {
+            ran &= lim;
+            if ran <= n {
+                break ran;
+            }
+            ran = RANDOM.with(|r| r.borrow_mut().next());
         }
-        v % limit
     };
     (lo as u64).wrapping_add(pick) as i64
 }
@@ -1547,7 +1614,7 @@ extern "C" fn host_setlocale(locale: zrtl::StringConstPtr) -> StringPtr {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 92] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 95] = [
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$clock".as_ptr(), host_clock as *const u8),
@@ -1573,6 +1640,15 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 92] = [
     zrtl::ZrtlSymbol::new(c"$Lua$upper".as_ptr(), host_upper as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$lower".as_ptr(), host_lower as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$random_seed".as_ptr(), host_random_seed as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$random_next".as_ptr(), host_random_next as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$random_seed_now".as_ptr(),
+        host_random_seed_now as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$random_seed_pid".as_ptr(),
+        host_random_seed_pid as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(
         c"$Lua$random_float".as_ptr(),
         host_random_float as *const u8,

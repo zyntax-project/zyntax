@@ -458,9 +458,25 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     ));
     d.push(define(
         "zl_co_isyieldable",
-        &[],
+        &[&co],
         boolean(),
-        vec![ret(not(is_nil(current())))],
+        vec![
+            // Asked about a coroutine: any but the main thread can
+            // yield; asked about nothing: whether one is running.
+            when(is_nil(co.e()), vec![ret(not(is_nil(current())))]),
+            when(
+                not(is_thread(co.e())),
+                vec![coroutine_expected("isyieldable")],
+            ),
+            ret(ne(
+                call(
+                    "zb_box_get_i64",
+                    vec![at(record_of(co.e()), int(HANDLE))],
+                    i64(),
+                ),
+                int(0),
+            )),
+        ],
     ));
     // `coroutine.close(co)`: a suspended or dead coroutine is dead.
     d.push(define(

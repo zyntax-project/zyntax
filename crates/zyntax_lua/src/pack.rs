@@ -14,6 +14,9 @@ const MAXINTSIZE: usize = 16;
 const MAXALIGN: usize = 8;
 /// What alignment pads with.
 const PADBYTE: u8 = 0;
+/// The largest size a format may describe, as the reference bounds
+/// it by a C int.
+const MAXSIZE: i64 = i32::MAX as i64;
 
 /// One argument as pack reads it: an integer or a float, kept as
 /// given so a conversion can fail with the right words; a string as
@@ -70,7 +73,7 @@ impl Format<'_> {
         let mut a: i64 = 0;
         while let Some(c) = self.peek()
             && c.is_ascii_digit()
-            && a <= (i64::MAX - 9) / 10
+            && a <= (MAXSIZE - 9) / 10
         {
             a = a * 10 + i64::from(c - b'0');
             self.at += 1;
@@ -347,7 +350,7 @@ pub fn packsize(fmt: &[u8]) -> Result<i64, String> {
             return Err(arg_error(1, "variable-length format").replace("'pack'", "'packsize'"));
         }
         let size = size + to_align;
-        if total > i64::MAX as usize - size {
+        if total > MAXSIZE as usize - size {
             return Err(arg_error(1, "format result too large").replace("'pack'", "'packsize'"));
         }
         total += size;

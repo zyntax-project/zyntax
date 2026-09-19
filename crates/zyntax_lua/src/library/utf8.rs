@@ -287,7 +287,8 @@ pub fn declarations(t: &Types) -> Vec<Decl> {
                     eq(r.e(), int(-1)),
                     vec![lua_error(text("invalid UTF-8 code"))],
                 ),
-                when(eq(r.e(), int(0)), vec![ret(nil())]),
+                // The end: no values at all.
+                when(eq(r.e(), int(0)), vec![ret(call("zl_none", vec![], any()))]),
                 ret(call(
                     "zb_box_tuple",
                     vec![list(
@@ -308,6 +309,19 @@ pub fn declarations(t: &Types) -> Vec<Decl> {
         &[&s, &lax],
         any(),
         vec![
+            // A string starting inside a character is refused at once.
+            when(
+                and(
+                    gt(call("zb_str_len", vec![s.e()], i64()), int(0)),
+                    eq(
+                        bitand(call("zl_byte_at", vec![s.e(), int(1)], i64()), int(0xC0)),
+                        int(0x80),
+                    ),
+                ),
+                vec![lua_error(text(
+                    "bad argument #1 to 'codes' (invalid UTF-8 code)",
+                ))],
+            ),
             f.decl(call(
                 "zl_func_of",
                 vec![code_of("zl_utf8_codes_code"), int(2)],

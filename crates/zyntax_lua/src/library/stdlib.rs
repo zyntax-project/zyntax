@@ -492,6 +492,20 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         lib: "math",
+        name: "deg",
+        func: "zl_math_deg",
+        params: &[Float],
+        ret: Ret::Float,
+    },
+    Builtin {
+        lib: "math",
+        name: "rad",
+        func: "zl_math_rad",
+        params: &[Float],
+        ret: Ret::Float,
+    },
+    Builtin {
+        lib: "math",
         name: "sin",
         func: "zl_math_sin",
         params: &[Float],
@@ -607,7 +621,7 @@ pub const BUILTINS: &[Builtin] = &[
         name: "randomseed",
         func: "zl_math_randomseed",
         params: &[Rest],
-        ret: Ret::Unit,
+        ret: Ret::Multi,
     },
     Builtin {
         lib: "math",
@@ -933,7 +947,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "coroutine",
         name: "isyieldable",
         func: "zl_co_isyieldable",
-        params: &[],
+        params: &[Any],
         ret: Ret::Bool,
     },
     Builtin {
@@ -1821,10 +1835,13 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         ),
         (
             "zl_random_seed",
-            vec![("n", i64())],
+            vec![("n1", i64()), ("n2", i64())],
             unit(),
             "$Lua$random_seed",
         ),
+        ("zl_random_next", vec![], i64(), "$Lua$random_next"),
+        ("zl_random_seed_now", vec![], i64(), "$Lua$random_seed_now"),
+        ("zl_random_seed_pid", vec![], i64(), "$Lua$random_seed_pid"),
         ("zl_random_float", vec![], f64(), "$Lua$random_float"),
         (
             "zl_random_int",
@@ -2006,6 +2023,18 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             vec![ret(call(shared, vec![f.e()], f64()))],
         ));
     }
+    d.push(define(
+        "zl_math_deg",
+        &[&f],
+        f64(),
+        vec![ret(mul(f.e(), float(180.0 / std::f64::consts::PI)))],
+    ));
+    d.push(define(
+        "zl_math_rad",
+        &[&f],
+        f64(),
+        vec![ret(mul(f.e(), float(std::f64::consts::PI / 180.0)))],
+    ));
     d.push(define(
         "zl_math_atan",
         &[&f, &x],
@@ -2192,12 +2221,21 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 eq(n.e(), int(0)),
                 vec![ret(box_f64(call("zl_random_float", vec![], f64())))],
             ),
+            when(
+                gt(n.e(), int(2)),
+                vec![lua_error(text("wrong number of arguments"))],
+            ),
             lo.decl(int(1)),
             hi.decl(call(
                 "zl_arg_int",
                 vec![at(args.e(), int(0)), bad_arg(1, "random")],
                 i64(),
             )),
+            // `random(0)`: a whole draw.
+            when(
+                and(eq(n.e(), int(1)), eq(hi.e(), int(0))),
+                vec![ret(box_i64(call("zl_random_next", vec![], i64())))],
+            ),
             when(
                 ge(n.e(), int(2)),
                 vec![
@@ -2212,33 +2250,54 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             when(
                 gt(lo.e(), hi.e()),
                 vec![lua_error(text(
-                    "bad argument #2 to 'random' (interval is empty)",
+                    "bad argument #1 to 'random' (interval is empty)",
                 ))],
             ),
             ret(box_i64(call("zl_random_int", vec![lo.e(), hi.e()], i64()))),
         ],
     ));
+    // `math.randomseed([n1 [, n2]])`: the two seed numbers are
+    // answered, so a run can be repeated. A float seed is taken by its
+    // integer value; nothing given seeds from the clock.
     d.push(define(
         "zl_math_randomseed",
         &[&args],
-        unit(),
+        any(),
         vec![
-            when(
-                gt(len(args.e()), int(0)),
-                vec![expr(call(
-                    "zl_random_seed",
-                    vec![cast(
-                        call(
-                            "zl_arg_float",
-                            vec![at(args.e(), int(0)), bad_arg(1, "randomseed")],
-                            f64(),
+            i.decl(int(0)),
+            j.decl(int(0)),
+            if_(
+                eq(len(args.e()), int(0)),
+                vec![
+                    i.set(call("zl_random_seed_now", vec![], i64())),
+                    j.set(call("zl_random_seed_pid", vec![], i64())),
+                ],
+                vec![
+                    x.decl(at(args.e(), int(0))),
+                    i.set(if_expr(
+                        and(not(is_nil(x.e())), is_int_box(x.e())),
+                        get_i64(x.e()),
+                        cast(
+                            call("zl_arg_float", vec![x.e(), bad_arg(1, "randomseed")], f64()),
+                            i64(),
                         ),
-                        i64(),
-                    )],
-                    unit(),
-                ))],
+                    )),
+                    when(
+                        gt(len(args.e()), int(1)),
+                        vec![j.set(call(
+                            "zl_arg_int",
+                            vec![at(args.e(), int(1)), bad_arg(2, "randomseed")],
+                            i64(),
+                        ))],
+                    ),
+                    expr(call("zl_random_seed", vec![i.e(), j.e()], unit())),
+                ],
             ),
-            ret_void(),
+            ret(call(
+                "zb_box_tuple",
+                vec![list(vec![box_i64(i.e()), box_i64(j.e())], anys.clone())],
+                any(),
+            )),
         ],
     ));
     d.push(define(

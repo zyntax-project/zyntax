@@ -616,8 +616,12 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             when(
                 is_func(handler.e()),
                 vec![ret(call(
-                    "zl_call_2",
-                    vec![handler.e(), box_table(tb.e()), key.clone()],
+                    "zl_first",
+                    vec![call(
+                        "zl_call_2",
+                        vec![handler.e(), box_table(tb.e()), key.clone()],
+                        any(),
+                    )],
                     any(),
                 ))],
             ),
