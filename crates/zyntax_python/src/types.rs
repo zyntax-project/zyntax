@@ -3704,11 +3704,8 @@ impl Walker<'_> {
                 self.locals.returns = true;
             }
             py::Stmt::For(f) => {
-                let iter = self.expr(&f.iter);
-                let item = match (&*f.iter, iter) {
-                    (py::Expr::Call(c), _) if is_name(&c.func, "range") => Ty::Int,
-                    (_, t) => t.element().unwrap_or(Ty::Object),
-                };
+                self.expr(&f.iter);
+                let item = self.typer().item_ty(&f.iter);
                 self.target(&f.target, item);
                 self.stmts(&f.body);
                 self.stmts(&f.orelse);
@@ -4019,26 +4016,20 @@ fn nonnegative_literal(e: &py::Expr) -> bool {
 
 impl Typer<'_> {
     /// The element type of `elt` under the loop variables of
-    /// `generators`: what a comprehension over them produces.
+    /// `generators`: what a comprehension over them produces, or
+    /// `Unknown` while that is not yet typed.
     pub(crate) fn comprehension_elem(
         &self,
         generators: &[py::Comprehension],
         elt: &py::Expr,
-    ) -> Elem {
-        let mut vars = self.vars.clone();
-        for g in generators {
-            bind_target(
-                &mut vars,
-                &g.target,
-                self.expr(&g.iter).element().unwrap_or(Ty::Object),
-            );
-        }
+    ) -> Ty {
+        let vars = self.comprehension_vars(generators);
         let inner = Typer {
             module: self.module,
             vars: &vars,
             outer: self.outer,
         };
-        Elem::of(inner.expr(elt))
+        inner.expr(elt)
     }
 
     /// The key and value types of a dict comprehension.
@@ -4048,20 +4039,62 @@ impl Typer<'_> {
         key: &py::Expr,
         value: &py::Expr,
     ) -> (Ty, Ty) {
-        let mut vars = self.vars.clone();
-        for g in generators {
-            bind_target(
-                &mut vars,
-                &g.target,
-                self.expr(&g.iter).element().unwrap_or(Ty::Object),
-            );
-        }
+        let vars = self.comprehension_vars(generators);
         let inner = Typer {
             module: self.module,
             vars: &vars,
             outer: self.outer,
         };
         (inner.expr(key), inner.expr(value))
+    }
+
+    /// The variables in scope inside a comprehension: this scope's, with
+    /// each generator's target bound to what one round of it yields,
+    /// where a later generator sees the earlier targets.
+    fn comprehension_vars(&self, generators: &[py::Comprehension]) -> HashMap<String, Ty> {
+        let mut vars = self.vars.clone();
+        for g in generators {
+            let item = Typer {
+                module: self.module,
+                vars: &vars,
+                outer: self.outer,
+            }
+            .item_ty(&g.iter);
+            bind_target(&mut vars, &g.target, item);
+        }
+        vars
+    }
+
+    /// What one round of iterating `iter` binds: an int from `range`,
+    /// the (index, element) pair from `enumerate`, else an element of
+    /// the iterable.
+    pub(crate) fn item_ty(&self, iter: &py::Expr) -> Ty {
+        if let py::Expr::Call(c) = iter
+            && let py::Expr::Name(n) = &*c.func
+            && !self.is_variable(n.id.as_str())
+            && c.arguments.keywords.is_empty()
+        {
+            match (n.id.as_str(), c.arguments.args.len()) {
+                ("range", 1..=3) => return Ty::Int,
+                ("enumerate", 1 | 2) => {
+                    let item = self
+                        .expr(&c.arguments.args[0])
+                        .element()
+                        .unwrap_or(Ty::Object);
+                    return tuple_of(vec![Ty::Int, item]);
+                }
+                _ => {}
+            }
+        }
+        self.expr(iter).element().unwrap_or(Ty::Object)
+    }
+
+    /// Whether `name` is a variable of this scope, an enclosing one or
+    /// the module, so a builtin of that name is shadowed.
+    fn is_variable(&self, name: &str) -> bool {
+        self.vars.contains_key(name)
+            || self.outer.contains_key(name)
+            || self.module.globals.contains_key(name)
     }
 
     pub(crate) fn expr(&self, e: &py::Expr) -> Ty {
@@ -4171,6 +4204,9 @@ impl Typer<'_> {
             }
             py::Expr::Subscript(s) => {
                 let seq = self.expr(&s.value);
+                if seq == Ty::Unknown {
+                    return Ty::Unknown;
+                }
                 if let py::Expr::Slice(slice) = &*s.slice {
                     match seq {
                         Ty::Str | Ty::List(_) => seq,
@@ -4196,8 +4232,14 @@ impl Typer<'_> {
                     seq.element().unwrap_or(Ty::Object)
                 }
             }
-            py::Expr::List(l) => Ty::List(self.elem_of(l.elts.iter())),
-            py::Expr::ListComp(c) => Ty::List(self.comprehension_elem(&c.generators, &c.elt)),
+            py::Expr::List(l) => match self.elem_of(l.elts.iter()) {
+                Some(e) => Ty::List(e),
+                None => Ty::Unknown,
+            },
+            py::Expr::ListComp(c) => match self.comprehension_elem(&c.generators, &c.elt) {
+                Ty::Unknown => Ty::Unknown,
+                elem => Ty::List(Elem::of(elem)),
+            },
             // A starred element spreads a sequence of a length only the
             // runtime knows.
             py::Expr::Tuple(t) => {
@@ -4263,18 +4305,23 @@ impl Typer<'_> {
     }
 
     /// The element kind of a literal: the one kind every element has,
-    /// or dynamic when they differ.
-    fn elem_of<'e>(&self, elts: impl Iterator<Item = &'e py::Expr>) -> Elem {
+    /// or dynamic when they differ; `None` while an element is not yet
+    /// typed.
+    fn elem_of<'e>(&self, elts: impl Iterator<Item = &'e py::Expr>) -> Option<Elem> {
         let mut kind: Option<Elem> = None;
         for e in elts {
-            let k = Elem::of(self.expr(e));
+            let ty = self.expr(e);
+            if ty == Ty::Unknown {
+                return None;
+            }
+            let k = Elem::of(ty);
             kind = Some(match kind {
                 None => k,
                 Some(prev) if prev == k => k,
-                Some(_) => return Elem::Object,
+                Some(_) => return Some(Elem::Object),
             });
         }
-        kind.unwrap_or(Elem::Object)
+        Some(kind.unwrap_or(Elem::Object))
     }
 
     /// The class a bare name is, when no variable shadows it.

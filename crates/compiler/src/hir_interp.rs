@@ -797,6 +797,45 @@ pub struct CompiledFunction {
 /// range for the frame's lifetime.
 struct FrameRoots(*const u8);
 
+/// Storage a frame took for itself: the blocks it owns until it
+/// finishes, as a stack frame owns its slots. A block may be named by
+/// nothing else once the register that held it is reused, so the list
+/// is a root range of its own, registered again whenever it moves.
+struct Scratch {
+    blocks: Vec<*mut u8>,
+    registered: *const u8,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            registered: std::ptr::null(),
+        }
+    }
+
+    fn push(&mut self, block: *mut u8) {
+        self.blocks.push(block);
+        if !crate::collector::is_enabled() {
+            return;
+        }
+        let now = self.blocks.as_ptr() as *const u8;
+        if now != self.registered && !self.registered.is_null() {
+            crate::collector::remove_root_range(self.registered);
+        }
+        crate::collector::add_root_range(now, std::mem::size_of_val(self.blocks.as_slice()));
+        self.registered = now;
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if !self.registered.is_null() {
+            crate::collector::remove_root_range(self.registered);
+        }
+    }
+}
+
 impl FrameRoots {
     fn new(regs: &[ZyntaxValue]) -> Self {
         let ptr = regs.as_ptr() as *const u8;
@@ -2727,7 +2766,7 @@ impl HirInterpreter {
         helper: *const u8,
         site: &OsrSite,
         regs: &[ZyntaxValue],
-        scratch: &mut Vec<*mut u8>,
+        scratch: &mut Scratch,
         dest: *mut u8,
     ) -> Result<ZyntaxValue, InterpError> {
         let frame = self.frame_alloc(scratch, site.frame.size.max(8) as usize);
@@ -3269,16 +3308,16 @@ impl HirInterpreter {
         func_id: HirId,
         dest: *mut u8,
     ) -> Result<ZyntaxValue, InterpError> {
-        let mut scratch: Vec<*mut u8> = Vec::new();
+        let mut scratch = Scratch::new();
         let result = self.run_frame(module, cf, args, func_id, dest, &mut scratch);
-        for block in scratch {
+        for block in scratch.blocks.drain(..) {
             self.memory.release_scratch(block);
         }
         result
     }
 
     /// Storage for this frame: zeroed, released with the frame.
-    fn frame_alloc(&mut self, scratch: &mut Vec<*mut u8>, size: usize) -> *mut u8 {
+    fn frame_alloc(&mut self, scratch: &mut Scratch, size: usize) -> *mut u8 {
         let p = self.memory.alloc_zeroed(size.max(1));
         if !p.is_null() {
             scratch.push(p);
@@ -3293,7 +3332,7 @@ impl HirInterpreter {
         args: Vec<ZyntaxValue>,
         func_id: HirId,
         dest: *mut u8,
-        scratch: &mut Vec<*mut u8>,
+        scratch: &mut Scratch,
     ) -> Result<ZyntaxValue, InterpError> {
         let mut regs: Vec<ZyntaxValue> = vec![ZyntaxValue::Undef; cf.n_regs as usize];
         // The registers hold pointers the collector cannot see on any

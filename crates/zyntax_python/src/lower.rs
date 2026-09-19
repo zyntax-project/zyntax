@@ -1331,7 +1331,11 @@ impl<'m> Lowerer<'m> {
     /// Anything else is lowered as it is.
     fn consumed(&mut self, e: &py::Expr, span: Span) -> Result<Val> {
         if let py::Expr::Generator(g) = e {
-            let elem = self.typer().comprehension_elem(&g.generators, &g.elt);
+            let elem = Elem::of(
+                self.typer()
+                    .comprehension_elem(&g.generators, &g.elt)
+                    .settled(),
+            );
             return self.comprehension(&g.generators, Produce::List(elem, &g.elt), span);
         }
         self.expr(e)
@@ -3640,6 +3644,29 @@ impl<'m> Lowerer<'m> {
         if seq.ty == Ty::Gen {
             return self.for_generator(f, seq, extra, span);
         }
+        self.for_items(f, seq, None, extra, span)
+    }
+
+    /// A loop over the items of `seq` by position. With `index_from`,
+    /// the target is a pair bound to the position counted from there
+    /// and the item, as `enumerate` yields them.
+    fn for_items(
+        &mut self,
+        f: &py::StmtFor,
+        seq: Val,
+        index_from: Option<Node>,
+        extra: Vec<Stmt>,
+        span: Span,
+    ) -> Result<TypedStatement> {
+        // A generator's items are pulled into a list first.
+        let seq = if seq.ty == Ty::Gen {
+            Val {
+                node: self.iterable(seq, span),
+                ty: Ty::List(Elem::Object),
+            }
+        } else {
+            seq
+        };
         // A tuple iterates as the list of its elements, whose kind is
         // the element the loop variable takes.
         let seq = self.tuple_as_list(seq);
@@ -3667,6 +3694,17 @@ impl<'m> Lowerer<'m> {
             }
             _ => self.hold(seq, &mut prologue, span),
         };
+        // The index origin is evaluated once as well.
+        let index_from = index_from.map(|start| {
+            self.hold(
+                Val {
+                    node: start,
+                    ty: Ty::Int,
+                },
+                &mut prologue,
+                span,
+            )
+        });
         let counter = self.temp();
         let len = match seq.ty {
             Ty::Str => call("zb_str_chars_len", vec![seq.node.clone()], Ty::Int, span),
@@ -3684,7 +3722,26 @@ impl<'m> Lowerer<'m> {
         // What reading the item hoists (a checked read of a dynamic
         // element) runs inside the body, ahead of the binding.
         let mut body = std::mem::take(&mut self.hoisted);
-        self.bind_after(&f.target, item, span, &mut body)?;
+        match index_from {
+            Some(start) => {
+                let py::Expr::Tuple(t) = &*f.target else {
+                    unreachable!("an enumerate loop binds a pair");
+                };
+                let index = Val {
+                    node: binary(
+                        BinaryOp::Add,
+                        start.node,
+                        var(counter, Ty::Int, span),
+                        Ty::Int,
+                        span,
+                    ),
+                    ty: Ty::Int,
+                };
+                self.bind_after(&t.elts[0], index, span, &mut body)?;
+                self.bind_after(&t.elts[1], item, span, &mut body)?;
+            }
+            None => self.bind_after(&f.target, item, span, &mut body)?,
+        }
         self.in_loop(|this| -> Result<()> {
             for s in &f.body {
                 this.stmt(s, &mut body)?;
@@ -3792,6 +3849,27 @@ impl<'m> Lowerer<'m> {
     ) -> Result<TypedStatement> {
         if f.is_async {
             return unsupported("async for", f);
+        }
+        // `for i, x in enumerate(xs)` counts alongside the sequence: no
+        // list of pairs is built.
+        if let py::Expr::Call(c) = &*f.iter
+            && types::is_name(&c.func, "enumerate")
+            && !self.is_variable("enumerate")
+            && matches!(c.arguments.args.len(), 1 | 2)
+            && c.arguments
+                .keywords
+                .iter()
+                .all(|k| k.arg.as_ref().is_some_and(|a| a == "start"))
+            && c.arguments.args.len() + c.arguments.keywords.len() <= 2
+            && matches!(&*f.target, py::Expr::Tuple(t) if t.elts.len() == 2 && !t.elts.iter().any(|e| matches!(e, py::Expr::Starred(_))))
+        {
+            let seq = self.expr(&c.arguments.args[0])?;
+            let start = match (c.arguments.args.get(1), c.arguments.keywords.first()) {
+                (Some(s), _) => self.expr_as(s, Ty::Int)?,
+                (None, Some(kw)) => self.expr_as(&kw.value, Ty::Int)?,
+                (None, None) => int_lit(0, span),
+            };
+            return self.for_items(f, seq, Some(start), extra, span);
         }
         let range = match &*f.iter {
             py::Expr::Call(c)
@@ -5860,10 +5938,7 @@ impl<'m> Lowerer<'m> {
         // Build innermost first: the add, wrapped in each `if`, wrapped
         // in each `for`, from the last generator outwards.
         for g in generators {
-            let item_ty = self.ty_of(&g.iter).element().unwrap_or(match &g.iter {
-                py::Expr::Call(call) if types::is_name(&call.func, "range") => Ty::Int,
-                _ => Ty::Object,
-            });
+            let item_ty = self.typer().item_ty(&g.iter).settled();
             bind_names(&mut self.locals.vars, &g.target, item_ty);
         }
         // What the element and the conditions hoist belongs inside the
