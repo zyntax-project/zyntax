@@ -13176,6 +13176,14 @@ impl SsaBuilder {
         use crate::hir::HirConstant;
         use zyntax_typed_ast::typed_ast::TypedLiteral;
 
+        // An aggregate held by reference has no literal but the address
+        // that stands for none: what a placeholder for a list or struct
+        // is before anything is assigned.
+        if crate::osr::is_held_by_reference(target_ty)
+            && matches!(lit, TypedLiteral::Integer(0) | TypedLiteral::Null)
+        {
+            return HirConstant::Null(HirType::Ptr(Box::new(HirType::U8)));
+        }
         match lit {
             TypedLiteral::Bool(b) => HirConstant::Bool(*b),
             // Integer literals respect the target type

@@ -80,8 +80,9 @@ pub enum Collector {
 
 /// The least budget a collection grants, and what the first one waits
 /// for: small enough to keep a short program's memory small, large
-/// enough that a collection sweeps a worthwhile amount.
-const MIN_HEAP: usize = 16 << 20;
+/// enough that a collection sweeps a worthwhile amount against the
+/// roots and live set it marks each time.
+const MIN_HEAP: usize = 32 << 20;
 
 /// How many times the live set a productive collection grants before
 /// the next. Every collection marks the whole live set again, so a

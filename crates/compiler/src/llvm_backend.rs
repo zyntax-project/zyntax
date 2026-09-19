@@ -1390,7 +1390,21 @@ impl<'ctx> LLVMBackend<'ctx> {
         }
 
         // Compile instructions
-        self.compile_block(block)?;
+        self.compile_block(block).map_err(|e| {
+            // Name the value an error is about, as the function defines it.
+            let named = function
+                .values
+                .iter()
+                .filter(|(id, _)| format!("{e}").contains(&format!("{id:?}")))
+                .map(|(id, v)| format!("{id:?} is {:?} of type {:?}", v.kind, v.ty))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if named.is_empty() {
+                e
+            } else {
+                CompilerError::CodeGen(format!("{e} [{named}]"))
+            }
+        })?;
 
         // Compile terminator
         self.compile_terminator(&block.terminator)?;
@@ -1819,7 +1833,8 @@ impl<'ctx> LLVMBackend<'ctx> {
                 const_args: _,
                 is_tail,
             } => {
-                let result_val = self.compile_call(callee, args, *is_tail, result.is_some())?;
+                let result_ty = result.and_then(|r| self.type_map.get(&r).cloned());
+                let result_val = self.compile_call(callee, args, *is_tail, result_ty.as_ref())?;
                 if let Some(res_id) = result {
                     self.value_map.insert(*res_id, result_val);
                 }
@@ -1884,6 +1899,12 @@ impl<'ctx> LLVMBackend<'ctx> {
                 indices,
             } => {
                 let ptr_val = self.get_value(*ptr)?;
+                if !ptr_val.is_pointer_value() {
+                    return Err(CompilerError::CodeGen(format!(
+                        "gep base {ptr:?} is {ptr_val:?}, not an address; declared {:?}",
+                        self.type_map.get(ptr)
+                    )));
+                }
                 // `ty` is the HIR result type (typically `Ptr(elem)`). LLVM
                 // GEP's first operand is the *element* type being indexed —
                 // the type that sets the stride. Unwrap one Ptr layer so
@@ -3464,6 +3485,11 @@ impl<'ctx> LLVMBackend<'ctx> {
         // An aggregate value meeting a phi of addresses is spilled to a
         // slot of the frame, whose address is what flows; an address
         // meeting a phi of aggregate values is read through.
+        if want.is_pointer_type() && v.is_int_value() {
+            return Ok(b
+                .build_int_to_ptr(v.into_int_value(), want.into_pointer_type(), "phi.addr")?
+                .into());
+        }
         if want.is_pointer_type() && (v.is_struct_value() || v.is_array_value()) {
             let slot = match self
                 .current_function
@@ -4342,8 +4368,9 @@ impl<'ctx> LLVMBackend<'ctx> {
         callee: &HirCallable,
         args: &[HirId],
         is_tail: bool,
-        expects_value: bool,
+        result_ty: Option<&HirType>,
     ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        let expects_value = result_ty.is_some();
         match callee {
             HirCallable::Function(func_id)
                 if !self.functions.contains_key(func_id)
@@ -4706,10 +4733,17 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // first time it tried to use the result as an f64 /
                 // f32 / bool. Mirrors `type_tag_to_cranelift_type` in
                 // the Cranelift backend.
-                let returns_void = sig_info
-                    .as_ref()
-                    .map(|s| matches!(s.return_type.category(), crate::zrtl::TypeCategory::Void))
-                    .unwrap_or(true);
+                // A symbol with no registered signature returns what the
+                // call's result is declared as: an address for an
+                // aggregate held by reference.
+                let declared: Option<HirType> = result_ty.cloned();
+                let returns_void = match (&sig_info, &declared) {
+                    (Some(s), _) => {
+                        matches!(s.return_type.category(), crate::zrtl::TypeCategory::Void)
+                    }
+                    (None, Some(ty)) => matches!(ty, HirType::Void),
+                    (None, None) => true,
+                };
                 let call_name = if returns_void { "" } else { symbol_name };
                 let fn_type = if let Some(ref sig) = sig_info {
                     use crate::zrtl::{PrimitiveSize, TypeCategory};
@@ -4742,7 +4776,18 @@ impl<'ctx> LLVMBackend<'ctx> {
                             .fn_type(&param_types, false),
                     }
                 } else {
-                    self.context.void_type().fn_type(&param_types, false)
+                    match &declared {
+                        Some(ty) if !matches!(ty, HirType::Void) => {
+                            if crate::osr::is_held_by_reference(ty) {
+                                self.context
+                                    .ptr_type(AddressSpace::default())
+                                    .fn_type(&param_types, false)
+                            } else {
+                                self.translate_type(ty)?.fn_type(&param_types, false)
+                            }
+                        }
+                        _ => self.context.void_type().fn_type(&param_types, false),
+                    }
                 };
                 let func = self
                     .module
