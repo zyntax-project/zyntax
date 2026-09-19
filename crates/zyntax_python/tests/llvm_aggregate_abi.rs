@@ -19,10 +19,10 @@ fn promoted_list_parameter_keeps_caller_header_and_aliases() {
     assert!(output.status.success(), "{stderr}");
     assert_eq!(stdout.trim(), "5000 10000 10000 10000 4999");
     let grow = stderr
-        .find("(grow) at tier 2")
+        .find("(grow) at tier 1 (Some(Optimized))")
         .expect("grow promotes to LLVM");
     assert!(
-        stderr[grow..].contains("[osr] llvm install tier=2"),
+        stderr[grow..].contains("[osr] llvm install tier=1"),
         "{stderr}"
     );
     assert!(!stderr.contains("LLVM compile failed"), "{stderr}");
