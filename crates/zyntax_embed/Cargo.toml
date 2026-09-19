@@ -42,7 +42,7 @@ pest_vm = "2.8"
 # Hot-function promotion broker (interp→JIT tier-up). Default features
 # off so no cranelift/llvm is dragged in on wasm targets; we only use
 # the core orchestrator API (Beadie, Bead, ThresholdPolicy, on_invoke).
-beadie = { git = "https://github.com/darmie/beadie.git", rev = "868d106", default-features = false }
+beadie = { git = "https://github.com/darmie/beadie.git", rev = "c403f29c8dd66635b545debcd2406847f613470e", default-features = false }
 
 # std::time::Instant panics on wasm32-unknown-unknown ("time not
 # implemented on this platform"). web-time is API-compatible with
