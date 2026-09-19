@@ -3,10 +3,8 @@
 # A listed case that starts passing fails the suite until it is removed here
 # and its issue is closed; an unlisted case that fails is a regression.
 
-official/api.lua              4da50c2
 official/attrib.lua           4da50c2
 official/bitwise.lua          4da50c2
-official/bwcoercion.lua       4da50c2
 official/calls.lua            4da50c2
 official/closure.lua          4da50c2
 official/constructs.lua       4da50c2
