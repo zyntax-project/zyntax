@@ -292,6 +292,15 @@ pub type Pc = u32;
 /// Compact, register-based opcode set. Every variant is ≤ 16 bytes on
 /// 64-bit; the most common variants (3-reg arithmetic) are 8 bytes,
 /// keeping the bytecode stream cache-friendly.
+/// The one-argument libm intrinsics the interpreter computes itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FUnaryOp {
+    Sin,
+    Cos,
+    Log,
+    Exp,
+}
+
 #[derive(Debug, Clone)]
 pub enum Op {
     /// `dst = const_pool[c]`
@@ -426,6 +435,19 @@ pub enum Op {
     FFloor {
         dst: Reg,
         src: Reg,
+    },
+    /// `dst = f(src)` for the one-argument libm intrinsics (sin, cos,
+    /// log, exp), as the native tiers call libm for them.
+    FUnary {
+        dst: Reg,
+        src: Reg,
+        op: FUnaryOp,
+    },
+    /// `dst = pow(a, b)`, for `HirCallable::Intrinsic(Intrinsic::Pow)`.
+    FPow {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
     },
     /// `dst = a * b + c` — fused multiply-add, single round.
     /// Emitted by the `fma_contract` HIR pass when it rewrites
@@ -868,7 +890,7 @@ pub struct OsrSite {
 }
 
 /// Header visits before an interpreted frame asks for promoted code.
-const OSR_REQUEST_VISITS: u32 = 256;
+const OSR_REQUEST_VISITS: u32 = 64;
 
 /// Which memory intrinsic an [`Op::MemOp`] performs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1651,10 +1673,28 @@ fn lower_inst(
                         sig,
                     });
                 }
-                HirCallable::Indirect(_) => {
-                    return Err(InterpError::UnsupportedInstruction(
-                        "indirect call".to_string(),
-                    ));
+                HirCallable::Indirect(target) => {
+                    // A call through a pointer: its shape is the operand
+                    // types and the result's, as a call by symbol's is.
+                    let fn_ptr_reg = reg(*target)?;
+                    let ret = result
+                        .and_then(|r| reg_of.get(&r).copied())
+                        .and_then(|r| cf.reg_types.get(r as usize).cloned())
+                        .unwrap_or(HirType::Void);
+                    let params: Vec<HirType> = cf.args_pool[args_idx as usize]
+                        .iter()
+                        .map(|r| cf.reg_types[*r as usize].clone())
+                        .collect();
+                    let sig = cf.sig_pool.len() as u32;
+                    cf.sig_pool.push(NativeSig::of_site(params, ret));
+                    cf.sig_thunks.push(Default::default());
+                    cf.code.push(Op::CallIndirect {
+                        dst,
+                        has_dst,
+                        fn_ptr_reg,
+                        args: args_idx,
+                        sig,
+                    });
                 }
                 HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc) => {
                     // First arg carries the size in bytes.
@@ -1736,6 +1776,46 @@ fn lower_inst(
                         .unwrap_or(0);
                     cf.code.push(Op::FFloor { dst, src: src_reg });
                 }
+                HirCallable::Intrinsic(
+                    intrinsic @ (crate::hir::Intrinsic::Sin
+                    | crate::hir::Intrinsic::Cos
+                    | crate::hir::Intrinsic::Log
+                    | crate::hir::Intrinsic::Exp),
+                ) => {
+                    let src_reg = cf
+                        .args_pool
+                        .get(args_idx as usize)
+                        .and_then(|args| args.first().copied())
+                        .unwrap_or(0);
+                    let op = match intrinsic {
+                        crate::hir::Intrinsic::Sin => FUnaryOp::Sin,
+                        crate::hir::Intrinsic::Cos => FUnaryOp::Cos,
+                        crate::hir::Intrinsic::Log => FUnaryOp::Log,
+                        _ => FUnaryOp::Exp,
+                    };
+                    cf.code.push(Op::FUnary {
+                        dst,
+                        src: src_reg,
+                        op,
+                    });
+                }
+                HirCallable::Intrinsic(crate::hir::Intrinsic::Pow) => {
+                    let arg_regs = cf
+                        .args_pool
+                        .get(args_idx as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    if arg_regs.len() != 2 {
+                        return Err(InterpError::UnsupportedInstruction(
+                            "pow with other than two arguments".to_string(),
+                        ));
+                    }
+                    cf.code.push(Op::FPow {
+                        dst,
+                        a: arg_regs[0],
+                        b: arg_regs[1],
+                    });
+                }
                 HirCallable::Intrinsic(crate::hir::Intrinsic::Fma) => {
                     // Three-arg math intrinsic — emitted by the
                     // `fma_contract` HIR pass when it rewrites
@@ -1774,10 +1854,10 @@ fn lower_inst(
                         len: regs[2],
                     });
                 }
-                HirCallable::Intrinsic(_) => {
-                    return Err(InterpError::UnsupportedInstruction(
-                        "intrinsic call".to_string(),
-                    ));
+                HirCallable::Intrinsic(intrinsic) => {
+                    return Err(InterpError::UnsupportedInstruction(format!(
+                        "intrinsic call {intrinsic:?}"
+                    )));
                 }
                 HirCallable::FuncRef(fn_id) => {
                     if let Some(r) = result {
@@ -2495,6 +2575,11 @@ pub struct HirInterpreter {
     /// The bead a function is promoted under, for a loop that asks.
     #[allow(clippy::type_complexity)]
     bead_source: Option<Box<dyn Fn(HirId) -> Option<u64> + Send + Sync>>,
+    /// The module function behind a code address, for a call through a
+    /// pointer: the call then goes by function id, and a function that
+    /// has no code yet is interpreted rather than compiled on the spot.
+    #[allow(clippy::type_complexity)]
+    address_source: Option<Box<dyn Fn(usize) -> Option<HirId> + Send + Sync>>,
     /// Thunks already made, by shape.
     thunks: HashMap<NativeSig, usize>,
     /// The call shape of each function called so far, with the thunk
@@ -2624,6 +2709,7 @@ impl HirInterpreter {
             thunk_source: None,
             entry_source: None,
             bead_source: None,
+            address_source: None,
             thunks: HashMap::new(),
             shapes: IdMap::default(),
             address_taken: HashMap::new(),
@@ -2768,6 +2854,15 @@ impl HirInterpreter {
         self.thunk_source = Some(thunk);
         self.entry_source = Some(entry);
         self.bead_source = Some(bead);
+    }
+
+    /// How a code address is told to be one of the module's functions;
+    /// see `address_source`.
+    pub fn set_address_source(
+        &mut self,
+        source: Box<dyn Fn(usize) -> Option<HirId> + Send + Sync>,
+    ) {
+        self.address_source = Some(source);
     }
 
     /// Leave an interpreted frame at a loop header for `helper`: the
@@ -3286,6 +3381,14 @@ impl HirInterpreter {
                     self.cache.insert(func_id, cf);
                 }
                 Err(InterpError::UnsupportedInstruction(why)) => {
+                    if trace_enabled() {
+                        let name = module
+                            .functions
+                            .get(&func_id)
+                            .and_then(|f| f.name.resolve_global())
+                            .unwrap_or_default();
+                        eprintln!("[interp] {name} runs natively: {why}");
+                    }
                     self.uncompilable.insert(func_id, why.clone());
                     return self.run_natively_or(module, func_id, args, dest, why);
                 }
@@ -3557,6 +3660,23 @@ impl HirInterpreter {
                 Op::FFloor { dst, src } => {
                     let x = freg_f64(&regs[*src as usize])?;
                     regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], x.floor());
+                    pc += 1;
+                }
+                Op::FUnary { dst, src, op } => {
+                    let x = freg_f64(&regs[*src as usize])?;
+                    let y = match op {
+                        FUnaryOp::Sin => x.sin(),
+                        FUnaryOp::Cos => x.cos(),
+                        FUnaryOp::Log => x.ln(),
+                        FUnaryOp::Exp => x.exp(),
+                    };
+                    regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], y);
+                    pc += 1;
+                }
+                Op::FPow { dst, a, b } => {
+                    let x = freg_f64(&regs[*a as usize])?;
+                    let y = freg_f64(&regs[*b as usize])?;
+                    regs[*dst as usize] = fval(&cf.reg_types[*dst as usize], x.powf(y));
                     pc += 1;
                 }
                 Op::FMulAdd { dst, a, b, c } => {
@@ -4093,7 +4213,8 @@ impl HirInterpreter {
                     }
                     let osr_site = &cf.osr_sites[i];
                     if visits[i] == OSR_REQUEST_VISITS {
-                        crate::osr::osr_request_promotion_interpreted(bead);
+                        let (body_tag, _, _) = crate::osr::decode_osr_site(osr_site.site_key);
+                        crate::osr::osr_request_promotion_interpreted(bead, body_tag);
                         slots[i] = crate::osr::helper_slot_addr(bead, osr_site.site_key)
                             as *const std::sync::atomic::AtomicU64;
                     }
@@ -4321,9 +4442,20 @@ impl HirInterpreter {
                     let arg_vals: Vec<ZyntaxValue> =
                         arg_regs.iter().map(|r| regs[*r as usize].clone()).collect();
                     let shape = &cf.sig_pool[*sig as usize];
+                    // A pointer to one of the module's functions is called
+                    // by id, which runs it here while it has no code.
+                    let own = if handle != 0 && self.indirect_call_dispatcher.is_none() {
+                        self.address_source
+                            .as_ref()
+                            .and_then(|f| f(handle as usize))
+                    } else {
+                        None
+                    };
                     // A host dispatcher (wasm) resolves the handle itself;
                     // otherwise the handle is native code.
-                    let result = if let Some(dispatcher) = self.indirect_call_dispatcher.as_mut() {
+                    let result = if let Some(target) = own {
+                        self.call_by_id(module, target, arg_vals, core::ptr::null_mut())?
+                    } else if let Some(dispatcher) = self.indirect_call_dispatcher.as_mut() {
                         dispatcher(handle, arg_vals)?
                     } else {
                         if self.thunk_source.is_none() {

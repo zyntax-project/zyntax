@@ -441,6 +441,10 @@ pub struct CraneliftBackend {
     wanted_stubs: Vec<HirId>,
     /// Lazy functions that have their stub.
     stubbed: HashSet<HirId>,
+    /// The function behind every code address handed out: each body
+    /// and stub as it was published. Never pruned, so a pointer taken
+    /// before a function's code was replaced still names it.
+    address_owners: HashMap<usize, HirId>,
     /// The interpreter's callers into native code, one per call shape.
     interp_thunks: HashMap<crate::hir_interp::NativeSig, usize>,
     /// Code offsets of tier-0 probe sites from the most recent compile,
@@ -632,6 +636,7 @@ impl CraneliftBackend {
             lazy_stubs: Vec::new(),
             wanted_stubs: Vec::new(),
             stubbed: HashSet::new(),
+            address_owners: HashMap::new(),
             interp_thunks: HashMap::new(),
             compile_generation: HashMap::new(),
             bead_ids: HashMap::new(),
@@ -939,6 +944,7 @@ impl CraneliftBackend {
             if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
                 eprintln!("[ptrs] {hir_id:?} -> {code_ptr:?}");
             }
+            self.address_owners.insert(code_ptr as usize, *hir_id);
             self.hot_reload
                 .function_pointers
                 .write()
@@ -1550,6 +1556,7 @@ impl CraneliftBackend {
         use cranelift_module::Module;
         for (hir_id, stub) in std::mem::take(&mut self.lazy_stubs) {
             let code_ptr = self.module.get_finalized_function(stub);
+            self.address_owners.insert(code_ptr as usize, hir_id);
             // Code installed meanwhile keeps the cell.
             if crate::reload::call_target(self.reload_key, hir_id) == 0 {
                 crate::reload::set_call_target(self.reload_key, hir_id, code_ptr as usize);
@@ -1682,6 +1689,29 @@ impl CraneliftBackend {
     /// `finalize_definitions`.
     fn compile_osr_helpers(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
         let headers = crate::osr::find_loop_headers(function);
+        self.compile_osr_helpers_for(id, function, &headers)
+    }
+
+    /// The resume points of `function` at `headers` alone, for a frame
+    /// waiting at one of them: the body it belongs to is compiled and
+    /// declared already. Compile tier and bead id are as set.
+    pub fn compile_resume_points_for(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        module: &Arc<HirModule>,
+        headers: &[HirId],
+    ) -> CompilerResult<()> {
+        self.note_shared_module(module);
+        self.compile_osr_helpers_for(id, function, headers)
+    }
+
+    fn compile_osr_helpers_for(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        headers: &[HirId],
+    ) -> CompilerResult<()> {
         if headers.is_empty() {
             return Ok(());
         }
@@ -1689,7 +1719,7 @@ impl CraneliftBackend {
         let bead_id = self.compile_bead_id;
         let trace = std::env::var_os("ZYNTAX_OSR_TRACE").is_some();
 
-        for header in headers {
+        for &header in headers {
             let layout = match crate::osr::osr_layout(function, header) {
                 Ok(l) => l,
                 Err(reason) => {
@@ -9629,6 +9659,11 @@ impl CraneliftBackend {
     #[allow(dead_code)]
 
     /// Get function pointer for JIT execution
+    /// The module function whose body or stub `addr` is, if any.
+    pub fn function_at(&self, addr: usize) -> Option<HirId> {
+        self.address_owners.get(&addr).copied()
+    }
+
     pub fn get_function_ptr(&self, id: HirId) -> Option<*const u8> {
         self.hot_reload
             .function_pointers
@@ -9663,6 +9698,7 @@ impl CraneliftBackend {
             if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
                 eprintln!("[ptrs] {hir_id:?} -> {code_ptr:?}");
             }
+            self.address_owners.insert(code_ptr as usize, *hir_id);
             self.hot_reload
                 .function_pointers
                 .write()

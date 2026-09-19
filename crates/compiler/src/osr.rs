@@ -89,17 +89,37 @@ pub fn decode_osr_site(site: u64) -> (u16, u64, u16) {
     (body_tag, loop_ordinal, live_in_count)
 }
 
-/// A number that tells one shape of a function's body from another:
-/// the same source lowered and then optimised has other instruction
-/// and value counts. Two bodies with equal tags are taken to be the
-/// same body.
+/// A number that tells one body of a function from another: a hash of
+/// which instruction sits where, with what result and operands, so
+/// the same source lowered and then optimised (an instruction hoisted,
+/// an operand folded, a call inlined) has another tag. Two bodies with
+/// equal tags are taken to be the same body.
 pub fn body_tag(function: &HirFunction) -> u16 {
-    let insts: usize = function.blocks.values().map(|b| b.instructions.len()).sum();
-    let phis: usize = function.blocks.values().map(|b| b.phis.len()).sum();
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for x in [function.blocks.len(), insts, phis, function.values.len()] {
-        h ^= x as u64;
+    let mut mix = |x: u64| {
+        h ^= x;
         h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    for (block_id, block) in &function.blocks {
+        mix(block_id.as_u32() as u64);
+        mix(block.phis.len() as u64);
+        for phi in &block.phis {
+            mix(phi.result.as_u32() as u64);
+        }
+        for inst in &block.instructions {
+            // The variant, then its result and operands.
+            let discriminant = std::mem::discriminant(inst);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&discriminant, &mut hasher);
+            mix(std::hash::Hasher::finish(&hasher));
+            if let Some(r) = instruction_result(inst) {
+                mix(r.as_u32() as u64);
+            }
+            inst.for_each_operand(|u| mix(u.as_u32() as u64));
+        }
+        for u in terminator_uses(&block.terminator) {
+            mix(u.as_u32() as u64);
+        }
     }
     (h ^ (h >> 32) ^ (h >> 16)) as u16
 }
@@ -1738,7 +1758,11 @@ pub const OSR_REQUEST_SYMBOL: &str = "__zyntax_osr_request";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Requester {
     Compiled,
-    Interpreted,
+    /// An interpreted frame, running the body with this [`body_tag`]:
+    /// the resume points it can leave through are that body's.
+    Interpreted {
+        body_tag: u16,
+    },
 }
 
 /// Installed by the runtime to answer a request: resume points for an
@@ -1777,8 +1801,16 @@ pub extern "C" fn osr_request_promotion(bead_id: u64) {
 /// The interpreter's request for the loop it is running: the same
 /// compile, and resume points it can leave through as soon as they
 /// exist, since it can enter no code mid-loop without one.
-pub fn osr_request_promotion_interpreted(bead_id: u64) {
-    request(bead_id, Requester::Interpreted);
+pub fn osr_request_promotion_interpreted(bead_id: u64, body_tag: u16) {
+    request(bead_id, Requester::Interpreted { body_tag });
+}
+
+/// Run the registered requester for `bead_id` now, on this thread: what
+/// a worker does with a request another thread queued. Returns whether
+/// it was fulfilled.
+pub fn run_promotion(bead_id: u64, from: Requester) -> bool {
+    let guard = promotion_requester().read().unwrap();
+    guard.as_ref().is_some_and(|f| f(bead_id, from))
 }
 
 fn request(bead_id: u64, from: Requester) {

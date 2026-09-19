@@ -119,6 +119,32 @@ impl ZyntaxCraneliftBackend {
     }
 }
 
+impl ZyntaxCraneliftBackend {
+    /// The resume point of `def` at `header` alone, compiled and
+    /// finalised, as `(site, code)`; the body is compiled already. The
+    /// cells stay with whatever tier holds them.
+    pub fn resume_point_at(&self, def: &ZyntaxFunctionDef, header: HirId) -> Vec<(u64, *mut ())> {
+        self.with_lock(|backend| {
+            backend.set_compile_tier(1);
+            backend.set_compile_bead_id(def.bead_id);
+            if backend
+                .compile_resume_points_for(def.id, &def.function, &def.module, &[header])
+                .is_err()
+            {
+                return Vec::new();
+            }
+            backend.set_defer_cell_publish(true);
+            let finalized = backend.finalize_definitions();
+            backend.set_defer_cell_publish(false);
+            backend.take_deferred_cells();
+            if finalized.is_err() {
+                return Vec::new();
+            }
+            backend.take_pending_osr_helpers()
+        })
+    }
+}
+
 impl JitBackend for ZyntaxCraneliftBackend {
     type FunctionDef = ZyntaxFunctionDef;
     type Error = CompileError;
