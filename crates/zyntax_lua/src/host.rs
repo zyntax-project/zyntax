@@ -1234,6 +1234,69 @@ extern "C" fn host_utf8_next(s: zrtl::StringConstPtr, n: i64, lax: bool) -> i64 
     }
 }
 
+// ─── load ───────────────────────────────────────────────────────────
+
+thread_local! {
+    static LOAD_ERROR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static LOADS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Chunks `load` compiles carry numbers from here, past any file the
+/// program was compiled with.
+const LOAD_CHUNKS_FROM: i64 = 1 << 20;
+
+/// The chunk name as `luaO_chunkid` spells it: `=name` and `@name` as
+/// given, anything else as `[string "..."]` cut at the first line.
+fn chunk_name(name: &[u8], source: &[u8]) -> String {
+    let text = if name.is_empty() { source } else { name };
+    if let Some(rest) = text.strip_prefix(b"=").or_else(|| text.strip_prefix(b"@")) {
+        return String::from_utf8_lossy(rest).into_owned();
+    }
+    const IDSIZE: usize = 60;
+    let room = IDSIZE - "[string \"".len() - "...\"]".len() - 1;
+    let first_line = text.split(|&b| b == b'\n').next().unwrap_or(b"");
+    let cut = first_line.len() < text.len() || first_line.len() > room;
+    let shown = if first_line.len() > room {
+        &first_line[..room]
+    } else {
+        first_line
+    };
+    let shown = String::from_utf8_lossy(shown);
+    if cut {
+        format!("[string \"{shown}...\"]")
+    } else {
+        format!("[string \"{shown}\"]")
+    }
+}
+
+/// `load(source, name)`: the chunk as a function value, or null with
+/// the message held for `$Lua$load_error`.
+extern "C" fn host_load(
+    source: zrtl::StringConstPtr,
+    name: zrtl::StringConstPtr,
+    env: *const DynamicBox,
+) -> *const DynamicBox {
+    let (source, name) = unsafe { (bytes_of(source), bytes_of(name)) };
+    let chunk_name = chunk_name(name, source);
+    let text = crate::source_text(source);
+    let index = LOADS.with(|n| {
+        let k = n.get();
+        n.set(k + 1);
+        LOAD_CHUNKS_FROM + k
+    });
+    match crate::load_chunk(&text, &chunk_name, index, env) {
+        Ok(record) => record,
+        Err(message) => {
+            LOAD_ERROR.with(|e| *e.borrow_mut() = message);
+            std::ptr::null()
+        }
+    }
+}
+
+extern "C" fn host_load_error() -> StringPtr {
+    LOAD_ERROR.with(|e| zrtl::string::string_from_bytes(e.borrow().as_bytes()))
+}
+
 // ─── the collector ──────────────────────────────────────────────────
 
 /// `collectgarbage`: 0 runs a collection, 1 answers the bytes the last
@@ -1251,7 +1314,7 @@ extern "C" fn host_gc(op: i64) -> i64 {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 46] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 48] = [
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$clock".as_ptr(), host_clock as *const u8),
@@ -1321,6 +1384,8 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 46] = [
     ),
     zrtl::ZrtlSymbol::new(c"$Lua$utf8_next".as_ptr(), host_utf8_next as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$gc".as_ptr(), host_gc as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$load".as_ptr(), host_load as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$load_error".as_ptr(), host_load_error as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Lua$replace_dots".as_ptr(),
         host_replace_dots as *const u8,

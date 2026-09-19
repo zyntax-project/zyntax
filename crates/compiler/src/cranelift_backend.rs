@@ -737,8 +737,11 @@ impl CraneliftBackend {
     /// Supply per-function bead ids for whole-module compiles, where one
     /// `compile_bead_id` cannot be right for every function. Falls back to
     /// [`Self::set_compile_bead_id`] for functions absent from the map.
+    /// The bead of each function, kept across modules: a stub made
+    /// for an earlier module's function after a later module compiled
+    /// still names that function's own bead.
     pub fn set_bead_ids(&mut self, bead_ids: HashMap<HirId, u64>) {
-        self.bead_ids = bead_ids;
+        self.bead_ids.extend(bead_ids);
     }
 
     /// Enable / disable OSR back-edge probe emission for subsequent
@@ -849,7 +852,12 @@ impl CraneliftBackend {
         // already in `function_map` (declaration is enough — bodies
         // compile in Pass 2). Compiling globals before declaration left
         // those relocations unresolved (null slots).
+        // A global an earlier module defined (a library both link) is
+        // the same global: one definition, shared.
         for (id, global) in &module.globals {
+            if self.global_map.contains_key(id) {
+                continue;
+            }
             self.compile_global(*id, global)?;
         }
 
@@ -2156,37 +2164,36 @@ impl CraneliftBackend {
             // and the region as resumed would order the live-ins it
             // repaired differently.
             let own_layout = self.compile_osr_layout.clone();
-            let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> = if self.emit_osr_probes
-                && within_budget
-            {
-                let dominators = crate::osr::Dominators::compute(function);
-                osr_loop_headers
-                    .iter()
-                    .filter_map(|h| {
-                        if let Some(own) = &own_layout
-                            && own.header == *h
-                        {
-                            return Some((*h, own.clone()));
-                        }
-                        match crate::osr::osr_layout_with(function, *h, &dominators) {
-                            Ok(layout) => Some((*h, layout)),
-                            Err(reason) => {
-                                if crate::osr::osr_trace_enabled() {
-                                    eprintln!(
-                                        "[osr] reject probe {} header_idx={}: {:?}",
-                                        function.name.resolve_global().unwrap_or_default(),
-                                        osr_block_index.get(h).copied().unwrap_or(u64::MAX),
-                                        reason
-                                    );
-                                }
-                                None
+            let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> =
+                if self.emit_osr_probes && within_budget {
+                    let dominators = crate::osr::Dominators::compute(function);
+                    osr_loop_headers
+                        .iter()
+                        .filter_map(|h| {
+                            if let Some(own) = &own_layout
+                                && own.header == *h
+                            {
+                                return Some((*h, own.clone()));
                             }
-                        }
-                    })
-                    .collect()
-            } else {
-                HashMap::new()
-            };
+                            match crate::osr::osr_layout_with(function, *h, &dominators) {
+                                Ok(layout) => Some((*h, layout)),
+                                Err(reason) => {
+                                    if crate::osr::osr_trace_enabled() {
+                                        eprintln!(
+                                            "[osr] reject probe {} header_idx={}: {:?}",
+                                            function.name.resolve_global().unwrap_or_default(),
+                                            osr_block_index.get(h).copied().unwrap_or(u64::MAX),
+                                            reason
+                                        );
+                                    }
+                                    None
+                                }
+                            }
+                        })
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
             if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
                 eprintln!(
                     "[clif]   osr prologue {:.2} ms ({} headers, {} layouts)",
@@ -10160,8 +10167,12 @@ impl CraneliftBackend {
         let externs = Self::collect_extern_dependencies(module);
         externs.iter().any(|name| {
             // Check if the extern is in our exported symbols but not in runtime symbols
-            self.exported_symbols.contains_key(name)
-                && !self.runtime_symbols.iter().any(|(n, _)| n == name)
+            let needs = self.exported_symbols.contains_key(name)
+                && !self.runtime_symbols.iter().any(|(n, _)| n == name);
+            if needs && std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                eprintln!("[clif] rebuild for extern {name}");
+            }
+            needs
         })
     }
 

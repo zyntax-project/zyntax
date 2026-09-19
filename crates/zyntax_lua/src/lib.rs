@@ -154,6 +154,66 @@ fn library() -> Result<Library> {
 /// host's own symbols, and the name a program is entered through, so
 /// only the library the program reaches is built. A host calls this
 /// once before compiling a program, after [`set_args`] if it has any.
+/// The runtime `load` compiles chunks with, set by the host before the
+/// program runs. A loaded chunk is compiled from inside the program,
+/// which the runtime's entry holds a shared reference to; what
+/// compiling touches is not what running reads.
+static RUNTIME: std::sync::atomic::AtomicPtr<zyntax_embed::TieredRuntime> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+pub fn set_runtime(runtime: &mut zyntax_embed::TieredRuntime) {
+    RUNTIME.store(runtime, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn runtime() -> Option<&'static mut zyntax_embed::TieredRuntime> {
+    let p = RUNTIME.load(std::sync::atomic::Ordering::Acquire);
+    // SAFETY: the host set it to a runtime that outlives the program,
+    // and runs the program on one thread.
+    unsafe { p.as_mut() }
+}
+
+/// Compile `source` as a chunk of the running program: the function
+/// value it is, or the message a syntax error gives.
+pub(crate) fn load_chunk(
+    source: &str,
+    chunk_name: &str,
+    index: i64,
+    env: *const zrtl::DynamicBox,
+) -> std::result::Result<*const zrtl::DynamicBox, String> {
+    let ast = match full_moon::parse_fallible(source, full_moon::LuaVersion::lua54()).into_result()
+    {
+        Ok(ast) => ast,
+        Err(errors) => {
+            let first = errors.into_iter().next().expect("an error");
+            let (message, range) = match &first {
+                full_moon::Error::AstError(e) => (e.error_message().to_string(), e.range()),
+                full_moon::Error::TokenizerError(e) => (e.error().to_string(), e.range()),
+            };
+            let line = source[..range.0.bytes().min(source.len())]
+                .matches('\n')
+                .count()
+                + 1;
+            return Err(format!("{chunk_name}:{line}: {message}"));
+        }
+    };
+    let library = library().map_err(|e| e.to_string())?;
+    let program = lower::loaded_program(&ast, source, chunk_name, index, library)
+        .map_err(|e| e.render(chunk_name, source, false))?;
+    let runtime = runtime().ok_or("no runtime to load into")?;
+    let init = format!("lua$l{index}$init");
+    runtime.declare_entry_points([init.as_str()]);
+    runtime
+        .compile_typed_program(program)
+        .map_err(|e| e.to_string())?;
+    let entry = runtime
+        .function_pointer(&init)
+        .ok_or("the loaded chunk has no entry")?;
+    // SAFETY: `init` was compiled with this signature just above.
+    let init: extern "C" fn(*const zrtl::DynamicBox) -> *const zrtl::DynamicBox =
+        unsafe { std::mem::transmute(entry) };
+    Ok(init(env))
+}
+
 pub fn register_runtime(
     runtime: &mut zyntax_embed::TieredRuntime,
 ) -> std::result::Result<(), zyntax_embed::RuntimeError> {

@@ -109,6 +109,7 @@ fn run() -> ExitCode {
         eprintln!("zylua: runtime: {e}");
         return ExitCode::from(4);
     }
+    zyntax_lua::set_runtime(&mut rt);
     lap("register");
     if let Err(e) = rt.compile_typed_program(program) {
         eprintln!("zylua: compile: {e}");

@@ -381,8 +381,10 @@ impl Walker {
         self.use_global(&binding);
         // The globals table reached as a value: every global is then
         // an entry of a real table.
+        // A chunk loaded while the program runs shares its globals
+        // through the table too.
         if let Binding::Global(name) = &binding
-            && Scopes::is_globals_name(name)
+            && (Scopes::is_globals_name(name) || name == "load" || name == "dofile")
         {
             self.out.dynamic_globals = true;
         }

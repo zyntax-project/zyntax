@@ -309,5 +309,6 @@ categories! {
     globals,
     utf8,
     modules,
+    load,
     official,
 }

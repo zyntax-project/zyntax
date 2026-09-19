@@ -290,6 +290,13 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         lib: "",
+        name: "load",
+        func: "zl_load",
+        params: &[Value, Any, Any, Any],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "",
         name: "collectgarbage",
         func: "zl_collectgarbage",
         params: &[OptStr("collect"), Any],
@@ -2508,6 +2515,114 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         ],
     ));
 
+    // `load(chunk, name, mode, env)`: the chunk, a string or a
+    // function giving pieces of it, compiled while the program runs;
+    // the function value, or nil and the message.
+    d.push(extern_fn(
+        "zl_load_raw",
+        &[("source", string()), ("name", string()), ("env", any())],
+        any(),
+        Some("$Lua$load"),
+    ));
+    d.push(extern_fn(
+        "zl_load_error",
+        &[],
+        string(),
+        Some("$Lua$load_error"),
+    ));
+    let chunk = kept("chunk", any());
+    let chunk_name = kept("chunk_name", any());
+    let mode = kept("mode", any());
+    let env = kept("env", any());
+    let piece = local("piece", any());
+    let cname = local("cname", string());
+    d.push(define(
+        "zl_load",
+        &[&chunk, &chunk_name, &mode, &env],
+        any(),
+        vec![
+            s.decl(text("")),
+            if_(
+                eq(category(chunk.e()), int(STR)),
+                vec![s.set(get_str(chunk.e()))],
+                vec![
+                    when(
+                        not(is_func(chunk.e())),
+                        vec![lua_error(concat(vec![
+                            text("bad argument #1 to 'load' (string expected, got "),
+                            type_name(chunk.e()),
+                            text(")"),
+                        ]))],
+                    ),
+                    // The reader gives pieces until nil or an empty string.
+                    expr(call("zl_buf_open", vec![], unit())),
+                    piece.decl(call(
+                        "zl_first",
+                        vec![call("zl_call_0", vec![chunk.e()], any())],
+                        any(),
+                    )),
+                    while_(
+                        and(
+                            not(is_nil(piece.e())),
+                            and(
+                                eq(category(piece.e()), int(STR)),
+                                gt(call("zb_str_len", vec![get_str(piece.e())], i64()), int(0)),
+                            ),
+                        ),
+                        vec![
+                            expr(call("zl_buf_push", vec![get_str(piece.e())], unit())),
+                            piece.set(call(
+                                "zl_first",
+                                vec![call("zl_call_0", vec![chunk.e()], any())],
+                                any(),
+                            )),
+                        ],
+                    ),
+                    s.set(call("zl_buf_close", vec![], string())),
+                    when(
+                        and(not(is_nil(piece.e())), ne(category(piece.e()), int(STR))),
+                        vec![ret(call(
+                            "zb_box_tuple",
+                            vec![list(
+                                vec![nil(), box_str(text("reader function must return a string"))],
+                                anys.clone(),
+                            )],
+                            any(),
+                        ))],
+                    ),
+                ],
+            ),
+            cname.decl(text("")),
+            when(
+                eq(category(chunk_name.e()), int(STR)),
+                vec![cname.set(get_str(chunk_name.e()))],
+            ),
+            y.decl(call("zl_load_raw", vec![s.e(), cname.e(), env.e()], any())),
+            when(
+                is_nil(y.e()),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(
+                        vec![nil(), box_str(call("zl_load_error", vec![], string()))],
+                        anys.clone(),
+                    )],
+                    any(),
+                ))],
+            ),
+            ret(y.e()),
+        ],
+    ));
+    // The globals a loaded chunk reads: the env it was given when that
+    // is a table, else the program's.
+    d.push(define(
+        "zl_env_table",
+        &[&env],
+        table.clone(),
+        vec![
+            when(is_table(env.e()), vec![ret(unbox_table(env.e(), t))]),
+            ret(call("zl_globals_table", vec![], table.clone())),
+        ],
+    ));
     // `collectgarbage(opt)`: a collection, or what the collector knows.
     d.push(extern_fn("zl_gc", &[("op", i64())], i64(), Some("$Lua$gc")));
     let opt = kept("opt", string());

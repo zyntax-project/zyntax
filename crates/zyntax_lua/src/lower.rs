@@ -84,6 +84,10 @@ struct Module<'a> {
     /// This chunk's number in the bits above `LINE_BITS` of a stored
     /// line: 0 for the main chunk.
     chunk_index: i64,
+    /// The module variable holding this chunk's globals table when it
+    /// has one of its own (a chunk loaded with an env), else the
+    /// program's.
+    env_var: Option<InternedString>,
     /// Byte offsets where each line starts, for positions.
     line_starts: Vec<usize>,
     /// The library functions that can raise.
@@ -1266,8 +1270,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     /// The globals table, when the program reaches its globals through
     /// one: every global is an entry, the builtins included.
     fn globals_table(&mut self, span: Span) -> Val {
+        let name = self.m.env_var.unwrap_or_else(|| intern(library::GLOBALS));
         Val {
-            node: var(intern(library::GLOBALS), self.ir(Ty::Table), span),
+            node: var(name, self.ir(Ty::Table), span),
             ty: Ty::Table,
         }
     }
@@ -4249,6 +4254,225 @@ fn line_starts_of(source: &str) -> Vec<usize> {
         .collect()
 }
 
+/// A module's variables and functions as declarations.
+fn declare(module: &Module<'_>, declarations: &mut Vec<TypedNode<TypedDeclaration>>) {
+    for (name, ty) in module.module_vars.borrow().iter() {
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Variable(TypedVariable {
+                name: *name,
+                ty: module.ir(*ty),
+                mutability: Mutability::Mutable,
+                initializer: None,
+                visibility: Visibility::Public,
+            }),
+            Type::Unknown,
+            Span::new(0, 0),
+        ));
+    }
+    for f in module.functions.borrow().iter() {
+        let span = f.body.as_ref().map(|b| b.span).unwrap_or(Span::new(0, 0));
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(f.clone()),
+            Type::Unknown,
+            span,
+        ));
+    }
+}
+
+/// A chunk besides the main one (a required file, a loaded string) as
+/// a function `lua$<tag>chunk($varargs) -> Any` returning its values,
+/// with a variadic record code `lua$<tag>chunk$fn` a program calls it
+/// through. Its declarations are appended; the record code's name is
+/// returned.
+#[allow(clippy::too_many_arguments)]
+fn chunk_module(
+    scopes: &Scopes,
+    inferred: &Inferred,
+    ast: &ast::Ast,
+    source: &str,
+    file: &str,
+    tag: &str,
+    chunk_index: i64,
+    env_var: Option<InternedString>,
+    library: &Library,
+    declarations: &mut Vec<TypedNode<TypedDeclaration>>,
+) -> Result<String> {
+    let mut module = Module {
+        scopes,
+        inferred,
+        types: library.types.clone(),
+        chunk: file,
+        tag: tag.to_string(),
+        chunk_index,
+        env_var,
+        line_starts: line_starts_of(source),
+        fallible: crate::fallible::FALLIBLE.iter().copied().collect(),
+        raising: None,
+        functions: RefCell::new(Vec::new()),
+        module_vars: RefCell::new(Vec::new()),
+        facts: RefCell::new(HashMap::new()),
+    };
+    let span = Span::new(0, source.len());
+    let lower = |module: &Module<'_>| -> Result<Vec<St>> {
+        let mut main = Lowerer::new(module, CHUNK);
+        main.returns = Returns::Dynamic;
+        main.varargs = Some(intern("$varargs"));
+        let mut statements = main.block(ast.nodes())?;
+        if main.entry_line {
+            statements.insert(0, entry_line_save(span));
+        }
+        if types::falls_through(ast.nodes()) {
+            main.return_stmt(&[], span, &mut statements)?;
+        }
+        module.facts.borrow_mut().insert(
+            CHUNK,
+            RaiseFact {
+                own: main.raised,
+                callees: main.raise_callees.clone(),
+            },
+        );
+        Ok(statements)
+    };
+    lower(&module)?;
+    let raising = raising_functions(&module.facts.borrow());
+    module.raising = Some(raising);
+    module.functions.borrow_mut().clear();
+    module.module_vars.borrow_mut().clear();
+    module.facts.borrow_mut().clear();
+    let statements = lower(&module)?;
+    let chunk_name = format!("lua${tag}chunk");
+    let code_name = format!("{chunk_name}$fn");
+    module.functions.borrow_mut().push(typed_function(
+        &chunk_name,
+        vec![parameter(intern("$varargs"), module.anys(), span)],
+        Type::Any,
+        statements,
+        span,
+    ));
+    // Its record code: a variadic taking the packed arguments.
+    module.functions.borrow_mut().push(typed_function(
+        &code_name,
+        vec![
+            parameter(intern("env"), module.anys(), span),
+            parameter(intern("packed"), Type::Any, span),
+        ],
+        Type::Any,
+        vec![ret(
+            Some(call(
+                &chunk_name,
+                vec![call(
+                    "zl_values",
+                    vec![var(intern("packed"), Type::Any, span)],
+                    module.anys(),
+                    span,
+                )],
+                Type::Any,
+                span,
+            )),
+            span,
+        )],
+        span,
+    ));
+    if let Some(env) = env_var {
+        module.declare_module_var(env, Ty::Table);
+    }
+    declare(&module, declarations);
+    Ok(code_name)
+}
+
+/// The import every program links the library through.
+fn library_import() -> TypedNode<TypedDeclaration> {
+    TypedNode::new(
+        TypedDeclaration::Import(zyntax_typed_ast::typed_ast::TypedImport {
+            language: Some(intern("lua")),
+            module_path: vec![intern(crate::policy::LIBRARY_MODULE)],
+            items: Vec::new(),
+            span: Span::new(0, 0),
+        }),
+        Type::Unknown,
+        Span::new(0, 0),
+    )
+}
+
+/// A chunk `load` compiles while the program runs, as a program of its
+/// own: the chunk's function, and `lua$l<k>$init(env) -> Any`, which
+/// registers the chunk's name for positions, takes the globals table
+/// the chunk reads (the program's when `env` is nil) and returns the
+/// chunk as a function value.
+pub(crate) fn loaded_program(
+    ast: &ast::Ast,
+    source: &str,
+    chunk_name: &str,
+    index: i64,
+    library: Library,
+) -> Result<TypedProgram> {
+    let mut scopes = crate::scope::resolve(ast);
+    scopes.dynamic_globals = true;
+    let inferred = types::infer(&scopes, ast);
+    let tag = format!("l{index}$");
+    let env_var = intern(&format!("lua$l{index}$env"));
+    let mut declarations = Vec::new();
+    let code_name = chunk_module(
+        &scopes,
+        &inferred,
+        ast,
+        source,
+        chunk_name,
+        &tag,
+        index,
+        Some(env_var),
+        &library,
+        &mut declarations,
+    )?;
+    let span = Span::new(0, source.len());
+    let table = library.types.table();
+    let env = intern("env");
+    let init = typed_function(
+        &format!("lua${tag}init"),
+        vec![parameter(env, Type::Any, span)],
+        Type::Any,
+        vec![
+            expr_stmt(call(
+                "zl_chunk_add",
+                vec![str_lit(chunk_name, span), int_lit(index, span)],
+                prim(PrimitiveType::Unit),
+                span,
+            )),
+            assign(
+                var(env_var, table.clone(), span),
+                call("zl_env_table", vec![var(env, Type::Any, span)], table, span),
+                span,
+            ),
+            ret(
+                Some(call(
+                    "zl_func_of",
+                    vec![code_of(&code_name, span), int_lit(VARIADIC_ARITY, span)],
+                    Type::Any,
+                    span,
+                )),
+                span,
+            ),
+        ],
+        span,
+    );
+    declarations.push(TypedNode::new(
+        TypedDeclaration::Function(init),
+        Type::Unknown,
+        span,
+    ));
+    declarations.push(library_import());
+    Ok(TypedProgram {
+        declarations,
+        language: Some(intern("lua")),
+        span,
+        source_files: vec![zyntax_typed_ast::source::SourceFile::new(
+            chunk_name.to_string(),
+            source.to_string(),
+        )],
+        type_registry: library.type_registry,
+    })
+}
+
 /// The whole chunk as a program.
 pub(crate) fn program(
     ast: &ast::Ast,
@@ -4283,6 +4507,7 @@ pub(crate) fn program(
         chunk: file,
         tag: String::new(),
         chunk_index: 0,
+        env_var: None,
         line_starts,
         fallible: crate::fallible::FALLIBLE.iter().copied().collect(),
         raising: None,
@@ -4381,29 +4606,6 @@ pub(crate) fn program(
         span,
     );
     let mut declarations = Vec::new();
-    let declare = |module: &Module<'_>, declarations: &mut Vec<TypedNode<TypedDeclaration>>| {
-        for (name, ty) in module.module_vars.borrow().iter() {
-            declarations.push(TypedNode::new(
-                TypedDeclaration::Variable(TypedVariable {
-                    name: *name,
-                    ty: module.ir(*ty),
-                    mutability: Mutability::Mutable,
-                    initializer: None,
-                    visibility: Visibility::Public,
-                }),
-                Type::Unknown,
-                Span::new(0, 0),
-            ));
-        }
-        for f in module.functions.borrow().iter() {
-            let span = f.body.as_ref().map(|b| b.span).unwrap_or(Span::new(0, 0));
-            declarations.push(TypedNode::new(
-                TypedDeclaration::Function(f.clone()),
-                Type::Unknown,
-                span,
-            ));
-        }
-    };
     declare(&module, &mut declarations);
 
     // Each required file is a chunk of its own, a function the program
@@ -4412,87 +4614,26 @@ pub(crate) fn program(
     let mut preloads: Vec<St> = Vec::new();
     for (k, m) in loaded.iter().enumerate() {
         let tag = format!("m${}$", m.name.replace('.', "$"));
-        let mut file_module = Module {
-            scopes: &m.scopes,
-            inferred: &module_inferred[k],
-            types: library.types.clone(),
-            chunk: &m.file,
-            tag: tag.clone(),
-            chunk_index: k as i64 + 1,
-            line_starts: line_starts_of(&m.source),
-            fallible: crate::fallible::FALLIBLE.iter().copied().collect(),
-            raising: None,
-            functions: RefCell::new(Vec::new()),
-            module_vars: RefCell::new(Vec::new()),
-            facts: RefCell::new(HashMap::new()),
-        };
-        let file_span = Span::new(0, m.source.len());
-        let lower_file = |module: &Module<'_>| -> Result<Vec<St>> {
-            let mut main = Lowerer::new(module, CHUNK);
-            main.returns = Returns::Dynamic;
-            main.varargs = Some(intern("$varargs"));
-            let mut statements = main.block(m.ast.nodes())?;
-            if main.entry_line {
-                statements.insert(0, entry_line_save(file_span));
-            }
-            if types::falls_through(m.ast.nodes()) {
-                main.return_stmt(&[], file_span, &mut statements)?;
-            }
-            module.facts.borrow_mut().insert(
-                CHUNK,
-                RaiseFact {
-                    own: main.raised,
-                    callees: main.raise_callees.clone(),
-                },
-            );
-            Ok(statements)
-        };
-        lower_file(&file_module)?;
-        let raising = raising_functions(&file_module.facts.borrow());
-        file_module.raising = Some(raising);
-        file_module.functions.borrow_mut().clear();
-        file_module.module_vars.borrow_mut().clear();
-        file_module.facts.borrow_mut().clear();
-        let statements = lower_file(&file_module)?;
-        let chunk_name = format!("lua${tag}chunk");
-        let code_name = format!("{chunk_name}$fn");
-        file_module.functions.borrow_mut().push(typed_function(
-            &chunk_name,
-            vec![parameter(intern("$varargs"), file_module.anys(), file_span)],
-            Type::Any,
-            statements,
-            file_span,
-        ));
-        // Its record code: a variadic taking the packed arguments.
-        file_module.functions.borrow_mut().push(typed_function(
-            &code_name,
-            vec![
-                parameter(intern("env"), file_module.anys(), file_span),
-                parameter(intern("packed"), Type::Any, file_span),
-            ],
-            Type::Any,
-            vec![ret(
-                Some(call(
-                    &chunk_name,
-                    vec![call(
-                        "zl_values",
-                        vec![var(intern("packed"), Type::Any, file_span)],
-                        file_module.anys(),
-                        file_span,
-                    )],
-                    Type::Any,
-                    file_span,
-                )),
-                file_span,
-            )],
-            file_span,
-        ));
-        declare(&file_module, &mut declarations);
+        let code_name = chunk_module(
+            &m.scopes,
+            &module_inferred[k],
+            &m.ast,
+            &m.source,
+            &m.file,
+            &tag,
+            k as i64 + 1,
+            None,
+            &library,
+            &mut declarations,
+        )?;
         // Positions name the file as `require` found it.
         let found_as = format!("./{}.lua", m.name.replace('.', "/"));
         preloads.push(expr_stmt(call(
             "zl_chunk_add",
-            vec![str_lit(&chunk_id(&found_as), span)],
+            vec![
+                str_lit(&chunk_id(&found_as), span),
+                int_lit(k as i64 + 1, span),
+            ],
             prim(PrimitiveType::Unit),
             span,
         )));
@@ -4564,16 +4705,7 @@ pub(crate) fn program(
     ));
     // The library itself arrives by import: its declarations for
     // typing, its HIR to link against.
-    declarations.push(TypedNode::new(
-        TypedDeclaration::Import(zyntax_typed_ast::typed_ast::TypedImport {
-            language: Some(intern("lua")),
-            module_path: vec![intern(crate::policy::LIBRARY_MODULE)],
-            items: Vec::new(),
-            span: Span::new(0, 0),
-        }),
-        Type::Unknown,
-        Span::new(0, 0),
-    ));
+    declarations.push(library_import());
     let mut source_files = vec![zyntax_typed_ast::source::SourceFile::new(
         file.to_string(),
         source.to_string(),

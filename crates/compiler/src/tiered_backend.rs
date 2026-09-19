@@ -327,6 +327,9 @@ pub struct TieredBackend {
     /// in their cell; the interpreter reaches their baseline the same
     /// way, so one compile is made of each.
     lazy: HashSet<HirId>,
+    /// Functions that arrived optimised with a snapshot, across every
+    /// module compiled so far.
+    finished: HashSet<HirId>,
     /// The body the first-call compile optimised for each function it
     /// compiled, which a later tier compiles again rather than the
     /// module's unoptimised one.
@@ -440,6 +443,7 @@ impl TieredBackend {
             _llvm_context,
             functions: HashMap::new(),
             lazy: HashSet::new(),
+            finished: HashSet::new(),
             optimized_bodies: Arc::new(Mutex::new(HashMap::new())),
             current_module: None,
             loaded: Vec::new(),
@@ -524,10 +528,19 @@ impl TieredBackend {
         // allocating them afterwards left every probe reading slot zero
         // while helpers published under the real ids — the transfer could
         // never happen.
+        // A function an earlier module brought keeps its bead: the
+        // stubs and probes already made name it.
         let bead_ids: HashMap<HirId, u64> = module
             .functions
             .keys()
-            .map(|id| (*id, osr::next_bead_id()))
+            .map(|id| {
+                let bead = self
+                    .functions
+                    .get(id)
+                    .map(|e| e.bead_id)
+                    .unwrap_or_else(osr::next_bead_id);
+                (*id, bead)
+            })
             .collect();
         self.cranelift
             .with_lock(|be| be.set_bead_ids(bead_ids.clone()));
@@ -606,6 +619,12 @@ impl TieredBackend {
         }
 
         for (func_id, function) in module_context.functions.iter() {
+            // A function an earlier module brought (a library both
+            // link) keeps its bead and entry: the stubs already handed
+            // out name that bead.
+            if self.functions.contains_key(func_id) {
+                continue;
+            }
             let bound = self.adapter.register(ptr::null_mut(), None);
 
             // The bead starts without code: interpreter calls tick it and
@@ -644,11 +663,16 @@ impl TieredBackend {
             );
         }
 
-        // Every bead now exists, so the handler can capture them.
+        // Every bead now exists, so the handler can capture them. The
+        // compiler installed covers every module so far: a program that
+        // compiles a chunk of itself still calls its earlier functions
+        // for the first time afterwards.
         self.lazy.extend(lazy.iter().copied());
+        self.finished.extend(finished.iter().copied());
         self.install_promotion_requester();
         if !lazy.is_empty() {
-            self.install_lazy_compiler(&lazy, &finished);
+            let (all_lazy, all_finished) = (self.lazy.clone(), self.finished.clone());
+            self.install_lazy_compiler(&all_lazy, &all_finished);
         }
         if trace {
             eprintln!(
@@ -2148,7 +2172,9 @@ impl TieredBackend {
             module: HirModule,
             cache: crate::OptCache,
         }
-        let optimized: Arc<Mutex<Option<Scratch>>> = Arc::new(Mutex::new(None));
+        // One scratch per module: a program that compiles a chunk of
+        // itself has bodies in more than one.
+        let optimized: Arc<Mutex<HashMap<usize, Scratch>>> = Arc::new(Mutex::new(HashMap::new()));
         let scratch_shared = Arc::clone(&optimized);
         // The optimised body outlives the baseline compile for the tier
         // above it; a ladder that ends at the baseline drops it then.
@@ -2194,7 +2220,8 @@ impl TieredBackend {
                         return None;
                     }
                     let mut optimized = optimized.lock().unwrap();
-                    let scratch = optimized.get_or_insert_with(|| {
+                    let key = Arc::as_ptr(module_arc) as usize;
+                    let scratch = optimized.entry(key).or_insert_with(|| {
                         // Every other function is marked through the
                         // pipeline and deferred, so a pass that walks the
                         // module touches the one being optimised alone.
@@ -2281,10 +2308,16 @@ impl TieredBackend {
                 entry as *const u8
             };
             let Some((func_id, bound, module_arc)) = by_bead.get(&bead_id) else {
+                if trace {
+                    eprintln!("[lazy] bead {bead_id} is not a function this compiler knows");
+                }
                 return publish(0);
             };
             let lazy_started = std::time::Instant::now();
             let Some(body) = optimize_body(bead_id) else {
+                if trace {
+                    eprintln!("[lazy] bead {bead_id} ({func_id:?}) has no body to compile");
+                }
                 return publish(0);
             };
             let body_at = lazy_started.elapsed();
@@ -2303,6 +2336,12 @@ impl TieredBackend {
             );
             let compiled_at = lazy_started.elapsed();
             if entry.is_null() {
+                if trace {
+                    eprintln!(
+                        "[lazy] {} did not compile",
+                        body.name.resolve_global().unwrap_or_default()
+                    );
+                }
                 return publish(0);
             }
             crate::reload::set_call_target(reload_key, *func_id, entry as usize);
@@ -2371,7 +2410,7 @@ impl TieredBackend {
                         // Every lazy function has its code: the scratch
                         // module the program's own were optimised in
                         // is done with.
-                        scratch_shared.lock().unwrap().take();
+                        scratch_shared.lock().unwrap().clear();
                     })
                     .ok();
             }

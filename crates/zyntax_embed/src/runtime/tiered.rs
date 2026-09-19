@@ -660,29 +660,61 @@ impl TieredRuntime {
             .compile_module_lazily(module, reachable, lazy, finished)?;
         // The backend owns the optimized HIR and native global slots. Bind
         // both into the interpreter before the initializer can run.
+        //
+        // Unless the interpreter is running: a program compiling a chunk
+        // of itself (a Lua `load`) arrives here from inside interpreted
+        // code, which holds the interpreter. Such a chunk is entered by
+        // native pointer and runs natively, so it needs no binding, and
+        // its constants are initialised natively too.
         let (symbols, globals) = self.backend.interpreter_bindings();
-        let mut interp = self.interpreter.lock().unwrap();
-        for (name, ptr) in symbols {
-            if let Some(sig) = self.plugin_signatures.get(&name) {
-                interp.register_symbol_typed(name, ptr, *sig);
-            } else {
-                interp.register_symbol(name, ptr, 0);
+        let interpreter_bound = match self.interpreter.try_lock() {
+            Ok(mut interp) => {
+                for (name, ptr) in symbols {
+                    if let Some(sig) = self.plugin_signatures.get(&name) {
+                        interp.register_symbol_typed(name, ptr, *sig);
+                    } else {
+                        interp.register_symbol(name, ptr, 0);
+                    }
+                }
+                for (id, ptr) in globals {
+                    interp.bind_global_slot(id, ptr);
+                }
+                for id in self.function_ids.values().copied() {
+                    if let Some(tick) = self.backend.interpreter_tick_callback(id) {
+                        interp.register_tick_callback(id, tick);
+                    }
+                }
+                interp.set_body_source(self.backend.interpreter_body_source());
+                let (thunk, entry, bead) = self.backend.interpreter_bridge();
+                interp.set_native_bridge(thunk, entry, bead);
+                true
             }
-        }
-        for (id, ptr) in globals {
-            interp.bind_global_slot(id, ptr);
-        }
-        for id in self.function_ids.values().copied() {
-            if let Some(tick) = self.backend.interpreter_tick_callback(id) {
-                interp.register_tick_callback(id, tick);
+            Err(std::sync::TryLockError::WouldBlock) => false,
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                return Err(RuntimeError::Execution(format!(
+                    "the interpreter is poisoned: {e}"
+                )));
             }
-        }
-        interp.set_body_source(self.backend.interpreter_body_source());
-        let (thunk, entry, bead) = self.backend.interpreter_bridge();
-        interp.set_native_bridge(thunk, entry, bead);
-        drop(interp);
+        };
         if init_boxed_constants {
-            self.call::<()>(zyntax_compiler::const_boxes::INIT_FUNCTION, &[])?;
+            let init = zyntax_compiler::const_boxes::INIT_FUNCTION;
+            if interpreter_bound {
+                self.call::<()>(init, &[])?;
+            } else {
+                let ptr = self
+                    .get_function_ptr(init)
+                    .ok_or_else(|| RuntimeError::FunctionNotFound(init.to_string()))?;
+                let sig = self
+                    .function_signatures
+                    .get(init)
+                    .cloned()
+                    .unwrap_or(NativeSignature {
+                        params: Vec::new(),
+                        ret: NativeType::Void,
+                    });
+                // SAFETY: the initializer was compiled with this signature.
+                unsafe { call_native_with_signature(ptr, &[], &sig)? };
+            }
         }
         if trace {
             eprintln!(

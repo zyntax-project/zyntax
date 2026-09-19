@@ -500,44 +500,52 @@ fn raising(t: &Types) -> Vec<Decl> {
         global_var(CHUNKS, any()),
     ];
     // The name of the chunk a stored line belongs to.
+    let found = local("found", any());
     d.push(define(
         "zl_chunk_of",
         &[&line],
         string(),
         vec![
             when(
-                eq(shr(line.e(), int(LINE_BITS)), int(0)),
+                or(
+                    eq(shr(line.e(), int(LINE_BITS)), int(0)),
+                    is_nil(read_global(CHUNKS, any())),
+                ),
                 vec![ret(read_global(CHUNK, string()))],
             ),
-            ret(get_str(call(
-                "zl_value_at",
+            found.decl(call(
+                "zl_index",
                 vec![
-                    call("zl_values", vec![read_global(CHUNKS, any())], t.anys()),
-                    shr(line.e(), int(LINE_BITS)),
+                    read_global(CHUNKS, any()),
+                    box_i64(shr(line.e(), int(LINE_BITS))),
                 ],
                 any(),
-            ))),
+            )),
+            when(is_nil(found.e()), vec![ret(read_global(CHUNK, string()))]),
+            ret(get_str(found.e())),
         ],
     ));
-    // A chunk a program loads besides its main one; its number is the
-    // count so far.
+    // A chunk a program runs besides its main one, under the number its
+    // lines carry.
     let name = kept("name", string());
+    let index = local("index", i64());
     d.push(define(
         "zl_chunk_add",
-        &[&name],
+        &[&name, &index],
         unit(),
         vec![
             when(
                 is_nil(read_global(CHUNKS, any())),
                 vec![set_global(
                     CHUNKS,
-                    call("zb_box_tuple", vec![list(vec![], t.anys())], any()),
+                    box_table(call("zl_table_new", vec![], t.table())),
                 )],
             ),
             expr(call(
-                "zl_append_values",
+                "zl_rawseti",
                 vec![
-                    call("zl_values", vec![read_global(CHUNKS, any())], t.anys()),
+                    unbox_table(read_global(CHUNKS, any()), t),
+                    index.e(),
                     box_str(name.e()),
                 ],
                 unit(),
