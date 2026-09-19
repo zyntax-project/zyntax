@@ -63,7 +63,9 @@ struct Outcome {
 fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
     // Only stdout is compared. A piped stderr nobody reads would stall
     // the child once it filled the pipe.
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

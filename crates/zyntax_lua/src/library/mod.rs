@@ -10,6 +10,7 @@
 
 pub mod calls;
 pub mod coroutines;
+pub mod io;
 pub mod patterns;
 pub mod stdlib;
 pub mod tables;
@@ -31,6 +32,8 @@ pub const THREAD_KIND: usize = 1;
 /// `error(nil)` in flight: nil means nothing pending, so a nil error
 /// value travels as this instance and is nil again when taken.
 pub const NIL_ERROR_KIND: usize = 2;
+/// A file: the handle of one of the host's streams.
+pub const FILE_KIND: usize = 3;
 
 pub fn table_tag() -> i64 {
     zyntax_builtins::instance_tag(TABLE_KIND)
@@ -40,6 +43,9 @@ pub fn thread_tag() -> i64 {
 }
 pub fn nil_error_tag() -> i64 {
     zyntax_builtins::instance_tag(NIL_ERROR_KIND)
+}
+pub fn file_tag() -> i64 {
+    zyntax_builtins::instance_tag(FILE_KIND)
 }
 
 /// The types the library is written against: `List<Any>` and the
@@ -229,6 +235,9 @@ pub fn is_table(x: Expr) -> Expr {
 pub fn is_thread(x: Expr) -> Expr {
     and(ne(x.clone(), nil()), eq(tag_of(x), int(thread_tag())))
 }
+pub fn is_file(x: Expr) -> Expr {
+    and(ne(x.clone(), nil()), eq(tag_of(x), int(file_tag())))
+}
 pub fn is_func(x: Expr) -> Expr {
     and(
         ne(x.clone(), nil()),
@@ -268,6 +277,14 @@ fn nil_error() -> Expr {
 /// the function's name.
 pub fn bad_arg(n: usize, name: &str) -> Expr {
     text(&format!("bad argument #{n} to '{name}'"))
+}
+/// The same for argument `i + 1`, `i` a value.
+pub fn bad_arg_at(i: Expr, name: &str) -> Expr {
+    concat(vec![
+        text("bad argument #"),
+        call("zb_str_of_int", vec![add(i, int(1))], string()),
+        text(&format!(" to '{name}'")),
+    ])
 }
 
 /// The table a box holds; the box is known to hold one.
@@ -365,6 +382,10 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
                     is_thread(x.e()),
                     vec![ret(add(text("thread: 0x"), hex(addr(x.e()))))],
                 ),
+                when(
+                    is_file(x.e()),
+                    vec![ret(call("zl_file_str", vec![x.e()], string()))],
+                ),
                 ret(add(text("table: 0x"), hex(addr(x.e())))),
             ],
         ),
@@ -374,6 +395,7 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
             string(),
             vec![
                 when(is_thread(x.e()), vec![ret(text("thread"))]),
+                when(is_file(x.e()), vec![ret(text("FILE*"))]),
                 ret(text("table")),
             ],
         ),
@@ -452,6 +474,12 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
         &[&x, &v],
         unit(),
         vec![ret_void()],
+    ));
+    d.push(define(
+        "zb_hook_shaped_repr",
+        &[&x],
+        string(),
+        vec![ret(text(""))],
     ));
     d
 }
@@ -848,6 +876,7 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     lib.declarations.extend(coroutines::declarations(&t));
     lib.declarations.extend(patterns::declarations(&t));
     lib.declarations.extend(utf8::declarations(&t));
+    lib.declarations.extend(io::declarations(&t));
     lib.declarations.extend(stdlib::declarations(policy, &t));
     lib.fallible = fallible_functions(&lib.declarations);
     (lib, t)

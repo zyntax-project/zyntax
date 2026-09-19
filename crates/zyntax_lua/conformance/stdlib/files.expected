@@ -1,0 +1,62 @@
+file	nil	nil	userdata
+true	true	true
+file	true
+true	closed file	file (closed)
+false	files.lua:9: attempt to use a closed file
+false	files.lua:10: attempt to use a closed file
+false	attempt to use a closed file
+nil	/nonexistent/dir/file: No such file or directory	2
+false	files.lua:13: bad argument #2 to 'open' (invalid mode)
+false	files.lua:14: bad argument #2 to 'open' (invalid mode)
+hello	42	1.5		last	nil
+hello
+	42		 1.5
+last		nil	nil	nil
+nil
+0	hello	5	17	6	42 1.5	13
+false	files.lua:24: bad argument #1 to 'seek' (invalid option 'middle')
+false	files.lua:25: bad argument #1 to 'read' (invalid format)
+false	files.lua:26: bad argument #1 to 'read' (string expected, got table)
+true	true	true
+false	files.lua:28: bad argument #1 to 'setvbuf' (invalid option 'sometimes')
+3	hello	42 1.5	last
+h	ello
+4	2 1.5
+l	ast
+[hello
+][42 1.5
+][last]file
+false	files.lua:38: cannot open file '/nonexistent/x' (No such file or directory)
+hello	42 1.5	last
+false	files.lua:41: file is already closed
+hello
+hello
+HELLO5
+last
+appended
+direct
+true
+a12.5
+false	files.lua:54: bad argument #1 to 'write' (string expected, got table)
+false	files.lua:55: bad argument #1 to 'write' (string expected, got nil)
+true	true	true
+piped
+
+nil	exit	3
+true	exit	0
+through the pipe
+
+false	files.lua:64: bad argument #2 to 'popen' (invalid mode)
+temp
+nil	nil	cannot close standard file
+via default output
+false	files.lua:75: default input file is closed
+false	files.lua:77: cannot open file '/nonexistent/x' (No such file or directory)
+false	files.lua:78: cannot open file '5' (No such file or directory)
+FILE*	true	true
+false	files.lua:80: bad argument #1 to '__gc' (FILE* expected, got no value)
+false	files.lua:81: bad argument #1 to 'read' (FILE* expected, got no value)
+false	files.lua:82: bad argument #1 to 'read' (FILE* expected, got number)
+nil	cannot close standard file
+true	true
+nil	false	files.lua:85: attempt to index a FILE* value (field 'stdout')

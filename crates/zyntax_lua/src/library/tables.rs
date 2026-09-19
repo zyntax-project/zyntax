@@ -474,6 +474,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 eq(category(o.e()), int(STR)),
                 vec![ret(call("zl_string_metatable", vec![], any()))],
             ),
+            when(
+                is_file(o.e()),
+                vec![ret(call("zl_file_metatable", vec![], any()))],
+            ),
             when(not(is_table(o.e())), vec![ret(nil())]),
             tb.decl(unbox_table(o.e(), t)),
             when(
@@ -742,6 +746,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 eq(category(o.e()), int(STR)),
                 vec![ret(call("zl_string_member", vec![o.e(), k.e()], any()))],
             ),
+            when(
+                is_file(o.e()),
+                vec![ret(call("zl_file_member", vec![o.e(), k.e()], any()))],
+            ),
             not_indexable(&o),
             ret(nil()),
         ],
@@ -767,6 +775,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     any(),
                 ))],
             ),
+            when(
+                is_file(o.e()),
+                vec![ret(call(
+                    "zl_file_member",
+                    vec![o.e(), box_str(s.e())],
+                    any(),
+                ))],
+            ),
             not_indexable(&o),
             ret(nil()),
         ],
@@ -787,6 +803,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             when(
                 eq(category(o.e()), int(STR)),
                 vec![ret(call("zl_string_member", vec![o.e(), k.e()], any()))],
+            ),
+            when(
+                is_file(o.e()),
+                vec![ret(call("zl_file_member", vec![o.e(), k.e()], any()))],
             ),
             not_indexable(&o),
             ret(nil()),

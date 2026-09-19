@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use zrtl::{DynamicBox, StringPtr, TypeCategory, TypeTag};
 
-use crate::host_os;
+use crate::{host_io, host_os};
 
 static ARGS: OnceLock<Vec<String>> = OnceLock::new();
 
@@ -322,6 +322,9 @@ unsafe fn read_arg<'a>(b: *const DynamicBox) -> Arg<'a> {
             unsafe { text_of(b.data as zrtl::StringConstPtr) },
             b.data as usize,
         ),
+        _ if type_word(b) == "FILE*" => {
+            Arg::Other(host_io::file_text(b.data as i64), b.data as usize)
+        }
         _ => Arg::Other(
             format!("{}: 0x{:x}", type_word(b), b.data as usize),
             b.data as usize,
@@ -335,6 +338,8 @@ fn type_word(b: &DynamicBox) -> &'static str {
         "function"
     } else if kind == zyntax_builtins::instance_tag(super::library::THREAD_KIND) as u32 >> 8 {
         "thread"
+    } else if kind == zyntax_builtins::instance_tag(super::library::FILE_KIND) as u32 >> 8 {
+        "FILE*"
     } else {
         "table"
     }
@@ -1536,7 +1541,7 @@ extern "C" fn host_setlocale(locale: zrtl::StringConstPtr) -> StringPtr {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 71] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 91] = [
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$clock".as_ptr(), host_clock as *const u8),
@@ -1650,6 +1655,77 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 71] = [
     ),
     zrtl::ZrtlSymbol::new(c"$Lua$unpack_str".as_ptr(), host_unpack_str as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$unpack_next".as_ptr(), host_unpack_next as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_error".as_ptr(),
+        host_io::host_io_error as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_reason".as_ptr(),
+        host_io::host_io_reason as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_errno".as_ptr(),
+        host_io::host_io_errno as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_failed".as_ptr(),
+        host_io::host_io_failed as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(c"$Lua$io_std".as_ptr(), host_io::host_io_std as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$io_open".as_ptr(), host_io::host_io_open as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_popen".as_ptr(),
+        host_io::host_io_popen as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_tmpfile".as_ptr(),
+        host_io::host_io_tmpfile as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_is_open".as_ptr(),
+        host_io::host_io_is_open as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_is_pipe".as_ptr(),
+        host_io::host_io_is_pipe as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_close".as_ptr(),
+        host_io::host_io_close as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_read_line".as_ptr(),
+        host_io::host_io_read_line as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_read_all".as_ptr(),
+        host_io::host_io_read_all as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_read_bytes".as_ptr(),
+        host_io::host_io_read_bytes as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_read_number".as_ptr(),
+        host_io::host_io_read_number as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_number_int".as_ptr(),
+        host_io::host_io_number_int as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_number_float".as_ptr(),
+        host_io::host_io_number_float as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_write".as_ptr(),
+        host_io::host_io_write as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(c"$Lua$io_seek".as_ptr(), host_io::host_io_seek as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_flush".as_ptr(),
+        host_io::host_io_flush as *const u8,
+    ),
 ];
 
 /// The host's symbols as a plugin the runtime links like any other.

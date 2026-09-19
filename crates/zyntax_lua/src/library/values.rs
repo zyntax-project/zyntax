@@ -188,7 +188,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ],
             ),
             when(
-                is_thread(x.e()),
+                or(is_thread(x.e()), is_file(x.e())),
                 vec![ret(call("zb_hook_instance_str", vec![x.e()], string()))],
             ),
             when(

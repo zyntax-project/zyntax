@@ -741,9 +741,150 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         lib: "io",
         name: "write",
-        func: "zl_io_write",
+        func: "zl_io_write_of",
         params: &[Rest],
-        ret: Ret::Unit,
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "io",
+        name: "read",
+        func: "zl_io_read",
+        params: &[Rest],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "io",
+        name: "lines",
+        func: "zl_io_lines",
+        params: &[Any, Rest],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "io",
+        name: "open",
+        func: "zl_io_open_of",
+        params: &[Str, OptStr("r")],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "io",
+        name: "close",
+        func: "zl_io_close_of",
+        params: &[Any],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "io",
+        name: "input",
+        func: "zl_io_input",
+        params: &[Any],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "io",
+        name: "output",
+        func: "zl_io_output",
+        params: &[Any],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "io",
+        name: "type",
+        func: "zl_io_type",
+        params: &[Value],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "io",
+        name: "popen",
+        func: "zl_io_popen_of",
+        params: &[Str, OptStr("r")],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "io",
+        name: "tmpfile",
+        func: "zl_io_tmpfile_of",
+        params: &[],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "io",
+        name: "flush",
+        func: "zl_io_flush_of",
+        params: &[],
+        ret: Ret::Multi,
+    },
+    // ─── files: the methods, then the metamethods ───
+    Builtin {
+        lib: "file",
+        name: "read",
+        func: "zl_file_read",
+        params: &[Expected("FILE*"), Rest],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "file",
+        name: "write",
+        func: "zl_file_write",
+        params: &[Expected("FILE*"), Rest],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "file",
+        name: "lines",
+        func: "zl_file_lines_of",
+        params: &[Expected("FILE*"), Rest],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "file",
+        name: "close",
+        func: "zl_file_close",
+        params: &[Expected("FILE*")],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "file",
+        name: "seek",
+        func: "zl_file_seek",
+        params: &[Expected("FILE*"), Any, Any],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "file",
+        name: "setvbuf",
+        func: "zl_file_setvbuf",
+        params: &[Expected("FILE*"), Any, Any],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "file",
+        name: "flush",
+        func: "zl_file_flush",
+        params: &[Expected("FILE*")],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "filemeta",
+        name: "__gc",
+        func: "zl_file_release",
+        params: &[Expected("FILE*")],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "filemeta",
+        name: "__close",
+        func: "zl_file_release",
+        params: &[Expected("FILE*")],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "filemeta",
+        name: "__tostring",
+        func: "zl_file_tostring",
+        params: &[Expected("FILE*")],
+        ret: Ret::Str,
     },
     // ─── coroutine ───
     Builtin {
@@ -848,6 +989,9 @@ pub const LIBS: &[&str] = &[
     "debug",
     "package",
 ];
+/// Tables of functions no global names: a file's methods and its
+/// metamethods.
+pub const HIDDEN_LIBS: &[&str] = &["file", "filemeta"];
 
 /// The name of a builtin's value wrapper.
 pub fn wrapper_name(b: &Builtin) -> String {
@@ -1096,6 +1240,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ),
                 vec![ret(text("function"))],
             ),
+            when(is_file(x.e()), vec![ret(text("userdata"))]),
             ret(type_name(x.e())),
         ],
     ));
@@ -2431,48 +2576,14 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ret_void(),
         ],
     ));
-    // `io.write` prints a float as `%.14g`, without the `.0` that
-    // `tostring` adds.
+    // A float as `%.14g`, without the `.0` that `tostring` adds, for
+    // `io.write`.
     d.push(extern_fn(
         "zl_format_g",
         &[("x", f64()), ("precision", i64())],
         string(),
         Some("$Lua$format_g"),
     ));
-    d.push(define(
-        "zl_io_write",
-        &[&args],
-        unit(),
-        vec![
-            i.decl(int(0)),
-            while_(
-                lt(i.e(), len(args.e())),
-                vec![
-                    x.decl(at(args.e(), i.e())),
-                    if_(
-                        and(not(is_nil(x.e())), eq(category(x.e()), int(FLOAT))),
-                        vec![expr(call(
-                            "zb_print_text",
-                            vec![call("zl_format_g", vec![get_f64(x.e()), int(14)], string())],
-                            unit(),
-                        ))],
-                        vec![expr(call(
-                            "zb_print_text",
-                            vec![call(
-                                "zl_arg_str",
-                                vec![x.e(), bad_arg_at(i.e(), "write")],
-                                string(),
-                            )],
-                            unit(),
-                        ))],
-                    ),
-                    i.add_assign(int(1)),
-                ],
-            ),
-            ret_void(),
-        ],
-    ));
-
     // ─── the value wrappers and the library tables ──────────────
     let packed = kept("packed", any());
     for b in BUILTINS {
@@ -2481,7 +2592,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         let mut st = vec![args.decl(call("zl_values", vec![packed.e()], anys.clone()))];
         // Called as a value, the function is named as the reference
         // finds it in its library's table: `string.rep`.
-        let qualified = if b.lib.is_empty() {
+        let qualified = if b.lib.is_empty() || HIDDEN_LIBS.contains(&b.lib) {
             b.name.to_string()
         } else {
             format!("{}.{}", b.lib, b.name)
@@ -2541,7 +2652,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     }
     // Each library's table, built once: the wrappers as function
     // values, then the constants.
-    for lib in LIBS {
+    for lib in LIBS.iter().chain(HIDDEN_LIBS) {
         let cache = format!("zl_lib_{lib}_cache");
         d.push(zyntax_typed_ast::TypedNode::new(
             zyntax_typed_ast::typed_ast::TypedDeclaration::Variable(
@@ -2600,6 +2711,19 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 vec![tb.e(), text(name), value],
                 unit(),
             )));
+        }
+        if *lib == "io" {
+            for (name, getter) in [
+                ("stdin", "zl_io_stdin"),
+                ("stdout", "zl_io_stdout"),
+                ("stderr", "zl_io_stderr"),
+            ] {
+                st.push(expr(call(
+                    "zl_rawset_str",
+                    vec![tb.e(), text(name), call(getter, vec![], any())],
+                    unit(),
+                )));
+            }
         }
         if *lib == "package" {
             st.push(expr(call(
