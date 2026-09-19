@@ -4444,6 +4444,8 @@ const RETURNED: &str = "lua$returned";
 
 /// The line a function was entered at: the caller's, for `error(v, 2)`.
 const ENTRY_LINE: &str = "$entry_line";
+/// The script's arguments, `...` at the main chunk.
+const MAIN_VARARGS: &str = "lua$varargs";
 
 /// `zl_depth += by`.
 fn depth_step(by: i64, span: Span) -> St {
@@ -4815,7 +4817,10 @@ pub(crate) fn program(
     let lower_chunk = |module: &Module<'_>| -> Result<Vec<St>> {
         let mut main = Lowerer::new(module, CHUNK);
         main.returns = Returns::Fixed(Vec::new());
-        let statements = if scopes.split_chunk {
+        // `...` at the main chunk: the script's arguments, in a module
+        // variable since a segment is a function of its own.
+        main.varargs = Some(intern(MAIN_VARARGS));
+        let mut statements = if scopes.split_chunk {
             // Each segment is a function; the chunk calls them in turn
             // and stops at an error or a `return`.
             let segments = main.segments(ast.nodes())?;
@@ -4873,6 +4878,14 @@ pub(crate) fn program(
             }
             statements
         };
+        statements.insert(
+            0,
+            assign(
+                var(intern(MAIN_VARARGS), module.anys(), span),
+                call("zl_script_args", vec![], module.anys(), span),
+                span,
+            ),
+        );
         module.facts.borrow_mut().insert(
             CHUNK,
             RaiseFact {
@@ -4901,6 +4914,17 @@ pub(crate) fn program(
     );
     let mut declarations = Vec::new();
     declare(&module, &mut declarations);
+    declarations.push(TypedNode::new(
+        TypedDeclaration::Variable(TypedVariable {
+            name: intern(MAIN_VARARGS),
+            ty: module.anys(),
+            mutability: Mutability::Mutable,
+            initializer: None,
+            visibility: Visibility::Public,
+        }),
+        Type::Unknown,
+        Span::new(0, 0),
+    ));
 
     // Each required file is a chunk of its own, a function the program
     // enters through `package.preload`, and named in positions by its

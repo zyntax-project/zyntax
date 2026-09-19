@@ -2691,6 +2691,26 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ],
         ));
     }
+    // The script's arguments after its name, as `...` at the main
+    // chunk gives them.
+    d.push(define(
+        "zl_script_args",
+        &[],
+        anys.clone(),
+        vec![
+            out.decl(list(vec![], anys.clone())),
+            n.decl(call("zl_argc", vec![], i64())),
+            i.decl(int(1)),
+            while_(
+                lt(i.e(), n.e()),
+                vec![
+                    push(out.e(), box_str(call("zl_argv", vec![i.e()], string()))),
+                    i.add_assign(int(1)),
+                ],
+            ),
+            ret(out.e()),
+        ],
+    ));
     // The globals table, for a program that reaches its globals through
     // `_G`: every base function, every library's table, `_G` itself,
     // `_VERSION` and `arg`. The program's own globals are set into it
