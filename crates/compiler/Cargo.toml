@@ -67,7 +67,7 @@ once_cell = "1.19"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 # Hot-function promotion broker for interpreter-to-JIT tiering
-beadie = { git = "https://github.com/darmie/beadie.git", rev = "868d106" }
+beadie = { git = "https://github.com/darmie/beadie.git", rev = "c403f29" }
 
 # Optional features for backend support
 # Pinned to a specific wasmtime commit (not `branch = "main"`) so a
