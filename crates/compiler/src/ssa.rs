@@ -6264,10 +6264,9 @@ impl SsaBuilder {
                 // `bitcast i32 to i64` step).
                 let field_typed_types = self.get_field_typed_types(&expr.ty);
 
-                // Start with an undefined struct value
-                let mut current_struct = self.create_value(struct_ty.clone(), HirValueKind::Undef);
-
-                // Insert each field value into the struct
+                // Every field is evaluated before the first insertion, so a
+                // field reading a struct this one replaces sees it whole.
+                let mut field_vals = Vec::with_capacity(struct_lit.fields.len());
                 for (i, field) in struct_lit.fields.iter().enumerate() {
                     let mut field_val = self.translate_expression(block_id, &field.value)?;
                     if let Some(types) = field_typed_types.as_ref() {
@@ -6287,7 +6286,14 @@ impl SsaBuilder {
                             field_val = self.coerce_scalar_to(block_id, field_val, &field_ty);
                         }
                     }
+                    field_vals.push(field_val);
+                }
 
+                // Start with an undefined struct value
+                let mut current_struct = self.create_value(struct_ty.clone(), HirValueKind::Undef);
+
+                // Insert each field value into the struct
+                for (i, field_val) in field_vals.into_iter().enumerate() {
                     log::trace!("[SSA STRUCT LIT] Inserting field {}", i);
 
                     // Create new struct value with the field inserted
@@ -6666,31 +6672,24 @@ impl SsaBuilder {
                     packed: false,
                 });
 
-                let alloc_result = self.create_value(tuple_ty.clone(), HirValueKind::Instruction);
-
-                self.add_instruction(
-                    block_id,
-                    HirInstruction::Alloca {
-                        result: alloc_result,
-                        ty: tuple_ty.clone(),
-                        count: None,
-                        align: 8,
-                    },
-                );
-
-                // Elements may branch (a checked read, a conditional), so
-                // each is translated where the previous one left off.
-                // The value is the last insertion's: the storage for an
-                // aggregate held by address, and for a struct carried as
-                // its single field that field.
+                // Every element is evaluated before the first insertion,
+                // so an element reading a tuple this one replaces sees it
+                // whole. Elements may branch (a checked read, a
+                // conditional), so each is translated where the previous
+                // one left off.
                 let started = block_id;
                 let mut cur = block_id;
-                let mut value = alloc_result;
+                let mut elems = Vec::with_capacity(elements.len());
                 for (i, elem_expr) in elements.iter().enumerate() {
                     let raw = self.translate_operand(&mut cur, elem_expr)?;
                     let raw = self.coerce_for_transfer(cur, raw, elem_expr, &field_types[i]);
-                    let elem_val = self.coerce_scalar_to(cur, raw, &field_hir[i]);
+                    elems.push(self.coerce_scalar_to(cur, raw, &field_hir[i]));
+                }
 
+                // The value is built from an undefined struct, the way a
+                // struct literal is; the last insertion is the tuple.
+                let mut value = self.create_value(tuple_ty.clone(), HirValueKind::Undef);
+                for (i, elem_val) in elems.into_iter().enumerate() {
                     let insert_result =
                         self.create_value(tuple_ty.clone(), HirValueKind::Instruction);
                     self.add_instruction(

@@ -1576,7 +1576,8 @@ fn test_tuple_construction_lowering() {
 
     let module = result.unwrap();
 
-    // Verify the function has Alloca and InsertValue instructions
+    // A tuple is built by inserting each element into an undefined
+    // struct value, the way a struct literal is: no storage of its own.
     let func = module.functions.values().next().unwrap();
     let has_alloca = func.blocks.values().any(|block| {
         block
@@ -1591,12 +1592,19 @@ fn test_tuple_construction_lowering() {
             .iter()
             .any(|inst| matches!(inst, HirInstruction::InsertValue { .. }))
     });
+    let from_undef = func.blocks.values().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(inst, HirInstruction::InsertValue { aggregate, .. }
+                if matches!(func.values.get(aggregate).map(|v| &v.kind), Some(zyntax_compiler::hir::HirValueKind::Undef)))
+        })
+    });
 
-    assert!(has_alloca, "Expected Alloca instruction for tuple");
+    assert!(!has_alloca, "a tuple value takes no stack slot of its own");
     assert!(
         has_insert,
         "Expected InsertValue instruction for tuple elements"
     );
+    assert!(from_undef, "the first insertion is into an undefined value");
 }
 
 #[test]
