@@ -374,6 +374,11 @@ pub fn list(items: Vec<Expr>, list_ty: Type) -> Expr {
     node(TypedExpression::Array(items), list_ty)
 }
 
+/// A tuple value of `ty` from its fields.
+pub fn tuple(items: Vec<Expr>, ty: Type) -> Expr {
+    node(TypedExpression::Tuple(items), ty)
+}
+
 // ─── statements ─────────────────────────────────────────────────────
 
 pub fn expr(e: Expr) -> Stmt {

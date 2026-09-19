@@ -704,6 +704,7 @@ pub fn parse_program_with(
             Span::new(0, 0),
         ));
     }
+    declarations.extend(lower::shape_declarations(&inferred, library.list_type));
     // The library itself arrives by import: its declarations for
     // typing, its HIR to link against.
     declarations.push(TypedNode::new(

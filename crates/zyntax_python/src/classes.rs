@@ -7,7 +7,8 @@
 
 use crate::lower::{
     self, Lowerer, Node, Val, binary, call, callm_name, cast, dispatch_name, field_storage,
-    getattr_name, int_lit, ir, new_name, node, setattr_name, str_lit, var, without_self,
+    getattr_name, int_lit, ir, method_call, new_name, node, setattr_name, str_lit, var,
+    without_self,
 };
 use crate::scope::Scope;
 use crate::types::{ClassInfo, Locals, Module, Sig, Ty, method_fn};
@@ -267,6 +268,9 @@ pub(crate) fn register(
     decls
 }
 
+fn ret_void(span: Span) -> TypedNode<TypedStatement> {
+    TypedNode::new(TypedStatement::Return(None), Type::Unknown, span)
+}
 fn stmt(e: Node, span: Span) -> TypedNode<TypedStatement> {
     TypedNode::new(TypedStatement::Expression(Box::new(e)), Type::Unknown, span)
 }
@@ -1039,30 +1043,32 @@ fn builtin_arms(
         )
     };
     let list_kind = |k: zyntax_builtins::Kind| kind(k.list_tag() >> 8);
-    let mut receivers: Vec<(Node, Ty, bool)> = vec![
-        (category(5), Ty::Str, false),
+    // Each receiver: the test on the box, its type, and the raw read of
+    // the payload where the trusted read of the type is not it.
+    let mut receivers: Vec<(Node, Ty, Option<String>)> = vec![
+        (category(5), Ty::Str, None),
         (
             list_kind(zyntax_builtins::Kind::Int),
             Ty::List(Elem::Int),
-            false,
+            None,
         ),
         (
             list_kind(zyntax_builtins::Kind::Float),
             Ty::List(Elem::Float),
-            false,
+            None,
         ),
         (
             list_kind(zyntax_builtins::Kind::Str),
             Ty::List(Elem::Str),
-            false,
+            None,
         ),
         (
             list_kind(zyntax_builtins::Kind::Any),
             Ty::List(Elem::Object),
-            false,
+            None,
         ),
-        (kind(zyntax_builtins::DICT_TAG >> 8), Ty::Dict, false),
-        (kind(zyntax_builtins::SET_TAG >> 8), Ty::Set, false),
+        (kind(zyntax_builtins::DICT_TAG >> 8), Ty::Dict, None),
+        (kind(zyntax_builtins::SET_TAG >> 8), Ty::Set, None),
     ];
     // A boxed tuple is a list of dynamic values under its own tag, and
     // answers the two methods a tuple has as that list.
@@ -1070,11 +1076,20 @@ fn builtin_arms(
         receivers.push((
             kind(zyntax_builtins::TUPLE_TAG >> 8),
             Ty::List(Elem::Object),
-            true,
+            Some("zb_unbox_tuple_raw".to_string()),
+        ));
+    }
+    // A list of tuples of each shape the program has.
+    for k in crate::types::tuple_lists() {
+        let e = Elem::Tuple(k);
+        receivers.push((
+            kind(e.list_tag() >> 8),
+            Ty::List(e),
+            Some(format!("zb_unbox_list_raw_{}", e.suffix())),
         ));
     }
     let mut arms = Vec::new();
-    for (test, ty, tuple) in receivers {
+    for (test, ty, raw) in receivers {
         let mut vars: Vec<(&str, Ty)> = vec![("s", ty)];
         for a in &args {
             vars.push((a.as_str(), Ty::Object));
@@ -1082,16 +1097,15 @@ fn builtin_arms(
         let mut lowerer = scratch_with(module, &vars);
         // The receiver is what the arm's test says it is; the method
         // then runs on it, and may leave statements to run ahead of it.
-        let receiver = if tuple {
-            call("zb_unbox_tuple_raw", vec![x.clone()], ty, span)
-        } else {
-            lowerer.trusted(
+        let receiver = match raw {
+            Some(read) => call(&read, vec![x.clone()], ty, span),
+            None => lowerer.trusted(
                 Val {
                     node: x.clone(),
                     ty: Ty::Object,
                 },
                 ty,
-            )
+            ),
         };
         let mut then = std::mem::take(&mut lowerer.hoisted);
         then.push(let_("s", ty, receiver, span));
@@ -1201,7 +1215,7 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         statements,
         span,
     );
-    vec![
+    let mut out = vec![
         str_hook,
         type_hook,
         eq_hook,
@@ -1209,6 +1223,180 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         arith_hook(module, span),
         box_hook(module, span),
         unbox_hook(module, span),
+    ];
+    out.extend(shaped_hooks(span));
+    out
+}
+
+/// What the library asks of a boxed list whose elements are a tuple
+/// shape: its elements as dynamic values, one element, a store and an
+/// append. Each dispatches on the box's kind to the list functions
+/// generated for the shape; a kind no list here has is a type error.
+fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
+    use crate::types::Elem;
+    let x = var(intern("x"), Ty::Object, span);
+    let i = var(intern("i"), Ty::Int, span);
+    let v = var(intern("v"), Ty::Object, span);
+    let shapes: Vec<u16> = crate::types::tuple_lists().into_iter().collect();
+    let kind = call("zb_any_kind", vec![x.clone()], Ty::Int, span);
+    let is_shape = |k: u16| {
+        binary(
+            BinaryOp::Eq,
+            kind.clone(),
+            int_lit(Elem::Tuple(k).list_tag() >> 8, span),
+            Ty::Bool,
+            span,
+        )
+    };
+    let raw = |k: u16| {
+        call(
+            &format!("zb_unbox_list_raw_{}", Elem::Tuple(k).suffix()),
+            vec![x.clone()],
+            Ty::List(Elem::Tuple(k)),
+            span,
+        )
+    };
+    let unknown = || {
+        stmt(
+            call(
+                "zb_fatal",
+                vec![
+                    str_lit("TypeError", span),
+                    str_lit("a list of an unknown kind", span),
+                ],
+                Ty::None,
+                span,
+            ),
+            span,
+        )
+    };
+    let mut items = Vec::new();
+    let mut get = Vec::new();
+    let mut set = Vec::new();
+    let mut append = Vec::new();
+    for &k in &shapes {
+        let e = Elem::Tuple(k);
+        items.push(when(
+            is_shape(k),
+            vec![ret(
+                call(
+                    &format!("zb_list_to_any_{}", e.suffix()),
+                    vec![raw(k)],
+                    Ty::List(Elem::Object),
+                    span,
+                ),
+                span,
+            )],
+            span,
+        ));
+        let element = call(
+            &format!("zb_list_get_{}", e.suffix()),
+            vec![raw(k), i.clone()],
+            Ty::Tuple(k),
+            span,
+        );
+        get.push(when(
+            is_shape(k),
+            vec![ret(
+                call(
+                    &format!("zb_tuple_box_{}", e.suffix()),
+                    vec![element],
+                    Ty::Object,
+                    span,
+                ),
+                span,
+            )],
+            span,
+        ));
+        let read = call(
+            &format!("zb_tuple_read_{}", e.suffix()),
+            vec![v.clone()],
+            Ty::Tuple(k),
+            span,
+        );
+        set.push(when(
+            is_shape(k),
+            vec![
+                stmt(
+                    call(
+                        &format!("zb_list_set_{}", e.suffix()),
+                        vec![raw(k), i.clone(), read.clone()],
+                        Ty::None,
+                        span,
+                    ),
+                    span,
+                ),
+                ret_void(span),
+            ],
+            span,
+        ));
+        append.push(when(
+            is_shape(k),
+            vec![
+                stmt(
+                    method_call(raw(k), "push", vec![read], Ty::None, span),
+                    span,
+                ),
+                ret_void(span),
+            ],
+            span,
+        ));
+    }
+    items.push(unknown());
+    items.push(ret(
+        node(
+            TypedExpression::Array(Vec::new()),
+            Ty::List(Elem::Object),
+            span,
+        ),
+        span,
+    ));
+    get.push(unknown());
+    get.push(ret(
+        node(
+            TypedExpression::Literal(TypedLiteral::Null),
+            Ty::Object,
+            span,
+        ),
+        span,
+    ));
+    set.push(unknown());
+    set.push(ret_void(span));
+    append.push(unknown());
+    append.push(ret_void(span));
+    vec![
+        function(
+            "zb_hook_shaped_items",
+            vec![param("x", Ty::Object, span)],
+            Ty::List(Elem::Object),
+            items,
+            span,
+        ),
+        function(
+            "zb_hook_shaped_get",
+            vec![param("x", Ty::Object, span), param("i", Ty::Int, span)],
+            Ty::Object,
+            get,
+            span,
+        ),
+        function(
+            "zb_hook_shaped_set",
+            vec![
+                param("x", Ty::Object, span),
+                param("i", Ty::Int, span),
+                param("v", Ty::Object, span),
+            ],
+            Ty::None,
+            set,
+            span,
+        ),
+        function(
+            "zb_hook_shaped_append",
+            vec![param("x", Ty::Object, span), param("v", Ty::Object, span)],
+            Ty::None,
+            append,
+            span,
+        ),
     ]
 }
 

@@ -70,7 +70,7 @@ pub(crate) enum Ty {
 
 /// The element kinds a list is instantiated for. Anything else in a
 /// list is a dynamic value.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Elem {
     Int,
     Float,
@@ -78,6 +78,9 @@ pub(crate) enum Elem {
     /// Instances of one class, held by address, so an element is the
     /// instance itself rather than a box to open.
     Class(u16),
+    /// Tuples of one shape, held as the struct itself; the list's
+    /// functions are generated for the shape.
+    Tuple(u16),
     Object,
 }
 
@@ -89,6 +92,7 @@ impl Elem {
             Ty::Float => Elem::Float,
             Ty::Str => Elem::Str,
             Ty::Class(k) => Elem::Class(k),
+            Ty::Tuple(k) => Elem::Tuple(k),
             _ => Elem::Object,
         }
     }
@@ -99,20 +103,39 @@ impl Elem {
             Elem::Float => Ty::Float,
             Elem::Str => Ty::Str,
             Elem::Class(k) => Ty::Class(k),
+            Elem::Tuple(k) => Ty::Tuple(k),
             Elem::Object => Ty::Object,
         }
     }
 
     /// The suffix of the library functions for this kind.
-    pub(crate) fn suffix(self) -> &'static str {
+    pub(crate) fn suffix(self) -> String {
         match self {
-            Elem::Int => "i64",
-            Elem::Float => "f64",
-            Elem::Str => "str",
-            Elem::Class(_) => "ptr",
-            Elem::Object => "any",
+            Elem::Int => "i64".to_string(),
+            Elem::Float => "f64".to_string(),
+            Elem::Str => "str".to_string(),
+            Elem::Class(_) => "ptr".to_string(),
+            Elem::Tuple(k) => tuple_suffix(k),
+            Elem::Object => "any".to_string(),
         }
     }
+
+    /// The tag a boxed list of this kind carries.
+    pub(crate) fn list_tag(self) -> i64 {
+        match self {
+            Elem::Int => zyntax_builtins::Kind::Int.list_tag(),
+            Elem::Float => zyntax_builtins::Kind::Float.list_tag(),
+            Elem::Str => zyntax_builtins::Kind::Str.list_tag(),
+            Elem::Class(_) => zyntax_builtins::Kind::Ptr.list_tag(),
+            Elem::Tuple(k) => zyntax_builtins::lists::shape_list_tag(k),
+            Elem::Object => zyntax_builtins::Kind::Any.list_tag(),
+        }
+    }
+}
+
+/// The suffix of the library functions generated for tuple shape `k`.
+pub(crate) fn tuple_suffix(k: u16) -> String {
+    format!("t{k}")
 }
 
 /// The builtin functions a name can be bound to and called through.
@@ -167,11 +190,31 @@ thread_local! {
     /// `Ty::Tuple` decided in one inference round names the same shape
     /// in the next and in the lowering.
     static TUPLE_SHAPES: std::cell::RefCell<Vec<Vec<Ty>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The shapes the lowering used as a list's element, which get the
+    /// library's list functions generated for them.
+    static TUPLE_LISTS: std::cell::RefCell<std::collections::BTreeSet<u16>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
 }
 
 /// Forget every shape: the start of a program.
 pub(crate) fn reset_tuple_shapes() {
     TUPLE_SHAPES.with(|t| t.borrow_mut().clear());
+    TUPLE_LISTS.with(|t| t.borrow_mut().clear());
+}
+
+/// Record that a list of tuples of shape `k` is used.
+pub(crate) fn note_tuple_list(k: u16) {
+    TUPLE_LISTS.with(|t| t.borrow_mut().insert(k));
+}
+
+/// The shapes noted as list elements so far.
+pub(crate) fn tuple_lists() -> std::collections::BTreeSet<u16> {
+    TUPLE_LISTS.with(|t| t.borrow().clone())
+}
+
+/// How many shapes the program has interned.
+pub(crate) fn tuple_shape_count() -> usize {
+    TUPLE_SHAPES.with(|t| t.borrow().len())
 }
 
 /// The tuple type of these element types. The empty tuple is a dynamic

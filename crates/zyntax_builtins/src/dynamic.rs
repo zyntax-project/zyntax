@@ -88,7 +88,23 @@ fn is_integral(cat: &Local) -> Expr {
 }
 /// Whether a custom-category box holds an instance of a frontend class.
 fn is_instance(x: Expr) -> Expr {
-    ge(kind(x), int(INSTANCE_KIND_BASE))
+    and(
+        ge(kind(x.clone()), int(INSTANCE_KIND_BASE)),
+        lt(kind(x), int(crate::lists::SHAPE_KIND_BASE)),
+    )
+}
+
+/// A boxed list whose elements are a tuple shape the frontend
+/// registered; its elements are reached through the frontend's hooks.
+fn is_shaped(x: Expr) -> Expr {
+    and(
+        eq(category(x.clone()), int(CUSTOM)),
+        ge(kind(x), int(crate::lists::SHAPE_KIND_BASE)),
+    )
+}
+
+fn shaped_items(x: Expr, anys: zyntax_typed_ast::Type) -> Expr {
+    call("zb_hook_shaped_items", vec![x], anys)
 }
 
 /// The instance hooks as the frontend that defines them declares them.
@@ -588,9 +604,15 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     // Two tuples, or two lists of dynamic values, are
                     // their storage already.
                     when(
-                        or(
-                            is_tuple(a.e()),
-                            eq(kind(a.e()), int(Kind::Any.list_tag() >> 8)),
+                        and(
+                            or(
+                                is_tuple(a.e()),
+                                eq(kind(a.e()), int(Kind::Any.list_tag() >> 8)),
+                            ),
+                            or(
+                                is_tuple(b.e()),
+                                eq(kind(b.e()), int(Kind::Any.list_tag() >> 8)),
+                            ),
                         ),
                         vec![ret(call(
                             "zb_list_eq_any",
@@ -1354,6 +1376,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 kind_is(Kind::Ptr, x.e()),
                 vec![ret(to_any(Kind::Ptr, unbox(Kind::Ptr, x.e())))],
             ),
+            when(
+                is_shaped(x.e()),
+                vec![ret(shaped_items(x.e(), anys.clone()))],
+            ),
             ret(unbox(Kind::Any, x.e())),
         ],
     ));
@@ -1392,6 +1418,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 kind_is(Kind::Ptr, x.e()),
                 vec![ret(repr_of(Kind::Ptr, x.e()))],
+            ),
+            when(
+                is_shaped(x.e()),
+                vec![ret(call(
+                    "zb_list_repr_any",
+                    vec![shaped_items(x.e(), anys.clone())],
+                    string(),
+                ))],
             ),
             when(
                 is_tuple(x.e()),
@@ -1500,6 +1534,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     any(),
                 ))],
             ),
+            when(
+                is_shaped(x.e()),
+                vec![ret(call(
+                    "zb_hook_shaped_get",
+                    vec![x.e(), index(i.e())],
+                    any(),
+                ))],
+            ),
             ret(call(
                 "zb_list_get_any",
                 vec![iter(x.e()), index(i.e())],
@@ -1589,6 +1631,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     any(),
                 ))],
             ),
+            when(
+                is_shaped(x.e()),
+                vec![ret(call(
+                    "zb_hook_shaped_get",
+                    vec![x.e(), position.e()],
+                    any(),
+                ))],
+            ),
             ret(call(
                 "zb_list_get_any",
                 vec![iter(x.e()), position.e()],
@@ -1605,7 +1655,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     kind_is(Kind::Int, x.clone()),
                     or(
                         kind_is(Kind::Float, x.clone()),
-                        or(kind_is(Kind::Str, x.clone()), kind_is(Kind::Ptr, x)),
+                        or(
+                            kind_is(Kind::Str, x.clone()),
+                            or(kind_is(Kind::Ptr, x.clone()), is_shaped(x)),
+                        ),
                     ),
                 ),
             ),
@@ -1679,6 +1732,17 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                         i.e(),
                         call("zb_any_as_str", vec![v.e()], string()),
                     ),
+                    ret_void(),
+                ],
+            ),
+            when(
+                is_shaped(x.e()),
+                vec![
+                    expr(call(
+                        "zb_hook_shaped_set",
+                        vec![x.e(), index(i.e()), v.e()],
+                        unit(),
+                    )),
                     ret_void(),
                 ],
             ),
@@ -1772,6 +1836,17 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                         position.e(),
                         call("zb_any_as_str", vec![v.e()], string()),
                     ),
+                    ret_void(),
+                ],
+            ),
+            when(
+                is_shaped(x.e()),
+                vec![
+                    expr(call(
+                        "zb_hook_shaped_set",
+                        vec![x.e(), position.e(), v.e()],
+                        unit(),
+                    )),
                     ret_void(),
                 ],
             ),

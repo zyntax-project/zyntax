@@ -110,6 +110,73 @@ fn list_type(elem: Type) -> Type {
     zyntax_builtins::list_of(id, elem)
 }
 
+/// How the library compares, prints, boxes and reads back a tuple's
+/// field of type `ty`.
+fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
+    use zyntax_builtins::lists::Field;
+    match ty {
+        Ty::Int => Field::Int,
+        Ty::Float => Field::Float,
+        Ty::Bool => Field::Bool,
+        Ty::Str => Field::Str,
+        Ty::Dict => Field::Dict,
+        Ty::Set => Field::Set,
+        Ty::Class(k) => Field::Instance {
+            ty: class_type(k as usize),
+            tag: zyntax_builtins::instance_tag(k as usize) as i32,
+        },
+        Ty::List(e) => Field::List {
+            suffix: e.suffix(),
+            ty: ir(ty),
+        },
+        Ty::Tuple(k) => Field::Tuple {
+            suffix: types::tuple_suffix(k),
+            ty: ir(ty),
+        },
+        Ty::None
+        | Ty::Gen
+        | Ty::Closure(_)
+        | Ty::Bound(_)
+        | Ty::Builtin(_)
+        | Ty::Object
+        | Ty::Unknown => Field::Any,
+    }
+}
+
+/// The library functions of the program's tuple shapes: every shape gets
+/// its own (equality, order, repr, boxing, reading back), and a shape
+/// the lowering used as a list's element gets the list functions too.
+/// Shapes are declared in interning order, which puts a shape after the
+/// shapes its fields name.
+pub(crate) fn shape_declarations(
+    module: &Module,
+    list_type: zyntax_typed_ast::TypeId,
+) -> Vec<TypedNode<zyntax_typed_ast::typed_ast::TypedDeclaration>> {
+    let _ = module;
+    let lists = types::tuple_lists();
+    let mut out = Vec::new();
+    for k in 0..types::tuple_shape_count() as u16 {
+        let suffix = types::tuple_suffix(k);
+        let tuple_ty = ir(Ty::Tuple(k));
+        let fields: Vec<zyntax_builtins::lists::Field> = types::tuple_shape(k)
+            .into_iter()
+            .map(|t| field_of(t.settled()))
+            .collect();
+        out.extend(zyntax_builtins::lists::tuple_declarations(
+            list_type,
+            &suffix,
+            tuple_ty.clone(),
+            &fields,
+        ));
+        if lists.contains(&k) {
+            out.extend(zyntax_builtins::lists::tuple_list_declarations(
+                list_type, k, &suffix, tuple_ty,
+            ));
+        }
+    }
+    out
+}
+
 /// The IR type a static type is carried as.
 pub(crate) fn ir(ty: Ty) -> Type {
     match ty {
@@ -135,6 +202,10 @@ pub(crate) fn ir(ty: Ty) -> Type {
 pub(crate) fn elem_ir(e: Elem) -> Type {
     match e {
         Elem::Class(_) => addr_type(),
+        Elem::Tuple(k) => {
+            types::note_tuple_list(k);
+            ir(Ty::Tuple(k))
+        }
         other => ir(other.ty()),
     }
 }
@@ -148,7 +219,13 @@ fn elem_call(op: &str, e: Elem, args: Vec<Node>, span: Span) -> Node {
     }
 }
 
-fn method_call(receiver: Node, method: &str, args: Vec<Node>, ty: Ty, span: Span) -> Node {
+pub(crate) fn method_call(
+    receiver: Node,
+    method: &str,
+    args: Vec<Node>,
+    ty: Ty,
+    span: Span,
+) -> Node {
     node(
         TypedExpression::MethodCall(TypedMethodCall {
             receiver: Box::new(receiver),
@@ -166,8 +243,12 @@ fn bind_names(vars: &mut std::collections::HashMap<String, Ty>, target: &py::Exp
     types::bind_target(vars, target, ty)
 }
 
-/// `zb_list_<op>_<kind>`.
+/// `zb_list_<op>_<kind>`. A list of tuples has its functions generated
+/// for the shape, so the shape is noted.
 fn list_fn(op: &str, elem: Elem) -> String {
+    if let Elem::Tuple(k) = elem {
+        types::note_tuple_list(k);
+    }
     format!("zb_list_{op}_{}", elem.suffix())
 }
 
@@ -195,13 +276,11 @@ fn tuple_value(items: Vec<Node>, ty: Ty, span: Span) -> Node {
 enum Hold<'a> {
     /// Into this statement list, which the reads follow.
     Into(&'a mut Vec<Stmt>),
-    /// Ahead of the statement, where reads of the parts may hoist
-    /// checks of their own that must come after it; or, where nothing
-    /// hoists, back to the caller.
+    /// Ahead of the statement, with everything else the expression
+    /// hoists, in the order it is emitted: a hold of a part comes after
+    /// the hold of its whole. Where nothing hoists, back to the caller,
+    /// to put in front of the reads.
     Ahead,
-    /// Back to the caller, to wrap around the reads: for reads that
-    /// never hoist.
-    Around,
 }
 
 /// What a comprehension builds.
@@ -1716,7 +1795,7 @@ impl<'m> Lowerer<'m> {
             }
             // A tuple's elements as a list of the kind wanted.
             (Ty::Tuple(_), Ty::List(e)) => {
-                let (fields, pre) = self.tuple_fields(v, span, Hold::Around);
+                let (fields, pre) = self.tuple_fields(v, span, Hold::Ahead);
                 let list = self.list_of(fields, e, span);
                 if pre.is_empty() {
                     list
@@ -1744,6 +1823,25 @@ impl<'m> Lowerer<'m> {
                 )
             }
         }
+    }
+
+    /// [`Self::bind`] of a value that statements already in `out`
+    /// produced: whatever the binding hoists is placed in `out` just
+    /// ahead of the binding's own statements, since the statement-wide
+    /// hoist would run before the value exists.
+    fn bind_after(
+        &mut self,
+        target: &py::Expr,
+        value: Val,
+        span: Span,
+        out: &mut Vec<Stmt>,
+    ) -> Result<()> {
+        let saved = std::mem::take(&mut self.hoisted);
+        let at = out.len();
+        let result = self.bind(target, value, span, out);
+        let hoisted = std::mem::replace(&mut self.hoisted, saved);
+        out.splice(at..at, hoisted);
+        result
     }
 
     /// A value the lowering itself stored, read back as the type it was
@@ -1802,7 +1900,7 @@ impl<'m> Lowerer<'m> {
         match place {
             Hold::Into(out) => out.append(&mut pre),
             Hold::Ahead if self.guards => self.hoisted.append(&mut pre),
-            Hold::Ahead | Hold::Around => {}
+            Hold::Ahead => {}
         }
         let fields = shape
             .into_iter()
@@ -1821,7 +1919,7 @@ impl<'m> Lowerer<'m> {
     /// A tuple value as a dynamic value: the tagged list of its boxed
     /// elements.
     fn box_tuple(&mut self, v: Val, span: Span) -> Node {
-        let (fields, pre) = self.tuple_fields(v, span, Hold::Around);
+        let (fields, pre) = self.tuple_fields(v, span, Hold::Ahead);
         let list = self.list_of(fields, Elem::Object, span);
         let boxed = call("zb_box_tuple", vec![list], Ty::Object, span);
         if pre.is_empty() {
@@ -3166,7 +3264,7 @@ impl<'m> Lowerer<'m> {
                         items.push(self.hold(field, out, span));
                     }
                     for (elt, item) in t.elts.iter().zip(items) {
-                        self.bind(elt, item, span, out)?;
+                        self.bind_after(elt, item, span, out)?;
                     }
                     return Ok(());
                 }
@@ -3246,7 +3344,7 @@ impl<'m> Lowerer<'m> {
                     items.push(self.hold(item, out, span));
                 }
                 for (elt, item) in t.elts.iter().zip(items) {
-                    self.bind(elt, item, span, out)?;
+                    self.bind_after(elt, item, span, out)?;
                 }
                 return Ok(());
             }
@@ -3457,9 +3555,6 @@ impl<'m> Lowerer<'m> {
         extra: Vec<Stmt>,
         span: Span,
     ) -> Result<TypedStatement> {
-        if let Some(specialized) = self.for_value_tuples(f, &extra, span)? {
-            return Ok(specialized);
-        }
         let seq = self.expr(&f.iter)?;
         if seq.ty == Ty::Gen {
             return self.for_generator(f, seq, extra, span);
@@ -3540,178 +3635,6 @@ impl<'m> Lowerer<'m> {
             statements: prologue,
             span,
         }))
-    }
-
-    /// A directly iterated list literal need not materialize Python tuple
-    /// objects when every tuple is immediately destructured into scalars.
-    fn for_value_tuples(
-        &mut self,
-        f: &py::StmtFor,
-        extra: &[Stmt],
-        span: Span,
-    ) -> Result<Option<TypedStatement>> {
-        let py::Expr::List(source) = &*f.iter else {
-            return Ok(None);
-        };
-        let targets = match &*f.target {
-            py::Expr::Tuple(t) => &t.elts,
-            py::Expr::List(l) => &l.elts,
-            _ => return Ok(None),
-        };
-        if targets.is_empty() || !targets.iter().all(|e| matches!(e, py::Expr::Name(_))) {
-            return Ok(None);
-        }
-        let mut field_types = Vec::new();
-        for (row_index, row) in source.elts.iter().enumerate() {
-            let py::Expr::Tuple(tuple) = row else {
-                return Ok(None);
-            };
-            if tuple.elts.len() != targets.len() {
-                return Ok(None);
-            }
-            for (index, field) in tuple.elts.iter().enumerate() {
-                let ty = self.ty_of(field);
-                if !matches!(ty, Ty::Int | Ty::Float | Ty::Bool)
-                    || (row_index != 0 && field_types[index] != ty)
-                {
-                    return Ok(None);
-                }
-                if row_index == 0 {
-                    field_types.push(ty);
-                }
-            }
-        }
-        if source.elts.is_empty() {
-            return Ok(None);
-        }
-
-        let tuple_ty = Type::Tuple(field_types.iter().copied().map(ir).collect());
-        let list_ty = Type::Array {
-            element_type: Box::new(tuple_ty.clone()),
-            size: None,
-            nullability: zyntax_typed_ast::NullabilityKind::NonNull,
-        };
-        let mut prologue = std::mem::take(&mut self.hoisted);
-        let mut rows = Vec::with_capacity(source.elts.len());
-        for row in &source.elts {
-            let py::Expr::Tuple(tuple) = row else {
-                unreachable!()
-            };
-            let mut fields = Vec::with_capacity(targets.len());
-            for field in &tuple.elts {
-                let value = self.expr(field)?;
-                prologue.append(&mut self.hoisted);
-                fields.push(self.hold(value, &mut prologue, span).node);
-            }
-            rows.push(TypedNode::new(
-                TypedExpression::Tuple(fields),
-                tuple_ty.clone(),
-                span,
-            ));
-        }
-        let seq_name = self.temp();
-        prologue.push(TypedNode::new(
-            TypedStatement::Let(TypedLet {
-                name: seq_name,
-                ty: list_ty.clone(),
-                mutability: Mutability::Immutable,
-                initializer: Some(Box::new(TypedNode::new(
-                    TypedExpression::Array(rows),
-                    list_ty.clone(),
-                    span,
-                ))),
-                span,
-            }),
-            Type::Unknown,
-            span,
-        ));
-        let seq = TypedNode::new(TypedExpression::Variable(seq_name), list_ty.clone(), span);
-        let len = TypedNode::new(
-            TypedExpression::MethodCall(TypedMethodCall {
-                receiver: Box::new(seq.clone()),
-                method: intern("len"),
-                type_args: vec![],
-                positional_args: vec![],
-                named_args: vec![],
-            }),
-            ir(Ty::Int),
-            span,
-        );
-        let counter = self.temp();
-        let item = TypedNode::new(
-            TypedExpression::Index(TypedIndex {
-                object: Box::new(seq),
-                index: Box::new(var(counter, Ty::Int, span)),
-            }),
-            tuple_ty.clone(),
-            span,
-        );
-        let mut body = Vec::new();
-        let item_name = self.temp();
-        body.push(TypedNode::new(
-            TypedStatement::Let(TypedLet {
-                name: item_name,
-                ty: tuple_ty.clone(),
-                mutability: Mutability::Immutable,
-                initializer: Some(Box::new(item)),
-                span,
-            }),
-            Type::Unknown,
-            span,
-        ));
-        for (index, (target, ty)) in targets.iter().zip(field_types).enumerate() {
-            let field = TypedNode::new(
-                TypedExpression::Index(TypedIndex {
-                    object: Box::new(TypedNode::new(
-                        TypedExpression::Variable(item_name),
-                        tuple_ty.clone(),
-                        span,
-                    )),
-                    index: Box::new(int_lit(index as i64, span)),
-                }),
-                ir(ty),
-                span,
-            );
-            self.bind(target, Val { node: field, ty }, span, &mut body)?;
-        }
-        self.in_loop(|this| -> Result<()> {
-            for stmt in &f.body {
-                this.stmt(stmt, &mut body)?;
-            }
-            Ok(())
-        })?;
-        body.extend_from_slice(extra);
-        prologue.push(TypedNode::new(
-            TypedStatement::For(TypedFor {
-                pattern: Box::new(TypedNode::new(
-                    TypedPattern::Identifier {
-                        name: counter,
-                        mutability: Mutability::Mutable,
-                    },
-                    prim(PrimitiveType::I64),
-                    span,
-                )),
-                iterator: Box::new(TypedNode::new(
-                    TypedExpression::Range(TypedRange {
-                        start: Some(Box::new(int_lit(0, span))),
-                        end: Some(Box::new(len)),
-                        inclusive: false,
-                    }),
-                    Type::Unknown,
-                    span,
-                )),
-                body: TypedBlock {
-                    statements: body,
-                    span,
-                },
-            }),
-            Type::Unknown,
-            span,
-        ));
-        Ok(Some(TypedStatement::Block(TypedBlock {
-            statements: prologue,
-            span,
-        })))
     }
 
     fn for_loop(&mut self, f: &py::StmtFor, span: Span) -> Result<TypedStatement> {
@@ -4485,9 +4408,29 @@ impl<'m> Lowerer<'m> {
         match &callee.node {
             TypedExpression::Variable(n) => n
                 .resolve_global()
-                .is_some_and(|name| self.module.fallible.contains(&name)),
+                .is_some_and(|name| self.is_fallible_name(&name)),
             _ => false,
         }
+    }
+
+    /// Whether the library function `name` can raise. The functions
+    /// generated for a tuple shape raise where their dynamic-list
+    /// counterparts do; reading a tuple back and ordering tuples can.
+    fn is_fallible_name(&self, name: &str) -> bool {
+        if self.module.fallible.contains(name) {
+            return true;
+        }
+        if let Some(rest) = name.strip_prefix("zb_tuple_") {
+            return rest.starts_with("read_") || rest.starts_with("lt_");
+        }
+        if let Some(rest) = name.strip_prefix("zb_list_")
+            && let Some((op, suffix)) = rest.rsplit_once('_')
+            && suffix.starts_with('t')
+            && suffix[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            return self.module.fallible.contains(&format!("zb_list_{op}_any"));
+        }
+        false
     }
 
     fn expr_unchecked(&mut self, e: &py::Expr) -> Result<Val> {

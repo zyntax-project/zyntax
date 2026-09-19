@@ -80,77 +80,403 @@ fn list_class() -> Decl {
     )
 }
 
-/// How one element kind compares and prints.
+type Binary = Box<dyn Fn(Expr, Expr) -> Expr>;
+type Unary = Box<dyn Fn(Expr) -> Expr>;
+
+/// How one element kind compares, prints, boxes and reads back.
 struct KindOps {
-    kind: Kind,
+    /// The library's own kinds; `None` for a tuple shape a frontend
+    /// registered.
+    kind: Option<Kind>,
+    /// The suffix of this kind's functions.
+    suffix: String,
+    /// The tag a boxed list of this kind carries.
+    tag: i64,
     elem: Type,
     list: Type,
     /// `List<String>`, for building text piece by piece.
     strs: Type,
-    eq: fn(Expr, Expr) -> Expr,
-    lt: fn(Expr, Expr) -> Expr,
-    repr: fn(Expr) -> Expr,
+    eq: Binary,
+    lt: Binary,
+    repr: Unary,
+    /// An element as a dynamic value.
+    boxed: Unary,
+    /// A dynamic value read back as an element, or a TypeError.
+    read: Unary,
 }
 
 fn ops(kind: Kind, list_type: TypeId) -> KindOps {
     let elem = kind.ty();
-    let (eq, lt, repr): (
-        fn(Expr, Expr) -> Expr,
-        fn(Expr, Expr) -> Expr,
-        fn(Expr) -> Expr,
-    ) = match kind {
+    let (eq, lt, repr): (Binary, Binary, Unary) = match kind {
         Kind::Int => (
-            |a, b| eq(a, b),
-            |a, b| lt(a, b),
-            |x| call("zb_str_of_int", vec![x], string()),
+            Box::new(|a, b| eq(a, b)),
+            Box::new(|a, b| lt(a, b)),
+            Box::new(|x| call("zb_str_of_int", vec![x], string())),
         ),
         Kind::Float => (
-            |a, b| eq(a, b),
-            |a, b| lt(a, b),
-            |x| call("zb_float_repr", vec![x], string()),
+            Box::new(|a, b| eq(a, b)),
+            Box::new(|a, b| lt(a, b)),
+            Box::new(|x| call("zb_float_repr", vec![x], string())),
         ),
         Kind::Str => (
-            |a, b| call("zb_str_eq", vec![a, b], boolean()),
-            |a, b| call("zb_str_lt", vec![a, b], boolean()),
-            |x| call("zb_str_repr", vec![x], string()),
+            Box::new(|a, b| call("zb_str_eq", vec![a, b], boolean())),
+            Box::new(|a, b| call("zb_str_lt", vec![a, b], boolean())),
+            Box::new(|x| call("zb_str_repr", vec![x], string())),
         ),
         // The same box is equal to itself before its value is looked
         // at, which is how a membership test or an element comparison
         // treats identity; shared boxes of small integers make that the
         // common case.
         Kind::Any => (
-            |a, b| {
+            Box::new(|a, b| {
                 or(
                     eq(a.clone(), b.clone()),
                     call("zb_any_eq", vec![a, b], boolean()),
                 )
-            },
-            |a, b| call("zb_any_lt", vec![a, b], boolean()),
-            |x| call("zb_any_repr", vec![x], string()),
+            }),
+            Box::new(|a, b| call("zb_any_lt", vec![a, b], boolean())),
+            Box::new(|x| call("zb_any_repr", vec![x], string())),
         ),
         // Instances compare by identity; ordering them is an error, and
         // printing one goes through its boxed form.
         Kind::Ptr => (
-            |a, b| eq(a, b),
-            |a, b| call("zb_ptr_lt", vec![a, b], boolean()),
-            |x| {
+            Box::new(|a, b| eq(a, b)),
+            Box::new(|a, b| call("zb_ptr_lt", vec![a, b], boolean())),
+            Box::new(|x| {
                 call(
                     "zb_any_repr",
                     vec![call("zb_hook_box_instance", vec![x], any())],
                     string(),
                 )
-            },
+            }),
         ),
     };
+    // A primitive boxes as itself on the push; an instance address
+    // boxes as the instance. Reading back checks the kind; an instance
+    // list takes the class tag its elements must carry, which the
+    // generated function reads from its own parameter.
+    let boxed: Unary = match kind {
+        Kind::Ptr => Box::new(|e| call("zb_hook_box_instance", vec![e], any())),
+        _ => Box::new(|e| e),
+    };
+    let read: Unary = match kind {
+        Kind::Int => Box::new(|e| call("zb_any_as_i64", vec![e], i64())),
+        Kind::Float => Box::new(|e| call("zb_any_as_f64", vec![e], f64())),
+        Kind::Str => Box::new(|e| call("zb_any_as_str", vec![e], string())),
+        Kind::Ptr => Box::new(|e| {
+            call(
+                "zb_hook_unbox_instance",
+                vec![e, local("tag", i32()).e()],
+                usize(),
+            )
+        }),
+        Kind::Any => Box::new(|e| e),
+    };
     KindOps {
-        kind,
+        kind: Some(kind),
+        suffix: kind.suffix().to_string(),
+        tag: kind.list_tag(),
         list: list_of(list_type, elem.clone()),
         strs: list_of(list_type, string()),
         elem,
         eq,
         lt,
         repr,
+        boxed,
+        read,
     }
+}
+
+/// How a field of a tuple shape is compared, printed, boxed and read
+/// back: what a frontend knows of the element type it put there.
+#[derive(Clone, Debug)]
+pub enum Field {
+    Int,
+    Float,
+    Bool,
+    Str,
+    /// A dynamic value.
+    Any,
+    Dict,
+    Set,
+    /// An instance of the frontend's class carrying `tag`, held by
+    /// address as `ty`.
+    Instance {
+        ty: Type,
+        tag: i32,
+    },
+    /// A list of the kind whose functions carry `suffix`.
+    List {
+        suffix: String,
+        ty: Type,
+    },
+    /// A tuple of the shape whose functions carry `suffix`.
+    Tuple {
+        suffix: String,
+        ty: Type,
+    },
+}
+
+impl Field {
+    fn ty(&self) -> Type {
+        match self {
+            Field::Int => i64(),
+            Field::Float => f64(),
+            Field::Bool => boolean(),
+            Field::Str => string(),
+            Field::Any | Field::Dict | Field::Set => any(),
+            Field::Instance { ty, .. } | Field::List { ty, .. } | Field::Tuple { ty, .. } => {
+                ty.clone()
+            }
+        }
+    }
+
+    fn eq(&self, a: Expr, b: Expr) -> Expr {
+        match self {
+            Field::Int | Field::Float | Field::Bool => eq(a, b),
+            Field::Str => call("zb_str_eq", vec![a, b], boolean()),
+            Field::Any => or(
+                eq(a.clone(), b.clone()),
+                call("zb_any_eq", vec![a, b], boolean()),
+            ),
+            Field::Dict => call("zb_dict_eq", vec![a, b], boolean()),
+            Field::Set => call("zb_set_eq", vec![a, b], boolean()),
+            Field::Instance { .. } => eq(cast(a, usize()), cast(b, usize())),
+            Field::List { suffix, .. } => {
+                call(&format!("zb_list_eq_{suffix}"), vec![a, b], boolean())
+            }
+            Field::Tuple { suffix, .. } => {
+                call(&format!("zb_tuple_eq_{suffix}"), vec![a, b], boolean())
+            }
+        }
+    }
+
+    fn lt(&self, a: Expr, b: Expr) -> Expr {
+        match self {
+            Field::Int | Field::Float => lt(a, b),
+            Field::Bool => lt(cast(a, i64()), cast(b, i64())),
+            Field::Str => call("zb_str_lt", vec![a, b], boolean()),
+            Field::Any | Field::Dict | Field::Set => call("zb_any_lt", vec![a, b], boolean()),
+            Field::Instance { .. } => call(
+                "zb_ptr_lt",
+                vec![cast(a, usize()), cast(b, usize())],
+                boolean(),
+            ),
+            Field::List { suffix, .. } => {
+                call(&format!("zb_list_lt_{suffix}"), vec![a, b], boolean())
+            }
+            Field::Tuple { suffix, .. } => {
+                call(&format!("zb_tuple_lt_{suffix}"), vec![a, b], boolean())
+            }
+        }
+    }
+
+    fn repr(&self, x: Expr) -> Expr {
+        match self {
+            Field::Int => call("zb_str_of_int", vec![x], string()),
+            Field::Float => call("zb_float_repr", vec![x], string()),
+            Field::Bool => call("zb_bool_repr", vec![x], string()),
+            Field::Str => call("zb_str_repr", vec![x], string()),
+            Field::Any => call("zb_any_repr", vec![x], string()),
+            Field::Dict => call("zb_dict_repr", vec![x], string()),
+            Field::Set => call("zb_set_repr", vec![x], string()),
+            Field::Instance { .. } => call("zb_any_repr", vec![self.boxed(x)], string()),
+            Field::List { suffix, .. } => {
+                call(&format!("zb_list_repr_{suffix}"), vec![x], string())
+            }
+            Field::Tuple { suffix, .. } => {
+                call(&format!("zb_tuple_repr_{suffix}"), vec![x], string())
+            }
+        }
+    }
+
+    fn boxed(&self, x: Expr) -> Expr {
+        match self {
+            Field::Int => call("zb_box_i64", vec![x], any()),
+            Field::Float => call("zb_box_f64", vec![x], any()),
+            Field::Bool => call("zb_box_bool", vec![x], any()),
+            Field::Str => call("zb_box_str", vec![x], any()),
+            Field::Any => x,
+            Field::Dict => call("zb_dict_box", vec![x], any()),
+            Field::Set => call("zb_set_box", vec![x], any()),
+            Field::Instance { tag, .. } => call(
+                "zb_box_instance",
+                vec![cast(x, usize()), int32(*tag)],
+                any(),
+            ),
+            Field::List { suffix, .. } => call(&format!("zb_list_box_{suffix}"), vec![x], any()),
+            Field::Tuple { suffix, .. } => call(&format!("zb_tuple_box_{suffix}"), vec![x], any()),
+        }
+    }
+
+    fn read(&self, x: Expr) -> Expr {
+        match self {
+            Field::Int => call("zb_any_as_i64", vec![x], i64()),
+            Field::Float => call("zb_any_as_f64", vec![x], f64()),
+            Field::Bool => call("zb_any_as_bool", vec![x], boolean()),
+            Field::Str => call("zb_any_as_str", vec![x], string()),
+            Field::Any => x,
+            Field::Dict => call("zb_dict_unbox", vec![x], any()),
+            Field::Set => call("zb_set_unbox", vec![x], any()),
+            Field::Instance { ty, tag } => cast(
+                call("zb_hook_unbox_instance", vec![x, int32(*tag)], usize()),
+                ty.clone(),
+            ),
+            Field::List { suffix, ty } => {
+                call(&format!("zb_list_unbox_{suffix}"), vec![x], ty.clone())
+            }
+            Field::Tuple { suffix, ty } => {
+                call(&format!("zb_tuple_read_{suffix}"), vec![x], ty.clone())
+            }
+        }
+    }
+}
+
+/// Kinds a frontend registers are numbered from here in a box's tag, so
+/// none collides with the library's own kinds or a class's instances.
+pub const SHAPE_KIND_BASE: i64 = 1 << 20;
+
+/// The box tag of a list whose elements are the tuple shape `index`.
+pub fn shape_list_tag(index: u16) -> i64 {
+    ((SHAPE_KIND_BASE + index as i64) << 8) | 255
+}
+
+/// The functions of a tuple shape a frontend registers: equality,
+/// order, repr, boxing and reading back of the tuple
+/// (`zb_tuple_{eq,lt,repr,box,read}_<suffix>`). Shapes a field names
+/// must have been declared before.
+pub fn tuple_declarations(
+    list_type: TypeId,
+    suffix: &str,
+    tuple_ty: Type,
+    fields: &[Field],
+) -> Vec<Decl> {
+    let anys = list_of(list_type, any());
+    let a = local("a", tuple_ty.clone());
+    let b = local("b", tuple_ty.clone());
+    let x = local("x", any());
+    let t = local("t", anys.clone());
+    let field = |v: &Local, i: usize| idx(v.e(), int(i as i64), fields[i].ty());
+    let mut d = Vec::new();
+
+    // Equal when every field is.
+    let mut all = bool(true);
+    for (i, f) in fields.iter().enumerate().rev() {
+        let this = f.eq(field(&a, i), field(&b, i));
+        all = if i + 1 == fields.len() {
+            this
+        } else {
+            and(this, all)
+        };
+    }
+    d.push(define(
+        &format!("zb_tuple_eq_{suffix}"),
+        &[&a, &b],
+        boolean(),
+        vec![ret(all)],
+    ));
+    // Ordered by the first field that differs.
+    let mut order: Vec<Stmt> = Vec::new();
+    for (i, f) in fields.iter().enumerate() {
+        order.push(when(
+            f.lt(field(&a, i), field(&b, i)),
+            vec![ret(bool(true))],
+        ));
+        order.push(when(
+            f.lt(field(&b, i), field(&a, i)),
+            vec![ret(bool(false))],
+        ));
+    }
+    order.push(ret(bool(false)));
+    d.push(define(
+        &format!("zb_tuple_lt_{suffix}"),
+        &[&a, &b],
+        boolean(),
+        order,
+    ));
+    // `(x, y)`, with the comma a one-element tuple keeps.
+    let mut text_of = text("(");
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            text_of = add(text_of, text(", "));
+        }
+        text_of = add(text_of, f.repr(field(&a, i)));
+    }
+    text_of = add(text_of, text(if fields.len() == 1 { ",)" } else { ")" }));
+    d.push(define(
+        &format!("zb_tuple_repr_{suffix}"),
+        &[&a],
+        string(),
+        vec![ret(text_of)],
+    ));
+    // Boxed as the tagged list of the boxed fields.
+    let boxed_fields: Vec<Expr> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| f.boxed(field(&a, i)))
+        .collect();
+    d.push(define(
+        &format!("zb_tuple_box_{suffix}"),
+        &[&a],
+        any(),
+        vec![ret(call(
+            "zb_box_tuple",
+            vec![list(boxed_fields, anys.clone())],
+            any(),
+        ))],
+    ));
+    // Read back once the tag and the length are checked.
+    let read_fields: Vec<Expr> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| f.read(idx(t.e(), int(i as i64), any())))
+        .collect();
+    d.push(define(
+        &format!("zb_tuple_read_{suffix}"),
+        &[&x],
+        tuple_ty.clone(),
+        vec![
+            t.decl(call("zb_unbox_tuple", vec![x.e()], anys.clone())),
+            expr(call(
+                "zb_list_expect_len_any",
+                vec![t.e(), int(fields.len() as i64)],
+                unit(),
+            )),
+            ret(tuple(read_fields, tuple_ty.clone())),
+        ],
+    ));
+    d
+}
+
+/// The list functions (`zb_list_*_<suffix>`) of a list whose elements
+/// are the tuple shape `index`, over the shape's own functions from
+/// [`tuple_declarations`].
+pub fn tuple_list_declarations(
+    list_type: TypeId,
+    index: u16,
+    suffix: &str,
+    tuple_ty: Type,
+) -> Vec<Decl> {
+    let eq_name = format!("zb_tuple_eq_{suffix}");
+    let lt_name = format!("zb_tuple_lt_{suffix}");
+    let repr_name = format!("zb_tuple_repr_{suffix}");
+    let box_name = format!("zb_tuple_box_{suffix}");
+    let read_name = format!("zb_tuple_read_{suffix}");
+    let elem = tuple_ty.clone();
+    let k = KindOps {
+        kind: None,
+        suffix: suffix.to_string(),
+        tag: shape_list_tag(index),
+        list: list_of(list_type, elem.clone()),
+        strs: list_of(list_type, string()),
+        elem: elem.clone(),
+        eq: Box::new(move |a, b| call(&eq_name, vec![a, b], boolean())),
+        lt: Box::new(move |a, b| call(&lt_name, vec![a, b], boolean())),
+        repr: Box::new(move |x| call(&repr_name, vec![x], string())),
+        boxed: Box::new(move |x| call(&box_name, vec![x], any())),
+        read: Box::new(move |x| call(&read_name, vec![x], elem.clone())),
+    };
+    kind_declarations(&k)
 }
 
 fn len(xs: Expr) -> Expr {
@@ -276,7 +602,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
 }
 
 fn kind_declarations(k: &KindOps) -> Vec<Decl> {
-    let name = |op: &str| format!("zb_list_{op}_{}", k.kind.suffix());
+    let name = |op: &str| format!("zb_list_{op}_{}", k.suffix);
     // The list every operation works on is read or edited in place and
     // never kept, except by the box that carries it into a dynamic slot.
     let xs = borrowed("xs", k.list.clone());
@@ -315,7 +641,7 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     ));
     let norm = |i: Expr, msg: &str| call(&name("norm"), vec![xs.e(), i, text(msg)], i64());
     let checked_index = |msg: &str| {
-        if k.kind != Kind::Float {
+        if k.kind != Some(Kind::Float) {
             return vec![j.decl(norm(i.e(), msg))];
         }
         vec![
@@ -1116,14 +1442,9 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         s.push(ret(best.e()));
         d.push(define(&name(op), &[&xs, &keys], k.elem.clone(), s));
     }
-    // Everything boxed, for a list that becomes dynamic. A primitive
-    // boxes as itself on the push; an instance address boxes as the
-    // instance.
+    // Everything boxed, for a list that becomes dynamic.
     let out_any = local("out", any_list.clone());
-    let boxed = |e: Expr| match k.kind {
-        Kind::Ptr => call("zb_hook_box_instance", vec![e], any()),
-        _ => e,
-    };
+    let boxed = |e: Expr| (k.boxed)(e);
     d.push(define(&name("to_any"), &[&xs], any_list.clone(), {
         let mut s = vec![
             out_any.decl(list(Vec::new(), any_list.clone())),
@@ -1148,15 +1469,9 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     let anys_in = local("xs", any_list.clone());
     let tag = local("tag", i32());
     let out_typed = local("out", k.list.clone());
-    let read = |e: Expr| match k.kind {
-        Kind::Int => call("zb_any_as_i64", vec![e], i64()),
-        Kind::Float => call("zb_any_as_f64", vec![e], f64()),
-        Kind::Str => call("zb_any_as_str", vec![e], string()),
-        Kind::Ptr => call("zb_hook_unbox_instance", vec![e, tag.e()], usize()),
-        Kind::Any => e,
-    };
+    let read = |e: Expr| (k.read)(e);
     let from_params: Vec<&Local> = match k.kind {
-        Kind::Ptr => vec![&anys_in, &tag],
+        Some(Kind::Ptr) => vec![&anys_in, &tag],
         _ => vec![&anys_in],
     };
     d.push(define(&name("from_any"), &from_params, k.list.clone(), {
@@ -1221,13 +1536,13 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     // A list flows into a dynamic slot by reference, under the tag of
     // its kind, and comes back out by checking that tag.
     d.push(extern_fn(
-        &format!("zb_box_list_raw_{}", k.kind.suffix()),
+        &format!("zb_box_list_raw_{}", k.suffix),
         &[("xs", k.list.clone()), ("tag", i32())],
         any(),
         Some("zyntax_box_ptr"),
     ));
     d.push(extern_fn(
-        &format!("zb_unbox_list_raw_{}", k.kind.suffix()),
+        &format!("zb_unbox_list_raw_{}", k.suffix),
         &[("x", any())],
         k.list.clone(),
         Some("zyntax_box_pointer"),
@@ -1237,8 +1552,8 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         &[&carried],
         any(),
         vec![ret(call(
-            &format!("zb_box_list_raw_{}", k.kind.suffix()),
-            vec![carried.e(), int32(k.kind.list_tag() as i32)],
+            &format!("zb_box_list_raw_{}", k.suffix),
+            vec![carried.e(), int32(k.tag as i32)],
             any(),
         ))],
     ));
@@ -1249,7 +1564,7 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     let tag = local("tag", i64());
     let mut unbox = vec![tag.decl(cast(call("zb_box_tag", vec![x.e()], i32()), i64()))];
     match k.kind {
-        Kind::Any => {
+        Some(Kind::Any) => {
             for other in Kind::ALL.iter().filter(|o| **o != Kind::Any) {
                 unbox.push(when(
                     eq(tag.e(), int(other.list_tag())),
@@ -1264,8 +1579,18 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
                     ))],
                 ));
             }
+            // A list of a shape a frontend registered comes out through
+            // its hook, as the frontend's kinds do.
+            unbox.push(when(
+                ge(tag.e(), int(SHAPE_KIND_BASE << 8)),
+                vec![ret(call(
+                    "zb_hook_shaped_items",
+                    vec![x.e()],
+                    k.list.clone(),
+                ))],
+            ));
         }
-        Kind::Int | Kind::Float | Kind::Str => {
+        Some(Kind::Int) | Some(Kind::Float) | Some(Kind::Str) | None => {
             unbox.push(when(
                 eq(tag.e(), int(Kind::Any.list_tag())),
                 vec![ret(call(
@@ -1279,10 +1604,10 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
                 ))],
             ));
         }
-        Kind::Ptr => {}
+        Some(Kind::Ptr) => {}
     }
     unbox.push(when(
-        ne(tag.e(), int(k.kind.list_tag())),
+        ne(tag.e(), int(k.tag)),
         vec![fatal(
             "TypeError",
             add(
@@ -1292,7 +1617,7 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         )],
     ));
     unbox.push(ret(call(
-        &format!("zb_unbox_list_raw_{}", k.kind.suffix()),
+        &format!("zb_unbox_list_raw_{}", k.suffix),
         vec![x.e()],
         k.list.clone(),
     )));
@@ -1372,6 +1697,71 @@ pub(crate) fn ptr_declarations(policy: &Policy) -> Vec<Decl> {
             ),
             ret(bool(false)),
         ],
+    ));
+    d
+}
+
+/// What the dynamic layer asks of a boxed list whose elements are a
+/// shape a frontend registered (a tag from [`SHAPE_KIND_BASE`] up): the
+/// frontend, which knows the shapes, defines these; a language without
+/// shapes gets versions that report the kind unknown.
+pub(crate) fn shape_hook_declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
+    let anys = list_of(list_type, any());
+    let x = local("x", any());
+    let i = local("i", i64());
+    let v = kept("v", any());
+    let mut d = Vec::new();
+    if policy.instance_hooks {
+        d.push(extern_fn(
+            "zb_hook_shaped_items",
+            &[("x", any())],
+            anys.clone(),
+            None,
+        ));
+        d.push(extern_fn(
+            "zb_hook_shaped_get",
+            &[("x", any()), ("i", i64())],
+            any(),
+            None,
+        ));
+        d.push(extern_fn(
+            "zb_hook_shaped_set",
+            &[("x", any()), ("i", i64()), ("v", any())],
+            unit(),
+            None,
+        ));
+        d.push(extern_fn(
+            "zb_hook_shaped_append",
+            &[("x", any()), ("v", any())],
+            unit(),
+            None,
+        ));
+        return d;
+    }
+    let unknown = || fatal("TypeError", text("a list of an unknown kind"));
+    d.push(define(
+        "zb_hook_shaped_items",
+        &[&x],
+        anys.clone(),
+        vec![unknown(), ret(list(Vec::new(), anys.clone()))],
+    ));
+    d.push(define(
+        "zb_hook_shaped_get",
+        &[&x, &i],
+        any(),
+        vec![unknown(), ret(null(any()))],
+    ));
+    d.push(define(
+        "zb_hook_shaped_set",
+        &[&x, &i, &v],
+        unit(),
+        vec![unknown(), ret_void()],
+    ));
+    d.push(define(
+        "zb_hook_shaped_append",
+        &[&x, &v],
+        unit(),
+        vec![unknown(), ret_void()],
     ));
     d
 }

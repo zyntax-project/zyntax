@@ -17,7 +17,7 @@ mod format;
 pub mod functions;
 mod io;
 mod iteration;
-mod lists;
+pub mod lists;
 mod math;
 mod strings;
 
@@ -172,6 +172,7 @@ pub fn library(policy: &Policy) -> Library {
         declarations.extend(dynamic::default_instance_hooks(policy));
     }
     declarations.extend(lists::ptr_declarations(policy));
+    declarations.extend(lists::shape_hook_declarations(policy, list_type));
     if policy.exceptions {
         declarations.push(build::extern_fn(
             "zb_hook_raise",
