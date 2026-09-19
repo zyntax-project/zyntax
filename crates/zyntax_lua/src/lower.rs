@@ -1502,10 +1502,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     /// A builtin as a function value.
     fn builtin_value(&mut self, b: &Builtin, span: Span) -> Val {
+        let index = crate::library::stdlib::builtin_index(b);
         Val {
             node: call(
-                "zl_func_of",
+                "zl_builtin_value",
                 vec![
+                    int_lit(index as i64, span),
                     code_of(&crate::library::stdlib::wrapper_name(b), span),
                     int_lit(VARIADIC_ARITY, span),
                 ],

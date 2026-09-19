@@ -993,6 +993,14 @@ pub const LIBS: &[&str] = &[
 /// metamethods.
 pub const HIDDEN_LIBS: &[&str] = &["file", "filemeta"];
 
+/// A builtin's number, the slot its one record as a value lives in.
+pub fn builtin_index(b: &Builtin) -> usize {
+    BUILTINS
+        .iter()
+        .position(|c| c.lib == b.lib && c.name == b.name)
+        .expect("a builtin")
+}
+
 /// The name of a builtin's value wrapper.
 pub fn wrapper_name(b: &Builtin) -> String {
     if b.lib.is_empty() {
@@ -1347,8 +1355,64 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             usize(),
         )
     };
-    let func_value =
-        |name: &str, arity: i64| call("zl_func_of", vec![code_of(name), int(arity)], any());
+    // A builtin as a value is one record, whatever names it: the
+    // reference compares functions by identity.
+    d.push(global_var("zl_builtin_values", any()));
+    let index = local("index", i64());
+    let code = local("code", usize());
+    let arity = local("arity", i64());
+    d.push(define(
+        "zl_builtin_value",
+        &[&index, &code, &arity],
+        any(),
+        vec![
+            when(
+                is_nil(read_global("zl_builtin_values", any())),
+                vec![set_global(
+                    "zl_builtin_values",
+                    box_table(call("zl_table_new", vec![], table.clone())),
+                )],
+            ),
+            tb.decl(unbox_table(read_global("zl_builtin_values", any()), t)),
+            y.decl(call("zl_rawgeti", vec![tb.e(), index.e()], any())),
+            when(not(is_nil(y.e())), vec![ret(y.e())]),
+            y.set(call("zl_func_of", vec![code.e(), arity.e()], any())),
+            expr(call("zl_rawseti", vec![tb.e(), index.e(), y.e()], unit())),
+            ret(y.e()),
+        ],
+    ));
+    let builtin_value = |b: &Builtin| {
+        let index = builtin_index(b);
+        call(
+            "zl_builtin_value",
+            vec![
+                int(index as i64),
+                code_of(&wrapper_name(b)),
+                int(VARIADIC_ARITY),
+            ],
+            any(),
+        )
+    };
+    // The iterators `pairs` and `ipairs` give: `next` itself, and one
+    // record for `ipairs`, past the builtins' slots.
+    let next_value = || {
+        let b = BUILTINS
+            .iter()
+            .find(|b| b.lib.is_empty() && b.name == "next")
+            .expect("next");
+        builtin_value(b)
+    };
+    let ipairs_value = || {
+        call(
+            "zl_builtin_value",
+            vec![
+                int(BUILTINS.len() as i64),
+                code_of("zl_ipairs_code"),
+                int(2),
+            ],
+            any(),
+        )
+    };
     d.push(define(
         "zl_pairs",
         &[&x],
@@ -1369,10 +1433,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ),
             ret(call(
                 "zb_box_tuple",
-                vec![list(
-                    vec![func_value("zl_next_code", 2), x.e(), nil()],
-                    anys.clone(),
-                )],
+                vec![list(vec![next_value(), x.e(), nil()], anys.clone())],
                 any(),
             )),
         ],
@@ -1384,7 +1445,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![ret(call(
             "zb_box_tuple",
             vec![list(
-                vec![func_value("zl_ipairs_code", 2), x.e(), box_i64(int(0))],
+                vec![ipairs_value(), x.e(), box_i64(int(0))],
                 anys.clone(),
             )],
             any(),
@@ -2692,11 +2753,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         for b in BUILTINS.iter().filter(|b| b.lib == *lib) {
             st.push(expr(call(
                 "zl_rawset_str",
-                vec![
-                    tb.e(),
-                    text(b.name),
-                    func_value(&wrapper_name(b), VARIADIC_ARITY),
-                ],
+                vec![tb.e(), text(b.name), builtin_value(b)],
                 unit(),
             )));
         }
@@ -2867,11 +2924,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         for b in BUILTINS.iter().filter(|b| b.lib.is_empty()) {
             st.push(expr(call(
                 "zl_rawset_str",
-                vec![
-                    tb.e(),
-                    text(b.name),
-                    func_value(&wrapper_name(b), VARIADIC_ARITY),
-                ],
+                vec![tb.e(), text(b.name), builtin_value(b)],
                 unit(),
             )));
         }
