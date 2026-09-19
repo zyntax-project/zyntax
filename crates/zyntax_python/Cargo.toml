@@ -31,6 +31,8 @@ indexmap = "2"
 # The frontend keys its tables by name; the default hasher is a fifth
 # of inference on a class-heavy program.
 rustc-hash = "2"
+# `_exit` at the end of a run: the process, not the runtime, frees.
+libc = "0.2"
 
 [build-dependencies]
 zyntax_typed_ast = { path = "../typed_ast" }
@@ -39,5 +41,3 @@ zyntax_compiler = { path = "../compiler", default-features = false }
 zyntax_builtins = { path = "../zyntax_builtins" }
 indexmap = "2"
 
-[dev-dependencies]
-libc = "0.2"

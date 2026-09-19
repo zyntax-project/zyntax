@@ -125,14 +125,37 @@ fn main() -> ExitCode {
     lap("compile");
     let outcome = rt.call_raw(zyntax_python::ENTRY, &[]);
     lap("run");
-    // The runtime waits for a compile still in flight; count that too.
-    drop(rt);
-    lap("shutdown");
-    match outcome {
-        Ok(_) => ExitCode::SUCCESS,
+    let code = match outcome {
+        Ok(_) => 0,
         Err(e) => {
             eprintln!("zypy: {e}");
-            ExitCode::from(1)
+            1
         }
-    }
+    };
+    // Stop the runtime's own threads; what it holds is the process's
+    // and goes with it. Freeing it all by hand took 8 to 25 ms, and
+    // waiting for a promotion still in flight the same again.
+    rt.shutdown();
+    lap("shutdown");
+    exit_now(rt, code)
+}
+
+/// End the process at once, the runtime left where it stands: no
+/// destructor runs, so a compile thread still in LLVM is killed rather
+/// than racing the statics an orderly exit would tear down under it.
+#[cfg(unix)]
+fn exit_now(rt: TieredRuntime, code: i32) -> ExitCode {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::mem::forget(rt);
+    // SAFETY: `_exit` ends the process without returning; nothing after
+    // it runs, and the streams were flushed above.
+    unsafe { libc::_exit(code) }
+}
+
+#[cfg(not(unix))]
+fn exit_now(rt: TieredRuntime, code: i32) -> ExitCode {
+    drop(rt);
+    ExitCode::from(code as u8)
 }
