@@ -8,7 +8,22 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use zyntax_embed::{TieredConfig, TieredRuntime};
 
+/// The stack the program runs on: Lua recursion is bounded by its own
+/// limit, not the main thread's.
+const STACK_BYTES: usize = 512 << 20;
+
 fn main() -> ExitCode {
+    let run = std::thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(run)
+        .expect("the program's thread");
+    match run.join() {
+        Ok(code) => code,
+        Err(_) => ExitCode::from(134),
+    }
+}
+
+fn run() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let command = args.next();
     // ZYLUA_LLVM=1 selects LLVM tier-up; use it for checked benchmark runs.
@@ -45,8 +60,8 @@ fn main() -> ExitCode {
     let mut argv = vec![path.display().to_string()];
     argv.extend(args);
     zyntax_lua::set_args(argv);
-    let source = match std::fs::read_to_string(&path) {
-        Ok(s) => prelude + &s,
+    let source = match std::fs::read(&path) {
+        Ok(bytes) => prelude + &zyntax_lua::source_text(&bytes),
         Err(e) => {
             eprintln!("zylua: cannot read {}: {e}", path.display());
             return ExitCode::from(2);

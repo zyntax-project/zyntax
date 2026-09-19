@@ -526,8 +526,47 @@ fn typed_function(
     }
 }
 
-/// The bytes of a string literal token, escapes decoded.
+/// The bytes of a string literal token, escapes decoded, and a byte the
+/// source could not spell as text restored from its stand-in.
 fn string_bytes(token: &TokenReference) -> std::result::Result<Vec<u8>, String> {
+    let bytes = literal_bytes(token)?;
+    Ok(restore_bytes(bytes))
+}
+
+/// Private-use characters standing for bytes (see `source_text`) back
+/// to the bytes.
+fn restore_bytes(bytes: Vec<u8>) -> Vec<u8> {
+    // U+F700..U+F7FF are EF 9C 80 .. EF 9F BF.
+    if !bytes
+        .windows(2)
+        .any(|w| w[0] == 0xEF && (0x9C..=0x9F).contains(&w[1]))
+    {
+        return bytes;
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 2 < bytes.len()
+            && bytes[i] == 0xEF
+            && (0x9C..=0x9F).contains(&bytes[i + 1])
+            && (0x80..=0xBF).contains(&bytes[i + 2])
+        {
+            let code = ((bytes[i] as u32 & 0x0F) << 12)
+                | ((bytes[i + 1] as u32 & 0x3F) << 6)
+                | (bytes[i + 2] as u32 & 0x3F);
+            if (crate::ESCAPED_BYTES..crate::ESCAPED_BYTES + 0x100).contains(&code) {
+                out.push((code - crate::ESCAPED_BYTES) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+fn literal_bytes(token: &TokenReference) -> std::result::Result<Vec<u8>, String> {
     use full_moon::tokenizer::{StringLiteralQuoteType, TokenType};
     let TokenType::StringLiteral {
         literal,
@@ -627,11 +666,16 @@ fn decode_escapes(s: &str) -> std::result::Result<Vec<u8>, String> {
                     return Err("missing '{' in \\u{xxxx}".to_string());
                 }
                 let end = s[i..].find('}').ok_or("missing '}' in \\u{xxxx}")? + i;
-                let code = u32::from_str_radix(&s[i + 1..end], 16)
-                    .map_err(|_| "hexadecimal digit expected")?;
-                let ch = char::from_u32(code).ok_or("UTF-8 value too large")?;
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                let digits = &s[i + 1..end];
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err("hexadecimal digit expected".to_string());
+                }
+                // Lua's own UTF-8 reaches 0x7FFFFFFF in six bytes.
+                let code = u64::from_str_radix(digits, 16).unwrap_or(u64::MAX);
+                if code > 0x7FFF_FFFF {
+                    return Err("UTF-8 value too large".to_string());
+                }
+                crate::host::utf8_encode(code as u32, &mut out);
                 i = end + 1;
             }
             d if d.is_ascii_digit() => {
@@ -1106,6 +1150,14 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     fn read_global(&mut self, name: &str, span: Span) -> Result<Val> {
+        if self.scopes().dynamic_globals {
+            let key = Val {
+                node: str_lit(name, span),
+                ty: Ty::Str,
+            };
+            let g = self.globals_table(span);
+            return Ok(self.index_read(g, key, span));
+        }
         if let Some(f) = self.scopes().known_global_function(name) {
             return Ok(self.function_value(f, span));
         }
@@ -1146,6 +1198,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     fn write_global(&mut self, name: &str, value: Val, span: Span) -> Result<St> {
+        if self.scopes().dynamic_globals {
+            if name == "_ENV" {
+                return unsupported("assigning `_ENV`", span);
+            }
+            let key = Val {
+                node: str_lit(name, span),
+                ty: Ty::Str,
+            };
+            let g = self.globals_table(span);
+            return Ok(self.index_write(g, key, value, span));
+        }
         if self.scopes().known_global_function(name).is_some() {
             // The one declaration of a known function is its typed
             // entry; nothing is stored.
@@ -1162,6 +1225,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         self.m.declare_module_var(symbol, ty);
         let value = self.coerce(value, ty);
         Ok(assign(var(symbol, self.ir(ty), span), value, span))
+    }
+
+    /// The globals table, when the program reaches its globals through
+    /// one: every global is an entry, the builtins included.
+    fn globals_table(&mut self, span: Span) -> Val {
+        Val {
+            node: var(intern(library::GLOBALS), self.ir(Ty::Table), span),
+            ty: Ty::Table,
+        }
     }
 
     /// A builtin as a function value.
@@ -2585,8 +2657,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if b.lib.is_empty() && (b.name == "rawget" || b.name == "rawset") {
             let exprs = self.args_exprs(args);
             if let Some(Expression::Var(Var::Name(token))) = exprs.first() {
-                let is_g = matches!(self.scopes().binding(token), Some(Binding::Global(g)) if g == "_G")
-                    && !self.scopes().global_writes.contains_key("_G");
+                let is_g = matches!(self.scopes().binding(token), Some(Binding::Global(g)) if Scopes::is_globals_name(g))
+                    && !self.scopes().global_writes.contains_key(&ident(token))
+                    && !self.scopes().dynamic_globals;
                 if is_g {
                     let name = exprs.get(1).and_then(|e| crate::scope::literal_string(e));
                     let Some(name) = name else {
@@ -2824,6 +2897,40 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     // ─── statements ─────────────────────────────────────────────
 
+    /// The chunk's outermost block as segments of at most
+    /// `SEGMENT_STATEMENTS` statements each, the final `return` in the
+    /// last.
+    fn segments(&mut self, block: &Block) -> Result<Vec<Vec<St>>> {
+        let mut segments = Vec::new();
+        let mut out = Vec::new();
+        for s in block.stmts() {
+            let at = out.len();
+            self.line_needed = false;
+            self.stmt(s, &mut out)?;
+            self.record_line(span_of(s), at, &mut out);
+            if out.len() >= crate::scope::SEGMENT_STATEMENTS {
+                segments.push(std::mem::take(&mut out));
+            }
+        }
+        if let Some(last) = block.last_stmt() {
+            let span = span_of(last);
+            let at = out.len();
+            self.line_needed = false;
+            match last {
+                ast::LastStmt::Return(r) => {
+                    let exprs: Vec<&Expression> = r.returns().iter().collect();
+                    self.return_stmt(&exprs, span, &mut out)?;
+                }
+                _ => return unsupported("this statement", span),
+            }
+            self.record_line(span, at, &mut out);
+        }
+        if !out.is_empty() || segments.is_empty() {
+            segments.push(out);
+        }
+        Ok(segments)
+    }
+
     fn block(&mut self, block: &Block) -> Result<Vec<St>> {
         let mut out = Vec::new();
         for s in block.stmts() {
@@ -2867,6 +2974,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 for e in exprs {
                     let v = self.expr(e)?;
                     out.push(expr_stmt(v.node));
+                }
+                if self.func == CHUNK && self.scopes().split_chunk {
+                    let flag = intern(RETURNED);
+                    self.m.declare_module_var(flag, Ty::Bool);
+                    out.push(assign(
+                        var(flag, prim(PrimitiveType::Bool), span),
+                        bool_lit(true, span),
+                        span,
+                    ));
                 }
                 out.push(ret(None, span));
             }
@@ -3956,6 +4072,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 /// runs it, and reports an error nothing caught.
 const CHUNK_FN: &str = "lua$chunk";
 
+/// Set by a `return` at the chunk's outermost level when the chunk
+/// runs as segments, so the driver stops.
+const RETURNED: &str = "lua$returned";
+
 /// The line a function was entered at: the caller's, for `error(v, 2)`.
 const ENTRY_LINE: &str = "$entry_line";
 
@@ -3992,8 +4112,13 @@ pub(crate) fn program(
     file: &str,
     library: Library,
 ) -> Result<TypedProgram> {
+    let started = std::time::Instant::now();
     let scopes = crate::scope::resolve(ast);
+    crate::trace_phase("scopes", started);
+    let started = std::time::Instant::now();
     let inferred = types::infer(&scopes, ast);
+    crate::trace_phase("infer", started);
+    let started = std::time::Instant::now();
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(source.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
@@ -4015,13 +4140,64 @@ pub(crate) fn program(
     let lower_chunk = |module: &Module<'_>| -> Result<Vec<St>> {
         let mut main = Lowerer::new(module, CHUNK);
         main.returns = Returns::Fixed(Vec::new());
-        let mut statements = main.block(ast.nodes())?;
-        if main.entry_line {
-            statements.insert(0, entry_line_save(span));
-        }
-        if types::falls_through(ast.nodes()) {
-            statements.push(ret(None, span));
-        }
+        let statements = if scopes.split_chunk {
+            // Each segment is a function; the chunk calls them in turn
+            // and stops at an error or a `return`.
+            let segments = main.segments(ast.nodes())?;
+            let unit = prim(PrimitiveType::Unit);
+            let mut driver = Vec::new();
+            let returned = module
+                .module_vars
+                .borrow()
+                .iter()
+                .any(|(n, _)| *n == intern(RETURNED));
+            for (k, mut body) in segments.into_iter().enumerate() {
+                if main.entry_line {
+                    body.insert(0, entry_line_save(span));
+                }
+                body.push(ret(None, span));
+                let name = format!("{CHUNK_FN}${k}");
+                module.functions.borrow_mut().push(typed_function(
+                    &name,
+                    Vec::new(),
+                    unit.clone(),
+                    body,
+                    span,
+                ));
+                driver.push(expr_stmt(call(&name, vec![], unit.clone(), span)));
+                driver.push(if_(
+                    binary(
+                        BinaryOp::Ne,
+                        Lowerer::pending(span),
+                        nil(span),
+                        prim(PrimitiveType::Bool),
+                        span,
+                    ),
+                    vec![ret(None, span)],
+                    None,
+                    span,
+                ));
+                if returned {
+                    driver.push(if_(
+                        var(intern(RETURNED), prim(PrimitiveType::Bool), span),
+                        vec![ret(None, span)],
+                        None,
+                        span,
+                    ));
+                }
+            }
+            driver.push(ret(None, span));
+            driver
+        } else {
+            let mut statements = main.block(ast.nodes())?;
+            if main.entry_line {
+                statements.insert(0, entry_line_save(span));
+            }
+            if types::falls_through(ast.nodes()) {
+                statements.push(ret(None, span));
+            }
+            statements
+        };
         module.facts.borrow_mut().insert(
             CHUNK,
             RaiseFact {
@@ -4037,7 +4213,10 @@ pub(crate) fn program(
     module.functions.borrow_mut().clear();
     module.module_vars.borrow_mut().clear();
     module.facts.borrow_mut().clear();
+    crate::trace_phase("lower 1", started);
+    let started = std::time::Instant::now();
     let statements = lower_chunk(&module)?;
+    crate::trace_phase("lower 2", started);
     let chunk_fn = typed_function(
         CHUNK_FN,
         Vec::new(),
@@ -4055,6 +4234,21 @@ pub(crate) fn program(
                 str_lit(&chunk_id(module.chunk), span),
                 span,
             ),
+            if scopes.dynamic_globals {
+                assign(
+                    var(intern(library::GLOBALS), module.ir(Ty::Table), span),
+                    call("zl_globals_table", vec![], module.ir(Ty::Table), span),
+                    span,
+                )
+            } else {
+                stmt(
+                    TypedStatement::Block(TypedBlock {
+                        statements: Vec::new(),
+                        span,
+                    }),
+                    span,
+                )
+            },
             expr_stmt(call(CHUNK_FN, vec![], prim(PrimitiveType::Unit), span)),
             expr_stmt(call(
                 "zl_report_pending",

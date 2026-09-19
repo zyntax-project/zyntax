@@ -174,7 +174,47 @@ pub fn register_runtime(
 
 /// Parse Lua source and rewrite it into a `TypedProgram`. `file` names
 /// the source in diagnostics.
+/// A source that is not UTF-8 as text the parser takes: each byte that
+/// is not part of a valid sequence becomes a private-use character,
+/// which a string literal turns back into the byte. Outside literals
+/// (comments) the bytes do not matter.
+pub fn source_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => std::borrow::Cow::Borrowed(s),
+        Err(_) => {
+            let mut out = String::with_capacity(bytes.len() + 16);
+            let mut rest = bytes;
+            loop {
+                match std::str::from_utf8(rest) {
+                    Ok(s) => {
+                        out.push_str(s);
+                        break;
+                    }
+                    Err(e) => {
+                        let good = e.valid_up_to();
+                        out.push_str(std::str::from_utf8(&rest[..good]).unwrap_or(""));
+                        let bad = e.error_len().unwrap_or(rest.len() - good);
+                        for &b in &rest[good..good + bad] {
+                            out.push(escaped_byte(b));
+                        }
+                        rest = &rest[good + bad..];
+                    }
+                }
+            }
+            std::borrow::Cow::Owned(out)
+        }
+    }
+}
+
+/// The private-use character standing for byte `b` in a source that
+/// is not UTF-8.
+pub(crate) fn escaped_byte(b: u8) -> char {
+    char::from_u32(ESCAPED_BYTES + b as u32).expect("a private-use character")
+}
+pub(crate) const ESCAPED_BYTES: u32 = 0xF700;
+
 pub fn parse_program(source: &str, file: &str) -> Result<TypedProgram> {
+    let started = std::time::Instant::now();
     let ast = match full_moon::parse_fallible(source, full_moon::LuaVersion::lua54()).into_result()
     {
         Ok(ast) => ast,
@@ -190,8 +230,21 @@ pub fn parse_program(source: &str, file: &str) -> Result<TypedProgram> {
             });
         }
     };
+    trace_phase("full_moon", started);
+    let started = std::time::Instant::now();
     let library = library()?;
+    trace_phase("library", started);
     lower::program(&ast, source, file, library)
+}
+
+/// `ZYNTAX_TRACE_LOWER_PHASES=1` times the frontend's steps on stderr.
+pub(crate) fn trace_phase(what: &str, since: std::time::Instant) {
+    if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
+        eprintln!(
+            "[ZYLUA] {what:<10} {:8.2} ms",
+            since.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 }
 
 pub(crate) fn intern(s: &str) -> InternedString {

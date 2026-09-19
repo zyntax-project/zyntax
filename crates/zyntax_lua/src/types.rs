@@ -180,6 +180,10 @@ impl<'a> Typer<'a> {
     }
 
     pub fn global_ty(&self, name: &str) -> Ty {
+        // An entry of the globals table can be anything.
+        if self.scopes.dynamic_globals {
+            return Ty::Any;
+        }
         if self.scopes.known_global_function(name).is_some() {
             return Ty::Any;
         }
@@ -283,7 +287,7 @@ impl<'a> Typer<'a> {
         let Some(Binding::Global(g)) = self.scopes.binding(token) else {
             return None;
         };
-        if g != "_G" || self.scopes.global_writes.contains_key("_G") {
+        if !Scopes::is_globals_name(g) || self.scopes.global_writes.contains_key(g) {
             return None;
         }
         match suffixes {

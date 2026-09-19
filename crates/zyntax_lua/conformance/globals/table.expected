@@ -1,0 +1,18 @@
+10	10	10
+20
+30	30
+table	true	Lua 5.4
+true	true	true
+3
+2	3	4
+40
+nil	nil
+dflt:undefined_global
+nil
+dflt:x
+20	true
+50
+true
+via table
+0
+nil	local

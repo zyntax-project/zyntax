@@ -288,6 +288,42 @@ pub const BUILTINS: &[Builtin] = &[
         params: &[Str, Str, Value, OptInt(i64::MAX)],
         ret: Ret::Multi,
     },
+    // ─── utf8 ───
+    Builtin {
+        lib: "utf8",
+        name: "char",
+        func: "zl_utf8_char",
+        params: &[Rest],
+        ret: Ret::Str,
+    },
+    Builtin {
+        lib: "utf8",
+        name: "len",
+        func: "zl_utf8_len",
+        params: &[Str, OptInt(1), OptInt(-1), Any],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "utf8",
+        name: "offset",
+        func: "zl_utf8_offset",
+        params: &[Str, Int, Any],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "utf8",
+        name: "codepoint",
+        func: "zl_utf8_codepoint",
+        params: &[Str, OptInt(1), Any, Any],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "utf8",
+        name: "codes",
+        func: "zl_utf8_codes",
+        params: &[Str, Any],
+        ret: Ret::Multi,
+    },
     // ─── math ───
     Builtin {
         lib: "math",
@@ -581,16 +617,24 @@ pub const CONSTANTS: &[(&str, &str, Constant)] = &[
     ("math", "huge", Constant::Float(f64::INFINITY)),
     ("math", "maxinteger", Constant::Int(i64::MAX)),
     ("math", "mininteger", Constant::Int(i64::MIN)),
+    // "[\0-\x7F\xC2-\xFD][\x80-\xBF]*"
+    (
+        "utf8",
+        "charpattern",
+        Constant::Bytes("5b002d7fc22dfd5d5b802dbf5d2a"),
+    ),
 ];
 
 #[derive(Clone, Copy, Debug)]
 pub enum Constant {
     Int(i64),
     Float(f64),
+    /// A string, spelled in hex since it need not be UTF-8.
+    Bytes(&'static str),
 }
 
 /// The libraries with a table of their own.
-pub const LIBS: &[&str] = &["string", "math", "table", "os", "io", "coroutine"];
+pub const LIBS: &[&str] = &["string", "math", "table", "os", "io", "coroutine", "utf8"];
 
 /// The name of a builtin's value wrapper.
 pub fn wrapper_name(b: &Builtin) -> String {
@@ -877,7 +921,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![ret(call(
             "zl_next_of",
             vec![
-                call("zl_as_table", vec![a0.e(), text("next")], table.clone()),
+                call(
+                    "zl_as_table",
+                    vec![a0.e(), bad_arg(1, "next")],
+                    table.clone(),
+                ),
                 a1.e(),
             ],
             any(),
@@ -2092,6 +2140,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             let value = match c {
                 Constant::Int(v) => box_i64(int(*v)),
                 Constant::Float(v) => box_f64(float(*v)),
+                Constant::Bytes(hex) => box_str(call("zl_bytes", vec![text(hex)], string())),
             };
             st.push(expr(call(
                 "zl_rawset_str",
@@ -2178,6 +2227,49 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ret(cached()),
             ],
         ));
+    }
+    // The globals table, for a program that reaches its globals through
+    // `_G`: every base function, every library's table, `_G` itself,
+    // `_VERSION` and `arg`. The program's own globals are set into it
+    // as it runs.
+    d.push(global_var(GLOBALS, table.clone()));
+    {
+        let mut st = vec![tb.decl(call("zl_table_new", vec![], table.clone()))];
+        for b in BUILTINS.iter().filter(|b| b.lib.is_empty()) {
+            st.push(expr(call(
+                "zl_rawset_str",
+                vec![
+                    tb.e(),
+                    text(b.name),
+                    func_value(&wrapper_name(b), VARIADIC_ARITY),
+                ],
+                unit(),
+            )));
+        }
+        for lib in LIBS {
+            st.push(expr(call(
+                "zl_rawset_str",
+                vec![tb.e(), text(lib), call(&lib_table_fn(lib), vec![], any())],
+                unit(),
+            )));
+        }
+        st.push(expr(call(
+            "zl_rawset_str",
+            vec![tb.e(), text("_G"), box_table(tb.e())],
+            unit(),
+        )));
+        st.push(expr(call(
+            "zl_rawset_str",
+            vec![tb.e(), text("_VERSION"), box_str(text("Lua 5.4"))],
+            unit(),
+        )));
+        st.push(expr(call(
+            "zl_rawset_str",
+            vec![tb.e(), text("arg"), call("zl_arg_table", vec![], any())],
+            unit(),
+        )));
+        st.push(ret(tb.e()));
+        d.push(define("zl_globals_table", &[], table.clone(), st));
     }
     // A member of the string library, for `s:method()` on a string.
     d.push(define(

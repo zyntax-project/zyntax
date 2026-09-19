@@ -13,6 +13,7 @@ pub mod coroutines;
 pub mod patterns;
 pub mod stdlib;
 pub mod tables;
+pub mod utf8;
 pub mod values;
 
 use zyntax_builtins::build::*;
@@ -430,6 +431,9 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
 /// here; every function that may raise leaves with a placeholder once
 /// it sees the value set, until a `pcall` takes it.
 pub const PENDING: &str = "zl_pending";
+/// The globals table, set before the chunk runs when the program
+/// reaches its globals through one.
+pub const GLOBALS: &str = "zl_G";
 /// The line of the statement running, for the position a message
 /// carries; zero outside any.
 pub const LINE: &str = "zl_line";
@@ -639,6 +643,7 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     lib.declarations.extend(calls::declarations(&t));
     lib.declarations.extend(coroutines::declarations(&t));
     lib.declarations.extend(patterns::declarations(&t));
+    lib.declarations.extend(utf8::declarations(&t));
     lib.declarations.extend(stdlib::declarations(policy, &t));
     lib.fallible = fallible_functions(&lib.declarations);
     (lib, t)

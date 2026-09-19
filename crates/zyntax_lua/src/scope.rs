@@ -113,7 +113,19 @@ pub struct Scopes {
     pub globals_initialized: HashSet<String>,
     /// Globals mentioned so far, in textual order, for the above.
     mentioned: HashSet<String>,
+    /// Whether `_G` or `_ENV` is used as a value anywhere: then the
+    /// globals live in a real table and every global is dynamic.
+    pub dynamic_globals: bool,
+    /// Whether the chunk's outermost block is lowered as several
+    /// functions run in sequence, so no one function is as long as a
+    /// whole test file: every outermost local is then a module
+    /// variable, reachable from any segment.
+    pub split_chunk: bool,
 }
+
+/// Outermost statements per chunk segment, and the count past which a
+/// chunk is split at all.
+pub const SEGMENT_STATEMENTS: usize = 150;
 
 impl Scopes {
     pub fn var(&self, id: VarId) -> &VarInfo {
@@ -133,10 +145,20 @@ impl Scopes {
     }
 
     /// The function a global name is, when it is declared once by a
-    /// top-level `function name()` and assigned nowhere else.
+    /// top-level `function name()` and assigned nowhere else, and no
+    /// global can be reached through the globals table.
     pub fn known_global_function(&self, name: &str) -> Option<FuncId> {
+        if self.dynamic_globals {
+            return None;
+        }
         let f = *self.global_functions.get(name)?;
         (self.global_writes.get(name).copied().unwrap_or(0) == 1).then_some(f)
+    }
+
+    /// Whether a name is the globals table: `_G` or `_ENV`, neither
+    /// shadowed by a local.
+    pub fn is_globals_name(name: &str) -> bool {
+        name == "_G" || name == "_ENV"
     }
 
     /// The function a local variable is, when `local function`
@@ -170,22 +192,15 @@ fn name_of(token: &TokenReference) -> String {
     }
 }
 
-/// The global `_G.name` or `_G["name"]` names, when `_G` is the global
-/// of that name and nothing shadows it.
+/// The global `_G.name` or `_G["name"]` names (`_ENV` as well), when
+/// `_G` is the global of that name and nothing shadows it.
 fn global_table_member(w: &Walker, v: &ast::VarExpression) -> Option<String> {
     let Prefix::Name(token) = v.prefix() else {
         return None;
     };
-    if name_of(token) != "_G" {
+    let g = name_of(token);
+    if !Scopes::is_globals_name(&g) || w.shadowed(&g) {
         return None;
-    }
-    // A local named `_G` is an ordinary variable.
-    for frame in w.frames.iter().rev() {
-        for block in frame.blocks.iter().rev() {
-            if block.contains_key("_G") {
-                return None;
-            }
-        }
     }
     let suffixes: Vec<&Suffix> = v.suffixes().collect();
     match suffixes.as_slice() {
@@ -259,6 +274,16 @@ pub fn resolve(ast: &ast::Ast) -> Scopes {
     for var in self_captures {
         w.out.vars[var.0 as usize].self_captured = true;
     }
+    // A long chunk runs as segments; its outermost locals are module
+    // variables, as a captured one already is.
+    if ast.nodes().stmts().count() > SEGMENT_STATEMENTS {
+        w.out.split_chunk = true;
+        for v in &mut w.out.vars {
+            if v.outermost && v.func == CHUNK {
+                v.captured = true;
+            }
+        }
+    }
     w.out
 }
 
@@ -316,6 +341,8 @@ impl Walker {
                 }
             }
         }
+        // `_ENV` not declared as a local is the globals table.
+        let name = if name == "_ENV" { "_G" } else { name };
         self.out.globals.insert(name.to_string());
         Binding::Global(name.to_string())
     }
@@ -329,11 +356,25 @@ impl Walker {
     fn use_name(&mut self, token: &TokenReference, as_callee: bool) -> Binding {
         let binding = self.lookup(&name_of(token));
         self.use_global(&binding);
+        // The globals table reached as a value: every global is then
+        // an entry of a real table.
+        if let Binding::Global(name) = &binding
+            && Scopes::is_globals_name(name)
+        {
+            self.out.dynamic_globals = true;
+        }
         self.out.names.insert(pos_of(token), binding.clone());
         if !as_callee {
             self.value_uses.push(binding.clone());
         }
         binding
+    }
+
+    /// Whether a local of this name is in scope.
+    fn shadowed(&self, name: &str) -> bool {
+        self.frames
+            .iter()
+            .any(|frame| frame.blocks.iter().any(|block| block.contains_key(name)))
     }
 
     fn assign_name(&mut self, token: &TokenReference) {
@@ -393,7 +434,14 @@ impl Walker {
                     match target {
                         Var::Name(token) => self.assign_name(token),
                         Var::Expression(v) => match global_table_member(self, v) {
-                            Some(name) => self.global_write(name),
+                            Some(name) => {
+                                if let Prefix::Name(token) = v.prefix() {
+                                    self.out
+                                        .names
+                                        .insert(pos_of(token), Binding::Global("_G".to_string()));
+                                }
+                                self.global_write(name);
+                            }
                             None => self.var_expression(v),
                         },
                         _ => {}
@@ -579,7 +627,13 @@ impl Walker {
 
     fn var_expression(&mut self, v: &ast::VarExpression) {
         if let Some(name) = global_table_member(self, v) {
-            // `_G.name` is the global `name`.
+            // `_G.name` is the global `name`; the table's own name is
+            // bound without being a value.
+            if let Prefix::Name(token) = v.prefix() {
+                self.out
+                    .names
+                    .insert(pos_of(token), Binding::Global("_G".to_string()));
+            }
             self.out.mentioned.insert(name.clone());
             self.out.globals.insert(name);
             return;
@@ -593,6 +647,33 @@ impl Walker {
     fn call(&mut self, c: &ast::FunctionCall) {
         let suffixes: Vec<&Suffix> = c.suffixes().collect();
         let callee_first = matches!(suffixes.first(), Some(Suffix::Call(_)));
+        // `rawget(_G, "name")` and `rawset(_G, "name", v)` name the
+        // global; `_G` there is not the table as a value.
+        if let (Prefix::Name(callee), [Suffix::Call(ast::Call::AnonymousCall(args))]) =
+            (c.prefix(), suffixes.as_slice())
+            && let ast::FunctionArgs::Parentheses { arguments, .. } = args
+            && let name = name_of(callee)
+            && (name == "rawget" || name == "rawset")
+            && !self.shadowed(&name)
+            && let arguments = arguments.iter().collect::<Vec<&Expression>>()
+            && let Some(Expression::Var(Var::Name(g))) = arguments.first()
+            && Scopes::is_globals_name(&name_of(g))
+            && !self.shadowed(&name_of(g))
+            && let Some(member) = arguments.get(1).and_then(|e| literal_string(e))
+        {
+            self.use_name(callee, true);
+            let binding = self.lookup(&name_of(g));
+            self.out.names.insert(pos_of(g), binding);
+            self.out.mentioned.insert(member.clone());
+            self.out.globals.insert(member.clone());
+            if name == "rawset" {
+                self.global_write(member);
+            }
+            for a in arguments.iter().skip(1) {
+                self.expr(a);
+            }
+            return;
+        }
         self.prefix(c.prefix(), callee_first);
         for s in suffixes {
             self.suffix(s);

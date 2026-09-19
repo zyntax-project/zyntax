@@ -306,5 +306,7 @@ categories! {
     stdlib,
     errors,
     patterns,
+    globals,
+    utf8,
     official,
 }
