@@ -3463,6 +3463,16 @@ impl HirInterpreter {
         let mut scratch = Scratch::new();
         let marks = self.waiting_marks.len();
         let result = self.run_frame(module, cf, args, func_id, dest, &mut scratch);
+        if let Err(e) = &result
+            && trace_enabled()
+        {
+            let name = module
+                .functions
+                .get(&func_id)
+                .and_then(|f| f.name.resolve_global())
+                .unwrap_or_default();
+            eprintln!("[interp] {name} failed: {e}");
+        }
         // The frame is gone, whether it returned or left through a
         // resume point: no resume point is owed to it any more.
         while self.waiting_marks.len() > marks {

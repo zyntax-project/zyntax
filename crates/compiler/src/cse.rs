@@ -116,6 +116,11 @@ pub fn eliminate_with(func: &mut HirFunction, pure_fns: &HashSet<HirId>) -> CseS
         bin_defs: collect_bin_defs(func),
         int_consts: collect_int_consts(func),
     };
+    // The dominator tree is what makes a match sound: the canonical
+    // instruction must run before the one it replaces. Built from the
+    // edges as they are now, not as the last pass to rebuild them left
+    // them.
+    func.rebuild_cfg_edges();
     let dt = DominatorTree::new(func);
     let mut value_table: HashMap<VnKey, HirId> = HashMap::new();
     let mut substitutions: HashMap<HirId, HirId> = HashMap::new();
@@ -509,166 +514,40 @@ fn apply_substitutions(func: &mut HirFunction, substitutions: &HashMap<HirId, Hi
     if substitutions.is_empty() {
         return 0;
     }
+    // Each substituted id to the end of its chain, applied with the
+    // instructions' own operand walk, which knows every variant.
+    let map: indexmap::IndexMap<HirId, HirId> = substitutions
+        .keys()
+        .map(|id| (*id, canonical(*id, substitutions)))
+        .collect();
     let mut rewrites = 0;
-
-    let map = |id: &mut HirId| -> bool {
-        let new = canonical(*id, substitutions);
-        if new != *id {
-            *id = new;
-            true
-        } else {
-            false
-        }
-    };
-
     for block in func.blocks.values_mut() {
         for inst in &mut block.instructions {
-            rewrites += rewrite_inst_operands(inst, &map);
+            inst.for_each_operand(|id| {
+                if map.contains_key(&id) {
+                    rewrites += 1;
+                }
+            });
+            inst.replace_uses(&map);
         }
-        rewrites += rewrite_terminator_operands(&mut block.terminator, &map);
-        // Phi node incoming values are rewritten too — they're real
-        // operand uses.
+        block.terminator.for_each_operand(|id| {
+            if map.contains_key(&id) {
+                rewrites += 1;
+            }
+        });
+        block.terminator.replace_uses(&map);
+        // A phi's incoming values are uses too; the blocks they come
+        // from are not.
         for phi in &mut block.phis {
-            for (_, incoming) in &mut phi.incoming {
-                if map(incoming) {
+            for (value, _) in &mut phi.incoming {
+                if let Some(new) = map.get(value) {
+                    *value = *new;
                     rewrites += 1;
                 }
             }
         }
     }
-
     rewrites
-}
-
-fn rewrite_inst_operands(inst: &mut HirInstruction, map: &impl Fn(&mut HirId) -> bool) -> usize {
-    let mut n = 0;
-    macro_rules! m {
-        ($e:expr) => {
-            if map($e) {
-                n += 1;
-            }
-        };
-    }
-    macro_rules! m_vec {
-        ($vec:expr) => {
-            for x in $vec.iter_mut() {
-                m!(x);
-            }
-        };
-    }
-    match inst {
-        HirInstruction::Binary { left, right, .. } => {
-            m!(left);
-            m!(right);
-        }
-        HirInstruction::Unary { operand, .. } => m!(operand),
-        HirInstruction::Cast { operand, .. } => m!(operand),
-        HirInstruction::Load { ptr, .. } => m!(ptr),
-        // The vector family. Leaving these out let this pass delete an
-        // instruction and rewrite every use of it except the ones a
-        // vector op held, so a `vload` kept pointing at an id nothing
-        // defined any more.
-        HirInstruction::VectorSplat { scalar, .. } => m!(scalar),
-        HirInstruction::VectorExtractLane { vector, .. } => m!(vector),
-        HirInstruction::VectorInsertLane { vector, scalar, .. } => {
-            m!(vector);
-            m!(scalar);
-        }
-        HirInstruction::VectorHorizontalReduce { vector, .. } => m!(vector),
-        HirInstruction::VectorLoad { ptr, .. } => m!(ptr),
-        HirInstruction::VectorStore { value, ptr, .. } => {
-            m!(value);
-            m!(ptr);
-        }
-        HirInstruction::VectorUnaryOp { operand, .. } => m!(operand),
-        HirInstruction::VectorMinMax { left, right, .. } => {
-            m!(left);
-            m!(right);
-        }
-        HirInstruction::VectorDot { acc, a, b, .. } => {
-            m!(acc);
-            m!(a);
-            m!(b);
-        }
-        HirInstruction::Store { value, ptr, .. } => {
-            m!(value);
-            m!(ptr);
-        }
-        HirInstruction::GetElementPtr { ptr, indices, .. } => {
-            m!(ptr);
-            m_vec!(indices);
-        }
-        HirInstruction::Call { args, .. } => m_vec!(args),
-        HirInstruction::IndirectCall { func_ptr, args, .. } => {
-            m!(func_ptr);
-            m_vec!(args);
-        }
-        HirInstruction::Select {
-            condition,
-            true_val,
-            false_val,
-            ..
-        } => {
-            m!(condition);
-            m!(true_val);
-            m!(false_val);
-        }
-        HirInstruction::ExtractValue { aggregate, .. } => m!(aggregate),
-        HirInstruction::InsertValue {
-            aggregate, value, ..
-        } => {
-            m!(aggregate);
-            m!(value);
-        }
-        HirInstruction::Atomic { ptr, value, .. } => {
-            m!(ptr);
-            if let Some(v) = value {
-                m!(v);
-            }
-        }
-        HirInstruction::Alloca { count, .. } => {
-            if let Some(c) = count {
-                m!(c);
-            }
-        }
-        _ => {
-            // Other variants (CreateUnion, AsyncSaveSlot, etc.)
-            // aren't CSE-able and their operands rarely refer to
-            // CSE'd values; we still walk them for correctness
-            // since the substitution map may cross variant
-            // boundaries when later passes are added.
-        }
-    }
-    n
-}
-
-fn rewrite_terminator_operands(
-    term: &mut HirTerminator,
-    map: &impl Fn(&mut HirId) -> bool,
-) -> usize {
-    let mut n = 0;
-    let mut m = |id: &mut HirId| {
-        if map(id) {
-            n += 1;
-        }
-    };
-    match term {
-        HirTerminator::Return { values } => {
-            for v in values {
-                m(v);
-            }
-        }
-        HirTerminator::CondBranch { condition, .. } => m(condition),
-        HirTerminator::Switch { value, .. } => m(value),
-        HirTerminator::Invoke { args, .. } => {
-            for a in args {
-                m(a);
-            }
-        }
-        HirTerminator::PatternMatch { value, .. } => m(value),
-        HirTerminator::Branch { .. } | HirTerminator::Unreachable => {}
-    }
-    n
 }
 
 /// Drop any instruction whose `result` was substituted away. Returns

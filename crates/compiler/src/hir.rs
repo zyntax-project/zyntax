@@ -2574,6 +2574,32 @@ impl HirModule {
 }
 
 impl HirFunction {
+    /// Set every block's successor and predecessor lists from the
+    /// terminators, which are the edges that run. The lists are not
+    /// kept up to date by every pass, and an analysis reading them
+    /// (dominators, loops) reads them as they are. Predecessors come
+    /// in block order, so they are the same on every run.
+    pub fn rebuild_cfg_edges(&mut self) {
+        let mut preds: std::collections::HashMap<HirId, Vec<HirId>> =
+            std::collections::HashMap::new();
+        let succs: Vec<(HirId, Vec<HirId>)> = self
+            .blocks
+            .iter()
+            .map(|(id, b)| (*id, b.terminator.targets()))
+            .collect();
+        for (from, to) in &succs {
+            for t in to {
+                preds.entry(*t).or_default().push(*from);
+            }
+        }
+        for (id, to) in succs {
+            if let Some(b) = self.blocks.get_mut(&id) {
+                b.successors = to;
+                b.predecessors = preds.remove(&id).unwrap_or_default();
+            }
+        }
+    }
+
     pub fn new(name: InternedString, signature: HirFunctionSignature) -> Self {
         let entry_block_id = HirId::new();
         let mut blocks = IndexMap::new();

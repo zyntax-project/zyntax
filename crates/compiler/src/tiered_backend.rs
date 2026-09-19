@@ -2485,12 +2485,29 @@ impl TieredBackend {
                     let f = scratch.module.functions.get_mut(func_id)?;
                     f.attributes.optimized = false;
                     f.attributes.deferred = false;
+                    // `ZYNTAX_DUMP_HIR_DIR` gets the body before and after
+                    // its own optimisation, as `fn-<name>-lowered.hir` and
+                    // `fn-<name>-body.hir`.
+                    let name = f.name.resolve_global().unwrap_or_default();
+                    if std::env::var_os("ZYNTAX_DUMP_HIR_DIR").is_some() {
+                        let lowered = f.clone();
+                        crate::hir_dump::dump_function_to_dir(
+                            &lowered,
+                            &scratch.module,
+                            &format!("{name}-lowered"),
+                        );
+                    }
                     crate::run_interp_safe_opts_cached(&mut scratch.module, &scratch.cache);
                     let f = scratch.module.functions.get_mut(func_id)?;
                     f.attributes.optimized = true;
                     f.attributes.deferred = true;
                     let mut body = f.clone();
                     body.attributes.deferred = false;
+                    crate::hir_dump::dump_function_to_dir(
+                        &body,
+                        &scratch.module,
+                        &format!("{name}-body"),
+                    );
                     Arc::new(body)
                 };
                 // Another thread may have made it meanwhile; the first
