@@ -275,6 +275,10 @@ struct Lowerer<'m, 'a> {
     /// block declaring it, innermost last. Leaving a block closes its
     /// variables in reverse order.
     tbc: Vec<(usize, VarId)>,
+    /// Whether this function counts itself in the call depth: every
+    /// program function does, so that recursion without end is an
+    /// error to catch; a chunk does not.
+    counts_depth: bool,
     /// How many blocks are open, the function's body counting as one.
     depth: usize,
     /// The depth of each enclosing loop's body.
@@ -742,6 +746,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             line_needed: false,
             entry_line: false,
             tbc: Vec::new(),
+            counts_depth: false,
             depth: 0,
             loop_depths: Vec::new(),
         }
@@ -978,6 +983,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     fn placeholder_return_plain(&mut self, span: Span) -> St {
+        let leave = self.placeholder_value(span);
+        if self.counts_depth {
+            let statements = vec![depth_step(-1, span), leave];
+            return stmt(TypedStatement::Block(TypedBlock { statements, span }), span);
+        }
+        leave
+    }
+
+    fn placeholder_value(&mut self, span: Span) -> St {
         let value = match self.returns.clone() {
             Returns::Fixed(types) if types.is_empty() => None,
             Returns::Fixed(types) if types.len() == 1 => {
@@ -1023,6 +1037,40 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let leave = self.placeholder_return(span);
         let restore = self.set_line(span);
         if_(cond, vec![leave], Some(vec![restore]), span)
+    }
+
+    /// `zl_depth += 1; if zl_depth > limit { raise; leave }`: one more
+    /// frame, refused past what the reference allows.
+    fn stack_check(&mut self, span: Span) -> St {
+        let i64_t = prim(PrimitiveType::I64);
+        let depth = var(intern(library::DEPTH), i64_t, span);
+        let over = binary(
+            BinaryOp::Gt,
+            depth,
+            int_lit(library::MAX_DEPTH, span),
+            prim(PrimitiveType::Bool),
+            span,
+        );
+        self.raised = true;
+        let leave = self.placeholder_return(span);
+        let statements = vec![
+            depth_step(1, span),
+            if_(
+                over,
+                vec![
+                    expr_stmt(call(
+                        "zl_stack_overflow",
+                        vec![],
+                        prim(PrimitiveType::Unit),
+                        span,
+                    )),
+                    leave,
+                ],
+                None,
+                span,
+            ),
+        ];
+        stmt(TypedStatement::Block(TypedBlock { statements, span }), span)
     }
 
     /// `zl_line = <the line of span>`.
@@ -3050,7 +3098,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     fn return_stmt(&mut self, exprs: &[&Expression], span: Span, out: &mut Vec<St>) -> Result<()> {
         self.return_values(exprs, span, out)?;
-        if self.tbc.is_empty() {
+        if self.tbc.is_empty() && !self.counts_depth {
             return Ok(());
         }
         // The values are computed before anything is closed.
@@ -3068,6 +3116,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             var(name, ty, span)
         });
         self.closes_from(1, None, span, out);
+        if self.counts_depth {
+            out.push(depth_step(-1, span));
+        }
         out.push(ret(value, span));
         Ok(())
     }
@@ -4018,10 +4069,14 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             params.push(parameter(name, self.m.anys(), span));
             child.varargs = Some(name);
         }
+        // The function counts itself on the stack, so an unbounded
+        // recursion is an error to catch; every return uncounts it.
+        child.counts_depth = true;
         let body_statements = child.block(body.block())?;
         if child.entry_line {
             statements.push(entry_line_save(span));
         }
+        statements.push(child.stack_check(span));
         statements.extend(body_statements);
         // Falling off the end returns nothing.
         if types::falls_through(body.block()) {
@@ -4161,6 +4216,17 @@ const RETURNED: &str = "lua$returned";
 
 /// The line a function was entered at: the caller's, for `error(v, 2)`.
 const ENTRY_LINE: &str = "$entry_line";
+
+/// `zl_depth += by`.
+fn depth_step(by: i64, span: Span) -> St {
+    let i64_t = prim(PrimitiveType::I64);
+    let depth = var(intern(library::DEPTH), i64_t.clone(), span);
+    assign(
+        depth.clone(),
+        binary(BinaryOp::Add, depth, int_lit(by, span), i64_t, span),
+        span,
+    )
+}
 
 fn entry_line_save(span: Span) -> St {
     let i64_t = prim(PrimitiveType::I64);

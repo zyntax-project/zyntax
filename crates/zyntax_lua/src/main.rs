@@ -10,7 +10,7 @@ use zyntax_embed::{TieredConfig, TieredRuntime};
 
 /// The stack the program runs on: Lua recursion is bounded by its own
 /// limit, not the main thread's.
-const STACK_BYTES: usize = 512 << 20;
+const STACK_BYTES: usize = 1 << 30;
 
 fn main() -> ExitCode {
     let run = std::thread::Builder::new()

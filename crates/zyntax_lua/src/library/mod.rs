@@ -436,6 +436,12 @@ pub const PENDING: &str = "zl_pending";
 /// chunk's number in the bits above `LINE_BITS`, 0 for the main chunk
 /// and `k` for the `k`th entry here.
 pub const CHUNKS: &str = "zl_chunks";
+/// How many program functions are on the stack; past `MAX_DEPTH` a
+/// call is a stack overflow, as the reference's stack limit makes it.
+/// A coroutine counts on from where it was resumed.
+pub const DEPTH: &str = "zl_depth";
+#[allow(dead_code)]
+pub const MAX_DEPTH: i64 = 200_000;
 pub const LINE_BITS: i64 = 32;
 /// The globals table, set before the chunk runs when the program
 /// reaches its globals through one.
@@ -498,7 +504,15 @@ fn raising(t: &Types) -> Vec<Decl> {
         global_var(LINE, i64()),
         global_var(CHUNK, string()),
         global_var(CHUNKS, any()),
+        global_var(DEPTH, i64()),
     ];
+    // Entered below the floor: the error every deeper call would raise.
+    d.push(define_cold(
+        "zl_stack_overflow",
+        &[],
+        unit(),
+        vec![lua_error(text("stack overflow")), ret_void()],
+    ));
     // The name of the chunk a stored line belongs to.
     let found = local("found", any());
     d.push(define(

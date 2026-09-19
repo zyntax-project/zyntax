@@ -8662,6 +8662,16 @@ impl SsaBuilder {
                     _ => {}
                 }
             }
+            // A condition or a returned value takes addresses too.
+            match &typed_block.terminator {
+                crate::typed_cfg::TypedTerminator::CondBranch { condition, .. } => {
+                    self.collect_address_taken_vars_from_expr(condition);
+                }
+                crate::typed_cfg::TypedTerminator::Return(Some(value)) => {
+                    self.collect_address_taken_vars_from_expr(value);
+                }
+                _ => {}
+            }
         }
 
         log::debug!(
@@ -8709,6 +8719,9 @@ impl SsaBuilder {
             }
             TypedExpression::Dereference(inner) => {
                 self.collect_address_taken_vars_from_expr(inner);
+            }
+            TypedExpression::Cast(cast) => {
+                self.collect_address_taken_vars_from_expr(&cast.expr);
             }
             TypedExpression::If(if_expr) => {
                 self.collect_address_taken_vars_from_expr(&if_expr.condition);

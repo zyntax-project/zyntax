@@ -38,7 +38,9 @@ pub const CURRENT: &str = "zl_co_current";
 
 /// The stack a coroutine runs on. Committed by the page as it is
 /// touched, so a large reservation costs little.
-const STACK_BYTES: i64 = 1 << 20;
+/// Reserved, not touched: the depth limit reaches this only through
+/// frames far larger than compiled code makes.
+const STACK_BYTES: i64 = 64 << 20;
 
 pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let anys = t.anys();
@@ -50,6 +52,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let args = kept("args", anys.clone());
     let out = borrowed("out", anys.clone());
     let step = local("step", i64());
+    let depth = local("depth", i64());
     let status = local("status", i64());
     let handle = local("handle", i64());
     let env = borrowed("env", anys.clone());
@@ -279,11 +282,15 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![at(rec.e(), int(HANDLE))],
                 i64(),
             )),
+            // The resumer's depth again afterwards: frames the fiber
+            // keeps while suspended are not on this stack.
+            depth.decl(read_global(DEPTH, i64())),
             step.decl(call(
                 "zl_fiber_resume_with",
                 vec![handle.e(), at(rec.e(), int(SLOT))],
                 i64(),
             )),
+            set_global(DEPTH, depth.e()),
             set_current(prev.e()),
             when(
                 not(is_nil(prev.e())),
@@ -354,11 +361,13 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 is_nil(current()),
                 vec![lua_error(text("attempt to yield from outside a coroutine"))],
             ),
+            depth.decl(read_global(DEPTH, i64())),
             expr(call(
                 "zl_fiber_yield",
                 vec![call("zl_pack", vec![args.e()], any())],
                 unit(),
             )),
+            set_global(DEPTH, depth.e()),
             ret(call("zl_fiber_take_input", vec![], any())),
         ],
     ));
