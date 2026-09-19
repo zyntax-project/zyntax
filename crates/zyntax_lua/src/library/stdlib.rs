@@ -19,6 +19,9 @@ pub enum Param {
     Any,
     /// Any value, including nil, but one must be passed.
     Value,
+    /// A value the implementation checks itself; when absent, the
+    /// error says what was expected and that nothing was passed.
+    Expected(&'static str),
     /// An integer: a number with an integral value, or a numeral.
     Int,
     /// A float: any number or numeral.
@@ -88,7 +91,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "",
         name: "tonumber",
         func: "zl_tonumber_of",
-        params: &[Any, Any],
+        params: &[Value, Any],
         ret: Ret::Any,
     },
     Builtin {
@@ -116,21 +119,21 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "",
         name: "select",
         func: "zl_select",
-        params: &[Any, Rest],
+        params: &[Expected("number"), Rest],
         ret: Ret::Multi,
     },
     Builtin {
         lib: "",
         name: "rawget",
         func: "zl_rawget",
-        params: &[Table, Any],
+        params: &[Table, Value],
         ret: Ret::Any,
     },
     Builtin {
         lib: "",
         name: "rawset",
         func: "zl_rawset_of",
-        params: &[Table, Any, Any],
+        params: &[Table, Value, Value],
         ret: Ret::Table,
     },
     Builtin {
@@ -144,7 +147,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "",
         name: "rawlen",
         func: "zl_rawlen",
-        params: &[Any],
+        params: &[Expected("table or string")],
         ret: Ret::Int,
     },
     Builtin {
@@ -165,7 +168,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "",
         name: "assert",
         func: "zl_assert",
-        params: &[Rest],
+        params: &[Value, Rest],
         ret: Ret::Multi,
     },
     Builtin {
@@ -179,14 +182,14 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "",
         name: "pcall",
         func: "zl_pcall",
-        params: &[Any, Rest],
+        params: &[Value, Rest],
         ret: Ret::Multi,
     },
     Builtin {
         lib: "",
         name: "xpcall",
         func: "zl_xpcall",
-        params: &[Any, Any, Rest],
+        params: &[Any, Expected("function"), Rest],
         ret: Ret::Multi,
     },
     Builtin {
@@ -292,7 +295,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "",
         name: "load",
         func: "zl_load",
-        params: &[Value, Any, Any, Any],
+        params: &[Expected("function"), Any, Any, Any],
         ret: Ret::Multi,
     },
     Builtin {
@@ -554,14 +557,14 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "math",
         name: "tointeger",
         func: "zl_math_tointeger",
-        params: &[Any],
+        params: &[Value],
         ret: Ret::Any,
     },
     Builtin {
         lib: "math",
         name: "type",
         func: "zl_math_type",
-        params: &[Any],
+        params: &[Value],
         ret: Ret::Any,
     },
     Builtin {
@@ -662,15 +665,15 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         lib: "coroutine",
         name: "create",
-        func: "zl_co_create",
-        params: &[Any],
+        func: "zl_co_create_of",
+        params: &[Expected("function")],
         ret: Ret::Any,
     },
     Builtin {
         lib: "coroutine",
         name: "resume",
         func: "zl_co_resume",
-        params: &[Any, Rest],
+        params: &[Expected("thread"), Rest],
         ret: Ret::Multi,
     },
     Builtin {
@@ -684,14 +687,14 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "coroutine",
         name: "status",
         func: "zl_co_status",
-        params: &[Any],
+        params: &[Expected("thread")],
         ret: Ret::Str,
     },
     Builtin {
         lib: "coroutine",
         name: "wrap",
         func: "zl_co_wrap",
-        params: &[Any],
+        params: &[Expected("function")],
         ret: Ret::Any,
     },
     Builtin {
@@ -699,7 +702,7 @@ pub const BUILTINS: &[Builtin] = &[
         name: "running",
         func: "zl_co_running",
         params: &[],
-        ret: Ret::Any,
+        ret: Ret::Multi,
     },
     Builtin {
         lib: "coroutine",
@@ -712,7 +715,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "coroutine",
         name: "close",
         func: "zl_co_close",
-        params: &[Any],
+        params: &[Expected("thread")],
         ret: Ret::Any,
     },
 ];
@@ -929,6 +932,21 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ret(nil()),
         ],
     ));
+    let kind = kept("kind", string());
+    d.push(define_cold(
+        "zl_arg_expected_missing",
+        &[&what, &kind],
+        any(),
+        vec![
+            lua_error(concat(vec![
+                what.e(),
+                text(" ("),
+                kind.e(),
+                text(" expected, got no value)"),
+            ])),
+            ret(nil()),
+        ],
+    ));
     d.push(define_cold(
         "zl_arg_int_missing",
         &[&what],
@@ -1006,10 +1024,18 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 is_nil(y.e()),
                 vec![ret(call("zl_tonumber", vec![x.e()], any()))],
             ),
+            when(
+                or(is_nil(x.e()), ne(category(x.e()), int(STR))),
+                vec![lua_error(concat(vec![
+                    text("bad argument #1 to 'tonumber' (string expected, got "),
+                    type_name(x.e()),
+                    text(")"),
+                ]))],
+            ),
             ret(call(
                 "zl_tonumber_base",
                 vec![
-                    call("zl_arg_str", vec![x.e(), bad_arg(1, "tonumber")], string()),
+                    get_str(x.e()),
                     call("zl_arg_int", vec![y.e(), bad_arg(2, "tonumber")], i64()),
                 ],
                 any(),
@@ -1126,22 +1152,14 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         "zl_ipairs",
         &[&x],
         any(),
-        vec![
-            when(
-                is_nil(x.e()),
-                vec![lua_error(text(
-                    "bad argument #1 to 'ipairs' (table expected, got nil)",
-                ))],
-            ),
-            ret(call(
-                "zb_box_tuple",
-                vec![list(
-                    vec![func_value("zl_ipairs_code", 2), x.e(), box_i64(int(0))],
-                    anys.clone(),
-                )],
-                any(),
-            )),
-        ],
+        vec![ret(call(
+            "zb_box_tuple",
+            vec![list(
+                vec![func_value("zl_ipairs_code", 2), x.e(), box_i64(int(0))],
+                anys.clone(),
+            )],
+            any(),
+        ))],
     ));
     d.push(define(
         "zl_select",
@@ -1199,7 +1217,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 and(not(is_nil(x.e())), eq(category(x.e()), int(STR))),
                 vec![ret(call("zb_str_len", vec![get_str(x.e())], i64()))],
             ),
-            lua_error(text("table or string expected")),
+            lua_error(concat(vec![
+                text("bad argument #1 to 'rawlen' (table or string expected, got "),
+                type_name(x.e()),
+                text(")"),
+            ])),
             ret(int(0)),
         ],
     ));
@@ -1207,21 +1229,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     // no position added.
     d.push(define(
         "zl_assert",
-        &[&args],
+        &[&x, &args],
         any(),
         vec![
             when(
-                not(call(
-                    "zl_truthy",
-                    vec![call("zl_value_at", vec![args.e(), int(1)], any())],
-                    boolean(),
-                )),
+                not(call("zl_truthy", vec![x.e()], boolean())),
                 vec![
                     if_(
-                        ge(len(args.e()), int(2)),
+                        ge(len(args.e()), int(1)),
                         vec![expr(call(
                             "zl_raise_value",
-                            vec![at(args.e(), int(1))],
+                            vec![at(args.e(), int(0))],
                             unit(),
                         ))],
                         vec![expr(call(
@@ -1237,6 +1255,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     ret(nil()),
                 ],
             ),
+            expr(mcall(args.e(), "insert_at", vec![int(0), x.e()], unit())),
             ret(call("zl_pack", vec![args.e()], any())),
         ],
     ));
@@ -1277,6 +1296,14 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         &[&x, &handler, &args],
         any(),
         vec![
+            when(
+                not(is_func(handler.e())),
+                vec![lua_error(concat(vec![
+                    text("bad argument #2 to 'xpcall' (function expected, got "),
+                    type_name(handler.e()),
+                    text(")"),
+                ]))],
+            ),
             set_global(LINE, int(0)),
             y.decl(call("zl_call_packed", vec![x.e(), args.e()], any())),
             when(
@@ -1460,18 +1487,19 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             while_(
                 lt(i.e(), len(args.e())),
                 vec![
-                    acc.set(add(
-                        acc.e(),
-                        call(
-                            "zl_from_byte",
-                            vec![call(
-                                "zl_arg_int",
-                                vec![at(args.e(), i.e()), bad_arg_at(i.e(), "char")],
-                                i64(),
-                            )],
-                            string(),
-                        ),
+                    n.decl(call(
+                        "zl_arg_int",
+                        vec![at(args.e(), i.e()), bad_arg_at(i.e(), "char")],
+                        i64(),
                     )),
+                    when(
+                        or(lt(n.e(), int(0)), gt(n.e(), int(255))),
+                        vec![lua_error(add(
+                            bad_arg_at(i.e(), "char"),
+                            text(" (value out of range)"),
+                        ))],
+                    ),
+                    acc.set(add(acc.e(), call("zl_from_byte", vec![n.e()], string()))),
                     i.add_assign(int(1)),
                 ],
             ),
@@ -1689,29 +1717,19 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             &[&args],
             any(),
             vec![
+                // The values are compared as `<` compares them, whatever
+                // they are; one alone is the answer.
                 when(
                     eq(len(args.e()), int(0)),
                     vec![lua_error(text(&format!(
-                        "bad argument #1 to '{what}' (number expected, got no value)"
+                        "bad argument #1 to '{what}' (value expected)"
                     )))],
                 ),
-                best.decl(call("zl_arith_operand", vec![at(args.e(), int(0))], any())),
-                when(
-                    is_nil(best.e()),
-                    vec![lua_error(text(&format!(
-                        "bad argument #1 to '{what}' (number expected)"
-                    )))],
-                ),
+                best.decl(at(args.e(), int(0))),
                 i.decl(int(1)),
                 while_(
                     lt(i.e(), len(args.e())),
                     vec![
-                        when(
-                            is_nil(call("zl_arith_operand", vec![at(args.e(), i.e())], any())),
-                            vec![lua_error(text(&format!(
-                                "bad argument to '{what}' (number expected)"
-                            )))],
-                        ),
                         when(better, vec![best.set(at(args.e(), i.e()))]),
                         i.add_assign(int(1)),
                     ],
@@ -2186,16 +2204,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         // A required argument not passed at all.
         for (idx, p) in b.params.iter().enumerate() {
             let expected = match p {
-                Param::Int | Param::Float => " (number expected, got no value)",
-                Param::Str => " (string expected, got no value)",
-                Param::Table => " (table expected, got no value)",
-                Param::Value => " (value expected)",
+                Param::Int | Param::Float => " (number expected, got no value)".to_string(),
+                Param::Str => " (string expected, got no value)".to_string(),
+                Param::Table => " (table expected, got no value)".to_string(),
+                Param::Value => " (value expected)".to_string(),
+                Param::Expected(kind) => format!(" ({kind} expected, got no value)"),
                 _ => continue,
             };
             st.push(when(
                 lt(len(args.e()), int(idx as i64 + 1)),
                 vec![
-                    lua_error(add(bad_arg(idx + 1, &qualified), text(expected))),
+                    lua_error(add(bad_arg(idx + 1, &qualified), text(&expected))),
                     ret(nil()),
                 ],
             ));
@@ -2205,7 +2224,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             let arg = call("zl_value_at", vec![args.e(), int(idx as i64 + 1)], any());
             let what = bad_arg(idx + 1, &qualified);
             call_args.push(match p {
-                Param::Any | Param::Value => arg,
+                Param::Any | Param::Value | Param::Expected(_) => arg,
                 Param::Int => call("zl_arg_int", vec![arg, what], i64()),
                 Param::Float => call("zl_arg_float", vec![arg, what], f64()),
                 Param::Str => call("zl_arg_str", vec![arg, what], string()),
@@ -2557,13 +2576,25 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![
             s.decl(text("")),
             if_(
-                eq(category(chunk.e()), int(STR)),
-                vec![s.set(get_str(chunk.e()))],
+                and(
+                    not(is_nil(chunk.e())),
+                    or(
+                        eq(category(chunk.e()), int(STR)),
+                        or(
+                            eq(category(chunk.e()), int(INT)),
+                            or(
+                                eq(category(chunk.e()), int(UINT)),
+                                eq(category(chunk.e()), int(FLOAT)),
+                            ),
+                        ),
+                    ),
+                ),
+                vec![s.set(call("zl_arg_str", vec![chunk.e(), text("")], string()))],
                 vec![
                     when(
                         not(is_func(chunk.e())),
                         vec![lua_error(concat(vec![
-                            text("bad argument #1 to 'load' (string expected, got "),
+                            text("bad argument #1 to 'load' (function expected, got "),
                             type_name(chunk.e()),
                             text(")"),
                         ]))],

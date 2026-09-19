@@ -999,26 +999,58 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     when(and(ge(i.e(), int(1)), le(i.e(), n.e())), vec![ret(i.e())]),
                 ],
             ),
-            when(is_nil(hash_field(tb.e())), vec![ret(int(-1))]),
-            h.decl(hash_of(tb.e())),
-            i.decl(int(0)),
-            count.decl(call("zb_dict_len", vec![h.e()], i64())),
-            while_(
-                lt(i.e(), count.e()),
+            when(
+                not(is_nil(hash_field(tb.e()))),
                 vec![
-                    when(
-                        call(
-                            "zb_any_eq",
-                            vec![at(h.e(), add(mul(i.e(), int(2)), int(1))), k.e()],
-                            boolean(),
-                        ),
-                        vec![ret(add(add(n.e(), i.e()), int(1)))],
+                    h.decl(hash_of(tb.e())),
+                    i.decl(int(0)),
+                    count.decl(call("zb_dict_len", vec![h.e()], i64())),
+                    while_(
+                        lt(i.e(), count.e()),
+                        vec![
+                            when(
+                                call(
+                                    "zb_any_eq",
+                                    vec![at(h.e(), add(mul(i.e(), int(2)), int(1))), k.e()],
+                                    boolean(),
+                                ),
+                                vec![ret(add(add(n.e(), i.e()), int(1)))],
+                            ),
+                            i.add_assign(int(1)),
+                        ],
                     ),
-                    i.add_assign(int(1)),
                 ],
+            ),
+            // An index past the array part was an element removed
+            // during the traversal, which shortened the part: the
+            // traversal goes on from its end.
+            when(
+                and(is_int_cat(&cat), ge(get_i64(k.e()), int(1))),
+                vec![ret(n.e())],
             ),
             lua_error(text("invalid key to 'next'")),
             ret(int(-1)),
+        ],
+    ));
+    // The position after `pos` when the array part held `seen` elements
+    // at the last step: elements removed since moved what follows.
+    let seen = local("seen", i64());
+    d.push(define(
+        "zl_next_pos_from",
+        &[&tb, &pos, &seen],
+        i64(),
+        vec![
+            n.decl(len(arr_of(tb.e()))),
+            i.decl(pos.e()),
+            when(
+                lt(n.e(), seen.e()),
+                vec![if_(
+                    ge(i.e(), seen.e()),
+                    vec![i.set(sub(i.e(), sub(seen.e(), n.e())))],
+                    vec![when(gt(i.e(), n.e()), vec![i.set(n.e())])],
+                )],
+            ),
+            ret(call("zl_next_pos", vec![tb.e(), i.e()], i64())),
         ],
     ));
     // `next(t, k)`: the key and value after `k`, as two values, or

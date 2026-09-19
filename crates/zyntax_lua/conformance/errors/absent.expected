@@ -1,0 +1,38 @@
+absent.lua:3: bad argument #1 to 'tonumber' (value expected)
+absent.lua:4: bad argument #1 to 'tonumber' (string expected, got number)
+absent.lua:5: bad argument #1 to 'select' (number expected, got no value)
+absent.lua:6: bad argument #1 to 'rawlen' (table or string expected, got no value)
+absent.lua:7: bad argument #1 to 'assert' (value expected)
+absent.lua:8: bad argument #1 to 'pcall' (value expected)
+absent.lua:9: bad argument #2 to 'xpcall' (function expected, got no value)
+absent.lua:10: bad argument #2 to 'xpcall' (function expected, got number)
+absent.lua:11: bad argument #3 to 'rawset' (value expected)
+absent.lua:12: bad argument #2 to 'rawget' (value expected)
+absent.lua:13: bad argument #1 to 'max' (value expected)
+absent.lua:14: bad argument #1 to 'tointeger' (value expected)
+absent.lua:15: bad argument #1 to 'type' (value expected)
+absent.lua:16: bad argument #1 to 'char' (value out of range)
+absent.lua:17: bad argument #2 to 'char' (value out of range)
+absent.lua:18: bad argument #1 to 'create' (function expected, got no value)
+absent.lua:19: bad argument #1 to 'resume' (thread expected, got no value)
+absent.lua:20: bad argument #1 to 'wrap' (function expected, got number)
+absent.lua:21: bad argument #1 to 'status' (thread expected, got nil)
+absent.lua:22: bad argument #1 to 'close' (thread expected, got no value)
+absent.lua:23: attempt to call a number value (metamethod 'add')
+absent.lua:24: attempt to call a table value (metamethod 'lt')
+absent.lua:25: attempt to call a number value (metamethod 'len')
+absent.lua:26: attempt to call a number value (local 'a')
+absent.lua:27: attempt to add a 'string' with a 'number'
+absent.lua:28: attempt to perform bitwise operation on a string value (constant '3')
+absent.lua:29: attempt to perform bitwise operation on a string value (constant '3')
+absent.lua:30: number (local 'a') has no integer representation
+1	1	b
+5
+3	true
+thread	true	running
+false	cannot resume non-suspended coroutine
+false	cannot close a running coroutine
+normal	false	cannot close a normal coroutine
+thread	false
+nil	true
+true	2.5

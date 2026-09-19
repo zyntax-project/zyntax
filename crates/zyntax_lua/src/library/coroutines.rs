@@ -35,6 +35,8 @@ const STEP_DONE: i64 = 1;
 /// The coroutine running now, or nil: what `coroutine.running` and
 /// `coroutine.isyieldable` answer, and what a nested resume restores.
 pub const CURRENT: &str = "zl_co_current";
+/// The main thread as a coroutine value, once something asks for it.
+const MAIN: &str = "zl_co_main_thread";
 
 /// The stack a coroutine runs on. Committed by the page as it is
 /// touched, so a large reservation costs little.
@@ -127,12 +129,6 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let record_of = |co: Expr| call("zb_unbox_list_raw_any", vec![co], anys.clone());
     let status_of = |rec: Expr| call("zb_box_get_i64", vec![at(rec, int(STATUS))], i64());
     let set_status = |rec: Expr, s: i64| set_idx(rec, int(STATUS), box_i64(int(s)));
-    let is_func = |x: Expr| {
-        and(
-            ne(x.clone(), nil()),
-            eq(tag_of(x), int(zyntax_builtins::FUNC_TAG)),
-        )
-    };
     let code_of = |name: &str| {
         node(
             zyntax_typed_ast::typed_ast::TypedExpression::Variable(intern(name)),
@@ -186,16 +182,20 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         SPAN,
     ));
 
-    // `coroutine.create(f)`.
+    // `coroutine.create(f)`; `what` names the function checking, for
+    // `wrap` shares it.
+    let what = kept("what", string());
     d.push(define(
         "zl_co_create",
-        &[&f],
+        &[&f, &what],
         any(),
         vec![
             when(
                 not(is_func(f.e())),
                 vec![lua_error(concat(vec![
-                    text("bad argument #1 to 'create' (function expected, got "),
+                    text("bad argument #1 to '"),
+                    what.e(),
+                    text("' (function expected, got "),
                     type_name(f.e()),
                     text(")"),
                 ]))],
@@ -221,15 +221,54 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ret(co.e()),
         ],
     ));
+    d.push(define(
+        "zl_co_create_of",
+        &[&f],
+        any(),
+        vec![ret(call(
+            "zl_co_create",
+            vec![f.e(), text("create")],
+            any(),
+        ))],
+    ));
     let coroutine_expected = |what: &str| {
         lua_error(concat(vec![
             text(&format!(
-                "bad argument #1 to '{what}' (coroutine expected, got "
+                "bad argument #1 to '{what}' (thread expected, got "
             )),
             type_name(co.e()),
             text(")"),
         ]))
     };
+    // The main thread as a value, made when first asked for: a record
+    // with no fiber, running, or normal while a coroutine runs.
+    d.push(global_var(MAIN, any()));
+    let main_thread = || read_global(MAIN, any());
+    d.push(define(
+        "zl_co_main",
+        &[],
+        any(),
+        vec![
+            when(
+                is_nil(main_thread()),
+                vec![set_global(
+                    MAIN,
+                    call(
+                        "zb_box_list_raw_any",
+                        vec![
+                            list(
+                                vec![box_i64(int(0)), box_i64(int(RUNNING)), nil(), nil()],
+                                anys.clone(),
+                            ),
+                            int32(thread_tag() as i32),
+                        ],
+                        any(),
+                    ),
+                )],
+            ),
+            ret(main_thread()),
+        ],
+    ));
     // `coroutine.resume(co, ...)`: true and the yielded or returned
     // values, or false and a message.
     d.push(define(
@@ -270,9 +309,13 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             set_idx(rec.e(), int(SLOT), call("zl_pack", vec![args.e()], any())),
             prev.decl(current()),
-            when(
+            if_(
                 not(is_nil(prev.e())),
                 vec![set_status(record_of(prev.e()), NORMAL)],
+                vec![when(
+                    not(is_nil(main_thread())),
+                    vec![set_status(record_of(main_thread()), NORMAL)],
+                )],
             ),
             set_status(rec.e(), RUNNING),
             set_current(co.e()),
@@ -292,9 +335,13 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             )),
             set_global(DEPTH, depth.e()),
             set_current(prev.e()),
-            when(
+            if_(
                 not(is_nil(prev.e())),
                 vec![set_status(record_of(prev.e()), RUNNING)],
+                vec![when(
+                    not(is_nil(main_thread())),
+                    vec![set_status(record_of(main_thread()), RUNNING)],
+                )],
             ),
             out.decl(list(vec![box_bool(bool(true))], anys.clone())),
             when(
@@ -384,7 +431,31 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ret(text("dead")),
         ],
     ));
-    d.push(define("zl_co_running", &[], any(), vec![ret(current())]));
+    // `coroutine.running()`: the running coroutine and whether it is
+    // the main one.
+    d.push(define(
+        "zl_co_running",
+        &[],
+        any(),
+        vec![
+            when(
+                is_nil(current()),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(
+                        vec![call("zl_co_main", vec![], any()), box_bool(bool(true))],
+                        anys.clone(),
+                    )],
+                    any(),
+                ))],
+            ),
+            ret(call(
+                "zb_box_tuple",
+                vec![list(vec![current(), box_bool(bool(false))], anys.clone())],
+                any(),
+            )),
+        ],
+    ));
     d.push(define(
         "zl_co_isyieldable",
         &[],
@@ -401,8 +472,12 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             rec.decl(record_of(co.e())),
             status.decl(status_of(rec.e())),
             when(
-                or(eq(status.e(), int(RUNNING)), eq(status.e(), int(NORMAL))),
+                eq(status.e(), int(RUNNING)),
                 vec![lua_error(text("cannot close a running coroutine"))],
+            ),
+            when(
+                eq(status.e(), int(NORMAL)),
+                vec![lua_error(text("cannot close a normal coroutine"))],
             ),
             when(
                 eq(status.e(), int(SUSPENDED)),
@@ -459,7 +534,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         &[&f],
         any(),
         vec![
-            co.decl(call("zl_co_create", vec![f.e()], any())),
+            co.decl(call("zl_co_create", vec![f.e(), text("wrap")], any())),
             ret(call(
                 "zb_func_new",
                 vec![

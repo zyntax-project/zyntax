@@ -153,7 +153,20 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                                 any(),
                             )),
                             when(
-                                ne(category(r.e()), int(STR)),
+                                and(
+                                    not(is_nil(r.e())),
+                                    or(
+                                        eq(category(r.e()), int(INT)),
+                                        or(
+                                            eq(category(r.e()), int(UINT)),
+                                            eq(category(r.e()), int(FLOAT)),
+                                        ),
+                                    ),
+                                ),
+                                vec![ret(call("zl_number_str", vec![r.e()], string()))],
+                            ),
+                            when(
+                                or(is_nil(r.e()), ne(category(r.e()), int(STR))),
                                 vec![lua_error(text("'__tostring' must return a string"))],
                             ),
                             ret(get_str(r.e())),

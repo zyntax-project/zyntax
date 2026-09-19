@@ -3061,10 +3061,23 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             }
         }
         let ret_ir = crate::library::stdlib::ret_type(b.ret, &self.m.types);
-        // An argument's conversion can raise as well as the function.
-        let converts = lowered.iter().any(|a| self.call_can_raise(a));
+        // An argument's conversion can raise as well as the function;
+        // it is checked before the call, which might otherwise take the
+        // error as its own (`pcall`), each argument bound in order.
+        if lowered.iter().any(|a| self.call_can_raise(a)) {
+            for a in lowered.iter_mut() {
+                let raises = self.call_can_raise(a);
+                let name = self.temp();
+                let ty = a.ty.clone();
+                let node = std::mem::replace(a, var(name, ty.clone(), span));
+                pre.push(let_(name, ty, node, span));
+                if raises {
+                    pre.push(self.pending_check(span));
+                }
+            }
+        }
         let value = call(b.func, lowered, ret_ir, span);
-        let raises = converts || self.call_can_raise(&value);
+        let raises = self.call_can_raise(&value);
         let ty = match b.ret {
             Ret::Unit => Ty::Nil,
             Ret::Multi => Ty::Any,
@@ -3095,6 +3108,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Param::Value => match v {
                 Some(v) => self.boxed(v),
                 None => call("zl_arg_value_missing", vec![what], Type::Any, span),
+            },
+            Param::Expected(kind) => match v {
+                Some(v) => self.boxed(v),
+                None => call(
+                    "zl_arg_expected_missing",
+                    vec![what, str_lit(kind, span)],
+                    Type::Any,
+                    span,
+                ),
             },
             Param::Int => match v {
                 Some(v) if v.ty == Ty::Int => v.node,
@@ -4082,6 +4104,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let table_t = self.ir(Ty::Table);
         let tname = self.temp();
         let pos = self.temp();
+        // The array part's length at the last step: a body that
+        // removes elements can shorten it, moving the positions after.
+        let seen = self.temp();
         let t = if t.ty == Ty::Table {
             t.node
         } else {
@@ -4110,6 +4135,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             ),
             span,
         ));
+        let array_len = |table_t: &Type| {
+            call(
+                "zl_len",
+                vec![var(tname, table_t.clone(), span)],
+                prim(PrimitiveType::I64),
+                span,
+            )
+        };
+        out.push(let_(seen, i64_t.clone(), array_len(&table_t), span));
         let mut body = Vec::new();
         if let Some(k) = names.first() {
             let key = call(
@@ -4154,12 +4188,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             body.push(self.declare_var(*v, n, span));
         }
         let inner = self.loop_body(block)?;
-        let advance = assign(
+        let step = assign(
             var(pos, i64_t.clone(), span),
             call(
-                "zl_next_pos",
+                "zl_next_pos_from",
                 vec![
-                    var(tname, table_t, span),
+                    var(tname, table_t.clone(), span),
                     binary(
                         BinaryOp::Add,
                         var(pos, i64_t.clone(), span),
@@ -4167,10 +4201,19 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         i64_t.clone(),
                         span,
                     ),
+                    var(seen, i64_t.clone(), span),
                 ],
                 i64_t.clone(),
                 span,
             ),
+            span,
+        );
+        let remember = assign(var(seen, i64_t.clone(), span), array_len(&table_t), span);
+        let advance = stmt(
+            TypedStatement::Block(TypedBlock {
+                statements: vec![step, remember],
+                span,
+            }),
             span,
         );
         let cond = binary(
