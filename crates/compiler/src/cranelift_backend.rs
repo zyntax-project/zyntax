@@ -910,6 +910,21 @@ impl CraneliftBackend {
             }
         }
 
+        // A lazy function whose address a table or a vtable holds is
+        // referenced by data the finalisation resolves against its own
+        // symbol, so that symbol is defined as the stub now; the rest
+        // wait for a compile to ask for one.
+        let held: Vec<HirId> = self
+            .lazy_functions
+            .iter()
+            .filter(|id| self.address_taken.contains(*id) && module.functions.contains_key(*id))
+            .copied()
+            .collect();
+        for id in held {
+            if !self.stubbed.contains(&id) && !self.compiled_functions.contains_key(&id) {
+                self.compile_lazy_stub_in_place(id)?;
+            }
+        }
         self.emit_wanted_stubs()?;
         // Finalize the module
         let _ = self.module.finalize_definitions();
@@ -1565,6 +1580,19 @@ impl CraneliftBackend {
     }
 
     fn compile_lazy_stub(&mut self, id: HirId) -> CompilerResult<()> {
+        self.compile_lazy_stub_as(id, false)
+    }
+
+    /// The stub as the function's own definition: data that holds the
+    /// function's address (a dispatch table, a vtable) is resolved
+    /// against its symbol when the module is finalised, so the symbol
+    /// has to have code. The body compiled later is the function's
+    /// next generation, as a hot reload's is.
+    fn compile_lazy_stub_in_place(&mut self, id: HirId) -> CompilerResult<()> {
+        self.compile_lazy_stub_as(id, true)
+    }
+
+    fn compile_lazy_stub_as(&mut self, id: HirId, in_place: bool) -> CompilerResult<()> {
         let Some(&declared) = self.function_map.get(&id) else {
             return Err(CompilerError::Backend(format!(
                 "lazy stub for an undeclared function {id:?}"
@@ -1574,10 +1602,13 @@ impl CraneliftBackend {
         let sig = decl.signature.clone();
         let base_name = decl.name.clone().unwrap_or_else(|| format!("{id:?}"));
         self.stubbed.insert(id);
-        let stub_id = self
-            .module
-            .declare_function(&format!("{base_name}__{id:?}__lazy"), Linkage::Local, &sig)
-            .map_err(|e| CompilerError::Backend(format!("Failed to declare lazy stub: {e}")))?;
+        let stub_id = if in_place {
+            declared
+        } else {
+            self.module
+                .declare_function(&format!("{base_name}__{id:?}__lazy"), Linkage::Local, &sig)
+                .map_err(|e| CompilerError::Backend(format!("Failed to declare lazy stub: {e}")))?
+        };
         let bead_id = self
             .bead_ids
             .get(&id)
@@ -1610,7 +1641,7 @@ impl CraneliftBackend {
         let bead_v = builder.ins().iconst(types::I64, bead_id as i64);
         let compiled = builder.ins().call(compile_ref, &[bead_v]);
         let target = builder.inst_results(compiled)[0];
-        let sig_ref = builder.import_signature(sig);
+        let sig_ref = builder.import_signature(sig.clone());
         let call = builder.ins().call_indirect(sig_ref, target, &args);
         let results: Vec<cranelift_codegen::ir::Value> = builder.inst_results(call).to_vec();
         builder.ins().return_(&results);
@@ -1620,7 +1651,24 @@ impl CraneliftBackend {
             .define_function(stub_id, &mut self.codegen_context)
             .map_err(|e| CompilerError::Backend(format!("Failed to define lazy stub: {e}")))?;
         self.codegen_context.clear();
-        self.lazy_stubs.push((id, stub_id));
+        if in_place {
+            // Published like any compiled body: the cell and the pointer
+            // table get the stub at finalisation, the real body replaces
+            // it as a new generation.
+            self.compiled_functions.insert(
+                id,
+                CompiledFunction {
+                    function_id: stub_id,
+                    version: 1,
+                    code_ptr: std::ptr::null(),
+                    size: 0,
+                    signature: sig,
+                },
+            );
+            self.unpublished.push(id);
+        } else {
+            self.lazy_stubs.push((id, stub_id));
+        }
         Ok(())
     }
 
@@ -5673,9 +5721,21 @@ impl CraneliftBackend {
                                     // handler is used (unchanged behaviour).
                                     let ptr_ty = self.module.target_config().pointer_type();
 
-                                    let static_ref =
-                                        self.module.declare_func_in_func(func_id, builder.func);
-                                    let static_addr = builder.ins().func_addr(ptr_ty, static_ref);
+                                    // A handler op left for its call has no
+                                    // code to take the address of yet: its
+                                    // cell holds the stub, then the code.
+                                    let static_addr = if self.lazy_functions.contains(&hir_id) {
+                                        self.wanted_stubs.push(hir_id);
+                                        let cell =
+                                            crate::reload::call_cell_addr(self.reload_key, hir_id)
+                                                as i64;
+                                        let cell_v = builder.ins().iconst(ptr_ty, cell);
+                                        builder.ins().load(ptr_ty, MemFlags::trusted(), cell_v, 0)
+                                    } else {
+                                        let static_ref =
+                                            self.module.declare_func_in_func(func_id, builder.func);
+                                        builder.ins().func_addr(ptr_ty, static_ref)
+                                    };
 
                                     let mut arg_values: Vec<Value> = args
                                         .iter()
@@ -9406,12 +9466,21 @@ impl CraneliftBackend {
 
                 // Store function pointer - get the actual function address
                 if let Some(&cranelift_func_id) = self.function_map.get(function) {
-                    // Declare the function reference in the current function
-                    let local_func_ref = self
-                        .module
-                        .declare_func_in_func(cranelift_func_id, builder.func);
-                    // Get the function address as a pointer value
-                    let func_ptr = builder.ins().func_addr(ptr_ty, local_func_ref);
+                    // A body left for its call: its cell holds the stub,
+                    // then the code.
+                    let func_ptr = if self.lazy_functions.contains(function) {
+                        self.wanted_stubs.push(*function);
+                        let cell = crate::reload::call_cell_addr(self.reload_key, *function) as i64;
+                        let cell_v = builder.ins().iconst(ptr_ty, cell);
+                        builder.ins().load(ptr_ty, MemFlags::trusted(), cell_v, 0)
+                    } else {
+                        // Declare the function reference in the current function
+                        let local_func_ref = self
+                            .module
+                            .declare_func_in_func(cranelift_func_id, builder.func);
+                        // Get the function address as a pointer value
+                        builder.ins().func_addr(ptr_ty, local_func_ref)
+                    };
                     builder
                         .ins()
                         .store(MemFlags::new(), func_ptr, closure_ptr, 0);
