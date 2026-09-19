@@ -1974,6 +1974,28 @@ impl<'m> Lowerer<'m> {
             .zip(shape)
             .map(|(item, elem)| {
                 let elem = elem.settled();
+                // A box going into a slot that stores boxes keeps its
+                // identity: checked, not unboxed and boxed again.
+                if item.ty == Ty::Object && tuple_field_storage(elem) == Ty::Object {
+                    let check = match elem {
+                        Ty::List(e) => Some(list_fn("as_box", e)),
+                        Ty::Dict(_) => Some("zb_dict_as_box".to_string()),
+                        Ty::Set => Some("zb_set_as_box".to_string()),
+                        _ => None,
+                    };
+                    let Some(check) = check else {
+                        return item.node;
+                    };
+                    let checked = Val {
+                        node: call(&check, vec![item.node], Ty::Object, span),
+                        ty: Ty::Object,
+                    };
+                    return if self.guards {
+                        self.guard(checked, span).node
+                    } else {
+                        checked.node
+                    };
+                }
                 let as_elem = Val {
                     node: self.coerce(item, elem),
                     ty: elem,
@@ -4180,11 +4202,16 @@ impl<'m> Lowerer<'m> {
     /// A dict key as the lookup takes it: a string as itself, for the
     /// lookups that hash and compare a string without boxing it, and
     /// anything else as a dynamic value. The suffix names the lookup.
-    fn dict_key(&mut self, e: &py::Expr) -> Result<(Node, &'static str)> {
-        if self.ty_of(e) == Ty::Str {
-            Ok((self.expr_as(e, Ty::Str)?, "_str"))
-        } else {
-            Ok((self.expr_as(e, Ty::Object)?, ""))
+    /// A dict key and the suffix of the dict functions that take it as
+    /// it is: a string or a tuple of known shape goes unboxed.
+    fn dict_key(&mut self, e: &py::Expr) -> Result<(Node, String)> {
+        match self.ty_of(e) {
+            Ty::Str => Ok((self.expr_as(e, Ty::Str)?, "_str".to_string())),
+            Ty::Tuple(k) => {
+                let v = self.expr(e)?;
+                Ok((v.node, format!("_{}", types::tuple_suffix(k))))
+            }
+            _ => Ok((self.expr_as(e, Ty::Object)?, String::new())),
         }
     }
 
@@ -4608,6 +4635,21 @@ impl<'m> Lowerer<'m> {
             && suffix[1..].chars().all(|c| c.is_ascii_digit())
         {
             return self.module.fallible.contains(&format!("zb_list_{op}_any"));
+        }
+        // A set or dict probed by a shape hashes the fields as their
+        // boxes would be hashed, and raises where the boxed lookup does.
+        if let Some(suffix) = name.strip_prefix("zb_set_contains_")
+            && suffix.starts_with('t')
+            && suffix[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            return self.module.fallible.contains("zb_set_contains");
+        }
+        if let Some(rest) = name.strip_prefix("zb_dict_")
+            && let Some((op, suffix)) = rest.rsplit_once('_')
+            && suffix.starts_with('t')
+            && suffix[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            return self.module.fallible.contains(&format!("zb_dict_{op}"));
         }
         false
     }
@@ -5314,8 +5356,18 @@ impl<'m> Lowerer<'m> {
                         span,
                     )
                 } else if right.ty == Ty::Set {
-                    let item = self.coerce(left, Ty::Object);
-                    call("zb_set_contains", vec![right.node, item], Ty::Bool, span)
+                    // A tuple of known shape probes by its fields, no box.
+                    if let Ty::Tuple(k) = left.ty {
+                        call(
+                            &format!("zb_set_contains_{}", types::tuple_suffix(k)),
+                            vec![right.node, left.node],
+                            Ty::Bool,
+                            span,
+                        )
+                    } else {
+                        let item = self.coerce(left, Ty::Object);
+                        call("zb_set_contains", vec![right.node, item], Ty::Bool, span)
+                    }
                 } else if matches!(right.ty, Ty::Tuple(_)) {
                     // Through the list of the elements, of the one kind
                     // they all are when they are.
@@ -5325,11 +5377,10 @@ impl<'m> Lowerer<'m> {
                     let item = self.elem_arg(left, e);
                     call(&list_fn("contains", e), vec![items, item], Ty::Bool, span)
                 } else if matches!(right.ty, Ty::Dict(_)) {
-                    let by = if left.ty == Ty::Str { "_str" } else { "" };
-                    let item = if left.ty == Ty::Str {
-                        left.node
-                    } else {
-                        self.coerce(left, Ty::Object)
+                    let (item, by) = match left.ty {
+                        Ty::Str => (left.node, "_str".to_string()),
+                        Ty::Tuple(k) => (left.node, format!("_{}", types::tuple_suffix(k))),
+                        _ => (self.coerce(left, Ty::Object), String::new()),
                     };
                     call(
                         &format!("zb_dict_contains{by}"),

@@ -11258,6 +11258,81 @@ impl SsaBuilder {
         Ok(self.create_undef(HirType::Void))
     }
 
+    /// `xs.append_all(ys)`: every element of `ys` after those of `xs`,
+    /// as one copy of the bytes.
+    pub(crate) fn emit_list_append_all(
+        &mut self,
+        block: HirId,
+        receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        elem_ty: &Type,
+        other: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        use crate::hir::BinaryOp as B;
+        let elem = self.convert_type(elem_ty);
+        let mut cur = block;
+        let list = self.translate_operand(&mut cur, receiver)?;
+        let ys = self.translate_operand(&mut cur, other)?;
+        let len = self.list_len(cur, list);
+        let more = self.list_len(cur, ys);
+        let needed = self.emit_bin(cur, B::Add, &HirType::I64, len, more);
+        self.list_reserve(&mut cur, list, needed, &elem);
+        let data = self.list_data(cur, list, &elem);
+        let to = self.emit_elem_gep(cur, data, len, elem.clone());
+        let from = self.list_data(cur, ys, &elem);
+        let size = self.i64_const(hir_ty_size(&elem).max(1) as i64);
+        let bytes = self.emit_bin(cur, B::Mul, &HirType::I64, more, size);
+        self.emit_intrinsic(
+            cur,
+            crate::hir::Intrinsic::Memcpy,
+            vec![to, from, bytes],
+            &HirType::Void,
+        );
+        self.list_set_len(cur, list, needed);
+        self.settle(block, cur);
+        Ok(self.create_undef(HirType::Void))
+    }
+
+    /// `list.resize_filled(n, byte)`: `n` elements, every byte of the
+    /// ones past the old length set to `byte`.
+    pub(crate) fn emit_list_resize_filled(
+        &mut self,
+        block: HirId,
+        receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        elem_ty: &Type,
+        wanted: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        byte: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        use crate::hir::BinaryOp as B;
+        let elem = self.convert_type(elem_ty);
+        let mut cur = block;
+        let list = self.translate_operand(&mut cur, receiver)?;
+        let n = self.translate_operand(&mut cur, wanted)?;
+        let n = self.coerce_scalar_to(cur, n, &HirType::I64);
+        let byte = self.translate_operand(&mut cur, byte)?;
+        let byte = self.coerce_scalar_to(cur, byte, &HirType::U8);
+        let len = self.list_len(cur, list);
+        self.list_reserve(&mut cur, list, n, &elem);
+        // Fill what the new length uncovers; a shorter length fills
+        // nothing, the count being clamped at zero.
+        let data = self.list_data(cur, list, &elem);
+        let from = self.emit_elem_gep(cur, data, len, elem.clone());
+        let added = self.emit_bin(cur, B::Sub, &HirType::I64, n, len);
+        let zero = self.i64_const(0);
+        let grows = self.emit_bin(cur, B::Gt, &HirType::I64, added, zero);
+        let count = self.emit_select(cur, grows, added, zero, &HirType::I64);
+        let size = self.i64_const(hir_ty_size(&elem).max(1) as i64);
+        let bytes = self.emit_bin(cur, B::Mul, &HirType::I64, count, size);
+        self.emit_intrinsic(
+            cur,
+            crate::hir::Intrinsic::Memset,
+            vec![from, byte, bytes],
+            &HirType::Void,
+        );
+        self.list_set_len(cur, list, n);
+        self.settle(block, cur);
+        Ok(self.create_undef(HirType::Void))
+    }
+
     /// `list.truncate(n)`: keep the first `n` elements (`n <= len`).
     pub(crate) fn emit_list_truncate(
         &mut self,

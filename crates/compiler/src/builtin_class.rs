@@ -415,9 +415,10 @@ fn ssa_unary(
 }
 
 /// The growable list, `List<T>` or an array of no fixed size. Owns the
-/// operations that change a list's header: length, growth, insertion
-/// and removal. Element access is the index expression; searching,
-/// sorting and printing are written in the language over these.
+/// operations that change a list's header: length, growth, insertion,
+/// removal, and the two bulk moves (`append_all`, `resize_filled`).
+/// Element access is the index expression; searching, sorting and
+/// printing are written in the language over these.
 pub struct ListClass;
 
 impl BuiltinClass for ListClass {
@@ -489,6 +490,16 @@ impl BuiltinClass for ListClass {
             "truncate" => {
                 arity(1)?;
                 ssa.emit_list_truncate(block_id, receiver, &args[0])
+                    .map(Some)
+            }
+            "append_all" => {
+                arity(1)?;
+                ssa.emit_list_append_all(block_id, receiver, elem, &args[0])
+                    .map(Some)
+            }
+            "resize_filled" => {
+                arity(2)?;
+                ssa.emit_list_resize_filled(block_id, receiver, elem, &args[0], &args[1])
                     .map(Some)
             }
             _ => Ok(None),

@@ -1400,6 +1400,34 @@ pub fn dump_module(module: &HirModule) -> String {
 /// `stage` names the point in the pipeline — call it after optimisation
 /// as well as before, since the two differ and a question about what
 /// reached the backend is a question about the later one.
+/// Write one function's dump to `$ZYNTAX_DUMP_HIR_DIR/<stage>.hir` when
+/// that variable is set: what a tier compiled, which the module dumps
+/// do not show for a body optimised on its own.
+pub fn dump_function_to_dir(
+    func: &HirFunction,
+    module: &crate::hir::HirModule,
+    stage: &str,
+) -> bool {
+    let Ok(dir) = std::env::var("ZYNTAX_DUMP_HIR_DIR") else {
+        return false;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let safe: String = stage
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = std::path::Path::new(&dir).join(format!("fn-{safe}.hir"));
+    std::fs::write(&path, dump_function(func, module)).is_ok()
+}
+
 pub fn dump_module_to_dir(module: &crate::hir::HirModule, stage: &str) -> bool {
     let Ok(dir) = std::env::var("ZYNTAX_DUMP_HIR_DIR") else {
         return false;

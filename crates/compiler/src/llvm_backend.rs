@@ -1438,7 +1438,17 @@ impl<'ctx> LLVMBackend<'ctx> {
             (HirType::Array(_, _), Some(p @ HirType::Ptr(_))) => p.clone(),
             _ => phi.ty.clone(),
         };
-        let llvm_ty = self.translate_type(&chosen)?;
+        // An aggregate held by reference meets here as its address:
+        // its incomings are addresses (a parameter, a box read, a call
+        // result) or values spilled to one when the edge is filled in.
+        let llvm_ty = if crate::osr::is_held_by_reference(&chosen) {
+            self.context
+                .i8_type()
+                .ptr_type(AddressSpace::default())
+                .into()
+        } else {
+            self.translate_type(&chosen)?
+        };
 
         // Create the phi node
         let phi_value = self.builder.build_phi(llvm_ty, "phi")?;
@@ -3450,6 +3460,28 @@ impl<'ctx> LLVMBackend<'ctx> {
         match pred.get_terminator() {
             Some(t) => b.position_before(&t),
             None => b.position_at_end(pred),
+        }
+        // An aggregate value meeting a phi of addresses is spilled to a
+        // slot of the frame, whose address is what flows; an address
+        // meeting a phi of aggregate values is read through.
+        if want.is_pointer_type() && (v.is_struct_value() || v.is_array_value()) {
+            let slot = match self
+                .current_function
+                .and_then(|f| f.get_first_basic_block())
+                .and_then(|entry| entry.get_first_instruction())
+            {
+                Some(first) => {
+                    let eb = self.context.create_builder();
+                    eb.position_before(&first);
+                    eb.build_alloca(v.get_type(), "phi.spill")?
+                }
+                None => b.build_alloca(v.get_type(), "phi.spill")?,
+            };
+            b.build_store(slot, v)?;
+            return Ok(slot.into());
+        }
+        if (want.is_struct_type() || want.is_array_type()) && v.is_pointer_value() {
+            return Ok(b.build_load(want, v.into_pointer_value(), "phi.read")?);
         }
         let out = if want.is_float_type() {
             let target = want.into_float_type();

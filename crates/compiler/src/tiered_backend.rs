@@ -2835,6 +2835,14 @@ pub fn compile_at_tier(
             OptimizationTier::from_index(tier_idx)
         );
     }
+    crate::hir_dump::dump_function_to_dir(
+        func_arc,
+        module_arc,
+        &format!(
+            "{}-tier{tier_idx}",
+            func_arc.name.resolve_global().unwrap_or_default()
+        ),
+    );
 
     #[cfg(feature = "llvm-backend")]
     if tier_idx == 2 && matches!(tier2_backend, Tier2Backend::LLVM) {

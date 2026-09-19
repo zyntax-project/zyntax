@@ -334,9 +334,73 @@ impl Field {
         }
     }
 
-    /// The stored form of a dynamic value: a dict, set or list comes
-    /// back as a box of the checked kind, converted when the box held a
-    /// list of another kind.
+    /// The hash of a field value, as `zb_any_hash` hashes its boxed
+    /// form, so a shaped tuple lands where its boxed twin does.
+    fn hash(&self, x: Expr) -> Expr {
+        match self {
+            Field::Int => x,
+            Field::Bool => cast(x, i64()),
+            Field::Float => call("zb_hash_of_f64", vec![x], i64()),
+            Field::Str => call("zb_hash_of_str", vec![x], i64()),
+            Field::Tuple { suffix, .. } => call(&format!("zb_tuple_hash_{suffix}"), vec![x], i64()),
+            Field::Any | Field::Dict { .. } | Field::Set { .. } | Field::List { .. } => {
+                call("zb_any_hash", vec![x], i64())
+            }
+            Field::Instance { .. } => call("zb_any_hash", vec![self.boxed(x)], i64()),
+        }
+    }
+
+    /// Whether the box `stored` equals the field value `v`, as
+    /// `zb_any_eq` would find its boxed form equal: a box of the
+    /// field's own kind is read directly, anything else goes through
+    /// the dynamic comparison.
+    fn eq_boxed(&self, stored: Expr, v: Expr) -> Expr {
+        let tag = |x: Expr| cast(call("zb_box_tag", vec![x], i32()), i64());
+        let any_eq = |a: Expr, b: Expr| call("zb_any_eq", vec![a, b], boolean());
+        match self {
+            Field::Int => if_expr(
+                eq(tag(stored.clone()), int(crate::dynamic::I64_TAG)),
+                eq(
+                    call("zb_box_payload_i64", vec![stored.clone()], i64()),
+                    v.clone(),
+                ),
+                any_eq(stored, call("zb_box_i64", vec![v], any())),
+            ),
+            Field::Float => if_expr(
+                eq(tag(stored.clone()), int(crate::dynamic::F64_TAG)),
+                eq(
+                    call("zb_box_payload_f64", vec![stored.clone()], f64()),
+                    v.clone(),
+                ),
+                any_eq(stored, call("zb_box_f64", vec![v], any())),
+            ),
+            Field::Bool => any_eq(stored, call("zb_box_bool", vec![v], any())),
+            Field::Str => and(
+                eq(
+                    call("zb_any_category", vec![stored.clone()], i64()),
+                    int(crate::dynamic::STR),
+                ),
+                call(
+                    "zb_str_eq",
+                    vec![call("zb_box_get_str", vec![stored], string()), v],
+                    boolean(),
+                ),
+            ),
+            Field::Tuple { suffix, .. } => call(
+                &format!("zb_tuple_eq_boxed_{suffix}"),
+                vec![stored, v],
+                boolean(),
+            ),
+            Field::Any | Field::Dict { .. } | Field::Set { .. } | Field::List { .. } => {
+                any_eq(stored, v)
+            }
+            Field::Instance { .. } => any_eq(stored, self.boxed(v)),
+        }
+    }
+
+    /// The stored form of a dynamic value: a dict, set or list stays the
+    /// box it came in once checked, or a list of another kind is
+    /// converted and boxed anew.
     fn read(&self, x: Expr) -> Expr {
         match self {
             Field::Int => call("zb_any_as_i64", vec![x], i64()),
@@ -344,29 +408,13 @@ impl Field {
             Field::Bool => call("zb_any_as_bool", vec![x], boolean()),
             Field::Str => call("zb_any_as_str", vec![x], string()),
             Field::Any => x,
-            Field::Dict { ty } => call(
-                "zb_dict_box",
-                vec![call("zb_dict_unbox", vec![x], ty.clone())],
-                any(),
-            ),
-            Field::Set { ty } => call(
-                "zb_set_box",
-                vec![call("zb_set_unbox", vec![x], ty.clone())],
-                any(),
-            ),
+            Field::Dict { .. } => call("zb_dict_as_box", vec![x], any()),
+            Field::Set { .. } => call("zb_set_as_box", vec![x], any()),
             Field::Instance { ty, tag } => cast(
                 call("zb_hook_unbox_instance", vec![x, int32(*tag)], usize()),
                 ty.clone(),
             ),
-            Field::List { suffix, ty } => call(
-                &format!("zb_list_box_{suffix}"),
-                vec![call(
-                    &format!("zb_list_unbox_{suffix}"),
-                    vec![x],
-                    ty.clone(),
-                )],
-                any(),
-            ),
+            Field::List { suffix, .. } => call(&format!("zb_list_as_box_{suffix}"), vec![x], any()),
             Field::Tuple { suffix, ty } => {
                 call(&format!("zb_tuple_read_{suffix}"), vec![x], ty.clone())
             }
@@ -486,6 +534,68 @@ pub fn tuple_declarations(
             )),
             ret(tuple(read_fields, tuple_ty.clone())),
         ],
+    ));
+    // The hash its boxed form has, so a lookup by the value lands on
+    // the box: the dynamic tuple hash's recurrence over the fields.
+    let mut h = int(0x2545_F491_4F6C_DD1D);
+    for (i, f) in fields.iter().enumerate() {
+        h = add(mul(h, int(1_000_003)), f.hash(field(&a, i)));
+    }
+    d.push(define(
+        &format!("zb_tuple_hash_{suffix}"),
+        &[&a],
+        i64(),
+        vec![ret(h)],
+    ));
+    // Whether a box holds a tuple equal to the value: a tuple of the
+    // arity whose every element equals the field.
+    let mut same = vec![
+        when(
+            ne(
+                cast(call("zb_box_tag", vec![x.e()], i32()), i64()),
+                int(TUPLE_TAG),
+            ),
+            vec![ret(bool(false))],
+        ),
+        t.decl(call("zb_unbox_tuple", vec![x.e()], anys.clone())),
+        when(
+            ne(len(t.e()), int(fields.len() as i64)),
+            vec![ret(bool(false))],
+        ),
+    ];
+    for (i, f) in fields.iter().enumerate() {
+        same.push(when(
+            not(f.eq_boxed(idx(t.e(), int(i as i64), any()), field(&a, i))),
+            vec![ret(bool(false))],
+        ));
+    }
+    same.push(ret(bool(true)));
+    d.push(define(
+        &format!("zb_tuple_eq_boxed_{suffix}"),
+        &[&x, &a],
+        boolean(),
+        same,
+    ));
+    // `value in set` and the dict lookups by the value, no box made.
+    let hash_name = format!("zb_tuple_hash_{suffix}");
+    let eq_name = format!("zb_tuple_eq_boxed_{suffix}");
+    let box_name = format!("zb_tuple_box_{suffix}");
+    let repr_name = format!("zb_tuple_repr_{suffix}");
+    d.push(crate::dicts::set_contains_by(
+        &format!("zb_set_contains_{suffix}"),
+        list_type,
+        tuple_ty.clone(),
+        &|key| call(&hash_name, vec![key], i64()),
+        &|stored, key| call(&eq_name, vec![stored, key], boolean()),
+    ));
+    d.extend(crate::dicts::dict_ops_by(
+        list_type,
+        suffix,
+        tuple_ty.clone(),
+        &|key| call(&hash_name, vec![key], i64()),
+        &|stored, key| call(&eq_name, vec![stored, key], boolean()),
+        &|key| call(&box_name, vec![key], any()),
+        &|key| call(&repr_name, vec![key], string()),
     ));
     d
 }
@@ -843,17 +953,17 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         unit(),
         merge_sort(&xs, None, &name("copy"), &|a, b| (k.lt)(a, b)),
     ));
-    d.push(define(&name("extend"), &[&xs, &ys], unit(), {
-        let mut s = vec![n.decl(len(ys.e()))];
-        s.extend(for_range(
-            &i,
-            int(0),
-            n.e(),
-            vec![expr(mcall(xs.e(), "push", vec![el(&ys, i.e())], unit()))],
-        ));
-        s.push(ret_void());
-        s
-    }));
+    // One copy of the bytes: an element is the word or struct it is
+    // stored as, whichever kind.
+    d.push(define(
+        &name("extend"),
+        &[&xs, &ys],
+        unit(),
+        vec![
+            expr(mcall(xs.e(), "append_all", vec![ys.e()], unit())),
+            ret_void(),
+        ],
+    ));
     d.push(define(
         &name("copy"),
         &[&xs],
@@ -1664,6 +1774,28 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         k.list.clone(),
     )));
     d.push(define(&name("unbox"), &[&x], k.list.clone(), unbox));
+    // A box holding a list of this kind, from a dynamic value: the box
+    // itself when its tag is the kind's, else the checked conversion
+    // boxed anew.
+    d.push(define(
+        &name("as_box"),
+        &[&x],
+        any(),
+        vec![
+            when(
+                eq(
+                    cast(call("zb_box_tag", vec![x.e()], i32()), i64()),
+                    int(k.tag),
+                ),
+                vec![ret(x.e())],
+            ),
+            ret(call(
+                &name("box"),
+                vec![call(&name("unbox"), vec![x.e()], k.list.clone())],
+                any(),
+            )),
+        ],
+    ));
     d
 }
 

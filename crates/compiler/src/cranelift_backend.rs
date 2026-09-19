@@ -2407,6 +2407,8 @@ impl CraneliftBackend {
                             let extended = (*v as u32) as i64;
                             builder.ins().iconst(types::I32, extended)
                         }
+                        HirConstant::U8(v) => builder.ins().iconst(types::I8, *v as i64),
+                        HirConstant::U16(v) => builder.ins().iconst(types::I16, *v as i64),
                         HirConstant::U32(v) => builder.ins().iconst(types::I32, *v as i64),
                         HirConstant::I64(v) => builder.ins().iconst(types::I64, *v),
                         HirConstant::U64(v) => builder.ins().iconst(types::I64, *v as i64),

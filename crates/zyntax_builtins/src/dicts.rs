@@ -7,7 +7,7 @@
 
 use crate::build::*;
 use crate::{DICT_TAG, SET_TAG, TUPLE_TAG, list_of};
-use zyntax_typed_ast::TypeId;
+use zyntax_typed_ast::{Type, TypeId};
 
 fn any_eq(a: Expr, b: Expr) -> Expr {
     call("zb_any_eq", vec![a, b], boolean())
@@ -110,33 +110,41 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
 
     // The hash a key lands by: the value's hash with its bits spread,
     // since the table takes the low ones.
+    let hv = local("h", i64());
     out_decls.push(define(
-        "zb_dict_hash",
-        &[&k],
+        "zb_hash_mix",
+        &[&hv],
         i64(),
         vec![
-            h.decl(call("zb_any_hash", vec![k.e()], i64())),
-            h.set(bitxor(h.e(), shr(h.e(), int(32)))),
+            h.decl(bitxor(hv.e(), shr(hv.e(), int(32)))),
             h.set(mul(h.e(), int(-7_046_029_254_386_353_131))),
             h.set(bitxor(h.e(), shr(h.e(), int(29)))),
             ret(h.e()),
         ],
     ));
-    // An empty table of `cap` slots.
+    out_decls.push(define(
+        "zb_dict_hash",
+        &[&k],
+        i64(),
+        vec![ret(call(
+            "zb_hash_mix",
+            vec![call("zb_any_hash", vec![k.e()], i64())],
+            i64(),
+        ))],
+    ));
+    // An empty table of `cap` slots: every word -1, the empty mark.
     out_decls.push(define("zb_dict_index_new", &[&cap], ints.clone(), {
         let table = local("table", ints.clone());
-        let mut st = vec![
+        vec![
             table.decl(list(Vec::new(), ints.clone())),
-            expr(mcall(table.e(), "reserve", vec![cap.e()], unit())),
-        ];
-        st.extend(for_range(
-            &i,
-            int(0),
-            cap.e(),
-            vec![expr(mcall(table.e(), "push", vec![int(-1)], unit()))],
-        ));
-        st.push(ret(table.e()));
-        st
+            expr(mcall(
+                table.e(),
+                "resize_filled",
+                vec![cap.e(), int(0xFF)],
+                unit(),
+            )),
+            ret(table.e()),
+        ]
     }));
     // Record entry `e`, whose key hashes to `h`, in `index`, which has
     // room for it.
@@ -810,7 +818,246 @@ fn dict(list_type: TypeId) -> Vec<Decl> {
             ret(call("zb_unbox_list_raw_any", vec![x.e()], anys.clone())),
         ],
     ));
+    out_decls.push(define(
+        "zb_dict_as_box",
+        &[&x],
+        any(),
+        vec![
+            expr(call("zb_dict_unbox", vec![x.e()], anys.clone())),
+            ret(x.e()),
+        ],
+    ));
     out_decls
+}
+
+/// The dict operations keyed by a value of `key_ty` that is not a box:
+/// `zb_dict_{find,contains,get,get_default,set}_<suffix>`. `hash_of` is
+/// the key's hash as its boxed form hashes, `matches(stored, key)`
+/// compares a stored key box with it, `boxed(key)` is the box a stored
+/// key becomes, and `text(key)` names it in a KeyError.
+pub(crate) fn dict_ops_by(
+    list_type: TypeId,
+    suffix: &str,
+    key_ty: Type,
+    hash_of: &dyn Fn(Expr) -> Expr,
+    matches: &dyn Fn(Expr, Expr) -> Expr,
+    boxed: &dyn Fn(Expr) -> Expr,
+    text: &dyn Fn(Expr) -> Expr,
+) -> Vec<Decl> {
+    let anys = list_of(list_type, any());
+    let ints = list_of(list_type, i64());
+    let d = borrowed("d", anys.clone());
+    let key = borrowed("key", key_ty);
+    let v = kept("v", any());
+    let default = kept("default", any());
+    let n = local("n", i64());
+    let i = local("i", i64());
+    let index = local("index", ints.clone());
+    let mask = local("mask", i64());
+    let slot = local("slot", i64());
+    let entry = local("e", i64());
+    let h = local("h", i64());
+    let name = |op: &str| format!("zb_dict_{op}_{suffix}");
+    let mut out = Vec::new();
+    // The key's position, or -1, given its mixed hash; the table's
+    // slots hold entry numbers, keys sit at 2e + 1.
+    out.push(define(
+        &name("find_hashed"),
+        &[&d, &key, &h],
+        i64(),
+        vec![
+            index.decl(call(
+                "zb_unbox_list_raw_i64",
+                vec![at(d.e(), int(0))],
+                ints.clone(),
+            )),
+            mask.decl(sub(len(index.e()), int(1))),
+            slot.decl(bitand(h.e(), mask.e())),
+            i.decl(int(0)),
+            while_(
+                le(i.e(), mask.e()),
+                vec![
+                    entry.decl(idx(index.e(), slot.e(), i64())),
+                    when(lt(entry.e(), int(0)), vec![ret(int(-1))]),
+                    when(
+                        matches(at(d.e(), add(mul(entry.e(), int(2)), int(1))), key.e()),
+                        vec![ret(add(mul(entry.e(), int(2)), int(1)))],
+                    ),
+                    slot.set(bitand(add(slot.e(), int(1)), mask.e())),
+                    i.add_assign(int(1)),
+                ],
+            ),
+            ret(int(-1)),
+        ],
+    ));
+    let mixed = |k: Expr| call("zb_hash_mix", vec![hash_of(k)], i64());
+    out.push(define(
+        &name("find"),
+        &[&d, &key],
+        i64(),
+        vec![
+            when(
+                eq(at(d.e(), int(0)), null(any())),
+                vec![
+                    n.decl(len(d.e())),
+                    i.decl(int(1)),
+                    while_(
+                        lt(i.e(), n.e()),
+                        vec![
+                            when(matches(at(d.e(), i.e()), key.e()), vec![ret(i.e())]),
+                            i.add_assign(int(2)),
+                        ],
+                    ),
+                    ret(int(-1)),
+                ],
+            ),
+            ret(call(
+                &name("find_hashed"),
+                vec![d.e(), key.e(), mixed(key.e())],
+                i64(),
+            )),
+        ],
+    ));
+    let find = || call(&name("find"), vec![d.e(), key.e()], i64());
+    out.push(define(
+        &name("contains"),
+        &[&d, &key],
+        boolean(),
+        vec![ret(ge(find(), int(0)))],
+    ));
+    out.push(define(
+        &name("get"),
+        &[&d, &key],
+        any(),
+        vec![
+            i.decl(find()),
+            when(lt(i.e(), int(0)), vec![fatal("KeyError", text(key.e()))]),
+            ret(at(d.e(), add(i.e(), int(1)))),
+        ],
+    ));
+    out.push(define(
+        &name("get_default"),
+        &[&d, &key, &default],
+        any(),
+        vec![
+            i.decl(find()),
+            when(lt(i.e(), int(0)), vec![ret(default.e())]),
+            ret(at(d.e(), add(i.e(), int(1)))),
+        ],
+    ));
+    out.push(define(
+        &name("set"),
+        &[&d, &key, &v],
+        unit(),
+        vec![
+            when(
+                eq(at(d.e(), int(0)), null(any())),
+                vec![
+                    i.decl(find()),
+                    if_(
+                        lt(i.e(), int(0)),
+                        vec![expr(call(
+                            "zb_dict_insert",
+                            vec![d.e(), boxed(key.e()), v.e()],
+                            unit(),
+                        ))],
+                        vec![set_idx(d.e(), add(i.e(), int(1)), v.e())],
+                    ),
+                    ret_void(),
+                ],
+            ),
+            h.decl(mixed(key.e())),
+            i.decl(call(
+                &name("find_hashed"),
+                vec![d.e(), key.e(), h.e()],
+                i64(),
+            )),
+            if_(
+                lt(i.e(), int(0)),
+                vec![expr(call(
+                    "zb_dict_insert_hashed",
+                    vec![d.e(), boxed(key.e()), v.e(), h.e()],
+                    unit(),
+                ))],
+                vec![set_idx(d.e(), add(i.e(), int(1)), v.e())],
+            ),
+            ret_void(),
+        ],
+    ));
+    out
+}
+
+/// `name(s, key) -> bool`: whether a set holds a value matching `key`,
+/// a value of `key_ty` that is not a box. `hash_of` is the key's hash
+/// as [`zb_any_hash`] would hash its boxed form, so the probe lands on
+/// the same slot; `matches(stored, key)` compares a stored box with it.
+/// A set below its table size is scanned instead.
+pub(crate) fn set_contains_by(
+    name: &str,
+    list_type: TypeId,
+    key_ty: Type,
+    hash_of: &dyn Fn(Expr) -> Expr,
+    matches: &dyn Fn(Expr, Expr) -> Expr,
+) -> Decl {
+    let anys = list_of(list_type, any());
+    let ints = list_of(list_type, i64());
+    let s = borrowed("s", anys.clone());
+    let key = borrowed("key", key_ty);
+    let n = local("n", i64());
+    let i = local("i", i64());
+    let index = local("index", ints.clone());
+    let mask = local("mask", i64());
+    let slot = local("slot", i64());
+    let entry = local("e", i64());
+    let h = local("h", i64());
+    let mut scan = vec![n.decl(len(s.e()))];
+    scan.extend(for_range(
+        &i,
+        int(1),
+        n.e(),
+        vec![when(
+            matches(at(s.e(), i.e()), key.e()),
+            vec![ret(bool(true))],
+        )],
+    ));
+    scan.push(ret(bool(false)));
+    define(
+        name,
+        &[&s, &key],
+        boolean(),
+        vec![
+            when(eq(at(s.e(), int(0)), null(any())), scan),
+            index.decl(call(
+                "zb_unbox_list_raw_i64",
+                vec![at(s.e(), int(0))],
+                ints.clone(),
+            )),
+            mask.decl(sub(div(len(index.e()), int(2)), int(1))),
+            h.decl(call("zb_hash_mix", vec![hash_of(key.e())], i64())),
+            slot.decl(bitand(h.e(), mask.e())),
+            i.decl(int(0)),
+            while_(
+                le(i.e(), mask.e()),
+                vec![
+                    entry.decl(idx(index.e(), mul(slot.e(), int(2)), i64())),
+                    when(lt(entry.e(), int(0)), vec![ret(bool(false))]),
+                    when(
+                        and(
+                            eq(
+                                idx(index.e(), add(mul(slot.e(), int(2)), int(1)), i64()),
+                                h.e(),
+                            ),
+                            matches(at(s.e(), add(entry.e(), int(1))), key.e()),
+                        ),
+                        vec![ret(bool(true))],
+                    ),
+                    slot.set(bitand(add(slot.e(), int(1)), mask.e())),
+                    i.add_assign(int(1)),
+                ],
+            ),
+            ret(bool(false)),
+        ],
+    )
 }
 
 fn set(list_type: TypeId) -> Vec<Decl> {
@@ -880,29 +1127,20 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         ],
     ));
     d.push(define("zb_set_len", &[&s], i64(), vec![ret(count(s.e()))]));
-    // An empty table of `cap` slots.
+    // An empty table of `cap` slots: every word -1, which is the empty
+    // entry mark, and a hash no probe reads.
     d.push(define("zb_set_index_new", &[&cap], ints.clone(), {
         let table = local("table", ints.clone());
-        let mut st = vec![
+        vec![
             table.decl(list(Vec::new(), ints.clone())),
             expr(mcall(
                 table.e(),
-                "reserve",
-                vec![mul(cap.e(), int(2))],
+                "resize_filled",
+                vec![mul(cap.e(), int(2)), int(0xFF)],
                 unit(),
             )),
-        ];
-        st.extend(for_range(
-            &i,
-            int(0),
-            cap.e(),
-            vec![
-                expr(mcall(table.e(), "push", vec![int(-1)], unit())),
-                expr(mcall(table.e(), "push", vec![int(0)], unit())),
-            ],
-        ));
-        st.push(ret(table.e()));
-        st
+            ret(table.e()),
+        ]
     }));
     // Record entry `e`, whose hash is `h`, in `index`, which has room.
     d.push(define(
@@ -1074,6 +1312,80 @@ fn set(list_type: TypeId) -> Vec<Decl> {
             ret_void(),
         ],
     ));
+    // The hash of each value, by entry: read off the table when the set
+    // has one, else computed; a set past `SMALL` values always has one.
+    let hs = local("hs", ints.clone());
+    d.push(define("zb_set_entry_hashes", &[&s], ints.clone(), {
+        let from_values = for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![set_idx(hs.e(), i.e(), hash(value_at(s.e(), i.e())))],
+        );
+        let mut from_table = vec![index.decl(index_of(s.e())), cap.decl(slots_of(index.e()))];
+        from_table.extend(for_range(
+            &j,
+            int(0),
+            cap.e(),
+            vec![
+                entry.decl(entry_at(index.e(), j.e())),
+                when(
+                    ge(entry.e(), int(0)),
+                    vec![set_idx(hs.e(), entry.e(), hash_at(index.e(), j.e()))],
+                ),
+            ],
+        ));
+        vec![
+            n.decl(count(s.e())),
+            hs.decl(list(Vec::new(), ints.clone())),
+            expr(mcall(hs.e(), "resize_filled", vec![n.e(), int(0)], unit())),
+            if_(unindexed(s.e()), from_values, from_table),
+            ret(hs.e()),
+        ]
+    }));
+    // Whether `v`, whose hash is `h`, is in `s`: by the table when there
+    // is one, else by the short scan.
+    d.push(define(
+        "zb_set_has_hashed",
+        &[&s, &value, &h],
+        boolean(),
+        vec![
+            when(unindexed(s.e()), vec![ret(ge(find(s.e(), v.e()), int(0)))]),
+            ret(ge(
+                call("zb_set_find_hashed", vec![s.e(), v.e(), h.e()], i64()),
+                int(0),
+            )),
+        ],
+    ));
+    // A set built from distinct values whose hashes are known: the
+    // table, when the count asks for one, is filled from those hashes.
+    let out_hs = borrowed("out_hs", ints.clone());
+    d.push(define("zb_set_settle_hashed", &[&s, &out_hs], unit(), {
+        let mut place = vec![
+            cap.decl(int(FIRST_TABLE)),
+            while_(
+                lt(cap.e(), mul(n.e(), int(2))),
+                vec![cap.set(mul(cap.e(), int(2)))],
+            ),
+            index.decl(call("zb_set_index_new", vec![cap.e()], ints.clone())),
+        ];
+        place.extend(for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![expr(call(
+                "zb_set_place_hashed",
+                vec![index.e(), i.e(), idx(out_hs.e(), i.e(), i64())],
+                unit(),
+            ))],
+        ));
+        place.push(set_idx(s.e(), int(0), box_index(index.e())));
+        vec![
+            n.decl(count(s.e())),
+            when(gt(n.e(), int(SMALL)), place),
+            ret_void(),
+        ]
+    }));
     d.push(define(
         "zb_set_add",
         &[&s, &v],
@@ -1279,6 +1591,18 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         &[&s, &other],
         boolean(),
         vec![
+            // Two sets whose first values are of one kind share it, and
+            // an empty set has no kind to be all of.
+            when(
+                or(
+                    or(eq(len(s.e()), int(1)), eq(len(other.e()), int(1))),
+                    eq(
+                        call("zb_any_kind", vec![at(s.e(), int(1))], i64()),
+                        call("zb_any_kind", vec![at(other.e(), int(1))], i64()),
+                    ),
+                ),
+                vec![ret(bool(false))],
+            ),
             when(
                 call("zb_set_all_kind", vec![s.e(), int(SET_TAG >> 8)], boolean()),
                 vec![ret(call(
@@ -1340,17 +1664,33 @@ fn set(list_type: TypeId) -> Vec<Decl> {
                 call("zb_set_disjoint_kinds", vec![s.e(), other.e()], boolean()),
                 vec![ret(out.e())],
             ),
+            hs.decl(call("zb_set_entry_hashes", vec![s.e()], ints.clone())),
+            out_hs.decl(list(Vec::new(), ints.clone())),
+            expr(mcall(out.e(), "reserve", vec![n.e()], unit())),
+            expr(mcall(out_hs.e(), "reserve", vec![n.e()], unit())),
         ];
         st.extend(for_range(
             &i,
             int(1),
             n.e(),
-            vec![when(
-                contains(other.e(), at(s.e(), i.e())),
-                vec![push(out.e(), at(s.e(), i.e()))],
-            )],
+            vec![
+                h.decl(idx(hs.e(), sub(i.e(), int(1)), i64())),
+                when(
+                    call(
+                        "zb_set_has_hashed",
+                        vec![other.e(), at(s.e(), i.e()), h.e()],
+                        boolean(),
+                    ),
+                    vec![push(out.e(), at(s.e(), i.e())), push(out_hs.e(), h.e())],
+                ),
+            ],
         ));
-        st.extend(settled(&out));
+        st.push(expr(call(
+            "zb_set_settle_hashed",
+            vec![out.e(), out_hs.e()],
+            unit(),
+        )));
+        st.push(ret(out.e()));
         st
     }));
     // Room for `extra` more values without the table growing as they
@@ -1396,7 +1736,9 @@ fn set(list_type: TypeId) -> Vec<Decl> {
             ret_void(),
         ],
     ));
-    // Every value of `other` added to `s`.
+    // Every value of `other` added to `s`, by the hashes `other` holds:
+    // into the table when `s` has one after making room, else by the
+    // short path.
     d.push(define("zb_set_update", &[&s, &other], unit(), {
         let mut st = vec![
             expr(call(
@@ -1406,7 +1748,32 @@ fn set(list_type: TypeId) -> Vec<Decl> {
             )),
             n.decl(len(other.e())),
         ];
-        st.extend(for_range(
+        let mut by_hash = vec![hs.decl(call("zb_set_entry_hashes", vec![other.e()], ints.clone()))];
+        by_hash.extend(for_range(
+            &i,
+            int(1),
+            n.e(),
+            vec![
+                h.decl(idx(hs.e(), sub(i.e(), int(1)), i64())),
+                when(
+                    lt(
+                        call(
+                            "zb_set_find_hashed",
+                            vec![s.e(), at(other.e(), i.e()), h.e()],
+                            i64(),
+                        ),
+                        int(0),
+                    ),
+                    vec![expr(call(
+                        "zb_set_insert_hashed",
+                        vec![s.e(), at(other.e(), i.e()), h.e()],
+                        unit(),
+                    ))],
+                ),
+            ],
+        ));
+        let mut by_add = Vec::new();
+        by_add.extend(for_range(
             &i,
             int(1),
             n.e(),
@@ -1416,6 +1783,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
                 unit(),
             ))],
         ));
+        st.push(if_(unindexed(s.e()), by_add, by_hash));
         st.push(ret_void());
         st
     }));
@@ -1457,17 +1825,33 @@ fn set(list_type: TypeId) -> Vec<Decl> {
                 call("zb_set_disjoint_kinds", vec![s.e(), other.e()], boolean()),
                 vec![ret(call("zb_set_copy", vec![s.e()], anys.clone()))],
             ),
+            hs.decl(call("zb_set_entry_hashes", vec![s.e()], ints.clone())),
+            out_hs.decl(list(Vec::new(), ints.clone())),
+            expr(mcall(out.e(), "reserve", vec![n.e()], unit())),
+            expr(mcall(out_hs.e(), "reserve", vec![n.e()], unit())),
         ];
         st.extend(for_range(
             &i,
             int(1),
             n.e(),
-            vec![when(
-                not(contains(other.e(), at(s.e(), i.e()))),
-                vec![push(out.e(), at(s.e(), i.e()))],
-            )],
+            vec![
+                h.decl(idx(hs.e(), sub(i.e(), int(1)), i64())),
+                when(
+                    not(call(
+                        "zb_set_has_hashed",
+                        vec![other.e(), at(s.e(), i.e()), h.e()],
+                        boolean(),
+                    )),
+                    vec![push(out.e(), at(s.e(), i.e())), push(out_hs.e(), h.e())],
+                ),
+            ],
         ));
-        st.extend(settled(&out));
+        st.push(expr(call(
+            "zb_set_settle_hashed",
+            vec![out.e(), out_hs.e()],
+            unit(),
+        )));
+        st.push(ret(out.e()));
         st
     }));
     d.push(define(
@@ -1579,6 +1963,17 @@ fn set(list_type: TypeId) -> Vec<Decl> {
                 )],
             ),
             ret(call("zb_unbox_list_raw_any", vec![x.e()], anys.clone())),
+        ],
+    ));
+    // The box itself, once it is known to hold a set: what a slot that
+    // stores sets as boxes takes from a dynamic value.
+    d.push(define(
+        "zb_set_as_box",
+        &[&x],
+        any(),
+        vec![
+            expr(call("zb_set_unbox", vec![x.e()], anys.clone())),
+            ret(x.e()),
         ],
     ));
     d

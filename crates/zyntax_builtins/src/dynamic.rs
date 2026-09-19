@@ -18,7 +18,7 @@ const CUSTOM: i64 = 255;
 /// The whole tag of a box of the width its category's readers assume:
 /// the width in the byte above the category.
 pub(crate) const I64_TAG: i64 = (4 << 8) | INT;
-const F64_TAG: i64 = (4 << 8) | FLOAT;
+pub(crate) const F64_TAG: i64 = (4 << 8) | FLOAT;
 
 fn tag(x: Expr) -> Expr {
     cast(call("zb_box_tag", vec![x], i32()), i64())
@@ -654,7 +654,38 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     let elem = local("elem", any());
     let n = local("n", i64());
     let i = local("i", i64());
-    let f = local("f", f64());
+    // The hash of a float: an integral value hashes as the integer it
+    // is, so it meets that integer in a table; anything else by its
+    // scaled bits.
+    let fv = local("f", f64());
+    d.push(define(
+        "zb_hash_of_f64",
+        &[&fv],
+        i64(),
+        vec![
+            when(
+                and(
+                    eq(fv.e(), cast(cast(fv.e(), i64()), f64())),
+                    and(gt(fv.e(), float(-9.2e18)), lt(fv.e(), float(9.2e18))),
+                ),
+                vec![ret(cast(fv.e(), i64()))],
+            ),
+            ret(cast(mul(fv.e(), float(1_048_576.0)), i64())),
+        ],
+    ));
+    // The hash of a string, never zero, which is what a string box
+    // records as "not yet hashed".
+    let sv = local("s", string());
+    d.push(define(
+        "zb_hash_of_str",
+        &[&sv],
+        i64(),
+        vec![
+            h.decl(call("zb_str_hash", vec![sv.e()], i64())),
+            when(eq(h.e(), int(0)), vec![ret(int(1))]),
+            ret(h.e()),
+        ],
+    ));
     d.push(define(
         "zb_any_hash",
         &[&x],
@@ -665,27 +696,15 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(is_integral(&cat), vec![ret(number_i64(x.e(), cat.e()))]),
             when(
                 is(&cat, FLOAT),
-                vec![
-                    f.decl(get_f64(x.e())),
-                    when(
-                        and(
-                            eq(f.e(), cast(cast(f.e(), i64()), f64())),
-                            and(gt(f.e(), float(-9.2e18)), lt(f.e(), float(9.2e18))),
-                        ),
-                        vec![ret(cast(f.e(), i64()))],
-                    ),
-                    ret(cast(mul(f.e(), float(1_048_576.0)), i64())),
-                ],
+                vec![ret(call("zb_hash_of_f64", vec![get_f64(x.e())], i64()))],
             ),
-            // A string box keeps its hash once computed, zero until
-            // then; a hash that comes out zero is recorded as one.
+            // A string box keeps its hash once computed, zero until then.
             when(
                 is(&cat, STR),
                 vec![
                     h.decl(call("zb_box_hash", vec![x.e()], i64())),
                     when(ne(h.e(), int(0)), vec![ret(h.e())]),
-                    h.set(call("zb_str_hash", vec![get_str(x.e())], i64())),
-                    when(eq(h.e(), int(0)), vec![h.set(int(1))]),
+                    h.set(call("zb_hash_of_str", vec![get_str(x.e())], i64())),
                     expr(call("zb_box_set_hash", vec![x.e(), h.e()], unit())),
                     ret(h.e()),
                 ],
