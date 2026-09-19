@@ -154,6 +154,11 @@ type Result<T> = std::result::Result<T, Error>;
 /// Python program by calling this.
 pub const ENTRY: &str = "__main__";
 
+/// The name of the prelude's file in a program's `source_files`. A
+/// declaration whose span names it is the built-in library's, not the
+/// program's.
+pub const PRELUDE: &str = "<prelude>";
+
 mod policy;
 pub use host::set_args;
 use policy::LIBRARY_MODULE;
@@ -301,7 +306,14 @@ pub fn parse_program_with(
     let prelude = ruff_python_parser::parse_module(prelude::SOURCE)
         .expect("the prelude parses")
         .into_syntax();
-    let mut origins: Vec<Option<String>> = vec![None; prelude.body.len()];
+    // The prelude is a file of its own, so a span tells its declarations
+    // from the program's.
+    files.insert(PRELUDE.to_string(), source_files.len() as u32);
+    source_files.push(zyntax_typed_ast::source::SourceFile::new(
+        PRELUDE.to_string(),
+        prelude::SOURCE.to_string(),
+    ));
+    let mut origins: Vec<Option<String>> = vec![Some(PRELUDE.to_string()); prelude.body.len()];
     let mut body = prelude.body;
     for (stmt, origin) in linked.statements {
         body.push(stmt);
@@ -974,4 +986,83 @@ pub(crate) fn span_of<N: Ranged>(node: &N) -> Span {
 
 pub(crate) fn prim(p: PrimitiveType) -> Type {
     Type::Primitive(p)
+}
+
+/// What a module exports to another module, by Python's convention: its
+/// top-level `def`s and `class`es, in order. With `__all__` assigned a
+/// list of string literals, the names it lists and nothing else; without
+/// it, every name that does not start with `_`. A host that publishes
+/// the module to other languages reads this rather than the program's
+/// declarations, which also carry the prelude's and the imported
+/// modules'.
+pub fn exports(source: &str) -> Result<Vec<zyntax_typed_ast::ExportedSymbol>> {
+    use zyntax_typed_ast::{ExportedSymbol, SymbolKind};
+    let parsed = ruff_python_parser::parse_module(source)
+        .map_err(|e| Error::syntax(e.error.to_string(), e.location))?;
+    let module = parsed.into_syntax();
+    let mut all: Option<Vec<String>> = None;
+    let mut declared: Vec<(String, SymbolKind)> = Vec::new();
+    for stmt in &module.body {
+        match stmt {
+            py::Stmt::FunctionDef(f) => declared.push((f.name.to_string(), SymbolKind::Function)),
+            py::Stmt::ClassDef(c) => declared.push((c.name.to_string(), SymbolKind::Class)),
+            py::Stmt::Assign(a) => {
+                let names_all = a
+                    .targets
+                    .iter()
+                    .any(|t| matches!(t, py::Expr::Name(n) if n.id.as_str() == "__all__"));
+                if names_all && let py::Expr::List(list) = &*a.value {
+                    all = Some(
+                        list.elts
+                            .iter()
+                            .filter_map(|e| match e {
+                                py::Expr::StringLiteral(s) => Some(s.value.to_string()),
+                                _ => None,
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(declared
+        .into_iter()
+        .filter(|(name, _)| match &all {
+            Some(all) => all.contains(name),
+            None => !name.starts_with('_'),
+        })
+        .map(|(name, kind)| ExportedSymbol {
+            name,
+            kind,
+            is_public: true,
+        })
+        .collect())
+}
+
+/// The methods a class exports, by Python's convention: the `def`s of
+/// its body whose names do not start with `_`, in order. `None` when
+/// `class` is not declared at the top level of `source`.
+pub fn class_exports(source: &str, class: &str) -> Result<Option<Vec<String>>> {
+    let parsed = ruff_python_parser::parse_module(source)
+        .map_err(|e| Error::syntax(e.error.to_string(), e.location))?;
+    let module = parsed.into_syntax();
+    for stmt in &module.body {
+        if let py::Stmt::ClassDef(c) = stmt
+            && c.name.as_str() == class
+        {
+            return Ok(Some(
+                c.body
+                    .iter()
+                    .filter_map(|s| match s {
+                        py::Stmt::FunctionDef(f) if !f.name.starts_with('_') => {
+                            Some(f.name.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+            ));
+        }
+    }
+    Ok(None)
 }

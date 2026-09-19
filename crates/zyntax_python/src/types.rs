@@ -1403,6 +1403,8 @@ pub(crate) struct ClassInfo {
     /// The methods this class itself defines.
     pub(crate) methods: Vec<String>,
     pub(crate) type_id: Option<zyntax_typed_ast::TypeId>,
+    /// The module the class was declared in; `None` for the main file.
+    pub(crate) module: Option<String>,
 }
 
 /// The name of the function a method lowers to.

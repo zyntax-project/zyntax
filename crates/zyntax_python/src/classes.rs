@@ -176,6 +176,7 @@ pub(crate) fn skeletons(defs: &[ClassDef<'_>]) -> Result<(Vec<ClassInfo>, HashMa
             fields: vec![("$class".to_string(), Ty::Int)],
             methods: def.methods.iter().map(|m| m.name.to_string()).collect(),
             type_id: None,
+            module: def.module.clone(),
         });
     }
     Ok((classes, index))
@@ -192,7 +193,15 @@ pub(crate) fn register(
     // an instance of a class declared later, or of its own, has a type.
     let ids: Vec<TypeId> = module.classes.iter().map(|_| TypeId::next()).collect();
     lower::set_class_types(ids.clone());
+    // The declaration names the class's file, so a reader tells the
+    // program's classes from the prelude's and the imported modules'.
+    let declared_in: Vec<Span> = module
+        .classes
+        .iter()
+        .map(|class| Span::in_file(0, 0, module.file_of(class.module.as_deref())))
+        .collect();
     for (k, class) in module.classes.iter_mut().enumerate() {
+        let declared = declared_in[k];
         let fields: Vec<FieldDef> = class
             .fields
             .iter()
@@ -259,10 +268,10 @@ pub(crate) fn register(
                     args: Vec::new(),
                     span,
                 }],
-                span,
+                span: declared,
             }),
             Type::Unknown,
-            span,
+            declared,
         ));
     }
     decls
