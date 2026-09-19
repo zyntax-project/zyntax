@@ -284,6 +284,20 @@ impl AutoVectorizePass {
                 if !matches!(op, BinaryOp::Add | BinaryOp::FAdd) {
                     return LoopOutcome::RejectHazard("non-Add reduction op");
                 }
+                // An accumulator is read only by its own update, and the
+                // update only by the phi: a value the body also computes
+                // from is a recurrence, whose every step matters.
+                let reads = |value: HirId| {
+                    body.instructions
+                        .iter()
+                        .chain(header.instructions.iter())
+                        .flat_map(|inst| inst.operands())
+                        .filter(|id| *id == value)
+                        .count()
+                };
+                if reads(phi.result) != 1 || reads(next) != 0 {
+                    return LoopOutcome::RejectShape("accumulator read inside the loop");
+                }
                 reductions.push(Reduction {
                     phi: phi.result,
                     next,
@@ -448,6 +462,11 @@ impl AutoVectorizePass {
             }
         }
 
+        // Without a vector load or store there is nothing a lane can
+        // carry that the scalar loop does not.
+        if vec_loads.is_empty() && vec_stores.is_empty() {
+            return LoopOutcome::RejectShape("no memory access to vectorize");
+        }
         // Pick the lane element type + lane count.
         let lane_ty = match elem_ty_hint {
             Some(t) => t,
@@ -890,6 +909,34 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
         reduction_phi_subs.insert(red.phi, red.phi);
     }
 
+    // An operand that is still a scalar after substitution comes from
+    // outside the loop and is the same in every lane.
+    fn lane_wide(
+        func: &mut HirFunction,
+        new_insts: &mut Vec<HirInstruction>,
+        sub: &IndexMap<HirId, HirId>,
+        id: HirId,
+        lane_ty: &HirType,
+        lanes: u32,
+    ) -> HirId {
+        let v = subbed(sub, id);
+        let is_vector = matches!(
+            func.values.get(&v).map(|x| &x.ty),
+            Some(HirType::Vector(_, _))
+        );
+        if is_vector {
+            return v;
+        }
+        let vec_ty = HirType::Vector(Box::new(lane_ty.clone()), lanes);
+        let splatted = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
+        new_insts.push(HirInstruction::VectorSplat {
+            result: splatted,
+            ty: vec_ty,
+            scalar: v,
+        });
+        splatted
+    }
+
     for inst in &plan.body_insts {
         match inst {
             HirInstruction::GetElementPtr {
@@ -971,25 +1018,28 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
                     // accumulated this iteration (must be a vector
                     // value via prior sub).
                     let red_ty = reduction_vec_ty[red_idx].clone();
+                    let rhs = lane_wide(func, &mut new_insts, &sub, *right, &lane_ty, lanes);
                     new_insts.push(HirInstruction::Binary {
                         op: *op,
                         result: reduction_vec_next[red_idx],
                         ty: red_ty,
                         left: plan.reductions[red_idx].phi,
-                        right: subbed(&sub, *right),
+                        right: rhs,
                     });
                     continue;
                 }
                 // Generic vector binary.
                 let vec_ty = HirType::Vector(Box::new(ty.clone()), lanes);
                 let new_res = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
+                let lhs = lane_wide(func, &mut new_insts, &sub, *left, ty, lanes);
+                let rhs = lane_wide(func, &mut new_insts, &sub, *right, ty, lanes);
                 sub.insert(*result, new_res);
                 new_insts.push(HirInstruction::Binary {
                     op: *op,
                     result: new_res,
                     ty: vec_ty,
-                    left: subbed(&sub, *left),
-                    right: subbed(&sub, *right),
+                    left: lhs,
+                    right: rhs,
                 });
             }
             HirInstruction::Unary {
