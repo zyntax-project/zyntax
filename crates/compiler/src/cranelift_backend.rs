@@ -4450,8 +4450,20 @@ impl CraneliftBackend {
                             volatile,
                         } => {
                             // Store value to memory
-                            let val = self.value_map[value];
-                            let ptr_val = self.value_map[ptr];
+                            let missing = |what: &str, id: &HirId| {
+                                panic!(
+                                    "store in `{}`: no value for its {what} {id:?}",
+                                    function.name.resolve_global().unwrap_or_default()
+                                )
+                            };
+                            let val = *self
+                                .value_map
+                                .get(value)
+                                .unwrap_or_else(|| missing("value", value));
+                            let ptr_val = *self
+                                .value_map
+                                .get(ptr)
+                                .unwrap_or_else(|| missing("pointer", ptr));
 
                             // TODO: Properly handle volatile flag
                             let flags = cranelift_codegen::ir::MemFlagsData::new();
