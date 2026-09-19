@@ -123,7 +123,7 @@ pub fn eliminate_with(func: &mut HirFunction, pure_fns: &HashSet<HirId>) -> CseS
     func.rebuild_cfg_edges();
     let dt = DominatorTree::new(func);
     let mut value_table: HashMap<VnKey, HirId> = HashMap::new();
-    let mut substitutions: HashMap<HirId, HirId> = HashMap::new();
+    let mut substitutions = same_constants(func);
 
     visit_block(
         func,
@@ -182,6 +182,40 @@ fn collect_bin_defs(func: &HirFunction) -> HashMap<HirId, (BinaryOp, HirId, HirI
         }
     }
     m
+}
+
+/// `duplicate → first` over the function's integer, boolean and null
+/// constants: two constants of one type and value are one operand, so
+/// two compares against them get one key. Floats are left alone (a zero
+/// equals a negative zero), as are aggregates and strings.
+fn same_constants(func: &HirFunction) -> HashMap<HirId, HirId> {
+    let mut first: HashMap<(HirType, HirConstant), HirId> = HashMap::new();
+    let mut duplicates = HashMap::new();
+    for (id, v) in &func.values {
+        let HirValueKind::Constant(c) = &v.kind else {
+            continue;
+        };
+        if matches!(
+            c,
+            HirConstant::F32(_)
+                | HirConstant::F64(_)
+                | HirConstant::Array(_)
+                | HirConstant::Struct(_)
+                | HirConstant::String(_)
+                | HirConstant::VTable(_)
+        ) {
+            continue;
+        }
+        match first.entry((v.ty.clone(), c.clone())) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                duplicates.insert(*id, *e.get());
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(*id);
+            }
+        }
+    }
+    duplicates
 }
 
 /// `id → integer value` for every integer-constant value.

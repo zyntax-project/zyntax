@@ -34,6 +34,7 @@ pub mod async_support;
 pub mod auto_vectorize;
 pub mod borrow_check; // HIR-level borrow checking pass
 pub mod boxes; // Dynamic boxes made, read and released in HIR
+pub mod branch_fold; // Conditional branches a dominating branch has decided
 pub mod builtin_class; // Wrapper-class dispatch for compiler-known built-in types (Fiber, future SimdVector, etc.)
 pub mod bytecode; // HIR bytecode serialization/deserialization
 pub mod cast_classify; // Pure classification of source/target coercions → CastKind
@@ -1781,6 +1782,7 @@ pub struct InterpOptStats {
     pub scalar_replace_alloc: scalar_replace_alloc::ScalarReplaceAllocStats,
     pub dead_store: dead_store::DeadStoreStats,
     pub sign_fold: sign_fold::SignFoldStats,
+    pub branch_fold: branch_fold::BranchFoldStats,
     pub licm: licm::LicmStats,
     pub affine_loop: affine_loop::AffineLoopStats,
     pub inline: inline::InlineStats,
@@ -2033,6 +2035,12 @@ fn run_interp_safe_opts_with(
         let cs = cse::eliminate_module(module);
         timed("cse", &mut at);
         check_hir_uses(module, "cse");
+        // After cse, which makes repeated compares one value: a branch
+        // on a condition a dominating branch decided is a jump.
+        let bf = branch_fold::run_module(module);
+        stats.branch_fold.folded += bf.folded;
+        timed("branch_fold", &mut at);
+        check_hir_uses(module, "branch_fold");
         // load_cse runs after value-cse so canonical pointer ids are
         // already chased — if two GEPs cse'd to one, the load_cse
         // pass sees both loads using the same canonical ptr id.
@@ -2104,7 +2112,8 @@ fn run_interp_safe_opts_with(
         // they are all that moved, they are run to their own fixed
         // point here rather than paying a round of every pass for each
         // step of it.
-        let restructured = lcse.eliminated > 0
+        let restructured = bf.folded > 0
+            || lcse.eliminated > 0
             || ags.round_trips_removed > 0
             || ags.field_reads_only > 0
             || agsc.webs > 0
