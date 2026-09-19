@@ -1104,7 +1104,7 @@ mod tests {
         let id = u64::MAX - 43;
         let attempts = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&attempts);
-        set_promotion_requester(move |bead| {
+        set_promotion_requester(move |bead, _| {
             assert_eq!(bead, id);
             seen.fetch_add(1, Ordering::Relaxed) > 0
         });
@@ -1113,7 +1113,7 @@ mod tests {
         osr_request_promotion(id);
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
         requested().write().unwrap().remove(&id);
-        set_promotion_requester(|_| false);
+        set_promotion_requester(|_, _| false);
     }
 
     #[test]
@@ -1601,11 +1601,20 @@ pub extern "C" fn lazy_compile(bead_id: u64) -> *const u8 {
 // Promotion requests
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Symbol a tier-0 function calls once its loop has stayed hot.
+/// Symbol a compiled function calls once its loop has stayed hot.
 pub const OSR_REQUEST_SYMBOL: &str = "__zyntax_osr_request";
 
-/// Installed by the runtime to queue a top-tier compile for a bead.
-type PromotionRequester = Box<dyn Fn(u64) -> bool + Send + Sync>;
+/// Where a request comes from: a frame running compiled code, or one
+/// the interpreter is still running.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Requester {
+    Compiled,
+    Interpreted,
+}
+
+/// Installed by the runtime to answer a request: resume points for an
+/// interpreted frame, a top-tier compile for either.
+type PromotionRequester = Box<dyn Fn(u64, Requester) -> bool + Send + Sync>;
 
 fn promotion_requester() -> &'static RwLock<Option<PromotionRequester>> {
     static R: OnceLock<RwLock<Option<PromotionRequester>>> = OnceLock::new();
@@ -1613,8 +1622,8 @@ fn promotion_requester() -> &'static RwLock<Option<PromotionRequester>> {
 }
 
 /// Register how a promotion request is fulfilled. The runtime owns the
-/// policy — whether to queue, and to which tier.
-pub fn set_promotion_requester(f: impl Fn(u64) -> bool + Send + Sync + 'static) {
+/// policy: what to compile, and where the frame can go meanwhile.
+pub fn set_promotion_requester(f: impl Fn(u64, Requester) -> bool + Send + Sync + 'static) {
     *promotion_requester().write().unwrap() = Some(Box::new(f));
 }
 
@@ -1625,22 +1634,33 @@ fn requested() -> &'static RwLock<std::collections::HashSet<u64>> {
     S.get_or_init(|| RwLock::new(std::collections::HashSet::new()))
 }
 
-/// Called when a tier-0 frame has revisited a resumable loop enough times
-/// to justify a background compile. Invocation counts alone cannot promote
-/// a function that remains in one long-running call.
+/// Called when a compiled frame has revisited a resumable loop enough
+/// times to justify a background compile. Invocation counts alone cannot
+/// promote a function that remains in one long-running call.
 ///
 /// # Safety
 /// Called from generated code with C ABI.
 #[unsafe(no_mangle)]
 pub extern "C" fn osr_request_promotion(bead_id: u64) {
+    request(bead_id, Requester::Compiled);
+}
+
+/// The interpreter's request for the loop it is running: the same
+/// compile, and resume points it can leave through as soon as they
+/// exist, since it can enter no code mid-loop without one.
+pub fn osr_request_promotion_interpreted(bead_id: u64) {
+    request(bead_id, Requester::Interpreted);
+}
+
+fn request(bead_id: u64, from: Requester) {
     if !requested().write().unwrap().insert(bead_id) {
         return;
     }
     if osr_trace_enabled() {
-        eprintln!("[osr] promotion requested for bead={bead_id}");
+        eprintln!("[osr] promotion requested for bead={bead_id} ({from:?})");
     }
     let guard = promotion_requester().read().unwrap();
-    let submitted = guard.as_ref().is_some_and(|f| f(bead_id));
+    let submitted = guard.as_ref().is_some_and(|f| f(bead_id, from));
     drop(guard);
     if !submitted {
         requested().write().unwrap().remove(&bead_id);

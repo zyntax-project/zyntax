@@ -225,8 +225,8 @@ fn a_tier1_promotion_installs_an_osr_entry() {
         "no helper should be published while only tier-0 code exists"
     );
     backend
-        .optimize_function(func_id, OptimizationTier::Standard)
-        .expect("force promote to tier 1");
+        .optimize_function(func_id, OptimizationTier::Optimized)
+        .expect("force promote to the optimizing tier");
 
     // Promotion may be queued on a beadie broker thread; poll rather than
     // assuming the compile already ran.

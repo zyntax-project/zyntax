@@ -3254,10 +3254,12 @@ impl HirInterpreter {
             if let Some(why) = self.uncompilable.get(&func_id).cloned() {
                 return self.run_natively_or(module, func_id, args, dest, why);
             }
+            // A callee the module does not hold is a function, not a
+            // value: reported as one.
             let func = module
                 .functions
                 .get(&func_id)
-                .ok_or(InterpError::UndefinedSsaValue(func_id))?;
+                .ok_or_else(|| InterpError::UnknownFunction(format!("{func_id:?}")))?;
             let taken = self.is_address_taken(module, func_id);
             match compile_function_with(module, &mut self.memory, func, taken) {
                 Ok(cf) => {
@@ -4071,7 +4073,7 @@ impl HirInterpreter {
                     }
                     let osr_site = &cf.osr_sites[i];
                     if visits[i] == OSR_REQUEST_VISITS {
-                        crate::osr::osr_request_promotion(bead);
+                        crate::osr::osr_request_promotion_interpreted(bead);
                         slots[i] = crate::osr::helper_slot_addr(bead, osr_site.site_key)
                             as *const std::sync::atomic::AtomicU64;
                     }

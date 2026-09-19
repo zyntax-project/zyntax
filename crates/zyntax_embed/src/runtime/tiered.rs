@@ -33,9 +33,10 @@ use zyntax_compiler::{
 /// - A function called `TieredConfig::baseline_threshold` times gets
 ///   Cranelift baseline code; a loop that stays interpreted asks for it
 ///   itself and transfers into the compiled code at its header.
-/// - **Tier 1 (Standard)** and **Tier 2 (Optimized)** recompile warm
-///   and hot functions in the background; entries are swapped
-///   atomically through the functions' call cells.
+/// - **Tier 1 (Optimized)**, LLVM when the build carries it, recompiles
+///   hot functions in the background and takes over a baseline loop that
+///   stays hot; entries are swapped atomically through the functions'
+///   call cells.
 ///
 /// ## Example
 ///
@@ -48,7 +49,7 @@ use zyntax_compiler::{
 /// // Production: Full tiered optimization with background worker
 /// let mut runtime = TieredRuntime::production()?;
 ///
-/// // Production with LLVM for Tier 2 (requires llvm-backend feature)
+/// // Production with LLVM as the optimizing tier (requires llvm-backend feature)
 /// let mut runtime = TieredRuntime::production_llvm()?;
 /// ```
 pub struct TieredRuntime {
@@ -496,7 +497,7 @@ impl TieredRuntime {
         Self::new(TieredConfig::production())
     }
 
-    /// Create a runtime with LLVM for maximum Tier 2 optimization
+    /// Create a runtime with LLVM as the optimizing tier
     ///
     /// - Uses LLVM MCJIT for hot-path optimization
     /// - Best performance for compute-intensive workloads

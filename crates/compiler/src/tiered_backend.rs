@@ -5,18 +5,22 @@
 //! threads, atomic code-pointer swap, generations, and (later) OSR / deopt
 //! infrastructure.
 //!
-//! ## Optimization tiers
+//! ## The ladder: interpreter, Cranelift, LLVM
 //! - **Interpreter** (`hir_interp`): where every call starts. Not a
 //!   rung of beadie's ladder; its tick callback ticks the bead as a
-//!   native call would, and the baseline takes over once installed.
+//!   native call would, and the baseline takes over once installed. A
+//!   loop that stays interpreted asks for promotion itself, and gets the
+//!   baseline's resume points to leave through at once.
 //! - **Tier 0 (Baseline)**: Cranelift. Declarations, globals and stubs
 //!   are emitted at module load; a body is compiled when its bead
 //!   crosses `TieredConfig::baseline_threshold` calls, when a stub is
-//!   called, or when an interpreted loop asks for promotion.
-//! - **Tier 1 (Standard)**: Cranelift recompile with OSR helpers, at the
-//!   warm threshold from `ProfileConfig`. Beadie generation 1.
-//! - **Tier 2 (Optimized)**: Cranelift or LLVM recompile, at the hot
-//!   threshold. Beadie generation 2.
+//!   called, or when an interpreted loop asks. Its loop headers carry
+//!   probes, in the body and in its resume points alike, so a frame
+//!   moves on once the tier above publishes.
+//! - **Tier 1 (Optimized)**: LLVM, at the hot threshold or when a
+//!   baseline loop has stayed hot. Beadie generation 1. A build without
+//!   LLVM ends the ladder at the baseline; an explicit request still
+//!   recompiles with Cranelift, which is what hot reload uses.
 //!
 //! The variants below are the JIT-tier ladder only; a function that has
 //! not been baselined is in the interpreter, which `function_tier()`
@@ -55,27 +59,22 @@ use inkwell::context::Context;
 // Public types (preserved from the legacy API)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Optimization tier level.
+/// The compiled tiers a function climbs: every call starts in the
+/// interpreter, moves to the Cranelift baseline, and from there to the
+/// optimizing tier where the build has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OptimizationTier {
-    Baseline,  // Tier 0 — fast compile, minimal opt
-    Standard,  // Tier 1 — moderate opt
-    Optimized, // Tier 2 — aggressive opt
+    /// Cranelift: compiled quickly, with probes at its loop headers.
+    Baseline,
+    /// LLVM, when the build carries it; a Cranelift recompile otherwise,
+    /// reached only by an explicit request.
+    Optimized,
 }
 
 impl OptimizationTier {
-    pub fn cranelift_opt_level(&self) -> &'static str {
-        match self {
-            OptimizationTier::Baseline => "none",
-            OptimizationTier::Standard => "speed",
-            OptimizationTier::Optimized => "speed_and_size",
-        }
-    }
-
     pub fn next_tier(&self) -> Option<OptimizationTier> {
         match self {
-            OptimizationTier::Baseline => Some(OptimizationTier::Standard),
-            OptimizationTier::Standard => Some(OptimizationTier::Optimized),
+            OptimizationTier::Baseline => Some(OptimizationTier::Optimized),
             OptimizationTier::Optimized => None,
         }
     }
@@ -83,16 +82,14 @@ impl OptimizationTier {
     fn index(self) -> usize {
         match self {
             OptimizationTier::Baseline => 0,
-            OptimizationTier::Standard => 1,
-            OptimizationTier::Optimized => 2,
+            OptimizationTier::Optimized => 1,
         }
     }
 
     fn from_index(idx: usize) -> Option<OptimizationTier> {
         match idx {
             0 => Some(OptimizationTier::Baseline),
-            1 => Some(OptimizationTier::Standard),
-            2 => Some(OptimizationTier::Optimized),
+            1 => Some(OptimizationTier::Optimized),
             _ => None,
         }
     }
@@ -411,14 +408,6 @@ impl TieredBackend {
         } else {
             (None, None)
         };
-
-        // With an LLVM tier above it, Cranelift's helpers are not resume
-        // points worth having: tier 1 emits the same code as tier 0, and a
-        // transfer into it consumes the loop's one chance to move up.
-        #[cfg(feature = "llvm-backend")]
-        if llvm.is_some() {
-            cranelift.with_lock(|be| be.set_publish_osr_helpers(false));
-        }
 
         // Every call between compiled functions goes through the callee's
         // cell, so a function compiled again at a higher tier, or on its
@@ -2297,17 +2286,14 @@ impl TieredBackend {
     }
 
     fn install_promotion_requester(&self) {
-        // Aim at whichever tier actually differs from the one the frame is
-        // already in. Without LLVM the ladder emits the same code at every
-        // tier, so there is nothing above Standard worth reaching.
+        // The request aims at the optimizing tier. A build without one
+        // has nothing above the baseline to compile; its interpreted
+        // frames still get the baseline's resume points below.
         #[cfg(feature = "llvm-backend")]
-        let target = match self.config.tier2_backend {
-            Tier2Backend::LLVM => OptimizationTier::Optimized,
-            Tier2Backend::Cranelift => OptimizationTier::Standard,
-        };
+        let optimizing = matches!(self.config.tier2_backend, Tier2Backend::LLVM);
         #[cfg(not(feature = "llvm-backend"))]
-        let target = OptimizationTier::Standard;
-        let tier_idx = target.index();
+        let optimizing = false;
+        let tier_idx = OptimizationTier::Optimized.index();
         let tier2_backend = self.config.tier2_backend;
         let verbosity = self.config.verbosity;
         let adapter = Arc::clone(&self.adapter);
@@ -2345,7 +2331,7 @@ impl TieredBackend {
             .collect();
 
         let optimized_bodies = Arc::clone(&self.optimized_bodies);
-        osr::set_promotion_requester(move |bead_id| {
+        osr::set_promotion_requester(move |bead_id, from| {
             let Some((func_id, bound, swapped, module_arc, lazy)) = by_bead.get(&bead_id) else {
                 if osr::osr_trace_enabled() {
                     eprintln!("[osr] request for unknown bead={bead_id}");
@@ -2363,34 +2349,7 @@ impl TieredBackend {
                     None => return false,
                 },
             };
-            #[cfg(feature = "llvm-backend")]
-            if matches!(tier2_backend, Tier2Backend::LLVM)
-                && !crate::abi::llvm_entry_abi_supported(&func_arc, false)
-            {
-                if osr::osr_trace_enabled() {
-                    eprintln!(
-                        "[osr] LLVM promotion unavailable for {}: aggregate ABI",
-                        func_arc.name.resolve_global().unwrap_or_default()
-                    );
-                }
-                return true;
-            }
-            #[cfg(feature = "llvm-backend")]
-            if matches!(tier2_backend, Tier2Backend::LLVM)
-                && !llvm_list_entry_has_headroom(&func_arc)
-            {
-                if osr::osr_trace_enabled() {
-                    eprintln!(
-                        "[osr] LLVM promotion skipped for {}: call-heavy list entry",
-                        func_arc.name.resolve_global().unwrap_or_default()
-                    );
-                }
-                return true;
-            }
             let module_arc = Arc::clone(module_arc);
-            let cranelift = Arc::clone(&cranelift);
-            #[cfg(feature = "llvm-backend")]
-            let llvm = llvm.clone();
             let func_id = *func_id;
             // An interpreted frame asks before its function has any
             // native code; the baseline comes first so the promotion has
@@ -2410,6 +2369,47 @@ impl TieredBackend {
             ) {
                 return false;
             }
+            // An interpreted frame can enter no code mid-loop without a
+            // resume point, and the baseline's body has only probes. Its
+            // resume points are compiled here, before anything is queued,
+            // so the frame leaves the interpreter at its next header
+            // visit; they carry probes of their own, so the frame moves
+            // on again once the optimizing tier publishes.
+            if from == osr::Requester::Interpreted {
+                publish_baseline_resume_points(
+                    &cranelift,
+                    func_id,
+                    bead_id,
+                    &func_arc,
+                    &module_arc,
+                );
+            }
+            if !optimizing {
+                return true;
+            }
+            #[cfg(feature = "llvm-backend")]
+            if !crate::abi::llvm_entry_abi_supported(&func_arc, false) {
+                if osr::osr_trace_enabled() {
+                    eprintln!(
+                        "[osr] LLVM promotion unavailable for {}: aggregate ABI",
+                        func_arc.name.resolve_global().unwrap_or_default()
+                    );
+                }
+                return true;
+            }
+            #[cfg(feature = "llvm-backend")]
+            if !llvm_list_entry_has_headroom(&func_arc) {
+                if osr::osr_trace_enabled() {
+                    eprintln!(
+                        "[osr] LLVM promotion skipped for {}: call-heavy list entry",
+                        func_arc.name.resolve_global().unwrap_or_default()
+                    );
+                }
+                return true;
+            }
+            let cranelift = Arc::clone(&cranelift);
+            #[cfg(feature = "llvm-backend")]
+            let llvm = llvm.clone();
             // The compile itself runs on a broker thread, so raising the
             // request costs the running loop only the submission.
             let submitted = adapter.force_promote(bound, tier_idx, move |bead| {
@@ -2514,13 +2514,11 @@ impl TieredBackend {
     pub fn get_statistics(&self) -> TieredStatistics {
         let profile_stats = self.profile_data.get_statistics();
         let mut baseline_count = 0usize;
-        let mut standard_count = 0usize;
         let mut optimized_count = 0usize;
 
         for entry in self.functions.values() {
             match entry.bound.current_tier() {
                 Some(0) => baseline_count += 1,
-                Some(1) => standard_count += 1,
                 Some(_) => optimized_count += 1,
                 None => {}
             }
@@ -2529,7 +2527,6 @@ impl TieredBackend {
         TieredStatistics {
             profile_stats,
             baseline_functions: baseline_count,
-            standard_functions: standard_count,
             optimized_functions: optimized_count,
             // Beadie does not surface queue depths; expose 0 instead of
             // lying or panicking. Background activity is observable via the
@@ -2544,7 +2541,7 @@ impl TieredBackend {
     pub fn shutdown(&mut self) {
         // The global callbacks own backend and LLVM handles. Release them
         // before the LLVM context; the adapter then joins promotion workers.
-        osr::set_promotion_requester(|_| false);
+        osr::set_promotion_requester(|_, _| false);
         osr::set_lazy_compiler(|_| ptr::null());
         self.warm_up_stop
             .store(true, std::sync::atomic::Ordering::Release);
@@ -2703,31 +2700,25 @@ fn warm_up_order(module: &HirModule, ready: &HashSet<HirId>) -> Vec<HirId> {
 /// Public so `zyntax_embed`'s interpreter-backed runtime can build the
 /// same `TieredAdapter` policy stack used by the native `TieredBackend`.
 pub fn make_policies(config: &TieredConfig) -> Vec<Box<dyn HotnessPolicy>> {
-    let warm = clamp_to_u32(config.profile_config.warm_threshold);
     let hot = clamp_to_u32(config.profile_config.hot_threshold);
 
     // Tier 0 is the baseline the interpreter promotes into.
     let tier0 = ThresholdPolicy::new(config.baseline_threshold.max(1));
 
-    // Tier 1 (Standard) — promote at warm threshold.
-    let queue_ahead_1 = (warm / 5).max(1);
-    let tier1 = ThresholdPolicy::new(warm).queue_ahead(queue_ahead_1);
-
-    // Tier 2 (Optimized) — promote at hot threshold.
-    let queue_ahead_2 = (hot / 10).max(10);
-    let tier2 = ThresholdPolicy::new(hot).queue_ahead(queue_ahead_2);
-
-    if config.enable_background_optimization {
-        vec![Box::new(tier0), Box::new(tier1), Box::new(tier2)]
+    // Tier 1 is the optimizing tier, reached at the hot threshold. A
+    // build without one, or one that optimizes nothing in the
+    // background, leaves the threshold out of reach: the ladder ends at
+    // the baseline rather than compiling the same Cranelift code twice.
+    #[cfg(feature = "llvm-backend")]
+    let has_optimizing_tier = matches!(config.tier2_backend, Tier2Backend::LLVM);
+    #[cfg(not(feature = "llvm-backend"))]
+    let has_optimizing_tier = false;
+    let tier1 = if config.enable_background_optimization && has_optimizing_tier {
+        ThresholdPolicy::new(hot).queue_ahead((hot / 10).max(10))
     } else {
-        // Disable promotion by setting tier 1/2 thresholds out of reach.
-        let unreachable = ThresholdPolicy::new(u32::MAX);
-        vec![
-            Box::new(tier0),
-            Box::new(ThresholdPolicy::new(u32::MAX)),
-            Box::new(unreachable),
-        ]
-    }
+        ThresholdPolicy::new(u32::MAX)
+    };
+    vec![Box::new(tier0), Box::new(tier1)]
 }
 
 fn clamp_to_u32(v: u64) -> u32 {
@@ -2829,6 +2820,54 @@ fn ensure_baseline(
     bound.bead().eager_install(entry as *mut ()) || bound.bead().compiled().is_some()
 }
 
+/// Compile the baseline's resume points for `func_id` and publish them,
+/// off the requesting frame's stack, which may be a fiber's. Each loop
+/// header the layout admits gets a helper the interpreter can transfer
+/// into; a helper the site already has is kept.
+fn publish_baseline_resume_points(
+    cranelift: &Arc<ZyntaxCraneliftBackend>,
+    func_id: HirId,
+    bead_id: u64,
+    func_arc: &Arc<HirFunction>,
+    module_arc: &Arc<HirModule>,
+) {
+    let def = ZyntaxFunctionDef {
+        id: func_id,
+        function: (**func_arc).clone(),
+        module: Arc::clone(module_arc),
+        tier: OptimizationTier::Baseline.index(),
+        bead_id,
+    };
+    let points: Vec<(u64, *mut ())> = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("zyntax-resume-points".into())
+            .stack_size(16 << 20)
+            .spawn_scoped(scope, || {
+                cranelift
+                    .resume_points(&def)
+                    .into_iter()
+                    .map(|(site, code)| (site, code as usize))
+                    .collect::<Vec<_>>()
+            })
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(site, code)| (site, code as *mut ()))
+            .collect()
+    });
+    for (site, code) in points {
+        if !code.is_null() && osr::helper_for(bead_id, site).is_null() {
+            if osr::osr_trace_enabled() {
+                eprintln!(
+                    "[osr] {} site=0x{site:x}: baseline resume point",
+                    func_arc.name.resolve_global().unwrap_or_default()
+                );
+            }
+            osr::publish_helper(bead_id, site, code);
+        }
+    }
+}
+
 pub fn compile_at_tier(
     tier_idx: usize,
     bead: &Arc<Bead>,
@@ -2868,7 +2907,9 @@ pub fn compile_at_tier(
     );
 
     #[cfg(feature = "llvm-backend")]
-    if tier_idx == 2 && matches!(tier2_backend, Tier2Backend::LLVM) {
+    if tier_idx == OptimizationTier::Optimized.index()
+        && matches!(tier2_backend, Tier2Backend::LLVM)
+    {
         if let Some(llvm) = llvm {
             let resume = def.clone();
             // A compile that panics is a compile that failed: the
@@ -2896,7 +2937,7 @@ pub fn compile_at_tier(
                             if missing.contains(&site) && !code.is_null() {
                                 if crate::osr::osr_trace_enabled() {
                                     eprintln!(
-                                        "[osr] {} site=0x{site:x}: resume point from tier 1",
+                                        "[osr] {} site=0x{site:x}: baseline resume point",
                                         resume.function.name.resolve_global().unwrap_or_default()
                                     );
                                 }
@@ -2917,8 +2958,9 @@ pub fn compile_at_tier(
         }
     }
 
-    // Cranelift handles tier 0/1, and tier 2 when the config doesn't pick
-    // LLVM (or the LLVM feature is off).
+    // Cranelift is the baseline, and the optimizing tier too when the
+    // config doesn't pick LLVM (or the LLVM feature is off): an explicit
+    // request then recompiles the function with the current module.
     let _ = tier2_backend; // silence unused-variable when llvm-backend is off
     match cranelift.compile(bead, def) {
         Ok(p) => p,
@@ -2940,7 +2982,6 @@ pub fn compile_at_tier(
 pub struct TieredStatistics {
     pub profile_stats: crate::profiling::ProfileStatistics,
     pub baseline_functions: usize,
-    pub standard_functions: usize,
     pub optimized_functions: usize,
     pub queued_for_optimization: usize,
     pub currently_optimizing: usize,
@@ -2949,11 +2990,10 @@ pub struct TieredStatistics {
 impl TieredStatistics {
     pub fn format(&self) -> String {
         format!(
-            "Tiered Compilation: {} Baseline (T0), {} Standard (T1), {} Optimized (T2)\n\
+            "Tiered Compilation: {} Baseline (T0), {} Optimized (T1)\n\
              Queue: {} waiting, {} optimizing\n\
              {}",
             self.baseline_functions,
-            self.standard_functions,
             self.optimized_functions,
             self.queued_for_optimization,
             self.currently_optimizing,

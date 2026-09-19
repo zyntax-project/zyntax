@@ -334,9 +334,6 @@ pub struct CraneliftBackend {
     inferred_extern_sigs: HashMap<HirId, (Vec<HirType>, Option<HirType>)>,
     /// Effect codegen context for algebraic effects
     effect_context: EffectCodegenContext,
-    /// Tier the next `compile_function` call should target. 0 = baseline,
-    /// 1+ = optimized. Used by OSR codegen to decide whether to emit
-    /// back-edge probes (tier 0 only) and OSR helpers (tier ≥ 1 only).
     /// Whether OSR helpers from this backend get published. See
     /// [`Self::publish_osr_helpers`].
     publish_osr_helpers: bool,
@@ -365,8 +362,11 @@ pub struct CraneliftBackend {
     /// with different state numbering.
     current_compile_id: Option<HirId>,
 
-    /// Defaults to 0; set via [`Self::set_compile_tier`] before each
-    /// `compile_function` call from the tiered runtime.
+    /// What the next `compile_function` builds: at 0 the function's
+    /// body, at 1 and up its OSR resume points as well. Every body
+    /// probes its loop headers either way. Set via
+    /// [`Self::set_compile_tier`] before each call from the tiered
+    /// runtime.
     compile_tier: usize,
     /// When `false`, tier-0 codegen skips the back-edge OSR probe and
     /// dispatch emission entirely — no arm-slot load and no
@@ -674,10 +674,9 @@ impl CraneliftBackend {
         self.compile_tier = tier;
     }
 
-    /// Whether this backend's OSR helpers should be published as resume
-    /// points. When a higher tier exists its helper is the one worth
-    /// resuming into; publishing this tier's would win the race to the
-    /// slot with code no better than what is already running.
+    /// Whether this backend's OSR helpers are published as resume points
+    /// as they are compiled. Hot reload turns this off and publishes the
+    /// ones that still fit the running code itself.
     pub fn publish_osr_helpers(&self) -> bool {
         self.publish_osr_helpers
     }
@@ -1085,7 +1084,8 @@ impl CraneliftBackend {
     }
 
     /// The last step: install what [`Translated::compile`] produced and,
-    /// at tier one and up, emit the function's OSR helpers.
+    /// on a resume-point compile (tier one and up), emit the function's
+    /// OSR helpers.
     pub fn install_function_in_shared_module(
         &mut self,
         translated: Translated,
@@ -2055,20 +2055,20 @@ impl CraneliftBackend {
                 block_order
             };
 
-            // OSR pre-pass: identify loop headers in tier 0 only. Tier ≥ 1
-            // emits OSR helpers (separate functions) and skips probes.
-            // Additionally suppress when `emit_osr_probes` is false — the
-            // embedder has declared no tier ≥ 1 backend will ever install
-            // OSR helpers, so the probe stream is pure overhead.
+            // OSR pre-pass: the loop headers that get a probe. A body and
+            // its resume points alike probe, so a frame resumed in one of
+            // them still moves on when the tier above publishes. Suppressed
+            // when `emit_osr_probes` is false: the embedder has declared
+            // that nothing will ever install a helper, so the probe stream
+            // would be pure overhead.
             let phase_started = std::time::Instant::now();
-            let osr_loop_headers: std::collections::HashSet<HirId> =
-                if self.compile_tier == 0 && self.emit_osr_probes {
-                    crate::osr::find_loop_headers(function)
-                        .into_iter()
-                        .collect()
-                } else {
-                    std::collections::HashSet::new()
-                };
+            let osr_loop_headers: std::collections::HashSet<HirId> = if self.emit_osr_probes {
+                crate::osr::find_loop_headers(function)
+                    .into_iter()
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
             // Stable per-function block index (matches `osr::block_index_of`).
             let osr_block_index: HashMap<HirId, u64> = function
                 .blocks
@@ -2089,31 +2089,40 @@ impl CraneliftBackend {
             // destination hands the destination over in the frame, and
             // the helper writes through it and returns it as this body
             // would.
-            let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> =
-                if self.compile_tier == 0 && self.emit_osr_probes {
-                    let dominators = crate::osr::Dominators::compute(function);
-                    osr_loop_headers
-                        .iter()
-                        .filter_map(|h| {
-                            match crate::osr::osr_layout_with(function, *h, &dominators) {
-                                Ok(layout) => Some((*h, layout)),
-                                Err(reason) => {
-                                    if crate::osr::osr_trace_enabled() {
-                                        eprintln!(
-                                            "[osr] reject tier-0 {} header_idx={}: {:?}",
-                                            function.name.resolve_global().unwrap_or_default(),
-                                            osr_block_index.get(h).copied().unwrap_or(u64::MAX),
-                                            reason
-                                        );
-                                    }
-                                    None
+            // A resume point's own header keeps the layout it was built
+            // from: that is the frame the tier above reads at that site,
+            // and the region as resumed would order the live-ins it
+            // repaired differently.
+            let own_layout = self.compile_osr_layout.clone();
+            let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> = if self.emit_osr_probes {
+                let dominators = crate::osr::Dominators::compute(function);
+                osr_loop_headers
+                    .iter()
+                    .filter_map(|h| {
+                        if let Some(own) = &own_layout
+                            && own.header == *h
+                        {
+                            return Some((*h, own.clone()));
+                        }
+                        match crate::osr::osr_layout_with(function, *h, &dominators) {
+                            Ok(layout) => Some((*h, layout)),
+                            Err(reason) => {
+                                if crate::osr::osr_trace_enabled() {
+                                    eprintln!(
+                                        "[osr] reject probe {} header_idx={}: {:?}",
+                                        function.name.resolve_global().unwrap_or_default(),
+                                        osr_block_index.get(h).copied().unwrap_or(u64::MAX),
+                                        reason
+                                    );
                                 }
+                                None
                             }
-                        })
-                        .collect()
-                } else {
-                    HashMap::new()
-                };
+                        }
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            };
             if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
                 eprintln!(
                     "[clif]   osr prologue {:.2} ms ({} headers, {} layouts)",
@@ -2313,7 +2322,7 @@ impl CraneliftBackend {
             // Tier-0 entry probe: a callee that compiled code reaches
             // through its cell is counted here, and asks for promotion
             // once it is hot.
-            if self.compile_tier == 0 && self.emit_osr_probes && osr_helper.is_none() {
+            if self.emit_osr_probes && osr_helper.is_none() {
                 emit_osr_request_after_calls(
                     &mut builder,
                     &mut self.module,
@@ -2619,9 +2628,17 @@ impl CraneliftBackend {
                     let (site_key, live_in_clir, slot_types, frame, return_clir, destination) =
                         if let Some(layout) = osr_layouts.get(hir_block_id) {
                             // Collect the Cranelift value backing each live-in.
+                            // In a resume point a live-in the region repairs
+                            // lives on as the phi standing for it.
                             let mut clir_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
                             for hir_id in &layout.live_ins {
-                                if let Some(&v) = self.value_map.get(hir_id) {
+                                let read = layout
+                                    .repairs
+                                    .iter()
+                                    .find(|r| r.value == *hir_id)
+                                    .map(|r| r.phi)
+                                    .unwrap_or(*hir_id);
+                                if let Some(&v) = self.value_map.get(&read) {
                                     clir_vals.push(v);
                                 }
                             }
@@ -2673,6 +2690,13 @@ impl CraneliftBackend {
                     // confused with a real source position.
                     let tag = crate::osr::probe_srcloc_tag(site_key);
                     builder.set_srcloc(cranelift_codegen::ir::SourceLoc::new(tag));
+                    // A resume point may find itself in the slot; it
+                    // transfers only into something else.
+                    let own = if osr_helper.is_some() {
+                        Some(self.module.declare_func_in_func(func_id, builder.func))
+                    } else {
+                        None
+                    };
                     emit_osr_back_edge_probe(
                         &mut builder,
                         &mut self.module,
@@ -2683,6 +2707,7 @@ impl CraneliftBackend {
                         &slot_types,
                         return_clir,
                         destination,
+                        own,
                     );
                     builder.set_srcloc(cranelift_codegen::ir::SourceLoc::default());
                     probe_site_tags.push((site_key, tag));
@@ -10236,6 +10261,7 @@ fn emit_osr_back_edge_probe(
     slot_types: &[cranelift_codegen::ir::Type],
     return_clir: Option<cranelift_codegen::ir::Type>,
     destination: Option<(cranelift_codegen::ir::Value, u32)>,
+    own: Option<cranelift_codegen::ir::FuncRef>,
 ) {
     // Helper signature: one pointer to the frame carrying the live-ins.
     // Passing them as arguments would force each to fit a register, which
@@ -10268,9 +10294,20 @@ fn emit_osr_back_edge_probe(
 
     let dispatch_block = builder.create_block();
     let post_probe_block = builder.create_block();
+    // A resume point reads the slot it may itself be published in, so it
+    // dispatches only to code that is not its own.
+    let armed = match own {
+        Some(own) => {
+            let own_addr = builder.ins().func_addr(types::I64, own);
+            let other = builder.ins().icmp(IntCC::NotEqual, helper_ptr, own_addr);
+            let present = builder.ins().icmp_imm(IntCC::NotEqual, helper_ptr, 0);
+            builder.ins().band(other, present)
+        }
+        None => helper_ptr,
+    };
     builder
         .ins()
-        .brif(helper_ptr, dispatch_block, &[], post_probe_block, &[]);
+        .brif(armed, dispatch_block, &[], post_probe_block, &[]);
 
     builder.switch_to_block(dispatch_block);
     builder.seal_block(dispatch_block);
