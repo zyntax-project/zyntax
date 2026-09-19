@@ -26,6 +26,7 @@ zrtl_math = { path = "../../plugins/zrtl_math", features = ["linked-into-host"] 
 full_moon = { version = "2.2", default-features = false, features = ["lua54"] }
 thiserror = "1"
 indexmap = "2"
+libc = "0.2"
 
 [build-dependencies]
 zyntax_typed_ast = { path = "../typed_ast" }

@@ -7,6 +7,8 @@ use std::sync::OnceLock;
 
 use zrtl::{DynamicBox, StringPtr, TypeCategory, TypeTag};
 
+use crate::host_os;
+
 static ARGS: OnceLock<Vec<String>> = OnceLock::new();
 
 /// The program's arguments, `arg` in Lua's terms: the script's path
@@ -1341,10 +1343,24 @@ extern "C" fn host_gc(op: i64) -> i64 {
     }
 }
 
+/// `os.setlocale`: only the C locale is on offer, so a query or a
+/// request for it answers "C" and any other locale is refused.
+extern "C" fn host_setlocale(locale: zrtl::StringConstPtr) -> StringPtr {
+    let wanted = if locale.is_null() {
+        &b""[..]
+    } else {
+        unsafe { bytes_of(locale) }
+    };
+    match wanted {
+        b"" | b"C" | b"POSIX" => zrtl::string::string_from_bytes(b"C"),
+        _ => std::ptr::null_mut(),
+    }
+}
+
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 49] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 61] = [
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$clock".as_ptr(), host_clock as *const u8),
@@ -1421,6 +1437,30 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 49] = [
         c"$Lua$replace_dots".as_ptr(),
         host_replace_dots as *const u8,
     ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$os_error".as_ptr(),
+        host_os::host_os_error as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$date_field".as_ptr(),
+        host_os::host_date_field as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(c"$Lua$time_of".as_ptr(), host_os::host_time_of as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$date_check".as_ptr(),
+        host_os::host_date_check as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(c"$Lua$date".as_ptr(), host_os::host_date as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$getenv".as_ptr(), host_os::host_getenv as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$tmpname".as_ptr(), host_os::host_tmpname as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$remove".as_ptr(), host_os::host_remove as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$rename".as_ptr(), host_os::host_rename as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$execute".as_ptr(), host_os::host_execute as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$exec_result".as_ptr(),
+        host_os::host_exec_result as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(c"$Lua$setlocale".as_ptr(), host_setlocale as *const u8),
 ];
 
 /// The host's symbols as a plugin the runtime links like any other.

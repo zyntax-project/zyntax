@@ -19,6 +19,7 @@ use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::{InternedString, PrimitiveType, Type, TypedProgram};
 
 mod host;
+mod host_os;
 pub mod library;
 mod lower;
 pub mod pattern;
