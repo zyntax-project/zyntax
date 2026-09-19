@@ -288,6 +288,91 @@ pub const BUILTINS: &[Builtin] = &[
         params: &[Str, Str, Value, OptInt(i64::MAX)],
         ret: Ret::Multi,
     },
+    Builtin {
+        lib: "",
+        name: "collectgarbage",
+        func: "zl_collectgarbage",
+        params: &[OptStr("collect"), Any],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "",
+        name: "require",
+        func: "zl_require",
+        params: &[Str],
+        ret: Ret::Any,
+    },
+    // ─── debug: what a program can be told without a debugger ───
+    Builtin {
+        lib: "debug",
+        name: "traceback",
+        func: "zl_debug_traceback",
+        params: &[Any, Any],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "debug",
+        name: "getinfo",
+        func: "zl_debug_getinfo",
+        params: &[Any, Any],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "debug",
+        name: "sethook",
+        func: "zl_debug_sethook",
+        params: &[Rest],
+        ret: Ret::Unit,
+    },
+    Builtin {
+        lib: "debug",
+        name: "gethook",
+        func: "zl_debug_gethook",
+        params: &[Rest],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "debug",
+        name: "getmetatable",
+        func: "zl_debug_getmetatable",
+        params: &[Value],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "debug",
+        name: "setmetatable",
+        func: "zl_debug_setmetatable",
+        params: &[Value, Any],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "debug",
+        name: "getregistry",
+        func: "zl_debug_getregistry",
+        params: &[],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "debug",
+        name: "getlocal",
+        func: "zl_debug_none",
+        params: &[Rest],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "debug",
+        name: "getupvalue",
+        func: "zl_debug_none",
+        params: &[Rest],
+        ret: Ret::Any,
+    },
+    Builtin {
+        lib: "debug",
+        name: "upvalueid",
+        func: "zl_debug_none",
+        params: &[Rest],
+        ret: Ret::Any,
+    },
     // ─── utf8 ───
     Builtin {
         lib: "utf8",
@@ -623,6 +708,16 @@ pub const CONSTANTS: &[(&str, &str, Constant)] = &[
         "charpattern",
         Constant::Bytes("5b002d7fc22dfd5d5b802dbf5d2a"),
     ),
+    // "./?.lua;./?/init.lua"
+    (
+        "package",
+        "path",
+        Constant::Bytes("2e2f3f2e6c75613b2e2f3f2f696e69742e6c7561"),
+    ),
+    ("package", "cpath", Constant::Bytes("")),
+    // The directory separator, path separator, template mark, and the
+    // rest, each on its own line.
+    ("package", "config", Constant::Bytes("2f0a3b0a3f0a210a2d0a")),
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -634,7 +729,17 @@ pub enum Constant {
 }
 
 /// The libraries with a table of their own.
-pub const LIBS: &[&str] = &["string", "math", "table", "os", "io", "coroutine", "utf8"];
+pub const LIBS: &[&str] = &[
+    "string",
+    "math",
+    "table",
+    "os",
+    "io",
+    "coroutine",
+    "utf8",
+    "debug",
+    "package",
+];
 
 /// The name of a builtin's value wrapper.
 pub fn wrapper_name(b: &Builtin) -> String {
@@ -1183,6 +1288,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             when(
                 eq(j.e(), int(i64::MIN)),
                 vec![j.set(call("zl_len", vec![tb.e()], i64()))],
+            ),
+            // The reference's stack holds a million values.
+            when(
+                and(
+                    le(i.e(), j.e()),
+                    or(
+                        ge(sub(cast(j.e(), u64()), cast(i.e(), u64())), int(1_000_000)),
+                        lt(sub(j.e(), i.e()), int(0)),
+                    ),
+                ),
+                vec![lua_error(text("too many results to unpack"))],
             ),
             out.decl(list(vec![], anys.clone())),
             k.decl(i.e()),
@@ -2121,9 +2237,21 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 any(),
             )
         };
+        // Cached before it is filled: `package.loaded` holds every
+        // library's table, `package` included.
         let mut st = vec![
             when(not(is_nil(cached())), vec![ret(cached())]),
             tb.decl(call("zl_table_new", vec![], table.clone())),
+            expr(node(
+                zyntax_typed_ast::typed_ast::TypedExpression::Binary(
+                    zyntax_typed_ast::typed_ast::TypedBinary {
+                        op: zyntax_typed_ast::typed_ast::BinaryOp::Assign,
+                        left: Box::new(cached()),
+                        right: Box::new(box_table(tb.e())),
+                    },
+                ),
+                any(),
+            )),
         ];
         for b in BUILTINS.iter().filter(|b| b.lib == *lib) {
             st.push(expr(call(
@@ -2148,16 +2276,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 unit(),
             )));
         }
-        st.push(expr(node(
-            zyntax_typed_ast::typed_ast::TypedExpression::Binary(
-                zyntax_typed_ast::typed_ast::TypedBinary {
-                    op: zyntax_typed_ast::typed_ast::BinaryOp::Assign,
-                    left: Box::new(cached()),
-                    right: Box::new(box_table(tb.e())),
-                },
-            ),
-            any(),
-        )));
+        if *lib == "package" {
+            st.push(expr(call(
+                "zl_rawset_str",
+                vec![
+                    tb.e(),
+                    text("loaded"),
+                    call("zl_package_loaded", vec![], any()),
+                ],
+                unit(),
+            )));
+        }
         st.push(ret(cached()));
         d.push(define(&lib_table_fn(lib), &[], any(), st));
     }
@@ -2234,7 +2363,28 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     // as it runs.
     d.push(global_var(GLOBALS, table.clone()));
     {
-        let mut st = vec![tb.decl(call("zl_table_new", vec![], table.clone()))];
+        // Built once, and reachable through `zl_G` while it is being
+        // filled: `package.loaded` holds `_G`.
+        let g = || {
+            node(
+                zyntax_typed_ast::typed_ast::TypedExpression::Variable(intern(GLOBALS)),
+                table.clone(),
+            )
+        };
+        let mut st = vec![
+            when(ne(g(), null(table.clone())), vec![ret(g())]),
+            tb.decl(call("zl_table_new", vec![], table.clone())),
+            expr(node(
+                zyntax_typed_ast::typed_ast::TypedExpression::Binary(
+                    zyntax_typed_ast::typed_ast::TypedBinary {
+                        op: zyntax_typed_ast::typed_ast::BinaryOp::Assign,
+                        left: Box::new(g()),
+                        right: Box::new(tb.e()),
+                    },
+                ),
+                table.clone(),
+            )),
+        ];
         for b in BUILTINS.iter().filter(|b| b.lib.is_empty()) {
             st.push(expr(call(
                 "zl_rawset_str",
@@ -2271,16 +2421,362 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         st.push(ret(tb.e()));
         d.push(define("zl_globals_table", &[], table.clone(), st));
     }
-    // A member of the string library, for `s:method()` on a string.
+    // The metatable every string shares, `{__index = string}`, which a
+    // program may edit; a member of a string is what its `__index`
+    // says.
+    d.push(global_var("zl_string_meta", any()));
+    let cached = |name: &str| {
+        node(
+            zyntax_typed_ast::typed_ast::TypedExpression::Variable(intern(name)),
+            any(),
+        )
+    };
+    let assign_global = |name: &str, value: Expr| {
+        expr(node(
+            zyntax_typed_ast::typed_ast::TypedExpression::Binary(
+                zyntax_typed_ast::typed_ast::TypedBinary {
+                    op: zyntax_typed_ast::typed_ast::BinaryOp::Assign,
+                    left: Box::new(cached(name)),
+                    right: Box::new(value),
+                },
+            ),
+            any(),
+        ))
+    };
+    d.push(define(
+        "zl_string_metatable",
+        &[],
+        any(),
+        vec![
+            when(
+                is_nil(cached("zl_string_meta")),
+                vec![
+                    tb.decl(call("zl_table_new", vec![], table.clone())),
+                    expr(call(
+                        "zl_rawset_str",
+                        vec![
+                            tb.e(),
+                            text("__index"),
+                            call(&lib_table_fn("string"), vec![], any()),
+                        ],
+                        unit(),
+                    )),
+                    assign_global("zl_string_meta", box_table(tb.e())),
+                ],
+            ),
+            ret(cached("zl_string_meta")),
+        ],
+    ));
+    let is_func = |x: Expr| {
+        and(
+            ne(x.clone(), nil()),
+            eq(tag_of(x), int(zyntax_builtins::FUNC_TAG)),
+        )
+    };
     d.push(define(
         "zl_string_member",
+        &[&x, &y],
+        any(),
+        vec![
+            handler.decl(call(
+                "zl_index",
+                vec![
+                    call("zl_string_metatable", vec![], any()),
+                    box_str(text("__index")),
+                ],
+                any(),
+            )),
+            when(is_nil(handler.e()), vec![ret(nil())]),
+            when(
+                is_func(handler.e()),
+                vec![ret(call(
+                    "zl_first",
+                    vec![call("zl_call_2", vec![handler.e(), x.e(), y.e()], any())],
+                    any(),
+                ))],
+            ),
+            ret(call("zl_index", vec![handler.e(), y.e()], any())),
+        ],
+    ));
+
+    // `collectgarbage(opt)`: a collection, or what the collector knows.
+    d.push(extern_fn("zl_gc", &[("op", i64())], i64(), Some("$Lua$gc")));
+    let opt = kept("opt", string());
+    let is = |name: &str| call("zb_str_eq", vec![opt.e(), text(name)], boolean());
+    d.push(define(
+        "zl_collectgarbage",
+        &[&opt, &x],
+        any(),
+        vec![
+            when(
+                or(is("collect"), is("step")),
+                vec![
+                    expr(call("zl_gc", vec![int(0)], i64())),
+                    when(is("step"), vec![ret(box_bool(bool(false)))]),
+                    ret(box_i64(int(0))),
+                ],
+            ),
+            when(
+                is("count"),
+                vec![
+                    n.decl(call("zl_gc", vec![int(1)], i64())),
+                    ret(box_f64(div(cast(n.e(), f64()), float(1024.0)))),
+                ],
+            ),
+            when(is("isrunning"), vec![ret(box_bool(bool(true)))]),
+            when(
+                or(is("incremental"), is("generational")),
+                vec![ret(box_str(text("incremental")))],
+            ),
+            when(
+                or(
+                    or(is("stop"), is("restart")),
+                    or(is("setpause"), is("setstepmul")),
+                ),
+                vec![ret(box_i64(int(0)))],
+            ),
+            lua_error(concat(vec![
+                text("bad argument #1 to 'collectgarbage' (invalid option '"),
+                opt.e(),
+                text("')"),
+            ])),
+            ret(nil()),
+        ],
+    ));
+    // `require(name)`: the standard libraries by name; nothing else is
+    // found, since a program is compiled whole.
+    let name = kept("name", string());
+    d.push(define(
+        "zl_require",
+        &[&name],
+        any(),
+        vec![
+            y.decl(call(
+                "zl_index",
+                vec![call("zl_package_loaded", vec![], any()), box_str(name.e())],
+                any(),
+            )),
+            when(not(is_nil(y.e())), vec![ret(y.e())]),
+            lua_error(concat(vec![
+                text("module '"),
+                name.e(),
+                text("' not found:\n\tno field package.preload['"),
+                name.e(),
+                text("']\n\tno file './"),
+                name.e(),
+                text(".lua'"),
+            ])),
+            ret(nil()),
+        ],
+    ));
+    // `package.loaded`: every library under its name, and `_G`.
+    d.push(global_var("zl_loaded", any()));
+    {
+        let mut st = vec![when(
+            not(is_nil(cached("zl_loaded"))),
+            vec![ret(cached("zl_loaded"))],
+        )];
+        st.push(tb.decl(call("zl_table_new", vec![], table.clone())));
+        for lib in LIBS {
+            st.push(expr(call(
+                "zl_rawset_str",
+                vec![tb.e(), text(lib), call(&lib_table_fn(lib), vec![], any())],
+                unit(),
+            )));
+        }
+        st.push(expr(call(
+            "zl_rawset_str",
+            vec![tb.e(), text("_G"), call("zl_globals_value", vec![], any())],
+            unit(),
+        )));
+        st.push(assign_global("zl_loaded", box_table(tb.e())));
+        st.push(ret(cached("zl_loaded")));
+        d.push(define("zl_package_loaded", &[], any(), st));
+    }
+    // `_G` as a value for a program that never reaches it as one.
+    d.push(define(
+        "zl_globals_value",
+        &[],
+        any(),
+        vec![ret(box_table(call(
+            "zl_globals_table",
+            vec![],
+            table.clone(),
+        )))],
+    ));
+
+    // ─── debug ──────────────────────────────────────────────────
+    // The message itself: there is no stack to print.
+    d.push(define(
+        "zl_debug_traceback",
+        &[&x, &y],
+        any(),
+        vec![
+            when(
+                and(not(is_nil(x.e())), ne(category(x.e()), int(STR))),
+                vec![ret(x.e())],
+            ),
+            when(is_nil(x.e()), vec![ret(box_str(text("stack traceback:")))]),
+            ret(box_str(add(get_str(x.e()), text("\nstack traceback:")))),
+        ],
+    ));
+    // What is known of the running function: its chunk and line.
+    d.push(define(
+        "zl_debug_getinfo",
+        &[&x, &y],
+        any(),
+        vec![
+            tb.decl(call("zl_table_new", vec![], table.clone())),
+            expr(call(
+                "zl_rawset_str",
+                vec![
+                    tb.e(),
+                    text("currentline"),
+                    box_i64(read_global(LINE, i64())),
+                ],
+                unit(),
+            )),
+            expr(call(
+                "zl_rawset_str",
+                vec![
+                    tb.e(),
+                    text("short_src"),
+                    box_str(read_global(CHUNK, string())),
+                ],
+                unit(),
+            )),
+            expr(call(
+                "zl_rawset_str",
+                vec![
+                    tb.e(),
+                    text("source"),
+                    box_str(add(text("@"), read_global(CHUNK, string()))),
+                ],
+                unit(),
+            )),
+            expr(call(
+                "zl_rawset_str",
+                vec![tb.e(), text("what"), box_str(text("Lua"))],
+                unit(),
+            )),
+            expr(call(
+                "zl_rawset_str",
+                vec![tb.e(), text("namewhat"), box_str(text(""))],
+                unit(),
+            )),
+            expr(call(
+                "zl_rawset_str",
+                vec![tb.e(), text("linedefined"), box_i64(int(0))],
+                unit(),
+            )),
+            expr(call(
+                "zl_rawset_str",
+                vec![tb.e(), text("lastlinedefined"), box_i64(int(0))],
+                unit(),
+            )),
+            expr(call(
+                "zl_rawset_str",
+                vec![tb.e(), text("nups"), box_i64(int(0))],
+                unit(),
+            )),
+            expr(call(
+                "zl_rawset_str",
+                vec![tb.e(), text("nparams"), box_i64(int(0))],
+                unit(),
+            )),
+            expr(call(
+                "zl_rawset_str",
+                vec![tb.e(), text("isvararg"), box_bool(bool(true))],
+                unit(),
+            )),
+            expr(call(
+                "zl_rawset_str",
+                vec![tb.e(), text("istailcall"), box_bool(bool(false))],
+                unit(),
+            )),
+            when(
+                is_func(x.e()),
+                vec![expr(call(
+                    "zl_rawset_str",
+                    vec![tb.e(), text("func"), x.e()],
+                    unit(),
+                ))],
+            ),
+            ret(box_table(tb.e())),
+        ],
+    ));
+    d.push(define(
+        "zl_debug_sethook",
+        &[&args],
+        unit(),
+        vec![ret_void()],
+    ));
+    d.push(define(
+        "zl_debug_gethook",
+        &[&args],
+        any(),
+        vec![ret(nil())],
+    ));
+    d.push(define("zl_debug_none", &[&args], any(), vec![ret(nil())]));
+    d.push(define(
+        "zl_debug_getmetatable",
         &[&x],
         any(),
-        vec![ret(call(
-            "zl_index",
-            vec![call(&lib_table_fn("string"), vec![], any()), x.e()],
-            any(),
-        ))],
+        vec![
+            when(
+                eq(category(x.e()), int(STR)),
+                vec![ret(call("zl_string_metatable", vec![], any()))],
+            ),
+            when(not(is_table(x.e())), vec![ret(nil())]),
+            tb.decl(unbox_table(x.e(), t)),
+            when(
+                eq(meta_of(tb.e(), t), null(table.clone())),
+                vec![ret(nil())],
+            ),
+            ret(box_table(meta_of(tb.e(), t))),
+        ],
+    ));
+    d.push(define(
+        "zl_debug_setmetatable",
+        &[&x, &y],
+        any(),
+        vec![
+            when(
+                and(not(is_nil(y.e())), not(is_table(y.e()))),
+                vec![lua_error(text(
+                    "bad argument #2 to 'setmetatable' (nil or table expected)",
+                ))],
+            ),
+            when(
+                eq(category(x.e()), int(STR)),
+                vec![assign_global("zl_string_meta", y.e()), ret(x.e())],
+            ),
+            when(
+                is_table(x.e()),
+                vec![expr(call(
+                    "zl_setmetatable",
+                    vec![unbox_table(x.e(), t), y.e()],
+                    table.clone(),
+                ))],
+            ),
+            ret(x.e()),
+        ],
+    ));
+    d.push(global_var("zl_registry", any()));
+    d.push(define(
+        "zl_debug_getregistry",
+        &[],
+        any(),
+        vec![
+            when(
+                is_nil(cached("zl_registry")),
+                vec![assign_global(
+                    "zl_registry",
+                    box_table(call("zl_table_new", vec![], table.clone())),
+                )],
+            ),
+            ret(cached("zl_registry")),
+        ],
     ));
     d
 }

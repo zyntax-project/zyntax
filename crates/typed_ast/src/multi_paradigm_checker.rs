@@ -483,7 +483,10 @@ impl TypeChecker {
                 }
                 Ok(())
             }
-            TypedStatement::Break(_) | TypedStatement::Continue => Ok(()),
+            TypedStatement::Break(_)
+            | TypedStatement::Continue
+            | TypedStatement::Label(_)
+            | TypedStatement::Goto(_) => Ok(()),
             TypedStatement::Throw(expr) => {
                 self.check_expression(expr)?;
                 Ok(())

@@ -1,0 +1,20 @@
+in block
+close	b	nil
+close	a	nil
+after block
+close	x	nil
+ret
+iter	1
+close	c1	nil
+close	c2	nil
+close	y	close.lua:28: boom
+false	close.lua:28: boom
+nil and false are fine
+false	close.lua:38: variable 'bad' got a non-closable value
+close	w	nil
+after goto
+close	z	nil
+computing
+close	second	nil
+close	first	nil
+1

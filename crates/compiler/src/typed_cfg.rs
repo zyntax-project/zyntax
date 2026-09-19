@@ -45,6 +45,9 @@ pub struct TypedCfgBuilder {
     /// Stack of loop contexts for Break/Continue handling
     /// Each entry is (header_id, after_id) for the loop
     loop_stack: Vec<(HirId, HirId)>,
+    /// The block each label of the function starts, made when the
+    /// label or a `goto` to it is first met.
+    labels: HashMap<InternedString, HirId>,
     /// `with` scopes discovered during construction, in source order.
     pub with_scopes: Vec<WithScopeInfo>,
 }
@@ -113,6 +116,7 @@ impl TypedCfgBuilder {
         Self {
             next_block_id: 0,
             loop_stack: Vec::new(),
+            labels: HashMap::new(),
             with_scopes: Vec::new(),
         }
     }
@@ -121,6 +125,16 @@ impl TypedCfgBuilder {
     fn new_block_id(&mut self) -> HirId {
         let id = HirId::new();
         self.next_block_id += 1;
+        id
+    }
+
+    /// The block a label starts, the same for every mention of it.
+    fn label_block(&mut self, name: InternedString) -> HirId {
+        if let Some(&id) = self.labels.get(&name) {
+            return id;
+        }
+        let id = self.new_block_id();
+        self.labels.insert(name, id);
         id
     }
 
@@ -1194,6 +1208,37 @@ impl TypedCfgBuilder {
                     } else {
                         current_statements.push(stmt.clone());
                     }
+                }
+
+                // A label starts its own block, which the statements
+                // before it fall into; a goto ends its block with a
+                // jump there and what follows is unreached.
+                TypedStatement::Label(name) => {
+                    let label_id = self.label_block(*name);
+                    all_blocks.push(TypedBasicBlock {
+                        id: current_block_id,
+                        label: None,
+                        statements: current_statements.clone(),
+                        terminator: TypedTerminator::Jump(label_id),
+                        pattern_check: None,
+                    });
+                    current_statements = Vec::new();
+                    current_block_id = label_id;
+                    exit_id = label_id;
+                }
+
+                TypedStatement::Goto(name) => {
+                    let label_id = self.label_block(*name);
+                    all_blocks.push(TypedBasicBlock {
+                        id: current_block_id,
+                        label: None,
+                        statements: current_statements.clone(),
+                        terminator: TypedTerminator::Jump(label_id),
+                        pattern_check: None,
+                    });
+                    let unreachable_id = self.new_block_id();
+                    current_statements = Vec::new();
+                    current_block_id = unreachable_id;
                 }
 
                 TypedStatement::Break(value_opt) => {

@@ -105,8 +105,18 @@ pub struct Scopes {
     /// Local functions: the variable a `local function` declares, and
     /// the function.
     pub local_functions: HashMap<VarId, FuncId>,
-    /// Label names by the byte offset of the `goto` referring to them.
-    pub gotos: HashMap<usize, String>,
+    /// Each label's number, by the byte offset of its token; unique
+    /// within the chunk, so two blocks may each have a `::done::`.
+    pub labels: HashMap<usize, u32>,
+    /// How many blocks enclose each label within its function, the
+    /// function's body counting as one: a `goto` from deeper leaves
+    /// the blocks between.
+    pub label_depths: HashMap<u32, usize>,
+    /// The label each `goto` jumps to, by the byte offset of its token:
+    /// the nearest enclosing block's label of that name. A `goto` with
+    /// no entry names a label that is not visible.
+    pub gotos: HashMap<usize, u32>,
+    next_label: u32,
     /// Globals whose first mention in the chunk, textually, is an
     /// assignment at the outermost block: never read as nil, so their
     /// type is the join of what is assigned to them.
@@ -225,6 +235,10 @@ pub fn literal_string(e: &Expression) -> Option<String> {
 struct Frame {
     id: FuncId,
     blocks: Vec<HashMap<String, VarId>>,
+    /// The labels of each open block, innermost last; every label of a
+    /// block is known before its statements are walked, since a `goto`
+    /// may jump forward.
+    labels: Vec<HashMap<String, u32>>,
 }
 
 struct Walker {
@@ -253,6 +267,7 @@ pub fn resolve(ast: &ast::Ast) -> Scopes {
     w.frames.push(Frame {
         id: CHUNK,
         blocks: vec![HashMap::new()],
+        labels: Vec::new(),
     });
     w.stmts(ast.nodes(), true);
     w.frames.pop();
@@ -408,9 +423,23 @@ impl Walker {
     }
 
     fn stmts(&mut self, block: &Block, _top: bool) {
+        // The block's labels, numbered before its statements are walked.
+        let mut labels = HashMap::new();
+        let depth = self.frame().labels.len() + 1;
+        for stmt in block.stmts() {
+            if let Stmt::Label(l) = stmt {
+                let id = self.out.next_label;
+                self.out.next_label += 1;
+                self.out.labels.insert(pos_of(l.name()), id);
+                self.out.label_depths.insert(id, depth);
+                labels.insert(name_of(l.name()), id);
+            }
+        }
+        self.frame().labels.push(labels);
         for stmt in block.stmts() {
             self.stmt(stmt);
         }
+        self.frame().labels.pop();
         if let Some(last) = block.last_stmt() {
             match last {
                 ast::LastStmt::Return(r) => {
@@ -557,9 +586,16 @@ impl Walker {
                 self.block(w.block());
             }
             Stmt::Goto(g) => {
-                self.out
-                    .gotos
-                    .insert(pos_of(g.goto_token()), name_of(g.label_name()));
+                let name = name_of(g.label_name());
+                let target = self
+                    .frame()
+                    .labels
+                    .iter()
+                    .rev()
+                    .find_map(|labels| labels.get(&name).copied());
+                if let Some(id) = target {
+                    self.out.gotos.insert(pos_of(g.goto_token()), id);
+                }
             }
             Stmt::Label(_) => {}
             _ => {}
@@ -590,6 +626,7 @@ impl Walker {
         self.frames.push(Frame {
             id,
             blocks: vec![HashMap::new()],
+            labels: Vec::new(),
         });
         let mut params = Vec::new();
         if is_method {

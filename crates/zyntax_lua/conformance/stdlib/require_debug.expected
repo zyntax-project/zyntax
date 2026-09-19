@@ -1,0 +1,10 @@
+true	true	true
+true	true	string
+nil	nil
+table	true	xx
+custom:foo
+ABC
+locked
+false	cannot change a protected metatable
+locked
+true	true	true	true

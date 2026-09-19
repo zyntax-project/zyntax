@@ -1555,7 +1555,7 @@ impl LoweringContext {
                     function_return_type,
                 )?;
             }
-            TypedStatement::Continue => {}
+            TypedStatement::Continue | TypedStatement::Label(_) | TypedStatement::Goto(_) => {}
         }
         Ok(())
     }
@@ -5048,7 +5048,10 @@ impl LoweringContext {
                     .as_ref()
                     .map(|expr| Box::new(self.retype_expression_node_with_self(expr, self_params))),
             ),
-            TypedStatement::Break(_) | TypedStatement::Continue => stmt_node.node.clone(),
+            TypedStatement::Break(_)
+            | TypedStatement::Continue
+            | TypedStatement::Label(_)
+            | TypedStatement::Goto(_) => stmt_node.node.clone(),
             TypedStatement::If(if_stmt) => {
                 use zyntax_typed_ast::TypedIf;
                 TypedStatement::If(TypedIf {

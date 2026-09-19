@@ -232,8 +232,6 @@ struct Lowerer<'m, 'a> {
     varargs: Option<InternedString>,
     returns: Returns,
     temps: usize,
-    /// The label a `goto` may continue to, per enclosing loop.
-    loops: Vec<Option<String>>,
     /// Names already bound by a `let` in this function, so a second
     /// declaration of a Lua local of the same name is a fresh symbol.
     bound: std::collections::HashSet<InternedString>,
@@ -251,6 +249,14 @@ struct Lowerer<'m, 'a> {
     /// Whether the body reads the line it was entered at, for
     /// `error(v, 2)`.
     entry_line: bool,
+    /// The `<close>` variables in scope, each with the depth of the
+    /// block declaring it, innermost last. Leaving a block closes its
+    /// variables in reverse order.
+    tbc: Vec<(usize, VarId)>,
+    /// How many blocks are open, the function's body counting as one.
+    depth: usize,
+    /// The depth of each enclosing loop's body.
+    loop_depths: Vec<usize>,
 }
 
 fn unsupported<T>(what: impl Into<String>, span: Span) -> Result<T> {
@@ -707,13 +713,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             varargs: None,
             returns,
             temps: 0,
-            loops: Vec::new(),
             bound: std::collections::HashSet::new(),
             nil_global: None,
             raised: false,
             raise_callees: HashSet::new(),
             line_needed: false,
             entry_line: false,
+            tbc: Vec::new(),
+            depth: 0,
+            loop_depths: Vec::new(),
         }
     }
 
@@ -938,6 +946,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     /// The placeholder this function leaves with once an error is
     /// pending: whoever called it checks next.
     fn placeholder_return(&mut self, span: Span) -> St {
+        if !self.tbc.is_empty() {
+            let mut statements = Vec::new();
+            self.closes_from(1, Some(Self::pending(span)), span, &mut statements);
+            statements.push(self.placeholder_return_plain(span));
+            return stmt(TypedStatement::Block(TypedBlock { statements, span }), span);
+        }
+        self.placeholder_return_plain(span)
+    }
+
+    fn placeholder_return_plain(&mut self, span: Span) -> St {
         let value = match self.returns.clone() {
             Returns::Fixed(types) if types.is_empty() => None,
             Returns::Fixed(types) if types.len() == 1 => {
@@ -2901,6 +2919,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     /// `SEGMENT_STATEMENTS` statements each, the final `return` in the
     /// last.
     fn segments(&mut self, block: &Block) -> Result<Vec<Vec<St>>> {
+        self.depth = 1;
         let mut segments = Vec::new();
         let mut out = Vec::new();
         for s in block.stmts() {
@@ -2932,6 +2951,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     fn block(&mut self, block: &Block) -> Result<Vec<St>> {
+        self.depth += 1;
         let mut out = Vec::new();
         for s in block.stmts() {
             let at = out.len();
@@ -2939,21 +2959,59 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             self.stmt(s, &mut out)?;
             self.record_line(span_of(s), at, &mut out);
         }
-        if let Some(last) = block.last_stmt() {
-            let span = span_of(last);
-            let at = out.len();
-            self.line_needed = false;
-            match last {
-                ast::LastStmt::Break(_) => out.push(stmt(TypedStatement::Break(None), span)),
-                ast::LastStmt::Return(r) => {
-                    let exprs: Vec<&Expression> = r.returns().iter().collect();
-                    self.return_stmt(&exprs, span, &mut out)?;
+        match block.last_stmt() {
+            Some(last) => {
+                let span = span_of(last);
+                let at = out.len();
+                self.line_needed = false;
+                match last {
+                    ast::LastStmt::Break(_) => {
+                        // The loop's body and everything within it is left.
+                        let loop_depth = self.loop_depths.last().copied().unwrap_or(1);
+                        self.closes_from(loop_depth, None, span, &mut out);
+                        out.push(stmt(TypedStatement::Break(None), span));
+                    }
+                    ast::LastStmt::Return(r) => {
+                        let exprs: Vec<&Expression> = r.returns().iter().collect();
+                        self.return_stmt(&exprs, span, &mut out)?;
+                    }
+                    _ => return unsupported("this statement", span),
                 }
-                _ => return unsupported("this statement", span),
+                self.record_line(span, at, &mut out);
             }
-            self.record_line(span, at, &mut out);
+            None => {
+                let span = span_of(block);
+                self.closes_from(self.depth, None, span, &mut out);
+            }
         }
+        self.tbc.retain(|(d, _)| *d < self.depth);
+        self.depth -= 1;
         Ok(out)
+    }
+
+    /// Close every `<close>` variable declared at `depth` or deeper,
+    /// innermost first, with `error` (the pending error on an error
+    /// exit) or nil. The variables stay in scope for the paths that
+    /// go on.
+    fn closes_from(&mut self, depth: usize, error: Option<Node>, span: Span, out: &mut Vec<St>) {
+        let vars: Vec<VarId> = self
+            .tbc
+            .iter()
+            .rev()
+            .filter(|(d, _)| *d >= depth)
+            .map(|(_, v)| *v)
+            .collect();
+        for v in vars {
+            let value = self.read_var(v, span);
+            let value = self.boxed(value);
+            let err = error.clone().unwrap_or_else(|| nil(span));
+            out.push(expr_stmt(call(
+                "zl_close",
+                vec![value, err],
+                prim(PrimitiveType::Unit),
+                span,
+            )));
+        }
     }
 
     /// A statement that checks for an error stores its line first, for
@@ -2968,6 +3026,35 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     fn return_stmt(&mut self, exprs: &[&Expression], span: Span, out: &mut Vec<St>) -> Result<()> {
+        self.return_values(exprs, span, out)?;
+        if self.tbc.is_empty() {
+            return Ok(());
+        }
+        // The values are computed before anything is closed.
+        let Some(last) = out.pop() else {
+            return Ok(());
+        };
+        let TypedStatement::Return(value) = last.node else {
+            out.push(last);
+            return Ok(());
+        };
+        let value = value.map(|value| {
+            let name = self.temp();
+            let ty = value.ty.clone();
+            out.push(let_(name, ty.clone(), *value, span));
+            var(name, ty, span)
+        });
+        self.closes_from(1, None, span, out);
+        out.push(ret(value, span));
+        Ok(())
+    }
+
+    fn return_values(
+        &mut self,
+        exprs: &[&Expression],
+        span: Span,
+        out: &mut Vec<St>,
+    ) -> Result<()> {
         let returns = self.returns.clone();
         match returns {
             Returns::Fixed(types) if types.is_empty() => {
@@ -3060,12 +3147,6 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         match s {
             Stmt::LocalAssignment(l) => {
                 let names: Vec<&TokenReference> = l.names().iter().collect();
-                for name in &names {
-                    let v = self.scopes().declared(name);
-                    if self.scopes().var(v).attribute.as_deref() == Some("close") {
-                        return unsupported("a `<close>` variable", span);
-                    }
-                }
                 let exprs: Vec<&Expression> = l.expressions().iter().collect();
                 let (pre, vals) = if exprs.is_empty() {
                     (
@@ -3079,6 +3160,21 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 for (name, v) in names.iter().zip(vals) {
                     let id = self.scopes().declared(name);
                     out.push(self.declare_var(id, v, span));
+                    // A `<close>` variable must hold something closable,
+                    // and is closed when its block is left.
+                    if self.scopes().var(id).attribute.as_deref() == Some("close") {
+                        let value = self.read_var(id, span);
+                        let value = self.boxed(value);
+                        let check = call(
+                            "zl_closable",
+                            vec![value, str_lit(&ident(name), span)],
+                            prim(PrimitiveType::Unit),
+                            span,
+                        );
+                        let st = self.guarded_stmt(check);
+                        out.push(st);
+                        self.tbc.push((self.depth, id));
+                    }
                 }
             }
             Stmt::Assignment(a) => {
@@ -3217,20 +3313,24 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 out.push(st);
             }
             Stmt::Goto(g) => {
-                let label = ident(g.label_name());
-                match self.loops.last() {
-                    Some(Some(l)) if *l == label => out.push(stmt(TypedStatement::Continue, span)),
-                    _ => {
-                        return unsupported(
-                            format!(
-                                "`goto {label}` (only a `goto` to a label ending the enclosing loop's body)"
-                            ),
-                            span,
-                        );
-                    }
-                }
+                let Some(&id) = self
+                    .scopes()
+                    .gotos
+                    .get(&crate::scope::pos_of(g.goto_token()))
+                else {
+                    return Err(Error::Syntax {
+                        message: format!("no visible label '{}' for goto", ident(g.label_name())),
+                        span: (span.start, span.end),
+                    });
+                };
+                let target_depth = self.scopes().label_depths[&id];
+                self.closes_from(target_depth + 1, None, span, out);
+                out.push(stmt(TypedStatement::Goto(label_name(id)), span));
             }
-            Stmt::Label(_) => {}
+            Stmt::Label(l) => {
+                let id = self.scopes().labels[&crate::scope::pos_of(l.name())];
+                out.push(stmt(TypedStatement::Label(label_name(id)), span));
+            }
             _ => return unsupported("this statement", span),
         }
         Ok(())
@@ -3304,16 +3404,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         Ok(if_(cond, then, els, span))
     }
 
-    /// A loop body: the label ending it, if any, is where a `goto` in
-    /// it continues to.
+    /// A loop body. A label ending it is where a `goto` continues to,
+    /// and lands ahead of whatever the loop does after the body.
     fn loop_body(&mut self, block: &Block) -> Result<Vec<St>> {
-        let label = match block.stmts().last() {
-            Some(Stmt::Label(l)) => Some(ident(l.name())),
-            _ => None,
-        };
-        self.loops.push(label);
+        self.loop_depths.push(self.depth + 1);
         let body = self.block(block);
-        self.loops.pop();
+        self.loop_depths.pop();
         body
     }
 
@@ -3506,29 +3602,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             binary(BinaryOp::Add, counter_v(), st_v(), ir.clone(), span),
             span,
         ));
-        // `continue` lands on the increment, so the body runs inside a
-        // loop that goes round once.
-        if self.loops_continue_used(f.block()) {
-            let once = self.temp();
-            body.push(let_(once, bool_t.clone(), bool_lit(true, span), span));
-            let mut guarded = vec![assign(
-                var(once, bool_t.clone(), span),
-                bool_lit(false, span),
-                span,
-            )];
-            guarded.extend(inner);
-            body.push(while_(var(once, bool_t.clone(), span), guarded, span));
-        } else {
-            body.extend(inner);
-        }
+        body.extend(inner);
         body.extend(after);
         out.push(while_(cond, body, span));
         Ok(())
-    }
-
-    /// Whether a loop body ends in a label some `goto` continues to.
-    fn loops_continue_used(&self, block: &Block) -> bool {
-        matches!(block.stmts().last(), Some(Stmt::Label(_)))
     }
 
     fn generic_for(&mut self, f: &ast::GenericFor, span: Span, out: &mut Vec<St>) -> Result<()> {
@@ -3729,7 +3806,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             ),
             span,
         );
-        self.push_loop_with_increment(body, inner, increment, block, span, out);
+        self.push_loop_with_increment(body, inner, increment, span, out);
         Ok(())
     }
 
@@ -3851,40 +3928,18 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         Ok(())
     }
 
-    /// A `while true` loop whose body ends in an increment that a
-    /// `continue` must still reach.
+    /// A `while true` loop whose body ends in an increment; a label
+    /// ending the body lands ahead of it.
     fn push_loop_with_increment(
         &mut self,
         head: Vec<St>,
         inner: Vec<St>,
         increment: St,
-        block: &Block,
         span: Span,
         out: &mut Vec<St>,
     ) {
         let mut body = head;
-        if self.loops_continue_used(block) {
-            let once = self.temp();
-            body.push(let_(
-                once,
-                prim(PrimitiveType::Bool),
-                bool_lit(true, span),
-                span,
-            ));
-            let mut guarded = vec![assign(
-                var(once, prim(PrimitiveType::Bool), span),
-                bool_lit(false, span),
-                span,
-            )];
-            guarded.extend(inner);
-            body.push(while_(
-                var(once, prim(PrimitiveType::Bool), span),
-                guarded,
-                span,
-            ));
-        } else {
-            body.extend(inner);
-        }
+        body.extend(inner);
         body.push(increment);
         out.push(while_(bool_lit(true, span), body, span));
     }
@@ -4071,6 +4126,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 /// The chunk's statements as a function; the entry names the chunk,
 /// runs it, and reports an error nothing caught.
 const CHUNK_FN: &str = "lua$chunk";
+
+/// A label's name in the typed program, from its number.
+fn label_name(id: u32) -> InternedString {
+    intern(&format!("$label{id}"))
+}
 
 /// Set by a `return` at the chunk's outermost level when the chunk
 /// runs as segments, so the driver stops.

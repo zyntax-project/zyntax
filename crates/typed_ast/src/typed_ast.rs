@@ -516,6 +516,12 @@ pub struct TypedVariable {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TypedStatement {
     Continue,
+    /// A point a `Goto` in the same function may jump to. Names are
+    /// unique within a function; the frontend makes them so.
+    Label(InternedString),
+    /// A jump to the label of that name, forward or backward, out of
+    /// any nesting but never into one.
+    Goto(InternedString),
     Expression(Box<TypedNode<TypedExpression>>),
     Let(TypedLet),
     /// Let with pattern destructuring: let (x, y) = expr

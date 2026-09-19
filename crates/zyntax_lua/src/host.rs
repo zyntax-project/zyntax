@@ -1225,10 +1225,24 @@ extern "C" fn host_utf8_next(s: zrtl::StringConstPtr, n: i64, lax: bool) -> i64 
     }
 }
 
+// ─── the collector ──────────────────────────────────────────────────
+
+/// `collectgarbage`: 0 runs a collection, 1 answers the bytes the last
+/// collection reached.
+extern "C" fn host_gc(op: i64) -> i64 {
+    match op {
+        0 => {
+            zyntax_compiler::collector::collect();
+            0
+        }
+        _ => zyntax_compiler::collector::stats().live as i64,
+    }
+}
+
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 44] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 45] = [
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$clock".as_ptr(), host_clock as *const u8),
@@ -1297,6 +1311,7 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 44] = [
         host_utf8_code_at as *const u8,
     ),
     zrtl::ZrtlSymbol::new(c"$Lua$utf8_next".as_ptr(), host_utf8_next as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$gc".as_ptr(), host_gc as *const u8),
 ];
 
 /// The host's symbols as a plugin the runtime links like any other.

@@ -321,6 +321,9 @@ impl CfgBuilder {
                 }
             }
 
+            // Labels and gotos are placed by the typed CFG builder.
+            TypedStatement::Label(_) | TypedStatement::Goto(_) => {}
+
             TypedStatement::Continue => {
                 if let Some((header, _)) = self.loop_stack.last() {
                     self.graph.add_edge(

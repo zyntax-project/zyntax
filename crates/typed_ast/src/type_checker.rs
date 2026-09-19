@@ -1276,6 +1276,8 @@ impl TypeChecker {
             | TypedStatement::Throw(_)
             | TypedStatement::Break(_)
             | TypedStatement::Continue
+            | TypedStatement::Label(_)
+            | TypedStatement::Goto(_)
             | TypedStatement::LetPattern(_) => {
                 // Placeholder for now
                 Ok(Type::Primitive(PrimitiveType::Unit))

@@ -436,6 +436,17 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         &[&tb, &mt],
         table.clone(),
         vec![
+            when(
+                and(
+                    ne(meta_of(tb.e(), t), null(table.clone())),
+                    not(is_nil(call(
+                        "zl_meta",
+                        vec![tb.e(), text("__metatable")],
+                        any(),
+                    ))),
+                ),
+                vec![lua_error(text("cannot change a protected metatable"))],
+            ),
             if_(
                 is_nil(mt.e()),
                 vec![set_field(tb.e(), "meta", null(table.clone()))],
@@ -452,17 +463,25 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ret(tb.e()),
         ],
     ));
+    let protected = local("protected", any());
     d.push(define(
         "zl_getmetatable",
         &[&o],
         any(),
         vec![
+            when(
+                eq(category(o.e()), int(STR)),
+                vec![ret(call("zl_string_metatable", vec![], any()))],
+            ),
             when(not(is_table(o.e())), vec![ret(nil())]),
             tb.decl(unbox_table(o.e(), t)),
             when(
                 eq(meta_of(tb.e(), t), null(table.clone())),
                 vec![ret(nil())],
             ),
+            // `__metatable` in the metatable is what is seen instead.
+            protected.decl(call("zl_meta", vec![tb.e(), text("__metatable")], any())),
+            when(not(is_nil(protected.e())), vec![ret(protected.e())]),
             ret(box_table(meta_of(tb.e(), t))),
         ],
     ));
@@ -498,6 +517,51 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![unbox_table(o.e(), t), event.e()],
                 any(),
             )),
+        ],
+    ));
+
+    // ─── to-be-closed variables ─────────────────────────────────
+    // A `<close>` variable holds nil, false, or a value with `__close`.
+    let name = kept("name", string());
+    let err = kept("err", any());
+    d.push(define(
+        "zl_closable",
+        &[&o, &name],
+        unit(),
+        vec![
+            when(
+                not(call("zl_truthy", vec![o.e()], boolean())),
+                vec![ret_void()],
+            ),
+            when(
+                is_nil(call("zl_meta_of", vec![o.e(), text("__close")], any())),
+                vec![lua_error(concat(vec![
+                    text("variable '"),
+                    name.e(),
+                    text("' got a non-closable value"),
+                ]))],
+            ),
+            ret_void(),
+        ],
+    ));
+    // Leaving its block: `__close(value, error)`, the error nil on a
+    // normal exit.
+    d.push(define(
+        "zl_close",
+        &[&o, &err],
+        unit(),
+        vec![
+            when(
+                not(call("zl_truthy", vec![o.e()], boolean())),
+                vec![ret_void()],
+            ),
+            x.decl(call("zl_meta_of", vec![o.e(), text("__close")], any())),
+            when(
+                is_nil(x.e()),
+                vec![lua_error(text("attempt to close non-closable variable"))],
+            ),
+            expr(call("zl_call_2", vec![x.e(), o.e(), err.e()], any())),
+            ret_void(),
         ],
     ));
 
@@ -651,7 +715,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             when(
                 eq(category(o.e()), int(STR)),
-                vec![ret(call("zl_string_member", vec![k.e()], any()))],
+                vec![ret(call("zl_string_member", vec![o.e(), k.e()], any()))],
             ),
             not_indexable(&o),
             ret(nil()),
@@ -672,7 +736,11 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             when(
                 eq(category(o.e()), int(STR)),
-                vec![ret(call("zl_string_member", vec![box_str(s.e())], any()))],
+                vec![ret(call(
+                    "zl_string_member",
+                    vec![o.e(), box_str(s.e())],
+                    any(),
+                ))],
             ),
             not_indexable(&o),
             ret(nil()),
@@ -693,7 +761,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             when(
                 eq(category(o.e()), int(STR)),
-                vec![ret(call("zl_string_member", vec![k.e()], any()))],
+                vec![ret(call("zl_string_member", vec![o.e(), k.e()], any()))],
             ),
             not_indexable(&o),
             ret(nil()),
