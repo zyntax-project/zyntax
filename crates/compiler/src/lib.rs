@@ -25,6 +25,7 @@
 
 pub mod abi; // The calling convention every backend derives from a signature
 pub mod affine_loop; // Closed-form affine reduction loops (acc += invariant over a counted loop)
+pub mod aggregate_scalarize; // Aggregate SSA values built by insertvalue become their fields
 pub mod aggregate_split; // Replace struct round-trips with direct field Load/Store (HIR-level SROA)
 pub mod alloca_promote; // Alloca → Malloc promotion for escaping allocations (pairs with drop_insert)
 pub mod analysis;
@@ -1776,6 +1777,7 @@ pub struct InterpOptStats {
     pub fma_contract: fma_contract::FmaStats,
     pub load_cse: load_cse::LoadCseStats,
     pub aggregate_split: aggregate_split::AggregateSplitStats,
+    pub aggregate_scalarize: aggregate_scalarize::AggregateScalarizeStats,
     pub scalar_replace_alloc: scalar_replace_alloc::ScalarReplaceAllocStats,
     pub dead_store: dead_store::DeadStoreStats,
     pub sign_fold: sign_fold::SignFoldStats,
@@ -1955,6 +1957,13 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
         // produced by `let mut b = arr[i]; b.x = …; arr[i] = b`.
         let ags = aggregate_split::run_module(module);
         timed("aggregate_split", &mut at);
+        // An aggregate that never touches memory has no bytes to split:
+        // its fields become values of their own.
+        let agsc = aggregate_scalarize::run_module(module);
+        stats.aggregate_scalarize.webs += agsc.webs;
+        stats.aggregate_scalarize.values += agsc.values;
+        stats.aggregate_scalarize.rematerialized += agsc.rematerialized;
+        timed("aggregate_scalarize", &mut at);
         // scalar_replace_alloc runs after aggregate_split:
         //   * aggregate_split has just rewritten any struct-typed
         //     round-trips into direct GEP+Load/Store. That exposes the
@@ -2037,6 +2046,7 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
             || lcse.eliminated > 0
             || ags.round_trips_removed > 0
             || ags.field_reads_only > 0
+            || agsc.webs > 0
             || sra.mallocs_eliminated > 0
             || il.inlined > 0
             || lc.hoisted > 0
