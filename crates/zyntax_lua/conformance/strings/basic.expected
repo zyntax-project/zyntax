@@ -1,0 +1,28 @@
+hello world	5	5	HELLO	ABC
+12	1.5	n=42	8.0
+ell	llo	ello	hello		
+104	111	104	101	108
+Hi	ababab	x-x-x	
+olleh	mixed	MIXED
+2	3	nil
+   42|42   |00042
+3.142 1.234568e+04 0.0001 1e+20
+str 12 1.5
+"a \"quoted\" line\
+next"
+ff FF 10 Hi
+     right|left      |
+%
+tab	here	nl\n	single 'quotes'	ABC	HI
+long
+string
+with ]] inside
+4	0
+11	7.0	10	nil	true	12	1.0
+42	31	3.5	nil	2	255	35
+100.0	nil	nil	nil
+true	true	true
+1000
+1-2-3-4-5
+xxx	Y
+string	number	nil	table	function	number	boolean

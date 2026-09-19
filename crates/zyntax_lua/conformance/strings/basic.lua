@@ -1,0 +1,31 @@
+-- Strings: concatenation, coercion, the string library, escapes.
+local s = "hello"
+print(s .. " " .. "world", #s, s:len(), s:upper(), ("abc"):upper())
+print(1 .. 2, 1.5 .. "", "n=" .. 42, 2^3 .. "")
+print(s:sub(2, 4), s:sub(-3), s:sub(2), s:sub(0), s:sub(10), s:sub(3, 2))
+print(s:byte(1), s:byte(-1), s:byte(1, 3))
+print(string.char(72, 105), string.rep("ab", 3), string.rep("x", 3, "-"), string.rep("q", 0))
+print(s:reverse(), string.lower("MiXeD"), string.upper("MiXeD"))
+print(("a,b,c"):find(",", 1, true), ("hello"):find("ll"), ("hello"):find("zz"))
+print(string.format("%5d|%-5d|%05d", 42, 42, 42))
+print(string.format("%.3f %e %g %g", 3.14159, 12345.678, 0.0001, 1e20))
+print(string.format("%s %s %s", "str", 12, 1.5))
+print(string.format("%q", 'a "quoted" line\nnext'))
+print(string.format("%x %X %o %c%c", 255, 255, 8, 72, 105))
+print(string.format("%10s|%-10s|", "right", "left"))
+print(string.format("%%"))
+print("tab\there", "nl\\n", 'single \'quotes\'', "\65\066\x43", "\u{48}\u{49}")
+print([[long
+string]])
+print([==[with ]] inside]==])
+print(#"\0abc", ("\0abc"):byte(1))
+print("10" + 1, "3.5" * 2, 10 .. "", tostring(nil), tostring(true), tostring(12), tostring(1.0))
+print(tonumber("42"), tonumber("0x1F"), tonumber("  3.5  "), tonumber("abc"), tonumber("10", 2), tonumber("ff", 16), tonumber("z", 36))
+print(tonumber(" 1e2 "), tonumber(""), tonumber("1 2"), tonumber(true))
+print("abc" == "abc", "abc" ~= "abd", "a" .. "b" == "ab")
+print(#("x"):rep(1000))
+local parts = {}
+for i = 1, 5 do parts[#parts + 1] = tostring(i) end
+print(table.concat(parts, "-"))
+print(("x"):rep(3), (("y")):upper())
+print(type("s"), type(1), type(nil), type({}), type(print), type(1.5), type(true))

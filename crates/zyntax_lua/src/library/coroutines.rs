@@ -1,0 +1,447 @@
+//! Coroutines over the runtime's fibers.
+//!
+//! A coroutine is a record under the thread tag: the fiber's handle,
+//! its status, the function it runs, and a slot the values in flight
+//! pass through, in either direction. The fiber's body is one
+//! trampoline that reads the record back as its environment, calls the
+//! function with the first resume's arguments and leaves the results
+//! in the slot. A yield hands its values to the resumer through the
+//! runtime and takes the next resume's arguments back the same way;
+//! being stackful, it works at any depth of call inside the body.
+//!
+//! The fiber's handle is carried as a plain word: the coroutine, not
+//! the compiler, owns its lifetime, and frees it once it has finished.
+
+use super::*;
+use zyntax_typed_ast::typed_ast::{TypedBlock, TypedDeclaration, TypedFunction};
+use zyntax_typed_ast::{Type, Visibility};
+
+/// The record's slots.
+const HANDLE: i64 = 0;
+const STATUS: i64 = 1;
+const BODY: i64 = 2;
+const SLOT: i64 = 3;
+
+/// Statuses, as the record stores them.
+const SUSPENDED: i64 = 0;
+const RUNNING: i64 = 1;
+const NORMAL: i64 = 2;
+const DEAD: i64 = 3;
+
+/// The packed step a resume returns: the tag in the low two bits.
+const STEP_YIELDED: i64 = 0;
+const STEP_DONE: i64 = 1;
+
+/// The coroutine running now, or nil: what `coroutine.running` and
+/// `coroutine.isyieldable` answer, and what a nested resume restores.
+pub const CURRENT: &str = "zl_co_current";
+
+/// The stack a coroutine runs on. Committed by the page as it is
+/// touched, so a large reservation costs little.
+const STACK_BYTES: i64 = 1 << 20;
+
+pub(super) fn declarations(t: &Types) -> Vec<Decl> {
+    let anys = t.anys();
+    let co = kept("co", any());
+    let f = kept("f", any());
+    let x = kept("x", any());
+    let rec = borrowed("rec", anys.clone());
+    let prev = kept("prev", any());
+    let args = kept("args", anys.clone());
+    let out = borrowed("out", anys.clone());
+    let step = local("step", i64());
+    let status = local("status", i64());
+    let handle = local("handle", i64());
+    let env = borrowed("env", anys.clone());
+    let mut d = vec![extern_fn(
+        "zl_fiber_new",
+        &[("code", usize()), ("env", any()), ("stack", i64())],
+        i64(),
+        Some("krio_fiber_new_with_env"),
+    )];
+    d.push(extern_fn(
+        "zl_fiber_resume_with",
+        &[("fiber", i64()), ("value", any())],
+        i64(),
+        Some("krio_fiber_resume_with"),
+    ));
+    d.push(extern_fn(
+        "zl_fiber_yield",
+        &[("value", any())],
+        unit(),
+        Some("krio_fiber_yield"),
+    ));
+    d.push(extern_fn(
+        "zl_fiber_take_input",
+        &[],
+        any(),
+        Some("krio_fiber_take_input"),
+    ));
+    d.push(extern_fn(
+        "zl_fiber_free",
+        &[("fiber", i64())],
+        unit(),
+        Some("krio_fiber_free"),
+    ));
+    // A word read back as the dynamic value whose address it is.
+    d.push(extern_fn(
+        "zl_word_as_any",
+        &[("w", i64())],
+        any(),
+        Some("$Lua$word"),
+    ));
+
+    // The coroutine running now.
+    d.push(zyntax_typed_ast::TypedNode::new(
+        TypedDeclaration::Variable(zyntax_typed_ast::typed_ast::TypedVariable {
+            name: intern(CURRENT),
+            ty: any(),
+            mutability: zyntax_typed_ast::Mutability::Mutable,
+            initializer: None,
+            visibility: Visibility::Public,
+        }),
+        Type::Unknown,
+        SPAN,
+    ));
+    let current = || {
+        node(
+            zyntax_typed_ast::typed_ast::TypedExpression::Variable(intern(CURRENT)),
+            any(),
+        )
+    };
+    let set_current = |v: Expr| {
+        expr(node(
+            zyntax_typed_ast::typed_ast::TypedExpression::Binary(
+                zyntax_typed_ast::typed_ast::TypedBinary {
+                    op: zyntax_typed_ast::typed_ast::BinaryOp::Assign,
+                    left: Box::new(current()),
+                    right: Box::new(v),
+                },
+            ),
+            any(),
+        ))
+    };
+    let record_of = |co: Expr| call("zb_unbox_list_raw_any", vec![co], anys.clone());
+    let status_of = |rec: Expr| call("zb_box_get_i64", vec![at(rec, int(STATUS))], i64());
+    let set_status = |rec: Expr, s: i64| set_idx(rec, int(STATUS), box_i64(int(s)));
+    let is_func = |x: Expr| {
+        and(
+            ne(x.clone(), nil()),
+            eq(tag_of(x), int(zyntax_builtins::FUNC_TAG)),
+        )
+    };
+    let code_of = |name: &str| {
+        node(
+            zyntax_typed_ast::typed_ast::TypedExpression::Variable(intern(name)),
+            usize(),
+        )
+    };
+
+    // The body every coroutine's fiber runs: the function in the
+    // record, with the arguments the first resume left in the slot;
+    // the results go back into the slot.
+    d.push(zyntax_typed_ast::TypedNode::new(
+        TypedDeclaration::Function(TypedFunction {
+            name: intern("zl_co_body"),
+            annotations: Vec::new(),
+            effects: Vec::new(),
+            with_handlers: Vec::new(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            return_type: any(),
+            body: Some(TypedBlock {
+                statements: vec![
+                    env.decl(record_of(call("zb_fiber_env", vec![], any()))),
+                    args.decl(call(
+                        "zl_values",
+                        vec![at(env.e(), int(SLOT))],
+                        anys.clone(),
+                    )),
+                    set_idx(
+                        env.e(),
+                        int(SLOT),
+                        call(
+                            "zl_call_packed",
+                            vec![at(env.e(), int(BODY)), args.e()],
+                            any(),
+                        ),
+                    ),
+                    ret(nil()),
+                ],
+                span: SPAN,
+            }),
+            visibility: Visibility::Public,
+            is_async: false,
+            is_fiber: true,
+            is_pure: false,
+            is_external: false,
+            calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
+            link_name: None,
+            module: Some(intern(zyntax_builtins::MODULE)),
+        }),
+        Type::Unknown,
+        SPAN,
+    ));
+
+    // `coroutine.create(f)`.
+    d.push(define(
+        "zl_co_create",
+        &[&f],
+        any(),
+        vec![
+            when(
+                not(is_func(f.e())),
+                vec![lua_error(concat(vec![
+                    text("bad argument #1 to 'create' (function expected, got "),
+                    type_name(f.e()),
+                    text(")"),
+                ]))],
+            ),
+            rec.decl(list(
+                vec![box_i64(int(0)), box_i64(int(SUSPENDED)), f.e(), nil()],
+                anys.clone(),
+            )),
+            co.decl(call(
+                "zb_box_list_raw_any",
+                vec![rec.e(), int32(thread_tag() as i32)],
+                any(),
+            )),
+            set_idx(
+                rec.e(),
+                int(HANDLE),
+                box_i64(call(
+                    "zl_fiber_new",
+                    vec![code_of("zl_co_body"), co.e(), int(STACK_BYTES)],
+                    i64(),
+                )),
+            ),
+            ret(co.e()),
+        ],
+    ));
+    let coroutine_expected = |what: &str| {
+        lua_error(concat(vec![
+            text(&format!(
+                "bad argument #1 to '{what}' (coroutine expected, got "
+            )),
+            type_name(co.e()),
+            text(")"),
+        ]))
+    };
+    // `coroutine.resume(co, ...)`: true and the yielded or returned
+    // values, or false and a message.
+    d.push(define(
+        "zl_co_resume",
+        &[&co, &args],
+        any(),
+        vec![
+            when(not(is_thread(co.e())), vec![coroutine_expected("resume")]),
+            rec.decl(record_of(co.e())),
+            status.decl(status_of(rec.e())),
+            when(
+                eq(status.e(), int(DEAD)),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(
+                        vec![
+                            box_bool(bool(false)),
+                            box_str(text("cannot resume dead coroutine")),
+                        ],
+                        anys.clone(),
+                    )],
+                    any(),
+                ))],
+            ),
+            when(
+                ne(status.e(), int(SUSPENDED)),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(
+                        vec![
+                            box_bool(bool(false)),
+                            box_str(text("cannot resume non-suspended coroutine")),
+                        ],
+                        anys.clone(),
+                    )],
+                    any(),
+                ))],
+            ),
+            set_idx(rec.e(), int(SLOT), call("zl_pack", vec![args.e()], any())),
+            prev.decl(current()),
+            when(
+                not(is_nil(prev.e())),
+                vec![set_status(record_of(prev.e()), NORMAL)],
+            ),
+            set_status(rec.e(), RUNNING),
+            set_current(co.e()),
+            handle.decl(call(
+                "zb_box_get_i64",
+                vec![at(rec.e(), int(HANDLE))],
+                i64(),
+            )),
+            step.decl(call(
+                "zl_fiber_resume_with",
+                vec![handle.e(), at(rec.e(), int(SLOT))],
+                i64(),
+            )),
+            set_current(prev.e()),
+            when(
+                not(is_nil(prev.e())),
+                vec![set_status(record_of(prev.e()), RUNNING)],
+            ),
+            out.decl(list(vec![box_bool(bool(true))], anys.clone())),
+            when(
+                eq(bitand(step.e(), int(3)), int(STEP_YIELDED)),
+                vec![
+                    set_status(rec.e(), SUSPENDED),
+                    expr(call(
+                        "zl_append_values",
+                        vec![
+                            out.e(),
+                            call("zl_word_as_any", vec![shr(step.e(), int(2))], any()),
+                        ],
+                        unit(),
+                    )),
+                    ret(call("zb_box_tuple", vec![out.e()], any())),
+                ],
+            ),
+            set_status(rec.e(), DEAD),
+            expr(call("zl_fiber_free", vec![handle.e()], unit())),
+            when(
+                eq(bitand(step.e(), int(3)), int(STEP_DONE)),
+                vec![
+                    expr(call(
+                        "zl_append_values",
+                        vec![out.e(), at(rec.e(), int(SLOT))],
+                        unit(),
+                    )),
+                    ret(call("zb_box_tuple", vec![out.e()], any())),
+                ],
+            ),
+            ret(call(
+                "zb_box_tuple",
+                vec![list(
+                    vec![box_bool(bool(false)), box_str(text("error in coroutine"))],
+                    anys.clone(),
+                )],
+                any(),
+            )),
+        ],
+    ));
+    // `coroutine.yield(...)`: the values to the resumer; the next
+    // resume's arguments back.
+    d.push(define(
+        "zl_co_yield",
+        &[&args],
+        any(),
+        vec![
+            when(
+                is_nil(current()),
+                vec![lua_error(text("attempt to yield from outside a coroutine"))],
+            ),
+            expr(call(
+                "zl_fiber_yield",
+                vec![call("zl_pack", vec![args.e()], any())],
+                unit(),
+            )),
+            ret(call("zl_fiber_take_input", vec![], any())),
+        ],
+    ));
+    d.push(define(
+        "zl_co_status",
+        &[&co],
+        string(),
+        vec![
+            when(not(is_thread(co.e())), vec![coroutine_expected("status")]),
+            status.decl(status_of(record_of(co.e()))),
+            when(eq(status.e(), int(SUSPENDED)), vec![ret(text("suspended"))]),
+            when(eq(status.e(), int(RUNNING)), vec![ret(text("running"))]),
+            when(eq(status.e(), int(NORMAL)), vec![ret(text("normal"))]),
+            ret(text("dead")),
+        ],
+    ));
+    d.push(define("zl_co_running", &[], any(), vec![ret(current())]));
+    d.push(define(
+        "zl_co_isyieldable",
+        &[],
+        boolean(),
+        vec![ret(not(is_nil(current())))],
+    ));
+    // `coroutine.close(co)`: a suspended or dead coroutine is dead.
+    d.push(define(
+        "zl_co_close",
+        &[&co],
+        any(),
+        vec![
+            when(not(is_thread(co.e())), vec![coroutine_expected("close")]),
+            rec.decl(record_of(co.e())),
+            status.decl(status_of(rec.e())),
+            when(
+                or(eq(status.e(), int(RUNNING)), eq(status.e(), int(NORMAL))),
+                vec![lua_error(text("cannot close a running coroutine"))],
+            ),
+            when(
+                eq(status.e(), int(SUSPENDED)),
+                vec![
+                    expr(call(
+                        "zl_fiber_free",
+                        vec![call(
+                            "zb_box_get_i64",
+                            vec![at(rec.e(), int(HANDLE))],
+                            i64(),
+                        )],
+                        unit(),
+                    )),
+                    set_status(rec.e(), DEAD),
+                ],
+            ),
+            ret(box_bool(bool(true))),
+        ],
+    ));
+    // `coroutine.wrap(f)`: a function resuming the coroutine; a failed
+    // resume is an error.
+    let packed = kept("packed", any());
+    let results = borrowed("results", anys.clone());
+    d.push(define(
+        "zl_co_wrap_code",
+        &[&env, &packed],
+        any(),
+        vec![
+            x.decl(call(
+                "zl_co_resume",
+                vec![
+                    at(env.e(), int(2)),
+                    call("zl_values", vec![packed.e()], anys.clone()),
+                ],
+                any(),
+            )),
+            results.decl(call("zl_values", vec![x.e()], anys.clone())),
+            when(
+                not(call("zl_truthy", vec![at(results.e(), int(0))], boolean())),
+                vec![lua_error(call(
+                    "zl_tostring",
+                    vec![call("zl_value_at", vec![results.e(), int(2)], any())],
+                    string(),
+                ))],
+            ),
+            ret(call("zl_values_from", vec![results.e(), int(2)], any())),
+        ],
+    ));
+    d.push(define(
+        "zl_co_wrap",
+        &[&f],
+        any(),
+        vec![
+            co.decl(call("zl_co_create", vec![f.e()], any())),
+            ret(call(
+                "zb_func_new",
+                vec![
+                    code_of("zl_co_wrap_code"),
+                    int(zyntax_builtins::functions::VARIADIC_ARITY),
+                    list(vec![co.e()], anys.clone()),
+                ],
+                any(),
+            )),
+        ],
+    ));
+    d
+}

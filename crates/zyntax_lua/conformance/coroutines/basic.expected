@@ -1,0 +1,28 @@
+suspended
+start	1	2
+true	3
+suspended
+got	10
+true	20
+got	x	y
+true	done	13
+dead
+false	cannot resume dead coroutine
+55
+0 1 1 2 3 5 8 13 21 34 55 89
+true	10
+true	20
+true	3
+dead
+false
+true
+true
+dead
+dead
+3	a
+1	2
+1	0
+x y z 
+dead
+false	cannot resume dead coroutine
+true

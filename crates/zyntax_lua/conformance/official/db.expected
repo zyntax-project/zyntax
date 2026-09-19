@@ -1,0 +1,8 @@
+testing debug library and debug information
++
+testing inspection of parameters/returned values
++
++
+testing traceback sizes
+testing debug functions on chunk without debug info
+OK

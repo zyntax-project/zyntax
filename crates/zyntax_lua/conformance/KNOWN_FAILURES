@@ -1,0 +1,31 @@
+# A conformance case expected to fail, and the git-bug issue tracking it.
+# One per line: <category>/<file>.lua <issue id>.
+# A listed case that starts passing fails the suite until it is removed here
+# and its issue is closed; an unlisted case that fails is a regression.
+
+official/api.lua              4da50c2
+official/attrib.lua           4da50c2
+official/bitwise.lua          4da50c2
+official/bwcoercion.lua       4da50c2
+official/calls.lua            4da50c2
+official/closure.lua          4da50c2
+official/constructs.lua       4da50c2
+official/coroutine.lua        4da50c2
+official/cstack.lua           4da50c2
+official/db.lua               4da50c2
+official/errors.lua           4da50c2
+official/events.lua           4da50c2
+official/files.lua            4da50c2
+official/gc.lua               4da50c2
+official/gengc.lua            4da50c2
+official/goto.lua             4da50c2
+official/literals.lua         4da50c2
+official/locals.lua           4da50c2
+official/math.lua             4da50c2
+official/nextvar.lua          4da50c2
+official/pm.lua               4da50c2
+official/sort.lua             4da50c2
+official/strings.lua          4da50c2
+official/tpack.lua            4da50c2
+official/utf8.lua             4da50c2
+official/vararg.lua           4da50c2

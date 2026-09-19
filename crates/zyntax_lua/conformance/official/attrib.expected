@@ -1,0 +1,4 @@
+testing require
+package config: /|;|?|!|-|
+testing 'require' message
++

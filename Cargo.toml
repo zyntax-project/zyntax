@@ -13,6 +13,7 @@ members = [
     "crates/zynml",
     "crates/pattern_engine",
     "crates/zyntax_python",
+    "crates/zyntax_lua",
     "crates/zyntax_builtins",
     "crates/passes/normalization",
     "crates/passes/algebraic_effects",
@@ -22,6 +23,10 @@ members = [
     "examples/imagepipe",
 ]
 
+
+# full_moon with empty statements accepted; see vendor/full_moon/Cargo.toml.
+[patch.crates-io]
+full_moon = { path = "vendor/full_moon" }
 
 [workspace.dependencies]
 rayon = "1.10.0"
