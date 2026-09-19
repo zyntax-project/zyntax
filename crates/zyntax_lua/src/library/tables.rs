@@ -423,7 +423,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                         )],
                         any(),
                     ),
-                    text("__len"),
+                    text("object length"),
                 ],
                 i64(),
             )),
@@ -797,7 +797,9 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ret_void(),
         ],
     ));
-    // The table a dynamic value must be, for the raw functions.
+    // The table a dynamic value must be, for the raw functions. When it
+    // is not one, the error is raised and an empty table stands in, so
+    // whatever runs before the error is seen has a table to run on.
     let what = kept("what", string());
     d.push(define(
         "zl_as_table",
@@ -806,13 +808,15 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         vec![
             when(
                 not(is_table(o.e())),
-                vec![lua_error(concat(vec![
-                    text("bad argument #1 to '"),
-                    what.e(),
-                    text("' (table expected, got "),
-                    type_name(o.e()),
-                    text(")"),
-                ]))],
+                vec![
+                    lua_error(concat(vec![
+                        what.e(),
+                        text(" (table expected, got "),
+                        type_name(o.e()),
+                        text(")"),
+                    ])),
+                    ret(call("zl_table_new", vec![], table.clone())),
+                ],
             ),
             ret(unbox_table(o.e(), t)),
         ],

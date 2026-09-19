@@ -6,6 +6,7 @@
 
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::path::PathBuf;
 
 use zyntax_embed::{SnapshotBuilder, lower_for_snapshot_releasing};
@@ -47,5 +48,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     SnapshotBuilder::new("lua")
         .module_lowered(policy::LIBRARY_MODULE, program, &hir)?
         .build_in(&out)?;
+
+    // Which library functions can raise, for the frontend's checks.
+    let mut fallible = String::from("pub const FALLIBLE: &[&str] = &[\n");
+    for name in &lib.fallible {
+        fallible.push_str(&format!("    {name:?},\n"));
+    }
+    fallible.push_str("];\n");
+    fs::write(out.join("fallible.rs"), fallible)?;
     Ok(())
 }

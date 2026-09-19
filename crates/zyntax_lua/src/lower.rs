@@ -13,7 +13,7 @@
 //! typed entry. Closures capture through cells or copies in the record.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use full_moon::ast::{self, BinOp, Block, Expression, Prefix, Stmt, Suffix, UnOp, Var};
 use full_moon::tokenizer::TokenReference;
@@ -75,11 +75,51 @@ struct Module<'a> {
     scopes: &'a Scopes,
     inferred: &'a Inferred,
     types: Types,
+    /// The chunk's name, as error positions spell it.
+    chunk: &'a str,
+    /// Byte offsets where each line starts, for positions.
+    line_starts: Vec<usize>,
+    /// The library functions that can raise.
+    fallible: HashSet<&'static str>,
+    /// The program's functions that can raise, once a first lowering
+    /// has found out; every one, before.
+    raising: Option<HashSet<FuncId>>,
     /// Functions lowered so far, in the order they were reached.
     functions: RefCell<Vec<TypedFunction>>,
     /// Module-level variables: globals, and chunk locals every function
     /// reaches. Name and type.
     module_vars: RefCell<Vec<(InternedString, Ty)>>,
+    /// What each function's lowering found about its raising.
+    facts: RefCell<HashMap<FuncId, RaiseFact>>,
+}
+
+/// Whether a function raises itself, and which functions it calls
+/// that may raise into it.
+#[derive(Clone, Default)]
+struct RaiseFact {
+    own: bool,
+    callees: HashSet<FuncId>,
+}
+
+/// The functions that may raise: those that check for an error
+/// themselves, and those calling one of them, and so on.
+fn raising_functions(facts: &HashMap<FuncId, RaiseFact>) -> HashSet<FuncId> {
+    let mut raising: HashSet<FuncId> = facts
+        .iter()
+        .filter(|(_, fact)| fact.own)
+        .map(|(f, _)| *f)
+        .collect();
+    loop {
+        let before = raising.len();
+        for (f, fact) in facts {
+            if fact.callees.iter().any(|c| raising.contains(c)) {
+                raising.insert(*f);
+            }
+        }
+        if raising.len() == before {
+            return raising;
+        }
+    }
 }
 
 impl<'a> Module<'a> {
@@ -87,6 +127,20 @@ impl<'a> Module<'a> {
         Typer {
             scopes: self.scopes,
             known: self.inferred,
+        }
+    }
+
+    /// The line a span starts on, counted from one.
+    fn line_of(&self, span: Span) -> i64 {
+        self.line_starts
+            .partition_point(|&start| start <= span.start) as i64
+    }
+
+    /// Whether a program function may raise, as far as is known.
+    fn raises(&self, f: FuncId) -> bool {
+        match &self.raising {
+            Some(set) => set.contains(&f),
+            None => true,
         }
     }
 
@@ -185,6 +239,18 @@ struct Lowerer<'m, 'a> {
     bound: std::collections::HashSet<InternedString>,
     /// The last global read as nil, for the message of a call to it.
     nil_global: Option<String>,
+    /// Whether this function checks for an error anywhere, so it may
+    /// leave with one pending.
+    raised: bool,
+    /// The program functions this one calls directly and that may
+    /// raise into it.
+    raise_callees: HashSet<FuncId>,
+    /// Whether the statement being lowered checks for an error, so its
+    /// line is recorded ahead of it.
+    line_needed: bool,
+    /// Whether the body reads the line it was entered at, for
+    /// `error(v, 2)`.
+    entry_line: bool,
 }
 
 fn unsupported<T>(what: impl Into<String>, span: Span) -> Result<T> {
@@ -585,6 +651,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             loops: Vec::new(),
             bound: std::collections::HashSet::new(),
             nil_global: None,
+            raised: false,
+            raise_callees: HashSet::new(),
+            line_needed: false,
+            entry_line: false,
         }
     }
 
@@ -768,6 +838,25 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
     }
 
+    /// A list literal whose items are plain reads: any other item is
+    /// bound ahead of the literal, since the lowering stores the elements
+    /// in one block and an item may carry control flow (a check after a
+    /// call) below a wrapper.
+    fn array_of(&mut self, items: Vec<Node>, pre: &mut Vec<St>, span: Span) -> Node {
+        let mut plain = Vec::with_capacity(items.len());
+        for item in items {
+            if Self::is_simple(&item) {
+                plain.push(item);
+            } else {
+                let name = self.temp();
+                let ty = item.ty.clone();
+                pre.push(let_(name, ty.clone(), item, span));
+                plain.push(var(name, ty, span));
+            }
+        }
+        node(TypedExpression::Array(plain), self.m.anys(), span)
+    }
+
     /// The truth of a value, as a boolean.
     fn truthy(&mut self, v: Val) -> Node {
         let span = v.node.span;
@@ -783,6 +872,119 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             }
             _ => call("zl_truthy", vec![v.node], prim(PrimitiveType::Bool), span),
         }
+    }
+
+    // ─── errors ─────────────────────────────────────────────────
+
+    /// The placeholder this function leaves with once an error is
+    /// pending: whoever called it checks next.
+    fn placeholder_return(&mut self, span: Span) -> St {
+        let value = match self.returns.clone() {
+            Returns::Fixed(types) if types.is_empty() => None,
+            Returns::Fixed(types) if types.len() == 1 => {
+                Some(self.zero_of(types[0].settled(), span))
+            }
+            Returns::Fixed(_) => Some(node(
+                TypedExpression::Array(Vec::new()),
+                self.m.anys(),
+                span,
+            )),
+            Returns::Dynamic => Some(nil(span)),
+        };
+        ret(value, span)
+    }
+
+    fn zero_of(&mut self, ty: Ty, span: Span) -> Node {
+        match ty {
+            Ty::Int => int_lit(0, span),
+            Ty::Float => float_lit(0.0, span),
+            Ty::Bool => bool_lit(false, span),
+            Ty::Str => str_lit("", span),
+            Ty::Table => call("zl_table_new", vec![], self.ir(Ty::Table), span),
+            _ => nil(span),
+        }
+    }
+
+    fn pending(span: Span) -> Node {
+        var(intern(library::PENDING), Type::Any, span)
+    }
+
+    /// `if an error is pending, leave`; then the line is this one
+    /// again, since a callee sets its own.
+    fn pending_check(&mut self, span: Span) -> St {
+        self.raised = true;
+        self.line_needed = true;
+        let cond = binary(
+            BinaryOp::Ne,
+            Self::pending(span),
+            nil(span),
+            prim(PrimitiveType::Bool),
+            span,
+        );
+        let leave = self.placeholder_return(span);
+        let restore = self.set_line(span);
+        if_(cond, vec![leave], Some(vec![restore]), span)
+    }
+
+    /// `zl_line = <the line of span>`.
+    fn set_line(&mut self, span: Span) -> St {
+        let line = self.m.line_of(span);
+        assign(
+            var(intern(library::LINE), prim(PrimitiveType::I64), span),
+            int_lit(line, span),
+            span,
+        )
+    }
+
+    /// Whether a call node names a library function that can raise.
+    fn call_can_raise(&self, node: &Node) -> bool {
+        let TypedExpression::Call(c) = &node.node else {
+            return false;
+        };
+        let TypedExpression::Variable(name) = &c.callee.node else {
+            return false;
+        };
+        name.resolve_global()
+            .is_some_and(|n| self.m.fallible.contains(n.as_str()))
+    }
+
+    /// A value from a call that may have raised: held, then checked
+    /// before anything uses it. A call that cannot raise is left alone.
+    fn guarded(&mut self, v: Val) -> Val {
+        if !self.call_can_raise(&v.node) {
+            return v;
+        }
+        self.guard(v)
+    }
+
+    fn guard(&mut self, v: Val) -> Val {
+        let span = v.node.span;
+        let mut pre = Vec::new();
+        let held = if v.node.ty == prim(PrimitiveType::Unit) {
+            pre.push(expr_stmt(v.node));
+            Val {
+                node: nil(span),
+                ty: Ty::Nil,
+            }
+        } else {
+            self.hold(v, &mut pre)
+        };
+        pre.push(self.pending_check(span));
+        Val {
+            node: block_value(pre, held.node, span),
+            ty: held.ty,
+        }
+    }
+
+    /// A statement calling something that may have raised, checked.
+    fn guarded_stmt(&mut self, node: Node) -> St {
+        if !self.call_can_raise(&node) {
+            return expr_stmt(node);
+        }
+        let span = node.span;
+        let mut statements = vec![expr_stmt(node)];
+        statements.push(self.pending_check(span));
+        stmt(TypedStatement::Block(TypedBlock { statements, span }), span)
     }
 
     // ─── variables ──────────────────────────────────────────────
@@ -867,8 +1069,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Storage::Cell(name, ty) => {
                 let value = self.coerce(value, ty);
                 let value = self.coerce(Val { node: value, ty }, Ty::Any);
-                let cell = node(TypedExpression::Array(vec![value]), self.m.anys(), span);
-                let_(name, self.m.anys(), cell, span)
+                let mut pre = Vec::new();
+                let cell = self.array_of(vec![value], &mut pre, span);
+                let_(name, self.m.anys(), block_value(pre, cell, span), span)
             }
         }
     }
@@ -978,18 +1181,20 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         for v in captures {
             cells.push(self.capture_value(v, span));
         }
-        let cells = node(TypedExpression::Array(cells), self.m.anys(), span);
+        let mut pre = Vec::new();
+        let cells = self.array_of(cells, &mut pre, span);
+        let record = call(
+            "zb_func_new",
+            vec![
+                code_of(&self.m.code_name(f), span),
+                int_lit(arity, span),
+                cells,
+            ],
+            Type::Any,
+            span,
+        );
         Val {
-            node: call(
-                "zb_func_new",
-                vec![
-                    code_of(&self.m.code_name(f), span),
-                    int_lit(arity, span),
-                    cells,
-                ],
-                Type::Any,
-                span,
-            ),
+            node: block_value(pre, record, span),
             ty: Ty::Any,
         }
     }
@@ -1235,7 +1440,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         for v in vals {
             items.push(self.boxed(v));
         }
-        let list = node(TypedExpression::Array(items), self.m.anys(), span);
+        let list = self.array_of(items, &mut pre, span);
         Ok(match tail {
             None => block_value(pre, list, span),
             Some(tail) => {
@@ -1331,10 +1536,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 },
                 _ => {
                     let b = self.boxed(v);
-                    Val {
+                    self.guard(Val {
                         node: call("zl_unm", vec![b], Type::Any, span),
                         ty: Ty::Any,
-                    }
+                    })
                 }
             },
             UnOp::Hash(_) => match v.ty {
@@ -1348,10 +1553,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 },
                 _ => {
                     let b = self.boxed(v);
-                    Val {
+                    self.guard(Val {
                         node: call("zl_len_any", vec![b], Type::Any, span),
                         ty: Ty::Any,
-                    }
+                    })
                 }
             },
             UnOp::Tilde(_) => match v.ty {
@@ -1367,10 +1572,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 },
                 _ => {
                     let b = self.boxed(v);
-                    Val {
+                    self.guard(Val {
                         node: call("zl_bnot", vec![b], Type::Any, span),
                         ty: Ty::Any,
-                    }
+                    })
                 }
             },
             _ => return unsupported("this unary operator", span),
@@ -1393,7 +1598,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
         let a = self.expr(lhs)?;
         let b = self.expr(rhs)?;
-        self.binary_vals(op, a, b, span)
+        let v = self.binary_vals(op, a, b, span)?;
+        Ok(self.guarded(v))
     }
 
     fn binary_vals(&mut self, op: &BinOp, a: Val, b: Val, span: Span) -> Result<Val> {
@@ -1566,7 +1772,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             ),
             _ => {
                 let b = self.boxed(v);
-                call("zl_concat_text", vec![b], prim(PrimitiveType::String), span)
+                self.guard(Val {
+                    node: call("zl_concat_text", vec![b], prim(PrimitiveType::String), span),
+                    ty: Ty::Str,
+                })
+                .node
             }
         }
     }
@@ -1741,17 +1951,19 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     fn raw_store(&mut self, tb: Node, k: Val, v: Val, span: Span) -> St {
         let v = self.boxed(v);
         let unit = prim(PrimitiveType::Unit);
-        if let Some(kb) = self.constant_key(&k) {
-            return expr_stmt(call("zl_rawset_key", vec![tb, kb, v], unit, span));
-        }
-        match k.ty {
-            Ty::Int => expr_stmt(call("zl_rawseti", vec![tb, k.node, v], unit, span)),
-            Ty::Str => expr_stmt(call("zl_rawset_str", vec![tb, k.node, v], unit, span)),
-            _ => {
-                let k = self.boxed(k);
-                expr_stmt(call("zl_rawset", vec![tb, k, v], unit, span))
+        let node = if let Some(kb) = self.constant_key(&k) {
+            call("zl_rawset_key", vec![tb, kb, v], unit, span)
+        } else {
+            match k.ty {
+                Ty::Int => call("zl_rawseti", vec![tb, k.node, v], unit, span),
+                Ty::Str => call("zl_rawset_str", vec![tb, k.node, v], unit, span),
+                _ => {
+                    let k = self.boxed(k);
+                    call("zl_rawset", vec![tb, k, v], unit, span)
+                }
             }
-        }
+        };
+        self.guarded_stmt(node)
     }
 
     /// A name the program spells, boxed once and shared: the compiler
@@ -1775,7 +1987,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     call("zl_index_key", vec![o, k], Type::Any, span)
                 }
             };
-            return Val { node, ty: Ty::Any };
+            return self.guarded(Val { node, ty: Ty::Any });
         }
         let node = match obj.ty {
             Ty::Table => match key.ty {
@@ -1803,7 +2015,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
             }
         };
-        Val { node, ty: Ty::Any }
+        self.guarded(Val { node, ty: Ty::Any })
     }
 
     /// `obj[key] = value`, with `__newindex`.
@@ -1818,7 +2030,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     call("zl_setindex_key", vec![o, k, v], unit, span)
                 }
             };
-            return expr_stmt(node);
+            return self.guarded_stmt(node);
         }
         let node = match obj.ty {
             Ty::Table => match key.ty {
@@ -1846,7 +2058,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
             }
         };
-        expr_stmt(node)
+        self.guarded_stmt(node)
     }
 
     // ─── calls ──────────────────────────────────────────────────
@@ -2087,7 +2299,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             for v in extras {
                 items.push(self.boxed(v));
             }
-            let list = node(TypedExpression::Array(items), self.m.anys(), span);
+            let list = self.array_of(items, &mut pre, span);
             match tail_name {
                 Some(t) => {
                     let list_name = self.temp();
@@ -2123,22 +2335,55 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             self.m.return_ir(&sig.returns),
             span,
         );
-        Ok(self.call_result(value, &sig.returns, pre, span))
+        let raises = self.m.raises(f);
+        if raises {
+            self.raise_callees.insert(f);
+        }
+        Ok(self.call_result(value, &sig.returns, pre, raises, span))
     }
 
-    /// The values a typed entry returned.
-    fn call_result(&mut self, value: Node, returns: &Returns, pre: Vec<St>, span: Span) -> Multi {
+    /// The values a typed entry returned, checked for an error when the
+    /// callee may raise.
+    fn call_result(
+        &mut self,
+        value: Node,
+        returns: &Returns,
+        pre: Vec<St>,
+        raises: bool,
+        span: Span,
+    ) -> Multi {
         match returns {
-            Returns::Fixed(types) if types.is_empty() => Multi::None(block_value(pre, value, span)),
-            Returns::Fixed(types) if types.len() == 1 => Multi::Fixed(vec![Val {
-                node: block_value(pre, value, span),
-                ty: types[0].settled(),
-            }]),
+            Returns::Fixed(types) if types.is_empty() => {
+                let mut pre = pre;
+                pre.push(expr_stmt(value));
+                if raises {
+                    pre.push(self.pending_check(span));
+                }
+                Multi::None(block_value(pre, nil(span), span))
+            }
+            Returns::Fixed(types) if types.len() == 1 => {
+                let ty = types[0].settled();
+                let mut pre = pre;
+                let value = if raises {
+                    let held = self.hold(Val { node: value, ty }, &mut pre);
+                    pre.push(self.pending_check(span));
+                    held.node
+                } else {
+                    value
+                };
+                Multi::Fixed(vec![Val {
+                    node: block_value(pre, value, span),
+                    ty,
+                }])
+            }
             Returns::Fixed(types) => {
                 // Several values: a list, each read out as its type.
                 let name = self.temp();
                 let mut pre = pre;
                 pre.push(let_(name, self.m.anys(), value, span));
+                if raises {
+                    pre.push(self.pending_check(span));
+                }
                 let mut vals = Vec::with_capacity(types.len());
                 for (i, ty) in types.iter().enumerate() {
                     let ty = ty.settled();
@@ -2164,7 +2409,18 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
                 Multi::Fixed(vals)
             }
-            Returns::Dynamic => Multi::Dynamic(block_value(pre, value, span)),
+            Returns::Dynamic => {
+                let value = if raises {
+                    self.guard(Val {
+                        node: value,
+                        ty: Ty::Any,
+                    })
+                    .node
+                } else {
+                    value
+                };
+                Multi::Dynamic(block_value(pre, value, span))
+            }
         }
     }
 
@@ -2221,17 +2477,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             for v in vals {
                 lowered.push(self.boxed(v));
             }
-            return Ok(Multi::Dynamic(block_value(
-                pre,
-                call(&format!("zl_call_{n}"), lowered, Type::Any, span),
-                span,
-            )));
+            let v = self.guard(Val {
+                node: call(&format!("zl_call_{n}"), lowered, Type::Any, span),
+                ty: Ty::Any,
+            });
+            return Ok(Multi::Dynamic(block_value(pre, v.node, span)));
         }
         let mut items = Vec::with_capacity(vals.len());
         for v in vals {
             items.push(self.boxed(v));
         }
-        let list = node(TypedExpression::Array(items), self.m.anys(), span);
+        let list = self.array_of(items, &mut pre, span);
         let list = match tail {
             None => list,
             Some(tail) => {
@@ -2246,11 +2502,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 var(name, self.m.anys(), span)
             }
         };
-        Ok(Multi::Dynamic(block_value(
-            pre,
-            call("zl_call_packed", vec![f, list], Type::Any, span),
-            span,
-        )))
+        let v = self.guard(Val {
+            node: call("zl_call_packed", vec![f, list], Type::Any, span),
+            ty: Ty::Any,
+        });
+        Ok(Multi::Dynamic(block_value(pre, v.node, span)))
     }
 
     /// `obj:name(args)`: `obj.name(obj, args)` with `obj` evaluated once.
@@ -2334,6 +2590,36 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
             }
         }
+        let is_method = receiver.is_some();
+        // `error(v, level)` above level 1 positions at the caller: the
+        // line this function was entered at.
+        if b.lib.is_empty() && b.name == "error" {
+            let exprs = self.args_exprs(args);
+            let level = exprs.get(1).and_then(|e| match e {
+                Expression::Number(n) => {
+                    match crate::host::parse_numeral(n.token().to_string().trim()) {
+                        crate::host::Numeral::Int(v) => Some(v),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            });
+            if level.is_some_and(|l| l >= 2) {
+                self.entry_line = true;
+                let (mut pre, vals, _) = self.call_values(None, args, span)?;
+                let v = vals.into_iter().next().map(|v| self.boxed(v));
+                let v = v.unwrap_or_else(|| nil(span));
+                let call = call(
+                    "zl_error_at",
+                    vec![v, var(intern(ENTRY_LINE), prim(PrimitiveType::I64), span)],
+                    prim(PrimitiveType::Unit),
+                    span,
+                );
+                pre.push(expr_stmt(call));
+                pre.push(self.pending_check(span));
+                return Ok(Multi::None(block_value(pre, nil(span), span)));
+            }
+        }
         let (mut pre, vals, tail) = self.call_values(receiver, args, span)?;
         let mut vals: Vec<Val> = vals.into_iter().map(|v| self.hold(v, &mut pre)).collect();
         // A tail of several values fills what follows through a list.
@@ -2351,7 +2637,6 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             None => None,
         };
         let mut lowered = Vec::with_capacity(b.params.len());
-        let what = str_lit(b.name, span);
         let mut consumed = 0;
         for (i, p) in b.params.iter().enumerate() {
             if let Param::Rest = p {
@@ -2360,7 +2645,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 for v in vals.drain(..) {
                     items.push(self.boxed(v));
                 }
-                let list = node(TypedExpression::Array(items), self.m.anys(), span);
+                let list = self.array_of(items, &mut pre, span);
                 let list = match tail_list {
                     Some(name) => {
                         let list_name = self.temp();
@@ -2401,8 +2686,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             } else {
                 None
             };
-            let _ = i;
-            lowered.push(self.builtin_arg(p, v, what.clone(), span));
+            // A method's receiver is not counted, and is not "bad
+            // argument #0".
+            let what = match (is_method, i) {
+                (true, 0) => format!("calling '{}' on bad self", b.name),
+                (true, i) => format!("bad argument #{i} to '{}'", b.name),
+                (false, i) => format!("bad argument #{} to '{}'", i + 1, b.name),
+            };
+            let what = str_lit(&what, span);
+            lowered.push(self.builtin_arg(p, v, what, span));
         }
         // Arguments past the parameters run for their effects.
         if consumed != usize::MAX {
@@ -2411,13 +2703,23 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             }
         }
         let ret_ir = crate::library::stdlib::ret_type(b.ret, &self.m.types);
+        // An argument's conversion can raise as well as the function.
+        let converts = lowered.iter().any(|a| self.call_can_raise(a));
         let value = call(b.func, lowered, ret_ir, span);
+        let raises = converts || self.call_can_raise(&value);
+        let ty = match b.ret {
+            Ret::Unit => Ty::Nil,
+            Ret::Multi => Ty::Any,
+            r => types::ret_ty(r),
+        };
+        let v = Val { node: value, ty };
+        let v = if raises { self.guard(v) } else { v };
         Ok(match b.ret {
-            Ret::Unit => Multi::None(block_value(pre, value, span)),
-            Ret::Multi => Multi::Dynamic(block_value(pre, value, span)),
-            r => Multi::Fixed(vec![Val {
-                node: block_value(pre, value, span),
-                ty: types::ret_ty(r),
+            Ret::Unit => Multi::None(block_value(pre, v.node, span)),
+            Ret::Multi => Multi::Dynamic(block_value(pre, v.node, span)),
+            _ => Multi::Fixed(vec![Val {
+                node: block_value(pre, v.node, span),
+                ty: v.ty,
             }]),
         })
     }
@@ -2432,13 +2734,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 Some(v) => self.boxed(v),
                 None => nil(span),
             },
+            Param::Value => match v {
+                Some(v) => self.boxed(v),
+                None => call("zl_arg_value_missing", vec![what], Type::Any, span),
+            },
             Param::Int => match v {
                 Some(v) if v.ty == Ty::Int => v.node,
                 Some(v) => {
                     let b = self.boxed(v);
                     call("zl_arg_int", vec![b, what], i64_t, span)
                 }
-                None => call("zl_arg_int", vec![nil(span), what], i64_t, span),
+                None => call("zl_arg_int_missing", vec![what], i64_t, span),
             },
             Param::Float => match v {
                 Some(v) if v.ty.is_number() => self.coerce(v, Ty::Float),
@@ -2446,7 +2752,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     let b = self.boxed(v);
                     call("zl_arg_float", vec![b, what], f64_t, span)
                 }
-                None => call("zl_arg_float", vec![nil(span), what], f64_t, span),
+                None => call("zl_arg_float_missing", vec![what], f64_t, span),
             },
             Param::Str => match v {
                 Some(v) if v.ty == Ty::Str => v.node,
@@ -2455,7 +2761,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     let b = self.boxed(v);
                     call("zl_arg_str", vec![b, what], str_t, span)
                 }
-                None => call("zl_arg_str", vec![nil(span), what], str_t, span),
+                None => call("zl_arg_str_missing", vec![what], str_t, span),
             },
             Param::Table => match v {
                 Some(v) if v.ty == Ty::Table => v.node,
@@ -2463,12 +2769,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     let b = self.boxed(v);
                     call("zl_as_table", vec![b, what], self.ir(Ty::Table), span)
                 }
-                None => call(
-                    "zl_as_table",
-                    vec![nil(span), what],
-                    self.ir(Ty::Table),
-                    span,
-                ),
+                None => call("zl_as_table_missing", vec![what], self.ir(Ty::Table), span),
             },
             Param::OptInt(d) => match v {
                 Some(v) if v.ty == Ty::Int => v.node,
@@ -2511,10 +2812,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     fn block(&mut self, block: &Block) -> Result<Vec<St>> {
         let mut out = Vec::new();
         for s in block.stmts() {
+            let at = out.len();
+            self.line_needed = false;
             self.stmt(s, &mut out)?;
+            self.record_line(span_of(s), at, &mut out);
         }
         if let Some(last) = block.last_stmt() {
             let span = span_of(last);
+            let at = out.len();
+            self.line_needed = false;
             match last {
                 ast::LastStmt::Break(_) => out.push(stmt(TypedStatement::Break(None), span)),
                 ast::LastStmt::Return(r) => {
@@ -2523,8 +2829,20 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
                 _ => return unsupported("this statement", span),
             }
+            self.record_line(span, at, &mut out);
         }
         Ok(out)
+    }
+
+    /// A statement that checks for an error stores its line first, for
+    /// the position the error's message carries.
+    fn record_line(&mut self, span: Span, at: usize, out: &mut Vec<St>) {
+        if !self.line_needed {
+            return;
+        }
+        self.line_needed = false;
+        let st = self.set_line(span);
+        out.insert(at, st);
     }
 
     fn return_stmt(&mut self, exprs: &[&Expression], span: Span, out: &mut Vec<St>) -> Result<()> {
@@ -2551,10 +2869,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 for v in vals {
                     items.push(self.boxed(v));
                 }
-                out.push(ret(
-                    Some(node(TypedExpression::Array(items), self.m.anys(), span)),
-                    span,
-                ));
+                let mut pre = Vec::new();
+                let list = self.array_of(items, &mut pre, span);
+                out.extend(pre);
+                out.push(ret(Some(list), span));
             }
             Returns::Dynamic => {
                 let (pre, vals, tail) = self.expr_list(exprs)?;
@@ -2570,7 +2888,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         for v in vals {
                             items.push(self.boxed(v));
                         }
-                        let list = node(TypedExpression::Array(items), self.m.anys(), span);
+                        let mut pre = Vec::new();
+                        let list = self.array_of(items, &mut pre, span);
+                        out.extend(pre);
                         match tail {
                             None => call("zl_pack", vec![list], Type::Any, span),
                             Some(tail) => {
@@ -2883,21 +3203,22 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Ty::Int | Ty::Float => self.coerce(start, num_ty),
             _ => {
                 let b = self.boxed(start);
-                if is_float {
+                let node = if is_float {
                     call(
-                        "zl_arg_float",
-                        vec![b, str_lit("for", span)],
+                        "zl_for_float",
+                        vec![b, str_lit("initial value", span)],
                         ir.clone(),
                         span,
                     )
                 } else {
                     call(
-                        "zl_arg_int",
-                        vec![b, str_lit("for", span)],
+                        "zl_for_int",
+                        vec![b, str_lit("initial value", span)],
                         ir.clone(),
                         span,
                     )
-                }
+                };
+                self.guard(Val { node, ty: num_ty }).node
             }
         };
         let limit_literal = match &limit.node.node {
@@ -2916,16 +3237,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             ),
             _ => {
                 let b = self.boxed(limit);
-                if is_float {
+                let node = if is_float {
                     call(
-                        "zl_arg_float",
-                        vec![b, str_lit("for", span)],
+                        "zl_for_float",
+                        vec![b, str_lit("limit", span)],
                         ir.clone(),
                         span,
                     )
                 } else {
                     call("zl_for_limit", vec![b], ir.clone(), span)
-                }
+                };
+                self.guard(Val { node, ty: num_ty }).node
             }
         };
         // The step's sign, when it is a literal, picks the test.
@@ -2949,21 +3271,22 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     Ty::Int | Ty::Float => self.coerce(s, num_ty),
                     _ => {
                         let b = self.boxed(s);
-                        if is_float {
+                        let node = if is_float {
                             call(
-                                "zl_arg_float",
-                                vec![b, str_lit("for", span)],
+                                "zl_for_float",
+                                vec![b, str_lit("step", span)],
                                 ir.clone(),
                                 span,
                             )
                         } else {
                             call(
-                                "zl_arg_int",
-                                vec![b, str_lit("for", span)],
+                                "zl_for_int",
+                                vec![b, str_lit("step", span)],
                                 ir.clone(),
                                 span,
                             )
-                        }
+                        };
+                        self.guard(Val { node, ty: num_ty }).node
                     }
                 };
                 (n, literal)
@@ -3139,6 +3462,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Type::Any,
             span,
         );
+        let step = self
+            .guard(Val {
+                node: step,
+                ty: Ty::Any,
+            })
+            .node;
         let mut body = vec![let_(
             vals_name,
             self.m.anys(),
@@ -3290,12 +3619,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             t.node
         } else {
             let b = self.boxed(t);
-            call(
+            let node = call(
                 "zl_as_table",
                 vec![b, str_lit("for iterator", span)],
                 table_t.clone(),
                 span,
-            )
+            );
+            self.guard(Val {
+                node,
+                ty: Ty::Table,
+            })
+            .node
         };
         out.push(let_(tname, table_t.clone(), t, span));
         out.push(let_(
@@ -3475,7 +3809,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             params.push(parameter(name, self.m.anys(), span));
             child.varargs = Some(name);
         }
-        statements.extend(child.block(body.block())?);
+        let body_statements = child.block(body.block())?;
+        if child.entry_line {
+            statements.push(entry_line_save(span));
+        }
+        statements.extend(body_statements);
         // Falling off the end returns nothing.
         if types::falls_through(body.block()) {
             child.return_stmt(&[], span, &mut statements)?;
@@ -3487,6 +3825,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             self.m.return_ir(&sig.returns),
             statements,
             span,
+        );
+        self.m.facts.borrow_mut().insert(
+            id,
+            RaiseFact {
+                own: child.raised,
+                callees: child.raise_callees.clone(),
+            },
         );
         self.m.functions.borrow_mut().push(function);
         // The record code, whether or not anything takes the function
@@ -3571,9 +3916,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         );
         // The result as one dynamic value.
         let result = match &sig.returns {
-            Returns::Fixed(types) if types.is_empty() => {
-                block_value(vec![expr_stmt(value)], nil(span), span)
-            }
+            Returns::Fixed(types) if types.is_empty() => block_value(
+                vec![expr_stmt(value)],
+                call("zl_none", vec![], Type::Any, span),
+                span,
+            ),
             Returns::Fixed(types) if types.len() == 1 => child.coerce(
                 Val {
                     node: value,
@@ -3590,6 +3937,39 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 }
 
+/// The chunk's statements as a function; the entry names the chunk,
+/// runs it, and reports an error nothing caught.
+const CHUNK_FN: &str = "lua$chunk";
+
+/// The line a function was entered at: the caller's, for `error(v, 2)`.
+const ENTRY_LINE: &str = "$entry_line";
+
+fn entry_line_save(span: Span) -> St {
+    let i64_t = prim(PrimitiveType::I64);
+    let_(
+        intern(ENTRY_LINE),
+        i64_t.clone(),
+        var(intern(library::LINE), i64_t, span),
+        span,
+    )
+}
+
+/// The chunk name as positions spell it (`luaO_chunkid`): a file name
+/// longer than the reference's buffer keeps its tail after `...`.
+fn chunk_id(file: &str) -> String {
+    const IDSIZE: usize = 60;
+    const KEPT: usize = IDSIZE - "...".len() - 1;
+    if file.len() < IDSIZE {
+        return file.to_string();
+    }
+    let tail = file.len() - KEPT;
+    let mut cut = tail;
+    while !file.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("...{}", &file[cut..])
+}
+
 /// The whole chunk as a program.
 pub(crate) fn program(
     ast: &ast::Ast,
@@ -3599,25 +3979,76 @@ pub(crate) fn program(
 ) -> Result<TypedProgram> {
     let scopes = crate::scope::resolve(ast);
     let inferred = types::infer(&scopes, ast);
-    let module = Module {
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let mut module = Module {
         scopes: &scopes,
         inferred: &inferred,
         types: library.types.clone(),
+        chunk: file,
+        line_starts,
+        fallible: crate::fallible::FALLIBLE.iter().copied().collect(),
+        raising: None,
         functions: RefCell::new(Vec::new()),
         module_vars: RefCell::new(Vec::new()),
+        facts: RefCell::new(HashMap::new()),
     };
     let span = Span::new(0, source.len());
-    let mut main = Lowerer::new(&module, CHUNK);
-    main.returns = Returns::Fixed(Vec::new());
-    let mut statements = main.block(ast.nodes())?;
-    if types::falls_through(ast.nodes()) {
-        statements.push(ret(None, span));
-    }
+    // Lowered twice: the first time finds which functions may raise, so
+    // the second checks after calls to those alone.
+    let lower_chunk = |module: &Module<'_>| -> Result<Vec<St>> {
+        let mut main = Lowerer::new(module, CHUNK);
+        main.returns = Returns::Fixed(Vec::new());
+        let mut statements = main.block(ast.nodes())?;
+        if main.entry_line {
+            statements.insert(0, entry_line_save(span));
+        }
+        if types::falls_through(ast.nodes()) {
+            statements.push(ret(None, span));
+        }
+        module.facts.borrow_mut().insert(
+            CHUNK,
+            RaiseFact {
+                own: main.raised,
+                callees: main.raise_callees.clone(),
+            },
+        );
+        Ok(statements)
+    };
+    lower_chunk(&module)?;
+    let raising = raising_functions(&module.facts.borrow());
+    module.raising = Some(raising);
+    module.functions.borrow_mut().clear();
+    module.module_vars.borrow_mut().clear();
+    module.facts.borrow_mut().clear();
+    let statements = lower_chunk(&module)?;
+    let chunk_fn = typed_function(
+        CHUNK_FN,
+        Vec::new(),
+        prim(PrimitiveType::Unit),
+        statements,
+        span,
+    );
     let entry = typed_function(
         ENTRY,
         Vec::new(),
         prim(PrimitiveType::Unit),
-        statements,
+        vec![
+            assign(
+                var(intern(library::CHUNK), prim(PrimitiveType::String), span),
+                str_lit(&chunk_id(module.chunk), span),
+                span,
+            ),
+            expr_stmt(call(CHUNK_FN, vec![], prim(PrimitiveType::Unit), span)),
+            expr_stmt(call(
+                "zl_report_pending",
+                vec![],
+                prim(PrimitiveType::Unit),
+                span,
+            )),
+            ret(None, span),
+        ],
         span,
     );
 
@@ -3643,6 +4074,11 @@ pub(crate) fn program(
             span,
         ));
     }
+    declarations.push(TypedNode::new(
+        TypedDeclaration::Function(chunk_fn),
+        Type::Unknown,
+        span,
+    ));
     declarations.push(TypedNode::new(
         TypedDeclaration::Function(entry),
         Type::Unknown,

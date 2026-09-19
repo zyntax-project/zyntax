@@ -89,6 +89,17 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ret_void(),
         ],
     ));
+    // No values at all, as one: what a function that returns nothing
+    // returns to a dynamic caller.
+    d.push(define(
+        "zl_none",
+        &[],
+        any(),
+        vec![
+            xs.decl(list(vec![], anys.clone())),
+            ret(call("zb_box_tuple", vec![xs.e()], any())),
+        ],
+    ));
     // Several values as one: exactly one is itself.
     d.push(define(
         "zl_pack",
@@ -217,6 +228,8 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     d.push(define("zl_call_packed", &[&f, &args], any(), {
         let mut st = vec![
             rec.decl(call("zl_callee", vec![f.e(), args.e()], anys.clone())),
+            // Nothing callable: the error is raised, the call is nil.
+            when(eq(len(rec.e()), int(0)), vec![ret(nil())]),
             arity.decl(call("zb_box_get_i64", vec![at(rec.e(), int(1))], i64())),
             when(
                 eq(arity.e(), int(VARIADIC_ARITY)),

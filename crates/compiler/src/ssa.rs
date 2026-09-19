@@ -2325,8 +2325,9 @@ impl SsaBuilder {
             std::mem::discriminant(&stmt.node)
         );
 
-        // NOTE: Don't clear continuation_block here - it should persist across statements
-        // and be consumed by the terminator. Only try expressions set it.
+        // `continuation_block` is left as a child expression set it until
+        // the tail of this function, which hands it back as the block the
+        // next statement lands in.
 
         match &stmt.node {
             TypedStatement::Let(let_stmt) => {
@@ -2449,6 +2450,12 @@ impl SsaBuilder {
             TypedStatement::Expression(expr) => {
                 // Evaluate expression for side effects
                 self.translate_expression(block_id, expr)?;
+            }
+            // A `return` nested in on-demand control flow (an `if` inside
+            // a block expression): the CFG builder never saw it, so it is
+            // terminated here. What follows in its block is unreached.
+            TypedStatement::Return(expr) => {
+                return self.emit_return(block_id, expr.as_deref());
             }
             TypedStatement::Block(block) => {
                 // Recurse into the inner statements. Closure / lambda
@@ -2642,19 +2649,21 @@ impl SsaBuilder {
                 for inner in &if_stmt.then_block.statements {
                     then_tail = self.process_statement(then_tail, inner)?;
                 }
+                // A branch that already ended (a `return`) does not reach
+                // the continuation.
                 {
                     let blk = self.function.blocks.get_mut(&then_tail).unwrap();
                     if matches!(blk.terminator, HirTerminator::Unreachable) {
                         blk.terminator = HirTerminator::Branch { target: cont_id };
                         blk.successors = vec![cont_id];
+                        self.function
+                            .blocks
+                            .get_mut(&cont_id)
+                            .unwrap()
+                            .predecessors
+                            .push(then_tail);
                     }
                 }
-                self.function
-                    .blocks
-                    .get_mut(&cont_id)
-                    .unwrap()
-                    .predecessors
-                    .push(then_tail);
 
                 // Translate the else-branch (or fall straight to cont
                 // when there's no else).
@@ -2669,14 +2678,14 @@ impl SsaBuilder {
                     if matches!(blk.terminator, HirTerminator::Unreachable) {
                         blk.terminator = HirTerminator::Branch { target: cont_id };
                         blk.successors = vec![cont_id];
+                        self.function
+                            .blocks
+                            .get_mut(&cont_id)
+                            .unwrap()
+                            .predecessors
+                            .push(else_tail);
                     }
                 }
-                self.function
-                    .blocks
-                    .get_mut(&cont_id)
-                    .unwrap()
-                    .predecessors
-                    .push(else_tail);
 
                 return Ok(cont_id);
             }
@@ -2797,9 +2806,11 @@ impl SsaBuilder {
             return Ok(simd_after);
         }
 
-        // Return the continuation block if set (try expression), otherwise the original block
-        let result_block = self.continuation_block.unwrap_or(block_id);
-        if self.continuation_block.is_some() {
+        // Where evaluation ended is where the next statement goes. Taken,
+        // so a nested `return` placed later does not land on a block this
+        // statement already terminated.
+        let result_block = self.continuation_block.take().unwrap_or(block_id);
+        if result_block != block_id {
             log::debug!(
                 "[SSA] process_statement: returning continuation_block {:?} instead of {:?}",
                 result_block,
@@ -2807,6 +2818,43 @@ impl SsaBuilder {
             );
         }
         Ok(result_block)
+    }
+
+    /// `return`: the value as the type the function declared, and the
+    /// terminator on the block where evaluation ended. That block is
+    /// returned.
+    fn emit_return(
+        &mut self,
+        block_id: HirId,
+        expr: Option<&zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>>,
+    ) -> CompilerResult<HirId> {
+        let values = if let Some(expr) = expr {
+            // A literal returned as a list outlives this frame.
+            let saved_growable = self.expected_growable;
+            self.expected_growable = self
+                .original_return_type
+                .as_ref()
+                .is_some_and(|t| self.declares_list(t));
+            let value = self.translate_expression(block_id, expr);
+            self.expected_growable = saved_growable;
+            let value = value?;
+            let value = match self.original_return_type.clone() {
+                Some(declared) if !matches!(declared, Type::Result { .. }) => {
+                    let at = self.continuation_block.unwrap_or(block_id);
+                    self.coerce_for_transfer(at, value, expr, &declared)
+                }
+                _ => value,
+            };
+            vec![value]
+        } else {
+            vec![]
+        };
+        // A control-flow expression in the value moved evaluation to a
+        // continuation block; the terminator goes there.
+        let target_block = self.continuation_block.take().unwrap_or(block_id);
+        let block = self.function.blocks.get_mut(&target_block).unwrap();
+        block.terminator = HirTerminator::Return { values };
+        Ok(target_block)
     }
 
     /// Process a terminator
@@ -2819,36 +2867,7 @@ impl SsaBuilder {
 
         match &term.node {
             TypedStatement::Return(expr) => {
-                let values = if let Some(expr) = expr {
-                    // A literal returned as a list outlives this frame.
-                    let saved_growable = self.expected_growable;
-                    self.expected_growable = self
-                        .original_return_type
-                        .as_ref()
-                        .is_some_and(|t| self.declares_list(t));
-                    let value = self.translate_expression(block_id, expr);
-                    self.expected_growable = saved_growable;
-                    let value = value?;
-                    // The value leaves as the type the function declared,
-                    // converted where evaluation ended.
-                    let value = match self.original_return_type.clone() {
-                        Some(declared) if !matches!(declared, Type::Result { .. }) => {
-                            let at = self.continuation_block.unwrap_or(block_id);
-                            self.coerce_for_transfer(at, value, expr, &declared)
-                        }
-                        _ => value,
-                    };
-                    vec![value]
-                } else {
-                    vec![]
-                };
-
-                // If a control flow expression (if/match) set a continuation block,
-                // place the Return terminator there instead of on the entry block
-                let target_block = self.continuation_block.take().unwrap_or(block_id);
-
-                let block = self.function.blocks.get_mut(&target_block).unwrap();
-                block.terminator = HirTerminator::Return { values };
+                self.emit_return(block_id, expr.as_deref())?;
             }
 
             TypedStatement::If(if_stmt) => {

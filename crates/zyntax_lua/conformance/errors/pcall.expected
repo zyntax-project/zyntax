@@ -1,0 +1,37 @@
+false	nil
+false	nil
+false	plain
+false	42
+false	true
+false	true
+true	1	2	3
+true
+false	pcall.lua:14: in f
+false	pcall.lua:17: in g
+false	no position
+true	false	inner	after
+false	first
+false	pcall.lua:34: attempt to perform arithmetic on a nil value
+false	pcall.lua:35: attempt to get length of a number value
+false	pcall.lua:36: attempt to compare string with number
+false	pcall.lua:37: bad argument #1 to 'rep' (number expected, got string)
+false	pcall.lua:38: bad argument #2 to 'rep' (number expected, got string)
+false	pcall.lua:39: bad argument #1 to 'floor' (number expected, got table)
+false	pcall.lua:40: bad argument #2 to 'tonumber' (base out of range)
+false	assertion failed!
+false	custom
+false	7
+true	1	2	3
+2
+false	handled: pcall.lua:50: boom
+true	fine	2
+false	table
+true	7
+false	pcall.lua:56: in co
+dead
+false	in wrap
+false	pcall.lua:66: stop
+1
+false	OBJ	true
+false	attempt to call a number value
+false	attempt to call a nil value

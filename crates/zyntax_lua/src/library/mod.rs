@@ -26,12 +26,18 @@ pub const TABLE_TYPE: &str = "LuaTable";
 /// coroutine's fiber, each under [`zyntax_builtins::instance_tag`].
 pub const TABLE_KIND: usize = 0;
 pub const THREAD_KIND: usize = 1;
+/// `error(nil)` in flight: nil means nothing pending, so a nil error
+/// value travels as this instance and is nil again when taken.
+pub const NIL_ERROR_KIND: usize = 2;
 
 pub fn table_tag() -> i64 {
     zyntax_builtins::instance_tag(TABLE_KIND)
 }
 pub fn thread_tag() -> i64 {
     zyntax_builtins::instance_tag(THREAD_KIND)
+}
+pub fn nil_error_tag() -> i64 {
+    zyntax_builtins::instance_tag(NIL_ERROR_KIND)
 }
 
 /// The types the library is written against: `List<Any>` and the
@@ -221,6 +227,23 @@ pub fn is_table(x: Expr) -> Expr {
 pub fn is_thread(x: Expr) -> Expr {
     and(ne(x.clone(), nil()), eq(tag_of(x), int(thread_tag())))
 }
+fn is_nil_error(x: Expr) -> Expr {
+    and(ne(x.clone(), nil()), eq(tag_of(x), int(nil_error_tag())))
+}
+fn nil_error() -> Expr {
+    // Any payload but zero, which boxes to nil.
+    call(
+        "zb_box_instance_raw",
+        vec![int(1), int32(nil_error_tag() as i32)],
+        any(),
+    )
+}
+
+/// The start of a `luaL_argerror` message: the argument's number and
+/// the function's name.
+pub fn bad_arg(n: usize, name: &str) -> Expr {
+    text(&format!("bad argument #{n} to '{name}'"))
+}
 
 /// The table a box holds; the box is known to hold one.
 pub fn unbox_table(x: Expr, t: &Types) -> Expr {
@@ -402,25 +425,200 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
     d
 }
 
-/// The shared library's error hook: a Lua error nothing catches ends
-/// the program the way `lua` does, the message on stderr and status 1.
-fn raise_hook() -> Decl {
+/// The error in flight, or nil. An error is raised by storing its value
+/// here; every function that may raise leaves with a placeholder once
+/// it sees the value set, until a `pcall` takes it.
+pub const PENDING: &str = "zl_pending";
+/// The line of the statement running, for the position a message
+/// carries; zero outside any.
+pub const LINE: &str = "zl_line";
+/// The chunk's name, for the same.
+pub const CHUNK: &str = "zl_chunk";
+
+pub fn global_var(name: &str, ty: Type) -> Decl {
+    zyntax_typed_ast::TypedNode::new(
+        TypedDeclaration::Variable(zyntax_typed_ast::typed_ast::TypedVariable {
+            name: intern(name),
+            ty,
+            mutability: Mutability::Mutable,
+            initializer: None,
+            visibility: Visibility::Public,
+        }),
+        Type::Unknown,
+        SPAN,
+    )
+}
+
+pub fn read_global(name: &str, ty: Type) -> Expr {
+    node(
+        zyntax_typed_ast::typed_ast::TypedExpression::Variable(intern(name)),
+        ty,
+    )
+}
+
+pub fn set_global(name: &str, value: Expr) -> Stmt {
+    let ty = value.ty.clone();
+    expr(node(
+        zyntax_typed_ast::typed_ast::TypedExpression::Binary(
+            zyntax_typed_ast::typed_ast::TypedBinary {
+                op: zyntax_typed_ast::typed_ast::BinaryOp::Assign,
+                left: Box::new(read_global(name, ty.clone())),
+                right: Box::new(value),
+            },
+        ),
+        ty,
+    ))
+}
+
+pub fn pending() -> Expr {
+    read_global(PENDING, any())
+}
+
+/// Raising: the first error stands until it is taken; a message gets
+/// the running statement's position, an error value is kept as it is.
+fn raising() -> Vec<Decl> {
     let kind = local("kind", string());
     let message = local("message", string());
-    define_cold(
+    let v = kept("v", any());
+    let level = local("level", i64());
+    let mut d = vec![
+        global_var(PENDING, any()),
+        global_var(LINE, i64()),
+        global_var(CHUNK, string()),
+    ];
+    // The message with the position of the statement running.
+    d.push(define(
+        "zl_position",
+        &[&message],
+        string(),
+        vec![
+            when(le(read_global(LINE, i64()), int(0)), vec![ret(message.e())]),
+            ret(concat(vec![
+                read_global(CHUNK, string()),
+                text(":"),
+                call("zb_str_of_int", vec![read_global(LINE, i64())], string()),
+                text(": "),
+                message.e(),
+            ])),
+        ],
+    ));
+    d.push(define_cold(
+        "zl_raise_value",
+        &[&v],
+        unit(),
+        vec![
+            when(not(is_nil(pending())), vec![ret_void()]),
+            if_(
+                is_nil(v.e()),
+                vec![set_global(PENDING, nil_error())],
+                vec![set_global(PENDING, v.e())],
+            ),
+            ret_void(),
+        ],
+    ));
+    // The shared library's hook: a message, positioned.
+    d.push(define_cold(
         "zb_hook_raise",
         &[&kind, &message],
         unit(),
         vec![
+            when(not(is_nil(pending())), vec![ret_void()]),
+            set_global(
+                PENDING,
+                box_str(call("zl_position", vec![message.e()], string())),
+            ),
+            ret_void(),
+        ],
+    ));
+    // `error(v, level)`: a string message at a level above zero is
+    // positioned; anything else is the error value itself.
+    d.push(define_cold(
+        "zl_error",
+        &[&v, &level],
+        unit(),
+        vec![
+            if_(
+                and(
+                    and(not(is_nil(v.e())), eq(category(v.e()), int(STR))),
+                    gt(level.e(), int(0)),
+                ),
+                vec![expr(call(
+                    "zl_raise_value",
+                    vec![box_str(call("zl_position", vec![get_str(v.e())], string()))],
+                    unit(),
+                ))],
+                vec![expr(call("zl_raise_value", vec![v.e()], unit()))],
+            ),
+            ret_void(),
+        ],
+    ));
+    // `error(v, 2)`: the position is the caller's, the line the
+    // function was entered at.
+    let line = local("line", i64());
+    d.push(define_cold(
+        "zl_error_at",
+        &[&v, &line],
+        unit(),
+        vec![
+            if_(
+                and(
+                    and(not(is_nil(v.e())), eq(category(v.e()), int(STR))),
+                    gt(line.e(), int(0)),
+                ),
+                vec![expr(call(
+                    "zl_raise_value",
+                    vec![box_str(concat(vec![
+                        read_global(CHUNK, string()),
+                        text(":"),
+                        call("zb_str_of_int", vec![line.e()], string()),
+                        text(": "),
+                        get_str(v.e()),
+                    ]))],
+                    unit(),
+                ))],
+                vec![expr(call("zl_raise_value", vec![v.e()], unit()))],
+            ),
+            ret_void(),
+        ],
+    ));
+    // The error taken by whoever handles it: the value, then nothing
+    // pending.
+    d.push(define(
+        "zl_take_pending",
+        &[],
+        any(),
+        vec![
+            v.decl(pending()),
+            set_global(PENDING, nil()),
+            when(is_nil_error(v.e()), vec![ret(nil())]),
+            ret(v.e()),
+        ],
+    ));
+    // An error nothing caught, reported the way `lua` reports it, ending
+    // the program with status 1.
+    d.push(define_cold(
+        "zl_report_pending",
+        &[],
+        unit(),
+        vec![
+            when(is_nil(pending()), vec![ret_void()]),
             expr(call(
                 "zb_eprintln",
-                vec![add(text("lua: "), message.e())],
+                vec![add(
+                    text("lua: "),
+                    call(
+                        "zl_tostring",
+                        vec![call("zl_take_pending", vec![], any())],
+                        string(),
+                    ),
+                )],
                 unit(),
             )),
             expr(call("zb_exit", vec![int32(1)], unit())),
             ret_void(),
         ],
-    )
+    ));
+    d
 }
 
 /// The whole library for Lua: the shared library under Lua's
@@ -434,11 +632,45 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     };
     lib.declarations.push(table_class(table_type));
     lib.declarations.extend(instance_hooks(&t));
-    lib.declarations.push(raise_hook());
+    lib.declarations.extend(raising());
     lib.declarations.extend(tables::declarations(&t));
     lib.declarations.extend(values::declarations(policy, &t));
     lib.declarations.extend(calls::declarations(&t));
     lib.declarations.extend(coroutines::declarations(&t));
     lib.declarations.extend(stdlib::declarations(policy, &t));
+    lib.fallible = fallible_functions(&lib.declarations);
     (lib, t)
+}
+
+/// Every function that raises, through any number of calls: one that
+/// reaches the shared library's `zb_fatal`, or Lua's `zl_raise_value`.
+fn fallible_functions(declarations: &[Decl]) -> std::collections::BTreeSet<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut calls: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for d in declarations {
+        if let TypedDeclaration::Function(f) = &d.node
+            && let (Some(name), Some(body)) = (f.name.resolve_global(), &f.body)
+        {
+            let mut callees = BTreeSet::new();
+            for s in &body.statements {
+                callees_of_stmt(s, &mut callees);
+            }
+            calls.insert(name, callees);
+        }
+    }
+    let mut fallible: BTreeSet<String> = ["zb_fatal".to_string(), "zl_raise_value".to_string()]
+        .into_iter()
+        .collect();
+    loop {
+        let before = fallible.len();
+        for (name, callees) in &calls {
+            if callees.iter().any(|c| fallible.contains(c)) {
+                fallible.insert(name.clone());
+            }
+        }
+        if fallible.len() == before {
+            break;
+        }
+    }
+    fallible
 }

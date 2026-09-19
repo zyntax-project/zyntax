@@ -1,0 +1,8 @@
+false	varinfo.lua:2: attempt to index a nil value (local 'x')
+false	varinfo.lua:3: attempt to index a nil value (global 'undefined_global')
+false	varinfo.lua:5: attempt to index a nil value (upvalue 'up')
+false	varinfo.lua:7: attempt to index a nil value (field 'a')
+false	varinfo.lua:8: attempt to perform arithmetic on a nil value (field 'a')
+false	varinfo.lua:9: attempt to concatenate a nil value (field 'a')
+false	varinfo.lua:10: attempt to get length of a nil value (field 'a')
+false	varinfo.lua:11: bad argument #1 to 'ipairs' (value expected)

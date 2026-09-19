@@ -129,7 +129,8 @@ fn reference() -> Command {
 }
 
 /// The official suite runs each file with `_U=true`, the portable
-/// subset, from its own directory.
+/// subset. Every case runs from its own directory under its bare name,
+/// so a chunk name in its output is the same on every checkout.
 fn is_official(case: &Path) -> bool {
     case.parent()
         .and_then(|d| d.file_name())
@@ -157,11 +158,9 @@ fn expected_for(case: &Path) -> Option<Outcome> {
     let mut cmd = reference();
     if is_official(case) {
         cmd.arg("-e").arg("_U=true");
-        cmd.current_dir(case.parent().unwrap());
-        cmd.arg("--").arg(case.file_name().unwrap());
-    } else {
-        cmd.arg("--").arg(case);
     }
+    cmd.current_dir(case.parent().unwrap());
+    cmd.arg("--").arg(case.file_name().unwrap());
     let got = run_bounded(cmd, Duration::from_secs(120));
     if got.status < 0 || got.status > 100 {
         eprintln!(
@@ -190,11 +189,9 @@ fn ours_for(case: &Path) -> Outcome {
         cmd.arg("run");
         if is_official(case) {
             cmd.arg("-e").arg("_U=true");
-            cmd.current_dir(case.parent().unwrap());
-            cmd.arg(case.file_name().unwrap());
-        } else {
-            cmd.arg(case);
         }
+        cmd.current_dir(case.parent().unwrap());
+        cmd.arg(case.file_name().unwrap());
         let got = run_bounded(cmd, Duration::from_secs(120));
         let died_before_running =
             got.status < 0 && got.status != -3 && got.stdout.is_empty() || got.status == -1;
@@ -307,5 +304,6 @@ categories! {
     metatables,
     coroutines,
     stdlib,
+    errors,
     official,
 }

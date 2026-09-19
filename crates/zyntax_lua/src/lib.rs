@@ -95,6 +95,12 @@ pub const ENTRY: &str = "lua$main";
 /// only the program.
 const SNAPSHOT: &[u8] = zyntax_embed::include_snapshot!("lua");
 
+/// The library functions that can raise, so a call to one is followed
+/// by a check for the error.
+mod fallible {
+    include!(concat!(env!("OUT_DIR"), "/fallible.rs"));
+}
+
 /// The snapshot, decoded once per process.
 fn snapshot() -> Result<std::sync::Arc<zyntax_embed::Snapshot>> {
     static SNAPSHOT_ONCE: std::sync::OnceLock<

@@ -273,6 +273,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             set_status(rec.e(), RUNNING),
             set_current(co.e()),
+            set_global(LINE, int(0)),
             handle.decl(call(
                 "zb_box_get_i64",
                 vec![at(rec.e(), int(HANDLE))],
@@ -306,6 +307,21 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             set_status(rec.e(), DEAD),
             expr(call("zl_fiber_free", vec![handle.e()], unit())),
+            // The body raised: the error comes back as the result.
+            when(
+                not(is_nil(pending())),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(
+                        vec![
+                            box_bool(bool(false)),
+                            call("zl_take_pending", vec![], any()),
+                        ],
+                        anys.clone(),
+                    )],
+                    any(),
+                ))],
+            ),
             when(
                 eq(bitand(step.e(), int(3)), int(STEP_DONE)),
                 vec![
@@ -417,11 +433,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             results.decl(call("zl_values", vec![x.e()], anys.clone())),
             when(
                 not(call("zl_truthy", vec![at(results.e(), int(0))], boolean())),
-                vec![lua_error(call(
-                    "zl_tostring",
-                    vec![call("zl_value_at", vec![results.e(), int(2)], any())],
-                    string(),
-                ))],
+                vec![
+                    expr(call(
+                        "zl_raise_value",
+                        vec![call("zl_value_at", vec![results.e(), int(2)], any())],
+                        unit(),
+                    )),
+                    ret(nil()),
+                ],
             ),
             ret(call("zl_values_from", vec![results.e(), int(2)], any())),
         ],

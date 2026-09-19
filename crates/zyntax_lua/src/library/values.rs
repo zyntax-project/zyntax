@@ -395,6 +395,48 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         let c = category(x);
         or(eq(c.clone(), int(INT)), eq(c, int(UINT)))
     }
+    // The initial value or step of a `for`, as the loop's number type;
+    // `what` names which for the message.
+    let what = kept("what", string());
+    let for_number = |x: &Local, what: &Local| {
+        vec![
+            na.decl(call("zl_arith_operand", vec![x.e()], any())),
+            when(
+                is_nil(na.e()),
+                vec![lua_error(concat(vec![
+                    text("bad 'for' "),
+                    what.e(),
+                    text(" (number expected, got "),
+                    type_name(x.e()),
+                    text(")"),
+                ]))],
+            ),
+        ]
+    };
+    let mut st = for_number(&a, &what);
+    st.extend([
+        when(is_int_cat_of(na.e()), vec![ret(get_i64(na.e()))]),
+        f.decl(get_f64(na.e())),
+        when(
+            not(call("zl_float_is_int", vec![f.e()], boolean())),
+            vec![lua_error(concat(vec![
+                text("'for' "),
+                what.e(),
+                text(" must be an integer"),
+            ]))],
+        ),
+        ret(cast(f.e(), i64())),
+    ]);
+    d.push(define("zl_for_int", &[&a, &what], i64(), st));
+    let mut st = for_number(&a, &what);
+    st.extend([
+        when(
+            is_int_cat_of(na.e()),
+            vec![ret(cast(get_i64(na.e()), f64()))],
+        ),
+        ret(get_f64(na.e())),
+    ]);
+    d.push(define("zl_for_float", &[&a, &what], f64(), st));
     // The integer limit of a `for` over integers: a float limit is
     // floored, a numeral read.
     d.push(define(
@@ -405,7 +447,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             na.decl(call("zl_arith_operand", vec![a.e()], any())),
             when(
                 is_nil(na.e()),
-                vec![lua_error(text("'for' limit must be a number"))],
+                vec![lua_error(concat(vec![
+                    text("bad 'for' limit (number expected, got "),
+                    type_name(a.e()),
+                    text(")"),
+                ]))],
             ),
             when(is_int_cat_of(na.e()), vec![ret(get_i64(na.e()))]),
             f.decl(call("floor", vec![get_f64(na.e())], f64())),

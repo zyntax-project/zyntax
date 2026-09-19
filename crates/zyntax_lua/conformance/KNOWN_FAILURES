@@ -29,3 +29,5 @@ official/strings.lua          4da50c2
 official/tpack.lua            4da50c2
 official/utf8.lua             4da50c2
 official/vararg.lua           4da50c2
+
+errors/varinfo.lua            cf4b102

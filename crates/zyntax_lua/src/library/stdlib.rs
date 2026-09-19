@@ -17,6 +17,8 @@ use zyntax_builtins::functions::VARIADIC_ARITY;
 pub enum Param {
     /// As the dynamic value it is, nil when absent.
     Any,
+    /// Any value, including nil, but one must be passed.
+    Value,
     /// An integer: a number with an integral value, or a numeral.
     Int,
     /// A float: any number or numeral.
@@ -72,14 +74,14 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "",
         name: "type",
         func: "zl_type",
-        params: &[Any],
+        params: &[Value],
         ret: Ret::Str,
     },
     Builtin {
         lib: "",
         name: "tostring",
         func: "zl_tostring",
-        params: &[Any],
+        params: &[Value],
         ret: Ret::Str,
     },
     Builtin {
@@ -100,14 +102,14 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "",
         name: "pairs",
         func: "zl_pairs",
-        params: &[Any],
+        params: &[Value],
         ret: Ret::Multi,
     },
     Builtin {
         lib: "",
         name: "ipairs",
         func: "zl_ipairs",
-        params: &[Any],
+        params: &[Value],
         ret: Ret::Multi,
     },
     Builtin {
@@ -135,7 +137,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "",
         name: "rawequal",
         func: "zl_rawequal",
-        params: &[Any, Any],
+        params: &[Value, Value],
         ret: Ret::Bool,
     },
     Builtin {
@@ -156,7 +158,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "",
         name: "getmetatable",
         func: "zl_getmetatable",
-        params: &[Any],
+        params: &[Value],
         ret: Ret::Any,
     },
     Builtin {
@@ -172,6 +174,20 @@ pub const BUILTINS: &[Builtin] = &[
         func: "zl_error",
         params: &[Any, OptInt(1)],
         ret: Ret::Unit,
+    },
+    Builtin {
+        lib: "",
+        name: "pcall",
+        func: "zl_pcall",
+        params: &[Any, Rest],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "",
+        name: "xpcall",
+        func: "zl_xpcall",
+        params: &[Any, Any, Rest],
+        ret: Ret::Multi,
     },
     Builtin {
         lib: "",
@@ -602,23 +618,32 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     let mut d = Vec::new();
 
     // ─── argument checks ────────────────────────────────────────
-    let bad_arg = |what: &Local, expected: &str, got: Expr| {
+    // The message's start for the `i`th of a function's values, counted
+    // from zero.
+    let bad_arg_at = |i: Expr, name: &str| {
+        concat(vec![
+            text("bad argument #"),
+            call("zb_str_of_int", vec![add(i, int(1))], string()),
+            text(&format!(" to '{name}'")),
+        ])
+    };
+    // `what` starts the message: `bad argument #n to 'f'`.
+    let arg_error = |what: &Local, expected: &str, got: Expr| {
         lua_error(concat(vec![
-            text("bad argument to '"),
             what.e(),
-            text(&format!("' ({expected} expected, got ")),
+            text(&format!(" ({expected} expected, got ")),
             got,
             text(")"),
         ]))
     };
-    let got_of = |x: &Local| if_expr(is_nil(x.e()), text("no value"), type_name(x.e()));
+    let got_of = |x: &Local| type_name(x.e());
     d.push(define(
         "zl_arg_int",
         &[&x, &what],
         i64(),
         vec![
             y.decl(call("zl_arith_operand", vec![x.e()], any())),
-            when(is_nil(y.e()), vec![bad_arg(&what, "number", got_of(&x))]),
+            when(is_nil(y.e()), vec![arg_error(&what, "number", got_of(&x))]),
             when(
                 or(
                     eq(category(y.e()), int(INT)),
@@ -629,11 +654,10 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             f.decl(get_f64(y.e())),
             when(
                 not(call("zl_float_is_int", vec![f.e()], boolean())),
-                vec![lua_error(concat(vec![
-                    text("bad argument to '"),
+                vec![lua_error(add(
                     what.e(),
-                    text("' (number has no integer representation)"),
-                ]))],
+                    text(" (number has no integer representation)"),
+                ))],
             ),
             ret(cast(f.e(), i64())),
         ],
@@ -644,7 +668,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         f64(),
         vec![
             y.decl(call("zl_arith_operand", vec![x.e()], any())),
-            when(is_nil(y.e()), vec![bad_arg(&what, "number", got_of(&x))]),
+            when(is_nil(y.e()), vec![arg_error(&what, "number", got_of(&x))]),
             when(
                 or(
                     eq(category(y.e()), int(INT)),
@@ -660,7 +684,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         &[&x, &what],
         string(),
         vec![
-            when(is_nil(x.e()), vec![bad_arg(&what, "string", got_of(&x))]),
+            when(is_nil(x.e()), vec![arg_error(&what, "string", got_of(&x))]),
             when(eq(category(x.e()), int(STR)), vec![ret(get_str(x.e()))]),
             when(
                 or(
@@ -672,7 +696,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ),
                 vec![ret(call("zl_number_str", vec![x.e()], string()))],
             ),
-            bad_arg(&what, "string", got_of(&x)),
+            arg_error(&what, "string", got_of(&x)),
             ret(text("")),
         ],
     ));
@@ -695,6 +719,50 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![
             when(is_nil(x.e()), vec![ret(default_s.e())]),
             ret(call("zl_arg_str", vec![x.e(), what.e()], string())),
+        ],
+    ));
+    // An argument that was not passed at all, which the caller can
+    // tell from nil: the error, then a stand-in.
+    let missing = |what: &Local, expected: &str| {
+        lua_error(add(
+            what.e(),
+            text(&format!(" ({expected} expected, got no value)")),
+        ))
+    };
+    d.push(define_cold(
+        "zl_arg_value_missing",
+        &[&what],
+        any(),
+        vec![
+            lua_error(add(what.e(), text(" (value expected)"))),
+            ret(nil()),
+        ],
+    ));
+    d.push(define_cold(
+        "zl_arg_int_missing",
+        &[&what],
+        i64(),
+        vec![missing(&what, "number"), ret(int(0))],
+    ));
+    d.push(define_cold(
+        "zl_arg_float_missing",
+        &[&what],
+        f64(),
+        vec![missing(&what, "number"), ret(float(0.0))],
+    ));
+    d.push(define_cold(
+        "zl_arg_str_missing",
+        &[&what],
+        string(),
+        vec![missing(&what, "string"), ret(text(""))],
+    ));
+    d.push(define_cold(
+        "zl_as_table_missing",
+        &[&what],
+        table.clone(),
+        vec![
+            missing(&what, "table"),
+            ret(call("zl_table_new", vec![], table.clone())),
         ],
     ));
 
@@ -750,8 +818,8 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ret(call(
                 "zl_tonumber_base",
                 vec![
-                    call("zl_arg_str", vec![x.e(), text("tonumber")], string()),
-                    call("zl_arg_int", vec![y.e(), text("tonumber")], i64()),
+                    call("zl_arg_str", vec![x.e(), bad_arg(1, "tonumber")], string()),
+                    call("zl_arg_int", vec![y.e(), bad_arg(2, "tonumber")], i64()),
                 ],
                 any(),
             )),
@@ -800,7 +868,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         any(),
         vec![
             i.decl(add(
-                call("zl_arg_int", vec![a1.e(), text("ipairs")], i64()),
+                call(
+                    "zl_arg_int",
+                    vec![a1.e(), bad_arg(2, "for iterator")],
+                    i64(),
+                ),
                 int(1),
             )),
             y.decl(call("zl_geti", vec![a0.e(), i.e()], any())),
@@ -889,7 +961,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ),
                 vec![ret(box_i64(n.e()))],
             ),
-            i.decl(call("zl_arg_int", vec![x.e(), text("select")], i64())),
+            i.decl(call("zl_arg_int", vec![x.e(), bad_arg(1, "select")], i64())),
             when(
                 lt(i.e(), int(0)),
                 vec![i.set(add(add(n.e(), i.e()), int(1)))],
@@ -936,6 +1008,8 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ret(int(0)),
         ],
     ));
+    // `assert(v, message)`: the message is the error value as it is,
+    // no position added.
     d.push(define(
         "zl_assert",
         &[&args],
@@ -948,28 +1022,87 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     boolean(),
                 )),
                 vec![
-                    when(
+                    if_(
                         ge(len(args.e()), int(2)),
-                        vec![lua_error(call(
-                            "zl_tostring",
+                        vec![expr(call(
+                            "zl_raise_value",
                             vec![at(args.e(), int(1))],
-                            string(),
+                            unit(),
+                        ))],
+                        vec![expr(call(
+                            "zl_raise_value",
+                            vec![box_str(call(
+                                "zl_position",
+                                vec![text("assertion failed!")],
+                                string(),
+                            ))],
+                            unit(),
                         ))],
                     ),
-                    lua_error(text("assertion failed!")),
+                    ret(nil()),
                 ],
             ),
             ret(call("zl_pack", vec![args.e()], any())),
         ],
     ));
-    let level = local("level", i64());
+    // `pcall(f, ...)`: true and the results, or false and the error.
+    // The call is from no line: what it calls directly reports no
+    // position, as under the reference where the caller is C.
+    let handler = kept("handler", any());
+    let err = kept("err", any());
     d.push(define(
-        "zl_error",
-        &[&x, &level],
-        unit(),
+        "zl_pcall",
+        &[&x, &args],
+        any(),
         vec![
-            lua_error(call("zl_tostring", vec![x.e()], string())),
-            ret_void(),
+            set_global(LINE, int(0)),
+            y.decl(call("zl_call_packed", vec![x.e(), args.e()], any())),
+            when(
+                not(is_nil(pending())),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(
+                        vec![
+                            box_bool(bool(false)),
+                            call("zl_take_pending", vec![], any()),
+                        ],
+                        anys.clone(),
+                    )],
+                    any(),
+                ))],
+            ),
+            out.decl(list(vec![box_bool(bool(true))], anys.clone())),
+            expr(call("zl_append_values", vec![out.e(), y.e()], unit())),
+            ret(call("zb_box_tuple", vec![out.e()], any())),
+        ],
+    ));
+    // `xpcall(f, handler, ...)`: the handler sees the error first.
+    d.push(define(
+        "zl_xpcall",
+        &[&x, &handler, &args],
+        any(),
+        vec![
+            set_global(LINE, int(0)),
+            y.decl(call("zl_call_packed", vec![x.e(), args.e()], any())),
+            when(
+                not(is_nil(pending())),
+                vec![
+                    err.decl(call("zl_take_pending", vec![], any())),
+                    err.set(call(
+                        "zl_first",
+                        vec![call("zl_call_1", vec![handler.e(), err.e()], any())],
+                        any(),
+                    )),
+                    ret(call(
+                        "zb_box_tuple",
+                        vec![list(vec![box_bool(bool(false)), err.e()], anys.clone())],
+                        any(),
+                    )),
+                ],
+            ),
+            out.decl(list(vec![box_bool(bool(true))], anys.clone())),
+            expr(call("zl_append_values", vec![out.e(), y.e()], unit())),
+            ret(call("zb_box_tuple", vec![out.e()], any())),
         ],
     ));
     // `table.unpack(t, i, j)`: the values `t[i]..t[j]`.
@@ -1126,7 +1259,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                             "zl_from_byte",
                             vec![call(
                                 "zl_arg_int",
-                                vec![at(args.e(), i.e()), text("char")],
+                                vec![at(args.e(), i.e()), bad_arg_at(i.e(), "char")],
                                 i64(),
                             )],
                             string(),
@@ -1322,7 +1455,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             g.decl(float(1.0)),
             when(
                 not(is_nil(x.e())),
-                vec![g.set(call("zl_arg_float", vec![x.e(), text("atan")], f64()))],
+                vec![g.set(call("zl_arg_float", vec![x.e(), bad_arg(2, "atan")], f64()))],
             ),
             ret(call("zb_math_atan2", vec![f.e(), g.e()], f64())),
         ],
@@ -1336,7 +1469,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 is_nil(x.e()),
                 vec![ret(call("zb_math_log", vec![f.e()], f64()))],
             ),
-            g.decl(call("zl_arg_float", vec![x.e(), text("log")], f64())),
+            g.decl(call("zl_arg_float", vec![x.e(), bad_arg(2, "log")], f64())),
             when(
                 eq(g.e(), float(2.0)),
                 vec![ret(call("zb_math_log2", vec![f.e()], f64()))],
@@ -1368,8 +1501,8 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ],
             ),
             ret(box_f64(rem(
-                call("zl_arg_float", vec![x.e(), text("fmod")], f64()),
-                call("zl_arg_float", vec![y.e(), text("fmod")], f64()),
+                call("zl_arg_float", vec![x.e(), bad_arg(1, "fmod")], f64()),
+                call("zl_arg_float", vec![y.e(), bad_arg(2, "fmod")], f64()),
             ))),
         ],
     ));
@@ -1513,7 +1646,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             lo.decl(int(1)),
             hi.decl(call(
                 "zl_arg_int",
-                vec![at(args.e(), int(0)), text("random")],
+                vec![at(args.e(), int(0)), bad_arg(1, "random")],
                 i64(),
             )),
             when(
@@ -1522,7 +1655,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     lo.set(hi.e()),
                     hi.set(call(
                         "zl_arg_int",
-                        vec![at(args.e(), int(1)), text("random")],
+                        vec![at(args.e(), int(1)), bad_arg(2, "random")],
                         i64(),
                     )),
                 ],
@@ -1548,7 +1681,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     vec![cast(
                         call(
                             "zl_arg_float",
-                            vec![at(args.e(), int(0)), text("randomseed")],
+                            vec![at(args.e(), int(0)), bad_arg(1, "randomseed")],
                             f64(),
                         ),
                         i64(),
@@ -1594,7 +1727,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ),
             i.decl(call(
                 "zl_arg_int",
-                vec![at(args.e(), int(0)), text("insert")],
+                vec![at(args.e(), int(0)), bad_arg(2, "insert")],
                 i64(),
             )),
             when(
@@ -1890,7 +2023,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                         ))],
                         vec![expr(call(
                             "zb_print_text",
-                            vec![call("zl_arg_str", vec![x.e(), text("write")], string())],
+                            vec![call(
+                                "zl_arg_str",
+                                vec![x.e(), bad_arg_at(i.e(), "write")],
+                                string(),
+                            )],
                             unit(),
                         ))],
                     ),
@@ -1907,12 +2044,36 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         // Each argument as the implementation takes it, from the
         // packed list; the result boxed.
         let mut st = vec![args.decl(call("zl_values", vec![packed.e()], anys.clone()))];
+        // Called as a value, the function is named as the reference
+        // finds it in its library's table: `string.rep`.
+        let qualified = if b.lib.is_empty() {
+            b.name.to_string()
+        } else {
+            format!("{}.{}", b.lib, b.name)
+        };
+        // A required argument not passed at all.
+        for (idx, p) in b.params.iter().enumerate() {
+            let expected = match p {
+                Param::Int | Param::Float => " (number expected, got no value)",
+                Param::Str => " (string expected, got no value)",
+                Param::Table => " (table expected, got no value)",
+                Param::Value => " (value expected)",
+                _ => continue,
+            };
+            st.push(when(
+                lt(len(args.e()), int(idx as i64 + 1)),
+                vec![
+                    lua_error(add(bad_arg(idx + 1, &qualified), text(expected))),
+                    ret(nil()),
+                ],
+            ));
+        }
         let mut call_args = Vec::new();
         for (idx, p) in b.params.iter().enumerate() {
             let arg = call("zl_value_at", vec![args.e(), int(idx as i64 + 1)], any());
-            let what = text(b.name);
+            let what = bad_arg(idx + 1, &qualified);
             call_args.push(match p {
-                Param::Any => arg,
+                Param::Any | Param::Value => arg,
                 Param::Int => call("zl_arg_int", vec![arg, what], i64()),
                 Param::Float => call("zl_arg_float", vec![arg, what], f64()),
                 Param::Str => call("zl_arg_str", vec![arg, what], string()),
@@ -1938,7 +2099,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             Ret::Table => ret(box_table(result)),
         });
         if b.ret == Ret::Unit {
-            st.push(ret(nil()));
+            st.push(ret(call("zl_none", vec![], any())));
         }
         d.push(define(&wrapper_name(b), &[&env, &packed], any(), st));
     }
