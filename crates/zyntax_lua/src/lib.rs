@@ -22,6 +22,7 @@ mod host;
 mod host_os;
 pub mod library;
 mod lower;
+mod pack;
 pub mod pattern;
 mod policy;
 mod scope;

@@ -291,14 +291,15 @@ struct ListHeader {
     capacity: i64,
 }
 
-/// A dynamic value read for formatting.
+/// A dynamic value read for formatting. A string or an object carries
+/// its address, for `%p`.
 pub(crate) enum Arg<'a> {
     Nil,
     Bool(bool),
     Int(i64),
     Float(f64),
-    Str(&'a str),
-    Other(String),
+    Str(&'a str, usize),
+    Other(String, usize),
 }
 
 unsafe fn read_arg<'a>(b: *const DynamicBox) -> Arg<'a> {
@@ -317,8 +318,14 @@ unsafe fn read_arg<'a>(b: *const DynamicBox) -> Arg<'a> {
             }
         }
         TypeCategory::Float => Arg::Float(b.as_f64().unwrap_or(0.0)),
-        TypeCategory::String => Arg::Str(unsafe { text_of(b.data as zrtl::StringConstPtr) }),
-        _ => Arg::Other(format!("{}: 0x{:x}", type_word(b), b.data as usize)),
+        TypeCategory::String => Arg::Str(
+            unsafe { text_of(b.data as zrtl::StringConstPtr) },
+            b.data as usize,
+        ),
+        _ => Arg::Other(
+            format!("{}: 0x{:x}", type_word(b), b.data as usize),
+            b.data as usize,
+        ),
     }
 }
 
@@ -482,18 +489,24 @@ pub fn format(fmt: &str, args: &[Arg<'_>]) -> Result<String, String> {
                     Arg::Bool(b) => b.to_string(),
                     Arg::Int(v) => v.to_string(),
                     Arg::Float(v) => float_text(*v),
-                    Arg::Str(s) => s.to_string(),
-                    Arg::Other(s) => s.clone(),
+                    Arg::Str(s, _) => s.to_string(),
+                    Arg::Other(s, _) => s.clone(),
                 };
                 match precision {
                     Some(p) => s.chars().take(p).collect(),
                     None => s,
                 }
             }
+            // The address of what is allocated; nothing for a value
+            // that is not, printed as C prints a null pointer.
+            'p' => match take(&mut next)? {
+                Arg::Str(_, address) | Arg::Other(_, address) => format!("0x{address:x}"),
+                _ => "(null)".to_string(),
+            },
             'q' => {
                 let a = take(&mut next)?;
                 match a {
-                    Arg::Str(s) => quoted(s),
+                    Arg::Str(s, _) => quoted(s),
                     Arg::Int(v) => v.to_string(),
                     Arg::Float(v) => {
                         if v.fract() == 0.0 && v.is_finite() {
@@ -506,7 +519,7 @@ pub fn format(fmt: &str, args: &[Arg<'_>]) -> Result<String, String> {
                     }
                     Arg::Nil => "nil".to_string(),
                     Arg::Bool(b) => b.to_string(),
-                    Arg::Other(_) => {
+                    Arg::Other(..) => {
                         return Err(
                             "bad argument to 'format' (value has no literal form)".to_string()
                         );
@@ -565,7 +578,7 @@ fn int_arg(a: &Arg<'_>, n: usize) -> Result<i64, String> {
         Arg::Float(_) => Err(format!(
             "bad argument #{n} to 'format' (number has no integer representation)"
         )),
-        Arg::Str(s) => match parse_numeral(s) {
+        Arg::Str(s, _) => match parse_numeral(s) {
             Numeral::Int(v) => Ok(v),
             Numeral::Float(v) if v.fract() == 0.0 => Ok(v as i64),
             _ => Err(format!(
@@ -583,7 +596,7 @@ fn float_arg(a: &Arg<'_>, n: usize) -> Result<f64, String> {
     match a {
         Arg::Int(v) => Ok(*v as f64),
         Arg::Float(v) => Ok(*v),
-        Arg::Str(s) => match parse_numeral(s) {
+        Arg::Str(s, _) => match parse_numeral(s) {
             Numeral::Int(v) => Ok(v as f64),
             Numeral::Float(v) => Ok(v),
             Numeral::None => Err(format!(
@@ -602,8 +615,8 @@ fn arg_type(a: &Arg<'_>) -> &'static str {
         Arg::Nil => "nil",
         Arg::Bool(_) => "boolean",
         Arg::Int(_) | Arg::Float(_) => "number",
-        Arg::Str(_) => "string",
-        Arg::Other(_) => "table",
+        Arg::Str(..) => "string",
+        Arg::Other(..) => "table",
     }
 }
 
@@ -690,6 +703,124 @@ extern "C" fn host_format(fmt: zrtl::StringConstPtr, args: *const ListHeader) ->
         Ok(s) => zrtl::string_new(&s),
         Err(e) => zrtl::string_new(&format!("\u{1}{e}")),
     }
+}
+
+// ─── string.pack ────────────────────────────────────────────────────
+
+thread_local! {
+    static PACK_ERROR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static UNPACKED: std::cell::RefCell<(Vec<crate::pack::Unpacked>, usize)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
+}
+
+/// One argument as `string.pack` takes it.
+unsafe fn read_pack_arg<'a>(b: *const DynamicBox) -> crate::pack::PackArg<'a> {
+    use crate::pack::PackArg;
+    if b.is_null() {
+        return PackArg::Other("nil");
+    }
+    let b = unsafe { &*b };
+    match b.tag.category() {
+        TypeCategory::Void => PackArg::Other("nil"),
+        TypeCategory::Bool => PackArg::Other("boolean"),
+        TypeCategory::Int | TypeCategory::UInt => {
+            if b.tag == TypeTag::I64 {
+                PackArg::Int(b.as_i64().unwrap_or(0))
+            } else {
+                PackArg::Int(b.as_i32().map(i64::from).unwrap_or(0))
+            }
+        }
+        TypeCategory::Float => PackArg::Float(b.as_f64().unwrap_or(0.0)),
+        TypeCategory::String => PackArg::Str(unsafe { bytes_of(b.data as zrtl::StringConstPtr) }),
+        _ => PackArg::Other(type_word(b)),
+    }
+}
+
+/// The packed bytes, or null with the message kept for `pack_error`.
+extern "C" fn host_pack(fmt: zrtl::StringConstPtr, args: *const ListHeader) -> StringPtr {
+    let fmt = unsafe { bytes_of(fmt) };
+    let args: Vec<crate::pack::PackArg<'_>> = if args.is_null() {
+        Vec::new()
+    } else {
+        let header = unsafe { &*args };
+        let len = header.len.max(0) as usize;
+        (0..len)
+            .map(|i| unsafe { read_pack_arg(*header.data.add(i)) })
+            .collect()
+    };
+    match crate::pack::pack(fmt, &args) {
+        Ok(bytes) => zrtl::string::string_from_bytes(&bytes),
+        Err(e) => {
+            PACK_ERROR.with(|err| *err.borrow_mut() = e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+extern "C" fn host_pack_error() -> StringPtr {
+    PACK_ERROR.with(|e| zrtl::string::string_from_bytes(e.borrow().as_bytes()))
+}
+
+/// The size, or -1 with the message kept.
+extern "C" fn host_packsize(fmt: zrtl::StringConstPtr) -> i64 {
+    match crate::pack::packsize(unsafe { bytes_of(fmt) }) {
+        Ok(n) => n,
+        Err(e) => {
+            PACK_ERROR.with(|err| *err.borrow_mut() = e);
+            -1
+        }
+    }
+}
+
+/// How many values were unpacked, kept for the accessors, or -1 with
+/// the message kept. `pos` is a byte offset.
+extern "C" fn host_unpack(fmt: zrtl::StringConstPtr, s: zrtl::StringConstPtr, pos: i64) -> i64 {
+    let (fmt, data) = unsafe { (bytes_of(fmt), bytes_of(s)) };
+    match crate::pack::unpack(fmt, data, pos.max(0) as usize) {
+        Ok((values, next)) => {
+            let n = values.len() as i64;
+            UNPACKED.with(|u| *u.borrow_mut() = (values, next));
+            n
+        }
+        Err(e) => {
+            PACK_ERROR.with(|err| *err.borrow_mut() = e);
+            -1
+        }
+    }
+}
+
+/// 0 for an integer, 1 for a float, 2 for a string.
+extern "C" fn host_unpack_kind(i: i64) -> i64 {
+    UNPACKED.with(|u| match u.borrow().0.get(i as usize) {
+        Some(crate::pack::Unpacked::Int(_)) => 0,
+        Some(crate::pack::Unpacked::Float(_)) => 1,
+        _ => 2,
+    })
+}
+
+extern "C" fn host_unpack_int(i: i64) -> i64 {
+    UNPACKED.with(|u| match u.borrow().0.get(i as usize) {
+        Some(crate::pack::Unpacked::Int(v)) => *v,
+        _ => 0,
+    })
+}
+
+extern "C" fn host_unpack_float(i: i64) -> f64 {
+    UNPACKED.with(|u| match u.borrow().0.get(i as usize) {
+        Some(crate::pack::Unpacked::Float(v)) => *v,
+        _ => 0.0,
+    })
+}
+
+extern "C" fn host_unpack_str(i: i64) -> StringPtr {
+    UNPACKED.with(|u| match u.borrow().0.get(i as usize) {
+        Some(crate::pack::Unpacked::Str(v)) => zrtl::string::string_from_bytes(v),
+        _ => zrtl::string::string_from_bytes(b""),
+    })
+}
+
+/// The position after the last unpacked value, 1-based.
+extern "C" fn host_unpack_next() -> i64 {
+    UNPACKED.with(|u| u.borrow().1 as i64)
 }
 
 /// `%.14g` of a float for `string.format`'s callers that have one.
@@ -1360,7 +1491,7 @@ extern "C" fn host_setlocale(locale: zrtl::StringConstPtr) -> StringPtr {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 61] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 70] = [
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$clock".as_ptr(), host_clock as *const u8),
@@ -1461,6 +1592,18 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 61] = [
         host_os::host_exec_result as *const u8,
     ),
     zrtl::ZrtlSymbol::new(c"$Lua$setlocale".as_ptr(), host_setlocale as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$pack".as_ptr(), host_pack as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$pack_error".as_ptr(), host_pack_error as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$packsize".as_ptr(), host_packsize as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$unpack".as_ptr(), host_unpack as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$unpack_kind".as_ptr(), host_unpack_kind as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$unpack_int".as_ptr(), host_unpack_int as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$unpack_float".as_ptr(),
+        host_unpack_float as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(c"$Lua$unpack_str".as_ptr(), host_unpack_str as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$unpack_next".as_ptr(), host_unpack_next as *const u8),
 ];
 
 /// The host's symbols as a plugin the runtime links like any other.
@@ -1535,15 +1678,15 @@ mod tests {
             "ff FF 10"
         );
         assert_eq!(
-            f("%s and %s", &[Arg::Str("a"), Arg::Float(1.5)]),
+            f("%s and %s", &[Arg::Str("a", 0), Arg::Float(1.5)]),
             "a and 1.5"
         );
-        assert_eq!(f("%q", &[Arg::Str("a\"b\n")]), "\"a\\\"b\\\n\"");
-        assert_eq!(f("%5.1s|", &[Arg::Str("abc")]), "    a|");
+        assert_eq!(f("%q", &[Arg::Str("a\"b\n", 0)]), "\"a\\\"b\\\n\"");
+        assert_eq!(f("%5.1s|", &[Arg::Str("abc", 0)]), "    a|");
         assert_eq!(f("%%", &[]), "%");
         assert_eq!(f("%e", &[Arg::Float(12345.678)]), "1.234568e+04");
         assert_eq!(f("%c%c", &[Arg::Int(72), Arg::Int(105)]), "Hi");
-        assert!(format("%d", &[Arg::Str("x")]).is_err());
+        assert!(format("%d", &[Arg::Str("x", 0)]).is_err());
         assert!(format("%d", &[]).is_err());
     }
 }

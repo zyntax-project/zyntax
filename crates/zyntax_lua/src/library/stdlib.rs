@@ -258,6 +258,27 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         lib: "string",
+        name: "pack",
+        func: "zl_string_pack",
+        params: &[Str, Rest],
+        ret: Ret::Str,
+    },
+    Builtin {
+        lib: "string",
+        name: "packsize",
+        func: "zl_string_packsize",
+        params: &[Str],
+        ret: Ret::Int,
+    },
+    Builtin {
+        lib: "string",
+        name: "unpack",
+        func: "zl_string_unpack",
+        params: &[Str, Str, OptInt(1)],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "string",
         name: "format",
         func: "zl_string_format",
         params: &[Str, Rest],
@@ -1474,6 +1495,50 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             string(),
             "$Lua$format",
         ),
+        (
+            "zl_pack_raw",
+            vec![("fmt", string()), ("args", anys.clone())],
+            string(),
+            "$Lua$pack",
+        ),
+        ("zl_pack_error", vec![], string(), "$Lua$pack_error"),
+        (
+            "zl_packsize_raw",
+            vec![("fmt", string())],
+            i64(),
+            "$Lua$packsize",
+        ),
+        (
+            "zl_unpack_raw",
+            vec![("fmt", string()), ("s", string()), ("pos", i64())],
+            i64(),
+            "$Lua$unpack",
+        ),
+        (
+            "zl_unpack_kind",
+            vec![("i", i64())],
+            i64(),
+            "$Lua$unpack_kind",
+        ),
+        (
+            "zl_unpack_int",
+            vec![("i", i64())],
+            i64(),
+            "$Lua$unpack_int",
+        ),
+        (
+            "zl_unpack_float",
+            vec![("i", i64())],
+            f64(),
+            "$Lua$unpack_float",
+        ),
+        (
+            "zl_unpack_str",
+            vec![("i", i64())],
+            string(),
+            "$Lua$unpack_str",
+        ),
+        ("zl_unpack_next", vec![], i64(), "$Lua$unpack_next"),
         ("zl_os_clock", vec![], f64(), "$Lua$clock"),
         ("zl_os_time", vec![], i64(), "$Lua$time"),
         ("zl_os_error", vec![], string(), "$Lua$os_error"),
@@ -2245,6 +2310,97 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 unit(),
             )),
             ret_void(),
+        ],
+    ));
+
+    // ─── string.pack ────────────────────────────────────────────
+    let packed = kept("packed", string());
+    d.push(define(
+        "zl_string_pack",
+        &[&s, &args],
+        string(),
+        vec![
+            packed.decl(call("zl_pack_raw", vec![s.e(), args.e()], string())),
+            when(
+                eq(packed.e(), null(string())),
+                vec![lua_error(call("zl_pack_error", vec![], string()))],
+            ),
+            ret(packed.e()),
+        ],
+    ));
+    d.push(define(
+        "zl_string_packsize",
+        &[&s],
+        i64(),
+        vec![
+            n.decl(call("zl_packsize_raw", vec![s.e()], i64())),
+            when(
+                lt(n.e(), int(0)),
+                vec![lua_error(call("zl_pack_error", vec![], string()))],
+            ),
+            ret(n.e()),
+        ],
+    ));
+    // `string.unpack(fmt, s, pos)`: the position is Lua's, relative
+    // from the end when negative; the values come back one by one.
+    let data = kept("data", string());
+    let pos = local("pos", i64());
+    d.push(define(
+        "zl_string_unpack",
+        &[&s, &data, &pos],
+        any(),
+        vec![
+            n.decl(call("zb_str_len", vec![data.e()], i64())),
+            when(
+                lt(pos.e(), int(0)),
+                vec![pos.set(if_expr(
+                    lt(pos.e(), sub(int(0), n.e())),
+                    int(1),
+                    add(add(n.e(), pos.e()), int(1)),
+                ))],
+            ),
+            when(eq(pos.e(), int(0)), vec![pos.set(int(1))]),
+            k.decl(call(
+                "zl_unpack_raw",
+                vec![s.e(), data.e(), sub(pos.e(), int(1))],
+                i64(),
+            )),
+            when(
+                lt(k.e(), int(0)),
+                vec![lua_error(call("zl_pack_error", vec![], string()))],
+            ),
+            out.decl(list(vec![], anys.clone())),
+            i.decl(int(0)),
+            while_(
+                lt(i.e(), k.e()),
+                vec![
+                    j.decl(call("zl_unpack_kind", vec![i.e()], i64())),
+                    when(
+                        eq(j.e(), int(0)),
+                        vec![push(
+                            out.e(),
+                            box_i64(call("zl_unpack_int", vec![i.e()], i64())),
+                        )],
+                    ),
+                    when(
+                        eq(j.e(), int(1)),
+                        vec![push(
+                            out.e(),
+                            box_f64(call("zl_unpack_float", vec![i.e()], f64())),
+                        )],
+                    ),
+                    when(
+                        eq(j.e(), int(2)),
+                        vec![push(
+                            out.e(),
+                            box_str(call("zl_unpack_str", vec![i.e()], string())),
+                        )],
+                    ),
+                    i.add_assign(int(1)),
+                ],
+            ),
+            push(out.e(), box_i64(call("zl_unpack_next", vec![], i64()))),
+            ret(call("zb_box_tuple", vec![out.e()], any())),
         ],
     ));
 
