@@ -231,7 +231,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         lib: "string",
         name: "rep",
-        func: "zl_string_rep",
+        func: "zl_string_rep_of",
         params: &[Str, Int, OptStr("")],
         ret: Ret::Str,
     },
@@ -649,7 +649,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "table",
         name: "concat",
         func: "zl_table_concat",
-        params: &[Table, OptStr(""), OptInt(1), OptInt(i64::MIN)],
+        params: &[Table, OptStr(""), OptInt(1), Any],
         ret: Ret::Str,
     },
     Builtin {
@@ -1245,7 +1245,16 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     i.add_assign(int(1)),
                 ],
             ),
-            expr(call("zb_print_line", vec![acc.e()], unit())),
+            // Written as bytes through the standard stream, as `io.write`
+            // writes: a string is whatever bytes it holds.
+            expr(call(
+                "zl_io_write",
+                vec![
+                    call("zl_io_std", vec![int(1)], i64()),
+                    add(acc.e(), text("\n")),
+                ],
+                i64(),
+            )),
             ret_void(),
         ],
     ));
@@ -1718,7 +1727,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         ),
         (
             "zl_format_raw",
-            vec![("fmt", string()), ("args", anys.clone())],
+            vec![
+                ("fmt", string()),
+                ("args", anys.clone()),
+                ("texts", anys.clone()),
+            ],
             string(),
             "$Lua$format",
         ),
@@ -1929,17 +1942,33 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         &[&s, &args],
         string(),
         vec![
-            acc.decl(call("zl_format_raw", vec![s.e(), args.e()], string())),
+            // An object's `%s` text is `tostring`'s, metamethods and
+            // `__name` included, worked out here for the host.
+            out.decl(list(vec![], anys.clone())),
+            i.decl(int(0)),
+            while_(
+                lt(i.e(), len(args.e())),
+                vec![
+                    x.decl(at(args.e(), i.e())),
+                    if_(
+                        and(not(is_nil(x.e())), eq(category(x.e()), int(CUSTOM))),
+                        vec![push(
+                            out.e(),
+                            box_str(call("zl_tostring", vec![x.e()], string())),
+                        )],
+                        vec![push(out.e(), nil())],
+                    ),
+                    i.add_assign(int(1)),
+                ],
+            ),
+            acc.decl(call(
+                "zl_format_raw",
+                vec![s.e(), args.e(), out.e()],
+                string(),
+            )),
             when(
-                and(
-                    gt(call("zb_str_len", vec![acc.e()], i64()), int(0)),
-                    eq(call("zl_byte_at", vec![acc.e(), int(1)], i64()), int(1)),
-                ),
-                vec![lua_error(call(
-                    "zl_string_sub",
-                    vec![acc.e(), int(2), int(-1)],
-                    string(),
-                ))],
+                eq(acc.e(), null(string())),
+                vec![lua_error(call("zl_pack_error", vec![], string()))],
             ),
             ret(acc.e()),
         ],
@@ -2448,19 +2477,27 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ret(v.e()),
         ],
     ));
+    // `table.concat(t, sep, i, j)`: the last index defaults to the
+    // length; the loop stops on reaching it rather than passing it, so
+    // an index at either end of the integers is fine.
+    let last = kept("last", any());
+    let ok = local("ok", boolean());
     d.push(define(
         "zl_table_concat",
-        &[&tb, &sep, &i, &j],
+        &[&tb, &sep, &i, &last],
         string(),
         vec![
-            when(
-                eq(j.e(), int(i64::MIN)),
-                vec![j.set(call("zl_len", vec![tb.e()], i64()))],
-            ),
+            j.decl(if_expr(
+                is_nil(last.e()),
+                call("zl_len", vec![tb.e()], i64()),
+                call("zl_arg_int", vec![last.e(), bad_arg(4, "concat")], i64()),
+            )),
             acc.decl(text("")),
+            when(gt(i.e(), j.e()), vec![ret(acc.e())]),
             k.decl(i.e()),
+            ok.decl(bool(true)),
             while_(
-                le(k.e(), j.e()),
+                ok.e(),
                 vec![
                     v.decl(call("zl_table_geti", vec![tb.e(), k.e()], any())),
                     when(
@@ -2472,14 +2509,19 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                             )),
                         ),
                         vec![lua_error(concat(vec![
-                            text("invalid value (at index "),
+                            text("invalid value ("),
+                            call("zl_type", vec![v.e()], string()),
+                            text(") at index "),
                             call("zb_str_of_int", vec![k.e()], string()),
-                            text(") in table for 'concat'"),
+                            text(" in table for 'concat'"),
                         ]))],
                     ),
-                    when(gt(k.e(), i.e()), vec![acc.set(add(acc.e(), sep.e()))]),
                     acc.set(add(acc.e(), call("zl_concat_text", vec![v.e()], string()))),
-                    k.add_assign(int(1)),
+                    if_(
+                        eq(k.e(), j.e()),
+                        vec![ok.set(bool(false))],
+                        vec![acc.set(add(acc.e(), sep.e())), k.add_assign(int(1))],
+                    ),
                 ],
             ),
             ret(acc.e()),
@@ -2582,6 +2624,23 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 unit(),
             )),
             ret_void(),
+        ],
+    ));
+
+    // `string.rep`, refused past the reference's size limit.
+    let sep = kept("sep", string());
+    let repeated = kept("repeated", string());
+    d.push(define(
+        "zl_string_rep_of",
+        &[&s, &n, &sep],
+        string(),
+        vec![
+            repeated.decl(call("zl_string_rep", vec![s.e(), n.e(), sep.e()], string())),
+            when(
+                eq(repeated.e(), null(string())),
+                vec![lua_error(text("resulting string too large"))],
+            ),
+            ret(repeated.e()),
         ],
     ));
 

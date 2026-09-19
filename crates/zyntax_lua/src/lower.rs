@@ -3031,16 +3031,30 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     items.push(self.boxed(v));
                 }
                 let list = self.array_of(items, &mut pre, span);
+                // The tail's values the parameters before took are
+                // not the rest.
                 let list = match tail_list {
                     Some(name) => {
                         let list_name = self.temp();
                         pre.push(let_(list_name, self.m.anys(), list, span));
+                        let tail = var(name, self.m.anys(), span);
+                        let rest = if consumed == 0 {
+                            tail
+                        } else {
+                            call(
+                                "zl_slice",
+                                vec![
+                                    tail.clone(),
+                                    int_lit(consumed as i64, span),
+                                    list_len(tail, span),
+                                ],
+                                self.m.anys(),
+                                span,
+                            )
+                        };
                         pre.push(expr_stmt(call(
                             "zb_list_extend_any",
-                            vec![
-                                var(list_name, self.m.anys(), span),
-                                var(name, self.m.anys(), span),
-                            ],
+                            vec![var(list_name, self.m.anys(), span), rest],
                             prim(PrimitiveType::Unit),
                             span,
                         )));
