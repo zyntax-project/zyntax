@@ -1,7 +1,7 @@
 //! Shapes retained across Python containers for unpacking in closed functions.
 //! Runtime values keep their ordinary list, tuple, and dict representation.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use ruff_python_ast as py;
 
@@ -419,13 +419,13 @@ pub(crate) fn infer(
             )
         })
         .collect();
-    let mut globals = HashMap::new();
-    let mut locals = HashMap::new();
+    let mut globals = HashMap::default();
+    let mut locals = HashMap::default();
     let mut converged = false;
     for _ in 0..16 {
-        let mut passed = HashMap::new();
+        let mut passed = HashMap::default();
         let mut next_profiles = profiles.clone();
-        let mut next_locals = HashMap::new();
+        let mut next_locals = HashMap::default();
         for item in items {
             let sig = &module.funcs[&item.name];
             let profile = &profiles[&item.name];
@@ -455,7 +455,7 @@ pub(crate) fn infer(
             profiles: &profiles,
             globals: &globals,
             passed: &mut passed,
-            env: HashMap::new(),
+            env: HashMap::default(),
             ret: Shape::Bottom,
         };
         entry_analyzer.block(entry);
@@ -474,7 +474,7 @@ pub(crate) fn infer(
                         profiles: &profiles,
                         globals: &next_globals,
                         passed: &mut passed,
-                        env: HashMap::new(),
+                        env: HashMap::default(),
                         ret: Shape::Bottom,
                     };
                     shape = shape.join(&analyzer.expr(default));
@@ -498,7 +498,7 @@ pub(crate) fn infer(
         locals = next_locals;
     }
     if !converged {
-        return HashMap::new();
+        return HashMap::default();
     }
     let refined: HashMap<_, _> = locals
         .into_iter()

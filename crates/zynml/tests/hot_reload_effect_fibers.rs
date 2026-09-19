@@ -119,7 +119,7 @@ def observe(): i64 {
     );
     let baseline = rt.function_pointer("observe").expect("baseline pointer");
 
-    rt.optimize_function("observe", OptimizationTier::Standard)
+    rt.optimize_function("observe", OptimizationTier::Optimized)
         .expect("request promotion");
     let mut promoted = false;
     for _ in 0..100 {
@@ -129,7 +129,7 @@ def observe(): i64 {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(promoted, "tier-1 promotion must install a new entry");
+    assert!(promoted, "promotion must install a new entry");
     assert_eq!(
         rt.call_raw("observe", &[]).expect("promoted call"),
         ZyntaxValue::Int(3)

@@ -2485,6 +2485,9 @@ pub struct HirInterpreter {
     /// and the call goes there instead of into the bytecode.
     #[allow(clippy::type_complexity)]
     tick_callbacks: IdMap<Box<dyn FnMut() -> Option<*const u8> + Send>>,
+    /// Where a function's body comes from when the runtime keeps one
+    /// apart from the module's: see [`Self::set_body_source`].
+    body_source: Option<Box<dyn FnMut(HirId) -> Option<std::sync::Arc<HirFunction>> + Send>>,
     /// Compiles, or finds, the thunk that calls native code of a given
     /// shape: `fn(target, words, out)`. Installed by a runtime with a
     /// native tier; without one, calls into native code use the fixed
@@ -2624,6 +2627,7 @@ impl HirInterpreter {
             cache: IdMap::default(),
             uncompilable: IdMap::default(),
             tick_callbacks: IdMap::default(),
+            body_source: None,
             thunk_source: None,
             entry_source: None,
             bead_source: None,
@@ -2738,6 +2742,16 @@ impl HirInterpreter {
         cb: Box<dyn FnMut() -> Option<*const u8> + Send>,
     ) {
         self.tick_callbacks.insert(func_id, cb);
+    }
+
+    /// The body to run for a function, asked once at its first run,
+    /// before it is compiled to bytecode: the body the tiers above
+    /// compile, so a frame can move to them. `None` means the module's.
+    pub fn set_body_source(
+        &mut self,
+        source: Box<dyn FnMut(HirId) -> Option<std::sync::Arc<HirFunction>> + Send>,
+    ) {
+        self.body_source = Some(source);
     }
 
     /// Drop the bridge and every tick callback. They hold the native
@@ -3261,10 +3275,18 @@ impl HirInterpreter {
             if let Some(why) = self.uncompilable.get(&func_id).cloned() {
                 return self.run_natively_or(module, func_id, args, dest, why);
             }
-            let func = module
-                .functions
-                .get(&func_id)
-                .ok_or(InterpError::UndefinedSsaValue(func_id))?;
+            // The body the tiers above compile, when the runtime keeps
+            // one apart from the module's; else the module's. A callee
+            // the module does not hold is a function, not a value:
+            // reported as one.
+            let shared = self.body_source.as_mut().and_then(|source| source(func_id));
+            let func: &HirFunction = match &shared {
+                Some(f) => f,
+                None => module
+                    .functions
+                    .get(&func_id)
+                    .ok_or_else(|| InterpError::UnknownFunction(format!("{func_id:?}")))?,
+            };
             let taken = self.is_address_taken(module, func_id);
             match compile_function_with(module, &mut self.memory, func, taken) {
                 Ok(cf) => {
@@ -4078,7 +4100,7 @@ impl HirInterpreter {
                     }
                     let osr_site = &cf.osr_sites[i];
                     if visits[i] == OSR_REQUEST_VISITS {
-                        crate::osr::osr_request_promotion(bead);
+                        crate::osr::osr_request_promotion_interpreted(bead);
                         slots[i] = crate::osr::helper_slot_addr(bead, osr_site.site_key)
                             as *const std::sync::atomic::AtomicU64;
                     }

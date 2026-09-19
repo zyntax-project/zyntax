@@ -1563,6 +1563,18 @@ impl HirInstruction {
 }
 
 impl HirTerminator {
+    /// Call `f` on every value this terminator reads.
+    pub fn for_each_operand(&self, mut f: impl FnMut(HirId)) {
+        match self {
+            HirTerminator::Return { values } => values.iter().copied().for_each(&mut f),
+            HirTerminator::CondBranch { condition, .. } => f(*condition),
+            HirTerminator::Switch { value, .. } => f(*value),
+            HirTerminator::Invoke { args, .. } => args.iter().copied().for_each(&mut f),
+            HirTerminator::PatternMatch { value, .. } => f(*value),
+            HirTerminator::Branch { .. } | HirTerminator::Unreachable => {}
+        }
+    }
+
     /// Replace uses of old values with new values according to the replacement map
     pub fn replace_uses(&mut self, replacements: &IndexMap<HirId, HirId>) {
         fn replace(id: &mut HirId, map: &IndexMap<HirId, HirId>) {
@@ -2610,6 +2622,40 @@ impl HirFunction {
         };
         self.values.insert(value_id, value);
         value_id
+    }
+
+    /// Drop every value no parameter, instruction, phi or terminator
+    /// names. Construction and the passes leave such values behind (an
+    /// undef made for a path no definition reaches, the result of a phi
+    /// since pruned), and everything downstream sizes itself by the
+    /// value table: the interpreter a register per value, the backends
+    /// a stack slot per undefined aggregate.
+    pub fn sweep_unreferenced_values(&mut self) -> usize {
+        let mut named: HashSet<HirId> = HashSet::new();
+        for param in &self.signature.params {
+            named.insert(param.id);
+        }
+        for block in self.blocks.values() {
+            for phi in &block.phis {
+                named.insert(phi.result);
+                named.extend(phi.incoming.iter().map(|(v, _)| *v));
+            }
+            for inst in &block.instructions {
+                if let Some(result) = inst.result_id() {
+                    named.insert(result);
+                }
+                inst.for_each_operand(|v| {
+                    named.insert(v);
+                });
+            }
+            block.terminator.for_each_operand(|v| {
+                named.insert(v);
+            });
+        }
+        let before = self.values.len();
+        self.values
+            .retain(|id, v| named.contains(id) || matches!(v.kind, HirValueKind::Parameter(_)));
+        before - self.values.len()
     }
 }
 

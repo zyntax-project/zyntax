@@ -1853,7 +1853,29 @@ pub fn run_native_only_opts(module: &mut HirModule) -> parallel_dispatch::Dispat
 }
 
 pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
-    run_interp_safe_opts_with(module, true)
+    run_interp_safe_opts_with(module, true, None)
+}
+
+/// What the passes learn about a module as a whole and optimising one
+/// body does not change: for a module whose functions are optimised one
+/// at a time, built once rather than per function.
+pub struct OptCache {
+    facts: drop_insert::ModuleFacts,
+    cycles: inline::Cycles,
+}
+
+impl OptCache {
+    pub fn build(module: &HirModule) -> Self {
+        Self {
+            facts: drop_insert::facts_of(module),
+            cycles: inline::cycles_of(module),
+        }
+    }
+}
+
+/// [`run_interp_safe_opts`] over what the cache already knows.
+pub fn run_interp_safe_opts_cached(module: &mut HirModule, cache: &OptCache) -> InterpOptStats {
+    run_interp_safe_opts_with(module, true, Some(cache))
 }
 
 /// [`run_interp_safe_opts`] for a module whose functions other modules
@@ -1862,7 +1884,7 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
 /// module reads them to know what a result aliases. The program's own
 /// pass expands them.
 pub fn run_interp_safe_opts_keeping_readers(module: &mut HirModule) -> InterpOptStats {
-    run_interp_safe_opts_with(module, false)
+    run_interp_safe_opts_with(module, false, None)
 }
 
 /// Mark every function as through the pipeline, so a program that
@@ -1874,8 +1896,21 @@ pub fn mark_optimized(module: &mut HirModule) {
     }
 }
 
-fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> InterpOptStats {
+fn run_interp_safe_opts_with(
+    module: &mut HirModule,
+    expand_box_reads: bool,
+    cache: Option<&OptCache>,
+) -> InterpOptStats {
     let mut stats = InterpOptStats::default();
+    // Every pass walks the functions still to optimise; with none, the
+    // module-wide facts some of them build first would be all the work.
+    if module
+        .functions
+        .values()
+        .all(|f| f.attributes.optimized || f.is_external)
+    {
+        return stats;
+    }
 
     // Alloca → Malloc promotion runs ONCE up front, before the
     // fixed-point sweep. Two reasons it goes here:
@@ -1980,7 +2015,7 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
         let ds = dead_store::run_module(module);
         stats.dead_store.removed += ds.removed;
         timed("dead_store", &mut at);
-        let il = inline::run_module(module);
+        let il = inline::run_module_with(module, cache.map(|c| &c.cycles));
         timed("inline", &mut at);
         let lc = licm::run_module(module);
         timed("licm", &mut at);
@@ -2308,7 +2343,10 @@ fn run_interp_safe_opts_with(module: &mut HirModule, expand_box_reads: bool) -> 
         stats.drop_glue_emitted += drop_glue::synthesise(module).glue_emitted;
     }
 
-    let di = drop_insert::run_module(module);
+    let di = match cache {
+        Some(cache) => drop_insert::run_module_with(module, &cache.facts),
+        None => drop_insert::run_module(module),
+    };
     timed("drop_insert", &mut at);
     stats.drop_insert.mallocs_scanned += di.mallocs_scanned;
     stats.drop_insert.frees_inserted += di.frees_inserted;

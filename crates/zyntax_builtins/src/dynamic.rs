@@ -1440,11 +1440,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ),
             when(
                 is_shaped(x.e()),
-                vec![ret(call(
-                    "zb_list_repr_any",
-                    vec![shaped_items(x.e(), anys.clone())],
-                    string(),
-                ))],
+                vec![ret(call("zb_hook_shaped_repr", vec![x.e()], string()))],
             ),
             when(
                 is_tuple(x.e()),

@@ -186,6 +186,24 @@ fn count_insts(function: &HirFunction) -> usize {
 /// (when the now-inlined body's prior nested call shape was a
 /// blocker), so we keep going until a pass finds nothing.
 pub fn run_module(module: &mut HirModule) -> InlineStats {
+    run_module_with(module, None)
+}
+
+/// The call cycles of `module`, for [`run_module_with`]. Inlining keeps
+/// every function's reach, so cycles found before a body was optimised
+/// still hold for it; a module whose functions are optimised one at a
+/// time computes them once.
+pub fn cycles_of(module: &HirModule) -> Cycles {
+    let changing = HashMap::new();
+    call_cycles(&Callees {
+        stable: &module.functions,
+        changing: &changing,
+    })
+}
+
+/// [`run_module`], with the call cycles already computed when `cycles`
+/// is given.
+pub fn run_module_with(module: &mut HirModule, cycles: Option<&Cycles>) -> InlineStats {
     let mut total = InlineStats::default();
 
     // The functions being optimised are taken out of the module while
@@ -216,11 +234,18 @@ pub fn run_module(module: &mut HirModule) -> InlineStats {
         // So does a callee whose cycle calls back into itself from
         // outside that cycle: its body brings the call that re-enters
         // it, and every round would inline one more level.
-        let cycles = call_cycles(&callees);
+        let computed;
+        let cycles = match cycles {
+            Some(c) => c,
+            None => {
+                computed = call_cycles(&callees);
+                &computed
+            }
+        };
 
         let mut this_pass = 0;
         for (_, caller_id, caller) in taken.iter_mut() {
-            let stats = inline_in_function(caller, *caller_id, &callees, &cycles);
+            let stats = inline_in_function(caller, *caller_id, &callees, cycles);
             this_pass += stats.inlined;
             total.inlined += stats.inlined;
             total.call_sites_visited += stats.call_sites_visited;
@@ -805,7 +830,7 @@ fn blocks_leading_to_cold(f: &HirFunction, callees: &Callees<'_>) -> HashSet<Hir
 /// reach each other.
 /// The call graph's cycles: each function's component, and which
 /// components a call re-enters, a self-call included.
-struct Cycles {
+pub struct Cycles {
     component: HashMap<HirId, usize>,
     recursive: HashSet<usize>,
 }

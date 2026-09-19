@@ -64,22 +64,44 @@ use crate::hir::{HirFunction, HirId, HirTerminator, HirType};
 /// everything computed before the resume point has to arrive with it.
 pub const OSR_MAX_LIVE_INS: usize = 128;
 
-/// Pack `(loop_ordinal, live_in_count)` into a 64-bit site key.
+/// Pack `(body_tag, loop_ordinal, live_in_count)` into a 64-bit site
+/// key: the tag in the top 16 bits, the ordinal in the 32 below, the
+/// count in the low 16.
 ///
 /// `loop_ordinal` is the 0-based position of the header among the
-/// `HirFunction.blocks`. `live_in_count` must fit in 16 bits; in practice
-/// it's ≤ [`OSR_MAX_LIVE_INS`].
+/// function's loop headers. `live_in_count` must fit in 16 bits; in
+/// practice it's ≤ [`OSR_MAX_LIVE_INS`]. `body_tag` names the shape of
+/// the body the layout was taken from (see [`body_tag`]): a function
+/// has one body the interpreter runs and another its compiled tiers
+/// were optimised from, and a resume point made for one is entered
+/// only by frames running that one.
 #[inline]
-pub fn encode_osr_site(loop_ordinal: u64, live_in_count: u16) -> u64 {
-    (loop_ordinal << 16) | (live_in_count as u64)
+pub fn encode_osr_site(body_tag: u16, loop_ordinal: u64, live_in_count: u16) -> u64 {
+    ((body_tag as u64) << 48) | ((loop_ordinal & 0xFFFF_FFFF) << 16) | (live_in_count as u64)
 }
 
-/// Unpack a site key. Returns `(loop_ordinal, live_in_count)`.
+/// Unpack a site key. Returns `(body_tag, loop_ordinal, live_in_count)`.
 #[inline]
-pub fn decode_osr_site(site: u64) -> (u64, u16) {
-    let loop_ordinal = site >> 16;
+pub fn decode_osr_site(site: u64) -> (u16, u64, u16) {
+    let body_tag = (site >> 48) as u16;
+    let loop_ordinal = (site >> 16) & 0xFFFF_FFFF;
     let live_in_count = (site & 0xFFFF) as u16;
-    (loop_ordinal, live_in_count)
+    (body_tag, loop_ordinal, live_in_count)
+}
+
+/// A number that tells one shape of a function's body from another:
+/// the same source lowered and then optimised has other instruction
+/// and value counts. Two bodies with equal tags are taken to be the
+/// same body.
+pub fn body_tag(function: &HirFunction) -> u16 {
+    let insts: usize = function.blocks.values().map(|b| b.instructions.len()).sum();
+    let phis: usize = function.blocks.values().map(|b| b.phis.len()).sum();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for x in [function.blocks.len(), insts, phis, function.values.len()] {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    (h ^ (h >> 32) ^ (h >> 16)) as u16
 }
 
 /// Block-index lookup: returns the 0-based position of `block_id` inside
@@ -361,6 +383,8 @@ pub struct OsrLayout {
     /// Position of `header` among the function's loop headers — the
     /// stable half of the site key.
     pub loop_ordinal: u64,
+    /// The shape of the body the layout was taken from; see [`body_tag`].
+    pub body_tag: u16,
     pub live_ins: Vec<HirId>,
     pub live_in_types: Vec<HirType>,
     /// Number of leading entries in `live_ins` that are phi results at
@@ -410,7 +434,7 @@ impl OsrLayout {
 impl OsrLayout {
     /// Encoded site key for this layout — see [`encode_osr_site`].
     pub fn site_key(&self) -> u64 {
-        encode_osr_site(self.loop_ordinal, self.live_ins.len() as u16)
+        encode_osr_site(self.body_tag, self.loop_ordinal, self.live_ins.len() as u16)
     }
 }
 
@@ -491,7 +515,7 @@ pub fn osr_layout_with(
     let in_region: IdSet = reachable.iter().copied().collect();
     // Dominance inside the region, entered at the header alone: the
     // helper's view of the control flow.
-    let region_dom = Dominators::compute_in(function, header, Some(&in_region), Edges::Terminators);
+    let region_dom = RegionDominators::compute(function, header, &in_region);
     // Only values defined in blocks the header dominates are guaranteed to
     // have been computed by the time the resumed code reads them. Anything
     // else (an enclosing loop's counter, say) must arrive in the frame.
@@ -574,6 +598,36 @@ pub fn osr_layout_with(
                 .is_some_and(|block| successors_of(&block.terminator).contains(&header))
         })
         .collect();
+    // Where each value is read inside the region: the blocks whose
+    // instructions or terminator use it, and the predecessors its phi
+    // incomings come in on. Built once; the repairs below look up rather
+    // than rescan.
+    let mut readers: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut phi_readers: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    for &b in &reachable {
+        let Some(rb) = function.blocks.get(&b) else {
+            continue;
+        };
+        let mut note = |used: HirId| {
+            let list = readers.entry(used).or_default();
+            if list.last() != Some(&b) {
+                list.push(b);
+            }
+        };
+        for inst in &rb.instructions {
+            inst.for_each_operand(&mut note);
+        }
+        for used in terminator_uses(&rb.terminator) {
+            note(used);
+        }
+        for p in &rb.phis {
+            for (v, pred) in &p.incoming {
+                if in_region.contains(pred) {
+                    phi_readers.entry(*v).or_default().push(*pred);
+                }
+            }
+        }
+    }
     let mut repairs = Vec::new();
     for &def_block in &reachable {
         // Entered from outside the region: not on every path to the
@@ -593,15 +647,15 @@ pub fn osr_layout_with(
                     .and_then(|r| function.values.get(&r).map(|v| (r, v.ty.clone())))
             }))
             .collect();
-        for (value, ty) in defs {
-            let reached_by_def = |b: &HirId| region_dom.dominates(def_block, *b);
-            // A block the definition does not dominate reads the header's
-            // phi. That is the value there only if every path from the
-            // definition to the block passes the header, where the phi
-            // merges again; a block the definition reaches around the
-            // header would need a phi of its own.
-            let mut around: IdSet = IdSet::default();
-            {
+        let reached_by_def = |b: &HirId| region_dom.dominates(def_block, *b);
+        // The region blocks the definition reaches without passing the
+        // header. Shared by every value the block defines, and needed
+        // only once one of them is read where the definition does not
+        // dominate.
+        let mut around: Option<IdSet> = None;
+        let mut mixed = |b: &HirId| {
+            let around = around.get_or_insert_with(|| {
+                let mut around: IdSet = IdSet::default();
                 let mut stack: Vec<HirId> = vec![def_block];
                 while let Some(b) = stack.pop() {
                     let Some(bb) = function.blocks.get(&b) else {
@@ -613,33 +667,31 @@ pub fn osr_layout_with(
                         }
                     }
                 }
-            }
-            let mixed = |b: &HirId| !reached_by_def(b) && around.contains(b);
+                around
+            });
+            !reached_by_def(b) && around.contains(b)
+        };
+        for (value, ty) in defs {
+            // A block the definition does not dominate reads the header's
+            // phi. That is the value there only if every path from the
+            // definition to the block passes the header, where the phi
+            // merges again; a block the definition reaches around the
+            // header would need a phi of its own.
             let mut escapes = false;
-            for &b in &reachable {
-                let Some(rb) = function.blocks.get(&b) else {
-                    continue;
-                };
-                let mut read = false;
-                for inst in &rb.instructions {
-                    inst.for_each_operand(|u| read |= u == value);
-                }
-                read |= terminator_uses(&rb.terminator).contains(&value);
-                if read && !reached_by_def(&b) {
-                    if mixed(&b) {
+            for b in readers.get(&value).map(Vec::as_slice).unwrap_or(&[]) {
+                if !reached_by_def(b) {
+                    if mixed(b) {
                         return Err(OsrReject::RegionHasExternalEntry);
                     }
                     escapes = true;
                 }
-                for p in &rb.phis {
-                    for (v, pred) in &p.incoming {
-                        if *v == value && in_region.contains(pred) && !reached_by_def(pred) {
-                            if mixed(pred) {
-                                return Err(OsrReject::RegionHasExternalEntry);
-                            }
-                            escapes = true;
-                        }
+            }
+            for pred in phi_readers.get(&value).map(Vec::as_slice).unwrap_or(&[]) {
+                if !reached_by_def(pred) {
+                    if mixed(pred) {
+                        return Err(OsrReject::RegionHasExternalEntry);
                     }
+                    escapes = true;
                 }
             }
             if !escapes {
@@ -703,6 +755,7 @@ pub fn osr_layout_with(
     Ok(OsrLayout {
         header,
         loop_ordinal,
+        body_tag: body_tag(function),
         live_ins,
         live_in_types,
         phi_count,
@@ -711,6 +764,114 @@ pub fn osr_layout_with(
         destination,
         repairs,
     })
+}
+
+/// Dominance over the blocks of a region entered at its header alone:
+/// edges into the header and edges from outside the region do not
+/// count. Immediate dominators over the region's reverse postorder,
+/// the same iteration as [`Dominators`].
+struct RegionDominators {
+    index: HashMap<HirId, usize>,
+    idom: Vec<usize>,
+}
+
+impl RegionDominators {
+    fn compute(function: &HirFunction, header: HirId, region: &IdSet) -> Self {
+        let succs = |b: HirId| -> smallvec::SmallVec<[HirId; 4]> {
+            function
+                .blocks
+                .get(&b)
+                .map(|block| {
+                    successors_of(&block.terminator)
+                        .into_iter()
+                        .filter(|s| *s != header && region.contains(s))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut order = Vec::with_capacity(region.len());
+        let mut visited: IdSet = IdSet::default();
+        let mut stack: Vec<(HirId, smallvec::SmallVec<[HirId; 4]>, usize)> =
+            vec![(header, succs(header), 0)];
+        visited.insert(header);
+        while let Some((b, ss, next)) = stack.last_mut() {
+            if *next < ss.len() {
+                let s = ss[*next];
+                *next += 1;
+                if visited.insert(s) {
+                    stack.push((s, succs(s), 0));
+                }
+            } else {
+                order.push(*b);
+                stack.pop();
+            }
+        }
+        order.reverse();
+        let index: HashMap<HirId, usize> = order.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); order.len()];
+        for (i, &b) in order.iter().enumerate() {
+            for s in succs(b) {
+                if let Some(&j) = index.get(&s) {
+                    preds[j].push(i);
+                }
+            }
+        }
+        let mut idom = vec![usize::MAX; order.len()];
+        if !idom.is_empty() {
+            idom[0] = 0;
+        }
+        let intersect = |idom: &[usize], mut a: usize, mut b: usize| {
+            while a != b {
+                while a > b {
+                    a = idom[a];
+                }
+                while b > a {
+                    b = idom[b];
+                }
+            }
+            a
+        };
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in 1..order.len() {
+                let mut new = usize::MAX;
+                for &p in &preds[b] {
+                    if idom[p] == usize::MAX {
+                        continue;
+                    }
+                    new = if new == usize::MAX {
+                        p
+                    } else {
+                        intersect(&idom, p, new)
+                    };
+                }
+                if new != usize::MAX && idom[b] != new {
+                    idom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+        RegionDominators { index, idom }
+    }
+
+    /// Whether `a` dominates `b` within the region; false for a block
+    /// outside it.
+    fn dominates(&self, a: HirId, b: HirId) -> bool {
+        let (Some(&a), Some(&b)) = (self.index.get(&a), self.index.get(&b)) else {
+            return false;
+        };
+        let mut b = b;
+        loop {
+            if b == a {
+                return true;
+            }
+            if b == 0 {
+                return false;
+            }
+            b = self.idom[b];
+        }
+    }
 }
 
 /// `function` as a helper resumes it at `layout.header`: each repaired
@@ -952,15 +1113,16 @@ mod tests {
     #[test]
     fn site_key_roundtrips() {
         let cases = [
-            (0u64, 0u16),
-            (1, 1),
-            (42, 4),
-            (0xFFFF, 4),
-            (0xFFFF_FFFF_FFFF, 3),
+            (0u16, 0u64, 0u16),
+            (1, 1, 1),
+            (7, 42, 4),
+            (0xFFFF, 0xFFFF, 4),
+            (0xABCD, 0xFFFF_FFFF, 3),
         ];
-        for (block_idx, count) in cases {
-            let site = encode_osr_site(block_idx, count);
-            let (b, c) = decode_osr_site(site);
+        for (tag, block_idx, count) in cases {
+            let site = encode_osr_site(tag, block_idx, count);
+            let (t, b, c) = decode_osr_site(site);
+            assert_eq!(t, tag);
             assert_eq!(b, block_idx);
             assert_eq!(c, count);
         }
@@ -1049,7 +1211,7 @@ mod tests {
         let id = u64::MAX - 43;
         let attempts = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&attempts);
-        set_promotion_requester(move |bead| {
+        set_promotion_requester(move |bead, _| {
             assert_eq!(bead, id);
             seen.fetch_add(1, Ordering::Relaxed) > 0
         });
@@ -1058,7 +1220,7 @@ mod tests {
         osr_request_promotion(id);
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
         requested().write().unwrap().remove(&id);
-        set_promotion_requester(|_| false);
+        set_promotion_requester(|_, _| false);
     }
 
     #[test]
@@ -1334,63 +1496,21 @@ pub struct Dominators {
     all: Vec<HirId>,
 }
 
-/// Where a dominator computation reads the CFG's edges from: the
-/// blocks' predecessor lists, which SSA construction maintains while
-/// terminators are still being placed, or the terminators, the truth
-/// once construction is done.
-#[derive(Clone, Copy)]
-pub enum Edges {
-    Lists,
-    Terminators,
-}
-
 impl Dominators {
     pub fn compute(function: &HirFunction) -> Self {
-        let Some(&entry) = function.blocks.keys().next() else {
+        let all: Vec<HirId> = function.blocks.keys().copied().collect();
+        let Some(&entry) = all.first() else {
             return Dominators {
                 order: Vec::new(),
                 index: HashMap::new(),
                 idom: Vec::new(),
-                all: Vec::new(),
+                all,
             };
         };
-        Self::compute_in(function, entry, None, Edges::Lists)
-    }
-
-    /// The tree over the blocks of `region` (every block when none)
-    /// entered at `entry` alone: edges from outside the region do not
-    /// count, and the entry's own predecessors are never consulted.
-    pub fn compute_in(
-        function: &HirFunction,
-        entry: HirId,
-        region: Option<&IdSet>,
-        edges: Edges,
-    ) -> Self {
-        let inside = |b: &HirId| region.is_none_or(|r| r.contains(b));
-        let all: Vec<HirId> = function.blocks.keys().copied().filter(inside).collect();
         let mut successors: HashMap<HirId, Vec<HirId>> = HashMap::new();
-        let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::new();
         for (&b, block) in &function.blocks {
-            if !inside(&b) {
-                continue;
-            }
-            match edges {
-                Edges::Lists => {
-                    for &p in &block.predecessors {
-                        if inside(&p) {
-                            successors.entry(p).or_default().push(b);
-                            predecessors.entry(b).or_default().push(p);
-                        }
-                    }
-                }
-                Edges::Terminators => {
-                    for s in successors_of(&block.terminator) {
-                        if inside(&s) {
-                            successors.entry(b).or_default().push(s);
-                            predecessors.entry(s).or_default().push(b);
-                        }
-                    }
-                }
+            for &p in &block.predecessors {
+                successors.entry(p).or_default().push(b);
             }
         }
         // Postorder from the entry, then reversed.
@@ -1416,10 +1536,8 @@ impl Dominators {
         let preds: Vec<Vec<usize>> = order
             .iter()
             .map(|b| {
-                predecessors
-                    .get(b)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[])
+                function.blocks[b]
+                    .predecessors
                     .iter()
                     .filter_map(|p| index.get(p).copied())
                     .collect()
@@ -1562,6 +1680,28 @@ pub fn set_lazy_compiler(f: impl Fn(u64) -> *const u8 + Send + Sync + 'static) {
     *lazy_compiler().write().unwrap() = Some(Box::new(f));
 }
 
+/// Installed by the runtime: the body of the function behind a bead as
+/// every tier runs it, optimised now if it was not yet.
+type LazyOptimizer = Box<dyn Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync>;
+
+fn lazy_optimizer() -> &'static RwLock<Option<LazyOptimizer>> {
+    static R: OnceLock<RwLock<Option<LazyOptimizer>>> = OnceLock::new();
+    R.get_or_init(|| RwLock::new(None))
+}
+
+/// Register how a lazy function's body is optimised ahead of its run.
+pub fn set_lazy_optimizer(f: impl Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync + 'static) {
+    *lazy_optimizer().write().unwrap() = Some(Box::new(f));
+}
+
+/// The body every tier of the function behind `bead_id` runs, or
+/// `None` when the function is not one left for its call: the
+/// interpreter then runs the module's.
+pub fn lazy_optimized_body(bead_id: u64) -> Option<Arc<HirFunction>> {
+    let guard = lazy_optimizer().read().unwrap();
+    guard.as_ref().and_then(|f| f(bead_id))
+}
+
 /// Called by a stub on the first call of the function it stands for.
 /// The runtime compiles the function and publishes its entry; the stub
 /// calls what comes back. With no compiler installed the process
@@ -1590,11 +1730,20 @@ pub extern "C" fn lazy_compile(bead_id: u64) -> *const u8 {
 // Promotion requests
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Symbol a tier-0 function calls once its loop has stayed hot.
+/// Symbol a compiled function calls once its loop has stayed hot.
 pub const OSR_REQUEST_SYMBOL: &str = "__zyntax_osr_request";
 
-/// Installed by the runtime to queue a top-tier compile for a bead.
-type PromotionRequester = Box<dyn Fn(u64) -> bool + Send + Sync>;
+/// Where a request comes from: a frame running compiled code, or one
+/// the interpreter is still running.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Requester {
+    Compiled,
+    Interpreted,
+}
+
+/// Installed by the runtime to answer a request: resume points for an
+/// interpreted frame, a top-tier compile for either.
+type PromotionRequester = Box<dyn Fn(u64, Requester) -> bool + Send + Sync>;
 
 fn promotion_requester() -> &'static RwLock<Option<PromotionRequester>> {
     static R: OnceLock<RwLock<Option<PromotionRequester>>> = OnceLock::new();
@@ -1602,8 +1751,8 @@ fn promotion_requester() -> &'static RwLock<Option<PromotionRequester>> {
 }
 
 /// Register how a promotion request is fulfilled. The runtime owns the
-/// policy — whether to queue, and to which tier.
-pub fn set_promotion_requester(f: impl Fn(u64) -> bool + Send + Sync + 'static) {
+/// policy: what to compile, and where the frame can go meanwhile.
+pub fn set_promotion_requester(f: impl Fn(u64, Requester) -> bool + Send + Sync + 'static) {
     *promotion_requester().write().unwrap() = Some(Box::new(f));
 }
 
@@ -1614,22 +1763,33 @@ fn requested() -> &'static RwLock<std::collections::HashSet<u64>> {
     S.get_or_init(|| RwLock::new(std::collections::HashSet::new()))
 }
 
-/// Called when a tier-0 frame has revisited a resumable loop enough times
-/// to justify a background compile. Invocation counts alone cannot promote
-/// a function that remains in one long-running call.
+/// Called when a compiled frame has revisited a resumable loop enough
+/// times to justify a background compile. Invocation counts alone cannot
+/// promote a function that remains in one long-running call.
 ///
 /// # Safety
 /// Called from generated code with C ABI.
 #[unsafe(no_mangle)]
 pub extern "C" fn osr_request_promotion(bead_id: u64) {
+    request(bead_id, Requester::Compiled);
+}
+
+/// The interpreter's request for the loop it is running: the same
+/// compile, and resume points it can leave through as soon as they
+/// exist, since it can enter no code mid-loop without one.
+pub fn osr_request_promotion_interpreted(bead_id: u64) {
+    request(bead_id, Requester::Interpreted);
+}
+
+fn request(bead_id: u64, from: Requester) {
     if !requested().write().unwrap().insert(bead_id) {
         return;
     }
     if osr_trace_enabled() {
-        eprintln!("[osr] promotion requested for bead={bead_id}");
+        eprintln!("[osr] promotion requested for bead={bead_id} ({from:?})");
     }
     let guard = promotion_requester().read().unwrap();
-    let submitted = guard.as_ref().is_some_and(|f| f(bead_id));
+    let submitted = guard.as_ref().is_some_and(|f| f(bead_id, from));
     drop(guard);
     if !submitted {
         requested().write().unwrap().remove(&bead_id);

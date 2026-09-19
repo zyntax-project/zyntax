@@ -19,6 +19,7 @@
 
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{TypedBlock, TypedDeclaration, TypedFunction, TypedVariable};
 use zyntax_typed_ast::{
@@ -153,6 +154,11 @@ type Result<T> = std::result::Result<T, Error>;
 /// Python program by calling this.
 pub const ENTRY: &str = "__main__";
 
+/// The name of the prelude's file in a program's `source_files`. A
+/// declaration whose span names it is the built-in library's, not the
+/// program's.
+pub const PRELUDE: &str = "<prelude>";
+
 mod policy;
 pub use host::set_args;
 use policy::LIBRARY_MODULE;
@@ -261,12 +267,26 @@ pub fn parse_program_with(
     file: &str,
     modules: &modules::Resolver<'_>,
 ) -> Result<TypedProgram> {
+    // `ZYNTAX_TRACE_LOWER_PHASES=1` times the frontend's steps on stderr,
+    // the same switch the embedder's phase trace reads.
+    let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
+    let mut phase = std::time::Instant::now();
+    let mut lap = |what: &str| {
+        if trace {
+            eprintln!(
+                "[PY-FRONT] {what:<14} {:8.2} ms",
+                phase.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        phase = std::time::Instant::now();
+    };
     let parsed = ruff_python_parser::parse_module(source)
         .map_err(|e| Error::syntax(e.error.to_string(), e.location))?;
     if let Some(first) = parsed.errors().first() {
         return Err(Error::syntax(first.error.to_string(), first.location));
     }
     types::reset_tuple_shapes();
+    scope::reset_cache();
     let mut module = parsed.into_syntax();
     let main: Vec<py::Stmt> = std::mem::take(&mut module.body).into_iter().collect();
     let linked = modules::link(main, modules)?;
@@ -276,7 +296,7 @@ pub fn parse_program_with(
         file.to_string(),
         source.to_string(),
     )];
-    let mut files: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut files: HashMap<String, u32> = HashMap::default();
     for (name, text) in linked.modules {
         files.insert(name.clone(), source_files.len() as u32);
         source_files.push(zyntax_typed_ast::source::SourceFile::new(name, text));
@@ -286,13 +306,21 @@ pub fn parse_program_with(
     let prelude = ruff_python_parser::parse_module(prelude::SOURCE)
         .expect("the prelude parses")
         .into_syntax();
-    let mut origins: Vec<Option<String>> = vec![None; prelude.body.len()];
+    // The prelude is a file of its own, so a span tells its declarations
+    // from the program's.
+    files.insert(PRELUDE.to_string(), source_files.len() as u32);
+    source_files.push(zyntax_typed_ast::source::SourceFile::new(
+        PRELUDE.to_string(),
+        prelude::SOURCE.to_string(),
+    ));
+    let mut origins: Vec<Option<String>> = vec![Some(PRELUDE.to_string()); prelude.body.len()];
     let mut body = prelude.body;
     for (stmt, origin) in linked.statements {
         body.push(stmt);
         origins.push(origin);
     }
     module.body = body;
+    lap("parse+link");
     let located = |e: Error, module: Option<&str>| match module {
         Some(m) => e.in_module(m),
         None => e,
@@ -350,8 +378,10 @@ pub fn parse_program_with(
         }
     }
 
+    lap("classes");
     let mut library = library()?;
     lower::set_list_type(library.list_type);
+    lap("library");
     let owned: Vec<py::Stmt> = top_level.iter().map(|(s, _)| (*s).clone()).collect();
     let entry_sig = types::Sig {
         params: Vec::new(),
@@ -380,9 +410,13 @@ pub fn parse_program_with(
         .iter()
         .map(|(_, origin)| inferred.file_of(*origin))
         .collect();
+    // Which functions declare a `global`: only those can write one, so
+    // only their bodies are re-read for the globals' types each round.
+    let mut writes_globals: Vec<bool> = Vec::with_capacity(items.len());
     for item in &items {
         let file = inferred.file_of(item.module.as_deref());
         let scope = scope::Scope::of_function(item.def);
+        writes_globals.push(!scope.globals.is_empty());
         let mut visible = scope.bound.clone();
         visible.extend(
             item.def
@@ -435,9 +469,12 @@ pub fn parse_program_with(
     // by its calls: opening a method makes more receivers unknown,
     // never fewer, so the set only grows from there, and a set taken
     // earlier would open methods on account of what was not yet known.
+    lap("closures");
     let declared_classes = inferred.classes.clone();
     let mut methods_settling = false;
+    let mut rounds = 0;
     for _ in 0..12 {
+        rounds += 1;
         let before = (
             inferred.globals.clone(),
             inferred.list_params.clone(),
@@ -494,7 +531,10 @@ pub fn parse_program_with(
                 (name.clone(), ty)
             })
             .collect();
-        for item in &items {
+        for (item, writes_global) in items.iter().zip(&writes_globals) {
+            if !writes_global {
+                continue;
+            }
             let sig = inferred.funcs[&item.name].clone();
             let file = inferred.file_of(item.module.as_deref());
             let locals = types::in_file(file, || {
@@ -521,6 +561,11 @@ pub fn parse_program_with(
             break;
         }
         if settled {
+            // The methods round reads the same inputs when this round
+            // found no dynamic methods; its answer would be this one.
+            if found_dynamic.is_empty() && inferred.dynamic_methods.is_empty() {
+                break;
+            }
             methods_settling = true;
             inferred.dynamic_methods = found_dynamic;
         }
@@ -529,6 +574,7 @@ pub fn parse_program_with(
     for ty in inferred.globals.values_mut() {
         *ty = ty.settled();
     }
+    lap(&format!("infer x{rounds}"));
     // `ZYNTAX_TRACE_TYPES=1` prints what inference decided: each
     // function's signature, each class's fields, the globals.
     if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
@@ -638,7 +684,7 @@ pub fn parse_program_with(
             locals,
             &scope,
             Vec::new(),
-            std::collections::HashMap::new(),
+            HashMap::default(),
         )
         .entry_body(&top_level)?;
         let span = Span::new(
@@ -705,6 +751,7 @@ pub fn parse_program_with(
         ));
     }
     declarations.extend(lower::shape_declarations(&inferred, library.list_type));
+    lap("lower");
     // The library itself arrives by import: its declarations for
     // typing, its HIR to link against.
     declarations.push(TypedNode::new(
@@ -729,16 +776,16 @@ pub fn parse_program_with(
 
 /// Module aliases to modules, and local names to the module and member
 /// they were imported from.
-type Imports = std::collections::HashMap<String, String>;
-type FromNames = std::collections::HashMap<String, (String, String)>;
+type Imports = HashMap<String, String>;
+type FromNames = HashMap<String, (String, String)>;
 
 /// Every `import` in the program, wherever it appears: the modules go
 /// by their aliases, the names brought in by `from` by theirs. A module
 /// this frontend does not know is refused here, before anything is
 /// lowered.
 fn collect_imports(body: &[py::Stmt]) -> Result<(Imports, FromNames)> {
-    let mut imports = Imports::new();
-    let mut from_names = FromNames::new();
+    let mut imports = Imports::default();
+    let mut from_names = FromNames::default();
     fn walk(stmts: &[py::Stmt], imports: &mut Imports, from_names: &mut FromNames) -> Result<()> {
         for s in stmts {
             match s {
@@ -845,11 +892,10 @@ fn collect_imports(body: &[py::Stmt]) -> Result<(Imports, FromNames)> {
 fn module_globals(
     body: &[py::Stmt],
     defs: &[&py::StmtFunctionDef],
-    classes: &std::collections::HashMap<String, usize>,
+    classes: &HashMap<String, usize>,
 ) -> Vec<String> {
     let module = scope::Scope::of_body(Vec::new(), body);
-    let mut functions: std::collections::HashSet<&str> =
-        defs.iter().map(|f| f.name.as_str()).collect();
+    let mut functions: HashSet<&str> = defs.iter().map(|f| f.name.as_str()).collect();
     functions.extend(classes.keys().map(|k| k.as_str()));
     let mut names: std::collections::BTreeSet<String> =
         module.declared_globals().into_iter().collect();
@@ -873,7 +919,7 @@ pub(crate) fn intern(s: &str) -> InternedString {
 fn lower_items(
     inferred: &types::Module,
     items: &[types::Item<'_>],
-    unpack_shapes: &std::collections::HashMap<String, std::collections::HashMap<String, types::Ty>>,
+    unpack_shapes: &HashMap<String, HashMap<String, types::Ty>>,
 ) -> Result<Vec<TypedNode<TypedDeclaration>>> {
     let mut declarations = Vec::with_capacity(items.len());
     for item in items {
@@ -904,7 +950,7 @@ fn lower_items(
                 locals,
                 &scope,
                 Vec::new(),
-                std::collections::HashMap::new(),
+                HashMap::default(),
             );
             lowerer.class = item.class;
             lowerer.trusted = trusted;
@@ -940,4 +986,83 @@ pub(crate) fn span_of<N: Ranged>(node: &N) -> Span {
 
 pub(crate) fn prim(p: PrimitiveType) -> Type {
     Type::Primitive(p)
+}
+
+/// What a module exports to another module, by Python's convention: its
+/// top-level `def`s and `class`es, in order. With `__all__` assigned a
+/// list of string literals, the names it lists and nothing else; without
+/// it, every name that does not start with `_`. A host that publishes
+/// the module to other languages reads this rather than the program's
+/// declarations, which also carry the prelude's and the imported
+/// modules'.
+pub fn exports(source: &str) -> Result<Vec<zyntax_typed_ast::ExportedSymbol>> {
+    use zyntax_typed_ast::{ExportedSymbol, SymbolKind};
+    let parsed = ruff_python_parser::parse_module(source)
+        .map_err(|e| Error::syntax(e.error.to_string(), e.location))?;
+    let module = parsed.into_syntax();
+    let mut all: Option<Vec<String>> = None;
+    let mut declared: Vec<(String, SymbolKind)> = Vec::new();
+    for stmt in &module.body {
+        match stmt {
+            py::Stmt::FunctionDef(f) => declared.push((f.name.to_string(), SymbolKind::Function)),
+            py::Stmt::ClassDef(c) => declared.push((c.name.to_string(), SymbolKind::Class)),
+            py::Stmt::Assign(a) => {
+                let names_all = a
+                    .targets
+                    .iter()
+                    .any(|t| matches!(t, py::Expr::Name(n) if n.id.as_str() == "__all__"));
+                if names_all && let py::Expr::List(list) = &*a.value {
+                    all = Some(
+                        list.elts
+                            .iter()
+                            .filter_map(|e| match e {
+                                py::Expr::StringLiteral(s) => Some(s.value.to_string()),
+                                _ => None,
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(declared
+        .into_iter()
+        .filter(|(name, _)| match &all {
+            Some(all) => all.contains(name),
+            None => !name.starts_with('_'),
+        })
+        .map(|(name, kind)| ExportedSymbol {
+            name,
+            kind,
+            is_public: true,
+        })
+        .collect())
+}
+
+/// The methods a class exports, by Python's convention: the `def`s of
+/// its body whose names do not start with `_`, in order. `None` when
+/// `class` is not declared at the top level of `source`.
+pub fn class_exports(source: &str, class: &str) -> Result<Option<Vec<String>>> {
+    let parsed = ruff_python_parser::parse_module(source)
+        .map_err(|e| Error::syntax(e.error.to_string(), e.location))?;
+    let module = parsed.into_syntax();
+    for stmt in &module.body {
+        if let py::Stmt::ClassDef(c) = stmt
+            && c.name.as_str() == class
+        {
+            return Ok(Some(
+                c.body
+                    .iter()
+                    .filter_map(|s| match s {
+                        py::Stmt::FunctionDef(f) if !f.name.starts_with('_') => {
+                            Some(f.name.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+            ));
+        }
+    }
+    Ok(None)
 }

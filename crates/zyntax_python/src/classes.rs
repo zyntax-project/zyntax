@@ -15,14 +15,14 @@ use crate::types::{ClassInfo, Locals, Module, Sig, Ty, method_fn};
 use crate::{Error, Result, intern};
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use zyntax_typed_ast::TypeId;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{FieldDef, TypeDefinition, TypeKind, TypeMetadata};
 use zyntax_typed_ast::typed_ast::{
-    TypedAnnotation, TypedBlock, TypedClass, TypedDeclaration, TypedField, TypedFieldAccess,
-    TypedFieldInit, TypedFunction, TypedIf, TypedLet, TypedLiteral, TypedParameter, TypedStatement,
-    TypedStructLiteral,
+    TypedAnnotation, TypedBlock, TypedCall, TypedCast, TypedClass, TypedDeclaration, TypedField,
+    TypedFieldAccess, TypedFieldInit, TypedFunction, TypedIf, TypedLet, TypedLiteral,
+    TypedParameter, TypedStatement, TypedStructLiteral,
 };
 use zyntax_typed_ast::{
     Mutability, ParamOwnership, ParameterKind, Type, TypeRegistry, TypedNode, Visibility,
@@ -107,7 +107,7 @@ pub(crate) fn collect<'a>(
 /// and the class tag as the only field.
 pub(crate) fn skeletons(defs: &[ClassDef<'_>]) -> Result<(Vec<ClassInfo>, HashMap<String, usize>)> {
     // A base is declared before what derives from it.
-    let mut declared: HashMap<&str, usize> = HashMap::new();
+    let mut declared: HashMap<&str, usize> = HashMap::default();
     let mut base_of: Vec<Option<usize>> = Vec::with_capacity(defs.len());
     for (i, def) in defs.iter().enumerate() {
         let base = match &def.base {
@@ -165,7 +165,7 @@ pub(crate) fn skeletons(defs: &[ClassDef<'_>]) -> Result<(Vec<ClassInfo>, HashMa
         position[i] = k;
     }
     let mut classes = Vec::with_capacity(defs.len());
-    let mut index = HashMap::new();
+    let mut index = HashMap::default();
     for &i in &order {
         let def = &defs[i];
         index.insert(def.name.clone(), classes.len());
@@ -176,6 +176,7 @@ pub(crate) fn skeletons(defs: &[ClassDef<'_>]) -> Result<(Vec<ClassInfo>, HashMa
             fields: vec![("$class".to_string(), Ty::Int)],
             methods: def.methods.iter().map(|m| m.name.to_string()).collect(),
             type_id: None,
+            module: def.module.clone(),
         });
     }
     Ok((classes, index))
@@ -192,7 +193,15 @@ pub(crate) fn register(
     // an instance of a class declared later, or of its own, has a type.
     let ids: Vec<TypeId> = module.classes.iter().map(|_| TypeId::next()).collect();
     lower::set_class_types(ids.clone());
+    // The declaration names the class's file, so a reader tells the
+    // program's classes from the prelude's and the imported modules'.
+    let declared_in: Vec<Span> = module
+        .classes
+        .iter()
+        .map(|class| Span::in_file(0, 0, module.file_of(class.module.as_deref())))
+        .collect();
     for (k, class) in module.classes.iter_mut().enumerate() {
+        let declared = declared_in[k];
         let fields: Vec<FieldDef> = class
             .fields
             .iter()
@@ -259,10 +268,10 @@ pub(crate) fn register(
                     args: Vec::new(),
                     span,
                 }],
-                span,
+                span: declared,
             }),
             Type::Unknown,
-            span,
+            declared,
         ));
     }
     decls
@@ -379,7 +388,7 @@ fn scratch(module: &Module) -> Lowerer<'_> {
         Locals::default(),
         &Scope::default(),
         Vec::new(),
-        HashMap::new(),
+        HashMap::default(),
     );
     lowerer.guards = false;
     lowerer
@@ -1141,7 +1150,7 @@ fn scratch_with<'m>(module: &'m Module, vars: &[(&str, Ty)]) -> Lowerer<'m> {
         locals,
         &Scope::default(),
         Vec::new(),
-        HashMap::new(),
+        HashMap::default(),
     )
 }
 
@@ -1278,8 +1287,227 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
     let mut get = Vec::new();
     let mut set = Vec::new();
     let mut append = Vec::new();
+    let mut repr = Vec::new();
+    // An array's kind holds its storage kind in the low byte, above
+    // `ARRAY_KIND_BASE`; every typecode stored that way shares the arms,
+    // and the repr reads the typecode letter out of the kind.
+    let base = zyntax_builtins::ARRAY_KIND_BASE;
+    let is_array_of = |storage: zyntax_builtins::Kind| {
+        binary(
+            BinaryOp::And,
+            binary(
+                BinaryOp::Ge,
+                kind.clone(),
+                int_lit(base, span),
+                Ty::Bool,
+                span,
+            ),
+            binary(
+                BinaryOp::Eq,
+                binary(
+                    BinaryOp::BitAnd,
+                    kind.clone(),
+                    int_lit(255, span),
+                    Ty::Bool,
+                    span,
+                ),
+                int_lit(storage.list_tag() >> 8, span),
+                Ty::Bool,
+                span,
+            ),
+            Ty::Bool,
+            span,
+        )
+    };
+    let letter = || {
+        call(
+            "zb_str_chr",
+            vec![binary(
+                BinaryOp::Shr,
+                binary(
+                    BinaryOp::Sub,
+                    kind.clone(),
+                    int_lit(base, span),
+                    Ty::Int,
+                    span,
+                ),
+                int_lit(8, span),
+                Ty::Int,
+                span,
+            )],
+            Ty::Str,
+            span,
+        )
+    };
+    for storage in crate::types::array_kinds() {
+        let suffix = storage.suffix();
+        let stored = storage.ty();
+        let wide = storage.wide().ty();
+        let list_ty = zyntax_builtins::list_of(lower::list_type_id(), stored.clone());
+        let raw = || {
+            TypedNode::new(
+                TypedExpression::Call(TypedCall {
+                    callee: Box::new(var(
+                        intern(&format!("zb_unbox_list_raw_{suffix}")),
+                        Ty::Unknown,
+                        span,
+                    )),
+                    positional_args: vec![x.clone()],
+                    named_args: Vec::new(),
+                    type_args: Vec::new(),
+                }),
+                list_ty.clone(),
+                span,
+            )
+        };
+        let typed_call = |name: &str, args: Vec<Node>, ty: Type| {
+            TypedNode::new(
+                TypedExpression::Call(TypedCall {
+                    callee: Box::new(var(intern(name), Ty::Unknown, span)),
+                    positional_args: args,
+                    named_args: Vec::new(),
+                    type_args: Vec::new(),
+                }),
+                ty,
+                span,
+            )
+        };
+        let widen = |e: Node| {
+            TypedNode::new(
+                TypedExpression::Cast(TypedCast {
+                    expr: Box::new(e),
+                    target_type: wide.clone(),
+                }),
+                wide.clone(),
+                span,
+            )
+        };
+        // The number a dynamic value holds, at the stored width: checked
+        // by the storage's narrowing where it has one.
+        let as_stored = |v: Node| {
+            let read = match storage.wide() {
+                zyntax_builtins::Kind::Float => call("zb_any_as_f64", vec![v], Ty::Float, span),
+                _ => call("zb_any_as_i64", vec![v], Ty::Int, span),
+            };
+            if storage.wide() == storage {
+                return read;
+            }
+            typed_call(
+                &format!("zb_list_narrow_{suffix}"),
+                vec![read],
+                stored.clone(),
+            )
+        };
+        let boxed = |e: Node| match storage.wide() {
+            zyntax_builtins::Kind::Float => call("zb_box_f64", vec![widen(e)], Ty::Object, span),
+            _ => call("zb_box_i64", vec![widen(e)], Ty::Object, span),
+        };
+        items.push(when(
+            is_array_of(storage),
+            vec![ret(
+                call(
+                    &format!("zb_list_to_any_{suffix}"),
+                    vec![raw()],
+                    Ty::List(Elem::Object),
+                    span,
+                ),
+                span,
+            )],
+            span,
+        ));
+        get.push(when(
+            is_array_of(storage),
+            vec![ret(
+                boxed(typed_call(
+                    &format!("zb_list_get_{suffix}"),
+                    vec![raw(), i.clone()],
+                    stored.clone(),
+                )),
+                span,
+            )],
+            span,
+        ));
+        set.push(when(
+            is_array_of(storage),
+            vec![
+                stmt(
+                    call(
+                        &format!("zb_list_set_{suffix}"),
+                        vec![raw(), i.clone(), as_stored(v.clone())],
+                        Ty::None,
+                        span,
+                    ),
+                    span,
+                ),
+                ret_void(span),
+            ],
+            span,
+        ));
+        append.push(when(
+            is_array_of(storage),
+            vec![
+                stmt(
+                    method_call(raw(), "push", vec![as_stored(v.clone())], Ty::None, span),
+                    span,
+                ),
+                ret_void(span),
+            ],
+            span,
+        ));
+        let empty = binary(
+            BinaryOp::Eq,
+            method_call(raw(), "len", vec![], Ty::Int, span),
+            int_lit(0, span),
+            Ty::Bool,
+            span,
+        );
+        let prefix = |open: &str| {
+            binary(
+                BinaryOp::Add,
+                binary(
+                    BinaryOp::Add,
+                    str_lit("array('", span),
+                    letter(),
+                    Ty::Str,
+                    span,
+                ),
+                str_lit(open, span),
+                Ty::Str,
+                span,
+            )
+        };
+        repr.push(when(
+            is_array_of(storage),
+            vec![
+                when(empty, vec![ret(prefix("')"), span)], span),
+                ret(
+                    call(
+                        &format!("zb_list_items_{suffix}"),
+                        vec![raw(), prefix("', ["), str_lit("])", span)],
+                        Ty::Str,
+                        span,
+                    ),
+                    span,
+                ),
+            ],
+            span,
+        ));
+    }
     for &k in &shapes {
         let e = Elem::Tuple(k);
+        repr.push(when(
+            is_shape(k),
+            vec![ret(
+                call(
+                    &format!("zb_list_repr_{}", e.suffix()),
+                    vec![raw(k)],
+                    Ty::Str,
+                    span,
+                ),
+                span,
+            )],
+            span,
+        ));
         items.push(when(
             is_shape(k),
             vec![ret(
@@ -1368,7 +1596,16 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
     set.push(ret_void(span));
     append.push(unknown());
     append.push(ret_void(span));
+    repr.push(unknown());
+    repr.push(ret(str_lit("", span), span));
     vec![
+        function(
+            "zb_hook_shaped_repr",
+            vec![param("x", Ty::Object, span)],
+            Ty::Str,
+            repr,
+            span,
+        ),
         function(
             "zb_hook_shaped_items",
             vec![param("x", Ty::Object, span)],

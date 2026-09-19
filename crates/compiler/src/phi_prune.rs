@@ -71,6 +71,8 @@ pub fn run_function(func: &mut HirFunction) -> PhiPruneStats {
             break;
         }
     }
+    // The results and the undefined incomings of the phis removed.
+    func.sweep_unreferenced_values();
     stats
 }
 

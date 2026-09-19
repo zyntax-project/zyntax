@@ -152,9 +152,9 @@ fn an_error_renders_against_its_source() {
     assert!(err.module().is_none(), "the main file has no module name");
 }
 
-/// A program of two files carries both as source files, and what came
-/// from the second names it, so a diagnostic about it quotes the right
-/// text.
+/// A program of two files carries both as source files, then the
+/// prelude as a file of its own, and what came from the second names
+/// it, so a diagnostic about it quotes the right text.
 #[test]
 fn a_module_span_names_its_file() {
     let helper = "def f(x):\n    return x * 2\n";
@@ -170,7 +170,7 @@ fn a_module_span_names_its_file() {
         .iter()
         .map(|f| f.name.as_str())
         .collect();
-    assert_eq!(names, ["main.py", "helper"]);
+    assert_eq!(names, ["main.py", "helper", zyntax_python::PRELUDE]);
     let f = program
         .declarations
         .iter()

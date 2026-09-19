@@ -1,9 +1,10 @@
 //! The standard library modules a program may import, and what each
 //! name in them is: a function over typed arguments in the shared
-//! library, a constant, or a value read from the host. `typing` is
-//! accepted whole and contributes nothing but annotations.
+//! library, a constant, a value read from the host, or the `array`
+//! type. `typing` is accepted whole and contributes nothing but
+//! annotations.
 
-use crate::types::{Elem, Ty};
+use crate::types::{Code, Elem, Ty};
 
 /// What a module's name stands for.
 #[derive(Clone, Copy, Debug)]
@@ -19,8 +20,25 @@ pub(crate) enum Member {
     Float(f64),
     /// An integer constant.
     Int(i64),
+    /// A string constant.
+    Str(&'static str),
     /// A value the library computes on each read.
     Value { ty: Ty, zb: &'static str },
+    /// `array.array`: a list stored at the width its typecode names;
+    /// see [`array_code`].
+    ArrayType,
+}
+
+/// The typecode an `array` call with this literal builds, or why it
+/// is not supported.
+pub(crate) fn array_code(typecode: &str) -> Result<Code, &'static str> {
+    match Code::of(typecode) {
+        Some(code) => Ok(code),
+        None => Err(match typecode {
+            "u" | "w" => "an array of characters is a string here",
+            _ => "not an array typecode",
+        }),
+    }
 }
 
 /// Modules that may be imported, with nothing to resolve at run time.
@@ -29,7 +47,7 @@ pub(crate) enum Member {
 pub(crate) fn is_known(module: &str) -> bool {
     matches!(
         module,
-        "math" | "sys" | "typing" | "time" | "bisect" | "__future__"
+        "math" | "sys" | "typing" | "time" | "bisect" | "array" | "__future__"
     )
 }
 
@@ -150,6 +168,8 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         // `exit` takes its status as an int; the lowering fills in the
         // default and the two-argument `log`.
         ("sys", "exit") => func(&[I], Ty::None, "zb_exit"),
+        ("array", "array") => Member::ArrayType,
+        ("array", "typecodes") => Member::Str("bBuwhHiIlLqQfd"),
         ("time", "time") => func(&[], F, "zb_time_time"),
         // The monotonic clocks are one clock here.
         ("time", "perf_counter" | "monotonic" | "process_time" | "clock") => {

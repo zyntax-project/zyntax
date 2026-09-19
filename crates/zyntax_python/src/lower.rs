@@ -14,7 +14,9 @@ use crate::types::{self, Elem, Locals, Module, Sig, Ty, Typer};
 use crate::{Error, Result, intern, prim, span_of};
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
-use std::collections::{BTreeSet, HashMap};
+use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
+use std::collections::BTreeSet;
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
     ParameterAttribute, TypedAnnotation, TypedBinary, TypedBlock, TypedCall, TypedCast,
@@ -102,12 +104,16 @@ pub(crate) fn field_storage(ty: Ty) -> Ty {
     }
 }
 
+/// The library's `List<T>` type id.
+pub(crate) fn list_type_id() -> zyntax_typed_ast::TypeId {
+    LIST_TYPE
+        .with(|c| c.get())
+        .expect("the library's List<T> is known before lowering")
+}
+
 /// `List<elem>` as the library declares it.
 fn list_type(elem: Type) -> Type {
-    let id = LIST_TYPE
-        .with(|c| c.get())
-        .expect("the library's List<T> is known before lowering");
-    zyntax_builtins::list_of(id, elem)
+    zyntax_builtins::list_of(list_type_id(), elem)
 }
 
 /// How a tuple stores a field of type `ty`: a scalar, an instance or a
@@ -136,6 +142,15 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
             ty: class_type(k as usize),
             tag: zyntax_builtins::instance_tag(k as usize) as i32,
         },
+        Ty::List(e @ Elem::Array(c)) => {
+            types::note_array_kind(c.storage());
+            Field::Array {
+                suffix: e.suffix(),
+                ty: ir(ty),
+                tag: c.tag(),
+                letter: c.letter().to_string(),
+            }
+        }
         Ty::List(e) => Field::List {
             suffix: e.suffix(),
             ty: ir(ty),
@@ -166,6 +181,15 @@ pub(crate) fn shape_declarations(
     let _ = module;
     let lists = types::tuple_lists();
     let mut out = Vec::new();
+    // The storage kinds the library does not carry, before anything
+    // that calls their functions.
+    for kind in types::array_kinds() {
+        if !zyntax_builtins::Kind::LIBRARY.contains(&kind) {
+            out.extend(zyntax_builtins::lists::array_kind_declarations(
+                kind, list_type,
+            ));
+        }
+    }
     for k in 0..types::tuple_shape_count() as u16 {
         let suffix = types::tuple_suffix(k);
         let tuple_ty = ir(Ty::Tuple(k));
@@ -215,7 +239,8 @@ pub(crate) fn ir(ty: Ty) -> Type {
 }
 
 /// The IR type a list of `e` holds per element: an instance is held by
-/// address, everything else as itself.
+/// address, an array's element at its typecode's width, everything
+/// else as itself.
 pub(crate) fn elem_ir(e: Elem) -> Type {
     match e {
         Elem::Class(_) => addr_type(),
@@ -223,15 +248,39 @@ pub(crate) fn elem_ir(e: Elem) -> Type {
             types::note_tuple_list(k);
             ir(Ty::Tuple(k))
         }
+        Elem::Array(c) => c.storage().ty(),
         other => ir(other.ty()),
     }
 }
 
+/// A call whose result has IR type `ty`.
+fn typed_call(name: &str, args: Vec<Node>, ty: Type, span: Span) -> Node {
+    TypedNode::new(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(var(intern(name), Ty::Unknown, span)),
+            positional_args: args,
+            named_args: Vec::new(),
+            type_args: Vec::new(),
+        }),
+        ty,
+        span,
+    )
+}
+
 /// A call to a list function that returns an element of kind `e`,
-/// typed as the element: an address comes back as the instance.
+/// typed as the element: an address comes back as the instance, an
+/// array's element widened to the number it reads as.
 fn elem_call(op: &str, e: Elem, args: Vec<Node>, span: Span) -> Node {
     match e {
         Elem::Class(k) => cast(addr_call(&list_fn(op, e), args, span), Ty::Class(k), span),
+        Elem::Array(c) => {
+            let stored = typed_call(&list_fn(op, e), args, c.storage().ty(), span);
+            if c.narrows() {
+                cast(stored, c.item(), span)
+            } else {
+                stored
+            }
+        }
         other => call(&list_fn(op, other), args, other.ty(), span),
     }
 }
@@ -256,15 +305,18 @@ pub(crate) fn method_call(
     )
 }
 
-fn bind_names(vars: &mut std::collections::HashMap<String, Ty>, target: &py::Expr, ty: Ty) {
+fn bind_names(vars: &mut HashMap<String, Ty>, target: &py::Expr, ty: Ty) {
     types::bind_target(vars, target, ty)
 }
 
 /// `zb_list_<op>_<kind>`. A list of tuples has its functions generated
-/// for the shape, so the shape is noted.
+/// for the shape, and an array's storage kind its functions and its
+/// hook arms, so both are noted.
 fn list_fn(op: &str, elem: Elem) -> String {
-    if let Elem::Tuple(k) = elem {
-        types::note_tuple_list(k);
+    match elem {
+        Elem::Tuple(k) => types::note_tuple_list(k),
+        Elem::Array(c) => types::note_array_kind(c.storage()),
+        _ => {}
     }
     format!("zb_list_{op}_{}", elem.suffix())
 }
@@ -607,7 +659,7 @@ pub(crate) fn adapter(module: &Module, name: &str, sig: &Sig) -> TypedFunction {
         Locals::default(),
         &scope,
         Vec::new(),
-        HashMap::new(),
+        HashMap::default(),
     );
     lowerer.guards = false;
     let mut params = vec![parameter("env", Ty::List(Elem::Object), span)];
@@ -706,16 +758,16 @@ pub(crate) struct Lowerer<'m> {
     /// stands: assigned from a constructor, or checked since. Cleared
     /// at every compound statement, so it never crosses a branch or a
     /// loop back edge.
-    nonnull: std::collections::HashSet<InternedString>,
+    nonnull: HashSet<InternedString>,
     /// Variables that hold an instance for the whole function: assigned
     /// a constructor's result before anything reads them, and assigned
     /// nothing else anywhere; see [`Self::always_instances`].
-    always_instance: std::collections::HashSet<InternedString>,
+    always_instance: HashSet<InternedString>,
     /// Fields `v.f` of a known instance `v` known not to be None where
     /// the lowering stands, from a test the control flow has settled.
     /// Cleared with `nonnull`, at any call (which may store to the
     /// field), and at a store to a field of that name.
-    nonnull_fields: std::collections::HashSet<(InternedString, String)>,
+    nonnull_fields: HashSet<(InternedString, String)>,
     /// Whether this is the variant of the function that takes its
     /// instance-typed parameters to be instances; see
     /// [`types::trusted_name`].
@@ -844,11 +896,11 @@ impl<'m> Lowerer<'m> {
             locals,
             bound,
             temps: 0,
-            comp_symbols: HashMap::new(),
+            comp_symbols: HashMap::default(),
             hoisted: Vec::new(),
-            nonnull: std::collections::HashSet::new(),
-            always_instance: std::collections::HashSet::new(),
-            nonnull_fields: std::collections::HashSet::new(),
+            nonnull: HashSet::default(),
+            always_instance: HashSet::default(),
+            nonnull_fields: HashSet::default(),
             trusted: false,
             defaults_after_cells: 0,
             guards: true,
@@ -1270,6 +1322,26 @@ impl<'m> Lowerer<'m> {
         self.escape_into(span, out);
     }
 
+    /// An expression Python always raises at: the operands are
+    /// evaluated for their effects, the exception is raised, and the
+    /// value stands for nothing.
+    fn raised_value(
+        &mut self,
+        operands: Vec<Node>,
+        class: &str,
+        message: &str,
+        ty: Ty,
+        span: Span,
+    ) -> Node {
+        let mut pre: Vec<Stmt> = operands
+            .into_iter()
+            .map(|n| TypedNode::new(TypedStatement::Expression(Box::new(n)), Type::Unknown, span))
+            .collect();
+        self.raise_named(class, str_lit(message, span), span, &mut pre);
+        self.hoisted.extend(pre);
+        self.zero_of(ty, span)
+    }
+
     /// Integer division and remainder trap on zero, so the divisor is
     /// checked first and a zero raises.
     fn nonzero(&mut self, divisor: Node, span: Span) -> Node {
@@ -1642,6 +1714,31 @@ impl<'m> Lowerer<'m> {
             (Ty::Int | Ty::Bool, Ty::Float) => cast(v.node, Ty::Float, span),
             (Ty::Bool, Ty::Int) => cast(v.node, Ty::Int, span),
             (Ty::Int, Ty::Bool) => binary(BinaryOp::Ne, v.node, int_lit(0, span), Ty::Bool, span),
+            // An array is boxed by reference under a tag of its typecode,
+            // and read back by checking that tag: a list stored the same
+            // way is not an array, nor is an array of another typecode.
+            (Ty::List(e @ Elem::Array(c)), Ty::Object) => call(
+                &list_fn("box_tagged", e),
+                vec![v.node, int_lit(c.tag(), span)],
+                Ty::Object,
+                span,
+            ),
+            (Ty::Object, Ty::List(e @ Elem::Array(c))) => {
+                let checked = Val {
+                    node: call(
+                        &list_fn("unbox_tagged", e),
+                        vec![v.node, int_lit(c.tag(), span), str_lit(c.letter(), span)],
+                        target,
+                        span,
+                    ),
+                    ty: target,
+                };
+                if self.guards {
+                    self.guard(checked, span).node
+                } else {
+                    checked.node
+                }
+            }
             // A list is boxed by reference under a tag of its kind, and
             // read back by checking that tag.
             (Ty::List(e), Ty::Object) => call(&list_fn("box", e), vec![v.node], Ty::Object, span),
@@ -1792,6 +1889,39 @@ impl<'m> Lowerer<'m> {
             // Lists of one kind into lists of dynamic values.
             (Ty::List(e), Ty::List(Elem::Object)) => {
                 call(&list_fn("to_any", e), vec![v.node], target, span)
+            }
+            // An array from the numbers it reads as, or into them, or
+            // from an array reading as the same: converted directly,
+            // each value checked on its way into a narrower typecode.
+            (Ty::List(from), Ty::List(to))
+                if from.code().is_some_and(|c| Elem::of(c.item()) == to)
+                    || to.code().is_some_and(|c| Elem::of(c.item()) == from)
+                    || from
+                        .code()
+                        .zip(to.code())
+                        .is_some_and(|(a, b)| a.item() == b.item()) =>
+            {
+                let mut node = v.node;
+                // Out of the array's storage first, when it is narrow.
+                if let Some(c) = from.code().filter(|c| c.narrows()) {
+                    let wide = Ty::List(Elem::of(c.item()));
+                    node = call(&list_fn("to_wide", from), vec![node], wide, span);
+                }
+                match to.code().filter(|c| c.narrows()) {
+                    Some(_) => {
+                        let converted = Val {
+                            node: call(&list_fn("from_wide", to), vec![node], target, span),
+                            ty: target,
+                        };
+                        if self.guards {
+                            self.guard(converted, span).node
+                        } else {
+                            converted.node
+                        }
+                    }
+                    // The same storage: the copy every conversion is.
+                    None => call(&list_fn("copy", to), vec![node], target, span),
+                }
             }
             // Lists of dynamic values into lists of one kind: each element
             // read back checked. Between two kinds, through the dynamic
@@ -2090,18 +2220,157 @@ impl<'m> Lowerer<'m> {
 
     /// A value as an element of a list of kind `e`: an instance goes in
     /// by address.
+    /// A value as an element of kind `e`: converted to what the kind
+    /// reads as, an instance to its address, an array's element to its
+    /// stored width, which for an integer typecode checks the range and
+    /// raises OverflowError where it is used.
     fn elem_arg(&mut self, v: Val, e: Elem) -> Node {
         let span = v.node.span;
         let node = self.coerce(v, e.ty());
         match e {
             Elem::Class(_) => as_addr(node, span),
+            Elem::Array(c) if c.narrows() => self.narrowed(node, c, span),
             _ => node,
         }
+    }
+
+    /// `value`, a number of what typecode `c` reads as, at the width
+    /// `c` stores.
+    fn narrowed(&mut self, value: Node, c: types::Code, span: Span) -> Node {
+        let stored = c.storage().ty();
+        if c.storage() == zyntax_builtins::Kind::F32 {
+            return TypedNode::new(
+                TypedExpression::Cast(TypedCast {
+                    expr: Box::new(value),
+                    target_type: stored.clone(),
+                }),
+                stored,
+                span,
+            );
+        }
+        let narrowed = typed_call(
+            &list_fn("narrow", Elem::Array(c)),
+            vec![value],
+            stored.clone(),
+            span,
+        );
+        // Held at the stored width, then checked before anything uses
+        // it, as `guard` holds a value of one of the frontend's types.
+        let name = self.temp();
+        self.hoisted.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name,
+                ty: stored.clone(),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(narrowed)),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        let check = self.pending_check(span);
+        self.hoisted.push(check);
+        TypedNode::new(TypedExpression::Variable(name), stored, span)
     }
 
     fn expr_as_elem(&mut self, expr: &py::Expr, e: Elem) -> Result<Node> {
         let v = self.expr(expr)?;
         Ok(self.elem_arg(v, e))
+    }
+
+    /// A search of array `xs` for `probe`: `contains`, `count`,
+    /// `index_or_neg`. A number the storage cannot hold is in no array,
+    /// so it is not narrowed but answered as absent; a value of another
+    /// type is absent too.
+    fn array_search(
+        &mut self,
+        probe: Val,
+        xs: Node,
+        e: Elem,
+        c: types::Code,
+        op: &str,
+        span: Span,
+    ) -> Result<Node> {
+        let (ty, absent) = match op {
+            "contains" => (Ty::Bool, TypedLiteral::Bool(false)),
+            "count" => (Ty::Int, TypedLiteral::Integer(0)),
+            _ => (Ty::Int, TypedLiteral::Integer(-1)),
+        };
+        let absent = node(TypedExpression::Literal(absent), ty, span);
+        let numeric = match (c.item(), probe.ty) {
+            (Ty::Int, Ty::Int | Ty::Bool) | (Ty::Float, Ty::Int | Ty::Float | Ty::Bool) => true,
+            (Ty::Int, Ty::Float) => {
+                return Err(Error::unsupported_span(
+                    "a float searched for in an integer array",
+                    span,
+                ));
+            }
+            (_, Ty::Object | Ty::Unknown) => {
+                return Err(Error::unsupported_span(
+                    "a dynamic value searched for in an array",
+                    span,
+                ));
+            }
+            _ => false,
+        };
+        if !numeric {
+            return Ok(Self::block_value(
+                vec![
+                    TypedNode::new(
+                        TypedStatement::Expression(Box::new(probe.node)),
+                        Type::Unknown,
+                        span,
+                    ),
+                    TypedNode::new(
+                        TypedStatement::Expression(Box::new(xs)),
+                        Type::Unknown,
+                        span,
+                    ),
+                ],
+                absent,
+                ty,
+                span,
+            ));
+        }
+        let wide = self.coerce(probe, c.item());
+        if !c.narrows() {
+            return Ok(call(&list_fn(op, e), vec![xs, wide], ty, span));
+        }
+        let mut pre = Vec::new();
+        let held = self.hold(
+            Val {
+                node: wide,
+                ty: c.item(),
+            },
+            &mut pre,
+            span,
+        );
+        let fits = call(
+            &list_fn("in_range", e),
+            vec![held.node.clone()],
+            Ty::Bool,
+            span,
+        );
+        let stored = c.storage().ty();
+        let narrowed = TypedNode::new(
+            TypedExpression::Cast(TypedCast {
+                expr: Box::new(held.node),
+                target_type: stored.clone(),
+            }),
+            stored,
+            span,
+        );
+        let found = call(&list_fn(op, e), vec![xs, narrowed], ty, span);
+        let value = node(
+            TypedExpression::If(TypedIfExpr {
+                condition: Box::new(fits),
+                then_branch: Box::new(found),
+                else_branch: Box::new(absent),
+            }),
+            ty,
+            span,
+        );
+        Ok(Self::block_value(pre, value, ty, span))
     }
 
     /// `bool(v)`: the value as a condition.
@@ -2237,6 +2506,38 @@ impl<'m> Lowerer<'m> {
             Ty::Str => v.node,
             Ty::None => {
                 Self::after_none(v.node, call("zb_none_repr", vec![], Ty::Str, span), Ty::Str)
+            }
+            // An array prints under its typecode: `array('i', [1, 2])`,
+            // and `array('i')` when empty.
+            Ty::List(e @ Elem::Array(c)) => {
+                let mut pre = Vec::new();
+                let held = self.hold(v, &mut pre, span);
+                let empty = binary(
+                    BinaryOp::Eq,
+                    method_call(held.node.clone(), "len", vec![], Ty::Int, span),
+                    int_lit(0, span),
+                    Ty::Bool,
+                    span,
+                );
+                let text = node(
+                    TypedExpression::If(TypedIfExpr {
+                        condition: Box::new(empty),
+                        then_branch: Box::new(str_lit(&format!("array('{}')", c.letter()), span)),
+                        else_branch: Box::new(call(
+                            &list_fn("items", e),
+                            vec![
+                                held.node,
+                                str_lit(&format!("array('{}', [", c.letter()), span),
+                                str_lit("])", span),
+                            ],
+                            Ty::Str,
+                            span,
+                        )),
+                    }),
+                    Ty::Str,
+                    span,
+                );
+                Self::block_value(pre, text, Ty::Str, span)
             }
             Ty::List(e) => call(&list_fn("repr", e), vec![v.node], Ty::Str, span),
             Ty::Tuple(_) => {
@@ -4025,10 +4326,17 @@ impl<'m> Lowerer<'m> {
                 node: int_lit(i, span),
                 ty: Ty::Int,
             },
+            stdlib::Member::Str(s) => Val {
+                node: str_lit(s, span),
+                ty: Ty::Str,
+            },
             stdlib::Member::Value { ty, zb } => Val {
                 node: call(zb, Vec::new(), ty, span),
                 ty,
             },
+            stdlib::Member::ArrayType => {
+                return unsupported(format!("`{name}` as a value"), e);
+            }
             stdlib::Member::Func { zb, .. } if zb.starts_with("zb_bisect_") => Val {
                 node: call(
                     "zb_func_new",
@@ -4048,6 +4356,70 @@ impl<'m> Lowerer<'m> {
         })
     }
 
+    /// `array(typecode[, initializer])`: the array of the typecode,
+    /// filled from the initializer's items, which are converted as the
+    /// typecode requires and copied, so the array shares nothing with
+    /// what it was made from. The typecode is the array's static type,
+    /// so it has to be spelled out.
+    fn array_new(
+        &mut self,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+        span: Span,
+    ) -> Result<Val> {
+        if !keywords.is_empty() {
+            return unsupported("keyword arguments to array()", c);
+        }
+        let (Some(first), true) = (args.first(), args.len() <= 2) else {
+            return unsupported(format!("array() with {} argument(s)", args.len()), c);
+        };
+        let py::Expr::StringLiteral(code) = first else {
+            return unsupported(
+                "array() with a typecode that is not a string literal; the typecode is the array's type",
+                first,
+            );
+        };
+        let typecode = code.value.to_str();
+        let code = match stdlib::array_code(typecode) {
+            Ok(code) => code,
+            Err(why) => {
+                return unsupported(format!("array typecode {typecode:?}: {why}"), first);
+            }
+        };
+        let elem = Elem::Array(code);
+        let target = Ty::List(elem);
+        let Some(init) = args.get(1) else {
+            return Ok(Val {
+                node: self.list_of(Vec::new(), elem, span),
+                ty: target,
+            });
+        };
+        let source = self.expr(init)?;
+        let node = match source.ty {
+            // The same typecode: a copy of its own.
+            Ty::List(e) if e == elem => {
+                call(&list_fn("copy", elem), vec![source.node], target, span)
+            }
+            Ty::List(_) | Ty::Tuple(_) => self.coerce(source, target),
+            // A dynamic iterable, a set or a generator: its items first.
+            Ty::Set | Ty::Object | Ty::Gen => {
+                let items = Val {
+                    node: self.iterable(source, span),
+                    ty: Ty::List(Elem::Object),
+                };
+                self.coerce(items, target)
+            }
+            Ty::Str => {
+                return unsupported("array() from a string or bytes", init);
+            }
+            _ => {
+                return unsupported("array() from a value that is not iterable", init);
+            }
+        };
+        Ok(Val { node, ty: target })
+    }
+
     /// A call to a module's function: arguments converted to the
     /// declared parameter types, the library function called.
     fn stdlib_call(
@@ -4059,6 +4431,9 @@ impl<'m> Lowerer<'m> {
         c: &py::ExprCall,
         span: Span,
     ) -> Result<Val> {
+        if let stdlib::Member::ArrayType = member {
+            return self.array_new(args, keywords, c, span);
+        }
         let stdlib::Member::Func { params, ret, zb } = member else {
             return unsupported(format!("calling `{name}`, which is not a function"), c);
         };
@@ -4636,6 +5011,19 @@ impl<'m> Lowerer<'m> {
         {
             return self.module.fallible.contains(&format!("zb_list_{op}_any"));
         }
+        // An array storage kind's functions are generated with the
+        // program and raise where the library's kinds do; narrowing and
+        // the checked unbox raise on their own.
+        if let Some(rest) = name.strip_prefix("zb_list_")
+            && let Some((op, suffix)) = rest.rsplit_once('_')
+            && zyntax_builtins::Kind::ALL
+                .iter()
+                .any(|k| !zyntax_builtins::Kind::LIBRARY.contains(k) && k.suffix() == suffix)
+        {
+            return matches!(op, "narrow" | "from_wide" | "unbox_tagged")
+                || self.module.fallible.contains(&format!("zb_list_{op}_i64"))
+                || self.module.fallible.contains(&format!("zb_list_{op}_f64"));
+        }
         // A set or dict probed by a shape hashes the fields as their
         // boxes would be hashed, and raises where the boxed lookup does.
         if let Some(suffix) = name.strip_prefix("zb_set_contains_")
@@ -5068,8 +5456,21 @@ impl<'m> Lowerer<'m> {
                 });
             }
         }
-        // Sequences concatenate and repeat.
+        // Sequences concatenate and repeat. An array concatenates with
+        // an array of its own typecode and nothing else.
         match (op, left.ty, right.ty) {
+            (py::Operator::Add, Ty::List(a), Ty::List(b))
+                if a != b && (a.code().is_some() || b.code().is_some()) =>
+            {
+                let message = match (a.code(), b.code()) {
+                    (Some(_), Some(_)) => "bad argument type for built-in operation".to_string(),
+                    (Some(_), None) => "can only append array (not \"list\") to array".to_string(),
+                    _ => "can only concatenate list (not \"array.array\") to list".to_string(),
+                };
+                let node =
+                    self.raised_value(vec![left.node, right.node], "TypeError", &message, ty, span);
+                return Ok(Val { node, ty });
+            }
             (py::Operator::Add, Ty::List(e), Ty::List(_)) if ty == left.ty => {
                 return Ok(Val {
                     node: call(&list_fn("concat", e), vec![left.node, right.node], ty, span),
@@ -5347,6 +5748,8 @@ impl<'m> Lowerer<'m> {
                         Ty::Bool,
                         span,
                     )
+                } else if let Ty::List(e @ Elem::Array(c)) = right.ty {
+                    self.array_search(left, right.node, e, c, "contains", span)?
                 } else if let Ty::List(e) = right.ty {
                     let item = self.elem_arg(left, e);
                     call(
@@ -5522,6 +5925,106 @@ impl<'m> Lowerer<'m> {
             Ty::List(e) => Some(e),
             _ => None,
         };
+        // An array equals no list, and is ordered against none; two
+        // arrays reading as the same number compare as those numbers.
+        if let (Some(e), Some(f)) = (seq_kind(left.ty), seq_kind(right.ty))
+            && e != f
+            && (e.code().is_some() || f.code().is_some())
+        {
+            let (mut left, mut right) = (left, right);
+            for side in [&mut left, &mut right] {
+                if let Some(c) = seq_kind(side.ty).and_then(Elem::code) {
+                    // As the list of the numbers it reads as: the same
+                    // header where the storage is already that wide.
+                    let wide = Ty::List(Elem::of(c.item()));
+                    if c.narrows() {
+                        let e = Elem::Array(c);
+                        side.node =
+                            call(&list_fn("to_wide", e), vec![side.node.clone()], wide, span);
+                    }
+                    side.ty = wide;
+                }
+            }
+            let both_arrays = e.code().is_some() && f.code().is_some();
+            if both_arrays && left.ty == right.ty {
+                let Ty::List(w) = left.ty else { unreachable!() };
+                let eq = |l: Node, r: Node| call(&list_fn("eq", w), vec![l, r], Ty::Bool, span);
+                let lt = |l: Node, r: Node| call(&list_fn("lt", w), vec![l, r], Ty::Bool, span);
+                let (l, r) = (left.node, right.node);
+                return Ok(match op {
+                    py::CmpOp::Eq => eq(l, r),
+                    py::CmpOp::NotEq => negate(eq(l, r)),
+                    py::CmpOp::Lt => lt(l, r),
+                    py::CmpOp::Gt => lt(r, l),
+                    py::CmpOp::LtE => negate(lt(r, l)),
+                    py::CmpOp::GtE => negate(lt(l, r)),
+                    _ => unreachable!(),
+                });
+            }
+            if !both_arrays {
+                let lit = |b: bool| {
+                    node(
+                        TypedExpression::Literal(TypedLiteral::Bool(b)),
+                        Ty::Bool,
+                        span,
+                    )
+                };
+                let effects = vec![
+                    TypedNode::new(
+                        TypedStatement::Expression(Box::new(left.node.clone())),
+                        Type::Unknown,
+                        span,
+                    ),
+                    TypedNode::new(
+                        TypedStatement::Expression(Box::new(right.node.clone())),
+                        Type::Unknown,
+                        span,
+                    ),
+                ];
+                return Ok(match op {
+                    py::CmpOp::Eq => Self::block_value(effects, lit(false), Ty::Bool, span),
+                    py::CmpOp::NotEq => Self::block_value(effects, lit(true), Ty::Bool, span),
+                    _ => {
+                        let (a, b) = if e.code().is_some() {
+                            ("array.array", "list")
+                        } else {
+                            ("list", "array.array")
+                        };
+                        self.raised_value(
+                            vec![left.node, right.node],
+                            "TypeError",
+                            &format!(
+                                "'{}' not supported between instances of '{a}' and '{b}'",
+                                match op {
+                                    py::CmpOp::Lt => "<",
+                                    py::CmpOp::Gt => ">",
+                                    py::CmpOp::LtE => "<=",
+                                    _ => ">=",
+                                }
+                            ),
+                            Ty::Bool,
+                            span,
+                        )
+                    }
+                });
+            }
+            // Two arrays of different numbers compare as dynamic values.
+            let (l, r) = (
+                self.coerce(left, Ty::List(Elem::Object)),
+                self.coerce(right, Ty::List(Elem::Object)),
+            );
+            let eq = |l: Node, r: Node| call("zb_list_eq_any", vec![l, r], Ty::Bool, span);
+            let lt = |l: Node, r: Node| call("zb_list_lt_any", vec![l, r], Ty::Bool, span);
+            return Ok(match op {
+                py::CmpOp::Eq => eq(l, r),
+                py::CmpOp::NotEq => negate(eq(l, r)),
+                py::CmpOp::Lt => lt(l, r),
+                py::CmpOp::Gt => lt(r, l),
+                py::CmpOp::LtE => negate(lt(r, l)),
+                py::CmpOp::GtE => negate(lt(l, r)),
+                _ => unreachable!(),
+            });
+        }
         if let (Some(e), Some(f)) = (seq_kind(left.ty), seq_kind(right.ty)) {
             let (l, r, e) = if e == f {
                 (left.node, right.node, e)
@@ -5875,13 +6378,19 @@ impl<'m> Lowerer<'m> {
             return Ok(Val { node, ty });
         }
         match seq.ty {
-            // A literal index into a shape is that field.
+            // A literal index into a shape is that field, read as the
+            // shape stores it.
             Ty::Tuple(k)
                 if let Some(i) = types::constant_index(&sub.slice, types::tuple_shape(k).len()) =>
             {
                 let field = types::tuple_shape(k)[i].settled();
+                let stored = tuple_field_storage(field);
+                let read = Val {
+                    node: slot(seq.node, i, stored, span),
+                    ty: stored,
+                };
                 Ok(Val {
-                    node: slot(seq.node, i, field, span),
+                    node: self.trusted(read, field),
                     ty: field,
                 })
             }
@@ -5944,7 +6453,7 @@ impl<'m> Lowerer<'m> {
         let saved_symbols = self.comp_symbols.clone();
         let mut target_names = BTreeSet::new();
         for g in generators {
-            let mut names = HashMap::new();
+            let mut names = HashMap::default();
             bind_names(&mut names, &g.target, Ty::Object);
             target_names.extend(names.into_keys());
         }
@@ -6098,6 +6607,130 @@ impl<'m> Lowerer<'m> {
             }
         };
         match receiver.ty {
+            Ty::List(e @ Elem::Array(c)) if !matches!(name, "append" | "pop" | "insert") => {
+                let list = receiver.node;
+                let node = match name {
+                    // A number the storage cannot hold is in no array.
+                    "count" => {
+                        expect(1, self)?;
+                        let v = self.expr(&args[0])?;
+                        self.array_search(v, list, e, c, "count", span)?
+                    }
+                    "index" | "remove" => {
+                        expect(1, self)?;
+                        let v = self.expr(&args[0])?;
+                        let at = self.array_search(v, list.clone(), e, c, "index_or_neg", span)?;
+                        let mut pre = Vec::new();
+                        let held = self.hold(
+                            Val {
+                                node: at,
+                                ty: Ty::Int,
+                            },
+                            &mut pre,
+                            span,
+                        );
+                        let mut raise = Vec::new();
+                        self.raise_named(
+                            "ValueError",
+                            str_lit(&format!("array.{name}(x): x not in array"), span),
+                            span,
+                            &mut raise,
+                        );
+                        pre.push(TypedNode::new(
+                            TypedStatement::If(TypedIf {
+                                condition: Box::new(binary(
+                                    BinaryOp::Lt,
+                                    held.node.clone(),
+                                    int_lit(0, span),
+                                    Ty::Bool,
+                                    span,
+                                )),
+                                then_block: TypedBlock {
+                                    statements: raise,
+                                    span,
+                                },
+                                else_block: None,
+                                span,
+                            }),
+                            Type::Unknown,
+                            span,
+                        ));
+                        self.hoisted.extend(pre);
+                        if name == "index" {
+                            held.node
+                        } else {
+                            method_call(list, "remove_at", vec![held.node], e.ty(), span)
+                        }
+                    }
+                    // From an array of the typecode, or from anything
+                    // else whose items become elements; an array of
+                    // another typecode is refused as CPython refuses it.
+                    "extend" | "fromlist" => {
+                        expect(1, self)?;
+                        let other = self.expr(&args[0])?;
+                        match other.ty {
+                            Ty::List(f) if f.code().is_some() && f != e => self.raised_value(
+                                vec![list, other.node],
+                                "TypeError",
+                                "can only extend with array of same kind",
+                                Ty::None,
+                                span,
+                            ),
+                            Ty::List(_) | Ty::Tuple(_) | Ty::Object if name == "extend" => {
+                                let items = self.coerce(other, receiver.ty);
+                                call(&list_fn("extend", e), vec![list, items], Ty::None, span)
+                            }
+                            Ty::List(_) => {
+                                let items = self.coerce(other, receiver.ty);
+                                call(&list_fn("extend", e), vec![list, items], Ty::None, span)
+                            }
+                            _ if name == "fromlist" => self.raised_value(
+                                vec![list, other.node],
+                                "TypeError",
+                                "arg must be list",
+                                Ty::None,
+                                span,
+                            ),
+                            _ => {
+                                let items = Val {
+                                    node: self.iterable(other, span),
+                                    ty: Ty::List(Elem::Object),
+                                };
+                                let items = self.coerce(items, receiver.ty);
+                                call(&list_fn("extend", e), vec![list, items], Ty::None, span)
+                            }
+                        }
+                    }
+                    "reverse" => {
+                        expect(0, self)?;
+                        call(&list_fn(name, e), vec![list], ty, span)
+                    }
+                    "tolist" => {
+                        expect(0, self)?;
+                        self.coerce(
+                            Val {
+                                node: list,
+                                ty: receiver.ty,
+                            },
+                            ty,
+                        )
+                    }
+                    "tobytes" | "frombytes" | "tofile" | "fromfile" | "tounicode"
+                    | "fromunicode" | "buffer_info" | "byteswap" => {
+                        return Err(Error::unsupported_span(
+                            format!("array.{name}: bytes and files are not here yet"),
+                            span,
+                        ));
+                    }
+                    _ => {
+                        return Err(Error::unsupported_span(
+                            format!("array.{name}, which an array does not have"),
+                            span,
+                        ));
+                    }
+                };
+                Ok(Val { node, ty })
+            }
             Ty::List(e) => {
                 let list = receiver.node;
                 let node = match name {
@@ -6125,7 +6758,8 @@ impl<'m> Lowerer<'m> {
                         let v = self.expr_as_elem(&args[0], e)?;
                         call(&list_fn(name, e), vec![list, v], ty, span)
                     }
-                    "extend" => {
+                    // An array extends from a list as a list does.
+                    "extend" | "fromlist" => {
                         expect(1, self)?;
                         let other = self.expr_as(&args[0], Ty::List(e))?;
                         call(&list_fn("extend", e), vec![list, other], Ty::None, span)
@@ -6133,6 +6767,10 @@ impl<'m> Lowerer<'m> {
                     "sort" | "reverse" | "copy" => {
                         expect(0, self)?;
                         call(&list_fn(name, e), vec![list], ty, span)
+                    }
+                    "tolist" => {
+                        expect(0, self)?;
+                        call(&list_fn("copy", e), vec![list], ty, span)
                     }
                     "clear" => {
                         expect(0, self)?;
@@ -6903,6 +7541,13 @@ impl<'m> Lowerer<'m> {
                         Some(a) => {
                             let v = self.consumed(a, span)?;
                             match v.ty {
+                                // An array's elements as the numbers they
+                                // read as; the copy below is then a list.
+                                Ty::List(Elem::Array(c)) => {
+                                    let wide = Ty::List(Elem::of(c.item()));
+                                    let node = self.coerce(v, wide);
+                                    Val { node, ty: wide }
+                                }
                                 Ty::List(_) => v,
                                 // A tuple's elements as the list the
                                 // result is typed as.
@@ -8190,11 +8835,11 @@ impl<'m> Lowerer<'m> {
     /// first mentioned by a top-level `x = C(...)` and every other
     /// assignment to it, anywhere in the body, is another constructor
     /// call at the top level.
-    fn always_instances(&self, body: &[py::Stmt]) -> std::collections::HashSet<InternedString> {
+    fn always_instances(&self, body: &[py::Stmt]) -> HashSet<InternedString> {
         use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
         struct Names {
-            mentioned: std::collections::HashSet<String>,
-            stored: std::collections::HashSet<String>,
+            mentioned: HashSet<String>,
+            stored: HashSet<String>,
         }
         impl<'a> Visitor<'a> for Names {
             fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
@@ -8256,9 +8901,9 @@ impl<'m> Lowerer<'m> {
                 _ => false,
             }
         };
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut disqualified: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::default();
+        let mut candidates: HashSet<String> = HashSet::default();
+        let mut disqualified: HashSet<String> = HashSet::default();
         for s in body {
             let mut names = Names {
                 mentioned: Default::default(),
@@ -8467,6 +9112,23 @@ impl<'m> Lowerer<'m> {
                 };
                 Ok(self.guard(v, span))
             }
+            // An array's typecode and element size are its type's.
+            Ty::List(Elem::Array(c)) if matches!(attr, "typecode" | "itemsize") => {
+                let (value, ty) = if attr == "typecode" {
+                    (str_lit(c.letter(), span), Ty::Str)
+                } else {
+                    (int_lit(c.itemsize(), span), Ty::Int)
+                };
+                let evaluated = TypedNode::new(
+                    TypedStatement::Expression(Box::new(object.node)),
+                    Type::Unknown,
+                    span,
+                );
+                Ok(Val {
+                    node: Self::block_value(vec![evaluated], value, ty, span),
+                    ty,
+                })
+            }
             other => Err(Error::unsupported_span(
                 format!("attribute `{attr}` of a {other:?}"),
                 span,
@@ -8501,7 +9163,7 @@ impl<'m> Lowerer<'m> {
             locals,
             &Scope::default(),
             Vec::new(),
-            HashMap::new(),
+            HashMap::default(),
         );
         let env = var(intern("env"), Ty::List(Elem::Object), span);
         let held = Val {
@@ -8633,7 +9295,7 @@ impl<'m> Lowerer<'m> {
                 Ty::List(e) => {
                     let ty = match method {
                         "index" | "count" => Ty::Int,
-                        "copy" => Ty::List(e),
+                        "copy" | "tolist" => Ty::List(e),
                         _ => Ty::None,
                     };
                     child.method(held, method, &c.arguments.args, ty, span)?

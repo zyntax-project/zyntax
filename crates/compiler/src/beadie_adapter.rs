@@ -74,10 +74,11 @@ impl ZyntaxCraneliftBackend {
         f(&mut guard)
     }
 
-    /// The tier-1 resume points of `def`'s function, for a tier above
-    /// that made none for some of its loops: the function is compiled
-    /// again here so a frame running its loop has somewhere to go, but
-    /// its call cell is left to the code the higher tier installed.
+    /// The baseline's resume points for `def`'s function: one helper per
+    /// loop header the layout admits, for an interpreted frame to leave
+    /// through, or for a loop the optimizing tier made none for. The
+    /// function is compiled again here for its helpers alone; its call
+    /// cell is left to whatever code is installed.
     pub fn resume_points(&self, def: &ZyntaxFunctionDef) -> Vec<(u64, *mut ())> {
         let (translated, isa) = self
             .with_lock(|backend| {
@@ -175,15 +176,15 @@ impl JitBackend for ZyntaxCraneliftBackend {
                     CompileError::new(format!("cranelift produced no fn ptr for {:?}", def.id))
                 })?;
 
-            // Tier ≥ 1 may have produced OSR helpers — install them
-            // alongside the new entry pointer atomically. Returning the
-            // null sentinel suppresses the broker's own swap_compiled
-            // call so the OSR-aware swap is the only one that runs.
+            // A resume-point compile (tier ≥ 1) has produced OSR
+            // helpers: install them alongside the new entry pointer
+            // atomically. Returning the null sentinel suppresses the
+            // broker's own swap_compiled call so the OSR-aware swap is
+            // the only one that runs.
             //
-            // When a higher tier will publish its own helpers, this
-            // tier's stay unpublished: they would fill the slots first
-            // with code no better than what the loop is already running,
-            // and a frame resumed in a helper never probes again.
+            // Under hot reload the backend keeps them unpublished: the
+            // reload decides which resume points still fit the running
+            // code and publishes those itself.
             let osr_pairs = backend.take_pending_osr_helpers();
             if !osr_pairs.is_empty() && backend.publish_osr_helpers() {
                 let osr_entries: Vec<beadie::OsrEntry> = osr_pairs

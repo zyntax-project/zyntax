@@ -438,6 +438,12 @@ pub fn when(c: Expr, then: Vec<Stmt>) -> Stmt {
     if_(c, then, Vec::new())
 }
 
+/// Statements grouped as one, so a list built by iteration sits in a
+/// body written out by hand.
+pub fn block_of(stmts: Vec<Stmt>) -> Stmt {
+    typed_node(TypedStatement::Block(block(stmts)), Type::Unknown, SPAN)
+}
+
 pub fn while_(c: Expr, body: Vec<Stmt>) -> Stmt {
     typed_node(
         TypedStatement::While(TypedWhile {
@@ -484,8 +490,11 @@ fn placeholder(ret_ty: &Type) -> Option<Expr> {
         Type::Primitive(PrimitiveType::Bool) => bool(false),
         Type::Primitive(PrimitiveType::I32) => int32(0),
         Type::Primitive(PrimitiveType::F64) => float(0.0),
+        Type::Primitive(PrimitiveType::F32) => cast(float(0.0), ret_ty.clone()),
         Type::Primitive(PrimitiveType::String) => text(""),
-        Type::Primitive(_) => int(0),
+        Type::Primitive(PrimitiveType::I64) => int(0),
+        // A zero at the width the function returns.
+        Type::Primitive(_) => cast(int(0), ret_ty.clone()),
         // Boxes, lists and code addresses: a null of the type.
         other => node(TypedExpression::Literal(TypedLiteral::Null), other.clone()),
     })
@@ -507,6 +516,10 @@ fn leave_after_fatal(stmts: Vec<Stmt>, ret_ty: &Type) -> Vec<Stmt> {
             TypedStatement::While(w) => {
                 let body = std::mem::take(&mut w.body.statements);
                 w.body.statements = leave_after_fatal(body, ret_ty);
+            }
+            TypedStatement::Block(b) => {
+                let body = std::mem::take(&mut b.statements);
+                b.statements = leave_after_fatal(body, ret_ty);
             }
             _ => {}
         }
@@ -639,6 +652,11 @@ pub fn callees_of_stmt(stmt: &Stmt, out: &mut std::collections::BTreeSet<String>
         TypedStatement::While(w) => {
             callees_of_expr(&w.condition, out);
             for s in &w.body.statements {
+                callees_of_stmt(s, out);
+            }
+        }
+        TypedStatement::Block(b) => {
+            for s in &b.statements {
                 callees_of_stmt(s, out);
             }
         }

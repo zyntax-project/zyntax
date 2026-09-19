@@ -334,9 +334,6 @@ pub struct CraneliftBackend {
     inferred_extern_sigs: HashMap<HirId, (Vec<HirType>, Option<HirType>)>,
     /// Effect codegen context for algebraic effects
     effect_context: EffectCodegenContext,
-    /// Tier the next `compile_function` call should target. 0 = baseline,
-    /// 1+ = optimized. Used by OSR codegen to decide whether to emit
-    /// back-edge probes (tier 0 only) and OSR helpers (tier ≥ 1 only).
     /// Whether OSR helpers from this backend get published. See
     /// [`Self::publish_osr_helpers`].
     publish_osr_helpers: bool,
@@ -365,8 +362,11 @@ pub struct CraneliftBackend {
     /// with different state numbering.
     current_compile_id: Option<HirId>,
 
-    /// Defaults to 0; set via [`Self::set_compile_tier`] before each
-    /// `compile_function` call from the tiered runtime.
+    /// What the next `compile_function` builds: at 0 the function's
+    /// body, at 1 and up its OSR resume points as well. Every body
+    /// probes its loop headers either way. Set via
+    /// [`Self::set_compile_tier`] before each call from the tiered
+    /// runtime.
     compile_tier: usize,
     /// When `false`, tier-0 codegen skips the back-edge OSR probe and
     /// dispatch emission entirely — no arm-slot load and no
@@ -432,9 +432,15 @@ pub struct CraneliftBackend {
     /// reload cell so the compiled entry replaces the stub. See
     /// [`Self::set_lazy_functions`].
     lazy_functions: HashSet<HirId>,
-    /// Stubs emitted for lazy functions in the module being compiled,
+    /// Stubs emitted for lazy functions since the last finalisation,
     /// published into the functions' cells once finalised.
     lazy_stubs: Vec<(HirId, FuncId)>,
+    /// Lazy functions whose cell some code compiled here reads, so they
+    /// need a stub before that code runs; a stub is made when a compile
+    /// asks for it rather than for every lazy function at load.
+    wanted_stubs: Vec<HirId>,
+    /// Lazy functions that have their stub.
+    stubbed: HashSet<HirId>,
     /// The interpreter's callers into native code, one per call shape.
     interp_thunks: HashMap<crate::hir_interp::NativeSig, usize>,
     /// Code offsets of tier-0 probe sites from the most recent compile,
@@ -624,6 +630,8 @@ impl CraneliftBackend {
             only_compile_reachable: None,
             lazy_functions: HashSet::new(),
             lazy_stubs: Vec::new(),
+            wanted_stubs: Vec::new(),
+            stubbed: HashSet::new(),
             interp_thunks: HashMap::new(),
             compile_generation: HashMap::new(),
             bead_ids: HashMap::new(),
@@ -674,10 +682,9 @@ impl CraneliftBackend {
         self.compile_tier = tier;
     }
 
-    /// Whether this backend's OSR helpers should be published as resume
-    /// points. When a higher tier exists its helper is the one worth
-    /// resuming into; publishing this tier's would win the race to the
-    /// slot with code no better than what is already running.
+    /// Whether this backend's OSR helpers are published as resume points
+    /// as they are compiled. Hot reload turns this off and publishes the
+    /// ones that still fit the running code itself.
     pub fn publish_osr_helpers(&self) -> bool {
         self.publish_osr_helpers
     }
@@ -866,8 +873,9 @@ impl CraneliftBackend {
                         continue;
                     }
                 }
+                // A lazy function gets its stub when compiled code first
+                // reads its cell, not now.
                 if self.lazy_functions.contains(id) {
-                    self.compile_lazy_stub(*id, function)?;
                     continue;
                 }
                 // Skip functions that fail to compile (e.g., signature mismatches with ZRTL)
@@ -902,20 +910,11 @@ impl CraneliftBackend {
             }
         }
 
+        self.emit_wanted_stubs()?;
         // Finalize the module
         let _ = self.module.finalize_definitions();
         self.register_root_globals();
-
-        // A lazy function's cell holds its stub until its first call.
-        for (hir_id, stub) in std::mem::take(&mut self.lazy_stubs) {
-            let code_ptr = self.module.get_finalized_function(stub);
-            crate::reload::set_call_target(self.reload_key, hir_id, code_ptr as usize);
-            self.hot_reload
-                .function_pointers
-                .write()
-                .unwrap()
-                .insert(hir_id, code_ptr);
-        }
+        self.publish_stubs();
 
         // Update function pointers after finalization
         for (hir_id, compiled_func) in &self.compiled_functions {
@@ -1085,7 +1084,8 @@ impl CraneliftBackend {
     }
 
     /// The last step: install what [`Translated::compile`] produced and,
-    /// at tier one and up, emit the function's OSR helpers.
+    /// on a resume-point compile (tier one and up), emit the function's
+    /// OSR helpers.
     pub fn install_function_in_shared_module(
         &mut self,
         translated: Translated,
@@ -1511,23 +1511,69 @@ impl CraneliftBackend {
         Ok(p)
     }
 
-    fn compile_lazy_stub(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
+    /// Stubs for the lazy functions whose cells the code compiled since
+    /// the last call reads and that have neither code nor a stub yet.
+    /// Runs before finalisation, so [`Self::publish_stubs`] can put
+    /// them in their cells.
+    fn emit_wanted_stubs(&mut self) -> CompilerResult<()> {
+        let wanted = std::mem::take(&mut self.wanted_stubs);
+        for id in wanted {
+            if self.stubbed.contains(&id) || self.compiled_functions.contains_key(&id) {
+                continue;
+            }
+            if !self.function_map.contains_key(&id) {
+                continue;
+            }
+            self.compile_lazy_stub(id)?;
+        }
+        Ok(())
+    }
+
+    /// A lazy function's cell holds its stub until its first call.
+    /// After finalisation.
+    fn publish_stubs(&mut self) {
+        use cranelift_module::Module;
+        for (hir_id, stub) in std::mem::take(&mut self.lazy_stubs) {
+            let code_ptr = self.module.get_finalized_function(stub);
+            // Code installed meanwhile keeps the cell.
+            if crate::reload::call_target(self.reload_key, hir_id) == 0 {
+                crate::reload::set_call_target(self.reload_key, hir_id, code_ptr as usize);
+            }
+            self.hot_reload
+                .function_pointers
+                .write()
+                .unwrap()
+                .entry(hir_id)
+                .or_insert(code_ptr);
+        }
+    }
+
+    /// The entry of `id` as compiled callers reach it: its code, else
+    /// its stub, made now if it is a lazy function without one.
+    pub fn entry_or_stub(&mut self, id: HirId) -> Option<*const u8> {
+        if let Some(p) = self.get_function_ptr(id) {
+            return Some(p);
+        }
+        if !self.lazy_functions.contains(&id) || !self.function_map.contains_key(&id) {
+            return None;
+        }
+        if !self.stubbed.contains(&id) {
+            self.compile_lazy_stub(id).ok()?;
+            self.finalize_definitions().ok()?;
+        }
+        self.get_function_ptr(id)
+    }
+
+    fn compile_lazy_stub(&mut self, id: HirId) -> CompilerResult<()> {
         let Some(&declared) = self.function_map.get(&id) else {
             return Err(CompilerError::Backend(format!(
-                "lazy stub for an undeclared function {:?}",
-                function.name
+                "lazy stub for an undeclared function {id:?}"
             )));
         };
-        let sig = self
-            .module
-            .declarations()
-            .get_function_decl(declared)
-            .signature
-            .clone();
-        let base_name = function
-            .name
-            .resolve_global()
-            .unwrap_or_else(|| format!("{:?}", function.name));
+        let decl = self.module.declarations().get_function_decl(declared);
+        let sig = decl.signature.clone();
+        let base_name = decl.name.clone().unwrap_or_else(|| format!("{id:?}"));
+        self.stubbed.insert(id);
         let stub_id = self
             .module
             .declare_function(&format!("{base_name}__{id:?}__lazy"), Linkage::Local, &sig)
@@ -2055,20 +2101,20 @@ impl CraneliftBackend {
                 block_order
             };
 
-            // OSR pre-pass: identify loop headers in tier 0 only. Tier ≥ 1
-            // emits OSR helpers (separate functions) and skips probes.
-            // Additionally suppress when `emit_osr_probes` is false — the
-            // embedder has declared no tier ≥ 1 backend will ever install
-            // OSR helpers, so the probe stream is pure overhead.
+            // OSR pre-pass: the loop headers that get a probe. A body and
+            // its resume points alike probe, so a frame resumed in one of
+            // them still moves on when the tier above publishes. Suppressed
+            // when `emit_osr_probes` is false: the embedder has declared
+            // that nothing will ever install a helper, so the probe stream
+            // would be pure overhead.
             let phase_started = std::time::Instant::now();
-            let osr_loop_headers: std::collections::HashSet<HirId> =
-                if self.compile_tier == 0 && self.emit_osr_probes {
-                    crate::osr::find_loop_headers(function)
-                        .into_iter()
-                        .collect()
-                } else {
-                    std::collections::HashSet::new()
-                };
+            let osr_loop_headers: std::collections::HashSet<HirId> = if self.emit_osr_probes {
+                crate::osr::find_loop_headers(function)
+                    .into_iter()
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
             // Stable per-function block index (matches `osr::block_index_of`).
             let osr_block_index: HashMap<HirId, u64> = function
                 .blocks
@@ -2099,37 +2145,48 @@ impl CraneliftBackend {
                 osr_loop_headers.len().saturating_mul(function.blocks.len()) <= OSR_LAYOUT_BUDGET;
             if !within_budget && crate::osr::osr_trace_enabled() {
                 eprintln!(
-                    "[osr] skip tier-0 {}: {} headers over {} blocks exceed the layout budget",
+                    "[osr] skip probes {}: {} headers over {} blocks exceed the layout budget",
                     function.name.resolve_global().unwrap_or_default(),
                     osr_loop_headers.len(),
                     function.blocks.len()
                 );
             }
-            let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> =
-                if self.compile_tier == 0 && self.emit_osr_probes && within_budget {
-                    let dominators = crate::osr::Dominators::compute(function);
-                    osr_loop_headers
-                        .iter()
-                        .filter_map(|h| {
-                            match crate::osr::osr_layout_with(function, *h, &dominators) {
-                                Ok(layout) => Some((*h, layout)),
-                                Err(reason) => {
-                                    if crate::osr::osr_trace_enabled() {
-                                        eprintln!(
-                                            "[osr] reject tier-0 {} header_idx={}: {:?}",
-                                            function.name.resolve_global().unwrap_or_default(),
-                                            osr_block_index.get(h).copied().unwrap_or(u64::MAX),
-                                            reason
-                                        );
-                                    }
-                                    None
+            // A resume point's own header keeps the layout it was built
+            // from: that is the frame the tier above reads at that site,
+            // and the region as resumed would order the live-ins it
+            // repaired differently.
+            let own_layout = self.compile_osr_layout.clone();
+            let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> = if self.emit_osr_probes
+                && within_budget
+            {
+                let dominators = crate::osr::Dominators::compute(function);
+                osr_loop_headers
+                    .iter()
+                    .filter_map(|h| {
+                        if let Some(own) = &own_layout
+                            && own.header == *h
+                        {
+                            return Some((*h, own.clone()));
+                        }
+                        match crate::osr::osr_layout_with(function, *h, &dominators) {
+                            Ok(layout) => Some((*h, layout)),
+                            Err(reason) => {
+                                if crate::osr::osr_trace_enabled() {
+                                    eprintln!(
+                                        "[osr] reject probe {} header_idx={}: {:?}",
+                                        function.name.resolve_global().unwrap_or_default(),
+                                        osr_block_index.get(h).copied().unwrap_or(u64::MAX),
+                                        reason
+                                    );
                                 }
+                                None
                             }
-                        })
-                        .collect()
-                } else {
-                    HashMap::new()
-                };
+                        }
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            };
             if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
                 eprintln!(
                     "[clif]   osr prologue {:.2} ms ({} headers, {} layouts)",
@@ -2329,7 +2386,7 @@ impl CraneliftBackend {
             // Tier-0 entry probe: a callee that compiled code reaches
             // through its cell is counted here, and asks for promotion
             // once it is hot.
-            if self.compile_tier == 0 && self.emit_osr_probes && osr_helper.is_none() {
+            if self.emit_osr_probes && osr_helper.is_none() {
                 emit_osr_request_after_calls(
                     &mut builder,
                     &mut self.module,
@@ -2635,9 +2692,17 @@ impl CraneliftBackend {
                     let (site_key, live_in_clir, slot_types, frame, return_clir, destination) =
                         if let Some(layout) = osr_layouts.get(hir_block_id) {
                             // Collect the Cranelift value backing each live-in.
+                            // In a resume point a live-in the region repairs
+                            // lives on as the phi standing for it.
                             let mut clir_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
                             for hir_id in &layout.live_ins {
-                                if let Some(&v) = self.value_map.get(hir_id) {
+                                let read = layout
+                                    .repairs
+                                    .iter()
+                                    .find(|r| r.value == *hir_id)
+                                    .map(|r| r.phi)
+                                    .unwrap_or(*hir_id);
+                                if let Some(&v) = self.value_map.get(&read) {
                                     clir_vals.push(v);
                                 }
                             }
@@ -2661,7 +2726,7 @@ impl CraneliftBackend {
                                 )
                             } else {
                                 (
-                                    crate::osr::encode_osr_site(block_index, 0),
+                                    crate::osr::encode_osr_site(0, block_index, 0),
                                     Vec::new(),
                                     Vec::new(),
                                     empty_frame.clone(),
@@ -2672,7 +2737,7 @@ impl CraneliftBackend {
                         } else {
                             // Layout rejected → probe only, no dispatch.
                             (
-                                crate::osr::encode_osr_site(block_index, 0),
+                                crate::osr::encode_osr_site(0, block_index, 0),
                                 Vec::new(),
                                 Vec::new(),
                                 empty_frame.clone(),
@@ -2689,6 +2754,13 @@ impl CraneliftBackend {
                     // confused with a real source position.
                     let tag = crate::osr::probe_srcloc_tag(site_key);
                     builder.set_srcloc(cranelift_codegen::ir::SourceLoc::new(tag));
+                    // A resume point may find itself in the slot; it
+                    // transfers only into something else.
+                    let own = if osr_helper.is_some() {
+                        Some(self.module.declare_func_in_func(func_id, builder.func))
+                    } else {
+                        None
+                    };
                     emit_osr_back_edge_probe(
                         &mut builder,
                         &mut self.module,
@@ -2699,6 +2771,7 @@ impl CraneliftBackend {
                         &slot_types,
                         return_clir,
                         destination,
+                        own,
                     );
                     builder.set_srcloc(cranelift_codegen::ir::SourceLoc::default());
                     probe_site_tags.push((site_key, tag));
@@ -3720,6 +3793,9 @@ impl CraneliftBackend {
                                                     builder.import_signature(declared_sig);
                                                 let ptr_ty =
                                                     self.module.target_config().pointer_type();
+                                                if self.lazy_functions.contains(func_id) {
+                                                    self.wanted_stubs.push(*func_id);
+                                                }
                                                 let cell = crate::reload::call_cell_addr(
                                                     self.reload_key,
                                                     *func_id,
@@ -3772,6 +3848,9 @@ impl CraneliftBackend {
                                             && !self.external_link_names.contains_key(func_id)
                                             && self.current_compile_id != Some(*func_id)
                                         {
+                                            if self.lazy_functions.contains(func_id) {
+                                                self.wanted_stubs.push(*func_id);
+                                            }
                                             let cell = crate::reload::call_cell_addr(
                                                 self.reload_key,
                                                 *func_id,
@@ -4974,6 +5053,9 @@ impl CraneliftBackend {
                                     && !self.external_link_names.contains_key(function)
                                     && self.current_compile_id != Some(*function)
                                 {
+                                    if self.lazy_functions.contains(function) {
+                                        self.wanted_stubs.push(*function);
+                                    }
                                     let cell =
                                         crate::reload::call_cell_addr(self.reload_key, *function)
                                             as i64;
@@ -8139,6 +8221,9 @@ impl CraneliftBackend {
                                 .clone();
                             let sig_ref = builder.import_signature(sig);
                             let ptr_ty = self.module.target_config().pointer_type();
+                            if self.lazy_functions.contains(func_id) {
+                                self.wanted_stubs.push(*func_id);
+                            }
                             let cell =
                                 crate::reload::call_cell_addr(self.reload_key, *func_id) as i64;
                             let cell_v = builder.ins().iconst(ptr_ty, cell);
@@ -8167,6 +8252,9 @@ impl CraneliftBackend {
                             && !self.external_link_names.contains_key(func_id)
                             && self.current_compile_id != Some(*func_id)
                         {
+                            if self.lazy_functions.contains(func_id) {
+                                self.wanted_stubs.push(*func_id);
+                            }
                             let cell =
                                 crate::reload::call_cell_addr(self.reload_key, *func_id) as i64;
                             let cell_v = builder.ins().iconst(ptr_ty, cell);
@@ -9516,11 +9604,13 @@ impl CraneliftBackend {
     pub fn finalize_definitions(&mut self) -> CompilerResult<()> {
         use cranelift_module::Module;
 
+        self.emit_wanted_stubs()?;
         // Finalize the module
         self.module.finalize_definitions().map_err(|e| {
             CompilerError::Backend(format!("Failed to finalize definitions: {}", e))
         })?;
         self.register_root_globals();
+        self.publish_stubs();
 
         // Update function pointers after finalization. Only what this
         // finalization compiled goes into a call cell: republishing every
@@ -10264,6 +10354,7 @@ fn emit_osr_back_edge_probe(
     slot_types: &[cranelift_codegen::ir::Type],
     return_clir: Option<cranelift_codegen::ir::Type>,
     destination: Option<(cranelift_codegen::ir::Value, u32)>,
+    own: Option<cranelift_codegen::ir::FuncRef>,
 ) {
     // Helper signature: one pointer to the frame carrying the live-ins.
     // Passing them as arguments would force each to fit a register, which
@@ -10296,9 +10387,20 @@ fn emit_osr_back_edge_probe(
 
     let dispatch_block = builder.create_block();
     let post_probe_block = builder.create_block();
+    // A resume point reads the slot it may itself be published in, so it
+    // dispatches only to code that is not its own.
+    let armed = match own {
+        Some(own) => {
+            let own_addr = builder.ins().func_addr(types::I64, own);
+            let other = builder.ins().icmp(IntCC::NotEqual, helper_ptr, own_addr);
+            let present = builder.ins().icmp_imm(IntCC::NotEqual, helper_ptr, 0);
+            builder.ins().band(other, present)
+        }
+        None => helper_ptr,
+    };
     builder
         .ins()
-        .brif(helper_ptr, dispatch_block, &[], post_probe_block, &[]);
+        .brif(armed, dispatch_block, &[], post_probe_block, &[]);
 
     builder.switch_to_block(dispatch_block);
     builder.seal_block(dispatch_block);
