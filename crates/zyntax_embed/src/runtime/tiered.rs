@@ -525,51 +525,38 @@ impl TieredRuntime {
         // library it imported.
         let trace_phases = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
         let started = std::time::Instant::now();
-        // What only an error path reaches is compiled, and optimised, on
-        // its first call rather than now. Decided from the declared entry
-        // points; a host calling anything else by name reaches it through
-        // its stub. Not under hot reload, whose cells are spoken for.
-        // `ZYNTAX_DISABLE_LAZY_COLD=1` compiles everything up front.
+        // Every body is compiled, and optimised, on its call rather than
+        // now: the interpreter runs the first calls, and the warm-up
+        // thread compiles ahead of it, the program's own functions first.
+        // Decided from the declared entry points; a host calling anything
+        // else by name reaches it through its stub. Not under hot reload,
+        // whose cells are spoken for. `ZYNTAX_DISABLE_LAZY=1` compiles
+        // everything up front; safe to run with.
         let mut lazy: std::collections::HashSet<HirId> = std::collections::HashSet::new();
         // Of the lazy functions, those that came in optimised already (a
         // linked snapshot's): they need no pass of their own and are
         // compiled as they are on first call.
         let mut finished: std::collections::HashSet<HirId> = std::collections::HashSet::new();
+        let lazily = entered.is_some()
+            && !self.config.enable_hot_reload
+            && std::env::var_os("ZYNTAX_DISABLE_LAZY").is_none();
         if let Some(names) = &entered {
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             let keep = zyntax_compiler::reachable_function_ids(&module, &names);
             module.functions.retain(|id, _| keep.contains(id));
-            if !self.config.enable_hot_reload
-                && std::env::var_os("ZYNTAX_DISABLE_LAZY_COLD").is_none()
-            {
-                let entries = self.entry_names();
-                let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
-                lazy = zyntax_compiler::dce::cold_only_function_ids(&module, &entries, &keep);
-                // A library function only a direct call reaches waits
-                // for that call too: most of what a program links is
-                // never called by it. `ZYNTAX_DISABLE_LAZY_LIBRARY=1`
-                // compiles the library up front.
-                if std::env::var_os("ZYNTAX_DISABLE_LAZY_LIBRARY").is_none() {
-                    let callable =
-                        zyntax_compiler::dce::callable_only_function_ids(&module, &entries, &keep);
-                    for id in callable {
-                        if module
-                            .functions
-                            .get(&id)
-                            .is_some_and(|f| f.attributes.optimized)
-                        {
-                            lazy.insert(id);
-                            finished.insert(id);
-                        }
+            if lazily {
+                for (id, f) in module.functions.iter_mut() {
+                    if f.is_external {
+                        continue;
                     }
-                }
-                // The optimisers walk only what runs now; the rest is
-                // optimised with its first compile.
-                for id in &lazy {
-                    if let Some(f) = module.functions.get_mut(id) {
-                        f.attributes.optimized = true;
-                        f.attributes.deferred = true;
+                    lazy.insert(*id);
+                    if f.attributes.optimized {
+                        finished.insert(*id);
                     }
+                    // The optimisers walk only what runs now; the rest is
+                    // optimised with its first compile.
+                    f.attributes.optimized = true;
+                    f.attributes.deferred = true;
                 }
             }
         }
@@ -598,6 +585,18 @@ impl TieredRuntime {
         let init_boxed_constants = if let Some(names) = &mut entered {
             if zyntax_compiler::const_boxes::run_module(&mut module) > 0 {
                 names.push(zyntax_compiler::const_boxes::INIT_FUNCTION.to_owned());
+                // Made after the marking above; it runs once, interpreted.
+                if lazily {
+                    for (id, f) in module.functions.iter_mut() {
+                        if f.name.resolve_global().as_deref()
+                            == Some(zyntax_compiler::const_boxes::INIT_FUNCTION)
+                        {
+                            lazy.insert(*id);
+                            f.attributes.optimized = true;
+                            f.attributes.deferred = true;
+                        }
+                    }
+                }
                 true
             } else {
                 false
@@ -678,6 +677,7 @@ impl TieredRuntime {
                 interp.register_tick_callback(id, tick);
             }
         }
+        interp.set_body_source(self.backend.interpreter_body_source());
         let (thunk, entry, bead) = self.backend.interpreter_bridge();
         interp.set_native_bridge(thunk, entry, bead);
         drop(interp);

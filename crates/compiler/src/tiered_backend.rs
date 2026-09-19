@@ -610,10 +610,12 @@ impl TieredBackend {
 
             // The bead starts without code: interpreter calls tick it and
             // beadie publishes the already generated baseline at tier-up.
-            if self
-                .cranelift
-                .with_lock(|be| be.get_function_ptr(*func_id))
-                .is_none()
+            if !lazy.contains(func_id)
+                && !function.is_external
+                && self
+                    .cranelift
+                    .with_lock(|be| be.get_function_ptr(*func_id))
+                    .is_none()
                 && osr::osr_trace_enabled()
             {
                 eprintln!(
@@ -1828,8 +1830,9 @@ impl TieredBackend {
     pub fn get_function_pointer(&self, func_id: HirId) -> Option<*const u8> {
         self.promoted_function_pointer(func_id).or_else(|| {
             // Explicit native-pointer consumers (fibers, effects, host
-            // exports) still need an address before a bead is hot.
-            self.cranelift.with_lock(|be| be.get_function_ptr(func_id))
+            // exports) still need an address before a bead is hot: a
+            // lazy function's stub, made now if it has none.
+            self.cranelift.with_lock(|be| be.entry_or_stub(func_id))
         })
     }
 
@@ -1882,7 +1885,10 @@ impl TieredBackend {
         // Everything a compile needs, behind one count the closure
         // handed to beadie clones per call.
         struct Compile {
-            func: Arc<HirFunction>,
+            /// The body a reload swapped in; otherwise the module's,
+            /// read when a compile needs it rather than copied out per
+            /// function at load.
+            swapped: Option<Arc<HirFunction>>,
             module: Arc<HirModule>,
             cranelift: Arc<ZyntaxCraneliftBackend>,
             #[cfg(feature = "llvm-backend")]
@@ -1893,7 +1899,7 @@ impl TieredBackend {
             bead_id: u64,
         }
         let ctx = Arc::new(Compile {
-            func: entry.body(func_id),
+            swapped: entry.function.clone(),
             module: Arc::clone(&entry.module),
             cranelift: Arc::clone(&self.cranelift),
             #[cfg(feature = "llvm-backend")]
@@ -1934,12 +1940,15 @@ impl TieredBackend {
                         return p as *mut ();
                     }
                 }
-                let body = optimized_bodies
-                    .lock()
-                    .unwrap()
-                    .get(&c.func_id)
-                    .cloned()
-                    .unwrap_or_else(|| Arc::clone(&c.func));
+                let optimized = optimized_bodies.lock().unwrap().get(&c.func_id).cloned();
+                let body = match (&c.swapped, optimized) {
+                    (Some(f), _) => Arc::clone(f),
+                    (None, Some(f)) => f,
+                    (None, None) => match c.module.functions.get(&c.func_id) {
+                        Some(f) => Arc::new(f.clone()),
+                        None => return ptr::null_mut(),
+                    },
+                };
                 let entry = compile_at_tier(
                     tier,
                     bead,
@@ -1964,6 +1973,26 @@ impl TieredBackend {
         }))
     }
 
+    /// The body the interpreter runs for each function: a lazy
+    /// function's optimised body, made at this first run if its first
+    /// compile has not, so the interpreter, the baseline and the tier
+    /// above share one body and a frame can move between them.
+    /// `None` leaves the module's body to it.
+    pub fn interpreter_body_source(
+        &self,
+    ) -> Box<dyn FnMut(HirId) -> Option<Arc<HirFunction>> + Send> {
+        let beads: HashMap<HirId, u64> = self
+            .functions
+            .iter()
+            .filter(|(id, _)| self.lazy.contains(id))
+            .map(|(id, e)| (*id, e.bead_id))
+            .collect();
+        Box::new(move |id: HirId| {
+            let bead = *beads.get(&id)?;
+            osr::lazy_optimized_body(bead)
+        })
+    }
+
     /// The interpreter's bridge into native code: a thunk maker for
     /// call shapes, and the current entry of a function as compiled
     /// callers reach it (its cell, else the code compiled at load).
@@ -1986,7 +2015,7 @@ impl TieredBackend {
             if cell != 0 {
                 return Some(cell as *const u8);
             }
-            cranelift.with_lock(|be| be.get_function_ptr(id))
+            cranelift.with_lock(|be| be.entry_or_stub(id))
         });
         // With OSR off an interpreted loop stays where it is, as a
         // native one does.
@@ -2087,6 +2116,7 @@ impl TieredBackend {
             .map(|(id, e)| (e.bead_id, (*id, e.bound.clone(), Arc::clone(&e.module))))
             .collect();
         let reload_key = self.cranelift.with_lock(|be| be.reload_key());
+        let all_lazy: HashSet<HirId> = lazy.clone();
         let lazy: HashSet<HirId> = lazy.difference(finished).copied().collect();
         let ready = finished.clone();
         let finished = finished.clone();
@@ -2109,20 +2139,127 @@ impl TieredBackend {
             ),
             None => (HashMap::new(), HashSet::new()),
         };
-        // The cold bodies were left as lowered; the first cold call
-        // optimises them all together, once, and later calls take the
-        // result from here.
-        let optimized: Mutex<Option<HashMap<HirId, Arc<HirFunction>>>> = Mutex::new(None);
+        // The program's own bodies were left as lowered. Each is
+        // optimised on its own at its first compile, in one scratch copy
+        // of the module: a body optimised earlier is what a later one
+        // inlines, and what the passes know about the module as a whole
+        // is built once, since optimising a body changes none of it.
+        struct Scratch {
+            module: HirModule,
+            cache: crate::OptCache,
+        }
+        let optimized: Arc<Mutex<Option<Scratch>>> = Arc::new(Mutex::new(None));
+        let scratch_shared = Arc::clone(&optimized);
+        // The optimised body outlives the baseline compile for the tier
+        // above it; a ladder that ends at the baseline drops it then.
+        #[cfg(feature = "llvm-backend")]
+        let keeps_bodies = matches!(tier2_backend, Tier2Backend::LLVM);
+        #[cfg(not(feature = "llvm-backend"))]
+        let keeps_bodies = false;
+        // The body of a lazy function as every tier runs it: the
+        // interpreter, the baseline and the tier above compile one body,
+        // so a frame in any of them can move to the next. Made once, at
+        // the first call or the first compile, whichever comes first,
+        // and kept in `optimized_bodies` from then.
+        let optimize_body = {
+            let by_bead: HashMap<u64, (HirId, Arc<HirModule>)> = by_bead
+                .iter()
+                .map(|(bead, (id, _, module))| (*bead, (*id, Arc::clone(module))))
+                .collect();
+            let optimized_bodies = Arc::clone(&optimized_bodies);
+            let optimized = Arc::clone(&optimized);
+            let finished = finished.clone();
+            let lazy = lazy.clone();
+            let externs = externs.clone();
+            let pure_fns = pure_fns.clone();
+            move |bead_id: u64| -> Option<Arc<HirFunction>> {
+                let (func_id, module_arc) = by_bead.get(&bead_id)?;
+                if let Some(body) = optimized_bodies.lock().unwrap().get(func_id) {
+                    return Some(Arc::clone(body));
+                }
+                let body = if finished.contains(func_id) {
+                    // Optimised with its snapshot; what the module's own
+                    // pass would have done to it, done to it alone: box
+                    // readers to loads, then what those loads let move.
+                    let mut f = module_arc.functions.get(func_id)?.clone();
+                    f.attributes.deferred = false;
+                    let boxed = crate::boxes::run_function(&mut f, &externs);
+                    if boxed.expanded + boxed.made + boxed.released + boxed.shared > 0 {
+                        crate::licm::run(&mut f);
+                        crate::cse::eliminate_with(&mut f, &pure_fns);
+                    }
+                    Arc::new(f)
+                } else {
+                    if !lazy.contains(func_id) {
+                        return None;
+                    }
+                    let mut optimized = optimized.lock().unwrap();
+                    let scratch = optimized.get_or_insert_with(|| {
+                        // Every other function is marked through the
+                        // pipeline and deferred, so a pass that walks the
+                        // module touches the one being optimised alone.
+                        let mut module: HirModule = (**module_arc).clone();
+                        for f in module.functions.values_mut() {
+                            f.attributes.optimized = true;
+                            f.attributes.deferred = true;
+                        }
+                        let cache = crate::OptCache::build(&module);
+                        Scratch { module, cache }
+                    });
+                    let f = scratch.module.functions.get_mut(func_id)?;
+                    f.attributes.optimized = false;
+                    f.attributes.deferred = false;
+                    crate::run_interp_safe_opts_cached(&mut scratch.module, &scratch.cache);
+                    let f = scratch.module.functions.get_mut(func_id)?;
+                    f.attributes.optimized = true;
+                    f.attributes.deferred = true;
+                    let mut body = f.clone();
+                    body.attributes.deferred = false;
+                    Arc::new(body)
+                };
+                // Another thread may have made it meanwhile; the first
+                // one in stays, so every tier reads the same body.
+                Some(Arc::clone(
+                    optimized_bodies
+                        .lock()
+                        .unwrap()
+                        .entry(*func_id)
+                        .or_insert(body),
+                ))
+            }
+        };
+        let optimize_body: Arc<dyn Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync> =
+            Arc::new(optimize_body);
+        // The interpreter asks for a body before its first run of it.
+        osr::set_lazy_optimizer({
+            let optimize_body = Arc::clone(&optimize_body);
+            move |bead_id| optimize_body(bead_id)
+        });
         // What compiling a function on its first call does, once off the
         // caller's stack.
         let compile_lazy_function = move |bead_id: u64| -> *const u8 {
+            let trace = std::env::var_os("ZYNTAX_TRACE_LAZY").is_some();
             {
                 let (table, published) = &*done;
                 let mut table = table.lock().unwrap();
+                let waited = std::time::Instant::now();
+                let mut did_wait = false;
                 loop {
                     match table.get(&bead_id) {
-                        Some(Some(entry)) => return *entry as *const u8,
-                        Some(None) => table = published.wait(table).unwrap(),
+                        Some(Some(entry)) => {
+                            if trace && did_wait {
+                                eprintln!(
+                                    "[lazy] {} waited {:.2} ms for bead {bead_id}",
+                                    std::thread::current().name().unwrap_or("?"),
+                                    waited.elapsed().as_secs_f64() * 1e3
+                                );
+                            }
+                            return *entry as *const u8;
+                        }
+                        Some(None) => {
+                            did_wait = true;
+                            table = published.wait(table).unwrap();
+                        }
                         None => {
                             table.insert(bead_id, None);
                             break;
@@ -2147,51 +2284,10 @@ impl TieredBackend {
                 return publish(0);
             };
             let lazy_started = std::time::Instant::now();
-            let body = if finished.contains(func_id) {
-                // Optimised with its snapshot; what the module's own pass
-                // would have done to it, done to it alone: box readers
-                // to loads, then what those loads let move.
-                match module_arc.functions.get(func_id) {
-                    Some(f) => {
-                        let mut f = f.clone();
-                        f.attributes.deferred = false;
-                        let boxed = crate::boxes::run_function(&mut f, &externs);
-                        if boxed.expanded + boxed.made + boxed.released + boxed.shared > 0 {
-                            crate::licm::run(&mut f);
-                            crate::cse::eliminate_with(&mut f, &pure_fns);
-                        }
-                        Arc::new(f)
-                    }
-                    None => return publish(0),
-                }
-            } else {
-                let mut optimized = optimized.lock().unwrap();
-                let bodies = optimized.get_or_insert_with(|| {
-                    let mut scratch: HirModule = (**module_arc).clone();
-                    for (id, f) in scratch.functions.iter_mut() {
-                        f.attributes.optimized = !lazy.contains(id);
-                        if lazy.contains(id) {
-                            f.attributes.deferred = false;
-                        }
-                    }
-                    crate::run_interp_safe_opts(&mut scratch);
-                    scratch
-                        .functions
-                        .into_iter()
-                        .filter(|(id, _)| lazy.contains(id))
-                        .map(|(id, f)| (id, Arc::new(f)))
-                        .collect()
-                });
-                match bodies.get(func_id) {
-                    Some(b) => Arc::clone(b),
-                    None => return publish(0),
-                }
+            let Some(body) = optimize_body(bead_id) else {
+                return publish(0);
             };
             let body_at = lazy_started.elapsed();
-            optimized_bodies
-                .lock()
-                .unwrap()
-                .insert(*func_id, Arc::clone(&body));
             let entry = compile_at_tier(
                 0,
                 bound.bead(),
@@ -2211,57 +2307,71 @@ impl TieredBackend {
             }
             crate::reload::set_call_target(reload_key, *func_id, entry as usize);
             bound.bead().eager_install(entry);
+            if !keeps_bodies {
+                optimized_bodies.lock().unwrap().remove(func_id);
+            }
             publish(entry as usize);
             // `ZYNTAX_TRACE_LAZY=1` names each first-call compile with
-            // the time it took, the wait for the backend included.
-            if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+            // the time it took, the wait for the backend included, and
+            // the thread that did it.
+            if trace {
                 eprintln!(
-                    "[lazy] compiled {} in {:.2} ms (body {:.2}, compile {:.2})",
+                    "[lazy] compiled {} in {:.2} ms (body {:.2}, compile {:.2}) on {}",
                     body.name.resolve_global().unwrap_or_default(),
                     lazy_started.elapsed().as_secs_f64() * 1e3,
                     body_at.as_secs_f64() * 1e3,
-                    (compiled_at - body_at).as_secs_f64() * 1e3
+                    (compiled_at - body_at).as_secs_f64() * 1e3,
+                    std::thread::current().name().unwrap_or("?")
                 );
             }
             entry as *const u8
         };
         let compile_lazy_function = Arc::new(compile_lazy_function);
-        // First calls waiting to compile. The warm-up thread stands
-        // aside while there is one, or it would take the lock back
-        // after every compile and the call would wait through them all.
-        let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        // The library functions the program reaches are compiled ahead
-        // of their first call on a thread of their own, nearest the
-        // program first; a call arriving first compiles its own and a
-        // call arriving during one waits for it. `ZYNTAX_DISABLE_WARM_UP=1`
-        // leaves every first call to compile its function; safe to run
-        // with.
+        // The functions left for their call are compiled ahead of it on
+        // a thread of their own, in the order the program is likely to
+        // call them; a call arriving first compiles its own and a call
+        // arriving during one waits for it. The thread does not stand
+        // aside for a first call: what it is compiling is what the
+        // program calls next, and the backend is held only to translate
+        // and install, not through Cranelift's own compile.
+        // `ZYNTAX_DISABLE_WARM_UP=1` leaves every first call to compile
+        // its function; safe to run with.
         if std::env::var_os("ZYNTAX_DISABLE_WARM_UP").is_none() {
             let order: Vec<u64> = match self.functions.values().next() {
-                Some(e) => warm_up_order(&e.module, &ready)
-                    .into_iter()
-                    .filter_map(|id| self.functions.get(&id).map(|e| e.bead_id))
-                    .collect(),
+                Some(e) => {
+                    let ids = warm_up_order(&e.module, &all_lazy, &ready);
+                    if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                        let names: Vec<String> = ids
+                            .iter()
+                            .filter_map(|id| e.module.functions.get(id))
+                            .map(|f| f.name.resolve_global().unwrap_or_default())
+                            .collect();
+                        eprintln!("[lazy] warm-up order: {}", names.join(" "));
+                    }
+                    ids.into_iter()
+                        .filter_map(|id| self.functions.get(&id).map(|e| e.bead_id))
+                        .collect()
+                }
                 None => Vec::new(),
             };
             if !order.is_empty() {
                 let compile = Arc::clone(&compile_lazy_function);
                 let stop = Arc::clone(&self.warm_up_stop);
-                let waiting = Arc::clone(&waiting);
                 self.warm_up = std::thread::Builder::new()
                     .name("zyntax-warm-up".into())
                     .stack_size(16 << 20)
                     .spawn(move || {
                         for bead_id in order {
-                            while waiting.load(std::sync::atomic::Ordering::Acquire) > 0 {
-                                std::thread::yield_now();
-                            }
                             if stop.load(std::sync::atomic::Ordering::Acquire) {
-                                break;
+                                return;
                             }
                             compile(bead_id);
                         }
+                        // Every lazy function has its code: the scratch
+                        // module the program's own were optimised in
+                        // is done with.
+                        scratch_shared.lock().unwrap().take();
                     })
                     .ok();
             }
@@ -2271,17 +2381,14 @@ impl TieredBackend {
         // which may be a fiber's, far too small for a compile. The
         // compile runs on a thread with room and the caller waits.
         osr::set_lazy_compiler(move |bead_id| {
-            waiting.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let entry = std::thread::scope(|scope| {
+            std::thread::scope(|scope| {
                 std::thread::Builder::new()
                     .name("zyntax-first-call-compile".into())
                     .stack_size(16 << 20)
                     .spawn_scoped(scope, || compile_lazy_function(bead_id) as usize)
                     .map(|handle| handle.join().unwrap_or(0))
                     .unwrap_or(0) as *const u8
-            });
-            waiting.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            entry
+            })
         });
     }
 
@@ -2387,6 +2494,18 @@ impl TieredBackend {
             if !optimizing {
                 return true;
             }
+            // The tier above compiles the body the baseline was optimised
+            // from, which a first-call compile just made when the request
+            // came from the interpreter.
+            let func_arc = match swapped {
+                Some(_) => func_arc,
+                None => optimized_bodies
+                    .lock()
+                    .unwrap()
+                    .get(&func_id)
+                    .cloned()
+                    .unwrap_or(func_arc),
+            };
             #[cfg(feature = "llvm-backend")]
             if !crate::abi::llvm_entry_abi_supported(&func_arc, false) {
                 if osr::osr_trace_enabled() {
@@ -2543,6 +2662,7 @@ impl TieredBackend {
         // before the LLVM context; the adapter then joins promotion workers.
         osr::set_promotion_requester(|_, _| false);
         osr::set_lazy_compiler(|_| ptr::null());
+        osr::set_lazy_optimizer(|_| None);
         self.warm_up_stop
             .store(true, std::sync::atomic::Ordering::Release);
         if let Some(handle) = self.warm_up.take() {
@@ -2647,10 +2767,14 @@ impl Drop for TieredBackend {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The functions of `ready` in the order the program is likely to call
-/// them: what its own functions call first, then what those call, and
-/// so on through `ready`.
-fn warm_up_order(module: &HirModule, ready: &HashSet<HirId>) -> Vec<HirId> {
+/// The functions of `lazy` in the order the program is likely to call
+/// them: breadth first over direct calls from the program's own
+/// functions nothing calls (its entry points), then whatever that walk
+/// missed, the program's own before `ready`, the ones that arrived
+/// optimised.
+fn warm_up_order(module: &HirModule, lazy: &HashSet<HirId>, ready: &HashSet<HirId>) -> Vec<HirId> {
+    // A function whose address a body takes is called from it too, by
+    // whatever the address is handed to.
     let callees = |id: &HirId| -> Vec<HirId> {
         let Some(f) = module.functions.get(id) else {
             return Vec::new();
@@ -2661,9 +2785,12 @@ fn warm_up_order(module: &HirModule, ready: &HashSet<HirId>) -> Vec<HirId> {
             .flat_map(|b| b.instructions.iter())
             .filter_map(|inst| match inst {
                 crate::hir::HirInstruction::Call {
-                    callee: crate::hir::HirCallable::Function(target),
+                    callee:
+                        crate::hir::HirCallable::Function(target)
+                        | crate::hir::HirCallable::FuncRef(target),
                     ..
                 } => Some(*target),
+                crate::hir::HirInstruction::CreateClosure { function, .. } => Some(*function),
                 _ => None,
             })
             .collect();
@@ -2671,27 +2798,59 @@ fn warm_up_order(module: &HirModule, ready: &HashSet<HirId>) -> Vec<HirId> {
         out.dedup();
         out
     };
+    let mut called: HashSet<HirId> = HashSet::new();
+    for id in module.functions.keys() {
+        called.extend(callees(id));
+    }
     let mut order: Vec<HirId> = Vec::new();
     let mut seen: HashSet<HirId> = HashSet::new();
-    let mut frontier: Vec<HirId> = module
+    // Roots: the program's own functions nothing calls. The one that
+    // reaches the most comes first, and everything it reaches before
+    // the next root: an entry point ahead of the hooks a table holds.
+    let mut roots: Vec<HirId> = module
         .functions
         .keys()
-        .filter(|id| !ready.contains(id))
+        .filter(|id| lazy.contains(id) && !ready.contains(id) && !called.contains(id))
         .copied()
         .collect();
-    frontier.sort();
-    while !frontier.is_empty() {
-        let mut next = Vec::new();
-        for id in frontier {
-            for c in callees(&id) {
-                if ready.contains(&c) && seen.insert(c) {
-                    order.push(c);
-                    next.push(c);
+    roots.sort_by_key(|id| (std::cmp::Reverse(callees(id).len()), *id));
+    // The program's own functions before the library's it calls: a
+    // library function compiles in a fraction of the time and the
+    // interpreter runs it well meanwhile; the program's carry the
+    // loops the run is waiting on.
+    let mut library: Vec<HirId> = Vec::new();
+    for root in roots {
+        if !seen.insert(root) {
+            continue;
+        }
+        order.push(root);
+        let mut frontier = vec![root];
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for id in frontier {
+                for c in callees(&id) {
+                    if lazy.contains(&c) && seen.insert(c) {
+                        if ready.contains(&c) {
+                            library.push(c);
+                        } else {
+                            order.push(c);
+                        }
+                        next.push(c);
+                    }
                 }
             }
+            frontier = next;
         }
-        frontier = next;
     }
+    order.extend(library);
+    let mut rest: Vec<HirId> = module
+        .functions
+        .keys()
+        .filter(|id| lazy.contains(id) && !seen.contains(id))
+        .copied()
+        .collect();
+    rest.sort_by_key(|id| (ready.contains(id), *id));
+    order.extend(rest);
     order
 }
 

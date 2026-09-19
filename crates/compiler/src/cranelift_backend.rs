@@ -432,9 +432,15 @@ pub struct CraneliftBackend {
     /// reload cell so the compiled entry replaces the stub. See
     /// [`Self::set_lazy_functions`].
     lazy_functions: HashSet<HirId>,
-    /// Stubs emitted for lazy functions in the module being compiled,
+    /// Stubs emitted for lazy functions since the last finalisation,
     /// published into the functions' cells once finalised.
     lazy_stubs: Vec<(HirId, FuncId)>,
+    /// Lazy functions whose cell some code compiled here reads, so they
+    /// need a stub before that code runs; a stub is made when a compile
+    /// asks for it rather than for every lazy function at load.
+    wanted_stubs: Vec<HirId>,
+    /// Lazy functions that have their stub.
+    stubbed: HashSet<HirId>,
     /// The interpreter's callers into native code, one per call shape.
     interp_thunks: HashMap<crate::hir_interp::NativeSig, usize>,
     /// Code offsets of tier-0 probe sites from the most recent compile,
@@ -624,6 +630,8 @@ impl CraneliftBackend {
             only_compile_reachable: None,
             lazy_functions: HashSet::new(),
             lazy_stubs: Vec::new(),
+            wanted_stubs: Vec::new(),
+            stubbed: HashSet::new(),
             interp_thunks: HashMap::new(),
             compile_generation: HashMap::new(),
             bead_ids: HashMap::new(),
@@ -865,8 +873,9 @@ impl CraneliftBackend {
                         continue;
                     }
                 }
+                // A lazy function gets its stub when compiled code first
+                // reads its cell, not now.
                 if self.lazy_functions.contains(id) {
-                    self.compile_lazy_stub(*id, function)?;
                     continue;
                 }
                 // Skip functions that fail to compile (e.g., signature mismatches with ZRTL)
@@ -901,20 +910,11 @@ impl CraneliftBackend {
             }
         }
 
+        self.emit_wanted_stubs()?;
         // Finalize the module
         let _ = self.module.finalize_definitions();
         self.register_root_globals();
-
-        // A lazy function's cell holds its stub until its first call.
-        for (hir_id, stub) in std::mem::take(&mut self.lazy_stubs) {
-            let code_ptr = self.module.get_finalized_function(stub);
-            crate::reload::set_call_target(self.reload_key, hir_id, code_ptr as usize);
-            self.hot_reload
-                .function_pointers
-                .write()
-                .unwrap()
-                .insert(hir_id, code_ptr);
-        }
+        self.publish_stubs();
 
         // Update function pointers after finalization
         for (hir_id, compiled_func) in &self.compiled_functions {
@@ -1511,23 +1511,69 @@ impl CraneliftBackend {
         Ok(p)
     }
 
-    fn compile_lazy_stub(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
+    /// Stubs for the lazy functions whose cells the code compiled since
+    /// the last call reads and that have neither code nor a stub yet.
+    /// Runs before finalisation, so [`Self::publish_stubs`] can put
+    /// them in their cells.
+    fn emit_wanted_stubs(&mut self) -> CompilerResult<()> {
+        let wanted = std::mem::take(&mut self.wanted_stubs);
+        for id in wanted {
+            if self.stubbed.contains(&id) || self.compiled_functions.contains_key(&id) {
+                continue;
+            }
+            if !self.function_map.contains_key(&id) {
+                continue;
+            }
+            self.compile_lazy_stub(id)?;
+        }
+        Ok(())
+    }
+
+    /// A lazy function's cell holds its stub until its first call.
+    /// After finalisation.
+    fn publish_stubs(&mut self) {
+        use cranelift_module::Module;
+        for (hir_id, stub) in std::mem::take(&mut self.lazy_stubs) {
+            let code_ptr = self.module.get_finalized_function(stub);
+            // Code installed meanwhile keeps the cell.
+            if crate::reload::call_target(self.reload_key, hir_id) == 0 {
+                crate::reload::set_call_target(self.reload_key, hir_id, code_ptr as usize);
+            }
+            self.hot_reload
+                .function_pointers
+                .write()
+                .unwrap()
+                .entry(hir_id)
+                .or_insert(code_ptr);
+        }
+    }
+
+    /// The entry of `id` as compiled callers reach it: its code, else
+    /// its stub, made now if it is a lazy function without one.
+    pub fn entry_or_stub(&mut self, id: HirId) -> Option<*const u8> {
+        if let Some(p) = self.get_function_ptr(id) {
+            return Some(p);
+        }
+        if !self.lazy_functions.contains(&id) || !self.function_map.contains_key(&id) {
+            return None;
+        }
+        if !self.stubbed.contains(&id) {
+            self.compile_lazy_stub(id).ok()?;
+            self.finalize_definitions().ok()?;
+        }
+        self.get_function_ptr(id)
+    }
+
+    fn compile_lazy_stub(&mut self, id: HirId) -> CompilerResult<()> {
         let Some(&declared) = self.function_map.get(&id) else {
             return Err(CompilerError::Backend(format!(
-                "lazy stub for an undeclared function {:?}",
-                function.name
+                "lazy stub for an undeclared function {id:?}"
             )));
         };
-        let sig = self
-            .module
-            .declarations()
-            .get_function_decl(declared)
-            .signature
-            .clone();
-        let base_name = function
-            .name
-            .resolve_global()
-            .unwrap_or_else(|| format!("{:?}", function.name));
+        let decl = self.module.declarations().get_function_decl(declared);
+        let sig = decl.signature.clone();
+        let base_name = decl.name.clone().unwrap_or_else(|| format!("{id:?}"));
+        self.stubbed.insert(id);
         let stub_id = self
             .module
             .declare_function(&format!("{base_name}__{id:?}__lazy"), Linkage::Local, &sig)
@@ -2662,7 +2708,7 @@ impl CraneliftBackend {
                                 )
                             } else {
                                 (
-                                    crate::osr::encode_osr_site(block_index, 0),
+                                    crate::osr::encode_osr_site(0, block_index, 0),
                                     Vec::new(),
                                     Vec::new(),
                                     empty_frame.clone(),
@@ -2673,7 +2719,7 @@ impl CraneliftBackend {
                         } else {
                             // Layout rejected → probe only, no dispatch.
                             (
-                                crate::osr::encode_osr_site(block_index, 0),
+                                crate::osr::encode_osr_site(0, block_index, 0),
                                 Vec::new(),
                                 Vec::new(),
                                 empty_frame.clone(),
@@ -3729,6 +3775,9 @@ impl CraneliftBackend {
                                                     builder.import_signature(declared_sig);
                                                 let ptr_ty =
                                                     self.module.target_config().pointer_type();
+                                                if self.lazy_functions.contains(func_id) {
+                                                    self.wanted_stubs.push(*func_id);
+                                                }
                                                 let cell = crate::reload::call_cell_addr(
                                                     self.reload_key,
                                                     *func_id,
@@ -3781,6 +3830,9 @@ impl CraneliftBackend {
                                             && !self.external_link_names.contains_key(func_id)
                                             && self.current_compile_id != Some(*func_id)
                                         {
+                                            if self.lazy_functions.contains(func_id) {
+                                                self.wanted_stubs.push(*func_id);
+                                            }
                                             let cell = crate::reload::call_cell_addr(
                                                 self.reload_key,
                                                 *func_id,
@@ -4971,6 +5023,9 @@ impl CraneliftBackend {
                                     && !self.external_link_names.contains_key(function)
                                     && self.current_compile_id != Some(*function)
                                 {
+                                    if self.lazy_functions.contains(function) {
+                                        self.wanted_stubs.push(*function);
+                                    }
                                     let cell =
                                         crate::reload::call_cell_addr(self.reload_key, *function)
                                             as i64;
@@ -8136,6 +8191,9 @@ impl CraneliftBackend {
                                 .clone();
                             let sig_ref = builder.import_signature(sig);
                             let ptr_ty = self.module.target_config().pointer_type();
+                            if self.lazy_functions.contains(func_id) {
+                                self.wanted_stubs.push(*func_id);
+                            }
                             let cell =
                                 crate::reload::call_cell_addr(self.reload_key, *func_id) as i64;
                             let cell_v = builder.ins().iconst(ptr_ty, cell);
@@ -8164,6 +8222,9 @@ impl CraneliftBackend {
                             && !self.external_link_names.contains_key(func_id)
                             && self.current_compile_id != Some(*func_id)
                         {
+                            if self.lazy_functions.contains(func_id) {
+                                self.wanted_stubs.push(*func_id);
+                            }
                             let cell =
                                 crate::reload::call_cell_addr(self.reload_key, *func_id) as i64;
                             let cell_v = builder.ins().iconst(ptr_ty, cell);
@@ -9513,11 +9574,13 @@ impl CraneliftBackend {
     pub fn finalize_definitions(&mut self) -> CompilerResult<()> {
         use cranelift_module::Module;
 
+        self.emit_wanted_stubs()?;
         // Finalize the module
         self.module.finalize_definitions().map_err(|e| {
             CompilerError::Backend(format!("Failed to finalize definitions: {}", e))
         })?;
         self.register_root_globals();
+        self.publish_stubs();
 
         // Update function pointers after finalization. Only what this
         // finalization compiled goes into a call cell: republishing every

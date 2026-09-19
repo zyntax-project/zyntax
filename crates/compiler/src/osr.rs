@@ -64,22 +64,44 @@ use crate::hir::{HirFunction, HirId, HirTerminator, HirType};
 /// everything computed before the resume point has to arrive with it.
 pub const OSR_MAX_LIVE_INS: usize = 128;
 
-/// Pack `(loop_ordinal, live_in_count)` into a 64-bit site key.
+/// Pack `(body_tag, loop_ordinal, live_in_count)` into a 64-bit site
+/// key: the tag in the top 16 bits, the ordinal in the 32 below, the
+/// count in the low 16.
 ///
 /// `loop_ordinal` is the 0-based position of the header among the
-/// `HirFunction.blocks`. `live_in_count` must fit in 16 bits; in practice
-/// it's ≤ [`OSR_MAX_LIVE_INS`].
+/// function's loop headers. `live_in_count` must fit in 16 bits; in
+/// practice it's ≤ [`OSR_MAX_LIVE_INS`]. `body_tag` names the shape of
+/// the body the layout was taken from (see [`body_tag`]): a function
+/// has one body the interpreter runs and another its compiled tiers
+/// were optimised from, and a resume point made for one is entered
+/// only by frames running that one.
 #[inline]
-pub fn encode_osr_site(loop_ordinal: u64, live_in_count: u16) -> u64 {
-    (loop_ordinal << 16) | (live_in_count as u64)
+pub fn encode_osr_site(body_tag: u16, loop_ordinal: u64, live_in_count: u16) -> u64 {
+    ((body_tag as u64) << 48) | ((loop_ordinal & 0xFFFF_FFFF) << 16) | (live_in_count as u64)
 }
 
-/// Unpack a site key. Returns `(loop_ordinal, live_in_count)`.
+/// Unpack a site key. Returns `(body_tag, loop_ordinal, live_in_count)`.
 #[inline]
-pub fn decode_osr_site(site: u64) -> (u64, u16) {
-    let loop_ordinal = site >> 16;
+pub fn decode_osr_site(site: u64) -> (u16, u64, u16) {
+    let body_tag = (site >> 48) as u16;
+    let loop_ordinal = (site >> 16) & 0xFFFF_FFFF;
     let live_in_count = (site & 0xFFFF) as u16;
-    (loop_ordinal, live_in_count)
+    (body_tag, loop_ordinal, live_in_count)
+}
+
+/// A number that tells one shape of a function's body from another:
+/// the same source lowered and then optimised has other instruction
+/// and value counts. Two bodies with equal tags are taken to be the
+/// same body.
+pub fn body_tag(function: &HirFunction) -> u16 {
+    let insts: usize = function.blocks.values().map(|b| b.instructions.len()).sum();
+    let phis: usize = function.blocks.values().map(|b| b.phis.len()).sum();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for x in [function.blocks.len(), insts, phis, function.values.len()] {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    (h ^ (h >> 32) ^ (h >> 16)) as u16
 }
 
 /// Block-index lookup: returns the 0-based position of `block_id` inside
@@ -361,6 +383,8 @@ pub struct OsrLayout {
     /// Position of `header` among the function's loop headers — the
     /// stable half of the site key.
     pub loop_ordinal: u64,
+    /// The shape of the body the layout was taken from; see [`body_tag`].
+    pub body_tag: u16,
     pub live_ins: Vec<HirId>,
     pub live_in_types: Vec<HirType>,
     /// Number of leading entries in `live_ins` that are phi results at
@@ -410,7 +434,7 @@ impl OsrLayout {
 impl OsrLayout {
     /// Encoded site key for this layout — see [`encode_osr_site`].
     pub fn site_key(&self) -> u64 {
-        encode_osr_site(self.loop_ordinal, self.live_ins.len() as u16)
+        encode_osr_site(self.body_tag, self.loop_ordinal, self.live_ins.len() as u16)
     }
 }
 
@@ -731,6 +755,7 @@ pub fn osr_layout_with(
     Ok(OsrLayout {
         header,
         loop_ordinal,
+        body_tag: body_tag(function),
         live_ins,
         live_in_types,
         phi_count,
@@ -1088,15 +1113,16 @@ mod tests {
     #[test]
     fn site_key_roundtrips() {
         let cases = [
-            (0u64, 0u16),
-            (1, 1),
-            (42, 4),
-            (0xFFFF, 4),
-            (0xFFFF_FFFF_FFFF, 3),
+            (0u16, 0u64, 0u16),
+            (1, 1, 1),
+            (7, 42, 4),
+            (0xFFFF, 0xFFFF, 4),
+            (0xABCD, 0xFFFF_FFFF, 3),
         ];
-        for (block_idx, count) in cases {
-            let site = encode_osr_site(block_idx, count);
-            let (b, c) = decode_osr_site(site);
+        for (tag, block_idx, count) in cases {
+            let site = encode_osr_site(tag, block_idx, count);
+            let (t, b, c) = decode_osr_site(site);
+            assert_eq!(t, tag);
             assert_eq!(b, block_idx);
             assert_eq!(c, count);
         }
@@ -1652,6 +1678,28 @@ fn lazy_compiler() -> &'static RwLock<Option<LazyCompiler>> {
 /// Register how a function left uncompiled is compiled on its first call.
 pub fn set_lazy_compiler(f: impl Fn(u64) -> *const u8 + Send + Sync + 'static) {
     *lazy_compiler().write().unwrap() = Some(Box::new(f));
+}
+
+/// Installed by the runtime: the body of the function behind a bead as
+/// every tier runs it, optimised now if it was not yet.
+type LazyOptimizer = Box<dyn Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync>;
+
+fn lazy_optimizer() -> &'static RwLock<Option<LazyOptimizer>> {
+    static R: OnceLock<RwLock<Option<LazyOptimizer>>> = OnceLock::new();
+    R.get_or_init(|| RwLock::new(None))
+}
+
+/// Register how a lazy function's body is optimised ahead of its run.
+pub fn set_lazy_optimizer(f: impl Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync + 'static) {
+    *lazy_optimizer().write().unwrap() = Some(Box::new(f));
+}
+
+/// The body every tier of the function behind `bead_id` runs, or
+/// `None` when the function is not one left for its call: the
+/// interpreter then runs the module's.
+pub fn lazy_optimized_body(bead_id: u64) -> Option<Arc<HirFunction>> {
+    let guard = lazy_optimizer().read().unwrap();
+    guard.as_ref().and_then(|f| f(bead_id))
 }
 
 /// Called by a stub on the first call of the function it stands for.

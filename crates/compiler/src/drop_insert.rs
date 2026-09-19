@@ -143,23 +143,36 @@ impl DropStats {
 
 /// Run the drop-site pass over every function in `module`.
 pub fn run_module(module: &mut HirModule) -> DropStats {
-    let mut total = DropStats::default();
     let t0 = web_time::Instant::now();
     let facts = ModuleFacts::build(module);
-    let tprof = std::env::var_os("ZYNTAX_TRACE_DROP_TIME").is_some();
-    if tprof {
+    if std::env::var_os("ZYNTAX_TRACE_DROP_TIME").is_some() {
         eprintln!(
             "[drop-time] facts {:.2} ms",
             t0.elapsed().as_secs_f64() * 1000.0
         );
     }
+    run_module_with(module, &facts)
+}
+
+/// What the pass knows about every function of `module`, for
+/// [`run_module_with`]. The facts are about what a call returns and
+/// keeps, which optimising a body does not change, so a module whose
+/// functions are optimised one at a time builds them once.
+pub fn facts_of(module: &HirModule) -> ModuleFacts {
+    ModuleFacts::build(module)
+}
+
+/// [`run_module`] with the facts already built.
+pub fn run_module_with(module: &mut HirModule, facts: &ModuleFacts) -> DropStats {
+    let mut total = DropStats::default();
+    let tprof = std::env::var_os("ZYNTAX_TRACE_DROP_TIME").is_some();
     let mut times: Vec<(f64, String)> = Vec::new();
     for func in module.functions_to_optimize() {
         if func.is_external {
             continue;
         }
         let t = web_time::Instant::now();
-        total.combine(run_function(func, &facts));
+        total.combine(run_function(func, facts));
         if tprof {
             times.push((
                 t.elapsed().as_secs_f64() * 1000.0,
@@ -178,7 +191,7 @@ pub fn run_module(module: &mut HirModule) -> DropStats {
 
 /// What this pass knows about the other functions in the module.
 #[derive(Default)]
-struct ModuleFacts {
+pub struct ModuleFacts {
     /// See [`automatic_release_for`].
     automatic_release: bool,
     returns_owned: std::collections::HashSet<HirId>,
@@ -359,12 +372,15 @@ impl ModuleFacts {
             if changed.is_empty() {
                 break;
             }
-            dirty = callees
+            dirty = changed
                 .iter()
-                .filter(|(_, called)| called.iter().any(|c| changed.contains(c)))
-                .map(|(key, _)| *key)
+                .filter_map(|c| callers.get(c))
+                .flatten()
+                .copied()
                 .filter(|key| module.functions.get(key).is_some_and(|f| !f.is_external))
                 .collect();
+            dirty.sort();
+            dirty.dedup();
         }
         if tprof {
             eprintln!(
