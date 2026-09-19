@@ -69,8 +69,10 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicIsize, AtomicUsize};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
-/// Largest request served from a pool. Above this, libc.
-const MAX_POOLED: usize = 1024;
+/// Largest request served from a pool. Above this, libc. Two kilobytes
+/// keeps a hash table of 64 slots and a list buffer of 256 words in
+/// the pool, where a release is a push and the collector can see them.
+const MAX_POOLED: usize = 2048;
 
 /// Size classes step by this, so class `i` holds `(i + 1) * STEP`
 /// payload bytes.

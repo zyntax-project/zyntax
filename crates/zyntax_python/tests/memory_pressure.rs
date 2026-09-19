@@ -30,10 +30,13 @@ use std::process::{Command, Stdio};
 
 /// Steps for the short and the long run.
 const SMALL: u64 = 2_000;
-const LARGE: u64 = 200_000;
-/// Growth a bounded program is allowed between the two, for the slabs
-/// its allocator takes and the noise of the process.
-const ALLOWED_GROWTH: u64 = 3 << 20;
+const LARGE: u64 = 400_000;
+/// Growth a bounded program is allowed between the two: the slabs its
+/// allocator takes, the code the long run compiles that the short one
+/// interprets, and the bodies kept for later tiers, all of which stop
+/// growing once the program is warm. A leak of one small block a step
+/// is twice this over the long run.
+const ALLOWED_GROWTH: u64 = 5 << 20;
 /// The collector's heap floor for the runs, in KB.
 const HEAP_FLOOR_KB: u64 = 512;
 
@@ -71,6 +74,10 @@ fn run(program: &Path, steps: u64) -> (i32, u64) {
         .arg(program)
         .arg(steps.to_string())
         .env("ZYNTAX_GC_FLOOR_KB", HEAP_FLOOR_KB.to_string())
+        // The long run promotes what the short one leaves at the
+        // baseline, and each tier's code is memory the program's heap
+        // is not; the tiers stay where they start.
+        .env("ZYNTAX_DISABLE_OSR", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()

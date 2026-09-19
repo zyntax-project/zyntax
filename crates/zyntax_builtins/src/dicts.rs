@@ -1032,19 +1032,19 @@ pub(crate) fn set_contains_by(
                 vec![at(s.e(), int(0))],
                 ints.clone(),
             )),
-            mask.decl(sub(div(len(index.e()), int(2)), int(1))),
+            mask.decl(sub(div(sub(len(index.e()), int(1)), int(2)), int(1))),
             h.decl(call("zb_hash_mix", vec![hash_of(key.e())], i64())),
             slot.decl(bitand(h.e(), mask.e())),
             i.decl(int(0)),
             while_(
                 le(i.e(), mask.e()),
                 vec![
-                    entry.decl(idx(index.e(), mul(slot.e(), int(2)), i64())),
+                    entry.decl(idx(index.e(), add(mul(slot.e(), int(2)), int(1)), i64())),
                     when(lt(entry.e(), int(0)), vec![ret(bool(false))]),
                     when(
                         and(
                             eq(
-                                idx(index.e(), add(mul(slot.e(), int(2)), int(1)), i64()),
+                                idx(index.e(), add(mul(slot.e(), int(2)), int(2)), i64()),
                                 h.e(),
                             ),
                             matches(at(s.e(), add(entry.e(), int(1))), key.e()),
@@ -1092,17 +1092,22 @@ fn set(list_type: TypeId) -> Vec<Decl> {
 
     // A set is laid out as a dict is: position 0 holds the hash index
     // (None while the set is small), the values follow in insertion
-    // order, so value `e` is at position 1 + e. The table holds two
-    // words per slot, the entry number (-1 when empty) and the entry's
-    // hash, so growing it and copying it hash nothing again and a probe
-    // reads a value only when its hash agrees.
+    // order, so value `e` is at position 1 + e. The table's first word
+    // caches the set's small-int mask (MASK_UNKNOWN until asked for,
+    // -1 when the values are not all small ints); then two words per
+    // slot, the entry number (-1 when empty) and the entry's hash, so
+    // growing it and copying it hash nothing again and a probe reads a
+    // value only when its hash agrees.
     let count = |s: Expr| sub(len(s), int(1));
     let value_at = |s: Expr, e: Expr| at(s, add(e, int(1)));
     let index_of = |s: Expr| call("zb_unbox_list_raw_i64", vec![at(s, int(0))], ints.clone());
     let box_index = |index: Expr| call("zb_list_box_i64", vec![index], any());
-    let entry_at = |index: Expr, slot: Expr| idx(index, mul(slot, int(2)), i64());
-    let hash_at = |index: Expr, slot: Expr| idx(index, add(mul(slot, int(2)), int(1)), i64());
-    let slots_of = |index: Expr| div(len(index), int(2));
+    let entry_at = |index: Expr, slot: Expr| idx(index, add(mul(slot, int(2)), int(1)), i64());
+    let hash_at = |index: Expr, slot: Expr| idx(index, add(mul(slot, int(2)), int(2)), i64());
+    let slots_of = |index: Expr| div(sub(len(index), int(1)), int(2));
+    /// The cached mask word before it is computed.
+    const MASK_UNKNOWN: i64 = -2;
+    let forget_mask = |index: Expr| set_idx(index, int(0), int(MASK_UNKNOWN));
     let hash = |k: Expr| call("zb_dict_hash", vec![k], i64());
     let next_slot = |s: Expr, mask: Expr| bitand(add(s, int(1)), mask);
     let unindexed = |s: Expr| eq(at(s, int(0)), null(any()));
@@ -1136,9 +1141,10 @@ fn set(list_type: TypeId) -> Vec<Decl> {
             expr(mcall(
                 table.e(),
                 "resize_filled",
-                vec![mul(cap.e(), int(2)), int(0xFF)],
+                vec![add(mul(cap.e(), int(2)), int(1)), int(0xFF)],
                 unit(),
             )),
+            forget_mask(table.e()),
             ret(table.e()),
         ]
     }));
@@ -1154,8 +1160,8 @@ fn set(list_type: TypeId) -> Vec<Decl> {
                 ge(entry_at(index.e(), slot.e()), int(0)),
                 vec![slot.set(next_slot(slot.e(), mask.e()))],
             ),
-            set_idx(index.e(), mul(slot.e(), int(2)), entry.e()),
-            set_idx(index.e(), add(mul(slot.e(), int(2)), int(1)), h.e()),
+            set_idx(index.e(), add(mul(slot.e(), int(2)), int(1)), entry.e()),
+            set_idx(index.e(), add(mul(slot.e(), int(2)), int(2)), h.e()),
             ret_void(),
         ],
     ));
@@ -1309,6 +1315,7 @@ fn set(list_type: TypeId) -> Vec<Decl> {
                 vec![index_of(s.e()), entry.e(), h.e()],
                 unit(),
             )),
+            forget_mask(index_of(s.e())),
             ret_void(),
         ],
     ));
@@ -1540,7 +1547,9 @@ fn set(list_type: TypeId) -> Vec<Decl> {
 
     // Integer board positions fit in a word. -1 means the set also
     // holds a value that needs the general equality path.
-    d.push(define("zb_set_mask63", &[&s], i64(), {
+    // Computed by a scan of the values; a set with a table keeps the
+    // answer in the table's first word until a value is added.
+    d.push(define("zb_set_mask63_scan", &[&s], i64(), {
         let mut st = vec![mask.decl(int(0)), n.decl(len(s.e()))];
         st.extend(for_range(
             &i,
@@ -1566,6 +1575,23 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         st.push(ret(mask.e()));
         st
     }));
+    d.push(define(
+        "zb_set_mask63",
+        &[&s],
+        i64(),
+        vec![
+            when(
+                unindexed(s.e()),
+                vec![ret(call("zb_set_mask63_scan", vec![s.e()], i64()))],
+            ),
+            index.decl(index_of(s.e())),
+            mask.decl(idx(index.e(), int(0), i64())),
+            when(ne(mask.e(), int(MASK_UNKNOWN)), vec![ret(mask.e())]),
+            mask.set(call("zb_set_mask63_scan", vec![s.e()], i64())),
+            set_idx(index.e(), int(0), mask.e()),
+            ret(mask.e()),
+        ],
+    ));
     d.push(define("zb_set_all_kind", &[&s, &wanted], boolean(), {
         let mut st = vec![
             n.decl(len(s.e())),
