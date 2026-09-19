@@ -1393,9 +1393,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             // `_ENV` is the environment itself, not an entry in it.
             if name == "_ENV" {
                 let g = self.globals_table(span);
-                return Ok(Val {
-                    node: self.box_table(g.node),
-                    ty: Ty::Any,
+                return Ok(match g.ty {
+                    Ty::Any => g,
+                    _ => Val {
+                        node: self.box_table(g.node),
+                        ty: Ty::Any,
+                    },
                 });
             }
             let key = Val {
@@ -1403,7 +1406,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 ty: Ty::Str,
             };
             let g = self.globals_table(span);
-            return Ok(self.index_read(g, key, None, span));
+            let desc = self.m.env_var.map(|_| "upvalue '_ENV'".to_string());
+            return Ok(self.index_read(g, key, desc, span));
         }
         if let Some(f) = self.scopes().known_global_function(name) {
             return Ok(self.function_value(f, span));
@@ -1445,15 +1449,21 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     fn write_global(&mut self, name: &str, value: Val, span: Span) -> Result<St> {
         if self.scopes().dynamic_globals {
+            // `_ENV = v`: the chunk's environment from here on.
             if name == "_ENV" {
-                return unsupported("assigning `_ENV`", span);
+                let Some(env) = self.m.env_var else {
+                    return unsupported("assigning `_ENV`", span);
+                };
+                let v = self.boxed(value);
+                return Ok(assign(var(env, Type::Any, span), v, span));
             }
             let key = Val {
                 node: str_lit(name, span),
                 ty: Ty::Str,
             };
             let g = self.globals_table(span);
-            return Ok(self.index_write(g, key, value, None, span));
+            let desc = self.m.env_var.map(|_| "upvalue '_ENV'".to_string());
+            return Ok(self.index_write(g, key, value, desc, span));
         }
         if self.scopes().known_global_function(name).is_some() {
             // The one declaration of a known function is its typed
@@ -1474,12 +1484,19 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     /// The globals table, when the program reaches its globals through
-    /// one: every global is an entry, the builtins included.
+    /// one: every global is an entry, the builtins included. A chunk
+    /// with an environment of its own reads it as a value, since
+    /// `_ENV = v` may make it anything.
     fn globals_table(&mut self, span: Span) -> Val {
-        let name = self.m.env_var.unwrap_or_else(|| intern(library::GLOBALS));
-        Val {
-            node: var(name, self.ir(Ty::Table), span),
-            ty: Ty::Table,
+        match self.m.env_var {
+            Some(env) => Val {
+                node: var(env, Type::Any, span),
+                ty: Ty::Any,
+            },
+            None => Val {
+                node: var(intern(library::GLOBALS), self.ir(Ty::Table), span),
+                ty: Ty::Table,
+            },
         }
     }
 
@@ -4454,6 +4471,8 @@ const RETURNED: &str = "lua$returned";
 const ENTRY_LINE: &str = "$entry_line";
 /// The script's arguments, `...` at the main chunk.
 const MAIN_VARARGS: &str = "lua$varargs";
+/// The main chunk's environment, when the program assigns `_ENV`.
+const MAIN_ENV: &str = "lua$env";
 
 /// `zl_depth += by`.
 fn depth_step(by: i64, span: Span) -> St {
@@ -4588,6 +4607,9 @@ fn declare(module: &Module<'_>, declarations: &mut Vec<TypedNode<TypedDeclaratio
 /// with a variadic record code `lua$<tag>chunk$fn` a program calls it
 /// through. Its declarations are appended; the record code's name is
 /// returned.
+/// `env_var` names the chunk's environment when it has one of its
+/// own; `own_env` says the chunk starts it as the globals table,
+/// rather than being handed one.
 #[allow(clippy::too_many_arguments)]
 fn chunk_module(
     scopes: &Scopes,
@@ -4598,6 +4620,7 @@ fn chunk_module(
     tag: &str,
     chunk_index: i64,
     env_var: Option<InternedString>,
+    own_env: bool,
     library: &Library,
     declarations: &mut Vec<TypedNode<TypedDeclaration>>,
 ) -> Result<String> {
@@ -4624,6 +4647,16 @@ fn chunk_module(
         let mut statements = main.block(ast.nodes())?;
         if main.entry_line {
             statements.insert(0, entry_line_save(span));
+        }
+        if let (Some(env), true) = (module.env_var, own_env) {
+            statements.insert(
+                0,
+                assign(
+                    var(env, Type::Any, span),
+                    call("zl_globals_value", vec![], Type::Any, span),
+                    span,
+                ),
+            );
         }
         if types::falls_through(ast.nodes()) {
             main.return_stmt(&[], span, &mut statements)?;
@@ -4678,7 +4711,7 @@ fn chunk_module(
         span,
     ));
     if let Some(env) = env_var {
-        module.declare_module_var(env, Ty::Table);
+        module.declare_module_var(env, Ty::Any);
     }
     declare(&module, declarations);
     Ok(code_name)
@@ -4725,11 +4758,11 @@ pub(crate) fn loaded_program(
         &tag,
         index,
         Some(env_var),
+        false,
         &library,
         &mut declarations,
     )?;
     let span = Span::new(0, source.len());
-    let table = library.types.table();
     let env = intern("env");
     let init = typed_function(
         &format!("lua${tag}init"),
@@ -4743,8 +4776,13 @@ pub(crate) fn loaded_program(
                 span,
             )),
             assign(
-                var(env_var, table.clone(), span),
-                call("zl_env_table", vec![var(env, Type::Any, span)], table, span),
+                var(env_var, Type::Any, span),
+                call(
+                    "zl_env_value",
+                    vec![var(env, Type::Any, span)],
+                    Type::Any,
+                    span,
+                ),
                 span,
             ),
             ret(
@@ -4804,6 +4842,12 @@ pub(crate) fn program(
     crate::trace_phase("infer", started);
     let started = std::time::Instant::now();
     let line_starts = line_starts_of(source);
+    // A program that assigns `_ENV` has an environment of its own,
+    // the globals table until then.
+    let env_var = scopes
+        .global_writes
+        .contains_key("_ENV")
+        .then(|| intern(MAIN_ENV));
     let mut module = Module {
         scopes: &scopes,
         inferred: &inferred,
@@ -4811,7 +4855,7 @@ pub(crate) fn program(
         chunk: file,
         tag: String::new(),
         chunk_index: 0,
-        env_var: None,
+        env_var,
         line_starts,
         fallible: crate::fallible::FALLIBLE.iter().copied().collect(),
         raising: None,
@@ -4886,6 +4930,16 @@ pub(crate) fn program(
             }
             statements
         };
+        if let Some(env) = module.env_var {
+            statements.insert(
+                0,
+                assign(
+                    var(env, Type::Any, span),
+                    call("zl_globals_value", vec![], Type::Any, span),
+                    span,
+                ),
+            );
+        }
         statements.insert(
             0,
             assign(
@@ -4920,6 +4974,9 @@ pub(crate) fn program(
         statements,
         span,
     );
+    if let Some(env) = module.env_var {
+        module.declare_module_var(env, Ty::Any);
+    }
     let mut declarations = Vec::new();
     declare(&module, &mut declarations);
     declarations.push(TypedNode::new(
@@ -4940,6 +4997,11 @@ pub(crate) fn program(
     let mut preloads: Vec<St> = Vec::new();
     for (k, m) in loaded.iter().enumerate() {
         let tag = format!("m${}$", m.name.replace('.', "$"));
+        let env_var = m
+            .scopes
+            .global_writes
+            .contains_key("_ENV")
+            .then(|| intern(&format!("lua${tag}env")));
         let code_name = chunk_module(
             &m.scopes,
             &module_inferred[k],
@@ -4948,7 +5010,8 @@ pub(crate) fn program(
             &m.file,
             &tag,
             k as i64 + 1,
-            None,
+            env_var,
+            true,
             &library,
             &mut declarations,
         )?;

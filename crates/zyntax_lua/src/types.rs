@@ -290,6 +290,11 @@ impl<'a> Typer<'a> {
         if !Scopes::is_globals_name(g) || self.scopes.global_writes.contains_key(g) {
             return None;
         }
+        // Once `_ENV` is assigned, `_G` is a global like any other,
+        // found in whatever the environment is.
+        if g == "_G" && self.scopes.global_writes.contains_key("_ENV") {
+            return None;
+        }
         match suffixes {
             [Suffix::Index(ast::Index::Dot { name, .. })] => Some(ident(name)),
             [Suffix::Index(ast::Index::Brackets { expression, .. })] => {

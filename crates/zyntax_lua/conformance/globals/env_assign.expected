@@ -1,0 +1,6 @@
+1	2	nil	2	true
+3	nil
+nil	true
+5	5
+7
+false	env_assign.lua:17: attempt to index a nil value (upvalue '_ENV')

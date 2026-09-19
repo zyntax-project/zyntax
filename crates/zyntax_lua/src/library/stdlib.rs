@@ -3254,6 +3254,20 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ret(call("zl_globals_table", vec![], table.clone())),
         ],
     ));
+    // The environment a chunk was given, or the globals table when it
+    // was given nothing.
+    d.push(define(
+        "zl_env_value",
+        &[&env],
+        any(),
+        vec![
+            when(
+                is_nil(env.e()),
+                vec![ret(call("zl_globals_value", vec![], any()))],
+            ),
+            ret(env.e()),
+        ],
+    ));
     // `collectgarbage(opt)`: a collection, or what the collector knows.
     d.push(extern_fn("zl_gc", &[("op", i64())], i64(), Some("$Lua$gc")));
     let opt = kept("opt", string());

@@ -409,6 +409,11 @@ impl Walker {
                 self.out.vars[id.0 as usize].assigned = true;
             }
             Binding::Global(name) => {
+                // `_ENV = t` replaces the environment: every global is
+                // then an entry of a real table.
+                if name == "_ENV" {
+                    self.out.dynamic_globals = true;
+                }
                 self.global_write(name.clone());
             }
         }
@@ -477,7 +482,7 @@ impl Walker {
                                 if let Prefix::Name(token) = v.prefix() {
                                     self.out
                                         .names
-                                        .insert(pos_of(token), Binding::Global("_G".to_string()));
+                                        .insert(pos_of(token), Binding::Global(name_of(token)));
                                 }
                                 self.global_write(name);
                             }
@@ -515,12 +520,19 @@ impl Walker {
                     }
                     self.out.names.insert(pos_of(token), binding.clone());
                     let id = self.function(f.body(), is_method, fname.clone());
-                    if let Binding::Global(name) = &binding
-                        && top
-                        && !self.out.global_functions.contains_key(name)
-                    {
-                        self.out.global_functions.insert(name.clone(), id);
-                        self.out.funcs[id.0 as usize].top_level = true;
+                    match &binding {
+                        Binding::Global(name)
+                            if top && !self.out.global_functions.contains_key(name) =>
+                        {
+                            self.out.global_functions.insert(name.clone(), id);
+                            self.out.funcs[id.0 as usize].top_level = true;
+                        }
+                        // Assigned to a variable declared elsewhere, the
+                        // function is a value: nothing knows its callers.
+                        Binding::Local(_) | Binding::Upvalue(_) => {
+                            self.out.funcs[id.0 as usize].escapes = true;
+                        }
+                        Binding::Global(_) => {}
                     }
                 } else {
                     // `function a.b.c()`: `a` is read, the rest indexed.
@@ -675,11 +687,12 @@ impl Walker {
     fn var_expression(&mut self, v: &ast::VarExpression) {
         if let Some(name) = global_table_member(self, v) {
             // `_G.name` is the global `name`; the table's own name is
-            // bound without being a value.
+            // bound without being a value, under its own name so that
+            // a program which replaces `_ENV` reads it from there.
             if let Prefix::Name(token) = v.prefix() {
                 self.out
                     .names
-                    .insert(pos_of(token), Binding::Global("_G".to_string()));
+                    .insert(pos_of(token), Binding::Global(name_of(token)));
             }
             self.out.mentioned.insert(name.clone());
             self.out.globals.insert(name);
