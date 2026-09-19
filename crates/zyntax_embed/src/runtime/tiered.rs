@@ -940,6 +940,12 @@ impl TieredRuntime {
             // runtime that owns the code its frames point into.
             unsafe { crate::effect_runtime::free_handler_state(e.state as *mut u8) };
         }
+        // The interpreter's callbacks hold the backends; they go before
+        // the backend and the LLVM context it owns.
+        self.interpreter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear_native_bridge();
         self.backend.shutdown();
         // The collector's roots were this runtime's globals, which go
         // with its code.

@@ -2651,6 +2651,15 @@ impl HirInterpreter {
         self.tick_callbacks.insert(func_id, cb);
     }
 
+    /// Drop the bridge and every tick callback. They hold the native
+    /// tiers' backends, which the runtime shuts down after them.
+    pub fn clear_native_bridge(&mut self) {
+        self.tick_callbacks = IdMap::default();
+        self.thunk_source = None;
+        self.entry_source = None;
+        self.bead_source = None;
+    }
+
     /// Install the bridge to a native tier: `thunk` compiles the caller
     /// for a call shape, `entry` reads a function's current native entry.
     #[allow(clippy::type_complexity)]
