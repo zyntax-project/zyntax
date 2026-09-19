@@ -1621,9 +1621,11 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     };
     let boxed_dict = |x: Expr| and(eq(category(x.clone()), int(CUSTOM)), is_dict(x));
     let v = kept("v", any());
+    // A dict keeps the key it is stored under.
+    let key = kept("i", any());
     d.push(define(
         "zb_any_setitem",
-        &[&x, &i, &v],
+        &[&x, &key, &v],
         unit(),
         vec![
             when(
