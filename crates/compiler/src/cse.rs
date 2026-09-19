@@ -87,6 +87,22 @@ struct CseCtx<'a> {
     bin_defs: HashMap<HirId, (BinaryOp, HirId, HirId)>,
     /// `id → integer value` for every integer constant.
     int_consts: HashMap<HirId, i128>,
+    /// Result types by a small id, so a key holds a number and not a
+    /// copy of a type; a struct's type is a tree, and cloning one per
+    /// instruction was a tenth of the pass.
+    types: std::cell::RefCell<HashMap<HirType, u32>>,
+}
+
+impl CseCtx<'_> {
+    fn type_id(&self, ty: &HirType) -> u32 {
+        let mut types = self.types.borrow_mut();
+        if let Some(id) = types.get(ty) {
+            return *id;
+        }
+        let id = types.len() as u32;
+        types.insert(ty.clone(), id);
+        id
+    }
 }
 
 /// Counters surfaced for callers / tests.
@@ -115,6 +131,7 @@ pub fn eliminate_with(func: &mut HirFunction, pure_fns: &HashSet<HirId>) -> CseS
         pure_fns,
         bin_defs: collect_bin_defs(func),
         int_consts: collect_int_consts(func),
+        types: std::cell::RefCell::new(HashMap::new()),
     };
     // The dominator tree is what makes a match sound: the canonical
     // instruction must run before the one it replaces. Built from the
@@ -353,13 +370,13 @@ fn visit_block(
 /// The canonical key for an SSA instruction's "abstract value".
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum VnKey {
-    Binary(BinaryOp, HirType, HirId, HirId),
-    Unary(UnaryOp, HirType, HirId),
-    Cast(CastOp, HirType, HirId),
+    Binary(BinaryOp, u32, HirId, HirId),
+    Unary(UnaryOp, u32, HirId),
+    Cast(CastOp, u32, HirId),
     /// GEP key: pointer + sequence of index ids + result type.
-    Gep(HirType, HirId, Vec<HirId>),
+    Gep(u32, HirId, Vec<HirId>),
     /// ExtractValue key: aggregate + indices + result type.
-    Extract(HirType, HirId, Vec<u32>),
+    Extract(u32, HirId, Vec<u32>),
     /// Pure call key: callee function id + affine forms of each argument
     /// + generic type/const args. Only built for callees in
     /// `ctx.pure_fns`, so two entries with this key are guaranteed to
@@ -387,7 +404,7 @@ fn vn_key_for(
             right,
         } => {
             let (l, r) = canonical_operand_order(*op, *left, *right, substitutions);
-            Some((*result, VnKey::Binary(*op, ty.clone(), l, r)))
+            Some((*result, VnKey::Binary(*op, ctx.type_id(ty), l, r)))
         }
         HirInstruction::Unary {
             op,
@@ -396,7 +413,7 @@ fn vn_key_for(
             operand,
         } => Some((
             *result,
-            VnKey::Unary(*op, ty.clone(), canonical(*operand, substitutions)),
+            VnKey::Unary(*op, ctx.type_id(ty), canonical(*operand, substitutions)),
         )),
         HirInstruction::Cast {
             op,
@@ -405,7 +422,7 @@ fn vn_key_for(
             operand,
         } => Some((
             *result,
-            VnKey::Cast(*op, ty.clone(), canonical(*operand, substitutions)),
+            VnKey::Cast(*op, ctx.type_id(ty), canonical(*operand, substitutions)),
         )),
         HirInstruction::GetElementPtr {
             result,
@@ -418,7 +435,7 @@ fn vn_key_for(
                 .iter()
                 .map(|i| canonical(*i, substitutions))
                 .collect();
-            Some((*result, VnKey::Gep(ty.clone(), p, ix)))
+            Some((*result, VnKey::Gep(ctx.type_id(ty), p, ix)))
         }
         HirInstruction::ExtractValue {
             result,
@@ -428,7 +445,7 @@ fn vn_key_for(
         } => Some((
             *result,
             VnKey::Extract(
-                ty.clone(),
+                ctx.type_id(ty),
                 canonical(*aggregate, substitutions),
                 indices.clone(),
             ),

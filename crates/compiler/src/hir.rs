@@ -1334,6 +1334,17 @@ impl HirInstruction {
         ops
     }
 
+    /// Whether some operand satisfies `f`, without collecting them.
+    pub fn any_operand(&self, mut f: impl FnMut(HirId) -> bool) -> bool {
+        let mut found = false;
+        self.for_each_operand(|id| {
+            if !found && f(id) {
+                found = true;
+            }
+        });
+        found
+    }
+
     /// Call `f` on every operand this instruction uses, in operand order,
     /// without building a list.
     pub fn for_each_operand(&self, mut f: impl FnMut(HirId)) {

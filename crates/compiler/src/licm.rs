@@ -94,6 +94,7 @@ use crate::analysis::{DominatorTree, LoopForest, NaturalLoop};
 use crate::hir::{
     BinaryOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirTerminator, HirType,
 };
+use fnv::{FnvHashMap, FnvHashSet};
 use std::collections::{HashMap, HashSet};
 
 /// Stats surfaced for callers / tests.
@@ -135,6 +136,35 @@ fn run_with(func: &mut HirFunction, pure: &HashSet<HirId>) -> LicmStats {
 
     let mut stats = LicmStats::default();
 
+    // What every loop asks of the whole function, made once: where
+    // each value is defined, and the address chains. Hoisting moves an
+    // instruction into a preheader that lies in every enclosing loop's
+    // body, so what the map says of it stays right for the loops still
+    // to come, and hoisting makes no new value.
+    let outside: FnvHashSet<HirId> = func
+        .values
+        .iter()
+        .filter(|(_, v)| !matches!(v.kind, crate::hir::HirValueKind::Instruction))
+        .map(|(id, _)| *id)
+        .collect();
+    let mut value_block: FnvHashMap<HirId, HirId> = FnvHashMap::default();
+    for (block_id, block) in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(res) = instruction_result(inst) {
+                value_block.insert(res, *block_id);
+            }
+        }
+        for phi in &block.phis {
+            value_block.insert(phi.result, *block_id);
+        }
+    }
+    let addr_index = build_addr_index(func);
+    let shared = Shared {
+        outside,
+        value_block,
+        addr_index,
+    };
+
     // Innermost-first ordering — `LoopForest::loops()` already
     // returns smaller-body-first. Processing inner loops before
     // outer ones means an inner-loop hoist makes its result visible
@@ -149,7 +179,7 @@ fn run_with(func: &mut HirFunction, pure: &HashSet<HirId>) -> LicmStats {
             }
         };
 
-        stats.hoisted += hoist_loop(func, lp, preheader, pure);
+        stats.hoisted += hoist_loop(func, lp, preheader, pure, &shared);
     }
 
     stats
@@ -234,6 +264,16 @@ fn unique_outside_predecessor(func: &HirFunction, lp: &NaturalLoop) -> Option<Hi
     }
 }
 
+/// What `hoist_loop` reads of the whole function, the same for each of
+/// its loops.
+struct Shared {
+    /// Values that live in no block: parameters, constants, globals.
+    outside: FnvHashSet<HirId>,
+    /// The block each instruction or phi result is defined in.
+    value_block: FnvHashMap<HirId, HirId>,
+    addr_index: HashMap<HirId, AddrLink>,
+}
+
 /// Hoist invariant instructions from `lp.body` into `preheader`.
 /// Returns the number of instructions hoisted.
 fn hoist_loop(
@@ -241,51 +281,13 @@ fn hoist_loop(
     lp: &NaturalLoop,
     preheader: HirId,
     pure: &HashSet<HirId>,
+    shared: &Shared,
 ) -> usize {
-    // Seed invariant set with every value defined outside the
-    // loop body. By "defined outside" we mean: produced by an
-    // instruction whose containing block isn't in `lp.body`, or
-    // produced as a Parameter / Global / Constant (none of those
-    // live in any block).
-    let mut invariant: HashSet<HirId> = HashSet::new();
-
-    // Walk every value in the function; if its kind isn't an
-    // Instruction it lives outside any block by construction
-    // (Param / Constant / Global / Undef). Mark those invariant
-    // upfront.
-    for (id, val) in &func.values {
-        match val.kind {
-            crate::hir::HirValueKind::Constant(_)
-            | crate::hir::HirValueKind::Parameter(_)
-            | crate::hir::HirValueKind::Global(_)
-            | crate::hir::HirValueKind::Undef => {
-                invariant.insert(*id);
-            }
-            crate::hir::HirValueKind::Instruction => {
-                // Defer — see if its defining block is outside the
-                // loop. This is O(blocks * insts); the body sizes we
-                // see don't make it interesting.
-            }
-        }
-    }
-
-    // For Instruction-kind values, also mark them invariant if the
-    // block that produces them isn't part of the loop body.
-    let mut value_block: indexmap::IndexMap<HirId, HirId> = indexmap::IndexMap::new();
-    for (block_id, block) in &func.blocks {
-        for inst in &block.instructions {
-            if let Some(res) = instruction_result(inst) {
-                value_block.insert(res, *block_id);
-            }
-        }
-        // Phi results are defined at the head of their block;
-        // record so the operand-check can see "header phi" as
-        // loop-internal even though it's a Phi not an Instruction.
-        for phi in &block.phis {
-            value_block.insert(phi.result, *block_id);
-        }
-    }
-    for (val_id, block_id) in &value_block {
+    // Seed invariant set with every value defined outside the loop
+    // body: one that lives in no block, or an instruction or phi
+    // result whose block is not in `lp.body`.
+    let mut invariant: FnvHashSet<HirId> = shared.outside.clone();
+    for (val_id, block_id) in &shared.value_block {
         if !lp.body.contains(block_id) {
             invariant.insert(*val_id);
         }
@@ -363,7 +365,7 @@ fn hoist_loop(
     // through GEP+Cast chains; if we can't trace the chain to a clean
     // (root, const_offset), the location is conservatively `None`
     // (treat as may-alias).
-    let addr_index = build_addr_index(func);
+    let addr_index = &shared.addr_index;
     let store_locs: Vec<MemLoc> = lp
         .body
         .iter()
@@ -374,7 +376,7 @@ fn hoist_loop(
                 *ptr,
                 value_byte_size(func, *value),
                 &identity_subst,
-                &addr_index,
+                addr_index,
             )),
             // A vectorized store writes memory exactly as the scalar one
             // it replaced. Counting only the scalar spelling makes a
@@ -385,7 +387,7 @@ fn hoist_loop(
                 *ptr,
                 value_byte_size(func, *value),
                 &identity_subst,
-                &addr_index,
+                addr_index,
             )),
             _ => None,
         })
@@ -456,7 +458,7 @@ fn hoist_loop(
                         continue;
                     }
                     let load_loc =
-                        extract_mem_loc(*ptr, hir_ty_byte_size(ty), &identity_subst, &addr_index);
+                        extract_mem_loc(*ptr, hir_ty_byte_size(ty), &identity_subst, addr_index);
                     // A Load with an entirely opaque root (no GEP+Cast
                     // chain we can trace) can't be disambiguated from
                     // any in-loop Store. Skip it.
@@ -535,7 +537,7 @@ fn is_safe_to_hoist(inst: &HirInstruction) -> bool {
 }
 
 /// Are every operand referenced by `inst` already in `invariant`?
-fn operands_all_invariant(inst: &HirInstruction, invariant: &HashSet<HirId>) -> bool {
+fn operands_all_invariant(inst: &HirInstruction, invariant: &FnvHashSet<HirId>) -> bool {
     let mut all_in = true;
     let check = |id: HirId| invariant.contains(&id);
     match inst {

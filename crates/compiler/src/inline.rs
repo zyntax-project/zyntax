@@ -210,6 +210,22 @@ pub fn run_module_with(module: &mut HirModule, cycles: Option<&Cycles>) -> Inlin
     // they are worked on, so the rest can be read in place as callees;
     // only the ones taken out are copied for that, each round. They go
     // back where they were.
+    // Functions that reach each other through calls are one cycle;
+    // inlining within a cycle copies the cycle into itself round after
+    // round, so a callee in the caller's cycle stays a call. So does a
+    // callee whose cycle calls back into itself from outside that
+    // cycle: its body brings the call that re-enters it, and every
+    // round would inline one more level. Inlining keeps every
+    // function's reach, so the cycles are computed once, over the
+    // module as it stands.
+    let computed;
+    let cycles = match cycles {
+        Some(c) => c,
+        None => {
+            computed = cycles_of(module);
+            &computed
+        }
+    };
     let optimizing: Vec<HirId> = module.ids_to_optimize();
     let mut taken: Vec<(usize, HirId, HirFunction)> = Vec::with_capacity(optimizing.len());
     for id in &optimizing {
@@ -219,28 +235,29 @@ pub fn run_module_with(module: &mut HirModule, cycles: Option<&Cycles>) -> Inlin
     }
 
     for _ in 0..8 {
+        // Copied only where read: a function being optimised that none
+        // of them calls is never looked up, and a body alone in the set
+        // was copied once per pass for nothing.
+        let called: HashSet<HirId> = taken
+            .iter()
+            .flat_map(|(_, _, f)| f.blocks.values())
+            .flat_map(|b| &b.instructions)
+            .filter_map(|inst| match inst {
+                HirInstruction::Call {
+                    callee: HirCallable::Function(id),
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .collect();
         let changing: HashMap<HirId, Arc<HirFunction>> = taken
             .iter()
+            .filter(|(_, id, _)| called.contains(id))
             .map(|(_, id, f)| (*id, Arc::new(f.clone())))
             .collect();
         let callees = Callees {
             stable: &module.functions,
             changing: &changing,
-        };
-
-        // Functions that reach each other through calls are one cycle;
-        // inlining within a cycle copies the cycle into itself round
-        // after round, so a callee in the caller's cycle stays a call.
-        // So does a callee whose cycle calls back into itself from
-        // outside that cycle: its body brings the call that re-enters
-        // it, and every round would inline one more level.
-        let computed;
-        let cycles = match cycles {
-            Some(c) => c,
-            None => {
-                computed = call_cycles(&callees);
-                &computed
-            }
         };
 
         let mut this_pass = 0;
@@ -797,7 +814,9 @@ fn blocks_leading_to_cold(f: &HirFunction, callees: &Callees<'_>) -> HashSet<Hir
     };
     // Greatest fixpoint from every block cold: a block stays cold if it
     // calls a cold function itself or all of its successors stay cold.
-    let mut cold: HashSet<HirId> = f.blocks.keys().copied().collect();
+    // Warmth spreads backwards from the blocks that return: a block
+    // with a warm successor is warm, so each block is settled once its
+    // first warm successor is, and a loop with no way out stays cold.
     let seeds: HashSet<HirId> = f
         .blocks
         .iter()
@@ -807,25 +826,32 @@ fn blocks_leading_to_cold(f: &HirFunction, callees: &Callees<'_>) -> HashSet<Hir
     if seeds.is_empty() {
         return HashSet::new();
     }
-    loop {
-        let warmed: Vec<HirId> = cold
-            .iter()
-            .copied()
-            .filter(|id| {
-                if seeds.contains(id) {
-                    return false;
-                }
-                let succ = successors(f, *id);
-                succ.is_empty() || succ.iter().any(|s| !cold.contains(s))
-            })
-            .collect();
-        if warmed.is_empty() {
-            return cold;
+    let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut warm: HashSet<HirId> = HashSet::new();
+    for id in f.blocks.keys() {
+        let succ = successors(f, *id);
+        if succ.is_empty() && !seeds.contains(id) {
+            warm.insert(*id);
         }
-        for id in warmed {
-            cold.remove(&id);
+        for s in succ {
+            predecessors.entry(s).or_default().push(*id);
         }
     }
+    let mut work: Vec<HirId> = warm.iter().copied().collect();
+    while let Some(b) = work.pop() {
+        if let Some(preds) = predecessors.get(&b) {
+            for p in preds {
+                if !seeds.contains(p) && warm.insert(*p) {
+                    work.push(*p);
+                }
+            }
+        }
+    }
+    f.blocks
+        .keys()
+        .copied()
+        .filter(|id| !warm.contains(id))
+        .collect()
 }
 
 /// The strongly connected component of each function in the graph of
