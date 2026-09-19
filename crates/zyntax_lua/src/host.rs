@@ -1460,6 +1460,51 @@ extern "C" fn host_load_error() -> StringPtr {
     LOAD_ERROR.with(|e| zrtl::string::string_from_bytes(e.borrow().as_bytes()))
 }
 
+/// `package.searchpath`: the first template of `path` that names a
+/// readable file with `name` (its `sep` turned into `rep`) put in
+/// for `?`; null when none does, with every file tried listed as
+/// the reference lists them for `load_error`.
+extern "C" fn host_searchpath(
+    name: zrtl::StringConstPtr,
+    path: zrtl::StringConstPtr,
+    sep: zrtl::StringConstPtr,
+    rep: zrtl::StringConstPtr,
+) -> StringPtr {
+    let (name, path, sep, rep) =
+        unsafe { (bytes_of(name), bytes_of(path), bytes_of(sep), bytes_of(rep)) };
+    let name = if sep.is_empty() {
+        name.to_vec()
+    } else {
+        replace_all(name, sep, rep)
+    };
+    let mut tried = Vec::new();
+    for template in path.split(|&b| b == b';').filter(|t| !t.is_empty()) {
+        let filename = replace_all(template, b"?", &name);
+        let text = String::from_utf8_lossy(&filename).into_owned();
+        if std::fs::File::open(&text).is_ok() {
+            return zrtl::string::string_from_bytes(&filename);
+        }
+        tried.push(format!("no file '{text}'"));
+    }
+    LOAD_ERROR.with(|e| *e.borrow_mut() = tried.join("\n\t"));
+    std::ptr::null_mut()
+}
+
+fn replace_all(s: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if !from.is_empty() && s[i..].starts_with(from) {
+            out.extend_from_slice(to);
+            i += from.len();
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 // ─── the collector ──────────────────────────────────────────────────
 
 /// `collectgarbage`: 0 runs a collection, 1 answers the bytes the last
@@ -1491,7 +1536,7 @@ extern "C" fn host_setlocale(locale: zrtl::StringConstPtr) -> StringPtr {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 70] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 71] = [
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$clock".as_ptr(), host_clock as *const u8),
@@ -1563,6 +1608,7 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 70] = [
     zrtl::ZrtlSymbol::new(c"$Lua$gc".as_ptr(), host_gc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$load".as_ptr(), host_load as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$load_error".as_ptr(), host_load_error as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$searchpath".as_ptr(), host_searchpath as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$read_file".as_ptr(), host_read_file as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Lua$replace_dots".as_ptr(),

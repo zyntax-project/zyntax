@@ -1,0 +1,19 @@
+loading mod	lib.mod	./lib/mod.lua
+lib.mod	table	true
+lib.util.deep	table	true
+no return module
+true	true
+false	true
+true
+./lib/mod.lua
+nil	no file './nowhere.lua'
+	no file './nowhere/init.lua'
+./lib/mod.lua
+./lib/mod.lua
+loading mod	mod	./lib/mod.lua
+mod	true
+true
+false	'package.path' must be a string
+false	./lib/erring.lua:2: attempt to index a nil value (local 't')
+true
+5	1
