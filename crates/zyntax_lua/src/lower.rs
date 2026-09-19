@@ -1390,6 +1390,14 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     fn read_global(&mut self, name: &str, span: Span) -> Result<Val> {
         if self.scopes().dynamic_globals {
+            // `_ENV` is the environment itself, not an entry in it.
+            if name == "_ENV" {
+                let g = self.globals_table(span);
+                return Ok(Val {
+                    node: self.box_table(g.node),
+                    ty: Ty::Any,
+                });
+            }
             let key = Val {
                 node: str_lit(name, span),
                 ty: Ty::Str,

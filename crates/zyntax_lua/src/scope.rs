@@ -364,8 +364,8 @@ impl Walker {
                 }
             }
         }
-        // `_ENV` not declared as a local is the globals table.
-        let name = if name == "_ENV" { "_G" } else { name };
+        // `_ENV` not declared as a local is the environment itself,
+        // which the lowering reads as the globals table.
         self.out.globals.insert(name.to_string());
         Binding::Global(name.to_string())
     }

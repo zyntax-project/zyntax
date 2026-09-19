@@ -11,8 +11,9 @@ use crate::{host_io, host_os};
 
 static ARGS: OnceLock<Vec<String>> = OnceLock::new();
 
-/// The program's arguments, `arg` in Lua's terms: the script's path
-/// first. Set once per process; a later call keeps the first.
+/// The program's arguments, `arg` in Lua's terms: the interpreter,
+/// then the script's path, then the rest. Set once per process; a
+/// later call keeps the first.
 pub fn set_args(args: Vec<String>) {
     let _ = ARGS.set(args);
 }
@@ -1437,7 +1438,12 @@ extern "C" fn host_read_file(path: zrtl::StringConstPtr) -> StringPtr {
     let path = String::from_utf8_lossy(unsafe { bytes_of(path) }).into_owned();
     match std::fs::read(&path) {
         Ok(bytes) => {
-            // A leading `#` line is skipped, as `lua` skips a shebang.
+            // A byte order mark is skipped, then a leading `#` line, as
+            // `lua` skips a shebang.
+            let bytes = bytes
+                .strip_prefix(b"\xEF\xBB\xBF")
+                .map_or(&bytes[..], |rest| rest)
+                .to_vec();
             let bytes = if bytes.first() == Some(&b'#') {
                 match bytes.iter().position(|&b| b == b'\n') {
                     Some(nl) => &bytes[nl..],
@@ -1541,7 +1547,7 @@ extern "C" fn host_setlocale(locale: zrtl::StringConstPtr) -> StringPtr {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 91] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 92] = [
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$clock".as_ptr(), host_clock as *const u8),
@@ -1725,6 +1731,10 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 91] = [
     zrtl::ZrtlSymbol::new(
         c"$Lua$io_flush".as_ptr(),
         host_io::host_io_flush as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_setvbuf".as_ptr(),
+        host_io::host_io_setvbuf as *const u8,
     ),
 ];
 

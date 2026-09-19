@@ -644,6 +644,12 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         &[&ia, &ib],
         i64(),
         vec![
+            // A shift by 64 or more, either way, is zero; a negative
+            // shift is the other direction.
+            when(
+                or(ge(ib.e(), int(64)), le(ib.e(), int(-64))),
+                vec![ret(int(0))],
+            ),
             when(
                 lt(ib.e(), int(0)),
                 vec![ret(call(
@@ -652,15 +658,20 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     i64(),
                 ))],
             ),
-            when(ge(ib.e(), int(64)), vec![ret(int(0))]),
             ret(shl(ia.e(), ib.e())),
         ],
     ));
+    // The shift right is logical: the bits the arithmetic shift fills
+    // with the sign are masked off.
     d.push(define(
         "zl_shr_i64",
         &[&ia, &ib],
         i64(),
         vec![
+            when(
+                or(ge(ib.e(), int(64)), le(ib.e(), int(-64))),
+                vec![ret(int(0))],
+            ),
             when(
                 lt(ib.e(), int(0)),
                 vec![ret(call(
@@ -669,8 +680,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     i64(),
                 ))],
             ),
-            when(ge(ib.e(), int(64)), vec![ret(int(0))]),
-            ret(cast(shr(cast(ia.e(), u64()), cast(ib.e(), u64())), i64())),
+            when(eq(ib.e(), int(0)), vec![ret(ia.e())]),
+            ret(bitand(
+                shr(ia.e(), ib.e()),
+                sub(shl(int(1), sub(int(64), ib.e())), int(1)),
+            )),
         ],
     ));
     // The operator on two integers, boxed.
@@ -1246,8 +1260,4 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     ));
     let _ = (&i, &r);
     d
-}
-
-fn u64() -> Type {
-    Type::Primitive(zyntax_typed_ast::PrimitiveType::U64)
 }

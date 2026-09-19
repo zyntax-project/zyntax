@@ -516,6 +516,30 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         &[&o, &event],
         any(),
         vec![
+            when(is_nil(o.e()), vec![ret(nil())]),
+            // Strings and files have metatables of their own.
+            when(
+                eq(category(o.e()), int(STR)),
+                vec![ret(call(
+                    "zl_rawget_str",
+                    vec![
+                        unbox_table(call("zl_string_metatable", vec![], any()), t),
+                        event.e(),
+                    ],
+                    any(),
+                ))],
+            ),
+            when(
+                is_file(o.e()),
+                vec![ret(call(
+                    "zl_rawget_str",
+                    vec![
+                        unbox_table(call("zl_file_metatable", vec![], any()), t),
+                        event.e(),
+                    ],
+                    any(),
+                ))],
+            ),
             when(not(is_table(o.e())), vec![ret(nil())]),
             ret(call(
                 "zl_meta",

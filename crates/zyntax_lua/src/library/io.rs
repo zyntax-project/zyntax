@@ -105,6 +105,12 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             "$Lua$io_seek",
         ),
         ("zl_io_flush", vec![("h", i64())], i64(), "$Lua$io_flush"),
+        (
+            "zl_io_setvbuf",
+            vec![("h", i64()), ("mode", i64()), ("size", i64())],
+            i64(),
+            "$Lua$io_setvbuf",
+        ),
     ] {
         let params: Vec<(&str, Type)> = params.into_iter().collect();
         d.push(extern_fn(fname, &params, ret_ty, Some(symbol)));
@@ -660,8 +666,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             one(box_bool(bool(true))),
         ],
     ));
-    // `f:setvbuf(mode [, size])`: the streams buffer as the host
-    // sees fit; the mode is checked.
+    // `f:setvbuf(mode [, size])`.
     d.push(define(
         "zl_file_setvbuf",
         &[&x, &y, &a],
@@ -688,14 +693,16 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     text("')"),
                 ]))],
             ),
-            when(
-                not(is_nil(a.e())),
-                vec![expr(call(
-                    "zl_arg_int",
-                    vec![a.e(), bad_arg(2, "setvbuf")],
-                    i64(),
-                ))],
-            ),
+            n.decl(if_expr(
+                is_nil(a.e()),
+                int(8192),
+                call("zl_arg_int", vec![a.e(), bad_arg(2, "setvbuf")], i64()),
+            )),
+            k.decl(int(2)),
+            when(str_eq(s.e(), text("no")), vec![k.set(int(0))]),
+            when(str_eq(s.e(), text("line")), vec![k.set(int(1))]),
+            r.decl(call("zl_io_setvbuf", vec![h.e(), k.e(), n.e()], i64())),
+            when(ne(r.e(), int(0)), vec![failure()]),
             one(box_bool(bool(true))),
         ],
     ));
@@ -795,6 +802,13 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![x.e(), bad_arg(1, "lines")],
                 i64(),
             )),
+            // The reference keeps the formats on its stack: 250 at most.
+            when(
+                gt(len(args.e()), int(250)),
+                vec![lua_error(text(
+                    "bad argument #252 to 'lines' (too many arguments)",
+                ))],
+            ),
             // Each format is checked now, as the reference checks them.
             i.decl(int(0)),
             while_(

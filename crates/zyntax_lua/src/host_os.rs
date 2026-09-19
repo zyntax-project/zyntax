@@ -139,7 +139,7 @@ fn conversion_len(rest: &[u8]) -> Option<usize> {
 }
 
 /// What follows the first conversion `strftime` does not take, from
-/// its `%` on; empty when every conversion is one.
+/// its `%` on; null when every conversion is one.
 pub(crate) extern "C" fn host_date_check(fmt: zrtl::StringConstPtr) -> StringPtr {
     let fmt = unsafe { bytes_of(fmt) };
     let mut i = 0;
@@ -153,42 +153,43 @@ pub(crate) extern "C" fn host_date_check(fmt: zrtl::StringConstPtr) -> StringPtr
             None => return zrtl::string::string_from_bytes(&fmt[i + 1..]),
         }
     }
-    zrtl::string::string_from_bytes(b"")
+    std::ptr::null_mut()
 }
 
-/// `t` formatted by `strftime`, local or UTC. A format is given as
-/// checked; one the library cannot represent gives an empty string.
+/// `t` formatted as the reference formats it: each conversion goes
+/// through `strftime` on its own and every other byte is copied, so
+/// a format may hold any byte. The format is given as checked. Null
+/// when the time cannot be represented.
 pub(crate) extern "C" fn host_date(fmt: zrtl::StringConstPtr, t: i64, utc: bool) -> StringPtr {
     let Some(tm) = broken_down(t, utc) else {
         return std::ptr::null_mut();
     };
-    let Some(fmt) = c_string(fmt) else {
-        return zrtl::string::string_from_bytes(b"");
-    };
-    if fmt.as_bytes().is_empty() {
-        return zrtl::string::string_from_bytes(b"");
-    }
-    // strftime tells an empty result from one too long only by size:
-    // the buffer grows until the text fits or is clearly empty.
-    let mut size = 256;
-    loop {
-        let mut buf = vec![0u8; size];
-        let n = unsafe {
+    let fmt = unsafe { bytes_of(fmt) };
+    let mut out = Vec::with_capacity(fmt.len());
+    let mut i = 0;
+    while i < fmt.len() {
+        if fmt[i] != b'%' {
+            out.push(fmt[i]);
+            i += 1;
+            continue;
+        }
+        let n = conversion_len(&fmt[i + 1..]).unwrap_or(0);
+        let mut one = Vec::with_capacity(n + 2);
+        one.extend_from_slice(&fmt[i..i + 1 + n]);
+        one.push(0);
+        let mut buf = [0u8; 256];
+        let written = unsafe {
             libc::strftime(
                 buf.as_mut_ptr() as *mut libc::c_char,
-                size,
-                fmt.as_ptr(),
+                buf.len(),
+                one.as_ptr() as *const libc::c_char,
                 &tm,
             )
         };
-        if n > 0 {
-            return zrtl::string::string_from_bytes(&buf[..n]);
-        }
-        if size >= fmt.as_bytes().len() * 64 + 4096 {
-            return zrtl::string::string_from_bytes(b"");
-        }
-        size *= 4;
+        out.extend_from_slice(&buf[..written]);
+        i += 1 + n;
     }
+    zrtl::string::string_from_bytes(&out)
 }
 
 // ─── the environment and files ──────────────────────────────────────

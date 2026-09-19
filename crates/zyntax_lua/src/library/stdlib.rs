@@ -2785,6 +2785,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 when(not(is_nil(cached())), vec![ret(cached())]),
                 tb.decl(call("zl_table_new", vec![], table.clone())),
                 n.decl(call("zl_argc", vec![], i64())),
+                // The interpreter sits at -1, the script at 0.
                 i.decl(int(0)),
                 while_(
                     lt(i.e(), n.e()),
@@ -2793,7 +2794,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                             "zl_rawseti",
                             vec![
                                 tb.e(),
-                                i.e(),
+                                sub(i.e(), int(1)),
                                 box_str(call("zl_argv", vec![i.e()], string())),
                             ],
                             unit(),
@@ -2824,7 +2825,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![
             out.decl(list(vec![], anys.clone())),
             n.decl(call("zl_argc", vec![], i64())),
-            i.decl(int(1)),
+            i.decl(int(2)),
             while_(
                 lt(i.e(), n.e()),
                 vec![
@@ -3082,7 +3083,16 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 eq(category(chunk_name.e()), int(STR)),
                 vec![cname.set(get_str(chunk_name.e()))],
             ),
-            y.decl(call("zl_load_raw", vec![s.e(), cname.e(), env.e()], any())),
+            y.decl(call("zl_load_mode_error", vec![s.e(), mode.e()], any())),
+            when(
+                not(is_nil(y.e())),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(vec![nil(), y.e()], anys.clone())],
+                    any(),
+                ))],
+            ),
+            y.set(call("zl_load_raw", vec![s.e(), cname.e(), env.e()], any())),
             when(
                 is_nil(y.e()),
                 vec![ret(call(
@@ -3095,6 +3105,65 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ))],
             ),
             ret(y.e()),
+        ],
+    ));
+    // What `mode` says about a chunk: a chunk starting with an escape
+    // byte is binary, which no mode without `b` allows and which
+    // cannot be loaded here at all; a text chunk needs `t`. The
+    // message when the chunk is refused, or nil.
+    d.push(define(
+        "zl_load_mode_error",
+        &[&s, &mode],
+        any(),
+        vec![
+            k.decl(int(0)),
+            when(
+                gt(call("zb_str_len", vec![s.e()], i64()), int(0)),
+                vec![k.set(cast(
+                    call("zb_str_code_at", vec![s.e(), int(0)], i32()),
+                    i64(),
+                ))],
+            ),
+            cname.decl(text("bt")),
+            when(
+                and(not(is_nil(mode.e())), eq(category(mode.e()), int(STR))),
+                vec![cname.set(get_str(mode.e()))],
+            ),
+            when(
+                and(
+                    eq(k.e(), int(27)),
+                    not(call(
+                        "zb_str_contains",
+                        vec![cname.e(), text("b")],
+                        boolean(),
+                    )),
+                ),
+                vec![ret(box_str(concat(vec![
+                    text("attempt to load a binary chunk (mode is '"),
+                    cname.e(),
+                    text("')"),
+                ])))],
+            ),
+            when(
+                and(
+                    ne(k.e(), int(27)),
+                    not(call(
+                        "zb_str_contains",
+                        vec![cname.e(), text("t")],
+                        boolean(),
+                    )),
+                ),
+                vec![ret(box_str(concat(vec![
+                    text("attempt to load a text chunk (mode is '"),
+                    cname.e(),
+                    text("')"),
+                ])))],
+            ),
+            when(
+                eq(k.e(), int(27)),
+                vec![ret(box_str(text("binary chunks cannot be loaded")))],
+            ),
+            ret(nil()),
         ],
     ));
     // `loadfile(name, mode, env)`: the file as a chunk named `@name`.
@@ -3122,7 +3191,16 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     any(),
                 ))],
             ),
-            y.decl(call(
+            y.decl(call("zl_load_mode_error", vec![s.e(), mode.e()], any())),
+            when(
+                not(is_nil(y.e())),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(vec![nil(), y.e()], anys.clone())],
+                    any(),
+                ))],
+            ),
+            y.set(call(
                 "zl_load_raw",
                 vec![s.e(), add(text("@"), path.e()), env.e()],
                 any(),
@@ -3895,7 +3973,7 @@ fn os_declarations(t: &Types) -> Vec<Decl> {
             ),
             bad.decl(call("zl_date_check", vec![s.e()], string())),
             when(
-                gt(call("zb_str_len", vec![bad.e()], i64()), int(0)),
+                ne(bad.e(), null(string())),
                 vec![lua_error(concat(vec![
                     text("bad argument #1 to 'date' (invalid conversion specifier '%"),
                     bad.e(),

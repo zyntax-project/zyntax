@@ -30,12 +30,26 @@ enum Inner {
     },
 }
 
+/// How writes to a disk file are held back, as `setvbuf` sets it:
+/// not at all, until a line ends, or until `size` bytes are waiting.
+/// Nothing is held back until asked: a file dropped without being
+/// closed has no collector to flush it here.
+#[derive(Clone, Copy)]
+enum Buffering {
+    No,
+    Line,
+    Full(usize),
+}
+
 /// A stream with the read-ahead `read` needs: bytes taken from the
 /// inner stream and not yet consumed sit in `ahead` from `at` on.
+/// Writes to a disk file wait in `pending` as the buffering says.
 struct Stream {
     inner: Inner,
     ahead: Vec<u8>,
     at: usize,
+    pending: Vec<u8>,
+    buffering: Buffering,
 }
 
 const CHUNK: usize = 8192;
@@ -46,6 +60,20 @@ impl Stream {
             inner,
             ahead: Vec::new(),
             at: 0,
+            pending: Vec::new(),
+            buffering: Buffering::No,
+        }
+    }
+
+    /// Pending writes go to the file.
+    fn drain(&mut self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let bytes = std::mem::take(&mut self.pending);
+        match &mut self.inner {
+            Inner::Disk(f) => f.write_all(&bytes),
+            _ => Ok(()),
         }
     }
 
@@ -54,6 +82,7 @@ impl Stream {
         if self.at < self.ahead.len() {
             return Ok(true);
         }
+        self.drain()?;
         self.ahead.clear();
         self.at = 0;
         let mut buf = vec![0u8; CHUNK];
@@ -143,11 +172,17 @@ impl Stream {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         if matches!(self.inner, Inner::Disk(_)) {
             self.discard_ahead()?;
+            self.pending.extend_from_slice(bytes);
+            let due = match self.buffering {
+                Buffering::No => true,
+                Buffering::Line => bytes.contains(&b'\n'),
+                Buffering::Full(size) => self.pending.len() >= size,
+            };
+            return if due { self.drain() } else { Ok(()) };
         }
         match &mut self.inner {
             Inner::Stdout => std::io::stdout().lock().write_all(bytes),
             Inner::Stderr => std::io::stderr().lock().write_all(bytes),
-            Inner::Disk(f) => f.write_all(bytes),
             Inner::Pipe { child, read: false } => match child.stdin.as_mut() {
                 Some(stdin) => stdin.write_all(bytes),
                 None => Ok(()),
@@ -171,6 +206,7 @@ impl Stream {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        self.drain()?;
         match &mut self.inner {
             Inner::Stdout => std::io::stdout().lock().flush(),
             Inner::Stderr => std::io::stderr().lock().flush(),
@@ -184,6 +220,7 @@ impl Stream {
     }
 
     fn seek(&mut self, whence: i64, offset: i64) -> std::io::Result<u64> {
+        self.drain()?;
         let Inner::Disk(f) = &mut self.inner else {
             return Err(std::io::Error::from_raw_os_error(libc::ESPIPE));
         };
@@ -452,6 +489,11 @@ pub(crate) extern "C" fn host_io_read_number(h: i64) -> i64 {
         }
         None => return 0,
     };
+    // A numeral that fills the buffer is refused, as the reference
+    // refuses one; what was read stays read.
+    if text.len() >= MAX_NUMERAL {
+        return 0;
+    }
     match crate::host::parse_numeral(&String::from_utf8_lossy(&text)) {
         Numeral::Int(v) => {
             NUMBER.with(|n| n.set((v, 0.0)));
@@ -465,8 +507,11 @@ pub(crate) extern "C" fn host_io_read_number(h: i64) -> i64 {
     }
 }
 
+/// How many bytes a numeral may run to.
+const MAX_NUMERAL: usize = 200;
+
 fn read_numeral(s: &mut Stream) -> std::io::Result<Vec<u8>> {
-    const MAX: usize = 200;
+    const MAX: usize = MAX_NUMERAL;
     let mut out = Vec::new();
     // Leading spaces go; then each piece is taken while it fits.
     while let Some(b) = s.peek_byte()? {
@@ -552,6 +597,23 @@ pub(crate) extern "C" fn host_io_seek(h: i64, whence: i64, offset: i64) -> i64 {
             -1
         }
         None => -1,
+    }
+}
+
+/// `setvbuf`: 0 for none, 1 for a line, 2 for `size` bytes.
+pub(crate) extern "C" fn host_io_setvbuf(h: i64, mode: i64, size: i64) -> i64 {
+    let buffering = match mode {
+        0 => Buffering::No,
+        1 => Buffering::Line,
+        _ => Buffering::Full(size.clamp(1, 1 << 30) as usize),
+    };
+    match with(h, |s| {
+        s.buffering = buffering;
+        s.drain()
+    }) {
+        Some(Ok(())) => 0,
+        Some(Err(e)) => note(&e, None),
+        None => libc::EBADF as i64,
     }
 }
 
