@@ -307,6 +307,10 @@ pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<Hi
     // Whether the address-taken closure has been seeded; once is enough,
     // since the set is a property of the module rather than of the walk.
     let mut seeded_address_taken = false;
+    // The module's own functions by name, built at the first call by
+    // name: resolving every function's name per such call site costs
+    // the square of the module.
+    let mut by_name: Option<HashMap<String, Vec<HirId>>> = None;
 
     while let Some(fid) = worklist.pop() {
         if !reachable.insert(fid) {
@@ -354,19 +358,28 @@ pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<Hi
                         // module function can be called this way too, and its
                         // body has to come along like any direct callee's.
                         HirCallable::Symbol(name) => {
-                            let mut defined_here = false;
-                            for (fid, f) in &module.functions {
-                                if !f.is_external
-                                    && f.name.resolve_global().as_deref() == Some(name.as_str())
-                                {
-                                    defined_here = true;
-                                    if !reachable.contains(fid) {
-                                        worklist.push(*fid);
+                            let by_name = by_name.get_or_insert_with(|| {
+                                let mut map: HashMap<String, Vec<HirId>> = HashMap::new();
+                                for (fid, f) in &module.functions {
+                                    if !f.is_external {
+                                        if let Some(n) = f.name.resolve_global() {
+                                            map.entry(n).or_default().push(*fid);
+                                        }
                                     }
                                 }
-                            }
-                            if !defined_here {
-                                called_extern_names.insert(name.clone());
+                                map
+                            });
+                            match by_name.get(name.as_str()) {
+                                Some(defined) => {
+                                    for fid in defined {
+                                        if !reachable.contains(fid) {
+                                            worklist.push(*fid);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    called_extern_names.insert(name.clone());
+                                }
                             }
                         }
                     },
