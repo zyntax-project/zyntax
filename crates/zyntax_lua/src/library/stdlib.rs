@@ -297,6 +297,20 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         lib: "",
+        name: "loadfile",
+        func: "zl_loadfile",
+        params: &[Str, Any, Any],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "",
+        name: "dofile",
+        func: "zl_dofile",
+        params: &[Str],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "",
         name: "collectgarbage",
         func: "zl_collectgarbage",
         params: &[OptStr("collect"), Any],
@@ -2610,6 +2624,74 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ))],
             ),
             ret(y.e()),
+        ],
+    ));
+    // `loadfile(name, mode, env)`: the file as a chunk named `@name`.
+    d.push(extern_fn(
+        "zl_read_file",
+        &[("path", string())],
+        string(),
+        Some("$Lua$read_file"),
+    ));
+    let path = kept("path", string());
+    d.push(define(
+        "zl_loadfile",
+        &[&path, &mode, &env],
+        any(),
+        vec![
+            s.decl(call("zl_read_file", vec![path.e()], string())),
+            when(
+                eq(s.e(), null(string())),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(
+                        vec![nil(), box_str(call("zl_load_error", vec![], string()))],
+                        anys.clone(),
+                    )],
+                    any(),
+                ))],
+            ),
+            y.decl(call(
+                "zl_load_raw",
+                vec![s.e(), add(text("@"), path.e()), env.e()],
+                any(),
+            )),
+            when(
+                is_nil(y.e()),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(
+                        vec![nil(), box_str(call("zl_load_error", vec![], string()))],
+                        anys.clone(),
+                    )],
+                    any(),
+                ))],
+            ),
+            ret(y.e()),
+        ],
+    ));
+    // `dofile(name)`: the file run, its values returned; an error in
+    // loading is raised.
+    d.push(define(
+        "zl_dofile",
+        &[&path],
+        any(),
+        vec![
+            s.decl(call("zl_read_file", vec![path.e()], string())),
+            when(
+                eq(s.e(), null(string())),
+                vec![lua_error(call("zl_load_error", vec![], string()))],
+            ),
+            y.decl(call(
+                "zl_load_raw",
+                vec![s.e(), add(text("@"), path.e()), nil()],
+                any(),
+            )),
+            when(
+                is_nil(y.e()),
+                vec![lua_error(call("zl_load_error", vec![], string()))],
+            ),
+            ret(call("zl_call_0", vec![y.e()], any())),
         ],
     ));
     // The globals a loaded chunk reads: the env it was given when that

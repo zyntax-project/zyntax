@@ -1293,6 +1293,36 @@ extern "C" fn host_load(
     }
 }
 
+/// `loadfile`/`dofile`: the file's bytes, or null with the message
+/// held for `$Lua$load_error`.
+extern "C" fn host_read_file(path: zrtl::StringConstPtr) -> StringPtr {
+    let path = String::from_utf8_lossy(unsafe { bytes_of(path) }).into_owned();
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            // A leading `#` line is skipped, as `lua` skips a shebang.
+            let bytes = if bytes.first() == Some(&b'#') {
+                match bytes.iter().position(|&b| b == b'\n') {
+                    Some(nl) => &bytes[nl..],
+                    None => &[][..],
+                }
+            } else {
+                &bytes[..]
+            };
+            zrtl::string::string_from_bytes(bytes)
+        }
+        Err(e) => {
+            let reason = e
+                .to_string()
+                .split(" (os error")
+                .next()
+                .unwrap_or("")
+                .to_string();
+            LOAD_ERROR.with(|err| *err.borrow_mut() = format!("cannot open {path}: {reason}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 extern "C" fn host_load_error() -> StringPtr {
     LOAD_ERROR.with(|e| zrtl::string::string_from_bytes(e.borrow().as_bytes()))
 }
@@ -1314,7 +1344,7 @@ extern "C" fn host_gc(op: i64) -> i64 {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 48] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 49] = [
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$clock".as_ptr(), host_clock as *const u8),
@@ -1386,6 +1416,7 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 48] = [
     zrtl::ZrtlSymbol::new(c"$Lua$gc".as_ptr(), host_gc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$load".as_ptr(), host_load as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$load_error".as_ptr(), host_load_error as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$read_file".as_ptr(), host_read_file as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Lua$replace_dots".as_ptr(),
         host_replace_dots as *const u8,
