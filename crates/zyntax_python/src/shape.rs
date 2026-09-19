@@ -36,7 +36,7 @@ impl Shape {
             Self::Scalar(t) => *t,
             Self::Tuple(fields) => crate::types::tuple_of(fields.iter().map(Shape::ty).collect()),
             Self::List(inner) => Ty::List(Elem::of(inner.ty())),
-            Self::Dict(_) => Ty::Dict,
+            Self::Dict(inner) => crate::types::dict_of(Ty::Object, inner.ty()),
             Self::Bottom => Ty::Unknown,
             Self::Dynamic => Ty::Object,
         }

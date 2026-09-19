@@ -110,8 +110,19 @@ fn list_type(elem: Type) -> Type {
     zyntax_builtins::list_of(id, elem)
 }
 
+/// How a tuple stores a field of type `ty`: a scalar, an instance or a
+/// nested tuple as itself; a list, dict or set boxed, since their
+/// headers have an identity a copy inside the tuple would lose; anything
+/// dynamic as the box it is.
+pub(crate) fn tuple_field_storage(ty: Ty) -> Ty {
+    match ty {
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Class(_) | Ty::Tuple(_) => ty,
+        _ => Ty::Object,
+    }
+}
+
 /// How the library compares, prints, boxes and reads back a tuple's
-/// field of type `ty`.
+/// field of type `ty`, stored as [`tuple_field_storage`] says.
 fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
     use zyntax_builtins::lists::Field;
     match ty {
@@ -119,8 +130,8 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         Ty::Float => Field::Float,
         Ty::Bool => Field::Bool,
         Ty::Str => Field::Str,
-        Ty::Dict => Field::Dict,
-        Ty::Set => Field::Set,
+        Ty::Dict(_) => Field::Dict { ty: ir(ty) },
+        Ty::Set => Field::Set { ty: ir(ty) },
         Ty::Class(k) => Field::Instance {
             ty: class_type(k as usize),
             tag: zyntax_builtins::instance_tag(k as usize) as i32,
@@ -186,9 +197,15 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Str => prim(PrimitiveType::String),
         Ty::None => prim(PrimitiveType::Unit),
         Ty::List(e) => list_type(elem_ir(e)),
-        // A shape is a value struct with one field per element.
-        Ty::Tuple(k) => Type::Tuple(types::tuple_shape(k).into_iter().map(ir).collect()),
-        Ty::Dict | Ty::Set => list_type(Type::Any),
+        // A shape is a value struct with one field per element, each
+        // stored as `tuple_field_storage` says.
+        Ty::Tuple(k) => Type::Tuple(
+            types::tuple_shape(k)
+                .into_iter()
+                .map(|t| ir(tuple_field_storage(t)))
+                .collect(),
+        ),
+        Ty::Dict(_) | Ty::Set => list_type(Type::Any),
         Ty::Class(k) => class_type(k as usize),
         Ty::Gen => Type::Fiber(Box::new(Type::Any)),
         // A known function value is still the record every function
@@ -267,7 +284,7 @@ fn slot(list: Node, i: usize, ty: Ty, span: Span) -> Node {
 }
 
 /// A tuple value of shape `ty` from its elements, each already of the
-/// shape's element type.
+/// shape's element type and stored as `tuple_field_storage` says.
 fn tuple_value(items: Vec<Node>, ty: Ty, span: Span) -> Node {
     node(TypedExpression::Tuple(items), ty, span)
 }
@@ -1647,19 +1664,16 @@ impl<'m> Lowerer<'m> {
                     );
                 }
                 let (fields, pre) = self.tuple_fields(v, span, Hold::Ahead);
-                let items = fields
-                    .into_iter()
-                    .zip(to)
-                    .map(|(f, t)| self.coerce(f, t.settled()))
-                    .collect();
-                let value = tuple_value(items, target, span);
+                let value = self.tuple_of_items(fields, target, span);
                 if pre.is_empty() {
                     value
                 } else {
                     Self::block_value(pre, value, target, span)
                 }
             }
-            (Ty::Dict, Ty::Object) => call("zb_dict_box", vec![v.node], Ty::Object, span),
+            (Ty::Dict(_), Ty::Object) => call("zb_dict_box", vec![v.node], Ty::Object, span),
+            // Every dict shape is stored the same way.
+            (Ty::Dict(_), Ty::Dict(_)) => v.node,
             (Ty::Set, Ty::Object) => call("zb_set_box", vec![v.node], Ty::Object, span),
             // A list read out of a box is checked like a primitive: a box
             // of anything else is a TypeError raised where it is used.
@@ -1693,7 +1707,7 @@ impl<'m> Lowerer<'m> {
                     checked.node
                 }
             }
-            (Ty::Object, Ty::Dict) => call("zb_dict_unbox", vec![v.node], Ty::Dict, span),
+            (Ty::Object, Ty::Dict(_)) => call("zb_dict_unbox", vec![v.node], target, span),
             (Ty::Object, Ty::Set) => call("zb_set_unbox", vec![v.node], Ty::Set, span),
             // Evaluate a None-producing expression before representing its result.
             (Ty::None, Ty::Class(_) | Ty::Object) => {
@@ -1755,7 +1769,20 @@ impl<'m> Lowerer<'m> {
             }
             // A dict iterates as its keys; a set is its list of elements;
             // a generator is run to exhaustion.
-            (Ty::Dict, Ty::List(Elem::Object)) => call("zb_dict_keys", vec![v.node], target, span),
+            (Ty::Dict(_), Ty::List(Elem::Object)) => {
+                call("zb_dict_keys", vec![v.node], target, span)
+            }
+            // A dict's keys as a list of the kind they are.
+            (Ty::Dict(_), Ty::List(e)) => {
+                let keys = call("zb_dict_keys", vec![v.node], Ty::List(Elem::Object), span);
+                self.coerce(
+                    Val {
+                        node: keys,
+                        ty: Ty::List(Elem::Object),
+                    },
+                    Ty::List(e),
+                )
+            }
             (Ty::Gen, Ty::List(Elem::Object)) => self.generator_to_list(v.node, span),
             (Ty::Set, Ty::List(Elem::Object)) => call("zb_set_items", vec![v.node], target, span),
             // Lists of one kind into lists of dynamic values.
@@ -1861,6 +1888,19 @@ impl<'m> Lowerer<'m> {
                 return cast(address, target, span);
             }
             (Ty::Object, Ty::Tuple(k)) => return self.unbox_tuple(v, k, true, span),
+            // The box is known to hold a list of the kind, or the
+            // header a dict or set is.
+            (Ty::Object, Ty::List(e)) => {
+                return call(
+                    &format!("zb_unbox_list_raw_{}", e.suffix()),
+                    vec![v.node],
+                    target,
+                    span,
+                );
+            }
+            (Ty::Object, Ty::Dict(_) | Ty::Set) => {
+                return call("zb_unbox_list_raw_any", vec![v.node], target, span);
+            }
             _ => return self.coerce(v, target),
         };
         call(read, vec![v.node], target, span)
@@ -1907,13 +1947,37 @@ impl<'m> Lowerer<'m> {
             .enumerate()
             .map(|(i, ty)| {
                 let ty = ty.settled();
+                let stored = tuple_field_storage(ty);
+                let read = Val {
+                    node: slot(held.node.clone(), i, stored, span),
+                    ty: stored,
+                };
                 Val {
-                    node: slot(held.node.clone(), i, ty, span),
+                    node: self.trusted(read, ty),
                     ty,
                 }
             })
             .collect();
         (fields, pre)
+    }
+
+    /// The elements of a tuple of shape `ty`, each as the shape's element
+    /// type, stored as the shape stores them.
+    fn tuple_of_items(&mut self, items: Vec<Val>, ty: Ty, span: Span) -> Node {
+        let shape = ty.tuple_elems().expect("a shape");
+        let stored: Vec<Node> = items
+            .into_iter()
+            .zip(shape)
+            .map(|(item, elem)| {
+                let elem = elem.settled();
+                let as_elem = Val {
+                    node: self.coerce(item, elem),
+                    ty: elem,
+                };
+                self.coerce(as_elem, tuple_field_storage(elem))
+            })
+            .collect();
+        tuple_value(stored, ty, span)
     }
 
     /// A tuple value as a dynamic value: the tagged list of its boxed
@@ -1981,14 +2045,16 @@ impl<'m> Lowerer<'m> {
                     ),
                     ty: Ty::Object,
                 };
-                if trusted {
-                    self.trusted(item, ty.settled())
+                let ty = ty.settled();
+                let node = if trusted {
+                    self.trusted(item, ty)
                 } else {
-                    self.coerce(item, ty.settled())
-                }
+                    self.coerce(item, ty)
+                };
+                Val { node, ty }
             })
             .collect();
-        let value = tuple_value(items, target, span);
+        let value = self.tuple_of_items(items, target, span);
         if pre.is_empty() {
             value
         } else {
@@ -2030,7 +2096,7 @@ impl<'m> Lowerer<'m> {
                 span,
             ),
             Ty::Str => call("zb_str_truthy", vec![v.node], Ty::Bool, span),
-            Ty::Dict => binary(
+            Ty::Dict(_) => binary(
                 BinaryOp::Ne,
                 call("zb_dict_len", vec![v.node], Ty::Int, span),
                 int_lit(0, span),
@@ -2151,7 +2217,7 @@ impl<'m> Lowerer<'m> {
                 let items = self.coerce(v, Ty::List(Elem::Object));
                 call("zb_tuple_repr", vec![items], Ty::Str, span)
             }
-            Ty::Dict => call("zb_dict_repr", vec![v.node], Ty::Str, span),
+            Ty::Dict(_) => call("zb_dict_repr", vec![v.node], Ty::Str, span),
             Ty::Set => call("zb_set_repr", vec![v.node], Ty::Str, span),
             Ty::Gen => str_lit("<generator object>", span),
             Ty::Closure(_) => str_lit("<function>", span),
@@ -2832,7 +2898,7 @@ impl<'m> Lowerer<'m> {
                             let i = self.expr_as(&sub.slice, Ty::Int)?;
                             elem_call("pop", e, vec![seq.node, i], span)
                         }
-                        Ty::Dict => {
+                        Ty::Dict(_) => {
                             let k = self.expr_as(&sub.slice, Ty::Object)?;
                             call("zb_dict_del", vec![seq.node, k], Ty::None, span)
                         }
@@ -3188,7 +3254,7 @@ impl<'m> Lowerer<'m> {
                         let v = self.elem_arg(value, e);
                         call(&list_fn("set", e), vec![seq.node, i, v], Ty::None, span)
                     }
-                    Ty::Dict => {
+                    Ty::Dict(_) => {
                         let (k, by) = self.dict_key(&sub.slice)?;
                         let v = self.coerce(value, Ty::Object);
                         call(
@@ -3524,6 +3590,21 @@ impl<'m> Lowerer<'m> {
 
     /// `seq[i]` for a sequence value and an int index already lowered.
     fn index_value(&mut self, seq: Val, index: Node, elem_ty: Ty, span: Span) -> Val {
+        // A list's element comes out as the list's kind, then as the
+        // type wanted when that differs (a dict's keys, read as they are
+        // typed).
+        if let Ty::List(e) = seq.ty
+            && e.ty() != elem_ty
+        {
+            let read = Val {
+                node: elem_call("get", e, vec![seq.node, index], span),
+                ty: e.ty(),
+            };
+            return Val {
+                node: self.coerce(read, elem_ty),
+                ty: elem_ty,
+            };
+        }
         let node = match seq.ty {
             Ty::List(e) => elem_call("get", e, vec![seq.node, index], span),
             // An index only the runtime knows reads the tuple as the
@@ -3568,9 +3649,11 @@ impl<'m> Lowerer<'m> {
         let seq = match seq.ty {
             // A dynamic iterable is snapshotted into a list of objects,
             // and a dict iterates over a snapshot of its keys.
-            Ty::Object | Ty::Dict => {
+            Ty::Object | Ty::Dict(_) => {
                 let items = match seq.ty {
-                    Ty::Dict => call("zb_dict_keys", vec![seq.node], Ty::List(Elem::Object), span),
+                    Ty::Dict(_) => {
+                        call("zb_dict_keys", vec![seq.node], Ty::List(Elem::Object), span)
+                    }
                     _ => call("zb_any_iter", vec![seq.node], Ty::List(Elem::Object), span),
                 };
                 self.hold(
@@ -3598,8 +3681,10 @@ impl<'m> Lowerer<'m> {
             elem_ty,
             span,
         );
-        let mut body = Vec::new();
-        self.bind(&f.target, item, span, &mut body)?;
+        // What reading the item hoists (a checked read of a dynamic
+        // element) runs inside the body, ahead of the binding.
+        let mut body = std::mem::take(&mut self.hoisted);
+        self.bind_after(&f.target, item, span, &mut body)?;
         self.in_loop(|this| -> Result<()> {
             for s in &f.body {
                 this.stmt(s, &mut body)?;
@@ -4404,6 +4489,22 @@ impl<'m> Lowerer<'m> {
         Ok(v)
     }
 
+    /// A library result read as `ty`: a call that can raise is checked
+    /// before its value is read, so a raised lookup is not also the
+    /// TypeError of reading nothing as the value.
+    fn read_as(&mut self, v: Val, ty: Ty, span: Span) -> Node {
+        let fallible = match &v.node.node {
+            TypedExpression::Call(c) => self.is_fallible_callee(&c.callee),
+            _ => false,
+        };
+        let v = if fallible && self.guards && v.ty != ty {
+            self.guard(v, span)
+        } else {
+            v
+        };
+        self.coerce(v, ty)
+    }
+
     fn is_fallible_callee(&self, callee: &Node) -> bool {
         match &callee.node {
             TypedExpression::Variable(n) => n
@@ -4640,17 +4741,10 @@ impl<'m> Lowerer<'m> {
                     items.push(self.expr(e)?);
                 }
                 match ty.tuple_elems() {
-                    Some(shape) if shape.len() == items.len() => {
-                        let items = items
-                            .into_iter()
-                            .zip(shape)
-                            .map(|(item, elem)| self.coerce(item, elem.settled()))
-                            .collect();
-                        Val {
-                            node: tuple_value(items, ty, span),
-                            ty,
-                        }
-                    }
+                    Some(shape) if shape.len() == items.len() => Val {
+                        node: self.tuple_of_items(items, ty, span),
+                        ty,
+                    },
                     _ => {
                         let list = self.list_of(items, Elem::Object, span);
                         Val {
@@ -4703,9 +4797,13 @@ impl<'m> Lowerer<'m> {
                 } else {
                     "zb_dict_from_pairs"
                 };
+                let dict_ty = match ty {
+                    Ty::Dict(_) => ty,
+                    _ => types::dynamic_dict(),
+                };
                 Val {
-                    node: call(maker, vec![pairs], Ty::Dict, span),
-                    ty: Ty::Dict,
+                    node: call(maker, vec![pairs], dict_ty, span),
+                    ty: dict_ty,
                 }
             }
             py::Expr::Set(st) => {
@@ -4864,13 +4962,7 @@ impl<'m> Lowerer<'m> {
                 let (more, mut pre_right) = self.tuple_fields(right, span, Hold::Ahead);
                 fields.extend(more);
                 pre.append(&mut pre_right);
-                let shape = ty.tuple_elems().expect("a shape");
-                let items = fields
-                    .into_iter()
-                    .zip(shape)
-                    .map(|(f, t)| self.coerce(f, t.settled()))
-                    .collect();
-                let value = tuple_value(items, ty, span);
+                let value = self.tuple_of_items(fields, ty, span);
                 return Ok(Val {
                     node: if pre.is_empty() {
                         value
@@ -5154,7 +5246,7 @@ impl<'m> Lowerer<'m> {
                     let items = self.coerce(right, Ty::List(e));
                     let item = self.elem_arg(left, e);
                     call(&list_fn("contains", e), vec![items, item], Ty::Bool, span)
-                } else if right.ty == Ty::Dict {
+                } else if matches!(right.ty, Ty::Dict(_)) {
                     let by = if left.ty == Ty::Str { "_str" } else { "" };
                     let item = if left.ty == Ty::Str {
                         left.node
@@ -5209,8 +5301,8 @@ impl<'m> Lowerer<'m> {
                         span,
                     ),
                     // Containers are identical when they are the same heap object.
-                    (Ty::List(_) | Ty::Tuple(_) | Ty::Dict | Ty::Set, _)
-                    | (_, Ty::List(_) | Ty::Tuple(_) | Ty::Dict | Ty::Set) => {
+                    (Ty::List(_) | Ty::Tuple(_) | Ty::Dict(_) | Ty::Set, _)
+                    | (_, Ty::List(_) | Ty::Tuple(_) | Ty::Dict(_) | Ty::Set) => {
                         let l = self.coerce(left, Ty::Object);
                         let r = self.coerce(right, Ty::Object);
                         call("zb_any_same", vec![l, r], Ty::Bool, span)
@@ -5609,8 +5701,14 @@ impl<'m> Lowerer<'m> {
                         && ty == types::tuple_of(picked.iter().map(|&i| shape[i]).collect())
                     {
                         let (fields, pre) = self.tuple_fields(seq, span, Hold::Ahead);
-                        let items = picked.iter().map(|&i| fields[i].node.clone()).collect();
-                        let value = tuple_value(items, ty, span);
+                        let items = picked
+                            .iter()
+                            .map(|&i| Val {
+                                node: fields[i].node.clone(),
+                                ty: fields[i].ty,
+                            })
+                            .collect();
+                        let value = self.tuple_of_items(items, ty, span);
                         return Ok(Val {
                             node: if pre.is_empty() {
                                 value
@@ -5662,9 +5760,10 @@ impl<'m> Lowerer<'m> {
                 let index = self.expr_as(&sub.slice, Ty::Int)?;
                 Ok(self.index_value(seq, index, ty, span))
             }
-            Ty::Dict => {
+            // The stored value is dynamic; it is read as the shape says.
+            Ty::Dict(_) => {
                 let (key, by) = self.dict_key(&sub.slice)?;
-                Ok(Val {
+                let value = Val {
                     node: call(
                         &format!("zb_dict_get{by}"),
                         vec![seq.node, key],
@@ -5672,6 +5771,10 @@ impl<'m> Lowerer<'m> {
                         span,
                     ),
                     ty: Ty::Object,
+                };
+                Ok(Val {
+                    node: self.read_as(value, ty, span),
+                    ty,
                 })
             }
             _ => {
@@ -5702,7 +5805,7 @@ impl<'m> Lowerer<'m> {
         let ty = match produce {
             Produce::List(elem, _) => Ty::List(elem),
             Produce::Set(_) => Ty::Set,
-            Produce::Dict(..) => Ty::Dict,
+            Produce::Dict(..) => types::dynamic_dict(),
             Produce::Yield(_) => Ty::None,
         };
         let out = self.temp();
@@ -5738,7 +5841,7 @@ impl<'m> Lowerer<'m> {
         let initializer = match produce {
             Produce::List(elem, _) => Some(self.list_of(Vec::new(), elem, span)),
             Produce::Set(_) => Some(call("zb_set_new", vec![], Ty::Set, span)),
-            Produce::Dict(..) => Some(call("zb_dict_new", vec![], Ty::Dict, span)),
+            Produce::Dict(..) => Some(call("zb_dict_new", vec![], ty, span)),
             _ => None,
         };
         if let Some(initializer) = initializer {
@@ -5922,8 +6025,12 @@ impl<'m> Lowerer<'m> {
                 };
                 Ok(Val { node, ty })
             }
-            Ty::Dict => {
+            // The stored keys and values are dynamic; what comes out is
+            // read as the shape says.
+            Ty::Dict(_) => {
                 let d = receiver.node;
+                let dict_ty = receiver.ty;
+                let mut produced = Ty::Object;
                 let node = match (name, args.len()) {
                     ("get", 1) => {
                         let (k, by) = self.dict_key(&args[0])?;
@@ -5969,13 +6076,29 @@ impl<'m> Lowerer<'m> {
                         let default = self.expr_as(&args[1], Ty::Object)?;
                         call("zb_dict_pop_default", vec![d, k, default], Ty::Object, span)
                     }
-                    ("keys", 0) => call("zb_dict_keys", vec![d], Ty::List(Elem::Object), span),
-                    ("values", 0) => call("zb_dict_values", vec![d], Ty::List(Elem::Object), span),
-                    ("items", 0) => call("zb_dict_items", vec![d], Ty::List(Elem::Object), span),
-                    ("copy", 0) => call("zb_dict_copy", vec![d], Ty::Dict, span),
-                    ("clear", 0) => method_call(d, "clear", vec![], Ty::None, span),
+                    ("keys", 0) => {
+                        produced = Ty::List(Elem::Object);
+                        call("zb_dict_keys", vec![d], produced, span)
+                    }
+                    ("values", 0) => {
+                        produced = Ty::List(Elem::Object);
+                        call("zb_dict_values", vec![d], produced, span)
+                    }
+                    ("items", 0) => {
+                        produced = Ty::List(Elem::Object);
+                        call("zb_dict_items", vec![d], produced, span)
+                    }
+                    ("copy", 0) => {
+                        produced = dict_ty;
+                        call("zb_dict_copy", vec![d], dict_ty, span)
+                    }
+                    ("clear", 0) => {
+                        produced = Ty::None;
+                        method_call(d, "clear", vec![], Ty::None, span)
+                    }
                     ("update", 1) => {
-                        let other = self.expr_as(&args[0], Ty::Dict)?;
+                        produced = Ty::None;
+                        let other = self.expr_as(&args[0], types::dynamic_dict())?;
                         call("zb_dict_update", vec![d, other], Ty::None, span)
                     }
                     _ => {
@@ -5985,7 +6108,11 @@ impl<'m> Lowerer<'m> {
                         ));
                     }
                 };
-                Ok(Val { node, ty })
+                let value = Val { node, ty: produced };
+                Ok(Val {
+                    node: self.read_as(value, ty, span),
+                    ty,
+                })
             }
             Ty::Set => {
                 let st = receiver.node;
@@ -6410,7 +6537,7 @@ impl<'m> Lowerer<'m> {
                             Ty::Int,
                         ),
                         Ty::Set => call("zb_set_len", vec![v.node], Ty::Int, span),
-                        Ty::Dict => call("zb_dict_len", vec![v.node], Ty::Int, span),
+                        Ty::Dict(_) => call("zb_dict_len", vec![v.node], Ty::Int, span),
                         Ty::Class(k) => {
                             match self.dunder(k as usize, "__len__", v.node, vec![], span) {
                                 Some(r) => self.coerce(r, Ty::Int),
@@ -6546,26 +6673,31 @@ impl<'m> Lowerer<'m> {
                     });
                 }
                 "dict" => {
+                    // The shape is what inference gave the call.
+                    let dict_ty = match ty {
+                        Ty::Dict(_) => ty,
+                        _ => types::dynamic_dict(),
+                    };
                     let node = match args.first() {
                         None => call(
                             "zb_dict_from_pairs",
                             vec![self.list_of(Vec::new(), Elem::Object, span)],
-                            Ty::Dict,
+                            dict_ty,
                             span,
                         ),
                         Some(a) => {
                             let v = self.consumed(a, span)?;
                             match v.ty {
-                                Ty::Dict => call("zb_dict_copy", vec![v.node], Ty::Dict, span),
+                                Ty::Dict(_) => call("zb_dict_copy", vec![v.node], dict_ty, span),
                                 // Anything else is a sequence of pairs.
                                 _ => {
                                     let items = self.iterable(v, span);
-                                    call("zb_dict_from_tuples", vec![items], Ty::Dict, span)
+                                    call("zb_dict_from_tuples", vec![items], dict_ty, span)
                                 }
                             }
                         }
                     };
-                    return Ok(Val { node, ty: Ty::Dict });
+                    return Ok(Val { node, ty: dict_ty });
                 }
                 "set" | "frozenset" => {
                     let items = match args.first() {
@@ -6573,7 +6705,7 @@ impl<'m> Lowerer<'m> {
                         Some(a) => {
                             let v = self.consumed(a, span)?;
                             match v.ty {
-                                Ty::List(_) | Ty::Tuple(_) | Ty::Set | Ty::Dict => {
+                                Ty::List(_) | Ty::Tuple(_) | Ty::Set | Ty::Dict(_) => {
                                     self.coerce(v, Ty::List(Elem::Object))
                                 }
                                 _ => {
@@ -6655,7 +6787,7 @@ impl<'m> Lowerer<'m> {
                                         ty: Ty::List(target_elem),
                                     }
                                 }
-                                Ty::Set | Ty::Dict | Ty::Gen => {
+                                Ty::Set | Ty::Dict(_) | Ty::Gen => {
                                     let node = self.coerce(v, Ty::List(Elem::Object));
                                     Val {
                                         node,
@@ -6768,14 +6900,10 @@ impl<'m> Lowerer<'m> {
                     let r = self.arithmetic(py::Operator::Mod, a, b, &args[1], span)?;
                     // The pair, of the shape inference gave it.
                     let pair = match ty.tuple_elems() {
-                        Some(shape) if shape.len() == 2 => {
-                            let q = self.coerce(q, shape[0].settled());
-                            let r = self.coerce(r, shape[1].settled());
-                            Val {
-                                node: tuple_value(vec![q, r], ty, span),
-                                ty,
-                            }
-                        }
+                        Some(shape) if shape.len() == 2 => Val {
+                            node: self.tuple_of_items(vec![q, r], ty, span),
+                            ty,
+                        },
                         _ => {
                             let list = self.list_of(vec![q, r], Elem::Object, span);
                             Val {
@@ -6866,7 +6994,7 @@ impl<'m> Lowerer<'m> {
                         Ty::None => str_lit("NoneType", span),
                         Ty::List(_) => str_lit("list", span),
                         Ty::Tuple(_) => str_lit("tuple", span),
-                        Ty::Dict => str_lit("dict", span),
+                        Ty::Dict(_) => str_lit("dict", span),
                         Ty::Set => str_lit("set", span),
                         Ty::Class(k) => str_lit(&self.module.classes[k as usize].name, span),
                         _ => call("zb_any_type", vec![v.node], Ty::Str, span),
@@ -7743,7 +7871,7 @@ impl<'m> Lowerer<'m> {
                 ("str", Ty::Str) => true,
                 ("list", Ty::List(_)) => true,
                 ("tuple", Ty::Tuple(_)) => true,
-                ("dict", Ty::Dict) => true,
+                ("dict", Ty::Dict(_)) => true,
                 ("set", Ty::Set) => true,
                 (_, Ty::Object | Ty::Unknown) => return None,
                 _ => false,

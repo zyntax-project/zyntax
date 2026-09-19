@@ -197,15 +197,23 @@ pub enum Field {
     Str,
     /// A dynamic value.
     Any,
-    Dict,
-    Set,
+    /// A dict or a set, stored as the box its tag identifies (a header
+    /// has an identity a copy inside the tuple would lose) and read raw
+    /// as `ty`, the list of dynamic values.
+    Dict {
+        ty: Type,
+    },
+    Set {
+        ty: Type,
+    },
     /// An instance of the frontend's class carrying `tag`, held by
     /// address as `ty`.
     Instance {
         ty: Type,
         tag: i32,
     },
-    /// A list of the kind whose functions carry `suffix`.
+    /// A list of the kind whose functions carry `suffix`, stored as the
+    /// box of the kind's tag and read raw as `ty`.
     List {
         suffix: String,
         ty: Type,
@@ -224,10 +232,22 @@ impl Field {
             Field::Float => f64(),
             Field::Bool => boolean(),
             Field::Str => string(),
-            Field::Any | Field::Dict | Field::Set => any(),
-            Field::Instance { ty, .. } | Field::List { ty, .. } | Field::Tuple { ty, .. } => {
-                ty.clone()
+            Field::Any | Field::Dict { .. } | Field::Set { .. } | Field::List { .. } => any(),
+            Field::Instance { ty, .. } | Field::Tuple { ty, .. } => ty.clone(),
+        }
+    }
+
+    /// The header a stored dict, set or list box holds; the tag was
+    /// checked when the field was stored.
+    fn raw(&self, x: Expr) -> Expr {
+        match self {
+            Field::Dict { ty } | Field::Set { ty } => {
+                call("zb_unbox_list_raw_any", vec![x], ty.clone())
             }
+            Field::List { suffix, ty } => {
+                call(&format!("zb_unbox_list_raw_{suffix}"), vec![x], ty.clone())
+            }
+            _ => x,
         }
     }
 
@@ -239,12 +259,14 @@ impl Field {
                 eq(a.clone(), b.clone()),
                 call("zb_any_eq", vec![a, b], boolean()),
             ),
-            Field::Dict => call("zb_dict_eq", vec![a, b], boolean()),
-            Field::Set => call("zb_set_eq", vec![a, b], boolean()),
+            Field::Dict { .. } => call("zb_dict_eq", vec![self.raw(a), self.raw(b)], boolean()),
+            Field::Set { .. } => call("zb_set_eq", vec![self.raw(a), self.raw(b)], boolean()),
             Field::Instance { .. } => eq(cast(a, usize()), cast(b, usize())),
-            Field::List { suffix, .. } => {
-                call(&format!("zb_list_eq_{suffix}"), vec![a, b], boolean())
-            }
+            Field::List { suffix, .. } => call(
+                &format!("zb_list_eq_{suffix}"),
+                vec![self.raw(a), self.raw(b)],
+                boolean(),
+            ),
             Field::Tuple { suffix, .. } => {
                 call(&format!("zb_tuple_eq_{suffix}"), vec![a, b], boolean())
             }
@@ -256,15 +278,19 @@ impl Field {
             Field::Int | Field::Float => lt(a, b),
             Field::Bool => lt(cast(a, i64()), cast(b, i64())),
             Field::Str => call("zb_str_lt", vec![a, b], boolean()),
-            Field::Any | Field::Dict | Field::Set => call("zb_any_lt", vec![a, b], boolean()),
+            Field::Any | Field::Dict { .. } | Field::Set { .. } => {
+                call("zb_any_lt", vec![a, b], boolean())
+            }
             Field::Instance { .. } => call(
                 "zb_ptr_lt",
                 vec![cast(a, usize()), cast(b, usize())],
                 boolean(),
             ),
-            Field::List { suffix, .. } => {
-                call(&format!("zb_list_lt_{suffix}"), vec![a, b], boolean())
-            }
+            Field::List { suffix, .. } => call(
+                &format!("zb_list_lt_{suffix}"),
+                vec![self.raw(a), self.raw(b)],
+                boolean(),
+            ),
             Field::Tuple { suffix, .. } => {
                 call(&format!("zb_tuple_lt_{suffix}"), vec![a, b], boolean())
             }
@@ -278,12 +304,14 @@ impl Field {
             Field::Bool => call("zb_bool_repr", vec![x], string()),
             Field::Str => call("zb_str_repr", vec![x], string()),
             Field::Any => call("zb_any_repr", vec![x], string()),
-            Field::Dict => call("zb_dict_repr", vec![x], string()),
-            Field::Set => call("zb_set_repr", vec![x], string()),
+            Field::Dict { .. } => call("zb_dict_repr", vec![self.raw(x)], string()),
+            Field::Set { .. } => call("zb_set_repr", vec![self.raw(x)], string()),
             Field::Instance { .. } => call("zb_any_repr", vec![self.boxed(x)], string()),
-            Field::List { suffix, .. } => {
-                call(&format!("zb_list_repr_{suffix}"), vec![x], string())
-            }
+            Field::List { suffix, .. } => call(
+                &format!("zb_list_repr_{suffix}"),
+                vec![self.raw(x)],
+                string(),
+            ),
             Field::Tuple { suffix, .. } => {
                 call(&format!("zb_tuple_repr_{suffix}"), vec![x], string())
             }
@@ -296,19 +324,19 @@ impl Field {
             Field::Float => call("zb_box_f64", vec![x], any()),
             Field::Bool => call("zb_box_bool", vec![x], any()),
             Field::Str => call("zb_box_str", vec![x], any()),
-            Field::Any => x,
-            Field::Dict => call("zb_dict_box", vec![x], any()),
-            Field::Set => call("zb_set_box", vec![x], any()),
+            Field::Any | Field::Dict { .. } | Field::Set { .. } | Field::List { .. } => x,
             Field::Instance { tag, .. } => call(
                 "zb_box_instance",
                 vec![cast(x, usize()), int32(*tag)],
                 any(),
             ),
-            Field::List { suffix, .. } => call(&format!("zb_list_box_{suffix}"), vec![x], any()),
             Field::Tuple { suffix, .. } => call(&format!("zb_tuple_box_{suffix}"), vec![x], any()),
         }
     }
 
+    /// The stored form of a dynamic value: a dict, set or list comes
+    /// back as a box of the checked kind, converted when the box held a
+    /// list of another kind.
     fn read(&self, x: Expr) -> Expr {
         match self {
             Field::Int => call("zb_any_as_i64", vec![x], i64()),
@@ -316,15 +344,29 @@ impl Field {
             Field::Bool => call("zb_any_as_bool", vec![x], boolean()),
             Field::Str => call("zb_any_as_str", vec![x], string()),
             Field::Any => x,
-            Field::Dict => call("zb_dict_unbox", vec![x], any()),
-            Field::Set => call("zb_set_unbox", vec![x], any()),
+            Field::Dict { ty } => call(
+                "zb_dict_box",
+                vec![call("zb_dict_unbox", vec![x], ty.clone())],
+                any(),
+            ),
+            Field::Set { ty } => call(
+                "zb_set_box",
+                vec![call("zb_set_unbox", vec![x], ty.clone())],
+                any(),
+            ),
             Field::Instance { ty, tag } => cast(
                 call("zb_hook_unbox_instance", vec![x, int32(*tag)], usize()),
                 ty.clone(),
             ),
-            Field::List { suffix, ty } => {
-                call(&format!("zb_list_unbox_{suffix}"), vec![x], ty.clone())
-            }
+            Field::List { suffix, ty } => call(
+                &format!("zb_list_box_{suffix}"),
+                vec![call(
+                    &format!("zb_list_unbox_{suffix}"),
+                    vec![x],
+                    ty.clone(),
+                )],
+                any(),
+            ),
             Field::Tuple { suffix, ty } => {
                 call(&format!("zb_tuple_read_{suffix}"), vec![x], ty.clone())
             }

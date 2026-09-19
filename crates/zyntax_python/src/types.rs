@@ -37,8 +37,10 @@ pub(crate) enum Ty {
     /// number of elements and the type of each, a value struct. A tuple
     /// no shape is settled for is a dynamic value.
     Tuple(u16),
-    /// A dict: keys and values, dynamic, in insertion order.
-    Dict,
+    /// A dict of the shape at this index of the dict shape table: what
+    /// its keys and values are typed as. Storage is dynamic whatever
+    /// the shape; the shape types what is read out.
+    Dict(u16),
     /// A set of dynamic values.
     Set,
     /// An instance of the module's class at this index, or None: the
@@ -194,12 +196,39 @@ thread_local! {
     /// library's list functions generated for them.
     static TUPLE_LISTS: std::cell::RefCell<std::collections::BTreeSet<u16>> =
         const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+    /// The dict shapes of the program being compiled: key and value
+    /// types, by index, interned like tuple shapes.
+    static DICT_SHAPES: std::cell::RefCell<Vec<(Ty, Ty)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Forget every shape: the start of a program.
 pub(crate) fn reset_tuple_shapes() {
     TUPLE_SHAPES.with(|t| t.borrow_mut().clear());
     TUPLE_LISTS.with(|t| t.borrow_mut().clear());
+    DICT_SHAPES.with(|t| t.borrow_mut().clear());
+}
+
+/// The dict type with these key and value types.
+pub(crate) fn dict_of(key: Ty, value: Ty) -> Ty {
+    DICT_SHAPES.with(|t| {
+        let mut table = t.borrow_mut();
+        if let Some(k) = table.iter().position(|shape| *shape == (key, value)) {
+            return Ty::Dict(k as u16);
+        }
+        let k = u16::try_from(table.len()).expect("fewer than 65536 dict shapes in a program");
+        table.push((key, value));
+        Ty::Dict(k)
+    })
+}
+
+/// The key and value types of dict shape `k`.
+pub(crate) fn dict_shape(k: u16) -> (Ty, Ty) {
+    DICT_SHAPES.with(|t| t.borrow()[k as usize])
+}
+
+/// A dict of dynamic keys and values.
+pub(crate) fn dynamic_dict() -> Ty {
+    dict_of(Ty::Object, Ty::Object)
 }
 
 /// Record that a list of tuples of shape `k` is used.
@@ -264,7 +293,38 @@ impl Ty {
                 }
                 tuple_of(a.into_iter().zip(b).map(|(x, y)| x.join(y)).collect())
             }
+            // Two dicts join key with key and value with value.
+            (Ty::Dict(a), Ty::Dict(b)) => {
+                let ((ka, va), (kb, vb)) = (dict_shape(a), dict_shape(b));
+                dict_of(ka.join(kb), va.join(vb))
+            }
+            // Two lists of shapes are one list seen before and after
+            // its elements were typed; of two shapes decided apart
+            // they are lists of two kinds.
+            (Ty::List(_), Ty::List(_)) if self.refined_by(other) => other,
+            (Ty::List(_), Ty::List(_)) if other.refined_by(self) => self,
             _ => Ty::Object,
+        }
+    }
+
+    /// Whether `other` is this type with some of what was still
+    /// undecided in it decided.
+    fn refined_by(self, other: Ty) -> bool {
+        match (self, other) {
+            (a, b) if a == b => true,
+            (Ty::Unknown, _) => true,
+            (Ty::Tuple(a), Ty::Tuple(b)) => {
+                let (a, b) = (tuple_shape(a), tuple_shape(b));
+                a.len() == b.len() && a.into_iter().zip(b).all(|(x, y)| x.refined_by(y))
+            }
+            (Ty::Dict(a), Ty::Dict(b)) => {
+                let ((ka, va), (kb, vb)) = (dict_shape(a), dict_shape(b));
+                ka.refined_by(kb) && va.refined_by(vb)
+            }
+            (Ty::List(Elem::Tuple(a)), Ty::List(Elem::Tuple(b))) => {
+                Ty::Tuple(a).refined_by(Ty::Tuple(b))
+            }
+            _ => false,
         }
     }
 
@@ -282,6 +342,11 @@ impl Ty {
         match self {
             Ty::Unknown => Ty::Object,
             Ty::Tuple(k) => tuple_of(tuple_shape(k).into_iter().map(Ty::settled).collect()),
+            Ty::Dict(k) => {
+                let (key, value) = dict_shape(k);
+                dict_of(key.settled(), value.settled())
+            }
+            Ty::List(Elem::Tuple(k)) => Ty::List(Elem::of(Ty::Tuple(k).settled())),
             other => other,
         }
     }
@@ -304,7 +369,12 @@ impl Ty {
                     other => Elem::of(other).ty(),
                 })
             }
-            Ty::Dict | Ty::Set | Ty::Gen => Some(Ty::Object),
+            // A dict iterates as its keys.
+            Ty::Dict(k) => Some(match dict_shape(k).0 {
+                Ty::Unknown => Ty::Unknown,
+                key => Elem::of(key).ty(),
+            }),
+            Ty::Set | Ty::Gen => Some(Ty::Object),
             Ty::Str => Some(Ty::Str),
             Ty::Unknown => Some(Ty::Unknown),
             _ => None,
@@ -1290,7 +1360,7 @@ pub(crate) fn annotation_in(classes: &HashMap<String, usize>, e: &py::Expr) -> T
             "str" => Ty::Str,
             "None" => Ty::None,
             "list" | "List" | "Sequence" | "Iterable" => Ty::List(Elem::Object),
-            "dict" | "Dict" | "Mapping" => Ty::Dict,
+            "dict" | "Dict" | "Mapping" => dynamic_dict(),
             "set" | "Set" => Ty::Set,
             "tuple" | "Tuple" => Ty::Object,
             other => classes
@@ -2466,10 +2536,15 @@ fn infer_locals_with(
         body,
         &locals.vars,
         unkinded_locals(body, &sig.params, seeds, &scope),
+        true,
     );
     locals.narrowed = asserted_classes(body, &module.class_index);
     for _ in 0..8 {
         let before = locals.clone();
+        // The result is decided afresh each round, from the types known
+        // now, as an unkinded list is.
+        locals.ret = Ty::Unknown;
+        locals.returns = false;
         let mut walker = Walker {
             module,
             locals: &mut locals,
@@ -2568,22 +2643,26 @@ pub(crate) enum ListFact {
     Writes(Ty),
 }
 
-/// The uses of each of `names`, list-typed variables of `body`. A read
-/// is an index, a slice, an iteration, a measure, a join, a membership
-/// test, a truth test, or a call of one of the reading methods; a write
-/// is `append`, `insert`, `extend`, `+=`, an element or slice store, or
-/// a pass to a function of the module. Anything else, in the body or a
-/// nested one, keeps the list.
 /// The key a class's field goes by among list sites.
 pub(crate) fn field_key(class: usize, field: &str) -> String {
     format!("{class}#{field}")
 }
 
+/// The uses of each of `names`, list-typed variables of `body`. A read
+/// is an index, a slice, an iteration, a measure, a join, a membership
+/// test, a truth test, or a call of one of the reading methods; a write
+/// is `append`, `insert`, `extend`, `+=`, an element or slice store, or
+/// a pass to a function of the module. Anything else, in the body or a
+/// nested one, keeps the list. Returning a name is a read when
+/// `returns_read`: a local built here leaves as the list it was decided
+/// to be, while a parameter or a field returned whole is an alias the
+/// caller may write through.
 pub(crate) fn list_sites<'ast>(
     module: &Module,
     body: &'ast [py::Stmt],
     vars: &HashMap<String, Ty>,
     names: Vec<String>,
+    returns_read: bool,
 ) -> HashMap<String, ListSites<'ast>> {
     use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     struct Uses<'a, 'm, 'ast> {
@@ -2592,6 +2671,7 @@ pub(crate) fn list_sites<'ast>(
         sites: HashMap<String, ListSites<'ast>>,
         /// Whether the current expression is one of the allowed uses.
         allowed: &'a std::cell::Cell<bool>,
+        returns_read: bool,
     }
     impl<'ast> Uses<'_, '_, 'ast> {
         fn site(&mut self, name: &str) -> &mut ListSites<'ast> {
@@ -2753,6 +2833,10 @@ pub(crate) fn list_sites<'ast>(
                     }
                     walk_stmt(self, stmt);
                 }
+                py::Stmt::Return(r)
+                    if self.returns_read
+                        && matches!(r.value.as_deref(), Some(py::Expr::Name(n)) if self.sites.contains_key(n.id.as_str())) =>
+                    {}
                 _ => walk_stmt(self, stmt),
             }
         }
@@ -2922,6 +3006,7 @@ pub(crate) fn list_sites<'ast>(
             .map(|n| (n, ListSites::default()))
             .collect(),
         allowed: &allowed,
+        returns_read,
     };
     for s in body {
         if let py::Stmt::FunctionDef(_) | py::Stmt::ClassDef(_) = s {
@@ -3221,7 +3306,7 @@ fn field_sites_into(
     keys: &[String],
     rounds: &mut HashMap<String, FieldRound>,
 ) {
-    let sites = list_sites(module, body, vars, keys.to_vec());
+    let sites = list_sites(module, body, vars, keys.to_vec(), false);
     let no_outer = HashMap::new();
     let typer = Typer {
         module,
@@ -3269,7 +3354,7 @@ fn list_param_facts(
         })
         .map(|(name, _)| name.clone())
         .collect();
-    let sites = list_sites(module, body, vars, followed);
+    let sites = list_sites(module, body, vars, followed, false);
     let no_outer = HashMap::new();
     let typer = Typer {
         module,
@@ -3417,9 +3502,12 @@ impl Walker<'_> {
                 .join(ty);
             self.locals.param_writes.insert(name.to_string(), written);
             // A value the declared type admits, None into an instance,
-            // a subclass instance into a base, changes nothing.
+            // a subclass instance into a base, changes nothing. A dict
+            // written with another kind widens at the call sites, through
+            // what was recorded above, and is read here as declared.
             if !matches!(*declared, Ty::Object | Ty::Unknown)
                 && ty != Ty::Unknown
+                && !matches!((*declared, ty), (Ty::Dict(_), Ty::Dict(_)))
                 && self.module.join_classes(*declared, ty) != *declared
             {
                 self.locals.vars.insert(name.to_string(), Ty::Object);
@@ -3476,6 +3564,20 @@ impl Walker<'_> {
                 self.field_write(a, ty);
             }
             py::Expr::Attribute(a) => self.field_write(a, ty),
+            // `d[k] = v` on a dict held by a name widens the dict's keys
+            // by the key's type and its values by the value's.
+            py::Expr::Subscript(sub) => {
+                if let py::Expr::Name(n) = &*sub.value
+                    && let Ty::Dict(k) = self.expr(&sub.value)
+                {
+                    let (key, value) = dict_shape(k);
+                    let written = self.expr(&sub.slice);
+                    let widened = dict_of(key.join(written), value.join(ty));
+                    if widened != Ty::Dict(k) {
+                        self.assign(n.id.as_str(), widened);
+                    }
+                }
+            }
             // Unpacking gives every name an element: its own from a
             // tuple of that arity, the element type from a list, and
             // otherwise whatever the runtime finds.
@@ -3939,6 +4041,29 @@ impl Typer<'_> {
         Elem::of(inner.expr(elt))
     }
 
+    /// The key and value types of a dict comprehension.
+    fn comprehension_pair(
+        &self,
+        generators: &[py::Comprehension],
+        key: &py::Expr,
+        value: &py::Expr,
+    ) -> (Ty, Ty) {
+        let mut vars = self.vars.clone();
+        for g in generators {
+            bind_target(
+                &mut vars,
+                &g.target,
+                self.expr(&g.iter).element().unwrap_or(Ty::Object),
+            );
+        }
+        let inner = Typer {
+            module: self.module,
+            vars: &vars,
+            outer: self.outer,
+        };
+        (inner.expr(key), inner.expr(value))
+    }
+
     pub(crate) fn expr(&self, e: &py::Expr) -> Ty {
         match e {
             py::Expr::NumberLiteral(n) => match &n.value {
@@ -4065,6 +4190,8 @@ impl Typer<'_> {
                         Some(i) => shape[i],
                         None => seq.element().unwrap_or(Ty::Object),
                     }
+                } else if let Ty::Dict(k) = seq {
+                    dict_shape(k).1
                 } else {
                     seq.element().unwrap_or(Ty::Object)
                 }
@@ -4080,7 +4207,29 @@ impl Typer<'_> {
                     tuple_of(t.elts.iter().map(|e| self.expr(e)).collect())
                 }
             }
-            py::Expr::Dict(_) | py::Expr::DictComp(_) => Ty::Dict,
+            // A literal's shape is the join of its keys and of its values;
+            // a spread brings keys and values of every kind.
+            py::Expr::Dict(d) => {
+                if d.items.iter().any(|item| item.key.is_none()) {
+                    return dynamic_dict();
+                }
+                let mut key = Ty::Unknown;
+                let mut value = Ty::Unknown;
+                for item in &d.items {
+                    if let Some(k) = &item.key {
+                        key = key.join(self.expr(k));
+                    }
+                    value = value.join(self.expr(&item.value));
+                }
+                dict_of(key, value)
+            }
+            py::Expr::DictComp(c) => {
+                let Some(key) = &c.key else {
+                    return dynamic_dict();
+                };
+                let (k, v) = self.comprehension_pair(&c.generators, key, &c.value);
+                dict_of(k, v)
+            }
             py::Expr::Set(_) | py::Expr::SetComp(_) => Ty::Set,
             py::Expr::Generator(_) => Ty::Gen,
             py::Expr::Yield(_) | py::Expr::YieldFrom(_) => Ty::None,
@@ -4226,6 +4375,18 @@ impl Typer<'_> {
                     _ => Ty::Object,
                 }
             }
+            // `d.get(k)` is a value or None; with a default, a value or
+            // the default.
+            py::Expr::Attribute(a)
+                if a.attr.as_str() == "get"
+                    && let Ty::Dict(k) = self.expr(&a.value) =>
+            {
+                let value = dict_shape(k).1;
+                match c.arguments.args.get(1) {
+                    Some(default) => value.join(self.expr(default)),
+                    None => value.join(Ty::None),
+                }
+            }
             // A method on a value whose type is known, or not yet.
             py::Expr::Attribute(a) => self.method_ret(self.expr(&a.value), a.attr.as_str()),
             _ => Ty::Object,
@@ -4246,7 +4407,9 @@ impl Typer<'_> {
                 Ty::List(e) => Ty::List(e),
                 Ty::Str => Ty::List(Elem::Str),
                 Ty::Tuple(_) => Ty::List(Elem::of(arg(0).element().unwrap_or(Ty::Object))),
-                Ty::Dict | Ty::Set | Ty::Gen => Ty::List(Elem::Object),
+                // A list of a dict is its keys.
+                Ty::Dict(k) => Ty::List(Elem::of(dict_shape(k).0)),
+                Ty::Set | Ty::Gen => Ty::List(Elem::Object),
                 _ => match args.first() {
                     Some(py::Expr::Call(c)) if is_name(&c.func, "range") => Ty::List(Elem::Int),
                     _ => Ty::List(Elem::Object),
@@ -4258,7 +4421,11 @@ impl Typer<'_> {
                 Ty::Tuple(k) => Ty::Tuple(k),
                 _ => Ty::Object,
             },
-            "dict" => Ty::Dict,
+            "dict" => match arg(0) {
+                Ty::Dict(k) => Ty::Dict(k),
+                Ty::Unknown => dict_of(Ty::Unknown, Ty::Unknown),
+                _ => dynamic_dict(),
+            },
             "set" | "frozenset" => Ty::Set,
             // Pairs and mapped values are dynamic; the lists are eager.
             "enumerate" | "zip" | "map" | "filter" => Ty::List(Elem::Object),
@@ -4349,12 +4516,18 @@ impl Typer<'_> {
                 .module
                 .dispatched_ret(k as usize, attr)
                 .unwrap_or(Ty::Object),
-            Ty::Dict => match attr {
-                "keys" | "values" | "items" => Ty::List(Elem::Object),
-                "copy" => Ty::Dict,
-                "clear" | "update" => Ty::None,
-                _ => Ty::Object,
-            },
+            Ty::Dict(k) => {
+                let (key, value) = dict_shape(k);
+                match attr {
+                    "keys" => Ty::List(Elem::of(key)),
+                    "values" => Ty::List(Elem::of(value)),
+                    "items" => Ty::List(Elem::of(tuple_of(vec![key, value]))),
+                    "pop" | "setdefault" => value,
+                    "copy" => receiver,
+                    "clear" | "update" => Ty::None,
+                    _ => Ty::Object,
+                }
+            }
             Ty::Set => match attr {
                 "add" | "remove" | "discard" | "clear" | "update" => Ty::None,
                 "union" | "intersection" | "difference" | "symmetric_difference" | "copy" => {

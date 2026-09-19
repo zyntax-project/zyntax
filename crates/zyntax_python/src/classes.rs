@@ -1067,7 +1067,11 @@ fn builtin_arms(
             Ty::List(Elem::Object),
             None,
         ),
-        (kind(zyntax_builtins::DICT_TAG >> 8), Ty::Dict, None),
+        (
+            kind(zyntax_builtins::DICT_TAG >> 8),
+            crate::types::dynamic_dict(),
+            None,
+        ),
         (kind(zyntax_builtins::SET_TAG >> 8), Ty::Set, None),
     ];
     // A boxed tuple is a list of dynamic values under its own tag, and

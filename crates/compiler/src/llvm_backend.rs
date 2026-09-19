@@ -1778,8 +1778,25 @@ impl<'ctx> LLVMBackend<'ctx> {
                 operand,
             } => {
                 let operand_val = self.get_value(*operand)?;
-                let target_ty = self.translate_type(ty)?;
-                let casted = self.compile_cast(*op, operand_val, target_ty)?;
+                // A bitcast of an address to an aggregate held by
+                // reference names the aggregate at that address, which
+                // this backend holds as the address itself.
+                let casted = if *op == CastOp::Bitcast
+                    && crate::osr::is_held_by_reference(ty)
+                    && (operand_val.is_pointer_value() || operand_val.is_int_value())
+                {
+                    let ptr_ty = self.context.i8_type().ptr_type(AddressSpace::default());
+                    if operand_val.is_pointer_value() {
+                        operand_val
+                    } else {
+                        self.builder
+                            .build_int_to_ptr(operand_val.into_int_value(), ptr_ty, "agg_addr")?
+                            .into()
+                    }
+                } else {
+                    let target_ty = self.translate_type(ty)?;
+                    self.compile_cast(*op, operand_val, target_ty)?
+                };
                 self.value_map.insert(*result, casted);
             }
 
