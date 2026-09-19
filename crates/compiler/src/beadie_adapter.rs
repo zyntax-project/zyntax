@@ -29,6 +29,7 @@ use crate::hir::{HirFunction, HirId, HirModule};
 /// `tier` drives OSR codegen: tier 0 emits back-edge probes; tier ≥ 1
 /// emits OSR helpers and skips probes. `bead_id` is the OSR registry key
 /// embedded as a constant into tier-0 probe call sites.
+#[derive(Clone)]
 pub struct ZyntaxFunctionDef {
     pub id: HirId,
     pub function: HirFunction,
@@ -71,6 +72,49 @@ impl ZyntaxCraneliftBackend {
     pub fn with_lock<R>(&self, f: impl FnOnce(&mut CraneliftBackend) -> R) -> R {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut guard)
+    }
+
+    /// The tier-1 resume points of `def`'s function, for a tier above
+    /// that made none for some of its loops: the function is compiled
+    /// again here so a frame running its loop has somewhere to go, but
+    /// its call cell is left to the code the higher tier installed.
+    pub fn resume_points(&self, def: &ZyntaxFunctionDef) -> Vec<(u64, *mut ())> {
+        let (translated, isa) = self
+            .with_lock(|backend| {
+                backend.set_compile_tier(1);
+                backend.set_compile_bead_id(def.bead_id);
+                backend
+                    .translate_function_in_shared_module(def.id, &def.function, &def.module)
+                    .ok()
+                    .flatten()
+                    .map(|t| (t, backend.isa()))
+            })
+            .map_or((None, None), |(t, isa)| (Some(t), Some(isa)));
+        let (Some(mut translated), Some(isa)) = (translated, isa) else {
+            return Vec::new();
+        };
+        if translated.compile(&*isa).is_err() {
+            return Vec::new();
+        }
+        self.with_lock(|backend| {
+            backend.set_compile_tier(1);
+            backend.set_compile_bead_id(def.bead_id);
+            if backend
+                .install_function_in_shared_module(translated, &def.function)
+                .is_err()
+            {
+                return Vec::new();
+            }
+            backend.set_defer_cell_publish(true);
+            let finalized = backend.finalize_definitions();
+            backend.set_defer_cell_publish(false);
+            // The cells stay with the higher tier.
+            backend.take_deferred_cells();
+            if finalized.is_err() {
+                return Vec::new();
+            }
+            backend.take_pending_osr_helpers()
+        })
     }
 }
 

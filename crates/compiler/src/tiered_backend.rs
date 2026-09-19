@@ -2839,8 +2839,33 @@ pub fn compile_at_tier(
     #[cfg(feature = "llvm-backend")]
     if tier_idx == 2 && matches!(tier2_backend, Tier2Backend::LLVM) {
         if let Some(llvm) = llvm {
+            let resume = def.clone();
             return match llvm.compile(bead, def) {
-                Ok(p) => p,
+                Ok(p) => {
+                    // A loop the LLVM tier made no resume point for
+                    // would keep its running frame where it is; the
+                    // Cranelift tier fills the slot instead.
+                    let missing: Vec<u64> = crate::osr::find_loop_headers(&resume.function)
+                        .into_iter()
+                        .filter_map(|h| crate::osr::osr_layout(&resume.function, h).ok())
+                        .map(|layout| layout.site_key())
+                        .filter(|site| crate::osr::helper_for(bead_id, *site).is_null())
+                        .collect();
+                    if !missing.is_empty() {
+                        for (site, code) in cranelift.resume_points(&resume) {
+                            if missing.contains(&site) && !code.is_null() {
+                                if crate::osr::osr_trace_enabled() {
+                                    eprintln!(
+                                        "[osr] {} site=0x{site:x}: resume point from tier 1",
+                                        resume.function.name.resolve_global().unwrap_or_default()
+                                    );
+                                }
+                                crate::osr::publish_helper(bead_id, site, code);
+                            }
+                        }
+                    }
+                    p
+                }
                 Err(e) => {
                     log::warn!("[TieredBackend] LLVM compile failed: {e}");
                     if verbosity >= 1 || crate::osr::osr_trace_enabled() {
