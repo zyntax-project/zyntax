@@ -56,7 +56,7 @@
 //! * Storage handed to an owning parameter is the callee's; a callee
 //!   that stores or returns its parameter must say so with `Owned`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::hir::{
     HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator,
@@ -1349,9 +1349,15 @@ fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
         }
     }
     let mallocs: Vec<MallocSite> = collect_owned_sites(func, facts);
+    // The use index every site's analysis walks, rebuilt when a release
+    // inserted for one site has moved the instructions.
+    let mut users = Users::of(func);
     for site in mallocs {
         stats.mallocs_scanned += 1;
-        let outcome = analyze_site(func, &site, facts);
+        if users.stale(func) {
+            users = Users::of(func);
+        }
+        let outcome = analyze_site(func, &site, facts, &users);
         if trace_enabled() {
             eprintln!(
                 "[drop] {}: site {} -> {}",
@@ -1961,7 +1967,12 @@ fn successors_of(block: &crate::hir::HirBlock) -> Vec<HirId> {
     block.terminator.targets()
 }
 
-fn analyze_site(func: &HirFunction, site: &MallocSite, facts: &ModuleFacts) -> SiteOutcome {
+fn analyze_site(
+    func: &HirFunction,
+    site: &MallocSite,
+    facts: &ModuleFacts,
+    users: &Users,
+) -> SiteOutcome {
     // Walk every block, every instruction, every terminator, and
     // for each use of `site.result`:
     //   - record the (block, idx) location and the use *kind*
@@ -1976,7 +1987,7 @@ fn analyze_site(func: &HirFunction, site: &MallocSite, facts: &ModuleFacts) -> S
     // hold the claim too and their uses keep the storage live. Without
     // this, storing a box in a struct forfeits it: the store reads as
     // an escape even where the struct never leaves.
-    let derived = derived_values_in(func, site.result, facts);
+    let derived = derived_values_using(func, site.result, true, Some(facts), users);
     let target = site.result;
     let mut last_idx_in_block: Option<usize> = None;
     let mut had_any_use = false;
@@ -2110,6 +2121,67 @@ fn derived_values_with(
     through_phis: bool,
     facts: Option<&ModuleFacts>,
 ) -> std::collections::HashSet<HirId> {
+    let users = Users::of(func);
+    derived_values_using(func, root, through_phis, facts, &users)
+}
+
+/// Which instructions and phis use each value, so a flow from a root is
+/// followed along its uses rather than by sweeping the function once
+/// per root. Positions go stale when instructions are inserted; the
+/// count says when.
+pub(crate) struct Users {
+    by_value: HashMap<HirId, Vec<(HirId, usize)>>,
+    phi_users: HashMap<HirId, Vec<(HirId, usize)>>,
+    instructions: usize,
+}
+
+impl Users {
+    pub(crate) fn of(func: &HirFunction) -> Self {
+        let mut by_value: HashMap<HirId, Vec<(HirId, usize)>> = HashMap::new();
+        let mut phi_users: HashMap<HirId, Vec<(HirId, usize)>> = HashMap::new();
+        let mut instructions = 0;
+        for (&bid, block) in &func.blocks {
+            instructions += block.instructions.len();
+            for (i, inst) in block.instructions.iter().enumerate() {
+                let mut seen: smallvec::SmallVec<[HirId; 4]> = smallvec::SmallVec::new();
+                for v in inst.operands() {
+                    if !seen.contains(&v) {
+                        seen.push(v);
+                        by_value.entry(v).or_default().push((bid, i));
+                    }
+                }
+            }
+            for (i, phi) in block.phis.iter().enumerate() {
+                for (v, _) in &phi.incoming {
+                    phi_users.entry(*v).or_default().push((bid, i));
+                }
+            }
+        }
+        Users {
+            by_value,
+            phi_users,
+            instructions,
+        }
+    }
+
+    /// Whether `func` has changed shape since this was built.
+    pub(crate) fn stale(&self, func: &HirFunction) -> bool {
+        func.blocks
+            .values()
+            .map(|b| b.instructions.len())
+            .sum::<usize>()
+            != self.instructions
+    }
+}
+
+/// [`derived_values_with`] over a prepared use index.
+fn derived_values_using(
+    func: &HirFunction,
+    root: HirId,
+    through_phis: bool,
+    facts: Option<&ModuleFacts>,
+    users: &Users,
+) -> std::collections::HashSet<HirId> {
     let mut set = std::collections::HashSet::new();
     set.insert(root);
     // A list header owns the element storage its first field names:
@@ -2138,118 +2210,128 @@ fn derived_values_with(
             )
         })
     };
-    // Blocks are unordered here, so a single sweep can miss a chain
-    // that runs backwards through the map. Repeat until nothing new
-    // appears; the set only grows and is bounded by the value count.
-    loop {
-        let before = set.len() + heads.len();
-        for block in func.blocks.values() {
-            if through_phis {
-                for phi in &block.phis {
-                    if phi.incoming.iter().any(|(v, _)| set.contains(v)) {
-                        set.insert(phi.result);
-                    }
-                }
-            }
-            for inst in &block.instructions {
-                if list {
-                    match inst {
-                        HirInstruction::Cast {
-                            result, operand, ..
-                        } if heads.contains(operand) => {
-                            heads.insert(*result);
-                        }
-                        HirInstruction::GetElementPtr {
-                            result,
-                            ptr,
-                            indices,
-                            ..
-                        } if heads.contains(ptr) && indices.iter().all(zero) => {
-                            heads.insert(*result);
-                        }
-                        HirInstruction::Load {
-                            result, ptr, ty, ..
-                        } if heads.contains(ptr) && matches!(ty, HirType::Ptr(_)) => {
-                            set.insert(*result);
-                        }
-                        // Growing the elements moves them: the result is
-                        // the same storage at its new address.
-                        HirInstruction::Call {
-                            result: Some(result),
-                            callee: HirCallable::Intrinsic(Intrinsic::Realloc),
-                            args,
-                            ..
-                        } if args.first().is_some_and(|a| set.contains(a)) => {
-                            set.insert(*result);
-                        }
-                        _ => {}
-                    }
-                }
-                // Two shapes produce a value that is not another name
-                // for this storage, and following them would put the
-                // whole program in the set.
-                //
-                // A dereference reads a pointer the allocation holds.
-                // Releasing this one leaves what it held untouched, so
-                // what comes out is a different object with its own
-                // life.
-                //
-                // A call hands back whatever the callee made. Nothing
-                // is given up by not following it: handing the pointer
-                // to a callee that does not merely borrow it is already
-                // an escape, and one that borrows has promised not to
-                // keep it. Following it instead made `t.check()`, an
-                // integer, an alias of the tree, and printing that
-                // integer read as the tree escaping. The exception is a
-                // callee known to hand the argument itself back: its
-                // result is this storage under another name.
-                if let HirInstruction::Call {
-                    result: Some(result),
-                    callee,
-                    args,
-                    ..
-                } = inst
+    // What one instruction makes of the values reached so far: another
+    // name for the storage, or a head. The rules are monotone in both
+    // sets, so a value is examined once, when it enters.
+    let mut work: Vec<HirId> = vec![root];
+    while let Some(v) = work.pop() {
+        if through_phis {
+            for (b, i) in users.phi_users.get(&v).map(|u| u.as_slice()).unwrap_or(&[]) {
+                if let Some(phi) = func.blocks.get(b).and_then(|blk| blk.phis.get(*i))
+                    && set.insert(phi.result)
                 {
-                    if let Some(facts) = facts {
-                        if args
-                            .iter()
-                            .any(|a| set.contains(a) && facts.result_aliases_arg(callee, args, *a))
-                        {
-                            set.insert(*result);
-                        }
-                    }
-                    continue;
-                }
-                if matches!(
-                    inst,
-                    HirInstruction::Load { .. }
-                        | HirInstruction::IndirectCall { .. }
-                        | HirInstruction::TraitMethodCall { .. }
-                        | HirInstruction::CallClosure { .. }
-                ) {
-                    continue;
-                }
-                // Anything else computing a value from one of these is
-                // another name for the same storage. Asked through
-                // `operands`, which every instruction answers, rather
-                // than through a list of the kinds thought of at the
-                // time: a kind left out of a list reads as a value the
-                // allocation never reaches, and a use through it as no
-                // use at all, which puts the release in front of it.
-                // The GEP a struct literal takes to reach a field was
-                // exactly that, and the store through it landed after
-                // the free.
-                if inst.operands().iter().any(|o| set.contains(o)) {
-                    if let Some(result) = inst.result_id() {
-                        set.insert(result);
-                    }
+                    work.push(phi.result);
                 }
             }
         }
-        if set.len() + heads.len() == before {
-            return set;
+        for (b, i) in users.by_value.get(&v).map(|u| u.as_slice()).unwrap_or(&[]) {
+            let Some(inst) = func.blocks.get(b).and_then(|blk| blk.instructions.get(*i)) else {
+                continue;
+            };
+            if list {
+                match inst {
+                    HirInstruction::Cast {
+                        result, operand, ..
+                    } if heads.contains(operand) => {
+                        if heads.insert(*result) {
+                            work.push(*result);
+                        }
+                    }
+                    HirInstruction::GetElementPtr {
+                        result,
+                        ptr,
+                        indices,
+                        ..
+                    } if heads.contains(ptr) && indices.iter().all(zero) => {
+                        if heads.insert(*result) {
+                            work.push(*result);
+                        }
+                    }
+                    HirInstruction::Load {
+                        result, ptr, ty, ..
+                    } if heads.contains(ptr) && matches!(ty, HirType::Ptr(_)) => {
+                        if set.insert(*result) {
+                            work.push(*result);
+                        }
+                    }
+                    // Growing the elements moves them: the result is
+                    // the same storage at its new address.
+                    HirInstruction::Call {
+                        result: Some(result),
+                        callee: HirCallable::Intrinsic(Intrinsic::Realloc),
+                        args,
+                        ..
+                    } if args.first().is_some_and(|a| set.contains(a)) => {
+                        if set.insert(*result) {
+                            work.push(*result);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Two shapes produce a value that is not another name
+            // for this storage, and following them would put the
+            // whole program in the set.
+            //
+            // A dereference reads a pointer the allocation holds.
+            // Releasing this one leaves what it held untouched, so
+            // what comes out is a different object with its own
+            // life.
+            //
+            // A call hands back whatever the callee made. Nothing
+            // is given up by not following it: handing the pointer
+            // to a callee that does not merely borrow it is already
+            // an escape, and one that borrows has promised not to
+            // keep it. Following it instead made `t.check()`, an
+            // integer, an alias of the tree, and printing that
+            // integer read as the tree escaping. The exception is a
+            // callee known to hand the argument itself back: its
+            // result is this storage under another name.
+            if let HirInstruction::Call {
+                result: Some(result),
+                callee,
+                args,
+                ..
+            } = inst
+            {
+                if let Some(facts) = facts
+                    && args
+                        .iter()
+                        .any(|a| set.contains(a) && facts.result_aliases_arg(callee, args, *a))
+                    && set.insert(*result)
+                {
+                    work.push(*result);
+                }
+                continue;
+            }
+            if matches!(
+                inst,
+                HirInstruction::Load { .. }
+                    | HirInstruction::IndirectCall { .. }
+                    | HirInstruction::TraitMethodCall { .. }
+                    | HirInstruction::CallClosure { .. }
+            ) {
+                continue;
+            }
+            // Anything else computing a value from one of these is
+            // another name for the same storage. Asked through
+            // `operands`, which every instruction answers, rather
+            // than through a list of the kinds thought of at the
+            // time: a kind left out of a list reads as a value the
+            // allocation never reaches, and a use through it as no
+            // use at all, which puts the release in front of it.
+            // The GEP a struct literal takes to reach a field was
+            // exactly that, and the store through it landed after
+            // the free.
+            if inst.operands().iter().any(|o| set.contains(o))
+                && let Some(result) = inst.result_id()
+                && set.insert(result)
+            {
+                work.push(result);
+            }
         }
     }
+    set
 }
 
 /// The more restrictive of two classifications.

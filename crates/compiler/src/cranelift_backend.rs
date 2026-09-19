@@ -2089,8 +2089,24 @@ impl CraneliftBackend {
             // destination hands the destination over in the frame, and
             // the helper writes through it and returns it as this body
             // would.
+            //
+            // Each layout walks the region its header reaches, so a huge
+            // body with many loops (a script's top level) would spend
+            // most of its compile here; past a budget it does without
+            // OSR and tiers up at its next entry instead.
+            const OSR_LAYOUT_BUDGET: usize = 200_000;
+            let within_budget =
+                osr_loop_headers.len().saturating_mul(function.blocks.len()) <= OSR_LAYOUT_BUDGET;
+            if !within_budget && crate::osr::osr_trace_enabled() {
+                eprintln!(
+                    "[osr] skip tier-0 {}: {} headers over {} blocks exceed the layout budget",
+                    function.name.resolve_global().unwrap_or_default(),
+                    osr_loop_headers.len(),
+                    function.blocks.len()
+                );
+            }
             let osr_layouts: HashMap<HirId, crate::osr::OsrLayout> =
-                if self.compile_tier == 0 && self.emit_osr_probes {
+                if self.compile_tier == 0 && self.emit_osr_probes && within_budget {
                     let dominators = crate::osr::Dominators::compute(function);
                     osr_loop_headers
                         .iter()

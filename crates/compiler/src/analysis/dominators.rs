@@ -60,6 +60,11 @@ pub struct DominatorTree {
     /// Reverse of `idom` — dom-tree children of each block. Built
     /// once at construction for O(1) tree traversal.
     children: HashMap<HirId, Vec<HirId>>,
+    /// Each reachable block's entry and exit times in a walk of the
+    /// dominator tree: `a` dominates `b` when `a`'s interval holds
+    /// `b`'s. A query is then a comparison, not a walk up a tree that
+    /// is a path as long as a straight-line body.
+    interval: HashMap<HirId, (usize, usize)>,
     /// Dominance frontier of each block. `frontier[b]` is the set of
     /// blocks `y` such that `b` dominates a predecessor of `y` but
     /// does not strictly dominate `y` itself — the φ-insertion sites
@@ -79,6 +84,7 @@ impl DominatorTree {
         let idom = compute_idom(func, entry, &rpo, &rpo_pos);
         let children = build_children(&idom);
         let frontier = compute_frontier(func, &idom, &rpo_pos);
+        let interval = compute_intervals(entry, &children);
 
         Self {
             entry,
@@ -87,6 +93,7 @@ impl DominatorTree {
             idom,
             children,
             frontier,
+            interval,
         }
     }
 
@@ -117,22 +124,10 @@ impl DominatorTree {
         if dominator == dominated {
             return false;
         }
-        // Walk up the dominator tree from `dominated`; if we hit
-        // `dominator` we're done.
-        let mut cur = dominated;
-        while let Some(&next) = self.idom.get(&cur) {
-            if next == dominator {
-                return true;
-            }
-            if next == cur {
-                // Hit the entry's self-loop sentinel — shouldn't
-                // happen in our representation (we omit entry from
-                // `idom`) but defensive.
-                return false;
-            }
-            cur = next;
+        match (self.interval.get(&dominator), self.interval.get(&dominated)) {
+            (Some(&(a_in, a_out)), Some(&(b_in, b_out))) => a_in < b_in && b_out < a_out,
+            _ => false,
         }
-        false
     }
 
     /// Dom-tree children of `block` — every block whose immediate
@@ -319,6 +314,35 @@ fn intersect(
 }
 
 /// Invert `idom` to give a children-of map.
+/// Entry and exit times of every block in a walk of the tree from
+/// `entry`, iterative so a tree as deep as a long body fits the stack.
+fn compute_intervals(
+    entry: HirId,
+    children: &HashMap<HirId, Vec<HirId>>,
+) -> HashMap<HirId, (usize, usize)> {
+    let mut interval: HashMap<HirId, (usize, usize)> = HashMap::new();
+    let mut clock = 0;
+    let mut stack: Vec<(HirId, usize)> = vec![(entry, 0)];
+    interval.insert(entry, (clock, usize::MAX));
+    while let Some((b, next)) = stack.last_mut() {
+        let kids = children.get(b).map(|v| v.as_slice()).unwrap_or(&[]);
+        if *next < kids.len() {
+            let k = kids[*next];
+            *next += 1;
+            clock += 1;
+            interval.insert(k, (clock, usize::MAX));
+            stack.push((k, 0));
+        } else {
+            clock += 1;
+            if let Some(entry) = interval.get_mut(b) {
+                entry.1 = clock;
+            }
+            stack.pop();
+        }
+    }
+    interval
+}
+
 fn build_children(idom: &HashMap<HirId, HirId>) -> HashMap<HirId, Vec<HirId>> {
     let mut out: HashMap<HirId, Vec<HirId>> = HashMap::new();
     for (child, parent) in idom {

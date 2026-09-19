@@ -491,7 +491,7 @@ pub fn osr_layout_with(
     let in_region: IdSet = reachable.iter().copied().collect();
     // Dominance inside the region, entered at the header alone: the
     // helper's view of the control flow.
-    let region_dom = region_dominators(function, header, &in_region);
+    let region_dom = Dominators::compute_in(function, header, Some(&in_region), Edges::Terminators);
     // Only values defined in blocks the header dominates are guaranteed to
     // have been computed by the time the resumed code reads them. Anything
     // else (an enclosing loop's counter, say) must arrive in the frame.
@@ -594,8 +594,7 @@ pub fn osr_layout_with(
             }))
             .collect();
         for (value, ty) in defs {
-            let reached_by_def =
-                |b: &HirId| region_dom.get(b).is_some_and(|d| d.contains(&def_block));
+            let reached_by_def = |b: &HirId| region_dom.dominates(def_block, *b);
             // A block the definition does not dominate reads the header's
             // phi. That is the value there only if every path from the
             // definition to the block passes the header, where the phi
@@ -712,60 +711,6 @@ pub fn osr_layout_with(
         destination,
         repairs,
     })
-}
-
-/// The dominators of each block of `region`, with `header` as the only
-/// entry: edges from outside the region do not count.
-fn region_dominators(
-    function: &HirFunction,
-    header: HirId,
-    region: &IdSet,
-) -> HashMap<HirId, IdSet> {
-    let mut preds: HashMap<HirId, Vec<HirId>> = HashMap::new();
-    for &b in region {
-        if let Some(block) = function.blocks.get(&b) {
-            for succ in successors_of(&block.terminator) {
-                if region.contains(&succ) && succ != header {
-                    preds.entry(succ).or_default().push(b);
-                }
-            }
-        }
-    }
-    let all: IdSet = region.iter().copied().collect();
-    let mut dom: HashMap<HirId, IdSet> = region
-        .iter()
-        .map(|&b| {
-            if b == header {
-                (b, std::iter::once(b).collect())
-            } else {
-                (b, all.clone())
-            }
-        })
-        .collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in region {
-            if b == header {
-                continue;
-            }
-            let mut next: Option<IdSet> = None;
-            for p in preds.get(&b).map(|v| v.as_slice()).unwrap_or(&[]) {
-                let pd = &dom[p];
-                next = Some(match next {
-                    None => pd.clone(),
-                    Some(acc) => acc.intersection(pd).copied().collect(),
-                });
-            }
-            let mut next = next.unwrap_or_default();
-            next.insert(b);
-            if next != dom[&b] {
-                dom.insert(b, next);
-                changed = true;
-            }
-        }
-    }
-    dom
 }
 
 /// `function` as a helper resumes it at `layout.header`: each repaired
@@ -1389,21 +1334,63 @@ pub struct Dominators {
     all: Vec<HirId>,
 }
 
+/// Where a dominator computation reads the CFG's edges from: the
+/// blocks' predecessor lists, which SSA construction maintains while
+/// terminators are still being placed, or the terminators, the truth
+/// once construction is done.
+#[derive(Clone, Copy)]
+pub enum Edges {
+    Lists,
+    Terminators,
+}
+
 impl Dominators {
     pub fn compute(function: &HirFunction) -> Self {
-        let all: Vec<HirId> = function.blocks.keys().copied().collect();
-        let Some(&entry) = all.first() else {
+        let Some(&entry) = function.blocks.keys().next() else {
             return Dominators {
                 order: Vec::new(),
                 index: HashMap::new(),
                 idom: Vec::new(),
-                all,
+                all: Vec::new(),
             };
         };
+        Self::compute_in(function, entry, None, Edges::Lists)
+    }
+
+    /// The tree over the blocks of `region` (every block when none)
+    /// entered at `entry` alone: edges from outside the region do not
+    /// count, and the entry's own predecessors are never consulted.
+    pub fn compute_in(
+        function: &HirFunction,
+        entry: HirId,
+        region: Option<&IdSet>,
+        edges: Edges,
+    ) -> Self {
+        let inside = |b: &HirId| region.is_none_or(|r| r.contains(b));
+        let all: Vec<HirId> = function.blocks.keys().copied().filter(inside).collect();
         let mut successors: HashMap<HirId, Vec<HirId>> = HashMap::new();
+        let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::new();
         for (&b, block) in &function.blocks {
-            for &p in &block.predecessors {
-                successors.entry(p).or_default().push(b);
+            if !inside(&b) {
+                continue;
+            }
+            match edges {
+                Edges::Lists => {
+                    for &p in &block.predecessors {
+                        if inside(&p) {
+                            successors.entry(p).or_default().push(b);
+                            predecessors.entry(b).or_default().push(p);
+                        }
+                    }
+                }
+                Edges::Terminators => {
+                    for s in successors_of(&block.terminator) {
+                        if inside(&s) {
+                            successors.entry(b).or_default().push(s);
+                            predecessors.entry(s).or_default().push(b);
+                        }
+                    }
+                }
             }
         }
         // Postorder from the entry, then reversed.
@@ -1429,8 +1416,10 @@ impl Dominators {
         let preds: Vec<Vec<usize>> = order
             .iter()
             .map(|b| {
-                function.blocks[b]
-                    .predecessors
+                predecessors
+                    .get(b)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[])
                     .iter()
                     .filter_map(|p| index.get(p).copied())
                     .collect()

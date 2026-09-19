@@ -958,6 +958,13 @@ pub fn compile_function_with(
     func: &HirFunction,
     address_taken: bool,
 ) -> Result<CompiledFunction, InterpError> {
+    // Every value takes a register, and a register is a `Reg`: a
+    // function past that is refused, and runs natively.
+    if func.values.len() + func.signature.params.len() > Reg::MAX as usize {
+        return Err(InterpError::UnsupportedInstruction(
+            "register overflow".to_string(),
+        ));
+    }
     let mut cf = CompiledFunction::default();
     let mut reg_of: HashMap<HirId, Reg> = HashMap::new();
     let abi = crate::abi::function_abi(func, address_taken);

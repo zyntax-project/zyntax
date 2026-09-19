@@ -7501,9 +7501,47 @@ impl SsaBuilder {
         self.read_variable_recursive(var, block)
     }
 
-    /// Recursively read variable, inserting phis as needed (before IDF)
-    /// After IDF placement, this won't create new phis - it will only traverse existing ones
+    /// Read a variable not defined in `block`, inserting phis as needed
+    /// (before IDF); after IDF placement only existing phis are used.
+    ///
+    /// A chain of sealed single-predecessor blocks is walked, not
+    /// recursed: a straight-line body is one such chain, as long as its
+    /// statements, and each step's predecessor scan costs the whole
+    /// function. The blocks walked cache the value for the next read.
     fn read_variable_recursive(&mut self, var: InternedString, block: HirId) -> HirId {
+        let mut walked = Vec::new();
+        let mut at = block;
+        loop {
+            if at != block
+                && let Some(&v) = self.definitions.get(&at).and_then(|d| d.get(&var))
+            {
+                return self.cache_read(var, &walked, v);
+            }
+            let preds = self.current_preds_of(at);
+            if self.sealed_blocks.contains(&at) && preds.len() == 1 && preds[0] != at {
+                walked.push(at);
+                at = preds[0];
+                continue;
+            }
+            break;
+        }
+        let value = self.read_variable_at(var, at);
+        self.cache_read(var, &walked, value)
+    }
+
+    /// The value a read through `blocks` found, recorded in each so the
+    /// next read stops there. Not a write: loop phi placement does not
+    /// see it.
+    fn cache_read(&mut self, var: InternedString, blocks: &[HirId], value: HirId) -> HirId {
+        for b in blocks {
+            if let Some(defs) = self.definitions.get_mut(b) {
+                defs.insert(var, value);
+            }
+        }
+        value
+    }
+
+    fn read_variable_at(&mut self, var: InternedString, block: HirId) -> HirId {
         let predecessors = self.current_preds_of(block);
         let is_sealed = self.sealed_blocks.contains(&block);
         if std::env::var_os("ZYNTAX_SSA_TRACE").is_some() {

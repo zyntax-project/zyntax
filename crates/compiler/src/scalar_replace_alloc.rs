@@ -123,16 +123,87 @@ pub fn run_module(module: &mut HirModule) -> ScalarReplaceAllocStats {
 
 fn run_function(func: &mut HirFunction) -> ScalarReplaceAllocStats {
     let mut stats = ScalarReplaceAllocStats::default();
+    // The integer constants, for GEP indices: gathered once, since a
+    // function has as many candidates as allocations and every value
+    // is a constant to look at. A rewrite adds no constants.
+    let const_map: HashMap<HirId, i64> = func
+        .values
+        .iter()
+        .filter_map(|(id, val)| match &val.kind {
+            HirValueKind::Constant(c) => const_as_i64(c).map(|n| (*id, n)),
+            _ => None,
+        })
+        .collect();
+    // Which blocks use each value, for the escape check; a rewrite
+    // substitutes loads with stored values, which can put a pointer in
+    // another block's hands, so the map is gathered again after one.
+    let mut uses = block_uses(func);
     let block_ids: Vec<HirId> = func.blocks.keys().copied().collect();
     for bid in block_ids {
-        stats.combine(run_block(func, bid));
+        stats.combine(run_block(func, bid, &const_map, &mut uses));
     }
     stats
 }
 
+/// Every value's using blocks: instructions, indirect callees,
+/// terminators and phi incomings.
+type BlockUses = HashMap<HirId, smallvec::SmallVec<[HirId; 2]>>;
+
+fn block_uses(func: &HirFunction) -> BlockUses {
+    use crate::hir::HirTerminator;
+    let mut uses: BlockUses = HashMap::new();
+    let mut note = |uses: &mut BlockUses, v: HirId, b: HirId| {
+        let blocks = uses.entry(v).or_default();
+        if !blocks.contains(&b) {
+            blocks.push(b);
+        }
+    };
+    for (&bid, blk) in &func.blocks {
+        for inst in &blk.instructions {
+            for v in inst.operands() {
+                note(&mut uses, v, bid);
+            }
+            if let HirInstruction::Call {
+                callee: HirCallable::Indirect(v),
+                ..
+            } = inst
+            {
+                note(&mut uses, *v, bid);
+            }
+        }
+        match &blk.terminator {
+            HirTerminator::Return { values } => {
+                for v in values {
+                    note(&mut uses, *v, bid);
+                }
+            }
+            HirTerminator::CondBranch { condition, .. } => note(&mut uses, *condition, bid),
+            HirTerminator::Switch { value, .. } => note(&mut uses, *value, bid),
+            HirTerminator::Invoke { args, .. } => {
+                for v in args {
+                    note(&mut uses, *v, bid);
+                }
+            }
+            HirTerminator::PatternMatch { value, .. } => note(&mut uses, *value, bid),
+            HirTerminator::Branch { .. } | HirTerminator::Unreachable => {}
+        }
+        for phi in &blk.phis {
+            for (v, _) in &phi.incoming {
+                note(&mut uses, *v, bid);
+            }
+        }
+    }
+    uses
+}
+
 /// Run scalar-replace-alloc on one block. Each non-escaping malloc is
 /// rewritten and removed; the sweep repeats until none remain.
-fn run_block(func: &mut HirFunction, bid: HirId) -> ScalarReplaceAllocStats {
+fn run_block(
+    func: &mut HirFunction,
+    bid: HirId,
+    const_map: &HashMap<HirId, i64>,
+    uses: &mut BlockUses,
+) -> ScalarReplaceAllocStats {
     let mut stats = ScalarReplaceAllocStats::default();
     // collect_candidates returns malloc-result HirIds in document order.
     // We rebuild on each iteration so positional indices stay valid
@@ -145,12 +216,13 @@ fn run_block(func: &mut HirFunction, bid: HirId) -> ScalarReplaceAllocStats {
         let mut applied_one = false;
         for malloc_result in candidates {
             stats.candidates_examined += 1;
-            match build_candidate(func, bid, malloc_result) {
+            match build_candidate(func, bid, malloc_result, const_map, uses) {
                 Some(c) => {
                     let (mallocs, frees) = apply_candidate(func, bid, &c);
                     stats.mallocs_eliminated += mallocs;
                     stats.frees_eliminated += frees;
                     applied_one = true;
+                    *uses = block_uses(func);
                     // Restart sweep — block indices have shifted.
                     break;
                 }
@@ -227,7 +299,13 @@ struct Candidate {
 
 /// Build a Candidate for the given malloc_result, or return None if
 /// it escapes / has unsupported shape.
-fn build_candidate(func: &HirFunction, bid: HirId, malloc_result: HirId) -> Option<Candidate> {
+fn build_candidate(
+    func: &HirFunction,
+    bid: HirId,
+    malloc_result: HirId,
+    const_map: &HashMap<HirId, i64>,
+    uses: &BlockUses,
+) -> Option<Candidate> {
     let block = func.blocks.get(&bid)?;
 
     // Locate the malloc instruction index.
@@ -241,18 +319,6 @@ fn build_candidate(func: &HirFunction, bid: HirId, malloc_result: HirId) -> Opti
             } if *r == malloc_result
         )
     })?;
-
-    // Block-scoped constant map for resolving GEP indices.
-    // Keyed by HirId, value is the i64 const value. Only integer
-    // constants are populated.
-    let mut const_map: HashMap<HirId, i64> = HashMap::new();
-    for (id, val) in &func.values {
-        if let HirValueKind::Constant(c) = &val.kind {
-            if let Some(n) = const_as_i64(c) {
-                const_map.insert(*id, n);
-            }
-        }
-    }
 
     let mut tracked: HashSet<HirId> = HashSet::new();
     tracked.insert(malloc_result);
@@ -491,38 +557,13 @@ fn build_candidate(func: &HirFunction, bid: HirId, malloc_result: HirId) -> Opti
         }
     }
 
-    // Cross-block escape sweep: any other block referencing any
-    // tracked id (instructions / terminator / phi-incomings) aborts.
-    for (other_bid, blk) in &func.blocks {
-        if *other_bid == bid {
-            continue;
-        }
-        for inst in &blk.instructions {
-            let uses_tracked = inst.operands().iter().any(|o| tracked.contains(o));
-            if uses_tracked {
-                return None;
-            }
-            // Indirect call's callee isn't in operands() but still uses ids.
-            if let HirInstruction::Call {
-                callee: HirCallable::Indirect(v),
-                ..
-            } = inst
-            {
-                if tracked.contains(v) {
-                    return None;
-                }
-            }
-        }
-        if term_uses_any(&blk.terminator, &tracked) {
-            return None;
-        }
-        for phi in &blk.phis {
-            for (val, _) in &phi.incoming {
-                if tracked.contains(val) {
-                    return None;
-                }
-            }
-        }
+    // Cross-block escape: any other block referencing a tracked id.
+    let used_elsewhere = |v: &HirId| {
+        uses.get(v)
+            .is_some_and(|blocks| blocks.iter().any(|b| *b != bid))
+    };
+    if tracked.iter().any(used_elsewhere) {
+        return None;
     }
 
     // Every load's offset must have a field type (we look it up at
