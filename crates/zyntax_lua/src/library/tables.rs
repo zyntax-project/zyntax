@@ -411,6 +411,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             handler.decl(call("zl_meta", vec![tb.e(), text("__len")], any())),
             when(is_nil(handler.e()), vec![ret(len(arr_of(tb.e())))]),
+            metamethod_call_check(handler.e(), text("len")),
             ret(call(
                 "zl_arg_int",
                 vec![
@@ -560,6 +561,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 is_nil(x.e()),
                 vec![lua_error(text("attempt to close non-closable variable"))],
             ),
+            metamethod_call_check(x.e(), text("close")),
             expr(call("zl_call_2", vec![x.e(), o.e(), err.e()], any())),
             ret_void(),
         ],
@@ -583,11 +585,20 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     any(),
                 ))],
             ),
-            ret(call(
-                "zl_call_2",
-                vec![handler.e(), box_table(tb.e()), key],
-                any(),
-            )),
+            when(
+                is_func(handler.e()),
+                vec![ret(call(
+                    "zl_call_2",
+                    vec![handler.e(), box_table(tb.e()), key.clone()],
+                    any(),
+                ))],
+            ),
+            x.set(call("zl_index", vec![handler.e(), key], any())),
+            when(
+                not(is_nil(read_global(PENDING, any()))),
+                vec![set_global(VARINFO, int(0))],
+            ),
+            ret(x.e()),
         ]
     };
     d.push(define(
@@ -642,11 +653,22 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     ret_void(),
                 ],
             ),
-            expr(call(
-                "zl_call_3",
-                vec![handler.e(), box_table(tb.e()), key, v.e()],
-                any(),
-            )),
+            when(
+                is_func(handler.e()),
+                vec![
+                    expr(call(
+                        "zl_call_3",
+                        vec![handler.e(), box_table(tb.e()), key.clone(), v.e()],
+                        any(),
+                    )),
+                    ret_void(),
+                ],
+            ),
+            expr(call("zl_setindex", vec![handler.e(), key, v.e()], unit())),
+            when(
+                not(is_nil(read_global(PENDING, any()))),
+                vec![set_global(VARINFO, int(0))],
+            ),
             ret_void(),
         ]
     };
@@ -694,11 +716,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     // The same on a dynamic value: a table is indexed as above, a
     // string through the string library, anything else is an error.
     let not_indexable = |o: &Local| {
-        lua_error(concat(vec![
-            text("attempt to index a "),
-            type_name(o.e()),
-            text(" value"),
-        ]))
+        type_error(
+            concat(vec![
+                text("attempt to index a "),
+                type_name(o.e()),
+                text(" value"),
+            ]),
+            int(OPERAND_LEFT),
+        )
     };
     d.push(define(
         "zl_index",

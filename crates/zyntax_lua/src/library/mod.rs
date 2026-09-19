@@ -229,6 +229,29 @@ pub fn is_table(x: Expr) -> Expr {
 pub fn is_thread(x: Expr) -> Expr {
     and(ne(x.clone(), nil()), eq(tag_of(x), int(thread_tag())))
 }
+pub fn is_func(x: Expr) -> Expr {
+    and(
+        ne(x.clone(), nil()),
+        eq(tag_of(x), int(zyntax_builtins::FUNC_TAG)),
+    )
+}
+/// `h`, a metamethod for `event`, checked to be callable before it is
+/// called: the error names the event, as the reference's does.
+pub fn metamethod_call_check(h: Expr, event: Expr) -> Stmt {
+    when(
+        and(
+            not(is_func(h.clone())),
+            is_nil(call("zl_meta_of", vec![h.clone(), text("__call")], any())),
+        ),
+        vec![lua_error(concat(vec![
+            text("attempt to call a "),
+            type_name(h),
+            text(" value (metamethod '"),
+            event,
+            text("')"),
+        ]))],
+    )
+}
 fn is_nil_error(x: Expr) -> Expr {
     and(ne(x.clone(), nil()), eq(tag_of(x), int(nil_error_tag())))
 }
@@ -313,6 +336,12 @@ pub fn type_name(x: Expr) -> Expr {
 /// A Lua error: reported through the hook, which never returns.
 pub fn lua_error(message: Expr) -> Stmt {
     fatal("error", message)
+}
+
+/// A type error about `operand`, which the site describes: `(local
+/// 'x')` and the like.
+pub fn type_error(message: Expr, operand: Expr) -> Stmt {
+    expr(call("zl_type_error", vec![message, operand], unit()))
 }
 
 /// What the library says about instances: how a table or a coroutine
@@ -451,6 +480,18 @@ pub const GLOBALS: &str = "zl_G";
 pub const LINE: &str = "zl_line";
 /// The chunk's name, for the same.
 pub const CHUNK: &str = "zl_chunk";
+/// Which operand a pending type error is about, for the variable
+/// description the site appends: `OPERAND_LEFT` or `OPERAND_RIGHT`,
+/// with `VARINFO_INSIDE` when the description goes after the message's
+/// first word rather than at its end, and `VARINFO_CALL` when the
+/// error is a call's, which only a call site describes; zero for any
+/// other error. Set by every raise, cleared by the check that
+/// consumes it.
+pub const VARINFO: &str = "zl_varinfo";
+pub const OPERAND_LEFT: i64 = 1;
+pub const OPERAND_RIGHT: i64 = 2;
+pub const VARINFO_INSIDE: i64 = 4;
+pub const VARINFO_CALL: i64 = 8;
 
 pub fn global_var(name: &str, ty: Type) -> Decl {
     zyntax_typed_ast::TypedNode::new(
@@ -497,6 +538,7 @@ fn raising(t: &Types) -> Vec<Decl> {
     let kind = local("kind", string());
     let message = local("message", string());
     let v = kept("v", any());
+    let s = local("s", string());
     let level = local("level", i64());
     let line = local("line", i64());
     let mut d = vec![
@@ -505,6 +547,7 @@ fn raising(t: &Types) -> Vec<Decl> {
         global_var(CHUNK, string()),
         global_var(CHUNKS, any()),
         global_var(DEPTH, i64()),
+        global_var(VARINFO, i64()),
     ];
     // Entered below the floor: the error every deeper call would raise.
     d.push(define_cold(
@@ -604,6 +647,7 @@ fn raising(t: &Types) -> Vec<Decl> {
         unit(),
         vec![
             when(not(is_nil(pending())), vec![ret_void()]),
+            set_global(VARINFO, int(0)),
             if_(
                 is_nil(v.e()),
                 vec![set_global(PENDING, nil_error())],
@@ -619,11 +663,83 @@ fn raising(t: &Types) -> Vec<Decl> {
         unit(),
         vec![
             when(not(is_nil(pending())), vec![ret_void()]),
+            set_global(VARINFO, int(0)),
             set_global(
                 PENDING,
                 box_str(call("zl_position", vec![message.e()], string())),
             ),
             ret_void(),
+        ],
+    ));
+    // A type error, positioned, with the operand it is about noted for
+    // the site to describe.
+    let operand = local("operand", i64());
+    d.push(define_cold(
+        "zl_type_error",
+        &[&message, &operand],
+        unit(),
+        vec![
+            when(not(is_nil(pending())), vec![ret_void()]),
+            set_global(VARINFO, operand.e()),
+            set_global(
+                PENDING,
+                box_str(call("zl_position", vec![message.e()], string())),
+            ),
+            ret_void(),
+        ],
+    ));
+    // The pending type error with the description of the operand it is
+    // about, `left` or `right`, appended; the note is consumed. A
+    // call's error is described at a call site only, and an
+    // operator's only at an operator's.
+    let left = kept("left", string());
+    let right = kept("right", string());
+    let calling = local("calling", boolean());
+    let mark = local("mark", i64());
+    let described = local("described", string());
+    let tail = " has no integer representation";
+    d.push(define_cold(
+        "zl_annotate",
+        &[&v, &left, &right, &calling],
+        any(),
+        vec![
+            mark.decl(read_global(VARINFO, i64())),
+            when(eq(mark.e(), int(0)), vec![ret(v.e())]),
+            set_global(VARINFO, int(0)),
+            when(
+                ne(ne(bitand(mark.e(), int(VARINFO_CALL)), int(0)), calling.e()),
+                vec![ret(v.e())],
+            ),
+            described.decl(if_expr(
+                eq(bitand(mark.e(), int(3)), int(OPERAND_LEFT)),
+                left.e(),
+                right.e(),
+            )),
+            when(
+                eq(call("zb_str_len", vec![described.e()], i64()), int(0)),
+                vec![ret(v.e())],
+            ),
+            s.decl(get_str(v.e())),
+            when(
+                ne(bitand(mark.e(), int(VARINFO_INSIDE)), int(0)),
+                vec![ret(box_str(concat(vec![
+                    call(
+                        "zb_str_substring",
+                        vec![
+                            s.e(),
+                            int(0),
+                            sub(
+                                call("zb_str_len", vec![s.e()], i64()),
+                                int(tail.len() as i64),
+                            ),
+                        ],
+                        string(),
+                    ),
+                    described.e(),
+                    text(tail),
+                ])))],
+            ),
+            ret(box_str(add(s.e(), described.e()))),
         ],
     ));
     // `error(v, level)`: a string message at a level above zero is
@@ -738,7 +854,8 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
 }
 
 /// Every function that raises, through any number of calls: one that
-/// reaches the shared library's `zb_fatal`, or Lua's `zl_raise_value`.
+/// reaches the shared library's `zb_fatal`, or Lua's `zl_raise_value`
+/// or `zl_type_error`.
 fn fallible_functions(declarations: &[Decl]) -> std::collections::BTreeSet<String> {
     use std::collections::{BTreeMap, BTreeSet};
     let mut calls: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -753,9 +870,13 @@ fn fallible_functions(declarations: &[Decl]) -> std::collections::BTreeSet<Strin
             calls.insert(name, callees);
         }
     }
-    let mut fallible: BTreeSet<String> = ["zb_fatal".to_string(), "zl_raise_value".to_string()]
-        .into_iter()
-        .collect();
+    let mut fallible: BTreeSet<String> = [
+        "zb_fatal".to_string(),
+        "zl_raise_value".to_string(),
+        "zl_type_error".to_string(),
+    ]
+    .into_iter()
+    .collect();
     loop {
         let before = fallible.len();
         for (name, callees) in &calls {

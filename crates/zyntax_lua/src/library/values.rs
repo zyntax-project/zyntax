@@ -303,16 +303,47 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ret(nil()),
         ],
     ));
-    let event_name = |op: Expr| {
-        // The event's name by code; a chain of comparisons keeps it in
-        // typed AST.
-        let mut e = text(EVENTS[EVENTS.len() - 1]);
+    // The event's name by code, or the operation's without the
+    // underscores; a chain of comparisons keeps it in typed AST.
+    let name_chain = |op: Expr, skip: usize| {
+        let mut e = text(&EVENTS[EVENTS.len() - 1][skip..]);
         for (i, name) in EVENTS.iter().enumerate().rev().skip(1) {
-            e = if_expr(eq(op.clone(), int(i as i64)), text(name), e);
+            e = if_expr(eq(op.clone(), int(i as i64)), text(&name[skip..]), e);
         }
         e
     };
-    // The metamethod for `op` on `a` or `b`, called; or the error.
+    let event_name = |op: Expr| name_chain(op, 0);
+    let operation_name = |op: Expr| name_chain(op, 2);
+    let is_text_like = |x: Expr| {
+        let c = category(x);
+        or(
+            eq(c.clone(), int(STR)),
+            or(
+                eq(c.clone(), int(INT)),
+                or(eq(c.clone(), int(UINT)), eq(c, int(FLOAT))),
+            ),
+        )
+    };
+    // Whether a number has an integer value.
+    let has_int = |x: Expr| {
+        or(
+            is_int_cat_of(x.clone()),
+            call("zl_float_is_int", vec![get_f64(x)], boolean()),
+        )
+    };
+    let is_str = |x: Expr| and(not(is_nil(x.clone())), eq(category(x), int(STR)));
+    let is_number = |x: Expr| {
+        and(
+            not(is_nil(x.clone())),
+            or(is_int_cat_of(x.clone()), eq(category(x), int(FLOAT))),
+        )
+    };
+    // The metamethod for `op` on `a` or `b`, called; or the error,
+    // about the first operand that is wrong: for `..` the first that is
+    // not text, otherwise the first that is not a number. A string
+    // whose arithmetic fails errs the way the string library's
+    // metamethods do.
+    let bad = local("bad", i64());
     d.push(define(
         "zl_arith_meta",
         &[&op, &a, &b],
@@ -326,25 +357,45 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ),
             when(
                 not(is_nil(h.e())),
-                vec![ret(call(
-                    "zl_first",
-                    vec![call("zl_call_2", vec![h.e(), a.e(), b.e()], any())],
-                    any(),
-                ))],
+                vec![
+                    metamethod_call_check(h.e(), operation_name(op.e())),
+                    ret(call(
+                        "zl_first",
+                        vec![call("zl_call_2", vec![h.e(), a.e(), b.e()], any())],
+                        any(),
+                    )),
+                ],
             ),
-            x.decl(if_expr(
-                is_nil(call("zl_arith_operand", vec![a.e()], any())),
-                a.e(),
-                b.e(),
-            )),
             when(
                 eq(op.e(), int(OP_CONCAT)),
-                vec![lua_error(concat(vec![
-                    text("attempt to concatenate a "),
-                    type_name(x.e()),
-                    text(" value"),
-                ]))],
+                vec![
+                    bad.decl(if_expr(
+                        and(not(is_nil(a.e())), is_text_like(a.e())),
+                        int(OPERAND_RIGHT),
+                        int(OPERAND_LEFT),
+                    )),
+                    x.decl(if_expr(eq(bad.e(), int(OPERAND_LEFT)), a.e(), b.e())),
+                    type_error(
+                        concat(vec![
+                            text("attempt to concatenate a "),
+                            type_name(x.e()),
+                            text(" value"),
+                        ]),
+                        bad.e(),
+                    ),
+                    ret(nil()),
+                ],
             ),
+            na.decl(call("zl_arith_operand", vec![a.e()], any())),
+            nb.decl(call("zl_arith_operand", vec![b.e()], any())),
+            bad.decl(if_expr(
+                is_nil(na.e()),
+                int(OPERAND_LEFT),
+                int(OPERAND_RIGHT),
+            )),
+            x.decl(if_expr(eq(bad.e(), int(OPERAND_LEFT)), a.e(), b.e())),
+            // A bitwise operand is a number by type: two numbers, one
+            // without an integer value, or the first that is not one.
             when(
                 or(
                     and(ge(op.e(), int(OP_BAND)), le(op.e(), int(OP_SHR))),
@@ -352,24 +403,57 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ),
                 vec![
                     when(
-                        and(
-                            not(is_nil(call("zl_arith_operand", vec![a.e()], any()))),
-                            not(is_nil(call("zl_arith_operand", vec![b.e()], any()))),
-                        ),
-                        vec![lua_error(text("number has no integer representation"))],
+                        and(is_number(a.e()), is_number(b.e())),
+                        vec![
+                            bad.set(if_expr(
+                                has_int(a.e()),
+                                int(OPERAND_RIGHT),
+                                int(OPERAND_LEFT),
+                            )),
+                            type_error(
+                                text("number has no integer representation"),
+                                bitor(bad.e(), int(VARINFO_INSIDE)),
+                            ),
+                            ret(nil()),
+                        ],
                     ),
-                    lua_error(concat(vec![
-                        text("attempt to perform bitwise operation on a "),
-                        type_name(x.e()),
-                        text(" value"),
-                    ])),
+                    bad.set(if_expr(
+                        is_number(a.e()),
+                        int(OPERAND_RIGHT),
+                        int(OPERAND_LEFT),
+                    )),
+                    x.set(if_expr(eq(bad.e(), int(OPERAND_LEFT)), a.e(), b.e())),
+                    type_error(
+                        concat(vec![
+                            text("attempt to perform bitwise operation on a "),
+                            type_name(x.e()),
+                            text(" value"),
+                        ]),
+                        bad.e(),
+                    ),
+                    ret(nil()),
                 ],
             ),
-            lua_error(concat(vec![
-                text("attempt to perform arithmetic on a "),
-                type_name(x.e()),
-                text(" value"),
-            ])),
+            when(
+                or(is_str(a.e()), is_str(b.e())),
+                vec![lua_error(concat(vec![
+                    text("attempt to "),
+                    operation_name(op.e()),
+                    text(" a '"),
+                    type_name(a.e()),
+                    text("' with a '"),
+                    type_name(b.e()),
+                    text("'"),
+                ]))],
+            ),
+            type_error(
+                concat(vec![
+                    text("attempt to perform arithmetic on a "),
+                    type_name(x.e()),
+                    text(" value"),
+                ]),
+                bad.e(),
+            ),
             ret(nil()),
         ],
     ));
@@ -653,9 +737,14 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ))],
             ),
         ];
-        // Bitwise operators convert floats with integral values.
+        // Bitwise operators convert floats with integral values, never
+        // strings: those are the string metatable's to handle.
         let meta = || ret(call("zl_arith_meta", vec![op.e(), a.e(), b.e()], any()));
-        let mut bitwise = to_int_stmts(&na, &ia, &fa, vec![meta()]);
+        let mut bitwise = vec![when(
+            or(eq(category(a.e()), int(STR)), eq(category(b.e()), int(STR))),
+            vec![meta()],
+        )];
+        bitwise.extend(to_int_stmts(&na, &ia, &fa, vec![meta()]));
         bitwise.extend(to_int_stmts(&nb, &ib, &fb, vec![meta()]));
         bitwise.extend(int_op(&op, ia.e(), ib.e()));
         st.push(ia.decl(int(0)));
@@ -720,7 +809,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ))
         };
         let mut st = vec![
-            when(is_table(a.e()), vec![meta()]),
+            when(or(is_table(a.e()), is_str(a.e())), vec![meta()]),
             na.decl(call("zl_arith_operand", vec![a.e()], any())),
             when(is_nil(na.e()), vec![meta()]),
             ia.decl(int(0)),
@@ -925,15 +1014,18 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     ),
                     when(
                         not(is_nil(h.e())),
-                        vec![ret(call(
-                            "zl_truthy",
-                            vec![call(
-                                "zl_first",
-                                vec![call("zl_call_2", vec![h.e(), a.e(), b.e()], any())],
-                                any(),
-                            )],
-                            boolean(),
-                        ))],
+                        vec![
+                            metamethod_call_check(h.e(), text("eq")),
+                            ret(call(
+                                "zl_truthy",
+                                vec![call(
+                                    "zl_first",
+                                    vec![call("zl_call_2", vec![h.e(), a.e(), b.e()], any())],
+                                    any(),
+                                )],
+                                boolean(),
+                            )),
+                        ],
                     ),
                 ],
             ),
@@ -1007,15 +1099,18 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ),
             when(
                 not(is_nil(h.e())),
-                vec![ret(call(
-                    "zl_truthy",
-                    vec![call(
-                        "zl_first",
-                        vec![call("zl_call_2", vec![h.e(), a.e(), b.e()], any())],
-                        any(),
-                    )],
-                    boolean(),
-                ))],
+                vec![
+                    metamethod_call_check(h.e(), text(&event[2..])),
+                    ret(call(
+                        "zl_truthy",
+                        vec![call(
+                            "zl_first",
+                            vec![call("zl_call_2", vec![h.e(), a.e(), b.e()], any())],
+                            any(),
+                        )],
+                        boolean(),
+                    )),
+                ],
             ),
         ];
         st.extend(compare_error(&a, &b));
@@ -1046,7 +1141,13 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![
             when(
                 is_nil(x.e()),
-                vec![lua_error(text("attempt to concatenate a nil value"))],
+                vec![
+                    type_error(
+                        text("attempt to concatenate a nil value"),
+                        int(OPERAND_LEFT),
+                    ),
+                    ret(text("")),
+                ],
             ),
             cat.decl(category(x.e())),
             when(is_cat(&cat, STR), vec![ret(get_str(x.e()))]),
@@ -1054,24 +1155,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 is_number_cat(&cat),
                 vec![ret(call("zl_number_str", vec![x.e()], string()))],
             ),
-            lua_error(concat(vec![
-                text("attempt to concatenate a "),
-                type_name(x.e()),
-                text(" value"),
-            ])),
+            type_error(
+                concat(vec![
+                    text("attempt to concatenate a "),
+                    type_name(x.e()),
+                    text(" value"),
+                ]),
+                int(OPERAND_LEFT),
+            ),
             ret(text("")),
         ],
     ));
-    let is_text_like = |x: Expr| {
-        let c = category(x);
-        or(
-            eq(c.clone(), int(STR)),
-            or(
-                eq(c.clone(), int(INT)),
-                or(eq(c.clone(), int(UINT)), eq(c, int(FLOAT))),
-            ),
-        )
-    };
     d.push(define(
         "zl_concat",
         &[&a, &b],
@@ -1114,20 +1208,26 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     h.decl(call("zl_meta_of", vec![x.e(), text("__len")], any())),
                     when(
                         not(is_nil(h.e())),
-                        vec![ret(call(
-                            "zl_first",
-                            vec![call("zl_call_1", vec![h.e(), x.e()], any())],
-                            any(),
-                        ))],
+                        vec![
+                            metamethod_call_check(h.e(), text("len")),
+                            ret(call(
+                                "zl_first",
+                                vec![call("zl_call_1", vec![h.e(), x.e()], any())],
+                                any(),
+                            )),
+                        ],
                     ),
                     ret(box_i64(call("zl_len", vec![unbox_table(x.e(), t)], i64()))),
                 ],
             ),
-            lua_error(concat(vec![
-                text("attempt to get length of a "),
-                type_name(x.e()),
-                text(" value"),
-            ])),
+            type_error(
+                concat(vec![
+                    text("attempt to get length of a "),
+                    type_name(x.e()),
+                    text(" value"),
+                ]),
+                int(OPERAND_LEFT),
+            ),
             ret(nil()),
         ],
     ));

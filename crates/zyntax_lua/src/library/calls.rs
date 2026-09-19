@@ -30,12 +30,6 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let n = local("n", i64());
     let mut d = Vec::new();
 
-    let is_func = |x: Expr| {
-        and(
-            ne(x.clone(), nil()),
-            eq(tag_of(x), int(zyntax_builtins::FUNC_TAG)),
-        )
-    };
     let is_tuple = |x: Expr| {
         and(
             ne(x.clone(), nil()),
@@ -172,11 +166,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     // The record `f` is, or the `__call` handler's with `f` put in
     // front of `args`; `args` is edited in place for the caller.
     let not_callable = |f: &Local| {
-        lua_error(concat(vec![
-            text("attempt to call a "),
-            type_name(f.e()),
-            text(" value"),
-        ]))
+        type_error(
+            concat(vec![
+                text("attempt to call a "),
+                type_name(f.e()),
+                text(" value"),
+            ]),
+            int(OPERAND_LEFT | VARINFO_CALL),
+        )
     };
     d.push(define(
         "zl_callee",
@@ -201,6 +198,12 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                             expr(mcall(args.e(), "insert_at", vec![int(0), f.e()], unit())),
                             ret(call("zb_unbox_list_raw_any", vec![h.e()], anys.clone())),
                         ],
+                    ),
+                    // A handler that is not a function is what the
+                    // error names, as the reference tries to call it.
+                    when(
+                        not(is_nil(h.e())),
+                        vec![not_callable(&h), ret(list(vec![], anys.clone()))],
                     ),
                 ],
             ),

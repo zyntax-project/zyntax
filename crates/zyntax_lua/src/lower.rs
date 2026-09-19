@@ -46,6 +46,44 @@ struct Val {
     ty: Ty,
 }
 
+/// What a value is called in a type error about it, `local 'x'`,
+/// `field 'y'` and the like; nothing for a temporary.
+type Desc = Option<String>;
+
+/// What a site's check describes a type error with: the names of the
+/// operands, and whether the site is a call, whose error names the
+/// callee, rather than an operator or index, whose error names an
+/// operand.
+struct Described {
+    operands: [Desc; 2],
+    call: bool,
+}
+
+impl Described {
+    const NONE: Described = Described {
+        operands: [None, None],
+        call: false,
+    };
+    fn operand(desc: Desc) -> Described {
+        Described {
+            operands: [desc, None],
+            call: false,
+        }
+    }
+    fn operands(left: Desc, right: Desc) -> Described {
+        Described {
+            operands: [left, right],
+            call: false,
+        }
+    }
+    fn callee(desc: Desc) -> Described {
+        Described {
+            operands: [desc, None],
+            call: true,
+        }
+    }
+}
+
 /// What an expression in last position produces: a fixed number of
 /// values, or one dynamic value that may hold several, or nothing: a
 /// call that runs for its effects.
@@ -257,8 +295,6 @@ struct Lowerer<'m, 'a> {
     /// Names already bound by a `let` in this function, so a second
     /// declaration of a Lua local of the same name is a fresh symbol.
     bound: std::collections::HashSet<InternedString>,
-    /// The last global read as nil, for the message of a call to it.
-    nil_global: Option<String>,
     /// Whether this function checks for an error anywhere, so it may
     /// leave with one pending.
     raised: bool,
@@ -740,7 +776,6 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             returns,
             temps: 0,
             bound: std::collections::HashSet::new(),
-            nil_global: None,
             raised: false,
             raise_callees: HashSet::new(),
             line_needed: false,
@@ -1023,8 +1058,18 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     /// `if an error is pending, leave`; then the line is this one
-    /// again, since a callee sets its own.
+    /// again, since a callee sets its own. A type error's note of which
+    /// operand it is about is cleared on the way: it was a deeper
+    /// site's.
     fn pending_check(&mut self, span: Span) -> St {
+        self.pending_check_described(span, &Described::NONE)
+    }
+
+    /// The same, the error described first: a type error about an
+    /// operand of this site gets that operand's description appended,
+    /// `(local 'x')` and the like, the way the reference names the
+    /// variable.
+    fn pending_check_described(&mut self, span: Span, descs: &Described) -> St {
         self.raised = true;
         self.line_needed = true;
         let cond = binary(
@@ -1034,9 +1079,36 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             prim(PrimitiveType::Bool),
             span,
         );
+        let settle = if descs.operands.iter().all(Option::is_none) {
+            assign(
+                var(intern(library::VARINFO), prim(PrimitiveType::I64), span),
+                int_lit(0, span),
+                span,
+            )
+        } else {
+            let text = |d: &Desc| {
+                let d = d.as_deref().map(|d| format!(" ({d})")).unwrap_or_default();
+                str_lit(&d, span)
+            };
+            assign(
+                Self::pending(span),
+                call(
+                    "zl_annotate",
+                    vec![
+                        Self::pending(span),
+                        text(&descs.operands[0]),
+                        text(&descs.operands[1]),
+                        bool_lit(descs.call, span),
+                    ],
+                    Type::Any,
+                    span,
+                ),
+                span,
+            )
+        };
         let leave = self.placeholder_return(span);
         let restore = self.set_line(span);
-        if_(cond, vec![leave], Some(vec![restore]), span)
+        if_(cond, vec![settle, leave], Some(vec![restore]), span)
     }
 
     /// `zl_depth += 1; if zl_depth > limit { raise; leave }`: one more
@@ -1097,14 +1169,18 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     /// A value from a call that may have raised: held, then checked
     /// before anything uses it. A call that cannot raise is left alone.
-    fn guarded(&mut self, v: Val) -> Val {
+    fn guarded_described(&mut self, v: Val, descs: &Described) -> Val {
         if !self.call_can_raise(&v.node) {
             return v;
         }
-        self.guard(v)
+        self.guard_described(v, descs)
     }
 
     fn guard(&mut self, v: Val) -> Val {
+        self.guard_described(v, &Described::NONE)
+    }
+
+    fn guard_described(&mut self, v: Val, descs: &Described) -> Val {
         let span = v.node.span;
         let mut pre = Vec::new();
         let held = if v.node.ty == prim(PrimitiveType::Unit) {
@@ -1116,7 +1192,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         } else {
             self.hold(v, &mut pre)
         };
-        pre.push(self.pending_check(span));
+        pre.push(self.pending_check_described(span, descs));
         Val {
             node: block_value(pre, held.node, span),
             ty: held.ty,
@@ -1124,14 +1200,89 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     /// A statement calling something that may have raised, checked.
-    fn guarded_stmt(&mut self, node: Node) -> St {
+    fn guarded_stmt(&mut self, node: Node, descs: &Described) -> St {
         if !self.call_can_raise(&node) {
             return expr_stmt(node);
         }
         let span = node.span;
         let mut statements = vec![expr_stmt(node)];
-        statements.push(self.pending_check(span));
+        statements.push(self.pending_check_described(span, descs));
         stmt(TypedStatement::Block(TypedBlock { statements, span }), span)
+    }
+
+    // ─── what a value is called ─────────────────────────────────
+    // The reference names the variable a type error is about: a local,
+    // an upvalue, a global, a field, a constant or a method. These give
+    // the same name for an expression, appended by the site's check.
+
+    fn describe_name(&self, token: &TokenReference) -> Desc {
+        let name = ident(token);
+        Some(match self.scopes().binding(token) {
+            Some(Binding::Local(_)) => format!("local '{name}'"),
+            Some(Binding::Upvalue(_)) => format!("upvalue '{name}'"),
+            _ => format!("global '{name}'"),
+        })
+    }
+
+    fn describe(&self, e: &Expression) -> Desc {
+        match e {
+            Expression::Var(Var::Name(token)) => self.describe_name(token),
+            Expression::Var(Var::Expression(v)) => {
+                let suffixes: Vec<&Suffix> = v.suffixes().collect();
+                self.describe_chain(v.prefix(), &suffixes)
+            }
+            Expression::Parentheses { expression, .. } => self.describe(expression),
+            Expression::String(t) => {
+                let bytes = string_bytes(t).ok()?;
+                Some(format!("constant '{}'", String::from_utf8_lossy(&bytes)))
+            }
+            _ => None,
+        }
+    }
+
+    /// What a prefix with suffixes applied names: the last suffix, or
+    /// the prefix itself without any.
+    fn describe_chain(&self, prefix: &Prefix, suffixes: &[&Suffix]) -> Desc {
+        let Some((last, init)) = suffixes.split_last() else {
+            return match prefix {
+                Prefix::Name(token) => self.describe_name(token),
+                Prefix::Expression(e) => self.describe(e),
+                _ => None,
+            };
+        };
+        // `_ENV.x` is the global `x`.
+        if init.is_empty()
+            && let Prefix::Name(token) = prefix
+            && ident(token) == "_ENV"
+            && let Suffix::Index(ast::Index::Dot { name, .. }) = last
+        {
+            return Some(format!("global '{}'", ident(name)));
+        }
+        Self::describe_suffix(last)
+    }
+
+    /// What an index suffix names its result: a field, by the key when
+    /// that is a constant string, `integer index` for a small integer
+    /// and `?` for any other key, as the reference has it.
+    fn describe_suffix(s: &Suffix) -> Desc {
+        let key = match s {
+            Suffix::Index(ast::Index::Dot { name, .. }) => ident(name),
+            Suffix::Index(ast::Index::Brackets { expression, .. }) => match expression {
+                Expression::String(t) => match string_bytes(t) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(_) => "?".to_string(),
+                },
+                Expression::Number(t) => {
+                    match crate::host::parse_numeral(t.token().to_string().trim()) {
+                        crate::host::Numeral::Int(0..=255) => "integer index".to_string(),
+                        _ => "?".to_string(),
+                    }
+                }
+                _ => "?".to_string(),
+            },
+            _ => return None,
+        };
+        Some(format!("field '{key}'"))
     }
 
     // ─── variables ──────────────────────────────────────────────
@@ -1244,7 +1395,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 ty: Ty::Str,
             };
             let g = self.globals_table(span);
-            return Ok(self.index_read(g, key, span));
+            return Ok(self.index_read(g, key, None, span));
         }
         if let Some(f) = self.scopes().known_global_function(name) {
             return Ok(self.function_value(f, span));
@@ -1273,7 +1424,6 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             if name == "_G" || name == "_ENV" {
                 return unsupported("`_G` other than as `_G.name`", span);
             }
-            self.nil_global = Some(name.to_string());
             return Ok(self.nil_val(span));
         }
         let ty = self.typer().global_ty(name);
@@ -1295,7 +1445,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 ty: Ty::Str,
             };
             let g = self.globals_table(span);
-            return Ok(self.index_write(g, key, value, span));
+            return Ok(self.index_write(g, key, value, None, span));
         }
         if self.scopes().known_global_function(name).is_some() {
             // The one declaration of a known function is its typed
@@ -1518,7 +1668,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             },
             Expression::UnaryOperator { unop, expression } => {
                 let v = self.expr(expression)?;
-                self.unary_op(unop, v, span)
+                let desc = self.describe(expression);
+                self.unary_op(unop, v, desc, span)
             }
             Expression::BinaryOperator { lhs, binop, rhs } => self.binary_op(binop, lhs, rhs, span),
             _ => unsupported("this expression form", span),
@@ -1686,7 +1837,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     // ─── operators ──────────────────────────────────────────────
 
-    fn unary_op(&mut self, op: &UnOp, v: Val, span: Span) -> Result<Val> {
+    fn unary_op(&mut self, op: &UnOp, v: Val, desc: Desc, span: Span) -> Result<Val> {
+        let descs = Described::operand(desc);
         Ok(match op {
             UnOp::Not(_) => {
                 let t = self.truthy(v);
@@ -1712,10 +1864,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 },
                 _ => {
                     let b = self.boxed(v);
-                    self.guard(Val {
-                        node: call("zl_unm", vec![b], Type::Any, span),
-                        ty: Ty::Any,
-                    })
+                    self.guard_described(
+                        Val {
+                            node: call("zl_unm", vec![b], Type::Any, span),
+                            ty: Ty::Any,
+                        },
+                        &descs,
+                    )
                 }
             },
             UnOp::Hash(_) => match v.ty {
@@ -1729,10 +1884,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 },
                 _ => {
                     let b = self.boxed(v);
-                    self.guard(Val {
-                        node: call("zl_len_any", vec![b], Type::Any, span),
-                        ty: Ty::Any,
-                    })
+                    self.guard_described(
+                        Val {
+                            node: call("zl_len_any", vec![b], Type::Any, span),
+                            ty: Ty::Any,
+                        },
+                        &descs,
+                    )
                 }
             },
             UnOp::Tilde(_) => match v.ty {
@@ -1748,10 +1906,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 },
                 _ => {
                     let b = self.boxed(v);
-                    self.guard(Val {
-                        node: call("zl_bnot", vec![b], Type::Any, span),
-                        ty: Ty::Any,
-                    })
+                    self.guard_described(
+                        Val {
+                            node: call("zl_bnot", vec![b], Type::Any, span),
+                            ty: Ty::Any,
+                        },
+                        &descs,
+                    )
                 }
             },
             _ => return unsupported("this unary operator", span),
@@ -1775,7 +1936,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let a = self.expr(lhs)?;
         let b = self.expr(rhs)?;
         let v = self.binary_vals(op, a, b, span)?;
-        Ok(self.guarded(v))
+        let descs = Described::operands(self.describe(lhs), self.describe(rhs));
+        Ok(self.guarded_described(v, &descs))
     }
 
     fn binary_vals(&mut self, op: &BinOp, a: Val, b: Val, span: Span) -> Result<Val> {
@@ -2139,7 +2301,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
             }
         };
-        self.guarded_stmt(node)
+        self.guarded_stmt(node, &Described::NONE)
     }
 
     /// A name the program spells, boxed once and shared: the compiler
@@ -2153,8 +2315,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
     }
 
-    /// `obj[key]`, with `__index`.
-    fn index_read(&mut self, obj: Val, key: Val, span: Span) -> Val {
+    /// `obj[key]`, with `__index`; `desc` is what `obj` is called.
+    fn index_read(&mut self, obj: Val, key: Val, desc: Desc, span: Span) -> Val {
+        let descs = Described::operand(desc);
         if let Some(k) = self.constant_key(&key) {
             let node = match obj.ty {
                 Ty::Table => call("zl_table_index_key", vec![obj.node, k], Type::Any, span),
@@ -2163,7 +2326,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     call("zl_index_key", vec![o, k], Type::Any, span)
                 }
             };
-            return self.guarded(Val { node, ty: Ty::Any });
+            return self.guarded_described(Val { node, ty: Ty::Any }, &descs);
         }
         let node = match obj.ty {
             Ty::Table => match key.ty {
@@ -2191,11 +2354,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
             }
         };
-        self.guarded(Val { node, ty: Ty::Any })
+        self.guarded_described(Val { node, ty: Ty::Any }, &descs)
     }
 
-    /// `obj[key] = value`, with `__newindex`.
-    fn index_write(&mut self, obj: Val, key: Val, value: Val, span: Span) -> St {
+    /// `obj[key] = value`, with `__newindex`; `desc` is what `obj` is
+    /// called.
+    fn index_write(&mut self, obj: Val, key: Val, value: Val, desc: Desc, span: Span) -> St {
+        let descs = Described::operand(desc);
         let unit = prim(PrimitiveType::Unit);
         let v = self.boxed(value);
         if let Some(k) = self.constant_key(&key) {
@@ -2206,7 +2371,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     call("zl_setindex_key", vec![o, k, v], unit, span)
                 }
             };
-            return self.guarded_stmt(node);
+            return self.guarded_stmt(node, &descs);
         }
         let node = match obj.ty {
             Ty::Table => match key.ty {
@@ -2234,7 +2399,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
             }
         };
-        self.guarded_stmt(node)
+        self.guarded_stmt(node, &descs)
     }
 
     // ─── calls ──────────────────────────────────────────────────
@@ -2253,7 +2418,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         {
             let mut multi = None;
             let head = self.read_global(&name, span)?;
-            return self.suffixes_from(head, suffixes, 1, &mut multi, span);
+            let desc = self.describe_chain(prefix, &suffixes[..1]);
+            return self.suffixes_from(head, desc, suffixes, 1, &mut multi, span);
         }
         // A direct call to a known function or a builtin, possibly
         // followed by more suffixes on its result.
@@ -2284,21 +2450,23 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         {
             return Ok(m);
         }
-        let current = match multi.take() {
-            Some(m) => self.first_of(m, span),
+        let (current, desc) = match multi.take() {
+            Some(m) => (self.first_of(m, span), None),
             None => match prefix {
-                Prefix::Name(token) => self.read_name(token)?,
-                Prefix::Expression(e) => self.expr(e)?,
+                Prefix::Name(token) => (self.read_name(token)?, self.describe_name(token)),
+                Prefix::Expression(e) => (self.expr(e)?, self.describe(e)),
                 _ => return unsupported("this prefix", span),
             },
         };
-        self.suffixes_from(current, suffixes, first, &mut multi, span)
+        self.suffixes_from(current, desc, suffixes, first, &mut multi, span)
     }
 
-    /// The suffixes from `first` on, applied to `current`.
+    /// The suffixes from `first` on, applied to `current`, which `desc`
+    /// names.
     fn suffixes_from(
         &mut self,
         mut current: Val,
+        mut desc: Desc,
         suffixes: &[&Suffix],
         first: usize,
         multi: &mut Option<Multi>,
@@ -2307,6 +2475,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         for (i, s) in suffixes.iter().enumerate().skip(first) {
             if let Some(m) = multi.take() {
                 current = self.first_of(m, span);
+                desc = None;
             }
             let last = i + 1 == suffixes.len();
             match s {
@@ -2315,25 +2484,29 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         node: str_lit(&ident(name), span),
                         ty: Ty::Str,
                     };
-                    current = self.index_read(current, key, span);
+                    current = self.index_read(current, key, desc, span);
+                    desc = Self::describe_suffix(s);
                 }
                 Suffix::Index(ast::Index::Brackets { expression, .. }) => {
                     let key = self.expr(expression)?;
-                    current = self.index_read(current, key, span);
+                    current = self.index_read(current, key, desc, span);
+                    desc = Self::describe_suffix(s);
                 }
                 Suffix::Call(ast::Call::AnonymousCall(args)) => {
-                    let m = self.value_call(current.clone(), None, args, span)?;
+                    let m = self.value_call(current.clone(), None, args, desc, span)?;
                     if last {
                         return Ok(m);
                     }
                     *multi = Some(m);
+                    desc = None;
                 }
                 Suffix::Call(ast::Call::MethodCall(mc)) => {
-                    let m = self.method_call(current.clone(), mc, span)?;
+                    let m = self.method_call(current.clone(), mc, desc, span)?;
                     if last {
                         return Ok(m);
                     }
                     *multi = Some(m);
+                    desc = None;
                 }
                 _ => return unsupported("this suffix", span),
             }
@@ -2600,30 +2773,22 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
     }
 
-    /// A call through a function value.
+    /// A call through a function value, which `desc` names.
     fn value_call(
         &mut self,
         callee: Val,
         receiver: Option<Val>,
         args: &ast::FunctionArgs,
+        desc: Desc,
         span: Span,
     ) -> Result<Multi> {
         // A value known to be nil cannot be called; the error names
         // what it was, as Lua's does.
         if callee.ty == Ty::Nil {
-            let (pre, _, _) = self.call_values(receiver, args, span)?;
-            let what = match callee.node.node {
-                TypedExpression::Variable(name) => {
-                    let text = name.resolve_global().unwrap_or_default();
-                    match text.strip_prefix("lua$g$") {
-                        Some(g) => format!("attempt to call a nil value (global '{g}')"),
-                        None => "attempt to call a nil value".to_string(),
-                    }
-                }
-                _ => match self.nil_global.take() {
-                    Some(g) => format!("attempt to call a nil value (global '{g}')"),
-                    None => "attempt to call a nil value".to_string(),
-                },
+            let (mut pre, _, _) = self.call_values(receiver, args, span)?;
+            let what = match desc {
+                Some(d) => format!("attempt to call a nil value ({d})"),
+                None => "attempt to call a nil value".to_string(),
             };
             let error = call(
                 "zb_fatal",
@@ -2631,7 +2796,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 prim(PrimitiveType::Unit),
                 span,
             );
-            return Ok(Multi::None(block_value(pre, error, span)));
+            pre.push(self.guarded_stmt(error, &Described::NONE));
+            return Ok(Multi::None(block_value(pre, nil(span), span)));
         }
         let f = self.boxed(callee);
         let (mut pre, vals, tail) = self.call_values(receiver, args, span)?;
@@ -2647,16 +2813,20 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             )
             .node
         };
+        let descs = Described::callee(desc);
         if tail.is_none() && vals.len() <= zyntax_builtins::functions::MAX_CALL_ARITY {
             let mut lowered = vec![f];
             let n = vals.len();
             for v in vals {
                 lowered.push(self.boxed(v));
             }
-            let v = self.guard(Val {
-                node: call(&format!("zl_call_{n}"), lowered, Type::Any, span),
-                ty: Ty::Any,
-            });
+            let v = self.guard_described(
+                Val {
+                    node: call(&format!("zl_call_{n}"), lowered, Type::Any, span),
+                    ty: Ty::Any,
+                },
+                &descs,
+            );
             return Ok(Multi::Dynamic(block_value(pre, v.node, span)));
         }
         let mut items = Vec::with_capacity(vals.len());
@@ -2678,15 +2848,25 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 var(name, self.m.anys(), span)
             }
         };
-        let v = self.guard(Val {
-            node: call("zl_call_packed", vec![f, list], Type::Any, span),
-            ty: Ty::Any,
-        });
+        let v = self.guard_described(
+            Val {
+                node: call("zl_call_packed", vec![f, list], Type::Any, span),
+                ty: Ty::Any,
+            },
+            &descs,
+        );
         Ok(Multi::Dynamic(block_value(pre, v.node, span)))
     }
 
-    /// `obj:name(args)`: `obj.name(obj, args)` with `obj` evaluated once.
-    fn method_call(&mut self, obj: Val, mc: &ast::MethodCall, span: Span) -> Result<Multi> {
+    /// `obj:name(args)`: `obj.name(obj, args)` with `obj` evaluated
+    /// once; `desc` names `obj`.
+    fn method_call(
+        &mut self,
+        obj: Val,
+        mc: &ast::MethodCall,
+        desc: Desc,
+        span: Span,
+    ) -> Result<Multi> {
         let name = ident(mc.name());
         let mut pre = Vec::new();
         let obj = self.hold(obj, &mut pre);
@@ -2701,8 +2881,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             node: str_lit(&name, span),
             ty: Ty::Str,
         };
-        let callee = self.index_read(obj.clone(), key, span);
-        let multi = self.value_call(callee, Some(obj), mc.args(), span)?;
+        let callee = self.index_read(obj.clone(), key, desc, span);
+        let method = Some(format!("method '{name}'"));
+        let multi = self.value_call(callee, Some(obj), mc.args(), method, span)?;
         Ok(self.prefixed(pre, multi, span))
     }
 
@@ -3245,7 +3426,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                             prim(PrimitiveType::Unit),
                             span,
                         );
-                        let st = self.guarded_stmt(check);
+                        let st = self.guarded_stmt(check, &Described::NONE);
                         out.push(st);
                         self.tbc.push((self.depth, id));
                     }
@@ -3364,13 +3545,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 // `function a.b.c()` / `function a.b:m()`: index down to
                 // the holder, then store.
                 let mut obj = self.read_name(names[0])?;
+                let mut desc = self.describe_name(names[0]);
                 let mut pre = Vec::new();
                 for name in &names[1..names.len() - if is_method { 0 } else { 1 }] {
                     let key = Val {
                         node: str_lit(&ident(name), span),
                         ty: Ty::Str,
                     };
-                    obj = self.index_read(obj, key, span);
+                    obj = self.index_read(obj, key, desc, span);
+                    desc = Some(format!("field '{}'", ident(name)));
                     obj = self.hold(obj, &mut pre);
                 }
                 let last = match f.name().method_name() {
@@ -3383,7 +3566,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     ty: Ty::Str,
                 };
                 out.extend(pre);
-                let st = self.index_write(obj, key, record, span);
+                let st = self.index_write(obj, key, record, desc, span);
                 out.push(st);
             }
             Stmt::Goto(g) => {
@@ -3445,6 +3628,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 };
                 let obj_multi = self.suffixed(ve.prefix(), init, span)?;
                 let obj = self.first_of(obj_multi, span);
+                let desc = self.describe_chain(ve.prefix(), init);
                 let key = match last {
                     Suffix::Index(ast::Index::Dot { name, .. }) => Val {
                         node: str_lit(&ident(name), span),
@@ -3455,7 +3639,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     }
                     _ => return unsupported("this assignment target", span),
                 };
-                Ok(self.index_write(obj, key, v, span))
+                Ok(self.index_write(obj, key, v, desc, span))
             }
             _ => unsupported("this assignment target", span),
         }
@@ -3829,6 +4013,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 node: var(counter, i64_t.clone(), span),
                 ty: Ty::Int,
             },
+            None,
             span,
         );
         let mut body = vec![let_(value, Type::Any, read.node, span)];
