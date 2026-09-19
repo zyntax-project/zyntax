@@ -1763,6 +1763,48 @@ impl CraneliftBackend {
         Ok(())
     }
 
+    /// The resume point at `header` of `function`, translated and not
+    /// yet compiled: the first half of [`Self::compile_resume_points_for`]
+    /// for one header. Cranelift's compile of it, the long part, needs
+    /// no module and so no lock; [`Self::install_resume_point`] takes
+    /// the result. `None` when the header admits no layout.
+    pub fn translate_resume_point(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        module: &Arc<HirModule>,
+        header: HirId,
+    ) -> CompilerResult<Option<(Translated, u64)>> {
+        self.note_shared_module(module);
+        let layout = match crate::osr::osr_layout(function, header) {
+            Ok(l) => l,
+            Err(reason) => {
+                if std::env::var_os("ZYNTAX_OSR_TRACE").is_some() {
+                    eprintln!(
+                        "[osr] reject helper for bead={} header_idx={}: {:?}",
+                        self.compile_bead_id,
+                        crate::osr::block_index_of(function, header).unwrap_or(u64::MAX),
+                        reason
+                    );
+                }
+                return Ok(None);
+            }
+        };
+        let resumed = crate::osr::resumable(function, &layout);
+        self.translate_osr_helper(id, &resumed, &layout).map(Some)
+    }
+
+    /// The second half of a resume-point compile: the compiled helper
+    /// defined, pending publication at `site` once the module is
+    /// finalized.
+    pub fn install_resume_point(
+        &mut self,
+        translated: Translated,
+        site: u64,
+    ) -> CompilerResult<()> {
+        self.install_osr_helper(translated, site)
+    }
+
     /// Compile a single OSR helper by reusing
     /// [`Self::compile_function_body`] under helper mode. Saves and
     /// restores any auxiliary state that mode mutates so the caller's
@@ -1773,6 +1815,19 @@ impl CraneliftBackend {
         function: &HirFunction,
         layout: &crate::osr::OsrLayout,
     ) -> CompilerResult<()> {
+        let (mut translated, site) = self.translate_osr_helper(id, function, layout)?;
+        translated.compile(&*self.isa)?;
+        self.install_osr_helper(translated, site)
+    }
+
+    /// The helper for `layout` declared and translated, with its site
+    /// key: [`Self::emit_osr_helper_via_body`] up to Cranelift's compile.
+    fn translate_osr_helper(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        layout: &crate::osr::OsrLayout,
+    ) -> CompilerResult<(Translated, u64)> {
         // One pointer to the frame carrying the live-ins, matching what
         // `compile_function_body` builds the definition with and what
         // the back-edge probe calls through. Declaring a parameter per
@@ -1803,7 +1858,7 @@ impl CraneliftBackend {
                 CompilerError::Backend(format!("declare OSR helper {}: {}", helper_name, e))
             })?;
 
-        // Drive compile_function_body in helper mode.
+        // Drive the translation in helper mode.
         let prev_layout = self.compile_osr_layout.take();
         let prev_func_id = self.compile_osr_func_id.take();
         self.compile_osr_layout = Some(layout.clone());
@@ -1812,14 +1867,12 @@ impl CraneliftBackend {
         // Empty hir_module — helpers don't need cross-module info; the
         // main function compile already populated trait dispatch state.
         let empty_module = HirModule::new(zyntax_typed_ast::InternedString::new_global("__osr__"));
-        let result = self.compile_function_body(id, function, &empty_module);
+        let result = self.translate_function_body(id, function, &empty_module);
 
         self.compile_osr_layout = prev_layout;
         self.compile_osr_func_id = prev_func_id;
 
-        result?;
-
-        self.pending_osr_helpers.push((layout.site_key(), func_id));
+        let translated = result?;
 
         if std::env::var_os("ZYNTAX_OSR_TRACE").is_some() {
             eprintln!(
@@ -1829,6 +1882,15 @@ impl CraneliftBackend {
             );
         }
 
+        Ok((translated, layout.site_key()))
+    }
+
+    /// The compiled helper defined, and noted for the slot `site` names
+    /// once the module is finalized.
+    fn install_osr_helper(&mut self, translated: Translated, site: u64) -> CompilerResult<()> {
+        let func_id = translated.func_id;
+        self.install_translated(translated)?;
+        self.pending_osr_helpers.push((site, func_id));
         Ok(())
     }
 
@@ -1857,8 +1919,15 @@ impl CraneliftBackend {
         hir_module: &HirModule,
     ) -> CompilerResult<Translated> {
         // Address-taking sites use this to spot self-references, which
-        // pin to this generation instead of the reload cell.
-        self.current_compile_id = Some(id);
+        // pin to this generation instead of the reload cell. A resume
+        // point is a copy of the function entered mid-loop, not its
+        // definition, which may not exist yet: what it says of the
+        // function it says through the cell.
+        self.current_compile_id = if self.compile_osr_layout.is_some() {
+            None
+        } else {
+            Some(id)
+        };
         // Reset per-function scratch state on every entry. The success
         // path clears these at the *end* of the function (~line 4784);
         // the OSR helper error path clears them inline. But any error

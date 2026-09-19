@@ -1239,7 +1239,7 @@ mod tests {
         osr_request_promotion(id);
         osr_request_promotion(id);
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
-        requested().write().unwrap().remove(&id);
+        requested().write().unwrap().remove(&(id, 0));
         set_promotion_requester(|_, _| false);
     }
 
@@ -1758,10 +1758,12 @@ pub const OSR_REQUEST_SYMBOL: &str = "__zyntax_osr_request";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Requester {
     Compiled,
-    /// An interpreted frame, running the body with this [`body_tag`]:
-    /// the resume points it can leave through are that body's.
+    /// An interpreted frame, at the loop header whose OSR site this is.
+    /// The site names the body the frame runs (its tag): the resume
+    /// points it can leave through are that body's, and the one at this
+    /// header is the one it waits at.
     Interpreted {
-        body_tag: u16,
+        site: u64,
     },
 }
 
@@ -1780,11 +1782,23 @@ pub fn set_promotion_requester(f: impl Fn(u64, Requester) -> bool + Send + Sync 
     *promotion_requester().write().unwrap() = Some(Box::new(f));
 }
 
-/// Beads that have already asked, so a function called repeatedly does not
-/// queue the same compile over and over.
-fn requested() -> &'static RwLock<std::collections::HashSet<u64>> {
-    static S: OnceLock<RwLock<std::collections::HashSet<u64>>> = OnceLock::new();
+/// Requests already made, so a function called repeatedly does not queue
+/// the same compile over and over: one per bead from compiled code, one
+/// per site from the interpreter, whose frame asks from each header it
+/// warms at and leaves through whichever resume point comes.
+fn requested() -> &'static RwLock<std::collections::HashSet<(u64, u64)>> {
+    static S: OnceLock<RwLock<std::collections::HashSet<(u64, u64)>>> = OnceLock::new();
     S.get_or_init(|| RwLock::new(std::collections::HashSet::new()))
+}
+
+impl Requester {
+    /// What a request from here is deduplicated on.
+    fn key(self, bead_id: u64) -> (u64, u64) {
+        match self {
+            Requester::Compiled => (bead_id, 0),
+            Requester::Interpreted { site } => (bead_id, site),
+        }
+    }
 }
 
 /// Called when a compiled frame has revisited a resumable loop enough
@@ -1801,8 +1815,8 @@ pub extern "C" fn osr_request_promotion(bead_id: u64) {
 /// The interpreter's request for the loop it is running: the same
 /// compile, and resume points it can leave through as soon as they
 /// exist, since it can enter no code mid-loop without one.
-pub fn osr_request_promotion_interpreted(bead_id: u64, body_tag: u16) {
-    request(bead_id, Requester::Interpreted { body_tag });
+pub fn osr_request_promotion_interpreted(bead_id: u64, site: u64) {
+    request(bead_id, Requester::Interpreted { site });
 }
 
 /// The compile worker's busy flag, raised while it is in a job.
@@ -1868,7 +1882,8 @@ pub fn run_promotion(bead_id: u64, from: Requester) -> bool {
 }
 
 fn request(bead_id: u64, from: Requester) {
-    if !requested().write().unwrap().insert(bead_id) {
+    let key = from.key(bead_id);
+    if !requested().write().unwrap().insert(key) {
         return;
     }
     if osr_trace_enabled() {
@@ -1878,6 +1893,6 @@ fn request(bead_id: u64, from: Requester) {
     let submitted = guard.as_ref().is_some_and(|f| f(bead_id, from));
     drop(guard);
     if !submitted {
-        requested().write().unwrap().remove(&bead_id);
+        requested().write().unwrap().remove(&key);
     }
 }

@@ -124,13 +124,28 @@ impl ZyntaxCraneliftBackend {
     /// finalised, as `(site, code)`; the body is compiled already. The
     /// cells stay with whatever tier holds them.
     pub fn resume_point_at(&self, def: &ZyntaxFunctionDef, header: HirId) -> Vec<(u64, *mut ())> {
+        // As in `compile`: translation and installation under the lock,
+        // Cranelift's compile between them without it, so the frame's
+        // own thread is not held behind a helper it is waiting for when
+        // it compiles a callee.
+        let (translated, isa) = self.with_lock(|backend| {
+            backend.set_compile_tier(1);
+            backend.set_compile_bead_id(def.bead_id);
+            (
+                backend.translate_resume_point(def.id, &def.function, &def.module, header),
+                backend.isa(),
+            )
+        });
+        let Ok(Some((mut translated, site))) = translated else {
+            return Vec::new();
+        };
+        if translated.compile(&*isa).is_err() {
+            return Vec::new();
+        }
         self.with_lock(|backend| {
             backend.set_compile_tier(1);
             backend.set_compile_bead_id(def.bead_id);
-            if backend
-                .compile_resume_points_for(def.id, &def.function, &def.module, &[header])
-                .is_err()
-            {
+            if backend.install_resume_point(translated, site).is_err() {
                 return Vec::new();
             }
             backend.set_defer_cell_publish(true);

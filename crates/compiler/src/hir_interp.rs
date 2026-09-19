@@ -1139,15 +1139,34 @@ pub fn compile_function_with(
         if !headers.is_empty() {
             let dominators = crate::osr::Dominators::compute(func);
             for header in headers {
-                let Ok(layout) = crate::osr::osr_layout_with(func, header, &dominators) else {
-                    continue;
+                let layout = match crate::osr::osr_layout_with(func, header, &dominators) {
+                    Ok(layout) => layout,
+                    Err(why) => {
+                        if trace_enabled() {
+                            eprintln!(
+                                "[interp] {} header {:?}: no site, {why:?}",
+                                func.name.resolve_global().unwrap_or_default(),
+                                header
+                            );
+                        }
+                        continue;
+                    }
                 };
                 let live_ins: Option<Vec<Reg>> = layout
                     .live_ins
                     .iter()
                     .map(|id| reg_of.get(id).copied())
                     .collect();
-                let Some(live_ins) = live_ins else { continue };
+                let Some(live_ins) = live_ins else {
+                    if trace_enabled() {
+                        eprintln!(
+                            "[interp] {} header {:?}: no site, a live-in has no register",
+                            func.name.resolve_global().unwrap_or_default(),
+                            header
+                        );
+                    }
+                    continue;
+                };
                 header_sites.insert(header, cf.osr_sites.len() as u32);
                 cf.osr_sites.push(OsrSite {
                     site_key: layout.site_key(),
@@ -4239,14 +4258,19 @@ impl HirInterpreter {
                         false
                     };
                     if asks {
-                        let (body_tag, _, _) = crate::osr::decode_osr_site(osr_site.site_key);
                         // Waiting from here until this frame leaves `run`.
                         if !waits {
                             waits = true;
                             self.waiting_marks.push(bead);
                             crate::osr::frame_waits(bead);
                         }
-                        crate::osr::osr_request_promotion_interpreted(bead, body_tag);
+                        if trace_enabled() {
+                            eprintln!(
+                                "[interp] asks at site=0x{:x} after {} visits",
+                                osr_site.site_key, visits[i]
+                            );
+                        }
+                        crate::osr::osr_request_promotion_interpreted(bead, osr_site.site_key);
                         slots[i] = crate::osr::helper_slot_addr(bead, osr_site.site_key)
                             as *const std::sync::atomic::AtomicU64;
                     } else if slots[i].is_null() {
@@ -4256,6 +4280,12 @@ impl HirInterpreter {
                     let helper = unsafe { &*slots[i] }.load(std::sync::atomic::Ordering::Acquire);
                     // A frame with nowhere to write its result stays here.
                     if helper != 0 && (osr_site.destination.is_none() || !dest.is_null()) {
+                        // Leaving through this one: the frame runs natively
+                        // from here, so no other resume point is owed to it.
+                        if waits {
+                            self.waiting_marks.pop();
+                            crate::osr::frame_left(bead);
+                        }
                         return self.transfer(helper as *const u8, osr_site, &regs, scratch, dest);
                     }
                 }

@@ -248,7 +248,8 @@ struct FunctionEntry {
 /// a job would wait behind it, so the asking thread does that one
 /// itself; the planned order of everything else fills the gaps.
 struct CompileQueue {
-    promote: Mutex<std::collections::VecDeque<(u64, u16)>>,
+    /// Interpreted frames' requests, each with the OSR site it waits at.
+    promote: Mutex<std::collections::VecDeque<(u64, u64)>>,
     /// Compile requests with the function's call count and the time
     /// when made: a request the function has not been called since is
     /// stale by the time the worker reaches it. A request made for the
@@ -257,6 +258,9 @@ struct CompileQueue {
     compile: Mutex<std::collections::VecDeque<(u64, Option<u32>, std::time::Instant)>>,
     /// Beads already queued, once each.
     queued: Mutex<HashSet<u64>>,
+    /// Beads with a promotion under way, each with the sites asked for
+    /// it meanwhile.
+    promoting: Mutex<HashMap<u64, Vec<u64>>>,
     /// Each lazy function's call count as the interpreter ticks it.
     counts: Mutex<HashMap<u64, Arc<std::sync::atomic::AtomicU32>>>,
     ready: std::sync::Condvar,
@@ -270,7 +274,7 @@ struct CompileQueue {
 }
 
 enum Job {
-    Promote(u64, u16),
+    Promote(u64, u64),
     Compile(u64, Option<u32>, std::time::Instant),
 }
 
@@ -280,6 +284,7 @@ impl CompileQueue {
             promote: Mutex::new(std::collections::VecDeque::new()),
             compile: Mutex::new(std::collections::VecDeque::new()),
             queued: Mutex::new(HashSet::new()),
+            promoting: Mutex::new(HashMap::new()),
             counts: Mutex::new(HashMap::new()),
             ready: std::sync::Condvar::new(),
             stop,
@@ -345,16 +350,63 @@ impl CompileQueue {
 
     /// A promotion request is queued even for a bead whose compile was:
     /// its resume points are what the frame waits on.
-    fn request_promote(&self, bead_id: u64, body_tag: u16) {
-        self.promote.lock().unwrap().push_back((bead_id, body_tag));
+    fn request_promote(&self, bead_id: u64, site: u64) {
+        self.promote.lock().unwrap().push_back((bead_id, site));
         self.ready.notify_one();
+    }
+
+    /// Note a request for `bead_id` at `site`; whether the caller runs
+    /// it. A frame asks from each loop header it warms at and leaves
+    /// through whichever resume point lands first, so a request for a
+    /// bead with a promotion under way is left to that one's thread to
+    /// run after its own, when the frame may have left and nothing need
+    /// be made.
+    fn begin_promotion(&self, bead_id: u64, site: u64) -> bool {
+        use std::collections::hash_map::Entry;
+        let mut promoting = self.promoting.lock().unwrap();
+        match promoting.entry(bead_id) {
+            Entry::Occupied(mut e) => {
+                e.get_mut().push(site);
+                false
+            }
+            Entry::Vacant(e) => {
+                e.insert(Vec::new());
+                true
+            }
+        }
+    }
+
+    /// A promotion of `bead_id` ran: the next site asked for it
+    /// meanwhile, or `None` once there is none, which ends the bead's
+    /// promotions.
+    fn next_promotion(&self, bead_id: u64) -> Option<u64> {
+        let mut promoting = self.promoting.lock().unwrap();
+        let sites = promoting.get_mut(&bead_id)?;
+        if sites.is_empty() {
+            promoting.remove(&bead_id);
+            None
+        } else {
+            Some(sites.remove(0))
+        }
+    }
+
+    /// Run the promotion of `bead_id` asked for at `site`, then those
+    /// asked for meanwhile.
+    fn run_promotions(&self, bead_id: u64, mut site: u64) {
+        loop {
+            osr::run_promotion(bead_id, osr::Requester::Interpreted { site });
+            match self.next_promotion(bead_id) {
+                Some(next) => site = next,
+                None => return,
+            }
+        }
     }
 
     /// The next request, or `None` once there is none and no wait was
     /// asked for.
     fn take(&self) -> Option<Job> {
-        if let Some((b, tag)) = self.promote.lock().unwrap().pop_front() {
-            return Some(Job::Promote(b, tag));
+        if let Some((b, site)) = self.promote.lock().unwrap().pop_front() {
+            return Some(Job::Promote(b, site));
         }
         self.compile
             .lock()
@@ -2598,12 +2650,9 @@ impl TieredBackend {
                         }
                         queue.busy.store(true, std::sync::atomic::Ordering::Release);
                         match queue.take() {
-                            Some(Job::Promote(bead_id, body_tag)) => {
+                            Some(Job::Promote(bead_id, site)) => {
                                 idle_since = None;
-                                osr::run_promotion(
-                                    bead_id,
-                                    osr::Requester::Interpreted { body_tag },
-                                );
+                                queue.run_promotions(bead_id, site);
                             }
                             Some(Job::Compile(bead_id, count, at)) => {
                                 idle_since = None;
@@ -2704,17 +2753,37 @@ impl TieredBackend {
                 return false;
             };
             // An interpreted frame's request compiles the baseline and its
-            // resume points, work the frame need not wait for: the
-            // warm-up thread takes it and the frame keeps running until
-            // the resume points land, which its next header visit sees.
-            if let osr::Requester::Interpreted { body_tag } = from
+            // resume point, work the frame need not wait for: the warm-up
+            // thread takes it, or a thread of its own when that one is in
+            // a job, and the frame keeps running until the resume point
+            // lands, which its next header visit sees. Done inline, the
+            // frame would stand still for the whole compile.
+            if let osr::Requester::Interpreted { site } = from
                 && *lazy
                 && !ON_WARM_UP.with(|on| on.get())
                 && let Some(queue) = &queue
-                && queue.idle()
             {
-                queue.request_promote(bead_id, body_tag);
-                return true;
+                if !queue.begin_promotion(bead_id, site) {
+                    return true;
+                }
+                if queue.idle() {
+                    queue.request_promote(bead_id, site);
+                    return true;
+                }
+                let on_thread = Arc::clone(queue);
+                let spawned = std::thread::Builder::new()
+                    .name("zyntax-promotion".into())
+                    .stack_size(16 << 20)
+                    .spawn(move || {
+                        ON_WARM_UP.with(|on| on.set(true));
+                        on_thread.run_promotions(bead_id, site);
+                    });
+                if spawned.is_ok() {
+                    return true;
+                }
+                // No thread to be had: the frame's own thread does the
+                // work below, as it did before there was a worker.
+                while queue.next_promotion(bead_id).is_some() {}
             }
             // The body: the one a reload swapped in, else the one the
             // first-call compile optimised, else the module's.
@@ -2729,31 +2798,15 @@ impl TieredBackend {
             };
             let module_arc = Arc::clone(module_arc);
             let func_id = *func_id;
-            // An interpreted frame asks before its function has any
-            // native code; the baseline comes first so the promotion has
-            // something to promote.
-            if !ensure_baseline(
-                bound,
-                func_id,
-                bead_id,
-                *lazy,
-                &func_arc,
-                &module_arc,
-                &cranelift,
-                #[cfg(feature = "llvm-backend")]
-                llvm.as_ref(),
-                tier2_backend,
-                verbosity,
-            ) {
-                return false;
-            }
             // An interpreted frame can enter no code mid-loop without a
             // resume point, and the baseline's body has only probes. Its
-            // resume points are compiled here, before anything is queued,
-            // so the frame leaves the interpreter at its next header
-            // visit; they carry probes of their own, so the frame moves
-            // on again once the optimizing tier publishes.
-            if let osr::Requester::Interpreted { body_tag } = from {
+            // resume points come first, before the body: the frame is
+            // running, slowly, until the first one lands, and needs
+            // nothing of the body itself, which every later call does.
+            // They carry probes of their own, so the frame moves on again
+            // once the optimizing tier publishes.
+            if let osr::Requester::Interpreted { site } = from {
+                let (body_tag, ordinal, _) = osr::decode_osr_site(site);
                 // The frame runs the body its tag names: the one the
                 // module holds when it started before the optimised body
                 // existed, else that one.
@@ -2772,7 +2825,25 @@ impl TieredBackend {
                     bead_id,
                     &frame_body,
                     &module_arc,
+                    ordinal,
                 );
+            }
+            // The baseline, so the promotion has something to promote and
+            // the next call has code.
+            if !ensure_baseline(
+                bound,
+                func_id,
+                bead_id,
+                *lazy,
+                &func_arc,
+                &module_arc,
+                &cranelift,
+                #[cfg(feature = "llvm-backend")]
+                llvm.as_ref(),
+                tier2_backend,
+                verbosity,
+            ) {
+                return false;
             }
             if !optimizing {
                 return true;
@@ -3203,16 +3274,16 @@ fn ensure_baseline(
     bound.bead().eager_install(entry as *mut ()) || bound.bead().compiled().is_some()
 }
 
-/// Compile the baseline's resume points for `func_id` and publish them,
-/// off the requesting frame's stack, which may be a fiber's. Each loop
-/// header the layout admits gets a helper the interpreter can transfer
-/// into; a helper the site already has is kept.
+/// Compile the baseline's resume point at the loop header with ordinal
+/// `asked_at` in `func_id` and publish it, off the requesting frame's
+/// stack, which may be a fiber's. A helper the site already has is kept.
 fn publish_baseline_resume_points(
     cranelift: &Arc<ZyntaxCraneliftBackend>,
     func_id: HirId,
     bead_id: u64,
     func_arc: &Arc<HirFunction>,
     module_arc: &Arc<HirModule>,
+    asked_at: u64,
 ) {
     let def = ZyntaxFunctionDef {
         id: func_id,
@@ -3221,48 +3292,49 @@ fn publish_baseline_resume_points(
         tier: OptimizationTier::Baseline.index(),
         bead_id,
     };
-    // One header at a time, the innermost first, each published as
-    // soon as it exists: the waiting frame is at the header it visits
-    // most, and leaves at the first one that has a resume point. Once
-    // no frame waits, whether it left through one or returned, the
-    // rest are not made.
-    let mut headers = osr::find_loop_headers(&def.function);
-    headers.reverse();
-    for header in headers {
-        if !osr::frame_waiting(bead_id) {
+    // Only the header the frame asked at: that is the one it watches,
+    // and it leaves through it at its next visit. A frame at another
+    // header asks from there, with that site, when its turn comes. Not
+    // made once no frame waits, whether it left or returned.
+    let Some(header) = osr::find_loop_headers(&def.function)
+        .get(asked_at as usize)
+        .copied()
+    else {
+        return;
+    };
+    if !osr::frame_waiting(bead_id) {
+        if osr::osr_trace_enabled() {
+            eprintln!(
+                "[osr] {}: no frame waits, resume point not made",
+                func_arc.name.resolve_global().unwrap_or_default()
+            );
+        }
+        return;
+    }
+    let points: Vec<(u64, usize)> = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("zyntax-resume-points".into())
+            .stack_size(16 << 20)
+            .spawn_scoped(scope, || {
+                cranelift
+                    .resume_point_at(&def, header)
+                    .into_iter()
+                    .map(|(site, code)| (site, code as usize))
+                    .collect::<Vec<_>>()
+            })
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default()
+    });
+    for (site, code) in points {
+        let code = code as *mut ();
+        if !code.is_null() && osr::helper_for(bead_id, site).is_null() {
             if osr::osr_trace_enabled() {
                 eprintln!(
-                    "[osr] {}: no frame waits, resume points not made",
+                    "[osr] {} site=0x{site:x}: baseline resume point",
                     func_arc.name.resolve_global().unwrap_or_default()
                 );
             }
-            break;
-        }
-        let points: Vec<(u64, usize)> = std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .name("zyntax-resume-points".into())
-                .stack_size(16 << 20)
-                .spawn_scoped(scope, || {
-                    cranelift
-                        .resume_point_at(&def, header)
-                        .into_iter()
-                        .map(|(site, code)| (site, code as usize))
-                        .collect::<Vec<_>>()
-                })
-                .map(|h| h.join().unwrap_or_default())
-                .unwrap_or_default()
-        });
-        for (site, code) in points {
-            let code = code as *mut ();
-            if !code.is_null() && osr::helper_for(bead_id, site).is_null() {
-                if osr::osr_trace_enabled() {
-                    eprintln!(
-                        "[osr] {} site=0x{site:x}: baseline resume point",
-                        func_arc.name.resolve_global().unwrap_or_default()
-                    );
-                }
-                osr::publish_helper(bead_id, site, code);
-            }
+            osr::publish_helper(bead_id, site, code);
         }
     }
 }
