@@ -133,6 +133,19 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             i64(),
             "$Host$file_remove",
         ),
+        // What `int()`, `float()` and `eval()` accept of a string.
+        (
+            "zb_str_is_int_literal",
+            vec![("s", string())],
+            i64(),
+            "$Host$is_int_literal",
+        ),
+        (
+            "zb_str_is_float_literal",
+            vec![("s", string())],
+            i64(),
+            "$Host$is_float_literal",
+        ),
     ] {
         d.push(extern_fn(name, &params, ret, Some(symbol)));
     }
@@ -708,6 +721,77 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             ret_void(),
         ],
     ));
+    // int(s) and float(s): the parse, or the ValueError Python raises.
+    let s = local("s", string());
+    d.push(define(
+        "zb_int_of_str",
+        &[&s],
+        i64(),
+        vec![
+            when(
+                eq(call("zb_str_is_int_literal", vec![s.e()], i64()), int(0)),
+                vec![fatal(
+                    "ValueError",
+                    add(
+                        text("invalid literal for int() with base 10: "),
+                        call("zb_str_repr", vec![s.e()], string()),
+                    ),
+                )],
+            ),
+            ret(call("zb_str_parse_int", vec![s.e()], i64())),
+        ],
+    ));
+    d.push(define(
+        "zb_float_of_str",
+        &[&s],
+        f64(),
+        vec![
+            when(
+                and(
+                    eq(call("zb_str_is_float_literal", vec![s.e()], i64()), int(0)),
+                    eq(call("zb_str_is_int_literal", vec![s.e()], i64()), int(0)),
+                ),
+                vec![fatal(
+                    "ValueError",
+                    add(
+                        text("could not convert string to float: "),
+                        call("zb_str_repr", vec![s.e()], string()),
+                    ),
+                )],
+            ),
+            ret(call("zb_str_parse_float", vec![s.e()], f64())),
+        ],
+    ));
+    // eval(s) of a number; the frontend handles the names it knows first.
+    d.push(define(
+        "zb_eval_literal",
+        &[&s],
+        any(),
+        vec![
+            when(
+                ne(call("zb_str_is_int_literal", vec![s.e()], i64()), int(0)),
+                vec![ret(call(
+                    "zb_box_i64",
+                    vec![call("zb_str_parse_int", vec![s.e()], i64())],
+                    any(),
+                ))],
+            ),
+            when(
+                ne(call("zb_str_is_float_literal", vec![s.e()], i64()), int(0)),
+                vec![ret(call(
+                    "zb_box_f64",
+                    vec![call("zb_str_parse_float", vec![s.e()], f64())],
+                    any(),
+                ))],
+            ),
+            fatal(
+                "NameError",
+                add(add(text("name '"), s.e()), text("' is not defined")),
+            ),
+            ret(null(any())),
+        ],
+    ));
+
     // os.remove(path)
     let path = local("path", string());
     d.push(define(

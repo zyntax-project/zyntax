@@ -1,0 +1,8 @@
+[1, 2, 1, 2, 1, 2] abab (1, 1)
+[[1.5, 2.5, 3.5], array('d', [4.0, 5.0, 6.0]), ['a', 'b', 'c']]
+[4, 5, 6, 7]
+42 -7 2.5 3.0
+ValueError 'x'
+ValueError '1.5'
+ValueError ''
+ValueError float

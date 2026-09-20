@@ -607,6 +607,8 @@ pub(crate) struct Module {
     pub(crate) lifted: std::cell::RefCell<Vec<TypedFunction>>,
     /// Module functions used as values, which need an adapter.
     pub(crate) adapters: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Classes used as values: called through a record, they construct.
+    pub(crate) class_adapters: std::cell::RefCell<std::collections::BTreeSet<usize>>,
     /// A counter for names no Python program can spell.
     pub(crate) counter: std::cell::Cell<usize>,
     /// The module's classes, bases before subclasses.
@@ -2489,6 +2491,61 @@ impl Calls<'_> {
         }
     }
 
+    /// `obj[key]` or `obj[key] = value` where `obj` is an instance: a
+    /// call of `__getitem__` or `__setitem__` on its class and on every
+    /// subclass overriding it; on a dynamic receiver, of any class's.
+    fn item_site(&mut self, method: &str, receiver: &py::Expr, args: &[Ty]) {
+        if self.opaque {
+            return;
+        }
+        match self.typer().expr(receiver) {
+            Ty::Class(k) => {
+                let k = k as usize;
+                let mut classes = vec![k];
+                classes.extend(self.module.overriders(k, method));
+                for c in classes {
+                    let Some((_, name)) = self.module.method_sig(c, method) else {
+                        continue;
+                    };
+                    for (i, ty) in args.iter().enumerate() {
+                        self.passed.push((Target::Item(name.clone()), i + 1, *ty));
+                    }
+                }
+            }
+            ty if (ty == Ty::Object || (ty == Ty::Unknown && self.settled))
+                && self
+                    .module
+                    .classes
+                    .iter()
+                    .any(|c| c.methods.iter().any(|m| m == method)) =>
+            {
+                self.dynamic_methods.insert(method.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// A store into `target`: the `__setitem__` it calls, when the
+    /// target is a subscript of an instance.
+    fn store_site(&mut self, target: &py::Expr, value: Ty) {
+        match target {
+            py::Expr::Subscript(sub) => {
+                let key = self.arg_ty(&sub.slice);
+                self.item_site("__setitem__", &sub.value, &[key, value]);
+            }
+            py::Expr::Tuple(t) => {
+                let elems = match value {
+                    Ty::Tuple(k) => tuple_shape(k),
+                    _ => vec![Ty::Object; t.elts.len()],
+                };
+                for (e, ty) in t.elts.iter().zip(elems) {
+                    self.store_site(e, ty);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// `left op right` where `left` is an instance: a call of the
     /// class's method for `op` with `right` as its one argument.
     fn operator_site(&mut self, op: py::Operator, left: &py::Expr, right: &py::Expr) {
@@ -2610,6 +2667,19 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
             }
             py::Stmt::AugAssign(a) => {
                 self.operator_site(a.op, &a.target, &a.value);
+                if !self.opaque {
+                    let value = self.arg_ty(&a.target);
+                    self.store_site(&a.target, value);
+                }
+                walk_stmt(self, stmt);
+            }
+            py::Stmt::Assign(a)
+                if a.targets.iter().any(|t| !matches!(t, py::Expr::Name(_))) && !self.opaque =>
+            {
+                let value = self.arg_ty(&a.value);
+                for t in &a.targets {
+                    self.store_site(t, value);
+                }
                 walk_stmt(self, stmt);
             }
             // A closure bound to a name, or returned, is still in view.
@@ -2642,9 +2712,15 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
             self.escape(k);
         }
         // An operator on an instance passes the right operand to the
-        // class's method for it.
+        // class's method for it; a subscript passes the key.
         if let py::Expr::BinOp(b) = expr {
             self.operator_site(b.op, &b.left, &b.right);
+        }
+        if let py::Expr::Subscript(sub) = expr
+            && !self.opaque
+        {
+            let key = self.arg_ty(&sub.slice);
+            self.item_site("__getitem__", &sub.value, &[key]);
         }
         match expr {
             py::Expr::Call(c) => {
@@ -4380,6 +4456,9 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
         }
         py::Operator::Mult if matches!(l, Ty::List(_)) && matches!(r, Ty::Int | Ty::Bool) => l,
         py::Operator::Mult if matches!(r, Ty::List(_)) && matches!(l, Ty::Int | Ty::Bool) => r,
+        // A list times a dynamic value is the list or a TypeError.
+        py::Operator::Mult if matches!(l, Ty::List(_)) && r == Ty::Object => l,
+        py::Operator::Mult if matches!(r, Ty::List(_)) && l == Ty::Object => r,
         // A repeated tuple has no shape the count does not decide.
         py::Operator::Mult
             if (matches!(l, Ty::Tuple(_)) && matches!(r, Ty::Int | Ty::Bool))
@@ -4759,6 +4838,10 @@ impl Typer<'_> {
                     }
                 } else if let Ty::Dict(k) = seq {
                     dict_shape(k).1
+                } else if let Ty::Class(k) = seq {
+                    self.module
+                        .dispatched_ret(k as usize, "__getitem__")
+                        .unwrap_or(Ty::Object)
                 } else {
                     seq.element().unwrap_or(Ty::Object)
                 }
@@ -5066,6 +5149,8 @@ impl Typer<'_> {
             "type" => Ty::Str,
             "str" | "repr" | "input" | "chr" => Ty::Str,
             "bytes" => Ty::Bytes,
+            // A name evaluated from a string is whatever it names.
+            "eval" => Ty::Object,
             // The mode decides what is read and written; it is a literal
             // or the file is a text one.
             "open" => Ty::File(open_mode(c).unwrap_or(Mode::Text)),

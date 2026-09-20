@@ -2247,6 +2247,19 @@ pub(crate) fn shape_hook_declarations(policy: &Policy, list_type: TypeId) -> Vec
             string(),
             None,
         ));
+        d.push(extern_fn(
+            "zb_hook_shaped_assign_slice",
+            &[
+                ("x", any()),
+                ("ys", anys.clone()),
+                ("start", i64()),
+                ("stop", i64()),
+                ("step", i64()),
+                ("mask", i64()),
+            ],
+            unit(),
+            None,
+        ));
         return d;
     }
     let unknown = || fatal("TypeError", text("a list of an unknown kind"));
@@ -2279,6 +2292,17 @@ pub(crate) fn shape_hook_declarations(policy: &Policy, list_type: TypeId) -> Vec
         &[&x],
         string(),
         vec![unknown(), ret(text(""))],
+    ));
+    let ys = borrowed("ys", anys.clone());
+    let start = local("start", i64());
+    let stop = local("stop", i64());
+    let step = local("step", i64());
+    let mask = local("mask", i64());
+    d.push(define(
+        "zb_hook_shaped_assign_slice",
+        &[&x, &ys, &start, &stop, &step, &mask],
+        unit(),
+        vec![unknown(), ret_void()],
     ));
     d
 }

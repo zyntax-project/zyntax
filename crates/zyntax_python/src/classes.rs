@@ -852,6 +852,32 @@ fn attribute_error(x: Node, attr: &str, span: Span) -> TypedNode<TypedStatement>
     )
 }
 
+/// `raise TypeError("'<type>'" + what)`.
+fn type_error_stmt(x: Node, what: &str, span: Span) -> TypedNode<TypedStatement> {
+    let message = binary(
+        BinaryOp::Add,
+        binary(
+            BinaryOp::Add,
+            str_lit("'", span),
+            call("zb_any_type", vec![x], Ty::Str, span),
+            Ty::Str,
+            span,
+        ),
+        str_lit(&format!("'{what}"), span),
+        Ty::Str,
+        span,
+    );
+    stmt(
+        call(
+            "zb_fatal",
+            vec![str_lit("TypeError", span), message],
+            Ty::None,
+            span,
+        ),
+        span,
+    )
+}
+
 fn getattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
     let x = var(intern("x"), Ty::Object, span);
     let mut statements = per_class(
@@ -1215,6 +1241,94 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         statements,
         span,
     );
+    // obj[key] and obj[key] = v: `__getitem__` and `__setitem__`.
+    let key_arg = |lowerer: &mut Lowerer<'_>, sig: &Sig, i: usize, name: &str| {
+        let ty = sig.params.get(i).map(|(_, t)| *t).unwrap_or(Ty::Object);
+        lowerer.coerce(
+            Val {
+                node: var(intern(name), Ty::Object, span),
+                ty: Ty::Object,
+            },
+            ty,
+        )
+    };
+    let mut statements = per_class(
+        module,
+        x.clone(),
+        |c| {
+            module
+                .method_sig(c, "__getitem__")
+                .is_some_and(|(sig, _)| sig.params.len() == 2)
+        },
+        |lowerer, c, obj| {
+            let (sig, _) = module.method_sig(c, "__getitem__").expect("picked");
+            let key = key_arg(lowerer, sig, 1, "key");
+            let result = lowerer
+                .invoke(c, "__getitem__", obj, vec![key], span)
+                .expect("picked");
+            let boxed = lowerer.coerce(result, Ty::Object);
+            vec![ret(boxed, span)]
+        },
+        span,
+    );
+    statements.push(type_error_stmt(
+        x.clone(),
+        " object is not subscriptable",
+        span,
+    ));
+    statements.push(ret(
+        node(
+            TypedExpression::Literal(TypedLiteral::Null),
+            Ty::Object,
+            span,
+        ),
+        span,
+    ));
+    let getitem_hook = function(
+        "zb_hook_instance_getitem",
+        vec![param("x", Ty::Object, span), param("key", Ty::Object, span)],
+        Ty::Object,
+        statements,
+        span,
+    );
+    let mut statements = per_class(
+        module,
+        x.clone(),
+        |c| {
+            module
+                .method_sig(c, "__setitem__")
+                .is_some_and(|(sig, _)| sig.params.len() == 3)
+        },
+        |lowerer, c, obj| {
+            let (sig, _) = module.method_sig(c, "__setitem__").expect("picked");
+            let key = key_arg(lowerer, sig, 1, "key");
+            let value = key_arg(lowerer, sig, 2, "v");
+            let result = lowerer
+                .invoke(c, "__setitem__", obj, vec![key, value], span)
+                .expect("picked");
+            vec![
+                stmt(result.node, span),
+                TypedNode::new(TypedStatement::Return(None), Type::Unknown, span),
+            ]
+        },
+        span,
+    );
+    statements.push(type_error_stmt(
+        x.clone(),
+        " object does not support item assignment",
+        span,
+    ));
+    let setitem_hook = function(
+        "zb_hook_instance_setitem",
+        vec![
+            param("x", Ty::Object, span),
+            param("key", Ty::Object, span),
+            param("v", Ty::Object, span),
+        ],
+        Ty::None,
+        statements,
+        span,
+    );
     // ==: `__eq__` on the left operand's class, else identity.
     let a = var(intern("a"), Ty::Object, span);
     let b = var(intern("b"), Ty::Object, span);
@@ -1251,6 +1365,8 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
     let mut out = vec![
         str_hook,
         repr_hook,
+        getitem_hook,
+        setitem_hook,
         type_hook,
         eq_hook,
         hash_hook(module, span),
@@ -1309,6 +1425,34 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
     let mut set = Vec::new();
     let mut append = Vec::new();
     let mut repr = Vec::new();
+    let mut assign_slice = Vec::new();
+    // `x[a:b:c] = ys` on a list of kind `e`: the values read as `e`.
+    let ys = var(intern("ys"), Ty::List(Elem::Object), span);
+    let bounds: Vec<Node> = ["start", "stop", "step", "mask"]
+        .iter()
+        .map(|n| var(intern(n), Ty::Int, span))
+        .collect();
+    let assign_arm = |test: Node, e: Elem, raw: Node| {
+        let typed = call(
+            &lower::list_fn("from_any", e),
+            vec![ys.clone()],
+            Ty::List(e),
+            span,
+        );
+        let mut args = vec![typed, raw];
+        args.extend(bounds.iter().cloned());
+        when(
+            test,
+            vec![
+                stmt(
+                    call(&lower::list_fn("assign_slice", e), args, Ty::None, span),
+                    span,
+                ),
+                ret_void(span),
+            ],
+            span,
+        )
+    };
     // An array's kind holds its storage kind in the low byte, above
     // `ARRAY_KIND_BASE`; every typecode stored that way shares the arms,
     // and the repr reads the typecode letter out of the kind.
@@ -1393,7 +1537,12 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
                 span,
             )
         };
+        // A storage as wide as it reads needs no cast; a cast of a
+        // float to itself is not a no-op to every backend.
         let widen = |e: Node| {
+            if storage.wide() == storage {
+                return e;
+            }
             TypedNode::new(
                 TypedExpression::Cast(TypedCast {
                     expr: Box::new(e),
@@ -1464,6 +1613,13 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
             ],
             span,
         ));
+        if let Some(code) = crate::types::Code::ALL
+            .iter()
+            .copied()
+            .find(|c| c.storage() == storage)
+        {
+            assign_slice.push(assign_arm(is_array_of(storage), Elem::Array(code), raw()));
+        }
         append.push(when(
             is_array_of(storage),
             vec![
@@ -1583,6 +1739,7 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
             ],
             span,
         ));
+        assign_slice.push(assign_arm(is_shape(k), e, raw(k)));
         append.push(when(
             is_shape(k),
             vec![
@@ -1619,7 +1776,23 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
     append.push(ret_void(span));
     repr.push(unknown());
     repr.push(ret(str_lit("", span), span));
+    assign_slice.push(unknown());
+    assign_slice.push(ret_void(span));
     vec![
+        function(
+            "zb_hook_shaped_assign_slice",
+            vec![
+                param("x", Ty::Object, span),
+                param("ys", Ty::List(Elem::Object), span),
+                param("start", Ty::Int, span),
+                param("stop", Ty::Int, span),
+                param("step", Ty::Int, span),
+                param("mask", Ty::Int, span),
+            ],
+            Ty::None,
+            assign_slice,
+            span,
+        ),
         function(
             "zb_hook_shaped_repr",
             vec![param("x", Ty::Object, span)],

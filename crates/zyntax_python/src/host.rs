@@ -282,6 +282,42 @@ extern "C" fn host_file_read(path: StringConstPtr) -> StringPtr {
     }
 }
 
+/// Whether `s` is what `int()` accepts: optional sign and digits, with
+/// surrounding whitespace and underscores between digits.
+extern "C" fn host_is_int_literal(s: StringConstPtr) -> i64 {
+    // SAFETY: a string the program holds.
+    let text = unsafe { zrtl::string::string_as_str(s) };
+    let Some(text) = text else {
+        return 0;
+    };
+    let text = text.trim();
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let ok = !digits.is_empty()
+        && digits.as_bytes()[0].is_ascii_digit()
+        && digits.as_bytes()[digits.len() - 1].is_ascii_digit()
+        && digits
+            .as_bytes()
+            .iter()
+            .all(|b| b.is_ascii_digit() || *b == b'_')
+        && !digits.contains("__");
+    ok as i64
+}
+
+/// Whether `s` is what `float()` accepts and `int()` does not.
+extern "C" fn host_is_float_literal(s: StringConstPtr) -> i64 {
+    // SAFETY: a string the program holds.
+    let text = unsafe { zrtl::string::string_as_str(s) };
+    let Some(text) = text else {
+        return 0;
+    };
+    let text = text.trim();
+    (text.parse::<f64>().is_ok()
+        || matches!(
+            text.to_ascii_lowercase().as_str(),
+            "inf" | "-inf" | "+inf" | "nan" | "infinity" | "-infinity"
+        )) as i64
+}
+
 /// Remove the file at `path`; 0 on success, -1 when it cannot be.
 extern "C" fn host_file_remove(path: StringConstPtr) -> i64 {
     match path_of(path).map(std::fs::remove_file) {
@@ -295,7 +331,7 @@ extern "C" fn host_file_exists(path: StringConstPtr) -> i64 {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 23] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 25] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$time".as_ptr(), host_time as *const u8),
@@ -342,6 +378,14 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 23] = [
     zrtl::ZrtlSymbol::new(c"$Host$file_write".as_ptr(), host_file_write as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$file_read".as_ptr(), host_file_read as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$file_remove".as_ptr(), host_file_remove as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$is_int_literal".as_ptr(),
+        host_is_int_literal as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$is_float_literal".as_ptr(),
+        host_is_float_literal as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(c"$Host$file_exists".as_ptr(), host_file_exists as *const u8),
 ];
 

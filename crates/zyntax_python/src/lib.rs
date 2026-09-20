@@ -690,9 +690,19 @@ pub fn parse_program_with(
     // A module function nothing reaches from the module body is never
     // run by the program, so what it writes need not compile: a Python
     // that never runs it never minds. One that does compile is kept, for
-    // a host that calls it by name. Every class is kept whole, since the
-    // dispatchers over dynamic receivers name every method of every class.
+    // a host that calls it by name. A method stays with its class, since
+    // the dispatchers over dynamic receivers name every method of that
+    // name; one whose name no attribute access spells, and that is not a
+    // dunder the runtime invokes, is never run and named by nothing.
     let reached = reachable_functions(&owned, &items);
+    let attrs_used = attribute_names(&owned, &items);
+    let unreached = |item: &types::Item<'_>| match item.class {
+        None => !reached.contains(&item.name),
+        Some(_) => {
+            let method = item.def.name.as_str();
+            !RUNTIME_DUNDERS.contains(&method) && !attrs_used.contains(method)
+        }
+    };
     let mut dropped: HashSet<String> = HashSet::default();
     let lower_all = |inferred: &types::Module,
                      dropped: &mut HashSet<String>|
@@ -704,7 +714,7 @@ pub fn parse_program_with(
             }
             match lower_items(inferred, std::slice::from_ref(item), &unpack_shapes) {
                 Ok(d) => out.extend(d),
-                Err(_) if item.class.is_none() && !reached.contains(&item.name) => {
+                Err(_) if unreached(item) => {
                     dropped.insert(item.name.clone());
                 }
                 Err(e) => return Err(e),
@@ -810,6 +820,13 @@ pub fn parse_program_with(
         let sig = &inferred.funcs[name];
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(lower::adapter(&inferred, name, sig)),
+            Type::Unknown,
+            Span::new(0, 0),
+        ));
+    }
+    for &k in inferred.class_adapters.borrow().iter() {
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(lower::class_adapter(&inferred, k)),
             Type::Unknown,
             Span::new(0, 0),
         ));
@@ -1047,6 +1064,95 @@ fn reachable_functions(body: &[py::Stmt], items: &[types::Item<'_>]) -> HashSet<
         }
     }
     reached
+}
+
+/// The methods the runtime invokes without the program naming them.
+const RUNTIME_DUNDERS: &[&str] = &[
+    "__init__",
+    "__new__",
+    "__del__",
+    "__str__",
+    "__repr__",
+    "__format__",
+    "__bool__",
+    "__len__",
+    "__hash__",
+    "__eq__",
+    "__ne__",
+    "__lt__",
+    "__le__",
+    "__gt__",
+    "__ge__",
+    "__getitem__",
+    "__setitem__",
+    "__delitem__",
+    "__contains__",
+    "__iter__",
+    "__next__",
+    "__call__",
+    "__enter__",
+    "__exit__",
+    "__getattr__",
+    "__setattr__",
+    "__int__",
+    "__float__",
+    "__index__",
+    "__neg__",
+    "__pos__",
+    "__abs__",
+    "__invert__",
+    "__add__",
+    "__sub__",
+    "__mul__",
+    "__truediv__",
+    "__floordiv__",
+    "__mod__",
+    "__pow__",
+    "__matmul__",
+    "__and__",
+    "__or__",
+    "__xor__",
+    "__lshift__",
+    "__rshift__",
+    "__radd__",
+    "__rsub__",
+    "__rmul__",
+    "__rtruediv__",
+    "__rfloordiv__",
+    "__rmod__",
+    "__rpow__",
+    "__iadd__",
+    "__isub__",
+    "__imul__",
+    "__itruediv__",
+    "__ifloordiv__",
+    "__imod__",
+];
+
+/// Every attribute name the program spells, `x.name`, in the module
+/// body and in every function.
+fn attribute_names(body: &[py::Stmt], items: &[types::Item<'_>]) -> HashSet<String> {
+    use ruff_python_ast::visitor::{Visitor, walk_expr};
+    #[derive(Default)]
+    struct Attrs(HashSet<String>);
+    impl<'a> Visitor<'a> for Attrs {
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            if let py::Expr::Attribute(a) = e {
+                self.0.insert(a.attr.to_string());
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut attrs = Attrs::default();
+    for s in body {
+        attrs.visit_stmt(s);
+    }
+    for item in items {
+        for s in &item.def.body {
+            attrs.visit_stmt(s);
+        }
+    }
+    attrs.0
 }
 
 /// Whether `body` reads any of `names`.

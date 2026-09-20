@@ -316,7 +316,7 @@ fn bind_names(vars: &mut HashMap<String, Ty>, target: &py::Expr, ty: Ty) {
 /// `zb_list_<op>_<kind>`. A list of tuples has its functions generated
 /// for the shape, and an array's storage kind its functions and its
 /// hook arms, so both are noted.
-fn list_fn(op: &str, elem: Elem) -> String {
+pub(crate) fn list_fn(op: &str, elem: Elem) -> String {
     match elem {
         Elem::Tuple(k) => types::note_tuple_list(k),
         Elem::Array(c) => types::note_array_kind(c.storage()),
@@ -653,6 +653,85 @@ pub(crate) fn dynamic_attribute(ty: Ty, span: Span) -> Vec<ParameterAttribute> {
 /// A module function in the shape of a function value: the record is
 /// ignored, each argument is unboxed to the declared type, the result
 /// is boxed.
+/// The name of the function a class is called through as a value.
+pub(crate) fn class_adapter_name(class: &str) -> String {
+    format!("{class}$value")
+}
+
+/// `C$value(env, a0, ...)`: the class constructed from boxed arguments,
+/// the instance boxed. What a class is as a value.
+pub(crate) fn class_adapter(module: &Module, k: usize) -> TypedFunction {
+    let span = Span::new(0, 0);
+    let scope = Scope::default();
+    let class = &module.classes[k];
+    let sig = match module.method_sig(k, "__init__") {
+        Some((sig, _)) => without_self(sig),
+        None => Sig {
+            params: Vec::new(),
+            ret: Ty::None,
+            defaults: Vec::new(),
+        },
+    };
+    let mut lowerer = Lowerer::new(
+        module,
+        &class_adapter_name(&class.name),
+        sig.clone(),
+        Locals::default(),
+        &scope,
+        Vec::new(),
+        HashMap::default(),
+    );
+    lowerer.guards = false;
+    let mut params = vec![parameter("env", Ty::List(Elem::Object), span)];
+    let mut args = Vec::new();
+    let first_default = sig.params.len() - sig.defaults.iter().flatten().count();
+    for (i, (_, ty)) in sig.params.iter().enumerate() {
+        let arg = format!("a{i}");
+        params.push(parameter(&arg, Ty::Object, span));
+        let given = var(intern(&arg), Ty::Object, span);
+        let given = if i >= first_default {
+            lowerer.or_default(given, RECORD_CELLS_AT + (i - first_default), span)
+        } else {
+            given
+        };
+        args.push(lowerer.coerce(
+            Val {
+                node: given,
+                ty: Ty::Object,
+            },
+            *ty,
+        ));
+    }
+    let instance = Val {
+        node: call(&new_name(&class.name), args, Ty::Class(k as u16), span),
+        ty: Ty::Class(k as u16),
+    };
+    let boxed = lowerer.coerce(instance, Ty::Object);
+    let statements = vec![TypedNode::new(
+        TypedStatement::Return(Some(Box::new(boxed))),
+        Type::Unknown,
+        span,
+    )];
+    TypedFunction {
+        name: intern(&class_adapter_name(&class.name)),
+        annotations: Vec::new(),
+        effects: Vec::new(),
+        with_handlers: Vec::new(),
+        type_params: Vec::new(),
+        params,
+        return_type: ir(Ty::Object),
+        body: Some(TypedBlock { statements, span }),
+        visibility: Visibility::Public,
+        is_async: false,
+        is_fiber: false,
+        is_pure: false,
+        is_external: false,
+        calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
+        link_name: None,
+        module: None,
+    }
+}
+
 pub(crate) fn adapter(module: &Module, name: &str, sig: &Sig) -> TypedFunction {
     let span = Span::new(0, 0);
     let scope = Scope::default();
@@ -3163,8 +3242,10 @@ impl<'m> Lowerer<'m> {
                             out.append(&mut self.hoisted);
                             values.push(self.hold(value, out, span));
                         }
+                        // What a binding hoists (a `__setitem__` call
+                        // checked for a raise) follows the holds it reads.
                         for (target, value) in targets.iter().zip(values) {
-                            self.bind(target, value, span, out)?;
+                            self.bind_after(target, value, span, out)?;
                         }
                         return Ok(());
                     }
@@ -3723,13 +3804,15 @@ impl<'m> Lowerer<'m> {
                     let seq = self.expr(&sub.value)?;
                     let target_pre = std::mem::take(&mut self.hoisted);
                     self.hoisted = rhs_pre;
-                    let Ty::List(e) = seq.ty else {
-                        return unsupported("slice assignment on a non-list", target);
-                    };
                     let seq_node = if target_pre.is_empty() {
                         seq.node
                     } else {
                         Self::block_value(target_pre, seq.node, seq.ty, span)
+                    };
+                    let elem = match seq.ty {
+                        Ty::List(e) => Some(e),
+                        Ty::Object => None,
+                        _ => return unsupported("slice assignment on a non-list", target),
                     };
                     let source = if matches!(value.ty, Ty::List(_)) {
                         value
@@ -3739,7 +3822,10 @@ impl<'m> Lowerer<'m> {
                             ty: Ty::List(Elem::Object),
                         }
                     };
-                    let typed = self.coerce(source, Ty::List(e));
+                    let typed = match elem {
+                        Some(e) => self.coerce(source, Ty::List(e)),
+                        None => self.coerce(source, Ty::List(Elem::Object)),
+                    };
                     let mut mask = 0;
                     let mut bound =
                         |this: &mut Self, expr: &Option<Box<py::Expr>>, bit: i64| -> Result<Node> {
@@ -3761,12 +3847,21 @@ impl<'m> Lowerer<'m> {
                     let start = bound(self, &sl.lower, 1)?;
                     let stop = bound(self, &sl.upper, 2)?;
                     let step = bound(self, &sl.step, 4)?;
-                    let call = call(
-                        &list_fn("assign_slice", e),
-                        vec![typed, seq_node, start, stop, step, int_lit(mask, span)],
-                        Ty::None,
-                        span,
-                    );
+                    let call = match elem {
+                        Some(e) => call(
+                            &list_fn("assign_slice", e),
+                            vec![typed, seq_node, start, stop, step, int_lit(mask, span)],
+                            Ty::None,
+                            span,
+                        ),
+                        // A dynamic sequence: the runtime picks the kind.
+                        None => call(
+                            "zb_any_assign_slice",
+                            vec![seq_node, typed, start, stop, step, int_lit(mask, span)],
+                            Ty::None,
+                            span,
+                        ),
+                    };
                     out.push(TypedNode::new(
                         TypedStatement::Expression(Box::new(call)),
                         Type::Unknown,
@@ -3805,6 +3900,23 @@ impl<'m> Lowerer<'m> {
                         } else {
                             let i = self.coerce(i, Ty::Object);
                             call("zb_any_setitem", vec![seq.node, i, v], Ty::None, span)
+                        }
+                    }
+                    // An instance stores through its class's `__setitem__`.
+                    Ty::Class(k) => {
+                        let i = self.expr(&sub.slice)?;
+                        match self.dunder(k as usize, "__setitem__", seq.node, vec![i, value], span)
+                        {
+                            Some(r) => r.node,
+                            None => {
+                                return Err(Error::unsupported_span(
+                                    format!(
+                                        "item assignment on {}, which defines no __setitem__",
+                                        self.module.classes[k as usize].name
+                                    ),
+                                    span,
+                                ));
+                            }
                         }
                     }
                     _ => {
@@ -4882,7 +4994,9 @@ impl<'m> Lowerer<'m> {
     /// a variable holding one, or a builtin's name, which becomes a
     /// function over one dynamic argument.
     fn callable_value(&mut self, e: &py::Expr) -> Result<Node> {
-        const BUILTINS: [&str; 8] = ["str", "int", "float", "bool", "len", "abs", "repr", "type"];
+        const BUILTINS: [&str; 9] = [
+            "str", "int", "float", "bool", "len", "abs", "repr", "type", "eval",
+        ];
         // A module's function (`math.sqrt`) or a name brought in from one
         // becomes the lambda that calls it.
         let imported = match e {
@@ -5423,6 +5537,13 @@ impl<'m> Lowerer<'m> {
                     ty: Ty::Builtin(k),
                 }
             }
+            // A module class named as a value constructs when called.
+            py::Expr::Name(n)
+                if !self.is_variable(n.id.as_str())
+                    && let Some(&k) = self.module.class_index.get(n.id.as_str()) =>
+            {
+                self.class_value(k, span)?
+            }
             py::Expr::Name(n) => Val {
                 node: var(self.local_symbol(n.id.as_str()), ty, span),
                 ty,
@@ -5688,6 +5809,34 @@ impl<'m> Lowerer<'m> {
                 ),
                 span,
             ));
+        }
+        // A sequence repeated by a dynamic count: the count is an int
+        // or the TypeError Python raises, and the repeat stays typed.
+        let repeatable = |t: Ty| matches!(t, Ty::List(_) | Ty::Str | Ty::Bytes | Ty::Tuple(_));
+        if op == py::Operator::Mult
+            && ((repeatable(left.ty) && right.ty == Ty::Object)
+                || (left.ty == Ty::Object && repeatable(right.ty)))
+        {
+            let (left, right) = if right.ty == Ty::Object {
+                let n = self.coerce(right, Ty::Int);
+                (
+                    left,
+                    Val {
+                        node: n,
+                        ty: Ty::Int,
+                    },
+                )
+            } else {
+                let n = self.coerce(left, Ty::Int);
+                (
+                    Val {
+                        node: n,
+                        ty: Ty::Int,
+                    },
+                    right,
+                )
+            };
+            return self.arithmetic(op, left, right, right_expr, span);
         }
         let ty = types::binop(op, left.ty, right.ty, right_expr);
         // Strings have their own operators.
@@ -6759,6 +6908,20 @@ impl<'m> Lowerer<'m> {
                     ty,
                 })
             }
+            // An instance answers through its class's `__getitem__`.
+            Ty::Class(k) => {
+                let key = self.expr(&sub.slice)?;
+                match self.dunder(k as usize, "__getitem__", seq.node, vec![key], span) {
+                    Some(r) => Ok(r),
+                    None => Err(Error::unsupported_span(
+                        format!(
+                            "subscript of {}, which defines no __getitem__",
+                            self.module.classes[k as usize].name
+                        ),
+                        span,
+                    )),
+                }
+            }
             _ => {
                 let key = self.expr(&sub.slice)?;
                 let o = self.coerce(seq, Ty::Object);
@@ -7756,12 +7919,13 @@ impl<'m> Lowerer<'m> {
                 }
                 "bytes" => return self.bytes_call(args, c, span),
                 "open" => return self.open_call(c, span),
+                "eval" => return self.eval_call(args, c, span),
                 "int" => {
                     let v = self.expr(&args[0])?;
                     let node = match v.ty {
                         Ty::Int => v.node,
                         Ty::Bool | Ty::Float => cast(v.node, Ty::Int, span),
-                        Ty::Str => call("zb_str_parse_int", vec![v.node], Ty::Int, span),
+                        Ty::Str => call("zb_int_of_str", vec![v.node], Ty::Int, span),
                         _ => call("zb_any_int", vec![v.node], Ty::Int, span),
                     };
                     return Ok(Val { node, ty: Ty::Int });
@@ -7771,7 +7935,7 @@ impl<'m> Lowerer<'m> {
                     let node = match v.ty {
                         Ty::Float => v.node,
                         Ty::Bool | Ty::Int => cast(v.node, Ty::Float, span),
-                        Ty::Str => call("zb_str_parse_float", vec![v.node], Ty::Float, span),
+                        Ty::Str => call("zb_float_of_str", vec![v.node], Ty::Float, span),
                         _ => call("zb_any_float", vec![v.node], Ty::Float, span),
                     };
                     return Ok(Val {
@@ -10031,6 +10195,14 @@ impl<'m> Lowerer<'m> {
         );
         let mut all = vec![receiver];
         all.extend(args);
+        // A generator method starts its fiber, `self` in the environment
+        // with the arguments; a dispatcher over overrides does that for
+        // whichever it reaches.
+        if sig.ret == Ty::Gen && target == fn_name {
+            let sig = sig.clone();
+            let started = self.start_generator(&fn_name, &sig, all, Vec::new(), span);
+            return Some((started, fn_name));
+        }
         Some((
             Val {
                 node: call(&target, all, ret, span),
@@ -10439,6 +10611,99 @@ impl<'m> Lowerer<'m> {
             defaults,
             span,
         ))
+    }
+
+    /// A module class as a value: a record whose call constructs.
+    fn class_value(&mut self, k: usize, span: Span) -> Result<Val> {
+        let sig = match self.module.method_sig(k, "__init__") {
+            Some((sig, _)) => without_self(sig),
+            None => Sig {
+                params: Vec::new(),
+                ret: Ty::None,
+                defaults: Vec::new(),
+            },
+        };
+        self.module.class_adapters.borrow_mut().insert(k);
+        let defaults = self.default_values(&sig)?;
+        let name = class_adapter_name(&self.module.classes[k].name);
+        Ok(self.record(&name, sig.params.len(), Vec::new(), defaults, span))
+    }
+
+    /// `eval(s)`: the module's function or class the string names, as
+    /// a value, or the number it spells. Nothing else is evaluated.
+    fn eval_call(&mut self, args: &[py::Expr], c: &py::ExprCall, span: Span) -> Result<Val> {
+        let [arg] = args else {
+            return unsupported("eval() with these arguments", c);
+        };
+        let text = self.expr_as(arg, Ty::Str)?;
+        let mut pre = Vec::new();
+        let held = self.hold(
+            Val {
+                node: text,
+                ty: Ty::Str,
+            },
+            &mut pre,
+            span,
+        );
+        // The names of the module this function is in.
+        let file = current_file();
+        let prefix = self
+            .module
+            .files
+            .iter()
+            .find(|(_, index)| **index == file)
+            .map(|(m, _)| format!("{m}$"))
+            .unwrap_or_default();
+        let module_level = |name: &str| {
+            name.strip_prefix(prefix.as_str())
+                .filter(|rest| !rest.contains('$'))
+                .map(str::to_string)
+        };
+        let mut functions: Vec<(String, String)> = self
+            .module
+            .funcs
+            .keys()
+            .filter_map(|full| module_level(full).map(|short| (short, full.clone())))
+            .collect();
+        functions.sort();
+        let mut classes: Vec<(String, usize)> = self
+            .module
+            .class_index
+            .iter()
+            .filter_map(|(full, &k)| module_level(full).map(|short| (short, k)))
+            .collect();
+        classes.sort();
+        let mut chosen = call("zb_eval_literal", vec![held.node.clone()], Ty::Object, span);
+        let mut arms: Vec<(String, Node)> = Vec::new();
+        for (short, full) in functions {
+            let value = self.function_value(&full, span)?.node;
+            arms.push((short, value));
+        }
+        for (short, k) in classes {
+            let value = self.class_value(k, span)?.node;
+            arms.push((short, value));
+        }
+        for (short, value) in arms.into_iter().rev() {
+            let test = call(
+                "zb_str_eq",
+                vec![held.node.clone(), str_lit(&short, span)],
+                Ty::Bool,
+                span,
+            );
+            chosen = node(
+                TypedExpression::If(TypedIfExpr {
+                    condition: Box::new(test),
+                    then_branch: Box::new(value),
+                    else_branch: Box::new(chosen),
+                }),
+                Ty::Object,
+                span,
+            );
+        }
+        Ok(Val {
+            node: Self::block_value(pre, chosen, Ty::Object, span),
+            ty: Ty::Object,
+        })
     }
 
     /// A `def` inside this function: lifted to a function of its own
