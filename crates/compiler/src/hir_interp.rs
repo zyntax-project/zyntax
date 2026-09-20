@@ -112,7 +112,7 @@ pub fn trace_enabled() -> bool {
 
 /// The address of `name` in the running process, if the dynamic linker
 /// knows it.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn process_symbol(name: &str) -> Option<*const u8> {
     let c = std::ffi::CString::new(name).ok()?;
     // SAFETY: `dlsym` with the default handle reads the process's own
@@ -121,7 +121,42 @@ fn process_symbol(name: &str) -> Option<*const u8> {
     (!p.is_null()).then_some(p as *const u8)
 }
 
-#[cfg(target_arch = "wasm32")]
+/// Windows has no default handle: every loaded module is asked in turn.
+#[cfg(windows)]
+fn process_symbol(name: &str) -> Option<*const u8> {
+    use std::ffi::{c_char, c_void};
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn K32EnumProcessModules(
+            process: *mut c_void,
+            modules: *mut *mut c_void,
+            size: u32,
+            needed: *mut u32,
+        ) -> i32;
+        fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *const c_void;
+    }
+    let c = std::ffi::CString::new(name).ok()?;
+    let mut modules = [std::ptr::null_mut::<c_void>(); 512];
+    let mut needed = 0u32;
+    // SAFETY: the buffer is passed with its own byte size, and only the
+    // handles written into it are read; `c` outlives the lookups.
+    unsafe {
+        let size = size_of_val(&modules) as u32;
+        if K32EnumProcessModules(GetCurrentProcess(), modules.as_mut_ptr(), size, &mut needed) == 0
+        {
+            return None;
+        }
+        let n = (needed as usize / size_of::<*mut c_void>()).min(modules.len());
+        modules[..n]
+            .iter()
+            .map(|&m| GetProcAddress(m, c.as_ptr()))
+            .find(|p| !p.is_null())
+            .map(|p| p as *const u8)
+    }
+}
+
+#[cfg(not(any(all(unix, not(target_arch = "wasm32")), windows)))]
 fn process_symbol(_name: &str) -> Option<*const u8> {
     None
 }
