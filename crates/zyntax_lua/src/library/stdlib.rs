@@ -2477,7 +2477,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ),
             // Within the array part of a table without a metatable:
             // shift in place.
-            arr.decl(super::arr_of(tb.e(), t)),
+            arr.decl(call("zl_arr_own", vec![tb.e()], t.anys())),
             when(
                 and(
                     eq(len(arr.e()), n.e()),
@@ -2537,7 +2537,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ))],
             ),
             v.decl(call("zl_table_geti", vec![tb.e(), i.e()], any())),
-            arr.decl(super::arr_of(tb.e(), t)),
+            arr.decl(call("zl_arr_own", vec![tb.e()], t.anys())),
             if_(
                 and(
                     and(eq(len(arr.e()), n.e()), le(i.e(), n.e())),
@@ -2843,7 +2843,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             when(
                 eq(super::meta_of(tb.e(), t), null(table.clone())),
                 vec![
-                    arr.decl(super::arr_of(tb.e(), t)),
+                    arr.decl(call("zl_arr_own", vec![tb.e()], t.anys())),
                     expr(call(
                         "zl_sort_range",
                         vec![

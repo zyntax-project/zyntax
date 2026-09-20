@@ -348,12 +348,11 @@ pub fn box_table(tb: Expr) -> Expr {
     )
 }
 
+pub fn arr_field(tb: Expr) -> Expr {
+    fld(tb, "arr", any())
+}
 pub fn arr_of(tb: Expr, t: &Types) -> Expr {
-    call(
-        "zb_unbox_list_raw_any",
-        vec![fld(tb, "arr", any())],
-        t.anys(),
-    )
+    call("zb_unbox_list_raw_any", vec![arr_field(tb)], t.anys())
 }
 pub fn hash_field(tb: Expr) -> Expr {
     fld(tb, "hash", any())
@@ -677,6 +676,10 @@ pub const HANDLER_RETRIES: i64 = 200;
 /// chunk's number in the bits above `LINE_BITS`, 0 for the main chunk
 /// and `k` for the `k`th entry here.
 pub const CHUNKS: &str = "zl_chunks";
+/// The one empty array part every table without positional values
+/// starts with, boxed; a write to a table's array part gives it one
+/// of its own first (see `zl_arr_own`).
+pub const ARR_EMPTY: &str = "zl_arr_empty";
 /// How many program functions are on the stack; past `MAX_DEPTH` a
 /// call is a stack overflow, as the reference's stack limit makes it.
 /// A coroutine counts on from where it was resumed.
@@ -773,6 +776,7 @@ fn raising(t: &Types) -> Vec<Decl> {
         global_var(VARINFO, i64()),
         global_var(FOR_SKIP, boolean()),
         global_var(OVERFLOWED, boolean()),
+        global_var(ARR_EMPTY, any()),
     ];
     // Entered below the floor: the error every deeper call would raise.
     d.push(define_cold(

@@ -4079,7 +4079,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 _ => None,
             })
             .collect();
-        let arr = self.packed_list(&positional, span)?;
+        // No positional values: the shared empty array part, made by
+        // no one.
+        let arr = if positional.is_empty() {
+            None
+        } else {
+            Some(self.packed_list(&positional, span)?)
+        };
         let table_t = self.ir(Ty::Table);
         // A constructor of a slotted shape lays its table out itself.
         if let Some(k) = types::constructor_shape(self.m.inferred, t)
@@ -4087,7 +4093,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         {
             return self.shaped_constructor(k, &fields, arr, positional.len(), span);
         }
-        let table = call("zl_table_with_arr", vec![arr], table_t.clone(), span);
+        let table = match arr {
+            Some(arr) => call("zl_table_with_arr", vec![arr], table_t.clone(), span),
+            None => call("zl_table_new", vec![], table_t.clone(), span),
+        };
         let keyed: Vec<&ast::Field> = fields
             .iter()
             .copied()
@@ -4134,7 +4143,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         &mut self,
         k: ShapeId,
         fields: &[&ast::Field],
-        arr: Node,
+        arr: Option<Node>,
         positional: usize,
         span: Span,
     ) -> Result<Val> {
@@ -4248,7 +4257,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let arr = self
             .hold(
                 Val {
-                    node: call("zl_arr_box", vec![arr], Type::Any, span),
+                    node: match arr {
+                        Some(arr) => call("zl_arr_box", vec![arr], Type::Any, span),
+                        None => call("zl_arr_shared", vec![], Type::Any, span),
+                    },
                     ty: Ty::Any,
                 },
                 &mut pre,

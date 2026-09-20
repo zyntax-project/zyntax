@@ -31,6 +31,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
 
     let arr_of = |tb: Expr| super::arr_of(tb, t);
     let hash_of = |tb: Expr| super::hash_of(tb, t);
+    // `arr` is the array part boxed.
     let struct_lit = |arr: Expr, high: Expr| {
         use zyntax_typed_ast::typed_ast::{TypedExpression, TypedFieldInit, TypedStructLiteral};
         node(
@@ -39,7 +40,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 fields: vec![
                     TypedFieldInit {
                         name: intern("arr"),
-                        value: Box::new(call("zb_list_box_any", vec![arr], any())),
+                        value: Box::new(arr),
                     },
                     TypedFieldInit {
                         name: intern("hash"),
@@ -83,11 +84,58 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let slot_key = |tb: Expr, i: Expr| call("zl_shape_key", vec![tb, i], string());
 
     // ─── construction ───────────────────────────────────────────
+    // The empty array part every table starts with, shared: made on
+    // first use and never written, since a write gives the table its
+    // own first.
+    d.push(define(
+        "zl_arr_shared",
+        &[],
+        any(),
+        vec![
+            when(
+                is_nil(read_global(ARR_EMPTY, any())),
+                vec![set_global(
+                    ARR_EMPTY,
+                    call(
+                        "zb_list_box_any",
+                        vec![list(Vec::new(), anys.clone())],
+                        any(),
+                    ),
+                )],
+            ),
+            ret(read_global(ARR_EMPTY, any())),
+        ],
+    ));
+    // The array part of `t` for writing: its own, made when it still
+    // holds the shared empty one.
+    d.push(define(
+        "zl_arr_own",
+        &[&tb],
+        anys.clone(),
+        vec![
+            when(
+                eq(arr_field(tb.e()), read_global(ARR_EMPTY, any())),
+                vec![set_field(
+                    tb.e(),
+                    "arr",
+                    call(
+                        "zb_list_box_any",
+                        vec![list(Vec::new(), anys.clone())],
+                        any(),
+                    ),
+                )],
+            ),
+            ret(arr_of(tb.e())),
+        ],
+    ));
     d.push(define(
         "zl_table_new",
         &[],
         table.clone(),
-        vec![ret(struct_lit(list(Vec::new(), anys.clone()), int(0)))],
+        vec![ret(struct_lit(
+            call("zl_arr_shared", vec![], any()),
+            int(0),
+        ))],
     ));
     // A table over the positional values of a constructor, which are
     // its array part as they are: a trailing nil is dropped so the
@@ -96,18 +144,12 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     d.push(define("zl_table_with_arr", &[&arr_kept], table.clone(), {
         vec![
             n.decl(len(arr.e())),
-            while_(
-                and(
-                    gt(len(arr.e()), int(0)),
-                    is_nil(at(arr.e(), sub(len(arr.e()), int(1)))),
-                ),
-                vec![expr(mcall(arr.e(), "pop_last", vec![], any()))],
-            ),
-            ret(struct_lit(arr.e(), n.e())),
+            ret(struct_lit(call("zl_arr_box", vec![arr.e()], any()), n.e())),
         ]
     }));
     // The array part of a shaped table, boxed, trimmed like a plain
-    // table's; the program lays the rest of the table out itself.
+    // table's; the program lays the rest of the table out itself. An
+    // empty one is the shared one.
     d.push(define("zl_arr_box", &[&arr_kept], any(), {
         vec![
             while_(
@@ -116,6 +158,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     is_nil(at(arr.e(), sub(len(arr.e()), int(1)))),
                 ),
                 vec![expr(mcall(arr.e(), "pop_last", vec![], any()))],
+            ),
+            when(
+                eq(len(arr.e()), int(0)),
+                vec![ret(call("zl_arr_shared", vec![], any()))],
             ),
             ret(call("zb_list_box_any", vec![arr.e()], any())),
         ]
@@ -291,7 +337,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         vec![
             when(is_nil(hash_field(tb.e())), vec![ret_void()]),
             h.decl(hash_of(tb.e())),
-            arr.decl(arr_of(tb.e())),
+            arr.decl(call("zl_arr_own", vec![tb.e()], anys.clone())),
             when(
                 eq(call("zb_dict_len", vec![h.e()], i64()), int(0)),
                 vec![ret_void()],
@@ -325,7 +371,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         &[&tb, &i, &v],
         unit(),
         vec![
-            arr.decl(arr_of(tb.e())),
+            arr.decl(call("zl_arr_own", vec![tb.e()], anys.clone())),
             n.decl(len(arr.e())),
             when(
                 and(ge(i.e(), int(1)), le(i.e(), n.e())),
