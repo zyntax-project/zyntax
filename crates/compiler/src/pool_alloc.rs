@@ -504,9 +504,15 @@ unsafe fn refill(class: usize) -> bool {
     true
 }
 
-/// Anything a pool will not take.
+/// Anything a pool will not take. The collector gets its say first,
+/// as on the pooled path: a program that churns large blocks while its
+/// small ones recycle off the free lists would otherwise never collect.
 #[inline]
 unsafe fn large_alloc(size: usize) -> *mut u8 {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::collector::wants_collection() {
+        crate::collector::collect();
+    }
     let total = HEADER + size.max(1);
     let block = sys_alloc(Layout::from_size_align_unchecked(total, HEADER));
     if block.is_null() {
