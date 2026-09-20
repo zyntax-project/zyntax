@@ -596,6 +596,38 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ret(tb.e()),
         ],
     ));
+    // The same for two tables the program holds as such; the metatable
+    // null to remove it, the table null for nil, which is the error.
+    let mt_table = kept("mt", table.clone());
+    d.push(define(
+        "zl_setmetatable_tables",
+        &[&tb, &mt_table],
+        table.clone(),
+        vec![
+            when(
+                eq(tb.e(), null(table.clone())),
+                vec![
+                    lua_error(text(
+                        "bad argument #1 to 'setmetatable' (table expected, got nil)",
+                    )),
+                    ret(call("zl_table_new", vec![], table.clone())),
+                ],
+            ),
+            when(
+                and(
+                    ne(meta_of(tb.e(), t), null(table.clone())),
+                    not(is_nil(call(
+                        "zl_meta",
+                        vec![tb.e(), text("__metatable")],
+                        any(),
+                    ))),
+                ),
+                vec![lua_error(text("cannot change a protected metatable"))],
+            ),
+            set_field(tb.e(), "meta", mt_table.e()),
+            ret(tb.e()),
+        ],
+    ));
     let protected = local("protected", any());
     d.push(define(
         "zl_getmetatable",

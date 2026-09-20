@@ -4402,7 +4402,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     present = binary(BinaryOp::BitOr, present, bit, i64_t.clone(), span);
                     stored
                 }
-                None => self.zero_of(slot.stored_ty(), span),
+                // An absent slot holds nothing: null for a table, never
+                // a table made for it.
+                None => match slot.kind {
+                    SlotKind::Table => null(table_t.clone(), span),
+                    _ => self.zero_of(slot.stored_ty(), span),
+                },
             };
             match slot.kind {
                 SlotKind::Scalar => {
@@ -4436,7 +4441,23 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 Val {
                     node: match arr {
                         Some(arr) => call("zl_arr_box", vec![arr], Type::Any, span),
-                        None => call("zl_arr_shared", vec![], Type::Any, span),
+                        // The shared empty one, made on the first table.
+                        None => {
+                            let shared = var(intern(library::ARR_EMPTY), Type::Any, span);
+                            if_value(
+                                binary(
+                                    BinaryOp::Ne,
+                                    shared.clone(),
+                                    nil(span),
+                                    prim(PrimitiveType::Bool),
+                                    span,
+                                ),
+                                shared,
+                                call("zl_arr_shared", vec![], Type::Any, span),
+                                Type::Any,
+                                span,
+                            )
+                        }
                     },
                     ty: Ty::Any,
                 },
@@ -4898,26 +4919,38 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     bool_t.clone(),
                     span,
                 );
-                let no_meta = binary(
-                    BinaryOp::Eq,
-                    field(t.node.clone(), "meta", self.ir(Ty::Table), span),
-                    null(self.ir(Ty::Table), span),
-                    bool_t.clone(),
-                    span,
-                );
-                let fast = binary(
-                    BinaryOp::And,
-                    not_null,
-                    binary(
-                        BinaryOp::Or,
-                        self.slot_present(&t.node, slot, span),
-                        no_meta,
+                // No metatable the types know of for this shape holds a
+                // `__newindex`: nothing can take the store instead.
+                let info = self.m.inferred.shape(shape);
+                let no_newindex = !info.unknown_meta
+                    && info
+                        .classes
+                        .iter()
+                        .all(|c| self.m.inferred.shape(*c).field("__newindex").is_none());
+                let fast = if no_newindex {
+                    not_null
+                } else {
+                    let no_meta = binary(
+                        BinaryOp::Eq,
+                        field(t.node.clone(), "meta", self.ir(Ty::Table), span),
+                        null(self.ir(Ty::Table), span),
                         bool_t.clone(),
                         span,
-                    ),
-                    bool_t,
-                    span,
-                );
+                    );
+                    binary(
+                        BinaryOp::And,
+                        not_null,
+                        binary(
+                            BinaryOp::Or,
+                            self.slot_present(&t.node, slot, span),
+                            no_meta,
+                            bool_t.clone(),
+                            span,
+                        ),
+                        bool_t,
+                        span,
+                    )
+                };
                 let then = self.slot_write(&t.node, layout, slot, stored.clone(), span);
                 let boxed = self.coerce(
                     Val {
@@ -6110,6 +6143,32 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         {
             return Ok(m);
         }
+        // `setmetatable` of tables the types know: neither is boxed.
+        if b.lib.is_empty()
+            && b.name == "setmetatable"
+            && tail.is_none()
+            && vals.len() == 2
+            && vals
+                .iter()
+                .all(|v| matches!(v.ty, Ty::Table | Ty::Shape(_)))
+        {
+            let table_t = self.ir(Ty::Table);
+            let ty = vals[0].ty;
+            let node = call(
+                "zl_setmetatable_tables",
+                vals.into_iter().map(|v| v.node).collect(),
+                table_t,
+                span,
+            );
+            let v = self.guard(Val {
+                node,
+                ty: Ty::Table,
+            });
+            return Ok(Multi::Fixed(vec![Val {
+                node: block_value(pre, v.node, span),
+                ty,
+            }]));
+        }
         // A tail of several values fills what follows through a list.
         let tail_list = match tail {
             Some(tail) => {
@@ -6379,6 +6438,31 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             },
             Param::Table => match v {
                 Some(v) if v.ty == Ty::Table => v.node,
+                // A shaped table is one unless it is nil, when the
+                // check raises as for any other value.
+                Some(v) if matches!(v.ty, Ty::Shape(_)) => {
+                    let table_t = self.ir(Ty::Table);
+                    let mut pre = Vec::new();
+                    let t = self.hold(v, &mut pre);
+                    let is_null = binary(
+                        BinaryOp::Eq,
+                        t.node.clone(),
+                        null(table_t.clone(), span),
+                        prim(PrimitiveType::Bool),
+                        span,
+                    );
+                    block_value(
+                        pre,
+                        if_value(
+                            is_null,
+                            call("zl_as_table", vec![nil(span), what], table_t.clone(), span),
+                            t.node,
+                            table_t,
+                            span,
+                        ),
+                        span,
+                    )
+                }
                 Some(v) => {
                     let b = self.boxed(v);
                     call("zl_as_table", vec![b, what], self.ir(Ty::Table), span)
