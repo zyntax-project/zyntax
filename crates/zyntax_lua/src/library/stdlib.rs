@@ -2019,6 +2019,37 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         st.push(ret(int_if_fits(call(op, vec![get_f64(y.e())], f64()))));
         d.push(define(name, &[&x], any(), st));
     }
+    // The same on a float the program knows it has.
+    for (name, op) in [
+        ("zl_math_floor_f", "floor"),
+        ("zl_math_ceil_f", "zl_ceil_f64"),
+    ] {
+        d.push(define(
+            name,
+            &[&f],
+            any(),
+            vec![ret(int_if_fits(call(op, vec![f.e()], f64())))],
+        ));
+    }
+    // The absolute value the compiler has an instruction for.
+    d.push(extern_fn("abs", &[("x", f64())], f64(), None));
+    // `math.fmod` on two integers: the remainder rounded toward zero;
+    // by -1 it is zero outright, since the least integer's overflows.
+    let ia = local("ia", i64());
+    let ib = local("ib", i64());
+    d.push(define(
+        "zl_fmod_i64",
+        &[&ia, &ib],
+        i64(),
+        vec![
+            when(
+                eq(ib.e(), int(0)),
+                vec![lua_error(text("bad argument #2 to 'fmod' (zero)"))],
+            ),
+            when(eq(ib.e(), int(-1)), vec![ret(int(0))]),
+            ret(rem(ia.e(), ib.e())),
+        ],
+    ));
     d.push(define("zl_math_abs", &[&x], any(), {
         let mut st = number_arg(&x, "abs");
         st.push(when(
@@ -2029,11 +2060,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 y.e(),
             ))],
         ));
-        st.push(ret(box_f64(call(
-            "zb_math_fabs",
-            vec![get_f64(y.e())],
-            f64(),
-        ))));
+        st.push(ret(box_f64(call("abs", vec![get_f64(y.e())], f64()))));
         st
     }));
     for (name, shared) in [
@@ -2109,13 +2136,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![
             when(
                 and(is_int_box(x.e()), is_int_box(y.e())),
-                vec![
-                    when(
-                        eq(get_i64(y.e()), int(0)),
-                        vec![lua_error(text("bad argument #2 to 'fmod' (zero)"))],
-                    ),
-                    ret(box_i64(rem(get_i64(x.e()), get_i64(y.e())))),
-                ],
+                vec![ret(box_i64(call(
+                    "zl_fmod_i64",
+                    vec![get_i64(x.e()), get_i64(y.e())],
+                    i64(),
+                )))],
             ),
             ret(box_f64(rem(
                 call("zl_arg_float", vec![x.e(), bad_arg(1, "fmod")], f64()),

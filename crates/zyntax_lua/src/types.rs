@@ -138,6 +138,36 @@ pub fn builtin_member(scopes: &Scopes, lib: &str, name: &str) -> Option<&'static
     BUILTINS.iter().find(|b| b.lib == lib && b.name == name)
 }
 
+/// The result of a `math` function whose arguments' types decide it:
+/// `math.abs` of an integer is an integer, `math.max` of floats a
+/// float. `None` when they do not, and the function's declared result
+/// stands; unknown when an argument is not known yet.
+pub fn math_result(b: &Builtin, args: &[Ty]) -> Option<Ty> {
+    if b.lib != "math" {
+        return None;
+    }
+    let numbers = |args: &[Ty]| -> Option<Ty> {
+        // All integers, or all floats.
+        let first = *args.first()?;
+        if !first.is_number() || args.iter().any(|t| *t != first) {
+            return None;
+        }
+        Some(first)
+    };
+    let result = match (b.name, args) {
+        ("abs" | "max" | "min", args) => numbers(args),
+        ("floor" | "ceil", [Ty::Int]) => Some(Ty::Int),
+        ("fmod", [Ty::Int, Ty::Int]) => Some(Ty::Int),
+        ("fmod", [a, b]) if a.is_number() && b.is_number() => Some(Ty::Float),
+        ("floor" | "ceil" | "fmod", _) => None,
+        _ => return None,
+    };
+    if args.contains(&Ty::Unknown) {
+        return Some(Ty::Unknown);
+    }
+    result
+}
+
 pub fn ret_ty(r: Ret) -> Ty {
     match r {
         Ret::Unit => Ty::Nil,
@@ -263,12 +293,43 @@ impl<'a> Typer<'a> {
                 .unwrap_or(Returns::Fixed(vec![Ty::Unknown]));
         }
         if let Some(b) = self.builtin_callee(prefix, suffixes) {
+            if let ast::Call::AnonymousCall(args) = last
+                && let Some(t) = self.math_call_ty(b, args)
+            {
+                return Returns::Fixed(vec![t]);
+            }
             return match b.ret {
                 Ret::Multi => Returns::Dynamic,
                 r => Returns::Fixed(vec![ret_ty(r)]),
             };
         }
         Returns::Dynamic
+    }
+
+    /// What a `math` call's arguments make its result, when they do.
+    /// The arguments are each expression's one value, the last one's
+    /// several; a last argument of no fixed count decides nothing.
+    fn math_call_ty(&self, b: &Builtin, args: &ast::FunctionArgs) -> Option<Ty> {
+        if b.lib != "math" {
+            return None;
+        }
+        let ast::FunctionArgs::Parentheses { arguments, .. } = args else {
+            return None;
+        };
+        let exprs: Vec<&Expression> = arguments.iter().collect();
+        let mut tys = Vec::with_capacity(exprs.len());
+        for (i, e) in exprs.iter().enumerate() {
+            if i + 1 == exprs.len() {
+                match multi_returns(self, e) {
+                    Some(Returns::Fixed(more)) => tys.extend(more),
+                    Some(Returns::Dynamic) => return None,
+                    None => tys.push(self.ty_of(e)),
+                }
+            } else {
+                tys.push(self.ty_of(e));
+            }
+        }
+        math_result(b, &tys)
     }
 
     fn prefix_ty(&self, p: &Prefix) -> Ty {

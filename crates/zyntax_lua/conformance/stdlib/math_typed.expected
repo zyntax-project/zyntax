@@ -1,0 +1,23 @@
+7	7	-9223372036854775808	9223372036854775807
+7.5	7.5	0.0	true
+inf	inf
+3	3	-3	-3
+3	4	-4	-3
+integer	integer
+1.1805916207174e+21	-1.1805916207174e+21	float
+0	0	0	0
+9	3	-2	-9223372036854775808
+9.25	3.5	2.5	-0.0
+integer	float	float
+2.5	1	2.5	1
+true	1	true	1
+1	-1	1	-1
+0	0	0	0
+1.5	-1.5	2.0	-1.5
+integer	float	float
+1.0	-1.0	true
+false	math_typed.lua:22: bad argument #2 to 'fmod' (zero)
+12	3	12	3
+8	2
+225	67.5	integer	float
+4	1	2	4	5

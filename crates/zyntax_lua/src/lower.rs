@@ -433,6 +433,18 @@ fn unary(op: UnaryOp, operand: Node, ty: Type, span: Span) -> Node {
     )
 }
 
+fn if_value(cond: Node, then: Node, els: Node, ty: Type, span: Span) -> Node {
+    node(
+        TypedExpression::If(TypedIfExpr {
+            condition: Box::new(cond),
+            then_branch: Box::new(then),
+            else_branch: Box::new(els),
+        }),
+        ty,
+        span,
+    )
+}
+
 fn cast(value: Node, ty: Type, span: Span) -> Node {
     node(
         TypedExpression::Cast(TypedCast {
@@ -2245,15 +2257,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         } else {
             (a_node, b_node)
         };
-        let value = node(
-            TypedExpression::If(TypedIfExpr {
-                condition: Box::new(test),
-                then_branch: Box::new(then),
-                else_branch: Box::new(els),
-            }),
-            self.ir(ty),
-            span,
-        );
+        let value = if_value(test, then, els, self.ir(ty), span);
         Ok(Val {
             node: block_value(pre, value, span),
             ty,
@@ -3007,6 +3011,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
         let (mut pre, vals, tail) = self.call_values(receiver, args, span)?;
         let mut vals: Vec<Val> = vals.into_iter().map(|v| self.hold(v, &mut pre)).collect();
+        if tail.is_none()
+            && let Some(m) = self.math_call(b, &mut vals, &mut pre, span)
+        {
+            return Ok(m);
+        }
         // A tail of several values fills what follows through a list.
         let tail_list = match tail {
             Some(tail) => {
@@ -3134,6 +3143,96 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 ty: v.ty,
             }]),
         })
+    }
+
+    /// A `math` call whose arguments' types decide its result, as the
+    /// typer decided it too: the arithmetic inline, nothing boxed on
+    /// the way in or out. `None` leaves the call to the library.
+    fn math_call(
+        &mut self,
+        b: &Builtin,
+        vals: &mut Vec<Val>,
+        pre: &mut Vec<St>,
+        span: Span,
+    ) -> Option<Multi> {
+        if b.lib != "math" {
+            return None;
+        }
+        let i64_t = prim(PrimitiveType::I64);
+        let f64_t = prim(PrimitiveType::F64);
+        let bool_t = prim(PrimitiveType::Bool);
+        let tys: Vec<Ty> = vals.iter().map(|v| v.ty).collect();
+        // A float rounds to the integer it makes when that fits, else
+        // stays a float: the result is dynamic either way, but the
+        // argument needs no box.
+        if let ("floor" | "ceil", [Ty::Float]) = (b.name, tys.as_slice()) {
+            let f = std::mem::take(vals).pop()?;
+            let node = call(
+                &format!("zl_math_{}_f", b.name),
+                vec![f.node],
+                Type::Any,
+                span,
+            );
+            let node = block_value(std::mem::take(pre), node, span);
+            return Some(Multi::Fixed(vec![Val { node, ty: Ty::Any }]));
+        }
+        let ty = match types::math_result(b, &tys) {
+            Some(Ty::Int) => Ty::Int,
+            Some(Ty::Float) => Ty::Float,
+            _ => return None,
+        };
+        let ir = self.ir(ty);
+        let mut args = std::mem::take(vals).into_iter();
+        let mut arg = || args.next().expect("an argument");
+        let node = match (b.name, ty) {
+            ("abs", Ty::Int) => {
+                let x = arg().node;
+                let negative = binary(BinaryOp::Lt, x.clone(), int_lit(0, span), bool_t, span);
+                let negated = binary(BinaryOp::Sub, int_lit(0, span), x.clone(), i64_t, span);
+                if_value(negative, negated, x, ir, span)
+            }
+            ("abs", Ty::Float) => call("abs", vec![arg().node], f64_t, span),
+            ("floor" | "ceil", Ty::Int) => arg().node,
+            ("max" | "min", _) => {
+                // The best so far gives way when it is less than the
+                // next (`max`), or the next is less (`min`): compared
+                // with a NaN neither is, so the first stays.
+                let mut best = arg();
+                for next in args {
+                    let (l, r) = if b.name == "max" {
+                        (best.node.clone(), next.node.clone())
+                    } else {
+                        (next.node.clone(), best.node.clone())
+                    };
+                    let moves = binary(BinaryOp::Lt, l, r, bool_t.clone(), span);
+                    let picked = Val {
+                        node: if_value(moves, next.node, best.node, ir.clone(), span),
+                        ty,
+                    };
+                    best = self.hold(picked, pre);
+                }
+                best.node
+            }
+            ("fmod", Ty::Int) => {
+                let (a, b) = (arg().node, arg().node);
+                call("zl_fmod_i64", vec![a, b], i64_t, span)
+            }
+            ("fmod", Ty::Float) => {
+                let (a, b) = (arg(), arg());
+                let a = self.coerce(a, Ty::Float);
+                let b = self.coerce(b, Ty::Float);
+                binary(BinaryOp::Rem, a, b, f64_t, span)
+            }
+            _ => unreachable!("math_result decided the shape"),
+        };
+        let v = Val { node, ty };
+        let v = if self.call_can_raise(&v.node) {
+            self.guard(v)
+        } else {
+            v
+        };
+        let node = block_value(std::mem::take(pre), v.node, span);
+        Some(Multi::Fixed(vec![Val { node, ty }]))
     }
 
     /// One argument of a builtin as its parameter takes it.
