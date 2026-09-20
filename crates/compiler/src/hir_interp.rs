@@ -5068,11 +5068,16 @@ unsafe fn write_typed(ptr: *mut u8, v: &ZyntaxValue, ty: &HirType) {
     // Coerce both sides to i64/f64 so we don't need a 2D table of
     // (HirType, variant) match arms.
     match ty {
-        HirType::Bool => {
-            if let ZyntaxValue::Bool(b) = v {
-                *ptr = *b as u8;
+        // A truth value arrives as a bool, or as the integer a compare or
+        // a bit operation produced.
+        HirType::Bool => match v {
+            ZyntaxValue::Bool(b) => *ptr = *b as u8,
+            other => {
+                if let Some(n) = value_to_i64(other) {
+                    *ptr = (n != 0) as u8;
+                }
             }
-        }
+        },
         HirType::I8 => {
             if let Some(n) = value_to_i64(v) {
                 *(ptr as *mut i8) = n as i8;
