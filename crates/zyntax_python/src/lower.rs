@@ -5276,12 +5276,32 @@ impl<'m> Lowerer<'m> {
                     ty: Ty::Object,
                 }
             }
+            // Any other builtin as a value: the name it is bound to is
+            // typed as the builtin, so a call through the name is the
+            // builtin's own; the record is for a call that is not.
             py::Expr::Name(n)
                 if !self.is_variable(n.id.as_str())
                     && !self.module.class_index.contains_key(n.id.as_str())
-                    && types::builtin_index(n.id.as_str()).is_some() =>
+                    && let Some(k) = types::builtin_index(n.id.as_str()) =>
             {
-                return unsupported(format!("`{}` as a value", n.id.as_str()), e);
+                let held = Val {
+                    node: str_lit(n.id.as_str(), span),
+                    ty: Ty::Str,
+                };
+                let env = self.list_of(vec![held], Elem::Object, span);
+                Val {
+                    node: call(
+                        "zb_func_new",
+                        vec![
+                            code_of("zb_builtin_value_call", span),
+                            int_lit(zyntax_builtins::functions::VARIADIC_ARITY, span),
+                            env,
+                        ],
+                        Ty::Object,
+                        span,
+                    ),
+                    ty: Ty::Builtin(k),
+                }
             }
             py::Expr::Name(n) => Val {
                 node: var(self.local_symbol(n.id.as_str()), ty, span),

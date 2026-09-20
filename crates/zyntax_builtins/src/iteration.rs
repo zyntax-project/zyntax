@@ -113,6 +113,31 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         ],
     ));
 
+    // A builtin bound to a name, `izip = zip`: calls through the name
+    // are the builtin's own, typed by the frontend, so the record the
+    // name holds is reached only by a call the frontend did not see
+    // through. Its environment holds the builtin's name for the message.
+    let held = local("held", anys.clone());
+    d.push(define(
+        "zb_builtin_value_call",
+        &[&env, &packed],
+        any(),
+        vec![
+            held.decl(env.e()),
+            expr(packed.e()),
+            fatal(
+                "TypeError",
+                add(
+                    add(
+                        text("calling "),
+                        call("zb_any_as_str", vec![at(&held, int(0))], string()),
+                    ),
+                    text(" through a value is not supported here"),
+                ),
+            ),
+        ],
+    ));
+
     // A `bisect` imported as a value (for example, a function default)
     // searches the iterable's dynamic elements without changing it.
     for side in ["left", "right"] {
