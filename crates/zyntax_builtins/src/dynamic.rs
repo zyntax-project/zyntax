@@ -577,6 +577,20 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 and(is(&ca, CUSTOM), is(&cb, CUSTOM)),
                 vec![
+                    // A function is equal to itself only.
+                    when(
+                        or(
+                            eq(kind(a.e()), int(FUNC_TAG >> 8)),
+                            eq(kind(b.e()), int(FUNC_TAG >> 8)),
+                        ),
+                        vec![ret(and(
+                            eq(kind(a.e()), kind(b.e())),
+                            eq(
+                                call("zb_unbox_instance_raw", vec![a.e()], i64()),
+                                call("zb_unbox_instance_raw", vec![b.e()], i64()),
+                            ),
+                        ))],
+                    ),
                     when(
                         ne(kind(a.e()), kind(b.e())),
                         vec![
