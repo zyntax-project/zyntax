@@ -126,8 +126,20 @@ impl Linker<'_> {
                         imports.modules.insert(local, module.to_string());
                         ours = true;
                     }
+                    // The statement keeps the standard modules it also
+                    // names; one naming only the program's own is done.
                     if ours {
-                        *stmt = pass(stmt.range());
+                        let kept: Vec<py::Alias> = i
+                            .names
+                            .iter()
+                            .filter(|a| stdlib::is_known(a.name.id.as_str()))
+                            .cloned()
+                            .collect();
+                        if kept.is_empty() {
+                            *stmt = pass(stmt.range());
+                        } else {
+                            i.names = kept;
+                        }
                     }
                 }
                 py::Stmt::ImportFrom(f) => {
