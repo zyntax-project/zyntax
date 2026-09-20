@@ -27,6 +27,9 @@ pub enum Ty {
     Str,
     /// A table, held by pointer; never nil.
     Table,
+    /// This function, as its record: a closure over whatever it
+    /// captured. A call through it is a direct call.
+    Func(FuncId),
     /// A dynamic value: a boxed `Any`.
     Any,
     /// Nothing known yet: the bottom of the join.
@@ -52,7 +55,10 @@ impl Ty {
 
     /// Whether a value of this type is always true in a condition.
     pub fn always_truthy(self) -> bool {
-        matches!(self, Ty::Int | Ty::Float | Ty::Number | Ty::Str | Ty::Table)
+        matches!(
+            self,
+            Ty::Int | Ty::Float | Ty::Number | Ty::Str | Ty::Table | Ty::Func(_)
+        )
     }
 
     /// What is known once inference has settled: a variable nothing
@@ -66,38 +72,29 @@ impl Ty {
 }
 
 /// What a function returns: a fixed number of values, each typed, or
-/// a dynamic value that may hold several.
+/// a dynamic value that may hold several; or nothing known yet, of a
+/// callee no round has typed, which decides nothing until it has.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Returns {
     Fixed(Vec<Ty>),
     Dynamic,
+    Unknown,
 }
 
 impl Returns {
-    /// Two returns of one arity join value by value; of different
-    /// arities, the count itself varies, which a caller can observe,
-    /// so the result is dynamic.
-    fn join(self, other: Returns) -> Returns {
-        match (self, other) {
-            (Returns::Fixed(a), Returns::Fixed(b)) if a.len() == b.len() => {
-                Returns::Fixed(a.into_iter().zip(b).map(|(x, y)| x.join(y)).collect())
-            }
-            _ => Returns::Dynamic,
-        }
-    }
-
     /// The type of the call in single-value position.
     pub fn first(&self) -> Ty {
         match self {
             Returns::Fixed(v) => v.first().copied().unwrap_or(Ty::Nil),
             Returns::Dynamic => Ty::Any,
+            Returns::Unknown => Ty::Unknown,
         }
     }
 
     pub fn settled(self) -> Returns {
         match self {
             Returns::Fixed(v) => Returns::Fixed(v.into_iter().map(Ty::settled).collect()),
-            Returns::Dynamic => Returns::Dynamic,
+            Returns::Dynamic | Returns::Unknown => Returns::Dynamic,
         }
     }
 }
@@ -113,6 +110,10 @@ pub struct Inferred {
     pub funcs: HashMap<FuncId, Sig>,
     pub vars: HashMap<VarId, Ty>,
     pub globals: HashMap<String, Ty>,
+    /// Functions that may be called through a value the types do not
+    /// follow: one lost into a dynamic value, or a table, or passed to
+    /// the library. Their parameters take anything. Only ever grows.
+    pub escaping: std::collections::HashSet<FuncId>,
 }
 
 impl Inferred {
@@ -204,12 +205,7 @@ pub struct Typer<'a> {
 impl<'a> Typer<'a> {
     fn name_ty(&self, token: &full_moon::tokenizer::TokenReference) -> Ty {
         match self.scopes.binding(token) {
-            Some(Binding::Local(v)) | Some(Binding::Upvalue(v)) => {
-                if self.scopes.known_local_function(*v).is_some() {
-                    return Ty::Any;
-                }
-                self.known.var(*v)
-            }
+            Some(Binding::Local(v)) | Some(Binding::Upvalue(v)) => self.known.var(*v),
             Some(Binding::Global(name)) => self.global_ty(name),
             Some(Binding::Field(..)) | None => Ty::Any,
         }
@@ -218,9 +214,6 @@ impl<'a> Typer<'a> {
     pub fn global_ty(&self, name: &str) -> Ty {
         // An entry of the globals table can be anything.
         if self.scopes.dynamic_globals {
-            return Ty::Any;
-        }
-        if self.scopes.known_global_function(name).is_some() {
             return Ty::Any;
         }
         if builtin_named(self.scopes, name).is_some() {
@@ -237,10 +230,10 @@ impl<'a> Typer<'a> {
         }
     }
 
-    /// The function a callee expression names, if it is a known one.
+    /// The function a callee expression is, when its type says.
     pub fn known_callee(&self, prefix: &Prefix) -> Option<FuncId> {
-        match prefix {
-            Prefix::Name(token) => self.scopes.known_function(self.scopes.binding(token)?),
+        match self.prefix_ty(prefix) {
+            Ty::Func(f) => Some(f),
             _ => None,
         }
     }
@@ -287,16 +280,20 @@ impl<'a> Typer<'a> {
             }
             return Returns::Dynamic;
         }
-        if suffixes.len() == 1
-            && let Some(f) = self.known_callee(prefix)
-        {
-            // A function no round has settled yet returns nothing
-            // known: the value stays undecided until it has.
-            return self
-                .known
-                .sig(f)
-                .map(|s| s.returns.clone())
-                .unwrap_or(Returns::Fixed(vec![Ty::Unknown]));
+        if suffixes.len() == 1 {
+            match self.prefix_ty(prefix) {
+                // A function no round has settled yet returns nothing
+                // known: the value stays undecided until it has.
+                Ty::Func(f) => {
+                    return self
+                        .known
+                        .sig(f)
+                        .map(|s| s.returns.clone())
+                        .unwrap_or(Returns::Unknown);
+                }
+                Ty::Unknown => return Returns::Unknown,
+                _ => {}
+            }
         }
         if let Some(b) = self.builtin_callee(prefix, suffixes) {
             if let ast::Call::AnonymousCall(args) = last
@@ -329,6 +326,7 @@ impl<'a> Typer<'a> {
                 match multi_returns(self, e) {
                     Some(Returns::Fixed(more)) => tys.extend(more),
                     Some(Returns::Dynamic) => return None,
+                    Some(Returns::Unknown) => tys.push(Ty::Unknown),
                     None => tys.push(self.ty_of(e)),
                 }
             } else {
@@ -397,7 +395,7 @@ impl<'a> Typer<'a> {
                 _ => Ty::Any,
             },
             Expression::Parentheses { expression, .. } => self.ty_of(expression),
-            Expression::Function(_) => Ty::Any,
+            Expression::Function(f) => Ty::Func(self.scopes.function_of(f.body())),
             Expression::TableConstructor(_) => Ty::Table,
             Expression::FunctionCall(c) => {
                 let suffixes: Vec<&Suffix> = c.suffixes().collect();
@@ -587,8 +585,58 @@ impl<'a> Round<'a> {
         }
     }
 
+    /// A function reached through this value may be called with
+    /// anything from here on.
+    fn escape(&mut self, ty: Ty) {
+        if let Ty::Func(f) = ty {
+            self.out.escaping.insert(f);
+        }
+    }
+
+    fn is_escaping(&self, f: FuncId) -> bool {
+        self.scopes.func(f).escapes
+            || self.known.escaping.contains(&f)
+            || self.out.escaping.contains(&f)
+    }
+
+    /// `value` joined into what `slot` holds: a function joined with
+    /// anything but itself is lost to the types, and escapes.
+    fn join_into(&mut self, slot: Ty, value: Ty) -> Ty {
+        let joined = slot.join(value);
+        if !matches!(joined, Ty::Func(_)) {
+            self.escape(slot);
+            self.escape(value);
+        }
+        joined
+    }
+
+    fn join_returns(&mut self, a: Returns, b: Returns) -> Returns {
+        match (a, b) {
+            (Returns::Unknown, r) | (r, Returns::Unknown) => r,
+            (Returns::Fixed(x), Returns::Fixed(y)) if x.len() == y.len() => Returns::Fixed(
+                x.into_iter()
+                    .zip(y)
+                    .map(|(p, q)| self.join_into(p, q))
+                    .collect(),
+            ),
+            (a, b) => {
+                self.escape_returns(&a);
+                self.escape_returns(&b);
+                Returns::Dynamic
+            }
+        }
+    }
+
+    fn escape_returns(&mut self, r: &Returns) {
+        if let Returns::Fixed(types) = r {
+            for t in types {
+                self.escape(*t);
+            }
+        }
+    }
+
     fn assign_var(&mut self, v: VarId, ty: Ty) {
-        let joined = self.out.var(v).join(ty);
+        let joined = self.join_into(self.out.var(v), ty);
         self.out.vars.insert(v, joined);
     }
 
@@ -596,11 +644,24 @@ impl<'a> Round<'a> {
         match binding {
             Binding::Local(v) | Binding::Upvalue(v) => self.assign_var(*v, ty),
             Binding::Global(name) => {
-                let joined = self.out.global(name).join(ty);
+                // In a program that reaches its globals through a
+                // table, a global is an entry of it.
+                if self.scopes.dynamic_globals {
+                    self.escape(ty);
+                }
+                let joined = self.join_into(self.out.global(name), ty);
                 self.out.globals.insert(name.clone(), joined);
             }
-            Binding::Field(..) => {}
+            Binding::Field(..) => self.escape(ty),
         }
+    }
+
+    /// An expression whose value goes where the types do not follow
+    /// it: a function there escapes.
+    fn value(&mut self, e: &Expression) {
+        self.expr(e);
+        let ty = self.typer().ty_of(e);
+        self.escape(ty);
     }
 
     /// The types of `n` targets assigned from `exprs`, Lua's way: the
@@ -625,6 +686,11 @@ impl<'a> Round<'a> {
                     Some(Returns::Dynamic) => {
                         while out.len() < n {
                             out.push(Ty::Any);
+                        }
+                    }
+                    Some(Returns::Unknown) => {
+                        while out.len() < n {
+                            out.push(Ty::Unknown);
                         }
                     }
                     None => {
@@ -664,6 +730,9 @@ impl<'a> Round<'a> {
                             Returns::Fixed(types)
                         }
                         Some(Returns::Dynamic) => Returns::Dynamic,
+                        // A tail not typed yet: this return decides
+                        // nothing this round.
+                        Some(Returns::Unknown) => Returns::Unknown,
                         None => {
                             types.push(typer.ty_of(last));
                             Returns::Fixed(types)
@@ -672,7 +741,7 @@ impl<'a> Round<'a> {
                 }
             };
             self.returns = Some(match self.returns.take() {
-                Some(r) => r.join(returns),
+                Some(r) => self.join_returns(r, returns),
                 None => returns,
             });
         }
@@ -682,10 +751,24 @@ impl<'a> Round<'a> {
         match stmt {
             Stmt::Assignment(a) => {
                 let exprs: Vec<&Expression> = a.expressions().iter().collect();
-                for e in &exprs {
-                    self.expr(e);
-                }
                 let targets: Vec<&Var> = a.variables().iter().collect();
+                // Stored into a variable, a value keeps its type; into
+                // a table, it is on its own.
+                let kept = targets.iter().all(|t| match t {
+                    Var::Name(_) => true,
+                    Var::Expression(v) => {
+                        let suffixes: Vec<&Suffix> = v.suffixes().collect();
+                        self.typer().global_member(v.prefix(), &suffixes).is_some()
+                    }
+                    _ => false,
+                });
+                for e in &exprs {
+                    if kept {
+                        self.expr(e);
+                    } else {
+                        self.value(e);
+                    }
+                }
                 let types = self.assigned_types(&exprs, targets.len());
                 for (target, ty) in targets.iter().zip(types) {
                     match target {
@@ -702,7 +785,7 @@ impl<'a> Round<'a> {
                             }
                             self.prefix(v.prefix());
                             for s in v.suffixes() {
-                                self.suffix(s);
+                                self.suffix(s, false);
                             }
                         }
                         _ => {}
@@ -713,19 +796,23 @@ impl<'a> Round<'a> {
             Stmt::FunctionCall(c) => self.call(c),
             Stmt::FunctionDeclaration(f) => {
                 let names: Vec<_> = f.name().names().iter().collect();
+                let id = self.scopes.function_of(f.body());
                 if names.len() == 1
                     && f.name().method_name().is_none()
                     && let Some(b) = self.scopes.binding(names[0]).cloned()
-                    && self.scopes.known_function(&b).is_none()
                 {
-                    self.assign_binding(&b, Ty::Any);
+                    self.assign_binding(&b, Ty::Func(id));
+                } else {
+                    // Stored in a table.
+                    self.escape(Ty::Func(id));
                 }
                 self.function(f.body());
             }
             Stmt::GenericFor(f) => {
                 let exprs: Vec<&Expression> = f.expressions().iter().collect();
+                // The iterator is called by the loop, through its value.
                 for e in &exprs {
-                    self.expr(e);
+                    self.value(e);
                 }
                 let names: Vec<VarId> = f.names().iter().map(|n| self.scopes.declared(n)).collect();
                 // `ipairs` gives an integer key; anything else, dynamic
@@ -741,11 +828,11 @@ impl<'a> Round<'a> {
                 self.block(f.block());
             }
             Stmt::If(i) => {
-                self.expr(i.condition());
+                self.value(i.condition());
                 self.block(i.block());
                 if let Some(elseifs) = i.else_if() {
                     for e in elseifs {
-                        self.expr(e.condition());
+                        self.value(e.condition());
                         self.block(e.block());
                     }
                 }
@@ -770,14 +857,15 @@ impl<'a> Round<'a> {
             }
             Stmt::LocalFunction(f) => {
                 let v = self.scopes.declared(f.name());
-                self.assign_var(v, Ty::Any);
+                let id = self.scopes.function_of(f.body());
+                self.assign_var(v, Ty::Func(id));
                 self.function(f.body());
             }
             Stmt::NumericFor(f) => {
-                self.expr(f.start());
-                self.expr(f.end());
+                self.value(f.start());
+                self.value(f.end());
                 if let Some(s) = f.step() {
-                    self.expr(s);
+                    self.value(s);
                 }
                 let typer = self.typer();
                 let start = typer.ty_of(f.start());
@@ -793,10 +881,10 @@ impl<'a> Round<'a> {
             }
             Stmt::Repeat(r) => {
                 self.block(r.block());
-                self.expr(r.until());
+                self.value(r.until());
             }
             Stmt::While(w) => {
-                self.expr(w.condition());
+                self.value(w.condition());
                 self.block(w.block());
             }
             _ => {}
@@ -812,7 +900,8 @@ impl<'a> Round<'a> {
         self.func = id;
         // Parameters: what direct calls pass, unless the function is
         // called through values too, when anything may arrive.
-        let param_tys: Vec<Ty> = if info.escapes {
+        let escapes = self.is_escaping(id);
+        let param_tys: Vec<Ty> = if escapes {
             vec![Ty::Any; info.params.len()]
         } else {
             info.params
@@ -832,7 +921,12 @@ impl<'a> Round<'a> {
         self.block(body.block());
         let mut returns = self.returns.take().unwrap_or(Returns::Fixed(Vec::new()));
         if crate::types::falls_through(body.block()) {
-            returns = returns.join(Returns::Fixed(Vec::new()));
+            returns = self.join_returns(returns, Returns::Fixed(Vec::new()));
+        }
+        // What an escaping function returns leaves through its record,
+        // as dynamic values.
+        if escapes {
+            self.escape_returns(&returns);
         }
         // The parameters stay what this round's calls joined into them;
         // only the result is settled here.
@@ -842,7 +936,7 @@ impl<'a> Round<'a> {
             returns: Returns::Fixed(Vec::new()),
         });
         entry.returns = returns;
-        if info.escapes {
+        if escapes {
             entry.params = vec![Ty::Any; n];
         }
         self.func = outer_func;
@@ -852,34 +946,55 @@ impl<'a> Round<'a> {
     fn call(&mut self, c: &ast::FunctionCall) {
         self.prefix(c.prefix());
         let suffixes: Vec<&Suffix> = c.suffixes().collect();
+        // The arguments of a direct call feed the callee's parameters,
+        // and so keep their types; a callee not typed yet may still
+        // turn out known. Anything else takes values.
+        let callee = self.typer().prefix_ty(c.prefix());
+        let direct = suffixes.len() == 1
+            && matches!(suffixes[0], Suffix::Call(ast::Call::AnonymousCall(_)))
+            && matches!(callee, Ty::Func(_) | Ty::Unknown);
         for s in &suffixes {
-            self.suffix(s);
+            self.suffix(s, direct);
         }
         // A direct call to a known function records what it passes.
-        if suffixes.len() == 1
-            && let (Some(f), Some(Suffix::Call(ast::Call::AnonymousCall(args)))) =
-                (self.typer().known_callee(c.prefix()), suffixes.first())
+        if let (Ty::Func(f), true, Some(Suffix::Call(ast::Call::AnonymousCall(args)))) =
+            (callee, direct, suffixes.first())
         {
-            {
-                let exprs: Vec<&Expression> = match args {
-                    ast::FunctionArgs::Parentheses { arguments, .. } => arguments.iter().collect(),
-                    _ => Vec::new(),
-                };
-                let n = self.scopes.func(f).params.len();
-                let mut types = match args {
-                    ast::FunctionArgs::String(_) => vec![Ty::Str],
-                    ast::FunctionArgs::TableConstructor(_) => vec![Ty::Table],
-                    _ => self.assigned_types(&exprs, n.max(exprs.len())),
-                };
-                types.resize(n, Ty::Nil);
-                let sig = self.out.funcs.entry(f).or_insert_with(|| Sig {
-                    params: vec![Ty::Unknown; n],
-                    returns: Returns::Fixed(Vec::new()),
-                });
-                for (p, t) in sig.params.iter_mut().zip(types) {
-                    *p = p.join(t);
+            let exprs: Vec<&Expression> = match args {
+                ast::FunctionArgs::Parentheses { arguments, .. } => arguments.iter().collect(),
+                _ => Vec::new(),
+            };
+            let info = self.scopes.func(f);
+            let n = info.params.len();
+            let is_vararg = info.is_vararg;
+            let mut types = match args {
+                ast::FunctionArgs::String(_) => vec![Ty::Str],
+                ast::FunctionArgs::TableConstructor(_) => vec![Ty::Table],
+                _ => self.assigned_types(&exprs, n.max(exprs.len())),
+            };
+            // The extras go into `...` as values, or are dropped.
+            for t in types.iter().skip(n) {
+                if is_vararg {
+                    self.escape(*t);
                 }
             }
+            types.resize(n, Ty::Nil);
+            let params = self
+                .out
+                .funcs
+                .get(&f)
+                .map(|s| s.params.clone())
+                .unwrap_or_else(|| vec![Ty::Unknown; n]);
+            let params: Vec<Ty> = params
+                .into_iter()
+                .zip(types)
+                .map(|(p, t)| self.join_into(p, t))
+                .collect();
+            let sig = self.out.funcs.entry(f).or_insert_with(|| Sig {
+                params: vec![Ty::Unknown; n],
+                returns: Returns::Fixed(Vec::new()),
+            });
+            sig.params = params;
         }
     }
 
@@ -889,23 +1004,28 @@ impl<'a> Round<'a> {
         }
     }
 
-    fn suffix(&mut self, s: &Suffix) {
+    /// `kept`: the arguments of a call keep their types.
+    fn suffix(&mut self, s: &Suffix, kept: bool) {
         match s {
             Suffix::Call(c) => match c {
-                ast::Call::AnonymousCall(args) => self.args(args),
-                ast::Call::MethodCall(m) => self.args(m.args()),
+                ast::Call::AnonymousCall(args) => self.args(args, kept),
+                ast::Call::MethodCall(m) => self.args(m.args(), false),
                 _ => {}
             },
-            Suffix::Index(ast::Index::Brackets { expression, .. }) => self.expr(expression),
+            Suffix::Index(ast::Index::Brackets { expression, .. }) => self.value(expression),
             _ => {}
         }
     }
 
-    fn args(&mut self, args: &ast::FunctionArgs) {
+    fn args(&mut self, args: &ast::FunctionArgs, kept: bool) {
         match args {
             ast::FunctionArgs::Parentheses { arguments, .. } => {
                 for a in arguments {
-                    self.expr(a);
+                    if kept {
+                        self.expr(a);
+                    } else {
+                        self.value(a);
+                    }
                 }
             }
             ast::FunctionArgs::TableConstructor(t) => self.table(t),
@@ -917,32 +1037,34 @@ impl<'a> Round<'a> {
         for field in t.fields() {
             match field {
                 ast::Field::ExpressionKey { key, value, .. } => {
-                    self.expr(key);
-                    self.expr(value);
+                    self.value(key);
+                    self.value(value);
                 }
-                ast::Field::NameKey { value, .. } => self.expr(value),
-                ast::Field::NoKey(e) => self.expr(e),
+                ast::Field::NameKey { value, .. } => self.value(value),
+                ast::Field::NoKey(e) => self.value(e),
                 _ => {}
             }
         }
     }
 
-    /// Walk an expression for the functions and calls inside it.
+    /// Walk an expression for the functions and calls inside it, in a
+    /// place that keeps the value's type: assigned to a variable,
+    /// returned, or passed to a known function.
     fn expr(&mut self, e: &Expression) {
         match e {
             Expression::BinaryOperator { lhs, rhs, .. } => {
-                self.expr(lhs);
-                self.expr(rhs);
+                self.value(lhs);
+                self.value(rhs);
             }
             Expression::Parentheses { expression, .. } => self.expr(expression),
-            Expression::UnaryOperator { expression, .. } => self.expr(expression),
+            Expression::UnaryOperator { expression, .. } => self.value(expression),
             Expression::Function(f) => self.function(f.body()),
             Expression::FunctionCall(c) => self.call(c),
             Expression::TableConstructor(t) => self.table(t),
             Expression::Var(Var::Expression(v)) => {
                 self.prefix(v.prefix());
                 for s in v.suffixes() {
-                    self.suffix(s);
+                    self.suffix(s, false);
                 }
             }
             _ => {}
@@ -986,6 +1108,8 @@ pub fn infer(scopes: &Scopes, ast: &ast::Ast) -> Inferred {
         };
         // The signatures from the last round carry over so a recursive
         // call in this one sees them; params are rejoined from calls.
+        // What escaped stays escaped.
+        round.out.escaping = known.escaping.clone();
         for (f, sig) in &known.funcs {
             round.out.funcs.insert(
                 *f,

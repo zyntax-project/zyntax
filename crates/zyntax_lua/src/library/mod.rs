@@ -644,11 +644,13 @@ fn raising(t: &Types) -> Vec<Decl> {
                 ),
                 vec![ret(read_global(CHUNK, string()))],
             ),
+            // An internal table, read raw: nothing of the program's
+            // runs while an error is positioned.
             found.decl(call(
-                "zl_index",
+                "zl_rawgeti",
                 vec![
-                    read_global(CHUNKS, any()),
-                    box_i64(shr(line.e(), int(LINE_BITS))),
+                    unbox_table(read_global(CHUNKS, any()), t),
+                    shr(line.e(), int(LINE_BITS)),
                 ],
                 any(),
             )),
@@ -934,6 +936,141 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     (lib, t)
 }
 
+/// Every library function that may run the program's code before it
+/// returns, through any number of calls: one that calls through a
+/// code pointer, a local rather than a function's name, as the
+/// callers of function values and the metamethod paths do.
+pub fn reentrant_functions(declarations: &[Decl]) -> std::collections::BTreeSet<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let declared: BTreeSet<String> = declarations
+        .iter()
+        .filter_map(|d| match &d.node {
+            TypedDeclaration::Function(f) => f.name.resolve_global(),
+            _ => None,
+        })
+        .collect();
+    let mut calls: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut reentrant = BTreeSet::new();
+    for d in declarations {
+        if let TypedDeclaration::Function(f) = &d.node
+            && let (Some(name), Some(body)) = (f.name.resolve_global(), &f.body)
+        {
+            let mut callees = BTreeSet::new();
+            for s in &body.statements {
+                callee_names(s, &mut callees);
+            }
+            if callees.iter().any(|c| !declared.contains(c)) {
+                reentrant.insert(name.clone());
+            }
+            calls.insert(name, callees);
+        }
+    }
+    loop {
+        let before = reentrant.len();
+        for (name, callees) in &calls {
+            if callees.iter().any(|c| reentrant.contains(c)) {
+                reentrant.insert(name.clone());
+            }
+        }
+        if reentrant.len() == before {
+            break;
+        }
+    }
+    reentrant
+}
+
+/// The names called anywhere in a statement, block expressions and
+/// all: what a lowered function calls.
+pub fn callee_names(stmt: &Stmt, out: &mut std::collections::BTreeSet<String>) {
+    use zyntax_typed_ast::typed_ast::{TypedExpression as E, TypedStatement as S};
+    fn expr(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
+        match &e.node {
+            E::Call(c) => {
+                if let E::Variable(n) = &c.callee.node
+                    && let Some(name) = n.resolve_global()
+                {
+                    out.insert(name);
+                } else {
+                    expr(&c.callee, out);
+                }
+                for a in &c.positional_args {
+                    expr(a, out);
+                }
+            }
+            E::MethodCall(m) => {
+                expr(&m.receiver, out);
+                for a in &m.positional_args {
+                    expr(a, out);
+                }
+            }
+            E::Binary(b) => {
+                expr(&b.left, out);
+                expr(&b.right, out);
+            }
+            E::Unary(u) => expr(&u.operand, out),
+            E::Index(i) => {
+                expr(&i.object, out);
+                expr(&i.index, out);
+            }
+            E::Field(f) => expr(&f.object, out),
+            E::Cast(c) => expr(&c.expr, out),
+            E::If(i) => {
+                expr(&i.condition, out);
+                expr(&i.then_branch, out);
+                expr(&i.else_branch, out);
+            }
+            E::Array(items) | E::Tuple(items) => {
+                for a in items {
+                    expr(a, out);
+                }
+            }
+            E::Struct(st) => {
+                for f in &st.fields {
+                    expr(&f.value, out);
+                }
+            }
+            E::Block(b) => {
+                for s in &b.statements {
+                    callee_names(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    match &stmt.node {
+        S::Expression(e) => expr(e, out),
+        S::Let(l) => {
+            if let Some(init) = &l.initializer {
+                expr(init, out);
+            }
+        }
+        S::Return(Some(e)) => expr(e, out),
+        S::If(i) => {
+            expr(&i.condition, out);
+            for s in &i.then_block.statements {
+                callee_names(s, out);
+            }
+            if let Some(e) = &i.else_block {
+                for s in &e.statements {
+                    callee_names(s, out);
+                }
+            }
+        }
+        S::While(w) => {
+            expr(&w.condition, out);
+            for s in &w.body.statements {
+                callee_names(s, out);
+            }
+        }
+        S::Block(b) => {
+            for s in &b.statements {
+                callee_names(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Lua's floats round at every operation: no multiply and add of the
 /// program's, or of the library's, is fused into one rounding.
 pub fn strict_fp() -> TypedAnnotation {
@@ -956,7 +1093,7 @@ fn fallible_functions(declarations: &[Decl]) -> std::collections::BTreeSet<Strin
         {
             let mut callees = BTreeSet::new();
             for s in &body.statements {
-                callees_of_stmt(s, &mut callees);
+                callee_names(s, &mut callees);
             }
             calls.insert(name, callees);
         }

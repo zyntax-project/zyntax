@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Released as the runtime will release: no Lua program frees
     // anything by hand.
+    let reentrant = library::reentrant_functions(&program.declarations);
     let hir = lower_for_snapshot_releasing(
         policy::LIBRARY_MODULE,
         program.clone(),
@@ -49,9 +50,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .module_lowered(policy::LIBRARY_MODULE, program, &hir)?
         .build_in(&out)?;
 
-    // Which library functions can raise, for the frontend's checks.
+    // Which library functions can raise, for the frontend's checks,
+    // and which may run the program's code before returning.
     let mut fallible = String::from("pub const FALLIBLE: &[&str] = &[\n");
     for name in &lib.fallible {
+        fallible.push_str(&format!("    {name:?},\n"));
+    }
+    fallible.push_str("];\n");
+    fallible.push_str("pub const REENTRANT: &[&str] = &[\n");
+    for name in &reentrant {
         fallible.push_str(&format!("    {name:?},\n"));
     }
     fallible.push_str("];\n");

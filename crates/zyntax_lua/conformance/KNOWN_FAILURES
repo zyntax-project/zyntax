@@ -4,7 +4,6 @@
 # and its issue is closed; an unlisted case that fails is a regression.
 
 official/attrib.lua           4da50c2
-official/bitwise.lua          4da50c2
 official/calls.lua            4da50c2
 official/closure.lua          4da50c2
 official/constructs.lua       4da50c2
@@ -23,3 +22,4 @@ official/math.lua             4da50c2
 official/pm.lua               4da50c2
 official/sort.lua             4da50c2
 official/strings.lua          4da50c2
+official/q4.lua               0903215

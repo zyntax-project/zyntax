@@ -130,9 +130,17 @@ struct Module<'a> {
     line_starts: Vec<usize>,
     /// The library functions that can raise.
     fallible: HashSet<&'static str>,
+    /// The library functions that may run the program's code before
+    /// they return.
+    reentrant: HashSet<&'static str>,
     /// The program's functions that can raise, once a first lowering
     /// has found out; every one, before.
     raising: Option<HashSet<FuncId>>,
+    /// The program's functions whose calls cannot go deeper than their
+    /// own callees, once a first lowering has found out: no recursion
+    /// through direct calls and no call through a value or the
+    /// library. They keep no count of their depth.
+    bounded: Option<HashSet<FuncId>>,
     /// Functions lowered so far, in the order they were reached.
     functions: RefCell<Vec<TypedFunction>>,
     /// Module-level variables: globals, and chunk locals every function
@@ -142,20 +150,75 @@ struct Module<'a> {
     facts: RefCell<HashMap<FuncId, RaiseFact>>,
 }
 
-/// Whether a function raises itself, and which functions it calls
-/// that may raise into it.
+/// What one lowering of a function found: whether it raises itself
+/// (its depth check aside), whether it checks its depth, whether it
+/// calls anything that may run the program's code before returning,
+/// and which functions it calls directly.
 #[derive(Clone, Default)]
 struct RaiseFact {
     own: bool,
+    checks_depth: bool,
+    dynamic: bool,
     callees: HashSet<FuncId>,
 }
 
+/// The functions whose depth is bounded by the program's text: not
+/// escaping, calling nothing through a value or the library, and not
+/// reaching themselves through direct calls. Their depth needs no
+/// count, and their depth check cannot raise.
+fn bounded_functions(
+    facts: &HashMap<FuncId, RaiseFact>,
+    escaping: impl Fn(FuncId) -> bool,
+) -> HashSet<FuncId> {
+    let mut unbounded: HashSet<FuncId> = facts
+        .iter()
+        .filter(|(f, fact)| fact.dynamic || escaping(**f))
+        .map(|(f, _)| *f)
+        .collect();
+    // A function on a cycle of direct calls.
+    for f in facts.keys() {
+        let mut seen = HashSet::new();
+        let mut todo: Vec<FuncId> = facts[f].callees.iter().copied().collect();
+        while let Some(g) = todo.pop() {
+            if g == *f {
+                unbounded.insert(*f);
+                break;
+            }
+            if seen.insert(g)
+                && let Some(fact) = facts.get(&g)
+            {
+                todo.extend(fact.callees.iter().copied());
+            }
+        }
+    }
+    loop {
+        let before = unbounded.len();
+        for (f, fact) in facts {
+            if fact.callees.iter().any(|c| unbounded.contains(c)) {
+                unbounded.insert(*f);
+            }
+        }
+        if unbounded.len() == before {
+            break;
+        }
+    }
+    facts
+        .keys()
+        .copied()
+        .filter(|f| !unbounded.contains(f))
+        .collect()
+}
+
 /// The functions that may raise: those that check for an error
-/// themselves, and those calling one of them, and so on.
-fn raising_functions(facts: &HashMap<FuncId, RaiseFact>) -> HashSet<FuncId> {
+/// themselves, or their depth without a bound on it, and those calling
+/// one of them, and so on.
+fn raising_functions(
+    facts: &HashMap<FuncId, RaiseFact>,
+    bounded: &HashSet<FuncId>,
+) -> HashSet<FuncId> {
     let mut raising: HashSet<FuncId> = facts
         .iter()
-        .filter(|(_, fact)| fact.own)
+        .filter(|(f, fact)| fact.own || (fact.checks_depth && !bounded.contains(f)))
         .map(|(f, _)| *f)
         .collect();
     loop {
@@ -195,6 +258,23 @@ impl<'a> Module<'a> {
         }
     }
 
+    /// Whether a function's depth is known bounded, so it keeps no
+    /// count of it. Nothing is, until a first lowering has looked.
+    fn is_bounded(&self, f: FuncId) -> bool {
+        self.bounded.as_ref().is_some_and(|set| set.contains(&f))
+    }
+
+    /// Whether the program's code may run inside this lowered body
+    /// before it returns: a call through a value, or into a library
+    /// function that makes one.
+    fn calls_dynamically(&self, statements: &[St]) -> bool {
+        let mut names = std::collections::BTreeSet::new();
+        for s in statements {
+            library::callee_names(s, &mut names);
+        }
+        names.iter().any(|n| self.reentrant.contains(n.as_str()))
+    }
+
     /// The IR type of a static type.
     fn ir(&self, ty: Ty) -> Type {
         match ty {
@@ -204,7 +284,9 @@ impl<'a> Module<'a> {
             Ty::Number => number_type(),
             Ty::Str => prim(PrimitiveType::String),
             Ty::Table => self.types.table(),
-            Ty::Nil | Ty::Any | Ty::Unknown => Type::Any,
+            // A known function is still the record every function value
+            // is; what is known is where calls through it go.
+            Ty::Func(_) | Ty::Nil | Ty::Any | Ty::Unknown => Type::Any,
         }
     }
 
@@ -279,7 +361,7 @@ impl<'a> Module<'a> {
             Returns::Fixed(v) if v.is_empty() => prim(PrimitiveType::Unit),
             Returns::Fixed(v) if v.len() == 1 => self.ir(v[0]),
             Returns::Fixed(_) => self.anys(),
-            Returns::Dynamic => Type::Any,
+            Returns::Dynamic | Returns::Unknown => Type::Any,
         }
     }
 }
@@ -937,6 +1019,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             (a, b) if a == b => v.node,
             (Ty::Unknown, _) => v.node,
             (Ty::Nil, Ty::Any) => v.node,
+            (Ty::Func(_), Ty::Any) | (Ty::Any, Ty::Func(_)) | (Ty::Func(_), Ty::Func(_)) => v.node,
             (Ty::Int, Ty::Float) => cast(v.node, prim(PrimitiveType::F64), span),
             (Ty::Int, Ty::Number) => number_of_int(v.node, span),
             (Ty::Float, Ty::Number) => number_of_float(v.node, span),
@@ -1223,7 +1306,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         match v.ty {
             Ty::Bool => v.node,
             Ty::Nil => block_value(vec![expr_stmt(v.node)], bool_lit(false, span), span),
-            Ty::Int | Ty::Float | Ty::Number | Ty::Str | Ty::Table => {
+            Ty::Int | Ty::Float | Ty::Number | Ty::Str | Ty::Table | Ty::Func(_) => {
                 if Self::is_simple(&v.node) {
                     bool_lit(true, span)
                 } else {
@@ -1268,7 +1351,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 self.m.anys(),
                 span,
             )),
-            Returns::Dynamic => Some(nil(span)),
+            Returns::Dynamic | Returns::Unknown => Some(nil(span)),
         };
         ret(value, span)
     }
@@ -1355,7 +1438,6 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             prim(PrimitiveType::Bool),
             span,
         );
-        self.raised = true;
         let leave = self.placeholder_return(span);
         let statements = vec![
             depth_step(1, span),
@@ -1936,7 +2018,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Expression::Function(f) => {
                 let id = self.scopes().function_of(f.body());
                 self.lower_function(id, f.body(), false)?;
-                Ok(self.function_value(id, span))
+                let record = self.function_value(id, span);
+                Ok(Val {
+                    node: record.node,
+                    ty: Ty::Func(id),
+                })
             }
             Expression::TableConstructor(t) => self.table_constructor(t, span),
             Expression::FunctionCall(c) => {
@@ -2977,7 +3063,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if let Some(Suffix::Call(ast::Call::AnonymousCall(args))) = suffixes.first()
             && let Some(f) = self.typer().known_callee(prefix)
         {
-            multi = Some(self.direct_call(f, args, span)?);
+            // A function with captures takes them from its value.
+            let record = if self.scopes().func(f).top_level {
+                None
+            } else {
+                Some(match prefix {
+                    Prefix::Name(token) => self.read_name(token)?,
+                    Prefix::Expression(e) => self.expr(e)?,
+                    _ => return unsupported("this prefix", span),
+                })
+            };
+            multi = Some(self.direct_call(f, record, None, args, span)?);
             first = 1;
         }
         if multi.is_none() {
@@ -3122,14 +3218,27 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     /// A call to a known function: its typed entry, the arguments
-    /// adjusted to its parameters.
-    fn direct_call(&mut self, f: FuncId, args: &ast::FunctionArgs, span: Span) -> Result<Multi> {
+    /// adjusted to its parameters. `record` is the function's value,
+    /// when the call went through one, which holds its captures;
+    /// `receiver` is the object of a method call, passed first.
+    fn direct_call(
+        &mut self,
+        f: FuncId,
+        record: Option<Val>,
+        receiver: Option<Val>,
+        args: &ast::FunctionArgs,
+        span: Span,
+    ) -> Result<Multi> {
         let info = self.scopes().func(f);
         let sig = self.m.sig(f);
         let n = info.params.len();
         let is_vararg = info.is_vararg;
         let has_env = !info.top_level;
-        let (mut pre, vals, tail) = self.call_values(None, args, span)?;
+        // The function's value is read before its arguments run.
+        let mut pre = Vec::new();
+        let record = record.map(|r| self.hold(r, &mut pre));
+        let (mut arg_pre, vals, tail) = self.call_values(receiver, args, span)?;
+        pre.append(&mut arg_pre);
         // A tail of several values is read through a list.
         let tail_name = match tail {
             Some(tail) => {
@@ -3147,16 +3256,20 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let mut lowered: Vec<Node> = Vec::new();
         if has_env {
             // A nested known function's record holds its captures; the
-            // typed entry takes it as `env`. The record lives in the
-            // function's variable.
-            let record = match self
-                .scopes()
-                .local_functions
-                .iter()
-                .find(|(_, id)| **id == f)
-            {
-                Some((v, _)) => self.read_var(*v, span),
-                None => self.function_value(f, span),
+            // typed entry takes it as `env`. The record is the value
+            // the call went through, else it lives in the function's
+            // variable.
+            let record = match record {
+                Some(r) => r,
+                None => match self
+                    .scopes()
+                    .local_functions
+                    .iter()
+                    .find(|(_, id)| **id == f)
+                {
+                    Some((v, _)) => self.read_var(*v, span),
+                    None => self.function_value(f, span),
+                },
             };
             lowered.push(call(
                 "zb_unbox_list_raw_any",
@@ -3307,7 +3420,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
                 Multi::Fixed(vals)
             }
-            Returns::Dynamic => {
+            Returns::Dynamic | Returns::Unknown => {
                 let value = if raises {
                     self.guard(Val {
                         node: value,
@@ -3331,6 +3444,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         desc: Desc,
         span: Span,
     ) -> Result<Multi> {
+        // A value the types know the function of calls it directly.
+        if let Ty::Func(f) = callee.ty {
+            return self.direct_call(f, Some(callee), receiver, args, span);
+        }
         // A value known to be nil cannot be called; the error names
         // what it was, as Lua's does.
         if callee.ty == Ty::Nil {
@@ -4027,7 +4144,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 out.extend(pre);
                 out.push(ret(Some(list), span));
             }
-            Returns::Dynamic => {
+            Returns::Dynamic | Returns::Unknown => {
                 let (pre, vals, tail) = self.expr_list(exprs)?;
                 out.extend(pre);
                 let value = match (vals.len(), tail) {
@@ -5232,13 +5349,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             child.varargs = Some(name);
         }
         // The function counts itself on the stack, so an unbounded
-        // recursion is an error to catch; every return uncounts it.
-        child.counts_depth = true;
+        // recursion is an error to catch; every return uncounts it. One
+        // whose depth is bounded by the text keeps no count.
+        child.counts_depth = !self.m.is_bounded(id);
         let body_statements = child.block(body.block())?;
         if child.entry_line {
             statements.push(entry_line_save(span));
         }
-        statements.push(child.stack_check(span));
+        if child.counts_depth {
+            statements.push(child.stack_check(span));
+        }
         statements.extend(body_statements);
         // Falling off the end returns nothing.
         if types::falls_through(body.block()) {
@@ -5252,10 +5372,19 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             statements,
             span,
         );
+        let dynamic = self.m.calls_dynamically(
+            &function
+                .body
+                .as_ref()
+                .map(|b| b.statements.clone())
+                .unwrap_or_default(),
+        );
         self.m.facts.borrow_mut().insert(
             id,
             RaiseFact {
                 own: child.raised,
+                checks_depth: child.counts_depth,
+                dynamic,
                 callees: child.raise_callees.clone(),
             },
         );
@@ -5355,7 +5484,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 Ty::Any,
             ),
             Returns::Fixed(_) => call("zb_box_tuple", vec![value], Type::Any, span),
-            Returns::Dynamic => value,
+            Returns::Dynamic | Returns::Unknown => value,
         };
         statements.push(ret(Some(result), span));
         let function = typed_function(&self.m.code_name(id), params, Type::Any, statements, span);
@@ -5560,7 +5689,9 @@ fn chunk_module(
         env_var,
         line_starts: line_starts_of(source),
         fallible: crate::fallible::FALLIBLE.iter().copied().collect(),
+        reentrant: crate::fallible::REENTRANT.iter().copied().collect(),
         raising: None,
+        bounded: None,
         functions: RefCell::new(Vec::new()),
         module_vars: RefCell::new(Vec::new()),
         facts: RefCell::new(HashMap::new()),
@@ -5591,13 +5722,19 @@ fn chunk_module(
             CHUNK,
             RaiseFact {
                 own: main.raised,
+                checks_depth: false,
+                dynamic: true,
                 callees: main.raise_callees.clone(),
             },
         );
         Ok(statements)
     };
     lower(&module)?;
-    let raising = raising_functions(&module.facts.borrow());
+    let bounded = bounded_functions(&module.facts.borrow(), |f| {
+        module.inferred.escaping.contains(&f) || module.scopes.func(f).escapes
+    });
+    let raising = raising_functions(&module.facts.borrow(), &bounded);
+    module.bounded = Some(bounded);
     module.raising = Some(raising);
     module.functions.borrow_mut().clear();
     module.module_vars.borrow_mut().clear();
@@ -5790,7 +5927,9 @@ pub(crate) fn program(
         env_var,
         line_starts,
         fallible: crate::fallible::FALLIBLE.iter().copied().collect(),
+        reentrant: crate::fallible::REENTRANT.iter().copied().collect(),
         raising: None,
+        bounded: None,
         functions: RefCell::new(Vec::new()),
         module_vars: RefCell::new(Vec::new()),
         facts: RefCell::new(HashMap::new()),
@@ -5884,13 +6023,19 @@ pub(crate) fn program(
             CHUNK,
             RaiseFact {
                 own: main.raised,
+                checks_depth: false,
+                dynamic: true,
                 callees: main.raise_callees.clone(),
             },
         );
         Ok(statements)
     };
     lower_chunk(&module)?;
-    let raising = raising_functions(&module.facts.borrow());
+    let bounded = bounded_functions(&module.facts.borrow(), |f| {
+        module.inferred.escaping.contains(&f) || module.scopes.func(f).escapes
+    });
+    let raising = raising_functions(&module.facts.borrow(), &bounded);
+    module.bounded = Some(bounded);
     module.raising = Some(raising);
     module.functions.borrow_mut().clear();
     module.module_vars.borrow_mut().clear();

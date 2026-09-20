@@ -187,22 +187,6 @@ impl Scopes {
     pub fn is_globals_name(name: &str) -> bool {
         name == "_G" || name == "_ENV"
     }
-
-    /// The function a local variable is, when `local function`
-    /// declared it and nothing assigns it again.
-    pub fn known_local_function(&self, var: VarId) -> Option<FuncId> {
-        let f = *self.local_functions.get(&var)?;
-        (!self.var(var).assigned).then_some(f)
-    }
-
-    /// The function a name occurrence calls, if it is a known one.
-    pub fn known_function(&self, binding: &Binding) -> Option<FuncId> {
-        match binding {
-            Binding::Local(v) | Binding::Upvalue(v) => self.known_local_function(*v),
-            Binding::Global(name) => self.known_global_function(name),
-            Binding::Field(..) => None,
-        }
-    }
 }
 
 pub fn pos_of(token: &TokenReference) -> usize {
@@ -266,16 +250,12 @@ struct Frame {
 struct Walker {
     out: Scopes,
     frames: Vec<Frame>,
-    /// Occurrences of known-function names used as values, resolved
-    /// after the walk once assignment counts are known.
-    value_uses: Vec<Binding>,
 }
 
 pub fn resolve(ast: &ast::Ast) -> Scopes {
     let mut w = Walker {
         out: Scopes::default(),
         frames: Vec::new(),
-        value_uses: Vec::new(),
     };
     w.out.funcs.push(FuncInfo {
         params: Vec::new(),
@@ -293,13 +273,6 @@ pub fn resolve(ast: &ast::Ast) -> Scopes {
     });
     w.stmts(ast.nodes(), true);
     w.frames.pop();
-    // A known function used as a value escapes.
-    let uses = std::mem::take(&mut w.value_uses);
-    for binding in uses {
-        if let Some(f) = w.out.known_function(&binding) {
-            w.out.funcs[f.0 as usize].escapes = true;
-        }
-    }
     // A local function capturing itself.
     let self_captures: Vec<VarId> = w
         .out
@@ -399,7 +372,7 @@ impl Walker {
         }
     }
 
-    fn use_name(&mut self, token: &TokenReference, as_callee: bool) -> Binding {
+    fn use_name(&mut self, token: &TokenReference) -> Binding {
         let binding = self.lookup(&name_of(token));
         self.use_global(&binding);
         // The globals table reached as a value: every global is then
@@ -417,9 +390,6 @@ impl Walker {
             self.out.dynamic_code = true;
         }
         self.out.names.insert(pos_of(token), binding.clone());
-        if !as_callee {
-            self.value_uses.push(binding.clone());
-        }
         binding
     }
 
@@ -557,19 +527,19 @@ impl Walker {
                             self.out.global_functions.insert(name.clone(), id);
                             self.out.funcs[id.0 as usize].top_level = true;
                         }
-                        // Assigned to a variable declared elsewhere, or
-                        // stored in an environment, the function is a
-                        // value: nothing knows its callers.
-                        Binding::Local(_) | Binding::Upvalue(_) | Binding::Field(..) => {
+                        // Stored in an environment, the function is a
+                        // value: nothing knows its callers. Assigned to
+                        // a variable, the types follow it.
+                        Binding::Field(..) => {
                             self.out.funcs[id.0 as usize].escapes = true;
                         }
-                        Binding::Global(_) => {}
+                        Binding::Local(_) | Binding::Upvalue(_) | Binding::Global(_) => {}
                     }
                 } else {
                     // `function a.b.c()`: `a` is read, the rest indexed,
                     // and the function is a value in a table: nothing
                     // knows its callers.
-                    self.use_name(names[0], false);
+                    self.use_name(names[0]);
                     let id = self.function(f.body(), is_method, fname.clone());
                     self.out.funcs[id.0 as usize].escapes = true;
                 }
@@ -732,7 +702,7 @@ impl Walker {
             self.out.globals.insert(name);
             return;
         }
-        self.prefix(v.prefix(), false);
+        self.prefix(v.prefix());
         for s in v.suffixes() {
             self.suffix(s);
         }
@@ -740,7 +710,6 @@ impl Walker {
 
     fn call(&mut self, c: &ast::FunctionCall) {
         let suffixes: Vec<&Suffix> = c.suffixes().collect();
-        let callee_first = matches!(suffixes.first(), Some(Suffix::Call(_)));
         // `require "name"`: a file the program is made of.
         if let (Prefix::Name(callee), [Suffix::Call(ast::Call::AnonymousCall(args))]) =
             (c.prefix(), suffixes.as_slice())
@@ -777,7 +746,7 @@ impl Walker {
             && !self.shadowed(&name_of(g))
             && let Some(member) = arguments.get(1).and_then(|e| literal_string(e))
         {
-            self.use_name(callee, true);
+            self.use_name(callee);
             let binding = self.lookup(&name_of(g));
             self.out.names.insert(pos_of(g), binding);
             self.out.mentioned.insert(member.clone());
@@ -790,16 +759,16 @@ impl Walker {
             }
             return;
         }
-        self.prefix(c.prefix(), callee_first);
+        self.prefix(c.prefix());
         for s in suffixes {
             self.suffix(s);
         }
     }
 
-    fn prefix(&mut self, p: &Prefix, as_callee: bool) {
+    fn prefix(&mut self, p: &Prefix) {
         match p {
             Prefix::Name(token) => {
-                self.use_name(token, as_callee);
+                self.use_name(token);
             }
             Prefix::Expression(e) => self.expr(e),
             _ => {}
@@ -853,18 +822,15 @@ impl Walker {
             }
             Expression::Parentheses { expression, .. } => self.expr(expression),
             Expression::UnaryOperator { expression, .. } => self.expr(expression),
-            // A function expression is a value from the start: its
-            // calls are never known.
             Expression::Function(f) => {
-                let id = self.function(f.body(), false, String::new());
-                self.out.funcs[id.0 as usize].escapes = true;
+                self.function(f.body(), false, String::new());
             }
             Expression::FunctionCall(c) => self.call(c),
             Expression::TableConstructor(t) => self.table(t),
             Expression::Number(_) | Expression::String(_) | Expression::Symbol(_) => {}
             Expression::Var(v) => match v {
                 Var::Name(token) => {
-                    self.use_name(token, false);
+                    self.use_name(token);
                 }
                 Var::Expression(v) => self.var_expression(v),
                 _ => {}
