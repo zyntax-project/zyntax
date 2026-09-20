@@ -78,7 +78,11 @@ pub fn prune_unreachable_module(module: &mut HirModule) -> usize {
 /// collapses to a single block in one pass).
 pub fn run(func: &mut HirFunction) -> CfgSimplifyStats {
     let mut total = CfgSimplifyStats::default();
-    for _ in 0..32 {
+    // Each merge and each threading removes a block, so the function's
+    // size bounds the work; the bound only guards against a step that
+    // fails to make progress.
+    let bound = func.blocks.len() + 8;
+    for _ in 0..bound {
         let pair = find_mergeable_pair(func);
         let (pred, succ) = match pair {
             Some(p) => p,
@@ -89,7 +93,7 @@ pub fn run(func: &mut HirFunction) -> CfgSimplifyStats {
         }
         total.merged += 1;
     }
-    for _ in 0..64 {
+    for _ in 0..bound {
         let Some(empty) = find_threadable_block(func) else {
             break;
         };
