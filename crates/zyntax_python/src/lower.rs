@@ -653,6 +653,12 @@ pub(crate) fn dynamic_attribute(ty: Ty, span: Span) -> Vec<ParameterAttribute> {
 /// A module function in the shape of a function value: the record is
 /// ignored, each argument is unboxed to the declared type, the result
 /// is boxed.
+/// The name of the dispatcher for a method of `class` that only its
+/// subclasses define.
+pub(crate) fn abstract_name(class: &str, method: &str) -> String {
+    format!("{class}${method}$abstract")
+}
+
 /// The name of the function a class is called through as a value.
 pub(crate) fn class_adapter_name(class: &str) -> String {
     format!("{class}$value")
@@ -2030,20 +2036,25 @@ impl<'m> Lowerer<'m> {
                     span,
                 )
             }
-            // An instance is boxed as its address under the class tag, and
-            // read back with a check; a subclass instance is its base. A
-            // null instance boxes as None.
+            // An instance is boxed as its address under its class's tag,
+            // and read back with a check; a subclass instance is its base.
+            // A null instance boxes as None. A value typed as a class with
+            // subclasses may be any of them, so its tag is read from it.
             (Ty::Class(k), Ty::Object) => {
                 let address = as_addr(v.node, span);
-                call(
-                    "zb_box_instance",
-                    vec![
-                        address,
-                        int32_lit(zyntax_builtins::instance_tag(k as usize) as i32, span),
-                    ],
-                    Ty::Object,
-                    span,
-                )
+                if self.module.classes[k as usize].descendants > 1 {
+                    call("zb_hook_box_instance", vec![address], Ty::Object, span)
+                } else {
+                    call(
+                        "zb_box_instance",
+                        vec![
+                            address,
+                            int32_lit(zyntax_builtins::instance_tag(k as usize) as i32, span),
+                        ],
+                        Ty::Object,
+                        span,
+                    )
+                }
             }
             // A value of another class is a TypeError, raised where the
             // instance is wanted.
@@ -10283,6 +10294,25 @@ impl<'m> Lowerer<'m> {
         dispatched: bool,
     ) -> Result<Val> {
         let Some((sig, fn_name)) = self.module.method_sig(k, method) else {
+            // A method only subclasses define goes to whichever the
+            // instance's class holds.
+            if let Some(sig) = self.module.abstract_sig(k, method) {
+                let sig = without_self(&sig);
+                let receiver = self.checked_instance(receiver, method, span);
+                let lowered = self.arguments(method, &sig, args, keywords, c)?;
+                self.module
+                    .abstract_calls
+                    .borrow_mut()
+                    .insert((k, method.to_string()));
+                let target = abstract_name(&self.module.classes[k].name, method);
+                let mut all = vec![receiver.node];
+                all.extend(lowered);
+                let v = Val {
+                    node: call(&target, all, sig.ret, span),
+                    ty: sig.ret,
+                };
+                return Ok(self.guard_named(v, &target, span));
+            }
             return Err(Error::unsupported_span(
                 format!(
                     "method `{method}` of {}, which defines none",

@@ -39,6 +39,7 @@ mod prelude;
 mod scope;
 mod shape;
 mod stdlib;
+mod sugar;
 mod types;
 
 /// Why a program could not be turned into a `TypedProgram`.
@@ -325,11 +326,15 @@ pub fn parse_program_with(
             origins.push(origin.clone());
         }
     }
-    module.body = body;
-    // `**kwargs` becomes keyword parameters and a name given a class
-    // becomes the class, before anything is typed.
-    kwargs::rewrite(&mut module.body)?;
-    aliases::rewrite(&mut module.body);
+    // Sugar the frontend does not model is rewritten away before
+    // anything is typed: `**kwargs` becomes keyword parameters, class
+    // and static methods become module functions, a name given a class
+    // becomes the class.
+    let mut statements: Vec<py::Stmt> = body.into_iter().collect();
+    kwargs::rewrite(&mut statements)?;
+    sugar::rewrite(&mut statements, &mut origins);
+    aliases::rewrite(&mut statements);
+    module.body = statements.into_iter().collect();
     lap("parse+link");
     let located = |e: Error, module: Option<&str>| match module {
         Some(m) => e.in_module(m),
@@ -758,6 +763,8 @@ pub fn parse_program_with(
     inferred.attr_reads.take();
     inferred.attr_writes.take();
     inferred.dyn_methods.take();
+    inferred.abstract_calls.take();
+    inferred.class_adapters.take();
     inferred.counter.set(inferred.closures.borrow().len());
     let kept = lower_all(&inferred, &mut dropped)?;
     declarations.extend(kept.into_iter().filter(|d| match &d.node {

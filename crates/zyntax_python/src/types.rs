@@ -609,6 +609,9 @@ pub(crate) struct Module {
     pub(crate) adapters: std::cell::RefCell<std::collections::BTreeSet<String>>,
     /// Classes used as values: called through a record, they construct.
     pub(crate) class_adapters: std::cell::RefCell<std::collections::BTreeSet<usize>>,
+    /// Methods called on a class that only its subclasses define, by
+    /// class and name: each needs a dispatcher over those subclasses.
+    pub(crate) abstract_calls: std::cell::RefCell<std::collections::BTreeSet<(usize, String)>>,
     /// A counter for names no Python program can spell.
     pub(crate) counter: std::cell::Cell<usize>,
     /// The module's classes, bases before subclasses.
@@ -1320,7 +1323,7 @@ fn infer_closure(module: &Module, k: u16, def: &ClosureDef, vars: &HashMap<Strin
         }
         ClosureDef::Def(f) => {
             let seeds = seeds_for(&crate::scope::Scope::of_function(f));
-            let locals = infer_locals_with(module, &sig, &f.body, &seeds, &[], false);
+            let locals = infer_locals_with(module, &sig, &f.body, &seeds, &[], false, false);
             let ret = if locals.returns { locals.ret } else { Ty::None };
             let mut inner = seeds;
             inner.extend(locals.vars);
@@ -1520,14 +1523,54 @@ impl Module {
     /// subclass of `k` would reach, since the call goes to whichever the
     /// instance's class holds.
     pub(crate) fn dispatched_ret(&self, k: usize, method: &str) -> Option<Ty> {
-        let (sig, _) = self.method_sig(k, method)?;
-        let mut ret = sig.ret;
-        for sub in self.overriders(k, method) {
-            if let Some((sub_sig, _)) = self.method_sig(sub, method) {
-                ret = self.join_classes(ret, sub_sig.ret);
+        match self.method_sig(k, method) {
+            Some((sig, _)) => {
+                let mut ret = sig.ret;
+                for sub in self.overriders(k, method) {
+                    if let Some((sub_sig, _)) = self.method_sig(sub, method) {
+                        ret = self.join_classes(ret, sub_sig.ret);
+                    }
+                }
+                Some(ret)
             }
+            // A method only subclasses define: what they return.
+            None => self.abstract_sig(k, method).map(|sig| sig.ret),
         }
-        Some(ret)
+    }
+
+    /// The signature of a call of `method` on an instance of `k`, where
+    /// `k` itself does not define it and some subclasses do: each
+    /// parameter the join of theirs, the result the join of their
+    /// results. None when no subclass defines it or their arities
+    /// differ.
+    pub(crate) fn abstract_sig(&self, k: usize, method: &str) -> Option<Sig> {
+        if self.method_sig(k, method).is_some() {
+            return None;
+        }
+        let subs = self.overriders(k, method);
+        let mut sigs = subs
+            .iter()
+            .filter_map(|&sub| self.method_sig(sub, method).map(|(sig, _)| sig));
+        let first = sigs.next()?;
+        let mut params: Vec<(String, Ty)> = first.params.clone();
+        let mut ret = first.ret;
+        for sig in sigs {
+            if sig.params.len() != params.len() {
+                return None;
+            }
+            for ((_, mine), (_, theirs)) in params.iter_mut().zip(&sig.params) {
+                *mine = self.join_classes(*mine, *theirs);
+            }
+            ret = self.join_classes(ret, sig.ret);
+        }
+        if let Some((_, this)) = params.first_mut() {
+            *this = Ty::Class(k as u16);
+        }
+        Some(Sig {
+            params,
+            ret,
+            defaults: vec![None; first.params.len()],
+        })
     }
 
     /// [`Ty::join`] knowing the hierarchy: two instance types join to
@@ -2029,7 +2072,7 @@ pub(crate) fn infer_module(
                 let sig = module.funcs[&item.name].clone();
                 let file = module.file_of(item.module.as_deref());
                 let locals = in_file(file, || {
-                    let locals = infer_locals_open(&module, &sig, &item.def.body, &[]);
+                    let locals = infer_locals_open(&module, &sig, &item.def.body, &[], false);
                     changed |= infer_closures_in(&module, &item.def.body, &[], &locals.vars);
                     locals
                 });
@@ -2108,7 +2151,7 @@ pub(crate) fn infer_module(
                 });
             } else if !entry_done {
                 entry_done = true;
-                entry_locals = infer_locals_open(&module, &entry_sig, entry, entry_files);
+                entry_locals = infer_locals_open(&module, &entry_sig, entry, entry_files, true);
                 for (k, field, ty) in &entry_locals.other_field_writes {
                     changed |= widen_field(&mut module.classes, *k, field, *ty);
                 }
@@ -2257,7 +2300,7 @@ pub(crate) fn infer_module(
             let sig = module.funcs[&item.name].clone();
             let file = module.file_of(item.module.as_deref());
             let locals = in_file(file, || {
-                infer_locals_open(&module, &sig, &item.def.body, &[])
+                infer_locals_open(&module, &sig, &item.def.body, &[], false)
             });
             in_file(file, || {
                 Calls {
@@ -2895,14 +2938,20 @@ pub(crate) fn infer_locals_entry(
     body: &[py::Stmt],
     files: &[u32],
 ) -> Locals {
-    infer_locals_with(module, sig, body, &HashMap::default(), files, true)
+    infer_locals_with(module, sig, body, &HashMap::default(), files, true, true)
 }
 
 /// [`infer_locals`] leaving what is undecided undecided, for the
 /// module-wide fixed point: a value another function has yet to type
 /// must not settle as dynamic here and poison every join it reaches.
-fn infer_locals_open(module: &Module, sig: &Sig, body: &[py::Stmt], files: &[u32]) -> Locals {
-    infer_locals_with(module, sig, body, &HashMap::default(), files, false)
+fn infer_locals_open(
+    module: &Module,
+    sig: &Sig,
+    body: &[py::Stmt],
+    files: &[u32],
+    entry: bool,
+) -> Locals {
+    infer_locals_with(module, sig, body, &HashMap::default(), files, false, entry)
 }
 
 /// Whatever inference left undecided is dynamic.
@@ -2921,7 +2970,7 @@ pub(crate) fn infer_locals_seeded(
     body: &[py::Stmt],
     seeds: &HashMap<String, Ty>,
 ) -> Locals {
-    infer_locals_with(module, sig, body, seeds, &[], true)
+    infer_locals_with(module, sig, body, seeds, &[], true, false)
 }
 
 /// `files` names the file of each top-level statement where the body
@@ -2934,6 +2983,7 @@ fn infer_locals_with(
     seeds: &HashMap<String, Ty>,
     files: &[u32],
     settled: bool,
+    entry: bool,
 ) -> Locals {
     let mut locals = Locals::default();
     for (name, ty) in seeds {
@@ -2945,6 +2995,14 @@ fn infer_locals_with(
     let scope = crate::scope::Scope::of_body(Vec::new(), body);
     for name in &scope.globals {
         locals.global_writes.insert(name.clone(), Ty::Unknown);
+    }
+    // The module body's variables that functions write are the module's
+    // globals: what the body reads of them is the join of every write,
+    // not its own last assignment.
+    if entry {
+        for name in module.globals.keys() {
+            locals.global_writes.insert(name.clone(), Ty::Unknown);
+        }
     }
     if !module.class_attrs.is_empty() {
         for (k, name) in class_attr_writes(&module.class_index, body) {

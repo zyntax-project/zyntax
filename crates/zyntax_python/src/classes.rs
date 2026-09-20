@@ -450,6 +450,9 @@ pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
     for (method, arity) in module.dyn_methods.borrow().iter() {
         out.push(dynamic_call(module, method, *arity, span));
     }
+    for (k, method) in module.abstract_calls.borrow().iter() {
+        out.push(abstract_dispatcher(module, *k, method, span));
+    }
     for class in module.raisers.borrow().iter() {
         out.push(raiser(module, class, span));
     }
@@ -778,6 +781,107 @@ fn dispatcher(
     );
     statements.push(ret(own, span));
     function(&dispatch_name(fn_name), params, sig.ret, statements, span)
+}
+
+/// `C$m$abstract(self, args)`: `m` on an instance of `C`, which only
+/// subclasses of `C` define: the one the instance's class holds, or an
+/// AttributeError.
+pub(crate) fn abstract_dispatcher(
+    module: &Module,
+    k: usize,
+    method: &str,
+    span: Span,
+) -> TypedFunction {
+    let sig = module
+        .abstract_sig(k, method)
+        .expect("an abstract call names a method of the subclasses");
+    let mut lowerer = scratch(module);
+    let self_ty = Ty::Class(k as u16);
+    let mut params = vec![param("self", self_ty, span)];
+    for (name, ty) in sig.params.iter().skip(1) {
+        params.push(param(name, *ty, span));
+    }
+    let tag = field(var(intern("self"), self_ty, span), "$class", Ty::Int, span);
+    let mut statements = vec![let_("tag", Ty::Int, tag, span)];
+    for sub in module.overriders(k, method) {
+        let sub_fn = method_fn(&module.classes[sub].name, method);
+        let sub_sig = &module.funcs[&sub_fn];
+        if sub_sig.params.len() != sig.params.len() {
+            continue;
+        }
+        let mut args = vec![lowerer.coerce(
+            Val {
+                node: var(intern("self"), self_ty, span),
+                ty: self_ty,
+            },
+            Ty::Class(sub as u16),
+        )];
+        for ((name, ty), (_, sub_ty)) in
+            sig.params.iter().skip(1).zip(sub_sig.params.iter().skip(1))
+        {
+            args.push(lowerer.coerce(
+                Val {
+                    node: var(intern(name), *ty, span),
+                    ty: *ty,
+                },
+                *sub_ty,
+            ));
+        }
+        let result = lowerer.coerce(
+            Val {
+                node: call(&sub_fn, args, sub_sig.ret, span),
+                ty: sub_sig.ret,
+            },
+            sig.ret,
+        );
+        // Every class between `sub` and its own overriding descendants
+        // holds `sub`'s method.
+        let mut arms = Vec::new();
+        for c in 0..module.classes.len() {
+            if module.is_subclass(c, sub) && module.method_owner(c, method) == Some(sub) {
+                arms.push(binary(
+                    BinaryOp::Eq,
+                    var(intern("tag"), Ty::Int, span),
+                    int_lit(c as i64, span),
+                    Ty::Bool,
+                    span,
+                ));
+            }
+        }
+        let Some(test) = arms
+            .into_iter()
+            .reduce(|a, b| binary(BinaryOp::Or, a, b, Ty::Bool, span))
+        else {
+            continue;
+        };
+        statements.push(when(test, vec![ret(result, span)], span));
+    }
+    statements.push(attribute_error(
+        lowerer.coerce(
+            Val {
+                node: var(intern("self"), self_ty, span),
+                ty: self_ty,
+            },
+            Ty::Object,
+        ),
+        method,
+        span,
+    ));
+    let none = lowerer.coerce(
+        Val {
+            node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+            ty: Ty::None,
+        },
+        sig.ret,
+    );
+    statements.push(ret(none, span));
+    function(
+        &lower::abstract_name(&module.classes[k].name, method),
+        params,
+        sig.ret,
+        statements,
+        span,
+    )
 }
 
 /// The `if kind == c { ... }` chain over the classes `pick` selects,
