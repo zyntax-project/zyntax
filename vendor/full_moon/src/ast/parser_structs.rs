@@ -297,6 +297,16 @@ impl AstResult {
 
         let block_has_last_stmt = block.last_stmt().is_some();
 
+        // A `return` or `break` ends the chunk: nothing may follow it,
+        // not even the empty statements a block otherwise skips.
+        if block_has_last_stmt {
+            if let Some(LexerResult::Ok(token)) = parser_state.lexer.current() {
+                if token.token_kind() != TokenKind::Eof {
+                    parser_state.token_error(token.clone(), "'<eof>' expected");
+                }
+            }
+        }
+
         loop {
             match parser_state.lexer.current() {
                 Some(LexerResult::Ok(token)) if token.token_kind() == TokenKind::Eof => {

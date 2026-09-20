@@ -1,8 +1,11 @@
 # full_moon 2.2.0 (MPL-2.0, https://github.com/Kampfkarren/full-moon),
-# vendored for one change: a block accepts empty statements (`;;`),
-# which Lua 5.2 and later allow anywhere a statement may stand. See
-# src/ast/parsers.rs, `parse_block`. Everything else is the published
-# crate without its test corpus.
+# vendored for three changes: a block accepts empty statements (`;;`),
+# which Lua 5.2 and later allow anywhere a statement may stand, but
+# not after the chunk's last statement (see src/ast/parsers.rs,
+# `parse_block`, and src/ast/parser_structs.rs), and the lexer takes a vertical
+# tab and a form feed as whitespace and lets `\z` skip every line
+# break that follows, as Lua's does (see src/tokenizer/lexer.rs).
+# Everything else is the published crate without its test corpus.
 
 [package]
 name = "full_moon"

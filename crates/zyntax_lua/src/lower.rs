@@ -745,7 +745,10 @@ fn decode_escapes(s: &str) -> std::result::Result<Vec<u8>, String> {
                 i += 2;
             }
             b'z' => {
-                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                // Lua's whitespace: a vertical tab counts.
+                while i < bytes.len()
+                    && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+                {
                     i += 1;
                 }
             }

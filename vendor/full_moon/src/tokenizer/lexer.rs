@@ -291,7 +291,9 @@ impl Lexer {
                 )
             }
 
-            initial @ (' ' | '\t' | '\r') => {
+            // Lua's lexer takes a vertical tab and a form feed as
+            // whitespace too.
+            initial @ (' ' | '\t' | '\r' | '\u{b}' | '\u{c}') => {
                 let mut whitespace = String::new();
                 whitespace.push(initial);
 
@@ -304,7 +306,7 @@ impl Lexer {
                 };
 
                 while let Some(next) = self.source.current() {
-                    if next == ' ' || next == '\t' {
+                    if next == ' ' || next == '\t' || next == '\u{b}' || next == '\u{c}' {
                         end_position.bytes += next.len_utf8();
                         end_position.character += 1;
                         whitespace.push(self.source.next().expect("peeked, but no next"));
@@ -1214,6 +1216,10 @@ impl Lexer {
 
         let mut escape = false;
         let mut z_escaped = false;
+        // After `\z`: every whitespace character up to the next
+        // other one is skipped, line breaks included, as Lua's lexer
+        // does.
+        let mut z_skipping = false;
 
         loop {
             let next = match self.source.next() {
@@ -1238,6 +1244,7 @@ impl Lexer {
                 {
                     escape = false;
                     z_escaped = true;
+                    z_skipping = true;
                     literal.push('z');
                 }
 
@@ -1254,6 +1261,10 @@ impl Lexer {
                 (false, '\\') => {
                     escape = true;
                     literal.push('\\');
+                }
+
+                (false, ' ' | '\t' | '\n' | '\r' | '\u{b}' | '\u{c}') if z_skipping => {
+                    literal.push(next);
                 }
 
                 (false, '\n' | '\r') if z_escaped => {
@@ -1284,6 +1295,7 @@ impl Lexer {
                 }
 
                 (false, ..) => {
+                    z_skipping = false;
                     literal.push(next);
                 }
             }
