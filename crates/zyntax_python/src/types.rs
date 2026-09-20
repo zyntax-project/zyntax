@@ -5223,6 +5223,8 @@ impl Typer<'_> {
             }
             "type" => Ty::Str,
             "str" | "repr" | "input" | "chr" | "hex" | "oct" | "bin" => Ty::Str,
+            // A dict of the module's variables, looked up by name.
+            "globals" => Ty::Object,
             "bytes" => Ty::Bytes,
             // A name evaluated from a string is whatever it names.
             "eval" => Ty::Object,

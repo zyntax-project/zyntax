@@ -6969,6 +6969,13 @@ impl<'m> Lowerer<'m> {
 
     /// `seq[i]` and `seq[a:b:c]`.
     fn subscript(&mut self, sub: &py::ExprSubscript, ty: Ty, span: Span) -> Result<Val> {
+        // `globals()[name]`: the module variable the string names.
+        if let py::Expr::Call(c) = &*sub.value
+            && matches!(&*c.func, py::Expr::Name(n) if n.id.as_str() == "globals" && !self.is_variable("globals"))
+            && c.arguments.args.is_empty()
+        {
+            return self.globals_lookup(&sub.slice, span);
+        }
         let seq = self.expr(&sub.value)?;
         if let py::Expr::Slice(sl) = &*sub.slice {
             let mut mask = 0;
@@ -10899,6 +10906,84 @@ impl<'m> Lowerer<'m> {
         let defaults = self.default_values(&sig)?;
         let name = class_adapter_name(&self.module.classes[k].name);
         Ok(self.record(&name, sig.params.len(), Vec::new(), defaults, span))
+    }
+
+    /// `globals()[s]`: the module variable of this file the string
+    /// names, boxed; a KeyError for any other string.
+    fn globals_lookup(&mut self, key: &py::Expr, span: Span) -> Result<Val> {
+        let text = self.expr_as(key, Ty::Str)?;
+        let mut pre = Vec::new();
+        let held = self.hold(
+            Val {
+                node: text,
+                ty: Ty::Str,
+            },
+            &mut pre,
+            span,
+        );
+        let file = current_file();
+        let prefix = self
+            .module
+            .files
+            .iter()
+            .find(|(_, index)| **index == file)
+            .map(|(m, _)| format!("{m}$"))
+            .unwrap_or_default();
+        let mut names: Vec<(String, String)> = self
+            .module
+            .globals
+            .keys()
+            .filter_map(|full| {
+                full.strip_prefix(prefix.as_str())
+                    .filter(|rest| !rest.contains('$'))
+                    .map(|short| (short.to_string(), full.clone()))
+            })
+            .collect();
+        names.sort();
+        let mut raise = Vec::new();
+        self.raise_named("KeyError", held.node.clone(), span, &mut raise);
+        raise.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(node(
+                TypedExpression::Literal(TypedLiteral::Null),
+                Ty::Object,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        ));
+        let mut chosen = Self::block_value(
+            raise,
+            node(
+                TypedExpression::Literal(TypedLiteral::Null),
+                Ty::Object,
+                span,
+            ),
+            Ty::Object,
+            span,
+        );
+        for (short, full) in names.into_iter().rev() {
+            let value = self.global_read(&full, span);
+            let boxed = self.coerce(value, Ty::Object);
+            let test = call(
+                "zb_str_eq",
+                vec![held.node.clone(), str_lit(&short, span)],
+                Ty::Bool,
+                span,
+            );
+            chosen = node(
+                TypedExpression::If(TypedIfExpr {
+                    condition: Box::new(test),
+                    then_branch: Box::new(boxed),
+                    else_branch: Box::new(chosen),
+                }),
+                Ty::Object,
+                span,
+            );
+        }
+        Ok(Val {
+            node: Self::block_value(pre, chosen, Ty::Object, span),
+            ty: Ty::Object,
+        })
     }
 
     /// `eval(s)`: the module's function or class the string names, as

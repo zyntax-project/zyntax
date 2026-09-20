@@ -416,6 +416,36 @@ extern "C" fn host_bytes_from_hex(a: StringConstPtr) -> StringPtr {
     zrtl::string::string_from_bytes(&out)
 }
 
+/// A string as JSON spells it: quoted, with `"`, `\\` and the control
+/// characters escaped and everything past ASCII as `\uXXXX`, as
+/// `json.dumps` writes by default.
+extern "C" fn host_json_escape(s: StringConstPtr) -> StringPtr {
+    // SAFETY: a string the program holds.
+    let text = unsafe { zrtl::string::string_as_str(s) }.unwrap_or("");
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 || (c as u32) > 0x7e => {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    zrtl::string::string_from_bytes(out.as_bytes())
+}
+
 /// `bytes.hex()`: two lowercase hex digits per byte.
 extern "C" fn host_bytes_hex(a: StringConstPtr) -> StringPtr {
     // SAFETY: a blob the program holds.
@@ -473,7 +503,7 @@ extern "C" fn host_file_exists(path: StringConstPtr) -> i64 {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 32] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 33] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$time".as_ptr(), host_time as *const u8),
@@ -526,6 +556,7 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 32] = [
     zrtl::ZrtlSymbol::new(c"$Host$file_remove".as_ptr(), host_file_remove as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$md5".as_ptr(), host_md5 as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$bytes_hex".as_ptr(), host_bytes_hex as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$json_escape".as_ptr(), host_json_escape as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Host$bytes_from_hex".as_ptr(),
         host_bytes_from_hex as *const u8,

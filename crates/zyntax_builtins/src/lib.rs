@@ -18,6 +18,7 @@ mod format;
 pub mod functions;
 mod io;
 mod iteration;
+mod json;
 pub mod lists;
 mod math;
 mod random;
@@ -260,6 +261,7 @@ pub fn library(policy: &Policy) -> Library {
     declarations.extend(math::declarations());
     declarations.extend(random::declarations(list_type));
     declarations.extend(bytes::declarations(list_type));
+    declarations.extend(json::declarations(list_type));
     // The hooks a frontend defines are declared here as externs, so the
     // library lowers on its own; the frontend's definition takes the
     // declaration's place when the two meet in a program.

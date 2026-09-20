@@ -64,6 +64,7 @@ pub(crate) fn is_known(module: &str) -> bool {
             | "io"
             | "hashlib"
             | "codecs"
+            | "json"
             | "__future__"
     )
 }
@@ -196,6 +197,7 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         ("os", "path.exists") => func(&[S], B, "zb_path_exists"),
         // A digest is the bytes it hashes to: `hexdigest()` spells them.
         ("hashlib", "md5") => func(&[Ty::Bytes], Ty::Bytes, "zb_md5"),
+        ("json", "dumps") => func(&[Ty::Object], S, "zb_json_dumps"),
         // `codecs.decode(b, 'hex')`: the lowering checks the codec name.
         ("codecs", "decode") => func(&[Ty::Bytes, S], Ty::Bytes, "zb_codecs_decode"),
         // A file that is its buffer; the lowering fills in the empty form.

@@ -1164,7 +1164,42 @@ fn module_globals(
             }
         }
     }
+    // `globals()[name]` may reach any module variable by name.
+    if uses_globals(body, defs) {
+        for name in &module.bound {
+            if !functions.contains(name.as_str()) {
+                names.insert(name.clone());
+            }
+        }
+    }
     names.into_iter().collect()
+}
+
+/// Whether the program calls `globals()` anywhere.
+fn uses_globals(body: &[py::Stmt], defs: &[&py::StmtFunctionDef]) -> bool {
+    use ruff_python_ast::visitor::{Visitor, walk_expr};
+    #[derive(Default)]
+    struct Finder(bool);
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            if let py::Expr::Call(c) = e
+                && matches!(&*c.func, py::Expr::Name(n) if n.id.as_str() == "globals")
+            {
+                self.0 = true;
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut finder = Finder::default();
+    for s in body {
+        finder.visit_stmt(s);
+    }
+    for f in defs {
+        for s in &f.body {
+            finder.visit_stmt(s);
+        }
+    }
+    finder.0
 }
 
 pub(crate) fn intern(s: &str) -> InternedString {

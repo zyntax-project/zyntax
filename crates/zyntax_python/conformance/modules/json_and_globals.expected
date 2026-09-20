@@ -1,0 +1,8 @@
+EMPTY {} 3
+SIMPLE {"key1": 0, "key2": true, "key3": "value"} 2
+1 ['EMPTY', 'SIMPLE']
+[1, -2, 2.5, 1e+300, -0.0, null, true, false]
+"quote\" backslash\\ newline\n tab\t bell\b ff\f unicode \u0105 del\u007f"
+{"a": [1, {"b": [2, 3]}], "c": {}} [] []
+Infinity -Infinity NaN
+KeyError
