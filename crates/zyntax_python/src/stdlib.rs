@@ -4,7 +4,7 @@
 //! type. `typing` is accepted whole and contributes nothing but
 //! annotations.
 
-use crate::types::{Code, Elem, Ty};
+use crate::types::{Code, Elem, Mode, Ty};
 use ruff_python_ast as py;
 
 /// What a module's name stands for.
@@ -60,6 +60,12 @@ pub(crate) fn is_known(module: &str) -> bool {
             | "random"
             | "operator"
             | "functools"
+            | "os"
+            | "io"
+            | "hashlib"
+            | "codecs"
+            | "json"
+            | "struct"
             | "__future__"
     )
 }
@@ -113,6 +119,7 @@ pub(crate) fn is_typing_name(name: &str) -> bool {
 const F: Ty = Ty::Float;
 const I: Ty = Ty::Int;
 const B: Ty = Ty::Bool;
+const S: Ty = Ty::Str;
 
 pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
     let func = |params: &'static [Ty], ret: Ty, zb: &'static str| Member::Func { params, ret, zb };
@@ -184,6 +191,27 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         ("array", "array") => Member::ArrayType,
         ("array", "typecodes") => Member::Str("bBuwhHiIlLqQfd"),
         ("time", "time") => func(&[], F, "zb_time_time"),
+        ("os", "remove") | ("os", "unlink") => func(&[S], Ty::None, "zb_file_remove"),
+        ("os", "path.join") => func(&[S, S], S, "zb_path_join"),
+        ("os", "path.dirname") => func(&[S], S, "zb_path_dirname"),
+        ("os", "path.basename") => func(&[S], S, "zb_path_basename"),
+        ("os", "path.exists") => func(&[S], B, "zb_path_exists"),
+        // A digest is the bytes it hashes to: `hexdigest()` spells them.
+        ("hashlib", "md5") => func(&[Ty::Bytes], Ty::Bytes, "zb_md5"),
+        ("json", "dumps") => func(&[Ty::Object], S, "zb_json_dumps"),
+        // The format is a literal the lowering reads; the result is the
+        // tuple it spells.
+        ("struct", "unpack") => func(&[S, Ty::Bytes], Ty::Object, "zb_struct_unpack"),
+        ("struct", "calcsize") => func(&[S], I, "zb_struct_calcsize"),
+        // `codecs.decode(b, 'hex')`: the lowering checks the codec name.
+        ("codecs", "decode") => func(&[Ty::Bytes, S], Ty::Bytes, "zb_codecs_decode"),
+        // A file that is its buffer; the lowering fills in the empty form.
+        ("io", "StringIO") => func(&[S], Ty::File(Mode::Text), "zb_stringio_new"),
+        // Where print writes: the process's stdout as None, or a file.
+        ("sys", "stdout") => Member::Value {
+            ty: Ty::Object,
+            zb: "zb_get_stdout",
+        },
         // The Mersenne Twister as CPython runs it; the lowering fills in
         // the forms with more arguments and the seed from the clock.
         ("random", "random") => func(&[], F, "zb_random_random"),
@@ -218,4 +246,127 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         }
         _ => return None,
     })
+}
+
+/// One value a `struct` format reads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Field {
+    /// An integer of this many bytes, signed or not.
+    Int {
+        size: i64,
+        signed: bool,
+    },
+    Float {
+        size: i64,
+    },
+    Bool,
+    /// `s` or `c`: this many bytes, as bytes.
+    Bytes {
+        size: i64,
+    },
+}
+
+/// A `struct` format string: whether it is big-endian, its fields with
+/// their byte offsets, and its size. Standard sizes throughout; the
+/// native modes `@` and `=` are taken as such without alignment.
+/// A parsed `struct` format: big-endian or not, the fields at their
+/// byte offsets, and the size.
+pub(crate) type StructFormat = (bool, Vec<(i64, Field)>, i64);
+
+pub(crate) fn struct_format(fmt: &str) -> Option<StructFormat> {
+    let mut chars = fmt.chars().peekable();
+    let mut big = false;
+    match chars.peek() {
+        Some('>') | Some('!') => {
+            big = true;
+            chars.next();
+        }
+        Some('<') | Some('=') | Some('@') => {
+            chars.next();
+        }
+        _ => {}
+    }
+    let mut fields = Vec::new();
+    let mut offset = 0i64;
+    let mut count: Option<i64> = None;
+    for c in chars {
+        if c.is_ascii_digit() {
+            count = Some(count.unwrap_or(0) * 10 + c.to_digit(10).unwrap() as i64);
+            continue;
+        }
+        if c.is_whitespace() {
+            continue;
+        }
+        let n = count.take().unwrap_or(1);
+        match c {
+            's' | 'p' => {
+                fields.push((offset, Field::Bytes { size: n }));
+                offset += n;
+                continue;
+            }
+            'x' => {
+                offset += n;
+                continue;
+            }
+            _ => {}
+        }
+        let field = match c {
+            'c' => Field::Bytes { size: 1 },
+            'b' => Field::Int {
+                size: 1,
+                signed: true,
+            },
+            'B' => Field::Int {
+                size: 1,
+                signed: false,
+            },
+            '?' => Field::Bool,
+            'h' => Field::Int {
+                size: 2,
+                signed: true,
+            },
+            'H' => Field::Int {
+                size: 2,
+                signed: false,
+            },
+            'i' | 'l' => Field::Int {
+                size: 4,
+                signed: true,
+            },
+            'I' | 'L' => Field::Int {
+                size: 4,
+                signed: false,
+            },
+            'q' | 'n' => Field::Int {
+                size: 8,
+                signed: true,
+            },
+            'Q' | 'N' => Field::Int {
+                size: 8,
+                signed: false,
+            },
+            'f' => Field::Float { size: 4 },
+            'd' => Field::Float { size: 8 },
+            _ => return None,
+        };
+        for _ in 0..n {
+            fields.push((offset, field));
+            offset += match field {
+                Field::Int { size, .. } | Field::Float { size } | Field::Bytes { size } => size,
+                Field::Bool => 1,
+            };
+        }
+    }
+    Some((big, fields, offset))
+}
+
+impl Field {
+    pub(crate) fn ty(self) -> Ty {
+        match self {
+            Field::Int { .. } => Ty::Int,
+            Field::Float { .. } => Ty::Float,
+            Field::Bool => Ty::Bool,
+            Field::Bytes { .. } => Ty::Bytes,
+        }
+    }
 }

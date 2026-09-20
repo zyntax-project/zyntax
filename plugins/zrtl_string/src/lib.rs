@@ -49,10 +49,8 @@ pub extern "C" fn string_len(s: StringPtr) -> i64 {
 /// Get string length in characters (Unicode-aware)
 #[no_mangle]
 pub extern "C" fn string_char_count(s: StringPtr) -> i64 {
-    // A character starts at every byte that is not a continuation
-    // byte; the text is UTF-8 already, so no validation.
-    let bytes = unsafe { string_as_bytes(s) };
-    bytes.iter().filter(|b| (*b & 0xC0) != 0x80).count() as i64
+    // A long string's count is kept with its character index.
+    unsafe { zrtl::string::string_char_count(s) as i64 }
 }
 
 /// Check if string is empty
@@ -411,9 +409,16 @@ pub extern "C" fn string_substring(s: StringPtr, start: i64, end: i64) -> String
 /// Get character at index (returns empty string if out of bounds)
 #[no_mangle]
 pub extern "C" fn string_char_at(s: StringPtr, index: i64) -> StringPtr {
-    let s_str = unsafe { string_as_str(s) }.unwrap_or("");
-    match s_str.chars().nth(index as usize) {
-        Some(c) => string_new(&c.to_string()),
+    // The character's bytes, found through the string's index when it
+    // is long; a copy of them as a string of its own.
+    let Ok(index) = usize::try_from(index) else {
+        return string_new("");
+    };
+    match unsafe { zrtl::string::string_char_range(s, index) } {
+        Some(range) => {
+            let bytes = unsafe { string_as_bytes(s) };
+            zrtl::string::string_from_bytes(&bytes[range])
+        }
         None => string_new(""),
     }
 }

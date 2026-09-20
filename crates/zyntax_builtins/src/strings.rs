@@ -471,8 +471,148 @@ pub(crate) fn declarations(policy: &Policy, list_type: zyntax_typed_ast::TypeId)
         body
     }));
 
+    out.extend(strip_chars());
+    // index: find, or the ValueError Python raises for a miss.
+    let h2 = local("h", string());
+    let n2 = local("n", string());
+    let at2 = local("at", i64());
+    out.push(define(
+        "zb_str_index",
+        &[&h2, &n2],
+        i64(),
+        vec![
+            at2.decl(call("zb_str_find", vec![h2.e(), n2.e()], i64())),
+            when(
+                lt(at2.e(), int(0)),
+                vec![fatal("ValueError", text("substring not found"))],
+            ),
+            ret(at2.e()),
+        ],
+    ));
+    // find: the character index of the first match, from the byte
+    // offset the search gives; -1 when absent.
+    let h = local("h", string());
+    let n = local("n", string());
+    let at = local("at", i64());
+    out.push(define(
+        "zb_str_find",
+        &[&h, &n],
+        i64(),
+        vec![
+            at.decl(call("zb_str_index_of", vec![h.e(), n.e()], i64())),
+            when(le(at.e(), int(0)), vec![ret(at.e())]),
+            ret(chars_len(call(
+                "zb_str_bytes",
+                vec![h.e(), int(0), at.e()],
+                string(),
+            ))),
+        ],
+    ));
     out.push(float_repr(policy));
     out
+}
+
+/// `s.strip(chars)`, `lstrip`, `rstrip`: the ends shorn of characters
+/// in `chars`, by byte cursor from the front and by stepping back over
+/// UTF-8 continuation bytes from the end.
+fn strip_chars() -> Vec<Decl> {
+    let s = local("s", string());
+    let chars = local("chars", string());
+    let n = local("n", i64());
+    let lo = local("lo", i64());
+    let hi = local("hi", i64());
+    let start = local("start", i64());
+    let done = local("done", boolean());
+    let c = local("c", string());
+    let byte = |i: Expr| call("zb_bytes_at", vec![s.e(), i], i64());
+    let in_chars = |ch: Expr| call("zb_str_contains", vec![chars.e(), ch], boolean());
+    let front = || {
+        vec![
+            done.set(bool(false)),
+            while_(
+                and(lt(lo.e(), n.e()), not(done.e())),
+                vec![
+                    c.decl(call("zb_str_char_at_byte", vec![s.e(), lo.e()], string())),
+                    if_(
+                        in_chars(c.e()),
+                        vec![lo.set(call("zb_str_next_byte", vec![s.e(), lo.e()], i64()))],
+                        vec![done.set(bool(true))],
+                    ),
+                ],
+            ),
+        ]
+    };
+    let back = || {
+        vec![
+            done.set(bool(false)),
+            while_(
+                and(gt(hi.e(), lo.e()), not(done.e())),
+                vec![
+                    start.decl(sub(hi.e(), int(1))),
+                    while_(
+                        and(
+                            gt(start.e(), lo.e()),
+                            and(
+                                ge(byte(start.e()), int(0x80)),
+                                lt(byte(start.e()), int(0xC0)),
+                            ),
+                        ),
+                        vec![start.set(sub(start.e(), int(1)))],
+                    ),
+                    c.decl(call(
+                        "zb_str_bytes",
+                        vec![s.e(), start.e(), hi.e()],
+                        string(),
+                    )),
+                    if_(
+                        in_chars(c.e()),
+                        vec![hi.set(start.e())],
+                        vec![done.set(bool(true))],
+                    ),
+                ],
+            ),
+        ]
+    };
+    let head = || {
+        vec![
+            n.decl(call("zb_str_len", vec![s.e()], i64())),
+            lo.decl(int(0)),
+            hi.decl(n.e()),
+            done.decl(bool(false)),
+        ]
+    };
+    let tail = || ret(call("zb_str_bytes", vec![s.e(), lo.e(), hi.e()], string()));
+    let body = |front_too: bool, back_too: bool| {
+        let mut b = head();
+        if front_too {
+            b.extend(front());
+        }
+        if back_too {
+            b.extend(back());
+        }
+        b.push(tail());
+        b
+    };
+    vec![
+        define(
+            "zb_str_strip_chars",
+            &[&s, &chars],
+            string(),
+            body(true, true),
+        ),
+        define(
+            "zb_str_lstrip_chars",
+            &[&s, &chars],
+            string(),
+            body(true, false),
+        ),
+        define(
+            "zb_str_rstrip_chars",
+            &[&s, &chars],
+            string(),
+            body(false, true),
+        ),
+    ]
 }
 
 /// repr(float): the shortest digits that round-trip, positional when the

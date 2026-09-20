@@ -30,6 +30,12 @@ pub(crate) enum Ty {
     Float,
     Bool,
     Str,
+    /// A byte string: stored as a string is, and boxed under its own
+    /// category, so nothing reads it as text.
+    Bytes,
+    /// An open file, in text or binary mode: the record the library
+    /// keeps for it.
+    File(Mode),
     None,
     /// A list whose elements are all of one kind.
     List(Elem),
@@ -68,6 +74,32 @@ pub(crate) enum Ty {
     Object,
     #[default]
     Unknown,
+}
+
+/// What a file reads and writes: text as strings, binary as bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Mode {
+    Text,
+    Binary,
+}
+
+impl Mode {
+    /// The mode of `open(..., mode)`: binary when the mode names `b`.
+    pub(crate) fn of(mode: &str) -> Mode {
+        if mode.contains('b') {
+            Mode::Binary
+        } else {
+            Mode::Text
+        }
+    }
+
+    /// What the file's contents are typed as.
+    pub(crate) fn content(self) -> Ty {
+        match self {
+            Mode::Text => Ty::Str,
+            Mode::Binary => Ty::Bytes,
+        }
+    }
 }
 
 /// The element kinds a list is instantiated for. Anything else in a
@@ -530,6 +562,9 @@ impl Ty {
             }),
             Ty::Set | Ty::Gen => Some(Ty::Object),
             Ty::Str => Some(Ty::Str),
+            // Bytes iterate as their byte values; a file as its lines.
+            Ty::Bytes => Some(Ty::Int),
+            Ty::File(mode) => Some(mode.content()),
             Ty::Unknown => Some(Ty::Unknown),
             _ => None,
         }
@@ -572,6 +607,11 @@ pub(crate) struct Module {
     pub(crate) lifted: std::cell::RefCell<Vec<TypedFunction>>,
     /// Module functions used as values, which need an adapter.
     pub(crate) adapters: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Classes used as values: called through a record, they construct.
+    pub(crate) class_adapters: std::cell::RefCell<std::collections::BTreeSet<usize>>,
+    /// Methods called on a class that only its subclasses define, by
+    /// class and name: each needs a dispatcher over those subclasses.
+    pub(crate) abstract_calls: std::cell::RefCell<std::collections::BTreeSet<(usize, String)>>,
     /// A counter for names no Python program can spell.
     pub(crate) counter: std::cell::Cell<usize>,
     /// The module's classes, bases before subclasses.
@@ -597,6 +637,8 @@ pub(crate) struct Module {
     pub(crate) from_names: HashMap<String, (String, String)>,
     /// The program's own modules, to the index of their source file.
     pub(crate) files: HashMap<String, u32>,
+    /// Each source file's path, by index: what `__file__` is.
+    pub(crate) file_names: Vec<String>,
     /// Functions every call of which is in view, so an unannotated
     /// parameter can be typed by what is passed; see [`closed_items`].
     pub(crate) closed: HashSet<String>,
@@ -1283,7 +1325,7 @@ fn infer_closure(module: &Module, k: u16, def: &ClosureDef, vars: &HashMap<Strin
         }
         ClosureDef::Def(f) => {
             let seeds = seeds_for(&crate::scope::Scope::of_function(f));
-            let locals = infer_locals_with(module, &sig, &f.body, &seeds, &[], false);
+            let locals = infer_locals_with(module, &sig, &f.body, &seeds, &[], false, false);
             let ret = if locals.returns { locals.ret } else { Ty::None };
             let mut inner = seeds;
             inner.extend(locals.vars);
@@ -1483,14 +1525,54 @@ impl Module {
     /// subclass of `k` would reach, since the call goes to whichever the
     /// instance's class holds.
     pub(crate) fn dispatched_ret(&self, k: usize, method: &str) -> Option<Ty> {
-        let (sig, _) = self.method_sig(k, method)?;
-        let mut ret = sig.ret;
-        for sub in self.overriders(k, method) {
-            if let Some((sub_sig, _)) = self.method_sig(sub, method) {
-                ret = self.join_classes(ret, sub_sig.ret);
+        match self.method_sig(k, method) {
+            Some((sig, _)) => {
+                let mut ret = sig.ret;
+                for sub in self.overriders(k, method) {
+                    if let Some((sub_sig, _)) = self.method_sig(sub, method) {
+                        ret = self.join_classes(ret, sub_sig.ret);
+                    }
+                }
+                Some(ret)
             }
+            // A method only subclasses define: what they return.
+            None => self.abstract_sig(k, method).map(|sig| sig.ret),
         }
-        Some(ret)
+    }
+
+    /// The signature of a call of `method` on an instance of `k`, where
+    /// `k` itself does not define it and some subclasses do: each
+    /// parameter the join of theirs, the result the join of their
+    /// results. None when no subclass defines it or their arities
+    /// differ.
+    pub(crate) fn abstract_sig(&self, k: usize, method: &str) -> Option<Sig> {
+        if self.method_sig(k, method).is_some() {
+            return None;
+        }
+        let subs = self.overriders(k, method);
+        let mut sigs = subs
+            .iter()
+            .filter_map(|&sub| self.method_sig(sub, method).map(|(sig, _)| sig));
+        let first = sigs.next()?;
+        let mut params: Vec<(String, Ty)> = first.params.clone();
+        let mut ret = first.ret;
+        for sig in sigs {
+            if sig.params.len() != params.len() {
+                return None;
+            }
+            for ((_, mine), (_, theirs)) in params.iter_mut().zip(&sig.params) {
+                *mine = self.join_classes(*mine, *theirs);
+            }
+            ret = self.join_classes(ret, sig.ret);
+        }
+        if let Some((_, this)) = params.first_mut() {
+            *this = Ty::Class(k as u16);
+        }
+        Some(Sig {
+            params,
+            ret,
+            defaults: vec![None; first.params.len()],
+        })
     }
 
     /// [`Ty::join`] knowing the hierarchy: two instance types join to
@@ -1992,7 +2074,7 @@ pub(crate) fn infer_module(
                 let sig = module.funcs[&item.name].clone();
                 let file = module.file_of(item.module.as_deref());
                 let locals = in_file(file, || {
-                    let locals = infer_locals_open(&module, &sig, &item.def.body, &[]);
+                    let locals = infer_locals_open(&module, &sig, &item.def.body, &[], false);
                     changed |= infer_closures_in(&module, &item.def.body, &[], &locals.vars);
                     locals
                 });
@@ -2071,7 +2153,7 @@ pub(crate) fn infer_module(
                 });
             } else if !entry_done {
                 entry_done = true;
-                entry_locals = infer_locals_open(&module, &entry_sig, entry, entry_files);
+                entry_locals = infer_locals_open(&module, &entry_sig, entry, entry_files, true);
                 for (k, field, ty) in &entry_locals.other_field_writes {
                     changed |= widen_field(&mut module.classes, *k, field, *ty);
                 }
@@ -2220,7 +2302,7 @@ pub(crate) fn infer_module(
             let sig = module.funcs[&item.name].clone();
             let file = module.file_of(item.module.as_deref());
             let locals = in_file(file, || {
-                infer_locals_open(&module, &sig, &item.def.body, &[])
+                infer_locals_open(&module, &sig, &item.def.body, &[], false)
             });
             in_file(file, || {
                 Calls {
@@ -2454,6 +2536,61 @@ impl Calls<'_> {
         }
     }
 
+    /// `obj[key]` or `obj[key] = value` where `obj` is an instance: a
+    /// call of `__getitem__` or `__setitem__` on its class and on every
+    /// subclass overriding it; on a dynamic receiver, of any class's.
+    fn item_site(&mut self, method: &str, receiver: &py::Expr, args: &[Ty]) {
+        if self.opaque {
+            return;
+        }
+        match self.typer().expr(receiver) {
+            Ty::Class(k) => {
+                let k = k as usize;
+                let mut classes = vec![k];
+                classes.extend(self.module.overriders(k, method));
+                for c in classes {
+                    let Some((_, name)) = self.module.method_sig(c, method) else {
+                        continue;
+                    };
+                    for (i, ty) in args.iter().enumerate() {
+                        self.passed.push((Target::Item(name.clone()), i + 1, *ty));
+                    }
+                }
+            }
+            ty if (ty == Ty::Object || (ty == Ty::Unknown && self.settled))
+                && self
+                    .module
+                    .classes
+                    .iter()
+                    .any(|c| c.methods.iter().any(|m| m == method)) =>
+            {
+                self.dynamic_methods.insert(method.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// A store into `target`: the `__setitem__` it calls, when the
+    /// target is a subscript of an instance.
+    fn store_site(&mut self, target: &py::Expr, value: Ty) {
+        match target {
+            py::Expr::Subscript(sub) => {
+                let key = self.arg_ty(&sub.slice);
+                self.item_site("__setitem__", &sub.value, &[key, value]);
+            }
+            py::Expr::Tuple(t) => {
+                let elems = match value {
+                    Ty::Tuple(k) => tuple_shape(k),
+                    _ => vec![Ty::Object; t.elts.len()],
+                };
+                for (e, ty) in t.elts.iter().zip(elems) {
+                    self.store_site(e, ty);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// `left op right` where `left` is an instance: a call of the
     /// class's method for `op` with `right` as its one argument.
     fn operator_site(&mut self, op: py::Operator, left: &py::Expr, right: &py::Expr) {
@@ -2489,6 +2626,12 @@ impl Calls<'_> {
         };
         let n = sig.params.len();
         let mut given: Vec<Option<Ty>> = vec![None; n];
+        // A starred tuple of known shape is its elements, one by one.
+        let spread = spread_starred(args, |e| self.arg_ty(e));
+        let args: &[py::Expr] = match &spread {
+            Some(expanded) => expanded,
+            None => args,
+        };
         let mut matched = !args.iter().any(|a| matches!(a, py::Expr::Starred(_)))
             && keywords.iter().all(|k| k.arg.is_some())
             && first + args.len() <= n;
@@ -2569,6 +2712,19 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
             }
             py::Stmt::AugAssign(a) => {
                 self.operator_site(a.op, &a.target, &a.value);
+                if !self.opaque {
+                    let value = self.arg_ty(&a.target);
+                    self.store_site(&a.target, value);
+                }
+                walk_stmt(self, stmt);
+            }
+            py::Stmt::Assign(a)
+                if a.targets.iter().any(|t| !matches!(t, py::Expr::Name(_))) && !self.opaque =>
+            {
+                let value = self.arg_ty(&a.value);
+                for t in &a.targets {
+                    self.store_site(t, value);
+                }
                 walk_stmt(self, stmt);
             }
             // A closure bound to a name, or returned, is still in view.
@@ -2601,9 +2757,15 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
             self.escape(k);
         }
         // An operator on an instance passes the right operand to the
-        // class's method for it.
+        // class's method for it; a subscript passes the key.
         if let py::Expr::BinOp(b) = expr {
             self.operator_site(b.op, &b.left, &b.right);
+        }
+        if let py::Expr::Subscript(sub) = expr
+            && !self.opaque
+        {
+            let key = self.arg_ty(&sub.slice);
+            self.item_site("__getitem__", &sub.value, &[key]);
         }
         match expr {
             py::Expr::Call(c) => {
@@ -2778,14 +2940,20 @@ pub(crate) fn infer_locals_entry(
     body: &[py::Stmt],
     files: &[u32],
 ) -> Locals {
-    infer_locals_with(module, sig, body, &HashMap::default(), files, true)
+    infer_locals_with(module, sig, body, &HashMap::default(), files, true, true)
 }
 
 /// [`infer_locals`] leaving what is undecided undecided, for the
 /// module-wide fixed point: a value another function has yet to type
 /// must not settle as dynamic here and poison every join it reaches.
-fn infer_locals_open(module: &Module, sig: &Sig, body: &[py::Stmt], files: &[u32]) -> Locals {
-    infer_locals_with(module, sig, body, &HashMap::default(), files, false)
+fn infer_locals_open(
+    module: &Module,
+    sig: &Sig,
+    body: &[py::Stmt],
+    files: &[u32],
+    entry: bool,
+) -> Locals {
+    infer_locals_with(module, sig, body, &HashMap::default(), files, false, entry)
 }
 
 /// Whatever inference left undecided is dynamic.
@@ -2804,7 +2972,7 @@ pub(crate) fn infer_locals_seeded(
     body: &[py::Stmt],
     seeds: &HashMap<String, Ty>,
 ) -> Locals {
-    infer_locals_with(module, sig, body, seeds, &[], true)
+    infer_locals_with(module, sig, body, seeds, &[], true, false)
 }
 
 /// `files` names the file of each top-level statement where the body
@@ -2817,6 +2985,7 @@ fn infer_locals_with(
     seeds: &HashMap<String, Ty>,
     files: &[u32],
     settled: bool,
+    entry: bool,
 ) -> Locals {
     let mut locals = Locals::default();
     for (name, ty) in seeds {
@@ -2828,6 +2997,14 @@ fn infer_locals_with(
     let scope = crate::scope::Scope::of_body(Vec::new(), body);
     for name in &scope.globals {
         locals.global_writes.insert(name.clone(), Ty::Unknown);
+    }
+    // The module body's variables that functions write are the module's
+    // globals: what the body reads of them is the join of every write,
+    // not its own last assignment.
+    if entry {
+        for name in module.globals.keys() {
+            locals.global_writes.insert(name.clone(), Ty::Unknown);
+        }
     }
     if !module.class_attrs.is_empty() {
         for (k, name) in class_attr_writes(&module.class_index, body) {
@@ -3092,6 +3269,18 @@ pub(crate) fn list_sites<'ast>(
                                 return;
                             }
                         }
+                    }
+                    // `self.f = xs` stores the list in a field of a known
+                    // class: the field takes the list's kind, as a caller
+                    // takes a returned list's, and what is written into
+                    // it later is checked against that kind.
+                    if let [py::Expr::Attribute(attr)] = a.targets.as_slice()
+                        && let py::Expr::Name(_) = &*a.value
+                        && self.is_candidate(&a.value).is_some()
+                        && matches!(self.typer.expr(&attr.value), Ty::Class(_))
+                    {
+                        self.visit_expr(&attr.value);
+                        return;
                     }
                     // The value is read whatever the targets are.
                     for t in &a.targets {
@@ -4060,7 +4249,16 @@ impl Walker<'_> {
                 self.stmts(&t.orelse);
                 self.stmts(&t.finalbody);
             }
-            py::Stmt::With(w) => self.stmts(&w.body),
+            // `with e as x` binds x to e: the file itself.
+            py::Stmt::With(w) => {
+                for item in &w.items {
+                    let ty = self.expr(&item.context_expr);
+                    if let Some(target) = &item.optional_vars {
+                        self.target(target, ty);
+                    }
+                }
+                self.stmts(&w.body)
+            }
             py::Stmt::FunctionDef(f) => {
                 let ty = self
                     .module
@@ -4286,12 +4484,40 @@ pub(crate) fn dunder_name(op: py::Operator) -> &'static str {
     }
 }
 
+/// The reflected method of `op`, tried on the right operand when the
+/// left one has no method for it: `__radd__` for `+`.
+pub(crate) fn reflected_dunder_name(op: py::Operator) -> &'static str {
+    match op {
+        py::Operator::Add => "__radd__",
+        py::Operator::Sub => "__rsub__",
+        py::Operator::Mult => "__rmul__",
+        py::Operator::Div => "__rtruediv__",
+        py::Operator::FloorDiv => "__rfloordiv__",
+        py::Operator::Mod => "__rmod__",
+        py::Operator::Pow => "__rpow__",
+        py::Operator::MatMult => "__rmatmul__",
+        py::Operator::BitAnd => "__rand__",
+        py::Operator::BitOr => "__ror__",
+        py::Operator::BitXor => "__rxor__",
+        py::Operator::LShift => "__rlshift__",
+        py::Operator::RShift => "__rrshift__",
+    }
+}
+
 /// What `left op right` produces. `/` is always a float on numbers,
 /// `**` with a negative literal exponent too.
 pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
     match op {
         // A `%` format.
         py::Operator::Mod if l == Ty::Str => Ty::Str,
+        py::Operator::Mod if l == Ty::Bytes => Ty::Bytes,
+        py::Operator::Add if l == Ty::Bytes && r == Ty::Bytes => Ty::Bytes,
+        py::Operator::Mult
+            if (l == Ty::Bytes && matches!(r, Ty::Int | Ty::Bool))
+                || (matches!(l, Ty::Int | Ty::Bool) && r == Ty::Bytes) =>
+        {
+            Ty::Bytes
+        }
         py::Operator::Div if l.is_numeric() && r.is_numeric() => Ty::Float,
         // `int ** int` is an int only when the exponent is visibly not
         // negative; otherwise Python's answer may be a float, and the
@@ -4322,6 +4548,9 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
         }
         py::Operator::Mult if matches!(l, Ty::List(_)) && matches!(r, Ty::Int | Ty::Bool) => l,
         py::Operator::Mult if matches!(r, Ty::List(_)) && matches!(l, Ty::Int | Ty::Bool) => r,
+        // A list times a dynamic value is the list or a TypeError.
+        py::Operator::Mult if matches!(l, Ty::List(_)) && r == Ty::Object => l,
+        py::Operator::Mult if matches!(r, Ty::List(_)) && l == Ty::Object => r,
         // A repeated tuple has no shape the count does not decide.
         py::Operator::Mult
             if (matches!(l, Ty::Tuple(_)) && matches!(r, Ty::Int | Ty::Bool))
@@ -4335,7 +4564,7 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
         {
             Ty::Str
         }
-        _ if l == Ty::Str || r == Ty::Str => {
+        _ if matches!(l, Ty::Str | Ty::Bytes) || matches!(r, Ty::Str | Ty::Bytes) => {
             if l == Ty::Unknown || r == Ty::Unknown {
                 Ty::Unknown
             } else {
@@ -4343,6 +4572,61 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
             }
         }
         _ => l.arith(r),
+    }
+}
+
+/// Call arguments with each `*name` whose tuple shape is known spread
+/// into that many element reads, and no other starred argument. None
+/// when there is no starred argument, or one that is not such a name.
+pub(crate) fn spread_starred(
+    args: &[py::Expr],
+    ty_of: impl Fn(&py::Expr) -> Ty,
+) -> Option<Vec<py::Expr>> {
+    if !args.iter().any(|a| matches!(a, py::Expr::Starred(_))) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(args.len() + 2);
+    for a in args {
+        let py::Expr::Starred(s) = a else {
+            out.push(a.clone());
+            continue;
+        };
+        // Only a name is read more than once without effect.
+        let py::Expr::Name(_) = &*s.value else {
+            return None;
+        };
+        let Ty::Tuple(k) = ty_of(&s.value) else {
+            return None;
+        };
+        for i in 0..tuple_shape(k).len() {
+            out.push(py::Expr::Subscript(py::ExprSubscript {
+                node_index: Default::default(),
+                range: s.range,
+                value: s.value.clone(),
+                slice: Box::new(py::Expr::NumberLiteral(py::ExprNumberLiteral {
+                    node_index: Default::default(),
+                    range: s.range,
+                    value: py::Number::Int(py::Int::from(i as u64)),
+                })),
+                ctx: py::ExprContext::Load,
+            }));
+        }
+    }
+    Some(out)
+}
+
+/// The mode `open(path, mode)` names, when it is a literal; `r` when
+/// left out. None when it is computed.
+pub(crate) fn open_mode(c: &py::ExprCall) -> Option<Mode> {
+    let mode = c
+        .arguments
+        .args
+        .get(1)
+        .or_else(|| c.arguments.find_keyword("mode").map(|k| &k.value));
+    match mode {
+        None => Some(Mode::Text),
+        Some(py::Expr::StringLiteral(s)) => Some(Mode::of(s.value.to_str())),
+        Some(_) => None,
     }
 }
 
@@ -4510,6 +4794,7 @@ impl Typer<'_> {
             py::Expr::BooleanLiteral(_) => Ty::Bool,
             py::Expr::NoneLiteral(_) => Ty::None,
             py::Expr::StringLiteral(_) | py::Expr::FString(_) => Ty::Str,
+            py::Expr::BytesLiteral(_) => Ty::Bytes,
             py::Expr::Name(n) => {
                 let name = n.id.as_str();
                 if let Some(ty) = self
@@ -4520,7 +4805,7 @@ impl Typer<'_> {
                 {
                     return *ty;
                 }
-                if name == "__name__" {
+                if name == "__name__" || name == "__file__" {
                     return Ty::Str;
                 }
                 if let Some(m) = self.module.imported_name(name) {
@@ -4626,7 +4911,7 @@ impl Typer<'_> {
                 }
                 if let py::Expr::Slice(slice) = &*s.slice {
                     match seq {
-                        Ty::Str | Ty::List(_) => seq,
+                        Ty::Str | Ty::Bytes | Ty::List(_) => seq,
                         // A slice of a tuple with literal bounds is the
                         // shape those bounds cut out.
                         Ty::Tuple(k) => {
@@ -4645,6 +4930,10 @@ impl Typer<'_> {
                     }
                 } else if let Ty::Dict(k) = seq {
                     dict_shape(k).1
+                } else if let Ty::Class(k) = seq {
+                    self.module
+                        .dispatched_ret(k as usize, "__getitem__")
+                        .unwrap_or(Ty::Object)
                 } else {
                     seq.element().unwrap_or(Ty::Object)
                 }
@@ -4763,6 +5052,9 @@ impl Typer<'_> {
         value: &py::Expr,
         attr: &str,
     ) -> Option<crate::stdlib::Member> {
+        if let py::Expr::Attribute(sub) = value {
+            return self.module_member_of(&sub.value, &format!("{}.{attr}", sub.attr.as_str()));
+        }
         let py::Expr::Name(m) = value else {
             return None;
         };
@@ -4778,6 +5070,16 @@ impl Typer<'_> {
 
     /// What a call of a module member returns.
     fn member_call_ty(&self, m: crate::stdlib::Member, c: &py::ExprCall) -> Ty {
+        // `struct.unpack` returns the tuple its literal format spells.
+        if let crate::stdlib::Member::Func {
+            zb: "zb_struct_unpack",
+            ..
+        } = m
+            && let Some(py::Expr::StringLiteral(fmt)) = c.arguments.args.first()
+            && let Some((_, fields, _)) = crate::stdlib::struct_format(fmt.value.to_str())
+        {
+            return tuple_of(fields.iter().map(|(_, f)| f.ty()).collect());
+        }
         match m {
             crate::stdlib::Member::ArrayType => array_call_ty(&c.arguments.args),
             crate::stdlib::Member::Binary(op) if c.arguments.args.len() == 2 => {
@@ -4820,6 +5122,14 @@ impl Typer<'_> {
                 return self.method_ret(receiver, &info.method);
             }
             Ty::Builtin(k) => return self.builtin_call(BUILTIN_VALUES[k as usize], c),
+            // `instance(...)` is its class's `__call__`.
+            Ty::Class(k) if !matches!(&*c.func, py::Expr::Name(n) if self.module.class_index.contains_key(n.id.as_str())) =>
+            {
+                return self
+                    .module
+                    .dispatched_ret(k as usize, "__call__")
+                    .unwrap_or(Ty::Object);
+            }
             _ => {}
         }
         match &*c.func {
@@ -4885,6 +5195,7 @@ impl Typer<'_> {
                 Ty::List(Elem::Array(c)) => Ty::List(Elem::of(c.item())),
                 Ty::List(e) => Ty::List(e),
                 Ty::Str => Ty::List(Elem::Str),
+                Ty::Bytes => Ty::List(Elem::Int),
                 Ty::Tuple(_) => Ty::List(Elem::of(arg(0).element().unwrap_or(Ty::Object))),
                 // A list of a dict is its keys.
                 Ty::Dict(k) => Ty::List(Elem::of(dict_shape(k).0)),
@@ -4911,7 +5222,7 @@ impl Typer<'_> {
             "any" | "all" => Ty::Bool,
             "sum" => {
                 let items = match arg(0) {
-                    Ty::List(Elem::Int) => Ty::Int,
+                    Ty::List(Elem::Int) | Ty::Bytes => Ty::Int,
                     Ty::List(Elem::Float) => Ty::Float,
                     t @ Ty::Tuple(_) => match t.element() {
                         Some(Ty::Int | Ty::Bool) => Ty::Int,
@@ -4941,7 +5252,15 @@ impl Typer<'_> {
                 tuple_of(vec![q, q])
             }
             "type" => Ty::Str,
-            "str" | "repr" | "input" | "chr" => Ty::Str,
+            "str" | "repr" | "input" | "chr" | "hex" | "oct" | "bin" => Ty::Str,
+            // A dict of the module's variables, looked up by name.
+            "globals" => Ty::Object,
+            "bytes" => Ty::Bytes,
+            // A name evaluated from a string is whatever it names.
+            "eval" => Ty::Object,
+            // The mode decides what is read and written; it is a literal
+            // or the file is a text one.
+            "open" => Ty::File(open_mode(c).unwrap_or(Mode::Text)),
             "float" => Ty::Float,
             "bool" | "isinstance" | "callable" | "hasattr" => Ty::Bool,
             "abs" => match arg(0) {
@@ -4983,8 +5302,10 @@ impl Typer<'_> {
                 "pop" => e.ty(),
                 "index" | "count" => Ty::Int,
                 "copy" => Ty::List(e),
-                // An array's elements as the list of what they read as.
+                // An array's elements as the list of what they read as,
+                // or as the bytes they are stored as.
                 "tolist" => Ty::List(Elem::of(e.ty())),
+                "tobytes" if e.code().is_some() => Ty::Bytes,
                 _ => Ty::None,
             },
             Ty::Tuple(_) => match attr {
@@ -5025,6 +5346,18 @@ impl Typer<'_> {
                 "startswith" | "endswith" | "isdigit" | "isalpha" | "isalnum" | "isspace"
                 | "isupper" | "islower" => Ty::Bool,
                 "split" | "rsplit" | "splitlines" => Ty::List(Elem::Str),
+                "encode" => Ty::Bytes,
+                _ => Ty::Object,
+            },
+            Ty::Bytes => match attr {
+                "decode" | "hex" | "hexdigest" => Ty::Str,
+                "digest" => Ty::Bytes,
+                _ => Ty::Object,
+            },
+            Ty::File(mode) => match attr {
+                "read" | "readline" | "getvalue" => mode.content(),
+                "readlines" => Ty::List(Elem::of(mode.content())),
+                "write" | "close" | "flush" => Ty::None,
                 _ => Ty::Object,
             },
             _ => Ty::Object,

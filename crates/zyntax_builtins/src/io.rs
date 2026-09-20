@@ -62,17 +62,42 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         ),
         extern_fn("zb_exit", &[("code", i32())], unit(), Some("exit")),
         // One line of text to stdout, and text with no line break.
+        // A redirected stdout (`sys.stdout = f`) takes the text instead.
         define(
             "zb_print_line",
             &[&s],
             unit(),
-            vec![expr(call("zb_println", vec![s.e()], unit())), ret_void()],
+            vec![
+                when(
+                    ne(call("zb_get_stdout", vec![], any()), null(any())),
+                    vec![
+                        expr(call(
+                            "zb_stdout_capture",
+                            vec![add(s.e(), text("\n"))],
+                            unit(),
+                        )),
+                        ret_void(),
+                    ],
+                ),
+                expr(call("zb_println", vec![s.e()], unit())),
+                ret_void(),
+            ],
         ),
         define(
             "zb_print_text",
             &[&s],
             unit(),
-            vec![expr(call("zb_print", vec![s.e()], unit())), ret_void()],
+            vec![
+                when(
+                    ne(call("zb_get_stdout", vec![], any()), null(any())),
+                    vec![
+                        expr(call("zb_stdout_capture", vec![s.e()], unit())),
+                        ret_void(),
+                    ],
+                ),
+                expr(call("zb_print", vec![s.e()], unit())),
+                ret_void(),
+            ],
         ),
         define_cold("zb_fatal", &[&kind, &message], unit(), fatal_body),
     ];

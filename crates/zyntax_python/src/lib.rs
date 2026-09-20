@@ -26,16 +26,20 @@ use zyntax_typed_ast::{
     InternedString, Mutability, PrimitiveType, Type, TypedNode, TypedProgram, Visibility,
 };
 
+mod aliases;
+mod bytes;
 mod class_attrs;
 mod classes;
 mod format;
 mod host;
+mod kwargs;
 mod lower;
 mod modules;
 mod prelude;
 mod scope;
 mod shape;
 mod stdlib;
+mod sugar;
 mod types;
 
 /// Why a program could not be turned into a `TypedProgram`.
@@ -317,10 +321,20 @@ pub fn parse_program_with(
     let mut origins: Vec<Option<String>> = vec![Some(PRELUDE.to_string()); prelude.body.len()];
     let mut body = prelude.body;
     for (stmt, origin) in linked.statements {
-        body.push(stmt);
-        origins.push(origin);
+        for stmt in flatten_true_if(stmt) {
+            body.push(stmt);
+            origins.push(origin.clone());
+        }
     }
-    module.body = body;
+    // Sugar the frontend does not model is rewritten away before
+    // anything is typed: `**kwargs` becomes keyword parameters, class
+    // and static methods become module functions, a name given a class
+    // becomes the class.
+    let mut statements: Vec<py::Stmt> = body.into_iter().collect();
+    kwargs::rewrite(&mut statements)?;
+    sugar::rewrite(&mut statements, &mut origins);
+    aliases::rewrite(&mut statements);
+    module.body = statements.into_iter().collect();
     lap("parse+link");
     let located = |e: Error, module: Option<&str>| match module {
         Some(m) => e.in_module(m),
@@ -409,6 +423,7 @@ pub fn parse_program_with(
         imports,
         from_names,
         files,
+        file_names: source_files.iter().map(|f| f.name.clone()).collect(),
         ..Default::default()
     };
     let def_stmts: Vec<&py::StmtFunctionDef> = defs.iter().map(|(f, _)| *f).collect();
@@ -487,7 +502,7 @@ pub fn parse_program_with(
     // never fewer, so the set only grows from there, and a set taken
     // earlier would open methods on account of what was not yet known.
     lap("closures");
-    let declared_classes = inferred.classes.clone();
+    let mut declared_classes = inferred.classes.clone();
     let mut methods_settling = false;
     let mut rounds = 0;
     for _ in 0..12 {
@@ -502,6 +517,23 @@ pub fn parse_program_with(
         let out = types::infer_module(&inferred, &items, &owned, &entry_files);
         inferred.funcs = out.funcs;
         inferred.classes = out.classes;
+        // A field a round found written on an instance other than
+        // `self` (`x.symbol = v` for `x` of a known class) is the class's
+        // from then on; its type is decided afresh each round like the
+        // others'.
+        let mut grew = false;
+        for (declared, found) in declared_classes.iter_mut().zip(&inferred.classes) {
+            for (name, _) in &found.fields {
+                if !declared.fields.iter().any(|(f, _)| f == name) {
+                    declared.fields.push((name.clone(), types::Ty::Unknown));
+                    grew = true;
+                }
+            }
+        }
+        if grew {
+            rounds -= 1;
+            continue;
+        }
         inferred.closures = std::cell::RefCell::new(out.closures);
         inferred.list_params = out.list_params;
         let found_dynamic = out.dynamic_methods.clone();
@@ -681,9 +713,17 @@ pub fn parse_program_with(
     // A module function nothing reaches from the module body is never
     // run by the program, so what it writes need not compile: a Python
     // that never runs it never minds. One that does compile is kept, for
-    // a host that calls it by name. Every class is kept whole, since the
-    // dispatchers over dynamic receivers name every method of every class.
+    // a host that calls it by name. A method stays with its class, since
+    // the dispatchers over dynamic receivers and the runtime's hooks may
+    // name it: one whose name no attribute access spells is replaced by
+    // a function that raises the reason, which is what Python does with
+    // a body it cannot run.
     let reached = reachable_functions(&owned, &items);
+    let attrs_used = attribute_names(&owned, &items);
+    let unreached = |item: &types::Item<'_>| match item.class {
+        None => !reached.contains(&item.name),
+        Some(_) => !attrs_used.contains(item.def.name.as_str()),
+    };
     let mut dropped: HashSet<String> = HashSet::default();
     let lower_all = |inferred: &types::Module,
                      dropped: &mut HashSet<String>|
@@ -695,7 +735,12 @@ pub fn parse_program_with(
             }
             match lower_items(inferred, std::slice::from_ref(item), &unpack_shapes) {
                 Ok(d) => out.extend(d),
-                Err(_) if item.class.is_none() && !reached.contains(&item.name) => {
+                // A method stands in for itself as a raise: the class's
+                // dispatchers may still name it.
+                Err(e) if unreached(item) && item.class.is_some() => {
+                    out.extend(lower_stub(inferred, item, &e));
+                }
+                Err(_) if unreached(item) => {
                     dropped.insert(item.name.clone());
                 }
                 Err(e) => return Err(e),
@@ -739,6 +784,8 @@ pub fn parse_program_with(
     inferred.attr_reads.take();
     inferred.attr_writes.take();
     inferred.dyn_methods.take();
+    inferred.abstract_calls.take();
+    inferred.class_adapters.take();
     inferred.counter.set(inferred.closures.borrow().len());
     let kept = lower_all(&inferred, &mut dropped)?;
     declarations.extend(kept.into_iter().filter(|d| match &d.node {
@@ -801,6 +848,13 @@ pub fn parse_program_with(
         let sig = &inferred.funcs[name];
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(lower::adapter(&inferred, name, sig)),
+            Type::Unknown,
+            Span::new(0, 0),
+        ));
+    }
+    for &k in inferred.class_adapters.borrow().iter() {
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(lower::class_adapter(&inferred, k)),
             Type::Unknown,
             Span::new(0, 0),
         ));
@@ -1040,6 +1094,32 @@ fn reachable_functions(body: &[py::Stmt], items: &[types::Item<'_>]) -> HashSet<
     reached
 }
 
+/// Every attribute name the program spells, `x.name`, in the module
+/// body and in every function.
+fn attribute_names(body: &[py::Stmt], items: &[types::Item<'_>]) -> HashSet<String> {
+    use ruff_python_ast::visitor::{Visitor, walk_expr};
+    #[derive(Default)]
+    struct Attrs(HashSet<String>);
+    impl<'a> Visitor<'a> for Attrs {
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            if let py::Expr::Attribute(a) = e {
+                self.0.insert(a.attr.to_string());
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut attrs = Attrs::default();
+    for s in body {
+        attrs.visit_stmt(s);
+    }
+    for item in items {
+        for s in &item.def.body {
+            attrs.visit_stmt(s);
+        }
+    }
+    attrs.0
+}
+
 /// Whether `body` reads any of `names`.
 fn reads_any_of(body: &[py::Stmt], names: &HashSet<String>) -> bool {
     use ruff_python_ast::visitor::{Visitor, walk_expr};
@@ -1084,7 +1164,42 @@ fn module_globals(
             }
         }
     }
+    // `globals()[name]` may reach any module variable by name.
+    if uses_globals(body, defs) {
+        for name in &module.bound {
+            if !functions.contains(name.as_str()) {
+                names.insert(name.clone());
+            }
+        }
+    }
     names.into_iter().collect()
+}
+
+/// Whether the program calls `globals()` anywhere.
+fn uses_globals(body: &[py::Stmt], defs: &[&py::StmtFunctionDef]) -> bool {
+    use ruff_python_ast::visitor::{Visitor, walk_expr};
+    #[derive(Default)]
+    struct Finder(bool);
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            if let py::Expr::Call(c) = e
+                && matches!(&*c.func, py::Expr::Name(n) if n.id.as_str() == "globals")
+            {
+                self.0 = true;
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut finder = Finder::default();
+    for s in body {
+        finder.visit_stmt(s);
+    }
+    for f in defs {
+        for s in &f.body {
+            finder.visit_stmt(s);
+        }
+    }
+    finder.0
 }
 
 pub(crate) fn intern(s: &str) -> InternedString {
@@ -1151,6 +1266,66 @@ fn lower_items(
         }
     }
     Ok(declarations)
+}
+
+/// The declarations of a method that failed to lower, each a function
+/// of its signature that raises the reason when called.
+fn lower_stub(
+    inferred: &types::Module,
+    item: &types::Item<'_>,
+    error: &Error,
+) -> Vec<TypedNode<TypedDeclaration>> {
+    let message = match error {
+        Error::Unsupported { what, .. } => format!("{what} is not supported"),
+        other => format!("{other:?}"),
+    };
+    let mut variants = vec![(item.name.clone(), false)];
+    if inferred.trusted.contains(&item.name) {
+        variants.push((types::trusted_name(&item.name), true));
+    }
+    let span = span_of(item.def);
+    let mut out = Vec::new();
+    for (name, trusted) in variants {
+        let sig = inferred.funcs[&item.name].clone();
+        let scope = scope::Scope::of_function(item.def);
+        let mut lowerer = lower::Lowerer::new(
+            inferred,
+            &item.name,
+            sig,
+            types::Locals::default(),
+            &scope,
+            Vec::new(),
+            HashMap::default(),
+        );
+        lowerer.class = item.class;
+        lowerer.trusted = trusted;
+        let func = lowerer.stub_function(&name, &message, span);
+        inferred
+            .raise_facts
+            .borrow_mut()
+            .insert(name, lowerer.raise_fact());
+        out.push(TypedNode::new(
+            TypedDeclaration::Function(func),
+            Type::Unknown,
+            span,
+        ));
+    }
+    out
+}
+
+/// A module-level `if True:` with no other branch (a version branch
+/// decided at link time) is its body: what it defines is the module's,
+/// not a closure's.
+fn flatten_true_if(stmt: py::Stmt) -> Vec<py::Stmt> {
+    match stmt {
+        py::Stmt::If(i)
+            if matches!(&*i.test, py::Expr::BooleanLiteral(b) if b.value)
+                && i.elif_else_clauses.is_empty() =>
+        {
+            i.body.into_iter().flat_map(flatten_true_if).collect()
+        }
+        other => vec![other],
+    }
 }
 
 pub(crate) fn span_of<N: Ranged>(node: &N) -> Span {

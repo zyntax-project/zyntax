@@ -125,8 +125,155 @@ pub fn string_empty() -> StringPtr {
 pub unsafe fn string_free(ptr: StringPtr) {
     if !ptr.is_null() {
         let len = *ptr as usize;
+        if len >= CHAR_INDEX_MIN {
+            char_index_forget(ptr);
+        }
         crate::heap::free(ptr as *mut u8, string_alloc_size(len), 4);
     }
+}
+
+/// Strings shorter than this are indexed by scanning; longer ones get a
+/// [`CharIndex`] on their first indexed access.
+const CHAR_INDEX_MIN: usize = 64;
+/// One byte offset is kept per this many characters.
+const CHAR_INDEX_STRIDE: usize = 32;
+
+/// Where the characters of a long string start, so indexing by
+/// character position costs a bounded scan rather than one from the
+/// front. An all-ASCII string needs no marks: a character is a byte.
+struct CharIndex {
+    len: usize,
+    chars: usize,
+    ascii: bool,
+    /// The byte offset of every `CHAR_INDEX_STRIDE`th character.
+    marks: Vec<u32>,
+    /// The string's first and last bytes, against a stale entry for
+    /// storage reused by another string after a free this did not see.
+    fingerprint: [u8; 16],
+}
+
+fn char_indexes() -> &'static std::sync::Mutex<std::collections::HashMap<usize, CharIndex>> {
+    static INDEXES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, CharIndex>>,
+    > = std::sync::OnceLock::new();
+    INDEXES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn fingerprint_of(bytes: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let head = bytes.len().min(8);
+    out[..head].copy_from_slice(&bytes[..head]);
+    let tail = bytes.len().min(8);
+    out[8..8 + tail].copy_from_slice(&bytes[bytes.len() - tail..]);
+    out
+}
+
+fn build_char_index(bytes: &[u8]) -> CharIndex {
+    let ascii = bytes.iter().all(|b| *b < 0x80);
+    let mut marks = Vec::new();
+    let mut chars = 0usize;
+    if ascii {
+        chars = bytes.len();
+    } else {
+        for (offset, b) in bytes.iter().enumerate() {
+            if (*b & 0xC0) != 0x80 {
+                if chars % CHAR_INDEX_STRIDE == 0 {
+                    marks.push(offset as u32);
+                }
+                chars += 1;
+            }
+        }
+    }
+    CharIndex {
+        len: bytes.len(),
+        chars,
+        ascii,
+        marks,
+        fingerprint: fingerprint_of(bytes),
+    }
+}
+
+/// Run `f` on the string's index, built if it is not there or is stale.
+fn with_char_index<R>(bytes: &[u8], key: usize, f: impl FnOnce(&CharIndex) -> R) -> R {
+    let mut indexes = char_indexes().lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = match indexes.get(&key) {
+        Some(index) => index.len == bytes.len() && index.fingerprint == fingerprint_of(bytes),
+        None => false,
+    };
+    if !fresh {
+        indexes.insert(key, build_char_index(bytes));
+    }
+    f(&indexes[&key])
+}
+
+fn char_index_forget(ptr: StringConstPtr) {
+    if let Ok(mut indexes) = char_indexes().lock() {
+        indexes.remove(&(ptr as usize));
+    }
+}
+
+/// The number of characters in a string.
+///
+/// # Safety
+/// The pointer must be null or a valid string.
+pub unsafe fn string_char_count(ptr: StringConstPtr) -> usize {
+    let bytes = unsafe { string_as_bytes(ptr) };
+    if bytes.len() < CHAR_INDEX_MIN {
+        return bytes.iter().filter(|b| (*b & 0xC0) != 0x80).count();
+    }
+    with_char_index(bytes, ptr as usize, |index| index.chars)
+}
+
+/// The byte range of the character at position `index`, or None past
+/// the end.
+///
+/// # Safety
+/// The pointer must be null or a valid string.
+pub unsafe fn string_char_range(
+    ptr: StringConstPtr,
+    index: usize,
+) -> Option<std::ops::Range<usize>> {
+    let bytes = unsafe { string_as_bytes(ptr) };
+    let width = |offset: usize| -> usize {
+        let b = bytes[offset];
+        let w = if b < 0x80 {
+            1
+        } else if b >= 0xF0 {
+            4
+        } else if b >= 0xE0 {
+            3
+        } else {
+            2
+        };
+        w.min(bytes.len() - offset)
+    };
+    let scan_from = |mut offset: usize, mut remaining: usize| -> Option<usize> {
+        while offset < bytes.len() {
+            if (bytes[offset] & 0xC0) != 0x80 {
+                if remaining == 0 {
+                    return Some(offset);
+                }
+                remaining -= 1;
+            }
+            offset += 1;
+        }
+        None
+    };
+    let start = if bytes.len() < CHAR_INDEX_MIN {
+        scan_from(0, index)?
+    } else {
+        with_char_index(bytes, ptr as usize, |ci| {
+            if index >= ci.chars {
+                return None;
+            }
+            if ci.ascii {
+                return Some(index);
+            }
+            let mark = ci.marks[index / CHAR_INDEX_STRIDE] as usize;
+            scan_from(mark, index % CHAR_INDEX_STRIDE)
+        })?
+    };
+    Some(start..start + width(start))
 }
 
 /// Copy a string

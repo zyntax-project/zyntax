@@ -265,6 +265,135 @@ impl Lowerer<'_> {
         Ok(Val { node, ty: Ty::Str })
     }
 
+    /// `"...{}...".format(args)` with a literal template: each field is
+    /// the argument it names, positional by count or index or keyword
+    /// by name, converted and formatted as an f-string's would be.
+    pub(crate) fn str_format(
+        &mut self,
+        template: &str,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        span: Span,
+    ) -> Result<Val> {
+        let mut pieces: Vec<Node> = Vec::new();
+        let mut literal = String::new();
+        let mut next_positional = 0usize;
+        let chars: Vec<char> = template.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '{' && chars.get(i + 1) == Some(&'{') {
+                literal.push('{');
+                i += 2;
+                continue;
+            }
+            if c == '}' && chars.get(i + 1) == Some(&'}') {
+                literal.push('}');
+                i += 2;
+                continue;
+            }
+            if c != '{' {
+                literal.push(c);
+                i += 1;
+                continue;
+            }
+            // A field: `{name!conv:spec}` up to the matching brace.
+            let start = i + 1;
+            let mut depth = 1;
+            let mut end = start;
+            while end < chars.len() {
+                match chars[end] {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                end += 1;
+            }
+            if end >= chars.len() {
+                return Err(Error::unsupported_span(
+                    "str.format with an unclosed `{`".to_string(),
+                    span,
+                ));
+            }
+            let field: String = chars[start..end].iter().collect();
+            i = end + 1;
+            if !literal.is_empty() {
+                pieces.push(crate::lower::str_lit(&literal, span));
+                literal.clear();
+            }
+            let (name, rest) = match field.find(['!', ':']) {
+                Some(at) => (&field[..at], &field[at..]),
+                None => (field.as_str(), ""),
+            };
+            let (conversion, spec) = match rest.strip_prefix('!') {
+                Some(r) => {
+                    let conv = r.chars().next();
+                    let spec = r.get(1..).and_then(|t| t.strip_prefix(':')).unwrap_or("");
+                    (conv, spec)
+                }
+                None => (None, rest.strip_prefix(':').unwrap_or(rest)),
+            };
+            let arg = if name.is_empty() {
+                let a = args.get(next_positional);
+                next_positional += 1;
+                a
+            } else if let Ok(index) = name.parse::<usize>() {
+                args.get(index)
+            } else {
+                keywords
+                    .iter()
+                    .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == name))
+                    .map(|k| &k.value)
+            };
+            let Some(arg) = arg else {
+                return Err(Error::unsupported_span(
+                    format!("str.format with no argument for `{{{field}}}`"),
+                    span,
+                ));
+            };
+            let value = self.expr(arg)?;
+            let value = match conversion {
+                Some('r') | Some('a') => Val {
+                    node: self.repr_of(value),
+                    ty: Ty::Str,
+                },
+                Some('s') => Val {
+                    node: self.str_of(value),
+                    ty: Ty::Str,
+                },
+                Some(other) => {
+                    return Err(Error::unsupported_span(
+                        format!("str.format conversion `!{other}`"),
+                        span,
+                    ));
+                }
+                None => value,
+            };
+            if spec.is_empty() {
+                pieces.push(self.str_of(value));
+            } else {
+                let parsed = parse_spec(spec).map_err(|message| {
+                    Error::unsupported_span(format!("format spec `{spec}` ({message})"), span)
+                })?;
+                pieces.push(self.format(value, &parsed, span));
+            }
+        }
+        if !literal.is_empty() {
+            pieces.push(crate::lower::str_lit(&literal, span));
+        }
+        let mut it = pieces.into_iter();
+        let first = it.next().unwrap_or_else(|| crate::lower::str_lit("", span));
+        let node = it.fold(first, |acc, piece| {
+            crate::lower::binary(BinaryOp::Add, acc, piece, Ty::Str, span)
+        });
+        Ok(Val { node, ty: Ty::Str })
+    }
+
     fn fstring_element(&mut self, element: &py::InterpolatedStringElement) -> Result<Node> {
         match element {
             py::InterpolatedStringElement::Literal(l) => {
@@ -351,7 +480,12 @@ impl Lowerer<'_> {
         Ok(Val { node, ty: Ty::Str })
     }
 
-    fn percent_field(&mut self, value: Val, field: &PercentField, span: Span) -> Result<Node> {
+    pub(crate) fn percent_field(
+        &mut self,
+        value: Val,
+        field: &PercentField,
+        span: Span,
+    ) -> Result<Node> {
         let mut spec = Spec {
             fill: if field.zero { "0" } else { " " }.to_string(),
             align: if field.left {

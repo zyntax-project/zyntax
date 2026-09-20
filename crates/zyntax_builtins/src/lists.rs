@@ -2191,17 +2191,19 @@ pub(crate) fn ptr_declarations(policy: &Policy) -> Vec<Decl> {
             ],
         ));
     }
+    // Two instances order by the frontend's `__lt__`, through boxes.
     d.push(define(
         "zb_ptr_lt",
         &[&a, &b],
         boolean(),
-        vec![
-            fatal(
-                "TypeError",
-                text("'<' not supported between instances of these objects"),
-            ),
-            ret(bool(false)),
-        ],
+        vec![ret(call(
+            "zb_hook_instance_lt",
+            vec![
+                call("zb_hook_box_instance", vec![a.e()], any()),
+                call("zb_hook_box_instance", vec![b.e()], any()),
+            ],
+            boolean(),
+        ))],
     ));
     d
 }
@@ -2247,6 +2249,19 @@ pub(crate) fn shape_hook_declarations(policy: &Policy, list_type: TypeId) -> Vec
             string(),
             None,
         ));
+        d.push(extern_fn(
+            "zb_hook_shaped_assign_slice",
+            &[
+                ("x", any()),
+                ("ys", anys.clone()),
+                ("start", i64()),
+                ("stop", i64()),
+                ("step", i64()),
+                ("mask", i64()),
+            ],
+            unit(),
+            None,
+        ));
         return d;
     }
     let unknown = || fatal("TypeError", text("a list of an unknown kind"));
@@ -2279,6 +2294,17 @@ pub(crate) fn shape_hook_declarations(policy: &Policy, list_type: TypeId) -> Vec
         &[&x],
         string(),
         vec![unknown(), ret(text(""))],
+    ));
+    let ys = borrowed("ys", anys.clone());
+    let start = local("start", i64());
+    let stop = local("stop", i64());
+    let step = local("step", i64());
+    let mask = local("mask", i64());
+    d.push(define(
+        "zb_hook_shaped_assign_slice",
+        &[&x, &ys, &start, &stop, &step, &mask],
+        unit(),
+        vec![unknown(), ret_void()],
     ));
     d
 }
@@ -2459,6 +2485,81 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 )],
                 unit(),
             )),
+            ret(chars.e()),
+        ],
+    ));
+    // splitlines: pieces between `\n`, `\r\n` and `\r`, no trailing
+    // empty piece. The next break is the nearer of the next `\n` and
+    // the next `\r`, each found by the host.
+    let nl = local("nl", i64());
+    let cr = local("cr", i64());
+    let cut = local("cut", i64());
+    let after = local("after", i64());
+    let find = |what: &str, from: Expr| {
+        call(
+            "zb_str_index_of_from",
+            vec![text_in.e(), text(what), from],
+            i64(),
+        )
+    };
+    d.push(define(
+        "zb_str_splitlines",
+        &[&text_in],
+        strs.clone(),
+        vec![
+            chars.decl(list(Vec::new(), strs.clone())),
+            n.decl(call("zb_str_len", vec![text_in.e()], i64())),
+            pos.decl(int(0)),
+            while_(
+                lt(pos.e(), n.e()),
+                vec![
+                    nl.decl(find("\n", pos.e())),
+                    cr.decl(find("\r", pos.e())),
+                    cut.decl(nl.e()),
+                    when(
+                        and(
+                            ge(cr.e(), int(0)),
+                            or(lt(cut.e(), int(0)), lt(cr.e(), cut.e())),
+                        ),
+                        vec![cut.set(cr.e())],
+                    ),
+                    if_(
+                        lt(cut.e(), int(0)),
+                        vec![
+                            expr(mcall(
+                                chars.e(),
+                                "push",
+                                vec![call(
+                                    "zb_str_bytes",
+                                    vec![text_in.e(), pos.e(), n.e()],
+                                    string(),
+                                )],
+                                unit(),
+                            )),
+                            pos.set(n.e()),
+                        ],
+                        vec![
+                            expr(mcall(
+                                chars.e(),
+                                "push",
+                                vec![call(
+                                    "zb_str_bytes",
+                                    vec![text_in.e(), pos.e(), cut.e()],
+                                    string(),
+                                )],
+                                unit(),
+                            )),
+                            after.decl(add(cut.e(), int(1))),
+                            // `\r\n` is one break.
+                            when(
+                                and(eq(cut.e(), cr.e()), eq(nl.e(), add(cr.e(), int(1)))),
+                                vec![after.set(add(cut.e(), int(2)))],
+                            ),
+                            pos.set(after.e()),
+                        ],
+                    ),
+                ],
+            ),
             ret(chars.e()),
         ],
     ));
