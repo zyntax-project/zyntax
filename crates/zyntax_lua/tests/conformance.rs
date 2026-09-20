@@ -208,6 +208,11 @@ fn ours_for(case: &Path) -> Outcome {
 /// Run every case in one category and report.
 fn category(name: &str) {
     let dir = root().join(name);
+    // The official suite ships `libs/P1` as an empty directory, which
+    // a checkout cannot hold; `attrib.lua` writes into it.
+    if name == "official" {
+        let _ = fs::create_dir_all(dir.join("libs").join("P1"));
+    }
     let known = known_failures();
     let mut cases: Vec<PathBuf> = fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("no conformance category `{name}` at {}: {e}", dir.display()))

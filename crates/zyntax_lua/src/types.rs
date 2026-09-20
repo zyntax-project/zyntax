@@ -176,6 +176,30 @@ impl ShapeInfo {
     }
 }
 
+/// One step of a field lookup through metatables, as the runtime
+/// takes it from the table in hand.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hop {
+    /// To the table's metatable, a table of this shape.
+    Meta(ShapeId),
+    /// The table, of this shape, lacks the field: the lookup goes on.
+    Absent(ShapeId),
+    /// Through the `__index` field of the table, of this shape, which
+    /// holds a table.
+    Index(ShapeId),
+}
+
+/// Where a lookup of a name may end: the field of a table of shape
+/// `shape`, reached by `hops`, holding `ty`; `sure` when the field is
+/// always there.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Lookup {
+    pub hops: Vec<Hop>,
+    pub shape: ShapeId,
+    pub ty: Ty,
+    pub sure: bool,
+}
+
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct Inferred {
     pub funcs: HashMap<FuncId, Sig>,
@@ -257,6 +281,90 @@ impl Inferred {
             table = self.index_behind(table)?;
         }
         Some(out)
+    }
+
+    /// Where reading `name` from a table of shape `k` may end, as the
+    /// runtime looks it up: the table's own field, then, when that is
+    /// absent, its metatable's `__index` table and the tables behind
+    /// it. None when the chain is not one the types follow to its end
+    /// (a metatable they do not know, an `__index` that is not a
+    /// table, a class with several metatables); an empty list when
+    /// the name is nowhere along it.
+    pub fn lookups(&self, k: ShapeId, name: &str) -> Option<Vec<Lookup>> {
+        let mut out = Vec::new();
+        let mut hops = Vec::new();
+        let info = self.shape(k);
+        if let Some((_, ty)) = info.field(name) {
+            let sure = info.always_present(name);
+            out.push(Lookup {
+                hops: hops.clone(),
+                shape: k,
+                ty,
+                sure,
+            });
+            if sure {
+                return Some(out);
+            }
+            hops.push(Hop::Absent(k));
+        }
+        if info.unknown_meta {
+            return None;
+        }
+        for class in &info.classes {
+            let mut hops = hops.clone();
+            hops.push(Hop::Meta(*class));
+            self.lookups_behind(*class, name, hops, &mut out)?;
+        }
+        Some(out)
+    }
+
+    /// The lookups of `name` that go through the `__index` of a
+    /// metatable of shape `class`.
+    fn lookups_behind(
+        &self,
+        class: ShapeId,
+        name: &str,
+        mut hops: Vec<Hop>,
+        out: &mut Vec<Lookup>,
+    ) -> Option<()> {
+        let mut table = match self.shape(class).field("__index") {
+            Some((_, Ty::Shape(t))) => t,
+            _ => return None,
+        };
+        hops.push(Hop::Index(class));
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert(table) {
+                return None;
+            }
+            let info = self.shape(table);
+            if let Some((_, ty)) = info.field(name) {
+                let sure = info.always_present(name);
+                out.push(Lookup {
+                    hops: hops.clone(),
+                    shape: table,
+                    ty,
+                    sure,
+                });
+                if sure {
+                    return Some(());
+                }
+                hops.push(Hop::Absent(table));
+            }
+            if !info.unknown_meta && info.classes.is_empty() {
+                return Some(());
+            }
+            if info.unknown_meta || info.classes.len() != 1 {
+                return None;
+            }
+            let behind = *info.classes.iter().next()?;
+            hops.push(Hop::Meta(behind));
+            table = match self.shape(behind).field("__index") {
+                Some((_, Ty::Shape(next))) => next,
+                _ => return None,
+            };
+            hops.push(Hop::Index(behind));
+        }
     }
 
     /// The table a lookup goes on to when a table of shape `t` lacks a
@@ -1101,6 +1209,21 @@ impl<'a> Round<'a> {
     /// `getmetatable`.
     fn settle_shapes(&mut self) {
         let dynamic_code = self.scopes.dynamic_code;
+        // A function under a metamethod's name is called by the
+        // runtime, with dynamic values, wherever its table serves as a
+        // metatable: it escapes. `__index` and `__newindex` too, when
+        // they are functions.
+        for k in 0..self.out.shapes.len() {
+            let metamethods: Vec<Ty> = self.out.shapes[k]
+                .fields
+                .iter()
+                .filter(|(name, _)| name.starts_with("__"))
+                .map(|(_, ty)| *ty)
+                .collect();
+            for ty in metamethods {
+                self.escape(ty);
+            }
+        }
         loop {
             let mut changed = false;
             for k in 0..self.out.shapes.len() {
@@ -1122,12 +1245,11 @@ impl<'a> Round<'a> {
                         Ty::Func(f)
                             if (self.blind_reads.contains(name)
                                 || self.blind_getmetatable
-                                || dynamic_code) =>
+                                || dynamic_code)
+                                && !self.out.escaping.contains(f) =>
                         {
-                            if !self.out.escaping.contains(f) {
-                                self.escape(Ty::Func(*f));
-                                changed = true;
-                            }
+                            self.escape(Ty::Func(*f));
+                            changed = true;
                         }
                         _ => {}
                     }

@@ -1,0 +1,15 @@
+false	method_lookup.lua:4: attempt to call a nil value (method 'm')
+1
+own
+1
+hello from A	hello from B	hello from B
+42
+false	method_lookup.lua:31: attempt to call a nil value (method 'late')
+6
+E
+dyn f
+g
+false	method_lookup.lua:46: attempt to call a nil value (method 'g')
+G.anything
+14	8
+36

@@ -22,8 +22,9 @@ use zyntax_builtins::functions::{VARIADIC_ARITY, arity_word};
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
     BinaryOp, ParamOwnership, TypedBinary, TypedBlock, TypedCall, TypedCast, TypedDeclaration,
-    TypedExpression, TypedFunction, TypedIf, TypedIfExpr, TypedIndex, TypedLet, TypedLiteral,
-    TypedParameter, TypedStatement, TypedUnary, TypedVariable, TypedWhile, UnaryOp,
+    TypedExpression, TypedFieldAccess, TypedFieldInit, TypedFunction, TypedIf, TypedIfExpr,
+    TypedIndex, TypedLet, TypedLiteral, TypedParameter, TypedStatement, TypedStructLiteral,
+    TypedUnary, TypedVariable, TypedWhile, UnaryOp,
 };
 use zyntax_typed_ast::{
     InternedString, Mutability, PrimitiveType, Type, TypedNode, TypedProgram, Visibility,
@@ -33,8 +34,9 @@ use crate::library::stdlib::{Builtin, Param, Ret};
 use crate::library::values::*;
 use crate::library::{self, Types};
 use crate::scope::{Binding, CHUNK, FuncId, Scopes, VarId};
-use crate::types::{self, Inferred, Returns, Ty, Typer, ident};
+use crate::types::{self, Hop, Inferred, Returns, ShapeId, Ty, Typer, ident};
 use crate::{ENTRY, Error, Library, Result, intern, prim};
+use zyntax_typed_ast::TypeId;
 
 type Node = TypedNode<TypedExpression>;
 type St = TypedNode<TypedStatement>;
@@ -104,11 +106,11 @@ enum Storage {
     Module(InternedString, Ty),
 }
 
-/// Where the record of a captured variable sits: `env[RECORD_CELLS_AT
-/// + i]` for the `i`th capture of the function. Before the captures,
-/// after the code and the arity every record has, sits the function's
-/// number: what tells a call site which known function a value is,
-/// since the code's address changes as the function is compiled again.
+/// Where the record of a captured variable sits: `env[RECORD_CELLS_AT +
+/// i]` for the `i`th capture of the function. Before the captures, after
+/// the code and the arity every record has, sits the function's number:
+/// what tells a call site which known function a value is, since the
+/// code's address changes as the function is compiled again.
 const RECORD_CELLS_AT: usize = 3;
 
 /// The whole program as the lowerers share it.
@@ -151,6 +153,137 @@ struct Module<'a> {
     module_vars: RefCell<Vec<(InternedString, Ty)>>,
     /// What each function's lowering found about its raising.
     facts: RefCell<HashMap<FuncId, RaiseFact>>,
+    /// How each shape's tables are laid out, by shape; none for a shape
+    /// whose tables are plain.
+    layouts: Vec<Option<ShapeLayout>>,
+}
+
+/// How a shape's tables are laid out: the table header, then one slot
+/// per field, each stored as its type. The struct is registered as
+/// `name` under `id`; `gid` is the number a table carries in its
+/// header, unique across the program's chunks.
+struct ShapeLayout {
+    id: TypeId,
+    name: String,
+    gid: i64,
+    slots: Vec<Slot>,
+}
+
+#[derive(Clone)]
+struct Slot {
+    name: String,
+    /// The slot's bit in the header's `present` word.
+    bit: usize,
+    kind: SlotKind,
+}
+
+/// What a slot stores.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotKind {
+    Int,
+    Float,
+    Bool,
+    Str,
+    Table,
+    /// A tagged scalar: three fields.
+    Scalar,
+    /// A boxed value, null for nil.
+    Any,
+}
+
+impl Slot {
+    fn kind_of(ty: Ty) -> SlotKind {
+        match ty {
+            Ty::Int => SlotKind::Int,
+            Ty::Float => SlotKind::Float,
+            Ty::Bool => SlotKind::Bool,
+            Ty::Str => SlotKind::Str,
+            Ty::Table | Ty::Shape(_) => SlotKind::Table,
+            Ty::Number | Ty::Scalar => SlotKind::Scalar,
+            Ty::Nil | Ty::Func(_) | Ty::Any | Ty::Unknown => SlotKind::Any,
+        }
+    }
+
+    /// The type a slot's value is read as, and stored as: its kind's.
+    fn stored_ty(&self) -> Ty {
+        match self.kind {
+            SlotKind::Int => Ty::Int,
+            SlotKind::Float => Ty::Float,
+            SlotKind::Bool => Ty::Bool,
+            SlotKind::Str => Ty::Str,
+            SlotKind::Table => Ty::Table,
+            SlotKind::Scalar => Ty::Scalar,
+            SlotKind::Any => Ty::Any,
+        }
+    }
+
+    /// The struct fields the slot occupies.
+    fn fields(&self, table_ty: &Type) -> Vec<(String, Type)> {
+        let base = format!("s{}", self.bit);
+        match self.kind {
+            SlotKind::Int => vec![(base, prim(PrimitiveType::I64))],
+            SlotKind::Float => vec![(base, prim(PrimitiveType::F64))],
+            SlotKind::Bool => vec![(base, prim(PrimitiveType::Bool))],
+            SlotKind::Str => vec![(base, prim(PrimitiveType::String))],
+            SlotKind::Table => vec![(base, table_ty.clone())],
+            SlotKind::Any => vec![(base, Type::Any)],
+            SlotKind::Scalar => vec![
+                (format!("{base}t"), prim(PrimitiveType::I64)),
+                (format!("{base}i"), prim(PrimitiveType::I64)),
+                (format!("{base}f"), prim(PrimitiveType::F64)),
+            ],
+        }
+    }
+
+    fn mask(&self) -> i64 {
+        1i64 << self.bit
+    }
+}
+
+/// The most slots a shape has: the bits of the header's `present` word.
+const MAX_SLOTS: usize = 63;
+
+/// A lookup of a name as run-time checks: when `guard` (a held
+/// boolean) holds, the lookup ends in slot `slot` of `table` (a held
+/// table pointer, laid out by `layout`), whose field is typed `ty`.
+struct Resolved<'a> {
+    guard: Node,
+    table: Node,
+    layout: &'a ShapeLayout,
+    slot: Slot,
+    ty: Ty,
+}
+
+/// The layouts of a chunk's shapes: a shape with fields, and not too
+/// many, gets slots. With `slots` off (a chunk compiled at run time,
+/// whose shapes the program's hooks do not know), none does.
+fn shape_layouts(inferred: &Inferred, chunk_index: i64, slots: bool) -> Vec<Option<ShapeLayout>> {
+    inferred
+        .shapes
+        .iter()
+        .enumerate()
+        .map(|(k, info)| {
+            if !slots || info.fields.is_empty() || info.fields.len() > MAX_SLOTS {
+                return None;
+            }
+            let gid = (chunk_index << 20) + k as i64 + 1;
+            Some(ShapeLayout {
+                id: TypeId::next(),
+                name: format!("LuaTable${gid}"),
+                gid,
+                slots: info
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(bit, (name, ty))| Slot {
+                        name: name.clone(),
+                        bit,
+                        kind: Slot::kind_of(ty.settled()),
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 /// What one lowering of a function found: whether it raises itself
@@ -259,6 +392,43 @@ impl<'a> Module<'a> {
             Some(set) => set.contains(&f),
             None => true,
         }
+    }
+
+    /// The struct of each slotted shape, declared and registered, and
+    /// its layout handed on for the hooks.
+    fn declare_shapes(
+        &mut self,
+        declarations: &mut Vec<TypedNode<TypedDeclaration>>,
+        registry: &mut zyntax_typed_ast::TypeRegistry,
+        hooks: &mut Vec<ShapeLayout>,
+    ) {
+        for layout in std::mem::take(&mut self.layouts).into_iter().flatten() {
+            let fields = self.layout_fields(&layout);
+            library::declare_reference_struct(registry, layout.id, &layout.name, &fields);
+            declarations.push(library::reference_struct_class(&layout.name, &fields));
+            hooks.push(layout);
+        }
+    }
+
+    /// How a shape's tables are laid out, when they have slots.
+    fn layout(&self, k: ShapeId) -> Option<&ShapeLayout> {
+        self.layouts.get(k.0 as usize).and_then(|l| l.as_ref())
+    }
+
+    /// The struct type of a layout's tables, as a pointer.
+    fn shape_ty(&self, layout: &ShapeLayout) -> Type {
+        library::table_ty(layout.id)
+    }
+
+    /// Every field of a layout's struct: the table header, then the
+    /// slots.
+    fn layout_fields(&self, layout: &ShapeLayout) -> Vec<(String, Type)> {
+        let table_ty = self.types.table();
+        let mut fields = library::table_header_fields(self.types.table_type);
+        for slot in &layout.slots {
+            fields.extend(slot.fields(&table_ty));
+        }
+        fields
     }
 
     /// Whether a function's depth is known bounded, so it keeps no
@@ -593,6 +763,23 @@ fn index(xs: Node, i: Node, ty: Type, span: Span) -> Node {
         ty,
         span,
     )
+}
+
+/// `obj.field`, a struct field read.
+fn field(obj: Node, name: &str, ty: Type, span: Span) -> Node {
+    node(
+        TypedExpression::Field(TypedFieldAccess {
+            object: Box::new(obj),
+            field: intern(name),
+        }),
+        ty,
+        span,
+    )
+}
+
+/// `t` as a pointer to the struct of a shape's tables.
+fn as_shape(t: Node, shape_ty: Type, span: Span) -> Node {
+    cast(cast(t, prim(PrimitiveType::I64), span), shape_ty, span)
 }
 
 fn assign(target: Node, value: Node, span: Span) -> St {
@@ -1563,6 +1750,350 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         );
         let signed_zero = binary(BinaryOp::Mul, x, float_lit(0.0, span), f64_t.clone(), span);
         block_value(pre, if_value(zero, signed_zero, r, f64_t, span), span)
+    }
+
+    // ─── slots ───────────────────────────────────────────────────
+    // A shaped table's constant-key fields sit in typed slots after
+    // the table header, with a bit in the header's `present` word for
+    // each that holds a value.
+
+    /// The slot a field has in a shape's tables, when they have slots.
+    fn slot_of(&self, k: ShapeId, name: &str) -> Option<(&'m ShapeLayout, Slot)> {
+        let layout = self.m.layout(k)?;
+        let slot = layout.slots.iter().find(|s| s.name == name)?;
+        Some((layout, slot.clone()))
+    }
+
+    /// The lookups of `name` from `t`, a held table of shape `k`, as
+    /// run-time checks: for each, a guard over the tables on its way,
+    /// evaluated in order (each check only where the one before it
+    /// holds, so nothing is read through a null), and the slot it ends
+    /// in. The guards go into `pre`. None when the types do not follow
+    /// the lookup to its end, when a table on the way has no slots,
+    /// or when the name is nowhere along it.
+    fn resolve_lookups(
+        &mut self,
+        t: &Val,
+        k: ShapeId,
+        name: &str,
+        pre: &mut Vec<St>,
+        span: Span,
+    ) -> Option<Vec<Resolved<'m>>> {
+        let lookups = self.m.inferred.lookups(k, name)?;
+        if lookups.is_empty() {
+            return None;
+        }
+        let table_t = self.ir(Ty::Table);
+        let bool_t = prim(PrimitiveType::Bool);
+        let i64_t = prim(PrimitiveType::I64);
+        let not_null = |x: &Node| {
+            binary(
+                BinaryOp::Ne,
+                x.clone(),
+                null(table_t.clone(), span),
+                bool_t.clone(),
+                span,
+            )
+        };
+        let start = self.hold(
+            Val {
+                node: not_null(&t.node),
+                ty: Ty::Bool,
+            },
+            pre,
+        );
+        let mut out = Vec::new();
+        for lookup in &lookups {
+            let mut g = start.node.clone();
+            let mut x = t.node.clone();
+            // `g` holding means `x` is a table.
+            for hop in &lookup.hops {
+                match *hop {
+                    Hop::Meta(k) => {
+                        let layout = self.m.layout(k)?;
+                        let meta = if_value(
+                            g.clone(),
+                            field(x.clone(), "meta", table_t.clone(), span),
+                            null(table_t.clone(), span),
+                            table_t.clone(),
+                            span,
+                        );
+                        x = self
+                            .hold(
+                                Val {
+                                    node: meta,
+                                    ty: Ty::Table,
+                                },
+                                pre,
+                            )
+                            .node;
+                        let shape_is = binary(
+                            BinaryOp::Eq,
+                            field(x.clone(), "shape", i64_t.clone(), span),
+                            int_lit(layout.gid, span),
+                            bool_t.clone(),
+                            span,
+                        );
+                        let ok = if_value(
+                            g,
+                            if_value(
+                                not_null(&x),
+                                shape_is,
+                                bool_lit(false, span),
+                                bool_t.clone(),
+                                span,
+                            ),
+                            bool_lit(false, span),
+                            bool_t.clone(),
+                            span,
+                        );
+                        g = self
+                            .hold(
+                                Val {
+                                    node: ok,
+                                    ty: Ty::Bool,
+                                },
+                                pre,
+                            )
+                            .node;
+                    }
+                    Hop::Absent(k) => {
+                        let (_, slot) = self.slot_of(k, name)?;
+                        let absent = binary(
+                            BinaryOp::Eq,
+                            binary(
+                                BinaryOp::BitAnd,
+                                self.present_of(&x, span),
+                                int_lit(slot.mask(), span),
+                                i64_t.clone(),
+                                span,
+                            ),
+                            int_lit(0, span),
+                            bool_t.clone(),
+                            span,
+                        );
+                        let ok = if_value(g, absent, bool_lit(false, span), bool_t.clone(), span);
+                        g = self
+                            .hold(
+                                Val {
+                                    node: ok,
+                                    ty: Ty::Bool,
+                                },
+                                pre,
+                            )
+                            .node;
+                    }
+                    Hop::Index(k) => {
+                        let (layout, slot) = self.slot_of(k, "__index")?;
+                        if slot.kind != SlotKind::Table {
+                            return None;
+                        }
+                        let ok = if_value(
+                            g,
+                            self.slot_present(&x, &slot, span),
+                            bool_lit(false, span),
+                            bool_t.clone(),
+                            span,
+                        );
+                        g = self
+                            .hold(
+                                Val {
+                                    node: ok,
+                                    ty: Ty::Bool,
+                                },
+                                pre,
+                            )
+                            .node;
+                        let through = if_value(
+                            g.clone(),
+                            self.slot_read(&x, layout, &slot, span).node,
+                            null(table_t.clone(), span),
+                            table_t.clone(),
+                            span,
+                        );
+                        x = self
+                            .hold(
+                                Val {
+                                    node: through,
+                                    ty: Ty::Table,
+                                },
+                                pre,
+                            )
+                            .node;
+                    }
+                }
+            }
+            let (layout, slot) = self.slot_of(lookup.shape, name)?;
+            if !lookup.sure {
+                let ok = if_value(
+                    g,
+                    self.slot_present(&x, &slot, span),
+                    bool_lit(false, span),
+                    bool_t.clone(),
+                    span,
+                );
+                g = self
+                    .hold(
+                        Val {
+                            node: ok,
+                            ty: Ty::Bool,
+                        },
+                        pre,
+                    )
+                    .node;
+            }
+            out.push(Resolved {
+                guard: g,
+                table: x,
+                layout,
+                slot,
+                ty: lookup.ty,
+            });
+        }
+        Some(out)
+    }
+
+    /// The `present` word of table `t`.
+    fn present_of(&self, t: &Node, span: Span) -> Node {
+        field(t.clone(), "present", prim(PrimitiveType::I64), span)
+    }
+
+    /// Whether slot `slot` of table `t` holds a value.
+    fn slot_present(&self, t: &Node, slot: &Slot, span: Span) -> Node {
+        let i64_t = prim(PrimitiveType::I64);
+        binary(
+            BinaryOp::Ne,
+            binary(
+                BinaryOp::BitAnd,
+                self.present_of(t, span),
+                int_lit(slot.mask(), span),
+                i64_t,
+                span,
+            ),
+            int_lit(0, span),
+            prim(PrimitiveType::Bool),
+            span,
+        )
+    }
+
+    /// The value in slot `slot` of table `t`, as the slot stores it.
+    fn slot_read(&self, t: &Node, layout: &ShapeLayout, slot: &Slot, span: Span) -> Val {
+        let shaped = as_shape(t.clone(), self.m.shape_ty(layout), span);
+        let base = format!("s{}", slot.bit);
+        let node = match slot.kind {
+            SlotKind::Scalar => number_value(
+                field(
+                    shaped.clone(),
+                    &format!("{base}t"),
+                    prim(PrimitiveType::I64),
+                    span,
+                ),
+                field(
+                    shaped.clone(),
+                    &format!("{base}i"),
+                    prim(PrimitiveType::I64),
+                    span,
+                ),
+                field(shaped, &format!("{base}f"), prim(PrimitiveType::F64), span),
+                span,
+            ),
+            _ => field(shaped, &base, self.ir(slot.stored_ty()), span),
+        };
+        Val {
+            node,
+            ty: slot.stored_ty(),
+        }
+    }
+
+    /// Statements storing `value`, already of the slot's stored type,
+    /// into slot `slot` of table `t`, and setting its bit; a value that
+    /// may be nil clears the bit when it is.
+    fn slot_write(
+        &mut self,
+        t: &Node,
+        layout: &ShapeLayout,
+        slot: &Slot,
+        value: Node,
+        span: Span,
+    ) -> Vec<St> {
+        let i64_t = prim(PrimitiveType::I64);
+        let shaped = as_shape(t.clone(), self.m.shape_ty(layout), span);
+        let base = format!("s{}", slot.bit);
+        let mut out = Vec::new();
+        let value = self
+            .hold(
+                Val {
+                    node: value,
+                    ty: slot.stored_ty(),
+                },
+                &mut out,
+            )
+            .node;
+        match slot.kind {
+            SlotKind::Scalar => {
+                let parts = NumberParts::of(&value, span);
+                out.push(assign(
+                    field(shaped.clone(), &format!("{base}t"), i64_t.clone(), span),
+                    parts.tag,
+                    span,
+                ));
+                out.push(assign(
+                    field(shaped.clone(), &format!("{base}i"), i64_t.clone(), span),
+                    parts.int,
+                    span,
+                ));
+                out.push(assign(
+                    field(shaped, &format!("{base}f"), prim(PrimitiveType::F64), span),
+                    parts.float,
+                    span,
+                ));
+            }
+            _ => out.push(assign(
+                field(shaped, &base, self.ir(slot.stored_ty()), span),
+                value.clone(),
+                span,
+            )),
+        }
+        let present = self.present_of(t, span);
+        let set = binary(
+            BinaryOp::BitOr,
+            present.clone(),
+            int_lit(slot.mask(), span),
+            i64_t.clone(),
+            span,
+        );
+        let updated = match self.slot_nil(&value, slot, span) {
+            Some(is_nil) => {
+                let cleared = binary(
+                    BinaryOp::BitAnd,
+                    present.clone(),
+                    int_lit(!slot.mask(), span),
+                    i64_t.clone(),
+                    span,
+                );
+                if_value(is_nil, cleared, set, i64_t, span)
+            }
+            None => set,
+        };
+        out.push(assign(present, updated, span));
+        out
+    }
+
+    /// Whether a value of the slot's stored type is nil, when it can be.
+    fn slot_nil(&self, value: &Node, slot: &Slot, span: Span) -> Option<Node> {
+        let bool_t = prim(PrimitiveType::Bool);
+        match slot.kind {
+            SlotKind::Scalar => Some(NumberParts::of(value, span).has_tag(TAG_NIL, span)),
+            SlotKind::Any => Some(binary(BinaryOp::Eq, value.clone(), nil(span), bool_t, span)),
+            SlotKind::Table => Some(binary(
+                BinaryOp::Eq,
+                value.clone(),
+                null(self.ir(Ty::Table), span),
+                bool_t,
+                span,
+            )),
+            _ => None,
+        }
     }
 
     /// The parts of a number, held first unless it is a plain read.
@@ -2692,10 +3223,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             pow2: pow2_divisor,
         };
         // A number whose kind is not known decides it at run time.
-        if numbers && (a.ty == Ty::Number || b.ty == Ty::Number) {
-            if let Some(v) = self.number_binary(op, a.clone(), b.clone(), divisor, span) {
-                return Ok(v);
-            }
+        if numbers
+            && (a.ty == Ty::Number || b.ty == Ty::Number)
+            && let Some(v) = self.number_binary(op, a.clone(), b.clone(), divisor, span)
+        {
+            return Ok(v);
         }
         // A scalar that may not be a number: arithmetic and ordering
         // raise for nil and booleans as the dynamic value does, then
@@ -3406,6 +3938,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             .collect();
         let arr = self.packed_list(&positional, span)?;
         let table_t = self.ir(Ty::Table);
+        // A constructor of a slotted shape lays its table out itself.
+        if let Some(k) = types::constructor_shape(self.m.inferred, t)
+            && self.m.layout(k).is_some()
+        {
+            return self.shaped_constructor(k, &fields, arr, positional.len(), span);
+        }
         let table = call("zl_table_with_arr", vec![arr], table_t.clone(), span);
         let keyed: Vec<&ast::Field> = fields
             .iter()
@@ -3445,6 +3983,179 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         })
     }
 
+    /// A constructor whose tables have shape `k`, laid out with its
+    /// slots: the header, then each constant-key field in its slot,
+    /// present when its value is not nil. Fields under other keys are
+    /// stored afterwards, as into a plain table.
+    fn shaped_constructor(
+        &mut self,
+        k: ShapeId,
+        fields: &[&ast::Field],
+        arr: Node,
+        positional: usize,
+        span: Span,
+    ) -> Result<Val> {
+        let table_t = self.ir(Ty::Table);
+        let i64_t = prim(PrimitiveType::I64);
+        let layout = self.m.layout(k).expect("a slotted shape");
+        let shape_ty = self.m.shape_ty(layout);
+        let gid = layout.gid;
+        let slot_of = |name: &str| layout.slots.iter().find(|s| s.name == name).cloned();
+        // The values, in source order, kept apart from the slots they
+        // go in.
+        let mut pre = Vec::new();
+        let mut slot_values: Vec<(Slot, Val)> = Vec::new();
+        let mut other: Vec<(Val, Val)> = Vec::new();
+        for f in fields {
+            match f {
+                ast::Field::NameKey { key, value, .. } => {
+                    let v = self.expr(value)?;
+                    let v = self.hold(v, &mut pre);
+                    let name = ident(key);
+                    match slot_of(&name) {
+                        Some(slot) => slot_values.push((slot, v)),
+                        None => other.push((
+                            Val {
+                                node: str_lit(&name, span),
+                                ty: Ty::Str,
+                            },
+                            v,
+                        )),
+                    }
+                }
+                ast::Field::ExpressionKey { key, value, .. } => {
+                    let kv = self.expr(key)?;
+                    let kv = self.hold(kv, &mut pre);
+                    let v = self.expr(value)?;
+                    let v = self.hold(v, &mut pre);
+                    match crate::scope::literal_string(key).and_then(|n| slot_of(&n)) {
+                        Some(slot) => slot_values.push((slot, v)),
+                        None => other.push((kv, v)),
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A key given twice: the last value stands, as in a plain table.
+        let mut inits: Vec<TypedFieldInit> = Vec::new();
+        let mut present: Node = int_lit(0, span);
+        let mut filled: Vec<usize> = Vec::new();
+        let layout = self.m.layout(k).expect("a slotted shape");
+        for slot in &layout.slots {
+            let value = slot_values
+                .iter()
+                .rev()
+                .find(|(s, _)| s.bit == slot.bit)
+                .map(|(_, v)| v.clone());
+            let stored = match value {
+                Some(v) => {
+                    filled.push(slot.bit);
+                    let stored = self.coerce(v, slot.stored_ty());
+                    let stored = self
+                        .hold(
+                            Val {
+                                node: stored,
+                                ty: slot.stored_ty(),
+                            },
+                            &mut pre,
+                        )
+                        .node;
+                    let bit = match self.slot_nil(&stored, slot, span) {
+                        Some(is_nil) => if_value(
+                            is_nil,
+                            int_lit(0, span),
+                            int_lit(slot.mask(), span),
+                            i64_t.clone(),
+                            span,
+                        ),
+                        None => int_lit(slot.mask(), span),
+                    };
+                    present = binary(BinaryOp::BitOr, present, bit, i64_t.clone(), span);
+                    stored
+                }
+                None => self.zero_of(slot.stored_ty(), span),
+            };
+            match slot.kind {
+                SlotKind::Scalar => {
+                    let parts = NumberParts::of(&stored, span);
+                    for (suffix, part) in [("t", parts.tag), ("i", parts.int), ("f", parts.float)] {
+                        inits.push(TypedFieldInit {
+                            name: intern(&format!("s{}{suffix}", slot.bit)),
+                            value: Box::new(part),
+                        });
+                    }
+                }
+                _ => inits.push(TypedFieldInit {
+                    name: intern(&format!("s{}", slot.bit)),
+                    value: Box::new(stored),
+                }),
+            }
+        }
+        // The struct's initializers are plain reads: the presence word
+        // and the array part are settled ahead of it.
+        let present = self
+            .hold(
+                Val {
+                    node: present,
+                    ty: Ty::Int,
+                },
+                &mut pre,
+            )
+            .node;
+        let arr = self
+            .hold(
+                Val {
+                    node: call("zl_arr_box", vec![arr], Type::Any, span),
+                    ty: Ty::Any,
+                },
+                &mut pre,
+            )
+            .node;
+        let header = [
+            ("arr", arr),
+            ("hash", nil(span)),
+            ("meta", null(table_t.clone(), span)),
+            ("high", int_lit(positional as i64, span)),
+            ("shape", int_lit(gid, span)),
+            ("present", present),
+        ];
+        let mut all: Vec<TypedFieldInit> = header
+            .into_iter()
+            .map(|(name, value)| TypedFieldInit {
+                name: intern(name),
+                value: Box::new(value),
+            })
+            .collect();
+        all.extend(inits);
+        let object = node(
+            TypedExpression::Struct(TypedStructLiteral {
+                name: intern(&layout.name),
+                fields: all,
+            }),
+            shape_ty,
+            span,
+        );
+        // The table as every holder sees it.
+        let table = as_shape(object, table_t.clone(), span);
+        let _ = filled;
+        if other.is_empty() {
+            return Ok(Val {
+                node: block_value(pre, table, span),
+                ty: Ty::Shape(k),
+            });
+        }
+        let name = self.temp();
+        pre.push(let_(name, table_t.clone(), table, span));
+        for (key, value) in other {
+            let tb = var(name, table_t.clone(), span);
+            pre.push(self.raw_store(tb, key, value, span));
+        }
+        Ok(Val {
+            node: block_value(pre, var(name, table_t, span), span),
+            ty: Ty::Shape(k),
+        })
+    }
+
     /// `t[k] = v` without metamethods, on a table.
     fn raw_store(&mut self, tb: Node, k: Val, v: Val, span: Span) -> St {
         let v = self.boxed(v);
@@ -3464,6 +4175,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         self.guarded_stmt(node, &Described::NONE)
     }
 
+    /// The name a constant string key spells.
+    fn literal_key(&self, key: &Val) -> Option<String> {
+        match &key.node.node {
+            TypedExpression::Literal(TypedLiteral::String(s)) if key.ty == Ty::Str => {
+                s.resolve_global()
+            }
+            _ => None,
+        }
+    }
+
     /// A name the program spells, boxed once and shared: the compiler
     /// keeps a boxed string literal as one constant.
     fn constant_key(&mut self, key: &Val) -> Option<Node> {
@@ -3476,18 +4197,40 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     /// `obj.name`: a read whose result the types may know, through a
-    /// shaped receiver.
+    /// shaped receiver; from the slot when the receiver's shape has one
+    /// for the name and it holds a value, else the dynamic path, which
+    /// raises for nil and consults the metatable for an absent field.
     fn field_read(&mut self, obj: Val, key: Val, name: &str, desc: Desc, span: Span) -> Val {
-        let ty = match obj.ty {
-            Ty::Shape(k) => self.typer().field_ty(Ty::Shape(k), name).settled(),
-            _ => Ty::Any,
+        let Ty::Shape(k) = obj.ty else {
+            return self.index_read(obj, key, desc, span);
         };
-        let read = self.index_read(obj, key, desc, span);
-        if ty == Ty::Any {
-            return read;
+        let ty = self.typer().field_ty(Ty::Shape(k), name).settled();
+        let mut pre = Vec::new();
+        let t = self.hold(obj, &mut pre);
+        // Each place the lookup may end, checked in order; the general
+        // read where none holds: nil, or a metatable the types do not
+        // follow, or the receiver being nil, which raises.
+        let Some(resolved) = self.resolve_lookups(&t, k, name, &mut pre, span) else {
+            let read = self.index_read(t, key, desc, span);
+            let node = if ty == Ty::Any {
+                read.node
+            } else {
+                self.coerce(read, ty)
+            };
+            return Val {
+                node: block_value(pre, node, span),
+                ty,
+            };
+        };
+        let slow = self.index_read(t, key, desc, span);
+        let mut value = self.coerce(slow, ty);
+        for r in resolved.iter().rev() {
+            let read = self.slot_read(&r.table, r.layout, &r.slot, span);
+            let read = self.coerce(read, ty);
+            value = if_value(r.guard.clone(), read, value, self.ir(ty), span);
         }
         Val {
-            node: self.coerce(read, ty),
+            node: block_value(pre, value, span),
             ty,
         }
     }
@@ -3567,6 +4310,82 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     fn index_write(&mut self, obj: Val, key: Val, value: Val, desc: Desc, span: Span) -> St {
         let descs = Described::operand(desc);
         let unit = prim(PrimitiveType::Unit);
+        // A shaped receiver's slot takes the value when the field is
+        // there already or no metatable could take it instead; else
+        // the dynamic path, which raises for nil and asks `__newindex`.
+        if let (Ty::Shape(shape), Some(name)) = (obj.ty, self.literal_key(&key)) {
+            let found = self.m.layout(shape).and_then(|layout| {
+                layout
+                    .slots
+                    .iter()
+                    .find(|s| s.name == name)
+                    .map(|s| (layout, s))
+            });
+            if let Some((layout, slot)) = found {
+                let bool_t = prim(PrimitiveType::Bool);
+                let mut pre = Vec::new();
+                let t = self.hold(obj, &mut pre);
+                let stored = self.coerce(value, slot.stored_ty());
+                let stored = self
+                    .hold(
+                        Val {
+                            node: stored,
+                            ty: slot.stored_ty(),
+                        },
+                        &mut pre,
+                    )
+                    .node;
+                let not_null = binary(
+                    BinaryOp::Ne,
+                    t.node.clone(),
+                    null(self.ir(Ty::Table), span),
+                    bool_t.clone(),
+                    span,
+                );
+                let no_meta = binary(
+                    BinaryOp::Eq,
+                    field(t.node.clone(), "meta", self.ir(Ty::Table), span),
+                    null(self.ir(Ty::Table), span),
+                    bool_t.clone(),
+                    span,
+                );
+                let fast = binary(
+                    BinaryOp::And,
+                    not_null,
+                    binary(
+                        BinaryOp::Or,
+                        self.slot_present(&t.node, slot, span),
+                        no_meta,
+                        bool_t.clone(),
+                        span,
+                    ),
+                    bool_t,
+                    span,
+                );
+                let then = self.slot_write(&t.node, layout, slot, stored.clone(), span);
+                let boxed = self.coerce(
+                    Val {
+                        node: stored,
+                        ty: slot.stored_ty(),
+                    },
+                    Ty::Any,
+                );
+                let boxed_t = self.coerce(t, Ty::Any);
+                let k = self.constant_key(&key).expect("a constant key");
+                let els = vec![
+                    expr_stmt(call("zl_setindex_key", vec![boxed_t, k, boxed], unit, span)),
+                    self.pending_check_described(span, &descs),
+                ];
+                pre.push(if_(fast, then, Some(els), span));
+                return stmt(
+                    TypedStatement::Block(TypedBlock {
+                        statements: pre,
+                        span,
+                    }),
+                    span,
+                );
+            }
+        }
         let v = self.boxed(value);
         if let Some(k) = self.constant_key(&key) {
             let node = match obj.ty {
@@ -4232,10 +5051,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             node: str_lit(&name, span),
             ty: Ty::Str,
         };
-        let callee = self.index_read(obj.clone(), key, desc, span);
         let method = Some(format!("method '{name}'"));
         // A method the types resolve to known functions is called
-        // directly, whichever of them the receiver's class holds.
+        // directly, whichever of them the receiver's class holds: told
+        // by the lookup's own checks when every table on its way has
+        // slots, else by the code of the value found.
         if let Ty::Shape(k) = obj.ty
             && let Some(targets) = self.typer().method_targets(k, &name)
         {
@@ -4248,7 +5068,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 .collect();
             if !funcs.is_empty() {
                 let returns = self.typer().method_returns(Ty::Shape(k), &name).settled();
-                let (arg_pre, vals, tail) = self.call_values(Some(obj), mc.args(), span)?;
+                let (arg_pre, vals, tail) = self.call_values(Some(obj.clone()), mc.args(), span)?;
+                if let Some(resolved) = self.resolve_lookups(&obj, k, &name, &mut pre, span)
+                    && resolved.iter().all(|r| matches!(r.ty, Ty::Func(_)))
+                {
+                    let multi = self.lookup_dispatch(
+                        obj, key, resolved, returns, arg_pre, vals, tail, method, desc, span,
+                    );
+                    return Ok(self.prefixed(pre, multi, span));
+                }
+                let callee = self.index_read(obj, key, desc, span);
                 let multi = self.dispatch(
                     callee,
                     Guard::ByCode,
@@ -4263,6 +5092,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 return Ok(self.prefixed(pre, multi, span));
             }
         }
+        let callee = self.index_read(obj.clone(), key, desc, span);
         let multi = self.value_call(callee, Some(obj), mc.args(), method, span)?;
         Ok(self.prefixed(pre, multi, span))
     }
@@ -4302,7 +5132,98 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Guard::NotNil => None,
         };
         head.append(&mut pre);
-        let mut pre = head;
+        let arms: Vec<(Node, FuncId, Val)> = funcs
+            .iter()
+            .map(|f| {
+                let is_f = match &code {
+                    Some(code) => binary(
+                        BinaryOp::Eq,
+                        code.node.clone(),
+                        int_lit(f.0 as i64, span),
+                        bool_t.clone(),
+                        span,
+                    ),
+                    None => binary(
+                        BinaryOp::Ne,
+                        callee.node.clone(),
+                        nil(span),
+                        bool_t.clone(),
+                        span,
+                    ),
+                };
+                (is_f, *f, callee.clone())
+            })
+            .collect();
+        self.dispatch_arms(callee, arms, returns, head, vals, tail, desc, span)
+    }
+
+    /// A method call whose lookups are `resolved`: each arm's guard
+    /// says the method is that function, found in that slot, and the
+    /// value is read the general way only when no guard holds. The
+    /// guards run before the arguments, as the lookup does.
+    #[allow(clippy::too_many_arguments)]
+    fn lookup_dispatch(
+        &mut self,
+        obj: Val,
+        key: Val,
+        resolved: Vec<Resolved<'m>>,
+        returns: Returns,
+        mut pre: Vec<St>,
+        vals: Vec<Val>,
+        tail: Option<Node>,
+        desc: Desc,
+        obj_desc: Desc,
+        span: Span,
+    ) -> Multi {
+        let bool_t = prim(PrimitiveType::Bool);
+        let mut head = Vec::new();
+        let mut any = bool_lit(false, span);
+        for r in resolved.iter().rev() {
+            any = if_value(
+                r.guard.clone(),
+                bool_lit(true, span),
+                any,
+                bool_t.clone(),
+                span,
+            );
+        }
+        let general = self.index_read(obj, key, obj_desc, span);
+        let callee = self.hold(
+            Val {
+                node: if_value(any, nil(span), general.node, Type::Any, span),
+                ty: Ty::Any,
+            },
+            &mut head,
+        );
+        head.append(&mut pre);
+        let arms: Vec<(Node, FuncId, Val)> = resolved
+            .iter()
+            .map(|r| {
+                let Ty::Func(f) = r.ty else {
+                    unreachable!("a lookup dispatched on is a function")
+                };
+                let record = self.slot_read(&r.table, r.layout, &r.slot, span);
+                (r.guard.clone(), f, record)
+            })
+            .collect();
+        self.dispatch_arms(callee, arms, returns, head, vals, tail, desc, span)
+    }
+
+    /// The arms of a dispatch around its fallback: `arms` are guards,
+    /// in order, each with the function it calls and the record the
+    /// call goes through; `callee` (held) is what the fallback calls.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_arms(
+        &mut self,
+        callee: Val,
+        arms: Vec<(Node, FuncId, Val)>,
+        returns: Returns,
+        mut pre: Vec<St>,
+        vals: Vec<Val>,
+        tail: Option<Node>,
+        desc: Desc,
+        span: Span,
+    ) -> Multi {
         let vals: Vec<Val> = vals.into_iter().map(|v| self.hold(v, &mut pre)).collect();
         let tail = tail.map(|t| {
             self.hold(
@@ -4330,32 +5251,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             span,
         );
         let mut value = self.yield_as(fallback, &shape, span);
-        for f in funcs.iter().rev() {
+        for (is_f, f, record) in arms.into_iter().rev() {
             let arm = self.direct_call_vals(
-                *f,
-                Some(callee.clone()),
+                f,
+                Some(record),
                 Vec::new(),
                 vals.clone(),
                 tail.clone(),
                 span,
             );
             let then = self.yield_as(arm, &shape, span);
-            let is_f = match &code {
-                Some(code) => binary(
-                    BinaryOp::Eq,
-                    code.node.clone(),
-                    int_lit(f.0 as i64, span),
-                    bool_t.clone(),
-                    span,
-                ),
-                None => binary(
-                    BinaryOp::Ne,
-                    callee.node.clone(),
-                    nil(span),
-                    bool_t.clone(),
-                    span,
-                ),
-            };
             let ty = then.ty.clone();
             value = if_value(is_f, then, value, ty, span);
         }
@@ -6623,7 +7528,10 @@ fn chunk_module(
     env_var: Option<InternedString>,
     own_env: bool,
     library: &Library,
+    slots: bool,
     declarations: &mut Vec<TypedNode<TypedDeclaration>>,
+    hooks: &mut Vec<ShapeLayout>,
+    registry: &mut zyntax_typed_ast::TypeRegistry,
 ) -> Result<String> {
     let mut module = Module {
         scopes,
@@ -6641,6 +7549,7 @@ fn chunk_module(
         functions: RefCell::new(Vec::new()),
         module_vars: RefCell::new(Vec::new()),
         facts: RefCell::new(HashMap::new()),
+        layouts: shape_layouts(inferred, chunk_index, slots),
     };
     let span = Span::new(0, source.len());
     let lower = |module: &Module<'_>| -> Result<Vec<St>> {
@@ -6723,6 +7632,7 @@ fn chunk_module(
         module.declare_module_var(env, Ty::Any);
     }
     declare(&module, declarations);
+    module.declare_shapes(declarations, registry, hooks);
     Ok(code_name)
 }
 
@@ -6738,6 +7648,261 @@ fn library_import() -> TypedNode<TypedDeclaration> {
         Type::Unknown,
         Span::new(0, 0),
     )
+}
+
+/// The name of the program's function for a library hook.
+fn shape_hook_name(hook: &str) -> String {
+    format!("lua$shape${hook}")
+}
+
+/// The hooks the library reads and writes slots through, over every
+/// slotted shape of the program: each is a chain over the shapes'
+/// numbers, then over the slots. In the order of
+/// [`library::SHAPE_HOOKS`]; none when the program has no slotted
+/// shape.
+fn shape_hooks(module: &Module<'_>, layouts: &[ShapeLayout], span: Span) -> Vec<TypedFunction> {
+    if layouts.is_empty() {
+        return Vec::new();
+    }
+    let table_t = module.ir(Ty::Table);
+    let i64_t = prim(PrimitiveType::I64);
+    let str_t = prim(PrimitiveType::String);
+    let bool_t = prim(PrimitiveType::Bool);
+    let t = || var(intern("t"), table_t.clone(), span);
+    let i = || var(intern("i"), i64_t.clone(), span);
+    let shape_is = |gid: i64| {
+        binary(
+            BinaryOp::Eq,
+            field(t(), "shape", i64_t.clone(), span),
+            int_lit(gid, span),
+            bool_t.clone(),
+            span,
+        )
+    };
+    let slot_is = |bit: usize| {
+        binary(
+            BinaryOp::Eq,
+            i(),
+            int_lit(bit as i64, span),
+            bool_t.clone(),
+            span,
+        )
+    };
+    let mut lowerer = Lowerer::new(module, CHUNK);
+    let param = |name: &str, ty: Type| parameter(intern(name), ty, span);
+
+    // zl_shape_index(t, name) -> i64
+    let mut index_body = Vec::new();
+    for layout in layouts {
+        let mut arms = Vec::new();
+        for slot in &layout.slots {
+            arms.push(if_(
+                call(
+                    "zb_str_eq",
+                    vec![
+                        var(intern("name"), str_t.clone(), span),
+                        str_lit(&slot.name, span),
+                    ],
+                    bool_t.clone(),
+                    span,
+                ),
+                vec![ret(Some(int_lit(slot.bit as i64, span)), span)],
+                None,
+                span,
+            ));
+        }
+        arms.push(ret(Some(int_lit(-1, span)), span));
+        index_body.push(if_(shape_is(layout.gid), arms, None, span));
+    }
+    index_body.push(ret(Some(int_lit(-1, span)), span));
+    let index = typed_function(
+        &shape_hook_name("index"),
+        vec![param("t", table_t.clone()), param("name", str_t.clone())],
+        i64_t.clone(),
+        index_body,
+        span,
+    );
+
+    // zl_shape_load(t, i) -> Any
+    let mut load_body = Vec::new();
+    for layout in layouts {
+        let mut arms = Vec::new();
+        for slot in &layout.slots {
+            let read = lowerer.slot_read(&t(), layout, slot, span);
+            let boxed = lowerer.coerce(read, Ty::Any);
+            let present = lowerer.slot_present(&t(), slot, span);
+            arms.push(if_(
+                slot_is(slot.bit),
+                vec![ret(
+                    Some(if_value(present, boxed, nil(span), Type::Any, span)),
+                    span,
+                )],
+                None,
+                span,
+            ));
+        }
+        load_body.push(if_(shape_is(layout.gid), arms, None, span));
+    }
+    load_body.push(ret(Some(nil(span)), span));
+    let load = typed_function(
+        &shape_hook_name("load"),
+        vec![param("t", table_t.clone()), param("i", i64_t.clone())],
+        Type::Any,
+        load_body,
+        span,
+    );
+
+    // zl_shape_store(t, i, v) -> i64: 0 stored, 1 not of the slot's kind
+    let v = || var(intern("v"), Type::Any, span);
+    let category = || call("zb_any_category", vec![v()], i64_t.clone(), span);
+    let is_cat = |c: i64| {
+        binary(
+            BinaryOp::Eq,
+            category(),
+            int_lit(c, span),
+            bool_t.clone(),
+            span,
+        )
+    };
+    let mut store_body = Vec::new();
+    for layout in layouts {
+        let mut arms = Vec::new();
+        for slot in &layout.slots {
+            // nil clears the slot's bit; nothing else is written.
+            let mask_off = binary(
+                BinaryOp::BitAnd,
+                lowerer.present_of(&t(), span),
+                int_lit(!slot.mask(), span),
+                i64_t.clone(),
+                span,
+            );
+            let mut on_nil = vec![assign(lowerer.present_of(&t(), span), mask_off, span)];
+            if slot.kind == SlotKind::Any {
+                let shaped = as_shape(t(), module.shape_ty(layout), span);
+                on_nil.push(assign(
+                    field(shaped, &format!("s{}", slot.bit), Type::Any, span),
+                    nil(span),
+                    span,
+                ));
+            }
+            on_nil.push(ret(Some(int_lit(0, span)), span));
+            let fits = match slot.kind {
+                SlotKind::Int => binary(
+                    BinaryOp::Or,
+                    is_cat(library::INT),
+                    is_cat(library::UINT),
+                    bool_t.clone(),
+                    span,
+                ),
+                SlotKind::Float => is_cat(library::FLOAT),
+                SlotKind::Bool => is_cat(library::BOOL),
+                SlotKind::Str => is_cat(library::STR),
+                SlotKind::Table => binary(
+                    BinaryOp::Eq,
+                    cast(
+                        call("zb_box_tag", vec![v()], prim(PrimitiveType::I32), span),
+                        i64_t.clone(),
+                        span,
+                    ),
+                    int_lit(library::table_tag(), span),
+                    bool_t.clone(),
+                    span,
+                ),
+                SlotKind::Scalar => binary(
+                    BinaryOp::Lt,
+                    category(),
+                    int_lit(library::STR, span),
+                    bool_t.clone(),
+                    span,
+                ),
+                SlotKind::Any => bool_lit(true, span),
+            };
+            let stored = lowerer.coerce(
+                Val {
+                    node: v(),
+                    ty: Ty::Any,
+                },
+                slot.stored_ty(),
+            );
+            let mut write = lowerer.slot_write(&t(), layout, slot, stored, span);
+            write.push(ret(Some(int_lit(0, span)), span));
+            arms.push(if_(
+                slot_is(slot.bit),
+                vec![
+                    if_(
+                        binary(BinaryOp::Eq, v(), nil(span), bool_t.clone(), span),
+                        on_nil,
+                        None,
+                        span,
+                    ),
+                    if_(
+                        fits,
+                        write,
+                        Some(vec![ret(Some(int_lit(1, span)), span)]),
+                        span,
+                    ),
+                ],
+                None,
+                span,
+            ));
+        }
+        store_body.push(if_(shape_is(layout.gid), arms, None, span));
+    }
+    store_body.push(ret(Some(int_lit(1, span)), span));
+    let store = typed_function(
+        &shape_hook_name("store"),
+        vec![
+            param("t", table_t.clone()),
+            param("i", i64_t.clone()),
+            param("v", Type::Any),
+        ],
+        i64_t.clone(),
+        store_body,
+        span,
+    );
+
+    // zl_shape_count(t) -> i64
+    let mut count_body = Vec::new();
+    for layout in layouts {
+        count_body.push(if_(
+            shape_is(layout.gid),
+            vec![ret(Some(int_lit(layout.slots.len() as i64, span)), span)],
+            None,
+            span,
+        ));
+    }
+    count_body.push(ret(Some(int_lit(0, span)), span));
+    let count = typed_function(
+        &shape_hook_name("count"),
+        vec![param("t", table_t.clone())],
+        i64_t.clone(),
+        count_body,
+        span,
+    );
+
+    // zl_shape_key(t, i) -> String
+    let mut key_body = Vec::new();
+    for layout in layouts {
+        let mut arms = Vec::new();
+        for slot in &layout.slots {
+            arms.push(if_(
+                slot_is(slot.bit),
+                vec![ret(Some(str_lit(&slot.name, span)), span)],
+                None,
+                span,
+            ));
+        }
+        key_body.push(if_(shape_is(layout.gid), arms, None, span));
+    }
+    key_body.push(ret(Some(str_lit("", span)), span));
+    let key = typed_function(
+        &shape_hook_name("key"),
+        vec![param("t", table_t), param("i", i64_t.clone())],
+        str_t,
+        key_body,
+        span,
+    );
+    vec![index, load, store, count, key]
 }
 
 /// A chunk `load` compiles while the program runs, as a program of its
@@ -6759,6 +7924,10 @@ pub(crate) fn loaded_program(
     let tag = format!("l{index}$");
     let env_var = intern(&format!("lua$l{index}$env"));
     let mut declarations = Vec::new();
+    // Its tables are plain: the program's hooks know nothing of a
+    // chunk's shapes, and it defines none of its own.
+    let mut registry = library.type_registry.clone();
+    let mut hooks = Vec::new();
     let code_name = chunk_module(
         &scopes,
         &inferred,
@@ -6770,7 +7939,10 @@ pub(crate) fn loaded_program(
         Some(env_var),
         false,
         &library,
+        false,
         &mut declarations,
+        &mut hooks,
+        &mut registry,
     )?;
     let span = Span::new(0, source.len());
     let env = intern("env");
@@ -6816,7 +7988,7 @@ pub(crate) fn loaded_program(
             chunk_name.to_string(),
             source.to_string(),
         )],
-        type_registry: library.type_registry,
+        type_registry: registry,
     })
 }
 
@@ -6879,6 +8051,7 @@ pub(crate) fn program(
         functions: RefCell::new(Vec::new()),
         module_vars: RefCell::new(Vec::new()),
         facts: RefCell::new(HashMap::new()),
+        layouts: shape_layouts(&inferred, 0, true),
     };
     let span = Span::new(0, source.len());
     // Lowered twice: the first time finds which functions may raise, so
@@ -7002,6 +8175,9 @@ pub(crate) fn program(
     }
     let mut declarations = Vec::new();
     declare(&module, &mut declarations);
+    let mut registry = library.type_registry.clone();
+    let mut hooks = Vec::new();
+    module.declare_shapes(&mut declarations, &mut registry, &mut hooks);
     declarations.push(TypedNode::new(
         TypedDeclaration::Variable(TypedVariable {
             name: intern(MAIN_VARARGS),
@@ -7036,7 +8212,10 @@ pub(crate) fn program(
             env_var,
             true,
             &library,
+            true,
             &mut declarations,
+            &mut hooks,
+            &mut registry,
         )?;
         // Positions name the file as `require` found it.
         let found_as = format!("./{}.lua", m.name.replace('.', "/"));
@@ -7065,7 +8244,20 @@ pub(crate) fn program(
         )));
     }
 
-    let mut entry_body = vec![
+    let hooks = shape_hooks(&module, &hooks, span);
+    let mut entry_body = Vec::new();
+    if !hooks.is_empty() {
+        entry_body.push(expr_stmt(call(
+            library::SHAPE_HOOKS_INSTALL,
+            library::SHAPE_HOOKS
+                .iter()
+                .map(|hook| code_of(&shape_hook_name(hook), span))
+                .collect(),
+            prim(PrimitiveType::Unit),
+            span,
+        )));
+    }
+    entry_body.extend([
         assign(
             var(intern(library::CHUNK), prim(PrimitiveType::String), span),
             str_lit(&chunk_id(module.chunk), span),
@@ -7086,7 +8278,7 @@ pub(crate) fn program(
                 span,
             )
         },
-    ];
+    ]);
     entry_body.extend(preloads);
     entry_body.extend([
         expr_stmt(call(CHUNK_FN, vec![], prim(PrimitiveType::Unit), span)),
@@ -7115,6 +8307,13 @@ pub(crate) fn program(
         Type::Unknown,
         span,
     ));
+    for hook in hooks {
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(hook),
+            Type::Unknown,
+            span,
+        ));
+    }
     // The library itself arrives by import: its declarations for
     // typing, its HIR to link against.
     declarations.push(library_import());
@@ -7133,6 +8332,6 @@ pub(crate) fn program(
         language: Some(intern("lua")),
         span,
         source_files,
-        type_registry: library.type_registry,
+        type_registry: registry,
     })
 }

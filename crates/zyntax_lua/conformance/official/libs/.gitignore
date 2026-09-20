@@ -1,0 +1,5 @@
+# What the suite writes while it runs; the sources are kept.
+*
+!.gitignore
+!*.c
+!makefile

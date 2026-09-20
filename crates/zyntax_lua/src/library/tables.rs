@@ -53,11 +53,34 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                         name: intern("high"),
                         value: Box::new(high),
                     },
+                    TypedFieldInit {
+                        name: intern("shape"),
+                        value: Box::new(int(0)),
+                    },
+                    TypedFieldInit {
+                        name: intern("present"),
+                        value: Box::new(int(0)),
+                    },
                 ],
             }),
             table.clone(),
         )
     };
+    let shaped = |tb: Expr| super::is_shaped(tb);
+    let slot_index = |tb: Expr, name: Expr| call("zl_shape_index", vec![tb, name], i64());
+    let slot_load = |tb: Expr, i: Expr| call("zl_shape_load", vec![tb, i], any());
+    // A store into a slot of a value not of its kind is a hole in the
+    // static rules that keep the two apart; it is reported, not made.
+    let slot_store = |tb: Expr, i: Expr, v: Expr| {
+        when(
+            ne(call("zl_shape_store", vec![tb, i, v], i64()), int(0)),
+            vec![lua_error(text(
+                "internal: a value of another kind stored into a shaped field",
+            ))],
+        )
+    };
+    let slot_count = |tb: Expr| call("zl_shape_count", vec![tb], i64());
+    let slot_key = |tb: Expr, i: Expr| call("zl_shape_key", vec![tb, i], string());
 
     // ─── construction ───────────────────────────────────────────
     d.push(define(
@@ -81,6 +104,20 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![expr(mcall(arr.e(), "pop_last", vec![], any()))],
             ),
             ret(struct_lit(arr.e(), n.e())),
+        ]
+    }));
+    // The array part of a shaped table, boxed, trimmed like a plain
+    // table's; the program lays the rest of the table out itself.
+    d.push(define("zl_arr_box", &[&arr_kept], any(), {
+        vec![
+            while_(
+                and(
+                    gt(len(arr.e()), int(0)),
+                    is_nil(at(arr.e(), sub(len(arr.e()), int(1)))),
+                ),
+                vec![expr(mcall(arr.e(), "pop_last", vec![], any()))],
+            ),
+            ret(call("zb_list_box_any", vec![arr.e()], any())),
         ]
     }));
     // The hash part, made on first use.
@@ -124,11 +161,20 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             )),
         ],
     ));
+    let slot = local("slot", i64());
     d.push(define(
         "zl_rawget_str",
         &[&tb, &s],
         any(),
         vec![
+            // A shaped table's constant-key fields are its slots.
+            when(
+                shaped(tb.e()),
+                vec![
+                    slot.decl(slot_index(tb.e(), s.e())),
+                    when(ge(slot.e(), int(0)), vec![ret(slot_load(tb.e(), slot.e()))]),
+                ],
+            ),
             when(is_nil(hash_field(tb.e())), vec![ret(nil())]),
             ret(call(
                 "zb_dict_get_default_str",
@@ -145,6 +191,13 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         &[&tb, &k],
         any(),
         vec![
+            when(
+                shaped(tb.e()),
+                vec![
+                    slot.decl(slot_index(tb.e(), get_str(k.e()))),
+                    when(ge(slot.e(), int(0)), vec![ret(slot_load(tb.e(), slot.e()))]),
+                ],
+            ),
             when(is_nil(hash_field(tb.e())), vec![ret(nil())]),
             ret(call(
                 "zb_dict_get_default",
@@ -158,6 +211,16 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         &[&tb, &k, &v],
         unit(),
         vec![
+            when(
+                shaped(tb.e()),
+                vec![
+                    slot.decl(slot_index(tb.e(), get_str(k.e()))),
+                    when(
+                        ge(slot.e(), int(0)),
+                        vec![slot_store(tb.e(), slot.e(), v.e()), ret_void()],
+                    ),
+                ],
+            ),
             when(
                 and(is_nil(v.e()), is_nil(hash_field(tb.e()))),
                 vec![ret_void()],
@@ -318,6 +381,16 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         &[&tb, &s, &v],
         unit(),
         vec![
+            when(
+                shaped(tb.e()),
+                vec![
+                    slot.decl(slot_index(tb.e(), s.e())),
+                    when(
+                        ge(slot.e(), int(0)),
+                        vec![slot_store(tb.e(), slot.e(), v.e()), ret_void()],
+                    ),
+                ],
+            ),
             when(
                 and(is_nil(v.e()), is_nil(hash_field(tb.e()))),
                 vec![ret_void()],
@@ -988,11 +1061,13 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     ));
 
     // ─── traversal ──────────────────────────────────────────────
-    // A traversal position: `0..n` for the array part, `n + e` for
-    // entry `e` of the hash part. The next position at or after `pos`
-    // holding a value, or -1 when the traversal is over.
+    // A traversal position: `0..n` for the array part, `n + j` for
+    // slot `j` of a shaped table, `n + slots + e` for entry `e` of the
+    // hash part. The next position at or after `pos` holding a value,
+    // or -1 when the traversal is over.
     let pos = local("pos", i64());
     let count = local("count", i64());
+    let slots = local("slots", i64());
     d.push(define(
         "zl_next_pos",
         &[&tb, &pos],
@@ -1008,16 +1083,27 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     i.add_assign(int(1)),
                 ],
             ),
+            slots.decl(if_expr(shaped(tb.e()), slot_count(tb.e()), int(0))),
+            while_(
+                lt(sub(i.e(), n.e()), slots.e()),
+                vec![
+                    when(
+                        super::slot_present(tb.e(), sub(i.e(), n.e())),
+                        vec![ret(i.e())],
+                    ),
+                    i.add_assign(int(1)),
+                ],
+            ),
             when(is_nil(hash_field(tb.e())), vec![ret(int(-1))]),
             h.decl(hash_of(tb.e())),
             count.decl(call("zb_dict_len", vec![h.e()], i64())),
             while_(
-                lt(sub(i.e(), n.e()), count.e()),
+                lt(sub(sub(i.e(), n.e()), slots.e()), count.e()),
                 vec![
                     when(
                         not(is_nil(at(
                             h.e(),
-                            add(mul(sub(i.e(), n.e()), int(2)), int(2)),
+                            add(mul(sub(sub(i.e(), n.e()), slots.e()), int(2)), int(2)),
                         ))),
                         vec![ret(i.e())],
                     ),
@@ -1034,9 +1120,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         vec![
             n.decl(len(arr_of(tb.e()))),
             when(lt(pos.e(), n.e()), vec![ret(box_i64(add(pos.e(), int(1))))]),
+            slots.decl(if_expr(shaped(tb.e()), slot_count(tb.e()), int(0))),
+            when(
+                lt(sub(pos.e(), n.e()), slots.e()),
+                vec![ret(box_str(slot_key(tb.e(), sub(pos.e(), n.e()))))],
+            ),
             ret(at(
                 hash_of(tb.e()),
-                add(mul(sub(pos.e(), n.e()), int(2)), int(1)),
+                add(mul(sub(sub(pos.e(), n.e()), slots.e()), int(2)), int(1)),
             )),
         ],
     ));
@@ -1048,9 +1139,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             arr.decl(arr_of(tb.e())),
             n.decl(len(arr.e())),
             when(lt(pos.e(), n.e()), vec![ret(at(arr.e(), pos.e()))]),
+            slots.decl(if_expr(shaped(tb.e()), slot_count(tb.e()), int(0))),
+            when(
+                lt(sub(pos.e(), n.e()), slots.e()),
+                vec![ret(slot_load(tb.e(), sub(pos.e(), n.e())))],
+            ),
             ret(at(
                 hash_of(tb.e()),
-                add(mul(sub(pos.e(), n.e()), int(2)), int(2)),
+                add(mul(sub(sub(pos.e(), n.e()), slots.e()), int(2)), int(2)),
             )),
         ],
     ));
@@ -1071,6 +1167,18 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     when(and(ge(i.e(), int(1)), le(i.e(), n.e())), vec![ret(i.e())]),
                 ],
             ),
+            slots.decl(if_expr(shaped(tb.e()), slot_count(tb.e()), int(0))),
+            // A string naming a slot: the position after that slot.
+            when(
+                and(gt(slots.e(), int(0)), eq(cat.e(), int(STR))),
+                vec![
+                    slot.decl(slot_index(tb.e(), get_str(k.e()))),
+                    when(
+                        ge(slot.e(), int(0)),
+                        vec![ret(add(add(n.e(), slot.e()), int(1)))],
+                    ),
+                ],
+            ),
             when(
                 not(is_nil(hash_field(tb.e()))),
                 vec![
@@ -1086,7 +1194,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                                     vec![at(h.e(), add(mul(i.e(), int(2)), int(1))), k.e()],
                                     boolean(),
                                 ),
-                                vec![ret(add(add(n.e(), i.e()), int(1)))],
+                                vec![ret(add(add(add(n.e(), slots.e()), i.e()), int(1)))],
                             ),
                             i.add_assign(int(1)),
                         ],

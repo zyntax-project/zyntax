@@ -100,24 +100,48 @@ pub fn table_ty(id: TypeId) -> Type {
 /// is the longest the array part has been before a store of nil
 /// shortened it: a key up to it may have been removed mid-traversal,
 /// which `next` continues from; one past it is no key of the table.
-const TABLE_FIELDS: [&str; 4] = ["arr", "hash", "meta", "high"];
+/// `shape` is the number of the shape a table was made with, 0 for
+/// none: a shaped table carries its constant-key fields in typed slots
+/// after this header, laid out by the program that made it, and
+/// `present` has a bit set for each slot holding a value. The program
+/// defines the hooks the library reads and writes them through.
+const TABLE_FIELDS: [&str; 6] = ["arr", "hash", "meta", "high", "shape", "present"];
 
 fn table_field_type(name: &str, id: TypeId) -> Type {
     match name {
         "meta" => table_ty(id),
-        "high" => i64(),
+        "high" | "shape" | "present" => i64(),
         _ => any(),
     }
+}
+
+/// The table header's fields, with their types.
+pub fn table_header_fields(id: TypeId) -> Vec<(String, Type)> {
+    TABLE_FIELDS
+        .iter()
+        .map(|name| (name.to_string(), table_field_type(name, id)))
+        .collect()
 }
 
 /// Register the table struct in `registry` and return its id.
 pub fn declare_table_type(registry: &mut zyntax_typed_ast::TypeRegistry) -> TypeId {
     let id = TypeId::next();
-    let fields: Vec<FieldDef> = TABLE_FIELDS
+    declare_reference_struct(registry, id, TABLE_TYPE, &table_header_fields(id));
+    id
+}
+
+/// Register a heap struct named `name` with `fields` under `id`.
+pub fn declare_reference_struct(
+    registry: &mut zyntax_typed_ast::TypeRegistry,
+    id: TypeId,
+    name: &str,
+    fields: &[(String, Type)],
+) {
+    let fields: Vec<FieldDef> = fields
         .iter()
-        .map(|name| FieldDef {
+        .map(|(name, ty)| FieldDef {
             name: intern(name),
-            ty: table_field_type(name, id),
+            ty: ty.clone(),
             visibility: Visibility::Public,
             mutability: Mutability::Mutable,
             is_static: false,
@@ -130,7 +154,7 @@ pub fn declare_table_type(registry: &mut zyntax_typed_ast::TypeRegistry) -> Type
     registry.register_type(zyntax_typed_ast::type_registry::TypeDefinition {
         id,
         module: None,
-        name: intern(TABLE_TYPE),
+        name: intern(name),
         kind: zyntax_typed_ast::type_registry::TypeKind::Struct {
             fields: fields.clone(),
             is_tuple: false,
@@ -146,21 +170,25 @@ pub fn declare_table_type(registry: &mut zyntax_typed_ast::TypeRegistry) -> Type
         },
         span: SPAN,
     });
-    id
 }
 
 /// The struct's declaration, so the lowering lays it out.
 pub fn table_class(id: TypeId) -> Decl {
+    reference_struct_class(TABLE_TYPE, &table_header_fields(id))
+}
+
+/// A heap struct's declaration: every holder shares the one object.
+pub fn reference_struct_class(name: &str, fields: &[(String, Type)]) -> Decl {
     typed_node_decl(TypedDeclaration::Class(TypedClass {
-        name: intern(TABLE_TYPE),
+        name: intern(name),
         type_params: Vec::new(),
         extends: None,
         implements: Vec::new(),
-        fields: TABLE_FIELDS
+        fields: fields
             .iter()
-            .map(|name| TypedField {
+            .map(|(name, ty)| TypedField {
                 name: intern(name),
-                ty: table_field_type(name, id),
+                ty: ty.clone(),
                 initializer: None,
                 visibility: Visibility::Public,
                 mutability: Mutability::Mutable,
@@ -338,6 +366,133 @@ pub fn meta_of(tb: Expr, t: &Types) -> Expr {
 }
 pub fn high_of(tb: Expr) -> Expr {
     fld(tb, "high", i64())
+}
+pub fn shape_of(tb: Expr) -> Expr {
+    fld(tb, "shape", i64())
+}
+pub fn is_shaped(tb: Expr) -> Expr {
+    ne(shape_of(tb), int(0))
+}
+/// Whether slot `i` of a shaped table holds a value: its bit of the
+/// header's `present` word.
+pub fn slot_present(tb: Expr, i: Expr) -> Expr {
+    ne(bitand(shr(fld(tb, "present", i64()), i), int(1)), int(0))
+}
+
+/// The hooks a program installs over its shapes, for the library's
+/// generic paths: the slot a name has in a table's shape (-1 for
+/// none), a slot's value boxed (nil when absent), a store into a slot
+/// (0, or 1 when the value is not of the slot's kind), how many slots
+/// a table's shape has, and a slot's name. Each is a function of the
+/// program, reached through its code kept in a global: the library is
+/// lowered before any program exists, and a chunk loaded later links
+/// against neither. Installed by [`SHAPE_HOOKS_INSTALL`] before the
+/// program runs; only a shaped table reaches them, and only a program
+/// with shapes makes one.
+pub const SHAPE_HOOKS: [&str; 5] = ["index", "load", "store", "count", "key"];
+pub const SHAPE_HOOKS_INSTALL: &str = "zl_shape_hooks";
+
+fn hook_global(hook: &str) -> String {
+    format!("zl_hook_{hook}")
+}
+
+fn fn_type(params: &[Type], ret: Type) -> Type {
+    use zyntax_typed_ast::type_registry::{
+        AsyncKind, CallingConvention, NullabilityKind, ParamInfo,
+    };
+    Type::Function {
+        params: params
+            .iter()
+            .map(|ty| ParamInfo {
+                name: None,
+                ty: ty.clone(),
+                is_optional: false,
+                is_varargs: false,
+                is_keyword_only: false,
+                is_positional_only: false,
+                is_out: false,
+                is_ref: false,
+                is_inout: false,
+            })
+            .collect(),
+        return_type: Box::new(ret),
+        is_varargs: false,
+        has_named_params: false,
+        has_default_params: false,
+        async_kind: AsyncKind::Sync,
+        calling_convention: CallingConvention::Default,
+        nullability: NullabilityKind::NonNull,
+    }
+}
+
+fn shape_hook_decls(t: &Types) -> Vec<Decl> {
+    let table = t.table();
+    let tb = kept("t", table.clone());
+    let name = kept("name", string());
+    let i = local("i", i64());
+    let v = kept("v", any());
+    let signatures: [(&str, Vec<&Local>, Type); 5] = [
+        ("index", vec![&tb, &name], i64()),
+        ("load", vec![&tb, &i], any()),
+        ("store", vec![&tb, &i, &v], i64()),
+        ("count", vec![&tb], i64()),
+        ("key", vec![&tb, &i], string()),
+    ];
+    let mut d = Vec::new();
+    for (hook, params, ret_ty) in &signatures {
+        let global = hook_global(hook);
+        let code_ty = fn_type(
+            &params.iter().map(|p| p.ty.clone()).collect::<Vec<_>>(),
+            ret_ty.clone(),
+        );
+        let unbox = format!("zl_hook_{hook}_code");
+        let fp = local("fp", code_ty.clone());
+        d.push(global_var(&global, any()));
+        d.push(extern_fn(
+            &unbox,
+            &[("x", any())],
+            code_ty.clone(),
+            Some("zyntax_box_pointer"),
+        ));
+        d.push(define(
+            &format!("zl_shape_{hook}"),
+            params,
+            ret_ty.clone(),
+            vec![
+                fp.decl(call(&unbox, vec![read_global(&global, any())], code_ty)),
+                ret(call(
+                    "fp",
+                    params.iter().map(|p| p.e()).collect(),
+                    ret_ty.clone(),
+                )),
+            ],
+        ));
+    }
+    let codes: Vec<Local> = SHAPE_HOOKS
+        .iter()
+        .map(|hook| local(Box::leak(hook.to_string().into_boxed_str()), usize()))
+        .collect();
+    d.push(define(
+        SHAPE_HOOKS_INSTALL,
+        &codes.iter().collect::<Vec<_>>(),
+        unit(),
+        SHAPE_HOOKS
+            .iter()
+            .zip(&codes)
+            .map(|(hook, code)| {
+                set_global(
+                    &hook_global(hook),
+                    call(
+                        "zb_box_fnptr_raw",
+                        vec![code.e(), int32(zyntax_builtins::CODE_TAG as i32)],
+                        any(),
+                    ),
+                )
+            })
+            .chain(std::iter::once(ret_void()))
+            .collect(),
+    ));
+    d
 }
 pub fn set_field(tb: Expr, name: &str, value: Expr) -> Stmt {
     let ty = value.ty.clone();
@@ -917,6 +1072,7 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
         table_type,
     };
     lib.declarations.push(table_class(table_type));
+    lib.declarations.extend(shape_hook_decls(&t));
     lib.declarations.extend(instance_hooks(&t));
     lib.declarations.extend(raising(&t));
     lib.declarations.extend(tables::declarations(&t));
