@@ -9783,7 +9783,11 @@ impl SsaBuilder {
             return Ok(None);
         }
 
-        let value = self.translate_expression(block_id, operand)?;
+        // The operand may build control flow of its own (a conditional
+        // value); what follows belongs where its evaluation ended.
+        let started = block_id;
+        let mut block_id = block_id;
+        let value = self.translate_operand(&mut block_id, operand)?;
         let value_ty = self
             .function
             .values
@@ -9858,6 +9862,7 @@ impl SsaBuilder {
         );
         self.add_use(subject, result);
         self.add_use(absent, result);
+        self.settle(started, block_id);
         Ok(Some(result))
     }
 
