@@ -759,6 +759,10 @@ pub(crate) struct Lowerer<'m> {
     /// at every compound statement, so it never crosses a branch or a
     /// loop back edge.
     nonnull: HashSet<InternedString>,
+    /// Parameters the body assigns somewhere: what the caller passed is
+    /// not what they hold from then on, so neither `self` nor a trusted
+    /// instance parameter is one once the body assigns it.
+    reassigned_params: HashSet<InternedString>,
     /// Variables that hold an instance for the whole function: assigned
     /// a constructor's result before anything reads them, and assigned
     /// nothing else anywhere; see [`Self::always_instances`].
@@ -889,6 +893,13 @@ impl<'m> Lowerer<'m> {
                 }
             }
         }
+        // Assigned by this body, or shared with a nested one that may.
+        let reassigned_params = sig
+            .params
+            .iter()
+            .filter(|(n, _)| scope.bound.contains(n) || cells.contains(n))
+            .map(|(n, _)| intern(n))
+            .collect();
         Self {
             module,
             name: name.to_string(),
@@ -899,6 +910,7 @@ impl<'m> Lowerer<'m> {
             comp_symbols: HashMap::default(),
             hoisted: Vec::new(),
             nonnull: HashSet::default(),
+            reassigned_params,
             always_instance: HashSet::default(),
             nonnull_fields: HashSet::default(),
             trusted: false,
@@ -8691,7 +8703,9 @@ impl<'m> Lowerer<'m> {
     fn known_instance(&self, node: &Node) -> bool {
         match &node.node {
             TypedExpression::Variable(name) => {
-                let is_self = self.class.is_some()
+                let as_passed = !self.reassigned_params.contains(name);
+                let is_self = as_passed
+                    && self.class.is_some()
                     && self
                         .sig
                         .params
@@ -8699,7 +8713,8 @@ impl<'m> Lowerer<'m> {
                         .is_some_and(|(p, _)| intern(p) == *name);
                 // The trusted variant takes every instance-typed parameter
                 // to be one.
-                let trusted_param = self.trusted
+                let trusted_param = as_passed
+                    && self.trusted
                     && self
                         .sig
                         .params
