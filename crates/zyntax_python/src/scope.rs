@@ -138,6 +138,9 @@ struct Collector {
 impl Collector {
     fn finish(self, params: Vec<String>) -> Scope {
         let mut free: HashSet<String> = self.loads;
+        // A name declared `nonlocal` is an enclosing body's whether or
+        // not this one reads it: a write alone still needs the cell.
+        free.extend(self.nonlocals.iter().cloned());
         for (_, child) in &self.children {
             free.extend(child.free.iter().cloned());
         }

@@ -2016,9 +2016,10 @@ impl<'m> Lowerer<'m> {
             (Ty::Object, Ty::Float) => "zb_box_payload_f64",
             (Ty::Object, Ty::Bool) => "zb_box_payload_truth",
             (Ty::Object, Ty::Str) => "zb_box_get_str",
-            // The box is known to hold an instance of the class.
+            // The box holds an instance of the class, or is the null box
+            // None stores as.
             (Ty::Object, Ty::Class(_)) => {
-                let address = addr_call("zb_unbox_instance_raw", vec![v.node], span);
+                let address = addr_call("zb_unbox_instance", vec![v.node], span);
                 return cast(address, target, span);
             }
             (Ty::Object, Ty::Tuple(k)) => return self.unbox_tuple(v, k, true, span),
