@@ -925,8 +925,23 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     lib.declarations.extend(utf8::declarations(&t));
     lib.declarations.extend(io::declarations(&t));
     lib.declarations.extend(stdlib::declarations(policy, &t));
+    for d in &mut lib.declarations {
+        if let TypedDeclaration::Function(f) = &mut d.node {
+            f.annotations.push(strict_fp());
+        }
+    }
     lib.fallible = fallible_functions(&lib.declarations);
     (lib, t)
+}
+
+/// Lua's floats round at every operation: no multiply and add of the
+/// program's, or of the library's, is fused into one rounding.
+pub fn strict_fp() -> TypedAnnotation {
+    TypedAnnotation {
+        name: intern("strict_fp"),
+        args: Vec::new(),
+        span: SPAN,
+    }
 }
 
 /// Every function that raises, through any number of calls: one that

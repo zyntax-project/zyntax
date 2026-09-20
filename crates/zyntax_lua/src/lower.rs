@@ -670,7 +670,7 @@ fn typed_function(
 ) -> TypedFunction {
     TypedFunction {
         name: intern(name),
-        annotations: Vec::new(),
+        annotations: vec![library::strict_fp()],
         effects: Vec::new(),
         with_handlers: Vec::new(),
         type_params: Vec::new(),
