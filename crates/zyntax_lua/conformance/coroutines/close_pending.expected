@@ -1,0 +1,18 @@
+true	suspended
+closing x	nil
+true
+false	dead
+true	1
+true
+c b a	dead
+false	close_pending.lua:37: in close
+true
+true	20
+false	cannot close a running coroutine
+true
+false	100
+false	100
+true
+true	dead
+true
+0	2	5

@@ -969,7 +969,7 @@ pub const BUILTINS: &[Builtin] = &[
         name: "close",
         func: "zl_co_close",
         params: &[Expected("thread")],
-        ret: Ret::Any,
+        ret: Ret::Multi,
     },
 ];
 
@@ -1614,6 +1614,8 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             c_stack_full(),
             set_global(LINE, int(0)),
             y.decl(call("zl_call_packed", vec![x.e(), args.e()], any())),
+            // A coroutine being closed unwinds through the call.
+            when(is_closing(pending()), vec![ret(nil())]),
             when(
                 not(is_nil(pending())),
                 vec![ret(call(
@@ -1660,6 +1662,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             c_stack_full(),
             set_global(LINE, int(0)),
             y.decl(call("zl_call_packed", vec![x.e(), args.e()], any())),
+            when(is_closing(pending()), vec![ret(nil())]),
             when(
                 not(is_nil(pending())),
                 vec![

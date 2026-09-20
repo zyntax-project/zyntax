@@ -16,11 +16,15 @@ use super::*;
 use zyntax_typed_ast::typed_ast::{TypedBlock, TypedDeclaration, TypedFunction};
 use zyntax_typed_ast::{Type, Visibility};
 
-/// The record's slots.
+/// The record's slots. `ERR` keeps the error a coroutine died of for
+/// the close that reports it; `STARTED` says the body has run, so a
+/// close has something to unwind.
 const HANDLE: i64 = 0;
 const STATUS: i64 = 1;
 const BODY: i64 = 2;
 const SLOT: i64 = 3;
+const ERR: i64 = 4;
+const STARTED: i64 = 5;
 
 /// Statuses, as the record stores them.
 const SUSPENDED: i64 = 0;
@@ -157,11 +161,12 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                         vec![at(env.e(), int(SLOT))],
                         anys.clone(),
                     )),
+                    // The resume counted the C-stack level already.
                     set_idx(
                         env.e(),
                         int(SLOT),
                         call(
-                            "zl_call_packed",
+                            "zl_apply_packed",
                             vec![at(env.e(), int(BODY)), args.e()],
                             any(),
                         ),
@@ -202,7 +207,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 ]))],
             ),
             rec.decl(list(
-                vec![box_i64(int(0)), box_i64(int(SUSPENDED)), f.e(), nil()],
+                vec![
+                    box_i64(int(0)),
+                    box_i64(int(SUSPENDED)),
+                    f.e(),
+                    nil(),
+                    nil(),
+                    box_bool(bool(false)),
+                ],
                 anys.clone(),
             )),
             co.decl(call(
@@ -321,6 +333,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 ))],
             ),
             set_idx(rec.e(), int(SLOT), call("zl_pack", vec![args.e()], any())),
+            set_idx(rec.e(), int(STARTED), box_bool(bool(true))),
             prev.decl(current()),
             if_(
                 not(is_nil(prev.e())),
@@ -377,20 +390,19 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             set_status(rec.e(), DEAD),
             expr(call("zl_fiber_free", vec![handle.e()], unit())),
-            // The body raised: the error comes back as the result.
+            // The body raised: the error comes back as the result, and
+            // is kept for a close to report.
             when(
                 not(is_nil(pending())),
-                vec![ret(call(
-                    "zb_box_tuple",
-                    vec![list(
-                        vec![
-                            box_bool(bool(false)),
-                            call("zl_take_pending", vec![], any()),
-                        ],
-                        anys.clone(),
-                    )],
-                    any(),
-                ))],
+                vec![
+                    x.decl(call("zl_take_pending", vec![], any())),
+                    set_idx(rec.e(), int(ERR), x.e()),
+                    ret(call(
+                        "zb_box_tuple",
+                        vec![list(vec![box_bool(bool(false)), x.e()], anys.clone())],
+                        any(),
+                    )),
+                ],
             ),
             when(
                 eq(bitand(step.e(), int(3)), int(STEP_DONE)),
@@ -431,7 +443,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 unit(),
             )),
             set_global(DEPTH, depth.e()),
-            ret(call("zl_fiber_take_input", vec![], any())),
+            x.decl(call("zl_fiber_take_input", vec![], any())),
+            // Resumed to be closed: the error every block leaves on,
+            // its `<close>` handlers seeing nil.
+            when(
+                is_closing(x.e()),
+                vec![set_global(PENDING, x.e()), ret(nil())],
+            ),
+            ret(x.e()),
         ],
     ));
     d.push(define(
@@ -494,7 +513,17 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             )),
         ],
     ));
-    // `coroutine.close(co)`: a suspended or dead coroutine is dead.
+    // `coroutine.close(co)`: a suspended coroutine is resumed to
+    // unwind, its `<close>` handlers running innermost first; an
+    // error one raises is the result. A dead one reports the error
+    // it died of, once.
+    let failed = |err: Expr| {
+        ret(call(
+            "zb_box_tuple",
+            vec![list(vec![box_bool(bool(false)), err], anys.clone())],
+            any(),
+        ))
+    };
     d.push(define(
         "zl_co_close",
         &[&co],
@@ -512,19 +541,58 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![lua_error(text("cannot close a normal coroutine"))],
             ),
             when(
-                eq(status.e(), int(SUSPENDED)),
+                eq(status.e(), int(DEAD)),
                 vec![
-                    expr(call(
-                        "zl_fiber_free",
-                        vec![call(
-                            "zb_box_get_i64",
-                            vec![at(rec.e(), int(HANDLE))],
-                            i64(),
-                        )],
-                        unit(),
-                    )),
-                    set_status(rec.e(), DEAD),
+                    x.decl(at(rec.e(), int(ERR))),
+                    when(is_nil(x.e()), vec![ret(box_bool(bool(true)))]),
+                    set_idx(rec.e(), int(ERR), nil()),
+                    failed(x.e()),
                 ],
+            ),
+            handle.decl(call(
+                "zb_box_get_i64",
+                vec![at(rec.e(), int(HANDLE))],
+                i64(),
+            )),
+            // Never run: nothing to unwind.
+            when(
+                not(get_bool(at(rec.e(), int(STARTED)))),
+                vec![
+                    expr(call("zl_fiber_free", vec![handle.e()], unit())),
+                    set_status(rec.e(), DEAD),
+                    ret(box_bool(bool(true))),
+                ],
+            ),
+            // Resumed with the closing error as the yield's result; it
+            // runs, so a close from one of its handlers is refused.
+            set_idx(rec.e(), int(SLOT), closing_marker()),
+            prev.decl(current()),
+            set_status(rec.e(), RUNNING),
+            set_current(co.e()),
+            // The handlers it runs count on the C stack; the close
+            // itself does not.
+            depth.decl(read_global(DEPTH, i64())),
+            ccalls.decl(read_global(CCALLS, i64())),
+            expr(call(
+                "zl_fiber_resume_with",
+                vec![handle.e(), at(rec.e(), int(SLOT))],
+                i64(),
+            )),
+            set_global(DEPTH, depth.e()),
+            set_global(CCALLS, ccalls.e()),
+            set_current(prev.e()),
+            set_status(rec.e(), DEAD),
+            expr(call("zl_fiber_free", vec![handle.e()], unit())),
+            when(
+                is_closing(pending()),
+                vec![
+                    expr(call("zl_take_pending", vec![], any())),
+                    ret(box_bool(bool(true))),
+                ],
+            ),
+            when(
+                not(is_nil(pending())),
+                vec![failed(call("zl_take_pending", vec![], any()))],
             ),
             ret(box_bool(bool(true))),
         ],

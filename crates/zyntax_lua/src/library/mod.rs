@@ -34,6 +34,9 @@ pub const THREAD_KIND: usize = 1;
 pub const NIL_ERROR_KIND: usize = 2;
 /// A file: the handle of one of the host's streams.
 pub const FILE_KIND: usize = 3;
+/// The error in flight while a suspended coroutine is closed: its
+/// `<close>` handlers see nil, and nothing catches it on the way up.
+pub const CLOSING_KIND: usize = 4;
 
 pub fn table_tag() -> i64 {
     zyntax_builtins::instance_tag(TABLE_KIND)
@@ -46,6 +49,19 @@ pub fn nil_error_tag() -> i64 {
 }
 pub fn file_tag() -> i64 {
     zyntax_builtins::instance_tag(FILE_KIND)
+}
+pub fn closing_tag() -> i64 {
+    zyntax_builtins::instance_tag(CLOSING_KIND)
+}
+pub fn is_closing(x: Expr) -> Expr {
+    and(ne(x.clone(), nil()), eq(tag_of(x), int(closing_tag())))
+}
+pub fn closing_marker() -> Expr {
+    call(
+        "zb_box_instance_raw",
+        vec![int(1), int32(closing_tag() as i32)],
+        any(),
+    )
 }
 
 /// The types the library is written against: `List<Any>` and the

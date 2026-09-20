@@ -603,7 +603,18 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![lua_error(text("attempt to close non-closable variable"))],
             ),
             metamethod_call_check(x.e(), text("close")),
-            expr(call("zl_call_2", vec![x.e(), o.e(), err.e()], any())),
+            // On an error exit the error is in flight: it is put aside
+            // while the handler runs, which may raise one of its own
+            // that replaces it, and put back otherwise. Closed by
+            // `coroutine.close`, the handler sees no error.
+            handler.decl(pending()),
+            set_global(PENDING, nil()),
+            expr(call(
+                "zl_call_2",
+                vec![x.e(), o.e(), if_expr(is_closing(err.e()), nil(), err.e())],
+                any(),
+            )),
+            when(is_nil(pending()), vec![set_global(PENDING, handler.e())]),
             ret_void(),
         ],
     ));
