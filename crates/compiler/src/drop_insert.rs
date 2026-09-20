@@ -500,13 +500,24 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
     // Copies to make on entry edges: the predecessor block, the phi, the
     // position of its incoming, and the value to copy.
     let mut copies: Vec<(HirId, HirId, usize, HirId)> = Vec::new();
-    // Every phi to begin with; a join's phi only under automatic release,
-    // since a program releasing by hand may release what arrives at one.
-    let mut candidates: IdSet = phi_blocks
+    // Every phi that may carry storage to begin with; a join's phi only
+    // under automatic release, since a program releasing by hand may
+    // release what arrives at one.
+    let mut candidates: IdSet = func
+        .blocks
         .iter()
-        .filter(|(_, block)| facts.automatic_release || bodies.contains_key(block))
-        .map(|(p, _)| *p)
+        .flat_map(|(b, block)| block.phis.iter().map(move |p| (p, *b)))
+        .filter(|(p, block)| {
+            may_be_storage(&p.ty) && (facts.automatic_release || bodies.contains_key(block))
+        })
+        .map(|(p, _)| p.result)
         .collect();
+    if candidates.is_empty() {
+        return 0;
+    }
+    // What the rounds below ask of each value does not change between
+    // them: indexed once.
+    let mut index = PhiIndex::of(func, &phi_blocks);
     loop {
         let before = candidates.len();
         copies.clear();
@@ -516,7 +527,7 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
                 if !candidates.contains(&phi.result) {
                     continue;
                 }
-                match phi_incomings_owned(func, facts, &sites, &candidates, body, phi) {
+                match phi_incomings_owned(func, facts, &sites, &candidates, body, phi, &mut index) {
                     Some(seed_copies) => copies.extend(seed_copies),
                     None => {
                         candidates.remove(&phi.result);
@@ -526,25 +537,24 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
         }
         // The phi's own value: read only by borrowers, and handed on only
         // to phis that own what they are handed.
-        let dropped: Vec<HirId> = candidates
-            .iter()
-            .copied()
-            .filter(|p| {
-                let derived = derived_values_local(func, *p, facts);
-                let kept = !uses_are_all_borrows(func, &derived, facts);
-                let handed_on = phis_using_any(func, &derived)
-                    .iter()
-                    .any(|other| !candidates.contains(other));
-                if (kept || handed_on) && trace_enabled() {
+        let mut dropped: Vec<HirId> = Vec::new();
+        for p in candidates.iter().copied() {
+            let kept = !index.borrowed_only(func, facts, p);
+            let handed_on = index
+                .phis_using_derived(func, facts, p)
+                .iter()
+                .any(|other| !candidates.contains(other));
+            if kept || handed_on {
+                if trace_enabled() {
                     eprintln!(
                         "[drop] {}: phi {:?} cannot own its value (kept by a use {kept}, handed to a phi that does not own {handed_on})",
                         func.name.resolve_global().unwrap_or_default(),
                         p
                     );
                 }
-                kept || handed_on
-            })
-            .collect();
+                dropped.push(p);
+            }
+        }
         for p in dropped {
             candidates.remove(&p);
         }
@@ -677,6 +687,142 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
 /// Whether every incoming of `phi` is storage the phi may own, given the
 /// sites and the phis still candidates. Returns the string seeds to copy
 /// on their entry edges, or `None` where an incoming fails.
+/// What the rounds deciding which phis own their values ask of each
+/// value, indexed once per function: the phis reading it, where it is
+/// defined, what is derived from it and whether all its uses borrow.
+struct PhiIndex {
+    users: Users,
+    /// The phis with the value among their incomings.
+    phi_users: std::collections::HashMap<HirId, Vec<HirId>>,
+    /// The blocks whose terminator reads the value.
+    terminator_users: std::collections::HashMap<HirId, Vec<HirId>>,
+    /// The block defining the value, by instruction or phi.
+    def_blocks: std::collections::HashMap<HirId, HirId>,
+    derived: std::collections::HashMap<HirId, IdSet>,
+    borrowed: std::collections::HashMap<HirId, bool>,
+    past_merge: std::collections::HashMap<(HirId, HirId), bool>,
+}
+
+impl PhiIndex {
+    fn of(func: &HirFunction, phi_blocks: &std::collections::HashMap<HirId, HirId>) -> Self {
+        let mut phi_users: std::collections::HashMap<HirId, Vec<HirId>> =
+            std::collections::HashMap::new();
+        let mut terminator_users: std::collections::HashMap<HirId, Vec<HirId>> =
+            std::collections::HashMap::new();
+        let mut def_blocks: std::collections::HashMap<HirId, HirId> = phi_blocks.clone();
+        for (b, block) in &func.blocks {
+            for phi in &block.phis {
+                for (v, _) in &phi.incoming {
+                    phi_users.entry(*v).or_default().push(phi.result);
+                }
+            }
+            for inst in &block.instructions {
+                if let Some(r) = inst.result_id() {
+                    def_blocks.insert(r, *b);
+                }
+            }
+            for v in terminator_operands(&block.terminator) {
+                terminator_users.entry(v).or_default().push(*b);
+            }
+        }
+        PhiIndex {
+            users: Users::of(func),
+            phi_users,
+            terminator_users,
+            def_blocks,
+            derived: std::collections::HashMap::new(),
+            borrowed: std::collections::HashMap::new(),
+            past_merge: std::collections::HashMap::new(),
+        }
+    }
+
+    fn derived(&mut self, func: &HirFunction, facts: &ModuleFacts, value: HirId) -> &IdSet {
+        let users = &self.users;
+        self.derived
+            .entry(value)
+            .or_insert_with(|| derived_values_using(func, value, false, Some(facts), users))
+    }
+
+    /// Whether every use of the value, and of what is derived from it,
+    /// borrows: only the instructions naming one of them can say
+    /// otherwise.
+    fn borrowed_only(&mut self, func: &HirFunction, facts: &ModuleFacts, value: HirId) -> bool {
+        if let Some(b) = self.borrowed.get(&value) {
+            return *b;
+        }
+        let derived = self.derived(func, facts, value).clone();
+        let mut seen: std::collections::HashSet<(HirId, usize)> = std::collections::HashSet::new();
+        let mut borrowed = true;
+        'scan: for d in &derived {
+            if let Some(sites) = self.users.by_value.get(d) {
+                for (b, i) in sites {
+                    let Some(inst) = func.blocks.get(b).and_then(|blk| blk.instructions.get(*i))
+                    else {
+                        continue;
+                    };
+                    if !seen.insert((*b, *i)) {
+                        continue;
+                    }
+                    if matches!(classify_derived_use(inst, &derived, facts), UseKind::Escape) {
+                        borrowed = false;
+                        break 'scan;
+                    }
+                }
+            }
+            if let Some(blocks) = self.terminator_users.get(d) {
+                for b in blocks {
+                    let Some(blk) = func.blocks.get(b) else {
+                        continue;
+                    };
+                    if matches!(
+                        classify_terminator_use(&blk.terminator, *d),
+                        UseKind::Escape
+                    ) {
+                        borrowed = false;
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        self.borrowed.insert(value, borrowed);
+        borrowed
+    }
+
+    /// The phis reading the value or anything derived from it.
+    fn phis_using_derived(
+        &mut self,
+        func: &HirFunction,
+        facts: &ModuleFacts,
+        value: HirId,
+    ) -> Vec<HirId> {
+        let derived = self.derived(func, facts, value).clone();
+        let mut out = Vec::new();
+        for d in &derived {
+            if let Some(users) = self.phi_users.get(d) {
+                out.extend(users.iter().copied());
+            }
+        }
+        out
+    }
+
+    fn used_past_merge(
+        &mut self,
+        func: &HirFunction,
+        facts: &ModuleFacts,
+        value: HirId,
+        merge: HirId,
+    ) -> bool {
+        if let Some(b) = self.past_merge.get(&(value, merge)) {
+            return *b;
+        }
+        let derived = self.derived(func, facts, value).clone();
+        let def_block = self.def_blocks.get(&value).copied();
+        let b = used_past_merge(func, &derived, def_block, merge);
+        self.past_merge.insert((value, merge), b);
+        b
+    }
+}
+
 fn phi_incomings_owned(
     func: &HirFunction,
     facts: &ModuleFacts,
@@ -684,10 +830,11 @@ fn phi_incomings_owned(
     candidates: &IdSet,
     body: Option<&IdSet>,
     phi: &crate::hir::HirPhi,
+    index: &mut PhiIndex,
 ) -> Option<Vec<(HirId, HirId, usize, HirId)>> {
-    let merge = phi_block_of(func, phi.result)?;
+    let merge = index.def_blocks.get(&phi.result).copied()?;
     let mut copies = Vec::new();
-    for (index, (val, pred)) in phi.incoming.iter().enumerate() {
+    for (position, (val, pred)) in phi.incoming.iter().enumerate() {
         // Carried round unchanged: one object, handed back to itself.
         if *val == phi.result {
             continue;
@@ -700,21 +847,20 @@ fn phi_incomings_owned(
         let round_back_edge = body.is_some_and(|b| b.contains(pred));
         let owned = sites.contains_key(val) || candidates.contains(val);
         // Nothing but owning phis may keep the incoming.
-        let kept_elsewhere = phis_using(func, *val)
-            .iter()
-            .any(|p| *p != phi.result && !candidates.contains(p));
-        let derived = derived_values_local(func, *val, facts);
-        let borrowed_only = uses_are_all_borrows(func, &derived, facts);
+        let kept_elsewhere = index.phi_users.get(val).is_some_and(|users| {
+            users
+                .iter()
+                .any(|p| *p != phi.result && !candidates.contains(p))
+        });
+        let borrowed_only = index.borrowed_only(func, facts, *val);
         let fine = if round_back_edge {
             // Built by the body, so the phi never carries one object
             // twice.
             let fresh = body.is_some_and(|b| {
-                b.iter()
-                    .filter(|id| **id != merge)
-                    .filter_map(|id| func.blocks.get(id))
-                    .any(|blk| {
-                        defines_value(blk, *val) || blk.phis.iter().any(|p| p.result == *val)
-                    })
+                index
+                    .def_blocks
+                    .get(val)
+                    .is_some_and(|d| *d != merge && b.contains(d))
             });
             owned && !kept_elsewhere && fresh && borrowed_only
         } else {
@@ -723,7 +869,7 @@ fn phi_incomings_owned(
             owned
                 && !kept_elsewhere
                 && borrowed_only
-                && !used_past_merge(func, &derived, def_block_of(func, *val), merge)
+                && !index.used_past_merge(func, facts, *val, merge)
         };
         if fine {
             continue;
@@ -739,7 +885,7 @@ fn phi_incomings_owned(
         }
         // An accumulator's seed a string from anywhere: a copy is ours.
         if body.is_some() && !round_back_edge && is_string(&phi.ty) && is_string_value(func, *val) {
-            copies.push((*pred, phi.result, index, *val));
+            copies.push((*pred, phi.result, position, *val));
             continue;
         }
         return None;
@@ -1371,16 +1517,30 @@ fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
             );
         }
     }
+    let phases = std::env::var_os("ZYNTAX_TRACE_DROP_PHASES").is_some();
+    let started = std::time::Instant::now();
     let mallocs: Vec<MallocSite> = collect_owned_sites(func, facts);
+    let sites = mallocs.len();
+    let collected = started.elapsed();
+    let mut rebuilding = std::time::Duration::ZERO;
+    let mut analyzing = std::time::Duration::ZERO;
+    let mut applying = std::time::Duration::ZERO;
+    let mut rebuilds = 0usize;
     // The use index every site's analysis walks, rebuilt when a release
     // inserted for one site has moved the instructions.
     let mut users = Users::of(func);
     for site in mallocs {
         stats.mallocs_scanned += 1;
+        let at = std::time::Instant::now();
         if users.stale(func) {
             users = Users::of(func);
+            rebuilds += 1;
         }
+        rebuilding += at.elapsed();
+        let at = std::time::Instant::now();
         let outcome = analyze_site(func, &site, facts, &users);
+        analyzing += at.elapsed();
+        let at = std::time::Instant::now();
         if trace_enabled() {
             eprintln!(
                 "[drop] {}: site {} -> {}",
@@ -1419,8 +1579,24 @@ fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
             SiteOutcome::MultiBlock => stats.multi_block_skipped += 1,
             SiteOutcome::NoUse => stats.no_use_skipped += 1,
         }
+        applying += at.elapsed();
     }
+    let at = std::time::Instant::now();
     stats.frees_inserted += release_owned_phis(func, facts);
+    let phis = at.elapsed();
+    if phases && started.elapsed().as_millis() >= 5 {
+        let blocks = func.blocks.len();
+        let insts: usize = func.blocks.values().map(|b| b.instructions.len()).sum();
+        eprintln!(
+            "[drop] {}: {blocks} blocks, {insts} insts, {sites} sites, {rebuilds} rebuilds; collect {:.1} ms, rebuild {:.1} ms, analyze {:.1} ms, apply {:.1} ms, phis {:.1} ms",
+            func.name.resolve_global().unwrap_or_default(),
+            collected.as_secs_f64() * 1000.0,
+            rebuilding.as_secs_f64() * 1000.0,
+            analyzing.as_secs_f64() * 1000.0,
+            applying.as_secs_f64() * 1000.0,
+            phis.as_secs_f64() * 1000.0,
+        );
+    }
     stats
 }
 
