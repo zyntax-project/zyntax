@@ -42,7 +42,7 @@
 //! `bead_id` as a constant in the probe call.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use beadie::Bead;
@@ -2034,6 +2034,30 @@ pub fn lazy_optimized_body(bead_id: u64) -> Option<Arc<HirFunction>> {
     guard.as_ref().and_then(|f| f(bead_id))
 }
 
+/// The entry each bead's stub calls once its function is compiled,
+/// read without a lock: a stub whose address something kept (a
+/// function value made before the compile, a code pointer stored in a
+/// global) is called for the life of the program.
+const PUBLISHED_ENTRIES: usize = 1 << 16;
+static PUBLISHED: [AtomicUsize; PUBLISHED_ENTRIES] =
+    [const { AtomicUsize::new(0) }; PUBLISHED_ENTRIES];
+
+/// The published entry of `bead_id`, or 0 when none is, or the id is
+/// past the table (then the runtime's table answers).
+pub fn published_entry(bead_id: u64) -> usize {
+    match PUBLISHED.get(bead_id as usize) {
+        Some(slot) => slot.load(Ordering::Acquire),
+        None => 0,
+    }
+}
+
+/// Record `entry` as what `bead_id`'s stub calls from now on.
+pub fn set_published_entry(bead_id: u64, entry: usize) {
+    if let Some(slot) = PUBLISHED.get(bead_id as usize) {
+        slot.store(entry, Ordering::Release);
+    }
+}
+
 /// Called by a stub on the first call of the function it stands for.
 /// The runtime compiles the function and publishes its entry; the stub
 /// calls what comes back. With no compiler installed the process
@@ -2043,6 +2067,10 @@ pub fn lazy_optimized_body(bead_id: u64) -> Option<Arc<HirFunction>> {
 /// Called from generated code with C ABI.
 #[unsafe(no_mangle)]
 pub extern "C" fn lazy_compile(bead_id: u64) -> *const u8 {
+    let entry = published_entry(bead_id);
+    if entry != 0 {
+        return entry as *const u8;
+    }
     let guard = lazy_compiler().read().unwrap();
     let Some(f) = guard.as_ref() else {
         eprintln!(

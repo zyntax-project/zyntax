@@ -2738,6 +2738,7 @@ impl TieredBackend {
                     table.remove(&bead_id);
                 } else {
                     table.insert(bead_id, Some(entry));
+                    osr::set_published_entry(bead_id, entry);
                 }
                 published.notify_all();
                 entry as *const u8
