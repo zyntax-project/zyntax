@@ -21,6 +21,9 @@ pub enum Ty {
     Bool,
     Int,
     Float,
+    /// An integer or a float, whichever it holds: the join of the two,
+    /// carried unboxed with a tag.
+    Number,
     Str,
     /// A table, held by pointer; never nil.
     Table,
@@ -36,17 +39,20 @@ impl Ty {
         match (self, other) {
             (Ty::Unknown, t) | (t, Ty::Unknown) => t,
             (a, b) if a == b => a,
+            (a, b) if a.is_number() && b.is_number() => Ty::Number,
             _ => Ty::Any,
         }
     }
 
+    /// An integer, a float, or one or the other: arithmetic on it
+    /// needs no box.
     pub fn is_number(self) -> bool {
-        matches!(self, Ty::Int | Ty::Float)
+        matches!(self, Ty::Int | Ty::Float | Ty::Number)
     }
 
     /// Whether a value of this type is always true in a condition.
     pub fn always_truthy(self) -> bool {
-        matches!(self, Ty::Int | Ty::Float | Ty::Str | Ty::Table)
+        matches!(self, Ty::Int | Ty::Float | Ty::Number | Ty::Str | Ty::Table)
     }
 
     /// What is known once inference has settled: a variable nothing
@@ -158,7 +164,7 @@ pub fn math_result(b: &Builtin, args: &[Ty]) -> Option<Ty> {
         ("abs" | "max" | "min", args) => numbers(args),
         ("floor" | "ceil", [Ty::Int]) => Some(Ty::Int),
         ("fmod", [Ty::Int, Ty::Int]) => Some(Ty::Int),
-        ("fmod", [a, b]) if a.is_number() && b.is_number() => Some(Ty::Float),
+        ("fmod", [Ty::Int | Ty::Float, Ty::Int | Ty::Float]) => Some(Ty::Float),
         ("floor" | "ceil" | "fmod", _) => None,
         _ => return None,
     };
@@ -413,7 +419,7 @@ impl<'a> Typer<'a> {
                 match unop {
                     UnOp::Not(_) => Ty::Bool,
                     UnOp::Minus(_) => match t {
-                        Ty::Int | Ty::Float => t,
+                        Ty::Int | Ty::Float | Ty::Number => t,
                         _ => Ty::Any,
                     },
                     UnOp::Hash(_) => match t {
@@ -493,12 +499,16 @@ pub fn binary_ty(op: &BinOp, a: Ty, b: Ty) -> Ty {
         | BinOp::Star(_)
         | BinOp::Percent(_)
         | BinOp::DoubleSlash(_) => {
-            if a == Ty::Int && b == Ty::Int {
+            // A float operand makes a float; two integers an integer;
+            // a number whose kind is not known keeps it open.
+            if !(a.is_number() && b.is_number()) {
+                Ty::Any
+            } else if a == Ty::Int && b == Ty::Int {
                 Ty::Int
-            } else if a.is_number() && b.is_number() {
+            } else if a == Ty::Float || b == Ty::Float {
                 Ty::Float
             } else {
-                Ty::Any
+                Ty::Number
             }
         }
         BinOp::Slash(_) | BinOp::Caret(_) => {
@@ -520,7 +530,7 @@ pub fn binary_ty(op: &BinOp, a: Ty, b: Ty) -> Ty {
             }
         }
         BinOp::TwoDots(_) => {
-            let text = |t: Ty| matches!(t, Ty::Str | Ty::Int | Ty::Float);
+            let text = |t: Ty| t == Ty::Str || t.is_number();
             if text(a) && text(b) { Ty::Str } else { Ty::Any }
         }
         BinOp::TwoEqual(_)

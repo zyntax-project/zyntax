@@ -201,6 +201,7 @@ impl<'a> Module<'a> {
             Ty::Bool => prim(PrimitiveType::Bool),
             Ty::Int => prim(PrimitiveType::I64),
             Ty::Float => prim(PrimitiveType::F64),
+            Ty::Number => number_type(),
             Ty::Str => prim(PrimitiveType::String),
             Ty::Table => self.types.table(),
             Ty::Nil | Ty::Any | Ty::Unknown => Type::Any,
@@ -327,6 +328,23 @@ struct Lowerer<'m, 'a> {
 enum Prepared<'e> {
     Whole(&'e Var),
     Index(Box<(Val, Val, Desc)>),
+}
+
+/// What is known of a `//` or `%` divisor from its literal.
+#[derive(Clone, Copy)]
+struct Divisor {
+    /// A literal that is not 0 or -1: the integer path cannot raise.
+    plain: bool,
+    /// A literal positive power of two.
+    pow2: Option<i64>,
+}
+
+/// How two numbers are compared.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Compare {
+    Eq,
+    Lt,
+    Le,
 }
 
 fn unsupported<T>(what: impl Into<String>, span: Span) -> Result<T> {
@@ -527,6 +545,62 @@ fn ret(value: Option<Node>, span: Span) -> St {
 }
 
 /// Statements followed by a value, as one expression.
+/// A number whose kind is decided at run time: the integer it holds,
+/// the float it holds, and which. A value struct, so it lives in
+/// registers; the field for the other kind is left zero.
+fn number_type() -> Type {
+    Type::Tuple(vec![
+        prim(PrimitiveType::I64),
+        prim(PrimitiveType::F64),
+        prim(PrimitiveType::Bool),
+    ])
+}
+
+fn number_value(int: Node, float: Node, is_int: Node, span: Span) -> Node {
+    node(
+        TypedExpression::Tuple(vec![int, float, is_int]),
+        number_type(),
+        span,
+    )
+}
+
+fn number_of_int(n: Node, span: Span) -> Node {
+    number_value(n, float_lit(0.0, span), bool_lit(true, span), span)
+}
+
+fn number_of_float(f: Node, span: Span) -> Node {
+    number_value(int_lit(0, span), f, bool_lit(false, span), span)
+}
+
+/// The parts of a number that is a plain read.
+struct NumberParts {
+    int: Node,
+    float: Node,
+    is_int: Node,
+}
+
+impl NumberParts {
+    fn of(n: &Node, span: Span) -> NumberParts {
+        let part = |i: i64, ty: PrimitiveType| index(n.clone(), int_lit(i, span), prim(ty), span);
+        NumberParts {
+            int: part(0, PrimitiveType::I64),
+            float: part(1, PrimitiveType::F64),
+            is_int: part(2, PrimitiveType::Bool),
+        }
+    }
+
+    /// The value as a float, whichever kind it holds.
+    fn as_float(&self, span: Span) -> Node {
+        if_value(
+            self.is_int.clone(),
+            cast(self.int.clone(), prim(PrimitiveType::F64), span),
+            self.float.clone(),
+            prim(PrimitiveType::F64),
+            span,
+        )
+    }
+}
+
 fn block_value(statements: Vec<St>, value: Node, span: Span) -> Node {
     if statements.is_empty() {
         return value;
@@ -864,6 +938,65 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             (Ty::Unknown, _) => v.node,
             (Ty::Nil, Ty::Any) => v.node,
             (Ty::Int, Ty::Float) => cast(v.node, prim(PrimitiveType::F64), span),
+            (Ty::Int, Ty::Number) => number_of_int(v.node, span),
+            (Ty::Float, Ty::Number) => number_of_float(v.node, span),
+            (Ty::Number, Ty::Float) => {
+                let (pre, n) = self.number_parts(v);
+                block_value(pre, n.as_float(span), span)
+            }
+            (Ty::Number, Ty::Int) => {
+                let (pre, n) = self.number_parts(v);
+                let value = if_value(
+                    n.is_int,
+                    n.int,
+                    cast(n.float, prim(PrimitiveType::I64), span),
+                    prim(PrimitiveType::I64),
+                    span,
+                );
+                block_value(pre, value, span)
+            }
+            (Ty::Number, Ty::Any) => {
+                let (pre, n) = self.number_parts(v);
+                let value = if_value(
+                    n.is_int,
+                    call("zb_box_i64", vec![n.int], Type::Any, span),
+                    call("zb_box_f64", vec![n.float], Type::Any, span),
+                    Type::Any,
+                    span,
+                );
+                block_value(pre, value, span)
+            }
+            // A dynamic value known to hold a number: its kind is read
+            // off the box with its payload.
+            (Ty::Any, Ty::Number) => {
+                let mut pre = Vec::new();
+                let b = self.hold(v, &mut pre);
+                let is_int = binary(
+                    BinaryOp::Ne,
+                    call(
+                        "zb_any_category",
+                        vec![b.node.clone()],
+                        prim(PrimitiveType::I64),
+                        span,
+                    ),
+                    int_lit(library::FLOAT, span),
+                    prim(PrimitiveType::Bool),
+                    span,
+                );
+                let int = call(
+                    "zb_box_payload_i64",
+                    vec![b.node.clone()],
+                    prim(PrimitiveType::I64),
+                    span,
+                );
+                let float = call(
+                    "zb_box_payload_f64",
+                    vec![b.node],
+                    prim(PrimitiveType::F64),
+                    span,
+                );
+                block_value(pre, number_value(int, float, is_int, span), span)
+            }
             (Ty::Bool, Ty::Any) => call("zb_box_bool", vec![v.node], Type::Any, span),
             (Ty::Int, Ty::Any) => call("zb_box_i64", vec![v.node], Type::Any, span),
             (Ty::Float, Ty::Any) => call("zb_box_f64", vec![v.node], Type::Any, span),
@@ -909,6 +1042,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 let zero = match t {
                     Ty::Int => int_lit(0, span),
                     Ty::Float => float_lit(0.0, span),
+                    Ty::Number => number_of_int(int_lit(0, span), span),
                     Ty::Bool => bool_lit(false, span),
                     Ty::Str => str_lit("", span),
                     Ty::Table => null(self.ir(Ty::Table), span),
@@ -1006,6 +1140,64 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
     }
 
+    /// `x % n` for a float `x` and a positive power of two `n`: the
+    /// quotient, its floor and the product are all exact, and so is the
+    /// difference; a zero keeps `x`'s sign, as fmod's does.
+    fn float_mod_pow2(&mut self, x: Node, n: i64, span: Span) -> Node {
+        let f64_t = prim(PrimitiveType::F64);
+        let mut pre = Vec::new();
+        let x = self
+            .hold(
+                Val {
+                    node: x,
+                    ty: Ty::Float,
+                },
+                &mut pre,
+            )
+            .node;
+        let quotient = binary(
+            BinaryOp::Mul,
+            x.clone(),
+            float_lit(1.0 / n as f64, span),
+            f64_t.clone(),
+            span,
+        );
+        let floored = call("floor", vec![quotient], f64_t.clone(), span);
+        let product = binary(
+            BinaryOp::Mul,
+            floored,
+            float_lit(n as f64, span),
+            f64_t.clone(),
+            span,
+        );
+        let r = self
+            .hold(
+                Val {
+                    node: binary(BinaryOp::Sub, x.clone(), product, f64_t.clone(), span),
+                    ty: Ty::Float,
+                },
+                &mut pre,
+            )
+            .node;
+        let zero = binary(
+            BinaryOp::Eq,
+            r.clone(),
+            float_lit(0.0, span),
+            prim(PrimitiveType::Bool),
+            span,
+        );
+        let signed_zero = binary(BinaryOp::Mul, x, float_lit(0.0, span), f64_t.clone(), span);
+        block_value(pre, if_value(zero, signed_zero, r, f64_t, span), span)
+    }
+
+    /// The parts of a number, held first unless it is a plain read.
+    fn number_parts(&mut self, v: Val) -> (Vec<St>, NumberParts) {
+        let span = v.node.span;
+        let mut pre = Vec::new();
+        let held = self.hold(v, &mut pre);
+        (pre, NumberParts::of(&held.node, span))
+    }
+
     /// A list literal whose items are plain reads: any other item is
     /// bound ahead of the literal, since the lowering stores the elements
     /// in one block and an item may carry control flow (a check after a
@@ -1031,7 +1223,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         match v.ty {
             Ty::Bool => v.node,
             Ty::Nil => block_value(vec![expr_stmt(v.node)], bool_lit(false, span), span),
-            Ty::Int | Ty::Float | Ty::Str | Ty::Table => {
+            Ty::Int | Ty::Float | Ty::Number | Ty::Str | Ty::Table => {
                 if Self::is_simple(&v.node) {
                     bool_lit(true, span)
                 } else {
@@ -1085,6 +1277,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         match ty {
             Ty::Int => int_lit(0, span),
             Ty::Float => float_lit(0.0, span),
+            Ty::Number => number_of_int(int_lit(0, span), span),
             Ty::Bool => bool_lit(false, span),
             Ty::Str => str_lit("", span),
             Ty::Table => call("zl_table_new", vec![], self.ir(Ty::Table), span),
@@ -1956,6 +2149,21 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     node: unary(UnaryOp::Minus, v.node, prim(PrimitiveType::F64), span),
                     ty: Ty::Float,
                 },
+                Ty::Number => {
+                    let (pre, n) = self.number_parts(v);
+                    let int = binary(
+                        BinaryOp::Sub,
+                        int_lit(0, span),
+                        n.int,
+                        prim(PrimitiveType::I64),
+                        span,
+                    );
+                    let float = unary(UnaryOp::Minus, n.float, prim(PrimitiveType::F64), span);
+                    Val {
+                        node: block_value(pre, number_value(int, float, n.is_int, span), span),
+                        ty: Ty::Number,
+                    }
+                }
                 _ => {
                     let b = self.boxed(v);
                     self.guard_described(
@@ -2037,6 +2245,28 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     fn binary_vals(&mut self, op: &BinOp, a: Val, b: Val, span: Span) -> Result<Val> {
         let ints = a.ty == Ty::Int && b.ty == Ty::Int;
         let numbers = a.ty.is_number() && b.ty.is_number();
+        // A literal divisor that is not 0 or -1 makes `//` and `%`
+        // plain arithmetic: nothing to raise, nothing to check after.
+        let literal_divisor = match &b.node.node {
+            TypedExpression::Literal(TypedLiteral::Integer(n)) if b.ty == Ty::Int => {
+                Some(*n as i64)
+            }
+            _ => None,
+        };
+        let plain_divisor = literal_divisor.is_some_and(|n| n != 0 && n != -1);
+        // A positive power of two divides a float exactly, so its
+        // modulo is three operations instead of fmod.
+        let pow2_divisor = literal_divisor.filter(|n| *n > 0 && n & (n - 1) == 0);
+        // A number whose kind is not known decides it at run time.
+        if numbers && (a.ty == Ty::Number || b.ty == Ty::Number) {
+            let divisor = Divisor {
+                plain: plain_divisor,
+                pow2: pow2_divisor,
+            };
+            if let Some(v) = self.number_binary(op, a.clone(), b.clone(), divisor, span) {
+                return Ok(v);
+            }
+        }
         let i64_t = prim(PrimitiveType::I64);
         let f64_t = prim(PrimitiveType::F64);
         let bool_t = prim(PrimitiveType::Bool);
@@ -2099,7 +2329,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
             }
             BinOp::DoubleSlash(_) => {
-                if ints {
+                if ints && plain_divisor {
+                    int_result(call("zb_floordiv_i64", vec![a.node, b.node], i64_t, span))
+                } else if ints {
                     int_result(call("zl_idiv_i64", vec![a.node, b.node], i64_t, span))
                 } else if numbers {
                     let (x, y) = (as_float(self, a), as_float(self, b));
@@ -2109,8 +2341,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
             }
             BinOp::Percent(_) => {
-                if ints {
+                if ints && plain_divisor {
+                    int_result(call("zb_mod_i64", vec![a.node, b.node], i64_t, span))
+                } else if ints {
                     int_result(call("zl_mod_i64", vec![a.node, b.node], i64_t, span))
+                } else if let (true, Some(n)) = (numbers, pow2_divisor) {
+                    let x = as_float(self, a);
+                    float_result(self.float_mod_pow2(x, n, span))
                 } else if numbers {
                     let (x, y) = (as_float(self, a), as_float(self, b));
                     float_result(call("zl_mod_f64", vec![x, y], f64_t, span))
@@ -2185,6 +2422,213 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         })
     }
 
+    /// Arithmetic where at least one operand's kind is decided at run
+    /// time: both integers takes the integer path, anything else the
+    /// float path, and the result says which it took. Bitwise
+    /// operators and concatenation are not handled here.
+    fn number_binary(
+        &mut self,
+        op: &BinOp,
+        a: Val,
+        b: Val,
+        divisor: Divisor,
+        span: Span,
+    ) -> Option<Val> {
+        let plain_divisor = divisor.plain;
+        let i64_t = prim(PrimitiveType::I64);
+        let f64_t = prim(PrimitiveType::F64);
+        let bool_t = prim(PrimitiveType::Bool);
+        let both_int = |x: &NumberParts, y: &NumberParts| {
+            binary(
+                BinaryOp::And,
+                x.is_int.clone(),
+                y.is_int.clone(),
+                prim(PrimitiveType::Bool),
+                span,
+            )
+        };
+        let a = Val {
+            node: self.coerce(a, Ty::Number),
+            ty: Ty::Number,
+        };
+        let b = Val {
+            node: self.coerce(b, Ty::Number),
+            ty: Ty::Number,
+        };
+        let (mut pre, x) = self.number_parts(a);
+        let (mut pre_b, y) = self.number_parts(b);
+        pre.append(&mut pre_b);
+        let number = |int: Node, float: Node, is_int: Node| Val {
+            node: block_value(pre.clone(), number_value(int, float, is_int, span), span),
+            ty: Ty::Number,
+        };
+        Some(match op {
+            BinOp::Plus(_) | BinOp::Minus(_) | BinOp::Star(_) => {
+                let bop = match op {
+                    BinOp::Plus(_) => BinaryOp::Add,
+                    BinOp::Minus(_) => BinaryOp::Sub,
+                    _ => BinaryOp::Mul,
+                };
+                // Both paths are pure, so both run and the tag picks.
+                let int = binary(bop, x.int.clone(), y.int.clone(), i64_t, span);
+                let float = binary(bop, x.as_float(span), y.as_float(span), f64_t, span);
+                number(int, float, both_int(&x, &y))
+            }
+            BinOp::Slash(_) | BinOp::Caret(_) => {
+                let (l, r) = (x.as_float(span), y.as_float(span));
+                let float = if matches!(op, BinOp::Slash(_)) {
+                    binary(BinaryOp::Div, l, r, f64_t, span)
+                } else {
+                    call("zl_pow", vec![l, r], f64_t, span)
+                };
+                Val {
+                    node: block_value(pre, float, span),
+                    ty: Ty::Float,
+                }
+            }
+            BinOp::DoubleSlash(_) | BinOp::Percent(_) => {
+                // The integer path raises on a zero divisor, so only
+                // the path taken runs.
+                let (fi, ff) = match (op, plain_divisor) {
+                    (BinOp::DoubleSlash(_), true) => ("zb_floordiv_i64", "zl_idiv_f64"),
+                    (BinOp::DoubleSlash(_), false) => ("zl_idiv_i64", "zl_idiv_f64"),
+                    (_, true) => ("zb_mod_i64", "zl_mod_f64"),
+                    (_, false) => ("zl_mod_i64", "zl_mod_f64"),
+                };
+                let is_int = both_int(&x, &y);
+                let int = if_value(
+                    is_int.clone(),
+                    call(fi, vec![x.int.clone(), y.int.clone()], i64_t.clone(), span),
+                    int_lit(0, span),
+                    i64_t,
+                    span,
+                );
+                let float_part = match (op, divisor.pow2) {
+                    (BinOp::Percent(_), Some(n)) => self.float_mod_pow2(x.as_float(span), n, span),
+                    _ => call(
+                        ff,
+                        vec![x.as_float(span), y.as_float(span)],
+                        f64_t.clone(),
+                        span,
+                    ),
+                };
+                let float = if_value(
+                    is_int.clone(),
+                    float_lit(0.0, span),
+                    float_part,
+                    f64_t,
+                    span,
+                );
+                // The call is below the value, where the check after a
+                // call would not find it.
+                let v = number(int, float, is_int);
+                if plain_divisor { v } else { self.guard(v) }
+            }
+            BinOp::TwoEqual(_) | BinOp::TildeEqual(_) => {
+                let eq = self.number_compare_parts(&x, &y, Compare::Eq, span);
+                let v = if matches!(op, BinOp::TildeEqual(_)) {
+                    unary(UnaryOp::Not, eq, bool_t, span)
+                } else {
+                    eq
+                };
+                Val {
+                    node: block_value(pre, v, span),
+                    ty: Ty::Bool,
+                }
+            }
+            BinOp::LessThan(_)
+            | BinOp::LessThanEqual(_)
+            | BinOp::GreaterThan(_)
+            | BinOp::GreaterThanEqual(_) => {
+                let (l, r, how) = match op {
+                    BinOp::LessThan(_) => (&x, &y, Compare::Lt),
+                    BinOp::LessThanEqual(_) => (&x, &y, Compare::Le),
+                    BinOp::GreaterThan(_) => (&y, &x, Compare::Lt),
+                    _ => (&y, &x, Compare::Le),
+                };
+                let v = self.number_compare_parts(l, r, how, span);
+                Val {
+                    node: block_value(pre, v, span),
+                    ty: Ty::Bool,
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    /// `a` against `b`, at least one of them a number of run-time kind.
+    fn number_compare(&mut self, a: Val, b: Val, how: Compare, span: Span) -> Node {
+        let a = Val {
+            node: self.coerce(a, Ty::Number),
+            ty: Ty::Number,
+        };
+        let b = Val {
+            node: self.coerce(b, Ty::Number),
+            ty: Ty::Number,
+        };
+        let (mut pre, x) = self.number_parts(a);
+        let (mut pre_b, y) = self.number_parts(b);
+        pre.append(&mut pre_b);
+        let v = self.number_compare_parts(&x, &y, how, span);
+        block_value(pre, v, span)
+    }
+
+    /// Two integers compare as integers, two floats as floats, and an
+    /// integer against a float exactly, as Lua does.
+    fn number_compare_parts(
+        &mut self,
+        x: &NumberParts,
+        y: &NumberParts,
+        how: Compare,
+        span: Span,
+    ) -> Node {
+        let bool_t = prim(PrimitiveType::Bool);
+        let (op, int_float, float_int) = match how {
+            Compare::Eq => (BinaryOp::Eq, "zl_eq_if", "zl_eq_if"),
+            Compare::Lt => (BinaryOp::Lt, "zl_lt_if", "zl_lt_fi"),
+            Compare::Le => (BinaryOp::Le, "zl_le_if", "zl_le_fi"),
+        };
+        let ints = binary(op, x.int.clone(), y.int.clone(), bool_t.clone(), span);
+        let floats = binary(op, x.float.clone(), y.float.clone(), bool_t.clone(), span);
+        // `zl_eq_if` takes the integer first whichever side it is on.
+        let x_int = call(
+            int_float,
+            vec![x.int.clone(), y.float.clone()],
+            bool_t.clone(),
+            span,
+        );
+        let y_int = if how == Compare::Eq {
+            call(
+                float_int,
+                vec![y.int.clone(), x.float.clone()],
+                bool_t.clone(),
+                span,
+            )
+        } else {
+            call(
+                float_int,
+                vec![x.float.clone(), y.int.clone()],
+                bool_t.clone(),
+                span,
+            )
+        };
+        let mixed = if_value(
+            x.is_int.clone(),
+            x_int,
+            if_value(y.is_int.clone(), y_int, floats, bool_t.clone(), span),
+            bool_t.clone(),
+            span,
+        );
+        let both = binary(
+            BinaryOp::And,
+            x.is_int.clone(),
+            y.is_int.clone(),
+            bool_t.clone(),
+            span,
+        );
+        if_value(both, ints, mixed, bool_t, span)
+    }
+
     /// The text a string or number contributes to `..`.
     fn text_of(&mut self, v: Val) -> Node {
         let span = v.node.span;
@@ -2202,6 +2646,18 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 prim(PrimitiveType::String),
                 span,
             ),
+            Ty::Number => {
+                let str_t = prim(PrimitiveType::String);
+                let (pre, n) = self.number_parts(v);
+                let text = if_value(
+                    n.is_int,
+                    call("zb_str_of_int", vec![n.int], str_t.clone(), span),
+                    call("zl_float_str", vec![n.float], str_t.clone(), span),
+                    str_t,
+                    span,
+                );
+                block_value(pre, text, span)
+            }
             _ => {
                 let b = self.boxed(v);
                 self.guard(Val {
@@ -2221,6 +2677,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             }
             (Ty::Int, Ty::Float) => call("zl_eq_if", vec![a.node, b.node], bool_t, span),
             (Ty::Float, Ty::Int) => call("zl_eq_if", vec![b.node, a.node], bool_t, span),
+            (x, y) if x.is_number() && y.is_number() => {
+                self.number_compare(a, b, Compare::Eq, span)
+            }
             (Ty::Str, Ty::Str) => call("zb_str_eq", vec![a.node, b.node], bool_t, span),
             (Ty::Nil, Ty::Nil) => block_value(
                 vec![expr_stmt(a.node), expr_stmt(b.node)],
@@ -2250,6 +2709,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let bool_t = prim(PrimitiveType::Bool);
         let op = if or_equal { BinaryOp::Le } else { BinaryOp::Lt };
         if a.ty.is_number() && b.ty.is_number() {
+            if a.ty == Ty::Number || b.ty == Ty::Number {
+                let how = if or_equal { Compare::Le } else { Compare::Lt };
+                return self.number_compare(a, b, how, span);
+            }
             if a.ty == b.ty {
                 return binary(op, a.node, b.node, bool_t, span);
             }

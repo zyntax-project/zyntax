@@ -2073,11 +2073,44 @@ fn arithmetic() -> Vec<Decl> {
             ret(r.e()),
         ],
     ));
+    // Integral operands below 2^53 have an integer remainder, exact on
+    // i64 and cheaper than fmod; a zero result keeps the dividend's
+    // sign, as fmod's does.
+    let integral = |x: Expr| {
+        and(
+            eq(call("floor", vec![x.clone()], f64()), x.clone()),
+            and(
+                gt(x.clone(), float(-9007199254740992.0)),
+                lt(x, float(9007199254740992.0)),
+            ),
+        )
+    };
+    let (ai, bi, ri) = (local("ai", i64()), local("bi", i64()), local("ri", i64()));
     d.push(define(
         "zb_mod_f64",
         &[&fa, &fb],
         f64(),
         vec![
+            when(
+                and(
+                    and(integral(fa.e()), integral(fb.e())),
+                    ne(fb.e(), float(0.0)),
+                ),
+                vec![
+                    ai.decl(cast(fa.e(), i64())),
+                    bi.decl(cast(fb.e(), i64())),
+                    ri.decl(rem(ai.e(), bi.e())),
+                    when(
+                        sign_differs(ri.e(), bi.e(), int(0)),
+                        vec![ri.set(add(ri.e(), bi.e()))],
+                    ),
+                    ret(if_expr(
+                        eq(ri.e(), int(0)),
+                        mul(fa.e(), float(0.0)),
+                        cast(ri.e(), f64()),
+                    )),
+                ],
+            ),
             fr.decl(rem(fa.e(), fb.e())),
             when(
                 sign_differs(fr.e(), fb.e(), float(0.0)),
