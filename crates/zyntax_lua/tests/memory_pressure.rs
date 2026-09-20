@@ -28,8 +28,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Steps for the short and the long run.
-const SMALL: u64 = 2_000;
+/// Steps for the short and the long run. The short run is long enough
+/// for every tier to have compiled the loop and the pool to have taken
+/// its slabs, so what remains between the two is what the steps keep.
+const SMALL: u64 = 20_000;
 const LARGE: u64 = 400_000;
 /// Growth a bounded program is allowed between the two: the slabs its
 /// allocator takes, the code the long run compiles that the short one
