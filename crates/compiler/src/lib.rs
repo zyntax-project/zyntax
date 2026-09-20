@@ -1880,6 +1880,16 @@ pub fn run_interp_safe_opts_cached(module: &mut HirModule, cache: &OptCache) -> 
     run_interp_safe_opts_with(module, true, Some(cache))
 }
 
+/// Release insertion alone, over the functions still to optimise, with
+/// the cache's facts: what a body run before its optimisation needs of
+/// the pipeline, so that it frees what it allocates.
+pub fn run_release_insertion_cached(
+    module: &mut HirModule,
+    cache: &OptCache,
+) -> drop_insert::DropStats {
+    drop_insert::run_module_with(module, &cache.facts)
+}
+
 /// [`run_interp_safe_opts`] for a module whose functions other modules
 /// will be analysed against later, as a snapshot's are: the box readers
 /// stay calls, since the release analysis of the program that links the

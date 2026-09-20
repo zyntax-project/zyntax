@@ -951,6 +951,308 @@ pub fn resumable(function: &HirFunction, layout: &OsrLayout) -> HirFunction {
     f
 }
 
+/// A resume point as a function of its own: the region `layout.header`
+/// reaches, entered through a block that hands the header the frame's
+/// values as the function's parameters, and an adapter with the helper's
+/// shape (one frame pointer) that calls it. The function is optimised
+/// and compiled like any other, so a frame interpreting a body that was
+/// never optimised leaves into optimised code, and a body that never
+/// warms is never optimised at all.
+pub struct Outlined {
+    /// The region as a function: one parameter per live-in, in live-in
+    /// order.
+    pub function: HirFunction,
+    /// `(frame) -> ret`: reads the live-ins as a helper does, calls
+    /// `function`, returns its result. Compiled in helper mode with
+    /// `adapter_layout`.
+    pub adapter: HirFunction,
+    /// The frame's layout for the adapter: the same live-ins and
+    /// offsets, none of them phis.
+    pub adapter_layout: OsrLayout,
+}
+
+/// Outline the resume point of `function` at `layout.header` (see
+/// [`Outlined`]). `region_id` names the outlined function; the adapter
+/// takes a fresh id. `None` for a function that returns through a
+/// destination, whose frame carries the destination too.
+pub fn outline(
+    function: &HirFunction,
+    layout: &OsrLayout,
+    region_id: HirId,
+    region_name: zyntax_typed_ast::InternedString,
+) -> Option<Outlined> {
+    use crate::hir::{
+        HirBlock, HirFunctionSignature, HirInstruction, HirParam, HirPhi, HirValue, HirValueKind,
+    };
+    if layout.destination.is_some() {
+        return None;
+    }
+    let resumed = resumable(function, layout);
+    let reachable = reachable_from(&resumed, layout.header);
+    let in_region: IdSet = reachable.iter().copied().collect();
+
+    // The region's function: parameters for the live-ins, the header's
+    // phis fed from the entry, every other way in gone.
+    let entry = HirId::new();
+    let mut params: Vec<HirParam> = Vec::with_capacity(layout.live_ins.len());
+    let mut values: indexmap::IndexMap<HirId, HirValue> = indexmap::IndexMap::new();
+    // A live-in the region defines too, as one of the header's own phis
+    // or in a block it reaches around the header (a repaired one),
+    // arrives under a parameter of its own, which the phi at the header
+    // takes from the entry: the id stays the region's definition, and
+    // reads that `resumable` left on it are the ones that definition
+    // reaches. Any other live-in keeps its id.
+    let mut entry_values: HashMap<HirId, HirId> = HashMap::new();
+    for (i, (id, ty)) in layout
+        .live_ins
+        .iter()
+        .zip(&layout.live_in_types)
+        .enumerate()
+    {
+        let param_id = if i < layout.phi_count || layout.enters_as_phi(*id) {
+            let fresh = HirId::new();
+            entry_values.insert(*id, fresh);
+            fresh
+        } else {
+            *id
+        };
+        values.insert(
+            param_id,
+            HirValue {
+                id: param_id,
+                ty: ty.clone(),
+                kind: HirValueKind::Parameter(i as u32),
+                uses: Default::default(),
+                span: None,
+            },
+        );
+        params.push(HirParam {
+            id: param_id,
+            name: zyntax_typed_ast::InternedString::new_global(&format!("live_in{i}")),
+            ty: ty.clone(),
+            attributes: Default::default(),
+            ownership: Default::default(),
+        });
+    }
+    // Every other value the region names: constants, globals and its
+    // own results, the header's phis and the repaired live-ins' region
+    // definitions among them. A parameter of the original function is
+    // a live-in if the region reads it, and gone otherwise.
+    for (id, v) in &resumed.values {
+        if values.contains_key(id) || matches!(v.kind, HirValueKind::Parameter(_)) {
+            continue;
+        }
+        values.insert(*id, v.clone());
+    }
+
+    let mut blocks: indexmap::IndexMap<HirId, HirBlock> = indexmap::IndexMap::new();
+    let mut entry_block = HirBlock::new(entry);
+    entry_block.terminator = HirTerminator::Branch {
+        target: layout.header,
+    };
+    entry_block.successors = vec![layout.header];
+    blocks.insert(entry, entry_block);
+    for &b in &reachable {
+        let Some(block) = resumed.blocks.get(&b) else {
+            continue;
+        };
+        let mut block = block.clone();
+        let is_header = b == layout.header;
+        for phi in &mut block.phis {
+            phi.incoming.retain(|(_, pred)| in_region.contains(pred));
+            if is_header {
+                // The header's own phis and the repairs' alike take the
+                // frame's value by its parameter.
+                let from_entry = layout
+                    .repairs
+                    .iter()
+                    .find(|r| r.phi == phi.result)
+                    .map(|r| r.value)
+                    .unwrap_or(phi.result);
+                let from_entry = entry_values.get(&from_entry).copied();
+                let Some(from_entry) = from_entry else {
+                    if osr_trace_enabled() {
+                        eprintln!(
+                            "[osr] outline {}: header phi {:?} is no live-in",
+                            function.name.resolve_global().unwrap_or_default(),
+                            phi.result
+                        );
+                    }
+                    return None;
+                };
+                phi.incoming.push((from_entry, entry));
+            }
+        }
+        if is_header {
+            block.predecessors.push(entry);
+        }
+        blocks.insert(b, block);
+    }
+    let mut region = HirFunction::new(
+        region_name,
+        HirFunctionSignature {
+            params,
+            returns: function.signature.returns.clone(),
+            type_params: Vec::new(),
+            const_params: Vec::new(),
+            lifetime_params: Vec::new(),
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: Vec::new(),
+            is_pure: false,
+        },
+    );
+    region.id = region_id;
+    region.entry_block = entry;
+    region.blocks = blocks;
+    region.values = values;
+    region.calling_convention = function.calling_convention;
+    region.attributes = function.attributes.clone();
+    region.attributes.optimized = false;
+    region.attributes.deferred = false;
+    region.rebuild_cfg_edges();
+    // Everything the region reads must be a parameter, a constant, a
+    // global or its own; a value from before the header that the layout
+    // did not carry (a header phi's incoming from a latch, say) leaves
+    // the resume point to the helper.
+    let mut defined: IdSet = region
+        .values
+        .iter()
+        .filter(|(_, v)| !matches!(v.kind, HirValueKind::Instruction))
+        .map(|(id, _)| *id)
+        .collect();
+    for b in region.blocks.values() {
+        defined.extend(b.phis.iter().map(|p| p.result));
+        defined.extend(b.instructions.iter().filter_map(|i| i.result_id()));
+    }
+    let mut missing: Vec<HirId> = Vec::new();
+    for b in region.blocks.values() {
+        for p in &b.phis {
+            missing.extend(
+                p.incoming
+                    .iter()
+                    .map(|(v, _)| *v)
+                    .filter(|v| !defined.contains(v)),
+            );
+        }
+        for inst in &b.instructions {
+            inst.for_each_operand(|id| {
+                if !defined.contains(&id) {
+                    missing.push(id);
+                }
+            });
+        }
+        b.terminator.for_each_operand(|id| {
+            if !defined.contains(&id) {
+                missing.push(id);
+            }
+        });
+    }
+    if !missing.is_empty() {
+        if osr_trace_enabled() {
+            eprintln!(
+                "[osr] outline {}: the region reads {:?}, which the frame does not carry",
+                function.name.resolve_global().unwrap_or_default(),
+                missing
+            );
+        }
+        return None;
+    }
+
+    // The adapter: the live-ins arrive under their own ids, as a
+    // helper's do, and go straight into the call.
+    let adapter_entry = HirId::new();
+    let adapter_header = HirId::new();
+    let mut adapter_values: indexmap::IndexMap<HirId, HirValue> = indexmap::IndexMap::new();
+    for (id, ty) in layout.live_ins.iter().zip(&layout.live_in_types) {
+        adapter_values.insert(
+            *id,
+            HirValue {
+                id: *id,
+                ty: ty.clone(),
+                kind: HirValueKind::Instruction,
+                uses: Default::default(),
+                span: None,
+            },
+        );
+    }
+    let returns_value = !matches!(layout.return_type, HirType::Void);
+    let result = returns_value.then(|| {
+        let id = HirId::new();
+        adapter_values.insert(
+            id,
+            HirValue {
+                id,
+                ty: layout.return_type.clone(),
+                kind: HirValueKind::Instruction,
+                uses: Default::default(),
+                span: None,
+            },
+        );
+        id
+    });
+    let mut adapter_blocks: indexmap::IndexMap<HirId, HirBlock> = indexmap::IndexMap::new();
+    let mut e = HirBlock::new(adapter_entry);
+    e.terminator = HirTerminator::Branch {
+        target: adapter_header,
+    };
+    adapter_blocks.insert(adapter_entry, e);
+    let mut h = HirBlock::new(adapter_header);
+    h.instructions.push(HirInstruction::Call {
+        result,
+        callee: crate::hir::HirCallable::Function(region_id),
+        args: layout.live_ins.clone(),
+        type_args: Vec::new(),
+        const_args: Vec::new(),
+        is_tail: false,
+    });
+    h.terminator = HirTerminator::Return {
+        values: result.into_iter().collect(),
+    };
+    adapter_blocks.insert(adapter_header, h);
+    let mut adapter = HirFunction::new(
+        zyntax_typed_ast::InternedString::new_global(&format!(
+            "{}$adapter",
+            region_name.resolve_global().unwrap_or_default()
+        )),
+        HirFunctionSignature {
+            params: Vec::new(),
+            returns: function.signature.returns.clone(),
+            type_params: Vec::new(),
+            const_params: Vec::new(),
+            lifetime_params: Vec::new(),
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: Vec::new(),
+            is_pure: false,
+        },
+    );
+    adapter.entry_block = adapter_entry;
+    adapter.blocks = adapter_blocks;
+    adapter.values = adapter_values;
+    adapter.calling_convention = function.calling_convention;
+    adapter.rebuild_cfg_edges();
+    let adapter_layout = OsrLayout {
+        header: adapter_header,
+        loop_ordinal: layout.loop_ordinal,
+        body_tag: layout.body_tag,
+        live_ins: layout.live_ins.clone(),
+        live_in_types: layout.live_in_types.clone(),
+        phi_count: 0,
+        return_type: layout.return_type.clone(),
+        frame: layout.frame.clone(),
+        destination: None,
+        repairs: Vec::new(),
+    };
+    Some(Outlined {
+        function: region,
+        adapter,
+        adapter_layout,
+    })
+}
+
 /// Add `used` to the live-ins list iff it's used in the loop body but
 /// not locally defined and not a constant/undef/global (those are
 /// rematerialized in the helper's prologue, not passed as args).

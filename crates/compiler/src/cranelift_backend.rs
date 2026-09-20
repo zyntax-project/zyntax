@@ -1805,6 +1805,20 @@ impl CraneliftBackend {
         self.install_osr_helper(translated, site)
     }
 
+    /// A helper translated from `function` with `layout` as given, for a
+    /// resume point outlined into a function of its own: `function` is
+    /// the adapter that reads the frame and calls it. Like
+    /// [`Self::translate_resume_point`], the result is compiled without
+    /// the lock and installed with [`Self::install_resume_point`].
+    pub fn translate_resume_adapter(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        layout: &crate::osr::OsrLayout,
+    ) -> CompilerResult<(Translated, u64)> {
+        self.translate_osr_helper(id, function, layout)
+    }
+
     /// Compile a single OSR helper by reusing
     /// [`Self::compile_function_body`] under helper mode. Saves and
     /// restores any auxiliary state that mode mutates so the caller's
