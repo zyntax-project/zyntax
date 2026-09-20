@@ -1,0 +1,12 @@
+a/b.txt x/y z.py
+False a/b
+5eb63bbbe01eeed093cb22bb8f5acdc3 16
+be50e8478cf24ff3595bc7307fb91b50 01ab
+1 and two a-b-a 1:   2
+3.142     ab 'q' {literal}
+0xff 0o10 0b101 -0x1
+[(1, 0, 0), (3, 10, -1), (5, 20, -2)]
+False True 2 1
+65 255 233
+b'import' import
+1 2 -1

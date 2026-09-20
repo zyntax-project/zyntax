@@ -62,6 +62,7 @@ pub(crate) fn is_known(module: &str) -> bool {
             | "functools"
             | "os"
             | "io"
+            | "hashlib"
             | "__future__"
     )
 }
@@ -188,6 +189,12 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         ("array", "typecodes") => Member::Str("bBuwhHiIlLqQfd"),
         ("time", "time") => func(&[], F, "zb_time_time"),
         ("os", "remove") | ("os", "unlink") => func(&[S], Ty::None, "zb_file_remove"),
+        ("os", "path.join") => func(&[S, S], S, "zb_path_join"),
+        ("os", "path.dirname") => func(&[S], S, "zb_path_dirname"),
+        ("os", "path.basename") => func(&[S], S, "zb_path_basename"),
+        ("os", "path.exists") => func(&[S], B, "zb_path_exists"),
+        // A digest is the bytes it hashes to: `hexdigest()` spells them.
+        ("hashlib", "md5") => func(&[Ty::Bytes], Ty::Bytes, "zb_md5"),
         // A file that is its buffer; the lowering fills in the empty form.
         ("io", "StringIO") => func(&[S], Ty::File(Mode::Text), "zb_stringio_new"),
         // Where print writes: the process's stdout as None, or a file.

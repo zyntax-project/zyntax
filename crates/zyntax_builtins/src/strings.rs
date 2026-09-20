@@ -472,6 +472,25 @@ pub(crate) fn declarations(policy: &Policy, list_type: zyntax_typed_ast::TypeId)
     }));
 
     out.extend(strip_chars());
+    // find: the character index of the first match, from the byte
+    // offset the search gives; -1 when absent.
+    let h = local("h", string());
+    let n = local("n", string());
+    let at = local("at", i64());
+    out.push(define(
+        "zb_str_find",
+        &[&h, &n],
+        i64(),
+        vec![
+            at.decl(call("zb_str_index_of", vec![h.e(), n.e()], i64())),
+            when(le(at.e(), int(0)), vec![ret(at.e())]),
+            ret(chars_len(call(
+                "zb_str_bytes",
+                vec![h.e(), int(0), at.e()],
+                string(),
+            ))),
+        ],
+    ));
     out.push(float_repr(policy));
     out
 }

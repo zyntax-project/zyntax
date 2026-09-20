@@ -6,7 +6,9 @@
 
 use crate::build::*;
 use crate::bytes::BYTES;
-use crate::{DICT_TAG, FUNC_TAG, INSTANCE_KIND_BASE, Kind, Policy, SET_TAG, TUPLE_TAG, list_of};
+use crate::{
+    DICT_TAG, FILE_TAG, FUNC_TAG, INSTANCE_KIND_BASE, Kind, Policy, SET_TAG, TUPLE_TAG, list_of,
+};
 use zyntax_typed_ast::TypeId;
 
 pub(crate) const NONE: i64 = 0;
@@ -128,6 +130,18 @@ pub(crate) fn extern_instance_hooks() -> Vec<Decl> {
             unit(),
             None,
         ),
+        extern_fn(
+            "zb_hook_instance_lt",
+            &[("a", any()), ("b", any())],
+            boolean(),
+            None,
+        ),
+        extern_fn(
+            "zb_hook_instance_le",
+            &[("a", any()), ("b", any())],
+            boolean(),
+            None,
+        ),
         extern_fn("zb_hook_instance_type", &[("x", any())], string(), None),
         extern_fn(
             "zb_hook_instance_eq",
@@ -182,6 +196,24 @@ pub(crate) fn default_instance_hooks(policy: &Policy) -> Vec<Decl> {
                 "TypeError",
                 text("object does not support item assignment"),
             )],
+        ),
+        define(
+            "zb_hook_instance_lt",
+            &[&a, &b],
+            boolean(),
+            vec![
+                fatal("TypeError", text("'<' not supported between instances")),
+                ret(bool(false)),
+            ],
+        ),
+        define(
+            "zb_hook_instance_le",
+            &[&a, &b],
+            boolean(),
+            vec![
+                fatal("TypeError", text("'<=' not supported between instances")),
+                ret(bool(false)),
+            ],
         ),
         define(
             "zb_hook_instance_type",
@@ -502,6 +534,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                         eq(kind(x.e()), int(SET_TAG >> 8)),
                         vec![ret(text(names.set))],
                     ),
+                    when(eq(kind(x.e()), int(FILE_TAG >> 8)), vec![ret(text("file"))]),
                     ret(text(names.list)),
                 ],
             ),
@@ -892,6 +925,17 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 ))],
             ),
             when(
+                or(
+                    and(is(&ca, CUSTOM), is_instance(a.e())),
+                    and(is(&cb, CUSTOM), is_instance(b.e())),
+                ),
+                vec![ret(call(
+                    "zb_hook_instance_lt",
+                    vec![a.e(), b.e()],
+                    boolean(),
+                ))],
+            ),
+            when(
                 and(is(&ca, CUSTOM), is(&cb, CUSTOM)),
                 vec![ret(call(
                     "zb_list_lt_any",
@@ -922,6 +966,17 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![ret(call(
                     "zb_set_issubset",
                     vec![raw_any(a.e()), raw_any(b.e())],
+                    boolean(),
+                ))],
+            ),
+            when(
+                or(
+                    and(eq(category(a.e()), int(CUSTOM)), is_instance(a.e())),
+                    and(eq(category(b.e()), int(CUSTOM)), is_instance(b.e())),
+                ),
+                vec![ret(call(
+                    "zb_hook_instance_le",
+                    vec![a.e(), b.e()],
                     boolean(),
                 ))],
             ),

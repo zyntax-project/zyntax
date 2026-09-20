@@ -205,6 +205,8 @@ pub const SET_TAG: i64 = ((LIST_KINDS + 3) << 8) | 255;
 pub const FUNC_TAG: i64 = ((LIST_KINDS + 4) << 8) | 255;
 /// The box tag of a bare code address inside a function record.
 pub const CODE_TAG: i64 = ((LIST_KINDS + 5) << 8) | 255;
+/// The box tag of an open file: the record `bytes` keeps for it.
+pub const FILE_TAG: i64 = ((LIST_KINDS + 6) << 8) | 255;
 /// Kinds from here up are instances of a frontend's classes, in the
 /// order the frontend numbers them.
 pub const INSTANCE_KIND_BASE: i64 = 32;

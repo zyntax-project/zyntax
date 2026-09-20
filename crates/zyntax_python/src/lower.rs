@@ -1715,6 +1715,50 @@ impl<'m> Lowerer<'m> {
 
     /// A `def` as a function, under `name`: its own for a module
     /// function, `Class$m` for a method.
+    /// A function of this signature whose body raises `message` as a
+    /// TypeError: what stands in for a method the frontend cannot
+    /// compile and the program never names, so that calling it reports
+    /// the form rather than the program failing to build.
+    pub(crate) fn stub_function(&mut self, name: &str, message: &str, span: Span) -> TypedFunction {
+        let params = self
+            .sig
+            .params
+            .iter()
+            .map(|(p, ty)| parameter(p, *ty, span))
+            .collect();
+        let mut statements = Vec::new();
+        self.raise_named("TypeError", str_lit(message, span), span, &mut statements);
+        let ret = self.sig.ret;
+        let value = if ret == Ty::None {
+            None
+        } else {
+            Some(Box::new(self.zero_of(ret, span)))
+        };
+        statements.push(TypedNode::new(
+            TypedStatement::Return(value),
+            Type::Unknown,
+            span,
+        ));
+        TypedFunction {
+            name: intern(name),
+            annotations: vec![strict_fp_annotation(span)],
+            effects: Vec::new(),
+            with_handlers: Vec::new(),
+            type_params: Vec::new(),
+            params,
+            return_type: ir(ret),
+            body: Some(TypedBlock { statements, span }),
+            visibility: Visibility::Public,
+            is_async: false,
+            is_fiber: false,
+            is_pure: false,
+            is_external: false,
+            calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
+            link_name: None,
+            module: None,
+        }
+    }
+
     pub(crate) fn function_named(
         &mut self,
         f: &py::StmtFunctionDef,
@@ -1959,15 +2003,10 @@ impl<'m> Lowerer<'m> {
                 }
             }
             (Ty::File(_), Ty::File(_)) => v.node,
-            (Ty::File(_), Ty::Object) => call(
-                &list_fn("box", Elem::Object),
-                vec![v.node],
-                Ty::Object,
-                span,
-            ),
+            (Ty::File(_), Ty::Object) => call("zb_file_box", vec![v.node], Ty::Object, span),
             (Ty::Object, Ty::File(_)) => {
                 let checked = Val {
-                    node: call(&list_fn("unbox", Elem::Object), vec![v.node], target, span),
+                    node: call("zb_file_unbox", vec![v.node], target, span),
                     ty: target,
                 };
                 if self.guards {
@@ -4628,6 +4667,10 @@ impl<'m> Lowerer<'m> {
     /// The member `value.attr` names when `value` is an imported
     /// module's name that no variable shadows.
     fn module_member_of(&self, value: &py::Expr, attr: &str) -> Option<stdlib::Member> {
+        // `os.path.join`: the submodule's member, named through it.
+        if let py::Expr::Attribute(sub) = value {
+            return self.module_member_of(&sub.value, &format!("{}.{attr}", sub.attr.as_str()));
+        }
         let py::Expr::Name(m) = value else {
             return None;
         };
@@ -5479,6 +5522,19 @@ impl<'m> Lowerer<'m> {
             py::Expr::Name(n) if n.id.as_str() == "__name__" && !self.is_variable("__name__") => {
                 Val {
                     node: str_lit(&self.module.name, span),
+                    ty: Ty::Str,
+                }
+            }
+            // The path of the source file this code is written in.
+            py::Expr::Name(n) if n.id.as_str() == "__file__" && !self.is_variable("__file__") => {
+                let path = self
+                    .module
+                    .file_names
+                    .get(current_file() as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                Val {
+                    node: str_lit(&path, span),
                     ty: Ty::Str,
                 }
             }
@@ -7505,7 +7561,7 @@ impl<'m> Lowerer<'m> {
                     }
                     ("find", 1) => {
                         let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
-                        call("zb_str_index_of", vec![s, a], Ty::Int, span)
+                        call("zb_str_find", vec![s, a], Ty::Int, span)
                     }
                     ("count", 1) => {
                         let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
@@ -7548,6 +7604,9 @@ impl<'m> Lowerer<'m> {
                     ("decode", 1) if self.is_utf8_name(&args[0]) => {
                         call("zb_bytes_decode", vec![b], Ty::Str, span)
                     }
+                    // A digest is bytes; its spelling is theirs.
+                    ("hex" | "hexdigest", 0) => call("zb_bytes_hex", vec![b], Ty::Str, span),
+                    ("digest", 0) => b,
                     _ => {
                         return Err(Error::unsupported_span(
                             format!("bytes.{name} with {} argument(s)", args.len()),
@@ -7766,6 +7825,14 @@ impl<'m> Lowerer<'m> {
                 ty: Ty::Set,
             });
         }
+        // `"...{}".format(args)` with a literal template is built here.
+        if let py::Expr::Attribute(a) = &*c.func
+            && a.attr.as_str() == "format"
+            && let py::Expr::StringLiteral(template) = &*a.value
+        {
+            let template = template.value.to_str().to_string();
+            return self.str_format(&template, args, keywords, span);
+        }
         // `sys.stdout.write(s)` and `.flush()`: print's own path, which
         // follows a redirection; flushing is the host's business.
         if let py::Expr::Attribute(a) = &*c.func
@@ -7982,6 +8049,24 @@ impl<'m> Lowerer<'m> {
                     let node = self.repr_of(v);
                     return Ok(Val { node, ty: Ty::Str });
                 }
+                // `hex`, `oct`, `bin`: the alternate form of the base.
+                "hex" | "oct" | "bin" if args.len() == 1 => {
+                    let v = self.expr(&args[0])?;
+                    let v = Val {
+                        node: self.coerce(v, Ty::Int),
+                        ty: Ty::Int,
+                    };
+                    let spec = crate::format::parse_spec(match name {
+                        "hex" => "#x",
+                        "oct" => "#o",
+                        _ => "#b",
+                    })
+                    .expect("a fixed spec parses");
+                    return Ok(Val {
+                        node: self.format(v, &spec, span),
+                        ty: Ty::Str,
+                    });
+                }
                 "bytes" => return self.bytes_call(args, c, span),
                 "open" => return self.open_call(c, span),
                 "eval" => return self.eval_call(args, c, span),
@@ -8085,10 +8170,23 @@ impl<'m> Lowerer<'m> {
                 // `ord` of a one-character string, `chr` of a code point.
                 "ord" if args.len() == 1 => {
                     let v = self.expr(&args[0])?;
-                    let s = self.coerce(v, Ty::Str);
-                    let ok = Val {
-                        node: call("zb_str_ord", vec![s], Ty::Int, span),
-                        ty: Ty::Int,
+                    let ok = match v.ty {
+                        // One byte's value.
+                        Ty::Bytes => Val {
+                            node: call("zb_bytes_ord", vec![v.node], Ty::Int, span),
+                            ty: Ty::Int,
+                        },
+                        Ty::Object => Val {
+                            node: call("zb_any_ord", vec![v.node], Ty::Int, span),
+                            ty: Ty::Int,
+                        },
+                        _ => {
+                            let s = self.coerce(v, Ty::Str);
+                            Val {
+                                node: call("zb_str_ord", vec![s], Ty::Int, span),
+                                ty: Ty::Int,
+                            }
+                        }
                     };
                     return Ok(self.guard(ok, span));
                 }

@@ -637,6 +637,8 @@ pub(crate) struct Module {
     pub(crate) from_names: HashMap<String, (String, String)>,
     /// The program's own modules, to the index of their source file.
     pub(crate) files: HashMap<String, u32>,
+    /// Each source file's path, by index: what `__file__` is.
+    pub(crate) file_names: Vec<String>,
     /// Functions every call of which is in view, so an unannotated
     /// parameter can be typed by what is passed; see [`closed_items`].
     pub(crate) closed: HashSet<String>,
@@ -3268,6 +3270,18 @@ pub(crate) fn list_sites<'ast>(
                             }
                         }
                     }
+                    // `self.f = xs` stores the list in a field of a known
+                    // class: the field takes the list's kind, as a caller
+                    // takes a returned list's, and what is written into
+                    // it later is checked against that kind.
+                    if let [py::Expr::Attribute(attr)] = a.targets.as_slice()
+                        && let py::Expr::Name(_) = &*a.value
+                        && self.is_candidate(&a.value).is_some()
+                        && matches!(self.typer.expr(&attr.value), Ty::Class(_))
+                    {
+                        self.visit_expr(&attr.value);
+                        return;
+                    }
                     // The value is read whatever the targets are.
                     for t in &a.targets {
                         if self.is_candidate(t).is_none() {
@@ -4771,7 +4785,7 @@ impl Typer<'_> {
                 {
                     return *ty;
                 }
-                if name == "__name__" {
+                if name == "__name__" || name == "__file__" {
                     return Ty::Str;
                 }
                 if let Some(m) = self.module.imported_name(name) {
@@ -5018,6 +5032,9 @@ impl Typer<'_> {
         value: &py::Expr,
         attr: &str,
     ) -> Option<crate::stdlib::Member> {
+        if let py::Expr::Attribute(sub) = value {
+            return self.module_member_of(&sub.value, &format!("{}.{attr}", sub.attr.as_str()));
+        }
         let py::Expr::Name(m) = value else {
             return None;
         };
@@ -5205,7 +5222,7 @@ impl Typer<'_> {
                 tuple_of(vec![q, q])
             }
             "type" => Ty::Str,
-            "str" | "repr" | "input" | "chr" => Ty::Str,
+            "str" | "repr" | "input" | "chr" | "hex" | "oct" | "bin" => Ty::Str,
             "bytes" => Ty::Bytes,
             // A name evaluated from a string is whatever it names.
             "eval" => Ty::Object,
@@ -5301,7 +5318,8 @@ impl Typer<'_> {
                 _ => Ty::Object,
             },
             Ty::Bytes => match attr {
-                "decode" => Ty::Str,
+                "decode" | "hex" | "hexdigest" => Ty::Str,
+                "digest" => Ty::Bytes,
                 _ => Ty::Object,
             },
             Ty::File(mode) => match attr {

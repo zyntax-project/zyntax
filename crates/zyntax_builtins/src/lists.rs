@@ -2191,17 +2191,19 @@ pub(crate) fn ptr_declarations(policy: &Policy) -> Vec<Decl> {
             ],
         ));
     }
+    // Two instances order by the frontend's `__lt__`, through boxes.
     d.push(define(
         "zb_ptr_lt",
         &[&a, &b],
         boolean(),
-        vec![
-            fatal(
-                "TypeError",
-                text("'<' not supported between instances of these objects"),
-            ),
-            ret(bool(false)),
-        ],
+        vec![ret(call(
+            "zb_hook_instance_lt",
+            vec![
+                call("zb_hook_box_instance", vec![a.e()], any()),
+                call("zb_hook_box_instance", vec![b.e()], any()),
+            ],
+            boolean(),
+        ))],
     ));
     d
 }

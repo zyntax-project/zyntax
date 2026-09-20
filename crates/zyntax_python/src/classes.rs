@@ -1211,6 +1211,41 @@ fn builtin_arms(
         ),
         (kind(zyntax_builtins::SET_TAG >> 8), Ty::Set, None),
     ];
+    // A boxed file reads text or bytes by the mode it was opened in.
+    let is_file = kind(zyntax_builtins::FILE_TAG >> 8);
+    let is_text = call("zb_file_is_text", vec![x.clone()], Ty::Bool, span);
+    receivers.push((
+        binary(
+            BinaryOp::And,
+            is_file.clone(),
+            is_text.clone(),
+            Ty::Bool,
+            span,
+        ),
+        Ty::File(crate::types::Mode::Text),
+        Some("zb_unbox_list_raw_any".to_string()),
+    ));
+    receivers.push((
+        binary(
+            BinaryOp::And,
+            is_file,
+            binary(
+                BinaryOp::Eq,
+                is_text,
+                node(
+                    TypedExpression::Literal(TypedLiteral::Bool(false)),
+                    Ty::Bool,
+                    span,
+                ),
+                Ty::Bool,
+                span,
+            ),
+            Ty::Bool,
+            span,
+        ),
+        Ty::File(crate::types::Mode::Binary),
+        Some("zb_unbox_list_raw_any".to_string()),
+    ));
     // A boxed tuple is a list of dynamic values under its own tag, and
     // answers the two methods a tuple has as that list.
     if matches!(method, "count" | "index") {
@@ -1458,7 +1493,10 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         },
         span,
     );
-    statements.push(ret(call("zb_any_same", vec![a, b], Ty::Bool, span), span));
+    statements.push(ret(
+        call("zb_any_same", vec![a.clone(), b.clone()], Ty::Bool, span),
+        span,
+    ));
     let eq_hook = function(
         "zb_hook_instance_eq",
         vec![param("a", Ty::Object, span), param("b", Ty::Object, span)],
@@ -1466,6 +1504,66 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         statements,
         span,
     );
+    // `<` and `<=`: the left operand's `__lt__` / `__le__`, else the
+    // right operand's reflected `__gt__` / `__ge__`, else a TypeError.
+    let order_hook = |name: &str, own: &str, reflected: &str| {
+        let compare =
+            |lowerer: &mut Lowerer<'_>, c: usize, obj: Node, method: &str, other: &str| {
+                let (sig, _) = module.method_sig(c, method).expect("picked");
+                let other_ty = sig.params.get(1).map(|(_, t)| *t).unwrap_or(Ty::Object);
+                let other = lowerer.coerce(
+                    Val {
+                        node: var(intern(other), Ty::Object, span),
+                        ty: Ty::Object,
+                    },
+                    other_ty,
+                );
+                let result = lowerer
+                    .invoke(c, method, obj, vec![other], span)
+                    .expect("picked");
+                let truth = lowerer.truthy(result);
+                vec![ret(truth, span)]
+            };
+        let mut statements = per_class(
+            module,
+            a.clone(),
+            |c| module.method_sig(c, own).is_some(),
+            |lowerer, c, obj| compare(lowerer, c, obj, own, "b"),
+            span,
+        );
+        statements.extend(per_class(
+            module,
+            b.clone(),
+            |c| module.method_sig(c, reflected).is_some(),
+            |lowerer, c, obj| compare(lowerer, c, obj, reflected, "a"),
+            span,
+        ));
+        statements.push(type_error_stmt(
+            a.clone(),
+            &format!(
+                " object does not support {}",
+                if own == "__lt__" { "<" } else { "<=" }
+            ),
+            span,
+        ));
+        statements.push(ret(
+            node(
+                TypedExpression::Literal(TypedLiteral::Bool(false)),
+                Ty::Bool,
+                span,
+            ),
+            span,
+        ));
+        function(
+            name,
+            vec![param("a", Ty::Object, span), param("b", Ty::Object, span)],
+            Ty::Bool,
+            statements,
+            span,
+        )
+    };
+    let lt_hook = order_hook("zb_hook_instance_lt", "__lt__", "__gt__");
+    let le_hook = order_hook("zb_hook_instance_le", "__le__", "__ge__");
     let mut out = vec![
         str_hook,
         repr_hook,
@@ -1473,6 +1571,8 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         setitem_hook,
         type_hook,
         eq_hook,
+        lt_hook,
+        le_hook,
         hash_hook(module, span),
         arith_hook(module, span),
         box_hook(module, span),

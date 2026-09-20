@@ -332,6 +332,109 @@ extern "C" fn host_is_float_literal(s: StringConstPtr) -> i64 {
         )) as i64
 }
 
+/// The MD5 digest of a blob, 16 bytes. RFC 1321, straight through: the
+/// benchmarks hash a few megabytes once.
+extern "C" fn host_md5(a: StringConstPtr) -> StringPtr {
+    // SAFETY: a blob the program holds.
+    let data = unsafe { blob(a) };
+    zrtl::string::string_from_bytes(&md5(data))
+}
+
+fn md5(data: &[u8]) -> [u8; 16] {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    let k: Vec<u32> = (0..64)
+        .map(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32)
+        .collect();
+    let (mut a0, mut b0, mut c0, mut d0) =
+        (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
+    let mut message = data.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&((data.len() as u64).wrapping_mul(8)).to_le_bytes());
+    for chunk in message.as_chunks::<64>().0 {
+        let m: Vec<u32> = chunk
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (f, g) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let f = f.wrapping_add(a).wrapping_add(k[i]).wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    let mut out = [0u8; 16];
+    out[..4].copy_from_slice(&a0.to_le_bytes());
+    out[4..8].copy_from_slice(&b0.to_le_bytes());
+    out[8..12].copy_from_slice(&c0.to_le_bytes());
+    out[12..].copy_from_slice(&d0.to_le_bytes());
+    out
+}
+
+/// `bytes.hex()`: two lowercase hex digits per byte.
+extern "C" fn host_bytes_hex(a: StringConstPtr) -> StringPtr {
+    // SAFETY: a blob the program holds.
+    let data = unsafe { blob(a) };
+    let mut out = String::with_capacity(data.len() * 2);
+    for b in data {
+        out.push_str(&format!("{b:02x}"));
+    }
+    zrtl::string::string_from_bytes(out.as_bytes())
+}
+
+/// `os.path.join(a, b)`.
+extern "C" fn host_path_join(a: StringConstPtr, b: StringConstPtr) -> StringPtr {
+    let (Some(a), Some(b)) = (path_of(a), path_of(b)) else {
+        return std::ptr::null_mut();
+    };
+    let joined = std::path::Path::new(&a).join(&b);
+    zrtl::string::string_from_bytes(joined.to_string_lossy().as_bytes())
+}
+
+/// `os.path.dirname(p)`.
+extern "C" fn host_path_dirname(p: StringConstPtr) -> StringPtr {
+    let Some(p) = path_of(p) else {
+        return std::ptr::null_mut();
+    };
+    let dir = std::path::Path::new(&p)
+        .parent()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    zrtl::string::string_from_bytes(dir.as_bytes())
+}
+
+/// `os.path.basename(p)`.
+extern "C" fn host_path_basename(p: StringConstPtr) -> StringPtr {
+    let Some(p) = path_of(p) else {
+        return std::ptr::null_mut();
+    };
+    let base = std::path::Path::new(&p)
+        .file_name()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    zrtl::string::string_from_bytes(base.as_bytes())
+}
+
 /// Remove the file at `path`; 0 on success, -1 when it cannot be.
 extern "C" fn host_file_remove(path: StringConstPtr) -> i64 {
     match path_of(path).map(std::fs::remove_file) {
@@ -345,7 +448,7 @@ extern "C" fn host_file_exists(path: StringConstPtr) -> i64 {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 26] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 31] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$time".as_ptr(), host_time as *const u8),
@@ -396,6 +499,17 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 26] = [
     zrtl::ZrtlSymbol::new(c"$Host$file_write".as_ptr(), host_file_write as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$file_read".as_ptr(), host_file_read as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$file_remove".as_ptr(), host_file_remove as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$md5".as_ptr(), host_md5 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_hex".as_ptr(), host_bytes_hex as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$path_join".as_ptr(), host_path_join as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$path_dirname".as_ptr(),
+        host_path_dirname as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$path_basename".as_ptr(),
+        host_path_basename as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(
         c"$Host$is_int_literal".as_ptr(),
         host_is_int_literal as *const u8,

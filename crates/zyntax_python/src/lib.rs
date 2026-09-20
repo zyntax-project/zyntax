@@ -423,6 +423,7 @@ pub fn parse_program_with(
         imports,
         from_names,
         files,
+        file_names: source_files.iter().map(|f| f.name.clone()).collect(),
         ..Default::default()
     };
     let def_stmts: Vec<&py::StmtFunctionDef> = defs.iter().map(|(f, _)| *f).collect();
@@ -501,7 +502,7 @@ pub fn parse_program_with(
     // never fewer, so the set only grows from there, and a set taken
     // earlier would open methods on account of what was not yet known.
     lap("closures");
-    let declared_classes = inferred.classes.clone();
+    let mut declared_classes = inferred.classes.clone();
     let mut methods_settling = false;
     let mut rounds = 0;
     for _ in 0..12 {
@@ -516,6 +517,23 @@ pub fn parse_program_with(
         let out = types::infer_module(&inferred, &items, &owned, &entry_files);
         inferred.funcs = out.funcs;
         inferred.classes = out.classes;
+        // A field a round found written on an instance other than
+        // `self` (`x.symbol = v` for `x` of a known class) is the class's
+        // from then on; its type is decided afresh each round like the
+        // others'.
+        let mut grew = false;
+        for (declared, found) in declared_classes.iter_mut().zip(&inferred.classes) {
+            for (name, _) in &found.fields {
+                if !declared.fields.iter().any(|(f, _)| f == name) {
+                    declared.fields.push((name.clone(), types::Ty::Unknown));
+                    grew = true;
+                }
+            }
+        }
+        if grew {
+            rounds -= 1;
+            continue;
+        }
         inferred.closures = std::cell::RefCell::new(out.closures);
         inferred.list_params = out.list_params;
         let found_dynamic = out.dynamic_methods.clone();
@@ -696,17 +714,15 @@ pub fn parse_program_with(
     // run by the program, so what it writes need not compile: a Python
     // that never runs it never minds. One that does compile is kept, for
     // a host that calls it by name. A method stays with its class, since
-    // the dispatchers over dynamic receivers name every method of that
-    // name; one whose name no attribute access spells, and that is not a
-    // dunder the runtime invokes, is never run and named by nothing.
+    // the dispatchers over dynamic receivers and the runtime's hooks may
+    // name it: one whose name no attribute access spells is replaced by
+    // a function that raises the reason, which is what Python does with
+    // a body it cannot run.
     let reached = reachable_functions(&owned, &items);
     let attrs_used = attribute_names(&owned, &items);
     let unreached = |item: &types::Item<'_>| match item.class {
         None => !reached.contains(&item.name),
-        Some(_) => {
-            let method = item.def.name.as_str();
-            !RUNTIME_DUNDERS.contains(&method) && !attrs_used.contains(method)
-        }
+        Some(_) => !attrs_used.contains(item.def.name.as_str()),
     };
     let mut dropped: HashSet<String> = HashSet::default();
     let lower_all = |inferred: &types::Module,
@@ -719,6 +735,11 @@ pub fn parse_program_with(
             }
             match lower_items(inferred, std::slice::from_ref(item), &unpack_shapes) {
                 Ok(d) => out.extend(d),
+                // A method stands in for itself as a raise: the class's
+                // dispatchers may still name it.
+                Err(e) if unreached(item) && item.class.is_some() => {
+                    out.extend(lower_stub(inferred, item, &e));
+                }
                 Err(_) if unreached(item) => {
                     dropped.insert(item.name.clone());
                 }
@@ -1073,69 +1094,6 @@ fn reachable_functions(body: &[py::Stmt], items: &[types::Item<'_>]) -> HashSet<
     reached
 }
 
-/// The methods the runtime invokes without the program naming them.
-const RUNTIME_DUNDERS: &[&str] = &[
-    "__init__",
-    "__new__",
-    "__del__",
-    "__str__",
-    "__repr__",
-    "__format__",
-    "__bool__",
-    "__len__",
-    "__hash__",
-    "__eq__",
-    "__ne__",
-    "__lt__",
-    "__le__",
-    "__gt__",
-    "__ge__",
-    "__getitem__",
-    "__setitem__",
-    "__delitem__",
-    "__contains__",
-    "__iter__",
-    "__next__",
-    "__call__",
-    "__enter__",
-    "__exit__",
-    "__getattr__",
-    "__setattr__",
-    "__int__",
-    "__float__",
-    "__index__",
-    "__neg__",
-    "__pos__",
-    "__abs__",
-    "__invert__",
-    "__add__",
-    "__sub__",
-    "__mul__",
-    "__truediv__",
-    "__floordiv__",
-    "__mod__",
-    "__pow__",
-    "__matmul__",
-    "__and__",
-    "__or__",
-    "__xor__",
-    "__lshift__",
-    "__rshift__",
-    "__radd__",
-    "__rsub__",
-    "__rmul__",
-    "__rtruediv__",
-    "__rfloordiv__",
-    "__rmod__",
-    "__rpow__",
-    "__iadd__",
-    "__isub__",
-    "__imul__",
-    "__itruediv__",
-    "__ifloordiv__",
-    "__imod__",
-];
-
 /// Every attribute name the program spells, `x.name`, in the module
 /// body and in every function.
 fn attribute_names(body: &[py::Stmt], items: &[types::Item<'_>]) -> HashSet<String> {
@@ -1273,6 +1231,51 @@ fn lower_items(
         }
     }
     Ok(declarations)
+}
+
+/// The declarations of a method that failed to lower, each a function
+/// of its signature that raises the reason when called.
+fn lower_stub(
+    inferred: &types::Module,
+    item: &types::Item<'_>,
+    error: &Error,
+) -> Vec<TypedNode<TypedDeclaration>> {
+    let message = match error {
+        Error::Unsupported { what, .. } => format!("{what} is not supported"),
+        other => format!("{other:?}"),
+    };
+    let mut variants = vec![(item.name.clone(), false)];
+    if inferred.trusted.contains(&item.name) {
+        variants.push((types::trusted_name(&item.name), true));
+    }
+    let span = span_of(item.def);
+    let mut out = Vec::new();
+    for (name, trusted) in variants {
+        let sig = inferred.funcs[&item.name].clone();
+        let scope = scope::Scope::of_function(item.def);
+        let mut lowerer = lower::Lowerer::new(
+            inferred,
+            &item.name,
+            sig,
+            types::Locals::default(),
+            &scope,
+            Vec::new(),
+            HashMap::default(),
+        );
+        lowerer.class = item.class;
+        lowerer.trusted = trusted;
+        let func = lowerer.stub_function(&name, &message, span);
+        inferred
+            .raise_facts
+            .borrow_mut()
+            .insert(name, lowerer.raise_fact());
+        out.push(TypedNode::new(
+            TypedDeclaration::Function(func),
+            Type::Unknown,
+            span,
+        ));
+    }
+    out
 }
 
 /// A module-level `if True:` with no other branch (a version branch

@@ -6,7 +6,7 @@
 //! `close` hands it to the host whole, reads take the whole file.
 
 use crate::build::*;
-use crate::list_of;
+use crate::{FILE_TAG, list_of};
 use zyntax_typed_ast::TypeId;
 
 /// The box category of a byte string; see `dynamic`.
@@ -21,6 +21,8 @@ const MEMORY: i64 = 8;
 const CLOSED: i64 = 16;
 /// A disk file whose contents have been read into the buffer.
 const LOADED: i64 = 32;
+/// A file opened in text mode: what it reads is text.
+const TEXT: i64 = 64;
 
 pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let anys = list_of(list_type, any());
@@ -147,6 +149,31 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             i64(),
             "$Host$file_remove",
         ),
+        ("zb_md5", vec![("a", string())], string(), "$Host$md5"),
+        (
+            "zb_bytes_hex",
+            vec![("a", string())],
+            string(),
+            "$Host$bytes_hex",
+        ),
+        (
+            "zb_path_join",
+            vec![("a", string()), ("b", string())],
+            string(),
+            "$Host$path_join",
+        ),
+        (
+            "zb_path_dirname",
+            vec![("p", string())],
+            string(),
+            "$Host$path_dirname",
+        ),
+        (
+            "zb_path_basename",
+            vec![("p", string())],
+            string(),
+            "$Host$path_basename",
+        ),
         // What `int()`, `float()` and `eval()` accept of a string.
         (
             "zb_str_is_int_literal",
@@ -195,6 +222,44 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 vec![fatal("IndexError", text("index out of range"))],
             ),
             ret(v.e()),
+        ],
+    ));
+
+    // ord(b): the value of a byte string of one byte; of a dynamic
+    // value, that or the character's code.
+    d.push(define(
+        "zb_bytes_ord",
+        &[&b],
+        i64(),
+        vec![
+            when(
+                ne(call("zb_str_len", vec![b.e()], i64()), int(1)),
+                vec![fatal(
+                    "TypeError",
+                    text("ord() expected a character, but bytes of another length found"),
+                )],
+            ),
+            ret(call("zb_bytes_at", vec![b.e(), int(0)], i64())),
+        ],
+    ));
+    d.push(define(
+        "zb_any_ord",
+        &[&x],
+        i64(),
+        vec![
+            when(
+                eq(call("zb_any_category", vec![x.e()], i64()), int(BYTES)),
+                vec![ret(call(
+                    "zb_bytes_ord",
+                    vec![call("zb_box_get_str", vec![x.e()], string())],
+                    i64(),
+                ))],
+            ),
+            ret(call(
+                "zb_str_ord",
+                vec![call("zb_any_as_str", vec![x.e()], string())],
+                i64(),
+            )),
         ],
     ));
 
@@ -562,7 +627,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         &[&path, &mode],
         anys.clone(),
         vec![
-            flags.decl(int(0)),
+            flags.decl(int(TEXT)),
             mode_len.decl(call("zb_str_len", vec![mode.e()], i64())),
             block_of(for_range(
                 &i,
@@ -586,10 +651,14 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                         eq(c.e(), int(43)),
                         vec![flags.set(bitor(flags.e(), int(READ | WRITE)))],
                     ),
+                    when(
+                        eq(c.e(), int(98)),
+                        vec![flags.set(bitand(flags.e(), int(!TEXT)))],
+                    ),
                 ],
             )),
             when(
-                eq(flags.e(), int(0)),
+                eq(bitand(flags.e(), int(!TEXT)), int(0)),
                 vec![fatal("ValueError", text("invalid mode"))],
             ),
             when(
@@ -648,7 +717,11 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             expr(mcall(
                 record.e(),
                 "push",
-                vec![call("zb_box_i64", vec![int(READ | WRITE | MEMORY)], any())],
+                vec![call(
+                    "zb_box_i64",
+                    vec![int(READ | WRITE | MEMORY | TEXT)],
+                    any(),
+                )],
                 unit(),
             )),
             expr(mcall(
@@ -778,6 +851,56 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             closed_check(),
             ret(call("zb_bytes_from_buffer", vec![file_buffer()], string())),
         ],
+    ));
+    // A file as a dynamic value: the record under the file tag, which
+    // the box then shares with whoever holds the record.
+    let carried = kept("f", anys.clone());
+    d.push(define(
+        "zb_file_box",
+        &[&carried],
+        any(),
+        vec![ret(call(
+            "zb_box_list_raw_any",
+            vec![carried.e(), int32(FILE_TAG as i32)],
+            any(),
+        ))],
+    ));
+    let x = local("x", any());
+    d.push(define(
+        "zb_file_unbox",
+        &[&x],
+        anys.clone(),
+        vec![
+            when(
+                ne(
+                    cast(call("zb_box_tag", vec![x.e()], i32()), i64()),
+                    int(FILE_TAG),
+                ),
+                vec![fatal("TypeError", text("expected a file"))],
+            ),
+            ret(call("zb_unbox_list_raw_any", vec![x.e()], anys.clone())),
+        ],
+    ));
+    // Whether a boxed file reads text, for the dynamic method arms.
+    d.push(define(
+        "zb_file_is_text",
+        &[&x],
+        boolean(),
+        vec![ret(ne(
+            bitand(
+                call(
+                    "zb_box_get_i64",
+                    vec![idx(
+                        call("zb_unbox_list_raw_any", vec![x.e()], anys.clone()),
+                        int(1),
+                        any(),
+                    )],
+                    i64(),
+                ),
+                int(TEXT),
+            ),
+            int(0),
+        ))],
     ));
     // A disk file is read into the buffer once, on the first read;
     // reads then take from the position, `count` bytes or the rest.
@@ -979,8 +1102,19 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         ],
     ));
 
-    // os.remove(path)
+    // os.path.exists(path)
     let path = local("path", string());
+    d.push(define(
+        "zb_path_exists",
+        &[&path],
+        boolean(),
+        vec![ret(ne(
+            call("zb_file_exists", vec![path.e()], i64()),
+            int(0),
+        ))],
+    ));
+
+    // os.remove(path)
     d.push(define(
         "zb_file_remove",
         &[&path],
