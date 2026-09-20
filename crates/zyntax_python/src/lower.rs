@@ -4790,8 +4790,83 @@ impl<'m> Lowerer<'m> {
                 };
                 self.coerce(items, target)
             }
+            // Bytes are the array's storage, as `frombytes` reads them:
+            // a list of zeros of the length they fill, then the copy.
+            Ty::Bytes => {
+                let mut pre = Vec::new();
+                let data = self.hold(source, &mut pre, span);
+                let size = call("zb_str_len", vec![data.node.clone()], Ty::Int, span);
+                let count = binary(
+                    BinaryOp::Div,
+                    size.clone(),
+                    int_lit(code.itemsize(), span),
+                    Ty::Int,
+                    span,
+                );
+                let ragged = binary(
+                    BinaryOp::Ne,
+                    binary(
+                        BinaryOp::Rem,
+                        size,
+                        int_lit(code.itemsize(), span),
+                        Ty::Int,
+                        span,
+                    ),
+                    int_lit(0, span),
+                    Ty::Bool,
+                    span,
+                );
+                let mut raise = Vec::new();
+                self.raise_named(
+                    "ValueError",
+                    str_lit("bytes length not a multiple of item size", span),
+                    span,
+                    &mut raise,
+                );
+                pre.push(TypedNode::new(
+                    TypedStatement::If(TypedIf {
+                        condition: Box::new(ragged),
+                        then_block: TypedBlock {
+                            statements: raise,
+                            span,
+                        },
+                        else_block: None,
+                        span,
+                    }),
+                    Type::Unknown,
+                    span,
+                ));
+                let zero = Val {
+                    node: int_lit(0, span),
+                    ty: Ty::Int,
+                };
+                let one = self.list_of(vec![zero], elem, span);
+                let zeros = call(&list_fn("repeat", elem), vec![one, count], target, span);
+                let xs = self.hold(
+                    Val {
+                        node: zeros,
+                        ty: target,
+                    },
+                    &mut pre,
+                    span,
+                );
+                pre.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(call(
+                        "zb_bytes_copy_out",
+                        vec![
+                            data.node,
+                            crate::bytes::field(xs.node.clone(), "data", Ty::Int, span),
+                        ],
+                        Ty::Int,
+                        span,
+                    ))),
+                    Type::Unknown,
+                    span,
+                ));
+                Self::block_value(pre, xs.node, target, span)
+            }
             Ty::Str => {
-                return unsupported("array() from a string or bytes", init);
+                return unsupported("array() from a string", init);
             }
             _ => {
                 return unsupported("array() from a value that is not iterable", init);
@@ -4889,6 +4964,21 @@ impl<'m> Lowerer<'m> {
             ("zb_math_log", 2) => (vec![Ty::Float, Ty::Float], "zb_math_log_base"),
             ("zb_random_seed", 0) => (Vec::new(), "zb_random_seed_clock"),
             ("zb_stringio_new", 0) => (Vec::new(), "zb_stringio_empty"),
+            // The one codec here is hex, named by a literal.
+            ("zb_codecs_decode", 2) => {
+                let Some(py::Expr::StringLiteral(codec)) = args.get(1) else {
+                    return unsupported("codecs.decode with a codec that is not a literal", c);
+                };
+                let codec = codec.value.to_str().to_lowercase();
+                if codec != "hex" && codec != "hex_codec" {
+                    return unsupported(format!("the `{codec}` codec"), c);
+                }
+                let data = self.expr_as(&args[0], Ty::Bytes)?;
+                return Ok(Val {
+                    node: call("zb_bytes_from_hex", vec![data], Ty::Bytes, span),
+                    ty: Ty::Bytes,
+                });
+            }
             ("zb_random_seed", 1) if matches!(&args[0], py::Expr::NoneLiteral(_)) => {
                 return Ok(Val {
                     node: call("zb_random_seed_clock", vec![], Ty::None, span),

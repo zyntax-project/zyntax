@@ -11,7 +11,9 @@ use crate::types::{Elem, Ty};
 use crate::{Error, Result, intern};
 use ruff_python_ast as py;
 use zyntax_typed_ast::source::Span;
-use zyntax_typed_ast::typed_ast::{TypedExpression, TypedLet, TypedLiteral, TypedStatement};
+use zyntax_typed_ast::typed_ast::{
+    TypedExpression, TypedFieldAccess, TypedLet, TypedLiteral, TypedStatement,
+};
 use zyntax_typed_ast::{BinaryOp, Mutability, Type, TypedNode};
 
 impl Lowerer<'_> {
@@ -253,4 +255,16 @@ impl Lowerer<'_> {
             ty: Ty::Bytes,
         })
     }
+}
+
+/// A field of a library record read as `ty`.
+pub(crate) fn field(object: Node, name: &str, ty: Ty, span: Span) -> Node {
+    node(
+        TypedExpression::Field(TypedFieldAccess {
+            object: Box::new(object),
+            field: intern(name),
+        }),
+        ty,
+        span,
+    )
 }

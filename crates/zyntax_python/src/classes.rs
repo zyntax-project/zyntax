@@ -1184,6 +1184,7 @@ fn builtin_arms(
     // the payload where the trusted read of the type is not it.
     let mut receivers: Vec<(Node, Ty, Option<String>)> = vec![
         (category(5), Ty::Str, None),
+        (category(6), Ty::Bytes, None),
         (
             list_kind(zyntax_builtins::Kind::Int),
             Ty::List(Elem::Int),
@@ -1254,6 +1255,21 @@ fn builtin_arms(
             Ty::List(Elem::Object),
             Some("zb_unbox_tuple_raw".to_string()),
         ));
+    }
+    // An array of each storage kind the program uses, under the tag of
+    // each typecode stored that way.
+    for storage in crate::types::array_kinds() {
+        for code in crate::types::Code::ALL {
+            if code.storage() != storage {
+                continue;
+            }
+            let e = Elem::Array(code);
+            receivers.push((
+                kind(code.tag() >> 8),
+                Ty::List(e),
+                Some(format!("zb_unbox_list_raw_{}", e.suffix())),
+            ));
+        }
     }
     // A list of tuples of each shape the program has.
     for k in crate::types::tuple_lists() {

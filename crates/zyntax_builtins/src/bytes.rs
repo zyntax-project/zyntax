@@ -157,6 +157,12 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             "$Host$bytes_hex",
         ),
         (
+            "zb_bytes_from_hex_raw",
+            vec![("a", string())],
+            string(),
+            "$Host$bytes_from_hex",
+        ),
+        (
             "zb_path_join",
             vec![("a", string()), ("b", string())],
             string(),
@@ -222,6 +228,28 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 vec![fatal("IndexError", text("index out of range"))],
             ),
             ret(v.e()),
+        ],
+    ));
+
+    // bytes.fromhex / codecs.decode(b, 'hex'): a ValueError for a
+    // non-hex digit or an odd count.
+    d.push(define(
+        "zb_bytes_from_hex",
+        &[&b],
+        string(),
+        vec![
+            v.decl(cast(
+                call("zb_bytes_from_hex_raw", vec![b.e()], string()),
+                i64(),
+            )),
+            when(
+                eq(v.e(), int(0)),
+                vec![fatal(
+                    "ValueError",
+                    text("non-hexadecimal number found in fromhex() arg"),
+                )],
+            ),
+            ret(cast(v.e(), string())),
         ],
     ));
 

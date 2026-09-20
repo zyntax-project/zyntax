@@ -391,6 +391,31 @@ fn md5(data: &[u8]) -> [u8; 16] {
     out
 }
 
+/// `codecs.decode(b, 'hex')` / `bytes.fromhex`: the bytes two hex digits
+/// spell each; null when a digit is not one.
+extern "C" fn host_bytes_from_hex(a: StringConstPtr) -> StringPtr {
+    // SAFETY: a blob the program holds.
+    let text = unsafe { blob(a) };
+    let digits: Vec<u8> = text
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    if !digits.len().is_multiple_of(2) {
+        return std::ptr::null_mut();
+    }
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.as_chunks::<2>().0 {
+        let hi = (pair[0] as char).to_digit(16);
+        let lo = (pair[1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
+            _ => return std::ptr::null_mut(),
+        }
+    }
+    zrtl::string::string_from_bytes(&out)
+}
+
 /// `bytes.hex()`: two lowercase hex digits per byte.
 extern "C" fn host_bytes_hex(a: StringConstPtr) -> StringPtr {
     // SAFETY: a blob the program holds.
@@ -448,7 +473,7 @@ extern "C" fn host_file_exists(path: StringConstPtr) -> i64 {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 31] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 32] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$time".as_ptr(), host_time as *const u8),
@@ -501,6 +526,10 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 31] = [
     zrtl::ZrtlSymbol::new(c"$Host$file_remove".as_ptr(), host_file_remove as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$md5".as_ptr(), host_md5 as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$bytes_hex".as_ptr(), host_bytes_hex as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_from_hex".as_ptr(),
+        host_bytes_from_hex as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(c"$Host$path_join".as_ptr(), host_path_join as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Host$path_dirname".as_ptr(),

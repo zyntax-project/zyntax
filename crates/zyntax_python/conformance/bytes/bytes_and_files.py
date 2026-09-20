@@ -66,3 +66,21 @@ def positions():
 
 
 positions()
+
+
+def hex_codec():
+    import codecs
+    from array import array
+    key = codecs.decode(b'a1f6258c877d5fcd', 'hex')
+    print(key, key.hex(), codecs.decode(b"FF00", "hex"))
+    a = array('B', key)
+    print(a, a.tobytes() == key, array('d', b'\x00' * 16))
+    boxed = [key, a]
+    print(boxed[0].hex(), boxed[1].tobytes(), len(boxed[1]))
+    try:
+        codecs.decode(b'zz', 'hex')
+    except ValueError:
+        print("ValueError")
+
+
+hex_codec()

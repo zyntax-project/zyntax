@@ -19,3 +19,7 @@ text mode
 second line
 
 b'012' b'3456' b'789' b''
+b'\xa1\xf6%\x8c\x87}_\xcd' a1f6258c877d5fcd b'\xff\x00'
+array('B', [161, 246, 37, 140, 135, 125, 95, 205]) True array('d', [0.0, 0.0])
+a1f6258c877d5fcd b'\xa1\xf6%\x8c\x87}_\xcd' 8
+ValueError
