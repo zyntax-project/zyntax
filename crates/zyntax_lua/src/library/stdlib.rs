@@ -1648,7 +1648,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![
             when(
                 eq(j.e(), int(i64::MIN)),
-                vec![j.set(call("zl_len", vec![tb.e()], i64()))],
+                vec![j.set(call("zl_table_len", vec![tb.e()], i64()))],
             ),
             // The reference's stack holds a million values.
             when(
@@ -2371,7 +2371,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         &[&tb, &args],
         unit(),
         vec![
-            n.decl(call("zl_len", vec![tb.e()], i64())),
+            n.decl(call("zl_table_len", vec![tb.e()], i64())),
             when(
                 eq(len(args.e()), int(1)),
                 vec![
@@ -2406,10 +2406,14 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     ret_void(),
                 ],
             ),
-            // Within the array part: shift in place.
+            // Within the array part of a table without a metatable:
+            // shift in place.
             arr.decl(super::arr_of(tb.e(), t)),
             when(
-                eq(len(arr.e()), n.e()),
+                and(
+                    eq(len(arr.e()), n.e()),
+                    eq(super::meta_of(tb.e(), t), null(table.clone())),
+                ),
                 vec![
                     expr(mcall(
                         arr.e(),
@@ -2446,11 +2450,16 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         &[&tb, &i],
         any(),
         vec![
-            n.decl(call("zl_len", vec![tb.e()], i64())),
+            n.decl(call("zl_table_len", vec![tb.e()], i64())),
             when(eq(i.e(), int(i64::MIN)), vec![i.set(n.e())]),
+            // An empty table: the entry at 0 or 1, taken out as well.
             when(
                 and(eq(n.e(), int(0)), or(eq(i.e(), int(0)), eq(i.e(), n.e()))),
-                vec![ret(call("zl_table_geti", vec![tb.e(), i.e()], any()))],
+                vec![
+                    v.decl(call("zl_table_geti", vec![tb.e(), i.e()], any())),
+                    expr(call("zl_table_seti", vec![tb.e(), i.e(), nil()], unit())),
+                    ret(v.e()),
+                ],
             ),
             when(
                 or(lt(i.e(), int(1)), gt(i.e(), add(n.e(), int(1)))),
@@ -2461,7 +2470,10 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             v.decl(call("zl_table_geti", vec![tb.e(), i.e()], any())),
             arr.decl(super::arr_of(tb.e(), t)),
             if_(
-                and(eq(len(arr.e()), n.e()), le(i.e(), n.e())),
+                and(
+                    and(eq(len(arr.e()), n.e()), le(i.e(), n.e())),
+                    eq(super::meta_of(tb.e(), t), null(table.clone())),
+                ),
                 vec![
                     when(
                         gt(n.e(), super::high_of(tb.e())),
@@ -2518,7 +2530,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![
             j.decl(if_expr(
                 is_nil(last.e()),
-                call("zl_len", vec![tb.e()], i64()),
+                call("zl_table_len", vec![tb.e()], i64()),
                 call("zl_arg_int", vec![last.e(), bad_arg(4, "concat")], i64()),
             )),
             acc.decl(text("")),
@@ -2646,12 +2658,47 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         &[&tb, &comp],
         unit(),
         vec![
-            arr.decl(super::arr_of(tb.e(), t)),
+            when(
+                eq(super::meta_of(tb.e(), t), null(table.clone())),
+                vec![
+                    arr.decl(super::arr_of(tb.e(), t)),
+                    expr(call(
+                        "zl_sort_range",
+                        vec![arr.e(), int(0), sub(len(arr.e()), int(1)), comp.e()],
+                        unit(),
+                    )),
+                    ret_void(),
+                ],
+            ),
+            // With a metatable, `t[1..n]` are read and written back
+            // through it, sorted in between.
+            n.decl(call("zl_table_len", vec![tb.e()], i64())),
+            out.decl(list(vec![], anys.clone())),
+            k.decl(int(1)),
+            while_(
+                le(k.e(), n.e()),
+                vec![
+                    push(out.e(), call("zl_table_geti", vec![tb.e(), k.e()], any())),
+                    k.add_assign(int(1)),
+                ],
+            ),
             expr(call(
                 "zl_sort_range",
-                vec![arr.e(), int(0), sub(len(arr.e()), int(1)), comp.e()],
+                vec![out.e(), int(0), sub(n.e(), int(1)), comp.e()],
                 unit(),
             )),
+            k.set(int(1)),
+            while_(
+                le(k.e(), n.e()),
+                vec![
+                    expr(call(
+                        "zl_table_seti",
+                        vec![tb.e(), k.e(), at(out.e(), sub(k.e(), int(1)))],
+                        unit(),
+                    )),
+                    k.add_assign(int(1)),
+                ],
+            ),
             ret_void(),
         ],
     ));
