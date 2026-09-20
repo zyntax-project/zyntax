@@ -5305,7 +5305,7 @@ impl Typer<'_> {
                 _ => Ty::Object,
             },
             Ty::File(mode) => match attr {
-                "read" | "readline" => mode.content(),
+                "read" | "readline" | "getvalue" => mode.content(),
                 "readlines" => Ty::List(Elem::of(mode.content())),
                 "write" | "close" | "flush" => Ty::None,
                 _ => Ty::Object,

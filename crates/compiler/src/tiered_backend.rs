@@ -2643,6 +2643,16 @@ impl TieredBackend {
                 f.attributes.optimized = false;
                 f.attributes.deferred = false;
                 crate::drop_insert::run_function_with(&mut f, &facts.of(module_arc));
+                // `ZYNTAX_DUMP_HIR_DIR` gets the body the interpreter runs
+                // as `fn-<name>-interp.hir`.
+                if std::env::var_os("ZYNTAX_DUMP_HIR_DIR").is_some() {
+                    let name = f.name.resolve_global().unwrap_or_default();
+                    crate::hir_dump::dump_function_to_dir(
+                        &f,
+                        module_arc,
+                        &format!("{name}-interp"),
+                    );
+                }
                 Some(Arc::new(f))
             }
         }));

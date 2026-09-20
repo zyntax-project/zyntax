@@ -4,7 +4,7 @@
 //! type. `typing` is accepted whole and contributes nothing but
 //! annotations.
 
-use crate::types::{Code, Elem, Ty};
+use crate::types::{Code, Elem, Mode, Ty};
 use ruff_python_ast as py;
 
 /// What a module's name stands for.
@@ -61,6 +61,7 @@ pub(crate) fn is_known(module: &str) -> bool {
             | "operator"
             | "functools"
             | "os"
+            | "io"
             | "__future__"
     )
 }
@@ -187,6 +188,13 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         ("array", "typecodes") => Member::Str("bBuwhHiIlLqQfd"),
         ("time", "time") => func(&[], F, "zb_time_time"),
         ("os", "remove") | ("os", "unlink") => func(&[S], Ty::None, "zb_file_remove"),
+        // A file that is its buffer; the lowering fills in the empty form.
+        ("io", "StringIO") => func(&[S], Ty::File(Mode::Text), "zb_stringio_new"),
+        // Where print writes: the process's stdout as None, or a file.
+        ("sys", "stdout") => Member::Value {
+            ty: Ty::Object,
+            zb: "zb_get_stdout",
+        },
         // The Mersenne Twister as CPython runs it; the lowering fills in
         // the forms with more arguments and the seed from the clock.
         ("random", "random") => func(&[], F, "zb_random_random"),

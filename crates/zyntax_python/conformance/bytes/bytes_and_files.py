@@ -54,3 +54,15 @@ def main():
     os.remove(path)
 
 main()
+
+
+def positions():
+    path = 'conformance_bytes_pos.bin'
+    with open(path, 'wb') as f:
+        f.write(b'0123456789')
+    with open(path, 'rb') as f:
+        print(f.read(3), f.read(4), f.read(), f.read(2))
+    os.remove(path)
+
+
+positions()

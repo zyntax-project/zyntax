@@ -229,6 +229,20 @@ extern "C" fn host_bytes_from_buffer(list: *const ListHeader) -> StringPtr {
     zrtl::string::string_from_bytes(unsafe { list_bytes(list, 1) })
 }
 
+/// Bytes `start` to `end` of a byte buffer, both clamped into it.
+extern "C" fn host_bytes_from_buffer_range(
+    list: *const ListHeader,
+    start: i64,
+    end: i64,
+) -> StringPtr {
+    // SAFETY: a list of u8 the program holds.
+    let all = unsafe { list_bytes(list, 1) };
+    let n = all.len() as i64;
+    let start = start.clamp(0, n) as usize;
+    let end = end.clamp(start as i64, n) as usize;
+    zrtl::string::string_from_bytes(&all[start..end])
+}
+
 /// `array.tobytes()`: the storage of a list of `width`-byte elements.
 extern "C" fn host_bytes_of_storage(list: *const ListHeader, width: i64) -> StringPtr {
     // SAFETY: a list the program holds, of elements `width` bytes wide.
@@ -331,7 +345,7 @@ extern "C" fn host_file_exists(path: StringConstPtr) -> i64 {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 25] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 26] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$time".as_ptr(), host_time as *const u8),
@@ -348,6 +362,10 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 25] = [
     zrtl::ZrtlSymbol::new(
         c"$Host$bytes_of_storage".as_ptr(),
         host_bytes_of_storage as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_from_buffer_range".as_ptr(),
+        host_bytes_from_buffer_range as *const u8,
     ),
     zrtl::ZrtlSymbol::new(
         c"$Host$bytes_repeat".as_ptr(),

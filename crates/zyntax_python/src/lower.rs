@@ -3791,6 +3791,29 @@ impl<'m> Lowerer<'m> {
             }
             py::Expr::Name(n) => n,
             // `C.X = v`: the class attribute's module variable.
+            // `sys.stdout = f`: print writes to `f` from here on; `None`
+            // or the value read from `sys.stdout` before restores it.
+            py::Expr::Attribute(a)
+                if self.module_member_of(&a.value, a.attr.as_str()).is_some() =>
+            {
+                if !matches!(&*a.value, py::Expr::Name(m) if m.id.as_str() == "sys")
+                    || a.attr.as_str() != "stdout"
+                {
+                    return unsupported("assignment to a module attribute", target);
+                }
+                let v = self.coerce(value, Ty::Object);
+                out.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(call(
+                        "zb_set_stdout",
+                        vec![v],
+                        Ty::None,
+                        span,
+                    ))),
+                    Type::Unknown,
+                    span,
+                ));
+                return Ok(());
+            }
             py::Expr::Attribute(a) if let Some(k) = self.module.class_of_expr(&a.value) => {
                 let attr = self.class_attr_of(k, a.attr.as_str(), span)?;
                 let ty = self.var_ty(&attr.global);
@@ -4822,6 +4845,7 @@ impl<'m> Lowerer<'m> {
             }
             ("zb_math_log", 2) => (vec![Ty::Float, Ty::Float], "zb_math_log_base"),
             ("zb_random_seed", 0) => (Vec::new(), "zb_random_seed_clock"),
+            ("zb_stringio_new", 0) => (Vec::new(), "zb_stringio_empty"),
             ("zb_random_seed", 1) if matches!(&args[0], py::Expr::NoneLiteral(_)) => {
                 return Ok(Val {
                     node: call("zb_random_seed_clock", vec![], Ty::None, span),
@@ -7475,6 +7499,10 @@ impl<'m> Lowerer<'m> {
                         let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
                         call(&format!("zb_str_{name}"), vec![s, a], Ty::Bool, span)
                     }
+                    ("strip" | "lstrip" | "rstrip", 1) => {
+                        let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
+                        call(&format!("zb_str_{name}_chars"), vec![s, a], Ty::Str, span)
+                    }
                     ("find", 1) => {
                         let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
                         call("zb_str_index_of", vec![s, a], Ty::Int, span)
@@ -7489,6 +7517,9 @@ impl<'m> Lowerer<'m> {
                         call("zb_str_replace", vec![s, a, b], Ty::Str, span)
                     }
                     ("split", 0) => call("zb_str_split_ws", vec![s], Ty::List(Elem::Str), span),
+                    ("splitlines", 0) => {
+                        call("zb_str_splitlines", vec![s], Ty::List(Elem::Str), span)
+                    }
                     ("split", 1) => {
                         let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
                         call("zb_str_split", vec![s, a], Ty::List(Elem::Str), span)
@@ -7534,6 +7565,11 @@ impl<'m> Lowerer<'m> {
                         call("zb_file_write", vec![f, data], Ty::None, span)
                     }
                     ("read", 0) => call("zb_file_read", vec![f], mode.content(), span),
+                    ("read", 1) => {
+                        let count = self.expr_as(&args[0], Ty::Int)?;
+                        call("zb_file_read_n", vec![f, count], mode.content(), span)
+                    }
+                    ("getvalue", 0) => call("zb_file_getvalue", vec![f], mode.content(), span),
                     ("close", 0) => call("zb_file_close", vec![f], Ty::None, span),
                     ("flush", 0) => Self::after_none(
                         f,
@@ -7729,6 +7765,24 @@ impl<'m> Lowerer<'m> {
                 node: result,
                 ty: Ty::Set,
             });
+        }
+        // `sys.stdout.write(s)` and `.flush()`: print's own path, which
+        // follows a redirection; flushing is the host's business.
+        if let py::Expr::Attribute(a) = &*c.func
+            && let py::Expr::Attribute(inner) = &*a.value
+            && matches!(&*inner.value, py::Expr::Name(m) if m.id.as_str() == "sys" && !self.is_variable("sys"))
+            && inner.attr.as_str() == "stdout"
+            && keywords.is_empty()
+        {
+            let node = match (a.attr.as_str(), args.len()) {
+                ("write", 1) => {
+                    let text = self.expr_as(&args[0], Ty::Str)?;
+                    call("zb_print_text", vec![text], Ty::None, span)
+                }
+                ("flush", 0) => node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+                _ => return unsupported("this method of sys.stdout", c),
+            };
+            return Ok(Val { node, ty: Ty::None });
         }
         // A function of an imported module, named through the module or
         // brought in by name.
@@ -11331,10 +11385,24 @@ impl<'m> Lowerer<'m> {
     fn print(&mut self, args: &[py::Expr], keywords: &[py::Keyword], span: Span) -> Result<Val> {
         let mut sep = str_lit(" ", span);
         let mut end: Option<Node> = None;
+        let mut file: Option<Node> = None;
         for k in keywords {
             match k.arg.as_ref().map(|a| a.as_str()) {
                 Some("sep") => sep = self.expr_as(&k.value, Ty::Str)?,
                 Some("end") => end = Some(self.expr_as(&k.value, Ty::Str)?),
+                // `file=f` writes the line to an open text file.
+                Some("file") => {
+                    let f = self.expr(&k.value)?;
+                    match f.ty {
+                        Ty::File(_) => file = Some(f.node),
+                        _ => {
+                            return unsupported(
+                                "print(..., file=) to something other than a file",
+                                k,
+                            );
+                        }
+                    }
+                }
                 Some(other) => {
                     return unsupported(format!("print(..., {other}=...)"), k);
                 }
@@ -11369,6 +11437,14 @@ impl<'m> Lowerer<'m> {
             });
         }
         let line = line.unwrap_or_else(|| str_lit("", span));
+        if let Some(file) = file {
+            let end = end.unwrap_or_else(|| str_lit("\n", span));
+            let text = binary(BinaryOp::Add, line, end, Ty::Str, span);
+            return Ok(Val {
+                node: call("zb_file_write", vec![file, text], Ty::None, span),
+                ty: Ty::None,
+            });
+        }
         let node = match end {
             None => call("zb_print_line", vec![line], Ty::None, span),
             Some(end) => call(

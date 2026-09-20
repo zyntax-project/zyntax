@@ -16,7 +16,11 @@ pub(crate) const BYTES: i64 = 6;
 const READ: i64 = 1;
 const WRITE: i64 = 2;
 const APPEND: i64 = 4;
+/// A file that is only its buffer: `io.StringIO`.
+const MEMORY: i64 = 8;
 const CLOSED: i64 = 16;
+/// A disk file whose contents have been read into the buffer.
+const LOADED: i64 = 32;
 
 pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let anys = list_of(list_type, any());
@@ -102,6 +106,16 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             vec![("xs", list_of(list_type, u8())), ("width", i64())],
             string(),
             "$Host$bytes_of_storage",
+        ),
+        (
+            "zb_bytes_from_buffer_range",
+            vec![
+                ("xs", list_of(list_type, u8())),
+                ("start", i64()),
+                ("end", i64()),
+            ],
+            string(),
+            "$Host$bytes_from_buffer_range",
         ),
         (
             "zb_bytes_copy_out",
@@ -540,7 +554,8 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let f = borrowed("f", anys.clone());
     let record = local("record", anys.clone());
     let buffer = local("buffer", bytes_buf.clone());
-    let data = local("data", string());
+    // Text written is only copied into the buffer: the caller's to free.
+    let written = borrowed("data", string());
     let mode_len = local("mode_len", i64());
     d.push(define(
         "zb_file_open",
@@ -610,8 +625,76 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 )],
                 unit(),
             )),
+            expr(mcall(
+                record.e(),
+                "push",
+                vec![call("zb_box_i64", vec![int(0)], any())],
+                unit(),
+            )),
             ret(record.e()),
         ],
+    ));
+    // io.StringIO(initial): a file that is its buffer, read and written
+    // in memory; `getvalue()` is the buffer as text.
+    let make_memory = |initial: Option<Expr>| {
+        let mut buffer_items = vec![
+            record.decl(list(Vec::new(), anys.clone())),
+            expr(mcall(
+                record.e(),
+                "push",
+                vec![call("zb_box_str", vec![text("")], any())],
+                unit(),
+            )),
+            expr(mcall(
+                record.e(),
+                "push",
+                vec![call("zb_box_i64", vec![int(READ | WRITE | MEMORY)], any())],
+                unit(),
+            )),
+            expr(mcall(
+                record.e(),
+                "push",
+                vec![call(
+                    "zb_list_box_u8",
+                    vec![list(Vec::new(), bytes_buf.clone())],
+                    any(),
+                )],
+                unit(),
+            )),
+            expr(mcall(
+                record.e(),
+                "push",
+                vec![call("zb_box_i64", vec![int(0)], any())],
+                unit(),
+            )),
+        ];
+        // The initial text fills the buffer; the position stays at 0.
+        if let Some(initial) = initial {
+            buffer_items.push(expr(call(
+                "zb_file_write",
+                vec![record.e(), initial],
+                unit(),
+            )));
+            buffer_items.push(set_idx(
+                record.e(),
+                int(3),
+                call("zb_box_i64", vec![int(0)], any()),
+            ));
+        }
+        buffer_items.push(ret(record.e()));
+        buffer_items
+    };
+    d.push(define(
+        "zb_stringio_empty",
+        &[],
+        anys.clone(),
+        make_memory(None),
+    ));
+    d.push(define(
+        "zb_stringio_new",
+        &[&written],
+        anys.clone(),
+        make_memory(Some(written.e())),
     ));
     let file_flags = || call("zb_box_get_i64", vec![idx(f.e(), int(1), any())], i64());
     let file_path = || call("zb_box_get_str", vec![idx(f.e(), int(0), any())], string());
@@ -622,16 +705,23 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             bytes_buf.clone(),
         )
     };
+    let file_pos = || call("zb_box_get_i64", vec![idx(f.e(), int(3), any())], i64());
+    let set_pos = |v: Expr| set_idx(f.e(), int(3), call("zb_box_i64", vec![v], any()));
+    let set_flags = |v: Expr| set_idx(f.e(), int(1), call("zb_box_i64", vec![v], any()));
     let closed_check = || {
         when(
             ne(bitand(file_flags(), int(CLOSED)), int(0)),
             vec![fatal("ValueError", text("I/O operation on closed file"))],
         )
     };
+    let pos = local("pos", i64());
+    let end = local("end", i64());
+    let count = local("count", i64());
+    let loaded = local("loaded", string());
     let old_len = local("old_len", i64());
     d.push(define(
         "zb_file_write",
-        &[&f, &data],
+        &[&f, &written],
         unit(),
         vec![
             closed_check(),
@@ -639,48 +729,111 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 eq(bitand(file_flags(), int(WRITE | APPEND)), int(0)),
                 vec![fatal("IOError", text("file not open for writing"))],
             ),
+            expr(call("zb_file_fill", vec![f.e(), written.e()], unit())),
+            ret_void(),
+        ],
+    ));
+    // The bytes into the buffer at the position, unchecked: what a write
+    // does once allowed, and how a disk file's contents are loaded.
+    d.push(define(
+        "zb_file_fill",
+        &[&f, &written],
+        unit(),
+        vec![
             buffer.decl(file_buffer()),
-            n.decl(call("zb_str_len", vec![data.e()], i64())),
+            n.decl(call("zb_str_len", vec![written.e()], i64())),
             old_len.decl(mcall(buffer.e(), "len", vec![], i64())),
-            block_of(for_range(
-                &i,
-                int(0),
-                n.e(),
-                vec![expr(mcall(
-                    buffer.e(),
-                    "push",
-                    vec![cast(int(0), u8())],
-                    unit(),
+            pos.decl(file_pos()),
+            // Room for the bytes past the end, then the copy at the
+            // position; the position moves past what was written.
+            end.decl(add(pos.e(), n.e())),
+            when(
+                gt(end.e(), old_len.e()),
+                vec![block_of(for_range(
+                    &i,
+                    old_len.e(),
+                    end.e(),
+                    vec![expr(mcall(
+                        buffer.e(),
+                        "push",
+                        vec![cast(int(0), u8())],
+                        unit(),
+                    ))],
                 ))],
-            )),
+            ),
             expr(call(
                 "zb_bytes_copy_out",
-                vec![data.e(), add(fld(buffer.e(), "data", i64()), old_len.e())],
+                vec![written.e(), add(fld(buffer.e(), "data", i64()), pos.e())],
                 i64(),
             )),
+            set_pos(end.e()),
             ret_void(),
         ],
     ));
     d.push(define(
-        "zb_file_read",
+        "zb_file_getvalue",
         &[&f],
         string(),
+        vec![
+            closed_check(),
+            ret(call("zb_bytes_from_buffer", vec![file_buffer()], string())),
+        ],
+    ));
+    // A disk file is read into the buffer once, on the first read;
+    // reads then take from the position, `count` bytes or the rest.
+    let load = || {
+        when(
+            eq(bitand(file_flags(), int(MEMORY | LOADED)), int(0)),
+            vec![
+                loaded.decl(call("zb_file_read_raw", vec![file_path()], string())),
+                when(
+                    eq(loaded.e(), null(string())),
+                    vec![fatal(
+                        "FileNotFoundError",
+                        add(text("No such file or directory: "), file_path()),
+                    )],
+                ),
+                set_pos(int(0)),
+                expr(call("zb_file_fill", vec![f.e(), loaded.e()], unit())),
+                set_pos(int(0)),
+                set_flags(bitor(file_flags(), int(LOADED))),
+            ],
+        )
+    };
+    let read_body = |count: Expr| {
         vec![
             closed_check(),
             when(
                 eq(bitand(file_flags(), int(READ)), int(0)),
                 vec![fatal("IOError", text("file not open for reading"))],
             ),
-            data.decl(call("zb_file_read_raw", vec![file_path()], string())),
+            load(),
+            buffer.decl(file_buffer()),
+            pos.decl(file_pos()),
+            n.decl(mcall(buffer.e(), "len", vec![], i64())),
+            end.decl(n.e()),
             when(
-                eq(data.e(), null(string())),
-                vec![fatal(
-                    "FileNotFoundError",
-                    add(text("No such file or directory: "), file_path()),
-                )],
+                and(
+                    ge(count.clone(), int(0)),
+                    lt(add(pos.e(), count.clone()), n.e()),
+                ),
+                vec![end.set(add(pos.e(), count))],
             ),
-            ret(data.e()),
-        ],
+            when(gt(pos.e(), end.e()), vec![pos.set(end.e())]),
+            set_pos(end.e()),
+            ret(call(
+                "zb_bytes_from_buffer_range",
+                vec![buffer.e(), pos.e(), end.e()],
+                string(),
+            )),
+        ]
+    };
+    d.push(define("zb_file_read", &[&f], string(), read_body(int(-1))));
+    d.push(define(
+        "zb_file_read_n",
+        &[&f, &count],
+        string(),
+        read_body(count.e()),
     ));
     d.push(define(
         "zb_file_close",
@@ -693,7 +846,10 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             ),
             flags.decl(file_flags()),
             when(
-                ne(bitand(flags.e(), int(WRITE | APPEND)), int(0)),
+                and(
+                    ne(bitand(flags.e(), int(WRITE | APPEND)), int(0)),
+                    eq(bitand(flags.e(), int(MEMORY)), int(0)),
+                ),
                 vec![
                     buffer.decl(file_buffer()),
                     when(
@@ -789,6 +945,37 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 add(add(text("name '"), s.e()), text("' is not defined")),
             ),
             ret(null(any())),
+        ],
+    ));
+
+    // sys.stdout: null while it is the process's; else the file record
+    // print writes to.
+    let target = local("zb_stdout_target", any());
+    d.push(global_var(target.name, any()));
+    // The file is kept in the global for as long as it is the target.
+    let redirect = kept("x", any());
+    d.push(define(
+        "zb_set_stdout",
+        &[&redirect],
+        unit(),
+        vec![target.set(redirect.e()), ret_void()],
+    ));
+    d.push(define("zb_get_stdout", &[], any(), vec![ret(target.e())]));
+    let line = borrowed("line", string());
+    d.push(define(
+        "zb_stdout_capture",
+        &[&line],
+        unit(),
+        vec![
+            expr(call(
+                "zb_file_write",
+                vec![
+                    call("zb_unbox_list_raw_any", vec![target.e()], anys.clone()),
+                    line.e(),
+                ],
+                unit(),
+            )),
+            ret_void(),
         ],
     ));
 

@@ -2486,6 +2486,81 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ret(chars.e()),
         ],
     ));
+    // splitlines: pieces between `\n`, `\r\n` and `\r`, no trailing
+    // empty piece. The next break is the nearer of the next `\n` and
+    // the next `\r`, each found by the host.
+    let nl = local("nl", i64());
+    let cr = local("cr", i64());
+    let cut = local("cut", i64());
+    let after = local("after", i64());
+    let find = |what: &str, from: Expr| {
+        call(
+            "zb_str_index_of_from",
+            vec![text_in.e(), text(what), from],
+            i64(),
+        )
+    };
+    d.push(define(
+        "zb_str_splitlines",
+        &[&text_in],
+        strs.clone(),
+        vec![
+            chars.decl(list(Vec::new(), strs.clone())),
+            n.decl(call("zb_str_len", vec![text_in.e()], i64())),
+            pos.decl(int(0)),
+            while_(
+                lt(pos.e(), n.e()),
+                vec![
+                    nl.decl(find("\n", pos.e())),
+                    cr.decl(find("\r", pos.e())),
+                    cut.decl(nl.e()),
+                    when(
+                        and(
+                            ge(cr.e(), int(0)),
+                            or(lt(cut.e(), int(0)), lt(cr.e(), cut.e())),
+                        ),
+                        vec![cut.set(cr.e())],
+                    ),
+                    if_(
+                        lt(cut.e(), int(0)),
+                        vec![
+                            expr(mcall(
+                                chars.e(),
+                                "push",
+                                vec![call(
+                                    "zb_str_bytes",
+                                    vec![text_in.e(), pos.e(), n.e()],
+                                    string(),
+                                )],
+                                unit(),
+                            )),
+                            pos.set(n.e()),
+                        ],
+                        vec![
+                            expr(mcall(
+                                chars.e(),
+                                "push",
+                                vec![call(
+                                    "zb_str_bytes",
+                                    vec![text_in.e(), pos.e(), cut.e()],
+                                    string(),
+                                )],
+                                unit(),
+                            )),
+                            after.decl(add(cut.e(), int(1))),
+                            // `\r\n` is one break.
+                            when(
+                                and(eq(cut.e(), cr.e()), eq(nl.e(), add(cr.e(), int(1)))),
+                                vec![after.set(add(cut.e(), int(2)))],
+                            ),
+                            pos.set(after.e()),
+                        ],
+                    ),
+                ],
+            ),
+            ret(chars.e()),
+        ],
+    ));
     // split on runs of whitespace
     let c = local("c", string());
     let is_space = |c: Expr| call("zb_str_is_space", vec![c], boolean());
