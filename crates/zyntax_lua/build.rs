@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     zyntax_compiler::set_target_pointer_size(width / 8);
 
     let (lib, _types) = library::library(&policy::POLICY);
+    let lib_declarations = lib.declarations.clone();
     let program = TypedProgram {
         declarations: lib.declarations,
         language: Some(InternedString::new_global("lua")),
@@ -59,6 +60,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     fallible.push_str("];\n");
     fallible.push_str("pub const REENTRANT: &[&str] = &[\n");
     for name in &reentrant {
+        fallible.push_str(&format!("    {name:?},\n"));
+    }
+    fallible.push_str("];\n");
+    // The host symbols the shared library declares, whichever
+    // frontend's host provides them: the ones this host does not are
+    // bound to a trap, so the code referring to them still links.
+    let mut host_externs: Vec<String> = lib_declarations
+        .iter()
+        .filter_map(|d| match &d.node {
+            zyntax_typed_ast::typed_ast::TypedDeclaration::Function(f) if f.is_external => f
+                .link_name
+                .as_ref()
+                .and_then(|n| n.resolve_global())
+                .filter(|n| n.starts_with("$Host$")),
+            _ => None,
+        })
+        .collect();
+    host_externs.sort();
+    host_externs.dedup();
+    fallible.push_str("pub const HOST_EXTERNS: &[&str] = &[\n");
+    for name in &host_externs {
         fallible.push_str(&format!("    {name:?},\n"));
     }
     fallible.push_str("];\n");

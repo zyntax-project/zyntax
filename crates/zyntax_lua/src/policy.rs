@@ -22,6 +22,8 @@ pub const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
         int: "number",
         float: "number",
         str: "string",
+        // No Lua value is one: a foreign kind, named as one.
+        bytes: "userdata",
         list: "table",
         tuple: "table",
         dict: "table",
