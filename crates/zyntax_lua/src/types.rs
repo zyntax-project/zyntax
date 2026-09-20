@@ -145,6 +145,11 @@ pub struct ShapeInfo {
     /// How many of the fields every constructor sets: the first
     /// `born` are present from birth, the rest may be absent.
     pub born: usize,
+    /// The join of what is stored under keys that are not strings:
+    /// the constructor's positional values, and stores under numbers.
+    /// What a read under such a key yields, when the table has no
+    /// metatable to ask instead.
+    pub element: Ty,
     /// The shapes of the metatables `setmetatable` gives tables of
     /// this shape.
     pub classes: BTreeSet<ShapeId>,
@@ -223,6 +228,10 @@ pub struct Inferred {
     /// Whether a store with a key not known at compile time, that may
     /// be a string, reaches a receiver the types do not know.
     pub blind_dynamic_stores: bool,
+    /// The join of what is stored under keys that are not strings
+    /// through receivers the types do not know: it may land in the
+    /// array part of any escaping shape.
+    pub blind_element: Ty,
     /// Whether `setmetatable` is applied to a receiver the types do
     /// not know: any escaping shape may get any metatable.
     pub blind_setmetatable: bool,
@@ -364,6 +373,27 @@ impl Inferred {
                 _ => return None,
             };
             hops.push(Hop::Index(behind));
+        }
+    }
+
+    /// What reading a table of shape `k` under a key of type `key_ty`
+    /// yields: its element type, or nil, when the key cannot be a
+    /// string and the table has no metatable to ask; else anything.
+    pub fn element_read_ty(&self, k: ShapeId, key_ty: Ty) -> Ty {
+        let info = self.shape(k);
+        if !key_is_number(key_ty) || info.unknown_meta || !info.classes.is_empty() {
+            return Ty::Any;
+        }
+        join_read(info.element, Ty::Nil)
+    }
+
+    /// The element type a `for` over `ipairs(t)` binds, for `t` of type
+    /// `ty`: the shape's, when its reads are typed.
+    pub fn ipairs_value_ty(&self, ty: Ty) -> Ty {
+        match ty {
+            Ty::Shape(k) if self.element_read_ty(k, Ty::Int) != Ty::Any => self.shape(k).element,
+            Ty::Unknown => Ty::Unknown,
+            _ => Ty::Any,
         }
     }
 
@@ -814,7 +844,13 @@ impl<'a> Typer<'a> {
                 let receiver = self.suffixed_ty(prefix, &suffixes[..suffixes.len() - 1]);
                 match constant_key(index) {
                     Some(name) => self.field_ty(receiver, &name),
-                    None => Ty::Any,
+                    None => match (receiver, index) {
+                        (Ty::Shape(k), ast::Index::Brackets { expression, .. }) => {
+                            self.known.element_read_ty(k, self.ty_of(expression))
+                        }
+                        (Ty::Unknown, _) => Ty::Unknown,
+                        _ => Ty::Any,
+                    },
                 }
             }
             _ => Ty::Any,
@@ -863,7 +899,7 @@ impl<'a> Typer<'a> {
                     },
                     UnOp::Hash(_) => match t {
                         Ty::Str => Ty::Int,
-                        Ty::Table if !self.scopes.len_meta => Ty::Int,
+                        Ty::Table | Ty::Shape(_) if !self.scopes.len_meta => Ty::Int,
                         _ => Ty::Any,
                     },
                     UnOp::Tilde(_) => match t {
@@ -1136,16 +1172,31 @@ impl<'a> Round<'a> {
             .insert(name.to_string(), joined);
     }
 
+    /// A store of `ty` under a key that is not a string into the
+    /// tables of shape `k`.
+    fn store_element(&mut self, k: ShapeId, ty: Ty) {
+        let element = self.out.shapes[k.0 as usize].element;
+        let joined = self.join_into(element, ty);
+        self.out.shapes[k.0 as usize].element = joined;
+    }
+
     /// A store through `receiver` under `key` of a value of type `ty`:
-    /// into the shape's field, or blind.
+    /// into the shape's field or element, or blind.
     fn store_through(&mut self, receiver: Ty, key: Option<String>, key_ty: Ty, ty: Ty) {
         match (receiver, key) {
             (Ty::Shape(k), Some(name)) => self.store_field(k, &name, ty),
+            // Under a number the value is an element and stays typed;
+            // under anything else it is lost in the hash part.
             (Ty::Shape(k), None) => {
-                if key_may_be_string(key_ty) {
-                    self.out.shapes[k.0 as usize].dynamic_keys = true;
+                if key_may_be_index(key_ty) {
+                    self.store_element(k, ty);
                 }
-                self.escape(ty);
+                if !key_is_number(key_ty) {
+                    if key_may_be_string(key_ty) {
+                        self.out.shapes[k.0 as usize].dynamic_keys = true;
+                    }
+                    self.escape(ty);
+                }
             }
             (Ty::Unknown, _) => {}
             (_, Some(name)) => {
@@ -1162,6 +1213,10 @@ impl<'a> Round<'a> {
             (_, None) => {
                 if key_may_be_string(key_ty) {
                     self.out.blind_dynamic_stores = true;
+                }
+                if key_may_be_index(key_ty) {
+                    let element = self.out.blind_element;
+                    self.out.blind_element = self.join_into(element, ty);
                 }
                 self.escape(ty);
             }
@@ -1263,6 +1318,22 @@ impl<'a> Round<'a> {
                 {
                     self.out.shapes[k].dynamic_keys = true;
                     changed = true;
+                }
+                // Its array part takes the stores made blind, and what
+                // it holds escapes with it.
+                let element = self.out.shapes[k].element;
+                let reaching = if dynamic_code {
+                    Ty::Any
+                } else {
+                    self.out.blind_element
+                };
+                let joined = self.join_into(element, reaching);
+                if joined != element {
+                    self.out.shapes[k].element = joined;
+                    changed = true;
+                }
+                if joined != Ty::Any && !matches!(joined, Ty::Unknown) {
+                    self.escape(joined);
                 }
                 if self.blind_getmetatable || dynamic_code {
                     let classes: Vec<ShapeId> =
@@ -1598,8 +1669,30 @@ impl<'a> Round<'a> {
                     && matches!(exprs[0], Expression::FunctionCall(c)
                         if self.typer().builtin_callee(c.prefix(), &c.suffixes().collect::<Vec<_>>())
                             .is_some_and(|b| b.name == "ipairs" && b.lib.is_empty()));
+                let element = if ipairs {
+                    let table = match exprs[0] {
+                        Expression::FunctionCall(c) => match c.suffixes().last() {
+                            Some(Suffix::Call(ast::Call::AnonymousCall(
+                                ast::FunctionArgs::Parentheses { arguments, .. },
+                            ))) => arguments
+                                .iter()
+                                .next()
+                                .map(|a| self.typer().ty_of(a))
+                                .unwrap_or(Ty::Nil),
+                            _ => Ty::Any,
+                        },
+                        _ => Ty::Any,
+                    };
+                    self.out.ipairs_value_ty(table)
+                } else {
+                    Ty::Any
+                };
                 for (i, v) in names.iter().enumerate() {
-                    let ty = if ipairs && i == 0 { Ty::Int } else { Ty::Any };
+                    let ty = match i {
+                        0 if ipairs => Ty::Int,
+                        1 if ipairs => element,
+                        _ => Ty::Any,
+                    };
                     self.assign_var(*v, ty);
                 }
                 self.block(f.block());
@@ -1725,19 +1818,44 @@ impl<'a> Round<'a> {
         // `setmetatable(t, m)` links a shape to its class; `rawset`
         // stores; neither loses its table.
         if let Some(b) = self.typer().builtin_callee(c.prefix(), &suffixes)
-            && b.lib.is_empty()
-            && matches!(
-                b.name,
-                "setmetatable" | "getmetatable" | "rawset" | "rawget"
-            )
             && let Some(Suffix::Call(ast::Call::AnonymousCall(ast::FunctionArgs::Parentheses {
                 arguments,
                 ..
             }))) = suffixes.last()
         {
             let args: Vec<&Expression> = arguments.iter().collect();
-            self.metatable_builtin(b.name, &args);
-            return;
+            if b.lib.is_empty()
+                && matches!(
+                    b.name,
+                    "setmetatable" | "getmetatable" | "rawset" | "rawget"
+                )
+            {
+                self.metatable_builtin(b.name, &args);
+                return;
+            }
+            // `table.insert` and `table.move` store elements into their
+            // table; the rest of the call takes values as any library
+            // call does.
+            if b.lib == "table" && matches!(b.name, "insert" | "move") {
+                self.chain(c.prefix(), &suffixes);
+                let tys: Vec<Ty> = args.iter().map(|a| self.typer().ty_of(a)).collect();
+                match b.name {
+                    "insert" if tys.len() >= 2 => {
+                        self.store_through(tys[0], None, Ty::Int, tys[tys.len() - 1]);
+                    }
+                    "move" if tys.len() >= 4 => {
+                        let element = match tys[0] {
+                            Ty::Shape(k) => self.out.shapes[k.0 as usize].element,
+                            Ty::Unknown => Ty::Unknown,
+                            _ => Ty::Any,
+                        };
+                        let into = tys.get(4).copied().unwrap_or(tys[0]);
+                        self.store_through(into, None, Ty::Int, element);
+                    }
+                    _ => {}
+                }
+                return;
+            }
         }
         self.chain(c.prefix(), &suffixes);
     }
@@ -1935,7 +2053,8 @@ impl<'a> Round<'a> {
     /// field's value joins the shape's field. The rest are values.
     fn table(&mut self, t: &ast::TableConstructor) {
         let shape = self.shape_for(t);
-        for field in t.fields() {
+        let count = t.fields().len();
+        for (i, field) in t.fields().iter().enumerate() {
             match field {
                 ast::Field::ExpressionKey { key, value, .. } => {
                     match crate::scope::literal_string(key) {
@@ -1955,7 +2074,21 @@ impl<'a> Round<'a> {
                     let ty = self.typer().ty_of(value);
                     self.store_field(shape, &ident(key), ty);
                 }
-                ast::Field::NoKey(e) => self.value(e),
+                // A positional value is an element; the last one's
+                // several values all are.
+                ast::Field::NoKey(e) => {
+                    self.expr(e);
+                    let last = i + 1 == count;
+                    let types = match multi_returns(&self.typer(), e) {
+                        Some(Returns::Fixed(types)) if last => types,
+                        Some(Returns::Dynamic) if last => vec![Ty::Any],
+                        Some(Returns::Unknown) if last => vec![Ty::Unknown],
+                        _ => vec![self.typer().ty_of(e)],
+                    };
+                    for ty in types {
+                        self.store_element(shape, ty);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1992,6 +2125,21 @@ fn join_read(a: Ty, b: Ty) -> Ty {
     } else {
         a.join(b)
     }
+}
+
+/// Whether a key of this type is a number: then a read under it is
+/// of the array part, or of the hash part's numbers.
+fn key_is_number(ty: Ty) -> bool {
+    matches!(ty, Ty::Int | Ty::Float | Ty::Number)
+}
+
+/// Whether a key of this type may be a number: then a store under it
+/// may land in a shape's array part.
+fn key_may_be_index(ty: Ty) -> bool {
+    !matches!(
+        ty,
+        Ty::Str | Ty::Bool | Ty::Nil | Ty::Table | Ty::Shape(_) | Ty::Func(_)
+    )
 }
 
 /// Whether a key of this type may be a string: then a store under it
@@ -2338,10 +2486,11 @@ fn trace_types(scopes: &Scopes, known: &Inferred) {
     if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
         for (i, shape) in known.shapes.iter().enumerate() {
             eprintln!(
-                "[types] shape {i}@{}: {:?} born={} classes={:?}{}{}{}",
+                "[types] shape {i}@{}: {:?} born={} element={:?} classes={:?}{}{}{}",
                 shape.line,
                 shape.fields,
                 shape.born,
+                shape.element,
                 shape.classes,
                 if shape.escapes { " escapes" } else { "" },
                 if shape.unknown_meta {
@@ -2357,8 +2506,11 @@ fn trace_types(scopes: &Scopes, known: &Inferred) {
             );
         }
         eprintln!(
-            "[types] blind stores {:?} dynamic={} setmetatable={}",
-            known.blind_stores, known.blind_dynamic_stores, known.blind_setmetatable
+            "[types] blind stores {:?} dynamic={} element={:?} setmetatable={}",
+            known.blind_stores,
+            known.blind_dynamic_stores,
+            known.blind_element,
+            known.blind_setmetatable
         );
         let mut escaping: Vec<String> = known
             .escaping
