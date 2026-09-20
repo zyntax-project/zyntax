@@ -2589,7 +2589,9 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     ));
     // `table.concat(t, sep, i, j)`: the last index defaults to the
     // length; the loop stops on reaching it rather than passing it, so
-    // an index at either end of the integers is fine.
+    // an index at either end of the integers is fine. The pieces are
+    // gathered and joined in one allocation of the result's length.
+    let parts = borrowed("parts", zyntax_builtins::list_of(t.list_type, string()));
     d.push(define(
         "zl_table_concat",
         &[&tb, &sep, &i, &last],
@@ -2600,8 +2602,8 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 call("zl_table_len", vec![tb.e()], i64()),
                 call("zl_arg_int", vec![last.e(), bad_arg(4, "concat")], i64()),
             )),
-            acc.decl(text("")),
-            when(gt(i.e(), j.e()), vec![ret(acc.e())]),
+            when(gt(i.e(), j.e()), vec![ret(text(""))]),
+            parts.decl(list(Vec::new(), parts.ty.clone())),
             k.decl(i.e()),
             ok.decl(bool(true)),
             while_(
@@ -2624,15 +2626,15 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                             text(" in table for 'concat'"),
                         ]))],
                     ),
-                    acc.set(add(acc.e(), call("zl_concat_text", vec![v.e()], string()))),
+                    push(parts.e(), call("zl_concat_text", vec![v.e()], string())),
                     if_(
                         eq(k.e(), j.e()),
                         vec![ok.set(bool(false))],
-                        vec![acc.set(add(acc.e(), sep.e())), k.add_assign(int(1))],
+                        vec![k.add_assign(int(1))],
                     ),
                 ],
             ),
-            ret(acc.e()),
+            ret(call("zb_str_join", vec![sep.e(), parts.e()], string())),
         ],
     ));
     d.push(define(
