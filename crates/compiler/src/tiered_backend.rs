@@ -2455,18 +2455,53 @@ impl TieredBackend {
             /// function marked through the pipeline and deferred, so a
             /// pass that walks the module touches the one being optimised
             /// alone.
-            fn of<'a>(slot: &'a mut Option<Scratch>, module: &Arc<HirModule>) -> &'a mut Scratch {
+            fn of<'a>(
+                slot: &'a mut Option<Scratch>,
+                module: &Arc<HirModule>,
+                facts: &Facts,
+            ) -> &'a mut Scratch {
                 slot.get_or_insert_with(|| {
+                    let started = std::time::Instant::now();
+                    let facts = facts.of(module);
                     let mut module: HirModule = (**module).clone();
                     for f in module.functions.values_mut() {
                         f.attributes.optimized = true;
                         f.attributes.deferred = true;
                     }
-                    let cache = crate::OptCache::build(&module);
+                    let cache = crate::OptCache::with_facts(facts, &module);
+                    if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                        eprintln!(
+                            "[lazy] scratch module made in {:.2} ms on {}",
+                            started.elapsed().as_secs_f64() * 1e3,
+                            std::thread::current().name().unwrap_or("?")
+                        );
+                    }
                     Scratch { module, cache }
                 })
             }
         }
+        /// What the release pass knows of the module, built once: the
+        /// worker builds it as it starts, and a thread that needs it
+        /// first builds it itself while the other waits.
+        #[derive(Default)]
+        struct Facts(std::sync::OnceLock<Arc<crate::drop_insert::ModuleFacts>>);
+        impl Facts {
+            fn of(&self, module: &HirModule) -> Arc<crate::drop_insert::ModuleFacts> {
+                Arc::clone(self.0.get_or_init(|| {
+                    let started = std::time::Instant::now();
+                    let facts = Arc::new(crate::drop_insert::facts_of(module));
+                    if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                        eprintln!(
+                            "[lazy] release facts built in {:.2} ms on {}",
+                            started.elapsed().as_secs_f64() * 1e3,
+                            std::thread::current().name().unwrap_or("?")
+                        );
+                    }
+                    facts
+                }))
+            }
+        }
+        let facts: Arc<Facts> = Arc::new(Facts::default());
         let optimized: Arc<Mutex<Option<Scratch>>> = Arc::new(Mutex::new(None));
         let scratch_shared = Arc::clone(&optimized);
         // The optimised body outlives the baseline compile for the tier
@@ -2487,6 +2522,7 @@ impl TieredBackend {
                 .collect();
             let optimized_bodies = Arc::clone(&optimized_bodies);
             let optimized = Arc::clone(&optimized);
+            let facts = Arc::clone(&facts);
             let finished = finished.clone();
             let lazy = lazy.clone();
             let externs = externs.clone();
@@ -2513,7 +2549,7 @@ impl TieredBackend {
                         return None;
                     }
                     let mut optimized = optimized.lock().unwrap();
-                    let scratch = Scratch::of(&mut optimized, module_arc);
+                    let scratch = Scratch::of(&mut optimized, module_arc, &facts);
                     let f = scratch.module.functions.get_mut(func_id)?;
                     f.attributes.optimized = false;
                     f.attributes.deferred = false;
@@ -2569,12 +2605,13 @@ impl TieredBackend {
                 .map(|(bead, (_, _, module))| (*bead, Arc::clone(module)))
                 .collect();
             let optimized = Arc::clone(&optimized);
+            let facts = Arc::clone(&facts);
             move |bead_id: u64, f: HirFunction| -> HirFunction {
                 let Some(module_arc) = by_bead.get(&bead_id) else {
                     return f;
                 };
                 let mut optimized = optimized.lock().unwrap();
-                let scratch = Scratch::of(&mut optimized, module_arc);
+                let scratch = Scratch::of(&mut optimized, module_arc, &facts);
                 let id = f.id;
                 scratch.module.functions.insert(id, f);
                 crate::run_interp_safe_opts_cached(&mut scratch.module, &scratch.cache);
@@ -2590,33 +2627,22 @@ impl TieredBackend {
             }
         }));
         // The body the interpreter runs before the first compile: the
-        // module's as lowered, with the release insertion pass alone run
-        // over it, so its first runs free what they allocate as its
-        // optimised body will. The rest of the pipeline waits for a call
-        // that proves the function worth it.
+        // module's as lowered, with the release pass alone run over it,
+        // so its first runs free what they allocate as its optimised
+        // body will. The rest of the pipeline waits for a call that
+        // proves the function worth it.
         self.make_interp_body = Some(Arc::new({
             let by_bead: HashMap<u64, (HirId, Arc<HirModule>)> = by_bead
                 .iter()
                 .map(|(bead, (id, _, module))| (*bead, (*id, Arc::clone(module))))
                 .collect();
-            let optimized = Arc::clone(&optimized);
+            let facts = Arc::clone(&facts);
             move |bead_id: u64| -> Option<Arc<HirFunction>> {
                 let (func_id, module_arc) = by_bead.get(&bead_id)?;
                 let mut f = module_arc.functions.get(func_id)?.clone();
                 f.attributes.optimized = false;
                 f.attributes.deferred = false;
-                let mut optimized = optimized.lock().unwrap();
-                let scratch = Scratch::of(&mut optimized, module_arc);
-                // Under a key of its own: the scratch's copy of the
-                // function is the one its first compile optimises.
-                let key = HirId::new();
-                scratch.module.functions.insert(key, f);
-                crate::run_release_insertion_cached(&mut scratch.module, &scratch.cache);
-                let f = scratch
-                    .module
-                    .functions
-                    .shift_remove(&key)
-                    .expect("the body given releases is still in the scratch module");
+                crate::drop_insert::run_function_with(&mut f, &facts.of(module_arc));
                 Some(Arc::new(f))
             }
         }));
@@ -2628,6 +2654,10 @@ impl TieredBackend {
         let queue_cell = Arc::clone(&queue_for_callees);
         let bead_of: HashMap<HirId, u64> =
             by_bead.iter().map(|(b, (id, _, _))| (*id, *b)).collect();
+        let facts_module: Option<Arc<HirModule>> = by_bead
+            .values()
+            .next()
+            .map(|(_, _, module)| Arc::clone(module));
         let compile_lazy_function = move |bead_id: u64| -> *const u8 {
             let trace = std::env::var_os("ZYNTAX_TRACE_LAZY").is_some();
             {
@@ -2746,6 +2776,7 @@ impl TieredBackend {
         if std::env::var_os("ZYNTAX_DISABLE_WARM_UP").is_none() {
             let compile = Arc::clone(&compile_lazy_function);
             let stop = Arc::clone(&self.warm_up_stop);
+            let facts = Arc::clone(&facts);
             let queue = Arc::new(CompileQueue::new(Arc::clone(&stop)));
             osr::set_compile_worker_busy(Some(Arc::clone(&queue.busy)));
             self.compile_queue = Some(Arc::clone(&queue));
@@ -2755,6 +2786,11 @@ impl TieredBackend {
                 .stack_size(16 << 20)
                 .spawn(move || {
                     ON_WARM_UP.with(|on| on.set(true));
+                    // The interpreter's first body needs the release
+                    // facts, and the program is about to start.
+                    if let Some(module) = &facts_module {
+                        facts.of(module);
+                    }
                     let mut idle_since: Option<std::time::Instant> = None;
                     loop {
                         if stop.load(std::sync::atomic::Ordering::Acquire) {

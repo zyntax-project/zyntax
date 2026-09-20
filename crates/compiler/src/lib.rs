@@ -1862,14 +1862,20 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
 /// body does not change: for a module whose functions are optimised one
 /// at a time, built once rather than per function.
 pub struct OptCache {
-    facts: drop_insert::ModuleFacts,
+    facts: std::sync::Arc<drop_insert::ModuleFacts>,
     cycles: inline::Cycles,
 }
 
 impl OptCache {
     pub fn build(module: &HirModule) -> Self {
+        Self::with_facts(std::sync::Arc::new(drop_insert::facts_of(module)), module)
+    }
+
+    /// [`Self::build`] with the release facts already built, by
+    /// something that needed them on their own.
+    pub fn with_facts(facts: std::sync::Arc<drop_insert::ModuleFacts>, module: &HirModule) -> Self {
         Self {
-            facts: drop_insert::facts_of(module),
+            facts,
             cycles: inline::cycles_of(module),
         }
     }
@@ -1878,16 +1884,6 @@ impl OptCache {
 /// [`run_interp_safe_opts`] over what the cache already knows.
 pub fn run_interp_safe_opts_cached(module: &mut HirModule, cache: &OptCache) -> InterpOptStats {
     run_interp_safe_opts_with(module, true, Some(cache))
-}
-
-/// Release insertion alone, over the functions still to optimise, with
-/// the cache's facts: what a body run before its optimisation needs of
-/// the pipeline, so that it frees what it allocates.
-pub fn run_release_insertion_cached(
-    module: &mut HirModule,
-    cache: &OptCache,
-) -> drop_insert::DropStats {
-    drop_insert::run_module_with(module, &cache.facts)
 }
 
 /// [`run_interp_safe_opts`] for a module whose functions other modules
