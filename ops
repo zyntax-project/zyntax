@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1789910182,"nonce":"Ht1RJ8Wy7klsf6dCkTyfJ1ruvv4=","added":["bug","area:gc","priority:high"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789911005,"nonce":"xToPeyajDBA1+kg/yx0eRWUj3Gk=","message":"Fixed in 0ab03f1d40113a6cc2cd721b2a74960637a49665: large_alloc collects when the budget is spent. Guarded by pressure/large_strings.{lua,py}.","files":null}]}
