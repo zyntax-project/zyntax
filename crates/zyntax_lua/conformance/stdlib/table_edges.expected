@@ -1,0 +1,42 @@
+false	bad argument #1 to 'table.move' (table expected, got number)
+true
+true
+true
+true
+true	true
+true	true
+true
+true
+true
+true
+true
+true	true
+(3,100)(4,110)(5,120)(6,130)
+false	true
+false	nil	true	true
+false	nil	true	true
+false	nil	true	true
+false	nil	true	true
+false	nil	true	true
+false	nil	true	true
+table_edges.lua:54: bad argument #3 to 'move' (too many elements to move)
+table_edges.lua:55: bad argument #3 to 'move' (too many elements to move)
+table_edges.lua:56: bad argument #3 to 'move' (too many elements to move)
+table_edges.lua:57: bad argument #3 to 'move' (too many elements to move)
+table_edges.lua:58: bad argument #4 to 'move' (destination wrap around)
+table_edges.lua:59: bad argument #4 to 'move' (destination wrap around)
+table_edges.lua:60: bad argument #4 to 'move' (destination wrap around)
+20
+12	23
+12.3	23.5
+12.3
+0
+false	too many results to unpack
+false	too many results to unpack
+0
+false	invalid order function for sorting
+false	invalid order function for sorting
+-1
+false	table_edges.lua:79: bad argument #1 to 'sort' (array too big)
+1,2,3,5,7,8,9
+9,8,7,5,3,2,1

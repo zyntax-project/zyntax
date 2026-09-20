@@ -196,7 +196,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "",
         name: "unpack",
         func: "zl_unpack",
-        params: &[Table, OptInt(1), OptInt(i64::MIN)],
+        params: &[Table, OptInt(1), Any],
         ret: Ret::Multi,
     },
     // ─── string ───
@@ -656,7 +656,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "table",
         name: "unpack",
         func: "zl_unpack",
-        params: &[Table, OptInt(1), OptInt(i64::MIN)],
+        params: &[Table, OptInt(1), Any],
         ret: Ret::Multi,
     },
     Builtin {
@@ -672,6 +672,13 @@ pub const BUILTINS: &[Builtin] = &[
         func: "zl_table_sort",
         params: &[Table, Any],
         ret: Ret::Unit,
+    },
+    Builtin {
+        lib: "table",
+        name: "move",
+        func: "zl_table_move",
+        params: &[Table, Int, Int, Int, Any],
+        ret: Ret::Any,
     },
     // ─── os ───
     Builtin {
@@ -1681,16 +1688,20 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ret(call("zb_box_tuple", vec![out.e()], any())),
         ],
     ));
-    // `table.unpack(t, i, j)`: the values `t[i]..t[j]`.
+    // `table.unpack(t, i, j)`: the values `t[i]..t[j]`, `j` the
+    // length when not given; any integer may be given.
+    let ok = local("ok", boolean());
+    let last = kept("last", any());
     d.push(define(
         "zl_unpack",
-        &[&tb, &i, &j],
+        &[&tb, &i, &last],
         any(),
         vec![
-            when(
-                eq(j.e(), int(i64::MIN)),
-                vec![j.set(call("zl_table_len", vec![tb.e()], i64()))],
-            ),
+            j.decl(if_expr(
+                is_nil(last.e()),
+                call("zl_table_len", vec![tb.e()], i64()),
+                call("zl_arg_int", vec![last.e(), bad_arg(3, "unpack")], i64()),
+            )),
             // The reference's stack holds a million values.
             when(
                 and(
@@ -1703,12 +1714,19 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 vec![lua_error(text("too many results to unpack"))],
             ),
             out.decl(list(vec![], anys.clone())),
+            // The loop stops on reaching `j` rather than passing it, so
+            // an index at the end of the integers is fine.
             k.decl(i.e()),
+            ok.decl(le(i.e(), j.e())),
             while_(
-                le(k.e(), j.e()),
+                ok.e(),
                 vec![
                     push(out.e(), call("zl_table_geti", vec![tb.e(), k.e()], any())),
-                    k.add_assign(int(1)),
+                    if_(
+                        eq(k.e(), j.e()),
+                        vec![ok.set(bool(false))],
+                        vec![k.add_assign(int(1))],
+                    ),
                 ],
             ),
             ret(call("zb_box_tuple", vec![out.e()], any())),
@@ -2562,8 +2580,6 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     // `table.concat(t, sep, i, j)`: the last index defaults to the
     // length; the loop stops on reaching it rather than passing it, so
     // an index at either end of the integers is fine.
-    let last = kept("last", any());
-    let ok = local("ok", boolean());
     d.push(define(
         "zl_table_concat",
         &[&tb, &sep, &i, &last],
@@ -2627,6 +2643,105 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ret(tb.e()),
         ],
     ));
+    // `table.move(a1, f, e, t, a2)`: `a1[f..e]` copied to `a2[t..]`,
+    // `a2` being `a1` when not given; the destination is returned.
+    // Overlapping ranges in one table are copied from the end when
+    // the move is forward, so nothing is overwritten before it is
+    // read.
+    let from = local("from", i64());
+    let to = local("to", i64());
+    let at_i = local("at_i", i64());
+    let dest = kept("dest", any());
+    let target = kept("target", table.clone());
+    d.push(define(
+        "zl_table_move",
+        &[&tb, &from, &to, &at_i, &dest],
+        any(),
+        vec![
+            target.decl(if_expr(
+                is_nil(dest.e()),
+                tb.e(),
+                call(
+                    "zl_as_table",
+                    vec![dest.e(), bad_arg(5, "move")],
+                    table.clone(),
+                ),
+            )),
+            when(
+                ge(to.e(), from.e()),
+                vec![
+                    when(
+                        and(
+                            le(from.e(), int(0)),
+                            ge(to.e(), add(int(i64::MAX), from.e())),
+                        ),
+                        vec![lua_error(text(
+                            "bad argument #3 to 'move' (too many elements to move)",
+                        ))],
+                    ),
+                    n.decl(add(sub(to.e(), from.e()), int(1))),
+                    when(
+                        gt(at_i.e(), add(sub(int(i64::MAX), n.e()), int(1))),
+                        vec![lua_error(text(
+                            "bad argument #4 to 'move' (destination wrap around)",
+                        ))],
+                    ),
+                    // A metamethod's error ends the move.
+                    if_(
+                        or(
+                            or(gt(at_i.e(), to.e()), le(at_i.e(), from.e())),
+                            ne(target.e(), tb.e()),
+                        ),
+                        vec![
+                            i.decl(int(0)),
+                            while_(
+                                and(lt(i.e(), n.e()), is_nil(pending())),
+                                vec![
+                                    expr(call(
+                                        "zl_table_seti",
+                                        vec![
+                                            target.e(),
+                                            add(at_i.e(), i.e()),
+                                            call(
+                                                "zl_table_geti",
+                                                vec![tb.e(), add(from.e(), i.e())],
+                                                any(),
+                                            ),
+                                        ],
+                                        unit(),
+                                    )),
+                                    i.add_assign(int(1)),
+                                ],
+                            ),
+                        ],
+                        vec![
+                            i.decl(sub(n.e(), int(1))),
+                            while_(
+                                and(ge(i.e(), int(0)), is_nil(pending())),
+                                vec![
+                                    expr(call(
+                                        "zl_table_seti",
+                                        vec![
+                                            target.e(),
+                                            add(at_i.e(), i.e()),
+                                            call(
+                                                "zl_table_geti",
+                                                vec![tb.e(), add(from.e(), i.e())],
+                                                any(),
+                                            ),
+                                        ],
+                                        unit(),
+                                    )),
+                                    i.set(sub(i.e(), int(1))),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            ret(box_table(target.e())),
+        ],
+    ));
     // `table.sort(t, comp)`: a quicksort over the array part, ordering
     // by `comp` or `<`.
     let comp = kept("comp", any());
@@ -2649,9 +2764,12 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ),
         )
     };
+    // `line` is the sort's own, for the error it raises after the
+    // comparator has moved the line elsewhere.
+    let line = local("line", i64());
     d.push(define(
         "zl_sort_range",
-        &[&arr, &lo_i, &hi_i, &comp],
+        &[&arr, &lo_i, &hi_i, &comp, &line],
         unit(),
         vec![
             when(ge(lo_i.e(), hi_i.e()), vec![ret_void()]),
@@ -2661,13 +2779,22 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             while_(
                 le(i.e(), j.e()),
                 vec![
+                    // An order that never settles walks off the range:
+                    // the comparator is not one.
                     while_(
-                        less(at(arr.e(), i.e()), pivot.e()),
+                        and(le(i.e(), hi_i.e()), less(at(arr.e(), i.e()), pivot.e())),
                         vec![i.add_assign(int(1))],
                     ),
                     while_(
-                        less(pivot.e(), at(arr.e(), j.e())),
+                        and(ge(j.e(), lo_i.e()), less(pivot.e(), at(arr.e(), j.e()))),
                         vec![j.set(sub(j.e(), int(1)))],
+                    ),
+                    when(
+                        or(gt(i.e(), hi_i.e()), lt(j.e(), lo_i.e())),
+                        vec![
+                            set_global(LINE, line.e()),
+                            lua_error(text("invalid order function for sorting")),
+                        ],
                     ),
                     when(
                         le(i.e(), j.e()),
@@ -2681,14 +2808,15 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     ),
                 ],
             ),
+            when(not(is_nil(pending())), vec![ret_void()]),
             expr(call(
                 "zl_sort_range",
-                vec![arr.e(), lo_i.e(), j.e(), comp.e()],
+                vec![arr.e(), lo_i.e(), j.e(), comp.e(), line.e()],
                 unit(),
             )),
             expr(call(
                 "zl_sort_range",
-                vec![arr.e(), i.e(), hi_i.e(), comp.e()],
+                vec![arr.e(), i.e(), hi_i.e(), comp.e(), line.e()],
                 unit(),
             )),
             ret_void(),
@@ -2699,13 +2827,20 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         &[&tb, &comp],
         unit(),
         vec![
+            line.decl(read_global(LINE, i64())),
             when(
                 eq(super::meta_of(tb.e(), t), null(table.clone())),
                 vec![
                     arr.decl(super::arr_of(tb.e(), t)),
                     expr(call(
                         "zl_sort_range",
-                        vec![arr.e(), int(0), sub(len(arr.e()), int(1)), comp.e()],
+                        vec![
+                            arr.e(),
+                            int(0),
+                            sub(len(arr.e()), int(1)),
+                            comp.e(),
+                            line.e(),
+                        ],
                         unit(),
                     )),
                     ret_void(),
@@ -2714,6 +2849,10 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             // With a metatable, `t[1..n]` are read and written back
             // through it, sorted in between.
             n.decl(call("zl_table_len", vec![tb.e()], i64())),
+            when(
+                ge(n.e(), int(i32::MAX as i64)),
+                vec![lua_error(text("bad argument #1 to 'sort' (array too big)"))],
+            ),
             out.decl(list(vec![], anys.clone())),
             k.decl(int(1)),
             while_(
@@ -2725,7 +2864,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ),
             expr(call(
                 "zl_sort_range",
-                vec![out.e(), int(0), sub(n.e(), int(1)), comp.e()],
+                vec![out.e(), int(0), sub(n.e(), int(1)), comp.e(), line.e()],
                 unit(),
             )),
             k.set(int(1)),
