@@ -1369,6 +1369,8 @@ pub(crate) fn member_ty(member: crate::stdlib::Member) -> Ty {
         crate::stdlib::Member::Value { ty, .. } => ty,
         // The type as a value; a call of it is typed by its typecode.
         crate::stdlib::Member::ArrayType => Ty::Object,
+        // As a value a function; a call is typed by its arguments.
+        crate::stdlib::Member::Binary(_) => Ty::Object,
     }
 }
 
@@ -4752,6 +4754,19 @@ impl Typer<'_> {
         self.module.module_member(alias, attr)
     }
 
+    /// What a call of a module member returns.
+    fn member_call_ty(&self, m: crate::stdlib::Member, c: &py::ExprCall) -> Ty {
+        match m {
+            crate::stdlib::Member::ArrayType => array_call_ty(&c.arguments.args),
+            crate::stdlib::Member::Binary(op) if c.arguments.args.len() == 2 => {
+                let l = self.expr(&c.arguments.args[0]);
+                let r = self.expr(&c.arguments.args[1]);
+                binop(op, l, r, &c.arguments.args[1])
+            }
+            other => member_ty(other),
+        }
+    }
+
     fn call(&self, c: &py::ExprCall) -> Ty {
         if let py::Expr::Attribute(a) = &*c.func
             && is_name(&a.value, "frozenset")
@@ -4762,10 +4777,7 @@ impl Typer<'_> {
         if let py::Expr::Attribute(a) = &*c.func
             && let Some(m) = self.module_member_of(&a.value, a.attr.as_str())
         {
-            return match m {
-                crate::stdlib::Member::ArrayType => array_call_ty(&c.arguments.args),
-                other => member_ty(other),
-            };
+            return self.member_call_ty(m, c);
         }
         // `Class.method(obj, ...)` is the method.
         if let py::Expr::Attribute(a) = &*c.func
@@ -4801,10 +4813,7 @@ impl Typer<'_> {
                     && !self.outer.contains_key(name)
                     && let Some(m) = self.module.imported_name(name)
                 {
-                    return match m {
-                        crate::stdlib::Member::ArrayType => array_call_ty(&c.arguments.args),
-                        other => member_ty(other),
-                    };
+                    return self.member_call_ty(m, c);
                 }
                 self.builtin_call(name, c)
             }

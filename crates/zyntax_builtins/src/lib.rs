@@ -19,6 +19,7 @@ mod io;
 mod iteration;
 pub mod lists;
 mod math;
+mod random;
 mod strings;
 
 use zyntax_typed_ast::typed_builder::TypedASTBuilder;
@@ -245,6 +246,7 @@ pub fn library(policy: &Policy) -> Library {
     declarations.extend(dicts::declarations(list_type));
     declarations.extend(iteration::declarations(list_type));
     declarations.extend(math::declarations());
+    declarations.extend(random::declarations(list_type));
     // The hooks a frontend defines are declared here as externs, so the
     // library lowers on its own; the frontend's definition takes the
     // declaration's place when the two meet in a program.

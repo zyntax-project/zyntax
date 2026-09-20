@@ -4458,6 +4458,10 @@ impl<'m> Lowerer<'m> {
             stdlib::Member::ArrayType => {
                 return unsupported(format!("`{name}` as a value"), e);
             }
+            stdlib::Member::Binary(_) => Val {
+                node: self.callable_value(e)?,
+                ty: Ty::Object,
+            },
             stdlib::Member::Func { zb, .. } if zb.starts_with("zb_bisect_") => Val {
                 node: call(
                     "zb_func_new",
@@ -4555,6 +4559,15 @@ impl<'m> Lowerer<'m> {
         if let stdlib::Member::ArrayType = member {
             return self.array_new(args, keywords, c, span);
         }
+        // `operator.add(a, b)`: the operator itself.
+        if let stdlib::Member::Binary(op) = member {
+            if args.len() != 2 || !keywords.is_empty() {
+                return unsupported(format!("calling `{name}` with these arguments"), c);
+            }
+            let l = self.expr(&args[0])?;
+            let r = self.expr(&args[1])?;
+            return self.arithmetic(op, l, r, &args[1], span);
+        }
         let stdlib::Member::Func { params, ret, zb } = member else {
             return unsupported(format!("calling `{name}`, which is not a function"), c);
         };
@@ -4619,6 +4632,19 @@ impl<'m> Lowerer<'m> {
                 });
             }
             ("zb_math_log", 2) => (vec![Ty::Float, Ty::Float], "zb_math_log_base"),
+            ("zb_random_seed", 0) => (Vec::new(), "zb_random_seed_clock"),
+            ("zb_random_seed", 1) if matches!(&args[0], py::Expr::NoneLiteral(_)) => {
+                return Ok(Val {
+                    node: call("zb_random_seed_clock", vec![], Ty::None, span),
+                    ty: Ty::None,
+                });
+            }
+            ("zb_random_randrange", 2) => (vec![Ty::Int, Ty::Int], "zb_random_randrange2"),
+            ("zb_random_randrange", 3) => (vec![Ty::Int, Ty::Int, Ty::Int], "zb_random_randrange3"),
+            ("zb_list_reduce", 2) => (
+                vec![Ty::Object, Ty::List(Elem::Object)],
+                "zb_list_reduce_first",
+            ),
             _ => (params.to_vec(), zb),
         };
         if args.len() != params.len() {
@@ -4633,10 +4659,21 @@ impl<'m> Lowerer<'m> {
         }
         let mut lowered = Vec::with_capacity(args.len());
         for (a, &want) in args.iter().zip(params.iter()) {
+            // The function `reduce` applies: a value it can be called
+            // through, whatever spells it.
+            if zb.starts_with("zb_list_reduce") && lowered.is_empty() {
+                lowered.push(self.callable_value(a)?);
+                continue;
+            }
             let v = self.expr(a)?;
             let node = match (v.ty, want) {
                 (Ty::Object, Ty::Float) => call("zb_any_float", vec![v.node], Ty::Float, span),
                 (Ty::Object, Ty::Int) => call("zb_any_int", vec![v.node], Ty::Int, span),
+                // A sequence of dynamic values: a string's characters,
+                // a typed list boxed.
+                (t, Ty::List(Elem::Object)) if t != Ty::List(Elem::Object) => {
+                    self.iterable(v, span)
+                }
                 _ => self.coerce(v, want),
             };
             lowered.push(node);
@@ -4801,8 +4838,13 @@ impl<'m> Lowerer<'m> {
             }
             _ => None,
         };
-        if let Some((stdlib::Member::Func { params, .. }, source)) = imported {
-            let args: Vec<String> = (0..params.len()).map(|i| format!("a{i}")).collect();
+        let arity = match imported {
+            Some((stdlib::Member::Func { params, .. }, _)) => Some(params.len()),
+            Some((stdlib::Member::Binary(_), _)) => Some(2),
+            _ => None,
+        };
+        if let (Some(arity), Some((_, source))) = (arity, imported) {
+            let args: Vec<String> = (0..arity).map(|i| format!("a{i}")).collect();
             let text = format!("lambda {}: {source}({})", args.join(", "), args.join(", "));
             let parsed = ruff_python_parser::parse_expression(&text).expect("a module call parses");
             let py::Expr::Lambda(lambda) = &*parsed.into_syntax().body else {

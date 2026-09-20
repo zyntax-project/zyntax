@@ -264,6 +264,51 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         s
     }));
 
+    // functools.reduce: `f` applied left to right, from `start`, or from
+    // the first element when none is given (an empty list is an error).
+    let acc = local("acc", any());
+    let start = local("start", any());
+    d.push(define("zb_list_reduce", &[&f, &xs, &start], any(), {
+        let mut s = vec![acc.decl(start.e()), n.decl(len(&xs))];
+        s.extend(for_range(
+            &i,
+            int(0),
+            n.e(),
+            vec![acc.set(call(
+                "zb_call_2",
+                vec![f.e(), acc.e(), at(&xs, i.e())],
+                any(),
+            ))],
+        ));
+        s.push(ret(acc.e()));
+        s
+    }));
+    d.push(define("zb_list_reduce_first", &[&f, &xs], any(), {
+        let mut s = vec![
+            n.decl(len(&xs)),
+            when(
+                eq(n.e(), int(0)),
+                vec![fatal(
+                    "TypeError",
+                    text("reduce() of empty iterable with no initial value"),
+                )],
+            ),
+            acc.decl(at(&xs, int(0))),
+        ];
+        s.extend(for_range(
+            &i,
+            int(1),
+            n.e(),
+            vec![acc.set(call(
+                "zb_call_2",
+                vec![f.e(), acc.e(), at(&xs, i.e())],
+                any(),
+            ))],
+        ));
+        s.push(ret(acc.e()));
+        s
+    }));
+
     let x = local("x", any());
     d.push(define("zb_list_filter", &[&f, &xs], anys.clone(), {
         let mut s = vec![out.decl(empty()), n.decl(len(&xs))];
