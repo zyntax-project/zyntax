@@ -618,7 +618,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![
             when(
                 eq(ib.e(), int(0)),
-                vec![lua_error(text("attempt to perform 'n%%0'"))],
+                vec![lua_error(text("attempt to perform 'n%0'"))],
             ),
             when(eq(ib.e(), int(-1)), vec![ret(int(0))]),
             ret(call("zb_mod_i64", vec![ia.e(), ib.e()], i64())),
@@ -938,6 +938,12 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         &[&ia, &fa],
         boolean(),
         vec![
+            // An integer a float holds exactly equals the float that is
+            // it, and nothing else.
+            when(
+                fits_float(ia.e()),
+                vec![ret(eq(cast(ia.e(), f64()), fa.e()))],
+            ),
             when(ne(fa.e(), fa.e()), vec![ret(bool(false))]),
             when(
                 ne(call("floor", vec![fa.e()], f64()), fa.e()),
