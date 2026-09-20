@@ -105,8 +105,11 @@ enum Storage {
 }
 
 /// Where the record of a captured variable sits: `env[RECORD_CELLS_AT
-/// + i]` for the `i`th capture of the function.
-const RECORD_CELLS_AT: usize = 2;
+/// + i]` for the `i`th capture of the function. Before the captures,
+/// after the code and the arity every record has, sits the function's
+/// number: what tells a call site which known function a value is,
+/// since the code's address changes as the function is compiled again.
+const RECORD_CELLS_AT: usize = 3;
 
 /// The whole program as the lowerers share it.
 struct Module<'a> {
@@ -283,7 +286,8 @@ impl<'a> Module<'a> {
             Ty::Float => prim(PrimitiveType::F64),
             Ty::Number | Ty::Scalar => number_type(),
             Ty::Str => prim(PrimitiveType::String),
-            Ty::Table => self.types.table(),
+            // A table of a known shape is a table, or null for nil.
+            Ty::Table | Ty::Shape(_) => self.types.table(),
             // A known function is still the record every function value
             // is; what is known is where calls through it go.
             Ty::Func(_) | Ty::Nil | Ty::Any | Ty::Unknown => Type::Any,
@@ -419,6 +423,22 @@ struct Divisor {
     plain: bool,
     /// A literal positive power of two.
     pow2: Option<i64>,
+}
+
+/// What a dispatch yields on every path: a fixed number of results,
+/// each typed, or a dynamic value.
+enum Yield {
+    Fixed(Vec<Ty>),
+    Dynamic,
+}
+
+/// How a call through a value tells which known function it is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Guard {
+    /// The value's code against each function's.
+    ByCode,
+    /// The value is not nil: it can only be the one function.
+    NotNil,
 }
 
 /// How two numbers are compared.
@@ -1308,6 +1328,49 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 block_value(pre, n.has_tag(TAG_TRUE, span), span)
             }
             (Ty::Scalar, Ty::Nil) => block_value(vec![expr_stmt(v.node)], nil(span), span),
+            // A shaped table is a table; null is nil.
+            (Ty::Table, Ty::Shape(_)) | (Ty::Shape(_), Ty::Shape(_)) => v.node,
+            (Ty::Nil, Ty::Shape(_)) => block_value(
+                vec![expr_stmt(v.node)],
+                null(self.ir(Ty::Table), span),
+                span,
+            ),
+            (Ty::Shape(_), Ty::Any) => {
+                let mut pre = Vec::new();
+                let t = self.hold(v, &mut pre);
+                let is_null = binary(
+                    BinaryOp::Eq,
+                    t.node.clone(),
+                    null(self.ir(Ty::Table), span),
+                    prim(PrimitiveType::Bool),
+                    span,
+                );
+                let boxed = self.box_table(t.node);
+                block_value(
+                    pre,
+                    if_value(is_null, nil(span), boxed, Type::Any, span),
+                    span,
+                )
+            }
+            (Ty::Any, Ty::Shape(_)) => {
+                let mut pre = Vec::new();
+                let b = self.hold(v, &mut pre);
+                let is_nil = binary(
+                    BinaryOp::Eq,
+                    b.node.clone(),
+                    nil(span),
+                    prim(PrimitiveType::Bool),
+                    span,
+                );
+                let table_t = self.ir(Ty::Table);
+                let unboxed = self.unbox_table(b.node);
+                block_value(
+                    pre,
+                    if_value(is_nil, null(table_t.clone(), span), unboxed, table_t, span),
+                    span,
+                )
+            }
+            (Ty::Shape(_), Ty::Nil) => block_value(vec![expr_stmt(v.node)], nil(span), span),
             (Ty::Bool, Ty::Any) => call("zb_box_bool", vec![v.node], Type::Any, span),
             (Ty::Int, Ty::Any) => call("zb_box_i64", vec![v.node], Type::Any, span),
             (Ty::Float, Ty::Any) => call("zb_box_f64", vec![v.node], Type::Any, span),
@@ -1357,7 +1420,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     Ty::Scalar => scalar_of_nil(span),
                     Ty::Bool => bool_lit(false, span),
                     Ty::Str => str_lit("", span),
-                    Ty::Table => null(self.ir(Ty::Table), span),
+                    Ty::Table | Ty::Shape(_) => null(self.ir(Ty::Table), span),
                     _ => nil(span),
                 };
                 block_value(vec![expr_stmt(v.node)], zero, span)
@@ -1539,8 +1602,24 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 let (pre, n) = self.number_parts(v);
                 block_value(pre, n.is_true(span), span)
             }
+            // A shaped table is nil when null.
+            Ty::Shape(_) => binary(
+                BinaryOp::Ne,
+                v.node,
+                null(self.ir(Ty::Table), span),
+                prim(PrimitiveType::Bool),
+                span,
+            ),
             Ty::Nil => block_value(vec![expr_stmt(v.node)], bool_lit(false, span), span),
-            Ty::Int | Ty::Float | Ty::Number | Ty::Str | Ty::Table | Ty::Func(_) => {
+            // A function value may be nil.
+            Ty::Func(_) => binary(
+                BinaryOp::Ne,
+                v.node,
+                nil(span),
+                prim(PrimitiveType::Bool),
+                span,
+            ),
+            Ty::Int | Ty::Float | Ty::Number | Ty::Str | Ty::Table => {
                 if Self::is_simple(&v.node) {
                     bool_lit(true, span)
                 } else {
@@ -1598,6 +1677,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Ty::Scalar => scalar_of_nil(span),
             Ty::Bool => bool_lit(false, span),
             Ty::Str => str_lit("", span),
+            Ty::Shape(_) => null(self.ir(Ty::Table), span),
             Ty::Table => call("zl_table_new", vec![], self.ir(Ty::Table), span),
             _ => nil(span),
         }
@@ -1960,7 +2040,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     node: str_lit(&name, span),
                     ty: Ty::Str,
                 };
-                Ok(self.index_read(env, key, Self::env_var_desc(upvalue), span))
+                Ok(self.field_read(env, key, &name, Self::env_var_desc(upvalue), span))
             }
         }
     }
@@ -2107,7 +2187,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             arity_word(info.params.len(), info.params.len())
         };
         let captures = info.captures.clone();
-        let mut cells = Vec::with_capacity(captures.len());
+        let mut cells = Vec::with_capacity(captures.len() + 1);
+        cells.push(call(
+            "zb_box_i64",
+            vec![int_lit(f.0 as i64, span)],
+            Type::Any,
+            span,
+        ));
         for v in captures {
             cells.push(self.capture_value(v, span));
         }
@@ -3174,6 +3260,33 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             (x, y) if (x == Ty::Scalar || y == Ty::Scalar) && x.is_scalar() && y.is_scalar() => {
                 self.scalar_eq(a, b, span)
             }
+            // Tables are equal when they are the same table, `__eq`
+            // aside; a shaped table may be nil.
+            (Ty::Shape(_), Ty::Nil) => binary(
+                BinaryOp::Eq,
+                a.node,
+                block_value(
+                    vec![expr_stmt(b.node)],
+                    null(self.ir(Ty::Table), span),
+                    span,
+                ),
+                bool_t,
+                span,
+            ),
+            (Ty::Nil, Ty::Shape(_)) => binary(
+                BinaryOp::Eq,
+                block_value(
+                    vec![expr_stmt(a.node)],
+                    null(self.ir(Ty::Table), span),
+                    span,
+                ),
+                b.node,
+                bool_t,
+                span,
+            ),
+            (Ty::Func(_), Ty::Nil) | (Ty::Nil, Ty::Func(_)) => {
+                binary(BinaryOp::Eq, a.node, b.node, bool_t, span)
+            }
             (Ty::Str, Ty::Str) => call("zb_str_eq", vec![a.node, b.node], bool_t, span),
             (Ty::Nil, Ty::Nil) => block_value(
                 vec![expr_stmt(a.node), expr_stmt(b.node)],
@@ -3183,7 +3296,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             // Two different known types are never equal; the operands
             // still run.
             (x, y)
-                if x != Ty::Any && y != Ty::Any && x != y && x != Ty::Table && y != Ty::Table =>
+                if x != Ty::Any
+                    && y != Ty::Any
+                    && x != y
+                    && !matches!(x, Ty::Table | Ty::Shape(_) | Ty::Func(_))
+                    && !matches!(y, Ty::Table | Ty::Shape(_) | Ty::Func(_)) =>
             {
                 block_value(
                     vec![expr_stmt(a.node), expr_stmt(b.node)],
@@ -3358,12 +3475,57 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
     }
 
+    /// `obj.name`: a read whose result the types may know, through a
+    /// shaped receiver.
+    fn field_read(&mut self, obj: Val, key: Val, name: &str, desc: Desc, span: Span) -> Val {
+        let ty = match obj.ty {
+            Ty::Shape(k) => self.typer().field_ty(Ty::Shape(k), name).settled(),
+            _ => Ty::Any,
+        };
+        let read = self.index_read(obj, key, desc, span);
+        if ty == Ty::Any {
+            return read;
+        }
+        Val {
+            node: self.coerce(read, ty),
+            ty,
+        }
+    }
+
     /// `obj[key]`, with `__index`; `desc` is what `obj` is called.
     fn index_read(&mut self, obj: Val, key: Val, desc: Desc, span: Span) -> Val {
         let descs = Described::operand(desc);
         if let Some(k) = self.constant_key(&key) {
             let node = match obj.ty {
                 Ty::Table => call("zl_table_index_key", vec![obj.node, k], Type::Any, span),
+                // A shaped table is a table unless it is nil, when the
+                // dynamic path raises as Lua does.
+                Ty::Shape(_) => {
+                    let mut pre = Vec::new();
+                    let t = self.hold(obj, &mut pre);
+                    let is_null = binary(
+                        BinaryOp::Eq,
+                        t.node.clone(),
+                        null(self.ir(Ty::Table), span),
+                        prim(PrimitiveType::Bool),
+                        span,
+                    );
+                    let read = if_value(
+                        is_null,
+                        call("zl_index_key", vec![nil(span), k.clone()], Type::Any, span),
+                        call("zl_table_index_key", vec![t.node, k], Type::Any, span),
+                        Type::Any,
+                        span,
+                    );
+                    let v = self.guard_described(
+                        Val {
+                            node: block_value(pre, read, span),
+                            ty: Ty::Any,
+                        },
+                        &descs,
+                    );
+                    return v;
+                }
                 _ => {
                     let o = self.boxed(obj);
                     call("zl_index_key", vec![o, k], Type::Any, span)
@@ -3409,6 +3571,51 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if let Some(k) = self.constant_key(&key) {
             let node = match obj.ty {
                 Ty::Table => call("zl_table_setindex_key", vec![obj.node, k, v], unit, span),
+                // A shaped table is a table unless it is nil, when the
+                // dynamic path raises as Lua does.
+                Ty::Shape(_) => {
+                    let mut pre = Vec::new();
+                    let t = self.hold(obj, &mut pre);
+                    let held_v = self.hold(
+                        Val {
+                            node: v,
+                            ty: Ty::Any,
+                        },
+                        &mut pre,
+                    );
+                    let is_null = binary(
+                        BinaryOp::Eq,
+                        t.node.clone(),
+                        null(self.ir(Ty::Table), span),
+                        prim(PrimitiveType::Bool),
+                        span,
+                    );
+                    let store = if_(
+                        is_null,
+                        vec![expr_stmt(call(
+                            "zl_setindex_key",
+                            vec![nil(span), k.clone(), held_v.node.clone()],
+                            unit.clone(),
+                            span,
+                        ))],
+                        Some(vec![expr_stmt(call(
+                            "zl_table_setindex_key",
+                            vec![t.node, k, held_v.node],
+                            unit,
+                            span,
+                        ))]),
+                        span,
+                    );
+                    pre.push(store);
+                    pre.push(self.pending_check_described(span, &descs));
+                    return stmt(
+                        TypedStatement::Block(TypedBlock {
+                            statements: pre,
+                            span,
+                        }),
+                        span,
+                    );
+                }
                 _ => {
                     let o = self.boxed(obj);
                     call("zl_setindex_key", vec![o, k, v], unit, span)
@@ -3471,17 +3678,43 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if let Some(Suffix::Call(ast::Call::AnonymousCall(args))) = suffixes.first()
             && let Some(f) = self.typer().known_callee(prefix)
         {
-            // A function with captures takes them from its value.
-            let record = if self.scopes().func(f).top_level {
-                None
+            // A global declared once as this function is the function;
+            // any other name holds its value, which may be nil by now.
+            let declared = match prefix {
+                Prefix::Name(token) => matches!(
+                    self.scopes().binding(token),
+                    Some(Binding::Global(name))
+                        if self.scopes().known_global_function(name) == Some(f)
+                ),
+                _ => false,
+            };
+            if declared {
+                multi = Some(self.direct_call(f, None, None, args, span)?);
             } else {
-                Some(match prefix {
+                let callee = match prefix {
                     Prefix::Name(token) => self.read_name(token)?,
                     Prefix::Expression(e) => self.expr(e)?,
                     _ => return unsupported("this prefix", span),
-                })
-            };
-            multi = Some(self.direct_call(f, record, None, args, span)?);
+                };
+                let desc = match prefix {
+                    Prefix::Name(token) => self.describe_name(token),
+                    Prefix::Expression(e) => self.describe(e),
+                    _ => None,
+                };
+                let returns = self.m.sig(f).returns.clone();
+                let (pre, vals, tail) = self.call_values(None, args, span)?;
+                multi = Some(self.dispatch(
+                    callee,
+                    Guard::NotNil,
+                    &[f],
+                    returns,
+                    pre,
+                    vals,
+                    tail,
+                    desc,
+                    span,
+                ));
+            }
             first = 1;
         }
         if multi.is_none() {
@@ -3537,12 +3770,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         node: str_lit(&ident(name), span),
                         ty: Ty::Str,
                     };
-                    current = self.index_read(current, key, desc, span);
+                    current = self.field_read(current, key, &ident(name), desc, span);
                     desc = Self::describe_suffix(s);
                 }
                 Suffix::Index(ast::Index::Brackets { expression, .. }) => {
                     let key = self.expr(expression)?;
-                    current = self.index_read(current, key, desc, span);
+                    current = match crate::scope::literal_string(expression) {
+                        Some(name) => self.field_read(current, key, &name, desc, span),
+                        None => self.index_read(current, key, desc, span),
+                    };
                     desc = Self::describe_suffix(s);
                 }
                 Suffix::Call(ast::Call::AnonymousCall(args)) => {
@@ -3637,16 +3873,30 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         args: &ast::FunctionArgs,
         span: Span,
     ) -> Result<Multi> {
-        let info = self.scopes().func(f);
-        let sig = self.m.sig(f);
-        let n = info.params.len();
-        let is_vararg = info.is_vararg;
-        let has_env = !info.top_level;
         // The function's value is read before its arguments run.
         let mut pre = Vec::new();
         let record = record.map(|r| self.hold(r, &mut pre));
         let (mut arg_pre, vals, tail) = self.call_values(receiver, args, span)?;
         pre.append(&mut arg_pre);
+        Ok(self.direct_call_vals(f, record, pre, vals, tail, span))
+    }
+
+    /// [`Self::direct_call`] with the arguments evaluated: `vals`, and
+    /// `tail` when the last supplies several values.
+    fn direct_call_vals(
+        &mut self,
+        f: FuncId,
+        record: Option<Val>,
+        mut pre: Vec<St>,
+        vals: Vec<Val>,
+        tail: Option<Node>,
+        span: Span,
+    ) -> Multi {
+        let info = self.scopes().func(f);
+        let sig = self.m.sig(f);
+        let n = info.params.len();
+        let is_vararg = info.is_vararg;
+        let has_env = !info.top_level;
         // A tail of several values is read through a list.
         let tail_name = match tail {
             Some(tail) => {
@@ -3758,7 +4008,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if raises {
             self.raise_callees.insert(f);
         }
-        Ok(self.call_result(value, &sig.returns, pre, raises, span))
+        self.call_result(value, &sig.returns, pre, raises, span)
     }
 
     /// The values a typed entry returned, checked for an error when the
@@ -3852,9 +4102,22 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         desc: Desc,
         span: Span,
     ) -> Result<Multi> {
-        // A value the types know the function of calls it directly.
+        // A value the types know the function of calls it directly,
+        // once it is seen not to be nil.
         if let Ty::Func(f) = callee.ty {
-            return self.direct_call(f, Some(callee), receiver, args, span);
+            let returns = self.m.sig(f).returns.clone();
+            let (pre, vals, tail) = self.call_values(receiver, args, span)?;
+            return Ok(self.dispatch(
+                callee,
+                Guard::NotNil,
+                &[f],
+                returns,
+                pre,
+                vals,
+                tail,
+                desc,
+                span,
+            ));
         }
         // A value known to be nil cannot be called; the error names
         // what it was, as Lua's does.
@@ -3874,7 +4137,21 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             return Ok(Multi::None(block_value(pre, nil(span), span)));
         }
         let f = self.boxed(callee);
-        let (mut pre, vals, tail) = self.call_values(receiver, args, span)?;
+        let (pre, vals, tail) = self.call_values(receiver, args, span)?;
+        Ok(self.value_call_vals(f, pre, vals, tail, desc, span))
+    }
+
+    /// [`Self::value_call`] with the callee boxed and the arguments
+    /// evaluated.
+    fn value_call_vals(
+        &mut self,
+        f: Node,
+        mut pre: Vec<St>,
+        vals: Vec<Val>,
+        tail: Option<Node>,
+        desc: Desc,
+        span: Span,
+    ) -> Multi {
         let f = if pre.is_empty() {
             f
         } else {
@@ -3901,7 +4178,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 },
                 &descs,
             );
-            return Ok(Multi::Dynamic(block_value(pre, v.node, span)));
+            return Multi::Dynamic(block_value(pre, v.node, span));
         }
         let mut items = Vec::with_capacity(vals.len());
         for v in vals {
@@ -3929,7 +4206,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             },
             &descs,
         );
-        Ok(Multi::Dynamic(block_value(pre, v.node, span)))
+        Multi::Dynamic(block_value(pre, v.node, span))
     }
 
     /// `obj:name(args)`: `obj.name(obj, args)` with `obj` evaluated
@@ -3957,8 +4234,269 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         };
         let callee = self.index_read(obj.clone(), key, desc, span);
         let method = Some(format!("method '{name}'"));
+        // A method the types resolve to known functions is called
+        // directly, whichever of them the receiver's class holds.
+        if let Ty::Shape(k) = obj.ty
+            && let Some(targets) = self.typer().method_targets(k, &name)
+        {
+            let funcs: Vec<FuncId> = targets
+                .iter()
+                .filter_map(|t| match t {
+                    Ty::Func(f) => Some(*f),
+                    _ => None,
+                })
+                .collect();
+            if !funcs.is_empty() {
+                let returns = self.typer().method_returns(Ty::Shape(k), &name).settled();
+                let (arg_pre, vals, tail) = self.call_values(Some(obj), mc.args(), span)?;
+                let multi = self.dispatch(
+                    callee,
+                    Guard::ByCode,
+                    &funcs,
+                    returns,
+                    arg_pre,
+                    vals,
+                    tail,
+                    method,
+                    span,
+                );
+                return Ok(self.prefixed(pre, multi, span));
+            }
+        }
         let multi = self.value_call(callee, Some(obj), mc.args(), method, span)?;
         Ok(self.prefixed(pre, multi, span))
+    }
+
+    /// A call through `callee`, a value the types say is one of
+    /// `funcs`: each is called directly when the guard says it is the
+    /// one, and anything else (nil, above all) is called through the
+    /// value, which raises as Lua does. Every path yields the call's
+    /// results the same way, typed as the call is. The arguments
+    /// (`vals` and `tail`, with `pre` before them) run once.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch(
+        &mut self,
+        callee: Val,
+        guard: Guard,
+        funcs: &[FuncId],
+        returns: Returns,
+        mut pre: Vec<St>,
+        vals: Vec<Val>,
+        tail: Option<Node>,
+        desc: Desc,
+        span: Span,
+    ) -> Multi {
+        let i64_t = prim(PrimitiveType::I64);
+        let bool_t = prim(PrimitiveType::Bool);
+        // The callee is read before the arguments run.
+        let mut head = Vec::new();
+        let callee = self.hold(callee, &mut head);
+        let code = match guard {
+            Guard::ByCode => Some(self.hold(
+                Val {
+                    node: call("zl_func_id", vec![callee.node.clone()], i64_t.clone(), span),
+                    ty: Ty::Int,
+                },
+                &mut head,
+            )),
+            Guard::NotNil => None,
+        };
+        head.append(&mut pre);
+        let mut pre = head;
+        let vals: Vec<Val> = vals.into_iter().map(|v| self.hold(v, &mut pre)).collect();
+        let tail = tail.map(|t| {
+            self.hold(
+                Val {
+                    node: t,
+                    ty: Ty::Any,
+                },
+                &mut pre,
+            )
+            .node
+        });
+        // What every path yields: the results as one value.
+        let shape = match &returns {
+            Returns::Fixed(types) => Yield::Fixed(types.iter().map(|t| t.settled()).collect()),
+            Returns::Dynamic | Returns::Unknown => Yield::Dynamic,
+        };
+        // The fallback first, then each function's arm around it.
+        let boxed_callee = self.boxed(callee.clone());
+        let fallback = self.value_call_vals(
+            boxed_callee,
+            Vec::new(),
+            vals.clone(),
+            tail.clone(),
+            desc,
+            span,
+        );
+        let mut value = self.yield_as(fallback, &shape, span);
+        for f in funcs.iter().rev() {
+            let arm = self.direct_call_vals(
+                *f,
+                Some(callee.clone()),
+                Vec::new(),
+                vals.clone(),
+                tail.clone(),
+                span,
+            );
+            let then = self.yield_as(arm, &shape, span);
+            let is_f = match &code {
+                Some(code) => binary(
+                    BinaryOp::Eq,
+                    code.node.clone(),
+                    int_lit(f.0 as i64, span),
+                    bool_t.clone(),
+                    span,
+                ),
+                None => binary(
+                    BinaryOp::Ne,
+                    callee.node.clone(),
+                    nil(span),
+                    bool_t.clone(),
+                    span,
+                ),
+            };
+            let ty = then.ty.clone();
+            value = if_value(is_f, then, value, ty, span);
+        }
+        self.yielded(block_value(pre, value, span), &shape, span)
+    }
+
+    /// The results of `multi` as the one value a dispatch arm yields:
+    /// the value itself for one result or a dynamic one, a list of the
+    /// boxed results for several, nil for none.
+    fn yield_as(&mut self, multi: Multi, shape: &Yield, span: Span) -> Node {
+        match shape {
+            Yield::Dynamic => match multi {
+                Multi::Dynamic(node) => node,
+                Multi::None(node) => block_value(vec![expr_stmt(node)], nil(span), span),
+                Multi::Fixed(vals) => {
+                    let mut pre = Vec::new();
+                    let mut items = Vec::with_capacity(vals.len());
+                    for v in vals {
+                        items.push(self.boxed(v));
+                    }
+                    let list = self.array_of(items, &mut pre, span);
+                    block_value(pre, call("zb_box_tuple", vec![list], Type::Any, span), span)
+                }
+            },
+            Yield::Fixed(types) => {
+                // The results, each as its type.
+                let mut pre = Vec::new();
+                let vals: Vec<Val> = match multi {
+                    Multi::Fixed(vals) => {
+                        let mut vals = vals.into_iter();
+                        let mut out = Vec::with_capacity(types.len());
+                        for ty in types {
+                            let v = vals.next().unwrap_or_else(|| self.nil_val(span));
+                            let v = Val {
+                                node: self.coerce(v, *ty),
+                                ty: *ty,
+                            };
+                            out.push(self.hold(v, &mut pre));
+                        }
+                        for v in vals {
+                            pre.push(expr_stmt(v.node));
+                        }
+                        out
+                    }
+                    Multi::None(node) => {
+                        pre.push(expr_stmt(node));
+                        types
+                            .iter()
+                            .map(|ty| Val {
+                                node: self.zero_of(*ty, span),
+                                ty: *ty,
+                            })
+                            .collect()
+                    }
+                    Multi::Dynamic(node) => {
+                        let list = self.temp();
+                        pre.push(let_(
+                            list,
+                            self.m.anys(),
+                            call("zl_values", vec![node], self.m.anys(), span),
+                            span,
+                        ));
+                        types
+                            .iter()
+                            .enumerate()
+                            .map(|(i, ty)| {
+                                let element = Val {
+                                    node: call(
+                                        "zl_value_at",
+                                        vec![
+                                            var(list, self.m.anys(), span),
+                                            int_lit(i as i64 + 1, span),
+                                        ],
+                                        Type::Any,
+                                        span,
+                                    ),
+                                    ty: Ty::Any,
+                                };
+                                Val {
+                                    node: self.coerce(element, *ty),
+                                    ty: *ty,
+                                }
+                            })
+                            .collect()
+                    }
+                };
+                match types.len() {
+                    0 => block_value(pre, nil(span), span),
+                    1 => block_value(pre, vals.into_iter().next().unwrap().node, span),
+                    _ => {
+                        let mut items = Vec::with_capacity(vals.len());
+                        for v in vals {
+                            items.push(self.boxed(v));
+                        }
+                        let list = self.array_of(items, &mut pre, span);
+                        block_value(pre, list, span)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The one value a dispatch yielded, back as the call's results.
+    fn yielded(&mut self, value: Node, shape: &Yield, span: Span) -> Multi {
+        match shape {
+            Yield::Dynamic => Multi::Dynamic(value),
+            Yield::Fixed(types) => match types.len() {
+                0 => Multi::None(value),
+                1 => Multi::Fixed(vec![Val {
+                    node: value,
+                    ty: types[0],
+                }]),
+                _ => {
+                    let name = self.temp();
+                    let mut pre = vec![let_(name, self.m.anys(), value, span)];
+                    let mut vals = Vec::with_capacity(types.len());
+                    for (i, ty) in types.iter().enumerate() {
+                        let element = Val {
+                            node: index(
+                                var(name, self.m.anys(), span),
+                                int_lit(i as i64, span),
+                                Type::Any,
+                                span,
+                            ),
+                            ty: Ty::Any,
+                        };
+                        let read = self.coerce(element, *ty);
+                        let read = if i == 0 {
+                            block_value(std::mem::take(&mut pre), read, span)
+                        } else {
+                            read
+                        };
+                        vals.push(Val {
+                            node: read,
+                            ty: *ty,
+                        });
+                    }
+                    Multi::Fixed(vals)
+                }
+            },
+        }
     }
 
     /// Statements run before several values.

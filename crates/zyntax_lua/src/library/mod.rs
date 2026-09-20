@@ -927,6 +927,7 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     lib.declarations.extend(utf8::declarations(&t));
     lib.declarations.extend(io::declarations(&t));
     lib.declarations.extend(stdlib::declarations(policy, &t));
+    lib.declarations.push(func_code_decl(&t));
     for d in &mut lib.declarations {
         if let TypedDeclaration::Function(f) = &mut d.node {
             f.annotations.push(strict_fp());
@@ -1069,6 +1070,33 @@ pub fn callee_names(stmt: &Stmt, out: &mut std::collections::BTreeSet<String>) {
         }
         _ => {}
     }
+}
+
+/// `zl_func_id(f)`: the number of the program function a function
+/// value is, or -1 for any other value, for a call site that knows
+/// which functions a method may be and calls them directly. A
+/// function of the program's making has its number after its code
+/// and arity; the library's values carry no number there.
+fn func_code_decl(t: &Types) -> Decl {
+    let f = kept("f", any());
+    let rec = borrowed("rec", t.anys());
+    let slot = kept("slot", any());
+    define(
+        "zl_func_id",
+        &[&f],
+        i64(),
+        vec![
+            when(not(is_func(f.e())), vec![ret(int(-1))]),
+            rec.decl(call("zb_unbox_list_raw_any", vec![f.e()], t.anys())),
+            when(le(len(rec.e()), int(2)), vec![ret(int(-1))]),
+            slot.decl(at(rec.e(), int(2))),
+            when(
+                or(is_nil(slot.e()), ne(category(slot.e()), int(INT))),
+                vec![ret(int(-1))],
+            ),
+            ret(get_i64(slot.e())),
+        ],
+    )
 }
 
 /// Lua's floats round at every operation: no multiply and add of the

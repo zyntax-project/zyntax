@@ -78,7 +78,7 @@ pub struct FuncInfo {
     pub top_level: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Binding {
     Local(VarId),
     Upvalue(VarId),
@@ -536,12 +536,11 @@ impl Walker {
                         Binding::Local(_) | Binding::Upvalue(_) | Binding::Global(_) => {}
                     }
                 } else {
-                    // `function a.b.c()`: `a` is read, the rest indexed,
-                    // and the function is a value in a table: nothing
-                    // knows its callers.
+                    // `function a.b.c()`: `a` is read, the rest indexed;
+                    // the types decide whether the table it is stored in
+                    // is known.
                     self.use_name(names[0]);
-                    let id = self.function(f.body(), is_method, fname.clone());
-                    self.out.funcs[id.0 as usize].escapes = true;
+                    self.function(f.body(), is_method, fname.clone());
                 }
             }
             Stmt::GenericFor(f) => {
