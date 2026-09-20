@@ -281,7 +281,7 @@ impl<'a> Module<'a> {
             Ty::Bool => prim(PrimitiveType::Bool),
             Ty::Int => prim(PrimitiveType::I64),
             Ty::Float => prim(PrimitiveType::F64),
-            Ty::Number => number_type(),
+            Ty::Number | Ty::Scalar => number_type(),
             Ty::Str => prim(PrimitiveType::String),
             Ty::Table => self.types.table(),
             // A known function is still the record every function value
@@ -627,54 +627,150 @@ fn ret(value: Option<Node>, span: Span) -> St {
 }
 
 /// Statements followed by a value, as one expression.
-/// A number whose kind is decided at run time: the integer it holds,
-/// the float it holds, and which. A value struct, so it lives in
-/// registers; the field for the other kind is left zero.
+/// A scalar whose kind is decided at run time: a tag, the integer it
+/// holds and the float it holds. A value struct, so it lives in
+/// registers; the fields the kind does not use are left zero. A
+/// number is one whose tag is never nil or boolean.
 fn number_type() -> Type {
     Type::Tuple(vec![
         prim(PrimitiveType::I64),
+        prim(PrimitiveType::I64),
         prim(PrimitiveType::F64),
-        prim(PrimitiveType::Bool),
     ])
 }
 
-fn number_value(int: Node, float: Node, is_int: Node, span: Span) -> Node {
+/// The tags of a run-time scalar. A boolean's truth is its tag, so a
+/// scalar is true from `TAG_TRUE` up and a number from `TAG_INT` up.
+const TAG_NIL: i64 = 0;
+const TAG_FALSE: i64 = 1;
+const TAG_TRUE: i64 = 2;
+const TAG_INT: i64 = 3;
+const TAG_FLOAT: i64 = 4;
+
+fn number_value(tag: Node, int: Node, float: Node, span: Span) -> Node {
     node(
-        TypedExpression::Tuple(vec![int, float, is_int]),
+        TypedExpression::Tuple(vec![tag, int, float]),
         number_type(),
         span,
     )
 }
 
 fn number_of_int(n: Node, span: Span) -> Node {
-    number_value(n, float_lit(0.0, span), bool_lit(true, span), span)
+    number_value(int_lit(TAG_INT, span), n, float_lit(0.0, span), span)
 }
 
 fn number_of_float(f: Node, span: Span) -> Node {
-    number_value(int_lit(0, span), f, bool_lit(false, span), span)
+    number_value(int_lit(TAG_FLOAT, span), int_lit(0, span), f, span)
 }
 
-/// The parts of a number that is a plain read.
+fn scalar_of_nil(span: Span) -> Node {
+    number_value(
+        int_lit(TAG_NIL, span),
+        int_lit(0, span),
+        float_lit(0.0, span),
+        span,
+    )
+}
+
+fn scalar_of_bool(b: Node, span: Span) -> Node {
+    let tag = if_value(
+        b,
+        int_lit(TAG_TRUE, span),
+        int_lit(TAG_FALSE, span),
+        prim(PrimitiveType::I64),
+        span,
+    );
+    number_value(tag, int_lit(0, span), float_lit(0.0, span), span)
+}
+
+/// The tag an integer-or-float result carries, from whether it is
+/// the integer.
+fn tag_of_is_int(is_int: Node, span: Span) -> Node {
+    if_value(
+        is_int,
+        int_lit(TAG_INT, span),
+        int_lit(TAG_FLOAT, span),
+        prim(PrimitiveType::I64),
+        span,
+    )
+}
+
+/// The parts of a scalar that is a plain read.
 struct NumberParts {
+    tag: Node,
     int: Node,
     float: Node,
-    is_int: Node,
 }
 
 impl NumberParts {
     fn of(n: &Node, span: Span) -> NumberParts {
         let part = |i: i64, ty: PrimitiveType| index(n.clone(), int_lit(i, span), prim(ty), span);
         NumberParts {
-            int: part(0, PrimitiveType::I64),
-            float: part(1, PrimitiveType::F64),
-            is_int: part(2, PrimitiveType::Bool),
+            tag: part(0, PrimitiveType::I64),
+            int: part(1, PrimitiveType::I64),
+            float: part(2, PrimitiveType::F64),
         }
     }
 
-    /// The value as a float, whichever kind it holds.
+    fn has_tag(&self, tag: i64, span: Span) -> Node {
+        binary(
+            BinaryOp::Eq,
+            self.tag.clone(),
+            int_lit(tag, span),
+            prim(PrimitiveType::Bool),
+            span,
+        )
+    }
+
+    fn is_int(&self, span: Span) -> Node {
+        self.has_tag(TAG_INT, span)
+    }
+
+    /// Whether the value is a number at all.
+    fn is_numeric(&self, span: Span) -> Node {
+        binary(
+            BinaryOp::Ge,
+            self.tag.clone(),
+            int_lit(TAG_INT, span),
+            prim(PrimitiveType::Bool),
+            span,
+        )
+    }
+
+    /// Whether the value is true: anything but nil and false.
+    fn is_true(&self, span: Span) -> Node {
+        binary(
+            BinaryOp::Ge,
+            self.tag.clone(),
+            int_lit(TAG_TRUE, span),
+            prim(PrimitiveType::Bool),
+            span,
+        )
+    }
+
+    /// Whether both values are numbers, without a short-circuit: the
+    /// tags are small, so their product says.
+    fn both_numeric(&self, other: &NumberParts, span: Span) -> Node {
+        let i64_t = prim(PrimitiveType::I64);
+        binary(
+            BinaryOp::Ge,
+            binary(
+                BinaryOp::Mul,
+                self.tag.clone(),
+                other.tag.clone(),
+                i64_t,
+                span,
+            ),
+            int_lit(TAG_INT * TAG_INT, span),
+            prim(PrimitiveType::Bool),
+            span,
+        )
+    }
+
+    /// The value as a float, whichever number it holds.
     fn as_float(&self, span: Span) -> Node {
         if_value(
-            self.is_int.clone(),
+            self.is_int(span),
             cast(self.int.clone(), prim(PrimitiveType::F64), span),
             self.float.clone(),
             prim(PrimitiveType::F64),
@@ -1030,7 +1126,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             (Ty::Number, Ty::Int) => {
                 let (pre, n) = self.number_parts(v);
                 let value = if_value(
-                    n.is_int,
+                    n.is_int(span),
                     n.int,
                     cast(n.float, prim(PrimitiveType::I64), span),
                     prim(PrimitiveType::I64),
@@ -1041,7 +1137,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             (Ty::Number, Ty::Any) => {
                 let (pre, n) = self.number_parts(v);
                 let value = if_value(
-                    n.is_int,
+                    n.is_int(span),
                     call("zb_box_i64", vec![n.int], Type::Any, span),
                     call("zb_box_f64", vec![n.float], Type::Any, span),
                     Type::Any,
@@ -1066,6 +1162,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     prim(PrimitiveType::Bool),
                     span,
                 );
+                let tag = tag_of_is_int(is_int, span);
                 let int = call(
                     "zb_box_payload_i64",
                     vec![b.node.clone()],
@@ -1078,8 +1175,139 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     prim(PrimitiveType::F64),
                     span,
                 );
-                block_value(pre, number_value(int, float, is_int, span), span)
+                block_value(pre, number_value(tag, int, float, span), span)
             }
+            // A number is a scalar as it is; the other scalars take
+            // their tag.
+            (Ty::Number, Ty::Scalar) | (Ty::Scalar, Ty::Number) => v.node,
+            (Ty::Nil, Ty::Scalar) => {
+                block_value(vec![expr_stmt(v.node)], scalar_of_nil(span), span)
+            }
+            (Ty::Bool, Ty::Scalar) => scalar_of_bool(v.node, span),
+            (Ty::Int, Ty::Scalar) => number_of_int(v.node, span),
+            (Ty::Float, Ty::Scalar) => number_of_float(v.node, span),
+            (Ty::Scalar, Ty::Any) => {
+                let (pre, n) = self.number_parts(v);
+                let bool_t = prim(PrimitiveType::Bool);
+                let is_true = n.has_tag(TAG_TRUE, span);
+                let is_bool = binary(
+                    BinaryOp::Lt,
+                    n.tag.clone(),
+                    int_lit(TAG_INT, span),
+                    bool_t,
+                    span,
+                );
+                let value = if_value(
+                    n.has_tag(TAG_NIL, span),
+                    nil(span),
+                    if_value(
+                        is_bool,
+                        call("zb_box_bool", vec![is_true], Type::Any, span),
+                        if_value(
+                            n.has_tag(TAG_INT, span),
+                            call("zb_box_i64", vec![n.int], Type::Any, span),
+                            call("zb_box_f64", vec![n.float], Type::Any, span),
+                            Type::Any,
+                            span,
+                        ),
+                        Type::Any,
+                        span,
+                    ),
+                    Type::Any,
+                    span,
+                );
+                block_value(pre, value, span)
+            }
+            // A dynamic value known to be a scalar: its tag is read off
+            // the box.
+            (Ty::Any, Ty::Scalar) => {
+                let mut pre = Vec::new();
+                let b = self.hold(v, &mut pre);
+                let i64_t = prim(PrimitiveType::I64);
+                let bool_t = prim(PrimitiveType::Bool);
+                let category = call("zb_any_category", vec![b.node.clone()], i64_t.clone(), span);
+                let is_cat = |c: i64| {
+                    binary(
+                        BinaryOp::Eq,
+                        category.clone(),
+                        int_lit(c, span),
+                        bool_t.clone(),
+                        span,
+                    )
+                };
+                let is_nil = binary(
+                    BinaryOp::Eq,
+                    b.node.clone(),
+                    nil(span),
+                    bool_t.clone(),
+                    span,
+                );
+                let truth = binary(
+                    BinaryOp::Ne,
+                    call(
+                        "zb_box_payload_bool",
+                        vec![b.node.clone()],
+                        prim(PrimitiveType::I32),
+                        span,
+                    ),
+                    int32_lit(0, span),
+                    bool_t.clone(),
+                    span,
+                );
+                let as_bool = scalar_of_bool(truth, span);
+                let as_float = number_of_float(
+                    call(
+                        "zb_box_payload_f64",
+                        vec![b.node.clone()],
+                        prim(PrimitiveType::F64),
+                        span,
+                    ),
+                    span,
+                );
+                let as_int =
+                    number_of_int(call("zb_box_payload_i64", vec![b.node], i64_t, span), span);
+                let value = if_value(
+                    is_nil,
+                    scalar_of_nil(span),
+                    if_value(
+                        is_cat(library::BOOL),
+                        as_bool,
+                        if_value(
+                            is_cat(library::FLOAT),
+                            as_float,
+                            as_int,
+                            number_type(),
+                            span,
+                        ),
+                        number_type(),
+                        span,
+                    ),
+                    number_type(),
+                    span,
+                );
+                block_value(pre, value, span)
+            }
+            // A scalar the types know the kind of.
+            (Ty::Scalar, Ty::Int) => {
+                let (pre, n) = self.number_parts(v);
+                let value = if_value(
+                    n.is_int(span),
+                    n.int,
+                    cast(n.float, prim(PrimitiveType::I64), span),
+                    prim(PrimitiveType::I64),
+                    span,
+                );
+                block_value(pre, value, span)
+            }
+            (Ty::Scalar, Ty::Float) => {
+                let (pre, n) = self.number_parts(v);
+                block_value(pre, n.as_float(span), span)
+            }
+            (Ty::Scalar, Ty::Bool) => {
+                let (pre, n) = self.number_parts(v);
+                block_value(pre, n.has_tag(TAG_TRUE, span), span)
+            }
+            (Ty::Scalar, Ty::Nil) => block_value(vec![expr_stmt(v.node)], nil(span), span),
             (Ty::Bool, Ty::Any) => call("zb_box_bool", vec![v.node], Type::Any, span),
             (Ty::Int, Ty::Any) => call("zb_box_i64", vec![v.node], Type::Any, span),
             (Ty::Float, Ty::Any) => call("zb_box_f64", vec![v.node], Type::Any, span),
@@ -1126,6 +1354,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     Ty::Int => int_lit(0, span),
                     Ty::Float => float_lit(0.0, span),
                     Ty::Number => number_of_int(int_lit(0, span), span),
+                    Ty::Scalar => scalar_of_nil(span),
                     Ty::Bool => bool_lit(false, span),
                     Ty::Str => str_lit("", span),
                     Ty::Table => null(self.ir(Ty::Table), span),
@@ -1305,6 +1534,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let span = v.node.span;
         match v.ty {
             Ty::Bool => v.node,
+            // False when nil or false: the tags below true.
+            Ty::Scalar => {
+                let (pre, n) = self.number_parts(v);
+                block_value(pre, n.is_true(span), span)
+            }
             Ty::Nil => block_value(vec![expr_stmt(v.node)], bool_lit(false, span), span),
             Ty::Int | Ty::Float | Ty::Number | Ty::Str | Ty::Table | Ty::Func(_) => {
                 if Self::is_simple(&v.node) {
@@ -1361,6 +1595,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Ty::Int => int_lit(0, span),
             Ty::Float => float_lit(0.0, span),
             Ty::Number => number_of_int(int_lit(0, span), span),
+            Ty::Scalar => scalar_of_nil(span),
             Ty::Bool => bool_lit(false, span),
             Ty::Str => str_lit("", span),
             Ty::Table => call("zl_table_new", vec![], self.ir(Ty::Table), span),
@@ -2235,8 +2470,24 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     node: unary(UnaryOp::Minus, v.node, prim(PrimitiveType::F64), span),
                     ty: Ty::Float,
                 },
-                Ty::Number => {
-                    let (pre, n) = self.number_parts(v);
+                Ty::Number | Ty::Scalar => {
+                    let mut pre = Vec::new();
+                    let held = self.hold(v.clone(), &mut pre);
+                    let n = NumberParts::of(&held.node, span);
+                    // A scalar that is not a number raises, as the
+                    // dynamic value does.
+                    if v.ty == Ty::Scalar {
+                        let boxed = self.coerce(held.clone(), Ty::Any);
+                        pre.push(if_(
+                            n.is_numeric(span),
+                            Vec::new(),
+                            Some(vec![
+                                expr_stmt(call("zl_unm", vec![boxed], Type::Any, span)),
+                                self.pending_check_described(span, &descs),
+                            ]),
+                            span,
+                        ));
+                    }
                     let int = binary(
                         BinaryOp::Sub,
                         int_lit(0, span),
@@ -2246,7 +2497,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     );
                     let float = unary(UnaryOp::Minus, n.float, prim(PrimitiveType::F64), span);
                     Val {
-                        node: block_value(pre, number_value(int, float, n.is_int, span), span),
+                        node: block_value(pre, number_value(n.tag, int, float, span), span),
                         ty: Ty::Number,
                     }
                 }
@@ -2323,12 +2574,19 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
         let a = self.expr(lhs)?;
         let b = self.expr(rhs)?;
-        let v = self.binary_vals(op, a, b, span)?;
         let descs = Described::operands(self.describe(lhs), self.describe(rhs));
+        let v = self.binary_vals(op, a, b, &descs, span)?;
         Ok(self.guarded_described(v, &descs))
     }
 
-    fn binary_vals(&mut self, op: &BinOp, a: Val, b: Val, span: Span) -> Result<Val> {
+    fn binary_vals(
+        &mut self,
+        op: &BinOp,
+        a: Val,
+        b: Val,
+        descs: &Described,
+        span: Span,
+    ) -> Result<Val> {
         let ints = a.ty == Ty::Int && b.ty == Ty::Int;
         let numbers = a.ty.is_number() && b.ty.is_number();
         // A literal divisor that is not 0 or -1 makes `//` and `%`
@@ -2343,15 +2601,39 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         // A positive power of two divides a float exactly, so its
         // modulo is three operations instead of fmod.
         let pow2_divisor = literal_divisor.filter(|n| *n > 0 && n & (n - 1) == 0);
+        let divisor = Divisor {
+            plain: plain_divisor,
+            pow2: pow2_divisor,
+        };
         // A number whose kind is not known decides it at run time.
         if numbers && (a.ty == Ty::Number || b.ty == Ty::Number) {
-            let divisor = Divisor {
-                plain: plain_divisor,
-                pow2: pow2_divisor,
-            };
             if let Some(v) = self.number_binary(op, a.clone(), b.clone(), divisor, span) {
                 return Ok(v);
             }
+        }
+        // A scalar that may not be a number: arithmetic and ordering
+        // raise for nil and booleans as the dynamic value does, then
+        // take the number path.
+        let arithmetic_or_order = matches!(
+            op,
+            BinOp::Plus(_)
+                | BinOp::Minus(_)
+                | BinOp::Star(_)
+                | BinOp::Slash(_)
+                | BinOp::Caret(_)
+                | BinOp::DoubleSlash(_)
+                | BinOp::Percent(_)
+                | BinOp::LessThan(_)
+                | BinOp::LessThanEqual(_)
+                | BinOp::GreaterThan(_)
+                | BinOp::GreaterThanEqual(_)
+        );
+        if arithmetic_or_order
+            && (a.ty == Ty::Scalar || b.ty == Ty::Scalar)
+            && a.ty.is_scalar()
+            && b.ty.is_scalar()
+        {
+            return Ok(self.scalar_binary(op, a, b, divisor, descs, span));
         }
         let i64_t = prim(PrimitiveType::I64);
         let f64_t = prim(PrimitiveType::F64);
@@ -2508,6 +2790,125 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         })
     }
 
+    /// Arithmetic or ordering on scalars of which at least one may be
+    /// nil or a boolean: the dynamic operation runs when either is,
+    /// which raises; then both are numbers and the number path runs.
+    fn scalar_binary(
+        &mut self,
+        op: &BinOp,
+        a: Val,
+        b: Val,
+        divisor: Divisor,
+        descs: &Described,
+        span: Span,
+    ) -> Val {
+        let bool_t = prim(PrimitiveType::Bool);
+        let mut pre = Vec::new();
+        let a = Val {
+            node: self.coerce(a, Ty::Scalar),
+            ty: Ty::Scalar,
+        };
+        let b = Val {
+            node: self.coerce(b, Ty::Scalar),
+            ty: Ty::Scalar,
+        };
+        let ha = self.hold(a, &mut pre);
+        let hb = self.hold(b, &mut pre);
+        let x = NumberParts::of(&ha.node, span);
+        let y = NumberParts::of(&hb.node, span);
+        let numeric = x.both_numeric(&y, span);
+        let boxed_a = self.coerce(ha.clone(), Ty::Any);
+        let boxed_b = self.coerce(hb.clone(), Ty::Any);
+        let raise = match op {
+            BinOp::LessThan(_) => call("zl_lt", vec![boxed_a, boxed_b], bool_t.clone(), span),
+            BinOp::LessThanEqual(_) => call("zl_le", vec![boxed_a, boxed_b], bool_t.clone(), span),
+            BinOp::GreaterThan(_) => call("zl_lt", vec![boxed_b, boxed_a], bool_t.clone(), span),
+            BinOp::GreaterThanEqual(_) => {
+                call("zl_le", vec![boxed_b, boxed_a], bool_t.clone(), span)
+            }
+            _ => {
+                let code = match op {
+                    BinOp::Plus(_) => OP_ADD,
+                    BinOp::Minus(_) => OP_SUB,
+                    BinOp::Star(_) => OP_MUL,
+                    BinOp::Slash(_) => OP_DIV,
+                    BinOp::Caret(_) => OP_POW,
+                    BinOp::DoubleSlash(_) => OP_IDIV,
+                    _ => OP_MOD,
+                };
+                call(
+                    "zl_arith",
+                    vec![int_lit(code, span), boxed_a, boxed_b],
+                    Type::Any,
+                    span,
+                )
+            }
+        };
+        pre.push(if_(
+            numeric,
+            Vec::new(),
+            Some(vec![
+                expr_stmt(raise),
+                self.pending_check_described(span, descs),
+            ]),
+            span,
+        ));
+        let na = Val {
+            node: ha.node,
+            ty: Ty::Number,
+        };
+        let nb = Val {
+            node: hb.node,
+            ty: Ty::Number,
+        };
+        let v = self
+            .number_binary(op, na, nb, divisor, span)
+            .expect("the number path takes every arithmetic and ordering operator");
+        Val {
+            node: block_value(pre, v.node, span),
+            ty: v.ty,
+        }
+    }
+
+    /// Equality of scalars: numbers compare as numbers, anything else
+    /// by tag and payload.
+    fn scalar_eq(&mut self, a: Val, b: Val, span: Span) -> Node {
+        let bool_t = prim(PrimitiveType::Bool);
+        let a = Val {
+            node: self.coerce(a, Ty::Scalar),
+            ty: Ty::Scalar,
+        };
+        let b = Val {
+            node: self.coerce(b, Ty::Scalar),
+            ty: Ty::Scalar,
+        };
+        let (mut pre, x) = self.number_parts(a);
+        let (mut pre_b, y) = self.number_parts(b);
+        pre.append(&mut pre_b);
+        let numeric = x.both_numeric(&y, span);
+        let as_numbers = self.number_compare_parts(&x, &y, Compare::Eq, span);
+        let same = binary(
+            BinaryOp::And,
+            binary(
+                BinaryOp::Eq,
+                x.tag.clone(),
+                y.tag.clone(),
+                bool_t.clone(),
+                span,
+            ),
+            binary(
+                BinaryOp::Eq,
+                x.int.clone(),
+                y.int.clone(),
+                bool_t.clone(),
+                span,
+            ),
+            bool_t.clone(),
+            span,
+        );
+        block_value(pre, if_value(numeric, as_numbers, same, bool_t, span), span)
+    }
+
     /// Arithmetic where at least one operand's kind is decided at run
     /// time: both integers takes the integer path, anything else the
     /// float path, and the result says which it took. Bitwise
@@ -2527,8 +2928,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let both_int = |x: &NumberParts, y: &NumberParts| {
             binary(
                 BinaryOp::And,
-                x.is_int.clone(),
-                y.is_int.clone(),
+                x.is_int(span),
+                y.is_int(span),
                 prim(PrimitiveType::Bool),
                 span,
             )
@@ -2545,7 +2946,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let (mut pre_b, y) = self.number_parts(b);
         pre.append(&mut pre_b);
         let number = |int: Node, float: Node, is_int: Node| Val {
-            node: block_value(pre.clone(), number_value(int, float, is_int, span), span),
+            node: block_value(
+                pre.clone(),
+                number_value(tag_of_is_int(is_int, span), int, float, span),
+                span,
+            ),
             ty: Ty::Number,
         };
         Some(match op {
@@ -2699,16 +3104,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             )
         };
         let mixed = if_value(
-            x.is_int.clone(),
+            x.is_int(span),
             x_int,
-            if_value(y.is_int.clone(), y_int, floats, bool_t.clone(), span),
+            if_value(y.is_int(span), y_int, floats, bool_t.clone(), span),
             bool_t.clone(),
             span,
         );
         let both = binary(
             BinaryOp::And,
-            x.is_int.clone(),
-            y.is_int.clone(),
+            x.is_int(span),
+            y.is_int(span),
             bool_t.clone(),
             span,
         );
@@ -2736,7 +3141,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 let str_t = prim(PrimitiveType::String);
                 let (pre, n) = self.number_parts(v);
                 let text = if_value(
-                    n.is_int,
+                    n.is_int(span),
                     call("zb_str_of_int", vec![n.int], str_t.clone(), span),
                     call("zl_float_str", vec![n.float], str_t.clone(), span),
                     str_t,
@@ -2765,6 +3170,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             (Ty::Float, Ty::Int) => call("zl_eq_if", vec![b.node, a.node], bool_t, span),
             (x, y) if x.is_number() && y.is_number() => {
                 self.number_compare(a, b, Compare::Eq, span)
+            }
+            (x, y) if (x == Ty::Scalar || y == Ty::Scalar) && x.is_scalar() && y.is_scalar() => {
+                self.scalar_eq(a, b, span)
             }
             (Ty::Str, Ty::Str) => call("zb_str_eq", vec![a.node, b.node], bool_t, span),
             (Ty::Nil, Ty::Nil) => block_value(

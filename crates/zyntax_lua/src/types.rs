@@ -24,6 +24,10 @@ pub enum Ty {
     /// An integer or a float, whichever it holds: the join of the two,
     /// carried unboxed with a tag.
     Number,
+    /// Nil, a boolean, an integer or a float: the join of any of them,
+    /// carried unboxed with a tag. Arithmetic on it raises for the
+    /// first two, as on the dynamic value.
+    Scalar,
     Str,
     /// A table, held by pointer; never nil.
     Table,
@@ -43,8 +47,17 @@ impl Ty {
             (Ty::Unknown, t) | (t, Ty::Unknown) => t,
             (a, b) if a == b => a,
             (a, b) if a.is_number() && b.is_number() => Ty::Number,
+            (a, b) if a.is_scalar() && b.is_scalar() => Ty::Scalar,
             _ => Ty::Any,
         }
+    }
+
+    /// Carried unboxed as a tagged scalar, or convertible to one.
+    pub fn is_scalar(self) -> bool {
+        matches!(
+            self,
+            Ty::Nil | Ty::Bool | Ty::Int | Ty::Float | Ty::Number | Ty::Scalar
+        )
     }
 
     /// An integer, a float, or one or the other: arithmetic on it
@@ -418,6 +431,7 @@ impl<'a> Typer<'a> {
                     UnOp::Not(_) => Ty::Bool,
                     UnOp::Minus(_) => match t {
                         Ty::Int | Ty::Float | Ty::Number => t,
+                        Ty::Scalar | Ty::Nil | Ty::Bool => Ty::Number,
                         _ => Ty::Any,
                     },
                     UnOp::Hash(_) => match t {
@@ -498,9 +512,14 @@ pub fn binary_ty(op: &BinOp, a: Ty, b: Ty) -> Ty {
         | BinOp::Percent(_)
         | BinOp::DoubleSlash(_) => {
             // A float operand makes a float; two integers an integer;
-            // a number whose kind is not known keeps it open.
+            // a number whose kind is not known keeps it open. A scalar
+            // that may not be a number raises, or is a number.
             if !(a.is_number() && b.is_number()) {
-                Ty::Any
+                if a.is_scalar() && b.is_scalar() {
+                    Ty::Number
+                } else {
+                    Ty::Any
+                }
             } else if a == Ty::Int && b == Ty::Int {
                 Ty::Int
             } else if a == Ty::Float || b == Ty::Float {
@@ -510,7 +529,7 @@ pub fn binary_ty(op: &BinOp, a: Ty, b: Ty) -> Ty {
             }
         }
         BinOp::Slash(_) | BinOp::Caret(_) => {
-            if a.is_number() && b.is_number() {
+            if a.is_scalar() && b.is_scalar() {
                 Ty::Float
             } else {
                 Ty::Any

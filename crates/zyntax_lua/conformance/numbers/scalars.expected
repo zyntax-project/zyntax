@@ -1,0 +1,20 @@
+5	nil	true	true	false	true	true
+true	nil	true	false	true
+1	2.5	false	nil	true	true	true	true
+6	12.5	2	2	2.5	25.0	-5	true	true	true	true
+false	scalars.lua:9: attempt to perform arithmetic on a nil value (upvalue 'b')
+false	scalars.lua:10: attempt to compare nil with number
+false	scalars.lua:11: attempt to perform arithmetic on a nil value (upvalue 'b')
+false	scalars.lua:12: attempt to perform arithmetic on a boolean value
+false	scalars.lua:13: attempt to perform arithmetic on a boolean value
+15	true	true
+525
+five	zero
+5	nil	number	nil	true	nil
+5	false	scalars.lua:24: attempt to concatenate a nil value (upvalue 'b')
+5	5	integer	nil
+5 nil 5	2
+3.5	dflt	dflt2	no	true	true	false
+nil is false
+false is false
+1 is true
