@@ -26,11 +26,13 @@ use zyntax_typed_ast::{
     InternedString, Mutability, PrimitiveType, Type, TypedNode, TypedProgram, Visibility,
 };
 
+mod aliases;
 mod bytes;
 mod class_attrs;
 mod classes;
 mod format;
 mod host;
+mod kwargs;
 mod lower;
 mod modules;
 mod prelude;
@@ -318,10 +320,16 @@ pub fn parse_program_with(
     let mut origins: Vec<Option<String>> = vec![Some(PRELUDE.to_string()); prelude.body.len()];
     let mut body = prelude.body;
     for (stmt, origin) in linked.statements {
-        body.push(stmt);
-        origins.push(origin);
+        for stmt in flatten_true_if(stmt) {
+            body.push(stmt);
+            origins.push(origin.clone());
+        }
     }
     module.body = body;
+    // `**kwargs` becomes keyword parameters and a name given a class
+    // becomes the class, before anything is typed.
+    kwargs::rewrite(&mut module.body)?;
+    aliases::rewrite(&mut module.body);
     lap("parse+link");
     let located = |e: Error, module: Option<&str>| match module {
         Some(m) => e.in_module(m),
@@ -1152,6 +1160,21 @@ fn lower_items(
         }
     }
     Ok(declarations)
+}
+
+/// A module-level `if True:` with no other branch (a version branch
+/// decided at link time) is its body: what it defines is the module's,
+/// not a closure's.
+fn flatten_true_if(stmt: py::Stmt) -> Vec<py::Stmt> {
+    match stmt {
+        py::Stmt::If(i)
+            if matches!(&*i.test, py::Expr::BooleanLiteral(b) if b.value)
+                && i.elif_else_clauses.is_empty() =>
+        {
+            i.body.into_iter().flat_map(flatten_true_if).collect()
+        }
+        other => vec![other],
+    }
 }
 
 pub(crate) fn span_of<N: Ranged>(node: &N) -> Span {

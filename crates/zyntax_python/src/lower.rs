@@ -6954,29 +6954,19 @@ impl<'m> Lowerer<'m> {
             Ty::List(e @ Elem::Array(c)) if !matches!(name, "append" | "pop" | "insert") => {
                 let list = receiver.node;
                 let node = match name {
-                    // The storage as it lies in memory.
+                    // The storage as it lies in memory; the host reads
+                    // it through the header, at the element width.
                     "tobytes" => {
                         expect(0, self)?;
-                        let mut pre = Vec::new();
-                        let held = self.hold(
-                            Val {
-                                node: list,
-                                ty: receiver.ty,
-                            },
-                            &mut pre,
-                            span,
-                        );
-                        let data = crate::bytes::field(held.node.clone(), "data", Ty::Int, span);
-                        let size = binary(
-                            BinaryOp::Mul,
-                            method_call(held.node, "len", vec![], Ty::Int, span),
-                            int_lit(c.itemsize(), span),
-                            Ty::Int,
-                            span,
-                        );
-                        let bytes = call("zb_bytes_from_buffer", vec![data, size], Ty::Bytes, span);
+                        let bytes = Ty::List(Elem::Array(types::Code::UB));
+                        let storage = cast(list, bytes, span);
                         return Ok(Val {
-                            node: Self::block_value(pre, bytes, Ty::Bytes, span),
+                            node: call(
+                                "zb_bytes_of_storage",
+                                vec![storage, int_lit(c.itemsize(), span)],
+                                Ty::Bytes,
+                                span,
+                            ),
                             ty: Ty::Bytes,
                         });
                     }
@@ -7405,9 +7395,127 @@ impl<'m> Lowerer<'m> {
         }
     }
 
+    /// `f(a, *rest)` with `rest` a dynamic value: its items, as many as
+    /// the callee has parameters left, read into temporaries the call is
+    /// then made with. A callee whose parameter count is not known, or
+    /// a starred argument that is not last, is refused.
+    fn spread_dynamic(&mut self, c: &py::ExprCall, span: Span) -> Result<Vec<py::Expr>> {
+        let args = &c.arguments.args;
+        let starred = args
+            .iter()
+            .filter(|a| matches!(a, py::Expr::Starred(_)))
+            .count();
+        let Some(py::Expr::Starred(s)) = args.last().filter(|_| starred == 1) else {
+            return unsupported("a starred argument that is not the last", c);
+        };
+        let given = args.len() - 1;
+        let Some(want) = self.spread_count(&c.func, given) else {
+            return unsupported(
+                "a starred argument to a call whose parameter count is not known",
+                c,
+            );
+        };
+        let value = self.expr(&s.value)?;
+        let items = Val {
+            node: self.iterable(value, span),
+            ty: Ty::List(Elem::Object),
+        };
+        let mut pre = Vec::new();
+        let held = self.hold(items, &mut pre, span);
+        pre.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(call(
+                "zb_list_expect_len_any",
+                vec![held.node.clone(), int_lit(want as i64, span)],
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        ));
+        pre.push(self.pending_check(span));
+        let mut out: Vec<py::Expr> = args[..given].to_vec();
+        for i in 0..want {
+            let item = Val {
+                node: call(
+                    "zb_list_get_unchecked_any",
+                    vec![held.node.clone(), int_lit(i as i64, span)],
+                    Ty::Object,
+                    span,
+                ),
+                ty: Ty::Object,
+            };
+            let temp = self.hold(item, &mut pre, span);
+            let TypedExpression::Variable(name) = temp.node.node else {
+                unreachable!("a held value is a variable");
+            };
+            let id = name.resolve_global().expect("a temporary's name");
+            self.locals.vars.insert(id.clone(), Ty::Object);
+            out.push(py::Expr::Name(py::ExprName {
+                node_index: Default::default(),
+                range: s.range,
+                id: py::name::Name::new(id),
+                ctx: py::ExprContext::Load,
+            }));
+        }
+        self.hoisted.extend(pre);
+        Ok(out)
+    }
+
+    /// How many parameters a call of `func` with `given` positional
+    /// arguments has left: from the function's or method's signature,
+    /// or from the classes defining the method when they agree.
+    fn spread_count(&self, func: &py::Expr, given: usize) -> Option<usize> {
+        let left = |params: usize, skip: usize| params.checked_sub(skip + given);
+        match func {
+            py::Expr::Name(n) if !self.is_variable(n.id.as_str()) => {
+                let name = n.id.as_str();
+                if let Some(&k) = self.module.class_index.get(name) {
+                    let (sig, _) = self.module.method_sig(k, "__init__")?;
+                    return left(sig.params.len(), 1);
+                }
+                left(self.module.funcs.get(name)?.params.len(), 0)
+            }
+            py::Expr::Attribute(a) => match self.ty_of(&a.value) {
+                Ty::Class(k) => {
+                    let (sig, _) = self.module.method_sig(k as usize, a.attr.as_str())?;
+                    left(sig.params.len(), 1)
+                }
+                Ty::Object => {
+                    let mut counts = (0..self.module.classes.len())
+                        .filter_map(|k| self.module.method_sig(k, a.attr.as_str()))
+                        .map(|(sig, _)| sig.params.len());
+                    let first = counts.next()?;
+                    counts.all(|n| n == first).then_some(())?;
+                    left(first, 1)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// A call: `print`, a conversion builtin, or a function the module
     /// defines.
     fn call(&mut self, c: &py::ExprCall, ty: Ty, span: Span) -> Result<Val> {
+        // `f(*t)` with `t` a tuple of known shape is `f(t[0], t[1], ...)`.
+        if c.arguments
+            .args
+            .iter()
+            .any(|a| matches!(a, py::Expr::Starred(_)))
+        {
+            let spread = match types::spread_starred(&c.arguments.args, |e| self.ty_of(e)) {
+                Some(spread) => spread,
+                None => self.spread_dynamic(c, span)?,
+            };
+            let expanded = py::ExprCall {
+                arguments: py::Arguments {
+                    args: spread.into_boxed_slice(),
+                    ..c.arguments.clone()
+                },
+                ..c.clone()
+            };
+            return self.call(&expanded, ty, span);
+        }
         let args = &c.arguments.args;
         let keywords = &c.arguments.keywords;
         if let py::Expr::Attribute(a) = &*c.func

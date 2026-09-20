@@ -229,6 +229,12 @@ extern "C" fn host_bytes_from_buffer(list: *const ListHeader) -> StringPtr {
     zrtl::string::string_from_bytes(unsafe { list_bytes(list, 1) })
 }
 
+/// `array.tobytes()`: the storage of a list of `width`-byte elements.
+extern "C" fn host_bytes_of_storage(list: *const ListHeader, width: i64) -> StringPtr {
+    // SAFETY: a list the program holds, of elements `width` bytes wide.
+    zrtl::string::string_from_bytes(unsafe { list_bytes(list, width.max(0) as usize) })
+}
+
 /// A blob's bytes copied to `data`, which holds room for them; the
 /// count copied.
 extern "C" fn host_bytes_copy_out(a: StringConstPtr, data: i64) -> i64 {
@@ -289,7 +295,7 @@ extern "C" fn host_file_exists(path: StringConstPtr) -> i64 {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 22] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 23] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$time".as_ptr(), host_time as *const u8),
@@ -303,6 +309,10 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 22] = [
         host_bytes_of_byte as *const u8,
     ),
     zrtl::ZrtlSymbol::new(c"$Host$bytes_box".as_ptr(), host_bytes_box as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_of_storage".as_ptr(),
+        host_bytes_of_storage as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(
         c"$Host$bytes_repeat".as_ptr(),
         host_bytes_repeat as *const u8,

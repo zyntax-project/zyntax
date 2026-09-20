@@ -1177,6 +1177,28 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         statements,
         span,
     );
+    // repr(): `__repr__`, or `<C object>`.
+    let mut statements = per_class(
+        module,
+        x.clone(),
+        |_| true,
+        |lowerer, c, obj| {
+            let text = lowerer.repr_of(Val {
+                node: obj,
+                ty: Ty::Class(c as u16),
+            });
+            vec![ret(text, span)]
+        },
+        span,
+    );
+    statements.push(ret(str_lit("<object>", span), span));
+    let repr_hook = function(
+        "zb_hook_instance_repr",
+        vec![param("x", Ty::Object, span)],
+        Ty::Str,
+        statements,
+        span,
+    );
     // type(): the class name.
     let mut statements = per_class(
         module,
@@ -1228,6 +1250,7 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
     );
     let mut out = vec![
         str_hook,
+        repr_hook,
         type_hook,
         eq_hook,
         hash_hook(module, span),

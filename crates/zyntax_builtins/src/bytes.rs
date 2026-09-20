@@ -98,6 +98,12 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             "$Host$bytes_from_buffer",
         ),
         (
+            "zb_bytes_of_storage",
+            vec![("xs", list_of(list_type, u8())), ("width", i64())],
+            string(),
+            "$Host$bytes_of_storage",
+        ),
+        (
             "zb_bytes_copy_out",
             vec![("a", string()), ("data", i64())],
             i64(),

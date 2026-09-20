@@ -2524,6 +2524,12 @@ impl Calls<'_> {
         };
         let n = sig.params.len();
         let mut given: Vec<Option<Ty>> = vec![None; n];
+        // A starred tuple of known shape is its elements, one by one.
+        let spread = spread_starred(args, |e| self.arg_ty(e));
+        let args: &[py::Expr] = match &spread {
+            Some(expanded) => expanded,
+            None => args,
+        };
         let mut matched = !args.iter().any(|a| matches!(a, py::Expr::Starred(_)))
             && keywords.iter().all(|k| k.arg.is_some())
             && first + args.len() <= n;
@@ -4398,6 +4404,46 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
     }
 }
 
+/// Call arguments with each `*name` whose tuple shape is known spread
+/// into that many element reads, and no other starred argument. None
+/// when there is no starred argument, or one that is not such a name.
+pub(crate) fn spread_starred(
+    args: &[py::Expr],
+    ty_of: impl Fn(&py::Expr) -> Ty,
+) -> Option<Vec<py::Expr>> {
+    if !args.iter().any(|a| matches!(a, py::Expr::Starred(_))) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(args.len() + 2);
+    for a in args {
+        let py::Expr::Starred(s) = a else {
+            out.push(a.clone());
+            continue;
+        };
+        // Only a name is read more than once without effect.
+        let py::Expr::Name(_) = &*s.value else {
+            return None;
+        };
+        let Ty::Tuple(k) = ty_of(&s.value) else {
+            return None;
+        };
+        for i in 0..tuple_shape(k).len() {
+            out.push(py::Expr::Subscript(py::ExprSubscript {
+                node_index: Default::default(),
+                range: s.range,
+                value: s.value.clone(),
+                slice: Box::new(py::Expr::NumberLiteral(py::ExprNumberLiteral {
+                    node_index: Default::default(),
+                    range: s.range,
+                    value: py::Number::Int(py::Int::from(i as u64)),
+                })),
+                ctx: py::ExprContext::Load,
+            }));
+        }
+    }
+    Some(out)
+}
+
 /// The mode `open(path, mode)` names, when it is a literal; `r` when
 /// left out. None when it is computed.
 pub(crate) fn open_mode(c: &py::ExprCall) -> Option<Mode> {
@@ -5064,8 +5110,10 @@ impl Typer<'_> {
                 "pop" => e.ty(),
                 "index" | "count" => Ty::Int,
                 "copy" => Ty::List(e),
-                // An array's elements as the list of what they read as.
+                // An array's elements as the list of what they read as,
+                // or as the bytes they are stored as.
                 "tolist" => Ty::List(Elem::of(e.ty())),
+                "tobytes" if e.code().is_some() => Ty::Bytes,
                 _ => Ty::None,
             },
             Ty::Tuple(_) => match attr {

@@ -115,6 +115,7 @@ fn shaped_items(x: Expr, anys: zyntax_typed_ast::Type) -> Expr {
 pub(crate) fn extern_instance_hooks() -> Vec<Decl> {
     vec![
         extern_fn("zb_hook_instance_str", &[("x", any())], string(), None),
+        extern_fn("zb_hook_instance_repr", &[("x", any())], string(), None),
         extern_fn("zb_hook_instance_type", &[("x", any())], string(), None),
         extern_fn(
             "zb_hook_instance_eq",
@@ -142,6 +143,12 @@ pub(crate) fn default_instance_hooks(policy: &Policy) -> Vec<Decl> {
     vec![
         define(
             "zb_hook_instance_str",
+            &[&x],
+            string(),
+            vec![ret(text(&format!("<{}>", policy.type_names.object)))],
+        ),
+        define(
+            "zb_hook_instance_repr",
             &[&x],
             string(),
             vec![ret(text(&format!("<{}>", policy.type_names.object)))],
@@ -542,6 +549,11 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 eq(category(x.e()), int(STR)),
                 vec![ret(call("zb_str_repr", vec![get_str(x.e())], string()))],
+            ),
+            // An instance's `__repr__`, where str() would take `__str__`.
+            when(
+                and(eq(category(x.e()), int(CUSTOM)), is_instance(x.e())),
+                vec![ret(call("zb_hook_instance_repr", vec![x.e()], string()))],
             ),
             ret(call("zb_any_str", vec![x.e()], string())),
         ],
