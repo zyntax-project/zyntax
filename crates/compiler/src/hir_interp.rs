@@ -4103,6 +4103,28 @@ impl HirInterpreter {
                             "a load through a null pointer".to_string(),
                         ));
                     }
+                    // `ZYNTAX_TRACE_MISALIGNED=1` names a load of a wide
+                    // value from an address not aligned to it, before the
+                    // debug build's own check aborts; safe to run with.
+                    if cfg!(debug_assertions)
+                        && (p as usize) % 8 != 0
+                        && matches!(
+                            target,
+                            HirType::I64 | HirType::U64 | HirType::F64 | HirType::Ptr(_)
+                        )
+                        && std::env::var_os("ZYNTAX_TRACE_MISALIGNED").is_some()
+                    {
+                        eprintln!(
+                            "[interp] misaligned load of {:?} at {:p} in {} pc={pc}",
+                            target,
+                            p,
+                            module
+                                .functions
+                                .get(&func_id)
+                                .and_then(|f| f.name.resolve_global())
+                                .unwrap_or_default()
+                        );
+                    }
                     regs[*dst as usize] = if held(target) == Held::ByReference {
                         // The loaded aggregate is a copy of its own.
                         let size = size_of_hir_ty(target);
