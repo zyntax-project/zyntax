@@ -2216,6 +2216,12 @@ pub struct FunctionAttributes {
     /// runs on it alone when the call comes.
     #[serde(default)]
     pub deferred: bool,
+    /// The body is a loop region outlined from another function's, its
+    /// parameters the values that function had live at the header:
+    /// pointers among them may name one object, so nothing takes two
+    /// of them for distinct memory.
+    #[serde(default)]
+    pub osr_region: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

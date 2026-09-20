@@ -373,6 +373,7 @@ fn hoist_loop(
         .flat_map(|b| b.instructions.iter())
         .filter_map(|inst| match inst {
             HirInstruction::Store { ptr, value, .. } => Some(extract_mem_loc(
+                func,
                 *ptr,
                 value_byte_size(func, *value),
                 &identity_subst,
@@ -384,6 +385,7 @@ fn hoist_loop(
             // and a load of what it wrote is then free to leave the loop
             // and be read before the loop fills it.
             HirInstruction::VectorStore { ptr, value, .. } => Some(extract_mem_loc(
+                func,
                 *ptr,
                 value_byte_size(func, *value),
                 &identity_subst,
@@ -457,8 +459,13 @@ fn hoist_loop(
                     if impure_call_in_loop {
                         continue;
                     }
-                    let load_loc =
-                        extract_mem_loc(*ptr, hir_ty_byte_size(ty), &identity_subst, addr_index);
+                    let load_loc = extract_mem_loc(
+                        func,
+                        *ptr,
+                        hir_ty_byte_size(ty),
+                        &identity_subst,
+                        addr_index,
+                    );
                     // A Load with an entirely opaque root (no GEP+Cast
                     // chain we can trace) can't be disambiguated from
                     // any in-loop Store. Skip it.
@@ -576,6 +583,10 @@ struct MemLoc {
     root: Option<HirId>,
     offset: Option<u64>,
     size: u32,
+    /// The root is a parameter of an outlined loop region: a pointer
+    /// the region's function had live at the header, which may name
+    /// the same object as any other root.
+    shared_root: bool,
 }
 
 impl MemLoc {
@@ -591,6 +602,7 @@ impl MemLoc {
     /// fall back to byte-range comparison.
     fn may_alias(&self, other: &MemLoc) -> bool {
         match (self.root, other.root) {
+            (Some(r1), Some(r2)) if r1 != r2 && (self.shared_root || other.shared_root) => true,
             (Some(r1), Some(r2)) if r1 != r2 => {
                 // Different SSA roots: rely on the SSA-level
                 // no-aliasing assumption. Holds for the patterns ZynML
@@ -705,6 +717,38 @@ fn build_addr_index(func: &HirFunction) -> HashMap<HirId, AddrLink> {
             }
         }
     }
+    // Two loads of a pointer from one address name one object: the
+    // second reads as the first, so a store through either is a store
+    // through both. A list's element pointer is read from its header
+    // wherever it is needed, and a hoisted read of an element must see
+    // the stores to it made through another copy of that pointer.
+    let mut loaded_from: HashMap<(HirId, u64), HirId> = HashMap::new();
+    let no_subst = indexmap::IndexMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            let HirInstruction::Load {
+                result,
+                ptr,
+                ty: HirType::Ptr(_),
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            let at = extract_mem_loc(func, *ptr, 8, &no_subst, &idx);
+            let (Some(root), Some(offset)) = (at.root, at.offset) else {
+                continue;
+            };
+            match loaded_from.get(&(root, offset)) {
+                Some(first) => {
+                    idx.insert(*result, AddrLink::Cast(*first));
+                }
+                None => {
+                    loaded_from.insert((root, offset), *result);
+                }
+            }
+        }
+    }
     idx
 }
 
@@ -713,6 +757,7 @@ fn build_addr_index(func: &HirFunction) -> HashMap<HirId, AddrLink> {
 /// (byte width of the Load/Store's value type). The chain step
 /// lookup is O(1) via the pre-built `addr_index`.
 fn extract_mem_loc(
+    func: &HirFunction,
     ptr: HirId,
     size: u32,
     identity_subst: &indexmap::IndexMap<HirId, HirId>,
@@ -749,6 +794,11 @@ fn extract_mem_loc(
             None => break,
         }
     }
+    let shared_root = func.attributes.osr_region
+        && func
+            .values
+            .get(&current)
+            .is_some_and(|v| matches!(v.kind, crate::hir::HirValueKind::Parameter(_)));
     MemLoc {
         root: Some(current),
         offset: if offset_known {
@@ -757,6 +807,7 @@ fn extract_mem_loc(
             None
         },
         size,
+        shared_root,
     }
 }
 
@@ -1192,5 +1243,124 @@ mod tests {
             });
         let stats = run(&mut f);
         assert_eq!(stats.hoisted, 0, "same-ptr Store blocks Load hoist");
+    }
+
+    /// entry: d1 = *h; body: d2 = *h; r = *(d1 + 8); store v -> d2[i].
+    /// Both loads of `h` name one buffer, so the read through `d1` is
+    /// not free of the store through `d2`.
+    #[test]
+    fn two_loads_of_one_pointer_slot_are_one_root() {
+        let (mut f, entry, _header, body, _exit) = mk_func();
+        let h = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
+        let i = add_param(&mut f, HirType::I64, 1);
+        let v = add_param(&mut f, HirType::I64, 2);
+        let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let d1 = add_inst(&mut f, ptr_ty.clone());
+        let d2 = add_inst(&mut f, ptr_ty.clone());
+        let at8 = add_inst(&mut f, ptr_ty.clone());
+        let at_i = add_inst(&mut f, ptr_ty.clone());
+        let r = add_inst(&mut f, HirType::I64);
+        let eight = HirId::new();
+        f.values.insert(
+            eight,
+            HirValue {
+                id: eight,
+                ty: HirType::I64,
+                kind: HirValueKind::Constant(crate::hir::HirConstant::I64(8)),
+                uses: Default::default(),
+                span: None,
+            },
+        );
+        let load = |result, ptr| HirInstruction::Load {
+            result,
+            ty: ptr_ty.clone(),
+            ptr,
+            align: 8,
+            volatile: false,
+        };
+        f.blocks
+            .get_mut(&entry)
+            .unwrap()
+            .instructions
+            .push(load(d1, h));
+        let b = f.blocks.get_mut(&body).unwrap();
+        b.instructions.push(load(d2, h));
+        b.instructions.push(HirInstruction::GetElementPtr {
+            result: at8,
+            ty: ptr_ty.clone(),
+            ptr: d1,
+            indices: vec![eight],
+        });
+        b.instructions.push(HirInstruction::Load {
+            result: r,
+            ty: HirType::I64,
+            ptr: at8,
+            align: 8,
+            volatile: false,
+        });
+        b.instructions.push(HirInstruction::GetElementPtr {
+            result: at_i,
+            ty: ptr_ty.clone(),
+            ptr: d2,
+            indices: vec![i],
+        });
+        b.instructions.push(HirInstruction::Store {
+            value: v,
+            ptr: at_i,
+            align: 8,
+            volatile: false,
+        });
+        run(&mut f);
+        assert!(
+            f.blocks[&body]
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, HirInstruction::Load { result, .. } if *result == r)),
+            "the element read stays in the loop"
+        );
+    }
+
+    /// In an outlined region two pointer parameters may name one
+    /// buffer: a read through one is not free of a store through the
+    /// other.
+    #[test]
+    fn region_parameters_may_alias() {
+        let (mut f, _entry, _header, body, _exit) = mk_func();
+        f.attributes.osr_region = true;
+        let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let last = add_param(&mut f, ptr_ty.clone(), 0);
+        let data = add_param(&mut f, ptr_ty.clone(), 1);
+        let i = add_param(&mut f, HirType::I64, 2);
+        let v = add_param(&mut f, HirType::I64, 3);
+        let at_i = add_inst(&mut f, ptr_ty.clone());
+        let r = add_inst(&mut f, HirType::I64);
+        let b = f.blocks.get_mut(&body).unwrap();
+        b.instructions.push(HirInstruction::Load {
+            result: r,
+            ty: HirType::I64,
+            ptr: last,
+            align: 8,
+            volatile: false,
+        });
+        b.instructions.push(HirInstruction::GetElementPtr {
+            result: at_i,
+            ty: ptr_ty,
+            ptr: data,
+            indices: vec![i],
+        });
+        b.instructions.push(HirInstruction::Store {
+            value: v,
+            ptr: at_i,
+            align: 8,
+            volatile: false,
+        });
+        run(&mut f);
+        assert!(
+            f.blocks[&body]
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, HirInstruction::Load { result, .. } if *result == r)),
+            "a region's parameters may alias: the read stays in the loop"
+        );
     }
 }

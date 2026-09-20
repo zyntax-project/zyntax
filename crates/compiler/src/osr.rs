@@ -1111,6 +1111,7 @@ pub fn outline(
     region.attributes = function.attributes.clone();
     region.attributes.optimized = false;
     region.attributes.deferred = false;
+    region.attributes.osr_region = true;
     region.rebuild_cfg_edges();
     // Everything the region reads must be a parameter, a constant, a
     // global or its own; a value from before the header that the layout
