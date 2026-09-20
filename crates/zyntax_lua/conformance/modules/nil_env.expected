@@ -1,0 +1,12 @@
+nil
+false	chunk:1: attempt to index a nil value (upvalue '_ENV')
+true
+true
+7	false
+8	8
+nil
+true
+true
+nil
+true
+1

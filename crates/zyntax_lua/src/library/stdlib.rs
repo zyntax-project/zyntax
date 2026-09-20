@@ -316,14 +316,14 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "",
         name: "load",
         func: "zl_load",
-        params: &[Expected("function"), Any, Any, Any],
+        params: &[Expected("function"), Any, Any, Rest],
         ret: Ret::Multi,
     },
     Builtin {
         lib: "",
         name: "loadfile",
         func: "zl_loadfile",
-        params: &[Str, Any, Any],
+        params: &[Str, Any, Rest],
         ret: Ret::Multi,
     },
     Builtin {
@@ -3178,12 +3178,21 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     let chunk = kept("chunk", any());
     let chunk_name = kept("chunk_name", any());
     let mode = kept("mode", any());
-    let env = kept("env", any());
+    // The arguments after `mode`: an environment when there is one,
+    // nil included, which is not the same as none.
+    let given = kept("given", anys.clone());
+    let chunk_env = local("chunk_env", any());
     let piece = local("piece", any());
     let cname = local("cname", string());
+    let env_given = |given: &Local, chunk_env: &Local| {
+        when(
+            gt(len(given.e()), int(0)),
+            vec![chunk_env.set(call("zl_value_at", vec![given.e(), int(1)], any()))],
+        )
+    };
     d.push(define(
         "zl_load",
-        &[&chunk, &chunk_name, &mode, &env],
+        &[&chunk, &chunk_name, &mode, &given],
         any(),
         vec![
             s.decl(text("")),
@@ -3263,7 +3272,13 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     any(),
                 ))],
             ),
-            y.set(call("zl_load_raw", vec![s.e(), cname.e(), env.e()], any())),
+            chunk_env.decl(call("zl_globals_value", vec![], any())),
+            env_given(&given, &chunk_env),
+            y.set(call(
+                "zl_load_raw",
+                vec![s.e(), cname.e(), chunk_env.e()],
+                any(),
+            )),
             when(
                 is_nil(y.e()),
                 vec![ret(call(
@@ -3347,7 +3362,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     let path = kept("path", string());
     d.push(define(
         "zl_loadfile",
-        &[&path, &mode, &env],
+        &[&path, &mode, &given],
         any(),
         vec![
             s.decl(call("zl_read_file", vec![path.e()], string())),
@@ -3371,9 +3386,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     any(),
                 ))],
             ),
+            chunk_env.decl(call("zl_globals_value", vec![], any())),
+            env_given(&given, &chunk_env),
             y.set(call(
                 "zl_load_raw",
-                vec![s.e(), add(text("@"), path.e()), env.e()],
+                vec![s.e(), add(text("@"), path.e()), chunk_env.e()],
                 any(),
             )),
             when(
@@ -3404,7 +3421,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ),
             y.decl(call(
                 "zl_load_raw",
-                vec![s.e(), add(text("@"), path.e()), nil()],
+                vec![
+                    s.e(),
+                    add(text("@"), path.e()),
+                    call("zl_globals_value", vec![], any()),
+                ],
                 any(),
             )),
             when(
@@ -3412,31 +3433,6 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 vec![lua_error(call("zl_load_error", vec![], string()))],
             ),
             ret(call("zl_call_0", vec![y.e()], any())),
-        ],
-    ));
-    // The globals a loaded chunk reads: the env it was given when that
-    // is a table, else the program's.
-    d.push(define(
-        "zl_env_table",
-        &[&env],
-        table.clone(),
-        vec![
-            when(is_table(env.e()), vec![ret(unbox_table(env.e(), t))]),
-            ret(call("zl_globals_table", vec![], table.clone())),
-        ],
-    ));
-    // The environment a chunk was given, or the globals table when it
-    // was given nothing.
-    d.push(define(
-        "zl_env_value",
-        &[&env],
-        any(),
-        vec![
-            when(
-                is_nil(env.e()),
-                vec![ret(call("zl_globals_value", vec![], any()))],
-            ),
-            ret(env.e()),
         ],
     ));
     // `collectgarbage(opt)`: a collection, or what the collector knows.
@@ -3595,7 +3591,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ),
             handler.set(call(
                 "zl_load_raw",
-                vec![s.e(), add(text("@"), path.e()), nil()],
+                vec![
+                    s.e(),
+                    add(text("@"), path.e()),
+                    call("zl_globals_value", vec![], any()),
+                ],
                 any(),
             )),
             when(

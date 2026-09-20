@@ -4793,12 +4793,7 @@ pub(crate) fn loaded_program(
             )),
             assign(
                 var(env_var, Type::Any, span),
-                call(
-                    "zl_env_value",
-                    vec![var(env, Type::Any, span)],
-                    Type::Any,
-                    span,
-                ),
+                var(env, Type::Any, span),
                 span,
             ),
             ret(
