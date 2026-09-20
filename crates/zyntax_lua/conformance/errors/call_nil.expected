@@ -1,0 +1,10 @@
+false	call_nil.lua:4: attempt to call a nil value (field 'm')
+false	call_nil.lua:5: attempt to call a nil value (field 'm')
+false	call_nil.lua:6: attempt to call a nil value (method 'm')
+false	call_nil.lua:7: attempt to call a nil value (global 'undefined_global')
+false	call_nil.lua:9: attempt to call a number value (upvalue 'n')
+42
+5
+false	call_nil.lua:10: attempt to perform arithmetic on a table value (local 'x')
+false	call_nil.lua:17: attempt to call a number value (upvalue 'uncallable')
+false	call_nil.lua:19: attempt to call a table value (upvalue 'plain')

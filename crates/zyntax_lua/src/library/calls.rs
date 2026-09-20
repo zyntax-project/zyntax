@@ -212,8 +212,11 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             // A handler that is not a function is what the error
             // names, as the reference tries to call it; a table with
-            // no handler is itself.
-            when(is_nil(h.e()), vec![h.set(at(args.e(), int(0)))]),
+            // no handler is itself, put in front of the arguments.
+            when(
+                and(is_nil(h.e()), gt(i.e(), int(0))),
+                vec![h.set(at(args.e(), int(0)))],
+            ),
             not_callable(&h),
             ret(list(vec![], anys.clone())),
         ],
