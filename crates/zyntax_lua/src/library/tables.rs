@@ -408,7 +408,9 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         i64(),
         vec![ret(len(arr_of(tb.e())))],
     ));
-    // `#t` with `__len`.
+    // `#t` with `__len`, as an integer: what the table library
+    // measures a table by, which a value the length cannot be read as
+    // one refuses.
     d.push(define(
         "zl_table_len",
         &[&tb],
@@ -421,22 +423,24 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             handler.decl(call("zl_meta", vec![tb.e(), text("__len")], any())),
             when(is_nil(handler.e()), vec![ret(len(arr_of(tb.e())))]),
             metamethod_call_check(handler.e(), text("len")),
-            ret(call(
-                "zl_arg_int",
-                vec![
-                    call(
-                        "zl_first",
-                        vec![call(
-                            "zl_call_1",
-                            vec![handler.e(), box_table(tb.e())],
-                            any(),
-                        )],
+            x.decl(call(
+                "zl_math_tointeger",
+                vec![call(
+                    "zl_first",
+                    vec![call(
+                        "zl_call_2",
+                        vec![handler.e(), box_table(tb.e()), box_table(tb.e())],
                         any(),
-                    ),
-                    text("object length"),
-                ],
-                i64(),
+                    )],
+                    any(),
+                )],
+                any(),
             )),
+            when(
+                is_nil(x.e()),
+                vec![lua_error(text("object length is not an integer"))],
+            ),
+            ret(get_i64(x.e())),
         ],
     ));
 

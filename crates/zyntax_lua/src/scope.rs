@@ -126,6 +126,15 @@ pub struct Scopes {
     /// Whether `_G` or `_ENV` is used as a value anywhere: then the
     /// globals live in a real table and every global is dynamic.
     pub dynamic_globals: bool,
+    /// Whether the chunk runs code it does not contain: `load`,
+    /// `loadfile`, `dofile`, or `require` of a name that is not a
+    /// literal. What that code defines is not known here.
+    pub dynamic_code: bool,
+    /// Whether `#` on a table may be whatever a `__len` metamethod
+    /// returns, of any type: some source of the program names one, or
+    /// code loaded while it runs might. Set by the program's assembly
+    /// over every chunk; off, `#` on a table is an integer.
+    pub len_meta: bool,
     /// The names `require` is called with as string literals, in order
     /// of appearance: the files the program is made of besides its
     /// main one.
@@ -387,6 +396,11 @@ impl Walker {
             && (Scopes::is_globals_name(name) || name == "load" || name == "dofile")
         {
             self.out.dynamic_globals = true;
+        }
+        if let Binding::Global(name) = &binding
+            && matches!(name.as_str(), "load" | "loadfile" | "dofile")
+        {
+            self.out.dynamic_code = true;
         }
         self.out.names.insert(pos_of(token), binding.clone());
         if !as_callee {
@@ -720,10 +734,13 @@ impl Walker {
                 }
                 _ => None,
             };
-            if let Some(name) = name
-                && !self.out.requires.contains(&name)
-            {
-                self.out.requires.push(name);
+            match name {
+                Some(name) => {
+                    if !self.out.requires.contains(&name) {
+                        self.out.requires.push(name);
+                    }
+                }
+                None => self.out.dynamic_code = true,
             }
         }
         // `rawget(_G, "name")` and `rawset(_G, "name", v)` name the

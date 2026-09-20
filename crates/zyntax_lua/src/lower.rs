@@ -1917,7 +1917,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     node: call("zb_str_len", vec![v.node], prim(PrimitiveType::I64), span),
                     ty: Ty::Int,
                 },
-                Ty::Table => Val {
+                Ty::Table if !self.scopes().len_meta => Val {
                     node: call("zl_table_len", vec![v.node], prim(PrimitiveType::I64), span),
                     ty: Ty::Int,
                 },
@@ -4851,7 +4851,9 @@ struct Loaded {
 /// The files `require`d by name, transitively, each parsed once. A
 /// name that is a standard library or has no file is left to
 /// `require` at run time.
-fn load_required(first: &[String], main_file: &str) -> Result<Vec<Loaded>> {
+/// The files `require` names, loaded in turn, and whether every name
+/// was found: one that was not is loaded while the program runs.
+fn load_required(first: &[String], main_file: &str) -> Result<(Vec<Loaded>, bool)> {
     let dir = std::path::Path::new(main_file)
         .parent()
         .map(|p| p.to_path_buf())
@@ -4859,6 +4861,7 @@ fn load_required(first: &[String], main_file: &str) -> Result<Vec<Loaded>> {
     let mut loaded: Vec<Loaded> = Vec::new();
     let mut queue: Vec<String> = first.to_vec();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut all_found = true;
     while let Some(name) = queue.pop() {
         if !seen.insert(name.clone())
             || crate::library::stdlib::LIBS.contains(&name.as_str())
@@ -4869,6 +4872,7 @@ fn load_required(first: &[String], main_file: &str) -> Result<Vec<Loaded>> {
         let relative = format!("{}.lua", name.replace('.', "/"));
         let path = dir.join(&relative);
         let Ok(bytes) = std::fs::read(&path) else {
+            all_found = false;
             continue;
         };
         let source = crate::source_text(&bytes).into_owned();
@@ -4896,7 +4900,20 @@ fn load_required(first: &[String], main_file: &str) -> Result<Vec<Loaded>> {
             scopes,
         });
     }
-    Ok(loaded)
+    Ok((loaded, all_found))
+}
+
+/// Whether `#` on a table may be a `__len` metamethod's value, of
+/// any type: a source of the program names the metamethod, or code
+/// the program loads while it runs might.
+fn len_meta_possible(source: &str, scopes: &Scopes, loaded: &[Loaded], all_found: bool) -> bool {
+    let names_it = |s: &str| s.contains("__len");
+    !all_found
+        || scopes.dynamic_code
+        || names_it(source)
+        || loaded
+            .iter()
+            .any(|m| m.scopes.dynamic_code || names_it(&m.source))
 }
 
 fn line_starts_of(source: &str) -> Vec<usize> {
@@ -5073,6 +5090,7 @@ pub(crate) fn loaded_program(
 ) -> Result<TypedProgram> {
     let mut scopes = crate::scope::resolve(ast);
     scopes.dynamic_globals = true;
+    scopes.len_meta = true;
     let inferred = types::infer(&scopes, ast);
     let tag = format!("l{index}$");
     let env_var = intern(&format!("lua$l{index}$env"));
@@ -5147,13 +5165,18 @@ pub(crate) fn program(
 ) -> Result<TypedProgram> {
     let started = std::time::Instant::now();
     let mut scopes = crate::scope::resolve(ast);
-    let mut loaded = load_required(&scopes.requires, file)?;
+    let (mut loaded, all_found) = load_required(&scopes.requires, file)?;
     // Files share their globals through the table.
     if !loaded.is_empty() {
         scopes.dynamic_globals = true;
         for m in &mut loaded {
             m.scopes.dynamic_globals = true;
         }
+    }
+    let len_meta = len_meta_possible(source, &scopes, &loaded, all_found);
+    scopes.len_meta = len_meta;
+    for m in &mut loaded {
+        m.scopes.len_meta = len_meta;
     }
     crate::trace_phase("scopes", started);
     let started = std::time::Instant::now();

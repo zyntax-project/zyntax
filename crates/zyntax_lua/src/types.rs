@@ -417,7 +417,8 @@ impl<'a> Typer<'a> {
                         _ => Ty::Any,
                     },
                     UnOp::Hash(_) => match t {
-                        Ty::Str | Ty::Table => Ty::Int,
+                        Ty::Str => Ty::Int,
+                        Ty::Table if !self.scopes.len_meta => Ty::Int,
                         _ => Ty::Any,
                     },
                     UnOp::Tilde(_) => match t {

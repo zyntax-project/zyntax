@@ -1273,9 +1273,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                         not(is_nil(h.e())),
                         vec![
                             metamethod_call_check(h.e(), text("len")),
+                            // The operand is passed twice, as for
+                            // every unary event.
                             ret(call(
                                 "zl_first",
-                                vec![call("zl_call_1", vec![h.e(), x.e()], any())],
+                                vec![call("zl_call_2", vec![h.e(), x.e(), x.e()], any())],
                                 any(),
                             )),
                         ],
