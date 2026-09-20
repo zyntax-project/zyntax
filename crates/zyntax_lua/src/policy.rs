@@ -14,6 +14,8 @@ pub const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
     // A library error goes through `zb_hook_raise`, which this frontend
     // defines.
     exceptions: true,
+    // `false ~= 0` and `true ~= 1`: a boolean is a key of its own.
+    bool_is_number: false,
     type_names: zyntax_builtins::TypeNames {
         none: "nil",
         bool: "boolean",

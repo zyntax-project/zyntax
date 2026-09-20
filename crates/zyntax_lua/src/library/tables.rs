@@ -200,7 +200,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![
                     f.decl(get_f64(k.e())),
                     when(
-                        eq(call("floor", vec![f.e()], f64()), f.e()),
+                        call("zl_float_is_int", vec![f.e()], boolean()),
                         vec![ret(call(
                             "zl_rawgeti",
                             vec![tb.e(), cast(f.e(), i64())],
@@ -372,7 +372,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                         vec![lua_error(text("table index is NaN"))],
                     ),
                     when(
-                        eq(call("floor", vec![f.e()], f64()), f.e()),
+                        call("zl_float_is_int", vec![f.e()], boolean()),
                         vec![
                             expr(call(
                                 "zl_rawseti",

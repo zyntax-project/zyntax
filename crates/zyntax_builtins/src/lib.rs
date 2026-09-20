@@ -50,6 +50,10 @@ pub struct Policy {
     /// after the hook, and the frontend checks for the pending exception
     /// after calling one; see [`Library::fallible`].
     pub exceptions: bool,
+    /// Whether a boolean equals the number it stands for, as in Python
+    /// (`True == 1`, one dict key), or is its own kind of value that
+    /// equals a boolean only, as in Lua.
+    pub bool_is_number: bool,
 }
 
 /// The names of the dynamic value kinds, as a language spells them.
@@ -328,6 +332,7 @@ mod tests {
             float_fraction: true,
             instance_hooks: false,
             exceptions: false,
+            bool_is_number: true,
             type_names: TypeNames {
                 none: "NoneType",
                 bool: "bool",

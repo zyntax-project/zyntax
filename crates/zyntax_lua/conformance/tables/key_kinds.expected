@@ -1,0 +1,7 @@
+zero	false	float one	true	float one
+big	huge	minus huge	inf	-inf	half
+alo	20	10	0	-3000	3000
+0
+false	key_kinds.lua:14: table index is NaN
+false	key_kinds.lua:15: table index is nil
+a	b	c

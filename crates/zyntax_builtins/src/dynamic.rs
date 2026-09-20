@@ -550,6 +550,22 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     ret(bool(false)),
                 ],
             ),
+            // A boolean beside a number: equal by value where the
+            // language counts a boolean as one, else never.
+            if policy.bool_is_number {
+                when(bool(false), vec![])
+            } else {
+                when(
+                    or(is(&ca, BOOL), is(&cb, BOOL)),
+                    vec![
+                        when(
+                            and(is(&ca, BOOL), is(&cb, BOOL)),
+                            vec![ret(eq(get_bool(a.e()), get_bool(b.e())))],
+                        ),
+                        ret(bool(false)),
+                    ],
+                )
+            },
             when(
                 and(is_number(ca.e()), is_number(cb.e())),
                 vec![
@@ -679,21 +695,42 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     let i = local("i", i64());
     // The hash of a float: an integral value hashes as the integer it
     // is, so it meets that integer in a table; anything else by its
-    // scaled bits.
+    // value scaled into the integers. A value is only ever converted
+    // where it fits, since the conversion traps otherwise.
     let fv = local("f", f64());
+    let within = |bound: f64| and(gt(fv.e(), float(-bound)), lt(fv.e(), float(bound)));
     d.push(define(
         "zb_hash_of_f64",
         &[&fv],
         i64(),
         vec![
             when(
-                and(
-                    eq(fv.e(), cast(cast(fv.e(), i64()), f64())),
-                    and(gt(fv.e(), float(-9.2e18)), lt(fv.e(), float(9.2e18))),
-                ),
-                vec![ret(cast(fv.e(), i64()))],
+                within(9.2e18),
+                vec![
+                    when(
+                        eq(fv.e(), cast(cast(fv.e(), i64()), f64())),
+                        vec![ret(cast(fv.e(), i64()))],
+                    ),
+                    when(
+                        within(8.0e12),
+                        vec![ret(cast(mul(fv.e(), float(1_048_576.0)), i64()))],
+                    ),
+                    ret(cast(fv.e(), i64())),
+                ],
             ),
-            ret(cast(mul(fv.e(), float(1_048_576.0)), i64())),
+            when(
+                within(8.0e37),
+                vec![ret(cast(
+                    div(fv.e(), float(9_223_372_036_854_775_808.0)),
+                    i64(),
+                ))],
+            ),
+            when(
+                within(1.0e300),
+                vec![ret(cast(div(fv.e(), float(1.0e282)), i64()))],
+            ),
+            // An infinity, a NaN or what is left.
+            ret(int(0x7ff0_0000_5a6e_0001)),
         ],
     ));
     // The hash of a string, never zero, which is what a string box

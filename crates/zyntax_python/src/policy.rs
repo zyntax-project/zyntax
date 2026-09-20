@@ -10,6 +10,7 @@ pub const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
     float_fraction: true,
     instance_hooks: true,
     exceptions: true,
+    bool_is_number: true,
     type_names: zyntax_builtins::TypeNames {
         none: "NoneType",
         bool: "bool",
