@@ -2585,19 +2585,14 @@ impl CraneliftBackend {
                     function_params
                 };
 
-                // Get HIR parameter value IDs sorted by parameter index
-                let mut param_value_ids = Vec::new();
+                // Map HIR params to Cranelift values by their index: a
+                // parameter nothing reads may have no value left, and
+                // the ones after it keep their places.
                 for value in function.values.values() {
-                    if let HirValueKind::Parameter(param_index) = value.kind {
-                        param_value_ids.push((param_index, value.id));
-                    }
-                }
-                param_value_ids.sort_by_key(|(index, _)| *index);
-
-                // Map HIR params to Cranelift values
-                for (i, (_, hir_value_id)) in param_value_ids.iter().enumerate() {
-                    if let Some(&cranelift_val) = function_params.get(i) {
-                        self.value_map.insert(*hir_value_id, cranelift_val);
+                    if let HirValueKind::Parameter(param_index) = value.kind
+                        && let Some(&cranelift_val) = function_params.get(param_index as usize)
+                    {
+                        self.value_map.insert(value.id, cranelift_val);
                     }
                 }
             }
