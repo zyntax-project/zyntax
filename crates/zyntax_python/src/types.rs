@@ -2058,6 +2058,7 @@ pub(crate) fn infer_module(
                         vars: &locals.vars,
                         class: item.class,
                         opaque: false,
+                        comp_vars: None,
                         passed: &mut passed,
                         allow_closure: false,
                         escaped: &mut escaped,
@@ -2089,6 +2090,7 @@ pub(crate) fn infer_module(
                     vars: &entry_locals.vars,
                     class: None,
                     opaque: false,
+                    comp_vars: None,
                     passed: &mut passed,
                     allow_closure: false,
                     escaped: &mut escaped,
@@ -2226,6 +2228,7 @@ pub(crate) fn infer_module(
                     vars: &locals.vars,
                     class: item.class,
                     opaque: false,
+                    comp_vars: None,
                     passed: &mut passed,
                     allow_closure: false,
                     escaped: &mut escaped,
@@ -2242,6 +2245,7 @@ pub(crate) fn infer_module(
             vars: &entry_locals.vars,
             class: None,
             opaque: false,
+            comp_vars: None,
             passed: &mut passed,
             allow_closure: false,
             escaped: &mut escaped,
@@ -2300,6 +2304,9 @@ pub(crate) fn infer_module(
 struct Calls<'a> {
     module: &'a Module,
     vars: &'a HashMap<String, Ty>,
+    /// Inside a comprehension: the body's variables with the
+    /// comprehension's own bound to what its iterables yield.
+    comp_vars: Option<HashMap<String, Ty>>,
     /// The class whose method this body is, for `super()`.
     class: Option<usize>,
     /// Inside a nested function or lambda, whose variables are not in
@@ -2416,9 +2423,18 @@ impl Calls<'_> {
     fn typer(&self) -> Typer<'_> {
         Typer {
             module: self.module,
-            vars: self.vars,
+            vars: self.comp_vars.as_ref().unwrap_or(self.vars),
             outer: &self.no_outer,
         }
+    }
+
+    /// Walk a comprehension with its variables bound: what it calls is
+    /// typed as the body's own calls are.
+    fn comprehension(&mut self, generators: &[py::Comprehension], walk: impl FnOnce(&mut Self)) {
+        let vars = self.typer().comprehension_vars(generators);
+        let was = self.comp_vars.replace(vars);
+        walk(self);
+        self.comp_vars = was;
     }
 
     /// The closure an expression is a value of, if inference knows. In a
@@ -2651,11 +2667,14 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
                     c.visit_expr(&l.body);
                 });
             }
-            // A comprehension's own variables are not in `vars`.
-            py::Expr::ListComp(_)
-            | py::Expr::SetComp(_)
-            | py::Expr::DictComp(_)
-            | py::Expr::Generator(_) => self.nested(|c| walk_expr(c, expr)),
+            // A comprehension's own variables are bound from its
+            // iterables for the walk of it.
+            py::Expr::ListComp(py::ExprListComp { generators, .. })
+            | py::Expr::SetComp(py::ExprSetComp { generators, .. })
+            | py::Expr::DictComp(py::ExprDictComp { generators, .. })
+            | py::Expr::Generator(py::ExprGenerator { generators, .. }) => {
+                self.comprehension(generators, |c| walk_expr(c, expr))
+            }
             _ => walk_expr(self, expr),
         }
     }
@@ -4432,7 +4451,10 @@ impl Typer<'_> {
     /// The variables in scope inside a comprehension: this scope's, with
     /// each generator's target bound to what one round of it yields,
     /// where a later generator sees the earlier targets.
-    fn comprehension_vars(&self, generators: &[py::Comprehension]) -> HashMap<String, Ty> {
+    pub(crate) fn comprehension_vars(
+        &self,
+        generators: &[py::Comprehension],
+    ) -> HashMap<String, Ty> {
         let mut vars = self.vars.clone();
         for g in generators {
             let item = Typer {
