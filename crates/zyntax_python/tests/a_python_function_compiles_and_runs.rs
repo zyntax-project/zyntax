@@ -111,7 +111,9 @@ def main() -> int:
 /// not a crash and not a silent mis-compile.
 #[test]
 fn an_unsupported_form_is_named() {
-    let err = zyntax_python::parse_program("async def f():\n    return 1\n")
+    // Reached from the module body: a function nothing reaches may use
+    // what the frontend lacks, as a Python that never runs it may.
+    let err = zyntax_python::parse_program("async def f():\n    return 1\nf()\n")
         .expect_err("an async def is not in the subset yet");
     let msg = err.to_string();
     assert!(

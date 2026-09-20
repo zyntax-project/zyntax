@@ -678,7 +678,59 @@ pub fn parse_program_with(
     // them can raise; the second time, a call to one that never does is
     // not followed by a check. Only the second lowering is kept.
     let unpack_shapes = shape::infer(&inferred, &items, &owned);
-    lower_items(&inferred, &items, &unpack_shapes)?;
+    // A module function nothing reaches from the module body is never
+    // run by the program, so what it writes need not compile: a Python
+    // that never runs it never minds. One that does compile is kept, for
+    // a host that calls it by name. Every class is kept whole, since the
+    // dispatchers over dynamic receivers name every method of every class.
+    let reached = reachable_functions(&owned, &items);
+    let mut dropped: HashSet<String> = HashSet::default();
+    let lower_all = |inferred: &types::Module,
+                     dropped: &mut HashSet<String>|
+     -> Result<Vec<TypedNode<TypedDeclaration>>> {
+        let mut out = Vec::new();
+        for item in &items {
+            if dropped.contains(&item.name) {
+                continue;
+            }
+            match lower_items(inferred, std::slice::from_ref(item), &unpack_shapes) {
+                Ok(d) => out.extend(d),
+                Err(_) if item.class.is_none() && !reached.contains(&item.name) => {
+                    dropped.insert(item.name.clone());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // What names a dropped function goes with it; nothing reached
+        // does, or it would have been reached itself.
+        loop {
+            let more: Vec<String> = items
+                .iter()
+                .filter(|i| i.class.is_none() && !reached.contains(&i.name))
+                .filter(|i| !dropped.contains(&i.name))
+                .filter(|i| reads_any_of(&i.def.body, dropped))
+                .map(|i| i.name.clone())
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            dropped.extend(more);
+        }
+        if !dropped.is_empty() && std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
+            let mut names: Vec<&String> = dropped.iter().collect();
+            names.sort();
+            eprintln!(
+                "[types] not compiled, unreached: {}",
+                names
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        Ok(out)
+    };
+    lower_all(&inferred, &mut dropped)?;
     let mut facts = inferred.raise_facts.take();
     classes::raise_facts(&inferred, &mut facts);
     inferred.non_raising = types::non_raising(&facts);
@@ -688,7 +740,13 @@ pub fn parse_program_with(
     inferred.attr_writes.take();
     inferred.dyn_methods.take();
     inferred.counter.set(inferred.closures.borrow().len());
-    declarations.extend(lower_items(&inferred, &items, &unpack_shapes)?);
+    let kept = lower_all(&inferred, &mut dropped)?;
+    declarations.extend(kept.into_iter().filter(|d| match &d.node {
+        TypedDeclaration::Function(f) => f.name.resolve_global().is_none_or(|n| {
+            !dropped.contains(&n) && !dropped.contains(n.trim_end_matches("$trusted"))
+        }),
+        _ => true,
+    }));
     // The module body is the entry even when it has no statements: a
     // program is built from its entry, and one without would have the
     // whole library built up front.
@@ -913,6 +971,102 @@ fn collect_imports(body: &[py::Stmt]) -> Result<(Imports, FromNames)> {
 
 /// The module-level names that are variables of the module rather than
 /// locals of its body: those a function reads or declares `global`.
+/// The module functions the module body reaches, through the names
+/// read in it, in the methods (every class is compiled), and in each
+/// function reached, transitively.
+fn reachable_functions(body: &[py::Stmt], items: &[types::Item<'_>]) -> HashSet<String> {
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+    #[derive(Default)]
+    struct Reads(HashSet<String>);
+    impl<'a> Visitor<'a> for Reads {
+        fn visit_stmt(&mut self, s: &'a py::Stmt) {
+            // A default is evaluated where the function is defined.
+            if let py::Stmt::FunctionDef(f) = s {
+                for p in f.parameters.iter_non_variadic_params() {
+                    if let Some(d) = &p.default {
+                        self.visit_expr(d);
+                    }
+                }
+            }
+            walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            if let py::Expr::Name(n) = e {
+                self.0.insert(n.id.to_string());
+            }
+            walk_expr(self, e);
+        }
+    }
+    let reads_of = |stmts: &[py::Stmt]| {
+        let mut r = Reads::default();
+        for s in stmts {
+            r.visit_stmt(s);
+        }
+        r.0
+    };
+    let functions: HashMap<&str, &types::Item<'_>> = items
+        .iter()
+        .filter(|i| i.class.is_none())
+        .map(|i| (i.name.as_str(), i))
+        .collect();
+    let mut pending: Vec<String> = reads_of(body).into_iter().collect();
+    for item in items.iter().filter(|i| i.class.is_some()) {
+        pending.extend(reads_of(&item.def.body));
+        for p in item.def.parameters.iter_non_variadic_params() {
+            if let Some(d) = &p.default {
+                let mut r = Reads::default();
+                r.visit_expr(d);
+                pending.extend(r.0);
+            }
+        }
+    }
+    let mut reached: HashSet<String> = HashSet::default();
+    while let Some(name) = pending.pop() {
+        let Some(item) = functions.get(name.as_str()) else {
+            continue;
+        };
+        if !reached.insert(name) {
+            continue;
+        }
+        pending.extend(reads_of(&item.def.body));
+        for p in item.def.parameters.iter_non_variadic_params() {
+            if let Some(d) = &p.default {
+                let mut r = Reads::default();
+                r.visit_expr(d);
+                pending.extend(r.0);
+            }
+        }
+    }
+    reached
+}
+
+/// Whether `body` reads any of `names`.
+fn reads_any_of(body: &[py::Stmt], names: &HashSet<String>) -> bool {
+    use ruff_python_ast::visitor::{Visitor, walk_expr};
+    struct Reads<'n> {
+        names: &'n HashSet<String>,
+        found: bool,
+    }
+    impl<'a> Visitor<'a> for Reads<'_> {
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            if let py::Expr::Name(n) = e
+                && self.names.contains(n.id.as_str())
+            {
+                self.found = true;
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut r = Reads {
+        names,
+        found: false,
+    };
+    for s in body {
+        r.visit_stmt(s);
+    }
+    r.found
+}
+
 fn module_globals(
     body: &[py::Stmt],
     defs: &[&py::StmtFunctionDef],
