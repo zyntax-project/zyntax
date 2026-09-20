@@ -883,7 +883,7 @@ fn query_stack_top() -> usize {
 #[cfg(windows)]
 fn query_stack_top() -> usize {
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize);
     }
     let (mut low, mut high) = (0usize, 0usize);
