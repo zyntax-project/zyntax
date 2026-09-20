@@ -345,13 +345,20 @@ pub const BUILTINS: &[Builtin] = &[
         name: "require",
         func: "zl_require",
         params: &[Str],
-        ret: Ret::Any,
+        ret: Ret::Multi,
     },
     Builtin {
         lib: "package",
         name: "searchpath",
         func: "zl_package_searchpath",
         params: &[Str, Str, OptStr("."), OptStr("/")],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "package",
+        name: "loadlib",
+        func: "zl_package_loadlib",
+        params: &[Str, Str],
         ret: Ret::Multi,
     },
     // ─── debug: what a program can be told without a debugger ───
@@ -3175,6 +3182,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ],
                 unit(),
             )));
+            // The searchers are built in; the table is there for a
+            // program to check or replace, and must stay a table.
+            st.push(expr(call(
+                "zl_rawset_str",
+                vec![
+                    tb.e(),
+                    text("searchers"),
+                    box_table(call("zl_table_new", vec![], table.clone())),
+                ],
+                unit(),
+            )));
         }
         st.push(ret(cached()));
         d.push(define(&lib_table_fn(lib), &[], any(), st));
@@ -3739,6 +3757,38 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     // program's own files, compiled with it), or a file along
     // `package.path`.
     let name = kept("name", string());
+    // A loader found, called with the name and `data`; the module it
+    // gives is entered and returned with the data.
+    let loader_run = |data: Expr| {
+        vec![
+            path.decl(data),
+            y.set(call(
+                "zl_first",
+                vec![call(
+                    "zl_call_2",
+                    vec![handler.e(), box_str(name.e()), box_str(path.e())],
+                    any(),
+                )],
+                any(),
+            )),
+            when(not(is_nil(pending())), vec![ret(nil())]),
+            when(is_nil(y.e()), vec![y.set(box_bool(bool(true)))]),
+            expr(call(
+                "zl_rawset_str",
+                vec![
+                    unbox_table(call("zl_package_loaded", vec![], any()), t),
+                    name.e(),
+                    y.e(),
+                ],
+                unit(),
+            )),
+            ret(call(
+                "zb_box_tuple",
+                vec![list(vec![y.e(), box_str(path.e())], anys.clone())],
+                any(),
+            )),
+        ]
+    };
     d.push(define(
         "zl_require",
         &[&name],
@@ -3749,50 +3799,51 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 vec![call("zl_package_loaded", vec![], any()), box_str(name.e())],
                 any(),
             )),
-            when(not(is_nil(y.e())), vec![ret(y.e())]),
-            // A loader in `package.preload`: what it returns is the
+            // Loaded already: the value alone. Loaded now: the value
+            // and what the loader was given, the file it came from.
+            when(
+                call("zl_truthy", vec![y.e()], boolean()),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(vec![y.e()], anys.clone())],
+                    any(),
+                ))],
+            ),
+            when(
+                not(is_table(call(
+                    "zl_index",
+                    vec![
+                        call(&lib_table_fn("package"), vec![], any()),
+                        box_str(text("searchers")),
+                    ],
+                    any(),
+                ))),
+                vec![lua_error(text("'package.searchers' must be a table"))],
+            ),
+            // One of the program's own files, entered before it ran: the
+            // loader sees the name and the file, `./name.lua` under the
+            // program's directory. Then a loader in `package.preload`,
+            // which sees `:preload:`. What either returns is the
             // module, or true when it returns nothing.
             handler.decl(call(
                 "zl_index",
-                vec![call("zl_package_preload", vec![], any()), box_str(name.e())],
+                vec![call("zl_static_modules", vec![], any()), box_str(name.e())],
                 any(),
             )),
             when(
                 not(is_nil(handler.e())),
-                vec![
-                    // The loader sees the name and the file it was found
-                    // as, `./name.lua` under the program's own directory.
-                    y.set(call(
-                        "zl_first",
-                        vec![call(
-                            "zl_call_2",
-                            vec![
-                                handler.e(),
-                                box_str(name.e()),
-                                box_str(concat(vec![
-                                    text("./"),
-                                    call("zl_module_path", vec![name.e()], string()),
-                                    text(".lua"),
-                                ])),
-                            ],
-                            any(),
-                        )],
-                        any(),
-                    )),
-                    when(not(is_nil(pending())), vec![ret(nil())]),
-                    when(is_nil(y.e()), vec![y.set(box_bool(bool(true)))]),
-                    expr(call(
-                        "zl_rawset_str",
-                        vec![
-                            unbox_table(call("zl_package_loaded", vec![], any()), t),
-                            name.e(),
-                            y.e(),
-                        ],
-                        unit(),
-                    )),
-                    ret(y.e()),
-                ],
+                loader_run(concat(vec![
+                    text("./"),
+                    call("zl_module_path", vec![name.e()], string()),
+                    text(".lua"),
+                ])),
             ),
+            handler.set(call(
+                "zl_index",
+                vec![call("zl_package_preload", vec![], any()), box_str(name.e())],
+                any(),
+            )),
+            when(not(is_nil(handler.e())), loader_run(text(":preload:"))),
             // A file along `package.path`, compiled now and run as the
             // loader with the name and its file.
             handler.decl(call(
@@ -3829,16 +3880,67 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ],
                 string(),
             )),
+            // Not there: `package.cpath` is searched as well, for the
+            // message's sake; a C module found cannot be loaded here.
             when(
                 eq(path.e(), null(string())),
-                vec![lua_error(concat(vec![
-                    text("module '"),
-                    name.e(),
-                    text("' not found:\n\tno field package.preload['"),
-                    name.e(),
-                    text("']\n\t"),
-                    call("zl_load_error", vec![], string()),
-                ]))],
+                vec![
+                    acc.decl(call("zl_load_error", vec![], string())),
+                    handler.set(call(
+                        "zl_index",
+                        vec![
+                            call(&lib_table_fn("package"), vec![], any()),
+                            box_str(text("cpath")),
+                        ],
+                        any(),
+                    )),
+                    when(
+                        or(
+                            is_nil(handler.e()),
+                            and(
+                                ne(category(handler.e()), int(STR)),
+                                and(
+                                    ne(category(handler.e()), int(INT)),
+                                    and(
+                                        ne(category(handler.e()), int(UINT)),
+                                        ne(category(handler.e()), int(FLOAT)),
+                                    ),
+                                ),
+                            ),
+                        ),
+                        vec![lua_error(text("'package.cpath' must be a string"))],
+                    ),
+                    path.set(call(
+                        "zl_searchpath",
+                        vec![
+                            name.e(),
+                            call("zl_arg_str", vec![handler.e(), text("")], string()),
+                            text("."),
+                            text("/"),
+                        ],
+                        string(),
+                    )),
+                    when(
+                        ne(path.e(), null(string())),
+                        vec![lua_error(concat(vec![
+                            text("error loading module '"),
+                            name.e(),
+                            text("' from file '"),
+                            path.e(),
+                            text("':\n\tC modules cannot be loaded"),
+                        ]))],
+                    ),
+                    lua_error(concat(vec![
+                        text("module '"),
+                        name.e(),
+                        text("' not found:\n\tno field package.preload['"),
+                        name.e(),
+                        text("']\n\t"),
+                        acc.e(),
+                        text("\n\t"),
+                        call("zl_load_error", vec![], string()),
+                    ])),
+                ],
             ),
             s.decl(call("zl_read_file", vec![path.e()], string())),
             when(
@@ -3894,8 +3996,33 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ],
                 unit(),
             )),
-            ret(y.e()),
+            ret(call(
+                "zb_box_tuple",
+                vec![list(vec![y.e(), box_str(path.e())], anys.clone())],
+                any(),
+            )),
         ],
+    ));
+    // `package.loadlib(path, name)`: no C library can be loaded here,
+    // which is told the way a build without dynamic libraries tells it.
+    d.push(define(
+        "zl_package_loadlib",
+        &[&path, &name],
+        any(),
+        vec![ret(call(
+            "zb_box_tuple",
+            vec![list(
+                vec![
+                    nil(),
+                    box_str(text(
+                        "dynamic libraries not enabled; check your Lua installation",
+                    )),
+                    box_str(text("absent")),
+                ],
+                anys.clone(),
+            )],
+            any(),
+        ))],
     ));
     // `package.searchpath(name, path [, sep [, rep]])`: the file found,
     // or nil and the list of files tried.
@@ -3954,6 +4081,24 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         string(),
         vec![ret(call("zl_buf_replace_dots", vec![name.e()], string()))],
     ));
+    // The program's own files as loaders, apart from `package.preload`
+    // so a program sees only what it put there.
+    d.push(global_var("zl_static", any()));
+    d.push(define(
+        "zl_static_modules",
+        &[],
+        any(),
+        vec![
+            when(
+                is_nil(cached("zl_static")),
+                vec![assign_global(
+                    "zl_static",
+                    box_table(call("zl_table_new", vec![], table.clone())),
+                )],
+            ),
+            ret(cached("zl_static")),
+        ],
+    ));
     d.push(define(
         "zl_preload_module",
         &[&name, &x],
@@ -3962,7 +4107,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             expr(call(
                 "zl_rawset_str",
                 vec![
-                    unbox_table(call("zl_package_preload", vec![], any()), t),
+                    unbox_table(call("zl_static_modules", vec![], any()), t),
                     name.e(),
                     x.e(),
                 ],

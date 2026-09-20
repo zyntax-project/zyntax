@@ -1,0 +1,22 @@
+m1	true	m1
+1	true
+false	2
+2
+false	module 'nothing' not found:
+	no field package.preload['nothing']
+	no file '<dir>_nothing.lua'
+	no file '<dir>_nothing.so'
+	no file '<dir>_nothing/init'
+pl	:preload:	:preload:
+nil	table
+false	'package.searchers' must be a table
+false	'package.path' must be a string
+module 'm3' not found:
+	no field package.preload['m3']
+	no file '<dir>_m3.lua'
+	no file '7'
+3
+nil	no file 'a/xuxu.lua'
+	no file 'b/xuxu/init.lua'
+	no file ''
+	no file ''

@@ -5281,8 +5281,13 @@ pub(crate) fn program(
     let started = std::time::Instant::now();
     let mut scopes = crate::scope::resolve(ast);
     let (mut loaded, all_found) = load_required(&scopes.requires, file)?;
-    // Files share their globals through the table.
-    if !loaded.is_empty() {
+    // Files share their globals through the table, as does code run
+    // at run time, which may write any global the program reads.
+    let shared = !loaded.is_empty()
+        || !all_found
+        || scopes.dynamic_code
+        || loaded.iter().any(|m| m.scopes.dynamic_code);
+    if shared {
         scopes.dynamic_globals = true;
         for m in &mut loaded {
             m.scopes.dynamic_globals = true;

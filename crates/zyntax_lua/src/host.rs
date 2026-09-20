@@ -1705,8 +1705,10 @@ extern "C" fn host_searchpath(
     } else {
         replace_all(name, sep, rep)
     };
+    // Every piece between separators is a template, the empty ones
+    // included: the reference tries and reports them like any other.
     let mut tried = Vec::new();
-    for template in path.split(|&b| b == b';').filter(|t| !t.is_empty()) {
+    for template in path.split(|&b| b == b';') {
         let filename = replace_all(template, b"?", &name);
         let text = String::from_utf8_lossy(&filename).into_owned();
         if std::fs::File::open(&text).is_ok() {
