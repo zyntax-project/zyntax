@@ -577,6 +577,8 @@ pub(crate) struct Module {
     /// The module's classes, bases before subclasses.
     pub(crate) classes: Vec<ClassInfo>,
     pub(crate) class_index: HashMap<String, usize>,
+    /// The attributes the classes declare (`class C: X = 1`, `C.X = v`).
+    pub(crate) class_attrs: std::sync::Arc<crate::class_attrs::ClassAttrs>,
     /// Attribute names read and written on dynamic receivers, and
     /// methods called on them with an argument count: each needs a
     /// dispatcher over the classes that have it.
@@ -1422,6 +1424,39 @@ impl Module {
             .map(|i| (i, self.classes[k].fields[i].1))
     }
 
+    /// The class attribute `name` as class `k` sees it, when `k` has no
+    /// field of that name.
+    pub(crate) fn class_attr(
+        &self,
+        k: usize,
+        name: &str,
+    ) -> Option<&crate::class_attrs::ClassAttr> {
+        if self.field(k, name).is_some() {
+            return None;
+        }
+        let bases: Vec<Option<usize>> = self.classes.iter().map(|c| c.base).collect();
+        self.class_attrs.lookup(&bases, k, name)
+    }
+
+    /// The type a class attribute has here: its constant's, else its
+    /// module variable's.
+    pub(crate) fn class_attr_ty(&self, attr: &crate::class_attrs::ClassAttr) -> Ty {
+        match &attr.constant {
+            Some(c) => c.ty(),
+            None => self
+                .globals
+                .get(&attr.global)
+                .copied()
+                .unwrap_or(Ty::Unknown),
+        }
+    }
+
+    /// The class `e` names, as a call of the name would construct: a
+    /// class's name is the class wherever it is written.
+    pub(crate) fn class_of_expr(&self, e: &py::Expr) -> Option<usize> {
+        crate::class_attrs::class_named(&self.class_index, e)
+    }
+
     /// The class in `k`'s chain that defines `method`, nearest first.
     pub(crate) fn method_owner(&self, k: usize, method: &str) -> Option<usize> {
         let mut at = Some(k);
@@ -1831,6 +1866,7 @@ pub(crate) fn infer_module(
         list_type: known.list_type,
         classes: known.classes.clone(),
         class_index: known.class_index.clone(),
+        class_attrs: known.class_attrs.clone(),
         closed: known.closed.clone(),
         closures: std::cell::RefCell::new(closures),
         closure_index: known.closure_index.clone(),
@@ -2487,6 +2523,21 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
                 }
                 self.nested(|c| c.visit_body(&f.body));
             }
+            // A module class's methods are items, visited as such; only
+            // what its body declares is evaluated here.
+            py::Stmt::ClassDef(c) if self.module.class_index.contains_key(c.name.as_str()) => {
+                for s in &c.body {
+                    match s {
+                        py::Stmt::Assign(a) => self.visit_expr(&a.value),
+                        py::Stmt::AnnAssign(a) => {
+                            if let Some(v) = &a.value {
+                                self.visit_expr(v);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             py::Stmt::ClassDef(c) => self.nested(|v| v.visit_body(&c.body)),
             // `raise C`: the class is called with nothing.
             py::Stmt::Raise(r) => {
@@ -2756,6 +2807,15 @@ fn infer_locals_with(
     let scope = crate::scope::Scope::of_body(Vec::new(), body);
     for name in &scope.globals {
         locals.global_writes.insert(name.clone(), Ty::Unknown);
+    }
+    if !module.class_attrs.is_empty() {
+        for (k, name) in class_attr_writes(&module.class_index, body) {
+            if let Some(attr) = module.class_attr(k, &name) {
+                locals
+                    .global_writes
+                    .insert(attr.global.clone(), Ty::Unknown);
+            }
+        }
     }
     for name in &scope.nonlocals {
         locals.nonlocal_writes.insert(name.clone(), Ty::Unknown);
@@ -3793,6 +3853,13 @@ impl Walker<'_> {
                 self.locals.field_writes.insert(a.attr.to_string(), joined);
                 self.field_write(a, ty);
             }
+            // `C.X = v`: the class attribute's module variable.
+            py::Expr::Attribute(a) if let Some(k) = self.module.class_of_expr(&a.value) => {
+                if let Some(attr) = self.module.class_attr(k, a.attr.as_str()) {
+                    let global = attr.global.clone();
+                    self.assign(&global, ty);
+                }
+            }
             py::Expr::Attribute(a) => self.field_write(a, ty),
             // `d[k] = v` on a dict held by a name widens the dict's keys
             // by the key's type and its values by the value's.
@@ -3981,7 +4048,28 @@ impl Walker<'_> {
                     .unwrap_or(Ty::Object);
                 self.assign(f.name.as_str(), ty)
             }
-            py::Stmt::ClassDef(c) => self.assign(c.name.as_str(), Ty::Object),
+            // A class of the module is not a variable: its name is the
+            // class wherever it is written. What its body declares and
+            // does not fix is written to its module variable here.
+            py::Stmt::ClassDef(c) => {
+                let Some(&k) = self.module.class_index.get(c.name.as_str()) else {
+                    self.assign(c.name.as_str(), Ty::Object);
+                    return;
+                };
+                if let Ok(declared) = crate::class_attrs::declared_in(c) {
+                    for d in declared {
+                        let Some(attr) = self.module.class_attr(k, &d.name) else {
+                            continue;
+                        };
+                        if attr.constant.is_some() {
+                            continue;
+                        }
+                        let global = attr.global.clone();
+                        let ty = self.expr(d.value);
+                        self.assign(&global, ty);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -4046,6 +4134,67 @@ pub(crate) fn unpacked(ty: Ty, targets: &[py::Expr]) -> Vec<Ty> {
         _ => Ty::Object,
     };
     vec![each; targets.len()]
+}
+
+/// Whether `body` stores to a class attribute, `C.X = v`, which makes
+/// the function a writer of the module variable behind it.
+pub(crate) fn writes_class_attrs(class_index: &HashMap<String, usize>, body: &[py::Stmt]) -> bool {
+    !class_attr_writes(class_index, body).is_empty()
+}
+
+/// The classes and attribute names `body` stores to as `C.X = v`.
+pub(crate) fn class_attr_writes(
+    class_index: &HashMap<String, usize>,
+    body: &[py::Stmt],
+) -> Vec<(usize, String)> {
+    use py::visitor::{Visitor, walk_expr, walk_stmt};
+    struct Finder<'a> {
+        classes: &'a HashMap<String, usize>,
+        found: Vec<(usize, String)>,
+    }
+    impl Finder<'_> {
+        fn target(&mut self, t: &py::Expr) {
+            match t {
+                py::Expr::Attribute(a) => {
+                    if let Some(k) = crate::class_attrs::class_named(self.classes, &a.value) {
+                        self.found.push((k, a.attr.to_string()));
+                    }
+                }
+                py::Expr::Tuple(t) => t.elts.iter().for_each(|e| self.target(e)),
+                py::Expr::List(l) => l.elts.iter().for_each(|e| self.target(e)),
+                py::Expr::Starred(s) => self.target(&s.value),
+                _ => {}
+            }
+        }
+    }
+    impl<'a> Visitor<'a> for Finder<'_> {
+        fn visit_stmt(&mut self, s: &'a py::Stmt) {
+            match s {
+                py::Stmt::Assign(a) => a.targets.iter().for_each(|t| self.target(t)),
+                py::Stmt::AugAssign(a) => self.target(&a.target),
+                py::Stmt::AnnAssign(a) => self.target(&a.target),
+                py::Stmt::For(f) => self.target(&f.target),
+                // A nested function's stores are its own.
+                py::Stmt::FunctionDef(_) => return,
+                _ => {}
+            }
+            walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            if let py::Expr::Named(n) = e {
+                self.target(&n.target);
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut f = Finder {
+        classes: class_index,
+        found: Vec::new(),
+    };
+    for s in body {
+        f.visit_stmt(s);
+    }
+    f.found
 }
 
 pub(crate) fn is_name(e: &py::Expr, name: &str) -> bool {
@@ -4416,11 +4565,22 @@ impl Typer<'_> {
                         return Ty::Bound(k);
                     }
                 }
+                if let Some(k) = self.module.class_of_expr(&a.value) {
+                    return match self.module.class_attr(k, a.attr.as_str()) {
+                        Some(attr) => self.module.class_attr_ty(attr),
+                        None => Ty::Object,
+                    };
+                }
                 match self.expr(&a.value) {
                     Ty::Class(k) => self
                         .module
                         .field(k as usize, a.attr.as_str())
                         .map(|(_, ty)| ty)
+                        .or_else(|| {
+                            self.module
+                                .class_attr(k as usize, a.attr.as_str())
+                                .map(|attr| self.module.class_attr_ty(attr))
+                        })
                         .unwrap_or(if self.module.settled.get() {
                             Ty::Object
                         } else {

@@ -244,6 +244,7 @@ impl Qualifier {
     fn new(prefix: Option<&str>, module_scope: &Scope, imports: UserImports) -> Self {
         let mut module_names = module_scope.bound.clone();
         module_names.extend(module_scope.declared_globals());
+        module_names.extend(module_scope.classes.iter().cloned());
         Self {
             prefix: prefix.map(str::to_string),
             module_names,
