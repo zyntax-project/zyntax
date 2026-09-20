@@ -2562,6 +2562,7 @@ impl TieredBackend {
         let queue_cell = Arc::clone(&queue_for_callees);
         let bead_of: HashMap<HirId, u64> =
             by_bead.iter().map(|(b, (id, _, _))| (*id, *b)).collect();
+        let published = Arc::clone(&done);
         let compile_lazy_function = move |bead_id: u64| -> *const u8 {
             let trace = std::env::var_os("ZYNTAX_TRACE_LAZY").is_some();
             {
@@ -2690,6 +2691,15 @@ impl TieredBackend {
         // ask for. `ZYNTAX_DISABLE_WARM_UP=1` leaves every compile to the
         // asking thread; safe to run with.
         if std::env::var_os("ZYNTAX_DISABLE_WARM_UP").is_none() {
+            // A compile after the first retires the worker before it,
+            // which served the module as it then was: told to stop and
+            // woken, it leaves on its own.
+            if let Some(queue) = self.compile_queue.take() {
+                self.warm_up_stop
+                    .store(true, std::sync::atomic::Ordering::Release);
+                queue.wake();
+                self.warm_up_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            }
             let compile = Arc::clone(&compile_lazy_function);
             let stop = Arc::clone(&self.warm_up_stop);
             let queue = Arc::new(CompileQueue::new(Arc::clone(&stop)));
@@ -2743,8 +2753,14 @@ impl TieredBackend {
 
         // The stub runs on whatever stack the first call was made from,
         // which may be a fiber's, far too small for a compile. The
-        // compile runs on a thread with room and the caller waits.
+        // compile runs on a thread with room and the caller waits. A
+        // pointer taken before the entry was published reaches the
+        // stub again: the entry is answered from the table then, with
+        // no thread.
         osr::set_lazy_compiler(move |bead_id| {
+            if let Some(Some(entry)) = published.0.lock().unwrap().get(&bead_id) {
+                return *entry as *const u8;
+            }
             std::thread::scope(|scope| {
                 std::thread::Builder::new()
                     .name("zyntax-first-call-compile".into())
