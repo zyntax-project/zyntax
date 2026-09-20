@@ -83,6 +83,10 @@ pub enum Binding {
     Local(VarId),
     Upvalue(VarId),
     Global(String),
+    /// A free name in the scope of a variable named `_ENV`: the field
+    /// of that variable, whatever it holds; the flag says the variable
+    /// is an upvalue at this use.
+    Field(VarId, String, bool),
 }
 
 #[derive(Default, Debug)]
@@ -196,6 +200,7 @@ impl Scopes {
         match binding {
             Binding::Local(v) | Binding::Upvalue(v) => self.known_local_function(*v),
             Binding::Global(name) => self.known_global_function(name),
+            Binding::Field(..) => None,
         }
     }
 }
@@ -222,7 +227,7 @@ fn global_table_member(w: &Walker, v: &ast::VarExpression) -> Option<String> {
         return None;
     };
     let g = name_of(token);
-    if !Scopes::is_globals_name(&g) || w.shadowed(&g) {
+    if !Scopes::is_globals_name(&g) || w.shadowed(&g) || w.shadowed("_ENV") {
         return None;
     }
     let suffixes: Vec<&Suffix> = v.suffixes().collect();
@@ -373,8 +378,17 @@ impl Walker {
                 }
             }
         }
-        // `_ENV` not declared as a local is the environment itself,
-        // which the lowering reads as the globals table.
+        // A free name where a variable named `_ENV` is visible is a
+        // field of it; `_ENV` not declared as a local is the
+        // environment itself, which the lowering reads as the globals
+        // table.
+        if name != "_ENV" && self.shadowed("_ENV") {
+            match self.lookup("_ENV") {
+                Binding::Local(id) => return Binding::Field(id, name.to_string(), false),
+                Binding::Upvalue(id) => return Binding::Field(id, name.to_string(), true),
+                _ => {}
+            }
+        }
         self.out.globals.insert(name.to_string());
         Binding::Global(name.to_string())
     }
@@ -430,6 +444,7 @@ impl Walker {
                 }
                 self.global_write(name.clone());
             }
+            Binding::Field(..) => {}
         }
         self.out.names.insert(pos_of(token), binding);
     }
@@ -531,6 +546,7 @@ impl Walker {
                         Binding::Local(v) | Binding::Upvalue(v) => {
                             self.out.vars[v.0 as usize].assigned = true;
                         }
+                        Binding::Field(..) => {}
                     }
                     self.out.names.insert(pos_of(token), binding.clone());
                     let id = self.function(f.body(), is_method, fname.clone());
@@ -541,9 +557,10 @@ impl Walker {
                             self.out.global_functions.insert(name.clone(), id);
                             self.out.funcs[id.0 as usize].top_level = true;
                         }
-                        // Assigned to a variable declared elsewhere, the
-                        // function is a value: nothing knows its callers.
-                        Binding::Local(_) | Binding::Upvalue(_) => {
+                        // Assigned to a variable declared elsewhere, or
+                        // stored in an environment, the function is a
+                        // value: nothing knows its callers.
+                        Binding::Local(_) | Binding::Upvalue(_) | Binding::Field(..) => {
                             self.out.funcs[id.0 as usize].escapes = true;
                         }
                         Binding::Global(_) => {}

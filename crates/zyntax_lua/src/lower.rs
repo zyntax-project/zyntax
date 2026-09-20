@@ -1236,6 +1236,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         })
     }
 
+    /// The `_ENV` a free name is a field of, described as the variable
+    /// it is at the use: what an index error on it names.
+    fn env_var_desc(upvalue: bool) -> Desc {
+        Some(if upvalue {
+            "upvalue '_ENV'".to_string()
+        } else {
+            "local '_ENV'".to_string()
+        })
+    }
+
     fn describe(&self, e: &Expression) -> Desc {
         match e {
             Expression::Var(Var::Name(token)) => self.describe_name(token),
@@ -1349,6 +1359,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     /// Store into a variable.
+    /// `name = v` where `name` is a field of a local or upvalue `_ENV`.
+    fn write_field(&mut self, env: VarId, name: &str, upvalue: bool, value: Val, span: Span) -> St {
+        let obj = self.read_var(env, span);
+        let key = Val {
+            node: str_lit(name, span),
+            ty: Ty::Str,
+        };
+        self.index_write(obj, key, value, Self::env_var_desc(upvalue), span)
+    }
+
     fn write_var(&mut self, v: VarId, value: Val, span: Span) -> St {
         match self.storage_of(v) {
             Storage::Local(name, ty) | Storage::Module(name, ty) => {
@@ -1397,6 +1417,14 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         match binding {
             Binding::Local(v) | Binding::Upvalue(v) => Ok(self.read_var(v, span)),
             Binding::Global(name) => self.read_global(&name, span),
+            Binding::Field(v, name, upvalue) => {
+                let env = self.read_var(v, span);
+                let key = Val {
+                    node: str_lit(&name, span),
+                    ty: Ty::Str,
+                };
+                Ok(self.index_read(env, key, Self::env_var_desc(upvalue), span))
+            }
         }
     }
 
@@ -3700,6 +3728,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     let st = match binding {
                         Binding::Local(v) | Binding::Upvalue(v) => self.write_var(v, record, span),
                         Binding::Global(name) => self.write_global(&name, record, span)?,
+                        Binding::Field(v, name, upvalue) => {
+                            self.write_field(v, &name, upvalue, record, span)
+                        }
                     };
                     out.push(st);
                     return Ok(());
@@ -3778,6 +3809,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         Ok(self.write_var(id, v, span))
                     }
                     Binding::Global(name) => self.write_global(&name, v, span),
+                    Binding::Field(id, name, upvalue) => {
+                        Ok(self.write_field(id, &name, upvalue, v, span))
+                    }
                 }
             }
             Var::Expression(ve) => {

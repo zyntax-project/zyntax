@@ -205,7 +205,7 @@ impl<'a> Typer<'a> {
                 self.known.var(*v)
             }
             Some(Binding::Global(name)) => self.global_ty(name),
-            None => Ty::Any,
+            Some(Binding::Field(..)) | None => Ty::Any,
         }
     }
 
@@ -589,6 +589,7 @@ impl<'a> Round<'a> {
                 let joined = self.out.global(name).join(ty);
                 self.out.globals.insert(name.clone(), joined);
             }
+            Binding::Field(..) => {}
         }
     }
 

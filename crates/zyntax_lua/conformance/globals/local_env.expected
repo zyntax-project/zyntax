@@ -1,0 +1,20 @@
+env x
+written
+5	5
+global x	nil
+1	2	2	stored in the env	nil
+false	local_env.lua:25: attempt to index a number value (upvalue '_ENV')
+false	local_env.lua:26: attempt to index a number value (upvalue '_ENV')
+local_env.lua:28: attempt to index a nil value (local '_ENV')
+local_env.lua:29: attempt to index a nil value (local '_ENV')
+true	false	nil
+x
+true	nil
+not the globals	not the globals
+changed
+table
+outer
+inner
+outer
+a!	b!
+a	b	3
