@@ -4831,12 +4831,32 @@ impl<'ctx> LLVMBackend<'ctx> {
                     }
                 }
             }
-            HirCallable::FuncRef(_) => Err(CompilerError::CodeGen(
-                "HirCallable::FuncRef is not callable directly — \
-                 use it only as a value (function address); for calls go \
-                 through Indirect"
-                    .to_string(),
-            )),
+            // A function's address as a value: the function's own when
+            // it is in this module, else its current entry read from
+            // its cell, as a call across tiers reads it.
+            HirCallable::FuncRef(func_id) => {
+                let i64t = self.context.i64_type();
+                if let Some(function) = self.functions.get(func_id) {
+                    let address = function.as_global_value().as_pointer_value();
+                    return Ok(self
+                        .builder
+                        .build_ptr_to_int(address, i64t, "func_addr")?
+                        .into());
+                }
+                let Some(callee) = self.cross_tier.get(func_id) else {
+                    return Err(CompilerError::CodeGen(format!(
+                        "the address of {:?} is taken, but it is neither in this module nor reachable across tiers",
+                        func_id
+                    )));
+                };
+                let ptr_ty = self.context.i8_type().ptr_type(AddressSpace::default());
+                let cell = self.builder.build_int_to_ptr(
+                    i64t.const_int(callee.cell as u64, false),
+                    ptr_ty,
+                    "cell",
+                )?;
+                Ok(self.builder.build_load(i64t, cell, "entry")?)
+            }
         }
     }
 
