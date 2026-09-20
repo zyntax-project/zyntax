@@ -16,6 +16,7 @@ pub const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
         int: "int",
         float: "float",
         str: "str",
+        bytes: "bytes",
         list: "list",
         tuple: "tuple",
         dict: "dict",

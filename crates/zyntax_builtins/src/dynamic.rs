@@ -5,6 +5,7 @@
 //! category and then does what the typed code does.
 
 use crate::build::*;
+use crate::bytes::BYTES;
 use crate::{DICT_TAG, FUNC_TAG, INSTANCE_KIND_BASE, Kind, Policy, SET_TAG, TUPLE_TAG, list_of};
 use zyntax_typed_ast::TypeId;
 
@@ -40,6 +41,9 @@ fn box_f64(v: Expr) -> Expr {
 }
 fn box_str(v: Expr) -> Expr {
     call("zb_box_str", vec![v], any())
+}
+fn box_bytes(v: Expr) -> Expr {
+    call("zb_box_bytes", vec![v], any())
 }
 fn get_i64(x: Expr) -> Expr {
     call("zb_box_get_i64", vec![x], i64())
@@ -347,6 +351,16 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         i64(),
         vec![ret(bitand(tag(x.e()), int(255)))],
     ));
+    // Whether the box holds an instance of a frontend class.
+    d.push(define(
+        "zb_any_is_instance",
+        &[&x],
+        boolean(),
+        vec![ret(and(
+            eq(category(x.e()), int(CUSTOM)),
+            is_instance(x.e()),
+        ))],
+    ));
     d.push(define(
         "zb_any_kind",
         &[&x],
@@ -427,6 +441,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(is_int(&cat), vec![ret(text(names.int))]),
             when(is(&cat, FLOAT), vec![ret(text(names.float))]),
             when(is(&cat, STR), vec![ret(text(names.str))]),
+            when(is(&cat, BYTES), vec![ret(text(names.bytes))]),
             when(
                 is(&cat, CUSTOM),
                 vec![
@@ -472,6 +487,13 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![ret(call("zb_str_truthy", vec![get_str(x.e())], boolean()))],
             ),
             when(
+                is(&cat, BYTES),
+                vec![ret(ne(
+                    call("zb_str_len", vec![get_str(x.e())], i64()),
+                    int(0),
+                ))],
+            ),
+            when(
                 and(
                     is(&cat, CUSTOM),
                     and(ne(kind(x.e()), int(FUNC_TAG >> 8)), not(is_instance(x.e()))),
@@ -501,6 +523,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![ret(call("zb_float_repr", vec![get_f64(x.e())], string()))],
             ),
             when(is(&cat, STR), vec![ret(get_str(x.e()))]),
+            when(
+                is(&cat, BYTES),
+                vec![ret(call("zb_bytes_repr", vec![get_str(x.e())], string()))],
+            ),
             when(
                 is(&cat, CUSTOM),
                 vec![ret(call("zb_seq_repr_any", vec![x.e()], string()))],
@@ -546,6 +572,19 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     when(
                         and(is(&ca, STR), is(&cb, STR)),
                         vec![ret(str_eq(get_str(a.e()), get_str(b.e())))],
+                    ),
+                    ret(bool(false)),
+                ],
+            ),
+            when(
+                or(is(&ca, BYTES), is(&cb, BYTES)),
+                vec![
+                    when(
+                        and(is(&ca, BYTES), is(&cb, BYTES)),
+                        vec![ret(ne(
+                            call("zb_bytes_eq", vec![get_str(a.e()), get_str(b.e())], i32()),
+                            int32(0),
+                        ))],
                     ),
                     ret(bool(false)),
                 ],
@@ -717,6 +756,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     expr(call("zb_box_set_hash", vec![x.e(), h.e()], unit())),
                     ret(h.e()),
                 ],
+            ),
+            when(
+                is(&cat, BYTES),
+                vec![ret(call("zb_bytes_hash", vec![get_str(x.e())], i64()))],
             ),
             when(
                 is_instance(x.e()),
@@ -940,6 +983,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![ret(call("zb_str_chars_len", vec![get_str(x.e())], i64()))],
             ),
             when(
+                is(&cat, BYTES),
+                vec![ret(call("zb_str_len", vec![get_str(x.e())], i64()))],
+            ),
+            when(
                 and(is(&cat, CUSTOM), not(is_instance(x.e()))),
                 vec![ret(call("zb_seq_len_any", vec![x.e()], i64()))],
             ),
@@ -1108,6 +1155,26 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 and(and(is(&ca, STR), is(&cb, STR)), eq(code.e(), int(0))),
                 vec![ret(box_str(add(get_str(a.e()), get_str(b.e()))))],
+            ),
+            when(
+                and(and(is(&ca, BYTES), is(&cb, BYTES)), eq(code.e(), int(0))),
+                vec![ret(box_bytes(add(get_str(a.e()), get_str(b.e()))))],
+            ),
+            when(
+                and(and(is(&ca, BYTES), eq(code.e(), int(2))), is_integral(&cb)),
+                vec![ret(box_bytes(call(
+                    "zb_bytes_repeat",
+                    vec![get_str(a.e()), number_i64(b.e(), cb.e())],
+                    string(),
+                )))],
+            ),
+            when(
+                and(and(is(&cb, BYTES), eq(code.e(), int(2))), is_integral(&ca)),
+                vec![ret(box_bytes(call(
+                    "zb_bytes_repeat",
+                    vec![get_str(b.e()), number_i64(a.e(), ca.e())],
+                    string(),
+                )))],
             ),
             when(
                 and(and(is(&ca, STR), eq(code.e(), int(2))), is_integral(&cb)),
@@ -1363,6 +1430,17 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 ))],
             ),
             when(
+                is(&cat, BYTES),
+                vec![ret(to_any(
+                    Kind::Int,
+                    call(
+                        "zb_bytes_to_list",
+                        vec![get_str(x.e())],
+                        list_of(list_type, i64()),
+                    ),
+                ))],
+            ),
+            when(
                 or(
                     ne(cat.e(), int(CUSTOM)),
                     or(eq(kind(x.e()), int(FUNC_TAG >> 8)), is_instance(x.e())),
@@ -1527,6 +1605,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 )))],
             ),
             when(
+                is(&cat, BYTES),
+                vec![ret(box_i64(call(
+                    "zb_bytes_index",
+                    vec![get_str(x.e()), index(i.e())],
+                    i64(),
+                )))],
+            ),
+            when(
                 ne(cat.e(), int(CUSTOM)),
                 vec![type_error(add(
                     quoted(type_name(x.e())),
@@ -1602,6 +1688,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     "zb_str_get",
                     vec![get_str(x.e()), position.e()],
                     string(),
+                )))],
+            ),
+            when(
+                is(&cat, BYTES),
+                vec![ret(box_i64(call(
+                    "zb_bytes_index",
+                    vec![get_str(x.e()), position.e()],
+                    i64(),
                 )))],
             ),
             when(
@@ -1949,6 +2043,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is(&cat, STR),
                 vec![ret(box_str(call(
                     "zb_str_slice",
+                    vec![get_str(x.e()), start.e(), stop.e(), step.e(), mask.e()],
+                    string(),
+                )))],
+            ),
+            when(
+                is(&cat, BYTES),
+                vec![ret(box_bytes(call(
+                    "zb_bytes_slice",
                     vec![get_str(x.e()), start.e(), stop.e(), step.e(), mask.e()],
                     string(),
                 )))],

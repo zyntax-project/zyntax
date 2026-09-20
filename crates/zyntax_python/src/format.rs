@@ -351,7 +351,12 @@ impl Lowerer<'_> {
         Ok(Val { node, ty: Ty::Str })
     }
 
-    fn percent_field(&mut self, value: Val, field: &PercentField, span: Span) -> Result<Node> {
+    pub(crate) fn percent_field(
+        &mut self,
+        value: Val,
+        field: &PercentField,
+        span: Span,
+    ) -> Result<Node> {
         let mut spec = Spec {
             fill: if field.zero { "0" } else { " " }.to_string(),
             align: if field.left {

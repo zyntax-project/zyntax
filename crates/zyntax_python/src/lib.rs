@@ -26,6 +26,7 @@ use zyntax_typed_ast::{
     InternedString, Mutability, PrimitiveType, Type, TypedNode, TypedProgram, Visibility,
 };
 
+mod bytes;
 mod class_attrs;
 mod classes;
 mod format;

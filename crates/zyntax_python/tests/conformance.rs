@@ -274,6 +274,7 @@ categories! {
     dict,
     set,
     string,
+    bytes,
     generators,
     exceptions,
     builtin,

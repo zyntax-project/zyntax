@@ -32,6 +32,10 @@ pub const MODULE: &str = "builtins";
 pub fn i64() -> Type {
     Type::Primitive(PrimitiveType::I64)
 }
+pub fn u8() -> Type {
+    Type::Primitive(PrimitiveType::U8)
+}
+
 pub fn i32() -> Type {
     Type::Primitive(PrimitiveType::I32)
 }

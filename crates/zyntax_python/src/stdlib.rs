@@ -60,6 +60,7 @@ pub(crate) fn is_known(module: &str) -> bool {
             | "random"
             | "operator"
             | "functools"
+            | "os"
             | "__future__"
     )
 }
@@ -113,6 +114,7 @@ pub(crate) fn is_typing_name(name: &str) -> bool {
 const F: Ty = Ty::Float;
 const I: Ty = Ty::Int;
 const B: Ty = Ty::Bool;
+const S: Ty = Ty::Str;
 
 pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
     let func = |params: &'static [Ty], ret: Ty, zb: &'static str| Member::Func { params, ret, zb };
@@ -184,6 +186,7 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         ("array", "array") => Member::ArrayType,
         ("array", "typecodes") => Member::Str("bBuwhHiIlLqQfd"),
         ("time", "time") => func(&[], F, "zb_time_time"),
+        ("os", "remove") | ("os", "unlink") => func(&[S], Ty::None, "zb_file_remove"),
         // The Mersenne Twister as CPython runs it; the lowering fills in
         // the forms with more arguments and the seed from the clock.
         ("random", "random") => func(&[], F, "zb_random_random"),

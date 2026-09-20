@@ -1,0 +1,20 @@
+b'P6\n'
+b'P6\n' 3 80 10
+b'3 2\n255\n'
+b'\xc8\xc8\xc8' 3 200
+b'P6\n\xc8\xc8\xc8' b'ababab' b'xyxy'
+True False False
+[97, 98, 99] b'hi' b'\x00\x00\x00' b''
+b'world' b'olleh' b'ell'
+hi b'h\xc3\xa9' hé
+6
+b'42|   42|42   |00042|ff|FF|10|in|%'
+b'3.14 1.234568e+04'
+True True False False True
+1 True
+[b'b', b'a'] 1
+20 b'P6\n' b'\xc8\xc8\xc8' b'P6\n3 2\n255\n\x00\x00\x00ddd\xc8\xc8\xc8'
+b'with statement\n'
+text mode
+second line
+

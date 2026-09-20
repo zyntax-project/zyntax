@@ -30,7 +30,7 @@ use zyntax_typed_ast::{
 };
 
 pub(crate) type Node = TypedNode<TypedExpression>;
-type Stmt = TypedNode<TypedStatement>;
+pub(crate) type Stmt = TypedNode<TypedStatement>;
 
 pub(crate) fn strict_fp_annotation(span: Span) -> TypedAnnotation {
     TypedAnnotation {
@@ -160,6 +160,8 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
             ty: ir(ty),
         },
         Ty::None
+        | Ty::Bytes
+        | Ty::File(_)
         | Ty::Gen
         | Ty::Closure(_)
         | Ty::Bound(_)
@@ -218,7 +220,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Int => prim(PrimitiveType::I64),
         Ty::Float => prim(PrimitiveType::F64),
         Ty::Bool => prim(PrimitiveType::Bool),
-        Ty::Str => prim(PrimitiveType::String),
+        Ty::Str | Ty::Bytes => prim(PrimitiveType::String),
         Ty::None => prim(PrimitiveType::Unit),
         Ty::List(e) => list_type(elem_ir(e)),
         // A shape is a value struct with one field per element, each
@@ -230,6 +232,8 @@ pub(crate) fn ir(ty: Ty) -> Type {
                 .collect(),
         ),
         Ty::Dict(_) | Ty::Set => list_type(Type::Any),
+        // A file is the record the library keeps: a list of its parts.
+        Ty::File(_) => list_type(Type::Any),
         Ty::Class(k) => class_type(k as usize),
         Ty::Gen => Type::Fiber(Box::new(Type::Any)),
         // A known function value is still the record every function
@@ -733,7 +737,7 @@ pub(crate) fn adapter(module: &Module, name: &str, sig: &Sig) -> TypedFunction {
     }
 }
 
-fn unsupported<T>(what: impl Into<String>, at: &impl Ranged) -> Result<T> {
+pub(crate) fn unsupported<T>(what: impl Into<String>, at: &impl Ranged) -> Result<T> {
     Err(Error::unsupported(what.into(), at))
 }
 
@@ -1610,12 +1614,12 @@ impl<'m> Lowerer<'m> {
     }
 
     /// A local no Python program can spell.
-    fn temp(&mut self) -> InternedString {
+    pub(crate) fn temp(&mut self) -> InternedString {
         self.temps += 1;
         intern(&format!("__tmp{}", self.temps))
     }
 
-    fn local_symbol(&self, name: &str) -> InternedString {
+    pub(crate) fn local_symbol(&self, name: &str) -> InternedString {
         self.comp_symbols
             .get(name)
             .copied()
@@ -1855,6 +1859,46 @@ impl<'m> Lowerer<'m> {
             // Every dict shape is stored the same way.
             (Ty::Dict(_), Ty::Dict(_)) => v.node,
             (Ty::Set, Ty::Object) => call("zb_set_box", vec![v.node], Ty::Object, span),
+            // Bytes box under their own category, so a box of text is
+            // never read as them; a file is boxed as the list it is.
+            (Ty::Bytes, Ty::Object) => call("zb_box_bytes", vec![v.node], Ty::Object, span),
+            (Ty::Object, Ty::Bytes) => {
+                let checked = Val {
+                    node: call("zb_any_as_bytes", vec![v.node], target, span),
+                    ty: target,
+                };
+                if self.guards {
+                    self.guard(checked, span).node
+                } else {
+                    checked.node
+                }
+            }
+            (Ty::File(_), Ty::File(_)) => v.node,
+            (Ty::File(_), Ty::Object) => call(
+                &list_fn("box", Elem::Object),
+                vec![v.node],
+                Ty::Object,
+                span,
+            ),
+            (Ty::Object, Ty::File(_)) => {
+                let checked = Val {
+                    node: call(&list_fn("unbox", Elem::Object), vec![v.node], target, span),
+                    ty: target,
+                };
+                if self.guards {
+                    self.guard(checked, span).node
+                } else {
+                    checked.node
+                }
+            }
+            // Bytes iterate as their values.
+            (Ty::Bytes, Ty::List(Elem::Int)) => {
+                call("zb_bytes_to_list", vec![v.node], target, span)
+            }
+            (Ty::Bytes, Ty::List(Elem::Object)) => {
+                let ints = call("zb_bytes_to_list", vec![v.node], Ty::List(Elem::Int), span);
+                call(&list_fn("to_any", Elem::Int), vec![ints], target, span)
+            }
             // A list read out of a box is checked like a primitive: a box
             // of anything else is a TypeError raised where it is used.
             (Ty::Object, Ty::List(e)) => {
@@ -2069,7 +2113,7 @@ impl<'m> Lowerer<'m> {
     /// produced: whatever the binding hoists is placed in `out` just
     /// ahead of the binding's own statements, since the statement-wide
     /// hoist would run before the value exists.
-    fn bind_after(
+    pub(crate) fn bind_after(
         &mut self,
         target: &py::Expr,
         value: Val,
@@ -2094,7 +2138,7 @@ impl<'m> Lowerer<'m> {
             (Ty::Object, Ty::Int) => "zb_box_payload_i64",
             (Ty::Object, Ty::Float) => "zb_box_payload_f64",
             (Ty::Object, Ty::Bool) => "zb_box_payload_truth",
-            (Ty::Object, Ty::Str) => "zb_box_get_str",
+            (Ty::Object, Ty::Str | Ty::Bytes) => "zb_box_get_str",
             // The box holds an instance of the class, or is the null box
             // None stores as.
             (Ty::Object, Ty::Class(_)) => {
@@ -2112,7 +2156,7 @@ impl<'m> Lowerer<'m> {
                     span,
                 );
             }
-            (Ty::Object, Ty::Dict(_) | Ty::Set) => {
+            (Ty::Object, Ty::Dict(_) | Ty::Set | Ty::File(_)) => {
                 return call("zb_unbox_list_raw_any", vec![v.node], target, span);
             }
             _ => return self.coerce(v, target),
@@ -2120,7 +2164,7 @@ impl<'m> Lowerer<'m> {
         call(read, vec![v.node], target, span)
     }
 
-    fn expr_as(&mut self, e: &py::Expr, target: Ty) -> Result<Node> {
+    pub(crate) fn expr_as(&mut self, e: &py::Expr, target: Ty) -> Result<Node> {
         let v = self.expr(e)?;
         Ok(self.coerce(v, target))
     }
@@ -2471,6 +2515,22 @@ impl<'m> Lowerer<'m> {
                 span,
             ),
             Ty::Str => call("zb_str_truthy", vec![v.node], Ty::Bool, span),
+            Ty::Bytes => binary(
+                BinaryOp::Ne,
+                call("zb_str_len", vec![v.node], Ty::Int, span),
+                int_lit(0, span),
+                Ty::Bool,
+                span,
+            ),
+            Ty::File(_) => Self::after_none(
+                v.node,
+                node(
+                    TypedExpression::Literal(TypedLiteral::Bool(true)),
+                    Ty::Bool,
+                    span,
+                ),
+                Ty::Bool,
+            ),
             Ty::Dict(_) => binary(
                 BinaryOp::Ne,
                 call("zb_dict_len", vec![v.node], Ty::Int, span),
@@ -2584,6 +2644,8 @@ impl<'m> Lowerer<'m> {
             Ty::Float => call("zb_float_repr", vec![v.node], Ty::Str, span),
             Ty::Bool => call("zb_bool_repr", vec![v.node], Ty::Str, span),
             Ty::Str => v.node,
+            Ty::Bytes => call("zb_bytes_repr", vec![v.node], Ty::Str, span),
+            Ty::File(_) => str_lit("<file>", span),
             Ty::None => {
                 Self::after_none(v.node, call("zb_none_repr", vec![], Ty::Str, span), Ty::Str)
             }
@@ -2655,6 +2717,7 @@ impl<'m> Lowerer<'m> {
         let span = v.node.span;
         match v.ty {
             Ty::Str => call("zb_str_repr", vec![v.node], Ty::Str, span),
+            Ty::Bytes => call("zb_bytes_repr", vec![v.node], Ty::Str, span),
             Ty::Class(k) => {
                 let k = k as usize;
                 if self.module.method_sig(k, "__repr__").is_none() {
@@ -2852,7 +2915,7 @@ impl<'m> Lowerer<'m> {
         Ok(())
     }
 
-    fn hold(&mut self, v: Val, out: &mut Vec<Stmt>, span: Span) -> Val {
+    pub(crate) fn hold(&mut self, v: Val, out: &mut Vec<Stmt>, span: Span) -> Val {
         let name = self.temp();
         let ty = v.ty;
         out.push(TypedNode::new(
@@ -2873,7 +2936,7 @@ impl<'m> Lowerer<'m> {
     }
 
     /// A block expression: statements, then the value.
-    fn block_value(statements: Vec<Stmt>, value: Node, ty: Ty, span: Span) -> Node {
+    pub(crate) fn block_value(statements: Vec<Stmt>, value: Node, ty: Ty, span: Span) -> Node {
         let mut statements = statements;
         statements.push(TypedNode::new(
             TypedStatement::Expression(Box::new(value)),
@@ -2897,7 +2960,7 @@ impl<'m> Lowerer<'m> {
         Ok(TypedBlock { statements, span })
     }
 
-    fn stmt(&mut self, s: &py::Stmt, out: &mut Vec<Stmt>) -> Result<()> {
+    pub(crate) fn stmt(&mut self, s: &py::Stmt, out: &mut Vec<Stmt>) -> Result<()> {
         let raised_before = self.raised;
         self.raised = false;
         // What is known about instances holds within one straight run of
@@ -3423,6 +3486,7 @@ impl<'m> Lowerer<'m> {
                 );
             }
             py::Stmt::Try(t) => self.try_stmt(t, span, out)?,
+            py::Stmt::With(w) => self.with_stmt(w, span, out)?,
             // Scope analysis already made the names module variables.
             py::Stmt::Global(_) => {}
             // The cells this body shares are already set up.
@@ -3565,7 +3629,7 @@ impl<'m> Lowerer<'m> {
     /// `target = value`: a `let` the first time a name is seen in this
     /// function, an assignment afterwards; the value converted to the
     /// type inference gave the name.
-    fn bind(
+    pub(crate) fn bind(
         &mut self,
         target: &py::Expr,
         value: Val,
@@ -4066,6 +4130,7 @@ impl<'m> Lowerer<'m> {
                 return self.index_value(items, index, elem_ty, span);
             }
             Ty::Str => call("zb_str_get", vec![seq.node, index], Ty::Str, span),
+            Ty::Bytes => call("zb_bytes_index", vec![seq.node, index], Ty::Int, span),
             _ => call(
                 "zb_any_getitem_i64",
                 vec![seq.node, index],
@@ -4152,6 +4217,7 @@ impl<'m> Lowerer<'m> {
         let counter = self.temp();
         let len = match seq.ty {
             Ty::Str => call("zb_str_chars_len", vec![seq.node.clone()], Ty::Int, span),
+            Ty::Bytes => call("zb_str_len", vec![seq.node.clone()], Ty::Int, span),
             _ => method_call(seq.node.clone(), "len", vec![], Ty::Int, span),
         };
         let item = self.index_value(
@@ -5237,11 +5303,23 @@ impl<'m> Lowerer<'m> {
                 TypedExpression::Literal(TypedLiteral::String(intern(s.value.to_str()))),
                 Ty::Str,
             ),
+            py::Expr::BytesLiteral(b) => {
+                let bytes: Vec<u8> = b.value.bytes().collect();
+                self.bytes_lit(&bytes, span)
+            }
             py::Expr::Name(n)
                 if !self.locals.vars.contains_key(n.id.as_str())
                     && matches!(
                         n.id.as_str(),
-                        "int" | "float" | "str" | "bool" | "list" | "tuple" | "dict" | "set"
+                        "int"
+                            | "float"
+                            | "str"
+                            | "bytes"
+                            | "bool"
+                            | "list"
+                            | "tuple"
+                            | "dict"
+                            | "set"
                     ) =>
             {
                 Val {
@@ -5372,6 +5450,16 @@ impl<'m> Lowerer<'m> {
                 };
                 let template = l.value.to_str().to_string();
                 self.percent_format(&template, &b.right, span)?
+            }
+            // `b"..." % values` with a literal format.
+            py::Expr::BinOp(b)
+                if b.op == py::Operator::Mod && matches!(&*b.left, py::Expr::BytesLiteral(_)) =>
+            {
+                let py::Expr::BytesLiteral(l) = &*b.left else {
+                    unreachable!()
+                };
+                let template: Vec<u8> = l.value.bytes().collect();
+                self.percent_format_bytes(&template, &b.right, span)?
             }
             py::Expr::BinOp(b) => {
                 let l = self.expr(&b.left)?;
@@ -5623,6 +5711,52 @@ impl<'m> Lowerer<'m> {
                     return Ok(Val {
                         node: call("zb_str_repeat", vec![right.node, n], Ty::Str, span),
                         ty: Ty::Str,
+                    });
+                }
+                _ => {}
+            }
+        }
+        // Bytes concatenate, repeat and format.
+        if left.ty == Ty::Bytes || right.ty == Ty::Bytes {
+            match (op, left.ty, right.ty) {
+                // Concatenation copies bytes, as it does for strings.
+                (py::Operator::Add, Ty::Bytes, Ty::Bytes) => {
+                    return Ok(Val {
+                        node: binary(BinaryOp::Add, left.node, right.node, Ty::Bytes, span),
+                        ty: Ty::Bytes,
+                    });
+                }
+                (py::Operator::Mult, Ty::Bytes, Ty::Int | Ty::Bool) => {
+                    let n = self.coerce(right, Ty::Int);
+                    return Ok(Val {
+                        node: call("zb_bytes_repeat", vec![left.node, n], Ty::Bytes, span),
+                        ty: Ty::Bytes,
+                    });
+                }
+                (py::Operator::Mult, Ty::Int | Ty::Bool, Ty::Bytes) => {
+                    let n = self.coerce(left, Ty::Int);
+                    return Ok(Val {
+                        node: call("zb_bytes_repeat", vec![right.node, n], Ty::Bytes, span),
+                        ty: Ty::Bytes,
+                    });
+                }
+                // A computed format: the values boxed, converted at run
+                // time.
+                (py::Operator::Mod, Ty::Bytes, _) => {
+                    let args = match right.ty {
+                        Ty::Tuple(_) => self.coerce(right, Ty::List(Elem::Object)),
+                        _ => {
+                            let one = self.coerce(right, Ty::Object);
+                            node(
+                                TypedExpression::Array(vec![one]),
+                                Ty::List(Elem::Object),
+                                span,
+                            )
+                        }
+                    };
+                    return Ok(Val {
+                        node: call("zb_bytes_format", vec![left.node, args], Ty::Bytes, span),
+                        ty: Ty::Bytes,
                     });
                 }
                 _ => {}
@@ -6235,6 +6369,22 @@ impl<'m> Lowerer<'m> {
                 _ => unreachable!(),
             });
         }
+        if left.ty == Ty::Bytes && right.ty == Ty::Bytes {
+            let eq = || {
+                binary(
+                    BinaryOp::Ne,
+                    call("zb_bytes_eq", vec![left.node, right.node], Ty::Int, span),
+                    int_lit(0, span),
+                    Ty::Bool,
+                    span,
+                )
+            };
+            return match op {
+                py::CmpOp::Eq => Ok(eq()),
+                py::CmpOp::NotEq => Ok(negate(eq())),
+                _ => Err(Error::unsupported_span("ordering bytes".to_string(), span)),
+            };
+        }
         if left.ty == Ty::Str && right.ty == Ty::Str {
             let n = match op {
                 py::CmpOp::Eq => call("zb_str_eq", vec![left.node, right.node], Ty::Bool, span),
@@ -6553,6 +6703,12 @@ impl<'m> Lowerer<'m> {
                     Ty::Str,
                     span,
                 ),
+                Ty::Bytes => call(
+                    "zb_bytes_slice",
+                    vec![seq.node, start, stop, step, mask],
+                    Ty::Bytes,
+                    span,
+                ),
                 _ => {
                     let o = self.coerce(seq, Ty::Object);
                     call(
@@ -6582,7 +6738,7 @@ impl<'m> Lowerer<'m> {
                     ty: field,
                 })
             }
-            Ty::List(_) | Ty::Tuple(_) | Ty::Str => {
+            Ty::List(_) | Ty::Tuple(_) | Ty::Str | Ty::Bytes => {
                 let index = self.expr_as(&sub.slice, Ty::Int)?;
                 Ok(self.index_value(seq, index, ty, span))
             }
@@ -6798,6 +6954,32 @@ impl<'m> Lowerer<'m> {
             Ty::List(e @ Elem::Array(c)) if !matches!(name, "append" | "pop" | "insert") => {
                 let list = receiver.node;
                 let node = match name {
+                    // The storage as it lies in memory.
+                    "tobytes" => {
+                        expect(0, self)?;
+                        let mut pre = Vec::new();
+                        let held = self.hold(
+                            Val {
+                                node: list,
+                                ty: receiver.ty,
+                            },
+                            &mut pre,
+                            span,
+                        );
+                        let data = crate::bytes::field(held.node.clone(), "data", Ty::Int, span);
+                        let size = binary(
+                            BinaryOp::Mul,
+                            method_call(held.node, "len", vec![], Ty::Int, span),
+                            int_lit(c.itemsize(), span),
+                            Ty::Int,
+                            span,
+                        );
+                        let bytes = call("zb_bytes_from_buffer", vec![data, size], Ty::Bytes, span);
+                        return Ok(Val {
+                            node: Self::block_value(pre, bytes, Ty::Bytes, span),
+                            ty: Ty::Bytes,
+                        });
+                    }
                     // A number the storage cannot hold is in no array.
                     "count" => {
                         expect(1, self)?;
@@ -6903,12 +7085,9 @@ impl<'m> Lowerer<'m> {
                             ty,
                         )
                     }
-                    "tobytes" | "frombytes" | "tofile" | "fromfile" | "tounicode"
-                    | "fromunicode" | "buffer_info" | "byteswap" => {
-                        return Err(Error::unsupported_span(
-                            format!("array.{name}: bytes and files are not here yet"),
-                            span,
-                        ));
+                    "frombytes" | "tofile" | "fromfile" | "tounicode" | "fromunicode"
+                    | "buffer_info" | "byteswap" => {
+                        return Err(Error::unsupported_span(format!("array.{name}"), span));
                     }
                     _ => {
                         return Err(Error::unsupported_span(
@@ -7154,9 +7333,52 @@ impl<'m> Lowerer<'m> {
                         let items = self.coerce(lowered.pop().unwrap(), Ty::List(Elem::Str));
                         call("zb_str_join", vec![s, items], Ty::Str, span)
                     }
+                    // A string is its UTF-8 already; any other encoding
+                    // is refused below.
+                    ("encode", 0) => s,
+                    ("encode", 1) if self.is_utf8_name(&args[0]) => s,
                     _ => {
                         return Err(Error::unsupported_span(
                             format!("str.{name} with {} argument(s)", args.len()),
+                            span,
+                        ));
+                    }
+                };
+                Ok(Val { node, ty })
+            }
+            Ty::Bytes => {
+                let b = receiver.node;
+                let node = match (name, args.len()) {
+                    ("decode", 0) => call("zb_bytes_decode", vec![b], Ty::Str, span),
+                    ("decode", 1) if self.is_utf8_name(&args[0]) => {
+                        call("zb_bytes_decode", vec![b], Ty::Str, span)
+                    }
+                    _ => {
+                        return Err(Error::unsupported_span(
+                            format!("bytes.{name} with {} argument(s)", args.len()),
+                            span,
+                        ));
+                    }
+                };
+                Ok(Val { node, ty })
+            }
+            Ty::File(mode) => {
+                let f = receiver.node;
+                let node = match (name, args.len()) {
+                    ("write", 1) => {
+                        let data = self.expr_as(&args[0], mode.content())?;
+                        call("zb_file_write", vec![f, data], Ty::None, span)
+                    }
+                    ("read", 0) => call("zb_file_read", vec![f], mode.content(), span),
+                    ("close", 0) => call("zb_file_close", vec![f], Ty::None, span),
+                    ("flush", 0) => Self::after_none(
+                        f,
+                        node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+                        Ty::None,
+                    ),
+                    _ => {
+                        return Err(Error::unsupported_span(
+                            format!("file.{name} with {} argument(s)", args.len()),
                             span,
                         ));
                     }
@@ -7257,6 +7479,12 @@ impl<'m> Lowerer<'m> {
                             ..c.clone()
                         };
                         return self.call(&builtin, ty, span);
+                    }
+                    // An instance is called through its class's `__call__`.
+                    Ty::Class(k) => {
+                        let receiver = self.expr(&c.func)?;
+                        return self
+                            .method_on(k as usize, receiver, "__call__", args, keywords, c, span);
                     }
                     Ty::Bound(k) => {
                         let info = self.module.bounds[k as usize].clone();
@@ -7400,6 +7628,9 @@ impl<'m> Lowerer<'m> {
             if let Ty::Closure(k) = self.ty_of(&c.func) {
                 return self.call_closure(k, callee, args, keywords, c, span);
             }
+            if let Ty::Class(k) = callee.ty {
+                return self.method_on(k as usize, callee, "__call__", args, keywords, c, span);
+            }
             return self.call_value(callee, args, keywords, c, span);
         }
         if let py::Expr::Name(n) = &*c.func {
@@ -7415,6 +7646,8 @@ impl<'m> Lowerer<'m> {
                     let node = self.repr_of(v);
                     return Ok(Val { node, ty: Ty::Str });
                 }
+                "bytes" => return self.bytes_call(args, c, span),
+                "open" => return self.open_call(c, span),
                 "int" => {
                     let v = self.expr(&args[0])?;
                     let node = match v.ty {
@@ -7481,6 +7714,7 @@ impl<'m> Lowerer<'m> {
                     let v = self.expr(&args[0])?;
                     let node = match v.ty {
                         Ty::Str => call("zb_str_chars_len", vec![v.node], Ty::Int, span),
+                        Ty::Bytes => call("zb_str_len", vec![v.node], Ty::Int, span),
                         Ty::List(_) => method_call(v.node, "len", vec![], Ty::Int, span),
                         // A shape's length is its arity.
                         Ty::Tuple(k) => Self::after_none(
@@ -7561,6 +7795,15 @@ impl<'m> Lowerer<'m> {
                 "sum" if args.len() == 1 || args.len() == 2 => {
                     let v = self.consumed(&args[0], span)?;
                     let v = self.tuple_as_list(v);
+                    // Bytes sum as their values.
+                    let v = if v.ty == Ty::Bytes {
+                        Val {
+                            node: self.coerce(v, Ty::List(Elem::Int)),
+                            ty: Ty::List(Elem::Int),
+                        }
+                    } else {
+                        v
+                    };
                     let (node, sum_ty) = match v.ty {
                         Ty::List(e @ (Elem::Int | Elem::Float | Elem::Object)) => {
                             (call(&list_fn("sum", e), vec![v.node], e.ty(), span), e.ty())
@@ -7762,6 +8005,15 @@ impl<'m> Lowerer<'m> {
                                     ),
                                     ty: Ty::List(Elem::Str),
                                 },
+                                Ty::Bytes => Val {
+                                    node: call(
+                                        "zb_bytes_to_list",
+                                        vec![v.node],
+                                        Ty::List(Elem::Int),
+                                        span,
+                                    ),
+                                    ty: Ty::List(Elem::Int),
+                                },
                                 _ => {
                                     let o = self.coerce(v, Ty::Object);
                                     Val {
@@ -7950,6 +8202,7 @@ impl<'m> Lowerer<'m> {
                         Ty::Float => str_lit("float", span),
                         Ty::Bool => str_lit("bool", span),
                         Ty::Str => str_lit("str", span),
+                        Ty::Bytes => str_lit("bytes", span),
                         Ty::None => str_lit("NoneType", span),
                         Ty::List(_) => str_lit("list", span),
                         Ty::Tuple(_) => str_lit("tuple", span),
@@ -8828,6 +9081,7 @@ impl<'m> Lowerer<'m> {
                 ("bool", Ty::Bool) => true,
                 ("float", Ty::Float) => true,
                 ("str", Ty::Str) => true,
+                ("bytes", Ty::Bytes) => true,
                 ("list", Ty::List(_)) => true,
                 ("tuple", Ty::Tuple(_)) => true,
                 ("dict", Ty::Dict(_)) => true,
@@ -9905,13 +10159,64 @@ impl<'m> Lowerer<'m> {
         for a in args {
             lowered.push(self.expr_as(a, Ty::Object)?);
         }
-        let v = Val {
-            node: call(
+        // Where a class defines `__call__` at this arity, an instance
+        // goes to it and anything else to the function record.
+        let callable_class = (0..self.module.classes.len()).any(|c| {
+            self.module
+                .method_sig(c, "__call__")
+                .is_some_and(|(sig, _)| sig.params.len() == args.len() + 1)
+        });
+        let node = if callable_class {
+            let mut pre = Vec::new();
+            let held: Vec<Node> = lowered
+                .into_iter()
+                .map(|n| {
+                    self.hold(
+                        Val {
+                            node: n,
+                            ty: Ty::Object,
+                        },
+                        &mut pre,
+                        span,
+                    )
+                    .node
+                })
+                .collect();
+            self.module
+                .dyn_methods
+                .borrow_mut()
+                .insert(("__call__".to_string(), args.len()));
+            let is_instance = call("zb_any_is_instance", vec![held[0].clone()], Ty::Bool, span);
+            let picked = node(
+                TypedExpression::If(TypedIfExpr {
+                    condition: Box::new(is_instance),
+                    then_branch: Box::new(call(
+                        &callm_name("__call__", args.len()),
+                        held.clone(),
+                        Ty::Object,
+                        span,
+                    )),
+                    else_branch: Box::new(call(
+                        &format!("zb_call_{}", args.len()),
+                        held,
+                        Ty::Object,
+                        span,
+                    )),
+                }),
+                Ty::Object,
+                span,
+            );
+            Self::block_value(pre, picked, Ty::Object, span)
+        } else {
+            call(
                 &format!("zb_call_{}", args.len()),
                 lowered,
                 Ty::Object,
                 span,
-            ),
+            )
+        };
+        let v = Val {
+            node,
             ty: Ty::Object,
         };
         Ok(self.guard(v, span))

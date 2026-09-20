@@ -30,6 +30,12 @@ pub(crate) enum Ty {
     Float,
     Bool,
     Str,
+    /// A byte string: stored as a string is, and boxed under its own
+    /// category, so nothing reads it as text.
+    Bytes,
+    /// An open file, in text or binary mode: the record the library
+    /// keeps for it.
+    File(Mode),
     None,
     /// A list whose elements are all of one kind.
     List(Elem),
@@ -68,6 +74,32 @@ pub(crate) enum Ty {
     Object,
     #[default]
     Unknown,
+}
+
+/// What a file reads and writes: text as strings, binary as bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Mode {
+    Text,
+    Binary,
+}
+
+impl Mode {
+    /// The mode of `open(..., mode)`: binary when the mode names `b`.
+    pub(crate) fn of(mode: &str) -> Mode {
+        if mode.contains('b') {
+            Mode::Binary
+        } else {
+            Mode::Text
+        }
+    }
+
+    /// What the file's contents are typed as.
+    pub(crate) fn content(self) -> Ty {
+        match self {
+            Mode::Text => Ty::Str,
+            Mode::Binary => Ty::Bytes,
+        }
+    }
 }
 
 /// The element kinds a list is instantiated for. Anything else in a
@@ -530,6 +562,9 @@ impl Ty {
             }),
             Ty::Set | Ty::Gen => Some(Ty::Object),
             Ty::Str => Some(Ty::Str),
+            // Bytes iterate as their byte values; a file as its lines.
+            Ty::Bytes => Some(Ty::Int),
+            Ty::File(mode) => Some(mode.content()),
             Ty::Unknown => Some(Ty::Unknown),
             _ => None,
         }
@@ -4060,7 +4095,16 @@ impl Walker<'_> {
                 self.stmts(&t.orelse);
                 self.stmts(&t.finalbody);
             }
-            py::Stmt::With(w) => self.stmts(&w.body),
+            // `with e as x` binds x to e: the file itself.
+            py::Stmt::With(w) => {
+                for item in &w.items {
+                    let ty = self.expr(&item.context_expr);
+                    if let Some(target) = &item.optional_vars {
+                        self.target(target, ty);
+                    }
+                }
+                self.stmts(&w.body)
+            }
             py::Stmt::FunctionDef(f) => {
                 let ty = self
                     .module
@@ -4292,6 +4336,14 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
     match op {
         // A `%` format.
         py::Operator::Mod if l == Ty::Str => Ty::Str,
+        py::Operator::Mod if l == Ty::Bytes => Ty::Bytes,
+        py::Operator::Add if l == Ty::Bytes && r == Ty::Bytes => Ty::Bytes,
+        py::Operator::Mult
+            if (l == Ty::Bytes && matches!(r, Ty::Int | Ty::Bool))
+                || (matches!(l, Ty::Int | Ty::Bool) && r == Ty::Bytes) =>
+        {
+            Ty::Bytes
+        }
         py::Operator::Div if l.is_numeric() && r.is_numeric() => Ty::Float,
         // `int ** int` is an int only when the exponent is visibly not
         // negative; otherwise Python's answer may be a float, and the
@@ -4335,7 +4387,7 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
         {
             Ty::Str
         }
-        _ if l == Ty::Str || r == Ty::Str => {
+        _ if matches!(l, Ty::Str | Ty::Bytes) || matches!(r, Ty::Str | Ty::Bytes) => {
             if l == Ty::Unknown || r == Ty::Unknown {
                 Ty::Unknown
             } else {
@@ -4343,6 +4395,21 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
             }
         }
         _ => l.arith(r),
+    }
+}
+
+/// The mode `open(path, mode)` names, when it is a literal; `r` when
+/// left out. None when it is computed.
+pub(crate) fn open_mode(c: &py::ExprCall) -> Option<Mode> {
+    let mode = c
+        .arguments
+        .args
+        .get(1)
+        .or_else(|| c.arguments.find_keyword("mode").map(|k| &k.value));
+    match mode {
+        None => Some(Mode::Text),
+        Some(py::Expr::StringLiteral(s)) => Some(Mode::of(s.value.to_str())),
+        Some(_) => None,
     }
 }
 
@@ -4510,6 +4577,7 @@ impl Typer<'_> {
             py::Expr::BooleanLiteral(_) => Ty::Bool,
             py::Expr::NoneLiteral(_) => Ty::None,
             py::Expr::StringLiteral(_) | py::Expr::FString(_) => Ty::Str,
+            py::Expr::BytesLiteral(_) => Ty::Bytes,
             py::Expr::Name(n) => {
                 let name = n.id.as_str();
                 if let Some(ty) = self
@@ -4626,7 +4694,7 @@ impl Typer<'_> {
                 }
                 if let py::Expr::Slice(slice) = &*s.slice {
                     match seq {
-                        Ty::Str | Ty::List(_) => seq,
+                        Ty::Str | Ty::Bytes | Ty::List(_) => seq,
                         // A slice of a tuple with literal bounds is the
                         // shape those bounds cut out.
                         Ty::Tuple(k) => {
@@ -4820,6 +4888,14 @@ impl Typer<'_> {
                 return self.method_ret(receiver, &info.method);
             }
             Ty::Builtin(k) => return self.builtin_call(BUILTIN_VALUES[k as usize], c),
+            // `instance(...)` is its class's `__call__`.
+            Ty::Class(k) if !matches!(&*c.func, py::Expr::Name(n) if self.module.class_index.contains_key(n.id.as_str())) =>
+            {
+                return self
+                    .module
+                    .dispatched_ret(k as usize, "__call__")
+                    .unwrap_or(Ty::Object);
+            }
             _ => {}
         }
         match &*c.func {
@@ -4885,6 +4961,7 @@ impl Typer<'_> {
                 Ty::List(Elem::Array(c)) => Ty::List(Elem::of(c.item())),
                 Ty::List(e) => Ty::List(e),
                 Ty::Str => Ty::List(Elem::Str),
+                Ty::Bytes => Ty::List(Elem::Int),
                 Ty::Tuple(_) => Ty::List(Elem::of(arg(0).element().unwrap_or(Ty::Object))),
                 // A list of a dict is its keys.
                 Ty::Dict(k) => Ty::List(Elem::of(dict_shape(k).0)),
@@ -4911,7 +4988,7 @@ impl Typer<'_> {
             "any" | "all" => Ty::Bool,
             "sum" => {
                 let items = match arg(0) {
-                    Ty::List(Elem::Int) => Ty::Int,
+                    Ty::List(Elem::Int) | Ty::Bytes => Ty::Int,
                     Ty::List(Elem::Float) => Ty::Float,
                     t @ Ty::Tuple(_) => match t.element() {
                         Some(Ty::Int | Ty::Bool) => Ty::Int,
@@ -4942,6 +5019,10 @@ impl Typer<'_> {
             }
             "type" => Ty::Str,
             "str" | "repr" | "input" | "chr" => Ty::Str,
+            "bytes" => Ty::Bytes,
+            // The mode decides what is read and written; it is a literal
+            // or the file is a text one.
+            "open" => Ty::File(open_mode(c).unwrap_or(Mode::Text)),
             "float" => Ty::Float,
             "bool" | "isinstance" | "callable" | "hasattr" => Ty::Bool,
             "abs" => match arg(0) {
@@ -5025,6 +5106,17 @@ impl Typer<'_> {
                 "startswith" | "endswith" | "isdigit" | "isalpha" | "isalnum" | "isspace"
                 | "isupper" | "islower" => Ty::Bool,
                 "split" | "rsplit" | "splitlines" => Ty::List(Elem::Str),
+                "encode" => Ty::Bytes,
+                _ => Ty::Object,
+            },
+            Ty::Bytes => match attr {
+                "decode" => Ty::Str,
+                _ => Ty::Object,
+            },
+            Ty::File(mode) => match attr {
+                "read" | "readline" => mode.content(),
+                "readlines" => Ty::List(Elem::of(mode.content())),
+                "write" | "close" | "flush" => Ty::None,
                 _ => Ty::Object,
             },
             _ => Ty::Object,
