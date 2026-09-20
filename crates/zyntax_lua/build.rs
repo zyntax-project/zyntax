@@ -51,6 +51,39 @@ fn main() -> Result<(), Box<dyn Error>> {
         .module_lowered(policy::LIBRARY_MODULE, program, &hir)?
         .build_in(&out)?;
 
+    // Every hook the shared library declares without a symbol is one
+    // this frontend must define, and the runtime only finds out when
+    // code naming it is compiled: checked here instead. (The other
+    // symbols without one are the platform's, `sqrt` and `free`.)
+    let defined: std::collections::HashSet<String> = lib_declarations
+        .iter()
+        .filter_map(|d| match &d.node {
+            zyntax_typed_ast::typed_ast::TypedDeclaration::Function(f) if !f.is_external => {
+                f.name.resolve_global()
+            }
+            _ => None,
+        })
+        .collect();
+    let undefined: Vec<String> = lib_declarations
+        .iter()
+        .filter_map(|d| match &d.node {
+            zyntax_typed_ast::typed_ast::TypedDeclaration::Function(f)
+                if f.is_external && f.link_name.is_none() =>
+            {
+                f.name.resolve_global()
+            }
+            _ => None,
+        })
+        .filter(|name| name.starts_with("zb_hook_") && !defined.contains(name))
+        .collect();
+    if !undefined.is_empty() {
+        return Err(format!(
+            "the shared library declares hooks the Lua library does not define: {}",
+            undefined.join(", ")
+        )
+        .into());
+    }
+
     // Which library functions can raise, for the frontend's checks,
     // and which may run the program's code before returning.
     let mut fallible = String::from("pub const FALLIBLE: &[&str] = &[\n");

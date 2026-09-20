@@ -566,6 +566,13 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
                 ret(add(text("table: 0x"), hex(addr(x.e())))),
             ],
         ),
+        // Lua has no second spelling of a value.
+        define(
+            "zb_hook_instance_repr",
+            &[&x],
+            string(),
+            vec![ret(call("zb_hook_instance_str", vec![x.e()], string()))],
+        ),
         define(
             "zb_hook_instance_type",
             &[&x],
@@ -574,6 +581,48 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
                 when(is_thread(x.e()), vec![ret(text("thread"))]),
                 when(is_file(x.e()), vec![ret(text("FILE*"))]),
                 ret(text("table")),
+            ],
+        ),
+        // Indexing, ordering and negation of an instance are Lua's own
+        // operations, with their metamethods.
+        define(
+            "zb_hook_instance_getitem",
+            &[&x, &b],
+            any(),
+            vec![ret(call("zl_index", vec![x.e(), b.e()], any()))],
+        ),
+        define(
+            "zb_hook_instance_setitem",
+            &[&x, &a, &b],
+            unit(),
+            vec![
+                expr(call("zl_setindex", vec![x.e(), a.e(), b.e()], unit())),
+                ret_void(),
+            ],
+        ),
+        define(
+            "zb_hook_instance_lt",
+            &[&a, &b],
+            boolean(),
+            vec![ret(call("zl_lt", vec![a.e(), b.e()], boolean()))],
+        ),
+        define(
+            "zb_hook_instance_le",
+            &[&a, &b],
+            boolean(),
+            vec![ret(call("zl_le", vec![a.e(), b.e()], boolean()))],
+        ),
+        define(
+            "zb_hook_instance_unary",
+            &[&code, &x],
+            any(),
+            vec![
+                when(
+                    eq(code.e(), int(0)),
+                    vec![ret(call("zl_unm", vec![x.e()], any()))],
+                ),
+                lua_error(text("attempt to perform arithmetic on a table value")),
+                ret(nil()),
             ],
         ),
         define(
@@ -657,6 +706,17 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
         &[&x],
         string(),
         vec![ret(text(""))],
+    ));
+    let ys = borrowed("ys", t.anys());
+    let start = local("start", i64());
+    let stop = local("stop", i64());
+    let step = local("step", i64());
+    let mask = local("mask", i64());
+    d.push(define(
+        "zb_hook_shaped_assign_slice",
+        &[&x, &ys, &start, &stop, &step, &mask],
+        unit(),
+        vec![ret_void()],
     ));
     d
 }
