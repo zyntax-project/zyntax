@@ -166,6 +166,9 @@ struct Module<'a> {
     /// The helpers made here that may run the program's code before
     /// they return: a call through them is a dynamic call.
     reentrant_helpers: RefCell<HashSet<String>>,
+    /// The sort made for each (shape, comparator) `table.sort` is
+    /// called with.
+    sorts: RefCell<HashMap<(ShapeId, FuncId), String>>,
 }
 
 /// How a shape's tables are laid out: the table header, then one slot
@@ -424,6 +427,12 @@ impl<'a> Module<'a> {
             declarations.push(library::reference_struct_class(&layout.name, &fields));
             hooks.push(layout);
         }
+    }
+
+    /// Whether tables of shape `k` never get a metatable.
+    fn plain_shape(&self, k: ShapeId) -> bool {
+        let info = self.inferred.shape(k);
+        !info.unknown_meta && info.classes.is_empty()
     }
 
     /// How a shape's tables are laid out, when they have slots.
@@ -1976,6 +1985,214 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         Some(Finder { helper, ends })
     }
 
+    /// The sort for `table.sort` over tables of shape `k` by the
+    /// function `f`: the library's quicksort over the array part, the
+    /// comparator called directly with the elements as their type.
+    /// `lua$sort$<k>$<f>(arr, lo, hi, line, rec)`, `line` the sort's
+    /// own for the error it raises, `rec` the comparator's record.
+    fn sort_helper(&mut self, k: ShapeId, f: FuncId, span: Span) -> String {
+        let key = (k, f);
+        if let Some(helper) = self.m.sorts.borrow().get(&key) {
+            return helper.clone();
+        }
+        let helper = format!("lua${}sort${}${}", self.m.tag, k.0, f.0);
+        let mut lowerer = Lowerer::new(self.m, CHUNK);
+        lowerer.returns = Returns::Fixed(Vec::new());
+        let anys = self.m.anys();
+        let i64_t = prim(PrimitiveType::I64);
+        let bool_t = prim(PrimitiveType::Bool);
+        let unit = prim(PrimitiveType::Unit);
+        let arr = || var(intern("arr"), anys.clone(), span);
+        let lo = || var(intern("lo"), i64_t.clone(), span);
+        let hi = || var(intern("hi"), i64_t.clone(), span);
+        let line = || var(intern("line"), i64_t.clone(), span);
+        let rec = || var(intern("rec"), Type::Any, span);
+        let i = intern("i");
+        let j = intern("j");
+        let pivot = intern("pivot");
+        let iv = || var(i, i64_t.clone(), span);
+        let jv = || var(j, i64_t.clone(), span);
+        let at = |x: Node| index(arr(), x, Type::Any, span);
+        let record = Val {
+            node: rec(),
+            ty: Ty::Any,
+        };
+        // `less(a, b)`: the comparator's first result, as a truth.
+        let less = |lowerer: &mut Lowerer<'m, 'a>, a: Node, b: Node| -> Node {
+            let multi = lowerer.direct_call_vals(
+                f,
+                Some(record.clone()),
+                Vec::new(),
+                vec![
+                    Val {
+                        node: a,
+                        ty: Ty::Any,
+                    },
+                    Val {
+                        node: b,
+                        ty: Ty::Any,
+                    },
+                ],
+                None,
+                span,
+            );
+            let first = match multi {
+                Multi::Fixed(vals) => vals
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| lowerer.nil_val(span)),
+                Multi::Dynamic(node) => Val {
+                    node: call("zl_first", vec![node], Type::Any, span),
+                    ty: Ty::Any,
+                },
+                Multi::None(node) => Val {
+                    node: block_value(vec![expr_stmt(node)], nil(span), span),
+                    ty: Ty::Nil,
+                },
+            };
+            lowerer.truthy(first)
+        };
+        let step =
+            |x: Node, by: i64| binary(BinaryOp::Add, x, int_lit(by, span), i64_t.clone(), span);
+        let cmp = |op: BinaryOp, a: Node, b: Node| binary(op, a, b, bool_t.clone(), span);
+        let less_i = less(&mut lowerer, at(iv()), var(pivot, Type::Any, span));
+        let less_j = less(&mut lowerer, var(pivot, Type::Any, span), at(jv()));
+        let tmp = intern("tmp");
+        let body = vec![
+            if_(
+                cmp(BinaryOp::Ge, lo(), hi()),
+                vec![ret(None, span)],
+                None,
+                span,
+            ),
+            let_(
+                pivot,
+                Type::Any,
+                at(binary(
+                    BinaryOp::Div,
+                    binary(BinaryOp::Add, lo(), hi(), i64_t.clone(), span),
+                    int_lit(2, span),
+                    i64_t.clone(),
+                    span,
+                )),
+                span,
+            ),
+            let_(i, i64_t.clone(), lo(), span),
+            let_(j, i64_t.clone(), hi(), span),
+            while_(
+                cmp(BinaryOp::Le, iv(), jv()),
+                vec![
+                    // An order that never settles walks off the range:
+                    // the comparator is not one.
+                    while_(
+                        binary(
+                            BinaryOp::And,
+                            cmp(BinaryOp::Le, iv(), hi()),
+                            less_i,
+                            bool_t.clone(),
+                            span,
+                        ),
+                        vec![assign(iv(), step(iv(), 1), span)],
+                        span,
+                    ),
+                    while_(
+                        binary(
+                            BinaryOp::And,
+                            cmp(BinaryOp::Ge, jv(), lo()),
+                            less_j,
+                            bool_t.clone(),
+                            span,
+                        ),
+                        vec![assign(jv(), step(jv(), -1), span)],
+                        span,
+                    ),
+                    if_(
+                        binary(
+                            BinaryOp::Or,
+                            cmp(BinaryOp::Gt, iv(), hi()),
+                            cmp(BinaryOp::Lt, jv(), lo()),
+                            bool_t.clone(),
+                            span,
+                        ),
+                        vec![
+                            assign(
+                                var(intern(library::LINE), i64_t.clone(), span),
+                                line(),
+                                span,
+                            ),
+                            expr_stmt(call(
+                                "zb_fatal",
+                                vec![
+                                    str_lit("error", span),
+                                    str_lit("invalid order function for sorting", span),
+                                ],
+                                unit.clone(),
+                                span,
+                            )),
+                            ret(None, span),
+                        ],
+                        None,
+                        span,
+                    ),
+                    if_(
+                        cmp(BinaryOp::Le, iv(), jv()),
+                        vec![
+                            let_(tmp, Type::Any, at(iv()), span),
+                            assign(at(iv()), at(jv()), span),
+                            assign(at(jv()), var(tmp, Type::Any, span), span),
+                            assign(iv(), step(iv(), 1), span),
+                            assign(jv(), step(jv(), -1), span),
+                        ],
+                        None,
+                        span,
+                    ),
+                ],
+                span,
+            ),
+            if_(
+                binary(
+                    BinaryOp::Ne,
+                    Lowerer::pending(span),
+                    nil(span),
+                    bool_t.clone(),
+                    span,
+                ),
+                vec![ret(None, span)],
+                None,
+                span,
+            ),
+            expr_stmt(call(
+                &helper,
+                vec![arr(), lo(), jv(), line(), rec()],
+                unit.clone(),
+                span,
+            )),
+            expr_stmt(call(
+                &helper,
+                vec![arr(), iv(), hi(), line(), rec()],
+                unit,
+                span,
+            )),
+            ret(None, span),
+        ];
+        let params = vec![
+            parameter(intern("arr"), anys, span),
+            parameter(intern("lo"), i64_t.clone(), span),
+            parameter(intern("hi"), i64_t.clone(), span),
+            parameter(intern("line"), i64_t, span),
+            parameter(intern("rec"), Type::Any, span),
+        ];
+        self.m.functions.borrow_mut().push(typed_function(
+            &helper,
+            params,
+            prim(PrimitiveType::Unit),
+            body,
+            span,
+        ));
+        self.m.sorts.borrow_mut().insert(key, helper.clone());
+        helper
+    }
+
     /// The function a method call on a receiver of shape `k` falls
     /// back on when its finder settles nothing: the value found, the
     /// receiver and the arguments in, the call through the value made
@@ -3316,6 +3533,42 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     node: call("zl_table_len", vec![v.node], prim(PrimitiveType::I64), span),
                     ty: Ty::Int,
                 },
+                // A shaped table is a table unless it is nil, when the
+                // dynamic path raises as Lua does.
+                Ty::Shape(_) if !self.scopes().len_meta => {
+                    let i64_t = prim(PrimitiveType::I64);
+                    let mut pre = Vec::new();
+                    let t = self.hold(v, &mut pre);
+                    let is_null = binary(
+                        BinaryOp::Eq,
+                        t.node.clone(),
+                        null(self.ir(Ty::Table), span),
+                        prim(PrimitiveType::Bool),
+                        span,
+                    );
+                    let on_nil = self.guard_described(
+                        Val {
+                            node: call("zl_len_any", vec![nil(span)], Type::Any, span),
+                            ty: Ty::Any,
+                        },
+                        &descs,
+                    );
+                    let on_nil = self.coerce(on_nil, Ty::Int);
+                    Val {
+                        node: block_value(
+                            pre,
+                            if_value(
+                                is_null,
+                                on_nil,
+                                call("zl_table_len", vec![t.node], i64_t.clone(), span),
+                                i64_t,
+                                span,
+                            ),
+                            span,
+                        ),
+                        ty: Ty::Int,
+                    }
+                }
                 _ => {
                     let b = self.boxed(v);
                     self.guard_described(
@@ -4773,14 +5026,22 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             descs,
         );
         let ty = self.m.inferred.element_read_ty(s, k.ty).settled();
-        if ty == Ty::Any {
+        // Without a metatable to ask, an element in range is the
+        // answer whatever its kind; a float key names an element only
+        // when it is integral, and the general path decides that.
+        let info = self.m.inferred.shape(s);
+        let plain = !info.unknown_meta && info.classes.is_empty();
+        if !plain {
+            let node = if ty == Ty::Any {
+                general.node
+            } else {
+                self.coerce(general, ty)
+            };
             return Val {
-                node: block_value(pre, general.node, span),
-                ty: Ty::Any,
+                node: block_value(pre, node, span),
+                ty,
             };
         }
-        // A float key names an element only when it is integral: the
-        // general path decides.
         if k.ty != Ty::Int {
             let general = self.coerce(general, ty);
             return Val {
@@ -5030,6 +5291,105 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
             };
             return self.guarded_stmt(node, &descs);
+        }
+        // A shaped receiver is a table unless it is nil, when the dynamic
+        // path raises as Lua does.
+        if let Ty::Shape(_) = obj.ty {
+            let table_t = self.ir(Ty::Table);
+            let mut pre = Vec::new();
+            let t = self.hold(obj, &mut pre);
+            let held_v = self
+                .hold(
+                    Val {
+                        node: v,
+                        ty: Ty::Any,
+                    },
+                    &mut pre,
+                )
+                .node;
+            let (on_table, on_nil) = match key.ty {
+                Ty::Int => {
+                    let k = self.hold(key, &mut pre);
+                    (
+                        call(
+                            "zl_table_seti",
+                            vec![t.node.clone(), k.node.clone(), held_v.clone()],
+                            unit.clone(),
+                            span,
+                        ),
+                        call(
+                            "zl_seti",
+                            vec![nil(span), k.node, held_v],
+                            unit.clone(),
+                            span,
+                        ),
+                    )
+                }
+                Ty::Str => {
+                    let k = self.hold(key, &mut pre);
+                    (
+                        call(
+                            "zl_table_setindex_str",
+                            vec![t.node.clone(), k.node.clone(), held_v.clone()],
+                            unit.clone(),
+                            span,
+                        ),
+                        call(
+                            "zl_setindex_str",
+                            vec![nil(span), k.node, held_v],
+                            unit.clone(),
+                            span,
+                        ),
+                    )
+                }
+                _ => {
+                    let k = self.boxed(key);
+                    let k = self
+                        .hold(
+                            Val {
+                                node: k,
+                                ty: Ty::Any,
+                            },
+                            &mut pre,
+                        )
+                        .node;
+                    (
+                        call(
+                            "zl_table_setindex",
+                            vec![t.node.clone(), k.clone(), held_v.clone()],
+                            unit.clone(),
+                            span,
+                        ),
+                        call(
+                            "zl_setindex",
+                            vec![nil(span), k, held_v],
+                            unit.clone(),
+                            span,
+                        ),
+                    )
+                }
+            };
+            let is_null = binary(
+                BinaryOp::Eq,
+                t.node,
+                null(table_t, span),
+                prim(PrimitiveType::Bool),
+                span,
+            );
+            pre.push(if_(
+                is_null,
+                vec![expr_stmt(on_nil)],
+                Some(vec![expr_stmt(on_table)]),
+                span,
+            ));
+            pre.push(self.pending_check_described(span, &descs));
+            return stmt(
+                TypedStatement::Block(TypedBlock {
+                    statements: pre,
+                    span,
+                }),
+                span,
+            );
         }
         let node = match obj.ty {
             Ty::Table => match key.ty {
@@ -6142,6 +6502,98 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             && let Some(m) = self.math_call(b, &mut vals, &mut pre, span)
         {
             return Ok(m);
+        }
+        // `tostring` of a string or a number is its text, made as `..`
+        // makes it.
+        if b.lib.is_empty()
+            && b.name == "tostring"
+            && tail.is_none()
+            && vals.len() == 1
+            && matches!(vals[0].ty, Ty::Str | Ty::Int | Ty::Float | Ty::Number)
+        {
+            let text = self.text_of(vals.remove(0));
+            return Ok(Multi::Fixed(vec![Val {
+                node: block_value(pre, text, span),
+                ty: Ty::Str,
+            }]));
+        }
+        // `table.sort` of a table with no metatable by a function the
+        // types know: a sort of its own, calling the comparator
+        // directly with the elements as their type.
+        if b.lib == "table"
+            && b.name == "sort"
+            && tail.is_none()
+            && vals.len() == 2
+            && let Ty::Shape(k) = vals[0].ty
+            && let Ty::Func(f) = vals[1].ty
+            && self.m.plain_shape(k)
+        {
+            let helper = self.sort_helper(k, f, span);
+            self.raise_callees.insert(f);
+            let table_t = self.ir(Ty::Table);
+            let bool_t = prim(PrimitiveType::Bool);
+            let i64_t = prim(PrimitiveType::I64);
+            let unit = prim(PrimitiveType::Unit);
+            let comp = vals.pop().expect("the comparator");
+            let t = vals.pop().expect("the table");
+            let t_null = binary(
+                BinaryOp::Eq,
+                t.node.clone(),
+                null(table_t, span),
+                bool_t.clone(),
+                span,
+            );
+            let comp_nil = binary(
+                BinaryOp::Eq,
+                comp.node.clone(),
+                nil(span),
+                bool_t.clone(),
+                span,
+            );
+            let boxed_t = self.boxed(t.clone());
+            let general = call(
+                "zl_table_sort",
+                vec![boxed_t, comp.node.clone()],
+                unit.clone(),
+                span,
+            );
+            let arr = self.temp();
+            let typed = vec![
+                let_(
+                    arr,
+                    self.m.anys(),
+                    call("zl_arr_own", vec![t.node], self.m.anys(), span),
+                    span,
+                ),
+                expr_stmt(call(
+                    &helper,
+                    vec![
+                        var(arr, self.m.anys(), span),
+                        int_lit(0, span),
+                        binary(
+                            BinaryOp::Sub,
+                            list_len(var(arr, self.m.anys(), span), span),
+                            int_lit(1, span),
+                            i64_t.clone(),
+                            span,
+                        ),
+                        var(intern(library::LINE), i64_t, span),
+                        comp.node,
+                    ],
+                    unit,
+                    span,
+                )),
+            ];
+            // A nil table raises through the general path; a nil
+            // comparator sorts by `<` there too.
+            pre.push(if_(
+                binary(BinaryOp::Or, t_null, comp_nil, bool_t, span),
+                vec![expr_stmt(general)],
+                Some(typed),
+                span,
+            ));
+            pre.push(self.pending_check(span));
+            return Ok(Multi::None(block_value(pre, nil(span), span)));
         }
         // `setmetatable` of tables the types know: neither is boxed.
         if b.lib.is_empty()
@@ -8245,6 +8697,7 @@ fn chunk_module(
         finders: RefCell::new(HashMap::new()),
         misses: RefCell::new(HashMap::new()),
         reentrant_helpers: RefCell::new(HashSet::new()),
+        sorts: RefCell::new(HashMap::new()),
         layouts: shape_layouts(inferred, chunk_index, slots),
     };
     let span = Span::new(0, source.len());
@@ -8293,6 +8746,7 @@ fn chunk_module(
     module.finders.borrow_mut().clear();
     module.misses.borrow_mut().clear();
     module.reentrant_helpers.borrow_mut().clear();
+    module.sorts.borrow_mut().clear();
     let statements = lower(&module)?;
     let chunk_name = format!("lua${tag}chunk");
     let code_name = format!("{chunk_name}$fn");
@@ -8753,6 +9207,7 @@ pub(crate) fn program(
         finders: RefCell::new(HashMap::new()),
         misses: RefCell::new(HashMap::new()),
         reentrant_helpers: RefCell::new(HashSet::new()),
+        sorts: RefCell::new(HashMap::new()),
         layouts: shape_layouts(&inferred, 0, true),
     };
     let span = Span::new(0, source.len());
@@ -8864,6 +9319,7 @@ pub(crate) fn program(
     module.finders.borrow_mut().clear();
     module.misses.borrow_mut().clear();
     module.reentrant_helpers.borrow_mut().clear();
+    module.sorts.borrow_mut().clear();
     crate::trace_phase("lower 1", started);
     let started = std::time::Instant::now();
     let statements = lower_chunk(&module)?;

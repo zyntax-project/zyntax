@@ -1973,6 +1973,23 @@ impl<'a> Round<'a> {
                 self.metatable_builtin(b.name, &args);
                 return;
             }
+            // `table.sort` of a table with no metatable by a known
+            // function calls it with the elements: a direct call, the
+            // comparator kept as it is.
+            if b.lib == "table"
+                && b.name == "sort"
+                && args.len() == 2
+                && let Ty::Shape(k) = self.typer().ty_of(args[0])
+                && let Ty::Func(f) = self.typer().ty_of(args[1])
+                && !self.out.shapes[k.0 as usize].unknown_meta
+                && self.out.shapes[k.0 as usize].classes.is_empty()
+            {
+                self.expr(args[0]);
+                self.expr(args[1]);
+                let element = self.out.shapes[k.0 as usize].element;
+                self.record_call_types(f, vec![element, element]);
+                return;
+            }
             // `table.insert` and `table.move` store elements into their
             // table; the rest of the call takes values as any library
             // call does.
