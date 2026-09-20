@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1789856030,"nonce":"SMjY0YSFWIYc1+SS0JlbOjCtHzM=","added":["bug","area:lua"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1789897968,"nonce":"MTT+ElDc8dnUZjc9Nyt2sduxoIE=","message":"Fixed in 95af01aac61564847523c3686c094232570dffd0.","files":null}]}
