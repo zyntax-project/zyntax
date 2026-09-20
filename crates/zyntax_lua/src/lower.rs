@@ -2853,7 +2853,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             }
             let v = self.guard_described(
                 Val {
-                    node: call(&format!("zl_call_{n}"), lowered, Type::Any, span),
+                    node: call(&format!("zl_apply_{n}"), lowered, Type::Any, span),
                     ty: Ty::Any,
                 },
                 &descs,
@@ -2881,7 +2881,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         };
         let v = self.guard_described(
             Val {
-                node: call("zl_call_packed", vec![f, list], Type::Any, span),
+                node: call("zl_apply_packed", vec![f, list], Type::Any, span),
                 ty: Ty::Any,
             },
             &descs,

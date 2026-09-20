@@ -495,6 +495,12 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
 /// here; every function that may raise leaves with a placeholder once
 /// it sees the value set, until a `pcall` takes it.
 pub const PENDING: &str = "zl_pending";
+/// Whether the pending error is a stack overflow: a message handler
+/// cannot run on one, as the reference has no stack left for it.
+pub const OVERFLOWED: &str = "zl_overflowed";
+/// How many times a message handler that raises is called again on
+/// its own error before that is 'error in error handling'.
+pub const HANDLER_RETRIES: i64 = 200;
 /// The names of the chunks a program is made of besides the main one,
 /// which `zl_chunk` names: a line stored in `zl_line` carries its
 /// chunk's number in the bits above `LINE_BITS`, 0 for the main chunk
@@ -504,6 +510,12 @@ pub const CHUNKS: &str = "zl_chunks";
 /// call is a stack overflow, as the reference's stack limit makes it.
 /// A coroutine counts on from where it was resumed.
 pub const DEPTH: &str = "zl_depth";
+/// How many calls from the library into the program are in progress:
+/// metamethods, iterators, comparators, what pcall protects, a
+/// coroutine resumed. These nest on the reference's C stack, which
+/// holds `CCALLS_LIMIT` of them.
+pub const CCALLS: &str = "zl_ccalls";
+pub const CCALLS_LIMIT: i64 = 200;
 #[allow(dead_code)]
 pub const MAX_DEPTH: i64 = 200_000;
 pub const LINE_BITS: i64 = 32;
@@ -586,15 +598,21 @@ fn raising(t: &Types) -> Vec<Decl> {
         global_var(CHUNK, string()),
         global_var(CHUNKS, any()),
         global_var(DEPTH, i64()),
+        global_var(CCALLS, i64()),
         global_var(VARINFO, i64()),
         global_var(FOR_SKIP, boolean()),
+        global_var(OVERFLOWED, boolean()),
     ];
     // Entered below the floor: the error every deeper call would raise.
     d.push(define_cold(
         "zl_stack_overflow",
         &[],
         unit(),
-        vec![lua_error(text("stack overflow")), ret_void()],
+        vec![
+            set_global(OVERFLOWED, bool(true)),
+            lua_error(text("stack overflow")),
+            ret_void(),
+        ],
     ));
     // The name of the chunk a stored line belongs to.
     let found = local("found", any());
@@ -839,6 +857,7 @@ fn raising(t: &Types) -> Vec<Decl> {
         vec![
             v.decl(pending()),
             set_global(PENDING, nil()),
+            set_global(OVERFLOWED, bool(false)),
             when(is_nil_error(v.e()), vec![ret(nil())]),
             ret(v.e()),
         ],

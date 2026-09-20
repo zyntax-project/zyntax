@@ -22,6 +22,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let h = kept("h", any());
     let rec = borrowed("rec", anys.clone());
     let arity = local("arity", i64());
+    let y = local("y", any());
     let most = local("most", i64());
     let xs = kept("xs", anys.clone());
     let out = borrowed("out", anys.clone());
@@ -188,26 +189,32 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     anys.clone(),
                 ))],
             ),
-            when(
-                is_table(f.e()),
+            // A table's `__call` handler, which may be a table with
+            // one of its own: each puts its object in front, as many
+            // times as the C stack allows.
+            h.decl(f.e()),
+            i.decl(int(0)),
+            while_(
+                and(is_table(h.e()), lt(i.e(), int(CCALLS_LIMIT))),
                 vec![
-                    h.decl(call("zl_meta_of", vec![f.e(), text("__call")], any())),
+                    expr(mcall(args.e(), "insert_at", vec![int(0), h.e()], unit())),
+                    h.set(call("zl_meta_of", vec![h.e(), text("__call")], any())),
                     when(
                         is_func(h.e()),
-                        vec![
-                            expr(mcall(args.e(), "insert_at", vec![int(0), f.e()], unit())),
-                            ret(call("zb_unbox_list_raw_any", vec![h.e()], anys.clone())),
-                        ],
+                        vec![ret(call(
+                            "zb_unbox_list_raw_any",
+                            vec![h.e()],
+                            anys.clone(),
+                        ))],
                     ),
-                    // A handler that is not a function is what the
-                    // error names, as the reference tries to call it.
-                    when(
-                        not(is_nil(h.e())),
-                        vec![not_callable(&h), ret(list(vec![], anys.clone()))],
-                    ),
+                    i.add_assign(int(1)),
                 ],
             ),
-            not_callable(&f),
+            // A handler that is not a function is what the error
+            // names, as the reference tries to call it; a table with
+            // no handler is itself.
+            when(is_nil(h.e()), vec![h.set(at(args.e(), int(0)))]),
+            not_callable(&h),
             ret(list(vec![], anys.clone())),
         ],
     ));
@@ -228,7 +235,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             )),
         ]
     };
-    d.push(define("zl_call_packed", &[&f, &args], any(), {
+    d.push(define("zl_apply_packed", &[&f, &args], any(), {
         let mut st = vec![
             rec.decl(call("zl_callee", vec![f.e(), args.e()], anys.clone())),
             // Nothing callable: the error is raised, the call is nil.
@@ -278,7 +285,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         let mut direct = vec![rec.e()];
         direct.extend(params[..n].iter().map(|p| p.e()));
         d.push(define(
-            &format!("zl_call_{n}"),
+            &format!("zl_apply_{n}"),
             &sig,
             any(),
             vec![
@@ -297,7 +304,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     ],
                 ),
                 ret(call(
-                    "zl_call_packed",
+                    "zl_apply_packed",
                     vec![
                         f.e(),
                         list(params[..n].iter().map(|p| p.e()).collect(), anys.clone()),
@@ -305,6 +312,47 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     any(),
                 )),
             ],
+        ));
+    }
+    // The same from the library: a metamethod, an iterator, a
+    // comparator, a handler. These nest on the reference's C stack,
+    // so they are counted and refused past its limit; a call the
+    // program makes itself is not, as its own recursion is bounded by
+    // the depth.
+    let ccalls = || read_global(CCALLS, i64());
+    let counted = |name: &str, apply: &str, sig: &[&Local], args: Vec<Expr>| {
+        define(
+            name,
+            sig,
+            any(),
+            vec![
+                when(
+                    ge(ccalls(), int(CCALLS_LIMIT)),
+                    vec![lua_error(text("C stack overflow")), ret(nil())],
+                ),
+                set_global(CCALLS, add(ccalls(), int(1))),
+                y.decl(call(apply, args, any())),
+                set_global(CCALLS, sub(ccalls(), int(1))),
+                ret(y.e()),
+            ],
+        )
+    };
+    d.push(counted(
+        "zl_call_packed",
+        "zl_apply_packed",
+        &[&f, &args],
+        vec![f.e(), args.e()],
+    ));
+    for n in 0..=MAX_CALL_ARITY {
+        let mut sig: Vec<&Local> = vec![&f];
+        sig.extend(params[..n].iter());
+        let mut args = vec![f.e()];
+        args.extend(params[..n].iter().map(|p| p.e()));
+        d.push(counted(
+            &format!("zl_call_{n}"),
+            &format!("zl_apply_{n}"),
+            &sig,
+            args,
         ));
     }
     // A record for a library function's code, so a program can pass

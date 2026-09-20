@@ -55,6 +55,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let out = borrowed("out", anys.clone());
     let step = local("step", i64());
     let depth = local("depth", i64());
+    let ccalls = local("ccalls", i64());
     let status = local("status", i64());
     let handle = local("handle", i64());
     let env = borrowed("env", anys.clone());
@@ -307,6 +308,18 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     any(),
                 ))],
             ),
+            // A resume nests on the reference's C stack.
+            when(
+                ge(read_global(CCALLS, i64()), int(CCALLS_LIMIT)),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(
+                        vec![box_bool(bool(false)), box_str(text("C stack overflow"))],
+                        anys.clone(),
+                    )],
+                    any(),
+                ))],
+            ),
             set_idx(rec.e(), int(SLOT), call("zl_pack", vec![args.e()], any())),
             prev.decl(current()),
             if_(
@@ -328,12 +341,15 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             // The resumer's depth again afterwards: frames the fiber
             // keeps while suspended are not on this stack.
             depth.decl(read_global(DEPTH, i64())),
+            ccalls.decl(read_global(CCALLS, i64())),
+            set_global(CCALLS, add(ccalls.e(), int(1))),
             step.decl(call(
                 "zl_fiber_resume_with",
                 vec![handle.e(), at(rec.e(), int(SLOT))],
                 i64(),
             )),
             set_global(DEPTH, depth.e()),
+            set_global(CCALLS, ccalls.e()),
             set_current(prev.e()),
             if_(
                 not(is_nil(prev.e())),
@@ -517,11 +533,15 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     // resume is an error.
     let packed = kept("packed", any());
     let results = borrowed("results", anys.clone());
+    let line = local("line", i64());
     d.push(define(
         "zl_co_wrap_code",
         &[&env, &packed],
         any(),
         vec![
+            // An error is raised again at the caller, a string with
+            // the caller's position in front.
+            line.decl(read_global(LINE, i64())),
             x.decl(call(
                 "zl_co_resume",
                 vec![
@@ -534,9 +554,13 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             when(
                 not(call("zl_truthy", vec![at(results.e(), int(0))], boolean())),
                 vec![
+                    set_global(LINE, line.e()),
                     expr(call(
-                        "zl_raise_value",
-                        vec![call("zl_value_at", vec![results.e(), int(2)], any())],
+                        "zl_error",
+                        vec![
+                            call("zl_value_at", vec![results.e(), int(2)], any()),
+                            int(1),
+                        ],
                         unit(),
                     )),
                     ret(nil()),

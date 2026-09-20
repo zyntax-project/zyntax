@@ -1538,8 +1538,8 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ret(int(0)),
         ],
     ));
-    // `assert(v, message)`: the message is the error value as it is,
-    // no position added.
+    // `assert(v, message)`: the message is raised as `error` raises
+    // it, a string positioned.
     d.push(define(
         "zl_assert",
         &[&x, &args],
@@ -1551,8 +1551,8 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     if_(
                         ge(len(args.e()), int(1)),
                         vec![expr(call(
-                            "zl_raise_value",
-                            vec![at(args.e(), int(0))],
+                            "zl_error",
+                            vec![at(args.e(), int(0)), int(1)],
                             unit(),
                         ))],
                         vec![expr(call(
@@ -1577,11 +1577,27 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     // position, as under the reference where the caller is C.
     let handler = kept("handler", any());
     let err = kept("err", any());
+    // Past the C stack's limit, the call is refused in pcall's own
+    // frame, so the message has no position.
+    let c_stack_full = || {
+        when(
+            ge(read_global(CCALLS, i64()), int(CCALLS_LIMIT)),
+            vec![ret(call(
+                "zb_box_tuple",
+                vec![list(
+                    vec![box_bool(bool(false)), box_str(text("C stack overflow"))],
+                    anys.clone(),
+                )],
+                any(),
+            ))],
+        )
+    };
     d.push(define(
         "zl_pcall",
         &[&x, &args],
         any(),
         vec![
+            c_stack_full(),
             set_global(LINE, int(0)),
             y.decl(call("zl_call_packed", vec![x.e(), args.e()], any())),
             when(
@@ -1603,7 +1619,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ret(call("zb_box_tuple", vec![out.e()], any())),
         ],
     ));
-    // `xpcall(f, handler, ...)`: the handler sees the error first.
+    // `xpcall(f, handler, ...)`: the handler sees the error first. A
+    // handler that raises is called again on its own error, some
+    // times; when it overflows the stack, or past them, the error is
+    // an error in error handling.
+    let failed = |err: Expr| {
+        ret(call(
+            "zb_box_tuple",
+            vec![list(vec![box_bool(bool(false)), err], anys.clone())],
+            any(),
+        ))
+    };
     d.push(define(
         "zl_xpcall",
         &[&x, &handler, &args],
@@ -1617,22 +1643,37 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     text(")"),
                 ]))],
             ),
+            c_stack_full(),
             set_global(LINE, int(0)),
             y.decl(call("zl_call_packed", vec![x.e(), args.e()], any())),
             when(
                 not(is_nil(pending())),
                 vec![
+                    k.decl(int(0)),
                     err.decl(call("zl_take_pending", vec![], any())),
-                    err.set(call(
-                        "zl_first",
-                        vec![call("zl_call_1", vec![handler.e(), err.e()], any())],
-                        any(),
-                    )),
-                    ret(call(
-                        "zb_box_tuple",
-                        vec![list(vec![box_bool(bool(false)), err.e()], anys.clone())],
-                        any(),
-                    )),
+                    while_(
+                        bool(true),
+                        vec![
+                            err.set(call(
+                                "zl_first",
+                                vec![call("zl_call_1", vec![handler.e(), err.e()], any())],
+                                any(),
+                            )),
+                            when(is_nil(pending()), vec![failed(err.e())]),
+                            when(
+                                or(
+                                    read_global(OVERFLOWED, boolean()),
+                                    ge(k.e(), int(HANDLER_RETRIES)),
+                                ),
+                                vec![
+                                    expr(call("zl_take_pending", vec![], any())),
+                                    failed(box_str(text("error in error handling"))),
+                                ],
+                            ),
+                            err.set(call("zl_take_pending", vec![], any())),
+                            k.add_assign(int(1)),
+                        ],
+                    ),
                 ],
             ),
             out.decl(list(vec![box_bool(bool(true))], anys.clone())),

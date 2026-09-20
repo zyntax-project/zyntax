@@ -1,0 +1,20 @@
+false	true	true	C stack overflow
+true
+false	c_stack.lua:15: C stack overflow
+true
+false	C stack overflow	true
+false	error in error handling
+false	h:c_stack.lua:30: again
+3
+false	error in error handling
+false	handled: stack overflow
+false	c_stack.lua:37: boom
+false	boom
+table
+false	42
+false	c_stack.lua:43: x
+false	c_stack.lua:46: c_stack.lua:45: y
+2
+table table table table table string string
+false	attempt to call a table value
+false	attempt to call a number value
