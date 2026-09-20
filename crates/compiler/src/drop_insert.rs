@@ -166,6 +166,13 @@ pub fn facts_of(module: &HirModule) -> ModuleFacts {
     ModuleFacts::build(module)
 }
 
+/// The pass over one function with the facts of its module: what a
+/// body run before its optimisation needs of the pipeline, so that it
+/// frees what it allocates.
+pub fn run_function_with(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
+    run_function(func, facts)
+}
+
 /// [`run_module`] with the facts already built.
 pub fn run_module_with(module: &mut HirModule, facts: &ModuleFacts) -> DropStats {
     let mut total = DropStats::default();

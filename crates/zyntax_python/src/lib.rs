@@ -26,6 +26,7 @@ use zyntax_typed_ast::{
     InternedString, Mutability, PrimitiveType, Type, TypedNode, TypedProgram, Visibility,
 };
 
+mod class_attrs;
 mod classes;
 mod format;
 mod host;
@@ -351,8 +352,8 @@ pub fn parse_program_with(
             // A module docstring declares nothing and runs nothing.
             py::Stmt::Expr(e) if matches!(*e.value, py::Expr::StringLiteral(_)) => {}
             py::Stmt::Pass(_) => {}
-            // Classes are declarations; their methods are functions.
-            py::Stmt::ClassDef(_) => {}
+            // A class's methods are functions; what its body declares
+            // besides runs where the class statement is.
             other => top_level.push((other, origin)),
         }
     }
@@ -378,6 +379,15 @@ pub fn parse_program_with(
         }
     }
 
+    let bases: Vec<Option<usize>> = class_infos.iter().map(|c| c.base).collect();
+    let top_stmts: Vec<&py::Stmt> = top_level.iter().map(|(s, _)| *s).collect();
+    let class_attrs = std::sync::Arc::new(class_attrs::collect(
+        &class_defs,
+        &class_index,
+        &bases,
+        &top_stmts,
+        &items,
+    )?);
     lap("classes");
     let mut library = library()?;
     lower::set_list_type(library.list_type);
@@ -393,6 +403,7 @@ pub fn parse_program_with(
         list_type: Some(library.list_type),
         classes: class_infos,
         class_index,
+        class_attrs,
         fallible: library.fallible.clone(),
         name: ENTRY.to_string(),
         imports,
@@ -401,7 +412,9 @@ pub fn parse_program_with(
         ..Default::default()
     };
     let def_stmts: Vec<&py::StmtFunctionDef> = defs.iter().map(|(f, _)| *f).collect();
-    let global_names = module_globals(&module.body, &def_stmts, &inferred.class_index);
+    let mut global_names = module_globals(&module.body, &def_stmts, &inferred.class_index);
+    // A class attribute not fixed as a constant is a module variable.
+    global_names.extend(inferred.class_attrs.globals().map(str::to_string));
     inferred.closed = types::closed_items(&module.body, &items);
     // Every lambda and nested def, so a call through a value of one is
     // a direct call wherever the value's type is known.
@@ -416,7 +429,11 @@ pub fn parse_program_with(
     for item in &items {
         let file = inferred.file_of(item.module.as_deref());
         let scope = scope::Scope::of_function(item.def);
-        writes_globals.push(!scope.globals.is_empty());
+        writes_globals.push(
+            !scope.globals.is_empty()
+                || (!inferred.class_attrs.is_empty()
+                    && types::writes_class_attrs(&inferred.class_index, &item.def.body)),
+        );
         let mut visible = scope.bound.clone();
         visible.extend(
             item.def
@@ -526,6 +543,7 @@ pub fn parse_program_with(
                     .entry
                     .vars
                     .get(name)
+                    .or_else(|| out.entry.global_writes.get(name))
                     .copied()
                     .unwrap_or(types::Ty::Unknown);
                 (name.clone(), ty)
@@ -905,7 +923,7 @@ fn module_globals(
     functions.extend(classes.keys().map(|k| k.as_str()));
     let mut names: std::collections::BTreeSet<String> =
         module.declared_globals().into_iter().collect();
-    for (_, child) in &module.children {
+    for (_, child) in module.children.iter().chain(&module.methods) {
         for name in &child.free {
             if module.bound.contains(name) && !functions.contains(name.as_str()) {
                 names.insert(name.clone());

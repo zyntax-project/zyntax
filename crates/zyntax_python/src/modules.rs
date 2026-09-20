@@ -48,6 +48,7 @@ pub(crate) fn link(main: Vec<py::Stmt>, resolve: &Resolver<'_>) -> Result<Linked
         in_progress: Vec::new(),
         out: Vec::new(),
         sources: Vec::new(),
+        reads: names_read(&main),
     };
     let mut main = main;
     let imports = linker.link_imports(&mut main)?;
@@ -67,6 +68,9 @@ struct Linker<'r> {
     in_progress: Vec<String>,
     out: Vec<(py::Stmt, Option<String>)>,
     sources: Vec<(String, String)>,
+    /// Every name the body being linked reads anywhere, so an import
+    /// nothing reads is known to be one.
+    reads: HashSet<String>,
 }
 
 impl Linker<'_> {
@@ -81,6 +85,22 @@ impl Linker<'_> {
                     for alias in &i.names {
                         let module = alias.name.id.as_str();
                         if stdlib::is_known(module) {
+                            continue;
+                        }
+                        // A module the program never reads through its
+                        // name is imported for nothing; one that is not
+                        // here is then no loss.
+                        let local = alias
+                            .asname
+                            .as_ref()
+                            .map(|a| a.id.as_str())
+                            .unwrap_or(module);
+                        if (self.resolve)(module).is_none()
+                            && !self
+                                .reads
+                                .contains(local.split('.').next().unwrap_or(local))
+                        {
+                            ours = true;
                             continue;
                         }
                         self.load(module, alias.range())?;
@@ -138,6 +158,29 @@ impl Linker<'_> {
                     imports.modules.extend(inner.modules);
                     imports.names.extend(inner.names);
                 }
+                // A branch on the interpreter's version is decided here:
+                // the one taken stays, under a test of `True`, and the
+                // others' imports are never made.
+                py::Stmt::If(i) if let Some(taken) = version_branch(i) => {
+                    let mut body = match taken {
+                        None => Default::default(),
+                        Some(0) => std::mem::take(&mut i.body),
+                        Some(n) => std::mem::take(&mut i.elif_else_clauses[n - 1].body),
+                    };
+                    let inner = self.link_imports(&mut body)?;
+                    imports.modules.extend(inner.modules);
+                    imports.names.extend(inner.names);
+                    *i.test = py::Expr::BooleanLiteral(py::ExprBooleanLiteral {
+                        node_index: Default::default(),
+                        range: i.test.range(),
+                        value: true,
+                    });
+                    i.body = body;
+                    i.elif_else_clauses.clear();
+                    if i.body.is_empty() {
+                        i.body.push(pass(i.range()));
+                    }
+                }
                 py::Stmt::If(i) => {
                     let inner = self.link_imports(&mut i.body)?;
                     imports.modules.extend(inner.modules);
@@ -190,9 +233,10 @@ impl Linker<'_> {
         self.in_progress.push(module.to_string());
         let mut body: Vec<py::Stmt> = parsed.into_syntax().body.into_iter().collect();
         // What goes wrong inside the module is reported against it.
-        let imports = self
-            .link_imports(&mut body)
-            .map_err(|e| e.in_module(module))?;
+        let outer_reads = std::mem::replace(&mut self.reads, names_read(&body));
+        let imports = self.link_imports(&mut body);
+        self.reads = outer_reads;
+        let imports = imports.map_err(|e| e.in_module(module))?;
         // `__name__` is the module's own; the assignment binds it at
         // module level so the qualifier renames every read of it.
         let mut with_name: Vec<py::Stmt> =
@@ -213,6 +257,112 @@ impl Linker<'_> {
             .extend(body.into_iter().map(|s| (s, Some(module.to_string()))));
         Ok(())
     }
+}
+
+/// Every name read anywhere in `body`, nested bodies included.
+fn names_read(body: &[py::Stmt]) -> HashSet<String> {
+    use ruff_python_ast::visitor::{Visitor, walk_expr};
+    #[derive(Default)]
+    struct Reads(HashSet<String>);
+    impl<'a> Visitor<'a> for Reads {
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            if let py::Expr::Name(n) = e
+                && n.ctx.is_load()
+            {
+                self.0.insert(n.id.to_string());
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut reads = Reads::default();
+    for s in body {
+        reads.visit_stmt(s);
+    }
+    reads.0
+}
+
+/// The Python this frontend speaks, as `sys.version_info` reports it.
+const VERSION: [i64; 3] = [3, 12, 0];
+
+/// Which branch of `i` runs, when its tests compare `sys.version_info`
+/// or one of its parts to literals: the index of the clause taken, the
+/// `if` being 0, or `None` for none of them. A test of any other shape
+/// leaves the statement alone.
+fn version_branch(i: &py::StmtIf) -> Option<Option<usize>> {
+    let mut tests = vec![Some(&*i.test)];
+    for clause in &i.elif_else_clauses {
+        tests.push(clause.test.as_ref());
+    }
+    for (n, test) in tests.iter().enumerate() {
+        match test {
+            None => return Some(Some(n)),
+            Some(test) => {
+                if version_test(test)? {
+                    return Some(Some(n));
+                }
+            }
+        }
+    }
+    Some(None)
+}
+
+/// `sys.version_info[k] <op> literal`, `sys.version_info <op> (a, b)`
+/// or `sys.version_info.major <op> literal`, decided for [`VERSION`].
+fn version_test(e: &py::Expr) -> Option<bool> {
+    let py::Expr::Compare(c) = e else {
+        return None;
+    };
+    if c.ops.len() != 1 {
+        return None;
+    }
+    let is_version_info = |e: &py::Expr| {
+        matches!(e, py::Expr::Attribute(a)
+            if a.attr.as_str() == "version_info" && matches!(&*a.value, py::Expr::Name(n) if n.id.as_str() == "sys"))
+    };
+    let int_of = |e: &py::Expr| match e {
+        py::Expr::NumberLiteral(n) => match &n.value {
+            py::Number::Int(i) => i.as_i64(),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (left, right): (Vec<i64>, Vec<i64>) = match &*c.left {
+        // sys.version_info[k]
+        py::Expr::Subscript(s) if is_version_info(&s.value) => {
+            let k = usize::try_from(int_of(&s.slice)?).ok()?;
+            (vec![*VERSION.get(k)?], vec![int_of(&c.comparators[0])?])
+        }
+        // sys.version_info.major / .minor
+        py::Expr::Attribute(a) if is_version_info(&a.value) => {
+            let k = match a.attr.as_str() {
+                "major" => 0,
+                "minor" => 1,
+                "micro" => 2,
+                _ => return None,
+            };
+            (vec![VERSION[k]], vec![int_of(&c.comparators[0])?])
+        }
+        // sys.version_info >= (3, 0)
+        left if is_version_info(left) => {
+            let py::Expr::Tuple(t) = &c.comparators[0] else {
+                return None;
+            };
+            let right: Option<Vec<i64>> = t.elts.iter().map(int_of).collect();
+            let right = right?;
+            (VERSION[..right.len().min(3)].to_vec(), right)
+        }
+        _ => return None,
+    };
+    let order = left.cmp(&right);
+    Some(match c.ops[0] {
+        py::CmpOp::Lt => order.is_lt(),
+        py::CmpOp::LtE => order.is_le(),
+        py::CmpOp::Gt => order.is_gt(),
+        py::CmpOp::GtE => order.is_ge(),
+        py::CmpOp::Eq => order.is_eq(),
+        py::CmpOp::NotEq => order.is_ne(),
+        _ => return None,
+    })
 }
 
 fn pass(range: ruff_text_size::TextRange) -> py::Stmt {
@@ -244,6 +394,7 @@ impl Qualifier {
     fn new(prefix: Option<&str>, module_scope: &Scope, imports: UserImports) -> Self {
         let mut module_names = module_scope.bound.clone();
         module_names.extend(module_scope.declared_globals());
+        module_names.extend(module_scope.classes.iter().cloned());
         Self {
             prefix: prefix.map(str::to_string),
             module_names,

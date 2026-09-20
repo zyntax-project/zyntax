@@ -1541,6 +1541,74 @@ impl<'m> Lowerer<'m> {
         Val { node, ty }
     }
 
+    /// Read the class attribute `attr`: its constant, or its module
+    /// variable.
+    fn class_attr_read(&mut self, attr: &crate::class_attrs::ClassAttr, span: Span) -> Val {
+        use crate::class_attrs::Constant as C;
+        match &attr.constant {
+            Some(c) => {
+                let (lit, ty) = match c {
+                    C::Int(i) => (TypedLiteral::Integer(*i as i128), Ty::Int),
+                    C::Float(f) => (TypedLiteral::Float(*f), Ty::Float),
+                    C::Bool(b) => (TypedLiteral::Bool(*b), Ty::Bool),
+                    C::Str(text) => {
+                        return Val {
+                            node: str_lit(text, span),
+                            ty: Ty::Str,
+                        };
+                    }
+                    C::None => (TypedLiteral::Null, Ty::None),
+                };
+                Val {
+                    node: node(TypedExpression::Literal(lit), ty, span),
+                    ty,
+                }
+            }
+            None => {
+                let global = attr.global.clone();
+                self.global_read(&global, span)
+            }
+        }
+    }
+
+    /// The class attribute `attr` of class `k`, or an error naming what
+    /// the class lacks.
+    fn class_attr_of(
+        &self,
+        k: usize,
+        attr: &str,
+        span: Span,
+    ) -> Result<crate::class_attrs::ClassAttr> {
+        self.module.class_attr(k, attr).cloned().ok_or_else(|| {
+            Error::unsupported_span(
+                format!(
+                    "attribute `{attr}` of {}, which has no such field or class attribute",
+                    self.module.classes[k].name
+                ),
+                span,
+            )
+        })
+    }
+
+    /// Store `value` in the module variable `name`, typed `ty`.
+    fn store_global(&mut self, name: &str, value: Val, ty: Ty, span: Span, out: &mut Vec<Stmt>) {
+        let stored = Self::storage(ty);
+        let value = self.coerce(value, ty);
+        let value = self.coerce(Val { node: value, ty }, stored);
+        let assign = binary(
+            BinaryOp::Assign,
+            var(global_symbol(name), stored, span),
+            value,
+            Ty::None,
+            span,
+        );
+        out.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(assign)),
+            Type::Unknown,
+            span,
+        ));
+    }
+
     /// A local no Python program can spell.
     fn temp(&mut self) -> InternedString {
         self.temps += 1;
@@ -3375,6 +3443,35 @@ impl<'m> Lowerer<'m> {
             // Imports were resolved when the module was collected; the
             // statement itself does nothing at run time.
             py::Stmt::Import(_) | py::Stmt::ImportFrom(_) => {}
+            // A class statement of the module body: its methods are the
+            // module's functions, its attributes not fixed as constants
+            // are stored now, in order.
+            py::Stmt::ClassDef(c) if self.module.class_index.contains_key(c.name.as_str()) => {
+                let k = self.module.class_index[c.name.as_str()];
+                let declared = crate::class_attrs::declared_in(c)?;
+                let names: Vec<String> = declared.iter().map(|d| d.name.clone()).collect();
+                for d in &declared {
+                    let attr = self.class_attr_of(k, &d.name, span)?;
+                    if attr.constant.is_some() {
+                        continue;
+                    }
+                    // A sibling read here would be the class's, not the
+                    // module's; only constants are read that way.
+                    if crate::class_attrs::reads_any(d.value, &names) {
+                        return unsupported(
+                            format!(
+                                "class attribute `{}` computed from another attribute that is not a constant",
+                                d.name
+                            ),
+                            d.value,
+                        );
+                    }
+                    let value = self.expr(d.value)?;
+                    let ty = self.var_ty(&attr.global);
+                    let value_span = crate::span_of(d.value);
+                    self.store_global(&attr.global, value, ty, value_span, out);
+                }
+            }
             other => return unsupported(types::stmt_kind(other), other),
         }
         Ok(())
@@ -3537,6 +3634,13 @@ impl<'m> Lowerer<'m> {
                 return self.bind(target, instance, span, out);
             }
             py::Expr::Name(n) => n,
+            // `C.X = v`: the class attribute's module variable.
+            py::Expr::Attribute(a) if let Some(k) = self.module.class_of_expr(&a.value) => {
+                let attr = self.class_attr_of(k, a.attr.as_str(), span)?;
+                let ty = self.var_ty(&attr.global);
+                self.store_global(&attr.global, value, ty, span, out);
+                return Ok(());
+            }
             // `obj.attr = v`
             py::Expr::Attribute(a) => {
                 let object = self.expr(&a.value)?;
@@ -3827,28 +3931,12 @@ impl<'m> Lowerer<'m> {
             return Ok(());
         }
         if self.is_global(n.id.as_str()) {
-            let stored = Self::storage(ty);
             if check_after {
                 self.guards = false;
             }
-            let value = self.coerce(value, ty);
+            self.store_global(n.id.as_str(), value, ty, span, out);
             if check_after {
                 self.guards = true;
-            }
-            let value = self.coerce(Val { node: value, ty }, stored);
-            let assign = binary(
-                BinaryOp::Assign,
-                var(global_symbol(n.id.as_str()), stored, span),
-                value,
-                Ty::None,
-                span,
-            );
-            out.push(TypedNode::new(
-                TypedStatement::Expression(Box::new(assign)),
-                Type::Unknown,
-                span,
-            ));
-            if check_after {
                 out.push(self.pending_check(span));
             }
             return Ok(());
@@ -4370,6 +4458,10 @@ impl<'m> Lowerer<'m> {
             stdlib::Member::ArrayType => {
                 return unsupported(format!("`{name}` as a value"), e);
             }
+            stdlib::Member::Binary(_) => Val {
+                node: self.callable_value(e)?,
+                ty: Ty::Object,
+            },
             stdlib::Member::Func { zb, .. } if zb.starts_with("zb_bisect_") => Val {
                 node: call(
                     "zb_func_new",
@@ -4467,6 +4559,15 @@ impl<'m> Lowerer<'m> {
         if let stdlib::Member::ArrayType = member {
             return self.array_new(args, keywords, c, span);
         }
+        // `operator.add(a, b)`: the operator itself.
+        if let stdlib::Member::Binary(op) = member {
+            if args.len() != 2 || !keywords.is_empty() {
+                return unsupported(format!("calling `{name}` with these arguments"), c);
+            }
+            let l = self.expr(&args[0])?;
+            let r = self.expr(&args[1])?;
+            return self.arithmetic(op, l, r, &args[1], span);
+        }
         let stdlib::Member::Func { params, ret, zb } = member else {
             return unsupported(format!("calling `{name}`, which is not a function"), c);
         };
@@ -4531,6 +4632,19 @@ impl<'m> Lowerer<'m> {
                 });
             }
             ("zb_math_log", 2) => (vec![Ty::Float, Ty::Float], "zb_math_log_base"),
+            ("zb_random_seed", 0) => (Vec::new(), "zb_random_seed_clock"),
+            ("zb_random_seed", 1) if matches!(&args[0], py::Expr::NoneLiteral(_)) => {
+                return Ok(Val {
+                    node: call("zb_random_seed_clock", vec![], Ty::None, span),
+                    ty: Ty::None,
+                });
+            }
+            ("zb_random_randrange", 2) => (vec![Ty::Int, Ty::Int], "zb_random_randrange2"),
+            ("zb_random_randrange", 3) => (vec![Ty::Int, Ty::Int, Ty::Int], "zb_random_randrange3"),
+            ("zb_list_reduce", 2) => (
+                vec![Ty::Object, Ty::List(Elem::Object)],
+                "zb_list_reduce_first",
+            ),
             _ => (params.to_vec(), zb),
         };
         if args.len() != params.len() {
@@ -4545,10 +4659,21 @@ impl<'m> Lowerer<'m> {
         }
         let mut lowered = Vec::with_capacity(args.len());
         for (a, &want) in args.iter().zip(params.iter()) {
+            // The function `reduce` applies: a value it can be called
+            // through, whatever spells it.
+            if zb.starts_with("zb_list_reduce") && lowered.is_empty() {
+                lowered.push(self.callable_value(a)?);
+                continue;
+            }
             let v = self.expr(a)?;
             let node = match (v.ty, want) {
                 (Ty::Object, Ty::Float) => call("zb_any_float", vec![v.node], Ty::Float, span),
                 (Ty::Object, Ty::Int) => call("zb_any_int", vec![v.node], Ty::Int, span),
+                // A sequence of dynamic values: a string's characters,
+                // a typed list boxed.
+                (t, Ty::List(Elem::Object)) if t != Ty::List(Elem::Object) => {
+                    self.iterable(v, span)
+                }
                 _ => self.coerce(v, want),
             };
             lowered.push(node);
@@ -4713,8 +4838,13 @@ impl<'m> Lowerer<'m> {
             }
             _ => None,
         };
-        if let Some((stdlib::Member::Func { params, .. }, source)) = imported {
-            let args: Vec<String> = (0..params.len()).map(|i| format!("a{i}")).collect();
+        let arity = match imported {
+            Some((stdlib::Member::Func { params, .. }, _)) => Some(params.len()),
+            Some((stdlib::Member::Binary(_), _)) => Some(2),
+            _ => None,
+        };
+        if let (Some(arity), Some((_, source))) = (arity, imported) {
+            let args: Vec<String> = (0..arity).map(|i| format!("a{i}")).collect();
             let text = format!("lambda {}: {source}({})", args.join(", "), args.join(", "));
             let parsed = ruff_python_parser::parse_expression(&text).expect("a module call parses");
             let py::Expr::Lambda(lambda) = &*parsed.into_syntax().body else {
@@ -5188,12 +5318,32 @@ impl<'m> Lowerer<'m> {
                     ty: Ty::Object,
                 }
             }
+            // Any other builtin as a value: the name it is bound to is
+            // typed as the builtin, so a call through the name is the
+            // builtin's own; the record is for a call that is not.
             py::Expr::Name(n)
                 if !self.is_variable(n.id.as_str())
                     && !self.module.class_index.contains_key(n.id.as_str())
-                    && types::builtin_index(n.id.as_str()).is_some() =>
+                    && let Some(k) = types::builtin_index(n.id.as_str()) =>
             {
-                return unsupported(format!("`{}` as a value", n.id.as_str()), e);
+                let held = Val {
+                    node: str_lit(n.id.as_str(), span),
+                    ty: Ty::Str,
+                };
+                let env = self.list_of(vec![held], Elem::Object, span);
+                Val {
+                    node: call(
+                        "zb_func_new",
+                        vec![
+                            code_of("zb_builtin_value_call", span),
+                            int_lit(zyntax_builtins::functions::VARIADIC_ARITY, span),
+                            env,
+                        ],
+                        Ty::Object,
+                        span,
+                    ),
+                    ty: Ty::Builtin(k),
+                }
             }
             py::Expr::Name(n) => Val {
                 node: var(self.local_symbol(n.id.as_str()), ty, span),
@@ -5204,6 +5354,11 @@ impl<'m> Lowerer<'m> {
             py::Expr::Attribute(a) => {
                 if let Some(member) = self.module_member_of(&a.value, a.attr.as_str()) {
                     return self.member_value(member, a.attr.as_str(), e, span);
+                }
+                // `C.X`: the class's attribute.
+                if let Some(k) = self.module.class_of_expr(&a.value) {
+                    let attr = self.class_attr_of(k, a.attr.as_str(), span)?;
+                    return Ok(self.class_attr_read(&attr, span));
                 }
                 let object = self.expr(&a.value)?;
                 self.attribute(object, a.attr.as_str(), span)?
@@ -9112,16 +9267,23 @@ impl<'m> Lowerer<'m> {
         }
         match object.ty {
             Ty::Class(k) => {
-                let object = self.checked_instance(object, attr, span);
                 let Some((_, ty)) = self.module.field(k as usize, attr) else {
-                    return Err(Error::unsupported_span(
-                        format!(
-                            "attribute `{attr}` of {}, which has no such field",
-                            self.module.classes[k as usize].name
-                        ),
+                    // The class's attribute, once the instance is known
+                    // not to be None.
+                    let class_attr = self.class_attr_of(k as usize, attr, span)?;
+                    let object = self.checked_instance(object, attr, span);
+                    let value = self.class_attr_read(&class_attr, span);
+                    let evaluated = TypedNode::new(
+                        TypedStatement::Expression(Box::new(object.node)),
+                        Type::Unknown,
                         span,
-                    ));
+                    );
+                    return Ok(Val {
+                        node: Self::block_value(vec![evaluated], value.node, value.ty, span),
+                        ty: value.ty,
+                    });
                 };
+                let object = self.checked_instance(object, attr, span);
                 let stored = field_storage(ty);
                 let field = node(
                     TypedExpression::Field(TypedFieldAccess {

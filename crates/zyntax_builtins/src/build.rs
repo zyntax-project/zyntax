@@ -543,6 +543,21 @@ fn leave_after_fatal(stmts: Vec<Stmt>, ret_ty: &Type) -> Vec<Stmt> {
 // ─── declarations ───────────────────────────────────────────────────
 
 /// A function with a body.
+/// A variable of the library's module: zero, or null, until written.
+pub fn global_var(name: &str, ty: Type) -> Decl {
+    typed_node(
+        TypedDeclaration::Variable(zyntax_typed_ast::typed_ast::TypedVariable {
+            name: intern(name),
+            ty,
+            mutability: Mutability::Mutable,
+            initializer: None,
+            visibility: Visibility::Public,
+        }),
+        Type::Unknown,
+        SPAN,
+    )
+}
+
 pub fn define(name: &str, params: &[&Local], ret_ty: Type, body: Vec<Stmt>) -> Decl {
     define_with(name, params, ret_ty, body, Vec::new())
 }

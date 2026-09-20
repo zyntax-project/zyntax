@@ -29,6 +29,13 @@ pub(crate) struct Scope {
     pub free: HashSet<String>,
     /// Nested function bodies, by name.
     pub children: Vec<(String, Scope)>,
+    /// The methods of classes defined in this body, by `Class.method`.
+    /// They read the module as functions do, but share nothing with
+    /// this body: a class's methods are the module's functions.
+    pub methods: Vec<(String, Scope)>,
+    /// The classes defined in this body. A class's name is the class
+    /// wherever it is written, never a variable.
+    pub classes: HashSet<String>,
 }
 
 impl Scope {
@@ -119,7 +126,7 @@ impl Scope {
     /// Every name declared `global` here or in a nested body.
     pub(crate) fn declared_globals(&self) -> HashSet<String> {
         let mut out = self.globals.clone();
-        for (_, child) in &self.children {
+        for (_, child) in self.children.iter().chain(&self.methods) {
             out.extend(child.declared_globals());
         }
         out
@@ -133,6 +140,8 @@ struct Collector {
     globals: HashSet<String>,
     nonlocals: HashSet<String>,
     children: Vec<(String, Scope)>,
+    methods: Vec<(String, Scope)>,
+    classes: HashSet<String>,
 }
 
 impl Collector {
@@ -153,6 +162,8 @@ impl Collector {
             nonlocals: self.nonlocals,
             free,
             children: self.children,
+            methods: self.methods,
+            classes: self.classes,
         }
     }
 
@@ -176,13 +187,14 @@ impl<'a> Visitor<'a> for Collector {
                 self.children
                     .push((f.name.to_string(), Scope::of_function(f)));
             }
-            // A class binds its name; its methods are bodies of their
-            // own, reading the module the way any function does.
+            // A class's name is the class wherever it is written, never
+            // a variable; its methods are bodies of their own, reading
+            // the module the way any function does.
             py::Stmt::ClassDef(c) => {
-                self.bind(c.name.as_str());
+                self.classes.insert(c.name.to_string());
                 for s in &c.body {
                     if let py::Stmt::FunctionDef(m) = s {
-                        self.children.push((
+                        self.methods.push((
                             format!("{}.{}", c.name.as_str(), m.name.as_str()),
                             Scope::of_function(m),
                         ));

@@ -28,11 +28,13 @@ use zyntax_typed_ast::{
     Mutability, ParamOwnership, ParameterKind, Type, TypeRegistry, TypedNode, Visibility,
 };
 
-/// A class as written: its name, base and methods.
+/// A class as written: its name, base, methods and the attributes its
+/// body declares.
 pub(crate) struct ClassDef<'a> {
     pub(crate) name: String,
     pub(crate) base: Option<String>,
     pub(crate) methods: Vec<&'a py::StmtFunctionDef>,
+    pub(crate) attrs: Vec<crate::class_attrs::Declared<'a>>,
     /// Where the class is written, for what is reported about it, and
     /// in which of the program's modules (`None` for the main file).
     pub(crate) range: ruff_text_size::TextRange,
@@ -78,26 +80,22 @@ pub(crate) fn collect<'a>(
                 }
             }
         }
-        let mut methods = Vec::new();
-        for s in &c.body {
-            match s {
-                py::Stmt::FunctionDef(f) => methods.push(f),
-                py::Stmt::Pass(_) => {}
-                py::Stmt::Expr(e) if matches!(*e.value, py::Expr::StringLiteral(_)) => {}
-                other => {
-                    return Err(located(Error::unsupported(
-                        "a class body statement other than a method",
-                        other,
-                    )));
-                }
-            }
-        }
+        let methods = c
+            .body
+            .iter()
+            .filter_map(|s| match s {
+                py::Stmt::FunctionDef(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        let attrs = crate::class_attrs::declared_in(c).map_err(located)?;
         out.push(ClassDef {
             range: c.range(),
             module: module.clone(),
             name: c.name.to_string(),
             base,
             methods,
+            attrs,
         });
     }
     Ok(out)

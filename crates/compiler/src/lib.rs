@@ -1862,14 +1862,20 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
 /// body does not change: for a module whose functions are optimised one
 /// at a time, built once rather than per function.
 pub struct OptCache {
-    facts: drop_insert::ModuleFacts,
+    facts: std::sync::Arc<drop_insert::ModuleFacts>,
     cycles: inline::Cycles,
 }
 
 impl OptCache {
     pub fn build(module: &HirModule) -> Self {
+        Self::with_facts(std::sync::Arc::new(drop_insert::facts_of(module)), module)
+    }
+
+    /// [`Self::build`] with the release facts already built, by
+    /// something that needed them on their own.
+    pub fn with_facts(facts: std::sync::Arc<drop_insert::ModuleFacts>, module: &HirModule) -> Self {
         Self {
-            facts: drop_insert::facts_of(module),
+            facts,
             cycles: inline::cycles_of(module),
         }
     }

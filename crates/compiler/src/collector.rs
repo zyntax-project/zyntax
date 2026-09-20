@@ -942,6 +942,11 @@ pub fn collect() {
 }
 
 /// A collection whose deepest live stack word is at `sp`.
+///
+/// Its own frame lies below `sp` and is not read: the marking state it
+/// holds names blocks, and read at the next collection as stale words
+/// it would keep alive whatever the last one marked.
+#[inline(never)]
 fn collect_from(sp: usize) {
     let host_top = host_stack_top();
     if host_top <= sp {
@@ -989,8 +994,11 @@ fn collect_from(sp: usize) {
                 let before = marker.marked_bytes;
                 marker.scan_outside("stack", lo, hi);
                 if trace_detail() {
+                    let direct = marker.marked_bytes - before;
+                    marker.drain();
                     eprintln!(
-                        "[gc]     {} KB reached directly",
+                        "[gc]     {} KB reached directly, {} KB through it",
+                        direct >> 10,
                         (marker.marked_bytes - before) >> 10
                     );
                 }
@@ -998,10 +1006,17 @@ fn collect_from(sp: usize) {
         }
         let roots: Vec<(usize, usize)> = marker.reg.roots.iter().map(|(a, l)| (*a, *l)).collect();
         for (a, l) in roots {
-            if trace_detail() {
-                eprintln!("[gc]   global {a:#x} ({l} bytes)");
-            }
+            let before = marker.marked_bytes;
             marker.scan_outside("global", a, a + l);
+            // Under the detailed trace each range is followed to the
+            // end before the next, so what it alone keeps alive shows.
+            if trace_detail() {
+                marker.drain();
+                eprintln!(
+                    "[gc]   global {a:#x} ({l} bytes): {} KB reached through it",
+                    (marker.marked_bytes - before) >> 10
+                );
+            }
         }
         let direct = marker.marked_bytes;
         let roots_at = started.elapsed();

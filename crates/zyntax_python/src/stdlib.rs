@@ -5,6 +5,7 @@
 //! annotations.
 
 use crate::types::{Code, Elem, Ty};
+use ruff_python_ast as py;
 
 /// What a module's name stands for.
 #[derive(Clone, Copy, Debug)]
@@ -27,6 +28,9 @@ pub(crate) enum Member {
     /// `array.array`: a list stored at the width its typecode names;
     /// see [`array_code`].
     ArrayType,
+    /// An arithmetic operator as a function, `operator.add`: a call is
+    /// the operator on its two arguments, typed as the operator is.
+    Binary(py::Operator),
 }
 
 /// The typecode an `array` call with this literal builds, or why it
@@ -47,7 +51,16 @@ pub(crate) fn array_code(typecode: &str) -> Result<Code, &'static str> {
 pub(crate) fn is_known(module: &str) -> bool {
     matches!(
         module,
-        "math" | "sys" | "typing" | "time" | "bisect" | "array" | "__future__"
+        "math"
+            | "sys"
+            | "typing"
+            | "time"
+            | "bisect"
+            | "array"
+            | "random"
+            | "operator"
+            | "functools"
+            | "__future__"
     )
 }
 
@@ -171,6 +184,34 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         ("array", "array") => Member::ArrayType,
         ("array", "typecodes") => Member::Str("bBuwhHiIlLqQfd"),
         ("time", "time") => func(&[], F, "zb_time_time"),
+        // The Mersenne Twister as CPython runs it; the lowering fills in
+        // the forms with more arguments and the seed from the clock.
+        ("random", "random") => func(&[], F, "zb_random_random"),
+        ("random", "seed") => func(&[I], Ty::None, "zb_random_seed"),
+        ("random", "randrange") => func(&[I], I, "zb_random_randrange"),
+        ("random", "randint") => func(&[I, I], I, "zb_random_randint"),
+        ("random", "uniform") => func(&[F, F], F, "zb_random_uniform"),
+        ("random", "getrandbits") => func(&[I], I, "zb_random_getrandbits"),
+        ("random", "choice") => func(&[Ty::List(Elem::Object)], Ty::Object, "zb_random_choice"),
+        ("operator", "add") => Member::Binary(py::Operator::Add),
+        ("operator", "sub") => Member::Binary(py::Operator::Sub),
+        ("operator", "mul") => Member::Binary(py::Operator::Mult),
+        ("operator", "truediv") => Member::Binary(py::Operator::Div),
+        ("operator", "floordiv") => Member::Binary(py::Operator::FloorDiv),
+        ("operator", "mod") => Member::Binary(py::Operator::Mod),
+        ("operator", "pow") => Member::Binary(py::Operator::Pow),
+        ("operator", "and_") => Member::Binary(py::Operator::BitAnd),
+        ("operator", "or_") => Member::Binary(py::Operator::BitOr),
+        ("operator", "xor") => Member::Binary(py::Operator::BitXor),
+        ("operator", "lshift") => Member::Binary(py::Operator::LShift),
+        ("operator", "rshift") => Member::Binary(py::Operator::RShift),
+        // `reduce(f, xs)` and `reduce(f, xs, start)`; the lowering picks
+        // the form by the argument count.
+        ("functools", "reduce") => func(
+            &[Ty::Object, Ty::List(Elem::Object), Ty::Object],
+            Ty::Object,
+            "zb_list_reduce",
+        ),
         // The monotonic clocks are one clock here.
         ("time", "perf_counter" | "monotonic" | "process_time" | "clock") => {
             func(&[], F, "zb_time_perf_counter")

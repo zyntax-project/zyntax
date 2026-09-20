@@ -160,6 +160,131 @@ impl ZyntaxCraneliftBackend {
     }
 }
 
+/// A resume point outlined and compiled: the sites to publish, and the
+/// region as optimised, for the tier above to compile its own resume
+/// points from.
+pub struct OutlinedResumePoint {
+    pub sites: Vec<(u64, *mut ())>,
+    pub region_id: HirId,
+    pub region: crate::hir::HirFunction,
+}
+
+impl ZyntaxCraneliftBackend {
+    /// The resume point at `header`, outlined into a function of its own
+    /// (see [`crate::osr::outline`]), `optimize` run over it, compiled
+    /// and installed with the adapter the site is published with.
+    /// `None` when the header admits no layout or the region cannot
+    /// stand alone; the caller falls back to [`Self::resume_point_at`].
+    pub fn outlined_resume_point_at(
+        &self,
+        def: &ZyntaxFunctionDef,
+        header: HirId,
+        optimize: &dyn Fn(crate::hir::HirFunction) -> crate::hir::HirFunction,
+    ) -> Option<OutlinedResumePoint> {
+        let Ok(layout) = crate::osr::osr_layout(&def.function, header) else {
+            return None;
+        };
+        let region_id = HirId::new();
+        let name = zyntax_typed_ast::InternedString::new_global(&format!(
+            "{}$resume{}",
+            def.function.name.resolve_global().unwrap_or_default(),
+            layout.loop_ordinal
+        ));
+        let Some(mut outlined) = crate::osr::outline(&def.function, &layout, region_id, name)
+        else {
+            return None;
+        };
+        // `ZYNTAX_DUMP_HIR_DIR` gets the region before and after its
+        // optimisation, and the adapter.
+        let dump = |f: &crate::hir::HirFunction, stage: &str| {
+            crate::hir_dump::dump_function_to_dir(
+                f,
+                &def.module,
+                &format!("{}-{stage}", f.name.resolve_global().unwrap_or_default()),
+            );
+        };
+        dump(&outlined.function, "outlined");
+        dump(&outlined.adapter, "adapter");
+        outlined.function = optimize(outlined.function);
+        dump(&outlined.function, "outlined-opt");
+        // Translation and installation under the lock, the compiles
+        // between them without it, as in `compile`. The region is a
+        // function of the baseline tier: it probes, and makes no resume
+        // points of its own.
+        let (region, adapter, isa) = self.with_lock(|backend| {
+            backend.set_compile_bead_id(def.bead_id);
+            backend.set_compile_tier(0);
+            let region = backend.translate_function_in_shared_module(
+                region_id,
+                &outlined.function,
+                &def.module,
+            );
+            backend.set_compile_tier(1);
+            let adapter = backend.translate_resume_adapter(
+                def.id,
+                &outlined.adapter,
+                &outlined.adapter_layout,
+            );
+            (region, adapter, backend.isa())
+        });
+        let trace = crate::osr::osr_trace_enabled();
+        let (mut region, (mut adapter, site)) = match (region, adapter) {
+            (Ok(Some(region)), Ok(adapter)) => (region, adapter),
+            (region, adapter) => {
+                if trace {
+                    eprintln!(
+                        "[osr] outline {}: translation failed: {:?} / {:?}",
+                        def.function.name.resolve_global().unwrap_or_default(),
+                        region.err(),
+                        adapter.err()
+                    );
+                }
+                return None;
+            }
+        };
+        if let Err(e) = region.compile(&*isa) {
+            if trace {
+                eprintln!("[osr] outline: region compile failed: {e}");
+            }
+            return None;
+        }
+        if let Err(e) = adapter.compile(&*isa) {
+            if trace {
+                eprintln!("[osr] outline: adapter compile failed: {e}");
+            }
+            return None;
+        }
+        let sites = self.with_lock(|backend| {
+            backend.set_compile_bead_id(def.bead_id);
+            backend.set_compile_tier(0);
+            let installed = backend
+                .install_function_in_shared_module(region, &outlined.function)
+                .and_then(|_| {
+                    backend.set_compile_tier(1);
+                    backend.install_resume_point(adapter, site)
+                })
+                // Cells publish: the adapter reaches the region through
+                // its cell, as every compiled call reaches its callee.
+                .and_then(|_| backend.finalize_definitions());
+            if let Err(e) = installed {
+                if trace {
+                    eprintln!("[osr] outline: install failed: {e}");
+                }
+                return Vec::new();
+            }
+            backend.take_pending_osr_helpers()
+        });
+        if sites.is_empty() {
+            return None;
+        }
+        Some(OutlinedResumePoint {
+            sites,
+            region_id,
+            region: outlined.function,
+        })
+    }
+}
+
 impl JitBackend for ZyntaxCraneliftBackend {
     type FunctionDef = ZyntaxFunctionDef;
     type Error = CompileError;
