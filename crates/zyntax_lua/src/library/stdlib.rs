@@ -2463,6 +2463,10 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             if_(
                 and(eq(len(arr.e()), n.e()), le(i.e(), n.e())),
                 vec![
+                    when(
+                        gt(n.e(), super::high_of(tb.e())),
+                        vec![set_field(tb.e(), "high", n.e())],
+                    ),
                     expr(mcall(arr.e(), "remove_at", vec![sub(i.e(), int(1))], any())),
                     while_(
                         and(

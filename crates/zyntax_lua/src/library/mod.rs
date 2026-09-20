@@ -80,12 +80,16 @@ pub fn table_ty(id: TypeId) -> Type {
 /// part is a boxed list of the values at keys `1..=n`, never holding a
 /// trailing nil, so its length is a border. The hash part is a boxed
 /// dict (see the shared library's dicts) or null until the first key
-/// outside the array. The metatable is a table pointer or null.
-const TABLE_FIELDS: [&str; 3] = ["arr", "hash", "meta"];
+/// outside the array. The metatable is a table pointer or null. `high`
+/// is the longest the array part has been before a store of nil
+/// shortened it: a key up to it may have been removed mid-traversal,
+/// which `next` continues from; one past it is no key of the table.
+const TABLE_FIELDS: [&str; 4] = ["arr", "hash", "meta", "high"];
 
 fn table_field_type(name: &str, id: TypeId) -> Type {
     match name {
         "meta" => table_ty(id),
+        "high" => i64(),
         _ => any(),
     }
 }
@@ -315,6 +319,9 @@ pub fn hash_of(tb: Expr, t: &Types) -> Expr {
 }
 pub fn meta_of(tb: Expr, t: &Types) -> Expr {
     fld(tb, "meta", t.table())
+}
+pub fn high_of(tb: Expr) -> Expr {
+    fld(tb, "high", i64())
 }
 pub fn set_field(tb: Expr, name: &str, value: Expr) -> Stmt {
     let ty = value.ty.clone();

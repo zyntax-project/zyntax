@@ -31,7 +31,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
 
     let arr_of = |tb: Expr| super::arr_of(tb, t);
     let hash_of = |tb: Expr| super::hash_of(tb, t);
-    let struct_lit = |arr: Expr| {
+    let struct_lit = |arr: Expr, high: Expr| {
         use zyntax_typed_ast::typed_ast::{TypedExpression, TypedFieldInit, TypedStructLiteral};
         node(
             TypedExpression::Struct(TypedStructLiteral {
@@ -49,6 +49,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                         name: intern("meta"),
                         value: Box::new(null(table.clone())),
                     },
+                    TypedFieldInit {
+                        name: intern("high"),
+                        value: Box::new(high),
+                    },
                 ],
             }),
             table.clone(),
@@ -60,7 +64,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         "zl_table_new",
         &[],
         table.clone(),
-        vec![ret(struct_lit(list(Vec::new(), anys.clone())))],
+        vec![ret(struct_lit(list(Vec::new(), anys.clone()), int(0)))],
     ));
     // A table over the positional values of a constructor, which are
     // its array part as they are: a trailing nil is dropped so the
@@ -68,6 +72,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let arr_kept = kept("arr", anys.clone());
     d.push(define("zl_table_with_arr", &[&arr_kept], table.clone(), {
         vec![
+            n.decl(len(arr.e())),
             while_(
                 and(
                     gt(len(arr.e()), int(0)),
@@ -75,7 +80,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 ),
                 vec![expr(mcall(arr.e(), "pop_last", vec![], any()))],
             ),
-            ret(struct_lit(arr.e())),
+            ret(struct_lit(arr.e(), n.e())),
         ]
     }));
     // The hash part, made on first use.
@@ -265,6 +270,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     if_(
                         and(is_nil(v.e()), eq(i.e(), n.e())),
                         vec![
+                            when(
+                                gt(n.e(), super::high_of(tb.e())),
+                                vec![set_field(tb.e(), "high", n.e())],
+                            ),
                             expr(mcall(arr.e(), "pop_last", vec![], any())),
                             while_(
                                 and(
@@ -1069,11 +1078,17 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     ),
                 ],
             ),
-            // An index past the array part was an element removed
-            // during the traversal, which shortened the part: the
-            // traversal goes on from its end.
+            // An index past the array part but within its longest
+            // was an element removed during the traversal, which
+            // shortened the part: the traversal goes on from its end.
             when(
-                and(is_int_cat(&cat), ge(get_i64(k.e()), int(1))),
+                and(
+                    is_int_cat(&cat),
+                    and(
+                        ge(get_i64(k.e()), int(1)),
+                        le(get_i64(k.e()), super::high_of(tb.e())),
+                    ),
+                ),
                 vec![ret(n.e())],
             ),
             lua_error(text("invalid key to 'next'")),
