@@ -181,6 +181,53 @@ impl ShapeInfo {
     }
 }
 
+/// What the types know of a shape's metamethod for an event.
+#[derive(Clone, PartialEq, Debug)]
+pub enum MetaTargets {
+    /// Some metatable's handler is not known: the runtime decides.
+    None,
+    /// Every metatable has a handler, but one is not typed yet.
+    Unsettled,
+    /// The handler of each class.
+    Funcs(Vec<(ShapeId, FuncId)>),
+}
+
+/// The metamethod an arithmetic operator dispatches to, when an
+/// operand is a table.
+pub fn arith_event(op: &BinOp) -> Option<&'static str> {
+    Some(match op {
+        BinOp::Plus(_) => "__add",
+        BinOp::Minus(_) => "__sub",
+        BinOp::Star(_) => "__mul",
+        BinOp::Slash(_) => "__div",
+        BinOp::Percent(_) => "__mod",
+        BinOp::Caret(_) => "__pow",
+        BinOp::DoubleSlash(_) => "__idiv",
+        _ => return None,
+    })
+}
+
+/// The metamethods the typed dispatch handles: a table operand's
+/// handler is called directly when the types know it, so the runtime
+/// never reaches it with values of its own.
+pub fn typed_event(event: &str) -> bool {
+    matches!(
+        event,
+        "__add" | "__sub" | "__mul" | "__div" | "__mod" | "__pow" | "__idiv" | "__unm"
+    )
+}
+
+/// Whether a value of this type can carry the handler for an
+/// arithmetic event of its own: a table can, a string does (the string
+/// metatable's, which defers to the other operand's), a number, a
+/// boolean or nil cannot.
+fn may_handle_arith(ty: Ty) -> bool {
+    !matches!(
+        ty,
+        Ty::Int | Ty::Float | Ty::Number | Ty::Scalar | Ty::Bool | Ty::Nil | Ty::Str
+    )
+}
+
 /// One step of a field lookup through metatables, as the runtime
 /// takes it from the table in hand.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -395,6 +442,27 @@ impl Inferred {
             Ty::Unknown => Ty::Unknown,
             _ => Ty::Any,
         }
+    }
+
+    /// The functions the metamethod `event` of a table of shape `k`
+    /// may be: one per class, read raw from the metatable as the
+    /// runtime reads it. None when the types do not know every
+    /// metatable's handler; Unsettled while some class's handler is
+    /// not typed yet.
+    pub fn metamethod_targets(&self, k: ShapeId, event: &str) -> MetaTargets {
+        let info = self.shape(k);
+        if info.unknown_meta || info.classes.is_empty() {
+            return MetaTargets::None;
+        }
+        let mut out = Vec::new();
+        for class in &info.classes {
+            match self.shape(*class).field(event) {
+                Some((_, Ty::Func(f))) => out.push((*class, f)),
+                Some((_, Ty::Unknown)) => return MetaTargets::Unsettled,
+                _ => return MetaTargets::None,
+            }
+        }
+        MetaTargets::Funcs(out)
     }
 
     /// The table a lookup goes on to when a table of shape `t` lacks a
@@ -895,6 +963,7 @@ impl<'a> Typer<'a> {
                     UnOp::Minus(_) => match t {
                         Ty::Int | Ty::Float | Ty::Number => t,
                         Ty::Scalar | Ty::Nil | Ty::Bool => Ty::Number,
+                        Ty::Shape(_) => self.metamethod_result("__unm", t, t).unwrap_or(Ty::Any),
                         _ => Ty::Any,
                     },
                     UnOp::Hash(_) => match t {
@@ -912,10 +981,70 @@ impl<'a> Typer<'a> {
             Expression::BinaryOperator { lhs, binop, rhs } => {
                 let a = self.ty_of(lhs);
                 let b = self.ty_of(rhs);
+                if let Some(event) = arith_event(binop)
+                    && let Some(ty) = self.metamethod_result(event, a, b)
+                {
+                    return ty;
+                }
                 binary_ty(binop, a, b)
             }
             _ => Ty::Any,
         }
+    }
+
+    /// What arithmetic on a table operand yields: the joined first
+    /// results of the handlers the types know, the left operand's
+    /// taking precedence as the runtime's do. None when the runtime
+    /// decides.
+    pub fn metamethod_result(&self, event: &str, a: Ty, b: Ty) -> Option<Ty> {
+        let sides = self.metamethod_sides(event, a, b)?;
+        let mut out: Option<Ty> = None;
+        for (_, _, f) in sides {
+            let r = self.callee_returns(Ty::Func(f)).first();
+            out = Some(match out {
+                None => r,
+                Some(so_far) => join_read(so_far, r),
+            });
+        }
+        Some(out.unwrap_or(Ty::Unknown))
+    }
+
+    /// The handlers arithmetic on `a` and `b` may call, in the order
+    /// the runtime tries them: the left operand's classes' when it is a
+    /// shaped table, then the right's when the left cannot carry a
+    /// handler of its own. Each with the operand's side and class.
+    /// None when an operand the types do not follow may answer first,
+    /// or when neither side is a shaped table with handlers.
+    pub fn metamethod_sides(
+        &self,
+        event: &str,
+        a: Ty,
+        b: Ty,
+    ) -> Option<Vec<(bool, ShapeId, FuncId)>> {
+        let mut out = Vec::new();
+        let mut left_settled = false;
+        if let Ty::Shape(k) = a {
+            match self.known.metamethod_targets(k, event) {
+                MetaTargets::Funcs(funcs) => {
+                    out.extend(funcs.into_iter().map(|(c, f)| (true, c, f)));
+                    left_settled = true;
+                }
+                MetaTargets::Unsettled => return Some(Vec::new()),
+                MetaTargets::None => {}
+            }
+        }
+        if let Ty::Shape(k) = b
+            && (left_settled || !may_handle_arith(a))
+        {
+            match self.known.metamethod_targets(k, event) {
+                MetaTargets::Funcs(funcs) => {
+                    out.extend(funcs.into_iter().map(|(c, f)| (false, c, f)));
+                }
+                MetaTargets::Unsettled => return Some(Vec::new()),
+                MetaTargets::None => {}
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
     }
 }
 
@@ -1266,17 +1395,28 @@ impl<'a> Round<'a> {
         let dynamic_code = self.scopes.dynamic_code;
         // A function under a metamethod's name is called by the
         // runtime, with dynamic values, wherever its table serves as a
-        // metatable: it escapes. `__index` and `__newindex` too, when
-        // they are functions.
+        // metatable: it escapes, unless the event is one the typed
+        // dispatch handles and no table of the shapes it is the
+        // metatable of ever reaches the runtime's own dispatch, that
+        // is, none of them escapes (nor the class itself).
         for k in 0..self.out.shapes.len() {
-            let metamethods: Vec<Ty> = self.out.shapes[k]
+            let metamethods: Vec<(String, Ty)> = self.out.shapes[k]
                 .fields
                 .iter()
                 .filter(|(name, _)| name.starts_with("__"))
-                .map(|(_, ty)| *ty)
+                .map(|(name, ty)| (name.clone(), *ty))
                 .collect();
-            for ty in metamethods {
-                self.escape(ty);
+            let class = ShapeId(k as u32);
+            let reached = self.out.shapes[k].escapes
+                || self
+                    .out
+                    .shapes
+                    .iter()
+                    .any(|s| s.escapes && s.classes.contains(&class));
+            for (name, ty) in metamethods {
+                if reached || !typed_event(&name) {
+                    self.escape(ty);
+                }
             }
         }
         loop {
@@ -1989,9 +2129,7 @@ impl<'a> Round<'a> {
             ast::FunctionArgs::Parentheses { arguments, .. } => arguments.iter().collect(),
             _ => Vec::new(),
         };
-        let info = self.scopes.func(f);
-        let n = info.params.len();
-        let is_vararg = info.is_vararg;
+        let n = self.scopes.func(f).params.len();
         let mut types: Vec<Ty> = receiver.into_iter().collect();
         let wanted = n.saturating_sub(types.len());
         types.extend(match args {
@@ -2002,7 +2140,15 @@ impl<'a> Round<'a> {
             }],
             _ => self.assigned_types(&exprs, wanted.max(exprs.len())),
         });
-        // The extras go into `...` as values, or are dropped.
+        self.record_call_types(f, types);
+    }
+
+    /// A direct call to `f` with arguments of `types`: they join the
+    /// parameters; the extras go into `...` as values, or are dropped.
+    fn record_call_types(&mut self, f: FuncId, mut types: Vec<Ty>) {
+        let info = self.scopes.func(f);
+        let n = info.params.len();
+        let is_vararg = info.is_vararg;
         for t in types.iter().skip(n) {
             if is_vararg {
                 self.escape(*t);
@@ -2099,12 +2245,44 @@ impl<'a> Round<'a> {
     /// returned, or passed to a known function.
     fn expr(&mut self, e: &Expression) {
         match e {
-            Expression::BinaryOperator { lhs, rhs, .. } => {
-                self.value(lhs);
-                self.value(rhs);
+            Expression::BinaryOperator { lhs, binop, rhs } => {
+                // Arithmetic the types dispatch to a handler passes
+                // the operands to it; anything else takes values.
+                let a = self.typer().ty_of(lhs);
+                let b = self.typer().ty_of(rhs);
+                let sides =
+                    arith_event(binop).and_then(|event| self.typer().metamethod_sides(event, a, b));
+                match sides {
+                    Some(sides) => {
+                        self.expr(lhs);
+                        self.expr(rhs);
+                        for (_, _, f) in sides {
+                            self.record_call_types(f, vec![a, b]);
+                        }
+                    }
+                    None => {
+                        self.value(lhs);
+                        self.value(rhs);
+                    }
+                }
             }
             Expression::Parentheses { expression, .. } => self.expr(expression),
-            Expression::UnaryOperator { expression, .. } => self.value(expression),
+            Expression::UnaryOperator { unop, expression } => {
+                let t = self.typer().ty_of(expression);
+                let sides = match unop {
+                    UnOp::Minus(_) => self.typer().metamethod_sides("__unm", t, t),
+                    _ => None,
+                };
+                match sides {
+                    Some(sides) => {
+                        self.expr(expression);
+                        for (_, _, f) in sides {
+                            self.record_call_types(f, vec![t, t]);
+                        }
+                    }
+                    None => self.value(expression),
+                }
+            }
             Expression::Function(f) => self.function(f.body()),
             Expression::FunctionCall(c) => self.call(c),
             Expression::TableConstructor(t) => self.table(t),

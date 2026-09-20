@@ -3261,6 +3261,41 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         ty: Ty::Number,
                     }
                 }
+                Ty::Shape(_)
+                    if let Some(sides) = self.typer().metamethod_sides("__unm", v.ty, v.ty)
+                        && !sides.is_empty() =>
+                {
+                    // The one operand is both: the handler takes it twice.
+                    let sides: Vec<(bool, ShapeId, FuncId)> =
+                        sides.into_iter().filter(|(left, _, _)| *left).collect();
+                    let mut pre = Vec::new();
+                    let held = self.hold(v, &mut pre);
+                    let b = self.boxed(held.clone());
+                    let generic = self.guard_described(
+                        Val {
+                            node: call("zl_unm", vec![b], Type::Any, span),
+                            ty: Ty::Any,
+                        },
+                        &descs,
+                    );
+                    let ty = self
+                        .typer()
+                        .metamethod_result("__unm", held.ty, held.ty)
+                        .unwrap_or(Ty::Any)
+                        .settled();
+                    let value = self.metamethod_dispatch(
+                        "__unm",
+                        sides,
+                        vec![held.clone(), held],
+                        generic,
+                        ty,
+                        span,
+                    );
+                    Val {
+                        node: block_value(pre, value, span),
+                        ty,
+                    }
+                }
                 _ => {
                     let b = self.boxed(v);
                     self.guard_described(
@@ -3318,6 +3353,111 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         })
     }
 
+    /// An operator's handler, called directly: for each side that is a
+    /// shaped table and each of its classes, in the order the runtime
+    /// tries them, when the operand's metatable is that class and the
+    /// handler is present in it; else `generic`, the runtime's own
+    /// dispatch. The operands are held; every path yields `ty`.
+    fn metamethod_dispatch(
+        &mut self,
+        event: &str,
+        sides: Vec<(bool, ShapeId, FuncId)>,
+        operands: Vec<Val>,
+        generic: Val,
+        ty: Ty,
+        span: Span,
+    ) -> Node {
+        let table_t = self.ir(Ty::Table);
+        let bool_t = prim(PrimitiveType::Bool);
+        let i64_t = prim(PrimitiveType::I64);
+        let mut pre = Vec::new();
+        let mut value = self.coerce(generic, ty);
+        for (left, class, f) in sides.into_iter().rev() {
+            let Some((layout, slot)) = self.slot_of(class, event) else {
+                continue;
+            };
+            let operand = if left { &operands[0] } else { &operands[1] };
+            let not_null = |x: &Node| {
+                binary(
+                    BinaryOp::Ne,
+                    x.clone(),
+                    null(table_t.clone(), span),
+                    bool_t.clone(),
+                    span,
+                )
+            };
+            let meta = self.hold(
+                Val {
+                    node: if_value(
+                        not_null(&operand.node),
+                        field(operand.node.clone(), "meta", table_t.clone(), span),
+                        null(table_t.clone(), span),
+                        table_t.clone(),
+                        span,
+                    ),
+                    ty: Ty::Table,
+                },
+                &mut pre,
+            );
+            let is_class = binary(
+                BinaryOp::And,
+                binary(
+                    BinaryOp::Eq,
+                    field(meta.node.clone(), "shape", i64_t.clone(), span),
+                    int_lit(layout.gid, span),
+                    bool_t.clone(),
+                    span,
+                ),
+                self.slot_present(&meta.node, &slot, span),
+                bool_t.clone(),
+                span,
+            );
+            let ok = self.hold(
+                Val {
+                    node: if_value(
+                        not_null(&meta.node),
+                        is_class,
+                        bool_lit(false, span),
+                        bool_t.clone(),
+                        span,
+                    ),
+                    ty: Ty::Bool,
+                },
+                &mut pre,
+            );
+            let record = self.slot_read(&meta.node, layout, &slot, span);
+            let multi =
+                self.direct_call_vals(f, Some(record), Vec::new(), operands.clone(), None, span);
+            let first = match multi {
+                Multi::Fixed(vals) => vals
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| self.nil_val(span)),
+                Multi::Dynamic(node) => Val {
+                    node: call("zl_first", vec![node], Type::Any, span),
+                    ty: Ty::Any,
+                },
+                Multi::None(node) => Val {
+                    node: block_value(vec![expr_stmt(node)], nil(span), span),
+                    ty: Ty::Nil,
+                },
+            };
+            // Held: the call's check leaves its block, and a branch's
+            // value is read after it.
+            let mut arm_pre = Vec::new();
+            let arm = self.coerce(first, ty);
+            let arm = self.hold(Val { node: arm, ty }, &mut arm_pre);
+            value = if_value(
+                ok.node,
+                block_value(arm_pre, arm.node, span),
+                value,
+                self.ir(ty),
+                span,
+            );
+        }
+        block_value(pre, value, span)
+    }
+
     fn binary_op(
         &mut self,
         op: &BinOp,
@@ -3347,6 +3487,43 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         descs: &Described,
         span: Span,
     ) -> Result<Val> {
+        // A shaped table operand whose handler the types know.
+        if let Some(event) = types::arith_event(op)
+            && let Some(sides) = self.typer().metamethod_sides(event, a.ty, b.ty)
+            && !sides.is_empty()
+        {
+            let code = match op {
+                BinOp::Plus(_) => OP_ADD,
+                BinOp::Minus(_) => OP_SUB,
+                BinOp::Star(_) => OP_MUL,
+                BinOp::Slash(_) => OP_DIV,
+                BinOp::Percent(_) => OP_MOD,
+                BinOp::Caret(_) => OP_POW,
+                _ => OP_IDIV,
+            };
+            let mut pre = Vec::new();
+            let a = self.hold(a, &mut pre);
+            let b = self.hold(b, &mut pre);
+            let x = self.boxed(a.clone());
+            let y = self.boxed(b.clone());
+            let generic = self.guard_described(
+                Val {
+                    node: call("zl_arith", vec![int_lit(code, span), x, y], Type::Any, span),
+                    ty: Ty::Any,
+                },
+                descs,
+            );
+            let ty = self
+                .typer()
+                .metamethod_result(event, a.ty, b.ty)
+                .unwrap_or(Ty::Any)
+                .settled();
+            let value = self.metamethod_dispatch(event, sides, vec![a, b], generic, ty, span);
+            return Ok(Val {
+                node: block_value(pre, value, span),
+                ty,
+            });
+        }
         let ints = a.ty == Ty::Int && b.ty == Ty::Int;
         let numbers = a.ty.is_number() && b.ty.is_number();
         // A literal divisor that is not 0 or -1 makes `//` and `%`
