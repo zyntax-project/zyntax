@@ -566,9 +566,12 @@ impl Walker {
                         Binding::Global(_) => {}
                     }
                 } else {
-                    // `function a.b.c()`: `a` is read, the rest indexed.
+                    // `function a.b.c()`: `a` is read, the rest indexed,
+                    // and the function is a value in a table: nothing
+                    // knows its callers.
                     self.use_name(names[0], false);
-                    self.function(f.body(), is_method, fname.clone());
+                    let id = self.function(f.body(), is_method, fname.clone());
+                    self.out.funcs[id.0 as usize].escapes = true;
                 }
             }
             Stmt::GenericFor(f) => {
