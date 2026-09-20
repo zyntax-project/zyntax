@@ -80,6 +80,15 @@ pub fn encode_osr_site(body_tag: u16, loop_ordinal: u64, live_in_count: u16) -> 
     ((body_tag as u64) << 48) | ((loop_ordinal & 0xFFFF_FFFF) << 16) | (live_in_count as u64)
 }
 
+/// A site key without its body tag: the loop's ordinal and live-in
+/// count, which an edited body shares with the one running. A reload
+/// matches the two bodies' sites on this and publishes the edited
+/// body's helper under the running code's key, whose probes carry it.
+#[inline]
+pub fn site_loop(site: u64) -> u64 {
+    site & 0x0000_FFFF_FFFF_FFFF
+}
+
 /// Unpack a site key. Returns `(body_tag, loop_ordinal, live_in_count)`.
 #[inline]
 pub fn decode_osr_site(site: u64) -> (u16, u64, u16) {
@@ -89,17 +98,37 @@ pub fn decode_osr_site(site: u64) -> (u16, u64, u16) {
     (body_tag, loop_ordinal, live_in_count)
 }
 
-/// A number that tells one shape of a function's body from another:
-/// the same source lowered and then optimised has other instruction
-/// and value counts. Two bodies with equal tags are taken to be the
-/// same body.
+/// A number that tells one body of a function from another: a hash of
+/// which instruction sits where, with what result and operands, so
+/// the same source lowered and then optimised (an instruction hoisted,
+/// an operand folded, a call inlined) has another tag. Two bodies with
+/// equal tags are taken to be the same body.
 pub fn body_tag(function: &HirFunction) -> u16 {
-    let insts: usize = function.blocks.values().map(|b| b.instructions.len()).sum();
-    let phis: usize = function.blocks.values().map(|b| b.phis.len()).sum();
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for x in [function.blocks.len(), insts, phis, function.values.len()] {
-        h ^= x as u64;
+    let mut mix = |x: u64| {
+        h ^= x;
         h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    for (block_id, block) in &function.blocks {
+        mix(block_id.as_u32() as u64);
+        mix(block.phis.len() as u64);
+        for phi in &block.phis {
+            mix(phi.result.as_u32() as u64);
+        }
+        for inst in &block.instructions {
+            // The variant, then its result and operands.
+            let discriminant = std::mem::discriminant(inst);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&discriminant, &mut hasher);
+            mix(std::hash::Hasher::finish(&hasher));
+            if let Some(r) = instruction_result(inst) {
+                mix(r.as_u32() as u64);
+            }
+            inst.for_each_operand(|u| mix(u.as_u32() as u64));
+        }
+        for u in terminator_uses(&block.terminator) {
+            mix(u.as_u32() as u64);
+        }
     }
     (h ^ (h >> 32) ^ (h >> 16)) as u16
 }
@@ -1219,7 +1248,7 @@ mod tests {
         osr_request_promotion(id);
         osr_request_promotion(id);
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
-        requested().write().unwrap().remove(&id);
+        requested().write().unwrap().remove(&(id, 0));
         set_promotion_requester(|_, _| false);
     }
 
@@ -1738,7 +1767,13 @@ pub const OSR_REQUEST_SYMBOL: &str = "__zyntax_osr_request";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Requester {
     Compiled,
-    Interpreted,
+    /// An interpreted frame, at the loop header whose OSR site this is.
+    /// The site names the body the frame runs (its tag): the resume
+    /// points it can leave through are that body's, and the one at this
+    /// header is the one it waits at.
+    Interpreted {
+        site: u64,
+    },
 }
 
 /// Installed by the runtime to answer a request: resume points for an
@@ -1756,11 +1791,23 @@ pub fn set_promotion_requester(f: impl Fn(u64, Requester) -> bool + Send + Sync 
     *promotion_requester().write().unwrap() = Some(Box::new(f));
 }
 
-/// Beads that have already asked, so a function called repeatedly does not
-/// queue the same compile over and over.
-fn requested() -> &'static RwLock<std::collections::HashSet<u64>> {
-    static S: OnceLock<RwLock<std::collections::HashSet<u64>>> = OnceLock::new();
+/// Requests already made, so a function called repeatedly does not queue
+/// the same compile over and over: one per bead from compiled code, one
+/// per site from the interpreter, whose frame asks from each header it
+/// warms at and leaves through whichever resume point comes.
+fn requested() -> &'static RwLock<std::collections::HashSet<(u64, u64)>> {
+    static S: OnceLock<RwLock<std::collections::HashSet<(u64, u64)>>> = OnceLock::new();
     S.get_or_init(|| RwLock::new(std::collections::HashSet::new()))
+}
+
+impl Requester {
+    /// What a request from here is deduplicated on.
+    fn key(self, bead_id: u64) -> (u64, u64) {
+        match self {
+            Requester::Compiled => (bead_id, 0),
+            Requester::Interpreted { site } => (bead_id, site),
+        }
+    }
 }
 
 /// Called when a compiled frame has revisited a resumable loop enough
@@ -1777,12 +1824,75 @@ pub extern "C" fn osr_request_promotion(bead_id: u64) {
 /// The interpreter's request for the loop it is running: the same
 /// compile, and resume points it can leave through as soon as they
 /// exist, since it can enter no code mid-loop without one.
-pub fn osr_request_promotion_interpreted(bead_id: u64) {
-    request(bead_id, Requester::Interpreted);
+pub fn osr_request_promotion_interpreted(bead_id: u64, site: u64) {
+    request(bead_id, Requester::Interpreted { site });
+}
+
+/// The compile worker's busy flag, raised while it is in a job.
+fn compile_worker_busy() -> &'static RwLock<Option<Arc<std::sync::atomic::AtomicBool>>> {
+    static B: OnceLock<RwLock<Option<Arc<std::sync::atomic::AtomicBool>>>> = OnceLock::new();
+    B.get_or_init(|| RwLock::new(None))
+}
+
+/// Register the flag the compile worker raises while it is in a job.
+pub fn set_compile_worker_busy(flag: Option<Arc<std::sync::atomic::AtomicBool>>) {
+    *compile_worker_busy().write().unwrap() = flag;
+}
+
+/// Whether there is a compile worker at all.
+pub fn compile_worker_present() -> bool {
+    compile_worker_busy().read().unwrap().is_some()
+}
+
+/// Interpreted frames that asked for resume points and are still
+/// running, by bead. A resume point is compiled for a bead only while
+/// one of them could take it.
+fn waiting_frames() -> &'static RwLock<HashMap<u64, u32>> {
+    static W: OnceLock<RwLock<HashMap<u64, u32>>> = OnceLock::new();
+    W.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// An interpreted frame of `bead_id` asks; it says so before the request.
+pub fn frame_waits(bead_id: u64) {
+    *waiting_frames()
+        .write()
+        .unwrap()
+        .entry(bead_id)
+        .or_insert(0) += 1;
+}
+
+/// The frame returned or left through a resume point.
+pub fn frame_left(bead_id: u64) {
+    let mut frames = waiting_frames().write().unwrap();
+    if let Some(n) = frames.get_mut(&bead_id) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            frames.remove(&bead_id);
+        }
+    }
+}
+
+/// Whether some interpreted frame of `bead_id` still waits for a resume
+/// point.
+pub fn frame_waiting(bead_id: u64) -> bool {
+    waiting_frames()
+        .read()
+        .unwrap()
+        .get(&bead_id)
+        .is_some_and(|n| *n > 0)
+}
+
+/// Run the registered requester for `bead_id` now, on this thread: what
+/// a worker does with a request another thread queued. Returns whether
+/// it was fulfilled.
+pub fn run_promotion(bead_id: u64, from: Requester) -> bool {
+    let guard = promotion_requester().read().unwrap();
+    guard.as_ref().is_some_and(|f| f(bead_id, from))
 }
 
 fn request(bead_id: u64, from: Requester) {
-    if !requested().write().unwrap().insert(bead_id) {
+    let key = from.key(bead_id);
+    if !requested().write().unwrap().insert(key) {
         return;
     }
     if osr_trace_enabled() {
@@ -1792,6 +1902,6 @@ fn request(bead_id: u64, from: Requester) {
     let submitted = guard.as_ref().is_some_and(|f| f(bead_id, from));
     drop(guard);
     if !submitted {
-        requested().write().unwrap().remove(&bead_id);
+        requested().write().unwrap().remove(&key);
     }
 }

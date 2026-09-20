@@ -87,6 +87,22 @@ struct CseCtx<'a> {
     bin_defs: HashMap<HirId, (BinaryOp, HirId, HirId)>,
     /// `id → integer value` for every integer constant.
     int_consts: HashMap<HirId, i128>,
+    /// Result types by a small id, so a key holds a number and not a
+    /// copy of a type; a struct's type is a tree, and cloning one per
+    /// instruction was a tenth of the pass.
+    types: std::cell::RefCell<HashMap<HirType, u32>>,
+}
+
+impl CseCtx<'_> {
+    fn type_id(&self, ty: &HirType) -> u32 {
+        let mut types = self.types.borrow_mut();
+        if let Some(id) = types.get(ty) {
+            return *id;
+        }
+        let id = types.len() as u32;
+        types.insert(ty.clone(), id);
+        id
+    }
 }
 
 /// Counters surfaced for callers / tests.
@@ -115,10 +131,16 @@ pub fn eliminate_with(func: &mut HirFunction, pure_fns: &HashSet<HirId>) -> CseS
         pure_fns,
         bin_defs: collect_bin_defs(func),
         int_consts: collect_int_consts(func),
+        types: std::cell::RefCell::new(HashMap::new()),
     };
+    // The dominator tree is what makes a match sound: the canonical
+    // instruction must run before the one it replaces. Built from the
+    // edges as they are now, not as the last pass to rebuild them left
+    // them.
+    func.rebuild_cfg_edges();
     let dt = DominatorTree::new(func);
     let mut value_table: HashMap<VnKey, HirId> = HashMap::new();
-    let mut substitutions: HashMap<HirId, HirId> = HashMap::new();
+    let mut substitutions = same_constants(func);
 
     visit_block(
         func,
@@ -177,6 +199,40 @@ fn collect_bin_defs(func: &HirFunction) -> HashMap<HirId, (BinaryOp, HirId, HirI
         }
     }
     m
+}
+
+/// `duplicate → first` over the function's integer, boolean and null
+/// constants: two constants of one type and value are one operand, so
+/// two compares against them get one key. Floats are left alone (a zero
+/// equals a negative zero), as are aggregates and strings.
+fn same_constants(func: &HirFunction) -> HashMap<HirId, HirId> {
+    let mut first: HashMap<(HirType, HirConstant), HirId> = HashMap::new();
+    let mut duplicates = HashMap::new();
+    for (id, v) in &func.values {
+        let HirValueKind::Constant(c) = &v.kind else {
+            continue;
+        };
+        if matches!(
+            c,
+            HirConstant::F32(_)
+                | HirConstant::F64(_)
+                | HirConstant::Array(_)
+                | HirConstant::Struct(_)
+                | HirConstant::String(_)
+                | HirConstant::VTable(_)
+        ) {
+            continue;
+        }
+        match first.entry((v.ty.clone(), c.clone())) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                duplicates.insert(*id, *e.get());
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(*id);
+            }
+        }
+    }
+    duplicates
 }
 
 /// `id → integer value` for every integer-constant value.
@@ -314,13 +370,13 @@ fn visit_block(
 /// The canonical key for an SSA instruction's "abstract value".
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum VnKey {
-    Binary(BinaryOp, HirType, HirId, HirId),
-    Unary(UnaryOp, HirType, HirId),
-    Cast(CastOp, HirType, HirId),
+    Binary(BinaryOp, u32, HirId, HirId),
+    Unary(UnaryOp, u32, HirId),
+    Cast(CastOp, u32, HirId),
     /// GEP key: pointer + sequence of index ids + result type.
-    Gep(HirType, HirId, Vec<HirId>),
+    Gep(u32, HirId, Vec<HirId>),
     /// ExtractValue key: aggregate + indices + result type.
-    Extract(HirType, HirId, Vec<u32>),
+    Extract(u32, HirId, Vec<u32>),
     /// Pure call key: callee function id + affine forms of each argument
     /// + generic type/const args. Only built for callees in
     /// `ctx.pure_fns`, so two entries with this key are guaranteed to
@@ -348,7 +404,7 @@ fn vn_key_for(
             right,
         } => {
             let (l, r) = canonical_operand_order(*op, *left, *right, substitutions);
-            Some((*result, VnKey::Binary(*op, ty.clone(), l, r)))
+            Some((*result, VnKey::Binary(*op, ctx.type_id(ty), l, r)))
         }
         HirInstruction::Unary {
             op,
@@ -357,7 +413,7 @@ fn vn_key_for(
             operand,
         } => Some((
             *result,
-            VnKey::Unary(*op, ty.clone(), canonical(*operand, substitutions)),
+            VnKey::Unary(*op, ctx.type_id(ty), canonical(*operand, substitutions)),
         )),
         HirInstruction::Cast {
             op,
@@ -366,7 +422,7 @@ fn vn_key_for(
             operand,
         } => Some((
             *result,
-            VnKey::Cast(*op, ty.clone(), canonical(*operand, substitutions)),
+            VnKey::Cast(*op, ctx.type_id(ty), canonical(*operand, substitutions)),
         )),
         HirInstruction::GetElementPtr {
             result,
@@ -379,7 +435,7 @@ fn vn_key_for(
                 .iter()
                 .map(|i| canonical(*i, substitutions))
                 .collect();
-            Some((*result, VnKey::Gep(ty.clone(), p, ix)))
+            Some((*result, VnKey::Gep(ctx.type_id(ty), p, ix)))
         }
         HirInstruction::ExtractValue {
             result,
@@ -389,7 +445,7 @@ fn vn_key_for(
         } => Some((
             *result,
             VnKey::Extract(
-                ty.clone(),
+                ctx.type_id(ty),
                 canonical(*aggregate, substitutions),
                 indices.clone(),
             ),
@@ -509,166 +565,40 @@ fn apply_substitutions(func: &mut HirFunction, substitutions: &HashMap<HirId, Hi
     if substitutions.is_empty() {
         return 0;
     }
+    // Each substituted id to the end of its chain, applied with the
+    // instructions' own operand walk, which knows every variant.
+    let map: indexmap::IndexMap<HirId, HirId> = substitutions
+        .keys()
+        .map(|id| (*id, canonical(*id, substitutions)))
+        .collect();
     let mut rewrites = 0;
-
-    let map = |id: &mut HirId| -> bool {
-        let new = canonical(*id, substitutions);
-        if new != *id {
-            *id = new;
-            true
-        } else {
-            false
-        }
-    };
-
     for block in func.blocks.values_mut() {
         for inst in &mut block.instructions {
-            rewrites += rewrite_inst_operands(inst, &map);
+            inst.for_each_operand(|id| {
+                if map.contains_key(&id) {
+                    rewrites += 1;
+                }
+            });
+            inst.replace_uses(&map);
         }
-        rewrites += rewrite_terminator_operands(&mut block.terminator, &map);
-        // Phi node incoming values are rewritten too — they're real
-        // operand uses.
+        block.terminator.for_each_operand(|id| {
+            if map.contains_key(&id) {
+                rewrites += 1;
+            }
+        });
+        block.terminator.replace_uses(&map);
+        // A phi's incoming values are uses too; the blocks they come
+        // from are not.
         for phi in &mut block.phis {
-            for (_, incoming) in &mut phi.incoming {
-                if map(incoming) {
+            for (value, _) in &mut phi.incoming {
+                if let Some(new) = map.get(value) {
+                    *value = *new;
                     rewrites += 1;
                 }
             }
         }
     }
-
     rewrites
-}
-
-fn rewrite_inst_operands(inst: &mut HirInstruction, map: &impl Fn(&mut HirId) -> bool) -> usize {
-    let mut n = 0;
-    macro_rules! m {
-        ($e:expr) => {
-            if map($e) {
-                n += 1;
-            }
-        };
-    }
-    macro_rules! m_vec {
-        ($vec:expr) => {
-            for x in $vec.iter_mut() {
-                m!(x);
-            }
-        };
-    }
-    match inst {
-        HirInstruction::Binary { left, right, .. } => {
-            m!(left);
-            m!(right);
-        }
-        HirInstruction::Unary { operand, .. } => m!(operand),
-        HirInstruction::Cast { operand, .. } => m!(operand),
-        HirInstruction::Load { ptr, .. } => m!(ptr),
-        // The vector family. Leaving these out let this pass delete an
-        // instruction and rewrite every use of it except the ones a
-        // vector op held, so a `vload` kept pointing at an id nothing
-        // defined any more.
-        HirInstruction::VectorSplat { scalar, .. } => m!(scalar),
-        HirInstruction::VectorExtractLane { vector, .. } => m!(vector),
-        HirInstruction::VectorInsertLane { vector, scalar, .. } => {
-            m!(vector);
-            m!(scalar);
-        }
-        HirInstruction::VectorHorizontalReduce { vector, .. } => m!(vector),
-        HirInstruction::VectorLoad { ptr, .. } => m!(ptr),
-        HirInstruction::VectorStore { value, ptr, .. } => {
-            m!(value);
-            m!(ptr);
-        }
-        HirInstruction::VectorUnaryOp { operand, .. } => m!(operand),
-        HirInstruction::VectorMinMax { left, right, .. } => {
-            m!(left);
-            m!(right);
-        }
-        HirInstruction::VectorDot { acc, a, b, .. } => {
-            m!(acc);
-            m!(a);
-            m!(b);
-        }
-        HirInstruction::Store { value, ptr, .. } => {
-            m!(value);
-            m!(ptr);
-        }
-        HirInstruction::GetElementPtr { ptr, indices, .. } => {
-            m!(ptr);
-            m_vec!(indices);
-        }
-        HirInstruction::Call { args, .. } => m_vec!(args),
-        HirInstruction::IndirectCall { func_ptr, args, .. } => {
-            m!(func_ptr);
-            m_vec!(args);
-        }
-        HirInstruction::Select {
-            condition,
-            true_val,
-            false_val,
-            ..
-        } => {
-            m!(condition);
-            m!(true_val);
-            m!(false_val);
-        }
-        HirInstruction::ExtractValue { aggregate, .. } => m!(aggregate),
-        HirInstruction::InsertValue {
-            aggregate, value, ..
-        } => {
-            m!(aggregate);
-            m!(value);
-        }
-        HirInstruction::Atomic { ptr, value, .. } => {
-            m!(ptr);
-            if let Some(v) = value {
-                m!(v);
-            }
-        }
-        HirInstruction::Alloca { count, .. } => {
-            if let Some(c) = count {
-                m!(c);
-            }
-        }
-        _ => {
-            // Other variants (CreateUnion, AsyncSaveSlot, etc.)
-            // aren't CSE-able and their operands rarely refer to
-            // CSE'd values; we still walk them for correctness
-            // since the substitution map may cross variant
-            // boundaries when later passes are added.
-        }
-    }
-    n
-}
-
-fn rewrite_terminator_operands(
-    term: &mut HirTerminator,
-    map: &impl Fn(&mut HirId) -> bool,
-) -> usize {
-    let mut n = 0;
-    let mut m = |id: &mut HirId| {
-        if map(id) {
-            n += 1;
-        }
-    };
-    match term {
-        HirTerminator::Return { values } => {
-            for v in values {
-                m(v);
-            }
-        }
-        HirTerminator::CondBranch { condition, .. } => m(condition),
-        HirTerminator::Switch { value, .. } => m(value),
-        HirTerminator::Invoke { args, .. } => {
-            for a in args {
-                m(a);
-            }
-        }
-        HirTerminator::PatternMatch { value, .. } => m(value),
-        HirTerminator::Branch { .. } | HirTerminator::Unreachable => {}
-    }
-    n
 }
 
 /// Drop any instruction whose `result` was substituted away. Returns

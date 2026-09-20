@@ -34,6 +34,7 @@ pub mod async_support;
 pub mod auto_vectorize;
 pub mod borrow_check; // HIR-level borrow checking pass
 pub mod boxes; // Dynamic boxes made, read and released in HIR
+pub mod branch_fold; // Conditional branches a dominating branch has decided
 pub mod builtin_class; // Wrapper-class dispatch for compiler-known built-in types (Fiber, future SimdVector, etc.)
 pub mod bytecode; // HIR bytecode serialization/deserialization
 pub mod cast_classify; // Pure classification of source/target coercions → CastKind
@@ -1781,6 +1782,7 @@ pub struct InterpOptStats {
     pub scalar_replace_alloc: scalar_replace_alloc::ScalarReplaceAllocStats,
     pub dead_store: dead_store::DeadStoreStats,
     pub sign_fold: sign_fold::SignFoldStats,
+    pub branch_fold: branch_fold::BranchFoldStats,
     pub licm: licm::LicmStats,
     pub affine_loop: affine_loop::AffineLoopStats,
     pub inline: inline::InlineStats,
@@ -1896,6 +1898,54 @@ pub fn mark_optimized(module: &mut HirModule) {
     }
 }
 
+/// `ZYNTAX_CHECK_HIR_USES=1`: after each pass, every operand of every
+/// function being optimised must have a definition (a parameter, a
+/// constant, a phi or an instruction result); the pass that left one
+/// without is named and the process panics. Slow; safe to run with.
+fn check_hir_uses(module: &HirModule, after: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("ZYNTAX_CHECK_HIR_USES").is_some()) {
+        return;
+    }
+    for f in module.functions.values() {
+        if f.attributes.optimized || f.is_external {
+            continue;
+        }
+        let mut defined: std::collections::HashSet<HirId> = f
+            .values
+            .iter()
+            .filter(|(_, v)| !matches!(v.kind, crate::hir::HirValueKind::Instruction))
+            .map(|(id, _)| *id)
+            .collect();
+        for b in f.blocks.values() {
+            defined.extend(b.phis.iter().map(|p| p.result));
+            for inst in &b.instructions {
+                if let Some(r) = inst.result_id() {
+                    defined.insert(r);
+                }
+            }
+        }
+        let name = f.name.resolve_global().unwrap_or_default();
+        let report = |what: &str, id: HirId| {
+            if !defined.contains(&id) {
+                panic!("after {after}: {name} reads {id:?} in {what}, which nothing defines");
+            }
+        };
+        for (bid, b) in &f.blocks {
+            for p in &b.phis {
+                for (v, _) in &p.incoming {
+                    report(&format!("a phi of {bid:?}"), *v);
+                }
+            }
+            for inst in &b.instructions {
+                inst.for_each_operand(|id| report(&format!("{bid:?}"), id));
+            }
+            b.terminator
+                .for_each_operand(|id| report(&format!("the terminator of {bid:?}"), id));
+        }
+    }
+}
+
 fn run_interp_safe_opts_with(
     module: &mut HirModule,
     expand_box_reads: bool,
@@ -1937,6 +1987,7 @@ fn run_interp_safe_opts_with(
     let mut at = web_time::Instant::now();
     let ap = alloca_promote::run_module(module);
     timed("alloca_promote", &mut at);
+    check_hir_uses(module, "alloca_promote");
     stats.alloca_promote.allocas_scanned += ap.allocas_scanned;
     stats.alloca_promote.promoted += ap.promoted;
     stats.alloca_promote.kept_on_stack += ap.kept_on_stack;
@@ -1949,6 +2000,7 @@ fn run_interp_safe_opts_with(
     // rewrites bodies and can expose freshly-shared pure calls.
     purity::infer_module(module);
     timed("purity", &mut at);
+    check_hir_uses(module, "purity");
 
     // Outer fixed-point: keeps iterating the whole sweep until none
     // of the passes report new work. Compounding example: inline
@@ -1974,17 +2026,27 @@ fn run_interp_safe_opts_with(
         }
         let cf = const_fold::fold_module(module);
         timed("const_fold", &mut at);
+        check_hir_uses(module, "const_fold");
         let sf = sign_fold::run_module(module);
         stats.sign_fold.compares += sf.compares;
         stats.sign_fold.selects += sf.selects;
         timed("sign_fold", &mut at);
+        check_hir_uses(module, "sign_fold");
         let cs = cse::eliminate_module(module);
         timed("cse", &mut at);
+        check_hir_uses(module, "cse");
+        // After cse, which makes repeated compares one value: a branch
+        // on a condition a dominating branch decided is a jump.
+        let bf = branch_fold::run_module(module);
+        stats.branch_fold.folded += bf.folded;
+        timed("branch_fold", &mut at);
+        check_hir_uses(module, "branch_fold");
         // load_cse runs after value-cse so canonical pointer ids are
         // already chased — if two GEPs cse'd to one, the load_cse
         // pass sees both loads using the same canonical ptr id.
         let lcse = load_cse::run_module(module);
         timed("load_cse", &mut at);
+        check_hir_uses(module, "load_cse");
         // aggregate_split runs after load_cse so the struct-typed
         // Loads it targets are the canonical ones (load_cse may
         // have collapsed sibling Loads of the same pointer).
@@ -1992,6 +2054,7 @@ fn run_interp_safe_opts_with(
         // produced by `let mut b = arr[i]; b.x = …; arr[i] = b`.
         let ags = aggregate_split::run_module(module);
         timed("aggregate_split", &mut at);
+        check_hir_uses(module, "aggregate_split");
         // An aggregate that never touches memory has no bytes to split:
         // its fields become values of their own.
         let agsc = aggregate_scalarize::run_module(module);
@@ -1999,6 +2062,7 @@ fn run_interp_safe_opts_with(
         stats.aggregate_scalarize.values += agsc.values;
         stats.aggregate_scalarize.rematerialized += agsc.rematerialized;
         timed("aggregate_scalarize", &mut at);
+        check_hir_uses(module, "aggregate_scalarize");
         // scalar_replace_alloc runs after aggregate_split:
         //   * aggregate_split has just rewritten any struct-typed
         //     round-trips into direct GEP+Load/Store. That exposes the
@@ -2010,15 +2074,19 @@ fn run_interp_safe_opts_with(
         // (Call results are opaque); this is the HIR-only path.
         let sra = scalar_replace_alloc::run_module(module);
         timed("scalar_replace_alloc", &mut at);
+        check_hir_uses(module, "scalar_replace_alloc");
         // A field a constructor defaulted and its caller then set: the
         // default's store is dead once both are in one block.
         let ds = dead_store::run_module(module);
         stats.dead_store.removed += ds.removed;
         timed("dead_store", &mut at);
+        check_hir_uses(module, "dead_store");
         let il = inline::run_module_with(module, cache.map(|c| &c.cycles));
         timed("inline", &mut at);
+        check_hir_uses(module, "inline");
         let lc = licm::run_module(module);
         timed("licm", &mut at);
+        check_hir_uses(module, "licm");
         // Before the loops are matched against a shape. A variable live
         // across a loop but never reassigned in it still carries a phi,
         // which reads as a definition in the header and makes a buffer
@@ -2029,55 +2097,22 @@ fn run_interp_safe_opts_with(
         stats.phi_prune.removed += ppf.removed;
         stats.phi_prune.rounds = stats.phi_prune.rounds.max(ppf.rounds);
         timed("phi_prune", &mut at);
-        let lv = loop_vectorize::run_module(module);
-        timed("loop_vectorize", &mut at);
-        // Reduction vectorization runs alongside loop_vectorize; the
-        // two recognise disjoint patterns (store-to-array vs.
-        // accumulator) so they can't double-fire on the same loop.
-        let rv = reduction_vectorize::run_module(module);
-        timed("reduction_vectorize", &mut at);
-        // FMA contraction runs after the vectorizers, not before them.
-        // A multiply feeding an add is the shape both the loop matcher
-        // and this pass want, and whichever runs first takes it: fusing
-        // to a single call leaves the matcher a call it cannot lower to
-        // lanes, and a scaled kernel such as `y[i] = a * x[i] + y[i]`
-        // stays scalar. Fusing afterwards costs nothing, because the
-        // pass contracts a vector-typed multiply and add just as
-        // readily as a scalar pair, so the loop ends up both widened
-        // and fused.
-        //
-        // It still runs after const_fold + cse, which is why it sits
-        // inside the round rather than after it: a multiply of
-        // constants has already collapsed, and a pattern CSE could
-        // eliminate outright is not contracted first.
-        //
-        // Temporary investigation gate: `ZYNTAX_DISABLE_FMA=1` skips
-        // the pass entirely so before/after HIR can be diffed and
-        // exec-time effect measured on Apple-Silicon. Remove once the
-        // hot-loop FMA-helps/hurts question is closed.
-        let fma_disabled = std::env::var("ZYNTAX_DISABLE_FMA")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let fma = if fma_disabled {
-            fma_contract::FmaStats::default()
-        } else {
-            fma_contract::run_module(module)
-        };
+        check_hir_uses(module, "phi_prune");
         // cfg_simplify runs last in the round — `const_fold`'s
         // CondBranch-on-known-Bool collapse routinely turns
         // conditional branches into unconditional ones, which makes
         // the target block a straight-line successor ready for
         // merging.
-        timed("fma_contract", &mut at);
         let cs_cfg = cfg_simplify::run_module(module);
         timed("cfg_simplify", &mut at);
+        check_hir_uses(module, "cfg_simplify");
 
         // The folders feed each other and nothing else: a compare
         // sign_fold rewrites is what const_fold folds next round. When
         // they are all that moved, they are run to their own fixed
         // point here rather than paying a round of every pass for each
         // step of it.
-        let restructured = fma.contracted > 0
+        let restructured = bf.folded > 0
             || lcse.eliminated > 0
             || ags.round_trips_removed > 0
             || ags.field_reads_only > 0
@@ -2085,8 +2120,6 @@ fn run_interp_safe_opts_with(
             || sra.mallocs_eliminated > 0
             || il.inlined > 0
             || lc.hoisted > 0
-            || lv.vectorized > 0
-            || rv.vectorized > 0
             || cs_cfg.merged > 0
             || cs_cfg.threaded > 0;
         let mut folded = cf.folded > 0 || sf.compares > 0 || sf.selects > 0 || cs.eliminated > 0;
@@ -2105,28 +2138,16 @@ fn run_interp_safe_opts_with(
                 }
             }
             timed("fold to fixed point", &mut at);
+            check_hir_uses(module, "fold to fixed point");
             folded = false;
         }
-        let made_progress = folded
-            || restructured
-            || fma.contracted > 0
-            || lcse.eliminated > 0
-            || ags.round_trips_removed > 0
-            || ags.field_reads_only > 0
-            || sra.mallocs_eliminated > 0
-            || il.inlined > 0
-            || lc.hoisted > 0
-            || lv.vectorized > 0
-            || rv.vectorized > 0
-            || cs_cfg.merged > 0
-            || cs_cfg.threaded > 0;
+        let made_progress = folded || restructured;
 
         // Accumulate stats from this round.
         stats.const_fold.folded += cf.folded;
         stats.const_fold.iterations = stats.const_fold.iterations.max(cf.iterations);
         stats.cse.eliminated += cs.eliminated;
         stats.cse.rewrites += cs.rewrites;
-        stats.fma_contract.contracted += fma.contracted;
         stats.load_cse.eliminated += lcse.eliminated;
         stats.aggregate_split.round_trips_removed += ags.round_trips_removed;
         stats.aggregate_split.field_accesses_emitted += ags.field_accesses_emitted;
@@ -2149,34 +2170,22 @@ fn run_interp_safe_opts_with(
         stats.licm.hoisted += lc.hoisted;
         stats.licm.loops_visited += lc.loops_visited;
         stats.licm.loops_skipped_no_preheader += lc.loops_skipped_no_preheader;
-        stats.loop_vectorize.vectorized += lv.vectorized;
-        stats.loop_vectorize.loops_visited += lv.loops_visited;
-        stats.loop_vectorize.skipped_shape += lv.skipped_shape;
-        stats.loop_vectorize.skipped_no_induction += lv.skipped_no_induction;
-        stats.loop_vectorize.skipped_op_unsupported += lv.skipped_op_unsupported;
-        stats.reduction_vectorize.vectorized += rv.vectorized;
-        stats.reduction_vectorize.loops_visited += rv.loops_visited;
-        stats.reduction_vectorize.skipped_shape += rv.skipped_shape;
-        stats.reduction_vectorize.skipped_op_unsupported += rv.skipped_op_unsupported;
         stats.cfg_simplify.merged += cs_cfg.merged;
         stats.cfg_simplify.threaded += cs_cfg.threaded;
 
         if trace {
             eprintln!(
-                "[OPT] round {round} progress: fold {} sign {}/{} cse {} fma {} lcse {} ags {}/{} sra {} inline {} licm {} vec {}/{} cfg {}/{}",
+                "[OPT] round {round} progress: fold {} sign {}/{} cse {} lcse {} ags {}/{} sra {} inline {} licm {} cfg {}/{}",
                 cf.folded,
                 sf.compares,
                 sf.selects,
                 cs.eliminated,
-                fma.contracted,
                 lcse.eliminated,
                 ags.round_trips_removed,
                 ags.field_reads_only,
                 sra.mallocs_eliminated,
                 il.inlined,
                 lc.hoisted,
-                lv.vectorized,
-                rv.vectorized,
                 cs_cfg.merged,
                 cs_cfg.threaded
             );
@@ -2214,6 +2223,7 @@ fn run_interp_safe_opts_with(
     at = web_time::Instant::now();
     let al = affine_loop::run_module(module);
     timed("affine_loop", &mut at);
+    check_hir_uses(module, "affine_loop");
     stats.affine_loop.folded += al.folded;
     stats.affine_loop.loops_visited += al.loops_visited;
     stats.affine_loop.skipped_shape += al.skipped_shape;
@@ -2231,8 +2241,32 @@ fn run_interp_safe_opts_with(
     // successor to `loop_vectorize` + `reduction_vectorize` which still
     // run inside the sweep for now (transition period — see module
     // docs).
+    // The loop and reduction vectorizers run once here too, after the
+    // sweep has settled the loop bodies: a round of each per sweep
+    // round found nothing more and cost a fifth of a call-heavy
+    // function's pass time. FMA contraction follows them: a multiply
+    // feeding an add is the shape both the loop matcher and the
+    // contraction want, and whichever runs first takes it; fusing
+    // afterwards costs nothing, since the pass contracts vector and
+    // scalar pairs alike. What they rewrite gets one cleaning pass.
+    let lv = loop_vectorize::run_module(module);
+    timed("loop_vectorize", &mut at);
+    check_hir_uses(module, "loop_vectorize");
+    let rv = reduction_vectorize::run_module(module);
+    timed("reduction_vectorize", &mut at);
+    check_hir_uses(module, "reduction_vectorize");
     let av = auto_vectorize::run_module(module);
     timed("auto_vectorize", &mut at);
+    check_hir_uses(module, "auto_vectorize");
+    stats.loop_vectorize.vectorized += lv.vectorized;
+    stats.loop_vectorize.loops_visited += lv.loops_visited;
+    stats.loop_vectorize.skipped_shape += lv.skipped_shape;
+    stats.loop_vectorize.skipped_no_induction += lv.skipped_no_induction;
+    stats.loop_vectorize.skipped_op_unsupported += lv.skipped_op_unsupported;
+    stats.reduction_vectorize.vectorized += rv.vectorized;
+    stats.reduction_vectorize.loops_visited += rv.loops_visited;
+    stats.reduction_vectorize.skipped_shape += rv.skipped_shape;
+    stats.reduction_vectorize.skipped_op_unsupported += rv.skipped_op_unsupported;
     stats.auto_vectorize.vectorized += av.vectorized;
     stats.auto_vectorize.loops_visited += av.loops_visited;
     stats.auto_vectorize.rejected_shape += av.rejected_shape;
@@ -2240,6 +2274,33 @@ fn run_interp_safe_opts_with(
     stats.auto_vectorize.rejected_cost += av.rejected_cost;
     stats.auto_vectorize.rejected_no_iv += av.rejected_no_iv;
     stats.auto_vectorize.rejected_trip_count += av.rejected_trip_count;
+    // `ZYNTAX_DISABLE_FMA=1` skips the contraction, for a before/after
+    // of a kernel; safe to run with.
+    let fma_disabled = std::env::var("ZYNTAX_DISABLE_FMA")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let fma = if fma_disabled {
+        fma_contract::FmaStats::default()
+    } else {
+        fma_contract::run_module(module)
+    };
+    stats.fma_contract.contracted += fma.contracted;
+    timed("fma_contract", &mut at);
+    check_hir_uses(module, "fma_contract");
+    if lv.vectorized > 0 || rv.vectorized > 0 || av.vectorized > 0 || fma.contracted > 0 {
+        let cf = const_fold::fold_module(module);
+        stats.const_fold.folded += cf.folded;
+        let cs = cse::eliminate_module(module);
+        stats.cse.eliminated += cs.eliminated;
+        stats.cse.rewrites += cs.rewrites;
+        let ppf = phi_prune::run_module(module);
+        stats.phi_prune.removed += ppf.removed;
+        let cs_cfg = cfg_simplify::run_module(module);
+        stats.cfg_simplify.merged += cs_cfg.merged;
+        stats.cfg_simplify.threaded += cs_cfg.threaded;
+        timed("vector cleanup", &mut at);
+        check_hir_uses(module, "vector cleanup");
+    }
 
     // Recursive inlining runs ONCE after the fixed-point sweep.
     // Trying to put it inside the fixed-point would invite divergence
@@ -2265,6 +2326,7 @@ fn run_interp_safe_opts_with(
     // pushes the register allocator into spilling a real one.
     let pp = phi_prune::run_module(module);
     timed("phi_prune", &mut at);
+    check_hir_uses(module, "phi_prune");
     stats.phi_prune.removed += pp.removed;
     stats.phi_prune.rounds = stats.phi_prune.rounds.max(pp.rounds);
 
@@ -2280,10 +2342,12 @@ fn run_interp_safe_opts_with(
         stats.recursive_inline.skipped_unsupported += ri.skipped_unsupported;
     }
     timed("recursive_inline", &mut at);
+    check_hir_uses(module, "recursive_inline");
     // The copies come with the callee's block seams; fold them before
     // anything reads the shape.
     let cs = cfg_simplify::run_module(module);
     timed("cfg_simplify", &mut at);
+    check_hir_uses(module, "cfg_simplify");
     stats.cfg_simplify.merged += cs.merged;
     stats.cfg_simplify.threaded += cs.threaded;
 
@@ -2298,12 +2362,15 @@ fn run_interp_safe_opts_with(
     //     dominance relationship.
     purity::infer_module(module);
     timed("purity", &mut at);
+    check_hir_uses(module, "purity");
     let pcp = pure_call_pre::run_module(module);
     timed("pure_call_pre", &mut at);
+    check_hir_uses(module, "pure_call_pre");
     stats.pure_call_pre.hoisted += pcp.hoisted;
     stats.pure_call_pre.groups_visited += pcp.groups_visited;
     let post_ri_cse = cse::eliminate_module(module);
     timed("cse", &mut at);
+    check_hir_uses(module, "cse");
     stats.cse.eliminated += post_ri_cse.eliminated;
     stats.cse.rewrites += post_ri_cse.rewrites;
 
@@ -2322,6 +2389,7 @@ fn run_interp_safe_opts_with(
     //     then add Free calls without those marks getting lost.
     let tc = tco::run_module(module);
     timed("tco", &mut at);
+    check_hir_uses(module, "tco");
     stats.tco.candidates_visited += tc.candidates_visited;
     stats.tco.marked += tc.marked;
 
@@ -2348,6 +2416,7 @@ fn run_interp_safe_opts_with(
         None => drop_insert::run_module(module),
     };
     timed("drop_insert", &mut at);
+    check_hir_uses(module, "drop_insert");
     stats.drop_insert.mallocs_scanned += di.mallocs_scanned;
     stats.drop_insert.frees_inserted += di.frees_inserted;
     stats.drop_insert.escapes_skipped += di.escapes_skipped;
@@ -2363,6 +2432,7 @@ fn run_interp_safe_opts_with(
         boxes::BoxStats::default()
     };
     timed("boxes", &mut at);
+    check_hir_uses(module, "boxes");
     stats.boxes.expanded += br.expanded;
     stats.boxes.made += br.made;
     stats.boxes.released += br.released;
@@ -2375,10 +2445,12 @@ fn run_interp_safe_opts_with(
         stats.cse.eliminated += cs.eliminated;
         stats.cse.rewrites += cs.rewrites;
         timed("licm+cse", &mut at);
+        check_hir_uses(module, "licm+cse");
     }
 
     stats.cfg_simplify.unreachable_removed += cfg_simplify::prune_unreachable_module(module);
     timed("prune_unreachable", &mut at);
+    check_hir_uses(module, "prune_unreachable");
 
     stats
 }

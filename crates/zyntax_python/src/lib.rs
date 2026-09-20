@@ -671,7 +671,10 @@ pub fn parse_program_with(
     inferred.dyn_methods.take();
     inferred.counter.set(inferred.closures.borrow().len());
     declarations.extend(lower_items(&inferred, &items, &unpack_shapes)?);
-    if !top_level.is_empty() {
+    // The module body is the entry even when it has no statements: a
+    // program is built from its entry, and one without would have the
+    // whole library built up front.
+    {
         let mut locals = types::infer_locals_entry(&inferred, &entry_sig, &owned, &entry_files);
         for name in inferred.globals.keys() {
             locals.vars.remove(name);
@@ -687,10 +690,13 @@ pub fn parse_program_with(
             HashMap::default(),
         )
         .entry_body(&top_level)?;
-        let span = Span::new(
-            top_level[0].0.range().start().to_usize(),
-            top_level[top_level.len() - 1].0.range().end().to_usize(),
-        );
+        let span = match (top_level.first(), top_level.last()) {
+            (Some(first), Some(last)) => Span::new(
+                first.0.range().start().to_usize(),
+                last.0.range().end().to_usize(),
+            ),
+            _ => Span::new(0, 0),
+        };
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(TypedFunction {
                 name: intern(ENTRY),

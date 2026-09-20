@@ -685,6 +685,7 @@ impl TieredRuntime {
                     }
                 }
                 interp.set_body_source(self.backend.interpreter_body_source());
+                interp.set_address_source(self.backend.interpreter_address_source());
                 let (thunk, entry, bead) = self.backend.interpreter_bridge();
                 interp.set_native_bridge(thunk, entry, bead);
                 true

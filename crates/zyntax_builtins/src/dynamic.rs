@@ -205,7 +205,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         i64(),
         Some("zyntax_box_pointer"),
     ));
-    // A null instance is None.
+    // A null instance is None, and None is a null box.
     let p = local("p", i64());
     let itag = local("tag", i32());
     d.push(define(
@@ -215,6 +215,15 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         vec![
             when(eq(p.e(), int(0)), vec![ret(null(any()))]),
             ret(call("zb_box_instance_raw", vec![p.e(), itag.e()], any())),
+        ],
+    ));
+    d.push(define(
+        "zb_unbox_instance",
+        &[&x],
+        i64(),
+        vec![
+            when(eq(x.e(), null(any())), vec![ret(int(0))]),
+            ret(call("zb_unbox_instance_raw", vec![x.e()], i64())),
         ],
     ));
     d.push(extern_fn(

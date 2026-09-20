@@ -241,6 +241,208 @@ struct FunctionEntry {
     bead_id: u64,
 }
 
+/// Work for the warm-up thread while it has none of its own: an
+/// interpreted loop that asked for its resume points comes first (it is
+/// running, slowly, until they land), a function whose calls crossed
+/// the baseline threshold next. A request made while the thread is in
+/// a job would wait behind it, so the asking thread does that one
+/// itself; the planned order of everything else fills the gaps.
+struct CompileQueue {
+    /// Interpreted frames' requests, each with the OSR site it waits at.
+    promote: Mutex<std::collections::VecDeque<(u64, u64)>>,
+    /// Compile requests with the function's call count and the time
+    /// when made: a request the function has not been called since is
+    /// stale by the time the worker reaches it. A request made for the
+    /// callee of a function being compiled carries no count: its calls
+    /// will come from native code, which the counter does not see.
+    compile: Mutex<std::collections::VecDeque<(u64, Option<u32>, std::time::Instant)>>,
+    /// Beads already queued, once each.
+    queued: Mutex<HashSet<u64>>,
+    /// Beads with a promotion under way, each with the sites asked for
+    /// it meanwhile.
+    promoting: Mutex<HashMap<u64, Vec<u64>>>,
+    /// Each lazy function's call count as the interpreter ticks it.
+    counts: Mutex<HashMap<u64, Arc<std::sync::atomic::AtomicU32>>>,
+    ready: std::sync::Condvar,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the worker is in a job. A request made while it is
+    /// would wait behind that job; the asking thread does the work
+    /// itself then, as it did before there was a worker. Shared with
+    /// the interpreter, which asks early for a warm loop while the
+    /// worker is quiescent.
+    busy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+enum Job {
+    Promote(u64, u64),
+    Compile(u64, Option<u32>, std::time::Instant),
+}
+
+impl CompileQueue {
+    fn new(stop: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            promote: Mutex::new(std::collections::VecDeque::new()),
+            compile: Mutex::new(std::collections::VecDeque::new()),
+            queued: Mutex::new(HashSet::new()),
+            promoting: Mutex::new(HashMap::new()),
+            counts: Mutex::new(HashMap::new()),
+            ready: std::sync::Condvar::new(),
+            stop,
+            busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether the worker would take a request now.
+    fn idle(&self) -> bool {
+        !self.busy.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether a compile of `bead_id` was asked for already.
+    fn is_queued(&self, bead_id: u64) -> bool {
+        self.queued.lock().unwrap().contains(&bead_id)
+    }
+
+    fn request_compile(&self, bead_id: u64, count: Option<u32>) {
+        if self.queued.lock().unwrap().insert(bead_id) {
+            self.compile
+                .lock()
+                .unwrap()
+                .push_back((bead_id, count, std::time::Instant::now()));
+            self.ready.notify_one();
+        }
+    }
+
+    /// The counter the interpreter keeps for `bead_id`'s calls.
+    fn count_of(&self, bead_id: u64) -> Arc<std::sync::atomic::AtomicU32> {
+        Arc::clone(
+            self.counts
+                .lock()
+                .unwrap()
+                .entry(bead_id)
+                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU32::new(0))),
+        )
+    }
+
+    /// Whether a compile request is still wanted: the function has been
+    /// called since it was made, or it was made just now. One that sat
+    /// while the function went quiet is dropped, and asked again should
+    /// the function come back.
+    fn still_wanted(&self, bead_id: u64, count: Option<u32>, at: std::time::Instant) -> bool {
+        let Some(count) = count else {
+            return true;
+        };
+        if at.elapsed() < std::time::Duration::from_millis(2) {
+            return true;
+        }
+        let now = self
+            .counts
+            .lock()
+            .unwrap()
+            .get(&bead_id)
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(count);
+        if now != count {
+            return true;
+        }
+        self.queued.lock().unwrap().remove(&bead_id);
+        false
+    }
+
+    /// A promotion request is queued even for a bead whose compile was:
+    /// its resume points are what the frame waits on.
+    fn request_promote(&self, bead_id: u64, site: u64) {
+        self.promote.lock().unwrap().push_back((bead_id, site));
+        self.ready.notify_one();
+    }
+
+    /// Note a request for `bead_id` at `site`; whether the caller runs
+    /// it. A frame asks from each loop header it warms at and leaves
+    /// through whichever resume point lands first, so a request for a
+    /// bead with a promotion under way is left to that one's thread to
+    /// run after its own, when the frame may have left and nothing need
+    /// be made.
+    fn begin_promotion(&self, bead_id: u64, site: u64) -> bool {
+        use std::collections::hash_map::Entry;
+        let mut promoting = self.promoting.lock().unwrap();
+        match promoting.entry(bead_id) {
+            Entry::Occupied(mut e) => {
+                e.get_mut().push(site);
+                false
+            }
+            Entry::Vacant(e) => {
+                e.insert(Vec::new());
+                true
+            }
+        }
+    }
+
+    /// A promotion of `bead_id` ran: the next site asked for it
+    /// meanwhile, or `None` once there is none, which ends the bead's
+    /// promotions.
+    fn next_promotion(&self, bead_id: u64) -> Option<u64> {
+        let mut promoting = self.promoting.lock().unwrap();
+        let sites = promoting.get_mut(&bead_id)?;
+        if sites.is_empty() {
+            promoting.remove(&bead_id);
+            None
+        } else {
+            Some(sites.remove(0))
+        }
+    }
+
+    /// Run the promotion of `bead_id` asked for at `site`, then those
+    /// asked for meanwhile.
+    fn run_promotions(&self, bead_id: u64, mut site: u64) {
+        loop {
+            osr::run_promotion(bead_id, osr::Requester::Interpreted { site });
+            match self.next_promotion(bead_id) {
+                Some(next) => site = next,
+                None => return,
+            }
+        }
+    }
+
+    /// The next request, or `None` once there is none and no wait was
+    /// asked for.
+    fn take(&self) -> Option<Job> {
+        if let Some((b, site)) = self.promote.lock().unwrap().pop_front() {
+            return Some(Job::Promote(b, site));
+        }
+        self.compile
+            .lock()
+            .unwrap()
+            .pop_front()
+            .map(|(b, count, at)| Job::Compile(b, count, at))
+    }
+
+    /// Wait until a request arrives or the runtime stops.
+    fn wait(&self) {
+        let guard = self.compile.lock().unwrap();
+        if !self.promote.lock().unwrap().is_empty() || !guard.is_empty() {
+            return;
+        }
+        if self.stop.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        // Timed, so a stop raised between the checks and the wait is
+        // seen without a notification.
+        let _ = self
+            .ready
+            .wait_timeout(guard, std::time::Duration::from_millis(20))
+            .unwrap();
+    }
+
+    fn wake(&self) {
+        self.ready.notify_all();
+    }
+}
+
+thread_local! {
+    /// Set on the warm-up thread: a request raised there runs inline,
+    /// since the thread that would take it is this one.
+    static ON_WARM_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl FunctionEntry {
     /// The function's current body.
     fn body(&self, id: HirId) -> Arc<HirFunction> {
@@ -364,6 +566,10 @@ pub struct TieredBackend {
     /// into goes away.
     warm_up: Option<std::thread::JoinHandle<()>>,
     warm_up_stop: Arc<std::sync::atomic::AtomicBool>,
+    /// What the warm-up thread compiles next: the requests of frames
+    /// waiting on code, ahead of its own order. `None` without the
+    /// thread, and every request then compiles on the asking thread.
+    compile_queue: Option<Arc<CompileQueue>>,
 
     /// Runtime FFI symbols registered post-construction.
     runtime_symbols: Arc<RwLock<Vec<RuntimeSymbol>>>,
@@ -452,6 +658,7 @@ impl TieredBackend {
             profile_data: ProfileData::new(config.profile_config.clone()),
             warm_up: None,
             warm_up_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            compile_queue: None,
             runtime_symbols: Arc::new(RwLock::new(Vec::new())),
             config,
         })
@@ -663,17 +870,18 @@ impl TieredBackend {
             );
         }
 
-        // Every bead now exists, so the handler can capture them. The
-        // compiler installed covers every module so far: a program that
-        // compiles a chunk of itself still calls its earlier functions
-        // for the first time afterwards.
+        // Every bead now exists, so the handlers can capture them. The
+        // lazy compiler first: the requester hands interpreted requests
+        // to its queue. The compiler installed covers every module so
+        // far: a program that compiles a chunk of itself still calls its
+        // earlier functions for the first time afterwards.
         self.lazy.extend(lazy.iter().copied());
         self.finished.extend(finished.iter().copied());
-        self.install_promotion_requester();
         if !lazy.is_empty() {
             let (all_lazy, all_finished) = (self.lazy.clone(), self.finished.clone());
             self.install_lazy_compiler(&all_lazy, &all_finished);
         }
+        self.install_promotion_requester();
         if trace {
             eprintln!(
                 "[OPT] codegen: registration {:8.2} ms",
@@ -1159,17 +1367,20 @@ impl TieredBackend {
 
             // A resume point is only sound where the old code's probe
             // writes the frame the edited body's helper reads: same
-            // site, same live-ins. Anything else completes on the old
-            // code and picks up the edit next call.
+            // loop, same live-ins. Anything else completes on the old
+            // code and picks up the edit next call. The two bodies' site
+            // keys differ in their tags; the helper is published under
+            // the running code's, which its probes carry.
             let mut helper_sites: Vec<(u64, u64)> = Vec::new();
             if !pending_resume.is_empty() {
                 let old_sites = site_layouts(old_fn);
                 let new_sites = site_layouts(&body);
                 for (site, code) in pending_resume {
-                    match (old_sites.get(&site), new_sites.get(&site)) {
-                        (Some(old_l), Some(new_l)) if old_l == new_l => {
-                            osr::publish_helper(bead_id, site, code);
-                            helper_sites.push((bead_id, site));
+                    let loop_key = osr::site_loop(site);
+                    match (old_sites.get(&loop_key), new_sites.get(&loop_key)) {
+                        (Some((old_site, old_l)), Some((_, new_l))) if old_l == new_l => {
+                            osr::publish_helper(bead_id, *old_site, code);
+                            helper_sites.push((bead_id, *old_site));
                         }
                         (Some(_), Some(_)) => report.resume_fell_back.push((
                             name.clone(),
@@ -1937,18 +2148,46 @@ impl TieredBackend {
         let adapter = Arc::clone(&self.adapter);
         let lazy = self.lazy.contains(&func_id);
         let threshold = self.config.baseline_threshold.max(1);
+        // Calls at which a function counts as warm: it will cross the
+        // threshold if the program goes on as it has, so its compile is
+        // asked of the worker then, and is done by the time the
+        // threshold comes.
+        let warm = (threshold / 4).max(2);
         let optimized_bodies = Arc::clone(&self.optimized_bodies);
+        let queue = self.compile_queue.clone();
+        let counter = queue.as_ref().map(|q| q.count_of(entry.bead_id));
         Some(Box::new(move || {
             if lazy && bound.bead().compiled().is_none() {
                 // Counted here until the first-call compiler has made
                 // the baseline and installed it in the bead; beadie's
                 // own ladder takes over from there.
                 let (count, _) = bound.bead().tick();
+                if let Some(counter) = &counter {
+                    counter.store(count, std::sync::atomic::Ordering::Relaxed);
+                }
                 if count >= threshold {
-                    let code = osr::lazy_compile(ctx.bead_id);
-                    if !code.is_null() {
-                        return Some(code);
+                    // Hot: queued already, so its code is on the way and
+                    // the call runs interpreted meanwhile; else asked of
+                    // the worker if it is free, else compiled here.
+                    match &queue {
+                        Some(queue) if queue.is_queued(ctx.bead_id) => {}
+                        Some(queue) if queue.idle() => {
+                            queue.request_compile(ctx.bead_id, Some(count))
+                        }
+                        _ => {
+                            let code = osr::lazy_compile(ctx.bead_id);
+                            if !code.is_null() {
+                                return Some(code);
+                            }
+                        }
                     }
+                } else if count >= warm
+                    && let Some(queue) = &queue
+                {
+                    // Warm: asked of the worker now, whatever it is doing,
+                    // so the code is there by the time the threshold
+                    // comes; nobody waits on this one.
+                    queue.request_compile(ctx.bead_id, Some(count));
                 }
                 return None;
             }
@@ -2005,15 +2244,53 @@ impl TieredBackend {
     pub fn interpreter_body_source(
         &self,
     ) -> Box<dyn FnMut(HirId) -> Option<Arc<HirFunction>> + Send> {
-        let beads: HashMap<HirId, u64> = self
+        let beads: HashMap<HirId, (u64, Arc<HirModule>)> = self
             .functions
             .iter()
             .filter(|(id, _)| self.lazy.contains(id))
-            .map(|(id, e)| (*id, e.bead_id))
+            .map(|(id, e)| (*id, (e.bead_id, Arc::clone(&e.module))))
             .collect();
+        let optimized_bodies = Arc::clone(&self.optimized_bodies);
         Box::new(move |id: HirId| {
-            let bead = *beads.get(&id)?;
-            osr::lazy_optimized_body(bead)
+            let (bead, module) = beads.get(&id)?;
+            // Only a frame in a loop can move to another tier mid-run; a
+            // body without one is run as lowered.
+            let has_loop = module
+                .functions
+                .get(&id)
+                .is_some_and(|f| !osr::find_loop_headers(f).is_empty());
+            if !has_loop {
+                return None;
+            }
+            if let Some(body) = optimized_bodies.lock().unwrap().get(&id) {
+                return Some(Arc::clone(body));
+            }
+            // Made now, on this thread: a frame that started on the body
+            // as lowered could leave only into code compiled from that
+            // body, and would finish its call there, unoptimised. The
+            // wait is the one compile step that stays on the caller.
+            osr::lazy_optimized_body(*bead)
+        })
+    }
+
+    /// The module function behind a code address, for the interpreter's
+    /// calls through pointers: a body the ground tier published, a
+    /// stub, or the code a tier above installed in a bead.
+    pub fn interpreter_address_source(&self) -> Box<dyn Fn(usize) -> Option<HirId> + Send + Sync> {
+        let cranelift = Arc::clone(&self.cranelift);
+        let beads: Vec<(HirId, TieredBound)> = self
+            .functions
+            .iter()
+            .map(|(id, e)| (*id, e.bound.clone()))
+            .collect();
+        Box::new(move |addr: usize| {
+            if let Some(id) = cranelift.with_lock(|be| be.function_at(addr)) {
+                return Some(id);
+            }
+            beads
+                .iter()
+                .find(|(_, bound)| bound.bead().compiled().is_some_and(|p| p as usize == addr))
+                .map(|(id, _)| *id)
         })
     }
 
@@ -2140,9 +2417,7 @@ impl TieredBackend {
             .map(|(id, e)| (e.bead_id, (*id, e.bound.clone(), Arc::clone(&e.module))))
             .collect();
         let reload_key = self.cranelift.with_lock(|be| be.reload_key());
-        let all_lazy: HashSet<HirId> = lazy.clone();
         let lazy: HashSet<HirId> = lazy.difference(finished).copied().collect();
-        let ready = finished.clone();
         let finished = finished.clone();
         // Compiled once: the entry once published, or the mark of a
         // compile under way, which a second call waits out. Different
@@ -2236,12 +2511,29 @@ impl TieredBackend {
                     let f = scratch.module.functions.get_mut(func_id)?;
                     f.attributes.optimized = false;
                     f.attributes.deferred = false;
+                    // `ZYNTAX_DUMP_HIR_DIR` gets the body before and after
+                    // its own optimisation, as `fn-<name>-lowered.hir` and
+                    // `fn-<name>-body.hir`.
+                    let name = f.name.resolve_global().unwrap_or_default();
+                    if std::env::var_os("ZYNTAX_DUMP_HIR_DIR").is_some() {
+                        let lowered = f.clone();
+                        crate::hir_dump::dump_function_to_dir(
+                            &lowered,
+                            &scratch.module,
+                            &format!("{name}-lowered"),
+                        );
+                    }
                     crate::run_interp_safe_opts_cached(&mut scratch.module, &scratch.cache);
                     let f = scratch.module.functions.get_mut(func_id)?;
                     f.attributes.optimized = true;
                     f.attributes.deferred = true;
                     let mut body = f.clone();
                     body.attributes.deferred = false;
+                    crate::hir_dump::dump_function_to_dir(
+                        &body,
+                        &scratch.module,
+                        &format!("{name}-body"),
+                    );
                     Arc::new(body)
                 };
                 // Another thread may have made it meanwhile; the first
@@ -2264,6 +2556,12 @@ impl TieredBackend {
         });
         // What compiling a function on its first call does, once off the
         // caller's stack.
+        // The queue is made after this closure, which reads it through
+        // this cell once it exists.
+        let queue_for_callees: Arc<Mutex<Option<Arc<CompileQueue>>>> = Arc::new(Mutex::new(None));
+        let queue_cell = Arc::clone(&queue_for_callees);
+        let bead_of: HashMap<HirId, u64> =
+            by_bead.iter().map(|(b, (id, _, _))| (*id, *b)).collect();
         let compile_lazy_function = move |bead_id: u64| -> *const u8 {
             let trace = std::env::var_os("ZYNTAX_TRACE_LAZY").is_some();
             {
@@ -2313,6 +2611,21 @@ impl TieredBackend {
                 }
                 return publish(0);
             };
+            // What this function calls will be called from its native code
+            // as soon as it runs, through stubs that compile on the spot:
+            // asked of the worker now, so they are compiled first.
+            if let Some(queue) = queue_for_callees.lock().unwrap().as_ref()
+                && let Some(f) = module_arc.functions.get(func_id)
+            {
+                for callee in direct_lazy_callees(f, &bead_of) {
+                    if !by_bead
+                        .get(&callee)
+                        .is_some_and(|(_, b, _)| b.bead().compiled().is_some())
+                    {
+                        queue.request_compile(callee, None);
+                    }
+                }
+            }
             let lazy_started = std::time::Instant::now();
             let Some(body) = optimize_body(bead_id) else {
                 if trace {
@@ -2346,7 +2659,10 @@ impl TieredBackend {
             }
             crate::reload::set_call_target(reload_key, *func_id, entry as usize);
             bound.bead().eager_install(entry);
-            if !keeps_bodies {
+            // A body with a loop is kept for the resume points an
+            // interpreted frame of it may still ask for; without one, or
+            // a tier above, the compile was its last reader.
+            if !keeps_bodies && osr::find_loop_headers(&body).is_empty() {
                 optimized_bodies.lock().unwrap().remove(func_id);
             }
             publish(entry as usize);
@@ -2367,53 +2683,62 @@ impl TieredBackend {
         };
         let compile_lazy_function = Arc::new(compile_lazy_function);
 
-        // The functions left for their call are compiled ahead of it on
-        // a thread of their own, in the order the program is likely to
-        // call them; a call arriving first compiles its own and a call
-        // arriving during one waits for it. The thread does not stand
-        // aside for a first call: what it is compiling is what the
-        // program calls next, and the backend is held only to translate
-        // and install, not through Cranelift's own compile.
-        // `ZYNTAX_DISABLE_WARM_UP=1` leaves every first call to compile
-        // its function; safe to run with.
+        // The compile worker: what the program's own profile asks for,
+        // a loop or a function that is warm or hot, nothing else. It
+        // stands idle otherwise, so a request is taken at once, and the
+        // program is never made to wait behind a compile it did not
+        // ask for. `ZYNTAX_DISABLE_WARM_UP=1` leaves every compile to the
+        // asking thread; safe to run with.
         if std::env::var_os("ZYNTAX_DISABLE_WARM_UP").is_none() {
-            let order: Vec<u64> = match self.functions.values().next() {
-                Some(e) => {
-                    let ids = warm_up_order(&e.module, &all_lazy, &ready);
-                    if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
-                        let names: Vec<String> = ids
-                            .iter()
-                            .filter_map(|id| e.module.functions.get(id))
-                            .map(|f| f.name.resolve_global().unwrap_or_default())
-                            .collect();
-                        eprintln!("[lazy] warm-up order: {}", names.join(" "));
-                    }
-                    ids.into_iter()
-                        .filter_map(|id| self.functions.get(&id).map(|e| e.bead_id))
-                        .collect()
-                }
-                None => Vec::new(),
-            };
-            if !order.is_empty() {
-                let compile = Arc::clone(&compile_lazy_function);
-                let stop = Arc::clone(&self.warm_up_stop);
-                self.warm_up = std::thread::Builder::new()
-                    .name("zyntax-warm-up".into())
-                    .stack_size(16 << 20)
-                    .spawn(move || {
-                        for bead_id in order {
-                            if stop.load(std::sync::atomic::Ordering::Acquire) {
-                                return;
-                            }
-                            compile(bead_id);
+            let compile = Arc::clone(&compile_lazy_function);
+            let stop = Arc::clone(&self.warm_up_stop);
+            let queue = Arc::new(CompileQueue::new(Arc::clone(&stop)));
+            osr::set_compile_worker_busy(Some(Arc::clone(&queue.busy)));
+            self.compile_queue = Some(Arc::clone(&queue));
+            *queue_cell.lock().unwrap() = Some(Arc::clone(&queue));
+            self.warm_up = std::thread::Builder::new()
+                .name("zyntax-warm-up".into())
+                .stack_size(16 << 20)
+                .spawn(move || {
+                    ON_WARM_UP.with(|on| on.set(true));
+                    let mut idle_since: Option<std::time::Instant> = None;
+                    loop {
+                        if stop.load(std::sync::atomic::Ordering::Acquire) {
+                            return;
                         }
-                        // Every lazy function has its code: the scratch
-                        // module the program's own were optimised in
-                        // is done with.
-                        scratch_shared.lock().unwrap().clear();
-                    })
-                    .ok();
-            }
+                        queue.busy.store(true, std::sync::atomic::Ordering::Release);
+                        match queue.take() {
+                            Some(Job::Promote(bead_id, site)) => {
+                                idle_since = None;
+                                queue.run_promotions(bead_id, site);
+                            }
+                            Some(Job::Compile(bead_id, count, at)) => {
+                                idle_since = None;
+                                if queue.still_wanted(bead_id, count, at) {
+                                    compile(bead_id);
+                                } else if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                                    eprintln!(
+                                        "[lazy] dropped compile of bead {bead_id}: no calls since"
+                                    );
+                                }
+                            }
+                            None => {
+                                // A quiet spell: the scratch modules the
+                                // program's functions are optimised in are
+                                // let go, and made again if asked.
+                                let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                                if since.elapsed() > std::time::Duration::from_millis(250) {
+                                    scratch_shared.lock().unwrap().clear();
+                                }
+                                queue
+                                    .busy
+                                    .store(false, std::sync::atomic::Ordering::Release);
+                                queue.wait();
+                            }
+                        }
+                    }
+                })
+                .ok();
         }
 
         // The stub runs on whatever stack the first call was made from,
@@ -2477,6 +2802,7 @@ impl TieredBackend {
             .collect();
 
         let optimized_bodies = Arc::clone(&self.optimized_bodies);
+        let queue = self.compile_queue.clone();
         osr::set_promotion_requester(move |bead_id, from| {
             let Some((func_id, bound, swapped, module_arc, lazy)) = by_bead.get(&bead_id) else {
                 if osr::osr_trace_enabled() {
@@ -2484,6 +2810,39 @@ impl TieredBackend {
                 }
                 return false;
             };
+            // An interpreted frame's request compiles the baseline and its
+            // resume point, work the frame need not wait for: the warm-up
+            // thread takes it, or a thread of its own when that one is in
+            // a job, and the frame keeps running until the resume point
+            // lands, which its next header visit sees. Done inline, the
+            // frame would stand still for the whole compile.
+            if let osr::Requester::Interpreted { site } = from
+                && *lazy
+                && !ON_WARM_UP.with(|on| on.get())
+                && let Some(queue) = &queue
+            {
+                if !queue.begin_promotion(bead_id, site) {
+                    return true;
+                }
+                if queue.idle() {
+                    queue.request_promote(bead_id, site);
+                    return true;
+                }
+                let on_thread = Arc::clone(queue);
+                let spawned = std::thread::Builder::new()
+                    .name("zyntax-promotion".into())
+                    .stack_size(16 << 20)
+                    .spawn(move || {
+                        ON_WARM_UP.with(|on| on.set(true));
+                        on_thread.run_promotions(bead_id, site);
+                    });
+                if spawned.is_ok() {
+                    return true;
+                }
+                // No thread to be had: the frame's own thread does the
+                // work below, as it did before there was a worker.
+                while queue.next_promotion(bead_id).is_some() {}
+            }
             // The body: the one a reload swapped in, else the one the
             // first-call compile optimised, else the module's.
             let optimized = optimized_bodies.lock().unwrap().get(func_id).cloned();
@@ -2497,9 +2856,38 @@ impl TieredBackend {
             };
             let module_arc = Arc::clone(module_arc);
             let func_id = *func_id;
-            // An interpreted frame asks before its function has any
-            // native code; the baseline comes first so the promotion has
-            // something to promote.
+            // An interpreted frame can enter no code mid-loop without a
+            // resume point, and the baseline's body has only probes. Its
+            // resume points come first, before the body: the frame is
+            // running, slowly, until the first one lands, and needs
+            // nothing of the body itself, which every later call does.
+            // They carry probes of their own, so the frame moves on again
+            // once the optimizing tier publishes.
+            if let osr::Requester::Interpreted { site } = from {
+                let (body_tag, ordinal, _) = osr::decode_osr_site(site);
+                // The frame runs the body its tag names: the one the
+                // module holds when it started before the optimised body
+                // existed, else that one.
+                let as_lowered = module_arc.functions.get(&func_id);
+                let frame_body = match as_lowered {
+                    Some(f)
+                        if osr::body_tag(f) == body_tag && osr::body_tag(&func_arc) != body_tag =>
+                    {
+                        Arc::new(f.clone())
+                    }
+                    _ => Arc::clone(&func_arc),
+                };
+                publish_baseline_resume_points(
+                    &cranelift,
+                    func_id,
+                    bead_id,
+                    &frame_body,
+                    &module_arc,
+                    ordinal,
+                );
+            }
+            // The baseline, so the promotion has something to promote and
+            // the next call has code.
             if !ensure_baseline(
                 bound,
                 func_id,
@@ -2514,21 +2902,6 @@ impl TieredBackend {
                 verbosity,
             ) {
                 return false;
-            }
-            // An interpreted frame can enter no code mid-loop without a
-            // resume point, and the baseline's body has only probes. Its
-            // resume points are compiled here, before anything is queued,
-            // so the frame leaves the interpreter at its next header
-            // visit; they carry probes of their own, so the frame moves
-            // on again once the optimizing tier publishes.
-            if from == osr::Requester::Interpreted {
-                publish_baseline_resume_points(
-                    &cranelift,
-                    func_id,
-                    bead_id,
-                    &func_arc,
-                    &module_arc,
-                );
             }
             if !optimizing {
                 return true;
@@ -2556,7 +2929,7 @@ impl TieredBackend {
                 return true;
             }
             #[cfg(feature = "llvm-backend")]
-            if !llvm_list_entry_has_headroom(&func_arc) {
+            if !llvm_list_entry_has_headroom(&func_arc, &module_arc) {
                 if osr::osr_trace_enabled() {
                     eprintln!(
                         "[osr] LLVM promotion skipped for {}: call-heavy list entry",
@@ -2702,8 +3075,12 @@ impl TieredBackend {
         osr::set_promotion_requester(|_, _| false);
         osr::set_lazy_compiler(|_| ptr::null());
         osr::set_lazy_optimizer(|_| None);
+        osr::set_compile_worker_busy(None);
         self.warm_up_stop
             .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(queue) = &self.compile_queue {
+            queue.wake();
+        }
         if let Some(handle) = self.warm_up.take() {
             let _ = handle.join();
         }
@@ -2806,20 +3183,11 @@ impl Drop for TieredBackend {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The functions of `lazy` in the order the program is likely to call
-/// them: breadth first over direct calls from the program's own
-/// functions nothing calls (its entry points), then whatever that walk
-/// missed, the program's own before `ready`, the ones that arrived
-/// optimised.
-fn warm_up_order(module: &HirModule, lazy: &HashSet<HirId>, ready: &HashSet<HirId>) -> Vec<HirId> {
-    // A function whose address a body takes is called from it too, by
-    // whatever the address is handed to.
-    let callees = |id: &HirId| -> Vec<HirId> {
-        let Some(f) = module.functions.get(id) else {
-            return Vec::new();
-        };
-        let mut out: Vec<HirId> = f
-            .blocks
+/// The beads of the functions `f` calls directly, or takes the address
+/// of, among those with a bead in `bead_of`.
+fn direct_lazy_callees(f: &HirFunction, bead_of: &HashMap<HirId, u64>) -> Vec<u64> {
+    let mut out: Vec<u64> =
+        f.blocks
             .values()
             .flat_map(|b| b.instructions.iter())
             .filter_map(|inst| match inst {
@@ -2832,65 +3200,11 @@ fn warm_up_order(module: &HirModule, lazy: &HashSet<HirId>, ready: &HashSet<HirI
                 crate::hir::HirInstruction::CreateClosure { function, .. } => Some(*function),
                 _ => None,
             })
+            .filter_map(|id| bead_of.get(&id).copied())
             .collect();
-        out.sort();
-        out.dedup();
-        out
-    };
-    let mut called: HashSet<HirId> = HashSet::new();
-    for id in module.functions.keys() {
-        called.extend(callees(id));
-    }
-    let mut order: Vec<HirId> = Vec::new();
-    let mut seen: HashSet<HirId> = HashSet::new();
-    // Roots: the program's own functions nothing calls. The one that
-    // reaches the most comes first, and everything it reaches before
-    // the next root: an entry point ahead of the hooks a table holds.
-    let mut roots: Vec<HirId> = module
-        .functions
-        .keys()
-        .filter(|id| lazy.contains(id) && !ready.contains(id) && !called.contains(id))
-        .copied()
-        .collect();
-    roots.sort_by_key(|id| (std::cmp::Reverse(callees(id).len()), *id));
-    // The program's own functions before the library's it calls: a
-    // library function compiles in a fraction of the time and the
-    // interpreter runs it well meanwhile; the program's carry the
-    // loops the run is waiting on.
-    let mut library: Vec<HirId> = Vec::new();
-    for root in roots {
-        if !seen.insert(root) {
-            continue;
-        }
-        order.push(root);
-        let mut frontier = vec![root];
-        while !frontier.is_empty() {
-            let mut next = Vec::new();
-            for id in frontier {
-                for c in callees(&id) {
-                    if lazy.contains(&c) && seen.insert(c) {
-                        if ready.contains(&c) {
-                            library.push(c);
-                        } else {
-                            order.push(c);
-                        }
-                        next.push(c);
-                    }
-                }
-            }
-            frontier = next;
-        }
-    }
-    order.extend(library);
-    let mut rest: Vec<HirId> = module
-        .functions
-        .keys()
-        .filter(|id| lazy.contains(id) && !seen.contains(id))
-        .copied()
-        .collect();
-    rest.sort_by_key(|id| (ready.contains(id), *id));
-    order.extend(rest);
-    order
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Build the per-tier hotness policies from a `TieredConfig`.
@@ -2927,11 +3241,13 @@ fn clamp_to_u32(v: u64) -> u32 {
     }
 }
 
-/// Calls across the LLVM/Cranelift boundary stay indirect. Large list-entry
-/// bodies with many such calls offer little LLVM optimization headroom.
-fn llvm_list_entry_has_headroom(f: &HirFunction) -> bool {
+/// Calls across the LLVM/Cranelift boundary stay indirect. A large
+/// list-entry body made of such calls offers LLVM little headroom. An
+/// intrinsic lowers in place and a cold callee is off the hot path, so
+/// neither is a boundary call.
+fn llvm_list_entry_has_headroom(f: &HirFunction, module: &HirModule) -> bool {
     use crate::abi::{Pass, function_abi};
-    use crate::hir::HirInstruction;
+    use crate::hir::{HirCallable, HirInstruction};
     if function_abi(f, false)
         .params
         .iter()
@@ -2939,10 +3255,22 @@ fn llvm_list_entry_has_headroom(f: &HirFunction) -> bool {
     {
         return true;
     }
+    let crosses = |inst: &&HirInstruction| match inst {
+        HirInstruction::Call {
+            callee: HirCallable::Intrinsic(_),
+            ..
+        } => false,
+        HirInstruction::Call {
+            callee: HirCallable::Function(id),
+            ..
+        } => !module.functions.get(id).is_some_and(|c| c.attributes.cold),
+        HirInstruction::Call { .. } => true,
+        _ => false,
+    };
     f.blocks
         .values()
         .flat_map(|block| &block.instructions)
-        .filter(|inst| matches!(inst, HirInstruction::Call { .. }))
+        .filter(crosses)
         .take(65)
         .count()
         <= 64
@@ -3018,16 +3346,16 @@ fn ensure_baseline(
     bound.bead().eager_install(entry as *mut ()) || bound.bead().compiled().is_some()
 }
 
-/// Compile the baseline's resume points for `func_id` and publish them,
-/// off the requesting frame's stack, which may be a fiber's. Each loop
-/// header the layout admits gets a helper the interpreter can transfer
-/// into; a helper the site already has is kept.
+/// Compile the baseline's resume point at the loop header with ordinal
+/// `asked_at` in `func_id` and publish it, off the requesting frame's
+/// stack, which may be a fiber's. A helper the site already has is kept.
 fn publish_baseline_resume_points(
     cranelift: &Arc<ZyntaxCraneliftBackend>,
     func_id: HirId,
     bead_id: u64,
     func_arc: &Arc<HirFunction>,
     module_arc: &Arc<HirModule>,
+    asked_at: u64,
 ) {
     let def = ZyntaxFunctionDef {
         id: func_id,
@@ -3036,24 +3364,41 @@ fn publish_baseline_resume_points(
         tier: OptimizationTier::Baseline.index(),
         bead_id,
     };
-    let points: Vec<(u64, *mut ())> = std::thread::scope(|scope| {
+    // Only the header the frame asked at: that is the one it watches,
+    // and it leaves through it at its next visit. A frame at another
+    // header asks from there, with that site, when its turn comes. Not
+    // made once no frame waits, whether it left or returned.
+    let Some(header) = osr::find_loop_headers(&def.function)
+        .get(asked_at as usize)
+        .copied()
+    else {
+        return;
+    };
+    if !osr::frame_waiting(bead_id) {
+        if osr::osr_trace_enabled() {
+            eprintln!(
+                "[osr] {}: no frame waits, resume point not made",
+                func_arc.name.resolve_global().unwrap_or_default()
+            );
+        }
+        return;
+    }
+    let points: Vec<(u64, usize)> = std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("zyntax-resume-points".into())
             .stack_size(16 << 20)
             .spawn_scoped(scope, || {
                 cranelift
-                    .resume_points(&def)
+                    .resume_point_at(&def, header)
                     .into_iter()
                     .map(|(site, code)| (site, code as usize))
                     .collect::<Vec<_>>()
             })
             .map(|h| h.join().unwrap_or_default())
             .unwrap_or_default()
-            .into_iter()
-            .map(|(site, code)| (site, code as *mut ()))
-            .collect()
     });
     for (site, code) in points {
+        let code = code as *mut ();
         if !code.is_null() && osr::helper_for(bead_id, site).is_null() {
             if osr::osr_trace_enabled() {
                 eprintln!(
@@ -3204,15 +3549,19 @@ impl TieredStatistics {
 /// `(phi_count, live-in types)`. Two functions agree at a site exactly
 /// when the frame one's probe writes is the frame the other's helper
 /// reads.
+/// Each resumable loop of `func` by its tag-less site (`osr::site_loop`):
+/// the full site key and the layout a helper for it must share.
+#[allow(clippy::type_complexity)]
 fn site_layouts(
     func: &HirFunction,
-) -> std::collections::HashMap<u64, (usize, Vec<crate::hir::HirType>)> {
+) -> std::collections::HashMap<u64, (u64, (usize, Vec<crate::hir::HirType>))> {
     let mut map = std::collections::HashMap::new();
     for header in osr::find_loop_headers(func) {
         if let Ok(layout) = osr::osr_layout(func, header) {
+            let site = layout.site_key();
             map.insert(
-                layout.site_key(),
-                (layout.phi_count, layout.live_in_types.clone()),
+                osr::site_loop(site),
+                (site, (layout.phi_count, layout.live_in_types.clone())),
             );
         }
     }

@@ -56,7 +56,11 @@
 //! * Storage handed to an owning parameter is the callee's; a callee
 //!   that stores or returns its parameter must say so with `Owned`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+/// Sets of ids: the pass spends its time asking whether a value is one
+/// of a handful, so the hasher is the cheap one.
+type IdSet = fnv::FnvHashSet<HirId>;
 
 use crate::hir::{
     HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator,
@@ -194,10 +198,10 @@ pub fn run_module_with(module: &mut HirModule, facts: &ModuleFacts) -> DropStats
 pub struct ModuleFacts {
     /// See [`automatic_release_for`].
     automatic_release: bool,
-    returns_owned: std::collections::HashSet<HirId>,
+    returns_owned: IdSet,
     /// Externs whose result is a fresh string: a call to one is an
     /// allocation the caller releases with the string free.
-    string_makers: std::collections::HashSet<HirId>,
+    string_makers: IdSet,
     /// Per function, which parameters it may hand back as its result. The
     /// result of such a call is another name for the argument, so the
     /// argument lives as long as the result does.
@@ -277,7 +281,7 @@ impl ModuleFacts {
             .collect();
         let mut facts = Self {
             automatic_release: automatic_release_for(module),
-            returns_owned: std::collections::HashSet::new(),
+            returns_owned: IdSet::default(),
             string_makers,
             returns_param: std::collections::HashMap::new(),
             extern_links,
@@ -475,7 +479,7 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
     }
     let dt = DominatorTree::new(func);
     let forest = LoopForest::detect(func, &dt);
-    let bodies: std::collections::HashMap<HirId, std::collections::HashSet<HirId>> = forest
+    let bodies: std::collections::HashMap<HirId, IdSet> = forest
         .loops()
         .iter()
         .map(|lp| (lp.header, lp.body.iter().copied().collect()))
@@ -491,7 +495,7 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
     let mut copies: Vec<(HirId, HirId, usize, HirId)> = Vec::new();
     // Every phi to begin with; a join's phi only under automatic release,
     // since a program releasing by hand may release what arrives at one.
-    let mut candidates: std::collections::HashSet<HirId> = phi_blocks
+    let mut candidates: IdSet = phi_blocks
         .iter()
         .filter(|(_, block)| facts.automatic_release || bodies.contains_key(block))
         .map(|(p, _)| *p)
@@ -640,7 +644,7 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
         let derived = derived_values_local(func, phi_result, facts);
         // Leaving a block along an edge into an owning phi hands the
         // value on.
-        let transfer_out: std::collections::HashSet<HirId> = func
+        let transfer_out: IdSet = func
             .blocks
             .values()
             .flat_map(|b| b.phis.iter())
@@ -670,8 +674,8 @@ fn phi_incomings_owned(
     func: &HirFunction,
     facts: &ModuleFacts,
     sites: &std::collections::HashMap<HirId, Release>,
-    candidates: &std::collections::HashSet<HirId>,
-    body: Option<&std::collections::HashSet<HirId>>,
+    candidates: &IdSet,
+    body: Option<&IdSet>,
     phi: &crate::hir::HirPhi,
 ) -> Option<Vec<(HirId, HirId, usize, HirId)>> {
     let merge = phi_block_of(func, phi.result)?;
@@ -789,7 +793,7 @@ fn def_block_of(func: &HirFunction, value: HirId) -> Option<HirId> {
 /// referred to under its old name past the merge.
 fn used_past_merge(
     func: &HirFunction,
-    names: &std::collections::HashSet<HirId>,
+    names: &IdSet,
     def_block: Option<HirId>,
     merge: HirId,
 ) -> bool {
@@ -800,7 +804,7 @@ fn used_past_merge(
     if def_block == merge {
         return false;
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = IdSet::default();
     let mut stack = vec![merge];
     while let Some(b) = stack.pop() {
         if b == def_block || !seen.insert(b) {
@@ -812,7 +816,7 @@ fn used_past_merge(
         let reads = block
             .instructions
             .iter()
-            .any(|i| i.operands().iter().any(|o| names.contains(o)))
+            .any(|i| i.any_operand(|o| names.contains(&o)))
             || terminator_operands(&block.terminator)
                 .iter()
                 .any(|o| names.contains(o));
@@ -838,7 +842,7 @@ fn phis_using(func: &HirFunction, value: HirId) -> Vec<HirId> {
 }
 
 /// The phis that read any of `values` on some edge.
-fn phis_using_any(func: &HirFunction, values: &std::collections::HashSet<HirId>) -> Vec<HirId> {
+fn phis_using_any(func: &HirFunction, values: &IdSet) -> Vec<HirId> {
     let mut out = Vec::new();
     for block in func.blocks.values() {
         for phi in &block.phis {
@@ -859,7 +863,7 @@ fn only_use_is_phi(func: &HirFunction, value: HirId, phi_result: HirId) -> bool 
             }
         }
         for inst in &block.instructions {
-            if inst.operands().contains(&value) {
+            if inst.any_operand(|o| o == value) {
                 return false;
             }
         }
@@ -912,11 +916,7 @@ fn instruction_defines(inst: &HirInstruction, value: HirId) -> bool {
 
 /// Whether every use of the set, anywhere in the function, leaves the
 /// storage to us.
-fn uses_are_all_borrows(
-    func: &HirFunction,
-    derived: &std::collections::HashSet<HirId>,
-    facts: &ModuleFacts,
-) -> bool {
+fn uses_are_all_borrows(func: &HirFunction, derived: &IdSet, facts: &ModuleFacts) -> bool {
     for block in func.blocks.values() {
         for inst in &block.instructions {
             if matches!(classify_derived_use(inst, derived, facts), UseKind::Escape) {
@@ -955,7 +955,7 @@ fn uses_are_all_borrows(
 /// Index of the last instruction in `block` that reads the set.
 fn last_use_index(
     block: &crate::hir::HirBlock,
-    derived: &std::collections::HashSet<HirId>,
+    derived: &IdSet,
     facts: &ModuleFacts,
 ) -> Option<usize> {
     let mut last = None;
@@ -1083,7 +1083,7 @@ fn returns_owned_storage(func: &HirFunction, facts: &ModuleFacts) -> bool {
             })
             .flatten()
             .collect();
-        let mut derived = std::collections::HashSet::new();
+        let mut derived = IdSet::default();
         let mut all_transfer = true;
         for site in &sites {
             let d = derived_values_in(func, site.result, facts);
@@ -1208,7 +1208,7 @@ fn trace_enabled() -> bool {
 /// Whether the allocation leaves this function only by being returned.
 fn escapes_only_by_return(
     func: &HirFunction,
-    derived: &std::collections::HashSet<HirId>,
+    derived: &IdSet,
     site: &MallocSite,
     facts: &ModuleFacts,
 ) -> bool {
@@ -1813,16 +1813,10 @@ fn collect_malloc_sites(func: &HirFunction) -> Vec<MallocSite> {
 fn drop_points(
     func: &HirFunction,
     site: &MallocSite,
-    derived: &std::collections::HashSet<HirId>,
+    derived: &IdSet,
     facts: &ModuleFacts,
 ) -> Option<Vec<Point>> {
-    drop_points_transferring(
-        func,
-        site,
-        derived,
-        facts,
-        &std::collections::HashSet::new(),
-    )
+    drop_points_transferring(func, site, derived, facts, &IdSet::default())
 }
 
 /// [`drop_points`] where leaving `transfer_out` blocks hands the storage
@@ -1832,14 +1826,14 @@ fn drop_points(
 fn drop_points_transferring(
     func: &HirFunction,
     site: &MallocSite,
-    derived: &std::collections::HashSet<HirId>,
+    derived: &IdSet,
     facts: &ModuleFacts,
-    transfer_out: &std::collections::HashSet<HirId>,
+    transfer_out: &IdSet,
 ) -> Option<Vec<Point>> {
     // Only blocks the entry can get to. An unreachable one has no
     // bearing on where the value dies and its successors would drag
     // liveness around the graph for nothing.
-    let mut reachable = std::collections::HashSet::new();
+    let mut reachable = IdSet::default();
     let mut stack = vec![func.entry_block];
     while let Some(b) = stack.pop() {
         if !reachable.insert(b) {
@@ -1853,7 +1847,7 @@ fn drop_points_transferring(
     // What each block does with the value: the last instruction that
     // uses it, and whether the terminator does.
     let mut last_use: std::collections::HashMap<HirId, usize> = std::collections::HashMap::new();
-    let mut uses_block: std::collections::HashSet<HirId> = std::collections::HashSet::new();
+    let mut uses_block: IdSet = IdSet::default();
     for (block_id, block) in &func.blocks {
         if !reachable.contains(block_id) {
             continue;
@@ -1904,8 +1898,8 @@ fn drop_points_transferring(
     // live_in[B] = B uses it, or its exit is live. The block holding
     // the allocation kills it: nothing before the call can be holding
     // what the call has not produced.
-    let mut live_in: std::collections::HashSet<HirId> = std::collections::HashSet::new();
-    let mut live_out: std::collections::HashSet<HirId> = std::collections::HashSet::new();
+    let mut live_in: IdSet = IdSet::default();
+    let mut live_out: IdSet = IdSet::default();
     loop {
         let mut changed = false;
         for (block_id, block) in &func.blocks {
@@ -2107,27 +2101,19 @@ fn analyze_site(
 /// Only the shapes that carry the same pointer are followed: putting it
 /// into an aggregate, taking it back out, and casting it. Following more
 /// would widen the live range without making anything reclaimable.
-pub(crate) fn derived_values(func: &HirFunction, root: HirId) -> std::collections::HashSet<HirId> {
+pub(crate) fn derived_values(func: &HirFunction, root: HirId) -> IdSet {
     derived_values_with(func, root, true, None)
 }
 
 /// [`derived_values`] knowing which callees hand an argument back.
-fn derived_values_in(
-    func: &HirFunction,
-    root: HirId,
-    facts: &ModuleFacts,
-) -> std::collections::HashSet<HirId> {
+fn derived_values_in(func: &HirFunction, root: HirId, facts: &ModuleFacts) -> IdSet {
     derived_values_with(func, root, true, Some(facts))
 }
 
 /// [`derived_values_in`] stopping at phis: the names for the storage on
 /// the paths where `root` itself is defined, which is where a release by
 /// its name is defined too.
-fn derived_values_local(
-    func: &HirFunction,
-    root: HirId,
-    facts: &ModuleFacts,
-) -> std::collections::HashSet<HirId> {
+fn derived_values_local(func: &HirFunction, root: HirId, facts: &ModuleFacts) -> IdSet {
     derived_values_with(func, root, false, Some(facts))
 }
 
@@ -2136,7 +2122,7 @@ fn derived_values_with(
     root: HirId,
     through_phis: bool,
     facts: Option<&ModuleFacts>,
-) -> std::collections::HashSet<HirId> {
+) -> IdSet {
     let users = Users::of(func);
     derived_values_using(func, root, through_phis, facts, &users)
 }
@@ -2197,8 +2183,8 @@ fn derived_values_using(
     through_phis: bool,
     facts: Option<&ModuleFacts>,
     users: &Users,
-) -> std::collections::HashSet<HirId> {
-    let mut set = std::collections::HashSet::new();
+) -> IdSet {
+    let mut set = IdSet::default();
     set.insert(root);
     // A list header owns the element storage its first field names:
     // releasing the header frees that too, so what is read out of the
@@ -2209,7 +2195,7 @@ fn derived_values_using(
         .values
         .get(&root)
         .is_some_and(|v| crate::ssa::is_list_header(&v.ty));
-    let mut heads = std::collections::HashSet::new();
+    let mut heads = IdSet::default();
     if list {
         heads.insert(root);
     }
@@ -2365,11 +2351,7 @@ fn strongest(a: UseKind, b: UseKind) -> UseKind {
 /// derived keeps the pointer inside the set, so it is a use rather than
 /// an escape: the aggregate's own uses are classified in turn, and an
 /// aggregate that does leave is caught there.
-fn classify_derived_use(
-    inst: &HirInstruction,
-    derived: &std::collections::HashSet<HirId>,
-    facts: &ModuleFacts,
-) -> UseKind {
+fn classify_derived_use(inst: &HirInstruction, derived: &IdSet, facts: &ModuleFacts) -> UseKind {
     match inst {
         HirInstruction::InsertValue {
             result,
@@ -2724,7 +2706,7 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Constant(c),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -2739,7 +2721,7 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );

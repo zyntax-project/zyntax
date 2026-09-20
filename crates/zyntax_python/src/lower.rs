@@ -755,10 +755,13 @@ pub(crate) struct Lowerer<'m> {
     /// an expression. Drained in front of each statement.
     pub(crate) hoisted: Vec<Stmt>,
     /// Class-typed variables known not to be None where the lowering
-    /// stands: assigned from a constructor, or checked since. Cleared
-    /// at every compound statement, so it never crosses a branch or a
-    /// loop back edge.
+    /// stands: assigned from a constructor, or checked since. A
+    /// compound statement keeps only those it does not assign.
     nonnull: HashSet<InternedString>,
+    /// Parameters the body assigns somewhere: what the caller passed is
+    /// not what they hold from then on, so neither `self` nor a trusted
+    /// instance parameter is one once the body assigns it.
+    reassigned_params: HashSet<InternedString>,
     /// Variables that hold an instance for the whole function: assigned
     /// a constructor's result before anything reads them, and assigned
     /// nothing else anywhere; see [`Self::always_instances`].
@@ -889,6 +892,13 @@ impl<'m> Lowerer<'m> {
                 }
             }
         }
+        // Assigned by this body, or shared with a nested one that may.
+        let reassigned_params = sig
+            .params
+            .iter()
+            .filter(|(n, _)| scope.bound.contains(n) || cells.contains(n))
+            .map(|(n, _)| intern(n))
+            .collect();
         Self {
             module,
             name: name.to_string(),
@@ -899,6 +909,7 @@ impl<'m> Lowerer<'m> {
             comp_symbols: HashMap::default(),
             hoisted: Vec::new(),
             nonnull: HashSet::default(),
+            reassigned_params,
             always_instance: HashSet::default(),
             nonnull_fields: HashSet::default(),
             trusted: false,
@@ -2016,9 +2027,10 @@ impl<'m> Lowerer<'m> {
             (Ty::Object, Ty::Float) => "zb_box_payload_f64",
             (Ty::Object, Ty::Bool) => "zb_box_payload_truth",
             (Ty::Object, Ty::Str) => "zb_box_get_str",
-            // The box is known to hold an instance of the class.
+            // The box holds an instance of the class, or is the null box
+            // None stores as.
             (Ty::Object, Ty::Class(_)) => {
-                let address = addr_call("zb_unbox_instance_raw", vec![v.node], span);
+                let address = addr_call("zb_unbox_instance", vec![v.node], span);
                 return cast(address, target, span);
             }
             (Ty::Object, Ty::Tuple(k)) => return self.unbox_tuple(v, k, true, span),
@@ -2833,14 +2845,31 @@ impl<'m> Lowerer<'m> {
                 | py::Stmt::FunctionDef(_)
                 | py::Stmt::ClassDef(_)
         );
-        if compound {
-            self.nonnull.clear();
+        // A variable the statement assigns may be None on some path
+        // through it, or at the top of its loop's next pass; one it
+        // never assigns holds what it held, into the statement and out
+        // of it. A field is written by whatever the statement calls.
+        let kept = if compound {
+            let scope = Scope::of_body(Vec::new(), std::slice::from_ref(s));
+            // What an `except` or a pattern binds is not a stored name,
+            // and a nested body may write through `nonlocal`.
+            let binds_unseen =
+                matches!(s, py::Stmt::Try(_) | py::Stmt::Match(_)) || !scope.children.is_empty();
+            if binds_unseen {
+                self.nonnull.clear();
+            } else {
+                self.nonnull
+                    .retain(|v| !v.resolve_global().is_some_and(|n| scope.bound.contains(&n)));
+            }
             self.nonnull_fields.clear();
-        }
+            Some(self.nonnull.clone())
+        } else {
+            None
+        };
         let mut own = Vec::new();
         self.stmt_into(s, &mut own)?;
-        if compound {
-            self.nonnull.clear();
+        if let Some(kept) = kept {
+            self.nonnull = kept;
             self.nonnull_fields.clear();
             // `if x is None: return` settles `x` for what follows: the
             // only way past is the branch the test failed in.
@@ -3113,6 +3142,10 @@ impl<'m> Lowerer<'m> {
                 // A test that hoists work re-does it every pass: the loop
                 // becomes `while true { work; if not test: break; body }`.
                 let pre = std::mem::take(&mut self.hoisted);
+                // The body runs only when the test held.
+                if let Some((place, true)) = self.instance_test(&w.test) {
+                    self.assume_place(&place);
+                }
                 let else_flag = if w.orelse.is_empty() {
                     None
                 } else {
@@ -8690,7 +8723,9 @@ impl<'m> Lowerer<'m> {
     fn known_instance(&self, node: &Node) -> bool {
         match &node.node {
             TypedExpression::Variable(name) => {
-                let is_self = self.class.is_some()
+                let as_passed = !self.reassigned_params.contains(name);
+                let is_self = as_passed
+                    && self.class.is_some()
                     && self
                         .sig
                         .params
@@ -8698,7 +8733,8 @@ impl<'m> Lowerer<'m> {
                         .is_some_and(|(p, _)| intern(p) == *name);
                 // The trusted variant takes every instance-typed parameter
                 // to be one.
-                let trusted_param = self.trusted
+                let trusted_param = as_passed
+                    && self.trusted
                     && self
                         .sig
                         .params
