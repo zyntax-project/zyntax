@@ -321,6 +321,14 @@ struct Lowerer<'m, 'a> {
     loop_depths: Vec<usize>,
 }
 
+/// A target of a multiple assignment: a name or a global, stored as
+/// a whole, or an indexed place whose table and key were evaluated
+/// ahead of the values.
+enum Prepared<'e> {
+    Whole(&'e Var),
+    Index(Box<(Val, Val, Desc)>),
+}
+
 fn unsupported<T>(what: impl Into<String>, span: Span) -> Result<T> {
     Err(Error::unsupported(what, span))
 }
@@ -961,6 +969,22 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             node.node,
             TypedExpression::Variable(_) | TypedExpression::Literal(_)
         )
+    }
+
+    /// The value copied into a temporary, unless it is a literal: a
+    /// variable read now, before a statement that may assign it.
+    fn snapshot(&mut self, v: Val, pre: &mut Vec<St>) -> Val {
+        if matches!(v.node.node, TypedExpression::Literal(_)) {
+            return v;
+        }
+        let span = v.node.span;
+        let name = self.temp();
+        let ty = self.ir(v.ty);
+        pre.push(let_(name, ty.clone(), v.node, span));
+        Val {
+            node: var(name, ty, span),
+            ty: v.ty,
+        }
     }
 
     /// The value held in a temporary, so it can be read more than
@@ -3632,11 +3656,24 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     out.push(st);
                     return Ok(());
                 }
-                // Every right side runs before any target is stored.
-                let (pre, vals) = self.adjusted(&exprs, targets.len(), span)?;
+                // Every target's table and key, then every right side,
+                // run before any target is stored.
+                let mut pre = Vec::new();
+                let mut prepared = Vec::with_capacity(targets.len());
+                for target in &targets {
+                    prepared.push(self.prepare_target(target, &mut pre, span)?);
+                }
+                let (mut values_pre, vals) = self.adjusted(&exprs, targets.len(), span)?;
+                // A value that is a variable is read now: a store may
+                // assign it before the value is used.
+                let vals: Vec<Val> = vals
+                    .into_iter()
+                    .map(|v| self.snapshot(v, &mut values_pre))
+                    .collect();
                 out.extend(pre);
-                for (target, v) in targets.iter().zip(vals) {
-                    let st = self.assign_target(target, v, span)?;
+                out.extend(values_pre);
+                for (target, v) in prepared.into_iter().zip(vals) {
+                    let st = self.store_prepared(target, v, span)?;
                     out.push(st);
                 }
             }
@@ -3787,6 +3824,50 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     /// Store into an assignment target.
+    /// A target of a multiple assignment with its table and key
+    /// evaluated ahead of the values, as the reference does.
+    fn prepare_target<'e>(
+        &mut self,
+        target: &'e Var,
+        pre: &mut Vec<St>,
+        span: Span,
+    ) -> Result<Prepared<'e>> {
+        let Var::Expression(ve) = target else {
+            return Ok(Prepared::Whole(target));
+        };
+        let suffixes: Vec<&Suffix> = ve.suffixes().collect();
+        if self.typer().global_member(ve.prefix(), &suffixes).is_some() {
+            return Ok(Prepared::Whole(target));
+        }
+        let Some((last, init)) = suffixes.split_last() else {
+            return unsupported("this assignment target", span);
+        };
+        let obj_multi = self.suffixed(ve.prefix(), init, span)?;
+        let obj = self.first_of(obj_multi, span);
+        let obj = self.snapshot(obj, pre);
+        let desc = self.describe_chain(ve.prefix(), init);
+        let key = match last {
+            Suffix::Index(ast::Index::Dot { name, .. }) => Val {
+                node: str_lit(&ident(name), span),
+                ty: Ty::Str,
+            },
+            Suffix::Index(ast::Index::Brackets { expression, .. }) => self.expr(expression)?,
+            _ => return unsupported("this assignment target", span),
+        };
+        let key = self.snapshot(key, pre);
+        Ok(Prepared::Index(Box::new((obj, key, desc))))
+    }
+
+    fn store_prepared(&mut self, target: Prepared<'_>, v: Val, span: Span) -> Result<St> {
+        match target {
+            Prepared::Whole(target) => self.assign_target(target, v, span),
+            Prepared::Index(place) => {
+                let (obj, key, desc) = *place;
+                Ok(self.index_write(obj, key, v, desc, span))
+            }
+        }
+    }
+
     fn assign_target(&mut self, target: &Var, v: Val, span: Span) -> Result<St> {
         match target {
             Var::Name(token) => {
