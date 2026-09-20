@@ -4964,6 +4964,22 @@ impl<'m> Lowerer<'m> {
             ("zb_math_log", 2) => (vec![Ty::Float, Ty::Float], "zb_math_log_base"),
             ("zb_random_seed", 0) => (Vec::new(), "zb_random_seed_clock"),
             ("zb_stringio_new", 0) => (Vec::new(), "zb_stringio_empty"),
+            ("zb_struct_unpack", 2) | ("zb_struct_calcsize", 1) => {
+                let Some(py::Expr::StringLiteral(fmt)) = args.first() else {
+                    return unsupported("struct with a format that is not a literal", c);
+                };
+                let text = fmt.value.to_str();
+                let Some((big, fields, size)) = stdlib::struct_format(text) else {
+                    return unsupported(format!("the struct format {text:?}"), c);
+                };
+                if zb == "zb_struct_calcsize" {
+                    return Ok(Val {
+                        node: int_lit(size, span),
+                        ty: Ty::Int,
+                    });
+                }
+                return self.struct_unpack(&args[1], big, &fields, size, span);
+            }
             // The one codec here is hex, named by a literal.
             ("zb_codecs_decode", 2) => {
                 let Some(py::Expr::StringLiteral(codec)) = args.get(1) else {
@@ -5943,6 +5959,31 @@ impl<'m> Lowerer<'m> {
                             ty: Ty::Object,
                         }
                     }
+                    // An instance answers through its class's dunder.
+                    Ty::Class(k) => {
+                        let name = match op {
+                            UnaryOp::Minus => "__neg__",
+                            UnaryOp::BitNot => "__invert__",
+                            _ => "__pos__",
+                        };
+                        match self.dunder(k as usize, name, operand.node, vec![], span) {
+                            Some(r) => r,
+                            None => {
+                                return Err(Error::unsupported_span(
+                                    format!(
+                                        "unary `{}` on {}, which defines no {name}",
+                                        match op {
+                                            UnaryOp::Minus => "-",
+                                            UnaryOp::BitNot => "~",
+                                            _ => "+",
+                                        },
+                                        self.module.classes[k as usize].name
+                                    ),
+                                    span,
+                                ));
+                            }
+                        }
+                    }
                     _ => {
                         // Bools count as ints under arithmetic.
                         let ty = if operand.ty == Ty::Bool {
@@ -5985,6 +6026,23 @@ impl<'m> Lowerer<'m> {
             return Err(Error::unsupported_span(
                 format!(
                     "`{}` on {}, which defines no {name}",
+                    op_text(op),
+                    self.module.classes[k as usize].name
+                ),
+                span,
+            ));
+        }
+        // `3 * d` with `d` an instance: the reflected method on the right.
+        if let Ty::Class(k) = right.ty
+            && left.ty != Ty::Object
+        {
+            let name = types::reflected_dunder_name(op);
+            if let Some(r) = self.dunder(k as usize, name, right.node, vec![left], span) {
+                return Ok(r);
+            }
+            return Err(Error::unsupported_span(
+                format!(
+                    "`{}` with {} on the right, which defines no {name}",
                     op_text(op),
                     self.module.classes[k as usize].name
                 ),
@@ -8173,6 +8231,21 @@ impl<'m> Lowerer<'m> {
                         Ty::Int => v.node,
                         Ty::Bool | Ty::Float => cast(v.node, Ty::Int, span),
                         Ty::Str => call("zb_int_of_str", vec![v.node], Ty::Int, span),
+                        // An instance answers through `__int__`.
+                        Ty::Class(k) => {
+                            match self.dunder(k as usize, "__int__", v.node, vec![], span) {
+                                Some(r) => self.coerce(r, Ty::Int),
+                                None => {
+                                    return Err(Error::unsupported_span(
+                                        format!(
+                                            "int() of {}, which defines no __int__",
+                                            self.module.classes[k as usize].name
+                                        ),
+                                        span,
+                                    ));
+                                }
+                            }
+                        }
                         _ => call("zb_any_int", vec![v.node], Ty::Int, span),
                     };
                     return Ok(Val { node, ty: Ty::Int });
@@ -8183,6 +8256,20 @@ impl<'m> Lowerer<'m> {
                         Ty::Float => v.node,
                         Ty::Bool | Ty::Int => cast(v.node, Ty::Float, span),
                         Ty::Str => call("zb_float_of_str", vec![v.node], Ty::Float, span),
+                        Ty::Class(k) => {
+                            match self.dunder(k as usize, "__float__", v.node, vec![], span) {
+                                Some(r) => self.coerce(r, Ty::Float),
+                                None => {
+                                    return Err(Error::unsupported_span(
+                                        format!(
+                                            "float() of {}, which defines no __float__",
+                                            self.module.classes[k as usize].name
+                                        ),
+                                        span,
+                                    ));
+                                }
+                            }
+                        }
                         _ => call("zb_any_float", vec![v.node], Ty::Float, span),
                     };
                     return Ok(Val {
@@ -10906,6 +10993,107 @@ impl<'m> Lowerer<'m> {
         let defaults = self.default_values(&sig)?;
         let name = class_adapter_name(&self.module.classes[k].name);
         Ok(self.record(&name, sig.params.len(), Vec::new(), defaults, span))
+    }
+
+    /// `struct.unpack(fmt, data)`: the buffer checked for the format's
+    /// size, then each field read at its offset into the tuple.
+    fn struct_unpack(
+        &mut self,
+        data: &py::Expr,
+        big: bool,
+        fields: &[(i64, stdlib::Field)],
+        size: i64,
+        span: Span,
+    ) -> Result<Val> {
+        let data = self.expr_as(data, Ty::Bytes)?;
+        let mut pre = Vec::new();
+        let held = self.hold(
+            Val {
+                node: data,
+                ty: Ty::Bytes,
+            },
+            &mut pre,
+            span,
+        );
+        pre.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(call(
+                "zb_struct_expect",
+                vec![held.node.clone(), int_lit(size, span)],
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        ));
+        pre.push(self.pending_check(span));
+        let big = int_lit(big as i64, span);
+        let items: Vec<Val> = fields
+            .iter()
+            .map(|(offset, field)| {
+                let node = match *field {
+                    stdlib::Field::Int { size, signed } => call(
+                        "zb_struct_int",
+                        vec![
+                            held.node.clone(),
+                            int_lit(*offset, span),
+                            int_lit(size, span),
+                            int_lit(signed as i64, span),
+                            big.clone(),
+                        ],
+                        Ty::Int,
+                        span,
+                    ),
+                    stdlib::Field::Bool => binary(
+                        BinaryOp::Ne,
+                        call(
+                            "zb_struct_int",
+                            vec![
+                                held.node.clone(),
+                                int_lit(*offset, span),
+                                int_lit(1, span),
+                                int_lit(0, span),
+                                big.clone(),
+                            ],
+                            Ty::Int,
+                            span,
+                        ),
+                        int_lit(0, span),
+                        Ty::Bool,
+                        span,
+                    ),
+                    stdlib::Field::Float { size } => call(
+                        "zb_struct_float",
+                        vec![
+                            held.node.clone(),
+                            int_lit(*offset, span),
+                            int_lit(size, span),
+                            big.clone(),
+                        ],
+                        Ty::Float,
+                        span,
+                    ),
+                    stdlib::Field::Bytes { size } => call(
+                        "zb_bytes_slice_raw",
+                        vec![
+                            held.node.clone(),
+                            int_lit(*offset, span),
+                            int_lit(*offset + size, span),
+                        ],
+                        Ty::Bytes,
+                        span,
+                    ),
+                };
+                Val {
+                    node,
+                    ty: field.ty(),
+                }
+            })
+            .collect();
+        let ty = types::tuple_of(items.iter().map(|v| v.ty).collect());
+        let tuple = self.tuple_of_items(items, ty, span);
+        // The buffer's hold and check run ahead of the statement.
+        self.hoisted.extend(pre);
+        Ok(Val { node: tuple, ty })
     }
 
     /// `globals()[s]`: the module variable of this file the string

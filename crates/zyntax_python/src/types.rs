@@ -4484,6 +4484,26 @@ pub(crate) fn dunder_name(op: py::Operator) -> &'static str {
     }
 }
 
+/// The reflected method of `op`, tried on the right operand when the
+/// left one has no method for it: `__radd__` for `+`.
+pub(crate) fn reflected_dunder_name(op: py::Operator) -> &'static str {
+    match op {
+        py::Operator::Add => "__radd__",
+        py::Operator::Sub => "__rsub__",
+        py::Operator::Mult => "__rmul__",
+        py::Operator::Div => "__rtruediv__",
+        py::Operator::FloorDiv => "__rfloordiv__",
+        py::Operator::Mod => "__rmod__",
+        py::Operator::Pow => "__rpow__",
+        py::Operator::MatMult => "__rmatmul__",
+        py::Operator::BitAnd => "__rand__",
+        py::Operator::BitOr => "__ror__",
+        py::Operator::BitXor => "__rxor__",
+        py::Operator::LShift => "__rlshift__",
+        py::Operator::RShift => "__rrshift__",
+    }
+}
+
 /// What `left op right` produces. `/` is always a float on numbers,
 /// `**` with a negative literal exponent too.
 pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
@@ -5050,6 +5070,16 @@ impl Typer<'_> {
 
     /// What a call of a module member returns.
     fn member_call_ty(&self, m: crate::stdlib::Member, c: &py::ExprCall) -> Ty {
+        // `struct.unpack` returns the tuple its literal format spells.
+        if let crate::stdlib::Member::Func {
+            zb: "zb_struct_unpack",
+            ..
+        } = m
+            && let Some(py::Expr::StringLiteral(fmt)) = c.arguments.args.first()
+            && let Some((_, fields, _)) = crate::stdlib::struct_format(fmt.value.to_str())
+        {
+            return tuple_of(fields.iter().map(|(_, f)| f.ty()).collect());
+        }
         match m {
             crate::stdlib::Member::ArrayType => array_call_ty(&c.arguments.args),
             crate::stdlib::Member::Binary(op) if c.arguments.args.len() == 2 => {

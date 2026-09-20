@@ -446,6 +446,61 @@ extern "C" fn host_json_escape(s: StringConstPtr) -> StringPtr {
     zrtl::string::string_from_bytes(out.as_bytes())
 }
 
+/// `struct.unpack`: the integer of `size` bytes at `offset`, signed or
+/// not, big-endian or little. An unsigned value past i64 is clamped to
+/// i64::MAX, the widest int here.
+extern "C" fn host_struct_int(
+    a: StringConstPtr,
+    offset: i64,
+    size: i64,
+    signed: i64,
+    big: i64,
+) -> i64 {
+    // SAFETY: a blob the program holds; the caller checked the length.
+    let data = unsafe { blob(a) };
+    let start = offset as usize;
+    let bytes = &data[start..start + size as usize];
+    let mut value: u64 = 0;
+    if big != 0 {
+        for b in bytes {
+            value = (value << 8) | *b as u64;
+        }
+    } else {
+        for b in bytes.iter().rev() {
+            value = (value << 8) | *b as u64;
+        }
+    }
+    if signed != 0 {
+        let shift = 64 - 8 * size as u32;
+        ((value << shift) as i64) >> shift
+    } else {
+        i64::try_from(value).unwrap_or(i64::MAX)
+    }
+}
+
+/// `struct.unpack`: the float of `size` bytes (4 or 8) at `offset`.
+extern "C" fn host_struct_float(a: StringConstPtr, offset: i64, size: i64, big: i64) -> f64 {
+    // SAFETY: a blob the program holds; the caller checked the length.
+    let data = unsafe { blob(a) };
+    let start = offset as usize;
+    let bytes = &data[start..start + size as usize];
+    if size == 4 {
+        let raw: [u8; 4] = bytes.try_into().expect("four bytes");
+        if big != 0 {
+            f32::from_be_bytes(raw) as f64
+        } else {
+            f32::from_le_bytes(raw) as f64
+        }
+    } else {
+        let raw: [u8; 8] = bytes.try_into().expect("eight bytes");
+        if big != 0 {
+            f64::from_be_bytes(raw)
+        } else {
+            f64::from_le_bytes(raw)
+        }
+    }
+}
+
 /// `bytes.hex()`: two lowercase hex digits per byte.
 extern "C" fn host_bytes_hex(a: StringConstPtr) -> StringPtr {
     // SAFETY: a blob the program holds.
@@ -503,7 +558,7 @@ extern "C" fn host_file_exists(path: StringConstPtr) -> i64 {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 33] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 35] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$time".as_ptr(), host_time as *const u8),
@@ -556,6 +611,11 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 33] = [
     zrtl::ZrtlSymbol::new(c"$Host$file_remove".as_ptr(), host_file_remove as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$md5".as_ptr(), host_md5 as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$bytes_hex".as_ptr(), host_bytes_hex as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$struct_int".as_ptr(), host_struct_int as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$struct_float".as_ptr(),
+        host_struct_float as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(c"$Host$json_escape".as_ptr(), host_json_escape as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Host$bytes_from_hex".as_ptr(),

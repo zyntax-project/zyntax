@@ -1100,31 +1100,42 @@ fn dynamic_call(module: &Module, method: &str, arity: usize, span: Span) -> Type
     for i in 0..arity {
         params.push(param(&format!("a{i}"), Ty::Object, span));
     }
+    // A method takes the call when its parameters past the given ones
+    // all have defaults, which the arm then evaluates.
+    let takes = |sig: &Sig| {
+        sig.params.len() > arity
+            && (arity + 1..sig.params.len())
+                .all(|i| sig.defaults.get(i).is_some_and(|d| d.is_some()))
+    };
     let mut statements = per_class(
         module,
         x.clone(),
         |c| {
             module
                 .method_sig(c, method)
-                .is_some_and(|(sig, _)| sig.params.len() == arity + 1)
+                .is_some_and(|(sig, _)| takes(sig))
         },
         |lowerer, c, obj| {
             let (sig, _) = module.method_sig(c, method).expect("picked");
-            let args: Vec<Node> = sig
-                .params
-                .iter()
-                .skip(1)
-                .enumerate()
-                .map(|(i, (_, ty))| {
-                    lowerer.coerce(
+            let sig = sig.clone();
+            let mut args = Vec::new();
+            for (i, (_, ty)) in sig.params.iter().skip(1).enumerate() {
+                if i < arity {
+                    args.push(lowerer.coerce(
                         Val {
                             node: var(intern(&format!("a{i}")), Ty::Object, span),
                             ty: Ty::Object,
                         },
                         *ty,
-                    )
-                })
-                .collect();
+                    ));
+                } else {
+                    let default = sig.defaults[i + 1].as_ref().expect("picked");
+                    let Ok(value) = lowerer.expr_as(default, *ty) else {
+                        return Vec::new();
+                    };
+                    args.push(value);
+                }
+            }
             let result = lowerer.invoke(c, method, obj, args, span).expect("picked");
             let boxed = lowerer.coerce(result, Ty::Object);
             vec![ret(boxed, span)]
@@ -1580,6 +1591,57 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
     };
     let lt_hook = order_hook("zb_hook_instance_lt", "__lt__", "__gt__");
     let le_hook = order_hook("zb_hook_instance_le", "__le__", "__ge__");
+    // Unary `-`, `+` and `~`: the class's dunder, by code.
+    let code = var(intern("code"), Ty::Int, span);
+    let mut statements = Vec::new();
+    for (value, method) in [
+        (0, "__neg__"),
+        (1, "__pos__"),
+        (2, "__invert__"),
+        (3, "__int__"),
+        (4, "__float__"),
+    ] {
+        let arms = per_class(
+            module,
+            x.clone(),
+            |c| module.method_sig(c, method).is_some(),
+            |lowerer, c, obj| {
+                let result = lowerer
+                    .invoke(c, method, obj, vec![], span)
+                    .expect("picked");
+                let boxed = lowerer.coerce(result, Ty::Object);
+                vec![ret(boxed, span)]
+            },
+            span,
+        );
+        statements.push(when(
+            binary(
+                BinaryOp::Eq,
+                code.clone(),
+                int_lit(value, span),
+                Ty::Bool,
+                span,
+            ),
+            arms,
+            span,
+        ));
+    }
+    statements.push(type_error_stmt(x.clone(), " has no unary operator", span));
+    statements.push(ret(
+        node(
+            TypedExpression::Literal(TypedLiteral::Null),
+            Ty::Object,
+            span,
+        ),
+        span,
+    ));
+    let unary_hook = function(
+        "zb_hook_instance_unary",
+        vec![param("code", Ty::Int, span), param("x", Ty::Object, span)],
+        Ty::Object,
+        statements,
+        span,
+    );
     let mut out = vec![
         str_hook,
         repr_hook,
@@ -1589,6 +1651,7 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         eq_hook,
         lt_hook,
         le_hook,
+        unary_hook,
         hash_hook(module, span),
         arith_hook(module, span),
         box_hook(module, span),
@@ -2155,6 +2218,48 @@ fn arith_hook(module: &Module, span: Span) -> TypedFunction {
         },
         span,
     );
+    // Else the reflected method on the right operand's class.
+    statements.extend(per_class(
+        module,
+        b.clone(),
+        |c| {
+            OPS.iter().any(|op| {
+                module
+                    .method_sig(c, crate::types::reflected_dunder_name(*op))
+                    .is_some()
+            })
+        },
+        |lowerer, c, obj| {
+            let mut arms = Vec::new();
+            for op in OPS {
+                let name = crate::types::reflected_dunder_name(op);
+                if module.method_sig(c, name).is_none() {
+                    continue;
+                }
+                let other = lower::Val {
+                    node: a.clone(),
+                    ty: Ty::Object,
+                };
+                let Some(result) = lowerer.dunder(c, name, obj.clone(), vec![other], span) else {
+                    continue;
+                };
+                let boxed = lowerer.coerce(result, Ty::Object);
+                arms.push(when(
+                    binary(
+                        BinaryOp::Eq,
+                        code.clone(),
+                        int_lit(crate::types::arith_code(op), span),
+                        Ty::Bool,
+                        span,
+                    ),
+                    vec![ret(boxed, span)],
+                    span,
+                ));
+            }
+            arms
+        },
+        span,
+    ));
     let message = binary(
         BinaryOp::Add,
         binary(

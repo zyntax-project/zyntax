@@ -16,6 +16,20 @@ use std::cell::RefCell;
 /// Finds a module's source by its dotted name, when it exists.
 pub type Resolver<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
+/// Standard modules written in Python and compiled with the program,
+/// found when the program's own files do not have the name.
+pub(crate) fn bundled(module: &str) -> Option<&'static str> {
+    match module {
+        "decimal" => Some(include_str!("../stdlib/decimal.py")),
+        _ => None,
+    }
+}
+
+/// A module's source: the program's own file, or the bundled one.
+fn source_of(resolve: &Resolver<'_>, module: &str) -> Option<String> {
+    resolve(module).or_else(|| bundled(module).map(str::to_string))
+}
+
 /// The qualified name of `member` in `module`.
 pub(crate) fn qualified(module: &str, member: &str) -> String {
     format!("{}${member}", module.replace('.', "$"))
@@ -95,7 +109,7 @@ impl Linker<'_> {
                             .as_ref()
                             .map(|a| a.id.as_str())
                             .unwrap_or(module);
-                        if (self.resolve)(module).is_none()
+                        if source_of(self.resolve, module).is_none()
                             && !self
                                 .reads
                                 .contains(local.split('.').next().unwrap_or(local))
@@ -126,11 +140,16 @@ impl Linker<'_> {
                     for alias in &f.names {
                         let name = alias.name.id.as_str();
                         let at = alias.range();
+                        // `from m import *`: every public name the module
+                        // binds at its top level.
                         if name == "*" {
-                            return Err(Error::unsupported(
-                                format!("`from {module} import *`"),
-                                &at,
-                            ));
+                            self.load(&module, at)?;
+                            for public in self.public_names(&module, at)? {
+                                imports
+                                    .names
+                                    .insert(public.clone(), qualified(&module, &public));
+                            }
+                            continue;
                         }
                         let local = alias
                             .asname
@@ -140,7 +159,7 @@ impl Linker<'_> {
                         // `from pkg import mod` names a module of the
                         // package when there is one; otherwise a member.
                         let submodule = format!("{module}.{name}");
-                        if (self.resolve)(&submodule).is_some() {
+                        if source_of(self.resolve, &submodule).is_some() {
                             self.load(&submodule, at)?;
                             imports.modules.insert(local, submodule);
                         } else {
@@ -219,7 +238,7 @@ impl Linker<'_> {
                 &at,
             ));
         }
-        let Some(source) = (self.resolve)(module) else {
+        let Some(source) = source_of(self.resolve, module) else {
             return Err(Error::unsupported(
                 format!("import of module `{module}`, which was not found"),
                 &at,
@@ -256,6 +275,49 @@ impl Linker<'_> {
         self.out
             .extend(body.into_iter().map(|s| (s, Some(module.to_string()))));
         Ok(())
+    }
+}
+
+impl Linker<'_> {
+    /// The names a module binds at its top level that `import *` takes:
+    /// those in `__all__` when it defines one, else every name not
+    /// starting with an underscore.
+    fn public_names(&self, module: &str, at: ruff_text_size::TextRange) -> Result<Vec<String>> {
+        let Some(source) = source_of(self.resolve, module) else {
+            return Err(Error::unsupported(
+                format!("import of module `{module}`, which was not found"),
+                &at,
+            ));
+        };
+        let parsed = ruff_python_parser::parse_module(&source)
+            .map_err(|e| Error::syntax(e.error.to_string(), e.location).in_module(module))?;
+        let body: Vec<py::Stmt> = parsed.into_syntax().body.into_iter().collect();
+        for s in &body {
+            if let py::Stmt::Assign(a) = s
+                && let [py::Expr::Name(target)] = a.targets.as_slice()
+                && target.id.as_str() == "__all__"
+                && let py::Expr::List(items) = &*a.value
+            {
+                return Ok(items
+                    .elts
+                    .iter()
+                    .filter_map(|e| match e {
+                        py::Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
+                        _ => None,
+                    })
+                    .collect());
+            }
+        }
+        let scope = Scope::of_body(Vec::new(), &body);
+        let mut names: Vec<String> = scope
+            .bound
+            .iter()
+            .chain(&scope.classes)
+            .filter(|n| !n.starts_with('_'))
+            .cloned()
+            .collect();
+        names.sort();
+        Ok(names)
     }
 }
 

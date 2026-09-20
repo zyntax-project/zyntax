@@ -137,6 +137,12 @@ pub(crate) fn extern_instance_hooks() -> Vec<Decl> {
             None,
         ),
         extern_fn(
+            "zb_hook_instance_unary",
+            &[("code", i64()), ("x", any())],
+            any(),
+            None,
+        ),
+        extern_fn(
             "zb_hook_instance_le",
             &[("a", any()), ("b", any())],
             boolean(),
@@ -204,6 +210,15 @@ pub(crate) fn default_instance_hooks(policy: &Policy) -> Vec<Decl> {
             vec![
                 fatal("TypeError", text("'<' not supported between instances")),
                 ret(bool(false)),
+            ],
+        ),
+        define(
+            "zb_hook_instance_unary",
+            &[&code, &x],
+            any(),
+            vec![
+                fatal("TypeError", text("bad operand type for unary operator")),
+                ret(null(any())),
             ],
         ),
         define(
@@ -1172,6 +1187,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             cat.decl(category(x.e())),
             when(is(&cat, FLOAT), vec![ret(cast(get_f64(x.e()), i64()))]),
             when(
+                and(is(&cat, CUSTOM), is_instance(x.e())),
+                vec![ret(call(
+                    "zb_any_as_i64",
+                    vec![call("zb_hook_instance_unary", vec![int(3), x.e()], any())],
+                    i64(),
+                ))],
+            ),
+            when(
                 is(&cat, STR),
                 vec![ret(call("zb_str_parse_int", vec![get_str(x.e())], i64()))],
             ),
@@ -1188,6 +1211,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is(&cat, STR),
                 vec![ret(call("zb_str_parse_float", vec![get_str(x.e())], f64()))],
             ),
+            when(
+                and(is(&cat, CUSTOM), is_instance(x.e())),
+                vec![ret(call(
+                    "zb_any_as_f64",
+                    vec![call("zb_hook_instance_unary", vec![int(4), x.e()], any())],
+                    f64(),
+                ))],
+            ),
             ret(number_f64(x.e(), cat.e())),
         ],
     ));
@@ -1201,11 +1232,34 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is(&cat, FLOAT),
                 vec![ret(box_f64(sub(float(0.0), get_f64(x.e()))))],
             ),
+            when(
+                and(is(&cat, CUSTOM), is_instance(x.e())),
+                vec![ret(call(
+                    "zb_hook_instance_unary",
+                    vec![int(0), x.e()],
+                    any(),
+                ))],
+            ),
             ret(box_i64(sub(int(0), number_i64(x.e(), cat.e())))),
         ],
     ));
     let same = kept("x", any());
-    d.push(define("zb_any_pos", &[&same], any(), vec![ret(same.e())]));
+    d.push(define(
+        "zb_any_pos",
+        &[&same],
+        any(),
+        vec![
+            when(
+                and(eq(category(same.e()), int(CUSTOM)), is_instance(same.e())),
+                vec![ret(call(
+                    "zb_hook_instance_unary",
+                    vec![int(1), same.e()],
+                    any(),
+                ))],
+            ),
+            ret(same.e()),
+        ],
+    ));
     let f = local("f", f64());
     let n = local("n", i64());
     d.push(define(
@@ -1231,10 +1285,17 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         "zb_any_invert",
         &[&x],
         any(),
-        vec![ret(box_i64(sub(
-            int(-1),
-            number_i64(x.e(), category(x.e())),
-        )))],
+        vec![
+            when(
+                and(eq(category(x.e()), int(CUSTOM)), is_instance(x.e())),
+                vec![ret(call(
+                    "zb_hook_instance_unary",
+                    vec![int(2), x.e()],
+                    any(),
+                ))],
+            ),
+            ret(box_i64(sub(int(-1), number_i64(x.e(), category(x.e()))))),
+        ],
     ));
 
     d.extend(arithmetic());

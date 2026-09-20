@@ -163,6 +163,29 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             "$Host$bytes_from_hex",
         ),
         (
+            "zb_struct_int",
+            vec![
+                ("a", string()),
+                ("offset", i64()),
+                ("size", i64()),
+                ("signed", i64()),
+                ("big", i64()),
+            ],
+            i64(),
+            "$Host$struct_int",
+        ),
+        (
+            "zb_struct_float",
+            vec![
+                ("a", string()),
+                ("offset", i64()),
+                ("size", i64()),
+                ("big", i64()),
+            ],
+            f64(),
+            "$Host$struct_float",
+        ),
+        (
             "zb_path_join",
             vec![("a", string()), ("b", string())],
             string(),
@@ -250,6 +273,29 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 )],
             ),
             ret(cast(v.e(), string())),
+        ],
+    ));
+
+    // struct.unpack: the buffer must be exactly the format's size.
+    d.push(define(
+        "zb_struct_expect",
+        &[&b, &n],
+        unit(),
+        vec![
+            when(
+                ne(call("zb_str_len", vec![b.e()], i64()), n.e()),
+                vec![fatal(
+                    "ValueError",
+                    add(
+                        add(
+                            text("unpack requires a buffer of "),
+                            call("zb_str_of_int", vec![n.e()], string()),
+                        ),
+                        text(" bytes"),
+                    ),
+                )],
+            ),
+            ret_void(),
         ],
     ));
 
