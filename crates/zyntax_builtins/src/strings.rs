@@ -472,6 +472,23 @@ pub(crate) fn declarations(policy: &Policy, list_type: zyntax_typed_ast::TypeId)
     }));
 
     out.extend(strip_chars());
+    // index: find, or the ValueError Python raises for a miss.
+    let h2 = local("h", string());
+    let n2 = local("n", string());
+    let at2 = local("at", i64());
+    out.push(define(
+        "zb_str_index",
+        &[&h2, &n2],
+        i64(),
+        vec![
+            at2.decl(call("zb_str_find", vec![h2.e(), n2.e()], i64())),
+            when(
+                lt(at2.e(), int(0)),
+                vec![fatal("ValueError", text("substring not found"))],
+            ),
+            ret(at2.e()),
+        ],
+    ));
     // find: the character index of the first match, from the byte
     // offset the search gives; -1 when absent.
     let h = local("h", string());

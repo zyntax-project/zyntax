@@ -1575,6 +1575,8 @@ impl<'m> Lowerer<'m> {
                 self.list_of(vec![none], Elem::Object, span)
             };
             self.bound.push(cell);
+            // What boxing the value holds runs ahead of the cell.
+            out.append(&mut self.hoisted);
             out.push(TypedNode::new(
                 TypedStatement::Let(TypedLet {
                     name: cell,
@@ -1858,6 +1860,8 @@ impl<'m> Lowerer<'m> {
                     },
                     local,
                 );
+                // What the conversion holds runs ahead of the binding.
+                prologue.append(&mut self.hoisted);
                 prologue.push(TypedNode::new(
                     TypedStatement::Let(TypedLet {
                         name,
@@ -4592,13 +4596,128 @@ impl<'m> Lowerer<'m> {
             _ => return unsupported("range() with more than three arguments", &*f.iter),
         };
         // The bounds are evaluated once, before the loop.
-        let pre = std::mem::take(&mut self.hoisted);
+        let mut pre = std::mem::take(&mut self.hoisted);
         // The loop counts in the target itself when the target is a
-        // plain int local; a shared, global or object-typed target is
-        // assigned from a hidden counter each time round.
+        // plain int local the body never assigns and the step's sign is
+        // known; a shared, global or object-typed target, or one the
+        // body writes (a nested loop over the same name), is assigned
+        // from a hidden counter each time round, since the range runs on
+        // regardless.
+        let body_writes_target = Scope::of_body(Vec::new(), &f.body)
+            .bound
+            .contains(target.id.as_str());
+        let step_sign = match c.arguments.args.get(2) {
+            None => Some(1),
+            Some(e) => types::int_literal(e).map(|v| v.signum()),
+        };
         let direct = !self.cells.contains_key(target.id.as_str())
             && !self.is_global(target.id.as_str())
-            && self.var_ty(target.id.as_str()) == Ty::Int;
+            && self.var_ty(target.id.as_str()) == Ty::Int
+            && !body_writes_target
+            && step_sign.is_some_and(|sign| sign != 0);
+        // A direct loop leaves the target one step past the last value
+        // it ran with; Python leaves the last value, and the start
+        // untouched when the range was empty. The bounds are held so
+        // the loop's end can be put right.
+        let (start, end, step, fixup) = if direct {
+            let held_start = self.hold(
+                Val {
+                    node: start,
+                    ty: Ty::Int,
+                },
+                &mut pre,
+                span,
+            );
+            let held_end = self.hold(
+                Val {
+                    node: end,
+                    ty: Ty::Int,
+                },
+                &mut pre,
+                span,
+            );
+            let step_node = step.map(|step| {
+                self.hold(
+                    Val {
+                        node: step,
+                        ty: Ty::Int,
+                    },
+                    &mut pre,
+                    span,
+                )
+                .node
+            });
+            let name = self.local_symbol(target.id.as_str());
+            let counter = || var(name, Ty::Int, span);
+            let (past_end, ran) = if step_sign == Some(1) {
+                (
+                    binary(
+                        BinaryOp::Ge,
+                        counter(),
+                        held_end.node.clone(),
+                        Ty::Bool,
+                        span,
+                    ),
+                    binary(
+                        BinaryOp::Gt,
+                        held_end.node.clone(),
+                        held_start.node.clone(),
+                        Ty::Bool,
+                        span,
+                    ),
+                )
+            } else {
+                (
+                    binary(
+                        BinaryOp::Le,
+                        counter(),
+                        held_end.node.clone(),
+                        Ty::Bool,
+                        span,
+                    ),
+                    binary(
+                        BinaryOp::Lt,
+                        held_end.node.clone(),
+                        held_start.node.clone(),
+                        Ty::Bool,
+                        span,
+                    ),
+                )
+            };
+            let back = binary(
+                BinaryOp::Sub,
+                counter(),
+                step_node.clone().unwrap_or_else(|| int_lit(1, span)),
+                Ty::Int,
+                span,
+            );
+            let fixup = TypedNode::new(
+                TypedStatement::If(TypedIf {
+                    condition: Box::new(binary(BinaryOp::And, past_end, ran, Ty::Bool, span)),
+                    then_block: TypedBlock {
+                        statements: vec![TypedNode::new(
+                            TypedStatement::Expression(Box::new(binary(
+                                BinaryOp::Assign,
+                                counter(),
+                                back,
+                                Ty::None,
+                                span,
+                            ))),
+                            Type::Unknown,
+                            span,
+                        )],
+                        span,
+                    },
+                    else_block: None,
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            );
+            (held_start.node, held_end.node, step_node, Some(fixup))
+        } else {
+            (start, end, step, None)
+        };
         let name = if direct {
             let name = self.local_symbol(target.id.as_str());
             if !self.bound.contains(&name) {
@@ -4654,11 +4773,12 @@ impl<'m> Lowerer<'m> {
             )),
             body,
         });
-        if pre.is_empty() {
+        if pre.is_empty() && fixup.is_none() {
             return Ok(loop_stmt);
         }
         let mut statements = pre;
         statements.push(TypedNode::new(loop_stmt, Type::Unknown, span));
+        statements.extend(fixup);
         Ok(TypedStatement::Block(TypedBlock { statements, span }))
     }
 
@@ -7717,6 +7837,10 @@ impl<'m> Lowerer<'m> {
                     ("find", 1) => {
                         let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
                         call("zb_str_find", vec![s, a], Ty::Int, span)
+                    }
+                    ("index", 1) => {
+                        let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
+                        call("zb_str_index", vec![s, a], Ty::Int, span)
                     }
                     ("count", 1) => {
                         let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
