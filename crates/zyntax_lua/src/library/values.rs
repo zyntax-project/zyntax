@@ -534,11 +534,46 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         ret(get_f64(na.e())),
     ]);
     d.push(define("zl_for_float", &[&a, &what], f64(), st));
-    // The integer limit of a `for` over integers: a float limit is
-    // floored, a numeral read.
+    // The integer limit of a `for` over integers with a float limit:
+    // the last integer the loop may reach, so floored when the step
+    // climbs and rounded up when it falls. Past the integers on the
+    // step's own side it is clamped, which the loop never runs past;
+    // on the other side the loop has no iteration, which the flag
+    // says, since no integer limit could.
+    let step = local("step", i64());
+    let fl = local("fl", f64());
+    d.push(define(
+        "zl_for_limit_f",
+        &[&fl, &step],
+        i64(),
+        vec![
+            set_global(FOR_SKIP, bool(false)),
+            f.decl(if_expr(
+                lt(step.e(), int(0)),
+                call("zl_ceil_f64", vec![fl.e()], f64()),
+                call("floor", vec![fl.e()], f64()),
+            )),
+            when(
+                ge(f.e(), float(9223372036854775808.0)),
+                vec![
+                    when(lt(step.e(), int(0)), vec![set_global(FOR_SKIP, bool(true))]),
+                    ret(int(i64::MAX)),
+                ],
+            ),
+            when(
+                lt(f.e(), float(-9223372036854775808.0)),
+                vec![
+                    when(gt(step.e(), int(0)), vec![set_global(FOR_SKIP, bool(true))]),
+                    ret(int(i64::MIN)),
+                ],
+            ),
+            ret(cast(f.e(), i64())),
+        ],
+    ));
+    // The same from a dynamic limit: a numeral read.
     d.push(define(
         "zl_for_limit",
-        &[&a],
+        &[&a, &step],
         i64(),
         vec![
             na.decl(call("zl_arith_operand", vec![a.e()], any())),
@@ -550,17 +585,15 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     text(")"),
                 ]))],
             ),
-            when(is_int_cat_of(na.e()), vec![ret(get_i64(na.e()))]),
-            f.decl(call("floor", vec![get_f64(na.e())], f64())),
             when(
-                ge(f.e(), float(9223372036854775808.0)),
-                vec![ret(int(i64::MAX))],
+                is_int_cat_of(na.e()),
+                vec![set_global(FOR_SKIP, bool(false)), ret(get_i64(na.e()))],
             ),
-            when(
-                lt(f.e(), float(-9223372036854775808.0)),
-                vec![ret(int(i64::MIN))],
-            ),
-            ret(cast(f.e(), i64())),
+            ret(call(
+                "zl_for_limit_f",
+                vec![get_f64(na.e()), step.e()],
+                i64(),
+            )),
         ],
     ));
     // Typed helpers with Lua's rules, shared with the typed fast paths.

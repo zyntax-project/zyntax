@@ -3844,7 +3844,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let ir = self.ir(num_ty);
         let bool_t = prim(PrimitiveType::Bool);
         // A limit or start of another type is converted as Lua would:
-        // a float limit of an integer loop is floored.
+        // a float limit of an integer loop is the last integer the
+        // loop may reach, which depends on the step's direction.
         let start_node = match start.ty {
             t if t == num_ty => start.node,
             Ty::Int | Ty::Float => self.coerce(start, num_ty),
@@ -3874,28 +3875,28 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             }
             _ => None,
         };
-        let limit_node = match limit.ty {
-            t if t == num_ty => limit.node,
-            Ty::Int => self.coerce(limit, num_ty),
-            Ty::Float if !is_float => cast(
-                call("floor", vec![limit.node], prim(PrimitiveType::F64), span),
-                ir.clone(),
-                span,
-            ),
-            _ => {
+        // A limit converted with the step in hand is evaluated before
+        // the step all the same.
+        enum Limit {
+            Ready(Node),
+            Float(Node),
+            Dynamic(Node),
+        }
+        let limit = match limit.ty {
+            t if t == num_ty => Limit::Ready(limit.node),
+            Ty::Int => Limit::Ready(self.coerce(limit, num_ty)),
+            Ty::Float => Limit::Float(limit.node),
+            _ if is_float => {
                 let b = self.boxed(limit);
-                let node = if is_float {
-                    call(
-                        "zl_for_float",
-                        vec![b, str_lit("limit", span)],
-                        ir.clone(),
-                        span,
-                    )
-                } else {
-                    call("zl_for_limit", vec![b], ir.clone(), span)
-                };
-                self.guard(Val { node, ty: num_ty }).node
+                let node = call(
+                    "zl_for_float",
+                    vec![b, str_lit("limit", span)],
+                    ir.clone(),
+                    span,
+                );
+                Limit::Ready(self.guard(Val { node, ty: num_ty }).node)
             }
+            _ => Limit::Dynamic(self.boxed(limit)),
         };
         // The step's sign, when it is a literal, picks the test.
         let (step_node, step_literal): (Node, Option<f64>) = match step {
@@ -3943,8 +3944,76 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let lim = self.temp();
         let st = self.temp();
         out.push(let_(counter, ir.clone(), start_node, span));
-        out.push(let_(lim, ir.clone(), limit_node, span));
-        out.push(let_(st, ir.clone(), step_node, span));
+        let converted = match limit {
+            Limit::Ready(node) => {
+                out.push(let_(lim, ir.clone(), node, span));
+                out.push(let_(st, ir.clone(), step_node, span));
+                false
+            }
+            Limit::Float(node) => {
+                let raw = self.temp();
+                let f64_t = prim(PrimitiveType::F64);
+                out.push(let_(raw, f64_t.clone(), node, span));
+                out.push(let_(st, ir.clone(), step_node, span));
+                let node = call(
+                    "zl_for_limit_f",
+                    vec![var(raw, f64_t, span), var(st, ir.clone(), span)],
+                    ir.clone(),
+                    span,
+                );
+                out.push(let_(lim, ir.clone(), node, span));
+                true
+            }
+            Limit::Dynamic(b) => {
+                let raw = self.temp();
+                out.push(let_(raw, Type::Any, b, span));
+                out.push(let_(st, ir.clone(), step_node, span));
+                let node = call(
+                    "zl_for_limit",
+                    vec![var(raw, Type::Any, span), var(st, ir.clone(), span)],
+                    ir.clone(),
+                    span,
+                );
+                let node = self.guard(Val { node, ty: num_ty }).node;
+                out.push(let_(lim, ir.clone(), node, span));
+                true
+            }
+        };
+        if converted {
+            // A limit past the integers against the step: the counter
+            // is put past the (clamped) limit, so the loop does not run.
+            let past = if_value(
+                binary(
+                    BinaryOp::Gt,
+                    var(st, ir.clone(), span),
+                    int_lit(0, span),
+                    bool_t.clone(),
+                    span,
+                ),
+                binary(
+                    BinaryOp::Add,
+                    var(lim, ir.clone(), span),
+                    int_lit(1, span),
+                    ir.clone(),
+                    span,
+                ),
+                binary(
+                    BinaryOp::Sub,
+                    var(lim, ir.clone(), span),
+                    int_lit(1, span),
+                    ir.clone(),
+                    span,
+                ),
+                ir.clone(),
+                span,
+            );
+            out.push(if_(
+                var(intern(library::FOR_SKIP), bool_t.clone(), span),
+                vec![assign(var(counter, ir.clone(), span), past, span)],
+                None,
+                span,
+            ));
+        }
         let zero = if is_float {
             float_lit(0.0, span)
         } else {
@@ -3953,18 +4022,26 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let counter_v = || var(counter, ir.clone(), span);
         let lim_v = || var(lim, ir.clone(), span);
         let st_v = || var(st, ir.clone(), span);
-        if step_literal.is_none() {
-            out.push(if_(
-                binary(BinaryOp::Eq, st_v(), zero.clone(), bool_t.clone(), span),
-                vec![expr_stmt(call(
-                    "zb_fatal",
-                    vec![str_lit("error", span), str_lit("'for' step is zero", span)],
-                    prim(PrimitiveType::Unit),
-                    span,
-                ))],
-                None,
+        // A zero step is an error, a literal one at once.
+        if step_literal.is_none_or(|x| x == 0.0) {
+            let raise = expr_stmt(call(
+                "zb_fatal",
+                vec![str_lit("error", span), str_lit("'for' step is zero", span)],
+                prim(PrimitiveType::Unit),
                 span,
             ));
+            let leave = self.pending_check(span);
+            if step_literal.is_none() {
+                out.push(if_(
+                    binary(BinaryOp::Eq, st_v(), zero.clone(), bool_t.clone(), span),
+                    vec![raise, leave],
+                    None,
+                    span,
+                ));
+            } else {
+                out.push(raise);
+                out.push(leave);
+            }
         }
         let cond = match step_literal {
             Some(x) if x > 0.0 => binary(BinaryOp::Le, counter_v(), lim_v(), bool_t.clone(), span),
@@ -4010,8 +4087,45 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let inner = self.loop_body(f.block())?;
         let mut after = Vec::new();
         if bounded {
+            // Whether the step fits between the counter and the limit:
+            // the distance and the step's size as unsigned values, so
+            // neither wraps.
+            let u64_t = prim(PrimitiveType::U64);
+            let distance = |from: Node, to: Node| {
+                cast(
+                    binary(BinaryOp::Sub, to, from, ir.clone(), span),
+                    u64_t.clone(),
+                    span,
+                )
+            };
+            let up = || distance(counter_v(), lim_v());
+            let down = || distance(lim_v(), counter_v());
+            let size = |negated: bool| {
+                let s = if negated {
+                    binary(BinaryOp::Sub, int_lit(0, span), st_v(), ir.clone(), span)
+                } else {
+                    st_v()
+                };
+                cast(s, u64_t.clone(), span)
+            };
+            let short =
+                |gap: Node, step: Node| binary(BinaryOp::Lt, gap, step, bool_t.clone(), span);
+            let done = match step_literal {
+                Some(x) if x == 1.0 || x == -1.0 => {
+                    binary(BinaryOp::Eq, counter_v(), lim_v(), bool_t.clone(), span)
+                }
+                Some(x) if x > 0.0 => short(up(), size(false)),
+                Some(_) => short(down(), size(true)),
+                None => if_value(
+                    binary(BinaryOp::Gt, st_v(), int_lit(0, span), bool_t.clone(), span),
+                    short(up(), size(false)),
+                    short(down(), size(true)),
+                    bool_t.clone(),
+                    span,
+                ),
+            };
             after.push(if_(
-                binary(BinaryOp::Eq, counter_v(), lim_v(), bool_t.clone(), span),
+                done,
                 vec![stmt(TypedStatement::Break(None), span)],
                 None,
                 span,

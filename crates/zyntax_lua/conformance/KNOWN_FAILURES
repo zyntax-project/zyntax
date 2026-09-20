@@ -20,7 +20,6 @@ official/goto.lua             4da50c2
 official/literals.lua         4da50c2
 official/locals.lua           4da50c2
 official/math.lua             4da50c2
-official/nextvar.lua          4da50c2
 official/pm.lua               4da50c2
 official/sort.lua             4da50c2
 official/strings.lua          4da50c2

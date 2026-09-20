@@ -523,6 +523,10 @@ pub const CHUNK: &str = "zl_chunk";
 /// other error. Set by every raise, cleared by the check that
 /// consumes it.
 pub const VARINFO: &str = "zl_varinfo";
+/// Set by the conversion of a `for` limit: whether the limit lies past
+/// the integers on the side the step moves away from, so the loop has
+/// no iteration whatever its start.
+pub const FOR_SKIP: &str = "zl_for_skip";
 pub const OPERAND_LEFT: i64 = 1;
 pub const OPERAND_RIGHT: i64 = 2;
 pub const VARINFO_INSIDE: i64 = 4;
@@ -583,6 +587,7 @@ fn raising(t: &Types) -> Vec<Decl> {
         global_var(CHUNKS, any()),
         global_var(DEPTH, i64()),
         global_var(VARINFO, i64()),
+        global_var(FOR_SKIP, boolean()),
     ];
     // Entered below the floor: the error every deeper call would raise.
     d.push(define_cold(
