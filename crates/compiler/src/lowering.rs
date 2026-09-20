@@ -931,6 +931,7 @@ impl AstLowering for LoweringContext {
                 self.lower_declaration(decl)?;
             }
         }
+        let mut slowest: Vec<(f64, String)> = Vec::new();
         for (index, decl) in program.declarations.iter().enumerate() {
             if matches!(
                 decl.node,
@@ -939,9 +940,31 @@ impl AstLowering for LoweringContext {
                 continue;
             }
             self.current_decl = index;
+            let at = phase.on().then(std::time::Instant::now);
             self.lower_declaration(decl)?;
+            if let Some(at) = at {
+                let ms = at.elapsed().as_secs_f64() * 1000.0;
+                if ms > 0.5 {
+                    let what = match &decl.node {
+                        TypedDeclaration::Function(f) => {
+                            format!("fn {}", f.name.resolve_global().unwrap_or_default())
+                        }
+                        TypedDeclaration::Class(c) => {
+                            format!("class {}", c.name.resolve_global().unwrap_or_default())
+                        }
+                        _ => "other".to_string(),
+                    };
+                    slowest.push((ms, what));
+                }
+            }
         }
         let declared_ms = phase.lap();
+        if phase.on() && !slowest.is_empty() {
+            slowest.sort_by(|a, b| b.0.total_cmp(&a.0));
+            for (ms, what) in slowest.iter().take(6) {
+                eprintln!("[LOWER-PROGRAM]   {ms:8.2} ms {what}");
+            }
+        }
         self.lower_until_nothing_is_owed(program)?;
 
         // `with H { }` post-pass: now that every function (including

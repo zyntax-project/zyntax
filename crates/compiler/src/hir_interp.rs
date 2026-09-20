@@ -3449,6 +3449,8 @@ impl HirInterpreter {
 
         // A native entry, once the tiers above have made one, takes the
         // call instead of the bytecode.
+        let first = !self.cache.contains_key(&func_id);
+        let phases = first && std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
         let native = match self.tick_callbacks.get_mut(&func_id) {
             Some(cb) => cb(),
             None => None,
@@ -3486,7 +3488,11 @@ impl HirInterpreter {
             // one apart from the module's; else the module's. A callee
             // the module does not hold is a function, not a value:
             // reported as one.
+            // The body's making is the first call's cost: reported when
+            // it shows.
+            let started = std::time::Instant::now();
             let shared = self.body_source.as_mut().and_then(|source| source(func_id));
+            let body_ms = started.elapsed().as_secs_f64() * 1000.0;
             let func: &HirFunction = match &shared {
                 Some(f) => f,
                 None => module
@@ -3494,6 +3500,12 @@ impl HirInterpreter {
                     .get(&func_id)
                     .ok_or_else(|| InterpError::UnknownFunction(format!("{func_id:?}")))?,
             };
+            if phases && body_ms >= 1.0 {
+                eprintln!(
+                    "[INTERP] body of {} {body_ms:8.2} ms",
+                    func.name.resolve_global().unwrap_or_default()
+                );
+            }
             let taken = self.is_address_taken(module, func_id);
             match compile_function_with(module, &mut self.memory, func, taken) {
                 Ok(cf) => {
