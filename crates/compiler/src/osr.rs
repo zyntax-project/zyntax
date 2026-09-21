@@ -405,7 +405,8 @@ fn successors_of(term: &HirTerminator) -> smallvec::SmallVec<[HirId; 4]> {
 /// result back through a destination its caller provides returns that
 /// pointer, and the helper does the same: the frame carries the
 /// destination at `destination`, the helper writes through it and
-/// returns it.
+/// returns it. A growable list header is returned as its address, so
+/// the helper's return type is a pointer for one too.
 #[derive(Debug, Clone)]
 pub struct OsrLayout {
     pub header: HirId,
@@ -521,11 +522,15 @@ pub fn osr_layout_with(
 
     // Multi-value return functions can't go through the helper ABI. A
     // struct returned through a caller-provided destination comes back
-    // as the pointer to it, which fits.
+    // as the pointer to it, which fits; so does a growable list header,
+    // which every tier returns as the address it lives at.
     let returns_through_destination = crate::abi::destination_return_type(function).is_some();
     let return_type = match function.signature.returns.as_slice() {
         [] => HirType::Void,
         [_] if returns_through_destination => HirType::Ptr(Box::new(HirType::U8)),
+        [HirType::Struct(s)] if crate::abi::is_growable_list_header(s) => {
+            HirType::Ptr(Box::new(HirType::U8))
+        }
         [ty] => ty.clone(),
         _ => return Err(OsrReject::ReturnDoesntFit),
     };

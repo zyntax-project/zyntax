@@ -3028,6 +3028,11 @@ impl HirInterpreter {
         let sig = NativeSig::of_site(vec![HirType::Ptr(Box::new(HirType::U8))], site.ret.clone());
         if trace_enabled() {
             eprintln!("[interp] transfer site=0x{:x} -> {helper:?}", site.site_key);
+        } else if crate::osr::osr_trace_enabled() {
+            eprintln!(
+                "[osr] interpreted frame leaves at site=0x{:x} -> {helper:?}",
+                site.site_key
+            );
         }
         self.call_native(
             helper,

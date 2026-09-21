@@ -108,3 +108,55 @@ fn a_loop_reading_a_two_way_callee_moves_to_the_optimizing_tier() {
         "the frame never moved into an LLVM resume point:\n{stderr}"
     );
 }
+
+/// The function returns the list its loop fills. The frame leaves
+/// through a resume point that hands the list back as the address of
+/// its header, and the call after runs the compiled body.
+#[test]
+fn a_frame_in_a_function_returning_a_list_leaves_through_a_resume_point() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/list_return.py");
+    let output = Command::new(env!("CARGO_BIN_EXE_zypy"))
+        .arg("run")
+        .arg(script)
+        .env("ZYNTAX_OSR_TRACE", "1")
+        .env("ZYNTAX_TRACE_INTERP", "1")
+        .output()
+        .expect("zypy starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout.trim(), "30 0 1483337328\n30 1483337328", "{stderr}");
+    assert!(
+        !stderr.contains("main header HirId"),
+        "main's loop header has no resume point:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("[osr] main site=") && stderr.contains("[interp] transfer site="),
+        "the frame never left through a resume point:\n{stderr}"
+    );
+}
+
+/// The same, with the optimizing tier on: the region outlined for the
+/// frame is compiled there too, with the list returned as its address.
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn a_region_returning_a_list_compiles_at_the_optimizing_tier() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/list_return.py");
+    let output = Command::new(env!("CARGO_BIN_EXE_zypy"))
+        .arg("run")
+        .arg(script)
+        .env("ZYPY_LLVM", "1")
+        .env("ZYNTAX_OSR_TRACE", "1")
+        .env("ZYNTAX_TRACE_INTERP", "1")
+        .output()
+        .expect("zypy starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout.trim(), "30 0 1483337328\n30 1483337328", "{stderr}");
+    assert!(
+        stderr.contains("[osr] main site=") && stderr.contains("[interp] transfer site="),
+        "the frame never left through a resume point:\n{stderr}"
+    );
+    assert!(!stderr.contains("LLVM compile failed"), "{stderr}");
+}
