@@ -81,3 +81,30 @@ fn a_frame_in_the_outlined_region_moves_to_the_optimizing_tier() {
         "the frame never moved to the optimizing tier:\n{stderr}"
     );
 }
+
+/// A loop reading the result of an inlined callee with two return
+/// paths moves to the optimizing tier mid-loop and finishes with
+/// CPython's answer: the resume point compiles its region in an order
+/// that defines the merged result before the loop reads it.
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn a_loop_reading_a_two_way_callee_moves_to_the_optimizing_tier() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/two_return_paths.py");
+    let output = Command::new(env!("CARGO_BIN_EXE_zypy"))
+        .arg("run")
+        .arg(script)
+        .env("ZYPY_LLVM", "1")
+        .env("ZYNTAX_OSR_TRACE", "1")
+        .output()
+        .expect("zypy starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout.trim(), "140000000", "{stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l.contains("FIRST TRANSFER") && l.ends_with("(llvm)")),
+        "the frame never moved into an LLVM resume point:\n{stderr}"
+    );
+}

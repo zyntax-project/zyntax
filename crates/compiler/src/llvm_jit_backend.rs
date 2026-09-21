@@ -5,7 +5,9 @@
 //!
 //! ## MCJIT (default)
 //!
-//! 1. **Lower**: HIR → LLVM IR (via `LLVMBackend`).
+//! 1. **Lower**: HIR → LLVM IR (via `LLVMBackend`), at tier >= 1 with a
+//!    resume point per selected loop header, then the pass pipeline over
+//!    all of it.
 //! 2. **Stamp**: give each function the host's `target-cpu` and
 //!    `target-features`, which the engine does not infer on its own.
 //! 3. **Verify**: `module.verify()`.
@@ -168,6 +170,10 @@ pub struct LLVMJitBackend<'ctx> {
     /// module at once while helper slots are keyed by bead, and only the
     /// caller knows which bead a function belongs to.
     pending_osr_helpers: Vec<(HirId, u64, usize)>,
+
+    /// The resume points the next install makes, as site keys; `None`
+    /// makes one at every header. See [`Self::set_osr_helper_sites`].
+    osr_helper_sites: Option<std::collections::HashSet<u64>>,
 }
 
 impl<'ctx> LLVMJitBackend<'ctx> {
@@ -207,6 +213,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             engines: Vec::new(),
             compile_tier: 0,
             pending_osr_helpers: Vec::new(),
+            osr_helper_sites: None,
         };
 
         // The allocation intrinsics call into the runtime's pools. Both
@@ -259,6 +266,14 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// tier >= 1 only.
     pub fn set_compile_tier(&mut self, tier: usize) {
         self.compile_tier = tier;
+    }
+
+    /// Limit the resume points the next tier >= 1 install makes to these
+    /// sites. A helper is the function from its header on, optimised like
+    /// the entry, so one is made only where a frame can take it; `None`
+    /// makes one at every header.
+    pub fn set_osr_helper_sites(&mut self, sites: Option<std::collections::HashSet<u64>>) {
+        self.osr_helper_sites = sites;
     }
 
     /// Drain `(function, site_key, helper_address)` from the last install.
@@ -321,13 +336,6 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// equivalent of the trampoline stubs the object path synthesises.
     /// The engine is retained because it owns the code pages.
     fn install_via_mcjit(&mut self, hir_module: &HirModule) -> CompilerResult<()> {
-        let (mut backend, _target_machine) = self.compile_module_to_ir(hir_module)?;
-
-        // Tier >= 1 additionally emits a resume point per loop header, so a
-        // frame already running tier-0 code can finish here rather than
-        // waiting for the next call. Emitted before the engine is created,
-        // since that consumes the module.
-        let mut helper_names: Vec<(HirId, u64, String)> = Vec::new();
         if crate::osr::osr_trace_enabled() {
             eprintln!(
                 "[osr] llvm install tier={} functions={}",
@@ -335,86 +343,13 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 hir_module.functions.len()
             );
         }
-        if self.compile_tier >= 1 {
-            for (func_id, func) in hir_module.functions.iter() {
-                if func.is_external {
-                    continue;
-                }
-                for header in crate::osr::find_loop_headers(func) {
-                    let layout = match crate::osr::osr_layout(func, header) {
-                        Ok(l) => l,
-                        Err(reason) => {
-                            if std::env::var_os("ZYNTAX_OSR_TRACE").is_some() {
-                                eprintln!(
-                                    "[osr] no layout for {:?} {header:?}: {reason:?}",
-                                    func.name.resolve_global().unwrap_or_default()
-                                );
-                            }
-                            continue;
-                        }
-                    };
-                    // Structured pointer live-ins cannot yet be reconstructed by
-                    // LLVM's resume helper; keep the existing frame in its tier.
-                    if layout.live_in_types.iter().any(|ty| {
-                        matches!(ty, HirType::Ptr(inner) if matches!(inner.as_ref(), HirType::Opaque(_) | HirType::Struct(_)))
-                    }) {
-                        if crate::osr::osr_trace_enabled() {
-                            eprintln!("[osr] no LLVM helper for {header:?}: structured pointer live-in");
-                        }
-                        continue;
-                    }
-                    // Resume helpers are not yet safe across allocation and
-                    // cross-tier calls; keep these loops in their current tier.
-                    let has_effectful_call = crate::osr::blocks_reachable_from(func, header)
-                        .iter()
-                        .filter_map(|id| func.blocks.get(id))
-                        .flat_map(|block| &block.instructions)
-                        .any(|inst| {
-                            use crate::hir::{HirCallable, HirInstruction, Intrinsic};
-                            match inst {
-                                HirInstruction::Call { callee, .. } => matches!(
-                                    callee,
-                                    HirCallable::Function(_)
-                                        | HirCallable::Symbol(_)
-                                        | HirCallable::Indirect(_)
-                                        | HirCallable::Intrinsic(
-                                            Intrinsic::Malloc
-                                                | Intrinsic::Realloc
-                                                | Intrinsic::Free
-                                        )
-                                ),
-                                HirInstruction::CreateClosure { .. } => true,
-                                _ => false,
-                            }
-                        });
-                    if has_effectful_call {
-                        if crate::osr::osr_trace_enabled() {
-                            eprintln!("[osr] no LLVM helper for {header:?}: effectful call");
-                        }
-                        continue;
-                    }
-                    let resumed = crate::osr::resumable(func, &layout);
-                    match backend.compile_osr_helper(&resumed, &layout) {
-                        Ok(name) => {
-                            if crate::osr::osr_trace_enabled() {
-                                eprintln!(
-                                    "[osr] {name}: phis={} live_ins={:?}",
-                                    layout.phi_count, layout.live_in_types
-                                );
-                            }
-                            helper_names.push((*func_id, layout.site_key(), name))
-                        }
-                        // A header the helper shape cannot express just
-                        // means no resume point for that loop.
-                        Err(e) => {
-                            if std::env::var_os("ZYNTAX_OSR_TRACE").is_some() {
-                                eprintln!("[osr] no helper for {header:?}: {e}");
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Tier >= 1 additionally carries a resume point per selected loop
+        // header, so a frame already running tier-0 code can finish here
+        // rather than waiting for the next call. They are built with the
+        // bodies, before the pass pipeline, so they are optimised like
+        // them; the engine created below consumes the module.
+        let (backend, _target_machine, helper_names) =
+            self.compile_module_to_ir(hir_module, self.compile_tier >= 1)?;
 
         // The engine builds its own target machine and defaults to a
         // generic CPU, where the object path tunes one from the host. Carry
@@ -667,7 +602,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     fn compile_module_to_ir(
         &self,
         hir_module: &HirModule,
-    ) -> CompilerResult<(LLVMBackend<'ctx>, TargetMachine)> {
+        with_osr_helpers: bool,
+    ) -> CompilerResult<(LLVMBackend<'ctx>, TargetMachine, Vec<(HirId, u64, String)>)> {
         // Step 1: Lower HIR → LLVM IR.
         let mut backend = LLVMBackend::new(self.context, "zyntax_jit");
         backend.register_symbol_signatures(&self.symbol_signatures);
@@ -698,6 +634,12 @@ impl<'ctx> LLVMJitBackend<'ctx> {
 
         // Patch internal function names to a linker-safe mangling.
         self.rename_mangled_functions(&backend, hir_module)?;
+
+        let helper_names = if with_osr_helpers {
+            self.emit_osr_helpers(&mut backend, hir_module)
+        } else {
+            Vec::new()
+        };
 
         // Step 2: Build a host-tuned TargetMachine. PIC reloc mode is
         // required for `-shared` / `-dynamiclib`; default code model
@@ -797,7 +739,69 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             }
         }
 
-        Ok((backend, target_machine))
+        Ok((backend, target_machine, helper_names))
+    }
+
+    /// Emit a resume point for each loop header of `hir_module` that
+    /// admits a layout and is among [`Self::set_osr_helper_sites`], as
+    /// `(function, site, helper name)`.
+    fn emit_osr_helpers(
+        &self,
+        backend: &mut LLVMBackend<'ctx>,
+        hir_module: &HirModule,
+    ) -> Vec<(HirId, u64, String)> {
+        let trace = crate::osr::osr_trace_enabled();
+        let mut helper_names = Vec::new();
+        for (func_id, func) in hir_module.functions.iter() {
+            if func.is_external {
+                continue;
+            }
+            if let Some(allowed) = &self.only_compile_reachable {
+                if !allowed.contains(func_id) {
+                    continue;
+                }
+            }
+            let name = func.name.resolve_global().unwrap_or_default();
+            for header in crate::osr::find_loop_headers(func) {
+                let layout = match crate::osr::osr_layout(func, header) {
+                    Ok(l) => l,
+                    Err(reason) => {
+                        if trace {
+                            eprintln!("[osr] no layout for {name:?} {header:?}: {reason:?}");
+                        }
+                        continue;
+                    }
+                };
+                let site = layout.site_key();
+                if self
+                    .osr_helper_sites
+                    .as_ref()
+                    .is_some_and(|sites| !sites.contains(&site))
+                {
+                    continue;
+                }
+                let resumed = crate::osr::resumable(func, &layout);
+                match backend.compile_osr_helper(&resumed, &layout) {
+                    Ok(helper) => {
+                        if trace {
+                            eprintln!(
+                                "[osr] {helper}: phis={} live_ins={:?}",
+                                layout.phi_count, layout.live_in_types
+                            );
+                        }
+                        helper_names.push((*func_id, site, helper));
+                    }
+                    // A header the helper shape cannot express just means
+                    // no resume point for that loop.
+                    Err(e) => {
+                        if trace {
+                            eprintln!("[osr] no helper for {name:?} {header:?}: {e}");
+                        }
+                    }
+                }
+            }
+        }
+        helper_names
     }
 
     /// Write the LLVM module to a position-independent object file.
@@ -910,7 +914,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         }
 
         // (1)–(3) Lower + optimise + build target machine.
-        let (backend, target_machine) = self.compile_module_to_ir(hir_module)?;
+        let (backend, target_machine, _) = self.compile_module_to_ir(hir_module, false)?;
 
         // (4) Write PIC object file to a tempfile.
         let triple = Triple::host();

@@ -338,7 +338,7 @@ fn an_unarmed_probe_site_costs_a_load_not_a_call() {
 
 static PROMOTION_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-extern "C" fn count_promotion_request(_bead_id: u64) {
+extern "C" fn count_promotion_request(_bead_id: u64, _site: u64) {
     PROMOTION_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 

@@ -587,6 +587,9 @@ struct MemLoc {
     /// the region's function had live at the header, which may name
     /// the same object as any other root.
     shared_root: bool,
+    /// The root is a module global: storage the compiler owns, which
+    /// no object pointer handed to a region points into.
+    global_root: bool,
 }
 
 impl MemLoc {
@@ -602,7 +605,9 @@ impl MemLoc {
     /// fall back to byte-range comparison.
     fn may_alias(&self, other: &MemLoc) -> bool {
         match (self.root, other.root) {
-            (Some(r1), Some(r2)) if r1 != r2 && (self.shared_root || other.shared_root) => true,
+            (Some(r1), Some(r2)) if r1 != r2 && (self.shared_root || other.shared_root) => {
+                !(self.global_root || other.global_root)
+            }
             (Some(r1), Some(r2)) if r1 != r2 => {
                 // Different SSA roots: rely on the SSA-level
                 // no-aliasing assumption. Holds for the patterns ZynML
@@ -794,11 +799,10 @@ fn extract_mem_loc(
             None => break,
         }
     }
+    let root_kind = func.values.get(&current).map(|v| &v.kind);
     let shared_root = func.attributes.osr_region
-        && func
-            .values
-            .get(&current)
-            .is_some_and(|v| matches!(v.kind, crate::hir::HirValueKind::Parameter(_)));
+        && matches!(root_kind, Some(crate::hir::HirValueKind::Parameter(_)));
+    let global_root = matches!(root_kind, Some(crate::hir::HirValueKind::Global(_)));
     MemLoc {
         root: Some(current),
         offset: if offset_known {
@@ -808,6 +812,7 @@ fn extract_mem_loc(
         },
         size,
         shared_root,
+        global_root,
     }
 }
 
@@ -1361,6 +1366,60 @@ mod tests {
                 .iter()
                 .any(|inst| matches!(inst, HirInstruction::Load { result, .. } if *result == r)),
             "a region's parameters may alias: the read stays in the loop"
+        );
+    }
+
+    /// A global's storage is the compiler's own: a store through a
+    /// region's pointer parameter cannot reach it, so a read of the
+    /// global leaves the loop.
+    #[test]
+    fn region_parameter_store_leaves_a_global_read_free() {
+        let (mut f, _entry, _header, body, _exit) = mk_func();
+        f.attributes.osr_region = true;
+        let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let data = add_param(&mut f, ptr_ty.clone(), 0);
+        let i = add_param(&mut f, HirType::I64, 1);
+        let v = add_param(&mut f, HirType::I64, 2);
+        let g = HirId::new();
+        f.values.insert(
+            g,
+            HirValue {
+                id: g,
+                ty: ptr_ty.clone(),
+                kind: HirValueKind::Global(HirId::new()),
+                uses: Default::default(),
+                span: None,
+            },
+        );
+        let at_i = add_inst(&mut f, ptr_ty.clone());
+        let r = add_inst(&mut f, HirType::I64);
+        let b = f.blocks.get_mut(&body).unwrap();
+        b.instructions.push(HirInstruction::GetElementPtr {
+            result: at_i,
+            ty: ptr_ty,
+            ptr: data,
+            indices: vec![i],
+        });
+        b.instructions.push(HirInstruction::Store {
+            value: v,
+            ptr: at_i,
+            align: 8,
+            volatile: false,
+        });
+        b.instructions.push(HirInstruction::Load {
+            result: r,
+            ty: HirType::I64,
+            ptr: g,
+            align: 8,
+            volatile: false,
+        });
+        run(&mut f);
+        assert!(
+            !f.blocks[&body]
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, HirInstruction::Load { result, .. } if *result == r)),
+            "the global read leaves the loop"
         );
     }
 }

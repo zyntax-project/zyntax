@@ -946,6 +946,16 @@ impl<'ctx> LLVMBackend<'ctx> {
         );
         let helper = self.module.add_function(&name, fn_ty, None);
 
+        // A resume point at an outlined region's entry header re-enters
+        // the region through its entry, which is the same code from the
+        // header on, rather than carrying a second copy of it.
+        if let Some(slots) = crate::osr::region_params_in_frame(func, layout)
+            && let Some(&entry) = self.functions.get(&func.id)
+        {
+            self.compile_region_reentry(helper, entry, func, layout, &slots)?;
+            return Ok(name);
+        }
+
         self.current_function = Some(helper);
         self.block_map.clear();
         self.phi_map.clear();
@@ -1160,6 +1170,154 @@ impl<'ctx> LLVMBackend<'ctx> {
                 layout.header
             )))
         }
+    }
+
+    /// The body of `helper`: `entry` called with each parameter read
+    /// from its frame slot (see [`crate::osr::region_params_in_frame`]),
+    /// its result returned.
+    fn compile_region_reentry(
+        &mut self,
+        helper: FunctionValue<'ctx>,
+        entry: FunctionValue<'ctx>,
+        func: &HirFunction,
+        layout: &crate::osr::OsrLayout,
+        slots: &[Option<usize>],
+    ) -> CompilerResult<()> {
+        let prologue = self.context.append_basic_block(helper, "osr_prologue");
+        self.builder.position_at_end(prologue);
+        let frame_ptr = helper
+            .get_nth_param(0)
+            .ok_or_else(|| CompilerError::CodeGen("OSR helper missing its frame pointer".into()))?
+            .into_pointer_value();
+        let i8_ty = self.context.i8_type();
+        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+        let gep = |e| CompilerError::CodeGen(format!("OSR frame gep: {e}"));
+        let load = |e| CompilerError::CodeGen(format!("OSR frame load: {e}"));
+        let mut args: Vec<BasicMetadataValueEnum> = Vec::with_capacity(slots.len());
+        for (i, want) in entry.get_type().get_param_types().iter().enumerate() {
+            let want: BasicTypeEnum<'ctx> = (*want).try_into().map_err(|_| {
+                CompilerError::CodeGen(format!("OSR re-entry parameter {i} is not a value"))
+            })?;
+            let Some(slot) = slots.get(i).copied().flatten() else {
+                args.push(want.const_zero().into());
+                continue;
+            };
+            let offset =
+                layout.frame.offsets.get(slot).copied().ok_or_else(|| {
+                    CompilerError::CodeGen(format!("OSR frame has no slot {slot}"))
+                })?;
+            let hir_ty = &layout.live_in_types[slot];
+            let at = unsafe {
+                self.builder
+                    .build_in_bounds_gep(
+                        i8_ty,
+                        frame_ptr,
+                        &[self.context.i32_type().const_int(offset as u64, false)],
+                        "osr_slot",
+                    )
+                    .map_err(gep)?
+            };
+            // A value held by reference travels as the pointer to its
+            // storage: the address itself for a parameter taking one,
+            // the value behind it otherwise.
+            let value: BasicValueEnum<'ctx> = if crate::osr::is_held_by_reference(hir_ty) {
+                let address = self
+                    .builder
+                    .build_load(ptr_ty, at, "osr_live_in")
+                    .map_err(load)?;
+                if want.is_pointer_type() {
+                    address
+                } else {
+                    self.builder
+                        .build_load(want, address.into_pointer_value(), "osr_live_in")
+                        .map_err(load)?
+                }
+            } else {
+                let held = self.translate_type(hir_ty)?;
+                let value = self
+                    .builder
+                    .build_load(held, at, "osr_live_in")
+                    .map_err(load)?;
+                self.coerce_scalar(value, want)?
+            };
+            args.push(value.into());
+        }
+        let call = self
+            .builder
+            .build_call(entry, &args, "osr_reenter")
+            .map_err(|e| CompilerError::CodeGen(format!("OSR re-entry call: {e}")))?;
+        if let Some(&cc) = self.func_cc.get(&func.id)
+            && cc != 0
+        {
+            call.set_call_convention(cc);
+        }
+        let ret = |e| CompilerError::CodeGen(format!("OSR re-entry return: {e}"));
+        match (
+            call.try_as_basic_value(),
+            helper.get_type().get_return_type(),
+        ) {
+            (ValueKind::Basic(value), Some(want)) => {
+                let value = self.coerce_scalar(value, want)?;
+                self.builder.build_return(Some(&value)).map_err(ret)?;
+            }
+            _ => {
+                self.builder.build_return(None).map_err(ret)?;
+            }
+        }
+        if helper.verify(crate::osr::osr_trace_enabled()) {
+            Ok(())
+        } else {
+            Err(CompilerError::CodeGen(format!(
+                "OSR re-entry helper for {:?} did not verify",
+                layout.header
+            )))
+        }
+    }
+
+    /// `value` as `want`, across the integer, pointer and float
+    /// representations one scalar can take between a frame and a
+    /// signature; anything else passes through for the verifier.
+    fn coerce_scalar(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        want: BasicTypeEnum<'ctx>,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        let cast = |e| CompilerError::CodeGen(format!("OSR scalar cast: {e}"));
+        Ok(match (value, want) {
+            (v, w) if v.get_type() == w => v,
+            (BasicValueEnum::IntValue(v), BasicTypeEnum::IntType(t)) => {
+                if v.get_type().get_bit_width() > t.get_bit_width() {
+                    self.builder
+                        .build_int_truncate(v, t, "osr_cast")
+                        .map_err(cast)?
+                        .into()
+                } else {
+                    self.builder
+                        .build_int_z_extend(v, t, "osr_cast")
+                        .map_err(cast)?
+                        .into()
+                }
+            }
+            (BasicValueEnum::IntValue(v), BasicTypeEnum::PointerType(t)) => self
+                .builder
+                .build_int_to_ptr(v, t, "osr_cast")
+                .map_err(cast)?
+                .into(),
+            (BasicValueEnum::PointerValue(v), BasicTypeEnum::IntType(t)) => self
+                .builder
+                .build_ptr_to_int(v, t, "osr_cast")
+                .map_err(cast)?
+                .into(),
+            (BasicValueEnum::IntValue(v), BasicTypeEnum::FloatType(t)) => self
+                .builder
+                .build_bit_cast(v, t, "osr_cast")
+                .map_err(cast)?,
+            (BasicValueEnum::FloatValue(v), BasicTypeEnum::IntType(t)) => self
+                .builder
+                .build_bit_cast(v, t, "osr_cast")
+                .map_err(cast)?,
+            (v, _) => v,
+        })
     }
 
     /// Recover a live-in from the i64 slot a back-edge marshalled it into.
@@ -1899,7 +2057,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                     )?
                 } else {
                     // Single value allocation
-                    self.builder.build_alloca(llvm_ty, "alloca")?
+                    self.entry_alloca(llvm_ty, "alloca")?
                 };
                 self.value_map.insert(*result, alloca.into());
                 // Record the type as a pointer to the allocated type
@@ -3471,6 +3629,33 @@ impl<'ctx> LLVMBackend<'ctx> {
         Ok(out.into())
     }
 
+    /// A stack slot of the current function, allocated in its entry block.
+    ///
+    /// One slot per activation, whatever block asks for it: an alloca
+    /// inside a loop would take fresh stack on every iteration, and only
+    /// an entry-block alloca is one the optimiser promotes.
+    fn entry_alloca(
+        &self,
+        ty: BasicTypeEnum<'ctx>,
+        name: &str,
+    ) -> CompilerResult<PointerValue<'ctx>> {
+        let entry = self
+            .current_function
+            .and_then(|f| f.get_first_basic_block());
+        let slot = match entry {
+            Some(entry) => {
+                let b = self.context.create_builder();
+                match entry.get_first_instruction() {
+                    Some(first) => b.position_before(&first),
+                    None => b.position_at_end(entry),
+                }
+                b.build_alloca(ty, name)
+            }
+            None => self.builder.build_alloca(ty, name),
+        };
+        slot.map_err(|e| CompilerError::CodeGen(format!("{name} alloca: {e}")))
+    }
+
     /// Coerce a phi incoming to the phi's own type, emitting the cast in the
     /// predecessor so it dominates the edge.
     ///
@@ -4287,7 +4472,7 @@ impl<'ctx> LLVMBackend<'ctx> {
         let destination = match &callee.abi.destination {
             Some(ty) => {
                 let llvm_ty = self.translate_type(ty)?;
-                let slot = self.builder.build_alloca(llvm_ty, "ret_dest")?;
+                let slot = self.entry_alloca(llvm_ty, "ret_dest")?;
                 param_types.push(ptr_ty.into());
                 arg_values.push(slot.into());
                 Some((slot, llvm_ty))
@@ -4305,7 +4490,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                         self.builder
                             .build_int_to_ptr(value.into_int_value(), ptr_ty, "arg_addr")?
                     } else {
-                        let slot = self.builder.build_alloca(value.get_type(), "arg")?;
+                        let slot = self.entry_alloca(value.get_type(), "arg")?;
                         self.builder.build_store(slot, value)?;
                         slot
                     };
@@ -4451,7 +4636,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                             Some(BasicMetadataTypeEnum::PointerType(_)),
                             BasicMetadataValueEnum::StructValue(sv),
                         ) => {
-                            let slot = self.builder.build_alloca(sv.get_type(), "call_arg")?;
+                            let slot = self.entry_alloca(sv.get_type().into(), "call_arg")?;
                             self.builder.build_store(slot, sv)?;
                             slot.into()
                         }
@@ -4459,7 +4644,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                             Some(BasicMetadataTypeEnum::PointerType(_)),
                             BasicMetadataValueEnum::ArrayValue(av),
                         ) => {
-                            let slot = self.builder.build_alloca(av.get_type(), "call_arg")?;
+                            let slot = self.entry_alloca(av.get_type().into(), "call_arg")?;
                             self.builder.build_store(slot, av)?;
                             slot.into()
                         }

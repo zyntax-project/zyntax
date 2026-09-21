@@ -312,3 +312,393 @@ fn a_helper_seeds_a_loop_carried_aggregate_with_the_shape_its_phi_wants() {
         backend.module().print_to_string().to_string()
     );
 }
+
+/// `walk(cell: ptr Cell, n: i64) -> i64`, with `Cell { step: i64 }`, and
+/// `bump(x: i64) -> i64 { x + 1000 }`:
+///
+/// ```text
+/// entry:  br header
+/// header: i = phi [0, entry], [i', latch]
+///         sum = phi [0, entry], [sum', latch]
+///         cmp = lt i, n; brcond cmp, body, exit
+/// body:   step = load i64, cell; s1 = add sum, step
+///         rare = eq i, 3; brcond rare, cold, latch
+/// cold:   s2 = call bump(s1); br latch
+/// latch:  sum' = phi [s1, body], [s2, cold]; i' = add i, 1; br header
+/// exit:   return sum
+/// ```
+///
+/// The loop reads through a pointer to a struct it was handed and calls
+/// a function on one of its iterations: the shapes a helper has to
+/// carry and reach. Returns the module, `walk`'s id, its header and the
+/// ids of its live-ins `(i, sum, n, cell)`.
+fn pointer_loop_with_a_cold_call() -> (
+    zyntax_compiler::hir::HirModule,
+    zyntax_compiler::hir::HirId,
+    zyntax_compiler::hir::HirId,
+    [zyntax_compiler::hir::HirId; 4],
+) {
+    use indexmap::IndexMap;
+    use zyntax_compiler::hir::{
+        BinaryOp, HirBlock, HirCallable, HirConstant, HirFunction, HirFunctionSignature, HirId,
+        HirInstruction, HirModule, HirParam, HirPhi, HirStructType, HirTerminator, HirType,
+        HirValue, HirValueKind,
+    };
+    use zyntax_typed_ast::InternedString;
+
+    let i64_ty = HirType::I64;
+    let cell_ty = HirType::Ptr(Box::new(HirType::Struct(HirStructType {
+        name: Some(InternedString::new_global("Cell")),
+        fields: vec![HirType::I64],
+        packed: false,
+    })));
+    let value = |id, ty: &HirType, kind| HirValue {
+        id,
+        ty: ty.clone(),
+        kind,
+        uses: Default::default(),
+        span: None,
+    };
+    let block = |id, phis, instructions, terminator| HirBlock {
+        id,
+        label: None,
+        phis,
+        instructions,
+        terminator,
+        dominance_frontier: Default::default(),
+        predecessors: vec![],
+        successors: vec![],
+    };
+    let signature = |params: Vec<(HirId, &str, HirType)>| HirFunctionSignature {
+        params: params
+            .into_iter()
+            .map(|(id, name, ty)| HirParam {
+                id,
+                name: InternedString::new_global(name),
+                ty,
+                attributes: Default::default(),
+                ownership: Default::default(),
+            })
+            .collect(),
+        returns: vec![HirType::I64],
+        type_params: vec![],
+        const_params: vec![],
+        lifetime_params: vec![],
+        is_variadic: false,
+        is_async: false,
+        is_fiber: false,
+        effects: vec![],
+        is_pure: false,
+    };
+
+    // bump(x) = x + 1000
+    let x = HirId::new();
+    let thousand = HirId::new();
+    let bumped = HirId::new();
+    let bump_entry = HirId::new();
+    let mut bump = HirFunction::new(
+        InternedString::new_global("bump"),
+        signature(vec![(x, "x", i64_ty.clone())]),
+    );
+    bump.values = IndexMap::from([
+        (x, value(x, &i64_ty, HirValueKind::Parameter(0))),
+        (
+            thousand,
+            value(
+                thousand,
+                &i64_ty,
+                HirValueKind::Constant(HirConstant::I64(1000)),
+            ),
+        ),
+        (bumped, value(bumped, &i64_ty, HirValueKind::Instruction)),
+    ]);
+    bump.blocks = IndexMap::from([(
+        bump_entry,
+        block(
+            bump_entry,
+            vec![],
+            vec![HirInstruction::Binary {
+                op: BinaryOp::Add,
+                result: bumped,
+                ty: i64_ty.clone(),
+                left: x,
+                right: thousand,
+            }],
+            HirTerminator::Return {
+                values: vec![bumped],
+            },
+        ),
+    )]);
+    bump.entry_block = bump_entry;
+    let bump_id = bump.id;
+
+    // walk(cell, n)
+    let [
+        cell,
+        n,
+        zero,
+        one,
+        three,
+        phi_i,
+        phi_sum,
+        cmp,
+        step,
+        s1,
+        rare,
+        s2,
+        sum_next,
+        i_next,
+    ] = std::array::from_fn(|_| HirId::new());
+    let [entry, header, body, cold, latch, exit] = std::array::from_fn(|_| HirId::new());
+    let mut walk = HirFunction::new(
+        InternedString::new_global("walk"),
+        signature(vec![
+            (cell, "cell", cell_ty.clone()),
+            (n, "n", i64_ty.clone()),
+        ]),
+    );
+    walk.values = IndexMap::from([
+        (cell, value(cell, &cell_ty, HirValueKind::Parameter(0))),
+        (n, value(n, &i64_ty, HirValueKind::Parameter(1))),
+        (
+            zero,
+            value(zero, &i64_ty, HirValueKind::Constant(HirConstant::I64(0))),
+        ),
+        (
+            one,
+            value(one, &i64_ty, HirValueKind::Constant(HirConstant::I64(1))),
+        ),
+        (
+            three,
+            value(three, &i64_ty, HirValueKind::Constant(HirConstant::I64(3))),
+        ),
+        (cmp, value(cmp, &HirType::Bool, HirValueKind::Instruction)),
+        (rare, value(rare, &HirType::Bool, HirValueKind::Instruction)),
+    ]);
+    for id in [phi_i, phi_sum, step, s1, s2, sum_next, i_next] {
+        walk.values
+            .insert(id, value(id, &i64_ty, HirValueKind::Instruction));
+    }
+    walk.blocks = IndexMap::from([
+        (
+            entry,
+            block(
+                entry,
+                vec![],
+                vec![],
+                HirTerminator::Branch { target: header },
+            ),
+        ),
+        (
+            header,
+            block(
+                header,
+                vec![
+                    HirPhi {
+                        result: phi_i,
+                        ty: i64_ty.clone(),
+                        incoming: vec![(zero, entry), (i_next, latch)],
+                    },
+                    HirPhi {
+                        result: phi_sum,
+                        ty: i64_ty.clone(),
+                        incoming: vec![(zero, entry), (sum_next, latch)],
+                    },
+                ],
+                vec![HirInstruction::Binary {
+                    op: BinaryOp::Lt,
+                    result: cmp,
+                    ty: HirType::Bool,
+                    left: phi_i,
+                    right: n,
+                }],
+                HirTerminator::CondBranch {
+                    condition: cmp,
+                    true_target: body,
+                    false_target: exit,
+                },
+            ),
+        ),
+        (
+            body,
+            block(
+                body,
+                vec![],
+                vec![
+                    HirInstruction::Load {
+                        result: step,
+                        ty: i64_ty.clone(),
+                        ptr: cell,
+                        align: 8,
+                        volatile: false,
+                    },
+                    HirInstruction::Binary {
+                        op: BinaryOp::Add,
+                        result: s1,
+                        ty: i64_ty.clone(),
+                        left: phi_sum,
+                        right: step,
+                    },
+                    HirInstruction::Binary {
+                        op: BinaryOp::Eq,
+                        result: rare,
+                        ty: HirType::Bool,
+                        left: phi_i,
+                        right: three,
+                    },
+                ],
+                HirTerminator::CondBranch {
+                    condition: rare,
+                    true_target: cold,
+                    false_target: latch,
+                },
+            ),
+        ),
+        (
+            cold,
+            block(
+                cold,
+                vec![],
+                vec![HirInstruction::Call {
+                    result: Some(s2),
+                    callee: HirCallable::Function(bump_id),
+                    args: vec![s1],
+                    type_args: vec![],
+                    const_args: vec![],
+                    is_tail: false,
+                }],
+                HirTerminator::Branch { target: latch },
+            ),
+        ),
+        (
+            latch,
+            block(
+                latch,
+                vec![HirPhi {
+                    result: sum_next,
+                    ty: i64_ty.clone(),
+                    incoming: vec![(s1, body), (s2, cold)],
+                }],
+                vec![HirInstruction::Binary {
+                    op: BinaryOp::Add,
+                    result: i_next,
+                    ty: i64_ty.clone(),
+                    left: phi_i,
+                    right: one,
+                }],
+                HirTerminator::Branch { target: header },
+            ),
+        ),
+        (
+            exit,
+            block(
+                exit,
+                vec![],
+                vec![],
+                HirTerminator::Return {
+                    values: vec![phi_sum],
+                },
+            ),
+        ),
+    ]);
+    walk.entry_block = entry;
+    let walk_id = walk.id;
+
+    let mut module = HirModule::new(InternedString::new_global("pointer_loop"));
+    module.functions.insert(bump_id, bump);
+    module.functions.insert(walk_id, walk);
+    (module, walk_id, header, [phi_i, phi_sum, n, cell])
+}
+
+/// A loop that calls a function on a cold path and reads through a
+/// struct pointer it was handed gets an LLVM resume point, and finishing
+/// in it gives the interpreter's answer.
+#[test]
+fn a_loop_with_a_cold_call_and_a_pointer_live_in_finishes_in_an_llvm_helper() {
+    use zyntax_compiler::cranelift_backend::CraneliftBackend;
+    use zyntax_compiler::hir::HirType;
+    use zyntax_compiler::hir_interp::{HirInterpreter, value_to_i64};
+    use zyntax_compiler::llvm_jit_backend::LLVMJitBackend;
+    use zyntax_compiler::value::ZyntaxValue;
+
+    const BEAD: u64 = 0x9021;
+    let (module, walk_id, header, [phi_i, phi_sum, n_id, cell_id]) =
+        pointer_loop_with_a_cold_call();
+    let walk = &module.functions[&walk_id];
+    let layout = osr::osr_layout(walk, header).expect("the loop should have an OSR layout");
+    assert!(
+        layout
+            .live_in_types
+            .iter()
+            .any(|ty| matches!(ty, HirType::Ptr(inner) if matches!(**inner, HirType::Struct(_)))),
+        "fixture should carry a struct pointer live-in: {:?}",
+        layout.live_in_types
+    );
+    let site = layout.site_key();
+
+    let mut cell: [i64; 1] = [7];
+    let n: i64 = 100;
+    let mut interp = HirInterpreter::new();
+    let expected = interp
+        .call(
+            &module,
+            "walk",
+            vec![
+                ZyntaxValue::Pointer(cell.as_mut_ptr() as *mut u8),
+                ZyntaxValue::Int(n),
+            ],
+        )
+        .expect("the interpreter runs walk");
+    let expected = value_to_i64(&expected).expect("an integer");
+    assert_eq!(expected, n * 7 + 1000);
+
+    let osr_syms = osr::osr_runtime_symbols();
+    let mut cranelift = CraneliftBackend::with_runtime_symbols(&osr_syms).expect("backend");
+    cranelift.set_compile_tier(0);
+    cranelift.set_compile_bead_id(BEAD);
+    cranelift.compile_module(&module).expect("tier-0 compile");
+    cranelift.finalize_definitions().expect("finalize");
+    let tier0 = cranelift.get_function_ptr(walk_id).expect("tier-0 pointer");
+    let f: extern "C" fn(*mut i64, i64) -> i64 = unsafe { std::mem::transmute(tier0) };
+    assert_eq!(f(cell.as_mut_ptr(), n), expected, "tier 0 alone");
+
+    let context = Context::create();
+    let mut llvm = LLVMJitBackend::new(&context).expect("llvm jit backend");
+    llvm.set_compile_tier(1);
+    llvm.compile_module(&module).expect("llvm compile");
+    let (_, helper_site, helper_code) = llvm
+        .take_pending_osr_helpers()
+        .into_iter()
+        .find(|(id, s, _)| *id == walk_id && *s == site)
+        .expect("LLVM should make a resume point for a loop with a call and a pointer live-in");
+    assert!(!helper_code.is_null());
+
+    // Entered directly from mid-loop state: i = 5 is past the cold
+    // iteration, so 95 more steps of 7 land on top of the sum handed in.
+    let helper: extern "C" fn(*mut u8) -> i64 = unsafe { std::mem::transmute(helper_code) };
+    let mut frame = vec![0u8; layout.frame.size as usize];
+    for (slot, id) in layout.live_ins.iter().enumerate() {
+        let off = layout.frame.offsets[slot] as usize;
+        let word: u64 = if *id == phi_i {
+            5
+        } else if *id == phi_sum {
+            10
+        } else if *id == n_id {
+            n as u64
+        } else if *id == cell_id {
+            cell.as_mut_ptr() as u64
+        } else {
+            panic!("unexpected live-in {id:?}");
+        };
+        frame[off..off + 8].copy_from_slice(&word.to_ne_bytes());
+    }
+    assert_eq!(helper(frame.as_mut_ptr()), 10 + 95 * 7);
+
+    // And through the back-edge: the first header visit transfers, and
+    // the whole run, cold call included, still gives the interpreter's
+    // answer.
+    osr::publish_helper(BEAD, helper_site, helper_code);
+    assert_eq!(f(cell.as_mut_ptr(), n), expected);
+    cell[0] = 3;
+    assert_eq!(f(cell.as_mut_ptr(), 50), 50 * 3 + 1000);
+}

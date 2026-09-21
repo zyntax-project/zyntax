@@ -1637,10 +1637,46 @@ mod tests {
             assert_eq!(bead, id);
             seen.fetch_add(1, Ordering::Relaxed) > 0
         });
-        osr_request_promotion(id);
-        osr_request_promotion(id);
-        osr_request_promotion(id);
+        osr_request_promotion(id, NO_SITE);
+        osr_request_promotion(id, NO_SITE);
+        osr_request_promotion(id, NO_SITE);
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        requested().write().unwrap().remove(&(id, 0));
+        set_promotion_requester(|_, _| false);
+    }
+
+    /// Once a bead's compile is asked for, a compiled frame at a header
+    /// without a resume point asks for one there, once per site; a frame
+    /// at a header that has one asks for nothing.
+    #[test]
+    fn a_later_frame_asks_for_its_own_resume_point() {
+        use std::sync::Mutex;
+
+        let id = u64::MAX - 44;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        set_promotion_requester(move |bead, from| {
+            assert_eq!(bead, id);
+            log.lock().unwrap().push(from);
+            true
+        });
+        let first = encode_osr_site(7, 0, 2);
+        let second = encode_osr_site(7, 1, 2);
+        osr_request_promotion(id, first);
+        osr_request_promotion(id, first);
+        osr_request_promotion(id, second);
+        osr_request_promotion(id, second);
+        publish_helper(id, first, 8 as *mut ());
+        osr_request_promotion(id, first);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                Requester::Compiled { site: first },
+                Requester::Resume { site: first },
+                Requester::Resume { site: second },
+            ]
+        );
+        assert_eq!(sites_asked(id), [first, second].into_iter().collect());
         requested().write().unwrap().remove(&(id, 0));
         set_promotion_requester(|_, _| false);
     }
@@ -2218,18 +2254,37 @@ pub extern "C" fn lazy_compile(bead_id: u64) -> *const u8 {
 /// Symbol a compiled function calls once its loop has stayed hot.
 pub const OSR_REQUEST_SYMBOL: &str = "__zyntax_osr_request";
 
+/// The site a request carries when the frame is at no header: one made
+/// at a function's entry, once it has been called often enough. Not a
+/// site key: a key's live-in count stays below `u16::MAX`.
+pub const NO_SITE: u64 = u64::MAX;
+
 /// Where a request comes from: a frame running compiled code, or one
 /// the interpreter is still running.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Requester {
-    Compiled,
+    /// A compiled frame, from the back-edge it has revisited past the
+    /// threshold: the site it will leave through.
+    Compiled { site: u64 },
     /// An interpreted frame, at the loop header whose OSR site this is.
     /// The site names the body the frame runs (its tag): the resume
     /// points it can leave through are that body's, and the one at this
     /// header is the one it waits at.
-    Interpreted {
-        site: u64,
-    },
+    Interpreted { site: u64 },
+    /// A compiled frame at a header of a bead whose compile was already
+    /// asked for, with no resume point at this site: it wants one there.
+    Resume { site: u64 },
+}
+
+impl Requester {
+    /// The site the requesting frame is at.
+    pub fn site(self) -> u64 {
+        match self {
+            Requester::Compiled { site }
+            | Requester::Interpreted { site }
+            | Requester::Resume { site } => site,
+        }
+    }
 }
 
 /// Installed by the runtime to answer a request: resume points for an
@@ -2260,21 +2315,193 @@ impl Requester {
     /// What a request from here is deduplicated on.
     fn key(self, bead_id: u64) -> (u64, u64) {
         match self {
-            Requester::Compiled => (bead_id, 0),
+            Requester::Compiled { .. } | Requester::Resume { .. } => (bead_id, 0),
             Requester::Interpreted { site } => (bead_id, site),
         }
     }
 }
 
+/// Sites frames asked for a resume point at, by bead, and whether a
+/// compiled frame asked: one from the back-edge it has revisited past
+/// the threshold, an interpreted frame from the header it waits at. The
+/// optimizing tier makes its resume points where one of these is.
+fn asked_sites() -> &'static RwLock<HashMap<u64, HashMap<u64, bool>>> {
+    static S: OnceLock<RwLock<HashMap<u64, HashMap<u64, bool>>>> = OnceLock::new();
+    S.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Record that a frame of `bead_id` asked for a resume point at `site`.
+pub fn note_site_asked(bead_id: u64, site: u64, compiled: bool) {
+    *asked_sites()
+        .write()
+        .unwrap()
+        .entry(bead_id)
+        .or_default()
+        .entry(site)
+        .or_default() |= compiled;
+}
+
+/// The sites of `bead_id` a frame could still take a resume point at:
+/// those compiled frames asked at, and those interpreted frames asked
+/// at while one of them still waits.
+pub fn sites_asked(bead_id: u64) -> std::collections::HashSet<u64> {
+    let waiting = frame_waiting(bead_id);
+    asked_sites()
+        .read()
+        .unwrap()
+        .get(&bead_id)
+        .map(|sites| {
+            sites
+                .iter()
+                .filter(|(_, compiled)| **compiled || waiting)
+                .map(|(site, _)| *site)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Sites of `bead_id` whose resume point at this site was asked for
+/// after the bead's compile, once each.
+fn late_sites() -> &'static RwLock<std::collections::HashSet<(u64, u64)>> {
+    static S: OnceLock<RwLock<std::collections::HashSet<(u64, u64)>>> = OnceLock::new();
+    S.get_or_init(|| RwLock::new(std::collections::HashSet::new()))
+}
+
+/// The loop header an outlined region's entry leads to: the header the
+/// frame the region was made for resumes at. `None` for a function
+/// whose entry does not lead straight to a loop.
+pub fn region_entry_header(function: &HirFunction) -> Option<HirId> {
+    let headers: std::collections::HashSet<HirId> =
+        find_loop_headers(function).into_iter().collect();
+    let mut block = function.entry_block;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if headers.contains(&block) {
+            return Some(block);
+        }
+        if !seen.insert(block) {
+            return None;
+        }
+        match &function.blocks.get(&block)?.terminator {
+            HirTerminator::Branch { target } => block = *target,
+            _ => return None,
+        }
+    }
+}
+
+/// Where each parameter of an outlined region sits in the frame a
+/// probe at the region's entry header hands over: the slot of the
+/// live-in it is, or of the header phi it seeds, `None` for a parameter
+/// nothing reads. A resume point at that header can then re-enter the
+/// region through its entry with the frame's values as arguments
+/// instead of carrying a copy of the region. `None` when it cannot: the
+/// header is not the entry's, a live-in is repaired at it, or a
+/// parameter is read on the way to the header (a hoisted computation),
+/// where the frame carries the result but not the input.
+pub fn region_params_in_frame(
+    function: &HirFunction,
+    layout: &OsrLayout,
+) -> Option<Vec<Option<usize>>> {
+    if !function.attributes.osr_region
+        || !layout.repairs.is_empty()
+        || layout.destination.is_some()
+        || region_entry_header(function) != Some(layout.header)
+    {
+        return None;
+    }
+    let slot_of: HashMap<HirId, usize> = layout
+        .live_ins
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+    let in_region: IdSet = reachable_from(function, layout.header)
+        .into_iter()
+        .collect();
+    // Params seeding a header phi through the entry edge take that
+    // phi's slot: the phi's value at the transfer is the state the
+    // region resumes from.
+    let mut seed_slot: HashMap<HirId, usize> = HashMap::new();
+    for phi in &function.blocks.get(&layout.header)?.phis {
+        let Some(&slot) = slot_of.get(&phi.result) else {
+            continue;
+        };
+        if slot >= layout.phi_count {
+            continue;
+        }
+        for (value, pred) in &phi.incoming {
+            if !in_region.contains(pred) {
+                seed_slot.insert(*value, slot);
+            }
+        }
+    }
+    // Everything read other than through an entry edge into a header phi.
+    let mut read: IdSet = IdSet::default();
+    for (block_id, block) in &function.blocks {
+        for inst in &block.instructions {
+            inst.for_each_operand(|u| {
+                read.insert(u);
+            });
+        }
+        read.extend(terminator_uses(&block.terminator));
+        for phi in &block.phis {
+            for (value, pred) in &phi.incoming {
+                if *block_id != layout.header || in_region.contains(pred) {
+                    read.insert(*value);
+                }
+            }
+        }
+    }
+    function
+        .signature
+        .params
+        .iter()
+        .map(|param| {
+            let id = param.id;
+            match (slot_of.get(&id), seed_slot.get(&id)) {
+                (Some(_), Some(_)) => None,
+                (Some(&slot), None) => Some(Some(slot)),
+                (None, Some(&slot)) if !read.contains(&id) => Some(Some(slot)),
+                (None, Some(_)) => None,
+                (None, None) if read.contains(&id) => None,
+                (None, None) => Some(None),
+            }
+        })
+        .collect()
+}
+
+/// The sites the optimizing tier makes resume points at when it
+/// compiles `function` for `bead_id`: those frames asked at, and for an
+/// outlined region the header its entry leads to, which the frame it
+/// was outlined for is in. A resume point is the function from its
+/// header on, optimised like the entry, so none is made where no frame
+/// can take it.
+pub fn wanted_resume_points(
+    bead_id: u64,
+    function: &HirFunction,
+) -> std::collections::HashSet<u64> {
+    let mut sites = sites_asked(bead_id);
+    if function.attributes.osr_region {
+        if let Some(site) = region_entry_header(function)
+            .and_then(|header| osr_layout(function, header).ok())
+            .map(|layout| layout.site_key())
+        {
+            sites.insert(site);
+        }
+    }
+    sites
+}
+
 /// Called when a compiled frame has revisited a resumable loop enough
 /// times to justify a background compile. Invocation counts alone cannot
-/// promote a function that remains in one long-running call.
+/// promote a function that remains in one long-running call. `site` is
+/// the header the frame is at, where its resume point goes.
 ///
 /// # Safety
 /// Called from generated code with C ABI.
 #[unsafe(no_mangle)]
-pub extern "C" fn osr_request_promotion(bead_id: u64) {
-    request(bead_id, Requester::Compiled);
+pub extern "C" fn osr_request_promotion(bead_id: u64, site: u64) {
+    request(bead_id, Requester::Compiled { site });
 }
 
 /// The interpreter's request for the loop it is running: the same
@@ -2347,17 +2574,38 @@ pub fn run_promotion(bead_id: u64, from: Requester) -> bool {
 }
 
 fn request(bead_id: u64, from: Requester) {
-    let key = from.key(bead_id);
-    if !requested().write().unwrap().insert(key) {
-        return;
+    if from.site() != NO_SITE {
+        note_site_asked(
+            bead_id,
+            from.site(),
+            !matches!(from, Requester::Interpreted { .. }),
+        );
     }
+    let key = from.key(bead_id);
+    let first = requested().write().unwrap().insert(key);
+    let from = if first {
+        from
+    } else {
+        // The bead's compile was asked for already. A compiled frame at
+        // a header it has no resume point at still wants one there.
+        match from {
+            Requester::Compiled { site }
+                if site != NO_SITE
+                    && helper_for(bead_id, site).is_null()
+                    && late_sites().write().unwrap().insert((bead_id, site)) =>
+            {
+                Requester::Resume { site }
+            }
+            _ => return,
+        }
+    };
     if osr_trace_enabled() {
         eprintln!("[osr] promotion requested for bead={bead_id} ({from:?})");
     }
     let guard = promotion_requester().read().unwrap();
     let submitted = guard.as_ref().is_some_and(|f| f(bead_id, from));
     drop(guard);
-    if !submitted {
+    if !submitted && first {
         requested().write().unwrap().remove(&key);
     }
 }

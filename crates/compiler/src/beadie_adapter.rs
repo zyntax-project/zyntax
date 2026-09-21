@@ -413,6 +413,48 @@ mod llvm_impl {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             f(&mut guard)
         }
+
+        /// This tier's resume points for `def`'s function at `sites`
+        /// alone, as `(site, code)`, published under the bead. The
+        /// function is compiled again for them; its entry is left to
+        /// whatever code is installed.
+        pub fn resume_points(
+            &self,
+            def: &ZyntaxFunctionDef,
+            sites: std::collections::HashSet<u64>,
+        ) -> Vec<(u64, *mut ())> {
+            if sites.is_empty() {
+                return Vec::new();
+            }
+            self.with_lock(|backend| {
+                backend.set_compile_tier(def.tier);
+                backend.set_module_context(std::sync::Arc::clone(&def.module));
+                backend.set_osr_helper_sites(Some(sites));
+                if backend.compile_function(def.id, &def.function).is_err() {
+                    return Vec::new();
+                }
+                Self::publish_helpers(backend, def)
+            })
+        }
+
+        /// Publish the helpers of the last install that belong to `def`'s
+        /// function under its bead, so back-edges still running tier-0
+        /// code can finish here instead of waiting for the next call.
+        fn publish_helpers(
+            backend: &mut LLVMJitBackend<'static>,
+            def: &ZyntaxFunctionDef,
+        ) -> Vec<(u64, *mut ())> {
+            backend
+                .take_pending_osr_helpers()
+                .into_iter()
+                .filter(|(id, _, _)| *id == def.id)
+                .map(|(_, site, code)| {
+                    crate::osr::note_llvm_helper(code as usize);
+                    crate::osr::publish_helper(def.bead_id, site, code);
+                    (site, code)
+                })
+                .collect()
+        }
     }
 
     impl JitBackend for ZyntaxLlvmBackend {
@@ -425,22 +467,17 @@ mod llvm_impl {
             def: Self::FunctionDef,
         ) -> Result<*mut (), Self::Error> {
             let tier = def.tier;
-            let bead_id = def.bead_id;
+            // Resume points where a frame can take one: the sites frames
+            // asked at, and an outlined region's own header.
+            let sites = crate::osr::wanted_resume_points(def.bead_id, &def.function);
             self.with_lock(|backend| {
                 backend.set_compile_tier(tier);
                 backend.set_module_context(std::sync::Arc::clone(&def.module));
+                backend.set_osr_helper_sites(Some(sites));
                 backend
                     .compile_function(def.id, &def.function)
                     .map_err(|e| CompileError::new(format!("llvm compile_function failed: {e}")))?;
-
-                // Publish this tier's resume points so back-edges still
-                // running tier-0 code can finish here instead of waiting
-                // for the next call. Only this function's own helpers are
-                // in play, so they all belong to this bead.
-                for (_, site, code) in backend.take_pending_osr_helpers() {
-                    crate::osr::note_llvm_helper(code as usize);
-                    crate::osr::publish_helper(bead_id, site, code);
-                }
+                Self::publish_helpers(backend, &def);
 
                 backend
                     .get_function_pointer(def.id)

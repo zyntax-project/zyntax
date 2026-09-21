@@ -2543,14 +2543,22 @@ impl CraneliftBackend {
                 builder.seal_block(entry_block);
             }
 
-            let osr_backedges = if osr_helper.is_none() && !osr_layouts.is_empty() {
-                let counter = builder.declare_var(types::I64);
-                let zero = builder.ins().iconst(types::I64, 0);
-                builder.def_var(counter, zero);
-                Some(counter)
-            } else {
-                None
-            };
+            // One visit counter per resumable header: the request names
+            // the header the frame is hot at, where its resume point goes.
+            let osr_backedges: HashMap<HirId, cranelift_frontend::Variable> =
+                if osr_helper.is_none() {
+                    osr_layouts
+                        .keys()
+                        .map(|header| {
+                            let counter = builder.declare_var(types::I64);
+                            let zero = builder.ins().iconst(types::I64, 0);
+                            builder.def_var(counter, zero);
+                            (*header, counter)
+                        })
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
             // Tier-0 entry probe: a callee that compiled code reaches
             // through its cell is counted here, and asks for promotion
             // once it is hot.
@@ -2841,14 +2849,6 @@ impl CraneliftBackend {
                 // happen.
                 if osr_loop_headers.contains(hir_block_id) && osr_layouts.contains_key(hir_block_id)
                 {
-                    if let Some(counter) = osr_backedges {
-                        emit_osr_request_after_backedges(
-                            &mut builder,
-                            &mut self.module,
-                            osr_bead_id,
-                            counter,
-                        );
-                    }
                     let block_index = osr_block_index.get(hir_block_id).copied().unwrap_or(0);
 
                     let empty_frame = crate::osr::OsrFrame::for_types(&[]);
@@ -2908,6 +2908,16 @@ impl CraneliftBackend {
                                 None,
                             )
                         };
+
+                    if let Some(counter) = osr_backedges.get(hir_block_id) {
+                        emit_osr_request_after_backedges(
+                            &mut builder,
+                            &mut self.module,
+                            osr_bead_id,
+                            site_key,
+                            *counter,
+                        );
+                    }
 
                     // Tag the probe's first instruction with a srcloc that
                     // encodes which site it is. `get_srclocs_sorted` is the
@@ -10458,12 +10468,13 @@ fn get_successors(terminator: &HirTerminator) -> Vec<HirId> {
 }
 
 /// Count visits in SSA so a short-lived loop does not start an LLVM compile.
-/// Only the threshold visit calls into the runtime; all other visits stay
-/// in generated code.
+/// Only the threshold visit calls into the runtime, naming this site; all
+/// other visits stay in generated code.
 fn emit_osr_request_after_backedges(
     builder: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
     bead_id: u64,
+    site_key: u64,
     counter: cranelift_frontend::Variable,
 ) {
     let count = builder.use_var(counter);
@@ -10482,11 +10493,13 @@ fn emit_osr_request_after_backedges(
     builder.seal_block(request_block);
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(types::I64));
+    sig.params.push(AbiParam::new(types::I64));
     if let Ok(fid) = module.declare_function(crate::osr::OSR_REQUEST_SYMBOL, Linkage::Import, &sig)
     {
         let f = module.declare_func_in_func(fid, builder.func);
         let bead = builder.ins().iconst(types::I64, bead_id as i64);
-        builder.ins().call(f, &[bead]);
+        let site = builder.ins().iconst(types::I64, site_key as i64);
+        builder.ins().call(f, &[bead, site]);
     }
     builder.ins().jump(continue_block, &[]);
 
@@ -10522,11 +10535,14 @@ fn emit_osr_request_after_calls(
     builder.seal_block(request_block);
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(types::I64));
+    sig.params.push(AbiParam::new(types::I64));
     if let Ok(fid) = module.declare_function(crate::osr::OSR_REQUEST_SYMBOL, Linkage::Import, &sig)
     {
         let f = module.declare_func_in_func(fid, builder.func);
         let bead = builder.ins().iconst(types::I64, bead_id as i64);
-        builder.ins().call(f, &[bead]);
+        // At its entry the frame is at no header.
+        let site = builder.ins().iconst(types::I64, crate::osr::NO_SITE as i64);
+        builder.ins().call(f, &[bead, site]);
     }
     builder.ins().jump(continue_block, &[]);
 
