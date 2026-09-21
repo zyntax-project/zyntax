@@ -146,9 +146,9 @@ fn run() -> ExitCode {
             1
         }
     };
-    // Stop the runtime's own threads; what it holds is the process's
-    // and goes with it.
-    rt.shutdown();
+    // The runtime's own threads are told to stop, not waited for: what
+    // it holds is the process's and goes with it.
+    rt.stop();
     lap("shutdown");
     exit_now(rt, code)
 }

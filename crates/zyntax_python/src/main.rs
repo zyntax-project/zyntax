@@ -132,10 +132,9 @@ fn main() -> ExitCode {
             1
         }
     };
-    // Stop the runtime's own threads; what it holds is the process's
-    // and goes with it. Freeing it all by hand took 8 to 25 ms, and
-    // waiting for a promotion still in flight the same again.
-    rt.shutdown();
+    // The runtime's own threads are told to stop, not waited for: what
+    // it holds is the process's and goes with it.
+    rt.stop();
     lap("shutdown");
     exit_now(rt, code)
 }

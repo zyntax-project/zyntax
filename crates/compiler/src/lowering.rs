@@ -253,6 +253,17 @@ pub struct LoweringContext {
     prelowered_functions: std::collections::HashMap<InternedString, crate::hir::HirId>,
     prelowered_bodies: std::collections::HashSet<InternedString>,
     prelowered_globals: std::collections::HashMap<InternedString, crate::hir::HirId>,
+    /// Which prelowered module holds each function, by id, built at
+    /// the first adoption round.
+    prelowered_by_id: Option<std::collections::HashMap<crate::hir::HirId, usize>>,
+    /// The module's functions and globals whose call targets an
+    /// adoption round has followed; a later round follows only what
+    /// arrived since.
+    adopt_followed: std::collections::HashSet<crate::hir::HirId>,
+    /// Functions adopted so far, and the time spent decoding them, for
+    /// the phase trace; the clock is read only when the trace is on.
+    adopted: (usize, f64),
+    trace_phases: bool,
     /// Functions dropped because their body failed analysis, keyed by
     /// the id a call site still carries, with the name and what the
     /// analysis said. A drop is only tolerable while nothing calls the
@@ -567,6 +578,10 @@ impl LoweringContext {
                 .iter()
                 .flat_map(|m| m.shell().globals.values().map(|g| (g.name, g.id)))
                 .collect(),
+            prelowered_by_id: None,
+            adopt_followed: std::collections::HashSet::new(),
+            adopted: (0, 0.0),
+            trace_phases: std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some(),
             dropped_for: std::collections::HashMap::new(),
             type_registry,
             arena,
@@ -725,17 +740,19 @@ impl LoweringContext {
     /// The prelowered functions the module's bodies reach, directly or
     /// through one another, and nothing else: a program calls a little
     /// of a library, and copying the rest in only to drop it again is
-    /// what an import would otherwise cost. Returns whether anything was
-    /// adopted.
+    /// what an import would otherwise cost. A round follows the calls
+    /// of what arrived since the last one; a body followed once is
+    /// never rewritten. Returns whether anything was adopted.
     fn adopt_prelowered_reached(&mut self) -> bool {
         use crate::hir::{HirCallable, HirInstruction};
-        let by_id: std::collections::HashMap<crate::hir::HirId, usize> = self
-            .config
-            .prelowered
-            .iter()
-            .enumerate()
-            .flat_map(|(m, module)| module.shell().functions.keys().map(move |id| (*id, m)))
-            .collect();
+        let by_id = self.prelowered_by_id.get_or_insert_with(|| {
+            self.config
+                .prelowered
+                .iter()
+                .enumerate()
+                .flat_map(|(m, module)| module.shell().functions.keys().map(move |id| (*id, m)))
+                .collect()
+        });
         if by_id.is_empty() {
             return false;
         }
@@ -756,11 +773,15 @@ impl LoweringContext {
             targets
         };
         let mut pending: Vec<crate::hir::HirId> = Vec::new();
-        for function in self.module.functions.values() {
-            pending.extend(targets_of(function));
+        for (id, function) in &self.module.functions {
+            if self.adopt_followed.insert(*id) {
+                pending.extend(targets_of(function));
+            }
         }
-        for global in self.module.globals.values() {
-            if let Some(init) = &global.initializer {
+        for (id, global) in &self.module.globals {
+            if self.adopt_followed.insert(*id)
+                && let Some(init) = &global.initializer
+            {
                 crate::dce::collect_vtable_funcs(init, &mut pending);
             }
         }
@@ -772,10 +793,16 @@ impl LoweringContext {
             let Some(&m) = by_id.get(&target) else {
                 continue;
             };
+            let decoding = self.trace_phases.then(web_time::Instant::now);
             let Some(function) = self.config.prelowered[m].function(target) else {
                 continue;
             };
+            self.adopted.0 += 1;
+            if let Some(decoding) = decoding {
+                self.adopted.1 += decoding.elapsed().as_secs_f64() * 1000.0;
+            }
             pending.extend(targets_of(&function));
+            self.adopt_followed.insert(target);
             self.module.functions.insert(target, function);
             adopted = true;
         }
@@ -868,7 +895,7 @@ impl AstLowering for LoweringContext {
         // Phase timings, behind the same env var the embedder's phase
         // trace uses, so one switch reports the whole front half. The
         // timer reads no clock unless the trace is on.
-        let mut phase = PhaseTimer::new(std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some());
+        let mut phase = PhaseTimer::new(self.trace_phases);
         self.initialize_copy_types();
         let copy_ms = phase.lap();
 
@@ -977,8 +1004,11 @@ impl AstLowering for LoweringContext {
             eprintln!(
                 "[LOWER-PROGRAM] copy_types = {copy_ms:.2}  typecheck = {typecheck_ms:.2}  \
                  method_types = {methods_ms:.2}  collect_decls = {collect_ms:.2}  \
-                 declarations = {declared_ms:.2} ms ({})  bodies = {bodies_ms:.2} ms",
-                program.declarations.len()
+                 declarations = {declared_ms:.2} ms ({})  bodies = {bodies_ms:.2} ms \
+                 (adopted {} functions, decoded in {:.2} ms)",
+                program.declarations.len(),
+                self.adopted.0,
+                self.adopted.1
             );
         }
 

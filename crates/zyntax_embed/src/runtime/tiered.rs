@@ -955,6 +955,14 @@ impl TieredRuntime {
         &self.config
     }
 
+    /// Tell the runtime's compile threads to stop and return at once,
+    /// without waiting for them or freeing anything: for a process that
+    /// ends with `_exit` right after, taking the threads with it. A host
+    /// that lives on calls [`Self::shutdown`] instead.
+    pub fn stop(&mut self) {
+        self.backend.stop();
+    }
+
     /// Shutdown the runtime (stops background optimization). Frees any
     /// host-driven fibers still registered — their stacks and handler
     /// segments do not outlive the runtime that owns them.

@@ -2771,17 +2771,27 @@ impl TieredBackend {
             };
             // What this function calls will be called from its native code
             // as soon as it runs, through stubs that compile on the spot:
-            // asked of the worker now, so they are compiled first.
+            // asked of the worker now, so they are compiled first. Not
+            // what a library function only takes the address of: a
+            // library builder fills a whole table with functions the
+            // program may never call. Nor a cold callee.
             if let Some(queue) = queue_for_callees.lock().unwrap().as_ref()
                 && let Some(f) = module_arc.functions.get(func_id)
             {
-                for callee in direct_lazy_callees(f, &bead_of) {
-                    if !by_bead
-                        .get(&callee)
-                        .is_some_and(|(_, b, _)| b.bead().compiled().is_some())
+                let closures = !finished.contains(func_id);
+                for callee in direct_lazy_callees(f, closures, &bead_of) {
+                    let Some((callee_id, bound, module)) = by_bead.get(&callee) else {
+                        continue;
+                    };
+                    if bound.bead().compiled().is_some()
+                        || module
+                            .functions
+                            .get(callee_id)
+                            .is_some_and(|f| f.attributes.cold)
                     {
-                        queue.request_compile(callee, None);
+                        continue;
                     }
+                    queue.request_compile(callee, None);
                 }
             }
             let lazy_started = std::time::Instant::now();
@@ -3435,6 +3445,18 @@ impl TieredBackend {
         }
     }
 
+    /// Tell the compile threads to stop, and return without waiting for
+    /// them: for a process about to `_exit`, whose threads end with it.
+    /// Nothing is unregistered and no callback is replaced, since a
+    /// compile in flight holds the callback it runs under.
+    pub fn stop(&mut self) {
+        self.warm_up_stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(queue) = &self.compile_queue {
+            queue.wake();
+        }
+    }
+
     /// Releases bead registrations on shutdown so a long-lived process
     /// reusing `TieredBackend` instances doesn't leak entries.
     pub fn shutdown(&mut self) {
@@ -3551,25 +3573,30 @@ impl Drop for TieredBackend {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The beads of the functions `f` calls directly, or takes the address
-/// of, among those with a bead in `bead_of`.
-fn direct_lazy_callees(f: &HirFunction, bead_of: &HashMap<HirId, u64>) -> Vec<u64> {
-    let mut out: Vec<u64> =
-        f.blocks
-            .values()
-            .flat_map(|b| b.instructions.iter())
-            .filter_map(|inst| match inst {
-                crate::hir::HirInstruction::Call {
-                    callee:
-                        crate::hir::HirCallable::Function(target)
-                        | crate::hir::HirCallable::FuncRef(target),
-                    ..
-                } => Some(*target),
-                crate::hir::HirInstruction::CreateClosure { function, .. } => Some(*function),
-                _ => None,
-            })
-            .filter_map(|id| bead_of.get(&id).copied())
-            .collect();
+/// The beads of the functions `f` calls directly, and with `closures`
+/// those it takes the address of or makes closures of, among those
+/// with a bead in `bead_of`.
+fn direct_lazy_callees(f: &HirFunction, closures: bool, bead_of: &HashMap<HirId, u64>) -> Vec<u64> {
+    let mut out: Vec<u64> = f
+        .blocks
+        .values()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| match inst {
+            crate::hir::HirInstruction::Call {
+                callee: crate::hir::HirCallable::Function(target),
+                ..
+            } => Some(*target),
+            crate::hir::HirInstruction::Call {
+                callee: crate::hir::HirCallable::FuncRef(target),
+                ..
+            } if closures => Some(*target),
+            crate::hir::HirInstruction::CreateClosure { function, .. } if closures => {
+                Some(*function)
+            }
+            _ => None,
+        })
+        .filter_map(|id| bead_of.get(&id).copied())
+        .collect();
     out.sort();
     out.dedup();
     out

@@ -321,6 +321,16 @@ impl<'ctx> LLVMBackend<'ctx> {
     /// 3. Compiles function bodies
     /// 4. Returns the compiled LLVM module
     pub fn compile_module(&mut self, hir_module: &HirModule) -> CompilerResult<String> {
+        self.lower_module(hir_module)?;
+        // Return LLVM IR as string for inspection/debugging
+        let ir = self.module.print_to_string().to_string();
+        log::debug!("[LLVM] Generated LLVM IR:\n{}", ir);
+        Ok(ir)
+    }
+
+    /// [`Self::compile_module`] without rendering the IR to text, for
+    /// a caller that goes on to compile the module.
+    pub fn lower_module(&mut self, hir_module: &HirModule) -> CompilerResult<()> {
         // Phase H: build the effect-handler lookup index up front so
         // each PerformEffect emission is an O(1) map probe.  Keyed by
         // (effect_id, op_name) → (handler-fn HirId, is_resumable).
@@ -363,7 +373,7 @@ impl<'ctx> LLVMBackend<'ctx> {
 
         // Phase 1: Process globals first (including vtables) in deterministic sorted order
         let mut global_ids: Vec<_> = hir_module.globals.keys().cloned().collect();
-        global_ids.sort_by_key(|id| format!("{:?}", id));
+        global_ids.sort();
 
         for id in &global_ids {
             if let Some(global) = hir_module.globals.get(id) {
@@ -373,7 +383,7 @@ impl<'ctx> LLVMBackend<'ctx> {
 
         // Phase 2: Declare all functions (allows forward references) in deterministic sorted order
         let mut declare_ids: Vec<_> = hir_module.functions.keys().cloned().collect();
-        declare_ids.sort_by_key(|id| format!("{:?}", id));
+        declare_ids.sort();
 
         for id in &declare_ids {
             if let Some(allowed) = &self.only_compile_reachable {
@@ -388,7 +398,7 @@ impl<'ctx> LLVMBackend<'ctx> {
 
         // Phase 3: Compile function bodies in deterministic sorted order
         let mut function_ids: Vec<_> = hir_module.functions.keys().cloned().collect();
-        function_ids.sort_by_key(|id| format!("{:?}", id));
+        function_ids.sort();
 
         for id in &function_ids {
             if let Some(allowed) = &self.only_compile_reachable {
@@ -400,11 +410,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 self.compile_function(*id, func)?;
             }
         }
-
-        // Return LLVM IR as string for inspection/debugging
-        let ir = self.module.print_to_string().to_string();
-        log::debug!("[LLVM] Generated LLVM IR:\n{}", ir);
-        Ok(ir)
+        Ok(())
     }
 
     /// Limit `compile_module` to a specific reachable subset.

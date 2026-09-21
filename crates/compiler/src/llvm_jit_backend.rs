@@ -125,6 +125,13 @@ pub struct LLVMJitBackend<'ctx> {
     /// Optimization level.
     opt_level: OptimizationLevel,
 
+    /// The host-tuned target machine the middle end runs under, made
+    /// once: it caches the subtarget every module's passes consult.
+    target_machine: TargetMachine,
+    /// Milliseconds the last compile spent lowering to IR and in the
+    /// optimisation passes, for the trace.
+    last_ir_ms: std::cell::Cell<(f64, f64)>,
+
     /// Runtime symbols available to JIT-compiled code. Each entry is a
     /// host-side function pointer that will get baked into a
     /// trampoline stub during link.
@@ -191,6 +198,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         Target::initialize_native(&InitializationConfig::default()).map_err(|e| {
             CompilerError::Backend(format!("Failed to initialise LLVM target: {}", e))
         })?;
+        Self::parse_llvm_args();
+        let target_machine = Self::host_target_machine(opt_level)?;
 
         let mut backend = Self {
             context,
@@ -204,6 +213,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             loaded_lib: None,
             function_pointers: IndexMap::new(),
             opt_level,
+            target_machine,
+            last_ir_ms: std::cell::Cell::new((0.0, 0.0)),
             runtime_symbols: IndexMap::new(),
             symbol_signatures: Vec::new(),
             only_compile_reachable: None,
@@ -302,6 +313,67 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         self.use_mcjit
     }
 
+    /// `ZYNTAX_LLVM_ARGS` holds LLVM command-line options (space
+    /// separated, as `opt` takes them), parsed once per process before
+    /// the first compile; safe to run with when the options are.
+    fn parse_llvm_args() {
+        static PARSED: std::sync::Once = std::sync::Once::new();
+        PARSED.call_once(|| {
+            let Some(args) = std::env::var_os("ZYNTAX_LLVM_ARGS") else {
+                return;
+            };
+            let args: Vec<std::ffi::CString> = std::iter::once("zyntax")
+                .chain(args.to_string_lossy().split_whitespace())
+                .filter_map(|a| std::ffi::CString::new(a).ok())
+                .collect();
+            let argv: Vec<*const std::ffi::c_char> = args.iter().map(|a| a.as_ptr()).collect();
+            // SAFETY: `argv` holds `argc` pointers to NUL-terminated
+            // strings that outlive the call, and LLVM copies what it
+            // keeps.
+            unsafe {
+                inkwell::llvm_sys::support::LLVMParseCommandLineOptions(
+                    argv.len() as std::ffi::c_int,
+                    argv.as_ptr(),
+                    std::ptr::null(),
+                );
+            }
+        });
+    }
+
+    /// A target machine tuned to the host. PIC reloc mode is what a
+    /// shared object needs; the default code model serves both x86_64
+    /// and aarch64.
+    fn host_target_machine(opt_level: OptimizationLevel) -> CompilerResult<TargetMachine> {
+        let target_triple = TargetMachine::get_default_triple();
+        let target = Target::from_triple(&target_triple).map_err(|e| {
+            CompilerError::Backend(format!("Failed to resolve target from triple: {}", e))
+        })?;
+        target
+            .create_target_machine(
+                &target_triple,
+                TargetMachine::get_host_cpu_name()
+                    .to_str()
+                    .unwrap_or("generic"),
+                TargetMachine::get_host_cpu_features()
+                    .to_str()
+                    .unwrap_or(""),
+                opt_level,
+                RelocMode::PIC,
+                CodeModel::Default,
+            )
+            .ok_or_else(|| CompilerError::Backend("Failed to create host target machine".into()))
+    }
+
+    /// The pass pipeline for an optimisation level.
+    fn pass_pipeline(opt_level: OptimizationLevel) -> &'static str {
+        match opt_level {
+            OptimizationLevel::None => "default<O0>",
+            OptimizationLevel::Less => "default<O1>",
+            OptimizationLevel::Default => "default<O2>",
+            OptimizationLevel::Aggressive => "default<O3>",
+        }
+    }
+
     /// Tag every defined function with the host's `target-cpu` and
     /// `target-features`.
     ///
@@ -336,6 +408,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// equivalent of the trampoline stubs the object path synthesises.
     /// The engine is retained because it owns the code pages.
     fn install_via_mcjit(&mut self, hir_module: &HirModule) -> CompilerResult<()> {
+        let started = std::time::Instant::now();
         if crate::osr::osr_trace_enabled() {
             eprintln!(
                 "[osr] llvm install tier={} functions={}",
@@ -348,8 +421,9 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         // rather than waiting for the next call. They are built with the
         // bodies, before the pass pipeline, so they are optimised like
         // them; the engine created below consumes the module.
-        let (backend, _target_machine, helper_names) =
+        let (backend, helper_names) =
             self.compile_module_to_ir(hir_module, self.compile_tier >= 1)?;
+        let ir_ms = started.elapsed().as_secs_f64() * 1e3;
 
         // The engine builds its own target machine and defaults to a
         // generic CPU, where the object path tunes one from the host. Carry
@@ -361,6 +435,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             .module()
             .create_jit_execution_engine(self.opt_level)
             .map_err(|e| CompilerError::Backend(format!("MCJIT engine: {e}")))?;
+        let engine_ms = started.elapsed().as_secs_f64() * 1e3 - ir_ms;
 
         // Bind host functions the module declares but does not define.
         for (name, addr) in &self.runtime_symbols {
@@ -412,6 +487,16 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 }
                 self.function_pointers.insert(hir_id, addr as usize);
             }
+        }
+        if crate::osr::osr_trace_enabled() {
+            let total_ms = started.elapsed().as_secs_f64() * 1e3;
+            let (lowered_ms, opt_ms) = self.last_ir_ms.get();
+            eprintln!(
+                "[osr] llvm install {total_ms:.2} ms: ir {lowered_ms:.2}, opt {opt_ms:.2}, \
+                 verify {:.2}, engine {engine_ms:.2}, codegen {:.2}",
+                ir_ms - lowered_ms - opt_ms,
+                total_ms - ir_ms - engine_ms
+            );
         }
 
         for (func_id, site, name) in helper_names {
@@ -595,15 +680,15 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         Ok(())
     }
 
-    /// Step (1)–(2) of the pipeline: lower HIR → LLVM IR, verify,
-    /// host-tune the target machine, run optimisation passes. The
+    /// Steps (1) to (2) of the pipeline: lower HIR → LLVM IR, verify, run
+    /// the optimisation passes under the host target machine. The
     /// resulting `LLVMBackend` owns a `Module` ready for object-file
     /// emission via [`Self::compile_to_object_file`].
     fn compile_module_to_ir(
         &self,
         hir_module: &HirModule,
         with_osr_helpers: bool,
-    ) -> CompilerResult<(LLVMBackend<'ctx>, TargetMachine, Vec<(HirId, u64, String)>)> {
+    ) -> CompilerResult<(LLVMBackend<'ctx>, Vec<(HirId, u64, String)>)> {
         // Step 1: Lower HIR → LLVM IR.
         let mut backend = LLVMBackend::new(self.context, "zyntax_jit");
         backend.register_symbol_signatures(&self.symbol_signatures);
@@ -630,7 +715,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             std::arch::is_x86_feature_detected!("avxvnni")
                 || std::arch::is_x86_feature_detected!("avx512vnni"),
         );
-        let _llvm_ir = backend.compile_module(hir_module)?;
+        let lowering = std::time::Instant::now();
+        backend.lower_module(hir_module)?;
 
         // Patch internal function names to a linker-safe mangling.
         self.rename_mangled_functions(&backend, hir_module)?;
@@ -640,29 +726,12 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         } else {
             Vec::new()
         };
+        self.last_ir_ms
+            .set((lowering.elapsed().as_secs_f64() * 1e3, 0.0));
 
-        // Step 2: Build a host-tuned TargetMachine. PIC reloc mode is
-        // required for `-shared` / `-dynamiclib`; default code model
-        // is correct for both x86_64 and aarch64.
-        let target_triple = TargetMachine::get_default_triple();
-        let target = Target::from_triple(&target_triple).map_err(|e| {
-            CompilerError::Backend(format!("Failed to resolve target from triple: {}", e))
-        })?;
-        let target_machine = target
-            .create_target_machine(
-                &target_triple,
-                TargetMachine::get_host_cpu_name()
-                    .to_str()
-                    .unwrap_or("generic"),
-                TargetMachine::get_host_cpu_features()
-                    .to_str()
-                    .unwrap_or(""),
-                self.opt_level,
-                RelocMode::PIC,
-                CodeModel::Default,
-            )
-            .ok_or_else(|| CompilerError::Backend("Failed to create host target machine".into()))?;
-        backend.module().set_triple(&target_triple);
+        // Step 2: the module targets the host machine.
+        let target_machine = &self.target_machine;
+        backend.module().set_triple(&target_machine.get_triple());
         backend
             .module()
             .set_data_layout(&target_machine.get_target_data().get_data_layout());
@@ -701,19 +770,19 @@ impl<'ctx> LLVMJitBackend<'ctx> {
 
         // Step 3: Run the optimisation pipeline.
         if self.opt_level != OptimizationLevel::None {
-            let passes = match self.opt_level {
-                OptimizationLevel::None => "default<O0>",
-                OptimizationLevel::Less => "default<O1>",
-                OptimizationLevel::Default => "default<O2>",
-                OptimizationLevel::Aggressive => "default<O3>",
-            };
+            let passes = Self::pass_pipeline(self.opt_level);
             let pass_options = Self::create_pass_options();
+            let optimising = std::time::Instant::now();
             backend
                 .module()
-                .run_passes(passes, &target_machine, pass_options)
+                .run_passes(passes, target_machine, pass_options)
                 .map_err(|e| {
                     CompilerError::Backend(format!("LLVM optimisation passes failed: {}", e))
                 })?;
+            self.last_ir_ms.set((
+                self.last_ir_ms.get().0,
+                optimising.elapsed().as_secs_f64() * 1e3,
+            ));
 
             if let Err(msg) = backend.module().verify() {
                 return Err(CompilerError::Backend(format!(
@@ -739,7 +808,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             }
         }
 
-        Ok((backend, target_machine, helper_names))
+        Ok((backend, helper_names))
     }
 
     /// Emit a resume point for each loop header of `hir_module` that
@@ -913,18 +982,17 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             }
         }
 
-        // (1)–(3) Lower + optimise + build target machine.
-        let (backend, target_machine, _) = self.compile_module_to_ir(hir_module, false)?;
+        // (1) to (3) Lower + optimise.
+        let (backend, _) = self.compile_module_to_ir(hir_module, false)?;
 
         // (4) Write PIC object file to a tempfile.
         let triple = Triple::host();
         let obj_path = Self::build_temp_path("o");
         let dylib_path = Self::build_temp_path(triple.dylib_ext());
-        self.compile_to_object_file(&backend, &target_machine, &obj_path)?;
-        // Module + TargetMachine are no longer needed; drop them so
-        // the LLVM resources are freed before the slow linker stage.
+        self.compile_to_object_file(&backend, &self.target_machine, &obj_path)?;
+        // The module is no longer needed; drop it so the LLVM
+        // resources are freed before the slow linker stage.
         drop(backend);
-        drop(target_machine);
 
         // (5) Synthesise trampolines + link to dylib. The runtime
         // symbols list comes from `self.runtime_symbols` — populated
@@ -1073,8 +1141,24 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                         },
                     );
                 }
+                // The globals these functions name, and no other: the
+                // rest of the module's would be declared and bound for
+                // nothing.
+                let used: HashSet<HirId> = functions
+                    .values()
+                    .flat_map(|f| f.values.values())
+                    .filter_map(|v| match v.kind {
+                        crate::hir::HirValueKind::Global(gid) => Some(gid),
+                        _ => None,
+                    })
+                    .collect();
+                for gid in &used {
+                    if let Some(g) = ctx.globals.get(gid) {
+                        globals.insert(*gid, g.clone());
+                    }
+                }
                 if let Some(resolve) = &self.global_resolver {
-                    for gid in ctx.globals.keys() {
+                    for gid in &used {
                         if let Some(addr) = resolve(*gid) {
                             self.pending_shared_globals.insert(*gid, addr);
                         }
@@ -1090,10 +1174,13 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                     }
                 }
             }
-            // Globals and type/effect tables are shared by whatever came
-            // along; carrying the module's wholesale is cheaper than
-            // tracing which of them each callee touches.
-            globals = ctx.globals.clone();
+            // Type and effect tables are shared by whatever came along;
+            // carrying the module's wholesale is cheaper than tracing
+            // which of them each callee touches. A module compiled with
+            // its callee closure takes every global too.
+            if !own_module {
+                globals = ctx.globals.clone();
+            }
             types = ctx.types.clone();
             effects = ctx.effects.clone();
             handlers = ctx.handlers.clone();
