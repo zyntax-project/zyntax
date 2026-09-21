@@ -22,7 +22,7 @@ use std::sync::Arc;
 use zyntax_compiler::hir::HirModule;
 
 const MAGIC: &[u8; 5] = b"ZSNAP";
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 /// magic, schema, and the length of the directory that follows.
 const HEADER_LEN: usize = MAGIC.len() + 2 * std::mem::size_of::<u32>();
 
@@ -401,6 +401,12 @@ pub fn lower_for_snapshot_releasing(
     module.automatic_release = automatic_release;
     let _ = zyntax_compiler::run_interp_safe_opts_keeping_readers(&mut module);
     zyntax_compiler::run_native_only_opts(&mut module);
+    // The bodies as every program adopts them, then the facts of those
+    // bodies: a program that links the module reads them rather than
+    // computing them over the library again.
+    zyntax_compiler::const_boxes::run_library(&mut module, name);
+    let facts = zyntax_compiler::drop_insert::facts_of(&module);
+    zyntax_compiler::drop_insert::record_facts(&mut module, &facts);
     zyntax_compiler::mark_optimized(&mut module);
     Ok(module)
 }

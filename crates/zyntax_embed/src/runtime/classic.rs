@@ -297,7 +297,11 @@ impl ZyntaxRuntime {
         // that never executes. Matches the filter installed at
         // `install_interp_jit_with` time so the two paths see the
         // same minimal set.
-        let names = self.entry_names();
+        // A linked library's boxed-constant initializer is entered by
+        // the host alone, once the module is installed.
+        let box_inits = zyntax_compiler::const_boxes::library_init_functions(&owned);
+        let mut names = self.entry_names();
+        names.extend(box_inits.iter().cloned());
         let entry_names: Vec<&str> = names.iter().map(String::as_str).collect();
         let reachable = zyntax_compiler::reachable_function_ids(&owned, &entry_names);
         self.backend.set_only_compile_reachable(Some(reachable));
@@ -314,6 +318,9 @@ impl ZyntaxRuntime {
         // drives the single tier-up loop.
         if let Ok(mut interp) = self.interp.lock() {
             interp.compile_module(owned);
+        }
+        for init in &box_inits {
+            self.call::<()>(init, &[])?;
         }
 
         Ok(())

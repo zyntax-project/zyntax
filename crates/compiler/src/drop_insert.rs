@@ -166,6 +166,85 @@ pub fn facts_of(module: &HirModule) -> ModuleFacts {
     ModuleFacts::build(module)
 }
 
+/// Write each function's facts into its attributes, for a module about
+/// to be stored: a module that links it later starts from them (see
+/// `FunctionAttributes::release_facts`).
+///
+/// A function declared here without a body or a symbol gets its body
+/// from the program that links the module, so what is read of it here
+/// (an extern that keeps every argument and returns nothing it owns)
+/// may not hold there. Nothing is recorded for a function whose facts
+/// read such a declaration's, directly or through a callee whose own
+/// were not recorded. A function returning no storage reads nothing
+/// that matters: both its facts are false whatever it calls, so it is
+/// recorded and what calls it is unaffected.
+pub fn record_facts(module: &mut HirModule, facts: &ModuleFacts) {
+    let supplied_later: Vec<HirId> = module
+        .functions
+        .iter()
+        .filter(|(_, f)| f.is_external && f.link_name.is_none())
+        .map(|(key, _)| *key)
+        .collect();
+    let defined: Vec<HirId> = module
+        .functions
+        .iter()
+        .filter(|(_, f)| !f.is_external)
+        .map(|(key, _)| *key)
+        .collect();
+    let mut callers: std::collections::HashMap<HirId, Vec<HirId>> =
+        std::collections::HashMap::new();
+    for (key, called) in callees_of(module, &defined) {
+        for c in called {
+            callers.entry(c).or_default().push(key);
+        }
+    }
+    let returns_storage = |key: &HirId| {
+        module.functions[key]
+            .signature
+            .returns
+            .iter()
+            .any(may_be_storage)
+    };
+    let mut program_dependent: IdSet = IdSet::default();
+    let mut pending = supplied_later;
+    while let Some(key) = pending.pop() {
+        for caller in callers.get(&key).into_iter().flatten() {
+            if returns_storage(caller) && program_dependent.insert(*caller) {
+                pending.push(*caller);
+            }
+        }
+    }
+    if trace_enabled() {
+        let mut names: Vec<String> = program_dependent
+            .iter()
+            .filter_map(|k| module.functions.get(k))
+            .map(|f| f.name.resolve_global().unwrap_or_default())
+            .collect();
+        names.sort();
+        eprintln!(
+            "[drop] recording facts for {} of {} functions; not for the {} reading a body the program supplies: {}",
+            defined.len() - program_dependent.len(),
+            defined.len(),
+            program_dependent.len(),
+            names.join(" ")
+        );
+    }
+    for (key, func) in module.functions.iter_mut() {
+        if func.is_external || program_dependent.contains(key) {
+            continue;
+        }
+        func.attributes.release_facts = Some(crate::hir::ReleaseFacts {
+            returns_owned: facts.returns_owned.contains(key),
+            returns_param: facts
+                .returns_param
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| vec![false; func.signature.params.len()]),
+            automatic_release: facts.automatic_release,
+        });
+    }
+}
+
 /// The pass over one function with the facts of its module: what a
 /// body run before its optimisation needs of the pipeline, so that it
 /// frees what it allocates.
@@ -228,7 +307,69 @@ pub struct ModuleFacts {
 }
 
 impl ModuleFacts {
+    /// The facts of `module`. A function carrying facts recorded when
+    /// its own module was optimised keeps them, and the fixed points run
+    /// over the rest: what a stored library recorded holds for any
+    /// program that links it (see [`record_facts`]), so the rest is the
+    /// program's own.
+    /// `ZYNTAX_CHECK_FACTS_SEED=1` also recomputes everything and
+    /// panics on a function whose recorded facts disagree; slow, safe to
+    /// run with.
     fn build(module: &HirModule) -> Self {
+        let facts = Self::build_seeded(module, true);
+        static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CHECK.get_or_init(|| std::env::var_os("ZYNTAX_CHECK_FACTS_SEED").is_some()) {
+            let fresh = Self::build_seeded(module, false);
+            let mut disagreements: Vec<String> = Vec::new();
+            for (key, func) in module.functions.iter() {
+                if func.is_external {
+                    continue;
+                }
+                let name = func.name.resolve_global().unwrap_or_default();
+                let seeded = if Self::seeded(func, facts.automatic_release) {
+                    "recorded"
+                } else {
+                    "computed"
+                };
+                let (owned, fresh_owned) = (
+                    facts.returns_owned.contains(key),
+                    fresh.returns_owned.contains(key),
+                );
+                if owned != fresh_owned {
+                    disagreements.push(format!(
+                        "{name} ({seeded}): returns_owned {owned}, fresh fixed point {fresh_owned}"
+                    ));
+                }
+                let (params, fresh_params) =
+                    (facts.returns_param.get(key), fresh.returns_param.get(key));
+                if params != fresh_params {
+                    disagreements.push(format!(
+                        "{name} ({seeded}): returns_param {params:?}, fresh fixed point {fresh_params:?}"
+                    ));
+                }
+            }
+            assert!(
+                disagreements.is_empty(),
+                "release facts disagree with a fresh fixed point:\n  {}",
+                disagreements.join("\n  ")
+            );
+        }
+        facts
+    }
+
+    /// Whether `func`'s recorded facts stand in for computing them here.
+    fn seeded(func: &HirFunction, automatic_release: bool) -> bool {
+        !func.is_external
+            && func
+                .attributes
+                .release_facts
+                .as_ref()
+                .is_some_and(|facts| facts.automatic_release == automatic_release)
+    }
+
+    fn build_seeded(module: &HirModule, use_seeds: bool) -> Self {
+        let automatic_release = automatic_release_for(module);
+        let seeded = |func: &HirFunction| use_seeds && Self::seeded(func, automatic_release);
         let mut borrowed_params = std::collections::HashMap::new();
         for (key, func) in module.functions.iter() {
             // What a host does with a pointer is unknown here, so an
@@ -287,7 +428,7 @@ impl ModuleFacts {
             .map(|(key, f)| (*key, f.name.resolve_global().unwrap_or_default()))
             .collect();
         let mut facts = Self {
-            automatic_release: automatic_release_for(module),
+            automatic_release,
             returns_owned: IdSet::default(),
             string_makers,
             returns_param: std::collections::HashMap::new(),
@@ -296,15 +437,40 @@ impl ModuleFacts {
             borrowed_params,
             glue,
         };
+        // Recorded facts first; the fixed points below read them and
+        // never ask the functions carrying them again.
+        let mut unseeded: Vec<HirId> = Vec::new();
+        for (key, func) in module.functions.iter() {
+            if func.is_external {
+                continue;
+            }
+            match func
+                .attributes
+                .release_facts
+                .as_ref()
+                .filter(|_| seeded(func))
+            {
+                Some(recorded) => {
+                    if recorded.returns_owned {
+                        facts.returns_owned.insert(*key);
+                    }
+                    facts
+                        .returns_param
+                        .insert(*key, recorded.returns_param.clone());
+                }
+                None => unseeded.push(*key),
+            }
+        }
         // A function returning a callee's result that is itself an
         // argument returns its own parameter, so this grows until it
         // stops; owned-returning functions likewise.
         let tprof = std::env::var_os("ZYNTAX_TRACE_DROP_TIME").is_some();
         let t = web_time::Instant::now();
         let mut rounds = 0;
-        let callees = callees_of(module);
+        let callees = callees_of(module, &unseeded);
         // Which functions call each, for asking only the callers of
-        // whoever changed again.
+        // whoever changed again. Only a function computed here is
+        // asked again, so only their calls are recorded.
         let mut callers: std::collections::HashMap<HirId, Vec<HirId>> =
             std::collections::HashMap::new();
         for (key, called) in &callees {
@@ -312,13 +478,9 @@ impl ModuleFacts {
                 callers.entry(*c).or_default().push(*key);
             }
         }
-        // Every function first, then the callers of whoever changed.
-        let mut dirty: Vec<HirId> = module
-            .functions
-            .iter()
-            .filter(|(_, f)| !f.is_external)
-            .map(|(key, _)| *key)
-            .collect();
+        // Every function computed here first, then the callers of
+        // whoever changed.
+        let mut dirty: Vec<HirId> = unseeded.clone();
         loop {
             rounds += 1;
             let mut changed: Vec<HirId> = Vec::new();
@@ -346,8 +508,9 @@ impl ModuleFacts {
         }
         if tprof {
             eprintln!(
-                "[drop-time] returns_param {:.2} ms in {rounds} rounds over {} functions",
+                "[drop-time] returns_param {:.2} ms in {rounds} rounds over {} of {} functions",
                 t.elapsed().as_secs_f64() * 1000.0,
+                unseeded.len(),
                 module.functions.len()
             );
         }
@@ -356,12 +519,7 @@ impl ModuleFacts {
         // only the callers of whoever changed are asked again.
         let t = web_time::Instant::now();
         let mut rounds = 0;
-        let mut dirty: Vec<HirId> = module
-            .functions
-            .iter()
-            .filter(|(_, f)| !f.is_external)
-            .map(|(key, _)| *key)
-            .collect();
+        let mut dirty: Vec<HirId> = unseeded;
         loop {
             rounds += 1;
             let mut changed: Vec<HirId> = Vec::new();
@@ -1328,11 +1486,10 @@ fn may_be_storage(ty: &HirType) -> bool {
     )
 }
 
-/// The functions each function calls by id.
-fn callees_of(module: &HirModule) -> std::collections::HashMap<HirId, Vec<HirId>> {
-    module
-        .functions
-        .iter()
+/// The functions each of `keys` calls directly.
+fn callees_of(module: &HirModule, keys: &[HirId]) -> std::collections::HashMap<HirId, Vec<HirId>> {
+    keys.iter()
+        .filter_map(|key| module.functions.get(key).map(|func| (key, func)))
         .map(|(key, func)| {
             let mut callees: Vec<HirId> = func
                 .blocks
@@ -3460,6 +3617,80 @@ mod tests {
             "a pass-through returns storage it does not own; releasing it would \
              free the caller's own pointer"
         );
+    }
+
+    fn caller_frees(m: &HirModule, caller_key: HirId) -> bool {
+        let caller = m.functions.get(&caller_key).unwrap();
+        let block = caller.blocks.values().next().unwrap();
+        block.instructions.iter().any(|i| {
+            matches!(
+                i,
+                HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(Intrinsic::Free),
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Facts recorded on a module's functions are what a later build
+    /// reads: the same answers, and no fixed point over those bodies.
+    #[test]
+    fn recorded_facts_are_read_back() {
+        let ctor_key = HirId::new();
+        let caller_key = HirId::new();
+        let mut m = HirModule::new(InternedString::new_global("m"));
+        m.functions.insert(ctor_key, build_constructor());
+        m.functions.insert(caller_key, build_caller(ctor_key));
+
+        let fresh = facts_of(&m);
+        assert!(fresh.returns_owned.contains(&ctor_key));
+        record_facts(&mut m, &fresh);
+        let recorded = m.functions[&ctor_key]
+            .attributes
+            .release_facts
+            .as_ref()
+            .expect("the constructor carries its facts");
+        assert!(recorded.returns_owned);
+        assert!(recorded.returns_param.is_empty());
+
+        let seeded = facts_of(&m);
+        assert!(seeded.returns_owned.contains(&ctor_key));
+        assert!(!seeded.returns_owned.contains(&caller_key));
+        assert_eq!(seeded.returns_param.get(&caller_key), Some(&Vec::new()));
+    }
+
+    /// A recorded fact stands in for the body: a constructor recorded as
+    /// returning nothing it owns is not released by its caller, whatever
+    /// its body does.
+    #[test]
+    fn a_recorded_fact_is_read_instead_of_the_body() {
+        let ctor_key = HirId::new();
+        let caller_key = HirId::new();
+        let mut ctor = build_constructor();
+        ctor.attributes.release_facts = Some(crate::hir::ReleaseFacts {
+            returns_owned: false,
+            returns_param: Vec::new(),
+            automatic_release: false,
+        });
+        let mut m = HirModule::new(InternedString::new_global("m"));
+        m.functions.insert(ctor_key, ctor);
+        m.functions.insert(caller_key, build_caller(ctor_key));
+        run_module(&mut m);
+        assert!(!caller_frees(&m, caller_key));
+
+        // Recorded under the other release setting, the fact is not
+        // for this module, and the body decides.
+        m.functions
+            .get_mut(&ctor_key)
+            .unwrap()
+            .attributes
+            .release_facts
+            .as_mut()
+            .unwrap()
+            .automatic_release = true;
+        run_module(&mut m);
+        assert!(caller_frees(&m, caller_key));
     }
 
     /// A loop whose header phi carries an allocation replaced each

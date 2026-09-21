@@ -2521,9 +2521,9 @@ impl TieredBackend {
                 })
             }
         }
-        /// What the release pass knows of each module, built once: the
-        /// worker builds it as it starts, and a thread that needs it
-        /// first builds it itself while the other waits.
+        /// What the release pass knows of each module, built once, by
+        /// the first thread that needs it. A linked library's functions
+        /// carry their facts, so the build covers the program's own.
         #[derive(Default)]
         struct Facts(Mutex<HashMap<usize, Arc<crate::drop_insert::ModuleFacts>>>);
         impl Facts {
@@ -2708,17 +2708,6 @@ impl TieredBackend {
         let bead_of: HashMap<HirId, u64> =
             by_bead.iter().map(|(b, (id, _, _))| (*id, *b)).collect();
         let published = Arc::clone(&done);
-        // The modules with a body the interpreter runs as lowered, whose
-        // facts the worker builds ahead.
-        let facts_modules: Vec<Arc<HirModule>> = {
-            let mut seen = HashSet::new();
-            by_bead
-                .values()
-                .filter(|(id, _, _)| !finished.contains(id))
-                .filter(|(_, _, module)| seen.insert(Arc::as_ptr(module) as usize))
-                .map(|(_, _, module)| Arc::clone(module))
-                .collect()
-        };
         let compile_lazy_function = move |bead_id: u64| -> *const u8 {
             let trace = std::env::var_os("ZYNTAX_TRACE_LAZY").is_some();
             {
@@ -2869,7 +2858,6 @@ impl TieredBackend {
             }
             let compile = Arc::clone(&compile_lazy_function);
             let stop = Arc::clone(&self.warm_up_stop);
-            let facts = Arc::clone(&facts);
             let queue = Arc::new(CompileQueue::new(Arc::clone(&stop)));
             osr::set_compile_worker_busy(Some(Arc::clone(&queue.busy)));
             self.compile_queue = Some(Arc::clone(&queue));
@@ -2879,11 +2867,6 @@ impl TieredBackend {
                 .stack_size(16 << 20)
                 .spawn(move || {
                     ON_WARM_UP.with(|on| on.set(true));
-                    // The interpreter's first body needs the release
-                    // facts, and the program is about to start.
-                    for module in &facts_modules {
-                        facts.of(module);
-                    }
                     let mut idle_since: Option<std::time::Instant> = None;
                     loop {
                         if stop.load(std::sync::atomic::Ordering::Acquire) {

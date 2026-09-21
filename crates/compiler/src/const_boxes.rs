@@ -11,6 +11,11 @@
 //! Runs before the release analysis: a load is not an allocation, so
 //! no use releases a box it did not make. The globals are writable, so
 //! a collector that reads the program's globals keeps the boxes.
+//!
+//! A library stored for linking runs the pass on itself, under its own
+//! name, so the bodies a program adopts are the bodies its release
+//! facts were recorded on; the program's pass leaves them alone and
+//! makes its own initializer. A program runs every initializer it holds.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,8 +26,31 @@ use crate::hir::{
 };
 use zyntax_typed_ast::InternedString;
 
-/// The name of the function that makes the boxes.
+/// The name of the function that makes the program's boxes.
 pub const INIT_FUNCTION: &str = "__zyntax_box_constants";
+
+/// The name of the function that makes a library's boxes.
+pub fn library_init_function(library: &str) -> String {
+    format!("{INIT_FUNCTION}${library}")
+}
+
+/// Whether `name` is an initializer this pass made, the program's or a
+/// library's.
+pub fn is_init_function(name: &str) -> bool {
+    name.strip_prefix(INIT_FUNCTION)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('$'))
+}
+
+/// The initializers of libraries linked into `module`, by name.
+pub fn library_init_functions(module: &HirModule) -> Vec<String> {
+    module
+        .functions
+        .values()
+        .filter(|f| !f.is_external)
+        .filter_map(|f| f.name.resolve_global())
+        .filter(|name| name != INIT_FUNCTION && is_init_function(name))
+        .collect()
+}
 
 /// Calls that box a string, by the symbol reached or the function's
 /// name, taking the string as their only argument.
@@ -31,6 +59,17 @@ const BOXERS: &[&str] = &["$IO$string_to_dynamic", "zyntax_box_str", "zb_box_str
 /// Prepare one box per string constant for the host to initialize after
 /// installing the module. Returns the number of replaced boxing sites.
 pub fn run_module(module: &mut HirModule) -> usize {
+    run_module_as(module, None)
+}
+
+/// [`run_module`] for a library about to be stored: its globals and
+/// initializer are named after it, apart from those of the program
+/// that links it.
+pub fn run_library(module: &mut HirModule, library: &str) -> usize {
+    run_module_as(module, Some(library))
+}
+
+fn run_module_as(module: &mut HirModule, library: Option<&str>) -> usize {
     // Which callees box a string.
     let mut boxers: HashSet<HirId> = HashSet::new();
     for (id, f) in &module.functions {
@@ -57,7 +96,11 @@ pub fn run_module(module: &mut HirModule) -> usize {
     // callee, so the box can be made the same way.
     let mut sites: Vec<(HirId, HirId, usize, HirId, HirCallable, HirType)> = Vec::new();
     for (fid, f) in &module.functions {
-        if f.is_external || f.name.resolve_global().as_deref() == Some(INIT_FUNCTION) {
+        if f.is_external
+            || f.name
+                .resolve_global()
+                .is_some_and(|name| is_init_function(&name))
+        {
             continue;
         }
         for (bid, block) in &f.blocks {
@@ -103,6 +146,7 @@ pub fn run_module(module: &mut HirModule) -> usize {
     let box_ty = crate::zrtl::dynamic_box_pointer_type();
     let mut box_global: HashMap<HirId, HirId> = HashMap::new();
     let mut made: Vec<(HirId, HirId, HirCallable, HirType)> = Vec::new();
+    let scope = library.map(|l| format!("${l}")).unwrap_or_default();
     for (_, _, _, gid, callee, ty) in &sites {
         if box_global.contains_key(gid) {
             continue;
@@ -112,7 +156,10 @@ pub fn run_module(module: &mut HirModule) -> usize {
             id,
             HirGlobal {
                 id,
-                name: InternedString::new_global(&format!("__zyntax$box${}", box_global.len())),
+                name: InternedString::new_global(&format!(
+                    "__zyntax$box{scope}${}",
+                    box_global.len()
+                )),
                 ty: box_ty.clone(),
                 initializer: None,
                 is_const: false,
@@ -125,11 +172,13 @@ pub fn run_module(module: &mut HirModule) -> usize {
         made.push((*gid, id, callee.clone(), ty.clone()));
     }
 
-    // Each use loads its global.
+    // Each use loads its global. The body is no longer the one any
+    // recorded release facts describe.
     for (fid, bid, i, gid, _, ty) in &sites {
         let Some(f) = module.functions.get_mut(fid) else {
             continue;
         };
+        f.attributes.release_facts = None;
         let global_ref = global_ref(f, box_global[gid], &box_ty);
         let Some(block) = f.blocks.get_mut(bid) else {
             continue;
@@ -158,7 +207,7 @@ pub fn run_module(module: &mut HirModule) -> usize {
         flag,
         HirGlobal {
             id: flag,
-            name: InternedString::new_global("__zyntax$boxes_made"),
+            name: InternedString::new_global(&format!("__zyntax$boxes_made{scope}")),
             ty: HirType::I64,
             initializer: Some(HirConstant::I64(0)),
             is_const: false,
@@ -167,7 +216,11 @@ pub fn run_module(module: &mut HirModule) -> usize {
             visibility: Visibility::Default,
         },
     );
-    let init = make_init(&made, &box_ty, flag, module);
+    let name = match library {
+        Some(library) => library_init_function(library),
+        None => INIT_FUNCTION.to_owned(),
+    };
+    let init = make_init(&name, &made, &box_ty, flag, module);
     let init_id = init.id;
     module.functions.insert(init_id, init);
     sites.len()
@@ -205,6 +258,7 @@ fn value(f: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
 }
 
 fn make_init(
+    name: &str,
     made: &[(HirId, HirId, HirCallable, HirType)],
     box_ty: &HirType,
     flag: HirId,
@@ -222,7 +276,7 @@ fn make_init(
         effects: Vec::new(),
         is_pure: false,
     };
-    let mut f = HirFunction::new(InternedString::new_global(INIT_FUNCTION), signature);
+    let mut f = HirFunction::new(InternedString::new_global(name), signature);
     let entry = f.entry_block;
     let make = HirId::new();
     let done = HirId::new();

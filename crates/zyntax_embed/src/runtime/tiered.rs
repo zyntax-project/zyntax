@@ -540,7 +540,13 @@ impl TieredRuntime {
         let lazily = entered.is_some()
             && !self.config.enable_hot_reload
             && std::env::var_os("ZYNTAX_DISABLE_LAZY").is_none();
-        if let Some(names) = &entered {
+        // The boxed-constant initializers to run once the module is
+        // installed: each linked library's, then the program's own.
+        // A library's is entered by the host alone, so it is named as
+        // an entry point to be kept and compiled.
+        let mut box_inits = zyntax_compiler::const_boxes::library_init_functions(&module);
+        if let Some(names) = &mut entered {
+            names.extend(box_inits.iter().cloned());
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             let keep = zyntax_compiler::reachable_function_ids(&module, &names);
             module.functions.retain(|id, _| keep.contains(id));
@@ -582,28 +588,26 @@ impl TieredRuntime {
         zyntax_compiler::boxes::set_interning(true);
         // Keep the initializer reachable for codegen, then run it once
         // after the module's globals and functions have been installed.
-        let init_boxed_constants = if let Some(names) = &mut entered {
-            if zyntax_compiler::const_boxes::run_module(&mut module) > 0 {
-                names.push(zyntax_compiler::const_boxes::INIT_FUNCTION.to_owned());
-                // Made after the marking above; it runs once, interpreted.
-                if lazily {
-                    for (id, f) in module.functions.iter_mut() {
-                        if f.name.resolve_global().as_deref()
-                            == Some(zyntax_compiler::const_boxes::INIT_FUNCTION)
-                        {
-                            lazy.insert(*id);
-                            f.attributes.optimized = true;
-                            f.attributes.deferred = true;
-                        }
+        if let Some(names) = &mut entered
+            && zyntax_compiler::const_boxes::run_module(&mut module) > 0
+        {
+            names.push(zyntax_compiler::const_boxes::INIT_FUNCTION.to_owned());
+            box_inits.push(zyntax_compiler::const_boxes::INIT_FUNCTION.to_owned());
+            // Made after the marking above; it runs once, interpreted,
+            // and needs no pass of its own: what it allocates it stores.
+            if lazily {
+                for (id, f) in module.functions.iter_mut() {
+                    if f.name.resolve_global().as_deref()
+                        == Some(zyntax_compiler::const_boxes::INIT_FUNCTION)
+                    {
+                        lazy.insert(*id);
+                        finished.insert(*id);
+                        f.attributes.optimized = true;
+                        f.attributes.deferred = true;
                     }
                 }
-                true
-            } else {
-                false
             }
-        } else {
-            false
-        };
+        }
 
         // Run interp-safe HIR opts before backend installation. Without this,
         // user programs run through `TieredRuntime::compile_module` never get
@@ -697,8 +701,7 @@ impl TieredRuntime {
                 )));
             }
         };
-        if init_boxed_constants {
-            let init = zyntax_compiler::const_boxes::INIT_FUNCTION;
+        for init in &box_inits {
             if interpreter_bound {
                 self.call::<()>(init, &[])?;
             } else {

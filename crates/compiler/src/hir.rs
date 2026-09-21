@@ -2222,6 +2222,25 @@ pub struct FunctionAttributes {
     /// of them for distinct memory.
     #[serde(default)]
     pub osr_region: bool,
+    /// What the release pass found of this body when its module was
+    /// optimised, for a module that links the body later to read
+    /// instead of recomputing. Holds for the body as recorded: a pass
+    /// that rewrites the body clears it.
+    #[serde(default)]
+    pub release_facts: Option<ReleaseFacts>,
+}
+
+/// The release pass's per-function facts; see
+/// `FunctionAttributes::release_facts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseFacts {
+    /// The result is storage the caller owns.
+    pub returns_owned: bool,
+    /// Per parameter, whether it may come back as the result.
+    pub returns_param: Vec<bool>,
+    /// Whether the module released storage automatically when these
+    /// were computed; they hold only for a module that does the same.
+    pub automatic_release: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

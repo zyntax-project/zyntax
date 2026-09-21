@@ -264,6 +264,10 @@ pub struct LoweringContext {
     /// the phase trace; the clock is read only when the trace is on.
     adopted: (usize, f64),
     trace_phases: bool,
+    /// The prelowered modules' boxed-constant initializers: called by
+    /// the host, not by any body, and adopted with the first function
+    /// reached, since their boxes are what the bodies load.
+    prelowered_inits: Vec<crate::hir::HirId>,
     /// Functions dropped because their body failed analysis, keyed by
     /// the id a call site still carries, with the name and what the
     /// analysis said. A drop is only tolerable while nothing calls the
@@ -582,6 +586,17 @@ impl LoweringContext {
             adopt_followed: std::collections::HashSet::new(),
             adopted: (0, 0.0),
             trace_phases: std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some(),
+            prelowered_inits: config
+                .prelowered
+                .iter()
+                .flat_map(|m| m.shell().functions.values())
+                .filter(|f| {
+                    f.name
+                        .resolve_global()
+                        .is_some_and(|n| crate::const_boxes::is_init_function(&n))
+                })
+                .map(|f| f.id)
+                .collect(),
             dropped_for: std::collections::HashMap::new(),
             type_registry,
             arena,
@@ -778,6 +793,7 @@ impl LoweringContext {
                 pending.extend(targets_of(function));
             }
         }
+        pending.extend(self.prelowered_inits.iter().copied());
         for (id, global) in &self.module.globals {
             if self.adopt_followed.insert(*id)
                 && let Some(init) = &global.initializer
