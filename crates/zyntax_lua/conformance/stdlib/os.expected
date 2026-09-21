@@ -9,7 +9,7 @@ false	os.lua:13: bad argument #1 to 'time' (table expected, got number)
 2000-01-01 00:00:00
 Thu Jan  1 00:00:00 1970
 01/01/70 00:00:00 AM 001 00 4 70 %
-Tuesday Tue February Feb 10 10 02/10/70 1970-02-10 00 12 00 00 UTC
+Tuesday Tue February Feb 10 10 02/10/70 1970-02-10 00 12 00 00
 2000	1	1	0	0	0	7	1	false
 true
 false	os.lua:21: bad argument #1 to 'date' (invalid conversion specifier '%Q')
