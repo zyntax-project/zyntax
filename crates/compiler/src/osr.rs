@@ -1526,6 +1526,96 @@ mod tests {
         );
     }
 
+    /// The region order puts a block before every block it branches to
+    /// that it reaches first, whatever order the blocks were inserted
+    /// in, and leaves out blocks the header does not reach.
+    #[test]
+    fn region_order_is_reverse_postorder_from_the_header() {
+        use crate::hir::{HirBlock, HirFunctionSignature, HirTerminator};
+        use zyntax_typed_ast::InternedString;
+
+        let signature = HirFunctionSignature {
+            params: vec![],
+            returns: vec![],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut function = HirFunction::new(InternedString::new_global("f"), signature);
+        let entry = function.entry_block;
+        function.blocks.clear();
+
+        let header = HirId::new();
+        let test_a = HirId::new();
+        let test_b = HirId::new();
+        let arm = HirId::new();
+        let definer = HirId::new();
+        let latch = HirId::new();
+        let exit = HirId::new();
+        let orphan = HirId::new();
+        let cond = HirId::new();
+
+        let block = |id: HirId, terminator: HirTerminator| HirBlock {
+            id,
+            label: None,
+            phis: Vec::new(),
+            instructions: Vec::new(),
+            terminator,
+            dominance_frontier: Default::default(),
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+        };
+        let branch = |target| HirTerminator::Branch { target };
+        let cond_branch = |true_target, false_target| HirTerminator::CondBranch {
+            condition: cond,
+            true_target,
+            false_target,
+        };
+
+        // Inserted with the tests ahead of the block that defines what
+        // they read: header → definer → test_a → (arm | test_b) → latch
+        // → header, an exit off the header, and an orphan nothing reaches.
+        function.blocks.insert(entry, block(entry, branch(header)));
+        function
+            .blocks
+            .insert(test_a, block(test_a, cond_branch(arm, test_b)));
+        function.blocks.insert(test_b, block(test_b, branch(latch)));
+        function.blocks.insert(arm, block(arm, branch(latch)));
+        function
+            .blocks
+            .insert(header, block(header, cond_branch(definer, exit)));
+        function
+            .blocks
+            .insert(definer, block(definer, branch(test_a)));
+        function.blocks.insert(latch, block(latch, branch(header)));
+        function
+            .blocks
+            .insert(exit, block(exit, HirTerminator::Return { values: vec![] }));
+        function.blocks.insert(orphan, block(orphan, branch(latch)));
+
+        let order = blocks_reachable_from_in_rpo(&function, header);
+        let position = |id: HirId| {
+            order
+                .iter()
+                .position(|b| *b == id)
+                .unwrap_or_else(|| panic!("{id:?} missing from {order:?}"))
+        };
+        assert_eq!(order[0], header);
+        assert!(position(definer) < position(test_a));
+        assert!(position(test_a) < position(test_b));
+        assert!(position(test_a) < position(arm));
+        assert!(position(test_b) < position(latch));
+        assert!(position(arm) < position(latch));
+        assert!(!order.contains(&entry));
+        assert!(!order.contains(&orphan));
+        assert_eq!(order.len(), 7);
+    }
+
     #[test]
     fn bead_ids_are_unique() {
         let a = next_bead_id();
