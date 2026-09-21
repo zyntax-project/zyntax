@@ -241,6 +241,26 @@ struct FunctionEntry {
     bead_id: u64,
 }
 
+/// What the tier above answered a bead's promotion request with, kept
+/// per bead and tier so the answer is not worked out again.
+#[derive(Clone, Copy)]
+enum PromotionOutcome {
+    /// Queued at the tier, or already compiled there.
+    Submitted,
+    /// The tier does not take the body, for the reason given.
+    #[cfg_attr(not(feature = "llvm-backend"), allow(dead_code))]
+    Refused(&'static str),
+}
+
+impl std::fmt::Display for PromotionOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PromotionOutcome::Submitted => f.write_str("submitted"),
+            PromotionOutcome::Refused(why) => write!(f, "refused: {why}"),
+        }
+    }
+}
+
 /// Work for the warm-up thread while it has none of its own: an
 /// interpreted loop that asked for its resume points comes first (it is
 /// running, slowly, until they land), a function whose calls crossed
@@ -2980,6 +3000,12 @@ impl TieredBackend {
         let optimized_bodies = Arc::clone(&self.optimized_bodies);
         let interp_bodies = Arc::clone(&self.interp_bodies);
         let queue = self.compile_queue.clone();
+        // What the tier above answered for each bead. A request repeated
+        // while the compile is queued, after it landed or after the tier
+        // refused the body costs the asking frame this lookup and no
+        // more. Made anew with the requester, which a reload reinstalls.
+        let outcomes: Arc<Mutex<HashMap<(u64, usize), PromotionOutcome>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         osr::set_promotion_requester(move |bead_id, from| {
             let Some((func_id, bound, swapped, module_arc, lazy)) = by_bead.get(&bead_id) else {
                 if osr::osr_trace_enabled() {
@@ -3159,6 +3185,19 @@ impl TieredBackend {
             if !optimizing {
                 return true;
             }
+            // Held through the submission, so two frames asking at once
+            // make one request between them.
+            let outcome_key = (bead_id, tier_idx);
+            let mut outcomes = outcomes.lock().unwrap();
+            if let Some(outcome) = outcomes.get(&outcome_key) {
+                if osr::osr_trace_enabled() {
+                    eprintln!(
+                        "[osr] {} tier={tier_idx}: answered before, {outcome}",
+                        func_arc.name.resolve_global().unwrap_or_default()
+                    );
+                }
+                return true;
+            }
             // The tier above compiles the body the baseline was optimised
             // from, which a first-call compile just made when the request
             // came from the interpreter.
@@ -3179,6 +3218,7 @@ impl TieredBackend {
                         func_arc.name.resolve_global().unwrap_or_default()
                     );
                 }
+                outcomes.insert(outcome_key, PromotionOutcome::Refused("aggregate ABI"));
                 return true;
             }
             #[cfg(feature = "llvm-backend")]
@@ -3189,6 +3229,10 @@ impl TieredBackend {
                         func_arc.name.resolve_global().unwrap_or_default()
                     );
                 }
+                outcomes.insert(
+                    outcome_key,
+                    PromotionOutcome::Refused("call-heavy list entry"),
+                );
                 return true;
             }
             let cranelift = Arc::clone(&cranelift);
@@ -3276,19 +3320,25 @@ impl TieredBackend {
                     func_id
                 );
             }
-            // A promotion already queued or done is not a refusal: the
-            // request is answered by the compile in flight, and later
-            // frames' requests at other headers go to the late path.
+            // Queued now, queued or installed by an earlier request: the
+            // answer stands, and later frames' requests at other headers
+            // go to the late path. A submission the broker could not take
+            // is asked again.
             #[cfg(feature = "llvm-backend")]
-            {
+            let queued_before = {
                 let mut late = late.lock().unwrap();
                 if submitted {
                     late.queued.insert(bead_id);
-                } else if late.queued.contains(&bead_id) {
-                    return true;
                 }
+                late.queued.contains(&bead_id)
+            };
+            #[cfg(not(feature = "llvm-backend"))]
+            let queued_before = false;
+            if submitted || queued_before || bound.is_queued_for(tier_idx) {
+                outcomes.insert(outcome_key, PromotionOutcome::Submitted);
+                return true;
             }
-            submitted
+            false
         });
     }
 
