@@ -920,7 +920,11 @@ impl<'ctx> LLVMBackend<'ctx> {
         }
         // The helper enters only at this header. Predecessors outside its
         // reachable graph are omitted when wiring the copied blocks' phis.
-        let in_loop = crate::osr::blocks_reachable_from(func, layout.header);
+        // The region is compiled in reverse postorder from the header, so
+        // a definition is built before any block that reads it; the
+        // function's block order does not promise that.
+        let region_rpo = crate::osr::blocks_reachable_from_in_rpo(func, layout.header);
+        let in_loop: std::collections::HashSet<HirId> = region_rpo.iter().copied().collect();
 
         // One pointer to the frame carrying the live-ins.
         let params: Vec<BasicMetadataTypeEnum> = vec![
@@ -1055,10 +1059,10 @@ impl<'ctx> LLVMBackend<'ctx> {
             .build_unconditional_branch(header_block)
             .map_err(|e| CompilerError::CodeGen(format!("OSR prologue branch: {e}")))?;
 
-        for (block_id, hir_block) in func.blocks.iter() {
-            if !in_loop.contains(block_id) {
+        for block_id in &region_rpo {
+            let Some(hir_block) = func.blocks.get(block_id) else {
                 continue;
-            }
+            };
             if let Some(llvm_block) = self.block_map.get(block_id) {
                 self.builder.position_at_end(*llvm_block);
                 self.compile_block_with_terminator(block_id, hir_block, func)?;

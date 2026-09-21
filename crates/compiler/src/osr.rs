@@ -1683,6 +1683,41 @@ pub fn blocks_reachable_from(
     reachable_from(function, start).into_iter().collect()
 }
 
+/// The blocks reachable from `start` in reverse postorder of the walk
+/// from it, `start` first: the order a helper compiles them in, so every
+/// definition in the region is built before the blocks that read it.
+/// Walks terminators, as [`blocks_reachable_from`] does.
+pub fn blocks_reachable_from_in_rpo(function: &HirFunction, start: HirId) -> Vec<HirId> {
+    enum Step {
+        Enter(HirId),
+        Exit(HirId),
+    }
+    let mut visited: IdSet = IdSet::default();
+    let mut postorder = Vec::new();
+    let mut stack = vec![Step::Enter(start)];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Enter(id) => {
+                if !visited.insert(id) {
+                    continue;
+                }
+                let Some(block) = function.blocks.get(&id) else {
+                    continue;
+                };
+                stack.push(Step::Exit(id));
+                for succ in successors_of(&block.terminator).into_iter().rev() {
+                    if !visited.contains(&succ) {
+                        stack.push(Step::Enter(succ));
+                    }
+                }
+            }
+            Step::Exit(id) => postorder.push(id),
+        }
+    }
+    postorder.reverse();
+    postorder
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Frame layout
 // ─────────────────────────────────────────────────────────────────────────────
