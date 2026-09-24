@@ -39,7 +39,11 @@ fn answer(body: &str, spread: bool) -> ZyntaxValue {
     let src = format!("{PRE}{body}");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        std::env::set_var("ZYNTAX_PARALLEL_LOOPS", if spread { "1" } else { "0" });
+        // SAFETY: every test in this binary holds the lock from
+        // `serialised` until this thread has answered, so no other test
+        // thread is running, and a runtime's own threads read the
+        // environment through std::env, which excludes set_var.
+        unsafe { std::env::set_var("ZYNTAX_PARALLEL_LOOPS", if spread { "1" } else { "0" }) };
         let got = (|| -> Result<ZyntaxValue, String> {
             let mut zynml = ZynML::new().map_err(|e| format!("{e:?}"))?;
             let mut cfg = TieredConfig::default();
@@ -124,6 +128,7 @@ fn the_spread_answer_is_the_same_every_time() {
 /// analysis is what has to say so.
 #[test]
 fn a_loop_sharing_scratch_across_iterations_is_refused() {
+    let _guard = serialised();
     let src = format!(
         "{PRE}
 def run(mut out: Ptr<f32>, src: Ptr<f32>, mut scratch: Ptr<f32>, rounds: i64, n: i64): i64 {{
@@ -158,19 +163,25 @@ def run(mut out: Ptr<f32>, src: Ptr<f32>, mut scratch: Ptr<f32>, rounds: i64, n:
     // dispatches a loop with a loop inside it, so the inner copy, which
     // genuinely is independent, is not a candidate either way; nothing
     // being dispatched is therefore a statement about the outer one.
-    let _guard = serialised();
-    std::env::set_var("ZYNTAX_PARALLEL_LOOPS", "1");
+    // SAFETY: this test holds the lock from `serialised`, as every test
+    // in this binary does, and the runtime's own threads read the
+    // environment through std::env, which excludes set_var.
+    unsafe { std::env::set_var("ZYNTAX_PARALLEL_LOOPS", "1") };
     // The inner copy is a candidate when flat loops are switched on,
     // and it is genuinely independent, so it would mask what this is
     // asking about. Off, nothing dispatched is a statement about the
     // rounds loop alone.
     let flat = std::env::var("ZYNTAX_PARALLEL_FLAT_LOOPS").ok();
-    std::env::set_var("ZYNTAX_PARALLEL_FLAT_LOOPS", "0");
+    // SAFETY: as above.
+    unsafe { std::env::set_var("ZYNTAX_PARALLEL_FLAT_LOOPS", "0") };
     let stats = zyntax_compiler::parallel_dispatch::run_module(&mut module);
-    std::env::set_var("ZYNTAX_PARALLEL_LOOPS", "0");
-    match flat {
-        Some(v) => std::env::set_var("ZYNTAX_PARALLEL_FLAT_LOOPS", v),
-        None => std::env::remove_var("ZYNTAX_PARALLEL_FLAT_LOOPS"),
+    // SAFETY: as above.
+    unsafe {
+        std::env::set_var("ZYNTAX_PARALLEL_LOOPS", "0");
+        match flat {
+            Some(v) => std::env::set_var("ZYNTAX_PARALLEL_FLAT_LOOPS", v),
+            None => std::env::remove_var("ZYNTAX_PARALLEL_FLAT_LOOPS"),
+        }
     }
     assert_eq!(
         stats.dispatched, 0,

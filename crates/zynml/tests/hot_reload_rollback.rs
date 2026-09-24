@@ -3,8 +3,16 @@
 //! rolled back — beads, reload cells and dispatch tables swing back to
 //! the previous generation, with state untouched either way.
 
+use std::sync::{Mutex, MutexGuard};
 use zynml::{Grammar2, ZYNML_GRAMMAR, ZynML, ZynMLConfig, ZynMLRuntimeProfile};
 use zyntax_embed::{TieredConfig, TieredRuntime, ZyntaxValue};
+
+/// The failure hook is a process-wide variable, so every test here runs
+/// alone and its runtime is dropped before the next one starts.
+fn serialised() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn runtime() -> ZynML {
     let config = ZynMLConfig {
@@ -43,6 +51,7 @@ fn source(f_step: i64, g_step: i64) -> String {
 /// against the restored code.
 #[test]
 fn a_rollback_restores_the_previous_generation() {
+    let _guard = serialised();
     let mut rt = runtime();
     rt.load_source(&source(1, 1)).expect("v1 should compile");
     let v1: i64 = rt.call_with_result("main").expect("main should run");
@@ -73,6 +82,7 @@ fn a_rollback_restores_the_previous_generation() {
 /// Rollback is one-shot and only meaningful after an applied reload.
 #[test]
 fn a_rollback_without_an_applied_reload_errors() {
+    let _guard = serialised();
     let mut rt = runtime();
     rt.load_source(&source(1, 1)).expect("v1 should compile");
     assert!(rt.rollback_last_reload().is_err());
@@ -94,12 +104,18 @@ fn a_rollback_without_an_applied_reload_errors() {
 /// test hook — real compile failures on validated HIR are rare.)
 #[test]
 fn a_partial_compile_failure_applies_nothing() {
+    let _guard = serialised();
     let mut rt = runtime();
     rt.load_source(&source(1, 1)).expect("v1 should compile");
 
-    std::env::set_var("ZYNTAX_RELOAD_INJECT_FAIL", "g");
+    // SAFETY: every test in this binary holds the lock from
+    // `serialised`, so no other test thread is running, and the
+    // runtime's own threads read the environment through std::env,
+    // which excludes set_var and remove_var.
+    unsafe { std::env::set_var("ZYNTAX_RELOAD_INJECT_FAIL", "g") };
     let report = rt.reload_source(&source(2, 2));
-    std::env::remove_var("ZYNTAX_RELOAD_INJECT_FAIL");
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("ZYNTAX_RELOAD_INJECT_FAIL") };
     let report = report.expect("an aborted reload reports, not errors");
 
     assert!(report.aborted, "{report:?}");
@@ -129,6 +145,7 @@ fn a_partial_compile_failure_applies_nothing() {
 /// implementation again.
 #[test]
 fn a_rollback_restores_handler_dispatch() {
+    let _guard = serialised();
     fn parse(src: &str) -> zyntax_embed::TypedProgram {
         let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar should compile");
         grammar

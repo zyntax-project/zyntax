@@ -40,7 +40,10 @@ fn build(src: &str, dump: &str, func: &str) -> (f64, usize, String) {
         .join(format!("hirdump_{dump}"));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
-    std::env::set_var("ZYNTAX_DUMP_HIR_DIR", &dir);
+    // SAFETY: every test in this binary holds DUMPING across this write,
+    // so no other test thread is running, and a runtime's own threads
+    // read the environment through std::env, which excludes set_var.
+    unsafe { std::env::set_var("ZYNTAX_DUMP_HIR_DIR", &dir) };
 
     let plugins = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/target/zrtl");
     let cfg = ZynMLConfig {
