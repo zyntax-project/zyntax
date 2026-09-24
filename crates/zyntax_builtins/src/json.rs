@@ -60,7 +60,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 eq(cat.e(), int(1)),
                 vec![
                     if_(
-                        call("zb_box_get_bool", vec![x.e()], boolean()),
+                        ne(call("zb_box_get_bool", vec![x.e()], i32()), int32(0)),
                         vec![piece(text("true"))],
                         vec![piece(text("false"))],
                     ),

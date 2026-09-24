@@ -284,6 +284,13 @@ pub fn library(policy: &Policy) -> Library {
             None,
         ));
     }
+    // Every call is typed as its callee returns; checked where the
+    // library is built in a debug build, and by the crate's tests.
+    debug_assert!(
+        build::mismatched_call_results(&declarations).is_empty(),
+        "{}",
+        build::mismatched_call_results(&declarations).join("; ")
+    );
     let fallible = fallible_functions(&declarations);
     Library {
         declarations,
@@ -382,5 +389,37 @@ mod tests {
         assert_eq!(sorted.len(), names.len(), "a name is declared twice");
         assert!(names.iter().any(|n| n == "zb_list_get_i64"));
         assert!(names.iter().any(|n| n == "zb_float_repr"));
+    }
+
+    #[test]
+    fn every_call_is_typed_as_its_callee_returns() {
+        for (instance_hooks, exceptions) in [(false, false), (true, true)] {
+            let lib = library(&Policy {
+                true_text: "True",
+                false_text: "False",
+                none_text: "None",
+                single_quotes: true,
+                float_fraction: true,
+                instance_hooks,
+                exceptions,
+                bool_is_number: true,
+                type_names: TypeNames {
+                    none: "NoneType",
+                    bool: "bool",
+                    int: "int",
+                    float: "float",
+                    str: "str",
+                    bytes: "bytes",
+                    list: "list",
+                    tuple: "tuple",
+                    dict: "dict",
+                    set: "set",
+                    function: "function",
+                    object: "object",
+                },
+            });
+            let mismatched = build::mismatched_call_results(&lib.declarations);
+            assert!(mismatched.is_empty(), "{}", mismatched.join("\n"));
+        }
     }
 }

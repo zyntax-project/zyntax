@@ -1,0 +1,16 @@
+true
+false
+null
+0
+-12
+3.5
+-0.0
+1e+21
+"text"
+[true, false]
+[null, 1]
+{"k": true}
+['true', '{"i": 0, "even": true, "half": 0.0, "name": "0"}', 'false', '{"i": 1, "even": false, "half": 0.5, "name": "1"}', 'true', '{"i": 2, "even": true, "half": 1.0, "name": "2"}']
+[[true], [false, null], {"nested": {"deep": [1, 2.5, "x", true]}}]
+True
+334

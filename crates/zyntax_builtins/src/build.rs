@@ -724,3 +724,129 @@ fn callees_of_expr(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
         _ => {}
     }
 }
+
+/// Every call whose result type differs from its callee's declared
+/// return type, as `caller: callee declared T, called as U`. A call
+/// node's type is what the caller's code is built against, so a
+/// mismatch is a lowering that reads a value at the wrong width.
+pub fn mismatched_call_results(declarations: &[Decl]) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut returns: HashMap<String, &Type> = HashMap::new();
+    for d in declarations {
+        if let TypedDeclaration::Function(f) = &d.node
+            && let Some(name) = f.name.resolve_global()
+        {
+            returns.insert(name, &f.return_type);
+        }
+    }
+    let mut out = Vec::new();
+    for d in declarations {
+        if let TypedDeclaration::Function(f) = &d.node
+            && let (Some(caller), Some(body)) = (f.name.resolve_global(), &f.body)
+        {
+            for s in &body.statements {
+                call_results_of_stmt(s, &caller, &returns, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn call_results_of_stmt(
+    stmt: &Stmt,
+    caller: &str,
+    returns: &std::collections::HashMap<String, &Type>,
+    out: &mut Vec<String>,
+) {
+    let expr = |e: &Expr, out: &mut Vec<String>| call_results_of_expr(e, caller, returns, out);
+    match &stmt.node {
+        TypedStatement::Expression(e) => expr(e, out),
+        TypedStatement::Let(l) => {
+            if let Some(init) = &l.initializer {
+                expr(init, out);
+            }
+        }
+        TypedStatement::Return(Some(e)) => expr(e, out),
+        TypedStatement::If(i) => {
+            expr(&i.condition, out);
+            for s in &i.then_block.statements {
+                call_results_of_stmt(s, caller, returns, out);
+            }
+            if let Some(e) = &i.else_block {
+                for s in &e.statements {
+                    call_results_of_stmt(s, caller, returns, out);
+                }
+            }
+        }
+        TypedStatement::While(w) => {
+            expr(&w.condition, out);
+            for s in &w.body.statements {
+                call_results_of_stmt(s, caller, returns, out);
+            }
+        }
+        TypedStatement::Block(b) => {
+            for s in &b.statements {
+                call_results_of_stmt(s, caller, returns, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn call_results_of_expr(
+    e: &Expr,
+    caller: &str,
+    returns: &std::collections::HashMap<String, &Type>,
+    out: &mut Vec<String>,
+) {
+    match &e.node {
+        TypedExpression::Call(c) => {
+            if let TypedExpression::Variable(n) = &c.callee.node
+                && let Some(name) = n.resolve_global()
+                && let Some(declared) = returns.get(&name)
+                && **declared != e.ty
+            {
+                out.push(format!(
+                    "{caller}: {name} declared {declared:?}, called as {:?}",
+                    e.ty
+                ));
+            }
+            for a in &c.positional_args {
+                call_results_of_expr(a, caller, returns, out);
+            }
+        }
+        TypedExpression::MethodCall(m) => {
+            call_results_of_expr(&m.receiver, caller, returns, out);
+            for a in &m.positional_args {
+                call_results_of_expr(a, caller, returns, out);
+            }
+        }
+        TypedExpression::Binary(b) => {
+            call_results_of_expr(&b.left, caller, returns, out);
+            call_results_of_expr(&b.right, caller, returns, out);
+        }
+        TypedExpression::Unary(u) => call_results_of_expr(&u.operand, caller, returns, out),
+        TypedExpression::Index(i) => {
+            call_results_of_expr(&i.object, caller, returns, out);
+            call_results_of_expr(&i.index, caller, returns, out);
+        }
+        TypedExpression::Field(f) => call_results_of_expr(&f.object, caller, returns, out),
+        TypedExpression::Cast(c) => call_results_of_expr(&c.expr, caller, returns, out),
+        TypedExpression::If(i) => {
+            call_results_of_expr(&i.condition, caller, returns, out);
+            call_results_of_expr(&i.then_branch, caller, returns, out);
+            call_results_of_expr(&i.else_branch, caller, returns, out);
+        }
+        TypedExpression::Array(items) | TypedExpression::Tuple(items) => {
+            for a in items {
+                call_results_of_expr(a, caller, returns, out);
+            }
+        }
+        TypedExpression::Block(b) => {
+            for s in &b.statements {
+                call_results_of_stmt(s, caller, returns, out);
+            }
+        }
+        _ => {}
+    }
+}
