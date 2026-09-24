@@ -1621,6 +1621,153 @@ mod tests {
         assert_eq!(order.len(), 7);
     }
 
+    /// A region whose entry reaches its header through code that only
+    /// computes values is re-entered through its entry; one that writes
+    /// memory or calls on the way is not, since the frame already did.
+    #[test]
+    fn region_reentry_needs_a_pure_path_to_the_header() {
+        use crate::hir::{
+            BinaryOp, HirBlock, HirCallable, HirConstant, HirFunctionSignature, HirInstruction,
+            HirParam, HirPhi, HirTerminator, HirValueKind, Intrinsic,
+        };
+        use zyntax_typed_ast::InternedString;
+
+        // `on_the_way(c)` is what the block between the entry and the
+        // header holds, given a constant `c` it may read.
+        let region = |on_the_way: &dyn Fn(HirId) -> Vec<HirInstruction>| {
+            let p = HirId::new();
+            let signature = HirFunctionSignature {
+                params: vec![HirParam {
+                    id: p,
+                    name: InternedString::new_global("p"),
+                    ty: HirType::I64,
+                    attributes: Default::default(),
+                    ownership: Default::default(),
+                }],
+                returns: vec![HirType::I64],
+                type_params: vec![],
+                const_params: vec![],
+                lifetime_params: vec![],
+                is_variadic: false,
+                is_async: false,
+                is_fiber: false,
+                effects: vec![],
+                is_pure: false,
+            };
+            let mut function = HirFunction::new(InternedString::new_global("r"), signature);
+            function.attributes.osr_region = true;
+            let c =
+                function.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(1)));
+            let entry = function.entry_block;
+            function.blocks.clear();
+            let pre = HirId::new();
+            let header = HirId::new();
+            let body = HirId::new();
+            let exit = HirId::new();
+            let (i, cond, next) = (HirId::new(), HirId::new(), HirId::new());
+            let block = |id, instructions, terminator| HirBlock {
+                id,
+                label: None,
+                phis: Vec::new(),
+                instructions,
+                terminator,
+                dominance_frontier: Default::default(),
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+            };
+            let binary = |op, result, left, right| HirInstruction::Binary {
+                op,
+                result,
+                ty: HirType::I64,
+                left,
+                right,
+            };
+            function.blocks.insert(
+                entry,
+                block(entry, Vec::new(), HirTerminator::Branch { target: pre }),
+            );
+            function.blocks.insert(
+                pre,
+                block(pre, on_the_way(c), HirTerminator::Branch { target: header }),
+            );
+            let mut head = block(
+                header,
+                vec![binary(BinaryOp::Eq, cond, i, i)],
+                HirTerminator::CondBranch {
+                    condition: cond,
+                    true_target: exit,
+                    false_target: body,
+                },
+            );
+            head.phis.push(HirPhi {
+                result: i,
+                ty: HirType::I64,
+                incoming: vec![(p, pre), (next, body)],
+            });
+            function.blocks.insert(header, head);
+            function.blocks.insert(
+                body,
+                block(
+                    body,
+                    vec![binary(BinaryOp::Add, next, i, i)],
+                    HirTerminator::Branch { target: header },
+                ),
+            );
+            function.blocks.insert(
+                exit,
+                block(exit, Vec::new(), HirTerminator::Return { values: vec![i] }),
+            );
+            let layout = osr_layout(&function, header).expect("layout");
+            region_params_in_frame(&function, &layout)
+        };
+        let call = |callee, args| HirInstruction::Call {
+            result: Some(HirId::new()),
+            callee,
+            args,
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        };
+
+        assert_eq!(region(&|_| Vec::new()), Some(vec![Some(0)]));
+        assert_eq!(
+            region(&|c| vec![HirInstruction::Binary {
+                op: BinaryOp::Add,
+                result: HirId::new(),
+                ty: HirType::I64,
+                left: c,
+                right: c,
+            }]),
+            Some(vec![Some(0)])
+        );
+        assert_eq!(
+            region(&|c| vec![HirInstruction::Store {
+                value: c,
+                ptr: c,
+                align: 8,
+                volatile: false,
+            }]),
+            None
+        );
+        assert_eq!(
+            region(&|_| vec![call(HirCallable::Symbol("f".into()), vec![])]),
+            None
+        );
+        assert_eq!(
+            region(&|c| vec![call(HirCallable::Intrinsic(Intrinsic::Malloc), vec![c])]),
+            None
+        );
+        assert_eq!(
+            region(&|_| vec![HirInstruction::Alloca {
+                result: HirId::new(),
+                ty: HirType::I64,
+                count: None,
+                align: 8,
+            }]),
+            None
+        );
+    }
+
     #[test]
     fn bead_ids_are_unique() {
         let a = next_bead_id();
@@ -2394,6 +2541,58 @@ pub fn region_entry_header(function: &HirFunction) -> Option<HirId> {
     }
 }
 
+/// Whether the blocks from `function`'s entry to `header` only compute
+/// values: a re-entry through the entry runs them a second time for a
+/// frame that already ran them, which is the same only when they call,
+/// allocate and write nothing.
+fn entry_path_is_pure(function: &HirFunction, header: HirId) -> bool {
+    use crate::hir::HirInstruction as I;
+    let mut block = function.entry_block;
+    let mut seen = std::collections::HashSet::new();
+    while block != header {
+        if !seen.insert(block) {
+            return false;
+        }
+        let Some(b) = function.blocks.get(&block) else {
+            return false;
+        };
+        let pure = b.instructions.iter().all(|inst| {
+            matches!(
+                inst,
+                I::Binary { .. }
+                    | I::Unary { .. }
+                    | I::Load {
+                        volatile: false,
+                        ..
+                    }
+                    | I::GetElementPtr { .. }
+                    | I::Cast { .. }
+                    | I::Select { .. }
+                    | I::ExtractValue { .. }
+                    | I::InsertValue { .. }
+                    | I::GetUnionDiscriminant { .. }
+                    | I::ExtractUnionValue { .. }
+                    | I::VectorSplat { .. }
+                    | I::VectorExtractLane { .. }
+                    | I::VectorInsertLane { .. }
+                    | I::VectorHorizontalReduce { .. }
+                    | I::VectorLoad { .. }
+                    | I::VectorUnaryOp { .. }
+                    | I::VectorMinMax { .. }
+                    | I::VectorDot { .. }
+            )
+        });
+        if !pure {
+            return false;
+        }
+        match &b.terminator {
+            HirTerminator::Branch { target } => block = *target,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Where each parameter of an outlined region sits in the frame a
 /// probe at the region's entry header hands over: the slot of the
 /// live-in it is, or of the header phi it seeds, `None` for a parameter
@@ -2402,7 +2601,8 @@ pub fn region_entry_header(function: &HirFunction) -> Option<HirId> {
 /// instead of carrying a copy of the region. `None` when it cannot: the
 /// header is not the entry's, a live-in is repaired at it, or a
 /// parameter is read on the way to the header (a hoisted computation),
-/// where the frame carries the result but not the input.
+/// where the frame carries the result but not the input, or a block on
+/// the way does more than compute values (see [`entry_path_is_pure`]).
 pub fn region_params_in_frame(
     function: &HirFunction,
     layout: &OsrLayout,
@@ -2411,6 +2611,7 @@ pub fn region_params_in_frame(
         || !layout.repairs.is_empty()
         || layout.destination.is_some()
         || region_entry_header(function) != Some(layout.header)
+        || !entry_path_is_pure(function, layout.header)
     {
         return None;
     }
