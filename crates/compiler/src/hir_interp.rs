@@ -887,6 +887,20 @@ pub struct CompiledFunction {
     pub func_refs: HashMap<HirId, HirId>,
 }
 
+/// Bytes of stack [`clear_stack_below`] zeroes.
+const CLEARED_STACK_BYTES: usize = 8 << 10;
+
+/// Zero the stack below the caller's frame, where a compiled callee's
+/// frames are about to lie. A slot such a frame reads only after
+/// writing it still holds, until then, what an earlier call at the
+/// same depth left there, and the collector reads every word of the
+/// stack: a stale pointer there keeps that call's garbage alive.
+#[inline(never)]
+fn clear_stack_below() {
+    let mut below = [0u8; CLEARED_STACK_BYTES];
+    std::hint::black_box(&mut below);
+}
+
 /// A frame's register file registered with the collector as a root
 /// range for as long as the frame runs interpreted. Once the frame
 /// transfers to compiled code its live-ins are the compiled frame's,
@@ -3222,6 +3236,9 @@ impl HirInterpreter {
             if let Some(cached) = self.shapes.get_mut(&func) {
                 cached.1 = thunk;
             }
+        }
+        if crate::collector::is_enabled() {
+            clear_stack_below();
         }
         self.call_native_through(entry, &sig, thunk, args, dest)
     }
