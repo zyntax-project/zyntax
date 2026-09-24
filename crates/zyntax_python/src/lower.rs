@@ -7216,6 +7216,20 @@ impl<'m> Lowerer<'m> {
             }
         }
         match op {
+            // Against None, a value of a type no None belongs to is
+            // decided here; the other operand still runs.
+            py::CmpOp::Eq | py::CmpOp::NotEq
+                if (left.ty == Ty::None && never_none(right.ty))
+                    || (right.ty == Ty::None && never_none(left.ty)) =>
+            {
+                let other = if left.ty == Ty::None { right } else { left };
+                let answer = node(
+                    TypedExpression::Literal(TypedLiteral::Bool(op == py::CmpOp::NotEq)),
+                    Ty::Bool,
+                    span,
+                );
+                return Ok(Self::after_none(other.node, answer, Ty::Bool));
+            }
             py::CmpOp::In | py::CmpOp::NotIn => {
                 let n = if left.ty == Ty::Str && right.ty == Ty::Str {
                     call(
@@ -12712,6 +12726,13 @@ impl<'m> Lowerer<'m> {
         };
         Ok(Val { node, ty: Ty::None })
     }
+}
+
+/// Whether no value of `ty` is None: a primitive, a container, a
+/// function value. An instance may be the null one, and a dynamic
+/// value anything.
+fn never_none(ty: Ty) -> bool {
+    !matches!(ty, Ty::None | Ty::Object | Ty::Unknown | Ty::Class(_))
 }
 
 /// Whether every key of a dict literal is a string literal and no two
