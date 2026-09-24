@@ -13,8 +13,10 @@
 //!
 //! `conformance/official/` is the test suite that ships with Lua 5.4
 //! (lua.org/tests), run as `all.lua` runs each file with `_U=true`, the
-//! portable subset. The hand-written categories are programs that
-//! print what they assert.
+//! portable subset, and judged as `all.lua` judges it: a file conforms
+//! when it runs to its end, exiting as the reference does with the
+//! reference's last line. The hand-written categories are programs that
+//! print what they assert, compared byte for byte.
 //!
 //! ## Known failures
 //!
@@ -282,9 +284,7 @@ fn category(name: &str, warm_up: WarmUp) {
             continue;
         };
         let got = ours_for(case, warm_up);
-        let ok = got.status == expected.status
-            && got.stdout == expected.stdout
-            && message.as_ref().is_none_or(|m| got.message == *m);
+        let ok = conforms(case, &got, &expected, message.as_deref());
         match (ok, known.get(&key)) {
             (true, None) => passed += 1,
             (true, Some(issue)) => fixed.push((key, issue.clone())),
@@ -341,6 +341,32 @@ fn category(name: &str, warm_up: WarmUp) {
         ));
     }
     assert!(problems.is_empty(), "\n{}", problems.join("\n\n"));
+}
+
+/// Whether `got` matches the reference. An official file asserts what
+/// it tests and ends by printing its final marker (`OK` for most), so it
+/// conforms when it exits as the reference did and its last line is the
+/// reference's; what it prints before that (seeds, timings, counts) is
+/// not compared. A file the reference itself fails, and every
+/// hand-written case, is compared byte for byte, and in its pinned
+/// message when it has one.
+fn conforms(case: &Path, got: &Outcome, expected: &Outcome, message: Option<&str>) -> bool {
+    if got.status != expected.status {
+        return false;
+    }
+    if is_official(case) && expected.status == 0 {
+        return last_line(&got.stdout) == last_line(&expected.stdout);
+    }
+    got.stdout == expected.stdout && message.is_none_or(|m| got.message == m)
+}
+
+/// The last line that is not blank.
+fn last_line(bytes: &[u8]) -> &[u8] {
+    bytes
+        .split(|&b| b == b'\n')
+        .rev()
+        .find(|l| !l.trim_ascii().is_empty())
+        .unwrap_or(&[])
 }
 
 /// Output for a failure report; bytes that are not UTF-8 show as U+FFFD.

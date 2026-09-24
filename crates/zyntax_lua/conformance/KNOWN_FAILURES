@@ -8,7 +8,6 @@ official/calls.lua            4da50c2
 official/closure.lua          4da50c2
 official/constructs.lua       4da50c2
 official/coroutine.lua        4da50c2
-official/cstack.lua           4da50c2
 official/db.lua               4da50c2
 official/errors.lua           4da50c2
 official/events.lua           4da50c2
@@ -18,8 +17,6 @@ official/gengc.lua            4da50c2
 official/goto.lua             4da50c2
 official/literals.lua         4da50c2
 official/locals.lua           4da50c2
-official/math.lua             4da50c2
 official/pm.lua               4da50c2
-official/sort.lua             4da50c2
 official/strings.lua          4da50c2
-official/q4.lua               0903215
+errors/library_names.lua      0903215
