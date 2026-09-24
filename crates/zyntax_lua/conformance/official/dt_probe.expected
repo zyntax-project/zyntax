@@ -1,9 +1,0 @@
-false	bad argument #1 to 'os.date' (invalid conversion specifier '%')
-false	bad argument #1 to 'os.date' (invalid conversion specifier '%9')
-false	bad argument #1 to 'os.date' (invalid conversion specifier '%O')
-false	bad argument #1 to 'os.date' (invalid conversion specifier '%E')
-false	bad argument #1 to 'os.date' (invalid conversion specifier '%Ea')
-false	field 'hour' is not an integer
-false	field 'hour' is not an integer
-false	field 'year' missing in date table
-true	10000	true

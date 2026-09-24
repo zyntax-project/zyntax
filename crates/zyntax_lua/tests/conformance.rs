@@ -54,7 +54,7 @@ fn known_failures() -> HashMap<String, String> {
 /// What one run produced.
 #[derive(Debug, PartialEq, Eq)]
 struct Outcome {
-    stdout: String,
+    stdout: Vec<u8>,
     status: i32,
 }
 
@@ -70,7 +70,7 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
         Ok(c) => c,
         Err(e) => {
             return Outcome {
-                stdout: format!("<could not start: {e}>"),
+                stdout: format!("<could not start: {e}>").into_bytes(),
                 status: -1,
             };
         }
@@ -79,12 +79,12 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
     // pipe holds does not wait on a reader that waits on its exit.
     let reader = child.stdout.take().map(|mut s| {
         std::thread::spawn(move || {
-            let mut out = String::new();
-            let _ = s.read_to_string(&mut out);
+            let mut out = Vec::new();
+            let _ = s.read_to_end(&mut out);
             out
         })
     });
-    let collect = |reader: Option<std::thread::JoinHandle<String>>| {
+    let collect = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
         reader.and_then(|r| r.join().ok()).unwrap_or_default()
     };
     let start = std::time::Instant::now();
@@ -101,14 +101,14 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
                 let _ = child.wait();
                 let _ = collect(reader);
                 return Outcome {
-                    stdout: format!("<timed out after {:?}>", limit),
+                    stdout: format!("<timed out after {:?}>", limit).into_bytes(),
                     status: -3,
                 };
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(e) => {
                 return Outcome {
-                    stdout: format!("<wait failed: {e}>"),
+                    stdout: format!("<wait failed: {e}>").into_bytes(),
                     status: -1,
                 };
             }
@@ -147,13 +147,13 @@ fn expected_for(case: &Path) -> Option<Outcome> {
     // A program that exits with a status pins it beside its output; one
     // that exits 0 pins nothing extra.
     let status_pin = case.with_extension("status");
-    if let Ok(text) = fs::read_to_string(&pin) {
+    if let Ok(bytes) = fs::read(&pin) {
         let status = fs::read_to_string(&status_pin)
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
         return Some(Outcome {
-            stdout: text,
+            stdout: bytes,
             status,
         });
     }
@@ -297,7 +297,9 @@ fn category(name: &str, warm_up: WarmUp) {
     assert!(problems.is_empty(), "\n{}", problems.join("\n\n"));
 }
 
-fn indent(s: &str) -> String {
+/// Output for a failure report; bytes that are not UTF-8 show as U+FFFD.
+fn indent(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(bytes);
     s.lines()
         .map(|l| format!("        {l}"))
         .collect::<Vec<_>>()

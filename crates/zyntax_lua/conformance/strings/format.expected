@@ -1,0 +1,37 @@
+"\0\0\1ÿÈ´"	true	true	nil	nil
+9223372036854775807	true	true	integer	integer
+0x8000000000000000	true	true	integer	integer
+0x1.921fb54442d18p+1	true	true	float	float
+0x1.999999999999ap-4	true	true	float	float
+true	true	true	nil	nil
+nil	true	true	nil	nil
+false	true	true	nil	nil
+1e9999	true	true	float	float
+-1e9999	true	true	float	float
+0x0p+0	true	true	float	float
+-0x0p+0	true	true	float	float
+0x1p+63	true	true	float	float
+hello hello
+hi: 
+1| true|"x"	true	file 
++0X1.80P+3	-0X1.8000P+3	0x0.000p+0	0x1p+0	0x1p+1	0x1.fp+0	0x1p+0	 0x1p-1	0x1.999999999999ap-4	0x1.999999999999a00p-4	-0x0.00p+0	INF
+         012	      0x64	0X64             	-000000000100	-00100
+	+000000000100.	a               	+1.5		
+ 1E+02	 1e+03
+%100.3d	false	invalid conversion specification: '%100.3d'
+%1000000000000000000	false	invalid format (too long)
+%1.100d	false	invalid conversion specification: '%1.100d'
+%10.1000000000000000	false	invalid format (too long)
+%t	false	invalid conversion '%t' to 'format'
+%10q	false	specifier '%q' cannot have modifiers
+%-10q	false	specifier '%q' cannot have modifiers
+%.1q	false	specifier '%q' cannot have modifiers
+%5c	true	    
+
+%d	true	10
+   ab|x    |00042|+5| 5|ffffffffffffffff
+true	6	true	false	format.lua:32: bad argument #2 to 'format' (number expected, got string)
+0x1.5555555555555p-2	0x8000000000000000	ab    |    cd|
+true
+false	resulting string too large
+true	alo	true
