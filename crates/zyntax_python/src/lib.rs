@@ -247,6 +247,9 @@ pub fn register_runtime(
     // releases what it can prove dead and the collector takes the rest.
     runtime.set_automatic_release(true);
     runtime.set_collector(zyntax_embed::Collector::MarkSweep);
+    // Programs declare no effects or handlers, and lower the same
+    // without the structural cleanup.
+    runtime.set_pattern_rewrites(false);
     let snapshot = snapshot().map_err(|e| zyntax_embed::RuntimeError::Execution(e.to_string()))?;
     runtime.install_snapshot(snapshot)?;
     runtime.declare_entry_points([ENTRY]);

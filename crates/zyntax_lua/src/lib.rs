@@ -158,27 +158,30 @@ fn library() -> Result<&'static Library> {
     static LIBRARY: std::sync::OnceLock<std::result::Result<Library, String>> =
         std::sync::OnceLock::new();
     LIBRARY
-        .get_or_init(|| read_library().map_err(|e| e.to_string()))
+        .get_or_init(read_library)
         .as_ref()
-        .map_err(|e| Error::Library(e.clone()))
+        .map_err(|message| Error::Library(message.clone()))
 }
 
-fn read_library() -> Result<Library> {
-    let snapshot = snapshot()?;
+fn read_library() -> std::result::Result<Library, String> {
+    let snapshot = snapshot().map_err(|e| match e {
+        Error::Library(message) => message,
+        other => other.to_string(),
+    })?;
     let module = snapshot
         .module(LIBRARY_MODULE)
-        .map_err(|e| Error::Library(e.to_string()))?
-        .ok_or_else(|| Error::Library(format!("the snapshot has no `{LIBRARY_MODULE}`")))?;
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("the snapshot has no `{LIBRARY_MODULE}`"))?;
     let program = module.program();
     let type_registry = program.type_registry.clone();
     let list_type = type_registry
         .get_type_by_name(intern("List"))
         .map(|def| def.id)
-        .ok_or_else(|| Error::Library("the library declares no List type".to_string()))?;
+        .ok_or_else(|| "the library declares no List type".to_string())?;
     let table_type = type_registry
         .get_type_by_name(intern(library::TABLE_TYPE))
         .map(|def| def.id)
-        .ok_or_else(|| Error::Library("the library declares no table type".to_string()))?;
+        .ok_or_else(|| "the library declares no table type".to_string())?;
     Ok(Library {
         type_registry,
         types: library::Types {
@@ -256,6 +259,9 @@ pub fn register_runtime(
     // what it can prove dead and the collector takes the rest.
     runtime.set_automatic_release(true);
     runtime.set_collector(zyntax_embed::Collector::MarkSweep);
+    // Programs declare no effects or handlers, and lower the same
+    // without the structural cleanup.
+    runtime.set_pattern_rewrites(false);
     let snapshot = snapshot().map_err(|e| zyntax_embed::RuntimeError::Execution(e.to_string()))?;
     runtime.install_snapshot(snapshot)?;
     runtime.declare_entry_points([ENTRY]);

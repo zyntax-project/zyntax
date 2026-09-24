@@ -22,7 +22,7 @@ use std::sync::Arc;
 use zyntax_compiler::hir::HirModule;
 
 const MAGIC: &[u8; 5] = b"ZSNAP";
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 /// magic, schema, and the length of the directory that follows.
 const HEADER_LEN: usize = MAGIC.len() + 2 * std::mem::size_of::<u32>();
 
@@ -117,6 +117,52 @@ struct DirectoryEntry {
     source: Option<Extent>,
     /// The module lowered, when the build did that.
     lowered: Option<LoweredEntry>,
+    /// The module's function declarations one by one, when it was
+    /// lowered: a [`SignatureIndex`] and what it addresses.
+    signatures: Option<Extent>,
+}
+
+/// A module's function declarations, each encoded on its own and found
+/// by name: postcard of this, then the bytes its extents address.
+///
+/// Typing a call needs the callee's declaration and no other, so a
+/// reader decodes the index and the declarations it asks for.
+#[derive(Serialize, Deserialize, Default)]
+struct SignatureIndex {
+    /// Name and declaration extents, ordered by name.
+    entries: Vec<(Extent, Extent)>,
+}
+
+/// Encode the function declarations of a program whose bodies were
+/// stripped, the first under each name.
+fn signature_table(program: &zyntax_typed_ast::TypedProgram) -> Result<Vec<u8>, SnapshotError> {
+    use zyntax_typed_ast::TypedDeclaration;
+    let mut named: Vec<(String, &zyntax_typed_ast::TypedFunction)> = Vec::new();
+    for decl in &program.declarations {
+        if let TypedDeclaration::Function(function) = &decl.node
+            && let Some(name) = function.name.resolve_global()
+        {
+            named.push((name, function));
+        }
+    }
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    named.dedup_by(|later, earlier| later.0 == earlier.0);
+
+    let mut data = Vec::new();
+    let mut index = SignatureIndex::default();
+    for (name, function) in named {
+        let name_extent = Extent::of(name.as_bytes(), data.len());
+        data.extend_from_slice(name.as_bytes());
+        let encoded =
+            postcard::to_allocvec(function).map_err(|e| SnapshotError::Encode(e.to_string()))?;
+        let decl_extent = Extent::of(&encoded, data.len());
+        data.extend_from_slice(&encoded);
+        index.entries.push((name_extent, decl_extent));
+    }
+    let mut bytes =
+        postcard::to_allocvec(&index).map_err(|e| SnapshotError::Encode(e.to_string()))?;
+    bytes.extend_from_slice(&data);
+    Ok(bytes)
 }
 
 /// Where a module's HIR sits, and what may read it.
@@ -144,25 +190,43 @@ impl LoweredEntry {
 /// what is already here, and a module is decoded only when something
 /// imports it.
 pub struct Snapshot {
-    /// Everything after the directory, addressed by the extents in it.
-    blobs: Vec<u8>,
+    /// The artifact: borrowed when the executable embeds it, owned when
+    /// it was read from anywhere else.
+    bytes: std::borrow::Cow<'static, [u8]>,
+    /// Where the bytes the extents address start: everything after the
+    /// directory.
+    blobs_at: usize,
     language: String,
     grammar: Option<Extent>,
     modules: Vec<DirectoryEntry>,
     /// Each module, decoded when something first asks for it. A module
     /// nobody imports is never decoded.
     decoded: Vec<std::sync::OnceLock<Result<CompiledImport, String>>>,
+    /// Each module's signature index, and where the bytes it addresses
+    /// start in its table, decoded when first asked for.
+    signature_indexes: Vec<std::sync::OnceLock<Result<(SignatureIndex, usize), String>>>,
 }
 
 impl Snapshot {
-    /// Read a snapshot, checking it is one and that this build
-    /// understands it.
+    /// Read the snapshot this build embedded (see [`include_snapshot!`]),
+    /// checking it is one and that this build understands it.
     ///
-    /// Reads the directory and keeps the rest as it arrived. Parsing a
-    /// container that owned every part copied the whole artifact before
-    /// a line of it was wanted, which was most of what installing a
-    /// language cost.
-    pub fn load(bytes: &[u8]) -> Result<Self, SnapshotError> {
+    /// Reads the directory and leaves the rest where it lies: a part is
+    /// read in place when something asks for it. The lowered modules are
+    /// not checked against their checksums, since the build that wrote
+    /// them is the one reading them.
+    pub fn load(bytes: &'static [u8]) -> Result<Self, SnapshotError> {
+        Self::read(std::borrow::Cow::Borrowed(bytes))
+    }
+
+    /// Read a snapshot that arrived from outside the executable, such as
+    /// a file. It is kept as it arrived, and a lowered module is checked
+    /// against its checksum before it is read.
+    pub fn load_owned(bytes: Vec<u8>) -> Result<Self, SnapshotError> {
+        Self::read(std::borrow::Cow::Owned(bytes))
+    }
+
+    fn read(bytes: std::borrow::Cow<'static, [u8]>) -> Result<Self, SnapshotError> {
         if bytes.len() < HEADER_LEN || &bytes[..MAGIC.len()] != MAGIC {
             return Err(SnapshotError::InvalidHeader);
         }
@@ -191,25 +255,56 @@ impl Snapshot {
         let directory: Directory = ciborium::from_reader(directory_bytes)
             .map_err(|e| SnapshotError::Decode(e.to_string()))?;
 
-        let blobs = bytes
-            .get(directory_end..)
-            .ok_or_else(|| SnapshotError::Truncated {
-                what: "the body".to_string(),
-            })?
-            .to_vec();
-
         let decoded = directory
             .modules
             .iter()
             .map(|_| std::sync::OnceLock::new())
             .collect();
+        let signature_indexes = directory
+            .modules
+            .iter()
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
         Ok(Self {
-            blobs,
+            bytes,
+            blobs_at: directory_end,
             language: directory.language,
             grammar: directory.grammar,
             modules: directory.modules,
             decoded,
+            signature_indexes,
         })
+    }
+
+    /// Everything after the directory, addressed by the extents in it.
+    fn blobs(&self) -> &[u8] {
+        &self.bytes[self.blobs_at..]
+    }
+
+    /// A module's lowered form, read in place from an embedded snapshot
+    /// and from a copy of its bytes otherwise.
+    fn lazy_hir(
+        &self,
+        extent: Extent,
+        name: &str,
+    ) -> Result<(zyntax_compiler::bytecode::LazyModule, usize), SnapshotError> {
+        let decode =
+            |e: zyntax_compiler::bytecode::BytecodeError| SnapshotError::Decode(e.to_string());
+        match &self.bytes {
+            std::borrow::Cow::Borrowed(all) => {
+                let blobs: &'static [u8] = &all[self.blobs_at..];
+                let bytes = extent.slice(blobs, name)?;
+                zyntax_compiler::bytecode::deserialize_module_lazy_trusted(bytes)
+                    .map(|hir| (hir, bytes.len()))
+                    .map_err(decode)
+            }
+            std::borrow::Cow::Owned(_) => {
+                let bytes = extent.slice(self.blobs(), name)?;
+                zyntax_compiler::bytecode::deserialize_module_lazy(bytes.to_vec())
+                    .map(|hir| (hir, bytes.len()))
+                    .map_err(decode)
+            }
+        }
     }
 
     /// The language this snapshot installs.
@@ -222,7 +317,7 @@ impl Snapshot {
     pub fn grammar_bytes(&self) -> Option<&[u8]> {
         self.grammar
             .as_ref()
-            .and_then(|extent| extent.slice(&self.blobs, "the grammar").ok())
+            .and_then(|extent| extent.slice(self.blobs(), "the grammar").ok())
     }
 
     /// The modules it carries, in the order they were built.
@@ -252,7 +347,7 @@ impl Snapshot {
                 let entry = &self.modules[index];
                 let bytes = entry
                     .artifact
-                    .slice(&self.blobs, &entry.name)
+                    .slice(self.blobs(), &entry.name)
                     .map_err(|e| e.to_string())?;
                 let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
                 let t0 = web_time::Instant::now();
@@ -261,11 +356,8 @@ impl Snapshot {
                 let Some(lowered) = entry.lowered.as_ref().filter(|l| l.usable_here()) else {
                     return Ok(import);
                 };
-                let hir_bytes = lowered
-                    .hir
-                    .slice(&self.blobs, &entry.name)
-                    .map_err(|e| e.to_string())?;
-                let hir = zyntax_compiler::bytecode::deserialize_module_lazy(hir_bytes)
+                let (hir, hir_len) = self
+                    .lazy_hir(lowered.hir, &entry.name)
                     .map_err(|e| e.to_string())?;
                 if trace {
                     eprintln!(
@@ -274,7 +366,7 @@ impl Snapshot {
                         (t1 - t0).as_secs_f64() * 1000.0,
                         bytes.len(),
                         t1.elapsed().as_secs_f64() * 1000.0,
-                        hir_bytes.len()
+                        hir_len
                     );
                 }
                 Ok(import.with_hir(Arc::new(hir)))
@@ -289,6 +381,48 @@ impl Snapshot {
                 })
             })
             .map_err(|e| SnapshotError::Decode(e.clone()))
+    }
+
+    /// Function `name` as module `module` declares it, without a body:
+    /// what typing a call to it needs. Decodes that declaration alone.
+    /// `None` when the module declares no such function or the snapshot
+    /// carries no declarations for it one by one.
+    pub fn function_signature(
+        &self,
+        module: &str,
+        name: &str,
+    ) -> Result<Option<zyntax_typed_ast::TypedFunction>, SnapshotError> {
+        let Some(at) = self.modules.iter().position(|m| m.name == module) else {
+            return Ok(None);
+        };
+        let entry = &self.modules[at];
+        let Some(extent) = entry.signatures else {
+            return Ok(None);
+        };
+        let table = extent.slice(self.blobs(), &entry.name)?;
+        let (index, data_at) = self.signature_indexes[at]
+            .get_or_init(|| {
+                postcard::take_from_bytes::<SignatureIndex>(table)
+                    .map(|(index, rest)| (index, table.len() - rest.len()))
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| SnapshotError::Decode(e.clone()))?;
+        let data = &table[*data_at..];
+        let name_of = |extent: &Extent| extent.slice(data, &entry.name).unwrap_or_default();
+        let first = index
+            .entries
+            .partition_point(|(entry_name, _)| name_of(entry_name) < name.as_bytes());
+        let Some((entry_name, declaration)) = index.entries.get(first) else {
+            return Ok(None);
+        };
+        if name_of(entry_name) != name.as_bytes() {
+            return Ok(None);
+        }
+        let bytes = declaration.slice(data, &entry.name)?;
+        postcard::from_bytes(bytes)
+            .map(Some)
+            .map_err(|e| SnapshotError::Decode(e.to_string()))
     }
 
     /// Whether a module's lowered form is carried and readable here.
@@ -317,7 +451,7 @@ impl Snapshot {
     pub fn module_source(&self, name: &str) -> Option<&str> {
         let entry = self.modules.iter().find(|m| m.name == name)?;
         let extent = entry.source.as_ref()?;
-        let bytes = extent.slice(&self.blobs, &entry.name).ok()?;
+        let bytes = extent.slice(self.blobs(), &entry.name).ok()?;
         std::str::from_utf8(bytes).ok()
     }
 
@@ -356,6 +490,8 @@ struct PendingModule {
     source: Option<String>,
     /// The module's HIR, encoded, with what may read it.
     lowered: Option<(Vec<u8>, String, u8)>,
+    /// The module's function declarations, from [`signature_table`].
+    signatures: Option<Vec<u8>>,
 }
 
 /// Lower a module the way a runtime would, for a snapshot to carry.
@@ -406,6 +542,7 @@ pub fn lower_for_snapshot_releasing(
             prelowered,
             linked: Arc::default(),
             selective: false,
+            pattern_rewrites: true,
         },
     )
     .map_err(|e| SnapshotError::Lowering {
@@ -507,6 +644,7 @@ impl SnapshotBuilder {
         hir: &HirModule,
     ) -> Result<Self, SnapshotError> {
         strip_bodies(&mut program);
+        let signatures = signature_table(&program)?;
         // Bodies encoded one by one, so a program decodes the ones it
         // reaches and no others.
         let encoded = zyntax_compiler::bytecode::serialize_module(
@@ -516,12 +654,16 @@ impl SnapshotBuilder {
         .map_err(|e| SnapshotError::Encode(e.to_string()))?;
         let pointer_size = u8::try_from(zyntax_compiler::target_pointer_size())
             .map_err(|e| SnapshotError::Encode(e.to_string()))?;
-        self.push_with(
+        let mut builder = self.push_with(
             name,
             program,
             None,
             Some((encoded, zyntax_compiler::BUILD_ID.to_string(), pointer_size)),
-        )
+        )?;
+        if let Some(module) = builder.modules.last_mut() {
+            module.signatures = Some(signatures);
+        }
+        Ok(builder)
     }
 
     fn push_with(
@@ -540,6 +682,7 @@ impl SnapshotBuilder {
             artifact: artifact.encode()?,
             source,
             lowered,
+            signatures: None,
         });
         Ok(self)
     }
@@ -573,12 +716,17 @@ impl SnapshotBuilder {
                     build_id: build_id.clone(),
                     pointer_size: *pointer_size,
                 });
+            let signatures = module
+                .signatures
+                .as_ref()
+                .map(|bytes| put(bytes, &mut blobs));
             entries.push(DirectoryEntry {
                 name: module.name.clone(),
                 max_type_id: module.max_type_id,
                 artifact,
                 source,
                 lowered,
+                signatures,
             });
         }
 
@@ -639,7 +787,7 @@ mod tests {
             .encode()
             .expect("encode");
 
-        let snapshot = Snapshot::load(&bytes).expect("load");
+        let snapshot = Snapshot::load_owned(bytes).expect("load");
         assert_eq!(snapshot.language(), "demo");
         assert_eq!(snapshot.grammar_bytes(), Some(&[1u8, 2, 3][..]));
         assert_eq!(snapshot.module_names().collect::<Vec<_>>(), vec!["prelude"]);
@@ -660,7 +808,7 @@ mod tests {
             .encode()
             .expect("encode");
 
-        let snapshot = Snapshot::load(&bytes).expect("load");
+        let snapshot = Snapshot::load_owned(bytes).expect("load");
         assert_eq!(
             snapshot.module_names().collect::<Vec<_>>(),
             vec!["prelude", "tensor", "simd"]
@@ -680,7 +828,7 @@ mod tests {
             .expect("module")
             .encode()
             .expect("encode");
-        let snapshot = Snapshot::load(&bytes).expect("load");
+        let snapshot = Snapshot::load_owned(bytes).expect("load");
         assert_eq!(snapshot.grammar_bytes(), None);
         assert_eq!(
             snapshot.module_names().collect::<Vec<_>>(),
@@ -697,10 +845,84 @@ mod tests {
             .expect("module")
             .encode()
             .expect("encode");
-        let snapshot = Snapshot::load(&bytes).expect("load");
+        let snapshot = Snapshot::load_owned(bytes).expect("load");
         assert!(snapshot.carries_hir("lib"));
         let module = snapshot.module("lib").expect("decodes").expect("present");
         assert!(module.hir().is_some(), "the HIR came with the module");
+    }
+
+    #[test]
+    fn a_lowered_module_answers_for_one_function_signature() {
+        use zyntax_typed_ast::{Span, Type, TypedDeclaration, TypedFunction, TypedNode};
+        let mut program = empty_program();
+        for name in ["len", "abs", "len"] {
+            let function = TypedFunction {
+                name: zyntax_typed_ast::InternedString::new_global(name),
+                return_type: Type::Unknown,
+                body: Some(zyntax_typed_ast::TypedBlock {
+                    statements: Vec::new(),
+                    span: Span::default(),
+                }),
+                is_pure: name == "abs",
+                ..Default::default()
+            };
+            program.declarations.push(TypedNode::new(
+                TypedDeclaration::Function(function),
+                Type::Unknown,
+                Span::default(),
+            ));
+        }
+        let mut arena = zyntax_typed_ast::AstArena::new();
+        let hir = HirModule::new(arena.intern_string("lib"));
+        let bytes = SnapshotBuilder::new("demo")
+            .module_lowered("lib", program, &hir)
+            .expect("module")
+            .encode()
+            .expect("encode");
+        let snapshot = Snapshot::load_owned(bytes).expect("load");
+
+        let abs = snapshot
+            .function_signature("lib", "abs")
+            .expect("decodes")
+            .expect("declared");
+        assert!(abs.is_pure);
+        assert!(abs.body.is_none(), "a signature carries no body");
+        let len = snapshot
+            .function_signature("lib", "len")
+            .expect("decodes")
+            .expect("declared");
+        assert!(!len.is_pure, "the first declaration under a name answers");
+        assert!(
+            snapshot
+                .function_signature("lib", "missing")
+                .expect("decodes")
+                .is_none()
+        );
+        assert!(
+            snapshot
+                .function_signature("other", "abs")
+                .expect("decodes")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_corrupted_snapshot_file_is_refused() {
+        let mut arena = zyntax_typed_ast::AstArena::new();
+        let hir = HirModule::new(arena.intern_string("lib"));
+        let mut bytes = SnapshotBuilder::new("demo")
+            .module_lowered("lib", empty_program(), &hir)
+            .expect("module")
+            .encode()
+            .expect("encode");
+        let snapshot = Snapshot::load_owned(bytes.clone()).expect("load");
+        let extent = snapshot.modules[0].lowered.as_ref().expect("lowered").hir;
+        let last = snapshot.blobs_at + (extent.at + extent.len) as usize - 1;
+        bytes[last] = bytes[last].wrapping_add(1);
+        // A snapshot from outside the executable is checked before its
+        // HIR is read.
+        let snapshot = Snapshot::load_owned(bytes).expect("the directory still reads");
+        assert!(snapshot.module("lib").is_err());
     }
 
     #[test]
@@ -716,7 +938,7 @@ mod tests {
             build_id.push('x');
         }
         let bytes = builder.encode().expect("encode");
-        let snapshot = Snapshot::load(&bytes).expect("load");
+        let snapshot = Snapshot::load_owned(bytes).expect("load");
         assert!(!snapshot.carries_hir("lib"));
         let module = snapshot.module("lib").expect("decodes").expect("present");
         assert!(
@@ -743,7 +965,7 @@ mod tests {
         let schema = MAGIC.len()..MAGIC.len() + 4;
         bytes[schema].copy_from_slice(&(SCHEMA_VERSION + 1).to_le_bytes());
         assert!(matches!(
-            Snapshot::load(&bytes),
+            Snapshot::load_owned(bytes),
             Err(SnapshotError::UnsupportedSchema { .. })
         ));
     }
@@ -758,8 +980,8 @@ mod tests {
             .expect("module")
             .encode()
             .expect("encode");
-        let cut = &bytes[..bytes.len() - 32];
-        let snapshot = Snapshot::load(cut).expect("the directory still reads");
+        let cut = bytes[..bytes.len() - 32].to_vec();
+        let snapshot = Snapshot::load_owned(cut).expect("the directory still reads");
         assert!(
             snapshot.module("prelude").is_err() || snapshot.grammar_bytes().is_none(),
             "a part that runs past the end is refused rather than guessed at"
@@ -774,7 +996,7 @@ mod tests {
             .expect("module")
             .encode()
             .expect("encode");
-        let snapshot = Snapshot::load(&bytes).expect("load");
+        let snapshot = Snapshot::load_owned(bytes).expect("load");
         assert_eq!(snapshot.module_source("prelude"), Some("fn main() {}"));
         assert_eq!(snapshot.module_source("missing"), None);
     }

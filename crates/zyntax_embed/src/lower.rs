@@ -42,6 +42,9 @@ pub(crate) struct Inputs<'a> {
     /// An import naming its items brings those functions alone (see
     /// `import_chain::process_imports_inner`).
     pub selective: bool,
+    /// Whether the pattern rewrites run on a program that declares no
+    /// effects; see `TieredRuntime::set_pattern_rewrites`.
+    pub pattern_rewrites: bool,
 }
 
 /// A lowered program.
@@ -193,19 +196,8 @@ pub(crate) fn lower_typed_program(
         ..LoweringConfig::default()
     };
 
-    {
-        let mut engine = pattern_engine::PatternEngine::new(pattern_engine::EngineConfig {
-            target: pattern_engine::LoweringTarget::Cpu,
-            max_iterations: 64,
-            trace: cfg!(debug_assertions),
-            verify_after: false,
-        });
-        engine.register_pass(normalization_pass::Pass);
-        engine.register_pass(algebraic_effects_pass::Pass);
-        engine.finalize().map_err(|e| {
-            RuntimeError::Execution(format!("Pattern engine finalize error: {}", e))
-        })?;
-        let _result = engine.run(&mut program, &type_registry);
+    if inputs.pattern_rewrites || declares_effects(&program) {
+        rewrite_patterns(&mut program, &type_registry)?;
     }
     lap("pattern engine", &mut at);
 
@@ -231,5 +223,51 @@ pub(crate) fn lower_typed_program(
     Ok(Lowered {
         module,
         entered: lowering_ctx.entered_functions(),
+    })
+}
+
+/// The structural cleanup and the effect rewrites, in the order their
+/// passes depend on.
+fn rewrite_patterns(
+    program: &mut TypedProgram,
+    type_registry: &Arc<zyntax_typed_ast::TypeRegistry>,
+) -> RuntimeResult<()> {
+    let mut engine = pattern_engine::PatternEngine::new(pattern_engine::EngineConfig {
+        target: pattern_engine::LoweringTarget::Cpu,
+        max_iterations: 64,
+        trace: cfg!(debug_assertions),
+        verify_after: false,
+    });
+    engine.register_pass(normalization_pass::Pass);
+    engine.register_pass(algebraic_effects_pass::Pass);
+    engine
+        .finalize()
+        .map_err(|e| RuntimeError::Execution(format!("Pattern engine finalize error: {}", e)))?;
+    let _result = engine.run(program, type_registry);
+    Ok(())
+}
+
+/// Whether `program` declares an effect or a handler, or a function
+/// that performs effects or installs handlers, which only the effect
+/// rewrites lower.
+fn declares_effects(program: &TypedProgram) -> bool {
+    use zyntax_typed_ast::{TypedAnnotation, TypedDeclaration};
+    let marked = |annotations: &[TypedAnnotation]| {
+        annotations.iter().any(|a| {
+            matches!(
+                a.name.resolve_global().as_deref(),
+                Some("effect") | Some("with")
+            )
+        })
+    };
+    program.declarations.iter().any(|decl| match &decl.node {
+        TypedDeclaration::Effect(_) | TypedDeclaration::EffectHandler(_) => true,
+        TypedDeclaration::Function(function) => {
+            !function.effects.is_empty()
+                || !function.with_handlers.is_empty()
+                || marked(&function.annotations)
+        }
+        TypedDeclaration::Impl(imp) => imp.methods.iter().any(|m| marked(&m.annotations)),
+        _ => false,
     })
 }

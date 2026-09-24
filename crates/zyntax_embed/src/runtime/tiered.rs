@@ -84,6 +84,9 @@ pub struct TieredRuntime {
     /// released across blocks and through returned storage. See
     /// [`Self::set_automatic_release`].
     automatic_release: bool,
+    /// Whether programs go through the pattern rewrites before
+    /// lowering. See [`Self::set_pattern_rewrites`].
+    pattern_rewrites: bool,
     /// Whether this runtime turned the collector on, and so turns it
     /// off again when it goes.
     collecting: bool,
@@ -425,6 +428,7 @@ impl TieredRuntime {
             loaded_plugins: Vec::new(),
             run_interp_opts: true,
             automatic_release: false,
+            pattern_rewrites: true,
             collecting: false,
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
@@ -1226,6 +1230,16 @@ impl TieredRuntime {
         self.automatic_release = on;
     }
 
+    /// Whether programs go through the pattern rewrites before lowering:
+    /// the structural cleanup and the rewrites that lower effect and
+    /// handler declarations. On by default. A language whose frontend
+    /// emits none of the forms they rewrite turns it off; a program
+    /// that declares an effect, a handler, or an `@effect` or `@with`
+    /// function is rewritten regardless.
+    pub fn set_pattern_rewrites(&mut self, on: bool) {
+        self.pattern_rewrites = on;
+    }
+
     /// What reclaims the storage the compiler cannot prove dead. The
     /// collector runs on the thread this is called from, and the
     /// program's code must run natively on it: see
@@ -1584,6 +1598,7 @@ impl TieredRuntime {
                 prelowered: Vec::new(),
                 linked: Arc::clone(&self.installed),
                 selective: true,
+                pattern_rewrites: self.pattern_rewrites,
             },
         )?;
         let mut hir_module = lowered.module;
@@ -2776,6 +2791,7 @@ impl TieredRuntime {
                 prelowered: Vec::new(),
                 linked: Arc::default(),
                 selective: false,
+                pattern_rewrites: self.pattern_rewrites,
             },
         )?;
         Ok((lowered.module, lowered.entered))

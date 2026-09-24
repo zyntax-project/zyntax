@@ -21,7 +21,9 @@
 //! ```
 
 use crate::hir::{HirFunction, HirModule};
+use std::borrow::Cow;
 use std::io::{Read, Write};
+use std::sync::OnceLock;
 use thiserror::Error;
 
 /// Bytecode serialization errors
@@ -62,20 +64,41 @@ pub enum Format {
     Split,
 }
 
-/// A module whose function bodies stay encoded until asked for.
+/// A module whose functions stay encoded until asked for.
 ///
 /// A program links against a library it reaches a little of; decoding
-/// every body up front was most of what loading the library cost. The
-/// shell holds everything but the bodies: globals, types, externs, and
-/// for each function with a body a stub with its id, name and
-/// signature and no blocks. [`Self::function`] decodes a body on
-/// demand, relocating its ids by the same base the shell's were.
-#[derive(Debug)]
+/// every function up front was most of what loading the library cost.
+/// The image holds a directory of functions and, for each, a shell
+/// (id, name, signature and attributes, no blocks) and a body, each
+/// encoded on its own. Reading the image decodes the directory only;
+/// [`Self::signature`] and [`Self::by_name`] decode one shell,
+/// [`Self::function`] one body, and every id decoded is relocated by
+/// the same base.
 pub struct LazyModule {
-    shell: HirModule,
-    /// Encoded bodies by function id, ids in them unrelocated.
-    bodies: std::collections::HashMap<crate::hir::HirId, Vec<u8>>,
-    /// What every id in the shell was shifted by on decode.
+    /// The image the extents address: borrowed from an image embedded
+    /// in the executable, owned when it was read from anywhere else.
+    bytes: Cow<'static, [u8]>,
+    /// Where the bytes the extents address start in `bytes`.
+    blob_at: usize,
+    /// The module without its functions.
+    stripped_at: Extent,
+    /// Every function, in the module's order.
+    directory: Vec<FnEntry>,
+    /// Directory positions ordered by function id.
+    by_id: Vec<u32>,
+    /// Directory positions ordered by function name, ties in module order.
+    by_name: Vec<u32>,
+    /// Each function's shell, decoded when first asked for; boxed, so
+    /// an empty slot costs a pointer.
+    shells: Box<[OnceLock<Option<Box<HirFunction>>>]>,
+    /// The module without its functions, decoded when first asked for.
+    stripped: OnceLock<HirModule>,
+    /// The module with a shell for each function, assembled when first
+    /// asked for; set from the start for a module built in memory.
+    whole: OnceLock<HirModule>,
+    /// Whether the module was built in memory rather than read.
+    in_memory: bool,
+    /// What every id in the image is shifted by on decode.
     base: u32,
     /// Made on first use; see [`Self::link_index`].
     index: std::sync::OnceLock<std::sync::Arc<LinkIndex>>,
@@ -98,21 +121,40 @@ pub struct LinkIndex {
 }
 
 impl LinkIndex {
-    fn of(module: &HirModule) -> Self {
+    /// Read from the module's directory and its function-less part;
+    /// no function of a module that was read is decoded.
+    fn of(module: &LazyModule) -> Self {
         let mut index = Self::default();
-        for f in module.functions.values() {
-            index.functions.insert(f.name, f.id);
-            if !f.is_external {
-                index.bodies.insert(f.name);
+        if module.in_memory {
+            let module = module.shell();
+            for f in module.functions.values() {
+                index.functions.insert(f.name, f.id);
+                if !f.is_external {
+                    index.bodies.insert(f.name);
+                }
+                if f.name
+                    .resolve_global()
+                    .is_some_and(|n| crate::const_boxes::is_init_function(&n))
+                {
+                    index.inits.push(f.id);
+                }
             }
-            if f.name
-                .resolve_global()
-                .is_some_and(|n| crate::const_boxes::is_init_function(&n))
-            {
-                index.inits.push(f.id);
+            for g in module.globals.values() {
+                index.globals.insert(g.name, g.id);
             }
+            return index;
         }
-        for g in module.globals.values() {
+        module.for_each_function(|name, id, has_body| {
+            let interned = zyntax_typed_ast::InternedString::new_global(name);
+            index.functions.insert(interned, id);
+            if has_body {
+                index.bodies.insert(interned);
+            }
+            if crate::const_boxes::is_init_function(name) {
+                index.inits.push(id);
+            }
+        });
+        for g in module.stripped().globals.values() {
             index.globals.insert(g.name, g.id);
         }
         index
@@ -133,11 +175,47 @@ impl LinkIndex {
     }
 }
 
-/// The wire shape of [`Format::Split`].
+impl std::fmt::Debug for LazyModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyModule")
+            .field("image_len", &self.bytes.len())
+            .field("functions", &self.directory.len())
+            .field("in_memory", &self.in_memory)
+            .field("base", &self.base)
+            .finish()
+    }
+}
+
+/// Where something sits among the bytes after a [`SplitPayload`].
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
+struct Extent {
+    at: u32,
+    len: u32,
+}
+
+/// One function of a [`Format::Split`] image.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
+struct FnEntry {
+    id: crate::hir::HirId,
+    /// The function's name, UTF-8.
+    name: Extent,
+    /// The function without blocks, values or locals; an external
+    /// function whole.
+    shell: Extent,
+    /// The whole function; absent for an external one.
+    body: Option<Extent>,
+}
+
+/// The wire shape of [`Format::Split`]: this, then `blob_len` bytes
+/// that its extents address.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SplitPayload {
-    shell: HirModule,
-    bodies: Vec<(crate::hir::HirId, Vec<u8>)>,
+    /// The module with no functions.
+    stripped: Extent,
+    directory: Vec<FnEntry>,
+    by_id: Vec<u32>,
+    by_name: Vec<u32>,
+    blob_len: u32,
     /// The largest id anywhere in the module, before relocation.
     max_id: u32,
 }
@@ -146,8 +224,16 @@ impl LazyModule {
     /// A module already in memory: nothing to decode later.
     pub fn eager(module: HirModule) -> Self {
         Self {
-            shell: module,
-            bodies: std::collections::HashMap::new(),
+            bytes: Cow::Borrowed(&[]),
+            blob_at: 0,
+            stripped_at: Extent { at: 0, len: 0 },
+            directory: Vec::new(),
+            by_id: Vec::new(),
+            by_name: Vec::new(),
+            shells: Box::new([]),
+            stripped: OnceLock::new(),
+            whole: OnceLock::from(module),
+            in_memory: true,
             base: 0,
             index: std::sync::OnceLock::new(),
         }
@@ -157,57 +243,180 @@ impl LazyModule {
     pub fn link_index(&self) -> std::sync::Arc<LinkIndex> {
         std::sync::Arc::clone(
             self.index
-                .get_or_init(|| std::sync::Arc::new(LinkIndex::of(&self.shell))),
+                .get_or_init(|| std::sync::Arc::new(LinkIndex::of(self))),
         )
     }
 
-    /// The shell: globals, types, externs, and a stub for each function
-    /// with a body. A stub has the function's id, name, signature and
-    /// attributes and no blocks; the body comes from [`Self::function`].
+    fn blob(&self, extent: Extent) -> Option<&[u8]> {
+        let at = self.blob_at.checked_add(extent.at as usize)?;
+        self.bytes.get(at..at.checked_add(extent.len as usize)?)
+    }
+
+    fn decode<T: serde::de::DeserializeOwned>(&self, extent: Extent) -> Option<T> {
+        let bytes = self.blob(extent)?;
+        crate::hir::HirId::relocated_by(self.base, || postcard::from_bytes(bytes).ok())
+    }
+
+    /// The directory position of function `id`.
+    fn position(&self, id: crate::hir::HirId) -> Option<usize> {
+        let at = self
+            .by_id
+            .binary_search_by_key(&id.as_u32(), |&i| {
+                self.directory
+                    .get(i as usize)
+                    .map_or(u32::MAX, |e| e.id.as_u32())
+            })
+            .ok()?;
+        Some(self.by_id[at] as usize)
+    }
+
+    fn name_at(&self, i: usize) -> &[u8] {
+        self.directory
+            .get(i)
+            .and_then(|e| self.blob(e.name))
+            .unwrap_or_default()
+    }
+
+    fn shell_at(&self, i: usize) -> Option<&HirFunction> {
+        self.shells[i]
+            .get_or_init(|| self.decode(self.directory[i].shell))
+            .as_deref()
+    }
+
+    fn function_at(&self, i: usize) -> Option<HirFunction> {
+        match self.directory[i].body {
+            Some(body) => self.decode(body),
+            None => self.shell_at(i).cloned(),
+        }
+    }
+
+    /// The module without its functions: globals, types, effects.
+    /// A module built in memory answers with itself.
+    pub fn stripped(&self) -> &HirModule {
+        if let Some(whole) = self.in_memory.then(|| self.whole.get()).flatten() {
+            return whole;
+        }
+        self.stripped.get_or_init(|| {
+            self.decode(self.stripped_at)
+                .expect("a split module image decodes: its checksum or its build vouched for it")
+        })
+    }
+
+    /// The module with a shell for each function: globals, types,
+    /// externs, and for each function with a body its id, name,
+    /// signature and attributes and no blocks. Decodes every shell;
+    /// [`Self::signature`] and [`Self::by_name`] decode one.
     pub fn shell(&self) -> &HirModule {
-        &self.shell
+        self.whole.get_or_init(|| {
+            let mut module = self.stripped().clone();
+            for i in 0..self.directory.len() {
+                let shell = self.shell_at(i).expect(
+                    "a split module image decodes: its checksum or its build vouched for it",
+                );
+                module.functions.insert(shell.id, shell.clone());
+            }
+            module
+        })
+    }
+
+    /// Call `each` with every function's name and id, in the module's
+    /// order, and whether the function has a body here. Decodes no
+    /// function of a module that was read.
+    pub fn for_each_function(&self, mut each: impl FnMut(&str, crate::hir::HirId, bool)) {
+        if self.in_memory {
+            for function in self.shell().functions.values() {
+                let name = function.name.resolve_global().unwrap_or_default();
+                each(&name, function.id, !function.is_external);
+            }
+            return;
+        }
+        for (i, entry) in self.directory.iter().enumerate() {
+            let name = std::str::from_utf8(self.name_at(i)).unwrap_or_default();
+            each(name, entry.id, entry.body.is_some());
+        }
+    }
+
+    /// How many functions the module holds.
+    pub fn function_count(&self) -> usize {
+        if self.in_memory {
+            return self.shell().functions.len();
+        }
+        self.directory.len()
     }
 
     /// Whether `id` names a function of this module.
     pub fn has_function(&self, id: crate::hir::HirId) -> bool {
-        self.shell.functions.contains_key(&id)
-    }
-
-    /// The function `id`, its body decoded if it was not yet.
-    pub fn function(&self, id: crate::hir::HirId) -> Option<HirFunction> {
-        match self.bodies.get(&id) {
-            Some(bytes) => {
-                let base = self.base;
-                crate::hir::HirId::relocated_by(base, || postcard::from_bytes(bytes).ok())
-            }
-            None => self.shell.functions.get(&id).cloned(),
+        if self.in_memory {
+            return self.shell().functions.contains_key(&id);
         }
+        self.position(id).is_some()
     }
 
-    /// Every function, decoded.
-    pub fn functions(&self) -> impl Iterator<Item = (crate::hir::HirId, HirFunction)> + '_ {
-        self.shell
-            .functions
-            .keys()
-            .filter_map(move |id| self.function(*id).map(|f| (*id, f)))
+    /// Function `id` without its body: signature and attributes. For a
+    /// module built in memory, the function itself.
+    pub fn signature(&self, id: crate::hir::HirId) -> Option<&HirFunction> {
+        if self.in_memory {
+            return self.shell().functions.get(&id);
+        }
+        self.shell_at(self.position(id)?)
+    }
+
+    /// The function named `name`, as [`Self::signature`] gives it; the
+    /// first in module order when several share it.
+    pub fn by_name(&self, name: &str) -> Option<&HirFunction> {
+        if self.in_memory {
+            return self
+                .shell()
+                .functions
+                .values()
+                .find(|f| f.name.resolve_global().as_deref() == Some(name));
+        }
+        let first = self
+            .by_name
+            .partition_point(|&i| self.name_at(i as usize) < name.as_bytes());
+        let &i = self.by_name.get(first)?;
+        (self.name_at(i as usize) == name.as_bytes())
+            .then(|| self.shell_at(i as usize))
+            .flatten()
+    }
+
+    /// The function `id`, its body decoded.
+    pub fn function(&self, id: crate::hir::HirId) -> Option<HirFunction> {
+        if self.in_memory {
+            return self.shell().functions.get(&id).cloned();
+        }
+        self.function_at(self.position(id)?)
+    }
+
+    /// Every function, decoded, in the module's order.
+    pub fn functions(&self) -> Box<dyn Iterator<Item = (crate::hir::HirId, HirFunction)> + '_> {
+        if self.in_memory {
+            return Box::new(
+                self.shell()
+                    .functions
+                    .iter()
+                    .map(|(id, f)| (*id, f.clone())),
+            );
+        }
+        Box::new(
+            (0..self.directory.len())
+                .filter_map(move |i| self.function_at(i).map(|f| (self.directory[i].id, f))),
+        )
     }
 
     /// The whole module, every body decoded.
-    pub fn into_module(self) -> HirModule {
-        let mut module = self.shell;
-        let bodies: Vec<(crate::hir::HirId, HirFunction)> = self
-            .bodies
-            .keys()
-            .filter_map(|id| {
-                let base = self.base;
-                crate::hir::HirId::relocated_by(base, || {
-                    postcard::from_bytes(&self.bodies[id]).ok()
-                })
-                .map(|f| (*id, f))
-            })
-            .collect();
-        for (id, f) in bodies {
-            module.functions.insert(id, f);
+    pub fn into_module(mut self) -> HirModule {
+        if self.in_memory {
+            return self
+                .whole
+                .take()
+                .expect("a module built in memory is whole from the start");
+        }
+        let mut module = self.stripped().clone();
+        for i in 0..self.directory.len() {
+            if let Some(function) = self.function_at(i) {
+                module.functions.insert(self.directory[i].id, function);
+            }
         }
         module
     }
@@ -215,45 +424,118 @@ impl LazyModule {
 
 /// Serialize a module as [`Format::Split`].
 pub fn serialize_module_split(module: &HirModule) -> Result<Vec<u8>> {
-    let mut shell = module.clone();
-    let mut bodies = Vec::new();
-    for (id, function) in shell.functions.iter_mut() {
-        if function.is_external {
-            continue;
-        }
-        let bytes = postcard::to_allocvec(&*function)
-            .map_err(|e| BytecodeError::SerializationError(e.to_string()))?;
-        bodies.push((*id, bytes));
-        function.blocks.clear();
-        function.values.clear();
-        function.locals.clear();
+    let mut blob: Vec<u8> = Vec::new();
+    let mut put = |bytes: &[u8]| -> Result<Extent> {
+        let extent = Extent {
+            at: u32::try_from(blob.len())
+                .map_err(|e| BytecodeError::SerializationError(e.to_string()))?,
+            len: u32::try_from(bytes.len())
+                .map_err(|e| BytecodeError::SerializationError(e.to_string()))?,
+        };
+        blob.extend_from_slice(bytes);
+        Ok(extent)
+    };
+
+    let mut stripped = module.clone();
+    stripped.functions.clear();
+    let stripped = put(&to_postcard(&stripped)?)?;
+
+    let mut directory = Vec::with_capacity(module.functions.len());
+    let mut names = Vec::with_capacity(module.functions.len());
+    for (id, function) in &module.functions {
+        let name = function.name.resolve_global().unwrap_or_default();
+        let name_extent = put(name.as_bytes())?;
+        let (shell, body) = if function.is_external {
+            (put(&to_postcard(function)?)?, None)
+        } else {
+            let shell = HirFunction {
+                blocks: Default::default(),
+                locals: Default::default(),
+                values: Default::default(),
+                ..function.clone()
+            };
+            (
+                put(&to_postcard(&shell)?)?,
+                Some(put(&to_postcard(function)?)?),
+            )
+        };
+        names.push(name);
+        directory.push(FnEntry {
+            id: *id,
+            name: name_extent,
+            shell,
+            body,
+        });
     }
+    let positions = 0..directory.len() as u32;
+    let mut by_id: Vec<u32> = positions.clone().collect();
+    by_id.sort_by_key(|&i| directory[i as usize].id.as_u32());
+    let mut by_name: Vec<u32> = positions.collect();
+    by_name.sort_by(|&a, &b| names[a as usize].cmp(&names[b as usize]));
+
     let payload = SplitPayload {
-        shell,
-        bodies,
+        stripped,
+        directory,
+        by_id,
+        by_name,
+        blob_len: u32::try_from(blob.len())
+            .map_err(|e| BytecodeError::SerializationError(e.to_string()))?,
         max_id: max_hir_id(module),
     };
-    let payload = postcard::to_allocvec(&payload)
-        .map_err(|e| BytecodeError::SerializationError(e.to_string()))?;
-    Ok(with_header(module, Format::Split, payload))
+    let mut bytes = to_postcard(&payload)?;
+    bytes.extend_from_slice(&blob);
+    Ok(with_header(module, Format::Split, bytes))
 }
 
-/// Read a [`Format::Split`] module without decoding its bodies. Any
-/// other format is decoded whole and wrapped.
-pub fn deserialize_module_lazy(bytes: &[u8]) -> Result<LazyModule> {
-    let (header, payload) = checked_payload(bytes)?;
+fn to_postcard<T: serde::Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    postcard::to_allocvec(value).map_err(|e| BytecodeError::SerializationError(e.to_string()))
+}
+
+/// Read a [`Format::Split`] image without decoding its functions,
+/// checking the image against its checksum first. Any other format is
+/// decoded whole and wrapped.
+pub fn deserialize_module_lazy(bytes: impl Into<Cow<'static, [u8]>>) -> Result<LazyModule> {
+    lazy_module(bytes.into(), true)
+}
+
+/// [`deserialize_module_lazy`] without the checksum, for an image this
+/// build embedded in its own executable. An image from anywhere else
+/// goes through the checked read.
+pub fn deserialize_module_lazy_trusted(bytes: &'static [u8]) -> Result<LazyModule> {
+    lazy_module(Cow::Borrowed(bytes), false)
+}
+
+fn lazy_module(bytes: Cow<'static, [u8]>, checked: bool) -> Result<LazyModule> {
+    let (header, payload) = if checked {
+        checked_payload(&bytes)?
+    } else {
+        header_and_payload(&bytes)?
+    };
     if Format::from_u8(header.format)? != Format::Split {
-        return deserialize_module(bytes).map(LazyModule::eager);
+        return deserialize_module(&bytes).map(LazyModule::eager);
     }
     let base = crate::hir::HirId::next_unminted();
-    let split: SplitPayload = crate::hir::HirId::relocated_by(base, || {
-        postcard::from_bytes(payload)
+    let (split, blob): (SplitPayload, &[u8]) = crate::hir::HirId::relocated_by(base, || {
+        postcard::take_from_bytes(payload)
             .map_err(|e| BytecodeError::DeserializationError(e.to_string()))
     })?;
+    let n = split.directory.len();
+    if blob.len() != split.blob_len as usize || split.by_id.len() != n || split.by_name.len() != n {
+        return Err(BytecodeError::InvalidFormat);
+    }
+    let blob_at = bytes.len() - blob.len();
     crate::hir::HirId::ensure_counter_above(base.saturating_add(split.max_id));
     Ok(LazyModule {
-        shell: split.shell,
-        bodies: split.bodies.into_iter().collect(),
+        bytes,
+        blob_at,
+        stripped_at: split.stripped,
+        shells: (0..n).map(|_| OnceLock::new()).collect(),
+        directory: split.directory,
+        by_id: split.by_id,
+        by_name: split.by_name,
+        stripped: OnceLock::new(),
+        whole: OnceLock::new(),
+        in_memory: false,
         base,
         index: std::sync::OnceLock::new(),
     })
@@ -282,11 +564,10 @@ pub struct BytecodeHeader {
 
 impl BytecodeHeader {
     const MAGIC: u32 = 0x5A424300; // "ZBC\0"
-    // Bumped to 2 when HirId switched from Uuid(16B) → u32(4B). Old
-    // postcard payloads have the wrong layout for HirModule, so they
-    // must be rejected at the header level — the validator below trips
-    // VersionMismatch and the cache loader falls back to recompile.
-    const CURRENT_MAJOR: u16 = 2;
+    // Moves with any change to a payload's layout, so a payload in an
+    // older layout is refused with VersionMismatch and a cache loader
+    // recompiles rather than misreading it.
+    const CURRENT_MAJOR: u16 = 3;
     const CURRENT_MINOR: u16 = 0;
 
     /// Create a new header for the given module and format
@@ -408,17 +689,23 @@ fn with_header(module: &HirModule, format: Format, payload: Vec<u8>) -> Vec<u8> 
 /// The header and the payload it covers, once the header has been
 /// validated and the payload's checksum has been verified.
 fn checked_payload(bytes: &[u8]) -> Result<(BytecodeHeader, &[u8])> {
+    let (header, payload) = header_and_payload(bytes)?;
+    if crc32fast::hash(payload) != header.checksum {
+        return Err(BytecodeError::ChecksumMismatch);
+    }
+    Ok((header, payload))
+}
+
+/// The header and the payload it covers, once the header has been
+/// validated; the payload is not checked against its checksum.
+fn header_and_payload(bytes: &[u8]) -> Result<(BytecodeHeader, &[u8])> {
     const HEADER_SIZE: usize = 44;
     if bytes.len() < HEADER_SIZE {
         return Err(BytecodeError::InvalidFormat);
     }
     let (header, header_size) = deserialize_raw_header(bytes)?;
     header.validate()?;
-    let payload = &bytes[header_size..];
-    if crc32fast::hash(payload) != header.checksum {
-        return Err(BytecodeError::ChecksumMismatch);
-    }
-    Ok((header, payload))
+    Ok((header, &bytes[header_size..]))
 }
 
 /// Serialize a HIR module to a writer
@@ -517,7 +804,7 @@ pub fn deserialize_module(bytes: &[u8]) -> Result<HirModule> {
     let (header, payload) = checked_payload(bytes)?;
     let format = Format::from_u8(header.format)?;
     if format == Format::Split {
-        return deserialize_module_lazy(bytes).map(LazyModule::into_module);
+        return lazy_module(Cow::Owned(bytes.to_vec()), false).map(LazyModule::into_module);
     }
 
     // Deserialize payload. The module's ids were minted by whichever
@@ -777,6 +1064,152 @@ mod tests {
         assert_eq!(*value_id, value.id);
         assert_eq!(value_id.as_u32(), id.as_u32() + 2);
         assert!(HirId::new().as_u32() > value_id.as_u32());
+    }
+
+    fn empty_signature() -> HirFunctionSignature {
+        HirFunctionSignature {
+            params: vec![],
+            returns: vec![],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        }
+    }
+
+    /// A module with two functions that have bodies and an external one.
+    fn split_test_module() -> HirModule {
+        let mut module = create_test_module();
+        let mut arena = zyntax_typed_ast::AstArena::new();
+        for name in ["zeta", "alpha"] {
+            let mut func = HirFunction::new(arena.intern_string(name), empty_signature());
+            let value = HirId::new();
+            func.values.insert(
+                value,
+                HirValue {
+                    id: value,
+                    ty: HirType::I64,
+                    kind: HirValueKind::Parameter(0),
+                    uses: std::collections::HashSet::new(),
+                    span: None,
+                },
+            );
+            module.functions.insert(func.id, func);
+        }
+        let mut external = HirFunction::new(arena.intern_string("puts"), empty_signature());
+        external.is_external = true;
+        external.blocks.clear();
+        module.functions.insert(external.id, external);
+        module
+    }
+
+    fn name_of(function: &HirFunction) -> String {
+        function.name.resolve_global().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_split_module_decodes_one_function_at_a_time() {
+        let module = split_test_module();
+        let bytes = serialize_module(&module, Format::Split).unwrap();
+        let lazy = deserialize_module_lazy(bytes).unwrap();
+        assert_eq!(lazy.function_count(), 3);
+
+        let mut names = Vec::new();
+        lazy.for_each_function(|name, _, has_body| names.push((name.to_string(), has_body)));
+        assert_eq!(
+            names,
+            vec![
+                ("zeta".to_string(), true),
+                ("alpha".to_string(), true),
+                ("puts".to_string(), false)
+            ],
+            "the directory keeps the module's order"
+        );
+
+        let alpha = lazy.by_name("alpha").expect("found by name");
+        assert_eq!(name_of(alpha), "alpha");
+        assert!(
+            alpha.blocks.is_empty() && alpha.values.is_empty(),
+            "a shell has no body"
+        );
+        assert!(lazy.by_name("beta").is_none());
+
+        let id = alpha.id;
+        assert!(lazy.has_function(id));
+        assert_eq!(lazy.signature(id).map(|f| f.id), Some(id));
+        let body = lazy.function(id).expect("the body decodes");
+        assert_eq!(body.id, id, "the body relocates by the shell's base");
+        let (value_id, value) = body.values.iter().next().expect("a value");
+        assert_eq!(*value_id, value.id);
+        assert!(value_id.as_u32() > id.as_u32());
+        assert!(HirId::new().as_u32() > value_id.as_u32());
+
+        let puts = lazy.by_name("puts").expect("an external function");
+        assert!(puts.is_external);
+        assert_eq!(lazy.function(puts.id).map(|f| f.id), Some(puts.id));
+
+        assert_eq!(lazy.shell().functions.len(), 3);
+        assert_eq!(lazy.functions().count(), 3);
+        let whole = lazy.into_module();
+        assert_eq!(whole.functions.len(), 3);
+        let names: Vec<String> = whole.functions.values().map(name_of).collect();
+        assert_eq!(names, ["zeta", "alpha", "puts"]);
+    }
+
+    #[test]
+    fn a_split_module_decodes_whole() {
+        let module = split_test_module();
+        let bytes = serialize_module(&module, Format::Split).unwrap();
+        let whole = deserialize_module(&bytes).unwrap();
+        assert_eq!(whole.functions.len(), 3);
+        assert!(
+            whole
+                .functions
+                .values()
+                .filter(|f| !f.is_external)
+                .all(|f| f.values.len() == 1),
+            "every body arrives"
+        );
+    }
+
+    #[test]
+    fn an_embedded_split_module_reads_without_its_checksum() {
+        let bytes = serialize_module(&split_test_module(), Format::Split).unwrap();
+        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let lazy = deserialize_module_lazy_trusted(bytes).unwrap();
+        let alpha = lazy.by_name("alpha").expect("found by name").id;
+        assert!(lazy.function(alpha).is_some());
+    }
+
+    #[test]
+    fn a_corrupted_split_module_fails_the_checked_read() {
+        let mut bytes = serialize_module(&split_test_module(), Format::Split).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] = bytes[last].wrapping_add(1);
+        assert!(matches!(
+            deserialize_module_lazy(bytes),
+            Err(BytecodeError::ChecksumMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_payload_in_an_older_layout_is_refused_by_version() {
+        let mut bytes = serialize_module(&split_test_module(), Format::Split).unwrap();
+        // The major version follows the four magic bytes.
+        let older = BytecodeHeader::CURRENT_MAJOR - 1;
+        bytes[4..6].copy_from_slice(&older.to_le_bytes());
+        assert!(matches!(
+            deserialize_module_lazy(bytes.clone()),
+            Err(BytecodeError::VersionMismatch { .. })
+        ));
+        assert!(matches!(
+            deserialize_module(&bytes),
+            Err(BytecodeError::VersionMismatch { .. })
+        ));
     }
 
     #[test]

@@ -276,9 +276,14 @@ fn process_imports_inner(
             let lowered = compiled_import.hir().is_some();
             if let Some(hir) = compiled_import.hir() {
                 if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
+                    let started = web_time::Instant::now();
+                    let stripped = hir.stripped();
                     eprintln!(
-                        "[IMPORT-LINK] {module_name} arrives lowered ({} functions)",
-                        hir.shell().functions.len()
+                        "[IMPORT-LINK] {module_name} arrives lowered ({} functions; {} globals and {} types decoded in {:.2} ms)",
+                        hir.function_count(),
+                        stripped.globals.len(),
+                        stripped.types.len(),
+                        started.elapsed().as_secs_f64() * 1000.0
                     );
                 }
                 prelowered.push(std::sync::Arc::clone(hir));
@@ -1428,7 +1433,7 @@ mod tests {
                 .expect("module")
                 .encode()
                 .expect("encode");
-            let snapshot = Arc::new(Snapshot::load(&bytes).expect("load"));
+            let snapshot = Arc::new(Snapshot::load_owned(bytes).expect("load"));
             modules.insert((language.to_string(), "prelude".to_string()), snapshot);
         }
         modules

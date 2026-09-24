@@ -725,7 +725,7 @@ impl LoweringContext {
     /// [`Self::adopt_all_prelowered`].
     fn adopt_prelowered(&mut self) {
         for prelowered in &self.config.prelowered {
-            let prelowered = prelowered.shell();
+            let prelowered = prelowered.stripped();
             for (id, global) in &prelowered.globals {
                 if self.config.linked.contains(id) {
                     continue;
@@ -4815,7 +4815,7 @@ impl LoweringContext {
                     self.config
                         .prelowered
                         .iter()
-                        .find_map(|m| m.shell().globals.get(id))
+                        .find_map(|m| m.stripped().globals.get(id))
                 })?;
                 let ty = global.ty.clone();
                 Some((*name, (*id, ty)))
