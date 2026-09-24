@@ -87,8 +87,8 @@ def comprehension_reads(x):
 
 
 def with_body(x):
-    with open("/dev/null", "rb") as f:
-        x = [x, len(f.read())]
+    with open(__file__, "rb") as f:
+        x = [x, len(f.read(0))]
         return x
 
 
