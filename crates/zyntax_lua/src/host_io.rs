@@ -362,8 +362,7 @@ pub(crate) extern "C" fn host_io_popen(
 ) -> i64 {
     let command = String::from_utf8_lossy(unsafe { bytes_of(command) }).into_owned();
     let read = unsafe { bytes_of(mode) } != b"w";
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(&command);
+    let mut cmd = shell(&command);
     if read {
         cmd.stdout(std::process::Stdio::piped());
     } else {
@@ -378,6 +377,70 @@ pub(crate) extern "C" fn host_io_popen(
     }
 }
 
+/// `command` as the platform's shell runs it: `sh -c` on Unix, and
+/// on Windows `cmd /C` with the command passed as written.
+#[cfg(unix)]
+fn shell(command: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg(command);
+    cmd
+}
+
+#[cfg(windows)]
+fn shell(command: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.arg("/C").raw_arg(command);
+    cmd
+}
+
+/// A file under the temporary directory that did not exist before,
+/// open for reading and writing, with its path. With `delete_on_close`
+/// the file goes when its last handle closes.
+#[cfg(windows)]
+pub(crate) fn fresh_temp_file(
+    delete_on_close: bool,
+) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir();
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let tag = (seed ^ (u64::from(std::process::id()) << 32)).wrapping_add(n) & 0xff_ffff;
+        let path = dir.join(format!("lua_{tag:06x}"));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        if delete_on_close {
+            options
+                .share_mode(0)
+                .custom_flags(FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) extern "C" fn host_io_tmpfile() -> i64 {
+    match fresh_temp_file(true) {
+        Ok((_, file)) => register(Stream::new(Inner::Disk(file))),
+        Err(e) => {
+            note(&e, None);
+            0
+        }
+    }
+}
+
+#[cfg(unix)]
 pub(crate) extern "C" fn host_io_tmpfile() -> i64 {
     let mut template = b"/tmp/lua_XXXXXX\0".to_vec();
     let fd = unsafe { libc::mkstemp(template.as_mut_ptr() as *mut libc::c_char) };
@@ -410,6 +473,19 @@ pub(crate) extern "C" fn host_io_is_pipe(h: i64) -> bool {
     with(h, |s| matches!(s.inner, Inner::Pipe { .. })).unwrap_or(false)
 }
 
+/// The status word `system` would give for a command that ended so.
+#[cfg(unix)]
+fn status_word(status: std::process::ExitStatus) -> i64 {
+    use std::os::unix::process::ExitStatusExt;
+    status.into_raw() as i64
+}
+
+/// On Windows that word is the exit code.
+#[cfg(windows)]
+fn status_word(status: std::process::ExitStatus) -> i64 {
+    status.code().map_or(-1, i64::from)
+}
+
 /// Closed: 0, or the error's number; for a command, the status word
 /// `system` would give, shifted past the low byte, with bit 0 set.
 pub(crate) extern "C" fn host_io_close(h: i64) -> i64 {
@@ -423,10 +499,7 @@ pub(crate) extern "C" fn host_io_close(h: i64) -> i64 {
         Inner::Pipe { mut child, .. } => {
             drop(child.stdin.take());
             match child.wait() {
-                Ok(status) => {
-                    use std::os::unix::process::ExitStatusExt;
-                    (status.into_raw() as i64) << 1 | 1
-                }
+                Ok(status) => status_word(status) << 1 | 1,
                 Err(e) => note(&e, None),
             }
         }

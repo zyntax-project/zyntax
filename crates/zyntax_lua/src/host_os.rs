@@ -3,7 +3,7 @@
 //! does it, the environment, temporary names, and files removed or
 //! renamed. Reached from the library as `$Lua$…` symbols.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 
 use zrtl::StringPtr;
 
@@ -56,14 +56,39 @@ fn broken_down(t: i64, utc: bool) -> Option<libc::tm> {
         return None;
     }
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let got = unsafe {
+    #[cfg(unix)]
+    let ok = unsafe {
         if utc {
-            libc::gmtime_r(&t, &mut tm)
+            !libc::gmtime_r(&t, &mut tm).is_null()
         } else {
-            libc::localtime_r(&t, &mut tm)
+            !libc::localtime_r(&t, &mut tm).is_null()
         }
     };
-    if got.is_null() { None } else { Some(tm) }
+    #[cfg(windows)]
+    let ok = unsafe {
+        if utc {
+            libc::gmtime_s(&mut tm, &t) == 0
+        } else {
+            libc::localtime_s(&mut tm, &t) == 0
+        }
+    };
+    ok.then_some(tm)
+}
+
+// The C runtime's calendar functions the `libc` crate declares only
+// for Unix. The UCRT exports `mktime` under its 64-bit name.
+#[cfg(unix)]
+use libc::{mktime, strftime};
+#[cfg(windows)]
+unsafe extern "C" {
+    #[link_name = "_mktime64"]
+    fn mktime(tm: *mut libc::tm) -> libc::time_t;
+    fn strftime(
+        s: *mut libc::c_char,
+        max: libc::size_t,
+        format: *const libc::c_char,
+        tm: *const libc::tm,
+    ) -> libc::size_t;
 }
 
 /// One field of the broken-down time of `t`, numbered as `os.date`'s
@@ -116,7 +141,7 @@ pub(crate) extern "C" fn host_time_of(
     tm.tm_min = min;
     tm.tm_sec = sec;
     tm.tm_isdst = isdst as i32;
-    let t = unsafe { libc::mktime(&mut tm) };
+    let t = unsafe { mktime(&mut tm) };
     t as i64
 }
 
@@ -179,7 +204,7 @@ pub(crate) extern "C" fn host_date(fmt: zrtl::StringConstPtr, t: i64, utc: bool)
         one.push(0);
         let mut buf = [0u8; 256];
         let written = unsafe {
-            libc::strftime(
+            strftime(
                 buf.as_mut_ptr() as *mut libc::c_char,
                 buf.len(),
                 one.as_ptr() as *const libc::c_char,
@@ -204,6 +229,7 @@ pub(crate) extern "C" fn host_getenv(name: zrtl::StringConstPtr) -> StringPtr {
 
 /// A fresh file under the temporary directory, made and closed, as
 /// the reference's `mkstemp` leaves it; its name.
+#[cfg(unix)]
 pub(crate) extern "C" fn host_tmpname() -> StringPtr {
     let mut template = b"/tmp/lua_XXXXXX\0".to_vec();
     let fd = unsafe { libc::mkstemp(template.as_mut_ptr() as *mut libc::c_char) };
@@ -211,8 +237,19 @@ pub(crate) extern "C" fn host_tmpname() -> StringPtr {
         return std::ptr::null_mut();
     }
     unsafe { libc::close(fd) };
-    let name = CStr::from_bytes_until_nul(&template).map_or(&b""[..], CStr::to_bytes);
+    let name =
+        std::ffi::CStr::from_bytes_until_nul(&template).map_or(&b""[..], std::ffi::CStr::to_bytes);
     zrtl::string::string_from_bytes(name)
+}
+
+/// A fresh file under the temporary directory, made and closed; its
+/// name.
+#[cfg(windows)]
+pub(crate) extern "C" fn host_tmpname() -> StringPtr {
+    match crate::host_io::fresh_temp_file(false) {
+        Ok((path, _)) => zrtl::string::string_from_bytes(path.to_string_lossy().as_bytes()),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 /// Zero, or the error's number with its text kept for `os_error`.
@@ -253,6 +290,7 @@ pub(crate) extern "C" fn host_execute(command: zrtl::StringConstPtr) -> i64 {
 
 /// How a status word from `system` ended: 0 and the exit code, or 1
 /// and the signal.
+#[cfg(unix)]
 pub(crate) extern "C" fn host_exec_result(status: i64, want_signal: bool) -> i64 {
     let status = status as i32;
     if libc::WIFEXITED(status) {
@@ -272,4 +310,11 @@ pub(crate) extern "C" fn host_exec_result(status: i64, want_signal: bool) -> i64
     } else {
         status as i64
     }
+}
+
+/// On Windows the status `system` gives is the exit code itself, as
+/// the reference reads it there: never a signal.
+#[cfg(windows)]
+pub(crate) extern "C" fn host_exec_result(status: i64, want_signal: bool) -> i64 {
+    if want_signal { 0 } else { status }
 }
