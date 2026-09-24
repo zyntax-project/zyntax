@@ -64,6 +64,7 @@ pub mod inline;
 pub mod interned; // The boxes every program shares
 pub mod licm;
 pub mod load_cse;
+pub mod loop_facts; // Static trip counts of counted loops
 pub mod loop_vectorize;
 pub mod lowering;
 pub mod memory_management;

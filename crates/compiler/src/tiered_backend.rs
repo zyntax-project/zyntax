@@ -651,6 +651,11 @@ pub struct TieredBackend {
     /// takes their body from the optimiser, which has little to do to
     /// it; every other body it runs as lowered, with its releases placed.
     finished: HashSet<HirId>,
+    /// Of the lazy functions looked at so far, whether each holds a loop
+    /// hot before its first call ([`crate::loop_facts::hot_static_loop`]):
+    /// such a function is compiled ahead of that call, which runs its
+    /// code, and asks for the optimizing tier as soon as it has some.
+    static_hot: HashMap<HirId, bool>,
     /// The optimiser for a function that is not the module's: an
     /// outlined resume point, optimised in the scratch module of the
     /// bead it belongs to. Installed with the lazy compiler.
@@ -786,6 +791,7 @@ impl TieredBackend {
             lazy: HashSet::new(),
             optimized_bodies: Arc::new(Mutex::new(HashMap::new())),
             finished: HashSet::new(),
+            static_hot: HashMap::new(),
             optimize_extra: None,
             interp_bodies: Arc::new(Mutex::new(HashMap::new())),
             make_interp_body: None,
@@ -1031,6 +1037,7 @@ impl TieredBackend {
         }
         if !joining {
             self.install_promotion_requester();
+            self.precompile_static_hot(&lazy);
         }
         if trace {
             eprintln!(
@@ -2338,8 +2345,19 @@ impl TieredBackend {
         let optimized_bodies = Arc::clone(&self.optimized_bodies);
         let queue = self.compile_queue.clone();
         let counter = queue.as_ref().map(|q| q.count_of(entry.bead_id));
+        let mut compile_first = self.static_hot.get(&func_id).copied().unwrap_or(false);
         Some(Box::new(move || {
             if lazy && bound.bead().compiled().is_none() {
+                // A loop hot before the first call: that call waits for
+                // the code the worker is making, or makes it, and runs
+                // it. Once: a compile that failed leaves the function to
+                // the interpreter.
+                if std::mem::take(&mut compile_first) {
+                    let code = osr::try_lazy_compile(ctx.bead_id);
+                    if !code.is_null() {
+                        return Some(code);
+                    }
+                }
                 // Counted here until the first-call compiler has made
                 // the baseline and installed it in the bead; beadie's
                 // own ladder takes over from there.
@@ -2606,6 +2624,7 @@ impl TieredBackend {
             .collect();
         let reload_key = self.cranelift.with_lock(|be| be.reload_key());
         let lazy: HashSet<HirId> = lazy.difference(finished).copied().collect();
+        let static_hot = self.static_hot_beads(&lazy);
         let finished = finished.clone();
         let done = Arc::clone(&self.first_compiles);
         // What the per-function finishing passes read from the module.
@@ -3048,6 +3067,9 @@ impl TieredBackend {
                 optimized_bodies.lock().unwrap().remove(func_id);
             }
             publish(entry as usize, false);
+            if keeps_bodies && static_hot.contains(&bead_id) {
+                promote_static_hot(bead_id, &body);
+            }
             // `ZYNTAX_TRACE_LAZY=1` names each first-call compile with
             // the time it took, the wait for the backend included, what
             // kind of body it was, and the thread that did it; and each
@@ -3172,6 +3194,49 @@ impl TieredBackend {
                     .unwrap_or(0) as *const u8
             })
         });
+    }
+
+    /// The beads of those of `lazy` that hold a loop hot before their
+    /// first call, each function looked at once.
+    /// `ZYNTAX_DISABLE_STATIC_HOT=1` finds none, leaving every function
+    /// to the interpreter until it warms; safe to run with.
+    fn static_hot_beads(&mut self, lazy: &HashSet<HirId>) -> HashSet<u64> {
+        let off = std::env::var_os("ZYNTAX_DISABLE_STATIC_HOT").is_some();
+        let mut beads = HashSet::new();
+        for id in lazy {
+            let Some(entry) = self.functions.get(id) else {
+                continue;
+            };
+            let hot =
+                *self.static_hot.entry(*id).or_insert_with(|| {
+                    !off && entry.module.functions.get(id).is_some_and(|f| {
+                        !f.attributes.cold && crate::loop_facts::hot_static_loop(f)
+                    })
+                });
+            if hot {
+                beads.insert(entry.bead_id);
+            }
+        }
+        beads
+    }
+
+    /// Asks the compile worker for each function of `lazy` that holds a
+    /// loop hot before its first call and has no code yet, so the code
+    /// is there, or on its way, when the call comes. After the promotion
+    /// requester, which the compile asks for the optimizing tier. With
+    /// no worker the first call compiles it.
+    fn precompile_static_hot(&self, lazy: &HashSet<HirId>) {
+        let Some(queue) = &self.compile_queue else {
+            return;
+        };
+        for id in lazy {
+            if self.static_hot.get(id) == Some(&true)
+                && let Some(entry) = self.functions.get(id)
+                && entry.bound.bead().compiled().is_none()
+            {
+                queue.request_compile(entry.bead_id, None);
+            }
+        }
     }
 
     fn install_promotion_requester(&self) {
@@ -4379,6 +4444,38 @@ fn publish_baseline_resume_points(
             osr::publish_helper(bead_id, site, code);
         }
     }
+}
+
+/// Asks the optimizing tier for the function of `bead_id`, just compiled
+/// at the baseline from `body`, as the baseline's probe at a loop asks
+/// once visited often enough. Resume points are asked at each counted
+/// loop that is hot and a frame can resume at, or else at the one of
+/// those running most often: the frame is in one of them when the
+/// optimizing tier's code lands, and moves there at its next header.
+fn promote_static_hot(bead_id: u64, body: &HirFunction) {
+    let dominators = osr::Dominators::compute(body);
+    let resumable: Vec<(u64, u64)> = crate::loop_facts::hot_static_loops(body)
+        .into_iter()
+        .filter_map(|(header, runs)| {
+            let layout = osr::osr_layout_with(body, header, &dominators).ok()?;
+            Some((layout.site_key(), runs))
+        })
+        .collect();
+    let mut sites: Vec<u64> = resumable
+        .iter()
+        .filter(|(_, runs)| *runs >= crate::loop_facts::STATIC_HOT_TRIPS)
+        .map(|(site, _)| *site)
+        .collect();
+    if sites.is_empty() {
+        sites.extend(resumable.first().map(|(site, _)| *site));
+    }
+    let Some((&first, rest)) = sites.split_first() else {
+        return;
+    };
+    for site in rest {
+        osr::note_site_asked(bead_id, *site, true);
+    }
+    osr::osr_request_promotion(bead_id, first);
 }
 
 pub fn compile_at_tier(

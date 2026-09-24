@@ -2384,19 +2384,34 @@ pub extern "C" fn lazy_compile(bead_id: u64) -> *const u8 {
     if entry != 0 {
         return entry as *const u8;
     }
-    let guard = lazy_compiler().read().unwrap();
-    let Some(f) = guard.as_ref() else {
+    if lazy_compiler().read().unwrap().is_none() {
         eprintln!(
             "a function compiled on first call was called before the runtime could compile it (bead {bead_id})"
         );
         std::process::abort();
-    };
-    let entry = f(bead_id);
+    }
+    let entry = try_lazy_compile(bead_id);
     if entry.is_null() {
         eprintln!("a function compiled on first call could not be compiled (bead {bead_id})");
         std::process::abort();
     }
     entry
+}
+
+/// The entry of the function behind `bead_id`, compiled now if it is not
+/// yet, or waited for if a compile of it is under way; null when there
+/// is no compiler or the function does not compile, for a caller that
+/// can run it some other way.
+pub fn try_lazy_compile(bead_id: u64) -> *const u8 {
+    let entry = published_entry(bead_id);
+    if entry != 0 {
+        return entry as *const u8;
+    }
+    let guard = lazy_compiler().read().unwrap();
+    match guard.as_ref() {
+        Some(f) => f(bead_id),
+        None => std::ptr::null(),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

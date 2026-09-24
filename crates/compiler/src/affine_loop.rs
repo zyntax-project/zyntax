@@ -69,6 +69,7 @@ use crate::hir::{
     BinaryOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
     HirTerminator, HirType, HirValue, HirValueKind, Intrinsic,
 };
+use crate::loop_facts::{NotCounted, const_int, counted_loop};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
@@ -260,19 +261,13 @@ fn try_recognize(func: &HirFunction, lp: &NaturalLoop) -> Result<FoldPlan, Skip>
     if header_block.instructions.len() != 1 {
         return Err(Skip::UnrecognizedBody);
     }
-    let (cmp_op, cmp_left, cmp_right) = match &header_block.instructions[0] {
+    let cmp_left = match &header_block.instructions[0] {
         HirInstruction::Binary {
-            op,
+            op: BinaryOp::Lt | BinaryOp::Le,
             left,
-            right,
             result,
             ..
-        } if *result == cond => (*op, *left, *right),
-        _ => return Err(Skip::Shape),
-    };
-    let is_le = match cmp_op {
-        BinaryOp::Lt => false,
-        BinaryOp::Le => true,
+        } if *result == cond => *left,
         _ => return Err(Skip::Shape),
     };
 
@@ -294,7 +289,8 @@ fn try_recognize(func: &HirFunction, lp: &NaturalLoop) -> Result<FoldPlan, Skip>
         return Err(Skip::UnrecognizedBody);
     }
 
-    // Induction phi is the compare's LHS; bound is the RHS constant.
+    // Induction phi is the compare's LHS; the bound, the start and the
+    // step are constants, which give the trip count.
     let ind_phi = cmp_left;
     let ind = carried
         .iter()
@@ -302,42 +298,22 @@ fn try_recognize(func: &HirFunction, lp: &NaturalLoop) -> Result<FoldPlan, Skip>
         .ok_or(Skip::Shape)?;
     let acc = carried.iter().find(|p| p.result != ind_phi).unwrap();
     let acc_phi = acc.result;
-    let bound = resolve_const_int(func, cmp_right, &ident_map).ok_or(Skip::TripCount)?;
+    let counted = counted_loop(func, lp, &|id| resolve_const_int(func, id, &ident_map)).map_err(
+        |e| match e {
+            NotCounted::Shape => Skip::Shape,
+            NotCounted::Step => Skip::Recurrence,
+            NotCounted::Bounds => Skip::TripCount,
+        },
+    )?;
 
     // Each carried phi has exactly two incomings: init [preheader],
     // next [latch].
-    let ind_init_id = phi_incoming(ind, preheader).ok_or(Skip::Shape)?;
     let ind_next_id = phi_incoming(ind, latch).ok_or(Skip::Shape)?;
     let acc_init_id = phi_incoming(acc, preheader).ok_or(Skip::Shape)?;
     let acc_next_id = phi_incoming(acc, latch).ok_or(Skip::Shape)?;
     if ind.incoming.len() != 2 || acc.incoming.len() != 2 {
         return Err(Skip::Shape);
     }
-
-    // --- Induction: i_next = Add(i, step), step const int > 0 -------
-    let ind_next_inst = find_def_in(latch_block, ind_next_id).ok_or(Skip::Recurrence)?;
-    let step = match ind_next_inst {
-        HirInstruction::Binary {
-            op: BinaryOp::Add,
-            left,
-            right,
-            ..
-        } => {
-            if *left == ind_phi {
-                resolve_const_int(func, *right, &ident_map)
-            } else if *right == ind_phi {
-                resolve_const_int(func, *left, &ident_map)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-    .ok_or(Skip::Recurrence)?;
-    if step <= 0 {
-        return Err(Skip::Recurrence);
-    }
-    let i_init = resolve_const_int(func, ind_init_id, &ident_map).ok_or(Skip::TripCount)?;
 
     // --- Accumulator: recognise the recurrence, coefficient == 1 ----
     let acc_ty = acc.ty.clone();
@@ -373,25 +349,9 @@ fn try_recognize(func: &HirFunction, lp: &NaturalLoop) -> Result<FoldPlan, Skip>
         _ => return Err(Skip::Shape),
     }
 
-    // --- Trip count (i128) ------------------------------------------
-    // lt: iterations until i >= bound.  le: until i > bound.
-    let trip: i128 = if !is_le {
-        if bound <= i_init {
-            0
-        } else {
-            (bound - i_init + step - 1) / step
-        }
-    } else if bound < i_init {
-        0
-    } else {
-        (bound - i_init) / step + 1
-    };
-    if trip < 0 {
-        return Err(Skip::TripCount);
-    }
-
     // i_final = i_init + trip*step (loop-exit value of the induction).
-    let i_final_i128 = i_init + trip * step;
+    let trip = counted.trips;
+    let i_final_i128 = counted.init + trip * counted.step;
     let i_final = int_constant(&acc_ind_int_ty(&ind.ty), i_final_i128).ok_or(Skip::TripCount)?;
 
     // --- Closed-form accumulator ------------------------------------
@@ -622,25 +582,6 @@ fn resolve_is_one(func: &HirFunction, id: HirId, ident_map: &HashMap<HirId, HirI
         return v == 1.0;
     }
     false
-}
-
-fn const_int(func: &HirFunction, id: HirId) -> Option<i128> {
-    match &func.values.get(&id)?.kind {
-        HirValueKind::Constant(c) => match c {
-            HirConstant::I8(x) => Some(*x as i128),
-            HirConstant::I16(x) => Some(*x as i128),
-            HirConstant::I32(x) => Some(*x as i128),
-            HirConstant::I64(x) => Some(*x as i128),
-            HirConstant::I128(x) => Some(*x),
-            HirConstant::U8(x) => Some(*x as i128),
-            HirConstant::U16(x) => Some(*x as i128),
-            HirConstant::U32(x) => Some(*x as i128),
-            HirConstant::U64(x) => Some(*x as i128),
-            HirConstant::U128(x) => i128::try_from(*x).ok(),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 fn const_float(func: &HirFunction, id: HirId) -> Option<f64> {
