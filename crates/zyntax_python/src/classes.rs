@@ -2098,15 +2098,22 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
         assign_slice.push(assign_arm(is_shape(k), e, raw(k)));
         let mut slice_args = vec![raw(k)];
         slice_args.extend(bounds.iter().cloned());
+        // A shaped list's slice is a List<Any>, like the list it came
+        // from as the dynamic code sees it: a later write may be any kind.
         getslice.push(when(
             is_shape(k),
             vec![ret(
                 call(
-                    &lower::list_fn("box", e),
+                    &lower::list_fn("box", Elem::Object),
                     vec![call(
-                        &lower::list_fn("slice", e),
-                        slice_args,
-                        Ty::List(e),
+                        &format!("zb_list_to_any_{}", e.suffix()),
+                        vec![call(
+                            &lower::list_fn("slice", e),
+                            slice_args,
+                            Ty::List(e),
+                            span,
+                        )],
+                        Ty::List(Elem::Object),
                         span,
                     )],
                     Ty::Object,

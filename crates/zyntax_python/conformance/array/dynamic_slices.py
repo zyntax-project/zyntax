@@ -1,4 +1,4 @@
-# slicing an array or a typed list through a dynamic value keeps its kind,
+# slicing an array through a dynamic value keeps its typecode,
 # and array(code, x) copies bytes it is handed dynamically as it copies
 # typed bytes
 from array import array

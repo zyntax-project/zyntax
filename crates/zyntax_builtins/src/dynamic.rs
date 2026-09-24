@@ -2529,13 +2529,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             vec![unbox(k, x.e()), start.e(), stop.e(), step.e(), mask.e()],
             list_of(list_type, k.ty()),
         );
+        let widened = call(
+            &format!("zb_list_to_any_{}", k.suffix()),
+            vec![sliced],
+            anys.clone(),
+        );
         when(
             kind_is(k, x.e()),
-            vec![ret(call(
-                &format!("zb_list_box_{}", k.suffix()),
-                vec![sliced],
-                any(),
-            ))],
+            vec![ret(call("zb_list_box_any", vec![widened], any()))],
         )
     };
     // `x[start:stop:step] = ys`: the values read as the list's kind.
@@ -2638,8 +2639,8 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     any(),
                 ))],
             ),
-            // A typed list's slice keeps its kind: the elements copied
-            // are the slice's, never the whole list boxed first.
+            // A typed list's slice copies only the slice's elements, and
+            // is a List<Any> so it takes a later write of any kind.
             slice_kind(Kind::Int),
             slice_kind(Kind::Float),
             slice_kind(Kind::Str),
