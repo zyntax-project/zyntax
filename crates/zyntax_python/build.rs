@@ -21,7 +21,7 @@ mod policy;
 /// through the executable's exports, and every symbol dyld need not
 /// coalesce or bind is time before `main`. Linux exports nothing from
 /// an executable by default and drops unused dylibs on its own.
-fn emit_link_flags(out: &std::path::Path) -> Result<(), Box<dyn Error>> {
+fn emit_link_flags(out: &std::path::Path) -> Result<(), BuildError> {
     if env::var("CARGO_CFG_TARGET_OS")? != "macos" {
         return Ok(());
     }
@@ -35,7 +35,21 @@ fn emit_link_flags(out: &std::path::Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+/// The stack the build runs on. Lowering the library recurses as deep
+/// as it nests, past the 1 MB a Windows main thread has.
+const STACK_BYTES: usize = 256 << 20;
+
+type BuildError = Box<dyn Error + Send + Sync>;
+
+fn main() -> Result<(), BuildError> {
+    std::thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(build)?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+fn build() -> Result<(), BuildError> {
     let out = PathBuf::from(env::var("OUT_DIR")?);
     emit_link_flags(&out)?;
     println!("cargo:rerun-if-changed=src/policy.rs");

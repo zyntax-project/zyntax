@@ -11,7 +11,7 @@ use zyntax_embed::{LanguageGrammar, SnapshotBuilder};
 /// through the executable's exports, and every symbol dyld need not
 /// coalesce or bind is time before `main`. Linux exports nothing from
 /// an executable by default and drops unused dylibs on its own.
-fn emit_link_flags(out: &std::path::Path) -> Result<(), Box<dyn Error>> {
+fn emit_link_flags(out: &std::path::Path) -> Result<(), BuildError> {
     if env::var("CARGO_CFG_TARGET_OS")? != "macos" {
         return Ok(());
     }
@@ -25,7 +25,21 @@ fn emit_link_flags(out: &std::path::Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+/// The stack the build runs on. Parsing the grammar and the library
+/// recurses as deep as they nest, and a Windows main thread has 1 MB.
+const STACK_BYTES: usize = 256 << 20;
+
+type BuildError = Box<dyn Error + Send + Sync>;
+
+fn main() -> Result<(), BuildError> {
+    std::thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(build)?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+fn build() -> Result<(), BuildError> {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let out = PathBuf::from(env::var("OUT_DIR")?);
     emit_link_flags(&out)?;
