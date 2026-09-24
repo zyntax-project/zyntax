@@ -104,6 +104,8 @@ pub struct TieredRuntime {
     /// The functions and globals compiled modules installed, which a
     /// program joining the running module links rather than brings.
     installed: Arc<std::collections::HashSet<HirId>>,
+    /// Whether the host enters programs only through `entry_points`.
+    closed: bool,
     /// Captured runtime semantic events (render/stream).
     runtime_events: Vec<RuntimeEvent>,
     /// Optional callback invoked whenever a runtime event is captured.
@@ -429,6 +431,7 @@ impl TieredRuntime {
             snapshot_modules: Default::default(),
             entry_points: Vec::new(),
             installed: Arc::default(),
+            closed: false,
             runtime_events: Vec::new(),
             event_sink: None,
             builtin_aliases: indexmap::IndexMap::new(),
@@ -1198,6 +1201,16 @@ impl TieredRuntime {
         }
     }
 
+    /// Promise that this host calls into the programs it compiles only
+    /// through the entry points declared with
+    /// [`Self::declare_entry_points`]. A function a program declares is
+    /// then built only when a built body calls it or takes its address,
+    /// so one nothing reaches costs nothing; calling it by name finds no
+    /// function.
+    pub fn enter_only_through_entry_points(&mut self) {
+        self.closed = true;
+    }
+
     /// Whether to run the interp-safe HIR optimisations before a module
     /// reaches a backend. On unless a caller says otherwise.
     pub fn set_run_interp_opts(&mut self, run: bool) {
@@ -1565,6 +1578,9 @@ impl TieredRuntime {
                 builtins: self.builtin_aliases.clone(),
                 builtin_registry: self.snapshot_builtin_registry(),
                 entry_names: entries.iter().map(|e| e.to_string()).collect(),
+                // A joined piece is small and about to run: every function
+                // it declares is built now.
+                closed: false,
                 prelowered: Vec::new(),
                 linked: Arc::clone(&self.installed),
                 selective: true,
@@ -2756,6 +2772,7 @@ impl TieredRuntime {
                 builtins,
                 builtin_registry: self.snapshot_builtin_registry(),
                 entry_names: self.entry_names(),
+                closed: self.closed && !self.entry_points.is_empty(),
                 prelowered: Vec::new(),
                 linked: Arc::default(),
                 selective: false,

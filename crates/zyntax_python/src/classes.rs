@@ -426,6 +426,7 @@ pub(crate) fn raise_facts(
 }
 
 /// The functions every class needs: construction, unboxing, dispatch.
+/// Marked generated, so their bodies are not type checked.
 pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
     let span = Span::new(0, 0);
     let mut out = Vec::new();
@@ -457,6 +458,9 @@ pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
         out.push(raiser(module, class, span));
     }
     out.extend(hooks(module, span));
+    for func in &mut out {
+        func.mark_generated();
+    }
     out
 }
 
@@ -2568,6 +2572,7 @@ pub(crate) fn raise_hook(module: &Module) -> TypedFunction {
         args: Vec::new(),
         span,
     });
+    hook.mark_generated();
     hook
 }
 

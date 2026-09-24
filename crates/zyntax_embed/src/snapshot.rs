@@ -402,6 +402,7 @@ pub fn lower_for_snapshot_releasing(
                 zyntax_compiler::builtin_class::BuiltinRegistry::with_defaults(),
             ),
             entry_names: Vec::new(),
+            closed: false,
             prelowered,
             linked: Arc::default(),
             selective: false,

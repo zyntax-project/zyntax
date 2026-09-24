@@ -31,6 +31,9 @@ pub(crate) struct Inputs<'a> {
     pub builtin_registry: Arc<BuiltinRegistry>,
     /// Names a program can be entered through; empty builds everything.
     pub entry_names: Vec<String>,
+    /// Whether `entry_names` are the only way in, so a function of the
+    /// program's own is built only when something built reaches it.
+    pub closed: bool,
     /// Modules already lowered, beyond what the program's imports bring.
     pub prelowered: Vec<Arc<zyntax_compiler::bytecode::LazyModule>>,
     /// Functions and globals of lowered imports already installed where
@@ -184,6 +187,7 @@ pub(crate) fn lower_typed_program(
         builtins,
         use_krio_async: cfg!(feature = "krio-async-backend"),
         entry_names: inputs.entry_names,
+        closed: inputs.closed,
         prelowered,
         linked: inputs.linked,
         ..LoweringConfig::default()

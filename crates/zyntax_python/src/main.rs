@@ -89,9 +89,11 @@ fn run() -> ExitCode {
             let Ok(mut rt) = TieredRuntime::new(TieredConfig::default()) else {
                 break;
             };
-            if zyntax_python::register_runtime(&mut rt).is_err()
-                || rt.compile_typed_program(program).is_err()
-            {
+            if zyntax_python::register_runtime(&mut rt).is_err() {
+                break;
+            }
+            rt.enter_only_through_entry_points();
+            if rt.compile_typed_program(program).is_err() {
                 break;
             }
         }
@@ -130,6 +132,8 @@ fn run() -> ExitCode {
         eprintln!("zypy: runtime: {e}");
         return ExitCode::from(4);
     }
+    // The program is entered through its module body and nothing else.
+    rt.enter_only_through_entry_points();
     lap("register");
     if let Err(e) = rt.compile_typed_program(program) {
         eprintln!("zypy: compile: {e}");

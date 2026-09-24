@@ -159,6 +159,9 @@ fn run() -> ExitCode {
         eprintln!("zylua: runtime: {e}");
         return ExitCode::from(4);
     }
+    // The program is entered through its main chunk, and a loaded chunk
+    // through its own, and nothing else.
+    rt.enter_only_through_entry_points();
     zyntax_lua::set_runtime(&mut rt);
     lap("register");
     if let Err(e) = rt.compile_typed_program(program) {

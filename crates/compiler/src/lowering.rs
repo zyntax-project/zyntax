@@ -230,6 +230,13 @@ pub struct LoweringContext {
     /// Where a skipped function was declared, so it can be lowered
     /// later without searching for it.
     skipped_at: std::collections::HashMap<InternedString, usize>,
+    /// The program's own functions a closed program left for their
+    /// first reach and has not built yet.
+    deferred_own: std::collections::HashSet<InternedString>,
+    /// Functions and globals whose targets an owed round has read, and
+    /// the targets read that had nowhere to land yet.
+    owed_scanned: std::collections::HashSet<crate::hir::HirId>,
+    owed_targets: Vec<crate::hir::HirId>,
     /// Index of the declaration being lowered.
     current_decl: usize,
     /// Whether a lowered body reached a target no declaration can
@@ -423,6 +430,11 @@ pub struct LoweringConfig {
     /// lowering skip the bodies nothing reaches. Empty means nobody
     /// said, and then every body is lowered.
     pub entry_names: Vec<String>,
+    /// Whether the host enters the program only through `entry_names`.
+    /// A function the program declares is then built only once a built
+    /// body calls it or takes its address, as an import's is; otherwise
+    /// a host may call any of them by name and every one is built.
+    pub closed: bool,
     /// Skip the legacy `AsyncCompiler` path inside `transform_async_function`.
     /// Async functions remain marked `is_async = true` after lowering, leaving
     /// them in shape for `krio_adapter` to transform via a post-lowering pass.
@@ -466,6 +478,7 @@ impl Default for LoweringConfig {
             import_resolver: None,
             builtins: indexmap::IndexMap::new(),
             entry_names: Vec::new(),
+            closed: false,
             prelowered: Vec::new(),
             linked: Arc::default(),
             use_krio_async: false,
@@ -556,6 +569,9 @@ impl LoweringContext {
             wanted: None,
             lowered_fns: std::collections::HashSet::new(),
             skipped_at: std::collections::HashMap::new(),
+            deferred_own: std::collections::HashSet::new(),
+            owed_scanned: std::collections::HashSet::new(),
+            owed_targets: Vec::new(),
             current_decl: 0,
             saw_indirect_call: false,
             entered: false,
@@ -811,7 +827,7 @@ impl LoweringContext {
     }
 
     /// The functions the program can be entered through, once
-    /// `lower_program` has run: everything it declared itself, since a
+    /// `lower_program` has run: everything it built of its own, since a
     /// host may call any of those by name, but nothing an import brought
     /// in, which only matters if one of the former reaches it. `None`
     /// when the program named no entry point, so a host may call
@@ -939,6 +955,7 @@ impl AstLowering for LoweringContext {
         if self.wanted.is_none() {
             self.adopt_all_prelowered();
         }
+        let deferred = self.defer_own_functions(program);
 
         // Effects first, whatever order the declarations arrive in. A
         // function that declares one resolves the operations it may
@@ -964,7 +981,8 @@ impl AstLowering for LoweringContext {
             if matches!(
                 decl.node,
                 TypedDeclaration::Effect(_) | TypedDeclaration::Variable(_)
-            ) {
+            ) || deferred.contains(&index)
+            {
                 continue;
             }
             self.current_decl = index;
@@ -1005,9 +1023,12 @@ impl AstLowering for LoweringContext {
             eprintln!(
                 "[LOWER-PROGRAM] copy_types = {copy_ms:.2}  typecheck = {typecheck_ms:.2}  \
                  method_types = {methods_ms:.2}  collect_decls = {collect_ms:.2}  \
-                 declarations = {declared_ms:.2} ms ({})  bodies = {bodies_ms:.2} ms \
+                 declarations = {declared_ms:.2} ms ({}, {} own functions left until \
+                 reached, {} never reached)  bodies = {bodies_ms:.2} ms \
                  (adopted {} functions, decoded in {:.2} ms)",
                 program.declarations.len(),
+                deferred.len(),
+                self.deferred_own.len(),
                 self.adopted.0,
                 self.adopted.1
             );
@@ -2763,7 +2784,9 @@ impl LoweringContext {
     /// regardless: a host can call it by name, a handler's operations
     /// are entered through an effect rather than a call, and a fiber's
     /// body is entered by the scheduler. None of those appear as a call
-    /// site, so none of them can be discovered by following calls.
+    /// site, so none of them can be discovered by following calls. A
+    /// closed program's own functions that can only be called are held
+    /// back before this, by [`Self::defer_own_functions`].
     fn should_lower(&mut self, func: &TypedFunction) -> bool {
         let Some(wanted) = self.wanted.as_ref() else {
             return true;
@@ -2777,6 +2800,63 @@ impl LoweringContext {
         }
         self.skipped_at.insert(func.name, self.current_decl);
         false
+    }
+
+    /// The declarations of a closed program's own functions to leave
+    /// for [`Self::lower_until_nothing_is_owed`], by index.
+    ///
+    /// The host enters a closed program only through its entry points,
+    /// so an own function is reached only by a built body calling it or
+    /// taking its address: a record, a closure, a dispatch table or a
+    /// library's call to a hook the program defines. Each is built when
+    /// the first of those appears. Kept are the entry points and what
+    /// is entered some other way or does work at lowering: externs and
+    /// bodiless declarations, fiber and async bodies, generics,
+    /// functions with effects or handlers, and a name declared twice,
+    /// whose meaning depends on the order its declarations are built.
+    ///
+    /// `ZYNTAX_DISABLE_REACH_LOWERING=1` builds every own function up
+    /// front, as for an open program; safe to run with.
+    fn defer_own_functions(&mut self, program: &TypedProgram) -> std::collections::HashSet<usize> {
+        let mut deferred = std::collections::HashSet::new();
+        let Some(wanted) = self.wanted.as_ref() else {
+            return deferred;
+        };
+        if !self.config.closed || std::env::var_os("ZYNTAX_DISABLE_REACH_LOWERING").is_some() {
+            return deferred;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut twice = std::collections::HashSet::new();
+        for decl in &program.declarations {
+            if let TypedDeclaration::Function(f) = &decl.node
+                && !seen.insert(f.name)
+            {
+                twice.insert(f.name);
+            }
+        }
+        for (index, decl) in program.declarations.iter().enumerate() {
+            let TypedDeclaration::Function(f) = &decl.node else {
+                continue;
+            };
+            let kept = f.module.is_some()
+                || f.is_external
+                || f.body.is_none()
+                || f.is_fiber
+                || f.is_async
+                || !f.type_params.is_empty()
+                || !f.effects.is_empty()
+                || !f.with_handlers.is_empty()
+                || wanted.contains(&f.name)
+                || twice.contains(&f.name)
+                || self.is_prelowered(f.name);
+            if kept {
+                continue;
+            }
+            self.skipped_at.insert(f.name, index);
+            self.deferred_own.insert(f.name);
+            deferred.insert(index);
+        }
+        deferred
     }
 
     /// The names lowering starts from, or `None` to build everything.
@@ -2866,12 +2946,23 @@ impl LoweringContext {
                     self.current_decl = index;
                     self.lower_declaration(&program.declarations[index])?;
                 }
+                // A body built under an id an adoption round already
+                // followed, as a stub for a hook the program defines,
+                // has its calls followed afresh.
+                for name in &owed {
+                    self.deferred_own.remove(name);
+                    if let Some(id) = self.symbols.functions.get(name) {
+                        self.adopt_followed.remove(id);
+                        self.owed_scanned.remove(id);
+                    }
+                }
                 continue;
             }
 
             // Nothing owed is anything skipped here, so no round can
             // settle it. Build the rest and stop assuming.
             self.wanted = None;
+            self.deferred_own.clear();
             self.adopt_all_prelowered();
             let mut rest: Vec<usize> = self.skipped_at.values().copied().collect();
             rest.sort_unstable();
@@ -2881,6 +2972,13 @@ impl LoweringContext {
                  building the remaining {} declaration(s)",
                 rest.len(),
             );
+            if self.trace_phases {
+                eprintln!(
+                    "[LOWER-PROGRAM] a call nothing skipped answers: building the remaining {} \
+                     declarations",
+                    rest.len()
+                );
+            }
             for index in rest {
                 self.current_decl = index;
                 self.lower_declaration(&program.declarations[index])?;
@@ -2969,21 +3067,14 @@ impl LoweringContext {
     fn calls_with_nowhere_to_land(&mut self) -> Vec<InternedString> {
         use crate::hir::{HirCallable, HirInstruction};
 
-        // A target that was skipped is not in the module, so its name
-        // has to come from what the declarations registered.
-        let mut name_of: std::collections::HashMap<crate::hir::HirId, InternedString> =
-            std::collections::HashMap::new();
-        for (name, id) in self.symbols.functions.iter() {
-            name_of.insert(*id, *name);
-        }
-        // A dropped function is no longer in the table, and without
-        // this its call site looks like a call through a value.
-        for (id, (name, _)) in &self.dropped_for {
-            name_of.insert(*id, *name);
-        }
-
-        let mut targets: Vec<crate::hir::HirId> = Vec::new();
-        for function in self.module.functions.values() {
+        // Each round reads only the bodies and globals that arrived since
+        // the last, and carries forward the targets still unsettled, so a
+        // program reached a layer per round costs one read of each body.
+        let mut targets = std::mem::take(&mut self.owed_targets);
+        for (id, function) in &self.module.functions {
+            if function.blocks.is_empty() || !self.owed_scanned.insert(*id) {
+                continue;
+            }
             for block in function.blocks.values() {
                 for inst in &block.instructions {
                     match inst {
@@ -2997,19 +3088,47 @@ impl LoweringContext {
                 }
             }
         }
-        for global in self.module.globals.values() {
-            if let Some(init) = &global.initializer {
+        for (id, global) in &self.module.globals {
+            if let Some(init) = &global.initializer
+                && self.owed_scanned.insert(*id)
+            {
                 crate::dce::collect_vtable_funcs(init, &mut targets);
             }
         }
 
+        // An extern stands for a hook the program defines until the
+        // program's body for it is built.
+        targets.retain(|target| {
+            let Some(target_fn) = self.module.functions.get(target) else {
+                return true;
+            };
+            let awaits_own_body =
+                target_fn.is_external && self.deferred_own.contains(&target_fn.name);
+            !((target_fn.is_external && !awaits_own_body) || !target_fn.blocks.is_empty())
+        });
+        if targets.is_empty() {
+            return Vec::new();
+        }
+
+        // A target that was skipped is not in the module, so its name
+        // has to come from what the declarations registered.
+        let mut name_of: std::collections::HashMap<crate::hir::HirId, InternedString> =
+            std::collections::HashMap::new();
+        for (name, id) in self.symbols.functions.iter() {
+            name_of.insert(*id, *name);
+        }
+        // A dropped function is no longer in the table, and without
+        // this its call site looks like a call through a value.
+        for (id, (name, _)) in &self.dropped_for {
+            name_of.insert(*id, *name);
+        }
+
         let mut owed: Vec<InternedString> = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut unsettled = std::collections::HashSet::new();
         for target in targets {
-            if let Some(target_fn) = self.module.functions.get(&target) {
-                if target_fn.is_external || !target_fn.blocks.is_empty() {
-                    continue;
-                }
+            if !unsettled.insert(target) {
+                continue;
             }
             // Installed where the module is going.
             if self.config.linked.contains(&target) {
@@ -3021,6 +3140,7 @@ impl LoweringContext {
                 self.saw_indirect_call = true;
                 return Vec::new();
             };
+            self.owed_targets.push(target);
             if seen.insert(name) {
                 owed.push(name);
             }

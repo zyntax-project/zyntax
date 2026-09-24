@@ -145,6 +145,7 @@ pub use type_registry::BuiltinTraitIds;
 
 pub use typed_ast::{
     BinaryOp,
+    GENERATED_ANNOTATION,
     ParamOwnership,
     ParameterKind,
     // Annotation types

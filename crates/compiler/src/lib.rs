@@ -1571,6 +1571,7 @@ pub fn compile_to_hir(
         builtins: config.builtins.clone(),
         use_krio_async: config.use_krio_async,
         entry_names: Vec::new(),
+        closed: false,
         prelowered: Vec::new(),
         linked: Arc::default(),
     };

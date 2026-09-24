@@ -681,7 +681,7 @@ pub fn tuple_declarations(
         &|key| call(&box_name, vec![key], any()),
         &|key| call(&repr_name, vec![key], string()),
     ));
-    d
+    generated(d)
 }
 
 /// The list functions (`zb_list_*_<suffix>`) of a list whose elements
@@ -712,7 +712,18 @@ pub fn tuple_list_declarations(
         boxed: Box::new(move |x| call(&box_name, vec![x], any())),
         read: Box::new(move |x| call(&read_name, vec![x], elem.clone())),
     };
-    kind_declarations(&k)
+    generated(kind_declarations(&k))
+}
+
+/// Mark what a frontend generates into a program as generated, so its
+/// bodies are not type checked with every program that declares them.
+fn generated(mut decls: Vec<Decl>) -> Vec<Decl> {
+    for decl in &mut decls {
+        if let TypedDeclaration::Function(f) = &mut decl.node {
+            f.mark_generated();
+        }
+    }
+    decls
 }
 
 fn len(xs: Expr) -> Expr {
@@ -841,7 +852,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
 /// generate into the program that uses arrays of it: the library holds
 /// only its own kinds.
 pub fn array_kind_declarations(kind: Kind, list_type: TypeId) -> Vec<Decl> {
-    kind_declarations(&ops(kind, list_type))
+    generated(kind_declarations(&ops(kind, list_type)))
 }
 
 fn kind_declarations(k: &KindOps) -> Vec<Decl> {

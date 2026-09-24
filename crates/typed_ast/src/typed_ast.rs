@@ -418,6 +418,32 @@ pub struct TypedFunction {
     pub module: Option<InternedString>,
 }
 
+/// The annotation marking a function a builder generated rather than a
+/// source defined. The type checker registers its signature for callers
+/// and does not check its body, which its generator is trusted to have
+/// built well typed.
+pub const GENERATED_ANNOTATION: &str = "generated";
+
+impl TypedFunction {
+    /// Whether [`GENERATED_ANNOTATION`] marks this function.
+    pub fn is_generated(&self) -> bool {
+        self.annotations
+            .iter()
+            .any(|a| a.name.resolve_global().as_deref() == Some(GENERATED_ANNOTATION))
+    }
+
+    /// Mark this function with [`GENERATED_ANNOTATION`].
+    pub fn mark_generated(&mut self) {
+        if !self.is_generated() {
+            self.annotations.push(TypedAnnotation {
+                name: InternedString::new_global(GENERATED_ANNOTATION),
+                args: Vec::new(),
+                span: Span::default(),
+            });
+        }
+    }
+}
+
 /// Function parameter with mutability and advanced features
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TypedParameter {

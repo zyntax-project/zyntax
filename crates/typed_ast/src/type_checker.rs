@@ -776,8 +776,15 @@ impl TypeChecker {
             }
         }
 
-        // Second pass: Type check all declarations
+        // Second pass: Type check all declarations. A generated
+        // function's signature is in scope from the first pass; its body
+        // is not checked.
         for decl_node in &program.declarations {
+            if let TypedDeclaration::Function(func) = &decl_node.node
+                && func.is_generated()
+            {
+                continue;
+            }
             self.check_declaration(&decl_node.node, decl_node.span);
         }
 
@@ -801,6 +808,13 @@ impl TypeChecker {
     /// Call this after check_program() to propagate inferred types.
     pub fn apply_inferred_types(&self, program: &mut TypedProgram) {
         for decl in &mut program.declarations {
+            // No constraint came from a generated body, so nothing
+            // inferred applies to it.
+            if let TypedDeclaration::Function(func) = &decl.node
+                && func.is_generated()
+            {
+                continue;
+            }
             self.apply_types_to_declaration(&mut decl.node);
         }
     }
