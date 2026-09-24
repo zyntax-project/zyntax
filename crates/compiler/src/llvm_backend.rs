@@ -3966,9 +3966,10 @@ impl<'ctx> LLVMBackend<'ctx> {
                         )?
                         .into()
                 } else {
+                    // Unordered: NaN is unequal to everything, itself included.
                     self.builder
                         .build_float_compare(
-                            FloatPredicate::ONE,
+                            FloatPredicate::UNE,
                             left.into_float_value(),
                             right.into_float_value(),
                             "fne",
@@ -4091,10 +4092,11 @@ impl<'ctx> LLVMBackend<'ctx> {
                     "feq",
                 )?
                 .into(),
+            // Unordered, as `Ne` on floats.
             FNe => self
                 .builder
                 .build_float_compare(
-                    FloatPredicate::ONE,
+                    FloatPredicate::UNE,
                     left.into_float_value(),
                     right.into_float_value(),
                     "fne",
