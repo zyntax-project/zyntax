@@ -1,10 +1,14 @@
-//! Boxes every program shares.
+//! Boxes and strings every program shares.
 //!
 //! The two booleans and the small integers are boxed so often, and
 //! carry so little, that one box of each serves every use: a value of
 //! these kinds is immutable, and nothing tells one box of `3` from
 //! another. The boxes live for the process; a release of one is a
-//! no-op, which the pool checks for before anything else.
+//! no-op, which the pool checks for before anything else. The
+//! one-character, one-byte and empty strings are the SDK's immortal
+//! table, static data under the same rules: never released, never
+//! written, and never scanned by the collector, since they hold no
+//! pointers.
 //!
 //! The box pass hands compiled code their addresses, so they are laid
 //! out exactly as a box it would make: the header and the payload
@@ -95,6 +99,13 @@ pub fn is_interned(p: usize) -> bool {
     p.wrapping_sub(BASE.load(Ordering::Relaxed)) < BYTES.load(Ordering::Relaxed)
 }
 
+/// Whether `p` is a shared box or an immortal string, which no release
+/// may touch and the collector does not follow.
+#[inline]
+pub fn is_shared_static(p: usize) -> bool {
+    is_interned(p) || ::zrtl::string::is_immortal_string(p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +123,19 @@ mod tests {
         assert!(is_interned(three));
         assert!(is_interned(bool_box(false)));
         assert!(!is_interned(three + SMALL_INT_COUNT * STRIDE));
+    }
+
+    #[test]
+    fn immortal_strings_are_shared_statics() {
+        let a = ::zrtl::string::char_text(b'a') as usize;
+        assert!(is_shared_static(a));
+        assert!(is_shared_static(::zrtl::string::empty_string() as usize));
+        assert!(!is_interned(a));
+        // A stray release of one is a no-op.
+        unsafe { crate::pool_alloc::zyntax_free(a as *mut u8) };
+        assert_eq!(
+            unsafe { ::zrtl::string::string_as_str(a as *const i32) },
+            Some("a")
+        );
     }
 }

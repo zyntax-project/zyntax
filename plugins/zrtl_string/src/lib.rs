@@ -30,11 +30,16 @@
 //! - `$String$parse_int`, `$String$parse_float` - Parse numbers
 //! - `$String$from_int`, `$String$from_float` - Convert to string
 
-use zrtl::string::{string_alloc_size, string_as_bytes, string_data_mut, string_from_bytes};
+use zrtl::string::{string_as_bytes, string_build, string_flags, string_from_bytes, TEXT};
 use zrtl::{
     array_new, array_push, string_as_str, string_data, string_length, string_new, zrtl_plugin,
     ArrayPtr, StringPtr,
 };
+
+/// Whether a string is TEXT; null is the empty text.
+fn is_text(s: StringPtr) -> bool {
+    s.is_null() || unsafe { string_flags(s) } & TEXT != 0
+}
 
 // ============================================================================
 // Basic Operations
@@ -49,7 +54,7 @@ pub extern "C" fn string_len(s: StringPtr) -> i64 {
 /// Get string length in characters (Unicode-aware)
 #[no_mangle]
 pub extern "C" fn string_char_count(s: StringPtr) -> i64 {
-    // A long string's count is kept with its character index.
+    // The header carries the count.
     unsafe { zrtl::string::string_char_count(s) as i64 }
 }
 
@@ -62,21 +67,7 @@ pub extern "C" fn string_is_empty(s: StringPtr) -> i32 {
 /// Concatenate two strings
 #[no_mangle]
 pub extern "C" fn string_concat(a: StringPtr, b: StringPtr) -> StringPtr {
-    // One allocation of the final length, the bytes copied straight in.
-    let a = unsafe { string_as_bytes(a) };
-    let b = unsafe { string_as_bytes(b) };
-    let total = a.len() + b.len();
-    unsafe {
-        let out = zrtl::heap::alloc(string_alloc_size(total), 4) as StringPtr;
-        if out.is_null() {
-            return out;
-        }
-        *out = total as i32;
-        let data = string_data_mut(out);
-        std::ptr::copy_nonoverlapping(a.as_ptr(), data, a.len());
-        std::ptr::copy_nonoverlapping(b.as_ptr(), data.add(a.len()), b.len());
-        out
-    }
+    zrtl::string::string_concat(a, b)
 }
 
 /// Repeat string n times
@@ -120,55 +111,74 @@ pub extern "C" fn string_join(arr: ArrayPtr, sep: StringPtr) -> StringPtr {
 /// allocation for the whole result.
 #[no_mangle]
 pub extern "C" fn string_join_n(data: *const StringPtr, n: i64, sep: StringPtr) -> StringPtr {
-    let sep = unsafe { string_as_bytes(sep) };
     if data.is_null() || n <= 0 {
         return string_new("");
     }
-    let n = n as usize;
-    let mut total = sep.len() * (n - 1);
-    for i in 0..n {
-        total += unsafe { string_as_bytes(*data.add(i)) }.len();
+    unsafe { join_parts(std::slice::from_raw_parts(data, n as usize), sep) }
+}
+
+/// `parts` joined with `sep`: TEXT when all of them are.
+///
+/// # Safety
+/// Every part and the separator must be null or valid strings.
+unsafe fn join_parts(parts: &[StringPtr], sep: StringPtr) -> StringPtr {
+    let n = parts.len();
+    let sep_bytes = string_as_bytes(sep);
+    let sep_chars = zrtl::string::string_char_count(sep);
+    let mut total = sep_bytes.len() * (n - 1);
+    let mut chars = sep_chars * (n - 1);
+    let mut text = is_text(sep);
+    for &p in parts {
+        total += string_length(p) as usize;
+        chars += zrtl::string::string_char_count(p);
+        text &= is_text(p);
     }
-    unsafe {
-        let out = zrtl::heap::alloc(string_alloc_size(total), 4) as StringPtr;
-        if out.is_null() {
-            return out;
-        }
-        *out = total as i32;
-        let mut at = string_data_mut(out);
-        for i in 0..n {
+    let fill = |mut at: *mut u8| {
+        for (i, &p) in parts.iter().enumerate() {
             if i > 0 {
-                std::ptr::copy_nonoverlapping(sep.as_ptr(), at, sep.len());
-                at = at.add(sep.len());
+                std::ptr::copy_nonoverlapping(sep_bytes.as_ptr(), at, sep_bytes.len());
+                at = at.add(sep_bytes.len());
             }
-            let part = string_as_bytes(*data.add(i));
+            let part = string_as_bytes(p);
             std::ptr::copy_nonoverlapping(part.as_ptr(), at, part.len());
             at = at.add(part.len());
         }
-        out
+    };
+    if text {
+        return string_build(total, chars, true, fill);
     }
+    // A part that is not TEXT: the joined bytes decide.
+    let mut joined = vec![0u8; total];
+    fill(joined.as_mut_ptr());
+    string_from_bytes(&joined)
 }
 
 // ============================================================================
 // Case Conversion
 // ============================================================================
 
-/// Convert to uppercase
+/// Convert to uppercase: Unicode casing on TEXT, ASCII bytewise on a
+/// byte string.
 #[no_mangle]
 pub extern "C" fn string_to_upper(s: StringPtr) -> StringPtr {
-    match unsafe { string_as_str(s) } {
-        Some(s) => string_new(&s.to_uppercase()),
-        None => string_new(""),
+    let bytes = unsafe { string_as_bytes(s) };
+    if !is_text(s) {
+        return zrtl::bytes_new(&bytes.to_ascii_uppercase());
     }
+    // SAFETY: a TEXT string holds UTF-8.
+    string_new(&unsafe { std::str::from_utf8_unchecked(bytes) }.to_uppercase())
 }
 
-/// Convert to lowercase
+/// Convert to lowercase: Unicode casing on TEXT, ASCII bytewise on a
+/// byte string.
 #[no_mangle]
 pub extern "C" fn string_to_lower(s: StringPtr) -> StringPtr {
-    match unsafe { string_as_str(s) } {
-        Some(s) => string_new(&s.to_lowercase()),
-        None => string_new(""),
+    let bytes = unsafe { string_as_bytes(s) };
+    if !is_text(s) {
+        return zrtl::bytes_new(&bytes.to_ascii_lowercase());
     }
+    // SAFETY: a TEXT string holds UTF-8.
+    string_new(&unsafe { std::str::from_utf8_unchecked(bytes) }.to_lowercase())
 }
 
 /// Capitalize first character
@@ -319,14 +329,7 @@ pub extern "C" fn string_hash(s: StringPtr) -> i64 {
     if s.is_null() {
         return 0;
     }
-    let len = unsafe { string_length(s) }.max(0) as usize;
-    let bytes = unsafe { std::slice::from_raw_parts(string_data(s), len) };
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h as i64
+    zrtl::fnv1a_bytes(unsafe { string_as_bytes(s) }) as i64
 }
 
 /// Find last index of substring, returns -1 if not found
@@ -388,7 +391,26 @@ pub extern "C" fn string_remove(s: StringPtr, pattern: StringPtr) -> StringPtr {
 /// Get substring from start to end (exclusive)
 #[no_mangle]
 pub extern "C" fn string_substring(s: StringPtr, start: i64, end: i64) -> StringPtr {
-    let s_str = unsafe { string_as_str(s) }.unwrap_or("");
+    unsafe { substring_of(s, start, end) }
+}
+
+/// Characters `start..end` of a string, clamped into it.
+///
+/// # Safety
+/// `s` must be null or a valid string.
+unsafe fn substring_of(s: StringPtr, start: i64, end: i64) -> StringPtr {
+    if !s.is_null() && is_text(s) {
+        // Character positions to byte offsets through the header.
+        let count = zrtl::string::string_char_count(s) as i64;
+        let (start, end) = (start.clamp(0, count), end.clamp(0, count));
+        if start >= end {
+            return string_new("");
+        }
+        let from = zrtl::string::string_char_offset(s, start as usize).unwrap_or(0);
+        let to = zrtl::string::string_char_offset(s, end as usize).unwrap_or(from);
+        return zrtl::string::string_slice(s, from, to);
+    }
+    let s_str = string_as_str(s).unwrap_or("");
     let len = s_str.len() as i64;
 
     let start = start.max(0).min(len) as usize;
@@ -415,10 +437,7 @@ pub extern "C" fn string_char_at(s: StringPtr, index: i64) -> StringPtr {
         return string_new("");
     };
     match unsafe { zrtl::string::string_char_range(s, index) } {
-        Some(range) => {
-            let bytes = unsafe { string_as_bytes(s) };
-            zrtl::string::string_from_bytes(&bytes[range])
-        }
+        Some(range) => unsafe { zrtl::string::string_slice(s, range.start, range.end) },
         None => string_new(""),
     }
 }
@@ -435,6 +454,13 @@ pub extern "C" fn string_char_at_byte(s: StringPtr, pos: i64) -> StringPtr {
     let data = unsafe { string_data(s) };
     let rest = unsafe { std::slice::from_raw_parts(data.add(pos as usize), (len - pos) as usize) };
     let width = utf8_width(rest[0]).min(rest.len());
+    if is_text(s) {
+        if rest[0] & 0xC0 == 0x80 {
+            return string_new("");
+        }
+        let pos = pos as usize;
+        return unsafe { zrtl::string::string_slice(s, pos, pos + width) };
+    }
     match std::str::from_utf8(&rest[..width]) {
         Ok(c) => string_new(c),
         Err(_) => string_new(""),
@@ -462,7 +488,7 @@ pub extern "C" fn string_bytes(s: StringPtr, start: i64, end: i64) -> StringPtr 
     if starts_inside || ends_inside {
         return string_new("");
     }
-    string_from_bytes(bytes)
+    unsafe { zrtl::string::string_slice(s, start as usize, end as usize) }
 }
 
 /// The byte offset of the character after the one at `pos`; the string's
@@ -491,7 +517,26 @@ fn utf8_width(lead: u8) -> usize {
 /// Get character code at index (returns -1 if out of bounds)
 #[no_mangle]
 pub extern "C" fn string_char_code_at(s: StringPtr, index: i64) -> i32 {
-    let s_str = unsafe { string_as_str(s) }.unwrap_or("");
+    unsafe { char_code_of(s, index) }
+}
+
+/// The code of character `index`, -1 out of range.
+///
+/// # Safety
+/// `s` must be null or a valid string.
+unsafe fn char_code_of(s: StringPtr, index: i64) -> i32 {
+    if !s.is_null() && is_text(s) {
+        let Ok(index) = usize::try_from(index) else {
+            return -1;
+        };
+        return match zrtl::string::string_char_range(s, index) {
+            Some(range) => string_as_str(s)
+                .and_then(|t| t[range].chars().next())
+                .map_or(-1, |c| c as i32),
+            None => -1,
+        };
+    }
+    let s_str = string_as_str(s).unwrap_or("");
     match s_str.chars().nth(index as usize) {
         Some(c) => c as i32,
         None => -1,
@@ -864,6 +909,41 @@ mod tests {
         let s = string_new("hello world");
         let sub = string_substring(s, 0, 5);
         assert_eq!(unsafe { string_as_str(sub) }, Some("hello"));
+        let t = string_new(&"héllo wörld ".repeat(10));
+        let sub = string_substring(t, 13, 18);
+        assert_eq!(unsafe { string_as_str(sub) }, Some("éllo "));
+        assert_eq!(
+            unsafe { string_as_str(string_substring(t, 115, 200)) },
+            Some("örld ")
+        );
+        assert_eq!(string_char_code_at(t, 13), 'é' as i32);
+        assert_eq!(string_char_code_at(t, 120), -1);
+        assert_eq!(unsafe { string_as_str(string_char_at(t, 1)) }, Some("é"));
+        assert_eq!(string_char_at(t, 1), zrtl::string::char_text(0xE9));
+    }
+
+    #[test]
+    fn test_header_flags_carry_through() {
+        use zrtl::string::{string_header, INDEXED, TEXT};
+        let a = string_new(&"é".repeat(40));
+        let b = string_new(&"x".repeat(40));
+        let joined = string_concat(a, b);
+        let h = unsafe { string_header(joined) };
+        assert_eq!((h.byte_len, h.char_len), (120, 80));
+        assert_eq!(h.flags & (TEXT | INDEXED), TEXT | INDEXED);
+        assert_eq!(string_char_count(joined), 80);
+        let parts = [a, b, a];
+        let sep = string_new("-");
+        let j = string_join_n(parts.as_ptr(), 3, sep);
+        assert_eq!(string_char_count(j), 122);
+        assert_eq!(string_len(j), 202);
+        let raw = zrtl::bytes_new(&[0xff, b'a']);
+        let up = string_to_upper(raw);
+        assert_eq!(unsafe { string_as_bytes(up) }, &[0xff, b'A']);
+        assert_eq!(unsafe { string_header(up) }.flags & TEXT, 0);
+        let mixed = string_concat(raw, b);
+        assert_eq!(unsafe { string_header(mixed) }.flags & TEXT, 0);
+        assert_eq!(string_hash(b), zrtl::fnv1a_bytes(&[b'x'; 40]) as i64);
     }
 
     #[test]

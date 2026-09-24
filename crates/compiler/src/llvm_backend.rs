@@ -1676,45 +1676,21 @@ impl<'ctx> LLVMBackend<'ctx> {
             return Ok(());
         }
 
-        // Handle string constants specially - emit in Haxe String format: [length: i32][utf8_bytes...]
-        // This matches the Cranelift backend format so runtime functions work correctly
+        // A string constant: the SDK's immortal image, never written.
         if let Some(HirConstant::String(s)) = &global.initializer {
             let actual_string = s.resolve_global().unwrap_or_else(|| {
                 log::warn!("Could not resolve InternedString for global, using empty string");
                 std::string::String::new()
             });
-
-            // Get UTF-8 bytes
-            let bytes = actual_string.as_bytes();
-            let length = bytes.len() as i32;
-
-            // Create Haxe String structure: [length: i32][utf8_bytes...]
-            // The struct is { i32, [N x i8] }
-            let i32_type = self.context.i32_type();
-            let byte_array_type = self.context.i8_type().array_type(bytes.len() as u32);
-            let haxe_string_type = self
-                .context
-                .struct_type(&[i32_type.into(), byte_array_type.into()], false);
-
-            // Create the length constant
-            let length_const = i32_type.const_int(length as u64, false);
-
-            // Create the byte array constant (no null terminator needed)
-            let byte_const = self.context.const_string(bytes, false);
-
-            // Create the struct constant
-            let haxe_string_const =
-                haxe_string_type.const_named_struct(&[length_const.into(), byte_const.into()]);
-
-            let global_value = self.module.add_global(
-                haxe_string_type,
-                Some(AddressSpace::default()),
-                &global_name,
-            );
+            let image = ::zrtl::string::encode_constant(actual_string.as_bytes());
+            let image_type = self.context.i8_type().array_type(image.len() as u32);
+            let image_const = self.context.const_string(&image, false);
+            let global_value =
+                self.module
+                    .add_global(image_type, Some(AddressSpace::default()), &global_name);
             global_value.set_linkage(inkwell::module::Linkage::External);
-            global_value.set_initializer(&haxe_string_const);
-
-            // Store the pointer to the global (address of the Haxe string struct)
+            global_value.set_alignment(16);
+            global_value.set_initializer(&image_const);
             self.globals_map
                 .insert(id, global_value.as_pointer_value().into());
             return Ok(());

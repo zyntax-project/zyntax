@@ -677,10 +677,10 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
     // for a block from another allocator the memory in front of it or
     // where its slab header would be may not be mapped at all.
     if !in_a_slab(ptr) {
-        // A box every program shares lives outside the slabs and is
-        // never released, so only this branch has to ask.
+        // A box or string every program shares lives outside the slabs
+        // and is never released, so only this branch has to ask.
         #[cfg(not(target_arch = "wasm32"))]
-        if crate::interned::is_interned(ptr as usize) {
+        if crate::interned::is_shared_static(ptr as usize) {
             return;
         }
         #[cfg(not(target_arch = "wasm32"))]

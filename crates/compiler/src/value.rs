@@ -539,19 +539,8 @@ impl ZyntaxValue {
             }
 
             TypeCategory::String => {
-                let str_ptr = value.value_ptr as *const i32;
-                if str_ptr.is_null() {
-                    return Ok(ZyntaxValue::String(String::new()));
-                }
-
-                let length = *str_ptr;
-                if length <= 0 {
-                    return Ok(ZyntaxValue::String(String::new()));
-                }
-
-                let bytes_ptr = str_ptr.offset(1) as *const u8;
-                let slice = std::slice::from_raw_parts(bytes_ptr, length as usize);
-                let string = std::str::from_utf8(slice)?.to_string();
+                let bytes = ::zrtl::string::string_as_bytes(value.value_ptr as *const i32);
+                let string = std::str::from_utf8(bytes)?.to_string();
                 Ok(ZyntaxValue::String(string))
             }
 

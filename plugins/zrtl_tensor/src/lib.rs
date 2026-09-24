@@ -1741,29 +1741,7 @@ pub extern "C" fn tensor_to_string(tensor: TensorPtr) -> *mut u8 {
         }
     };
 
-    // Convert to ZRTL string (heap-allocated)
-    // ZRTL string format: [i32 length][utf8 bytes...]
-    // Header size is 4 bytes (one i32 for length)
-    let bytes = result.as_bytes();
-    let len = bytes.len();
-
-    // Allocate: [i32 len][bytes...]
-    let total_size = 4 + len;
-    let layout = std::alloc::Layout::from_size_align(total_size, 4).unwrap();
-    let ptr = unsafe { std::alloc::alloc(layout) };
-
-    if ptr.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    unsafe {
-        // Write length at offset 0
-        *(ptr as *mut i32) = len as i32;
-        // Copy string data at offset 4
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(4), len);
-    }
-
-    ptr
+    zrtl::string_new(&result) as *mut u8
 }
 
 // ============================================================================

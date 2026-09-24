@@ -1387,7 +1387,7 @@ extern "C" {
     fn js_console_log_partial(chunk: &str);
 }
 
-/// Read a ZRTL `StringConstPtr` ([i32 length][utf8 bytes...]) into a
+/// Read a ZRTL `StringConstPtr` into a
 /// borrowed &str. Returns "" on null / malformed UTF-8 so the caller
 /// always has a valid view.
 ///
@@ -1402,18 +1402,10 @@ extern "C" {
 /// # Safety
 ///
 /// Caller guarantees the low bits of `ptr` (when cast to a pointer)
-/// either are null or point at a ZRTL string header followed by
-/// `length` UTF-8 bytes.
+/// either are null or point at a ZRTL string.
 #[cfg(target_arch = "wasm32")]
 unsafe fn zrtl_str_borrow_i64<'a>(ptr: i64) -> &'a str {
-    let ptr = ptr as usize as *const i32;
-    if ptr.is_null() {
-        return "";
-    }
-    let len = (*ptr).max(0) as usize;
-    let data = (ptr as *const u8).add(core::mem::size_of::<i32>());
-    let bytes = core::slice::from_raw_parts(data, len);
-    core::str::from_utf8(bytes).unwrap_or("")
+    zrtl::string_as_str(ptr as usize as *const i32).unwrap_or("")
 }
 
 #[cfg(target_arch = "wasm32")]

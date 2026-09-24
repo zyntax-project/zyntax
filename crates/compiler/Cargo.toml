@@ -12,6 +12,9 @@ pattern_engine = { path = "../pattern_engine" }
 normalization_pass = { path = "../passes/normalization" }
 algebraic_effects_pass = { path = "../passes/algebraic_effects" }
 
+# The runtime string layout, its constructors and immortal strings
+zrtl = { path = "../../sdk/zrtl" }
+
 # Core data structures
 dashmap = { workspace = true }
 parking_lot = { workspace = true }

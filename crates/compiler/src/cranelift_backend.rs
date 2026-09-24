@@ -7283,23 +7283,13 @@ impl CraneliftBackend {
                 vtable.methods.len()
             );
         } else if let Some(HirConstant::String(s)) = &global.initializer {
-            // String constants - emit as ZRTL String format: [length: i32][utf8_bytes...]
+            // A string constant: the SDK's immortal image, never written.
             let string_val = s.resolve_global().ok_or_else(|| {
                 CompilerError::CodeGen(format!("Failed to resolve string constant: {:?}", s))
             })?;
-
-            // Get UTF-8 bytes
-            let bytes = string_val.as_bytes();
-            let length = bytes.len() as i32;
-
-            // Create ZRTL String structure: length header (i32) + UTF-8 bytes
-            let mut data = Vec::with_capacity(4 + bytes.len());
-            data.extend_from_slice(&length.to_le_bytes()); // Length as little-endian i32
-            data.extend_from_slice(bytes);
-
-            // Set 4-byte alignment for the i32 length header
-            self.data_desc.set_align(4);
-            self.data_desc.define(data.into_boxed_slice());
+            let image = ::zrtl::string::encode_constant(string_val.as_bytes());
+            self.data_desc.set_align(16);
+            self.data_desc.define(image.into_boxed_slice());
         } else if global.initializer.is_some() {
             // Other constants - emit as zeroinit placeholder for now
             // TODO: Implement other constant types

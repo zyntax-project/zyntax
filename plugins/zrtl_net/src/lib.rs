@@ -74,16 +74,7 @@ macro_rules! get_map {
 // ============================================================================
 
 unsafe fn zrtl_string_to_str<'a>(s: StringConstPtr) -> Option<&'a str> {
-    if s.is_null() {
-        return None;
-    }
-    let len = string_length(s) as usize;
-    let data = string_data(s);
-    if len == 0 || data.is_null() {
-        return Some("");
-    }
-    let bytes = std::slice::from_raw_parts(data, len);
-    std::str::from_utf8(bytes).ok()
+    zrtl::string_as_str(s)
 }
 
 // ============================================================================

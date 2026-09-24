@@ -1,9 +1,7 @@
-//! ZyntaxString - Direct interop with Zyntax's length-prefixed string format
+//! ZyntaxString - Direct interop with Zyntax's string format
 //!
-//! Zyntax uses a length-prefixed string format:
-//! ```text
-//! Memory layout: [i32 length][utf8_bytes...]
-//! ```
+//! A Zyntax string is the ZRTL SDK's: a sixteen-byte header, then the
+//! bytes (see [`zrtl::string`]).
 //!
 //! This module provides `ZyntaxString` for direct manipulation of these strings
 //! without intermediate conversion to Rust `String`.
@@ -11,55 +9,32 @@
 use crate::error::{ConversionError, ConversionResult};
 use std::ptr::NonNull;
 
-/// A string in Zyntax's native length-prefixed format.
-///
-/// This is a wrapper around a pointer to Zyntax's string format:
-/// `[i32 length][utf8_bytes...]`
+/// A string in Zyntax's native format.
 ///
 /// # Memory Ownership
 ///
 /// `ZyntaxString` can either own its memory (will free on drop) or borrow
 /// from Zyntax runtime (must not be freed by Rust).
 pub struct ZyntaxString {
-    /// Pointer to the length field
+    /// Pointer to the header
     ptr: NonNull<i32>,
     /// Whether we own this memory (should free on drop)
     owned: bool,
 }
 
 impl ZyntaxString {
-    /// Header size in bytes (just the i32 length)
-    pub const HEADER_SIZE: usize = std::mem::size_of::<i32>();
+    /// Header size in bytes
+    pub const HEADER_SIZE: usize = zrtl::STRING_HEADER_SIZE;
 
     /// Create a new ZyntaxString from a Rust string
     pub fn from_str(s: &str) -> Self {
-        let len = s.len() as i32;
-        let total_size = Self::HEADER_SIZE + s.len();
+        Self::owning(zrtl::string_new(s))
+    }
 
-        unsafe {
-            let layout = std::alloc::Layout::from_size_align(total_size, 4).unwrap();
-            let ptr = std::alloc::alloc(layout) as *mut i32;
-
-            if ptr.is_null() {
-                panic!("Failed to allocate ZyntaxString");
-            }
-
-            // Write length
-            *ptr = len;
-
-            // Write string bytes
-            if !s.is_empty() {
-                std::ptr::copy_nonoverlapping(
-                    s.as_ptr(),
-                    (ptr as *mut u8).add(Self::HEADER_SIZE),
-                    s.len(),
-                );
-            }
-
-            Self {
-                ptr: NonNull::new_unchecked(ptr),
-                owned: true,
-            }
+    fn owning(ptr: *mut i32) -> Self {
+        Self {
+            ptr: NonNull::new(ptr).expect("Failed to allocate ZyntaxString"),
+            owned: true,
         }
     }
 
@@ -82,7 +57,7 @@ impl ZyntaxString {
     ///
     /// # Safety
     /// - The pointer must be valid and point to a valid Zyntax string
-    /// - The memory must have been allocated with the same allocator
+    /// - The string must be one `zrtl::string_free` releases
     /// - Ownership is transferred to this ZyntaxString
     pub unsafe fn from_ptr_owned(ptr: *mut i32) -> Option<Self> {
         NonNull::new(ptr).map(|ptr| Self { ptr, owned: true })
@@ -100,7 +75,7 @@ impl ZyntaxString {
 
     /// Get the length in bytes
     pub fn len(&self) -> usize {
-        unsafe { *self.ptr.as_ptr() as usize }
+        unsafe { zrtl::string_length(self.ptr.as_ptr()) as usize }
     }
 
     /// Check if empty
@@ -110,14 +85,7 @@ impl ZyntaxString {
 
     /// Get the string data as a byte slice
     pub fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            let len = self.len();
-            if len == 0 {
-                return &[];
-            }
-            let data_ptr = (self.ptr.as_ptr() as *const u8).add(Self::HEADER_SIZE);
-            std::slice::from_raw_parts(data_ptr, len)
-        }
+        unsafe { zrtl::string_as_bytes(self.ptr.as_ptr()) }
     }
 
     /// Get the string as a str (returns error if not valid UTF-8)
@@ -152,53 +120,22 @@ impl ZyntaxString {
 
     /// Get the total allocation size
     pub fn allocation_size(&self) -> usize {
-        Self::HEADER_SIZE + self.len()
+        unsafe { zrtl::string_size(self.ptr.as_ptr()) }
     }
 }
 
 impl Drop for ZyntaxString {
     fn drop(&mut self) {
         if self.owned {
-            unsafe {
-                let size = Self::HEADER_SIZE + self.len();
-                let layout = std::alloc::Layout::from_size_align_unchecked(size, 4);
-                std::alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout);
-            }
+            unsafe { zrtl::string_free(self.ptr.as_ptr()) }
         }
     }
 }
 
 impl Clone for ZyntaxString {
     fn clone(&self) -> Self {
-        // Always create an owned copy
-        if let Ok(s) = self.as_str() {
-            Self::from_str(s)
-        } else {
-            // For invalid UTF-8, copy the raw bytes
-            let bytes = self.as_bytes();
-            let total_size = Self::HEADER_SIZE + bytes.len();
-
-            unsafe {
-                let layout = std::alloc::Layout::from_size_align(total_size, 4).unwrap();
-                let ptr = std::alloc::alloc(layout) as *mut i32;
-
-                if ptr.is_null() {
-                    panic!("Failed to allocate ZyntaxString clone");
-                }
-
-                *ptr = bytes.len() as i32;
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    (ptr as *mut u8).add(Self::HEADER_SIZE),
-                    bytes.len(),
-                );
-
-                Self {
-                    ptr: NonNull::new_unchecked(ptr),
-                    owned: true,
-                }
-            }
-        }
+        // Always an owned string of the same bytes.
+        Self::owning(zrtl::string_from_bytes(self.as_bytes()))
     }
 }
 
@@ -299,6 +236,14 @@ mod tests {
     }
 
     #[test]
+    fn test_reads_through_the_header() {
+        let s = ZyntaxString::from_str("héllo wörld");
+        assert_eq!(s.len(), 13);
+        assert_eq!(s.as_str().unwrap(), "héllo wörld");
+        assert_eq!(s.allocation_size(), zrtl::STRING_HEADER_SIZE + 13);
+    }
+
+    #[test]
     fn test_to_string() {
         let s = ZyntaxString::from_str("convert me");
         let rust_string = s.to_string().unwrap();
@@ -336,10 +281,7 @@ mod tests {
             let len = *ptr;
             assert_eq!(len, 16);
 
-            // Manually free
-            let total_size = ZyntaxString::HEADER_SIZE + len as usize;
-            let layout = std::alloc::Layout::from_size_align_unchecked(total_size, 4);
-            std::alloc::dealloc(ptr as *mut u8, layout);
+            zrtl::string_free(ptr);
         }
     }
 }

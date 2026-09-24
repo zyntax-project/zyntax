@@ -1174,9 +1174,9 @@ pub fn compile_function_with(
             let size = size_of_hir_ty(&val_def.ty).max(8);
             cf.entry_storage.push((reg_of[val_id], vec![0u8; size]));
         } else if let HirValueKind::Global(global_id) = &val_def.kind {
-            // Resolve the global to a ZRTL-formatted string buffer
-            // ([i32 length][utf8 bytes]) in `memory`, then pre-load
-            // the pointer into the value's register via `LoadConst`.
+            // Resolve the global to a ZRTL string image in `memory`,
+            // then pre-load the pointer into the value's register via
+            // `LoadConst`.
             // The BC interpreter has no `Op::AddressOfGlobal` today,
             // so we bake the address into the const pool exactly
             // like a numeric Constant — the host bridge sees a real
@@ -1190,14 +1190,7 @@ pub fn compile_function_with(
                     cf.global_consts.push((*global_id, idx));
                 } else if let Some(HirConstant::String(interned)) = &global.initializer {
                     let s = interned.resolve_global().unwrap_or_default();
-                    let bytes = s.as_bytes();
-                    let total = 4 + bytes.len();
-                    let ptr = memory.alloc_zeroed(total);
-                    unsafe {
-                        *(ptr as *mut i32) = bytes.len() as i32;
-                        let data = ptr.add(4);
-                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
-                    }
+                    let ptr = memory.string_constant(s.as_bytes());
                     let idx = cf.const_pool.len() as u32;
                     cf.const_pool.push(ZyntaxValue::Pointer(ptr));
                     const_idx_for.insert(*val_id, idx);
@@ -2564,6 +2557,17 @@ impl Memory {
     pub fn use_native_allocator(&mut self) {
         self.native_allocator = true;
     }
+    /// A string constant's image, sixteen-aligned, never written or
+    /// released.
+    pub fn string_constant(&mut self, bytes: &[u8]) -> *mut u8 {
+        let image = ::zrtl::string::encode_constant(bytes);
+        // A pool block is sixteen-aligned; room to align any other.
+        let block = self.alloc_zeroed(image.len() + 15);
+        let ptr = unsafe { block.add(block.align_offset(16)) };
+        unsafe { std::ptr::copy_nonoverlapping(image.as_ptr(), ptr, image.len()) };
+        ptr
+    }
+
     pub fn alloc_zeroed(&mut self, n_bytes: usize) -> *mut u8 {
         if self.native_allocator {
             // The compiled tier uses this same allocator. In particular,

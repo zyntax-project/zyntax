@@ -3,9 +3,10 @@
 //! clocks, `$Host$time` and `$Host$perf_counter`, byte strings and
 //! whole files.
 //!
-//! A byte string is laid out as a string is, `[i32 length][bytes]`, so
-//! the two share storage and release; what differs is that its bytes
-//! are not text, so nothing here reads them as UTF-8.
+//! A byte string is laid out as a string is, so the two share storage
+//! and release; what differs is that its bytes are not text, so
+//! nothing here reads them as UTF-8, and what is made only as bytes
+//! carries no TEXT flag.
 
 use std::sync::OnceLock;
 use zrtl::{StringConstPtr, StringPtr};
@@ -61,16 +62,13 @@ extern "C" fn host_missing_arg() -> *const u8 {
 
 /// The bytes of a blob, empty for null.
 unsafe fn blob<'a>(p: StringConstPtr) -> &'a [u8] {
-    if p.is_null() {
-        return &[];
-    }
-    // SAFETY: a blob is a length followed by that many bytes.
-    unsafe { std::slice::from_raw_parts(zrtl::string::string_data(p), *p as usize) }
+    // SAFETY: null or a string the program holds.
+    unsafe { zrtl::string_as_bytes(p) }
 }
 
 /// A blob of the one byte `v`.
 extern "C" fn host_bytes_of_byte(v: i64) -> StringPtr {
-    zrtl::string::string_from_bytes(&[v as u8])
+    zrtl::bytes_new(&[v as u8])
 }
 
 /// The box category of a byte string, the tag's low byte.
@@ -101,7 +99,7 @@ extern "C" fn host_bytes_box(a: StringConstPtr) -> *mut zrtl::DynamicBox {
 extern "C" fn host_bytes_repeat(a: StringConstPtr, n: i64) -> StringPtr {
     // SAFETY: a blob the program holds.
     let a = unsafe { blob(a) };
-    zrtl::string::string_from_bytes(&a.repeat(usize::try_from(n).unwrap_or(0)))
+    zrtl::bytes_new(&a.repeat(usize::try_from(n).unwrap_or(0)))
 }
 
 /// The byte at `i`, counted from the end when negative; -1 out of range.
@@ -122,7 +120,7 @@ extern "C" fn host_bytes_slice(a: StringConstPtr, start: i64, end: i64) -> Strin
     let n = a.len() as i64;
     let start = start.clamp(0, n) as usize;
     let end = end.clamp(start as i64, n) as usize;
-    zrtl::string::string_from_bytes(&a[start..end])
+    zrtl::bytes_new(&a[start..end])
 }
 
 extern "C" fn host_bytes_eq(a: StringConstPtr, b: StringConstPtr) -> i32 {
@@ -134,12 +132,7 @@ extern "C" fn host_bytes_hash(a: StringConstPtr) -> i64 {
     // SAFETY: a blob the program holds.
     let a = unsafe { blob(a) };
     // FNV-1a, folded to a non-negative value like a string's hash.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in a {
-        h ^= *byte as u64;
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    (h >> 1) as i64
+    (zrtl::fnv1a_bytes(a) >> 1) as i64
 }
 
 /// `repr(b)`: the bytes as Python spells a bytes literal.
@@ -215,12 +208,12 @@ extern "C" fn host_bytes_from_ints(list: *const ListHeader) -> StringPtr {
             Err(_) => return std::ptr::null_mut(),
         }
     }
-    zrtl::string::string_from_bytes(&out)
+    zrtl::bytes_new(&out)
 }
 
 /// `bytes(n)`: `n` zero bytes.
 extern "C" fn host_bytes_zeros(n: i64) -> StringPtr {
-    zrtl::string::string_from_bytes(&vec![0u8; usize::try_from(n).unwrap_or(0)])
+    zrtl::bytes_new(&vec![0u8; usize::try_from(n).unwrap_or(0)])
 }
 
 /// A byte buffer built up, as a blob.
@@ -246,7 +239,7 @@ extern "C" fn host_bytes_from_buffer_range(
 /// `array.tobytes()`: the storage of a list of `width`-byte elements.
 extern "C" fn host_bytes_of_storage(list: *const ListHeader, width: i64) -> StringPtr {
     // SAFETY: a list the program holds, of elements `width` bytes wide.
-    zrtl::string::string_from_bytes(unsafe { list_bytes(list, width.max(0) as usize) })
+    zrtl::bytes_new(unsafe { list_bytes(list, width.max(0) as usize) })
 }
 
 /// A blob's bytes copied to `data`, which holds room for them; the
@@ -337,7 +330,7 @@ extern "C" fn host_is_float_literal(s: StringConstPtr) -> i64 {
 extern "C" fn host_md5(a: StringConstPtr) -> StringPtr {
     // SAFETY: a blob the program holds.
     let data = unsafe { blob(a) };
-    zrtl::string::string_from_bytes(&md5(data))
+    zrtl::bytes_new(&md5(data))
 }
 
 fn md5(data: &[u8]) -> [u8; 16] {
@@ -413,7 +406,7 @@ extern "C" fn host_bytes_from_hex(a: StringConstPtr) -> StringPtr {
             _ => return std::ptr::null_mut(),
         }
     }
-    zrtl::string::string_from_bytes(&out)
+    zrtl::bytes_new(&out)
 }
 
 /// A string as JSON spells it: quoted, with `"`, `\\` and the control

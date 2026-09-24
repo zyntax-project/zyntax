@@ -718,7 +718,7 @@ impl<'a> Marker<'a> {
         if a < self.lo || a >= self.hi || self.seen.contains(&a) {
             return;
         }
-        if crate::interned::is_interned(a) {
+        if crate::interned::is_shared_static(a) {
             return;
         }
         let slab = a & !(pool_alloc::SLAB_BYTES - 1);

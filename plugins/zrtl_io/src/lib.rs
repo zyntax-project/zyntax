@@ -1,7 +1,7 @@
 //! ZRTL I/O Plugin
 //!
 //! Provides standard I/O operations for Zyntax-based languages using
-//! the ZRTL SDK string format `[i32 length][utf8_bytes...]`.
+//! the ZRTL SDK string format.
 //!
 //! ## Exported Symbols
 //!
@@ -26,9 +26,7 @@
 //! - `$IO$format_bool` - Format boolean as ZRTL string
 
 use std::io::{self, BufRead, Write};
-use zrtl::{
-    string_data, string_free, string_length, string_new, zrtl_plugin, StringConstPtr, StringPtr,
-};
+use zrtl::{string_free, string_length, string_new, zrtl_plugin, StringConstPtr, StringPtr};
 
 // ============================================================================
 // DynamicBox Dropper Functions
@@ -49,8 +47,6 @@ extern "C" fn drop_zrtl_string(ptr: *mut u8) {
 
 /// Print a ZRTL string to stdout (no newline)
 ///
-/// ZRTL string format: `[i32 length][utf8_bytes...]`
-///
 /// # Safety
 /// The pointer must be a valid ZRTL string pointer.
 #[no_mangle]
@@ -58,11 +54,8 @@ pub unsafe extern "C" fn io_print(s: StringConstPtr) {
     if s.is_null() {
         return;
     }
-    let len = string_length(s) as usize;
-    let data = string_data(s);
-    if len > 0 && !data.is_null() {
-        let bytes = std::slice::from_raw_parts(data, len);
-        if let Ok(str_slice) = std::str::from_utf8(bytes) {
+    if string_length(s) > 0 {
+        if let Some(str_slice) = zrtl::string_as_str(s) {
             print!("{}", str_slice);
         }
     }
@@ -78,11 +71,8 @@ pub unsafe extern "C" fn io_println(s: StringConstPtr) {
         println!();
         return;
     }
-    let len = string_length(s) as usize;
-    let data = string_data(s);
-    if len > 0 && !data.is_null() {
-        let bytes = std::slice::from_raw_parts(data, len);
-        if let Ok(str_slice) = std::str::from_utf8(bytes) {
+    if string_length(s) > 0 {
+        if let Some(str_slice) = zrtl::string_as_str(s) {
             println!("{}", str_slice);
         } else {
             println!();
@@ -101,11 +91,8 @@ pub unsafe extern "C" fn io_eprint(s: StringConstPtr) {
     if s.is_null() {
         return;
     }
-    let len = string_length(s) as usize;
-    let data = string_data(s);
-    if len > 0 && !data.is_null() {
-        let bytes = std::slice::from_raw_parts(data, len);
-        if let Ok(str_slice) = std::str::from_utf8(bytes) {
+    if string_length(s) > 0 {
+        if let Some(str_slice) = zrtl::string_as_str(s) {
             eprint!("{}", str_slice);
         }
     }
@@ -121,11 +108,8 @@ pub unsafe extern "C" fn io_eprintln(s: StringConstPtr) {
         eprintln!();
         return;
     }
-    let len = string_length(s) as usize;
-    let data = string_data(s);
-    if len > 0 && !data.is_null() {
-        let bytes = std::slice::from_raw_parts(data, len);
-        if let Ok(str_slice) = std::str::from_utf8(bytes) {
+    if string_length(s) > 0 {
+        if let Some(str_slice) = zrtl::string_as_str(s) {
             eprintln!("{}", str_slice);
         } else {
             eprintln!();
@@ -235,7 +219,7 @@ pub extern "C" fn io_flush_stderr() -> i32 {
 
 /// Read a line from stdin
 ///
-/// Returns a ZRTL string pointer `[i32 length][utf8_bytes...]`
+/// Returns a ZRTL string pointer.
 /// The caller must free this memory using `string_free` from the SDK.
 /// Returns null on EOF or error.
 #[no_mangle]
@@ -391,7 +375,7 @@ use std::fmt::Write as FmtWrite;
 ///
 /// This handles ALL known ZRTL runtime types including:
 /// - Primitives: Void, Bool, Int, UInt, Float
-/// - String: ZRTL string format [i32 length][utf8 bytes]
+/// - String: ZRTL string
 /// - Array: ZRTL array format [i32 cap][i32 len][elements]
 /// - Tuple: Sequence of DynamicBox values
 /// - Optional: None or Some(value)
@@ -502,14 +486,11 @@ unsafe fn format_dynamic_box(value: &zrtl::DynamicBox, output: &mut String) {
         },
 
         TypeCategory::String => {
-            // ZRTL string format: [i32 length][utf8 bytes]
             let ptr = value.data as StringConstPtr;
             if !ptr.is_null() {
-                let len = string_length(ptr) as usize;
-                let data = string_data(ptr);
-                if len > 0 && !data.is_null() {
-                    let bytes = std::slice::from_raw_parts(data, len);
-                    if let Ok(s) = std::str::from_utf8(bytes) {
+                let len = string_length(ptr);
+                if len > 0 {
+                    if let Some(s) = zrtl::string_as_str(ptr) {
                         output.push_str(s);
                     } else {
                         let _ = write!(output, "<invalid utf8, {} bytes>", len);
@@ -995,20 +976,7 @@ pub unsafe extern "C" fn io_string_adopt_dynamic(s: StringPtr) -> *mut zrtl::Dyn
 /// Returns a new ZRTL string, caller must free with `string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn io_string_concat(a: StringConstPtr, b: StringConstPtr) -> StringPtr {
-    // One allocation of the final length, the bytes copied straight
-    // in: both are text already.
-    let a = zrtl::string_as_bytes(a);
-    let b = zrtl::string_as_bytes(b);
-    let total = a.len() + b.len();
-    let out = zrtl::heap::alloc(zrtl::string_alloc_size(total), 4) as StringPtr;
-    if out.is_null() {
-        return out;
-    }
-    *out = total as i32;
-    let data = zrtl::string::string_data_mut(out);
-    std::ptr::copy_nonoverlapping(a.as_ptr(), data, a.len());
-    std::ptr::copy_nonoverlapping(b.as_ptr(), data.add(a.len()), b.len());
-    out
+    zrtl::string::string_concat(a, b)
 }
 
 /// Concatenate two values (DynamicBox) and return a DynamicBox containing the resulting string
@@ -1028,15 +996,8 @@ pub unsafe extern "C" fn io_concat_dynamic(
         // Check if it's a string type - if so, extract directly
         if box_a.tag.category() == TypeCategory::String {
             let ptr = box_a.data as StringConstPtr;
-            if !ptr.is_null() {
-                let len = string_length(ptr) as usize;
-                let data = string_data(ptr);
-                if len > 0 && !data.is_null() {
-                    let bytes = std::slice::from_raw_parts(data, len);
-                    if let Ok(s) = std::str::from_utf8(bytes) {
-                        result.push_str(s);
-                    }
-                }
+            if let Some(s) = zrtl::string_as_str(ptr) {
+                result.push_str(s);
             }
         } else {
             // Use format_dynamic_box for other types
@@ -1049,15 +1010,8 @@ pub unsafe extern "C" fn io_concat_dynamic(
         let box_b = &*b;
         if box_b.tag.category() == TypeCategory::String {
             let ptr = box_b.data as StringConstPtr;
-            if !ptr.is_null() {
-                let len = string_length(ptr) as usize;
-                let data = string_data(ptr);
-                if len > 0 && !data.is_null() {
-                    let bytes = std::slice::from_raw_parts(data, len);
-                    if let Ok(s) = std::str::from_utf8(bytes) {
-                        result.push_str(s);
-                    }
-                }
+            if let Some(s) = zrtl::string_as_str(ptr) {
+                result.push_str(s);
             }
         } else {
             format_dynamic_box(box_b, &mut result);

@@ -73,7 +73,7 @@
 //!
 //! Zyntax uses specific inline memory formats:
 //!
-//! - **Strings**: `[i32 length][utf8_bytes...]`
+//! - **Strings**: a 16-byte header `[u32 byte_len][u32 char_len][u32 aux][u32 flags]`, then the bytes
 //! - **Arrays**: `[i32 capacity][i32 length][elements...]`
 //!
 //! Use the `string` and `array` modules to work with these formats.
@@ -135,8 +135,9 @@ pub use closure::{
 
 // Re-export string functions
 pub use string::{
-    STRING_HEADER_SIZE, string_alloc_size, string_as_bytes, string_as_str, string_copy,
-    string_data, string_empty, string_equals, string_free, string_length, string_new,
+    STRING_HEADER_SIZE, bytes_new, encode_constant, fnv1a_bytes, is_immortal_string,
+    string_as_bytes, string_as_str, string_copy, string_data, string_empty, string_equals,
+    string_free, string_from_bytes, string_length, string_new, string_size,
 };
 
 // Re-export array functions

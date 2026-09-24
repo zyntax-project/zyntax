@@ -1185,6 +1185,12 @@ impl ZrtlPlugin {
                     crate::pool_alloc::zyntax_free,
                 );
             }
+            // And hands out the host's immortal strings, which the
+            // host's release recognises, rather than its own copy's.
+            type SetImmortals = unsafe extern "C" fn(*const ::zrtl::string::ImmortalTable);
+            if let Ok(set) = library.get::<SetImmortals>(b"_zrtl_set_immortal_table\0") {
+                set(::zrtl::string::immortal_table());
+            }
 
             // Collect symbols until sentinel (null name)
             let mut symbols = Vec::new();

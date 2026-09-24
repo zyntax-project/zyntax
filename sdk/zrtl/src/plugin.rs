@@ -772,6 +772,18 @@ macro_rules! zrtl_plugin {
             $crate::heap::set_allocator(alloc, free);
         }
 
+        /// The loader hands the host's immortal strings to this copy of
+        /// the SDK, so the process has one table of them.
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "linked-into-host")))]
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn _zrtl_set_immortal_table(
+            table: *const $crate::string::ImmortalTable,
+        ) {
+            // SAFETY: the loader passes its own table, static for the
+            // life of the process.
+            unsafe { $crate::string::set_immortal_table(table) }
+        }
+
         /// Static accessor for register-without-dlopen flows
         /// (wasm32, embedded native binaries). Always emitted.
         pub fn static_plugin() -> $crate::StaticPlugin {
