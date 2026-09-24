@@ -1,0 +1,15 @@
+true
+0
+0
+float	true
+boolean	boolean
+generational
+incremental	generational
+generational	incremental
+200	100	0
+100	48	0
+0	false
+0	true
+false	bad argument #1 to 'collectgarbage' (invalid option 'bogus')
+false	bad argument #2 to 'collectgarbage' (number expected, got string)
+true

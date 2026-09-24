@@ -420,6 +420,24 @@ impl Inferred {
             && (info.dynamic_keys || (info.escapes && self.blind_stores.contains_key(name)))
     }
 
+    /// Whether a metatable of shape `c` may hold `event`, in a field or
+    /// otherwise.
+    pub fn class_may_hold(&self, c: ShapeId, event: &str) -> bool {
+        self.shape(c).field(event).is_some() || self.may_hold_unnamed(c, event)
+    }
+
+    /// Whether a table of shape `k` may be weak: a metatable it may get
+    /// holds `__mode`, or is one the types do not follow. The collector
+    /// reaches a weak table's entries only outside slots.
+    pub fn may_be_weak(&self, k: ShapeId) -> bool {
+        let info = self.shape(k);
+        info.unknown_meta
+            || info
+                .classes
+                .iter()
+                .any(|c| self.class_may_hold(*c, "__mode"))
+    }
+
     /// What a table of shape `k` itself holds under `name` when that
     /// is no field of its shape: nil, or what such stores put there.
     pub fn unnamed_ty(&self, k: ShapeId, name: &str) -> Ty {
@@ -1931,6 +1949,12 @@ impl<'a> Round<'a> {
             }
             for k in 0..self.out.shapes.len() {
                 changed |= self.settle_reads(k);
+                // A weak table's entries may be collected: no field is
+                // sure to be present.
+                if self.out.shapes[k].born > 0 && self.out.may_be_weak(ShapeId(k as u32)) {
+                    self.out.shapes[k].born = 0;
+                    changed = true;
+                }
                 if !self.out.shapes[k].escapes {
                     continue;
                 }

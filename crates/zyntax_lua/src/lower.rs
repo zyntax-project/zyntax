@@ -330,10 +330,11 @@ enum End {
 }
 
 /// The layouts of a chunk's shapes: a shape with fields, and not too
-/// many, gets slots. With `slots` off (a chunk compiled at run time,
-/// whose shapes the program's hooks do not know), none does. Number
-/// slots take kind bits from bit 63 down while those stay above the
-/// presence bits; a Number slot left without one is a Scalar slot.
+/// many, that no weak metatable may reach, gets slots. With `slots`
+/// off (a chunk compiled at run time, whose shapes the program's hooks
+/// do not know), none does. Number slots take kind bits from bit 63
+/// down while those stay above the presence bits; a Number slot left
+/// without one is a Scalar slot.
 fn shape_layouts(inferred: &Inferred, chunk_index: i64, slots: bool) -> Vec<Option<ShapeLayout>> {
     let trace = std::env::var_os("ZYNTAX_TRACE_TYPES").is_some();
     inferred
@@ -341,7 +342,11 @@ fn shape_layouts(inferred: &Inferred, chunk_index: i64, slots: bool) -> Vec<Opti
         .iter()
         .enumerate()
         .map(|(k, info)| {
-            if !slots || info.fields.is_empty() || info.fields.len() > MAX_SLOTS {
+            if !slots
+                || info.fields.is_empty()
+                || info.fields.len() > MAX_SLOTS
+                || inferred.may_be_weak(ShapeId(k as u32))
+            {
                 return None;
             }
             let gid = (chunk_index << 20) + k as i64 + 1;
@@ -5672,15 +5677,21 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             }
         }
         // A table the lowering has just made has no metatable to
-        // protect: `setmetatable` of it with a table (or nil) is the
-        // header's store; anything else goes through the library,
-        // which checks it.
+        // protect: `setmetatable` of it with a class that holds neither
+        // `__gc` nor `__mode` is the header's store; anything else goes
+        // through the library, which checks it and tells the collector.
         let (meta, meta_checked) = match meta {
             Some(e) => {
                 let m = self.expr(e)?;
                 let m = self.hold(m, &mut pre);
+                let inferred = self.m.inferred;
                 match m.ty {
-                    Ty::Shape(_) | Ty::Table => (m.node, None),
+                    Ty::Shape(c)
+                        if !inferred.class_may_hold(c, "__gc")
+                            && !inferred.class_may_hold(c, "__mode") =>
+                    {
+                        (m.node, None)
+                    }
                     _ => (null(table_t.clone(), span), Some(self.boxed(m))),
                 }
             }

@@ -1,0 +1,6 @@
+false	bad argument #1 to 'warn' (string expected, got no value)
+false	bad argument #2 to 'warn' (string expected, got table)
+false	bad argument #2 to 'warn' (string expected, got nil)
+true
+0
+ok

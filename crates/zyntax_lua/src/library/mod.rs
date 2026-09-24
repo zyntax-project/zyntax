@@ -12,6 +12,7 @@ pub mod calls;
 pub mod coroutines;
 pub mod debug;
 pub mod foreign;
+pub mod gc;
 pub mod io;
 pub mod patterns;
 pub mod stdlib;
@@ -39,6 +40,9 @@ pub const FILE_KIND: usize = 3;
 /// The error in flight while a suspended coroutine is closed: its
 /// `<close>` handlers see nil, and nothing catches it on the way up.
 pub const CLOSING_KIND: usize = 4;
+/// A weak table's key whose object the collector took: a tombstone no
+/// lookup matches, under a nil value, until the table is compacted.
+pub const DEAD_KEY_KIND: usize = 5;
 
 pub fn table_tag() -> i64 {
     zyntax_builtins::instance_tag(TABLE_KIND)
@@ -1185,14 +1189,20 @@ fn raising(t: &Types) -> Vec<Decl> {
         ],
     ));
     // An error nothing caught, reported by the host the way `lua`
-    // reports it, ending the program with status 1. The host formats
-    // the message itself, so the chunk's entry reaches nothing of the
-    // library's `tostring`.
+    // reports it; `zl_exit_uncaught` then ends the program with status
+    // 1. The host formats the message itself, so the chunk's entry
+    // reaches nothing of the library's `tostring`.
     d.push(extern_fn(
         "zl_report_uncaught",
         &[("err", any())],
         unit(),
         Some("$Lua$report_pending"),
+    ));
+    d.push(extern_fn(
+        "zl_exit_uncaught",
+        &[],
+        unit(),
+        Some("$Lua$exit_uncaught"),
     ));
     d.push(define_cold(
         "zl_report_pending",
@@ -1200,10 +1210,17 @@ fn raising(t: &Types) -> Vec<Decl> {
         unit(),
         vec![
             v.decl(pending()),
-            when(is_nil(v.e()), vec![ret_void()]),
+            // The state closes after the message, running every
+            // pending finalizer, as `lua` closes it.
+            when(
+                is_nil(v.e()),
+                vec![expr(call("zl_gc_at_exit", vec![], unit())), ret_void()],
+            ),
             set_global(PENDING, nil()),
             set_global(OVERFLOWED, bool(false)),
             expr(call("zl_report_uncaught", vec![v.e()], unit())),
+            expr(call("zl_gc_at_exit", vec![], unit())),
+            expr(call("zl_exit_uncaught", vec![], unit())),
             ret_void(),
         ],
     ));
@@ -1265,6 +1282,7 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     lib.declarations.extend(stdlib::declarations(policy, &t));
     lib.declarations.extend(debug::declarations(&t));
     lib.declarations.extend(foreign::declarations(&t));
+    lib.declarations.extend(gc::declarations(&t));
     lib.declarations.push(func_code_decl(&t));
     for d in &mut lib.declarations {
         if let TypedDeclaration::Function(f) = &mut d.node {

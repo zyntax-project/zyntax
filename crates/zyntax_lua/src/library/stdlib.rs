@@ -342,6 +342,13 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         lib: "",
+        name: "warn",
+        func: "zl_warn",
+        params: &[Str, Rest],
+        ret: Ret::Unit,
+    },
+    Builtin {
+        lib: "",
         name: "require",
         func: "zl_require",
         params: &[Str],
@@ -811,7 +818,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "os",
         name: "exit",
         func: "zl_os_exit",
-        params: &[Any],
+        params: &[Any, Any],
         ret: Ret::Unit,
     },
     // ─── io ───
@@ -3074,11 +3081,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
 
     // ─── os and io ──────────────────────────────────────────────
     d.extend(os_declarations(t));
+    let y_close = kept("close", any());
     d.push(define(
         "zl_os_exit",
-        &[&x],
+        &[&x, &y_close],
         unit(),
         vec![
+            // Closing the state first runs every pending finalizer.
+            when(
+                call("zl_truthy", vec![y_close.e()], boolean()),
+                vec![expr(call("zl_gc_at_exit", vec![], unit()))],
+            ),
             k.decl(int(0)),
             when(
                 and(not(is_nil(x.e())), eq(category(x.e()), int(BOOL))),
@@ -3791,50 +3804,6 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 vec![lua_error(call("zl_load_error", vec![], string()))],
             ),
             ret(call("zl_call_0", vec![y.e()], any())),
-        ],
-    ));
-    // `collectgarbage(opt)`: a collection, or what the collector knows.
-    d.push(extern_fn("zl_gc", &[("op", i64())], i64(), Some("$Lua$gc")));
-    let opt = kept("opt", string());
-    let is = |name: &str| call("zb_str_eq", vec![opt.e(), text(name)], boolean());
-    d.push(define(
-        "zl_collectgarbage",
-        &[&opt, &x],
-        any(),
-        vec![
-            when(
-                or(is("collect"), is("step")),
-                vec![
-                    expr(call("zl_gc", vec![int(0)], i64())),
-                    when(is("step"), vec![ret(box_bool(bool(false)))]),
-                    ret(box_i64(int(0))),
-                ],
-            ),
-            when(
-                is("count"),
-                vec![
-                    n.decl(call("zl_gc", vec![int(1)], i64())),
-                    ret(box_f64(div(cast(n.e(), f64()), float(1024.0)))),
-                ],
-            ),
-            when(is("isrunning"), vec![ret(box_bool(bool(true)))]),
-            when(
-                or(is("incremental"), is("generational")),
-                vec![ret(box_str(text("incremental")))],
-            ),
-            when(
-                or(
-                    or(is("stop"), is("restart")),
-                    or(is("setpause"), is("setstepmul")),
-                ),
-                vec![ret(box_i64(int(0)))],
-            ),
-            lua_error(concat(vec![
-                text("bad argument #1 to 'collectgarbage' (invalid option '"),
-                opt.e(),
-                text("')"),
-            ])),
-            ret(nil()),
         ],
     ));
     // `require(name)`: what is loaded, a preloaded module (the

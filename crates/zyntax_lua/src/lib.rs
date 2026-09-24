@@ -20,6 +20,7 @@ use zyntax_typed_ast::{InternedString, PrimitiveType, Type, TypedProgram};
 
 mod host;
 mod host_debug;
+mod host_gc;
 mod host_io;
 mod host_os;
 pub mod library;

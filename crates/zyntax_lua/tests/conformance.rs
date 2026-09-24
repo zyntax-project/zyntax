@@ -474,5 +474,6 @@ categories! {
     modules,
     load,
     debug,
+    gc,
     official,
 }

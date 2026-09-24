@@ -564,6 +564,15 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     ));
 
     // ─── metatables ─────────────────────────────────────────────
+    // What the collector is told once a metatable is set.
+    let old_meta = local("old_meta", table.clone());
+    let gc_note = |tb: Expr| {
+        expr(call(
+            "zl_gc_metatable_set",
+            vec![tb.clone(), meta_of(tb, t), old_meta.e()],
+            unit(),
+        ))
+    };
     d.push(define(
         "zl_setmetatable",
         &[&tb, &mt],
@@ -580,6 +589,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 ),
                 vec![lua_error(text("cannot change a protected metatable"))],
             ),
+            old_meta.decl(meta_of(tb.e(), t)),
             if_(
                 is_nil(mt.e()),
                 vec![set_field(tb.e(), "meta", null(table.clone()))],
@@ -595,6 +605,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     set_field(tb.e(), "meta", unbox_table(mt.e(), t)),
                 ],
             ),
+            gc_note(tb.e()),
             ret(tb.e()),
         ],
     ));
@@ -626,7 +637,9 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 ),
                 vec![lua_error(text("cannot change a protected metatable"))],
             ),
+            old_meta.decl(meta_of(tb.e(), t)),
             set_field(tb.e(), "meta", mt_table.e()),
+            gc_note(tb.e()),
             ret(tb.e()),
         ],
     ));

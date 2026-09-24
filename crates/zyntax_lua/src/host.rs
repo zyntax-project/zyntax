@@ -1020,7 +1020,7 @@ extern "C" fn host_word(w: i64) -> i64 {
 
 // ─── strings by the byte ────────────────────────────────────────────
 
-unsafe fn bytes_of(s: zrtl::StringConstPtr) -> &'static [u8] {
+pub(crate) unsafe fn bytes_of(s: zrtl::StringConstPtr) -> &'static [u8] {
     unsafe { zrtl::string_as_bytes(s) }
 }
 
@@ -1745,20 +1745,6 @@ fn replace_all(s: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     out
 }
 
-// ─── the collector ──────────────────────────────────────────────────
-
-/// `collectgarbage`: 0 runs a collection, 1 answers the bytes the last
-/// collection reached.
-extern "C" fn host_gc(op: i64) -> i64 {
-    match op {
-        0 => {
-            zyntax_compiler::collector::collect();
-            0
-        }
-        _ => zyntax_compiler::collector::stats().live as i64,
-    }
-}
-
 /// `os.setlocale`: only the C locale is on offer, so a query or a
 /// request for it answers "C" and any other locale is refused.
 extern "C" fn host_setlocale(locale: zrtl::StringConstPtr) -> StringPtr {
@@ -1775,10 +1761,7 @@ extern "C" fn host_setlocale(locale: zrtl::StringConstPtr) -> StringPtr {
 
 // ─── uncaught errors ────────────────────────────────────────────────
 
-/// An error nothing caught, on stderr the way `lua` reports it, then
-/// the end of the program with status 1. It ends as a program that
-/// returns does: every open stream flushed, no destructor run, so a
-/// compile thread still running is not raced by the process's teardown.
+/// An error nothing caught, on stderr the way `lua` reports it.
 extern "C" fn host_report_pending(err: *const DynamicBox) {
     use std::io::Write;
     let mut out = b"lua: ".to_vec();
@@ -1791,6 +1774,14 @@ extern "C" fn host_report_pending(err: *const DynamicBox) {
     }
     host_io::host_io_flush_all();
     let _ = std::io::stderr().write_all(&out);
+}
+
+/// The end of the program with status 1, after an uncaught error is
+/// reported and the state closed. It ends as a program that returns
+/// does: every open stream flushed, no destructor run, so a compile
+/// thread still running is not raced by the process's teardown.
+extern "C" fn host_exit_uncaught() {
+    host_io::host_io_flush_all();
     // SAFETY: `_exit` does not return, and the streams are flushed.
     unsafe { libc::_exit(1) }
 }
@@ -1945,12 +1936,15 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 97] = [
         host_utf8_code_at as *const u8,
     ),
     zrtl::ZrtlSymbol::new(c"$Lua$utf8_next".as_ptr(), host_utf8_next as *const u8),
-    zrtl::ZrtlSymbol::new(c"$Lua$gc".as_ptr(), host_gc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$load".as_ptr(), host_load as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$load_error".as_ptr(), host_load_error as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Lua$report_pending".as_ptr(),
         host_report_pending as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$exit_uncaught".as_ptr(),
+        host_exit_uncaught as *const u8,
     ),
     zrtl::ZrtlSymbol::new(c"$Lua$searchpath".as_ptr(), host_searchpath as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$read_file".as_ptr(), host_read_file as *const u8),
@@ -2092,6 +2086,7 @@ pub(crate) fn static_plugin() -> zrtl::StaticPlugin {
         let provided: std::collections::HashSet<&str> = SYMBOLS
             .iter()
             .chain(crate::host_debug::SYMBOLS.iter())
+            .chain(crate::host_gc::SYMBOLS.iter())
             .filter_map(|s| {
                 // SAFETY: every entry's name is a C string literal.
                 unsafe { std::ffi::CStr::from_ptr(s.name) }.to_str().ok()
@@ -2100,6 +2095,7 @@ pub(crate) fn static_plugin() -> zrtl::StaticPlugin {
         let mut all: Vec<zrtl::ZrtlSymbol> = SYMBOLS
             .iter()
             .chain(crate::host_debug::SYMBOLS.iter())
+            .chain(crate::host_gc::SYMBOLS.iter())
             .map(|s| zrtl::ZrtlSymbol::new(s.name, s.ptr))
             .collect();
         for name in crate::fallible::HOST_EXTERNS {
