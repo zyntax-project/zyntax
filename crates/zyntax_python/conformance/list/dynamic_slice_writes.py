@@ -37,13 +37,14 @@ for xs in lists:
     print(keep(xs), whole(xs), backwards(xs))
     print(xs)
 
-ss = mid([1, 2, 3, 4])
+others = [[1, 2, 3, 4], ["x", "y", "z"], [(1, 2), (3, 4), (5, 6)]]
+ss = mid(others[0])
 ss.extend(["p", 2.5])
 print(ss)
-ts = mid(["x", "y", "z"])
+ts = mid(others[1])
 ts.insert(0, 7)
 ts += [(8, 9)]
 print(ts)
-us = mid([(1, 2), (3, 4), (5, 6)])
+us = mid(others[2])
 us[1] = "q"
 print(us, len(us))
