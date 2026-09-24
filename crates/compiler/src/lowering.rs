@@ -983,7 +983,7 @@ impl AstLowering for LoweringContext {
                 continue;
             }
             self.current_decl = index;
-            let at = phase.on().then(std::time::Instant::now);
+            let at = phase.on().then(web_time::Instant::now);
             self.lower_declaration(decl)?;
             if let Some(at) = at {
                 let ms = at.elapsed().as_secs_f64() * 1000.0;

@@ -245,9 +245,9 @@ impl Snapshot {
                     .slice(&self.blobs, &entry.name)
                     .map_err(|e| e.to_string())?;
                 let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
-                let t0 = std::time::Instant::now();
+                let t0 = web_time::Instant::now();
                 let import = CompiledImport::decode(bytes).map_err(|e| e.to_string())?;
-                let t1 = std::time::Instant::now();
+                let t1 = web_time::Instant::now();
                 let Some(lowered) = entry.lowered.as_ref().filter(|l| l.usable_here()) else {
                     return Ok(import);
                 };

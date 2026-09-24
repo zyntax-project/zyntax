@@ -1733,7 +1733,7 @@ fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
         }
     }
     let phases = std::env::var_os("ZYNTAX_TRACE_DROP_PHASES").is_some();
-    let started = std::time::Instant::now();
+    let started = web_time::Instant::now();
     let mallocs: Vec<MallocSite> = collect_owned_sites(func, facts);
     let sites = mallocs.len();
     let collected = started.elapsed();
@@ -1746,16 +1746,16 @@ fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
     let mut users = Users::of(func);
     for site in mallocs {
         stats.mallocs_scanned += 1;
-        let at = std::time::Instant::now();
+        let at = web_time::Instant::now();
         if users.stale(func) {
             users = Users::of(func);
             rebuilds += 1;
         }
         rebuilding += at.elapsed();
-        let at = std::time::Instant::now();
+        let at = web_time::Instant::now();
         let outcome = analyze_site(func, &site, facts, &users);
         analyzing += at.elapsed();
-        let at = std::time::Instant::now();
+        let at = web_time::Instant::now();
         if trace_enabled() {
             eprintln!(
                 "[drop] {}: site {} -> {}",
@@ -1796,7 +1796,7 @@ fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
         }
         applying += at.elapsed();
     }
-    let at = std::time::Instant::now();
+    let at = web_time::Instant::now();
     stats.frees_inserted += release_owned_phis(func, facts);
     let phis = at.elapsed();
     if phases && started.elapsed().as_millis() >= 5 {

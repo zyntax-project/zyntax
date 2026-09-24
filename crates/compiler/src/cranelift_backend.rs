@@ -2276,7 +2276,7 @@ impl CraneliftBackend {
             // when `emit_osr_probes` is false: the embedder has declared
             // that nothing will ever install a helper, so the probe stream
             // would be pure overhead.
-            let phase_started = std::time::Instant::now();
+            let phase_started = web_time::Instant::now();
             let osr_loop_headers: std::collections::HashSet<HirId> = if self.emit_osr_probes {
                 crate::osr::find_loop_headers(function)
                     .into_iter()
@@ -6989,7 +6989,7 @@ impl CraneliftBackend {
         );
 
         // Verify the generated IR (catches errors before they become cryptic panics)
-        let verify_started = std::time::Instant::now();
+        let verify_started = web_time::Instant::now();
         let verified = verify_function(&self.codegen_context.func, self.module.isa());
         if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
             eprintln!(

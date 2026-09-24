@@ -275,7 +275,7 @@ struct CompileQueue {
     /// stale by the time the worker reaches it. A request made for the
     /// callee of a function being compiled carries no count: its calls
     /// will come from native code, which the counter does not see.
-    compile: Mutex<std::collections::VecDeque<(u64, Option<u32>, std::time::Instant)>>,
+    compile: Mutex<std::collections::VecDeque<(u64, Option<u32>, web_time::Instant)>>,
     /// Beads already queued, once each.
     queued: Mutex<HashSet<u64>>,
     /// Beads with a promotion under way, each with the sites asked for
@@ -295,7 +295,7 @@ struct CompileQueue {
 
 enum Job {
     Promote(u64, u64),
-    Compile(u64, Option<u32>, std::time::Instant),
+    Compile(u64, Option<u32>, web_time::Instant),
 }
 
 impl CompileQueue {
@@ -327,7 +327,7 @@ impl CompileQueue {
             self.compile
                 .lock()
                 .unwrap()
-                .push_back((bead_id, count, std::time::Instant::now()));
+                .push_back((bead_id, count, web_time::Instant::now()));
             self.ready.notify_one();
         }
     }
@@ -340,7 +340,7 @@ impl CompileQueue {
         if !self.queued.lock().unwrap().insert(bead_id) {
             compile.retain(|job| job.0 != bead_id);
         }
-        compile.push_front((bead_id, None, std::time::Instant::now()));
+        compile.push_front((bead_id, None, web_time::Instant::now()));
         self.ready.notify_one();
     }
 
@@ -359,7 +359,7 @@ impl CompileQueue {
     /// called since it was made, or it was made just now. One that sat
     /// while the function went quiet is dropped, and asked again should
     /// the function come back.
-    fn still_wanted(&self, bead_id: u64, count: Option<u32>, at: std::time::Instant) -> bool {
+    fn still_wanted(&self, bead_id: u64, count: Option<u32>, at: web_time::Instant) -> bool {
         let Some(count) = count else {
             return true;
         };
@@ -499,7 +499,7 @@ struct QuickBaseline {
     cells: Mutex<HashMap<u64, usize>>,
     /// When each quick baseline was published, kept under
     /// `ZYNTAX_TRACE_LAZY` alone.
-    published_at: Mutex<HashMap<u64, std::time::Instant>>,
+    published_at: Mutex<HashMap<u64, web_time::Instant>>,
 }
 
 impl QuickBaseline {
@@ -529,7 +529,7 @@ impl QuickBaseline {
         self.published_at
             .lock()
             .unwrap()
-            .insert(bead_id, std::time::Instant::now());
+            .insert(bead_id, web_time::Instant::now());
     }
 
     /// How long ago `bead_id`'s quick baseline was published, once.
@@ -910,7 +910,7 @@ impl TieredBackend {
         // The filter applies to this module alone; a rebuild recompiles
         // earlier modules whole, and their ids are not in this set.
         let trace = std::env::var_os("ZYNTAX_TRACE_OPT_PHASES").is_some();
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         self.cranelift.with_lock(|be| {
             be.set_only_compile_reachable(reachable);
             be.add_lazy_functions(lazy.iter().copied());
@@ -924,7 +924,7 @@ impl TieredBackend {
                 started.elapsed().as_secs_f64() * 1000.0
             );
         }
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
 
         // Recorded before it becomes `current_module`, so a later
         // rebuild can put every one of them back. Kept by identity
@@ -2593,7 +2593,7 @@ impl TieredBackend {
             ) -> &'a mut Scratch {
                 let key = Arc::as_ptr(module) as usize;
                 slots.entry(key).or_insert_with(|| {
-                    let started = std::time::Instant::now();
+                    let started = web_time::Instant::now();
                     let facts = facts.of(module);
                     let mut module: HirModule = (**module).clone();
                     for f in module.functions.values_mut() {
@@ -2622,7 +2622,7 @@ impl TieredBackend {
                 let key = Arc::as_ptr(module) as usize;
                 let mut built = self.0.lock().unwrap();
                 Arc::clone(built.entry(key).or_insert_with(|| {
-                    let started = std::time::Instant::now();
+                    let started = web_time::Instant::now();
                     let facts = Arc::new(crate::drop_insert::facts_of(module));
                     if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
                         eprintln!(
@@ -2816,7 +2816,7 @@ impl TieredBackend {
             {
                 let (table, published) = &*done;
                 let mut table = table.lock().unwrap();
-                let waited = std::time::Instant::now();
+                let waited = web_time::Instant::now();
                 let mut did_wait = false;
                 loop {
                     match table.get(&bead_id) {
@@ -2895,7 +2895,7 @@ impl TieredBackend {
                     queue.request_compile(callee, None);
                 }
             }
-            let lazy_started = std::time::Instant::now();
+            let lazy_started = web_time::Instant::now();
             let optimized = optimized_bodies.lock().unwrap().contains_key(func_id);
             if quick
                 && !optimized
@@ -3061,7 +3061,7 @@ impl TieredBackend {
                 .stack_size(16 << 20)
                 .spawn(move || {
                     ON_WARM_UP.with(|on| on.set(true));
-                    let mut idle_since: Option<std::time::Instant> = None;
+                    let mut idle_since: Option<web_time::Instant> = None;
                     loop {
                         if stop.load(std::sync::atomic::Ordering::Acquire) {
                             return;
@@ -3086,7 +3086,7 @@ impl TieredBackend {
                                 // A quiet spell: the scratch modules the
                                 // program's functions are optimised in are
                                 // let go, and made again if asked.
-                                let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                                let since = *idle_since.get_or_insert_with(web_time::Instant::now);
                                 if since.elapsed() > std::time::Duration::from_millis(250) {
                                     scratch_shared.lock().unwrap().clear();
                                 }

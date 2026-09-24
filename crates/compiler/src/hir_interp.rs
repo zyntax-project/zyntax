@@ -3528,7 +3528,7 @@ impl HirInterpreter {
             // reported as one.
             // The body's making is the first call's cost: reported when
             // it shows.
-            let started = std::time::Instant::now();
+            let started = web_time::Instant::now();
             let shared = self.body_source.as_mut().and_then(|source| source(func_id));
             let body_ms = started.elapsed().as_secs_f64() * 1000.0;
             let func: &HirFunction = match &shared {

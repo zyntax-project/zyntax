@@ -113,7 +113,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// Current task ID counter for wakers
 static NEXT_TASK_ID: AtomicUsize = AtomicUsize::new(1);

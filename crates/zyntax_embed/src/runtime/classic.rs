@@ -402,7 +402,7 @@ impl ZyntaxRuntime {
         use zyntax_typed_ast::{
             AstArena, InternedString, TypeRegistry, TypedDeclaration, type_registry::*,
         };
-        let fn_start = std::time::Instant::now();
+        let fn_start = web_time::Instant::now();
 
         // Handler state (Phase 3): a `handler H for E { var s: T = init; ... }`
         // gets a synthesized `@reference` struct `H$state` holding its fields,
@@ -673,21 +673,21 @@ impl ZyntaxRuntime {
         // Process imports FIRST to load stdlib traits and impls
         // This merges declarations from imported modules into the program
         // and registers their opaque types in the type registry
-        let t_imports = std::time::Instant::now();
+        let t_imports = web_time::Instant::now();
         let mut prelowered = Vec::new();
         self.process_imports_for_traits(&mut program, &mut type_registry, &mut prelowered)?;
         let imports_ms = t_imports.elapsed().as_secs_f64() * 1000.0;
 
         // Now process extern declarations from the merged program (main + imports)
         // to ensure all opaque types are registered (needs &mut)
-        let t_externs = std::time::Instant::now();
+        let t_externs = web_time::Instant::now();
         self.process_extern_declarations_mut(&program, &mut type_registry)?;
         let externs_ms = t_externs.elapsed().as_secs_f64() * 1000.0;
 
         // IMPORTANT: Resolve all Type::Unresolved in the TypedAST before lowering
         // This mutates the program to replace Unresolved types with actual types from TypeRegistry
         // The compiler's type checker and SSA builder need resolved types
-        let t_resolve = std::time::Instant::now();
+        let t_resolve = web_time::Instant::now();
         self.resolve_unresolved_types(&mut program, &type_registry);
         let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
 
@@ -745,7 +745,7 @@ impl ZyntaxRuntime {
         // very different costs, which a single number hides.
         let phase_trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
         let prologue_ms = fn_start.elapsed().as_secs_f64() * 1000.0;
-        let engine_start = std::time::Instant::now();
+        let engine_start = web_time::Instant::now();
 
         // Run pattern engine (term-rewriting passes on TypedAST)
         {
@@ -785,7 +785,7 @@ impl ZyntaxRuntime {
         // built-in set.
         lowering_ctx.set_builtin_registry(self.snapshot_builtin_registry());
 
-        let lower_start = std::time::Instant::now();
+        let lower_start = web_time::Instant::now();
         let mut hir_module = lowering_ctx
             .lower_program(&mut program)
             .map_err(|e| RuntimeError::Execution(format!("Lowering error: {:?}", e)))?;
@@ -798,13 +798,13 @@ impl ZyntaxRuntime {
                  pattern_engine = {engine_ms:.2} ms  lower_program = {lower_ms:.2} ms"
             );
         }
-        let epilogue_start = std::time::Instant::now();
+        let epilogue_start = web_time::Instant::now();
 
         // Display lowering diagnostics (type inference warnings, etc.)
         lowering_ctx.display_diagnostics(&program);
 
         // Monomorphization
-        let mono_start = std::time::Instant::now();
+        let mono_start = web_time::Instant::now();
         zyntax_compiler::monomorphize_module(&mut hir_module)
             .map_err(|e| RuntimeError::Execution(format!("Monomorphization error: {:?}", e)))?;
         if phase_trace {

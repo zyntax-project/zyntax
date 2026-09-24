@@ -408,7 +408,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// equivalent of the trampoline stubs the object path synthesises.
     /// The engine is retained because it owns the code pages.
     fn install_via_mcjit(&mut self, hir_module: &HirModule) -> CompilerResult<()> {
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         if crate::osr::osr_trace_enabled() {
             eprintln!(
                 "[osr] llvm install tier={} functions={}",
@@ -715,7 +715,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             std::arch::is_x86_feature_detected!("avxvnni")
                 || std::arch::is_x86_feature_detected!("avx512vnni"),
         );
-        let lowering = std::time::Instant::now();
+        let lowering = web_time::Instant::now();
         backend.lower_module(hir_module)?;
 
         // Patch internal function names to a linker-safe mangling.
@@ -772,7 +772,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         if self.opt_level != OptimizationLevel::None {
             let passes = Self::pass_pipeline(self.opt_level);
             let pass_options = Self::create_pass_options();
-            let optimising = std::time::Instant::now();
+            let optimising = web_time::Instant::now();
             backend
                 .module()
                 .run_passes(passes, target_machine, pass_options)
@@ -916,8 +916,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     fn build_temp_path(extension: &str) -> std::path::PathBuf {
         let counter = AOT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let nanos = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let mut p = std::env::temp_dir();

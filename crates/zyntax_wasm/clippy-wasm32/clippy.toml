@@ -1,0 +1,13 @@
+# Clippy configuration for the wasm32 build of zyntax_wasm and the
+# workspace crates it links (selected with CLIPPY_CONF_DIR; see
+# .github/workflows/ci.yml). std::time's clocks panic on
+# wasm32-unknown-unknown; web_time's are std::time on native and
+# performance.now() on wasm, so only a wasm32 build can tell them apart.
+disallowed-types = [
+    { path = "std::time::Instant", reason = "panics on wasm32-unknown-unknown; use web_time::Instant" },
+    { path = "std::time::SystemTime", reason = "panics on wasm32-unknown-unknown; use web_time::SystemTime" },
+]
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "panics on wasm32-unknown-unknown; use web_time::Instant::now" },
+    { path = "std::time::SystemTime::now", reason = "panics on wasm32-unknown-unknown; use web_time::SystemTime::now" },
+]

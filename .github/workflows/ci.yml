@@ -199,11 +199,22 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
           key: wasm-headless-chrome
+
+      # std::time's clocks panic on wasm32-unknown-unknown. On native,
+      # web_time::Instant is std::time::Instant, so only a wasm32 lint
+      # can refuse the std clock in the crates the shim links.
+      - name: Refuse std::time clocks in the wasm32 build
+        env:
+          CLIPPY_CONF_DIR: ${{ github.workspace }}/crates/zyntax_wasm/clippy-wasm32
+        run: >-
+          cargo clippy -p zyntax_wasm --lib --target wasm32-unknown-unknown --
+          -A clippy::all -D clippy::disallowed_methods -D clippy::disallowed_types
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0

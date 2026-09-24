@@ -295,7 +295,7 @@ fn process_imports_inner(
                     break;
                 }
 
-                let started = std::time::Instant::now();
+                let started = web_time::Instant::now();
                 if let Ok(imported_program) =
                     grammar.parse_with_signatures(&source, &module_name, plugin_signatures)
                 {

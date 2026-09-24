@@ -1351,12 +1351,12 @@ mod tests {
             runtime.call_function("read_global", vec![]).unwrap(),
             ZyntaxValue::Int(17)
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = web_time::Instant::now() + std::time::Duration::from_secs(2);
         while runtime
             .bead_for(reader_id)
             .and_then(|bead| bead.compiled())
             .is_none()
-            && std::time::Instant::now() < deadline
+            && web_time::Instant::now() < deadline
         {
             runtime.call_function("read_global", vec![]).unwrap();
             std::thread::yield_now();

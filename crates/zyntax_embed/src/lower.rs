@@ -53,14 +53,14 @@ pub(crate) fn lower_typed_program(
     use zyntax_typed_ast::type_registry::*;
 
     let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
-    let mut at = std::time::Instant::now();
-    let mut lap = |name: &str, at: &mut std::time::Instant| {
+    let mut at = web_time::Instant::now();
+    let mut lap = |name: &str, at: &mut web_time::Instant| {
         if trace {
             eprintln!(
                 "[LOWER] {name:<20} {:8.2} ms",
                 at.elapsed().as_secs_f64() * 1000.0
             );
-            *at = std::time::Instant::now();
+            *at = web_time::Instant::now();
         }
     };
     // Stateful handlers need their state struct, ctor and implicit

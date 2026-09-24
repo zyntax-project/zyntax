@@ -10,6 +10,9 @@ categories = ["development-tools::ffi", "compilers"]
 
 [dependencies]
 inventory = "0.3"
+# std::time::Instant panics on wasm32-unknown-unknown; web-time is std::time
+# on native and performance.now() on wasm.
+web-time = "1"
 
 [dev-dependencies]
 zrtl_macros = { path = "../zrtl_macros" }

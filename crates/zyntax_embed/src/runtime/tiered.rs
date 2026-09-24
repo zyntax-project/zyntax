@@ -524,7 +524,7 @@ impl TieredRuntime {
         // optimisers run, so they walk the program rather than the
         // library it imported.
         let trace_phases = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         // Every body is compiled, and optimised, on its call rather than
         // now: the interpreter runs the first calls, and the warm-up
         // thread compiles ahead of it, the program's own functions first.
@@ -617,7 +617,7 @@ impl TieredRuntime {
         // `ZYNTAX_DISABLE_INTERP_OPTS=1`.)
         zyntax_compiler::hir_dump::dump_module_to_dir(&module, "pre-opt-tiered-compile_module");
         let trace = std::env::var_os("ZYNTAX_TRACE_OPT_PHASES").is_some();
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         if self.run_interp_opts && std::env::var("ZYNTAX_DISABLE_INTERP_OPTS").is_err() {
             let _stats = zyntax_compiler::run_interp_safe_opts(&mut module);
             zyntax_compiler::run_native_only_opts(&mut module);
@@ -630,7 +630,7 @@ impl TieredRuntime {
         }
         zyntax_compiler::hir_dump::dump_module_to_dir(&module, "post-opt-tiered-compile_module");
 
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         // Store function name -> ID mapping and signatures (resolve InternedString to actual string)
         for (id, func) in &module.functions {
             if let Some(name) = func.name.resolve_global() {
@@ -659,7 +659,7 @@ impl TieredRuntime {
         }
 
         // Compile the module (consumes it).
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         self.backend
             .compile_module_lazily(module, reachable, lazy, finished)?;
         // The backend owns the optimized HIR and native global slots. Bind
@@ -1473,7 +1473,7 @@ impl TieredRuntime {
         );
         let fiber_decls = collect_fiber_decls(&program);
         let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         let (mut hir_module, entered) =
             self.lower_typed_program(program, self.builtin_aliases.clone())?;
         if trace {
@@ -1482,7 +1482,7 @@ impl TieredRuntime {
                 started.elapsed().as_secs_f64() * 1000.0
             );
         }
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         hir_module.automatic_release = self.automatic_release;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
