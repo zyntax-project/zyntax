@@ -3575,8 +3575,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     ty: Ty::Int,
                 },
                 // A shaped table is a table unless it is nil, when the
-                // dynamic path raises as Lua does.
-                Ty::Shape(_) if !self.scopes().len_meta => {
+                // dynamic path raises as Lua does. With no `__len` in
+                // any metatable it may have, its length is its array
+                // part's.
+                Ty::Shape(k) if !self.scopes().len_meta => {
                     let i64_t = prim(PrimitiveType::I64);
                     let mut pre = Vec::new();
                     let t = self.hold(v, &mut pre);
@@ -3595,18 +3597,21 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         &descs,
                     );
                     let on_nil = self.coerce(on_nil, Ty::Int);
-                    Val {
-                        node: block_value(
-                            pre,
-                            if_value(
-                                is_null,
-                                on_nil,
-                                call("zl_table_len", vec![t.node], i64_t.clone(), span),
-                                i64_t,
+                    let len = if self.m.inferred.plain_len(k) {
+                        list_len(
+                            call(
+                                "zb_unbox_list_raw_any",
+                                vec![field(t.node, "arr", Type::Any, span)],
+                                self.m.anys(),
                                 span,
                             ),
                             span,
-                        ),
+                        )
+                    } else {
+                        call("zl_table_len", vec![t.node], i64_t.clone(), span)
+                    };
+                    Val {
+                        node: block_value(pre, if_value(is_null, on_nil, len, i64_t, span), span),
                         ty: Ty::Int,
                     }
                 }

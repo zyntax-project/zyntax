@@ -367,6 +367,16 @@ impl Inferred {
         ty
     }
 
+    /// Whether `#t` on a table of shape `k` is the length of its array
+    /// part: no metatable it may have holds a `__len`.
+    pub fn plain_len(&self, k: ShapeId) -> bool {
+        let info = self.shape(k);
+        !info.unknown_meta
+            && info.classes.iter().all(|c| {
+                self.shape(*c).field("__len").is_none() && !self.may_hold_unnamed(*c, "__len")
+            })
+    }
+
     /// The functions `name` may resolve to for a table whose metatable
     /// has shape `k`, looked up as Lua does when the table itself
     /// lacks it: in the metatable's `__index` table, then in that

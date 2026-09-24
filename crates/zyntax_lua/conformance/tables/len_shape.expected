@@ -1,0 +1,14 @@
+3
+5
+4
+true
+0
+1
+42
+10
+3
+2
+99
+5	0	11
+3	2
+false	len_shape.lua:47: attempt to get length of a nil value (local 'x')
