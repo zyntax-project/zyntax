@@ -201,6 +201,88 @@ fn host_bridge_await_emits_register_future_and_pending_return() {
     );
 }
 
+/// The memory pass places `DecRef`/`IncRef` on an awaited value and a
+/// `Drop` after the await. For a host bridge that value is not a
+/// Promise object and the lowering deletes its definition, so those
+/// operations are stripped before lowering and nothing reads it after.
+#[test]
+fn host_bridge_await_value_keeps_no_ownership_ops() {
+    let AsyncFnFixture { mut function, .. } =
+        make_async_function_with_host_bridge_await("__zyntax_async_set_timeout");
+
+    let entry = function.entry_block;
+    let (bridge_value, await_idx) = {
+        let block = &function.blocks[&entry];
+        let await_idx = block
+            .instructions
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    HirInstruction::Call {
+                        callee: HirCallable::Intrinsic(Intrinsic::Await),
+                        ..
+                    }
+                )
+            })
+            .expect("fixture awaits");
+        let HirInstruction::Call { args, .. } = &block.instructions[await_idx] else {
+            unreachable!()
+        };
+        (args[0], await_idx)
+    };
+    let ownership_op = |intrinsic| HirInstruction::Call {
+        result: None,
+        callee: HirCallable::Intrinsic(intrinsic),
+        args: vec![bridge_value],
+        type_args: vec![],
+        const_args: vec![],
+        is_tail: false,
+    };
+    {
+        let block = function.blocks.get_mut(&entry).unwrap();
+        block
+            .instructions
+            .insert(await_idx + 1, ownership_op(Intrinsic::Drop));
+        block
+            .instructions
+            .insert(await_idx, ownership_op(Intrinsic::IncRef));
+        block
+            .instructions
+            .insert(await_idx, ownership_op(Intrinsic::DecRef));
+    }
+
+    assert_eq!(
+        krio_adapter::abi_emit::strip_host_bridge_ownership_ops(&mut function),
+        3
+    );
+
+    let frame = HirId::new();
+    function.values.insert(
+        frame,
+        HirValue {
+            id: frame,
+            ty: HirType::Ptr(Box::new(HirType::I64)),
+            kind: HirValueKind::Instruction,
+            uses: HashSet::new(),
+            span: None,
+        },
+    );
+    let module = module_of(function.clone());
+    let live_out = live_out_for_entry_only(&function, _placeholder_live(&function));
+    orchestrator::lower_async_function_in_module(&mut function, &module, frame, 16, &live_out)
+        .expect("orchestrator must succeed for host-bridge await");
+
+    for block in function.blocks.values() {
+        for inst in &block.instructions {
+            assert!(
+                !inst.any_operand(|id| id == bridge_value),
+                "the host-bridge value has no definition after lowering, yet {inst:?} reads it"
+            );
+        }
+    }
+}
+
 // Liveness placeholder — for these tests we use `live_across` (the
 // `x` SSA defined before the await) so the orchestrator generates
 // captures-lift saves; the test doesn't assert on that, only on the

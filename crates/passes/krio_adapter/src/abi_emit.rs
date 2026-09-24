@@ -492,7 +492,7 @@ pub fn lower_await_calls(
         // the JS bridge shims that resolve handles.
         let producing = find_producing_call(&function.blocks, &yield_hir, promise_ptr, await_idx);
         if let Some((producing_idx, symbol_name)) = &producing {
-            if symbol_name.starts_with("__zyntax_async_") {
+            if symbol_name.starts_with(HOST_BRIDGE_PREFIX) {
                 let result_slot = next_slot;
                 next_slot += 1;
                 lower_host_bridge_await_site(
@@ -811,6 +811,68 @@ pub fn lower_await_calls(
     }
 
     next_slot
+}
+
+/// Callee prefix of the host bridges an await parks on (sleep, fetch,
+/// ws_open, ...). The JS side resolves the parked future directly.
+pub const HOST_BRIDGE_PREFIX: &str = "__zyntax_async_";
+
+/// Removes the ownership operations (`IncRef`, `DecRef`, `Drop`) placed
+/// on the value of an awaited host-bridge call.
+///
+/// That value is not a Promise object: the cooperative lowering drops
+/// the call's result binding, so any other use of it would read an
+/// undefined value. Runs before liveness, so the value is not saved
+/// across the suspension either. Returns the number of operations
+/// removed.
+pub fn strip_host_bridge_ownership_ops(function: &mut HirFunction) -> usize {
+    let awaited: HashSet<HirId> = function
+        .blocks
+        .values()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| match inst {
+            HirInstruction::Call {
+                callee: HirCallable::Intrinsic(Intrinsic::Await),
+                args,
+                ..
+            } => args.first().copied(),
+            _ => None,
+        })
+        .collect();
+    let bridge_values: HashSet<HirId> = function
+        .blocks
+        .values()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| match inst {
+            HirInstruction::Call {
+                callee: HirCallable::Symbol(name),
+                result: Some(r),
+                ..
+            } if name.starts_with(HOST_BRIDGE_PREFIX) && awaited.contains(r) => Some(*r),
+            _ => None,
+        })
+        .collect();
+    if bridge_values.is_empty() {
+        return 0;
+    }
+    let mut removed = 0;
+    for block in function.blocks.values_mut() {
+        let before = block.instructions.len();
+        block.instructions.retain(|inst| {
+            !matches!(
+                inst,
+                HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(
+                        Intrinsic::IncRef | Intrinsic::DecRef | Intrinsic::Drop
+                    ),
+                    args,
+                    ..
+                } if args.len() == 1 && bridge_values.contains(&args[0])
+            )
+        });
+        removed += before - block.instructions.len();
+    }
+    removed
 }
 
 /// Scan `yield_block.instructions[..await_idx]` (reversed) for the

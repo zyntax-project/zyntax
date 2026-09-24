@@ -3,7 +3,7 @@
 //! Run via:
 //!
 //! ```bash
-//! wasm-pack test --headless --chrome crates/zyntax_wasm
+//! WASM_BINDGEN_USE_BROWSER=1 wasm-pack test --headless --chrome crates/zyntax_wasm
 //! ```
 //!
 //! These tests exercise the wasm-bindgen export surface end-to-end
@@ -66,13 +66,11 @@ fn install_host_stubs() {
     complete_fn.forget();
 }
 
-// No `wasm_bindgen_test_configure!` — default is "wasm context"
-// (Node when run via `wasm-pack test --node`, browser when run
-// via `wasm-pack test --headless --chrome`). Neither test body
-// uses DOM APIs, so both targets work with the same code. CI's
-// `wasm-headless-chrome` job runs the browser variant; Node mode
-// is the local-dev shortcut for environments where Chrome's
-// headless driver dies (macOS quarantine / codesigning issues).
+// No `wasm_bindgen_test_configure!`, so the suite runs in either host.
+// The test runner defaults to Node, and `wasm-pack test --headless
+// --chrome` skips a Node suite; `WASM_BINDGEN_USE_BROWSER=1` selects the
+// browser, which is how CI's `wasm-headless-chrome` job runs it.
+// `wasm-pack test --node` runs the same bodies; neither uses DOM APIs.
 
 // ----- Smoke: module loads + version is reported -----------------
 

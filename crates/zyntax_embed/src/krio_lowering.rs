@@ -285,6 +285,11 @@ pub fn apply_krio_async_lowering(
         if async_fn_ids.is_empty() {
             return Ok(());
         }
+        for fn_id in &async_fn_ids {
+            if let Some(function) = _module.functions.get_mut(fn_id) {
+                krio_adapter::abi_emit::strip_host_bridge_ownership_ops(function);
+            }
+        }
         let mut live_out: HashMap<HirId, HashMap<HirId, HashSet<HirId>>> = HashMap::new();
         let mut analyzer = AnalysisRunner::new(_module.clone());
         match analyzer.run_for(&async_fn_ids) {

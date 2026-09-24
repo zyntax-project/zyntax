@@ -247,4 +247,8 @@ jobs:
       # engine via wasm-bindgen-test.
       - name: Run headless Chrome smoke
         working-directory: crates/zyntax_wasm
+        # The suite does not pin a host, and the runner defaults to Node,
+        # which `--chrome` skips; this selects the browser.
+        env:
+          WASM_BINDGEN_USE_BROWSER: "1"
         run: wasm-pack test --headless --chrome
