@@ -1,0 +1,7 @@
+ValueError: invalid literal for int() with base 10: 'z'
+ValueError: invalid literal for int() with base 10: 'x'
+parsed [7, 8]
+ValueError: invalid literal for int() with base 10: 'eight'
+[1]
+ValueError: invalid literal for int() with base 10: 'q'
+last

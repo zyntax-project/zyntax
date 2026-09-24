@@ -8022,6 +8022,8 @@ impl<'m> Lowerer<'m> {
         // What the element and the conditions hoist belongs inside the
         // loop, where they are evaluated.
         let outer_hoisted = std::mem::take(&mut self.hoisted);
+        let raised_before = self.raised;
+        self.raised = false;
         let add = match produce {
             Produce::List(elem, elt) => {
                 let value = self.expr_as_elem(elt, elem)?;
@@ -8096,6 +8098,17 @@ impl<'m> Lowerer<'m> {
         self.locals.vars = saved_vars;
         self.comp_symbols = saved_symbols;
         statements.extend(inner);
+        // A check inside the loop left the loop; where leaving is a
+        // break, the value must not be used before the check is made
+        // again outside it.
+        if self.raised
+            && !matches!(produce, Produce::Yield(_))
+            && self.escapes.last() == Some(&Escape::Break)
+        {
+            let check = self.pending_check(span);
+            statements.push(check);
+        }
+        self.raised |= raised_before;
         self.hoisted = outer_hoisted;
         self.hoisted.extend(statements);
         Ok(Val {
