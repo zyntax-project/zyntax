@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790261265,"nonce":"47KW4YxxLUvxoXUQuo7uQ0AlVzo=","message":"Fixed in 4c42cdd5780f02684d12544f131765f778ee4425 (worktree branch worktree-wf_b2063457-04f-2, not yet on main). Conformance green (Python 23/23, Lua 17/17). Compile time grows on deltablue; see 5200715.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1790261265,"nonce":"h0YhuWfRNXSYAH6dbZsK4y5PlMs=","status":2}]}
