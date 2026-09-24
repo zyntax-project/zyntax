@@ -545,6 +545,19 @@ impl<'a> Module<'a> {
         format!("lua${}{name}${}", self.tag, f.0)
     }
 
+    /// The restores of the line in a body that nothing reads.
+    fn strip_line_restores(&self, statements: &mut [St]) {
+        let reads_line = |name: &str| self.fallible.contains(name) || self.reentrant.contains(name);
+        LineRestores::strip(statements, &reads_line);
+    }
+
+    /// Whether a function's typed entry takes its record as `env`: a
+    /// nested function capturing something, which the record holds.
+    fn takes_env(&self, f: FuncId) -> bool {
+        let info = self.scopes.func(f);
+        !info.top_level && !info.captures.is_empty()
+    }
+
     /// The record code's name for a function.
     fn code_name(&self, f: FuncId) -> String {
         format!("{}$fn", self.entry_name(f))
@@ -1026,6 +1039,21 @@ fn block_value(statements: Vec<St>, value: Node, span: Span) -> Node {
         ty,
         span,
     )
+}
+
+/// `x % n` for an integer `x` and a positive power of two `n`: the low
+/// bits, which are the floored modulo whatever `x`'s sign.
+fn pow2_mod(x: Node, n: i64, span: Span) -> Node {
+    let i64_t = prim(PrimitiveType::I64);
+    binary(BinaryOp::BitAnd, x, int_lit(n - 1, span), i64_t, span)
+}
+
+/// `x // n` for an integer `x` and a positive power of two `n`: an
+/// arithmetic shift, which rounds toward negative infinity.
+fn pow2_floordiv(x: Node, n: i64, span: Span) -> Node {
+    let i64_t = prim(PrimitiveType::I64);
+    let shift = int_lit(n.trailing_zeros() as i64, span);
+    binary(BinaryOp::Shr, x, shift, i64_t, span)
 }
 
 /// The length of a list.
@@ -2579,9 +2607,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     /// `if an error is pending, leave`; then the line is this one
-    /// again, since a callee sets its own. A type error's note of which
-    /// operand it is about is cleared on the way: it was a deeper
-    /// site's.
+    /// again, since a callee sets its own (unless nothing reads it
+    /// before it is stored again: see [`LineRestores`]). A type error's
+    /// note of which operand it is about is cleared on the way: it was
+    /// a deeper site's.
     fn pending_check(&mut self, span: Span) -> St {
         self.pending_check_described(span, &Described::NONE)
     }
@@ -3789,7 +3818,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         };
         let plain_divisor = literal_divisor.is_some_and(|n| n != 0 && n != -1);
         // A positive power of two divides a float exactly, so its
-        // modulo is three operations instead of fmod.
+        // modulo is three operations instead of fmod; an integer's
+        // floor division and modulo by it are an arithmetic shift and a
+        // mask, for either sign.
         let pow2_divisor = literal_divisor.filter(|n| *n > 0 && n & (n - 1) == 0);
         let divisor = Divisor {
             plain: plain_divisor,
@@ -3888,7 +3919,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
             }
             BinOp::DoubleSlash(_) => {
-                if ints && plain_divisor {
+                if let (true, Some(n)) = (ints, pow2_divisor) {
+                    int_result(pow2_floordiv(a.node, n, span))
+                } else if ints && plain_divisor {
                     int_result(call("zb_floordiv_i64", vec![a.node, b.node], i64_t, span))
                 } else if ints {
                     int_result(call("zl_idiv_i64", vec![a.node, b.node], i64_t, span))
@@ -3900,7 +3933,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
             }
             BinOp::Percent(_) => {
-                if ints && plain_divisor {
+                if let (true, Some(n)) = (ints, pow2_divisor) {
+                    int_result(pow2_mod(a.node, n, span))
+                } else if ints && plain_divisor {
                     int_result(call("zb_mod_i64", vec![a.node, b.node], i64_t, span))
                 } else if ints {
                     int_result(call("zl_mod_i64", vec![a.node, b.node], i64_t, span))
@@ -4178,13 +4213,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     (_, false) => ("zl_mod_i64", "zl_mod_f64"),
                 };
                 let is_int = both_int(&x, &y);
-                let int = if_value(
-                    is_int.clone(),
-                    call(fi, vec![x.int.clone(), y.int.clone()], i64_t.clone(), span),
-                    int_lit(0, span),
-                    i64_t,
-                    span,
-                );
+                let int_part = match (op, divisor.pow2) {
+                    (BinOp::Percent(_), Some(n)) => pow2_mod(x.int.clone(), n, span),
+                    (_, Some(n)) => pow2_floordiv(x.int.clone(), n, span),
+                    _ => call(fi, vec![x.int.clone(), y.int.clone()], i64_t.clone(), span),
+                };
+                let int = if_value(is_int.clone(), int_part, int_lit(0, span), i64_t, span);
                 let float_part = match (op, divisor.pow2) {
                     (BinOp::Percent(_), Some(n)) => self.float_mod_pow2(x.as_float(span), n, span),
                     _ => call(
@@ -5446,18 +5480,29 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if let Some(Suffix::Call(ast::Call::AnonymousCall(args))) = suffixes.first()
             && let Some(f) = self.typer().known_callee(prefix)
         {
-            // A global declared once as this function is the function;
-            // any other name holds its value, which may be nil by now.
+            // A global declared once as this function is the function,
+            // and so is a local that holds a function from its
+            // declaration on; any other name holds its value, which may
+            // be nil by now.
             let declared = match prefix {
-                Prefix::Name(token) => matches!(
-                    self.scopes().binding(token),
-                    Some(Binding::Global(name))
-                        if self.scopes().known_global_function(name) == Some(f)
-                ),
+                Prefix::Name(token) => match self.scopes().binding(token) {
+                    Some(Binding::Global(name)) => {
+                        self.scopes().known_global_function(name) == Some(f)
+                    }
+                    Some(Binding::Local(v) | Binding::Upvalue(v)) => {
+                        self.scopes().always_function(*v)
+                    }
+                    _ => false,
+                },
                 _ => false,
             };
             if declared {
-                multi = Some(self.direct_call(f, None, None, args, span)?);
+                // The record holds the captures, when there are any.
+                let record = match prefix {
+                    Prefix::Name(token) if self.m.takes_env(f) => Some(self.read_name(token)?),
+                    _ => None,
+                };
+                multi = Some(self.direct_call(f, record, None, args, span)?);
             } else {
                 let callee = match prefix {
                     Prefix::Name(token) => self.read_name(token)?,
@@ -5664,7 +5709,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let sig = self.m.sig(f);
         let n = info.params.len();
         let is_vararg = info.is_vararg;
-        let has_env = !info.top_level;
+        let has_env = self.m.takes_env(f);
         // A tail of several values is read through a list.
         let tail_name = match tail {
             Some(tail) => {
@@ -8296,8 +8341,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     // ─── functions ──────────────────────────────────────────────
 
     /// Lower a function's body into its typed entry, and its record
-    /// code if it is used as a value. Nested functions take their
-    /// record as `env`.
+    /// code if it is used as a value. Nested functions that capture
+    /// something take their record as `env`.
     fn lower_function(
         &mut self,
         id: FuncId,
@@ -8307,7 +8352,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let span = span_of(body);
         let info = self.scopes().func(id).clone();
         let sig = self.m.sig(id);
-        let has_env = !info.top_level;
+        let has_env = self.m.takes_env(id);
         let mut child = Lowerer::new(self.m, id);
         let mut params = Vec::new();
         let mut statements = Vec::new();
@@ -8360,6 +8405,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if types::falls_through(body.block()) {
             child.return_stmt(&[], span, &mut statements)?;
         }
+        self.m.strip_line_restores(&mut statements);
         let entry = self.m.entry_name(id);
         let function = typed_function(
             &entry,
@@ -8397,7 +8443,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let info = self.scopes().func(id).clone();
         let mut params = vec![parameter(intern("env"), self.m.anys(), span)];
         let mut args: Vec<Node> = Vec::new();
-        if !info.top_level {
+        if self.m.takes_env(id) {
             args.push(var(intern("env"), self.m.anys(), span));
         }
         let mut statements = Vec::new();
@@ -8491,6 +8537,198 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 /// The chunk's statements as a function; the entry names the chunk,
 /// runs it, and reports an error nothing caught.
 const CHUNK_FN: &str = "lua$chunk";
+
+/// The restores of the line after checked calls that nothing reads:
+/// removed where every path from the restore stores the line again, or
+/// returns, before a raise or anything else that reads it. Walks a
+/// function body backwards, tracking whether the line is still to be
+/// read (`later`); what reads it is a check (the raising call before
+/// it), a read of the line itself, and a library call that may raise
+/// or run the program's code.
+struct LineRestores<'a> {
+    reads_line: &'a dyn Fn(&str) -> bool,
+    line: InternedString,
+    pending: InternedString,
+    /// Whether the line is read after each enclosing loop, innermost
+    /// last: where a `break` goes.
+    exits: Vec<bool>,
+}
+
+impl LineRestores<'_> {
+    fn strip(statements: &mut [St], reads_line: &dyn Fn(&str) -> bool) {
+        let mut walk = LineRestores {
+            reads_line,
+            line: intern(library::LINE),
+            pending: intern(library::PENDING),
+            exits: Vec::new(),
+        };
+        walk.stmts(statements, false, true);
+    }
+
+    /// Whether the line is read from before `statements` on, given
+    /// `later` after them; `strip` removes dead restores on the way.
+    fn stmts(&mut self, statements: &mut [St], mut later: bool, strip: bool) -> bool {
+        for s in statements.iter_mut().rev() {
+            later = self.stmt(s, later, strip);
+        }
+        later
+    }
+
+    fn stmt(&mut self, s: &mut St, later: bool, strip: bool) -> bool {
+        match &mut s.node {
+            TypedStatement::Expression(e) => self.expr(e, later, strip),
+            TypedStatement::Let(l) => match &mut l.initializer {
+                Some(e) => self.expr(e, later, strip),
+                None => later,
+            },
+            TypedStatement::If(i) if self.is_check(&i.condition) => {
+                // The raising call before the check reads the line.
+                if strip && !later && self.is_restore(i.else_block.as_ref()) {
+                    i.else_block = None;
+                }
+                true
+            }
+            TypedStatement::If(i) => {
+                let then = self.stmts(&mut i.then_block.statements, later, strip);
+                let els = match &mut i.else_block {
+                    Some(b) => self.stmts(&mut b.statements, later, strip),
+                    None => later,
+                };
+                self.expr(&mut i.condition, then || els, strip)
+            }
+            TypedStatement::While(w) => {
+                // The line read at the head, which the end of the body
+                // reaches again: the least answer, from a first walk
+                // assuming it is not; inner loops assume it is.
+                let head = if strip {
+                    self.exits.push(later);
+                    let body = self.stmts(&mut w.body.statements, false, false);
+                    self.exits.pop();
+                    self.expr(&mut w.condition, body || later, false)
+                } else {
+                    true
+                };
+                self.exits.push(later);
+                let body = self.stmts(&mut w.body.statements, head, strip);
+                self.exits.pop();
+                self.expr(&mut w.condition, body || later, strip)
+            }
+            TypedStatement::Block(b) => self.stmts(&mut b.statements, later, strip),
+            TypedStatement::Return(v) => match v {
+                Some(e) => self.expr(e, false, strip),
+                None => false,
+            },
+            TypedStatement::Break(None) => self.exits.last().copied().unwrap_or(true),
+            TypedStatement::Label(_) => later,
+            _ => true,
+        }
+    }
+
+    fn expr(&mut self, e: &mut Node, later: bool, strip: bool) -> bool {
+        match &mut e.node {
+            TypedExpression::Literal(_) => later,
+            TypedExpression::Variable(name) => later || *name == self.line,
+            TypedExpression::Call(c) => {
+                let reads = match &c.callee.node {
+                    TypedExpression::Variable(name) => name
+                        .resolve_global()
+                        .is_some_and(|n| (self.reads_line)(n.as_str())),
+                    _ => true,
+                };
+                let mut later = later || reads;
+                for a in c.positional_args.iter_mut().rev() {
+                    later = self.expr(a, later, strip);
+                }
+                if c.named_args.is_empty() { later } else { true }
+            }
+            TypedExpression::MethodCall(c) => {
+                let mut later = later;
+                for a in c.positional_args.iter_mut().rev() {
+                    later = self.expr(a, later, strip);
+                }
+                if c.named_args.is_empty() {
+                    self.expr(&mut c.receiver, later, strip)
+                } else {
+                    true
+                }
+            }
+            TypedExpression::Binary(b) => match b.op {
+                BinaryOp::Assign => match &b.left.node {
+                    // A store of the line: nothing before it is read
+                    // through it.
+                    TypedExpression::Variable(name) if *name == self.line => {
+                        self.expr(&mut b.right, false, strip)
+                    }
+                    _ => {
+                        let later = self.expr(&mut b.left, later, strip);
+                        self.expr(&mut b.right, later, strip)
+                    }
+                },
+                BinaryOp::And | BinaryOp::Or => {
+                    let right = self.expr(&mut b.right, later, strip);
+                    self.expr(&mut b.left, right || later, strip)
+                }
+                _ => {
+                    let later = self.expr(&mut b.right, later, strip);
+                    self.expr(&mut b.left, later, strip)
+                }
+            },
+            TypedExpression::Unary(u) => self.expr(&mut u.operand, later, strip),
+            TypedExpression::Cast(c) => self.expr(&mut c.expr, later, strip),
+            TypedExpression::Field(f) => self.expr(&mut f.object, later, strip),
+            TypedExpression::Index(i) => {
+                let later = self.expr(&mut i.index, later, strip);
+                self.expr(&mut i.object, later, strip)
+            }
+            TypedExpression::If(i) => {
+                let then = self.expr(&mut i.then_branch, later, strip);
+                let els = self.expr(&mut i.else_branch, later, strip);
+                self.expr(&mut i.condition, then || els, strip)
+            }
+            TypedExpression::Block(b) => self.stmts(&mut b.statements, later, strip),
+            TypedExpression::Array(items) | TypedExpression::Tuple(items) => {
+                let mut later = later;
+                for item in items.iter_mut().rev() {
+                    later = self.expr(item, later, strip);
+                }
+                later
+            }
+            TypedExpression::Struct(s) => {
+                let mut later = later;
+                for f in s.fields.iter_mut().rev() {
+                    later = self.expr(&mut f.value, later, strip);
+                }
+                later
+            }
+            _ => true,
+        }
+    }
+
+    /// `pending != nil`: the check after a call that may have raised.
+    fn is_check(&self, cond: &Node) -> bool {
+        matches!(&cond.node, TypedExpression::Binary(b)
+            if b.op == BinaryOp::Ne
+                && matches!(&b.left.node, TypedExpression::Variable(n) if *n == self.pending)
+                && matches!(&b.right.node, TypedExpression::Literal(TypedLiteral::Null)))
+    }
+
+    /// A check's else branch that only stores the line.
+    fn is_restore(&self, els: Option<&TypedBlock>) -> bool {
+        let Some(b) = els else {
+            return false;
+        };
+        let [only] = b.statements.as_slice() else {
+            return false;
+        };
+        let TypedStatement::Expression(e) = &only.node else {
+            return false;
+        };
+        matches!(&e.node, TypedExpression::Binary(b)
+            if b.op == BinaryOp::Assign
+                && matches!(&b.left.node, TypedExpression::Variable(n) if *n == self.line)
+                && matches!(&b.right.node, TypedExpression::Literal(TypedLiteral::Integer(_))))
+    }
+}
 
 /// A label's name in the typed program, from its number.
 fn label_name(id: u32) -> InternedString {
@@ -8722,6 +8960,7 @@ fn chunk_module(
         if types::falls_through(ast.nodes()) {
             main.return_stmt(&[], span, &mut statements)?;
         }
+        module.strip_line_restores(&mut statements);
         module.facts.borrow_mut().insert(
             CHUNK,
             RaiseFact {
@@ -9235,6 +9474,7 @@ pub(crate) fn program(
                     body.insert(0, entry_line_save(span));
                 }
                 body.push(ret(None, span));
+                module.strip_line_restores(&mut body);
                 let name = format!("{CHUNK_FN}${k}");
                 module.functions.borrow_mut().push(typed_function(
                     &name,
@@ -9275,6 +9515,7 @@ pub(crate) fn program(
             if types::falls_through(ast.nodes()) {
                 statements.push(ret(None, span));
             }
+            module.strip_line_restores(&mut statements);
             statements
         };
         if let Some(env) = module.env_var {

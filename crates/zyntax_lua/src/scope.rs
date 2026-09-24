@@ -41,6 +41,21 @@ pub struct VarInfo {
     /// A `local function` whose body refers to itself by value: its
     /// record cannot hold a copy of itself, so it goes through a cell.
     pub self_captured: bool,
+    /// What its declaration assigns it, as far as that tells a function.
+    pub init: Init,
+}
+
+/// The value a `local` declaration gives a variable, when it is known
+/// to be a function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Init {
+    /// Nothing known: no value, or one of another kind.
+    Other,
+    /// This function: `local function f`, or a function expression.
+    Function(FuncId),
+    /// The first result of calling the name whose token starts at this
+    /// byte offset, with the arguments it is given.
+    Call(usize),
 }
 
 impl VarInfo {
@@ -76,6 +91,9 @@ pub struct FuncInfo {
     /// Declared at the chunk's outermost block as `function f` or
     /// `local function f`, so it can be a top-level function.
     pub top_level: bool,
+    /// Every way out of its body returns a function expression as its
+    /// first value: a call to it that returns yields a function.
+    pub returns_function: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -182,6 +200,36 @@ impl Scopes {
         (self.global_writes.get(name).copied().unwrap_or(0) == 1).then_some(f)
     }
 
+    /// Whether a variable holds a function from its declaration on and
+    /// no statement assigns it again: every read of it is a function,
+    /// never nil, since a name is only visible once its declaration has
+    /// run (a `local function` inside its own body as well). Which
+    /// function it is, the types say.
+    pub fn always_function(&self, v: VarId) -> bool {
+        let info = self.var(v);
+        if info.assigned {
+            return false;
+        }
+        match info.init {
+            Init::Other => false,
+            Init::Function(_) => true,
+            Init::Call(callee) => {
+                let f = match self.names.get(&callee) {
+                    Some(Binding::Local(u) | Binding::Upvalue(u)) => match self.var(*u).init {
+                        Init::Function(f) if !self.var(*u).assigned => f,
+                        _ => return false,
+                    },
+                    Some(Binding::Global(name)) => match self.known_global_function(name) {
+                        Some(f) => f,
+                        None => return false,
+                    },
+                    _ => return false,
+                };
+                self.func(f).returns_function
+            }
+        }
+    }
+
     /// Whether a name is the globals table: `_G` or `_ENV`, neither
     /// shadowed by a local.
     pub fn is_globals_name(name: &str) -> bool {
@@ -265,6 +313,7 @@ pub fn resolve(ast: &ast::Ast) -> Scopes {
         name: "main".to_string(),
         escapes: false,
         top_level: true,
+        returns_function: false,
     });
     w.frames.push(Frame {
         id: CHUNK,
@@ -319,6 +368,7 @@ impl Walker {
             is_function: false,
             attribute,
             self_captured: false,
+            init: Init::Other,
         });
         self.frame().blocks.last_mut().unwrap().insert(name, id);
         self.out.decls.insert(pos_of(token), id);
@@ -575,15 +625,19 @@ impl Walker {
                     .attributes()
                     .map(|a| a.map(|a| name_of(a.name())))
                     .collect();
+                let exprs: Vec<&Expression> = l.expressions().iter().collect();
                 for (i, name) in l.names().iter().enumerate() {
                     let attribute = attributes.get(i).cloned().flatten();
-                    self.declare(name, attribute);
+                    let var = self.declare(name, attribute);
+                    let init = exprs.get(i).map_or(Init::Other, |e| self.init_of(e));
+                    self.out.vars[var.0 as usize].init = init;
                 }
             }
             Stmt::LocalFunction(f) => {
                 let var = self.declare(f.name(), None);
                 self.out.vars[var.0 as usize].is_function = true;
                 let id = self.function(f.body(), false, name_of(f.name()));
+                self.out.vars[var.0 as usize].init = Init::Function(id);
                 self.out.local_functions.insert(var, id);
                 let top = self.current() == CHUNK && self.frame().blocks.len() == 1;
                 self.out.funcs[id.0 as usize].top_level = top;
@@ -646,6 +700,7 @@ impl Walker {
             name,
             escapes: false,
             top_level: false,
+            returns_function: false,
         });
         self.out.func_at.insert(pos, id);
         self.frames.push(Frame {
@@ -666,6 +721,7 @@ impl Walker {
                 is_function: false,
                 attribute: None,
                 self_captured: false,
+                init: Init::Other,
             });
             self.frame().blocks.last_mut().unwrap().insert(name, vid);
             params.push(vid);
@@ -684,7 +740,28 @@ impl Walker {
         self.out.funcs[id.0 as usize].params = params;
         self.stmts(body.block(), false);
         self.frames.pop();
+        self.out.funcs[id.0 as usize].returns_function =
+            !crate::types::falls_through(body.block()) && returns_functions(body.block());
         id
+    }
+
+    /// What a declaration's expression tells of the value, once the
+    /// expression has been walked.
+    fn init_of(&self, e: &Expression) -> Init {
+        match e {
+            Expression::Parentheses { expression, .. } => self.init_of(expression),
+            Expression::Function(f) => Init::Function(self.out.func_at[&body_pos(f.body())]),
+            Expression::FunctionCall(c) => {
+                let suffixes: Vec<&Suffix> = c.suffixes().collect();
+                match (c.prefix(), suffixes.as_slice()) {
+                    (Prefix::Name(callee), [Suffix::Call(ast::Call::AnonymousCall(_))]) => {
+                        Init::Call(pos_of(callee))
+                    }
+                    _ => Init::Other,
+                }
+            }
+            _ => Init::Other,
+        }
     }
 
     fn var_expression(&mut self, v: &ast::VarExpression) {
@@ -837,4 +914,35 @@ impl Walker {
             _ => {}
         }
     }
+}
+
+/// Whether every `return` in a block, outside nested functions, has a
+/// function expression as its first value.
+fn returns_functions(block: &Block) -> bool {
+    let first_is_function = |r: &ast::Return| {
+        let mut e = r.returns().iter().next();
+        while let Some(Expression::Parentheses { expression, .. }) = e {
+            e = Some(expression);
+        }
+        matches!(e, Some(Expression::Function(_)))
+    };
+    if let Some(ast::LastStmt::Return(r)) = block.last_stmt()
+        && !first_is_function(r)
+    {
+        return false;
+    }
+    block.stmts().all(|stmt| match stmt {
+        Stmt::Do(d) => returns_functions(d.block()),
+        Stmt::If(i) => {
+            returns_functions(i.block())
+                && i.else_if()
+                    .is_none_or(|e| e.iter().all(|e| returns_functions(e.block())))
+                && i.else_block().is_none_or(returns_functions)
+        }
+        Stmt::While(w) => returns_functions(w.block()),
+        Stmt::Repeat(r) => returns_functions(r.block()),
+        Stmt::NumericFor(f) => returns_functions(f.block()),
+        Stmt::GenericFor(f) => returns_functions(f.block()),
+        _ => true,
+    })
 }

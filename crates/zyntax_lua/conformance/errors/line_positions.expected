@@ -1,0 +1,20 @@
+false	line_positions.lua:5: big
+false	line_positions.lua:16: attempt to perform arithmetic on a nil value
+false	line_positions.lua:17: attempt to concatenate a table value
+false	line_positions.lua:18: attempt to perform arithmetic on a nil value (field 'y')
+false	line_positions.lua:19: deep 2
+false	line_positions.lua:20: deep 3
+false	line_positions.lua:12: attempt to index a nil value (field 'x')
+false	line_positions.lua:22: attempt to perform arithmetic on a nil value
+false	line_positions.lua:23: bad argument #3 to 'rep' (string expected, got table)
+false	line_positions.lua:24: bad argument #2 to 'format' (number has no integer representation)
+false	line_positions.lua:25: bad argument #2 to 'format' (value has no literal form)
+false	line_positions.lua:28: attempt to perform arithmetic on a nil value
+false	line_positions.lua:33: attempt to compare number with nil
+false	line_positions.lua:41: attempt to concatenate a table value
+false	line_positions.lua:5: big
+false	line_positions.lua:57: fail at 2
+false	line_positions.lua:61: fail2 at 3
+false	line_positions.lua:62: attempt to perform arithmetic on a nil value (field 'missing')
+false	line_positions.lua:65: attempt to perform arithmetic on a nil value (local 'b')
+false	line_positions.lua:65: attempt to add a 'string' with a 'table'

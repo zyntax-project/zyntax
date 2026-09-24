@@ -1,0 +1,17 @@
+local function	342
+function expression	42	5.0
+recursive	3628800
+first 1
+second 2
+1 2 3 
+branch
+false	local_function_direct.lua:44: attempt to call a nil value (upvalue 'gone')
+closure	354
+1
+false	local_function_direct.lua:66: attempt to call a nil value (upvalue 'none')
+2	0
+2	nil
+nested	50
+global
+local
+global
