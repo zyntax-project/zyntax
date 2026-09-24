@@ -81,7 +81,7 @@
 //! }
 //!
 //! // Export the async function
-//! #[no_mangle]
+//! #[unsafe(no_mangle)]
 //! pub extern "C" fn http_get(url: *const u8) -> *const ZrtlPromise {
 //!     let state = Box::new(HttpRequestState {
 //!         header: StateMachineHeader::new(),

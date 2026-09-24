@@ -38,7 +38,7 @@ pub fn runtime_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     // This ensures the function is exported as exactly "$haxe$trace$int" (or whatever name)
     let expanded = quote! {
         #(#attrs)*
-        #[export_name = #symbol_name]
+        #[unsafe(export_name = #symbol_name)]
         #vis #sig #block
 
         // Register this symbol in the inventory for JIT runtime lookup
@@ -162,7 +162,7 @@ pub fn runtime_method(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Use export_name to set the exact symbol name for both JIT and AOT linking
     let expanded = quote! {
         #(#attrs)*
-        #[export_name = #symbol_name]
+        #[unsafe(export_name = #symbol_name)]
         #vis #sig #block
 
         // Register the runtime symbol for JIT lookup

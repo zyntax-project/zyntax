@@ -80,7 +80,7 @@ pub fn zrtl_plugin(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         // Plugin info export
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub static _zrtl_info: ::zrtl::ZrtlInfo = ::zrtl::ZrtlInfo {
             version: ::zrtl::ZRTL_VERSION,
             name: concat!(#name_value, "\0").as_ptr() as *const ::std::ffi::c_char,
@@ -90,7 +90,7 @@ pub fn zrtl_plugin(input: TokenStream) -> TokenStream {
         // using the inventory crate for collection
         ::inventory::collect!(::zrtl::ZrtlSymbolEntry);
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub static mut _zrtl_symbols: [::zrtl::ZrtlSymbol; 256] = [::zrtl::ZrtlSymbol {
             name: ::std::ptr::null(),
             ptr: ::std::ptr::null(),
@@ -98,9 +98,9 @@ pub fn zrtl_plugin(input: TokenStream) -> TokenStream {
 
         // Constructor to populate the symbol table
         #[used]
-        #[cfg_attr(target_os = "linux", link_section = ".init_array")]
-        #[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
-        #[cfg_attr(target_os = "windows", link_section = ".CRT$XCU")]
+        #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+        #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+        #[cfg_attr(target_os = "windows", unsafe(link_section = ".CRT$XCU"))]
         static INIT_SYMBOLS: extern "C" fn() = {
             extern "C" fn init() {
                 unsafe {
@@ -175,7 +175,7 @@ pub fn zrtl_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     let symbol_name_with_null = format!("{}\0", symbol_name);
 
     let expanded = quote! {
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         #func
 
         // Register the symbol using inventory
@@ -391,7 +391,7 @@ pub fn zrtl_async(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         // Poll function (extern "C" for ABI compatibility)
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         unsafe extern "C" fn #poll_fn_name(state: *mut u8) -> i64 {
             let state_machine = &mut *(state as *mut #state_machine_name);
 
@@ -421,7 +421,7 @@ pub fn zrtl_async(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         // Wrapper function that creates the promise
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         #func_vis extern "C" fn #wrapper_fn_name(#params) -> *const ::zrtl::ZrtlPromise {
             // Create the future
             let future: ::std::pin::Pin<Box<dyn ::std::future::Future<Output = #return_type> + Send>> =
