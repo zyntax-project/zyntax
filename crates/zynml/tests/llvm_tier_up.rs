@@ -49,7 +49,7 @@ fn tier_up_to_llvm_dispatches_correctly() {
         def trivial(): i64 { return 7 }
         "#,
         1, // warm
-        1, // hot — fires immediately after r#gen=1
+        1, // hot — fires immediately after gen=1
     );
 
     // Call repeatedly to drive both tier promotions. The tick callback
@@ -59,7 +59,7 @@ fn tier_up_to_llvm_dispatches_correctly() {
     // dispatches into LLVM-emitted code.
     //
     // Beadie indexing reminder: `install_compiled` (Tier 0) leaves
-    // generation at 0, so r#gen=0 means "running Cranelift", r#gen=1 means
+    // generation at 0, so gen=0 means "running Cranelift", gen=1 means
     // "running LLVM" (after the PromotionBroker swap).
     for _ in 0..30 {
         let r = rt.call_function_raw("trivial", vec![]).unwrap();
@@ -82,7 +82,7 @@ fn tier_up_to_llvm_dispatches_correctly() {
         .unwrap_or(0);
     assert!(
         reached_llvm,
-        "LLVM tier never fired (max r#gen = {})",
+        "LLVM tier never fired (max gen = {})",
         max_gen
     );
 

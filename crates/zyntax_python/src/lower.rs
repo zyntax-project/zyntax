@@ -602,7 +602,7 @@ fn is_generator_start(r#gen: &Node) -> bool {
     )
 }
 
-/// `zb_fiber_free(r#gen)`: a drained generator's fiber released.
+/// `zb_fiber_free(gen)`: a drained generator's fiber released.
 fn free_generator(r#gen: Node, span: Span) -> Stmt {
     TypedNode::new(
         TypedStatement::Expression(Box::new(call("zb_fiber_free", vec![r#gen], Ty::None, span))),
@@ -10027,7 +10027,7 @@ impl<'m> Lowerer<'m> {
         ])
     }
 
-    /// `match r#gen.next() { Some(x) => { ... }, _ => { ... } }` as a
+    /// `match gen.next() { Some(x) => { ... }, _ => { ... } }` as a
     /// statement, with `x` bound as `item` in the first arm.
     fn next_match(
         &mut self,
@@ -10178,7 +10178,7 @@ impl<'m> Lowerer<'m> {
         var(out, Ty::List(Elem::Object), span)
     }
 
-    /// `next(r#gen)`: the next value, or the default, or StopIteration.
+    /// `next(gen)`: the next value, or the default, or StopIteration.
     fn next_of(&mut self, r#gen: Node, default: Option<Node>, span: Span) -> Val {
         let mut pre = Vec::new();
         let result = self.temp();

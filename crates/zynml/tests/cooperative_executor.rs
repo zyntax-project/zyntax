@@ -186,13 +186,13 @@ fn timeout_frees_a_fiber_owning_tasks_fiber() {
     compile(
         &mut rt,
         r#"
-        fiber def r#gen(): i64 {
+        fiber def gen(): i64 {
             yield 1
             yield 2
             yield 3
         }
         async def main(): i64 {
-            let f = r#gen()
+            let f = gen()
             let mut sum: i64 = 0
             while let Some(x) = f.next() {
                 await sleep(500)
