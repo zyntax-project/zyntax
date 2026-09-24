@@ -84,36 +84,78 @@ pub fn function_abi(function: &HirFunction, address_taken: bool) -> FunctionAbi 
     }
 }
 
-/// The entry shapes LLVM can currently publish into a Cranelift call cell.
-/// Growable list headers stay at their caller-owned address so changes to
-/// their data pointer, length, or capacity remain visible to aliases;
-/// they arrive and return as that address.
+/// Whether LLVM can compile `function` to the convention above, so its
+/// entry can stand in a call cell Cranelift callers read.
+///
+/// A struct or array parameter arrives as the address of the caller's
+/// storage, which the body reads and writes in place; a struct of one
+/// scalar field arrives as that scalar; a struct returned by value is
+/// written through the destination. A union, several return values, an
+/// array returned by value, and a struct returned by value from a
+/// function whose address is taken (which returns it directly) are
+/// refused, as is any aggregate whose fields the two backends might lay
+/// out differently.
 pub fn llvm_entry_abi_supported(function: &HirFunction, address_taken: bool) -> bool {
     let abi = function_abi(function, address_taken);
-    let direct_shape = |ty: &HirType| {
-        !matches!(
-            ty,
-            HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_)
-        )
+    let returns: Vec<&HirType> = function
+        .signature
+        .returns
+        .iter()
+        .filter(|t| **t != HirType::Void)
+        .collect();
+    let param = |ty: &HirType, pass: &Pass| match (ty, pass) {
+        (HirType::Struct(s), Pass::Direct) => struct_carried_as_its_field(s).is_some(),
+        (HirType::Struct(_) | HirType::Array(_, _), Pass::Pointer) => laid_out_alike(ty),
+        (HirType::Union(_) | HirType::Array(_, _), _) => false,
+        _ => true,
     };
-    let travels = |ty: &HirType, pass: &Pass| match pass {
-        Pass::Direct => direct_shape(ty),
-        Pass::Pointer => matches!(ty, HirType::Struct(s) if is_growable_list_header(s)),
+    let ret = |ty: &HirType, pass: &Pass| match (ty, pass) {
+        (HirType::Struct(s), Pass::Direct) => struct_carried_as_its_field(s).is_some(),
+        (HirType::Struct(s), Pass::Pointer) if is_growable_list_header(s) => true,
+        (HirType::Struct(_), Pass::Pointer) => {
+            abi.destination.as_ref() == Some(ty) && laid_out_alike(ty)
+        }
+        (HirType::Union(_) | HirType::Array(_, _), _) => false,
+        _ => true,
     };
-    abi.destination.is_none()
-        && function
-            .signature
-            .returns
-            .iter()
-            .filter(|t| **t != HirType::Void)
-            .zip(&abi.returns)
-            .all(|(ret, pass)| travels(ret, pass))
+    returns.len() <= 1
+        && returns.iter().zip(&abi.returns).all(|(t, p)| ret(t, p))
         && function
             .signature
             .params
             .iter()
             .zip(&abi.params)
-            .all(|(param, pass)| travels(&param.ty, pass))
+            .all(|(p, pass)| param(&p.ty, pass))
+}
+
+/// Whether both backends put the bytes of a value of `ty` in the same
+/// places: fields at their natural alignment, nested structs and arrays
+/// inline, every leaf a scalar or an address.
+fn laid_out_alike(ty: &HirType) -> bool {
+    match ty {
+        HirType::Struct(s) => s.fields.iter().all(laid_out_alike),
+        HirType::Array(elem, _) => laid_out_alike(elem),
+        HirType::Bool
+        | HirType::I8
+        | HirType::I16
+        | HirType::I32
+        | HirType::I64
+        | HirType::I128
+        | HirType::U8
+        | HirType::U16
+        | HirType::U32
+        | HirType::U64
+        | HirType::U128
+        | HirType::F32
+        | HirType::F64
+        | HirType::USize
+        | HirType::ISize
+        | HirType::Ptr(_)
+        | HirType::Ref { .. }
+        | HirType::Function(_)
+        | HirType::Opaque(_) => true,
+        _ => false,
+    }
 }
 
 /// How a value of `ty` travels.
@@ -266,24 +308,44 @@ mod tests {
         assert_eq!(abi.destination, None);
         // An address in, an address out: the LLVM entry can take it.
         assert!(llvm_entry_abi_supported(&f, false));
-        // A struct returned as a value needs a destination the entry
-        // cannot pass.
+        // A struct returned as a value goes through the destination.
         let f = function(vec![list()], vec![vec3()]);
-        assert!(!llvm_entry_abi_supported(&f, false));
+        assert!(llvm_entry_abi_supported(&f, false));
+        // Unless the address is taken, when it would come back directly.
+        assert!(!llvm_entry_abi_supported(&f, true));
     }
 
     #[test]
-    fn llvm_entry_keeps_mutable_list_parameters_by_address() {
+    fn llvm_entry_takes_aggregates_by_address_and_refuses_unions() {
         let f = function(vec![list(), HirType::I64], vec![HirType::I64]);
         assert!(llvm_entry_abi_supported(&f, false));
-        let f = function(vec![vec3()], vec![HirType::I64]);
-        assert!(!llvm_entry_abi_supported(&f, false));
+        let f = function(vec![vec3(), HirType::I64], vec![vec3()]);
+        assert!(llvm_entry_abi_supported(&f, false));
+        let f = function(vec![HirType::Array(Box::new(HirType::F64), 4)], vec![]);
+        assert!(llvm_entry_abi_supported(&f, false));
         let wrapped = HirType::Struct(HirStructType {
             name: None,
             fields: vec![HirType::I64],
             packed: false,
         });
-        let f = function(vec![wrapped], vec![HirType::I64]);
+        let f = function(vec![wrapped.clone()], vec![wrapped]);
+        assert!(llvm_entry_abi_supported(&f, false));
+        let union = HirType::Union(Box::new(crate::hir::HirUnionType {
+            name: None,
+            variants: vec![],
+            discriminant_type: Box::new(HirType::U8),
+            is_c_union: false,
+        }));
+        let f = function(vec![union.clone()], vec![HirType::I64]);
+        assert!(!llvm_entry_abi_supported(&f, false));
+        let holding_union = HirType::Struct(HirStructType {
+            name: None,
+            fields: vec![HirType::I64, union],
+            packed: false,
+        });
+        let f = function(vec![holding_union], vec![HirType::I64]);
+        assert!(!llvm_entry_abi_supported(&f, false));
+        let f = function(vec![HirType::I64], vec![HirType::I64, HirType::I64]);
         assert!(!llvm_entry_abi_supported(&f, false));
     }
 

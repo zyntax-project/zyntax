@@ -88,3 +88,36 @@ fn a_site_asked_during_an_entry_count_promotion_gets_the_optimizing_tier() {
     }
     assert!(transfers > 0, "no frame moved to a resume point in 20 runs");
 }
+
+/// A loop whose number is an integer on one path and a float on the
+/// other runs in an outlined region taking a Number aggregate. LLVM
+/// compiles that region with the aggregate by address, and the frame
+/// transfers into it.
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn a_region_taking_a_number_aggregate_runs_on_llvm() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/number_region.lua");
+    let output = Command::new(env!("CARGO_BIN_EXE_zylua"))
+        .arg("run")
+        .arg(script)
+        .env("ZYLUA_LLVM", "1")
+        .env("ZYNTAX_OSR_TRACE", "1")
+        .output()
+        .expect("zylua starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    // lua5.4 prints the same.
+    assert_eq!(stdout.trim(), "16757736", "{stderr}");
+    assert!(
+        stderr.contains("(lua$main$1$resume0) at tier 1"),
+        "the region was not recompiled at tier 1:\n{stderr}"
+    );
+    assert!(stderr.contains("[osr] llvm install tier=1"), "{stderr}");
+    assert!(
+        stderr.contains("(llvm)") && stderr.contains("FIRST TRANSFER"),
+        "no transfer into LLVM code:\n{stderr}"
+    );
+    assert!(!stderr.contains("unsupported LLVM entry ABI"), "{stderr}");
+    assert!(!stderr.contains("LLVM compile failed"), "{stderr}");
+}

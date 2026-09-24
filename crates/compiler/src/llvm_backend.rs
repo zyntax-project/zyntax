@@ -46,6 +46,16 @@ pub struct CrossTierCallee {
     pub cell: usize,
 }
 
+/// Where a call shaped by a native convention goes.
+#[derive(Clone, Copy)]
+enum NativeTarget<'ctx> {
+    /// The entry held in the call cell at this address.
+    Cell(usize),
+    /// A function of this module, with its calling convention and
+    /// whether the call is in tail position.
+    Function(FunctionValue<'ctx>, u32, bool),
+}
+
 // Helper macro to convert inkwell errors to CompilerError
 macro_rules! llvm_try {
     ($expr:expr) => {
@@ -151,6 +161,14 @@ pub struct LLVMBackend<'ctx> {
     cross_tier: std::collections::HashMap<HirId, CrossTierCallee>,
     /// A promoted entry whose signature must match its Cranelift callers.
     entry_abi: Option<(HirId, crate::abi::FunctionAbi)>,
+    /// That entry as a call site in this module reaches it: its own
+    /// recursive calls are shaped by the same convention.
+    entry_callee: Option<(HirId, CrossTierCallee)>,
+    /// The destination the function being compiled writes its returned
+    /// struct through, and returns. It is storage the caller set aside
+    /// for the result, so it never aliases a parameter or the returned
+    /// value's own storage; the copy into it is a memmove all the same.
+    entry_destination: Option<PointerValue<'ctx>>,
     /// External declarations in a promoted module use the native ABI.
     native_external_abi: bool,
     /// HIR aliases of one native symbol may view its pointer-sized result
@@ -258,6 +276,8 @@ impl<'ctx> LLVMBackend<'ctx> {
             x86_target_vnni: false,
             cross_tier: std::collections::HashMap::new(),
             entry_abi: None,
+            entry_callee: None,
+            entry_destination: None,
             native_external_abi: false,
             native_return_types: std::collections::HashMap::new(),
             shared_globals: std::collections::HashMap::new(),
@@ -277,7 +297,9 @@ impl<'ctx> LLVMBackend<'ctx> {
     }
 
     /// Use the shared ABI for a function published into another tier's
-    /// call cell. Aggregate list parameters arrive as their live address.
+    /// call cell: aggregate parameters arrive as the address of the
+    /// caller's storage, a struct returned by value goes through a
+    /// leading destination.
     pub fn set_entry_abi(&mut self, id: HirId, abi: crate::abi::FunctionAbi) {
         self.entry_abi = Some((id, abi));
         self.native_external_abi = true;
@@ -583,6 +605,54 @@ impl<'ctx> LLVMBackend<'ctx> {
         }
     }
 
+    /// The LLVM type of a function entered by `abi`: a leading `ptr` for
+    /// a destination, then each parameter as the address of its storage
+    /// or as itself (a struct of one scalar as that scalar), returning
+    /// the destination, an address, or the value. The definition of an
+    /// entry and every call to one take their type from here.
+    fn entry_fn_type(
+        &self,
+        params: &[HirType],
+        returns: &[HirType],
+        abi: &crate::abi::FunctionAbi,
+    ) -> CompilerResult<FunctionType<'ctx>> {
+        use crate::abi::Pass;
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(params.len() + 1);
+        if abi.destination.is_some() {
+            param_types.push(ptr_ty.into());
+        }
+        for (ty, pass) in params.iter().zip(&abi.params) {
+            param_types.push(match pass {
+                Pass::Pointer => ptr_ty.into(),
+                Pass::Direct => self.direct_type(ty)?.into(),
+            });
+        }
+        let returns: Vec<&HirType> = returns.iter().filter(|t| **t != HirType::Void).collect();
+        Ok(match (returns.as_slice(), abi.returns.as_slice()) {
+            ([], _) => self.context.void_type().fn_type(&param_types, false),
+            ([_], [Pass::Pointer]) => ptr_ty.fn_type(&param_types, false),
+            ([ret], [Pass::Direct]) => self.direct_type(ret)?.fn_type(&param_types, false),
+            _ => {
+                return Err(CompilerError::CodeGen(
+                    "an entry with several return values".into(),
+                ));
+            }
+        })
+    }
+
+    /// The register form of a value of `ty` that travels as itself: a
+    /// struct of one scalar field is that scalar.
+    fn direct_type(&self, ty: &HirType) -> CompilerResult<BasicTypeEnum<'ctx>> {
+        match ty {
+            HirType::Struct(s) => match crate::abi::struct_carried_as_its_field(s) {
+                Some(field) => self.translate_type(field),
+                None => self.translate_type(ty),
+            },
+            _ => self.translate_type(ty),
+        }
+    }
+
     /// Declare a function signature without compiling its body
     ///
     /// This allows other functions to call this one before it's fully compiled.
@@ -591,13 +661,19 @@ impl<'ctx> LLVMBackend<'ctx> {
         id: HirId,
         func: &HirFunction,
     ) -> CompilerResult<FunctionValue<'ctx>> {
-        // Translate parameter types
+        if !func.is_external
+            && let Some(abi) = self
+                .entry_abi
+                .as_ref()
+                .and_then(|(entry, abi)| (*entry == id).then(|| abi.clone()))
+        {
+            return self.declare_entry(id, func, abi);
+        }
+        // An extern of a promoted module takes aggregates by address.
         let native_abi = if func.is_external && self.native_external_abi {
             Some(crate::abi::function_abi(func, true))
         } else {
-            self.entry_abi
-                .as_ref()
-                .and_then(|(entry, abi)| (*entry == id).then_some(abi.clone()))
+            None
         };
         let entry_passes = native_abi.as_ref().map(|abi| &abi.params);
         let param_types: Vec<BasicMetadataTypeEnum> = func
@@ -649,26 +725,7 @@ impl<'ctx> LLVMBackend<'ctx> {
             tuple_type.fn_type(&param_types, false)
         };
 
-        // Add function to module
-        // Use actual name for:
-        // - External functions (for linking with C libraries)
-        // - Main function (for linker entry point in AOT compilation)
-        // Otherwise use mangled name with HirId for internal functions
-        let actual_name = func
-            .name
-            .resolve_global()
-            .unwrap_or_else(|| format!("{:?}", func.name));
-        let fn_name = if func.is_external {
-            // An extern's declared name is an alias; the symbol the host
-            // actually provides is the link name, when one is set.
-            func.link_name.clone().unwrap_or(actual_name)
-        } else if self.entry_names.contains(&actual_name) {
-            // An entry keeps the name a host asks for it by.
-            actual_name
-        } else {
-            // Regular functions use mangled name with HirId
-            format!("func_{:?}", id)
-        };
+        let fn_name = self.symbol_name(id, func);
         let fn_value = if func.is_external && self.native_external_abi {
             match self.module.get_function(&fn_name) {
                 Some(existing) if existing.get_type() == fn_type => existing,
@@ -695,14 +752,73 @@ impl<'ctx> LLVMBackend<'ctx> {
         } else {
             self.module.add_function(&fn_name, fn_type, None)
         };
+        self.finish_declaration(id, func, fn_value, 0);
+        Ok(fn_value)
+    }
 
-        // Set parameter names (helps with debugging IR)
-        for (i, param) in func.signature.params.iter().enumerate() {
-            let param_name = format!("param_{}", i);
-            fn_value
-                .get_nth_param(i as u32)
-                .unwrap()
-                .set_name(&param_name);
+    /// Declare the promoted entry `id` with the convention its Cranelift
+    /// callers use, from [`Self::entry_fn_type`].
+    fn declare_entry(
+        &mut self,
+        id: HirId,
+        func: &HirFunction,
+        abi: crate::abi::FunctionAbi,
+    ) -> CompilerResult<FunctionValue<'ctx>> {
+        let params: Vec<HirType> = func.signature.params.iter().map(|p| p.ty.clone()).collect();
+        let fn_type = self.entry_fn_type(&params, &func.signature.returns, &abi)?;
+        let fn_name = self.symbol_name(id, func);
+        let fn_value = self.module.add_function(&fn_name, fn_type, None);
+        let shift = u32::from(abi.destination.is_some());
+        if shift == 1
+            && let Some(dest) = fn_value.get_nth_param(0)
+        {
+            dest.set_name("dest");
+        }
+        self.finish_declaration(id, func, fn_value, shift);
+        self.entry_callee = Some((
+            id,
+            CrossTierCallee {
+                name: fn_name,
+                params,
+                returns: func.signature.returns.clone(),
+                abi,
+                cell: 0,
+            },
+        ));
+        Ok(fn_value)
+    }
+
+    /// The symbol `func` is declared under. An extern keeps its link
+    /// name (else its own), an entry the name a host asks for it by;
+    /// every other function is mangled to its id.
+    fn symbol_name(&self, id: HirId, func: &HirFunction) -> String {
+        let actual_name = func
+            .name
+            .resolve_global()
+            .unwrap_or_else(|| format!("{:?}", func.name));
+        if func.is_external {
+            func.link_name.clone().unwrap_or(actual_name)
+        } else if self.entry_names.contains(&actual_name) {
+            actual_name
+        } else {
+            format!("func_{:?}", id)
+        }
+    }
+
+    /// Name the declared parameters (the first `shift` are not declared
+    /// ones), set the calling convention and attributes, and record the
+    /// declaration.
+    fn finish_declaration(
+        &mut self,
+        id: HirId,
+        func: &HirFunction,
+        fn_value: FunctionValue<'ctx>,
+        shift: u32,
+    ) {
+        for i in 0..func.signature.params.len() as u32 {
+            if let Some(param) = fn_value.get_nth_param(i + shift) {
+                param.set_name(&format!("param_{i}"));
+            }
         }
 
         // Apply calling-convention + function attributes per the
@@ -724,8 +840,6 @@ impl<'ctx> LLVMBackend<'ctx> {
 
         // Store for later reference
         self.functions.insert(id, fn_value);
-
-        Ok(fn_value)
     }
 
     /// Compile a function body
@@ -745,10 +859,15 @@ impl<'ctx> LLVMBackend<'ctx> {
         self.value_map.clear(); // Clear value_map between functions
         self.type_map.clear(); // Clear type_map between functions
 
+        // The entry block is the first one appended, so it is LLVM's entry.
+        let entry_block_name = format!("bb_{:?}", func.entry_block);
+        let entry_llvm_block = self.context.append_basic_block(fn_value, &entry_block_name);
+        self.block_map.insert(func.entry_block, entry_llvm_block);
+
         // Map function parameters to HIR value IDs and store their types
-        for (i, param) in func.signature.params.iter().enumerate() {
-            let param_value = fn_value.get_nth_param(i as u32).unwrap();
-            self.value_map.insert(param.id, param_value);
+        let params = self.entry_params(id, func, fn_value, entry_llvm_block)?;
+        for (param, value) in func.signature.params.iter().zip(&params) {
+            self.value_map.insert(param.id, *value);
             self.type_map.insert(param.id, param.ty.clone());
         }
 
@@ -768,8 +887,8 @@ impl<'ctx> LLVMBackend<'ctx> {
                 HirValueKind::Parameter(param_index) => {
                     // SSA creates new value IDs for parameters with HirValueKind::Parameter
                     // Map these to the actual LLVM function parameters
-                    if let Some(param_value) = fn_value.get_nth_param(*param_index) {
-                        self.value_map.insert(*value_id, param_value);
+                    if let Some(param_value) = params.get(*param_index as usize) {
+                        self.value_map.insert(*value_id, *param_value);
                         self.type_map.insert(*value_id, value.ty.clone());
                     }
                 }
@@ -798,12 +917,7 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
         }
 
-        // Phase 1: Create LLVM basic blocks for all HIR blocks
-        // IMPORTANT: Create entry block FIRST, as the first block added becomes the entry in LLVM IR
-        let entry_block_name = format!("bb_{:?}", func.entry_block);
-        let entry_llvm_block = self.context.append_basic_block(fn_value, &entry_block_name);
-        self.block_map.insert(func.entry_block, entry_llvm_block);
-
+        // Phase 1: Create LLVM basic blocks for the other HIR blocks.
         // Create remaining blocks in insertion order (IndexMap preserves insertion order)
         // This ensures deterministic LLVM IR generation and correct phi node handling
         for (block_id, _) in func.blocks.iter() {
@@ -898,7 +1012,151 @@ impl<'ctx> LLVMBackend<'ctx> {
         // (LLVM will check that all blocks have terminators and phi nodes are valid)
 
         self.current_function = None;
+        self.entry_destination = None;
         Ok(())
+    }
+
+    /// The value each declared parameter of `func` has in its body. The
+    /// declared parameters of a promoted entry follow its destination,
+    /// which becomes [`Self::entry_destination`]; one carried as its
+    /// single field is put back into its struct at the top of the entry
+    /// block. An aggregate arriving by address stays that address, so
+    /// the body works on the caller's storage.
+    fn entry_params(
+        &mut self,
+        id: HirId,
+        func: &HirFunction,
+        fn_value: FunctionValue<'ctx>,
+        entry_block: BasicBlock<'ctx>,
+    ) -> CompilerResult<Vec<BasicValueEnum<'ctx>>> {
+        let has_destination = self
+            .entry_abi
+            .as_ref()
+            .is_some_and(|(entry, abi)| *entry == id && abi.destination.is_some());
+        let shift = u32::from(has_destination);
+        self.entry_destination = if has_destination {
+            let dest = fn_value.get_nth_param(0).ok_or_else(|| {
+                CompilerError::CodeGen("entry declared without its destination".into())
+            })?;
+            Some(dest.into_pointer_value())
+        } else {
+            None
+        };
+        self.builder.position_at_end(entry_block);
+        let mut params = Vec::with_capacity(func.signature.params.len());
+        for (i, param) in func.signature.params.iter().enumerate() {
+            let raw = fn_value.get_nth_param(i as u32 + shift).ok_or_else(|| {
+                CompilerError::CodeGen(format!(
+                    "{} declared without its parameter {i}",
+                    func.name.resolve_global().unwrap_or_default()
+                ))
+            })?;
+            let value = match &param.ty {
+                HirType::Struct(s)
+                    if !raw.is_struct_value()
+                        && crate::abi::struct_carried_as_its_field(s).is_some() =>
+                {
+                    self.wrap_in_struct(raw, &param.ty)?
+                }
+                _ => raw,
+            };
+            params.push(value);
+        }
+        Ok(params)
+    }
+
+    /// The field of `value`, a struct of one field, when `want` is the
+    /// type that field travels as.
+    fn carried_field(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        want: BasicTypeEnum<'ctx>,
+    ) -> CompilerResult<Option<BasicValueEnum<'ctx>>> {
+        let BasicValueEnum::StructValue(sv) = value else {
+            return Ok(None);
+        };
+        if sv.get_type().count_fields() != 1
+            || sv.get_type().get_field_type_at_index(0) != Some(want)
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.builder.build_extract_value(sv, 0, "carried")?))
+    }
+
+    /// Return the value `id` through `dest`: its bytes are written there
+    /// and `dest` is what the function returns.
+    fn return_through_destination(
+        &mut self,
+        dest: PointerValue<'ctx>,
+        id: HirId,
+    ) -> CompilerResult<()> {
+        let val = self.get_value(id)?;
+        if val.is_struct_value() || val.is_array_value() {
+            self.builder.build_store(dest, val)?;
+        } else if val.is_pointer_value() {
+            let ty = self
+                .entry_abi
+                .as_ref()
+                .and_then(|(_, abi)| abi.destination.clone())
+                .ok_or_else(|| {
+                    CompilerError::CodeGen("destination return without its type".into())
+                })?;
+            self.copy_aggregate(dest, val.into_pointer_value(), &ty)?;
+        } else {
+            return Err(CompilerError::CodeGen(format!(
+                "return of {id:?} through a destination, but it is {val:?}"
+            )));
+        }
+        self.builder.build_return(Some(&dest))?;
+        Ok(())
+    }
+
+    /// Copy the bytes of a value of `ty` from `src` to `dest`. A memmove:
+    /// nothing here proves the two apart.
+    fn copy_aggregate(
+        &self,
+        dest: PointerValue<'ctx>,
+        src: PointerValue<'ctx>,
+        ty: &HirType,
+    ) -> CompilerResult<()> {
+        let size = self
+            .translate_type(ty)?
+            .size_of()
+            .ok_or_else(|| CompilerError::CodeGen(format!("copy of {ty:?}, which has no size")))?;
+        self.builder
+            .build_memmove(dest, 1, src, 1, size)
+            .map_err(|e| CompilerError::CodeGen(format!("aggregate copy: {e}")))?;
+        Ok(())
+    }
+
+    /// Write the value `id` to `ptr`. An aggregate held by address has
+    /// its bytes copied, never the address itself.
+    fn store_value(&self, ptr: PointerValue<'ctx>, id: HirId) -> CompilerResult<()> {
+        let val = self.get_value(id)?;
+        let by_reference = self
+            .type_map
+            .get(&id)
+            .is_some_and(|ty| crate::hir_interp::held(ty) == crate::hir_interp::Held::ByReference);
+        if by_reference && val.is_pointer_value() {
+            let ty = self.type_map[&id].clone();
+            return self.copy_aggregate(ptr, val.into_pointer_value(), &ty);
+        }
+        self.builder.build_store(ptr, val)?;
+        Ok(())
+    }
+
+    /// `value`, a struct of one field carried as that field, back in its
+    /// struct of type `ty`.
+    fn wrap_in_struct(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        ty: &HirType,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        let struct_ty = self.translate_type(ty)?.into_struct_type();
+        Ok(self
+            .builder
+            .build_insert_value(struct_ty.get_undef(), value, 0, "wrapped")?
+            .as_basic_value_enum())
     }
 
     /// Emit an OSR helper for `header`: a standalone function that resumes
@@ -1239,7 +1497,13 @@ impl<'ctx> LLVMBackend<'ctx> {
                         .map_err(load)?
                 }
             } else {
-                let held = self.translate_type(hir_ty)?;
+                // A struct of one field the entry takes as that field is
+                // read as the field.
+                let held = if want.is_struct_type() {
+                    self.translate_type(hir_ty)?
+                } else {
+                    self.direct_type(hir_ty)?
+                };
                 let value = self
                     .builder
                     .build_load(held, at, "osr_live_in")
@@ -1262,6 +1526,19 @@ impl<'ctx> LLVMBackend<'ctx> {
             call.try_as_basic_value(),
             helper.get_type().get_return_type(),
         ) {
+            (ValueKind::Basic(value), Some(BasicTypeEnum::StructType(want)))
+                if !value.is_struct_value() && want.count_fields() == 1 =>
+            {
+                let field = want.get_field_type_at_index(0).ok_or_else(|| {
+                    CompilerError::CodeGen("OSR re-entry return has no field".into())
+                })?;
+                let value = self.coerce_scalar(value, field)?;
+                let wrapped = self
+                    .builder
+                    .build_insert_value(want.get_undef(), value, 0, "osr_wrapped")
+                    .map_err(ret)?;
+                self.builder.build_return(Some(&wrapped)).map_err(ret)?;
+            }
             (ValueKind::Basic(value), Some(want)) => {
                 let value = self.coerce_scalar(value, want)?;
                 self.builder.build_return(Some(&value)).map_err(ret)?;
@@ -1662,6 +1939,9 @@ impl<'ctx> LLVMBackend<'ctx> {
                 if values.is_empty() {
                     self.builder.build_return(None)?;
                 } else if values.len() == 1 {
+                    if let Some(dest) = self.entry_destination {
+                        return self.return_through_destination(dest, values[0]);
+                    }
                     let val = self.get_value(values[0])?;
                     // Defensive: if the operand's LLVM type does not match
                     // the function's declared return type, synthesize a
@@ -1677,7 +1957,12 @@ impl<'ctx> LLVMBackend<'ctx> {
                         Some(et) => et != val.get_type(),
                         None => true, // void function but we have a value
                     };
-                    if needs_fixup {
+                    if needs_fixup
+                        && let Some(et) = expected
+                        && let Some(field) = self.carried_field(val, et)?
+                    {
+                        self.builder.build_return(Some(&field))?;
+                    } else if needs_fixup {
                         if let Some(et) = expected {
                             // An aggregate returned as its address must be
                             // one already; a copy of the header would be
@@ -2046,9 +2331,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 volatile: _,
             } => {
                 let addr = self.get_value(*ptr)?;
-                let val = self.get_value(*value)?;
-                let ptr_val = addr.into_pointer_value();
-                self.builder.build_store(ptr_val, val)?;
+                self.store_value(addr.into_pointer_value(), *value)?;
             }
 
             HirInstruction::Alloca {
@@ -2271,7 +2554,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                     };
 
                     // Store the value
-                    self.builder.build_store(field_ptr, val)?;
+                    self.store_value(field_ptr, *value)?;
 
                     // The result is the original pointer (for chaining)
                     self.value_map.insert(*result, current_agg);
@@ -2299,6 +2582,18 @@ impl<'ctx> LLVMBackend<'ctx> {
                         let coerced = match expected {
                             Some(et) if et != val.get_type() && is_placeholder_zero => {
                                 self.zero_of_basic_type(et)
+                            }
+                            // An aggregate field arriving as the address
+                            // of its bytes is read from there.
+                            Some(et)
+                                if (et.is_struct_type() || et.is_array_type())
+                                    && val.is_pointer_value() =>
+                            {
+                                self.builder.build_load(
+                                    et,
+                                    val.into_pointer_value(),
+                                    "field_read",
+                                )?
                             }
                             _ => val,
                         };
@@ -4458,14 +4753,27 @@ impl<'ctx> LLVMBackend<'ctx> {
     }
 
     /// A call to a function another tier compiled: through its cell, in
-    /// the shape its convention gives it. An aggregate argument the body
-    /// holds as a value is spilled to the frame and passed by address,
-    /// one it holds as an address is passed as it is; a struct the callee
-    /// returns through a destination is read back from the storage
-    /// passed for it.
+    /// the shape its convention gives it (see [`Self::compile_native_call`]).
     fn compile_cross_tier_call(
         &mut self,
         callee: &CrossTierCallee,
+        args: &[HirId],
+        expects_value: bool,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        self.compile_native_call(callee, NativeTarget::Cell(callee.cell), args, expects_value)
+    }
+
+    /// A call in the shape `callee`'s convention gives it, whose type is
+    /// the one [`Self::entry_fn_type`] declares an entry with. An
+    /// aggregate argument the body holds as a value is spilled to the
+    /// frame and passed by address, one it holds as an address is passed
+    /// as it is; a struct of one field goes as that field; a struct the
+    /// callee returns through a destination is read back from the
+    /// storage passed for it.
+    fn compile_native_call(
+        &mut self,
+        callee: &CrossTierCallee,
+        target: NativeTarget<'ctx>,
         args: &[HirId],
         expects_value: bool,
     ) -> CompilerResult<BasicValueEnum<'ctx>> {
@@ -4478,15 +4786,14 @@ impl<'ctx> LLVMBackend<'ctx> {
                 callee.params.len()
             )));
         }
-        let ptr_ty = self.context.i8_type().ptr_type(AddressSpace::default());
+        let fn_type = self.entry_fn_type(&callee.params, &callee.returns, &callee.abi)?;
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64t = self.context.i64_type();
-        let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::new();
         let mut arg_values: Vec<BasicMetadataValueEnum> = Vec::new();
         let destination = match &callee.abi.destination {
             Some(ty) => {
                 let llvm_ty = self.translate_type(ty)?;
                 let slot = self.entry_alloca(llvm_ty, "ret_dest")?;
-                param_types.push(ptr_ty.into());
                 arg_values.push(slot.into());
                 Some((slot, llvm_ty))
             }
@@ -4496,7 +4803,6 @@ impl<'ctx> LLVMBackend<'ctx> {
             let value = self.get_value(*arg)?;
             match pass {
                 Pass::Pointer => {
-                    param_types.push(ptr_ty.into());
                     let address = if value.is_pointer_value() {
                         value.into_pointer_value()
                     } else if value.is_int_value() {
@@ -4510,8 +4816,8 @@ impl<'ctx> LLVMBackend<'ctx> {
                     arg_values.push(address.into());
                 }
                 Pass::Direct => {
-                    let llvm_ty = self.translate_type(ty)?;
-                    param_types.push(llvm_ty.into());
+                    let llvm_ty = self.direct_type(ty)?;
+                    let value = self.carried_field(value, llvm_ty)?.unwrap_or(value);
                     let coerced: BasicValueEnum = match (llvm_ty, value) {
                         (BasicTypeEnum::IntType(it), BasicValueEnum::PointerValue(pv)) => {
                             self.builder.build_ptr_to_int(pv, it, "arg_p2i")?.into()
@@ -4534,34 +4840,46 @@ impl<'ctx> LLVMBackend<'ctx> {
                 }
             }
         }
-        let fn_type = match (callee.returns.as_slice(), callee.abi.returns.as_slice()) {
-            ([], _) => self.context.void_type().fn_type(&param_types, false),
-            ([_], [Pass::Pointer]) => ptr_ty.fn_type(&param_types, false),
-            ([ret], [Pass::Direct]) => self.translate_type(ret)?.fn_type(&param_types, false),
-            _ => {
-                return Err(CompilerError::CodeGen(format!(
-                    "call to {} across tiers: several return values",
-                    callee.name
-                )));
+        let call_site = match target {
+            NativeTarget::Cell(cell) => {
+                let cell = self.builder.build_int_to_ptr(
+                    i64t.const_int(cell as u64, false),
+                    ptr_ty,
+                    "cell",
+                )?;
+                let entry = self
+                    .builder
+                    .build_load(ptr_ty, cell, "entry")?
+                    .into_pointer_value();
+                self.builder
+                    .build_indirect_call(fn_type, entry, &arg_values, "cross_tier_call")?
+            }
+            NativeTarget::Function(function, cc, is_tail) => {
+                let call = self
+                    .builder
+                    .build_call(function, &arg_values, "entry_call")?;
+                if cc != 0 {
+                    call.set_call_convention(cc);
+                }
+                // `tail` promises the callee reads no alloca of this
+                // frame, which a destination or spilled argument is.
+                call.set_tail_call(is_tail && callee.abi.is_scalar());
+                call
             }
         };
-        let cell = self.builder.build_int_to_ptr(
-            i64t.const_int(callee.cell as u64, false),
-            ptr_ty,
-            "cell",
-        )?;
-        let target = self
-            .builder
-            .build_load(ptr_ty, cell, "entry")?
-            .into_pointer_value();
-        let call_site =
-            self.builder
-                .build_indirect_call(fn_type, target, &arg_values, "cross_tier_call")?;
         if let Some((slot, llvm_ty)) = destination {
             return Ok(self.builder.build_load(llvm_ty, slot, "ret")?);
         }
         match call_site.try_as_basic_value() {
-            ValueKind::Basic(val) => Ok(val),
+            ValueKind::Basic(val) => match callee.returns.iter().find(|t| **t != HirType::Void) {
+                Some(ret @ HirType::Struct(s))
+                    if !val.is_struct_value()
+                        && crate::abi::struct_carried_as_its_field(s).is_some() =>
+                {
+                    self.wrap_in_struct(val, ret)
+                }
+                _ => Ok(val),
+            },
             ValueKind::Instruction(_) if !expects_value => {
                 Ok(self.context.i32_type().get_undef().into())
             }
@@ -4591,6 +4909,23 @@ impl<'ctx> LLVMBackend<'ctx> {
             {
                 let callee = self.cross_tier[func_id].clone();
                 self.compile_cross_tier_call(&callee, args, expects_value)
+            }
+            // The entry calling itself, in the convention it is declared with.
+            HirCallable::Function(func_id)
+                if self
+                    .entry_callee
+                    .as_ref()
+                    .is_some_and(|(entry, _)| entry == func_id) =>
+            {
+                let (_, callee) = self.entry_callee.clone().unwrap();
+                let function = self.functions[func_id];
+                let cc = self.func_cc.get(func_id).copied().unwrap_or(0);
+                self.compile_native_call(
+                    &callee,
+                    NativeTarget::Function(function, cc, is_tail),
+                    args,
+                    expects_value,
+                )
             }
             HirCallable::Function(func_id) => {
                 // Direct function call
@@ -4661,6 +4996,16 @@ impl<'ctx> LLVMBackend<'ctx> {
                             self.builder.build_store(slot, av)?;
                             slot.into()
                         }
+                        // An aggregate the body holds by address, for a
+                        // parameter taking the value.
+                        (
+                            Some(BasicMetadataTypeEnum::StructType(st)),
+                            BasicMetadataValueEnum::PointerValue(pv),
+                        ) => self.builder.build_load(*st, pv, "call_arg_read")?.into(),
+                        (
+                            Some(BasicMetadataTypeEnum::ArrayType(at)),
+                            BasicMetadataValueEnum::PointerValue(pv),
+                        ) => self.builder.build_load(*at, pv, "call_arg_read")?.into(),
                         (_, other) => other,
                     };
                     arg_values.push(coerced);

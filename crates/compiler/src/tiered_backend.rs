@@ -4053,17 +4053,19 @@ fn publish_late_resume_point(
     }
 }
 
-/// Calls across the LLVM/Cranelift boundary stay indirect. A large
-/// list-entry body made of such calls offers LLVM little headroom. An
-/// intrinsic lowers in place and a cold callee is off the hot path, so
-/// neither is a boundary call.
+/// Whether an entry taking a growable list header can go to LLVM. Calls
+/// across the LLVM/Cranelift boundary stay indirect, so a large
+/// list-entry body made of such calls offers LLVM little headroom and is
+/// kept on Cranelift. An intrinsic lowers in place and a cold callee is
+/// off the hot path, so neither is a boundary call. Keyed on list headers
+/// only; other aggregate parameters do not trip it.
 fn llvm_list_entry_has_headroom(f: &HirFunction, module: &HirModule) -> bool {
-    use crate::abi::{Pass, function_abi};
     use crate::hir::{HirCallable, HirInstruction};
-    if function_abi(f, false)
+    if !f
+        .signature
         .params
         .iter()
-        .all(|p| *p == Pass::Direct)
+        .any(|p| matches!(&p.ty, crate::hir::HirType::Struct(s) if crate::abi::is_growable_list_header(s)))
     {
         return true;
     }
@@ -4650,5 +4652,75 @@ fn remap_body(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::llvm_list_entry_has_headroom;
+    use crate::hir::{
+        HirCallable, HirFunction, HirFunctionSignature, HirInstruction, HirModule, HirParam,
+        HirStructType, HirType, ParamOwnership,
+    };
+    use zyntax_typed_ast::InternedString;
+
+    fn calling_100_times(param: HirType) -> (HirFunction, HirModule) {
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        let callee = HirFunction::new(
+            InternedString::new_global("g"),
+            HirFunctionSignature {
+                params: vec![],
+                returns: vec![HirType::Void],
+                type_params: vec![],
+                const_params: vec![],
+                lifetime_params: vec![],
+                is_variadic: false,
+                is_async: false,
+                is_fiber: false,
+                effects: vec![],
+                is_pure: false,
+            },
+        );
+        let callee_id = callee.id;
+        module.add_function(callee);
+        let mut signature = module.functions[&callee_id].signature.clone();
+        signature.params = vec![HirParam {
+            id: crate::hir::HirId::new(),
+            name: InternedString::new_global("p"),
+            ty: param,
+            attributes: Default::default(),
+            ownership: ParamOwnership::default(),
+        }];
+        let mut f = HirFunction::new(InternedString::new_global("f"), signature);
+        let entry = f.entry_block;
+        for _ in 0..100 {
+            f.blocks[&entry].instructions.push(HirInstruction::Call {
+                result: None,
+                callee: HirCallable::Function(callee_id),
+                args: vec![],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            });
+        }
+        (f, module)
+    }
+
+    #[test]
+    fn only_a_list_header_parameter_is_held_to_the_call_budget() {
+        let vec3 = HirType::Struct(HirStructType {
+            name: Some(InternedString::new_global("Vec3")),
+            fields: vec![HirType::F64, HirType::F64, HirType::F64],
+            packed: false,
+        });
+        let (f, module) = calling_100_times(vec3);
+        assert!(llvm_list_entry_has_headroom(&f, &module));
+        let list = HirType::Struct(HirStructType {
+            name: Some(InternedString::new_global("List")),
+            fields: vec![HirType::I64, HirType::I64, HirType::I64],
+            packed: false,
+        });
+        let (f, module) = calling_100_times(list);
+        assert!(!llvm_list_entry_has_headroom(&f, &module));
     }
 }

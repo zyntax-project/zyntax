@@ -409,3 +409,206 @@ fn llvm_gives_two_calls_two_values() {
 
     assert_eq!(got, EXPECTED);
 }
+
+/// A struct entering an LLVM entry by address and leaving through the
+/// destination, called through the cell Cranelift callers use.
+#[cfg(feature = "llvm-backend")]
+mod aggregate_entry {
+    use super::*;
+
+    fn vec3_ty() -> HirType {
+        HirType::Struct(HirStructType {
+            name: Some(InternedString::new_global("Vec3")),
+            fields: vec![HirType::I64, HirType::I64, HirType::I64],
+            packed: false,
+        })
+    }
+
+    /// `def bump(a: Vec3, k: i64): Vec3 { a.x += k; return Vec3 { x: a.x * 2,
+    /// y: a.y + k, z: a.z * k } }`: writes into the argument's storage, then
+    /// returns a fresh struct through the destination.
+    fn build_bump() -> HirFunction {
+        let mut f = HirFunction::new(
+            InternedString::new_global("bump"),
+            sig(vec![vec3_ty(), HirType::I64], vec![vec3_ty()]),
+        );
+        let a = add_value(&mut f, vec3_ty(), HirValueKind::Parameter(0));
+        let k = add_value(&mut f, HirType::I64, HirValueKind::Parameter(1));
+        let two = konst(&mut f, 2);
+        let i64v = |f: &mut HirFunction| add_value(f, HirType::I64, HirValueKind::Instruction);
+        let vec3v = |f: &mut HirFunction| add_value(f, vec3_ty(), HirValueKind::Instruction);
+        let (a0, s, b0, b1, b2, t0, t1, t2) = (
+            i64v(&mut f),
+            i64v(&mut f),
+            i64v(&mut f),
+            i64v(&mut f),
+            i64v(&mut f),
+            i64v(&mut f),
+            i64v(&mut f),
+            i64v(&mut f),
+        );
+        let a1 = vec3v(&mut f);
+        let undef = add_value(&mut f, vec3_ty(), HirValueKind::Undef);
+        let (r0, r1, r2) = (vec3v(&mut f), vec3v(&mut f), vec3v(&mut f));
+        let extract = |result: HirId, agg: HirId, idx: u32| HirInstruction::ExtractValue {
+            result,
+            ty: HirType::I64,
+            aggregate: agg,
+            indices: vec![idx],
+        };
+        let insert =
+            |result: HirId, agg: HirId, value: HirId, idx: u32| HirInstruction::InsertValue {
+                result,
+                ty: vec3_ty(),
+                aggregate: agg,
+                value,
+                indices: vec![idx],
+            };
+        let arith =
+            |op: BinaryOp, result: HirId, left: HirId, right: HirId| HirInstruction::Binary {
+                op,
+                result,
+                ty: HirType::I64,
+                left,
+                right,
+            };
+        let blk = body(&mut f);
+        blk.instructions.extend([
+            extract(a0, a, 0),
+            arith(BinaryOp::Add, s, a0, k),
+            insert(a1, a, s, 0),
+            extract(b0, a1, 0),
+            extract(b1, a1, 1),
+            extract(b2, a1, 2),
+            arith(BinaryOp::Mul, t0, b0, two),
+            arith(BinaryOp::Add, t1, b1, k),
+            arith(BinaryOp::Mul, t2, b2, k),
+            insert(r0, undef, t0, 0),
+            insert(r1, r0, t1, 1),
+            insert(r2, r1, t2, 2),
+        ]);
+        blk.terminator = HirTerminator::Return { values: vec![r2] };
+        f
+    }
+
+    /// `def bump_main(): i64 { let a = Vec3 {1, 2, 3}; let r = bump(a, 10);
+    /// ... }`, folding the bytes of `a` after the call and of `r` into one
+    /// number, two decimal digits per field.
+    fn build_bump_main(bump_id: HirId) -> HirFunction {
+        let mut f = HirFunction::new(
+            InternedString::new_global("bump_main"),
+            sig(vec![], vec![HirType::I64]),
+        );
+        let consts: Vec<HirId> = [1, 2, 3, 10]
+            .into_iter()
+            .map(|v| konst(&mut f, v))
+            .collect();
+        let hundred = konst(&mut f, 100);
+        let undef = add_value(&mut f, vec3_ty(), HirValueKind::Undef);
+        let a: Vec<HirId> = (0..3)
+            .map(|_| add_value(&mut f, vec3_ty(), HirValueKind::Instruction))
+            .collect();
+        let r = add_value(&mut f, vec3_ty(), HirValueKind::Instruction);
+        let fields: Vec<HirId> = (0..6)
+            .map(|_| add_value(&mut f, HirType::I64, HirValueKind::Instruction))
+            .collect();
+        let acc: Vec<HirId> = (0..10)
+            .map(|_| add_value(&mut f, HirType::I64, HirValueKind::Instruction))
+            .collect();
+        let blk = body(&mut f);
+        let mut prev = undef;
+        for (i, slot) in a.iter().enumerate() {
+            blk.instructions.push(HirInstruction::InsertValue {
+                result: *slot,
+                ty: vec3_ty(),
+                aggregate: prev,
+                value: consts[i],
+                indices: vec![i as u32],
+            });
+            prev = *slot;
+        }
+        blk.instructions.push(HirInstruction::Call {
+            result: Some(r),
+            callee: HirCallable::Function(bump_id),
+            args: vec![a[2], consts[3]],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        for (i, field) in fields.iter().enumerate() {
+            blk.instructions.push(HirInstruction::ExtractValue {
+                result: *field,
+                ty: HirType::I64,
+                aggregate: if i < 3 { a[2] } else { r },
+                indices: vec![(i % 3) as u32],
+            });
+        }
+        // ((((f0 * 100 + f1) * 100 + f2) * 100 + f3) * 100 + f4) * 100 + f5
+        let mut total = fields[0];
+        for (step, field) in fields[1..].iter().enumerate() {
+            let (scaled, summed) = (acc[2 * step], acc[2 * step + 1]);
+            blk.instructions.push(HirInstruction::Binary {
+                op: BinaryOp::Mul,
+                result: scaled,
+                ty: HirType::I64,
+                left: total,
+                right: hundred,
+            });
+            blk.instructions.push(HirInstruction::Binary {
+                op: BinaryOp::Add,
+                result: summed,
+                ty: HirType::I64,
+                left: scaled,
+                right: *field,
+            });
+            total = summed;
+        }
+        blk.terminator = HirTerminator::Return {
+            values: vec![total],
+        };
+        f
+    }
+
+    /// `a` is {11, 2, 3} after the call and `r` is {22, 12, 30}.
+    const BUMP_EXPECTED: i64 = 11_02_03_22_12_30;
+
+    /// One call cell, entered first by Cranelift's code for `bump` and then
+    /// by LLVM's, from the same Cranelift caller: the argument's storage and
+    /// the returned struct come out byte for byte the same.
+    #[test]
+    fn llvm_entry_takes_a_struct_by_address_and_returns_through_the_destination() {
+        use inkwell::context::Context;
+        use std::sync::Arc;
+        use zyntax_compiler::cranelift_backend::CraneliftBackend;
+        use zyntax_compiler::llvm_jit_backend::LLVMJitBackend;
+
+        let bump = build_bump();
+        let bump_id = bump.id;
+        let main = build_bump_main(bump_id);
+        let main_id = main.id;
+        let mut module = HirModule::new(InternedString::new_global("struct_entry"));
+        module.functions.insert(bump_id, bump.clone());
+        module.functions.insert(main_id, main);
+
+        let mut cranelift = CraneliftBackend::new().expect("backend");
+        cranelift.set_reloadable_calls(true);
+        cranelift.compile_module(&module).expect("compile");
+        cranelift.finalize_definitions().expect("finalize");
+        let ptr = cranelift.get_function_ptr(main_id).expect("main compiled");
+        let run: unsafe extern "C" fn() -> i64 = unsafe { std::mem::transmute(ptr) };
+        let on_cranelift = unsafe { run() };
+        assert_eq!(on_cranelift, BUMP_EXPECTED);
+
+        let context = Context::create();
+        let mut llvm = LLVMJitBackend::new(&context).expect("backend");
+        llvm.set_use_mcjit(true);
+        llvm.set_module_context(Arc::new(module.clone()));
+        llvm.set_cross_tier_links(cranelift.reload_key(), Arc::new(|_| None));
+        llvm.compile_function(bump_id, &bump)
+            .expect("LLVM takes the aggregate entry");
+        let entry = llvm.get_function_pointer(bump_id).expect("bump compiled");
+        cranelift.publish_call_target(bump_id, entry as usize);
+        let on_llvm = unsafe { run() };
+        assert_eq!(on_llvm, on_cranelift);
+    }
+}
