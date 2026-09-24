@@ -5855,6 +5855,19 @@ impl Typer<'_> {
                 {
                     return self.member_call_ty(m, c);
                 }
+                // A variable is called through the value it holds, as
+                // lowering does, whatever builtin shares its name.
+                if let Some(held) = self
+                    .vars
+                    .get(name)
+                    .or_else(|| self.outer.get(name))
+                    .or_else(|| self.module.globals.get(name))
+                {
+                    return match held {
+                        Ty::Unknown => Ty::Unknown,
+                        _ => Ty::Object,
+                    };
+                }
                 self.builtin_call(name, c)
             }
             // `super().m(...)`: the base's method.
