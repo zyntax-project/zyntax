@@ -2188,7 +2188,8 @@ impl<'a> Round<'a> {
     fn call(&mut self, c: &ast::FunctionCall) {
         let suffixes: Vec<&Suffix> = c.suffixes().collect();
         // `setmetatable(t, m)` links a shape to its class; `rawset`
-        // stores; neither loses its table.
+        // stores; neither loses its table. The `debug` library's
+        // metatable functions do the same to a table.
         if let Some(b) = self.typer().builtin_callee(c.prefix(), &suffixes)
             && let Some(Suffix::Call(ast::Call::AnonymousCall(ast::FunctionArgs::Parentheses {
                 arguments,
@@ -2196,11 +2197,12 @@ impl<'a> Round<'a> {
             }))) = suffixes.last()
         {
             let args: Vec<&Expression> = arguments.iter().collect();
-            if b.lib.is_empty()
+            if (b.lib.is_empty()
                 && matches!(
                     b.name,
                     "setmetatable" | "getmetatable" | "rawset" | "rawget"
-                )
+                ))
+                || (b.lib == "debug" && matches!(b.name, "setmetatable" | "getmetatable"))
             {
                 self.metatable_builtin(b.name, &args);
                 return;

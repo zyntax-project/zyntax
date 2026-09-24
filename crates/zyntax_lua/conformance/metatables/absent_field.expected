@@ -23,3 +23,6 @@ locked	false	cannot change a protected metatable
 1	2	20
 15	5	15
 count=5 total=15
+swapped a	2
+nil
+through the class

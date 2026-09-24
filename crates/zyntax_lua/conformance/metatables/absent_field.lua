@@ -109,3 +109,16 @@ local keys = {}
 for key, value in pairs(acc) do keys[#keys + 1] = key .. "=" .. tostring(value) end
 table.sort(keys)
 print(table.concat(keys, " "))
+
+-- 11. metatables given and read through the debug library
+local Q = {}
+Q.__index = Q
+local dq = setmetatable({a = nil, b = 2}, Q)
+debug.setmetatable(dq, {__index = function(_, key) return "swapped " .. key end})
+print(dq.a, dq.b)
+local R = {}
+R.__index = R
+local dr = setmetatable({a = nil, b = 2}, R)
+print(dr.a)
+debug.getmetatable(dr).a = "through the class"
+print(dr.a)
