@@ -24,12 +24,14 @@ mod host_os;
 pub mod library;
 mod lower;
 mod pack;
+mod parse;
 pub mod pattern;
 mod policy;
 mod scope;
 mod types;
 
 pub use host::set_args;
+pub use parse::SyntaxError;
 use policy::LIBRARY_MODULE;
 pub use policy::POLICY;
 
@@ -39,7 +41,11 @@ pub use policy::POLICY;
 /// [`Error::render`] shows it against the source.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Lua that does not parse.
+    /// Lua the reference refuses to read, with its message and line as
+    /// the reference gives them.
+    #[error("Lua syntax error: {}", .0.message)]
+    Rejected(parse::SyntaxError),
+    /// Lua that does not parse, found while it is compiled.
     #[error("Lua syntax error: {message} at {}..{}", span.0, span.1)]
     Syntax {
         message: String,
@@ -63,11 +69,31 @@ impl Error {
         }
     }
 
+    /// The error on one line, as the reference reports a chunk it cannot
+    /// read: `chunk:line: message`. `chunk` is the chunk's name as a
+    /// message shows it.
+    pub fn one_line(&self, chunk: &str, source: &str) -> String {
+        let line_of = |at: usize| source[..at.min(source.len())].matches('\n').count() + 1;
+        match self {
+            Error::Rejected(e) => e.with_chunk(chunk),
+            Error::Syntax { message, span } => format!("{chunk}:{}: {message}", line_of(span.0)),
+            Error::Unsupported { what, span } => {
+                format!("{chunk}:{}: {what} is not supported yet", line_of(span.0))
+            }
+            Error::Library(message) => format!("the built-in library is unreadable: {message}"),
+        }
+    }
+
     /// The error shown against its source, the way the compiler shows
     /// its own diagnostics.
     pub fn render(&self, file: &str, source: &str, use_colors: bool) -> String {
         use zyntax_typed_ast::diagnostics::{Diagnostic, render_diagnostic};
         let (message, label, span) = match self {
+            Error::Rejected(e) => (
+                format!("syntax error: {}", e.message),
+                "here",
+                (e.offset, e.offset),
+            ),
             Error::Syntax { message, span } => (format!("syntax error: {message}"), "here", *span),
             Error::Unsupported { what, span } => (
                 format!("{what} is not supported yet"),
@@ -127,7 +153,17 @@ pub(crate) struct Library {
     types: library::Types,
 }
 
-fn library() -> Result<Library> {
+/// The library, read from the snapshot once per process.
+fn library() -> Result<&'static Library> {
+    static LIBRARY: std::sync::OnceLock<std::result::Result<Library, String>> =
+        std::sync::OnceLock::new();
+    LIBRARY
+        .get_or_init(|| read_library().map_err(|e| e.to_string()))
+        .as_ref()
+        .map_err(|e| Error::Library(e.clone()))
+}
+
+fn read_library() -> Result<Library> {
     let snapshot = snapshot()?;
     let module = snapshot
         .module(LIBRARY_MODULE)
@@ -183,38 +219,34 @@ pub(crate) fn load_chunk(
     index: i64,
     env: *const zrtl::DynamicBox,
 ) -> std::result::Result<*const zrtl::DynamicBox, String> {
-    let ast = match full_moon::parse_fallible(source, full_moon::LuaVersion::lua54()).into_result()
-    {
-        Ok(ast) => ast,
-        Err(errors) => {
-            let first = errors.into_iter().next().expect("an error");
-            let (message, range) = match &first {
-                full_moon::Error::AstError(e) => (e.error_message().to_string(), e.range()),
-                full_moon::Error::TokenizerError(e) => (e.error().to_string(), e.range()),
-            };
-            let line = source[..range.0.bytes().min(source.len())]
-                .matches('\n')
-                .count()
-                + 1;
-            return Err(format!("{chunk_name}:{line}: {message}"));
-        }
-    };
+    let started = std::time::Instant::now();
+    let (ast, source) =
+        parse_chunk(source, LOAD_LEVEL).map_err(|e| e.one_line(chunk_name, source))?;
+    trace_phase("load:parse", started);
+    let started = std::time::Instant::now();
     let library = library().map_err(|e| e.to_string())?;
-    let program = lower::loaded_program(&ast, source, chunk_name, index, library)
-        .map_err(|e| e.render(chunk_name, source, false))?;
+    trace_phase("load:lib", started);
+    let started = std::time::Instant::now();
+    let program = lower::loaded_program(&ast, &source, chunk_name, index, library)
+        .map_err(|e| e.one_line(chunk_name, &source))?;
+    trace_phase("load:lower", started);
+    let started = std::time::Instant::now();
     let runtime = runtime().ok_or("no runtime to load into")?;
     let init = format!("lua$l{index}$init");
-    runtime.declare_entry_points([init.as_str()]);
     runtime
-        .compile_typed_program(program)
+        .join_typed_program(program, &[init.as_str()])
         .map_err(|e| e.to_string())?;
+    trace_phase("load:compile", started);
+    let started = std::time::Instant::now();
     let entry = runtime
         .function_pointer(&init)
         .ok_or("the loaded chunk has no entry")?;
     // SAFETY: `init` was compiled with this signature just above.
     let init: extern "C" fn(*const zrtl::DynamicBox) -> *const zrtl::DynamicBox =
         unsafe { std::mem::transmute(entry) };
-    Ok(init(env))
+    let chunk = init(env);
+    trace_phase("load:init", started);
+    Ok(chunk)
 }
 
 pub fn register_runtime(
@@ -276,28 +308,67 @@ pub(crate) fn escaped_byte(b: u8) -> char {
 }
 pub(crate) const ESCAPED_BYTES: u32 = 0xF700;
 
-pub fn parse_program(source: &str, file: &str) -> Result<TypedProgram> {
-    let started = std::time::Instant::now();
-    let ast = match full_moon::parse_fallible(source, full_moon::LuaVersion::lua54()).into_result()
-    {
-        Ok(ast) => ast,
+/// The C call depth the reference reads a chunk at: a script from the
+/// interpreter's entry, a chunk `load`ed from a script's main chunk.
+const MAIN_LEVEL: usize = 1;
+pub(crate) const LOAD_LEVEL: usize = 2;
+
+/// `text` as the source it was read from: each private-use character
+/// [`source_text`] made of a byte that was not UTF-8 is that byte again.
+fn source_bytes(text: &str) -> std::borrow::Cow<'_, [u8]> {
+    let escaped = |c: char| (ESCAPED_BYTES..ESCAPED_BYTES + 256).contains(&(c as u32));
+    if !text.chars().any(escaped) {
+        return std::borrow::Cow::Borrowed(text.as_bytes());
+    }
+    let mut out = Vec::with_capacity(text.len());
+    let mut utf8 = [0; 4];
+    for c in text.chars() {
+        if escaped(c) {
+            out.push((c as u32 - ESCAPED_BYTES) as u8);
+        } else {
+            out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Read a chunk: refused as the reference refuses it, then parsed. The
+/// text the tree was parsed from comes with it, since a form `full_moon`
+/// does not take is rewritten into one it does, lines unmoved.
+pub(crate) fn parse_chunk(
+    text: &str,
+    level: usize,
+) -> Result<(full_moon::ast::Ast, std::borrow::Cow<'_, str>)> {
+    let bytes = source_bytes(text);
+    let checked = parse::check(&bytes, level).map_err(Error::Rejected)?;
+    let text = match parse::with_breaks_closed(&bytes, &checked) {
+        Some(rewritten) => std::borrow::Cow::Owned(source_text(&rewritten).into_owned()),
+        None => std::borrow::Cow::Borrowed(text),
+    };
+    match full_moon::parse_fallible(&text, full_moon::LuaVersion::lua54()).into_result() {
+        Ok(ast) => Ok((ast, text)),
         Err(errors) => {
             let first = errors.into_iter().next().expect("an error");
             let (message, range) = match &first {
                 full_moon::Error::AstError(e) => (e.error_message().to_string(), e.range()),
                 full_moon::Error::TokenizerError(e) => (e.error().to_string(), e.range()),
             };
-            return Err(Error::Syntax {
+            Err(Error::Syntax {
                 message,
                 span: (range.0.bytes(), range.1.bytes()),
-            });
+            })
         }
-    };
+    }
+}
+
+pub fn parse_program(source: &str, file: &str) -> Result<TypedProgram> {
+    let started = std::time::Instant::now();
+    let (ast, source) = parse_chunk(source, MAIN_LEVEL)?;
     trace_phase("full_moon", started);
     let started = std::time::Instant::now();
     let library = library()?;
     trace_phase("library", started);
-    lower::program(&ast, source, file, library)
+    lower::program(&ast, &source, file, library)
 }
 
 /// `ZYNTAX_TRACE_LOWER_PHASES=1` times the frontend's steps on stderr.

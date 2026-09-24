@@ -23,7 +23,7 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: zylua [run] [-e stat] [file.lua [args...]]";
+const USAGE: &str = "usage: zylua [run] [--pretty-errors] [-e stat] [file.lua [args...]]";
 
 fn run() -> ExitCode {
     let mut args = std::env::args().skip(1).peekable();
@@ -40,17 +40,24 @@ fn run() -> ExitCode {
     // statement joins the chunk's first line so nothing below moves.
     // Without a file, the statements are the whole program.
     let mut prelude = String::new();
+    // `--pretty-errors` shows a chunk that does not compile against its
+    // source; without it the error is one line, as `lua` reports it.
+    let mut pretty = false;
     let mut next = args.next();
-    while next.as_deref() == Some("-e") {
-        match args.next() {
-            Some(stat) => {
-                prelude.push_str(&stat);
-                prelude.push_str("; ");
-            }
-            None => {
-                eprintln!("{USAGE}");
-                return ExitCode::from(2);
-            }
+    loop {
+        match next.as_deref() {
+            Some("--pretty-errors") => pretty = true,
+            Some("-e") => match args.next() {
+                Some(stat) => {
+                    prelude.push_str(&stat);
+                    prelude.push_str("; ");
+                }
+                None => {
+                    eprintln!("{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            _ => break,
         }
         next = args.next();
     }
@@ -78,10 +85,21 @@ fn run() -> ExitCode {
     zyntax_lua::set_args(argv);
     let (source, file) = match &path {
         Some(path) => match std::fs::read(path) {
-            Ok(bytes) => (
-                prelude + &zyntax_lua::source_text(&bytes),
-                path.display().to_string(),
-            ),
+            Ok(mut bytes) => {
+                // A first line starting with `#` is skipped, as `lua` skips
+                // it; its line break stays so lines keep their numbers.
+                if bytes.first() == Some(&b'#') {
+                    let end = bytes
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .unwrap_or(bytes.len());
+                    bytes.drain(..end);
+                }
+                (
+                    prelude + &zyntax_lua::source_text(&bytes),
+                    path.display().to_string(),
+                )
+            }
             Err(e) => {
                 eprintln!("zylua: cannot read {}: {e}", path.display());
                 return ExitCode::from(2);
@@ -104,10 +122,21 @@ fn run() -> ExitCode {
     let program = match zyntax_lua::parse_program(&source, &file) {
         Ok(p) => p,
         Err(e) => {
-            // Colour follows the terminal, NO_COLOR and CLICOLOR_FORCE.
-            let colors = zyntax_typed_ast::diagnostics::colors_enabled();
-            eprint!("{}", e.render(&file, &source, colors));
-            return ExitCode::from(3);
+            if pretty {
+                // Colour follows the terminal, NO_COLOR and CLICOLOR_FORCE.
+                let colors = zyntax_typed_ast::diagnostics::colors_enabled();
+                eprint!("{}", e.render(&file, &source, colors));
+            } else {
+                let chunk = file.strip_prefix('=').unwrap_or(&file);
+                eprintln!("zylua: {}", e.one_line(chunk, &source));
+            }
+            // A chunk Lua refuses fails as `lua` fails it; a form this
+            // frontend does not compile yet is its own status.
+            let refused = matches!(
+                e,
+                zyntax_lua::Error::Rejected(_) | zyntax_lua::Error::Syntax { .. }
+            );
+            return ExitCode::from(if refused { 1 } else { 3 });
         }
     };
     lap("parse");

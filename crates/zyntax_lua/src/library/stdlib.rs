@@ -3480,6 +3480,9 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         any(),
         vec![
             s.decl(text("")),
+            // A chunk is named for its text, or `=(load)` when a reader
+            // gives it, unless the call names it.
+            cname.decl(text("=(load)")),
             if_(
                 and(
                     not(is_nil(chunk.e())),
@@ -3494,7 +3497,10 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                         ),
                     ),
                 ),
-                vec![s.set(call("zl_arg_str", vec![chunk.e(), text("")], string()))],
+                vec![
+                    s.set(call("zl_arg_str", vec![chunk.e(), text("")], string())),
+                    cname.set(s.e()),
+                ],
                 vec![
                     when(
                         not(is_func(chunk.e())),
@@ -3542,7 +3548,6 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     ),
                 ],
             ),
-            cname.decl(text("")),
             when(
                 eq(category(chunk_name.e()), int(STR)),
                 vec![cname.set(get_str(chunk_name.e()))],

@@ -1601,17 +1601,29 @@ thread_local! {
 /// program was compiled with.
 const LOAD_CHUNKS_FROM: i64 = 1 << 20;
 
-/// The chunk name as `luaO_chunkid` spells it: `=name` and `@name` as
-/// given, anything else as `[string "..."]` cut at the first line.
-fn chunk_name(name: &[u8], source: &[u8]) -> String {
-    let text = if name.is_empty() { source } else { name };
-    if let Some(rest) = text.strip_prefix(b"=").or_else(|| text.strip_prefix(b"@")) {
-        return String::from_utf8_lossy(rest).into_owned();
-    }
+/// The chunk name as `luaO_chunkid` spells it within `LUA_IDSIZE`:
+/// `=name` as given, `@name` as given or its end, anything else as
+/// `[string "..."]` cut at the first line.
+fn chunk_name(name: &[u8]) -> String {
     const IDSIZE: usize = 60;
+    if let Some(rest) = name.strip_prefix(b"=") {
+        let shown = if name.len() <= IDSIZE {
+            rest
+        } else {
+            &rest[..IDSIZE - 1]
+        };
+        return String::from_utf8_lossy(shown).into_owned();
+    }
+    if let Some(rest) = name.strip_prefix(b"@") {
+        if name.len() <= IDSIZE {
+            return String::from_utf8_lossy(rest).into_owned();
+        }
+        let keep = IDSIZE - "...".len() - 1;
+        return format!("...{}", String::from_utf8_lossy(&rest[rest.len() - keep..]));
+    }
     let room = IDSIZE - "[string \"".len() - "...\"]".len() - 1;
-    let first_line = text.split(|&b| b == b'\n').next().unwrap_or(b"");
-    let cut = first_line.len() < text.len() || first_line.len() > room;
+    let first_line = name.split(|&b| b == b'\n').next().unwrap_or(b"");
+    let cut = first_line.len() < name.len() || name.len() >= room;
     let shown = if first_line.len() > room {
         &first_line[..room]
     } else {
@@ -1633,7 +1645,7 @@ extern "C" fn host_load(
     env: *const DynamicBox,
 ) -> *const DynamicBox {
     let (source, name) = unsafe { (bytes_of(source), bytes_of(name)) };
-    let chunk_name = chunk_name(name, source);
+    let chunk_name = chunk_name(name);
     let text = crate::source_text(source);
     let index = LOADS.with(|n| {
         let k = n.get();

@@ -1,0 +1,5 @@
+false	true	true	true	false
+true	true	1	2
+true	true	a	b
+42	s
+42	3.0	nil	x

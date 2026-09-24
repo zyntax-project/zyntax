@@ -709,7 +709,19 @@ fn expr_stmt(e: Node) -> St {
     stmt(TypedStatement::Expression(Box::new(e)), span)
 }
 
+thread_local! {
+    /// Every name a chunk being lowered refers to, while one is: what
+    /// it needs declared of the library.
+    static NAMED: std::cell::RefCell<Option<std::collections::HashSet<InternedString>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn var(name: InternedString, ty: Type, span: Span) -> Node {
+    NAMED.with(|named| {
+        if let Some(named) = named.borrow_mut().as_mut() {
+            named.insert(name);
+        }
+    });
     node(TypedExpression::Variable(name), ty, span)
 }
 
@@ -9460,21 +9472,17 @@ fn load_required(first: &[String], main_file: &str) -> Result<(Vec<Loaded>, bool
             all_found = false;
             continue;
         };
-        let source = crate::source_text(&bytes).into_owned();
+        let text = crate::source_text(&bytes);
         let file = path.display().to_string();
-        let ast = match full_moon::parse_fallible(&source, full_moon::LuaVersion::lua54())
-            .into_result()
-        {
-            Ok(ast) => ast,
-            Err(errors) => {
-                let first = errors.into_iter().next().expect("an error");
-                let message = match &first {
-                    full_moon::Error::AstError(e) => e.error_message().to_string(),
-                    full_moon::Error::TokenizerError(e) => e.error().to_string(),
-                };
-                return Err(Error::Library(format!("{file}: {message}")));
-            }
-        };
+        // Positioned in the file it is in, not the program's.
+        let (ast, source) = crate::parse_chunk(&text, crate::LOAD_LEVEL).map_err(|e| {
+            Error::Rejected(crate::parse::SyntaxError {
+                line: None,
+                message: e.one_line(&file, &text),
+                offset: 0,
+            })
+        })?;
+        let source = source.into_owned();
         let scopes = crate::scope::resolve(&ast);
         queue.extend(scopes.requires.iter().cloned());
         loaded.push(Loaded {
@@ -9946,12 +9954,56 @@ pub(crate) fn loaded_program(
     source: &str,
     chunk_name: &str,
     index: i64,
-    library: Library,
+    library: &Library,
 ) -> Result<TypedProgram> {
     let mut scopes = crate::scope::resolve(ast);
     scopes.dynamic_globals = true;
     scopes.len_meta = true;
+    // The chunk is a function value, called by whoever `load` gave it to.
+    scopes.funcs[CHUNK.0 as usize].escapes = true;
     let inferred = types::infer(&scopes, ast);
+    NAMED.with(|named| *named.borrow_mut() = Some(Default::default()));
+    let lowered = loaded_declarations(&scopes, &inferred, ast, source, chunk_name, index, library);
+    let named = NAMED
+        .with(|named| named.borrow_mut().take())
+        .unwrap_or_default();
+    let (mut declarations, registry) = lowered?;
+    // The library's functions the chunk names, and no others: the rest
+    // are already where the chunk will run.
+    let mut import = library_import();
+    if let TypedDeclaration::Import(i) = &mut import.node {
+        i.items = named
+            .into_iter()
+            .map(|name| zyntax_typed_ast::typed_ast::TypedImportItem::Named { name, alias: None })
+            .collect();
+    }
+    declarations.push(import);
+    let span = Span::new(0, source.len());
+    Ok(TypedProgram {
+        declarations,
+        language: Some(intern("lua")),
+        span,
+        source_files: vec![zyntax_typed_ast::source::SourceFile::new(
+            chunk_name.to_string(),
+            source.to_string(),
+        )],
+        type_registry: registry,
+    })
+}
+
+/// The declarations of a loaded chunk: its functions and its `init`.
+fn loaded_declarations(
+    scopes: &Scopes,
+    inferred: &Inferred,
+    ast: &ast::Ast,
+    source: &str,
+    chunk_name: &str,
+    index: i64,
+    library: &Library,
+) -> Result<(
+    Vec<TypedNode<TypedDeclaration>>,
+    zyntax_typed_ast::TypeRegistry,
+)> {
     let tag = format!("l{index}$");
     let env_var = intern(&format!("lua$l{index}$env"));
     let mut declarations = Vec::new();
@@ -9960,8 +10012,8 @@ pub(crate) fn loaded_program(
     let mut registry = library.type_registry.clone();
     let mut hooks = Vec::new();
     let code_name = chunk_module(
-        &scopes,
-        &inferred,
+        scopes,
+        inferred,
         ast,
         source,
         chunk_name,
@@ -9969,7 +10021,7 @@ pub(crate) fn loaded_program(
         index,
         Some(env_var),
         false,
-        &library,
+        library,
         false,
         &mut declarations,
         &mut hooks,
@@ -10010,17 +10062,7 @@ pub(crate) fn loaded_program(
         Type::Unknown,
         span,
     ));
-    declarations.push(library_import());
-    Ok(TypedProgram {
-        declarations,
-        language: Some(intern("lua")),
-        span,
-        source_files: vec![zyntax_typed_ast::source::SourceFile::new(
-            chunk_name.to_string(),
-            source.to_string(),
-        )],
-        type_registry: registry,
-    })
+    Ok((declarations, registry))
 }
 
 /// The entry the host reports an uncaught table error through, in the
@@ -10065,7 +10107,7 @@ pub(crate) fn program(
     ast: &ast::Ast,
     source: &str,
     file: &str,
-    library: Library,
+    library: &Library,
 ) -> Result<TypedProgram> {
     let started = std::time::Instant::now();
     let mut scopes = crate::scope::resolve(ast);
@@ -10304,7 +10346,7 @@ pub(crate) fn program(
             k as i64 + 1,
             env_var,
             true,
-            &library,
+            library,
             true,
             &mut declarations,
             &mut hooks,

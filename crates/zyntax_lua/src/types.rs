@@ -3211,6 +3211,13 @@ fn infer_given(
             );
         }
         round.block(ast.nodes());
+        // A chunk used as a value hands what it returns to callers the
+        // types do not see.
+        if round.is_escaping(CHUNK)
+            && let Some(returns) = round.returns.take()
+        {
+            round.escape_returns(&returns);
+        }
         round.settle_shapes();
         let out = round.out;
         if std::env::var_os("ZYNTAX_TRACE_ROUNDS").is_some() {
