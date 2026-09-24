@@ -294,6 +294,9 @@ pub struct ModuleFacts {
     returns_param: std::collections::HashMap<HirId, Vec<bool>>,
     /// The runtime symbol behind each extern function.
     extern_links: std::collections::HashMap<HirId, String>,
+    /// Functions that are the copying box call on their one parameter
+    /// and nothing else: a call to one boxes a string as that call does.
+    string_boxers: IdSet,
     /// Function names by key, for the trace.
     names: std::collections::HashMap<HirId, String>,
     /// Per callee, which parameters are only borrowed. Keyed on the
@@ -416,11 +419,17 @@ impl ModuleFacts {
             })
             .map(|(key, _)| *key)
             .collect();
-        let extern_links = module
+        let extern_links: std::collections::HashMap<HirId, String> = module
             .functions
             .iter()
             .filter(|(_, f)| f.is_external)
             .filter_map(|(key, f)| f.link_name.clone().map(|n| (*key, n)))
+            .collect();
+        let string_boxers = module
+            .functions
+            .iter()
+            .filter(|(_, f)| wraps_string_boxing(f, &extern_links))
+            .map(|(key, _)| *key)
             .collect();
         let names = module
             .functions
@@ -433,6 +442,7 @@ impl ModuleFacts {
             string_makers,
             returns_param: std::collections::HashMap::new(),
             extern_links,
+            string_boxers,
             names,
             borrowed_params,
             glue,
@@ -1559,12 +1569,60 @@ fn escapes_only_by_return(
 fn boxes_string(callee: &HirCallable, facts: &ModuleFacts) -> bool {
     match callee {
         HirCallable::Symbol(name) => name == STRING_TO_BOX,
-        HirCallable::Function(id) => facts
-            .extern_links
-            .get(id)
-            .is_some_and(|n| n == STRING_TO_BOX),
+        HirCallable::Function(id) => {
+            facts
+                .extern_links
+                .get(id)
+                .is_some_and(|n| n == STRING_TO_BOX)
+                || facts.string_boxers.contains(id)
+        }
         _ => false,
     }
+}
+
+/// Whether `func` is a wrapper of the copying box call: one parameter,
+/// one block, whose only instruction boxes that parameter and whose
+/// result is returned. Such a call means what the box call means, so it
+/// can be turned into the adopting one the same way.
+fn wraps_string_boxing(
+    func: &HirFunction,
+    extern_links: &std::collections::HashMap<HirId, String>,
+) -> bool {
+    if func.is_external || func.blocks.len() != 1 || func.signature.params.len() != 1 {
+        return false;
+    }
+    let Some(block) = func.blocks.get(&func.entry_block) else {
+        return false;
+    };
+    let [
+        HirInstruction::Call {
+            result: Some(result),
+            callee,
+            args,
+            ..
+        },
+    ] = block.instructions.as_slice()
+    else {
+        return false;
+    };
+    let boxes = match callee {
+        HirCallable::Symbol(name) => name == STRING_TO_BOX,
+        HirCallable::Function(id) => extern_links.get(id).is_some_and(|n| n == STRING_TO_BOX),
+        _ => false,
+    };
+    // The body names its parameter by the value of `Parameter` kind,
+    // not by the signature's id.
+    let [arg] = args.as_slice() else {
+        return false;
+    };
+    let is_param = func
+        .values
+        .get(arg)
+        .is_some_and(|v| matches!(v.kind, crate::hir::HirValueKind::Parameter(0)));
+    boxes
+        && is_param
+        && block.phis.is_empty()
+        && matches!(&block.terminator, HirTerminator::Return { values } if values.as_slice() == [*result])
 }
 
 /// One string boxed twice on a path, the first box read only by calls
@@ -4129,5 +4187,138 @@ mod tests {
         // Call's args include `ptr` and our classifier treats that
         // as an escape (refusing to double-insert).
         assert_eq!(stats.escapes_skipped, 1);
+    }
+
+    fn string_param() -> crate::hir::HirParam {
+        crate::hir::HirParam {
+            id: HirId::new(),
+            name: InternedString::new_global("v"),
+            ty: HirType::Ptr(Box::new(HirType::I8)),
+            attributes: Default::default(),
+            ownership: crate::hir::ParamOwnership::Borrowed,
+        }
+    }
+
+    fn string_to_box_sig() -> HirFunctionSignature {
+        HirFunctionSignature {
+            params: vec![string_param()],
+            ..empty_sig(HirType::I64)
+        }
+    }
+
+    /// A module with the extern for the copying box call, the wrapper
+    /// `wrap(v) { return to_dyn(v) }` around it, and
+    /// `boxed() { s = concat(a, b); return wrap(s) }`.
+    fn build_boxing_through_wrapper() -> (HirModule, HirId, HirId) {
+        let extern_key = HirId::new();
+        let mut to_dyn =
+            HirFunction::new(InternedString::new_global("to_dyn"), string_to_box_sig());
+        to_dyn.is_external = true;
+        to_dyn.link_name = Some(STRING_TO_BOX.to_string());
+
+        let wrap_key = HirId::new();
+        let mut wrap = HirFunction::new(InternedString::new_global("wrap"), string_to_box_sig());
+        let entry = HirId::new();
+        wrap.entry_block = entry;
+        wrap.blocks.clear();
+        wrap.blocks.insert(entry, HirBlock::new(entry));
+        let v = HirId::new();
+        wrap.values.insert(
+            v,
+            HirValue {
+                id: v,
+                ty: HirType::Ptr(Box::new(HirType::I8)),
+                kind: HirValueKind::Parameter(0),
+                uses: Default::default(),
+                span: None,
+            },
+        );
+        let boxed = add_inst_val(&mut wrap, HirType::I64);
+        let block = wrap.blocks.get_mut(&entry).unwrap();
+        block.instructions.push(HirInstruction::Call {
+            result: Some(boxed),
+            callee: HirCallable::Function(extern_key),
+            args: vec![v],
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            is_tail: false,
+        });
+        block.terminator = HirTerminator::Return {
+            values: vec![boxed],
+        };
+
+        let caller_key = HirId::new();
+        let mut caller =
+            HirFunction::new(InternedString::new_global("boxed"), empty_sig(HirType::I64));
+        let entry = HirId::new();
+        caller.entry_block = entry;
+        caller.blocks.clear();
+        caller.blocks.insert(entry, HirBlock::new(entry));
+        let a = add_const(
+            &mut caller,
+            HirType::Ptr(Box::new(HirType::I8)),
+            HirConstant::I64(0),
+        );
+        let s = add_inst_val(&mut caller, HirType::Ptr(Box::new(HirType::I8)));
+        let result = add_inst_val(&mut caller, HirType::I64);
+        let block = caller.blocks.get_mut(&entry).unwrap();
+        block.instructions.push(HirInstruction::Call {
+            result: Some(s),
+            callee: HirCallable::Symbol("$IO$string_concat".to_string()),
+            args: vec![a, a],
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            is_tail: false,
+        });
+        block.instructions.push(HirInstruction::Call {
+            result: Some(result),
+            callee: HirCallable::Function(wrap_key),
+            args: vec![s],
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            is_tail: false,
+        });
+        block.terminator = HirTerminator::Return {
+            values: vec![result],
+        };
+
+        let mut m = HirModule::new(InternedString::new_global("m"));
+        m.functions.insert(extern_key, to_dyn);
+        m.functions.insert(wrap_key, wrap);
+        m.functions.insert(caller_key, caller);
+        (m, caller_key, s)
+    }
+
+    /// A fresh string whose last use is the wrapper around the copying
+    /// box call is given to the box instead of being copied and freed.
+    #[test]
+    fn a_string_boxed_through_the_wrapper_is_adopted() {
+        let (mut m, caller_key, s) = build_boxing_through_wrapper();
+        run_module(&mut m);
+        let caller = m.functions.get(&caller_key).unwrap();
+        let block = caller.blocks.values().next().unwrap();
+        let adopted = block.instructions.iter().any(|i| {
+            matches!(
+                i,
+                HirInstruction::Call { callee: HirCallable::Symbol(n), args, .. }
+                    if n == STRING_INTO_BOX && args == &vec![s]
+            )
+        });
+        assert!(
+            adopted,
+            "expected the adopting box call, got {:?}",
+            block.instructions
+        );
+        let freed = block.instructions.iter().any(|i| {
+            matches!(
+                i,
+                HirInstruction::Call { callee: HirCallable::Symbol(n), .. } if n == STRING_FREE
+            )
+        });
+        assert!(
+            !freed,
+            "the box owns the string now, got {:?}",
+            block.instructions
+        );
     }
 }
