@@ -3213,6 +3213,7 @@ impl TieredBackend {
             // Held through the submission, so two frames asking at once
             // make one request between them.
             let outcome_key = (bead_id, tier_idx);
+            let outcomes_for_install = Arc::clone(&outcomes);
             let mut outcomes = outcomes.lock().unwrap();
             if let Some(outcome) = outcomes.get(&outcome_key) {
                 if osr::osr_trace_enabled() {
@@ -3263,6 +3264,8 @@ impl TieredBackend {
             let cranelift = Arc::clone(&cranelift);
             #[cfg(feature = "llvm-backend")]
             let llvm = llvm.clone();
+            #[cfg(feature = "llvm-backend")]
+            let late_for_install = Arc::clone(&late);
             #[cfg(feature = "llvm-backend")]
             let promoted_regions = Arc::clone(&promoted_regions);
             let outlined_regions = Arc::clone(&outlined_regions);
@@ -3316,6 +3319,12 @@ impl TieredBackend {
                 if !entry.is_null() {
                     let key = cranelift.with_lock(|be| be.reload_key());
                     crate::reload::set_call_target(key, func_id, entry as usize);
+                } else {
+                    // No code: the answer is open again, so a later
+                    // request drives the bead anew.
+                    outcomes_for_install.lock().unwrap().remove(&outcome_key);
+                    #[cfg(feature = "llvm-backend")]
+                    late_for_install.lock().unwrap().queued.remove(&bead_id);
                 }
                 entry
             });
