@@ -1690,7 +1690,12 @@ impl<'ctx> LLVMBackend<'ctx> {
                                     values[0]
                                 )));
                             }
-                            let synth = self.zero_of_basic_type(et);
+                            // An address typed as an integer, or the
+                            // reverse, is returned as the same bits.
+                            let synth = match self.reinterpret_int_ptr(val, et)? {
+                                Some(v) => v,
+                                None => self.zero_of_basic_type(et),
+                            };
                             self.builder.build_return(Some(&synth))?;
                         } else {
                             // Void return expected but we have a value — drop it.
@@ -5019,7 +5024,26 @@ impl<'ctx> LLVMBackend<'ctx> {
                     Ok(self.context.i32_type().const_zero().into())
                 } else {
                     match call_site.try_as_basic_value() {
-                        ValueKind::Basic(val) => Ok(val),
+                        ValueKind::Basic(val) => {
+                            // A registered signature may type an address
+                            // as an integer: the result takes the type
+                            // the call declares it with.
+                            let want = match &declared {
+                                Some(ty) if crate::osr::is_held_by_reference(ty) => {
+                                    Some(self.context.ptr_type(AddressSpace::default()).into())
+                                }
+                                Some(ty) if !matches!(ty, HirType::Void) => {
+                                    self.translate_type(ty).ok()
+                                }
+                                _ => None,
+                            };
+                            match want {
+                                Some(want) if want != val.get_type() => {
+                                    Ok(self.reinterpret_int_ptr(val, want)?.unwrap_or(val))
+                                }
+                                _ => Ok(val),
+                            }
+                        }
                         ValueKind::Instruction(_) => {
                             Ok(self.context.i32_type().const_zero().into())
                         }
@@ -6082,6 +6106,32 @@ impl<'ctx> LLVMBackend<'ctx> {
             .get(&id)
             .copied()
             .ok_or_else(|| CompilerError::CodeGen(format!("Value not found: {:?}", id)))
+    }
+
+    /// `val` as `want` when one is an address and the other a 64-bit
+    /// integer: the same bits under the other type. Anything else is
+    /// `None`.
+    fn reinterpret_int_ptr(
+        &self,
+        val: BasicValueEnum<'ctx>,
+        want: BasicTypeEnum<'ctx>,
+    ) -> CompilerResult<Option<BasicValueEnum<'ctx>>> {
+        let i64t = self.context.i64_type();
+        if want.is_pointer_type() && val.is_int_value() && val.into_int_value().get_type() == i64t {
+            return Ok(Some(
+                self.builder
+                    .build_int_to_ptr(val.into_int_value(), want.into_pointer_type(), "as_ptr")?
+                    .into(),
+            ));
+        }
+        if val.is_pointer_value() && want.is_int_type() && want.into_int_type() == i64t {
+            return Ok(Some(
+                self.builder
+                    .build_ptr_to_int(val.into_pointer_value(), i64t, "as_int")?
+                    .into(),
+            ));
+        }
+        Ok(None)
     }
 
     /// Synthesize a zero / null / undef of any LLVM basic type.
