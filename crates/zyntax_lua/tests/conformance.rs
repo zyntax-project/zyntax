@@ -179,15 +179,26 @@ fn expected_for(case: &Path) -> Option<Outcome> {
     Some(got)
 }
 
-fn ours_for(case: &Path) -> Outcome {
+/// Whether the compile worker runs beside the program: off, every
+/// compile is made on the thread that asks for it; on, the worker takes
+/// requests and replaces the quick first compiles of loop-free
+/// functions with optimised ones.
+#[derive(Clone, Copy)]
+enum WarmUp {
+    Off,
+    On,
+}
+
+fn ours_for(case: &Path, warm_up: WarmUp) -> Outcome {
     // A binary run the moment it was linked can die before its first
     // instruction (the loader refusing it, a spawn failing under load);
     // that says nothing about the program, so it is tried again.
     for attempt in 0..3 {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_zylua"));
-        // The warm-up thread races first-call compiles; see git-bug
-        // 5f65d75241969a35a13e2bbe5a008e10bdcea080024cd9c5fae56badabe3b24a.
-        cmd.env("ZYNTAX_DISABLE_WARM_UP", "1");
+        match warm_up {
+            WarmUp::Off => cmd.env("ZYNTAX_DISABLE_WARM_UP", "1"),
+            WarmUp::On => cmd.env_remove("ZYNTAX_DISABLE_WARM_UP"),
+        };
         cmd.arg("run");
         if is_official(case) {
             cmd.arg("-e").arg("_U=true");
@@ -206,7 +217,7 @@ fn ours_for(case: &Path) -> Outcome {
 }
 
 /// Run every case in one category and report.
-fn category(name: &str) {
+fn category(name: &str, warm_up: WarmUp) {
     let dir = root().join(name);
     // The official suite ships `libs/P1` as an empty directory, which
     // a checkout cannot hold; `attrib.lua` writes into it.
@@ -234,7 +245,7 @@ fn category(name: &str) {
             unpinned += 1;
             continue;
         };
-        let got = ours_for(case);
+        let got = ours_for(case, warm_up);
         let ok = got.status == expected.status && got.stdout == expected.stdout;
         match (ok, known.get(&key)) {
             (true, None) => passed += 1,
@@ -252,8 +263,12 @@ fn category(name: &str) {
         }
     }
 
+    let mode = match warm_up {
+        WarmUp::Off => "",
+        WarmUp::On => " (warm-up on)",
+    };
     println!(
-        "conformance/{name}: {passed} pass, {} known failing, {} regression(s), {} newly passing, {unpinned} unpinned",
+        "conformance/{name}{mode}: {passed} pass, {} known failing, {} regression(s), {} newly passing, {unpinned} unpinned",
         known_failed.len(),
         regressions.len(),
         fixed.len()
@@ -294,9 +309,18 @@ macro_rules! categories {
         $(
             #[test]
             fn $name() {
-                category(stringify!($name));
+                category(stringify!($name), WarmUp::Off);
             }
         )*
+        /// Every category again with the compile worker on.
+        mod warm_up {
+            $(
+                #[test]
+                fn $name() {
+                    super::category(stringify!($name), super::WarmUp::On);
+                }
+            )*
+        }
     };
 }
 
