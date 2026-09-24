@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1789823794,"nonce":"6o/RuPDzip3qJPGbSu/TG8sX8g8=","added":["bug","area:runtime"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790292454,"nonce":"V8ZQ5fWKmmn47r/QqPLrQiORY/c=","message":"Fixed by b77087e5 (branch ci/ci-workspace); see f95761a. hot_reload_effect_fibers passes 7/7 at default features.","files":null}]}
