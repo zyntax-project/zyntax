@@ -1,0 +1,15 @@
+5	1
+a string	2
+false	index_function.lua:14: attempt to call a string value (method 'name')
+false	index_function.lua:15: attempt to call a nil value (method 'nothing')
+5	5
+base hello	base bye
+own hello	base bye
+fn go
+table go
+own
+9
+raw	raw
+6
+got 1
+index go,arg

@@ -1,0 +1,4 @@
+m 1
+false	args_drop.lua:6: attempt to call a nil value (method 'm')
+own 2
+false	args_drop.lua:11: attempt to call a nil value (method 'm')

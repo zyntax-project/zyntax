@@ -1,0 +1,8 @@
+false	field_call.lua:4: attempt to call a nil value (field 'new')
+false	field_call.lua:6: attempt to call a nil value (method 'new')
+false	field_call.lua:7: attempt to call a nil value (field 'new')
+true	true
+true	true
+false	field_call.lua:12: attempt to call a nil value (field 'fn')
+false	field_call.lua:13: attempt to call a nil value (method 'fn')
+false	field_call.lua:14: attempt to index a nil value (local 'u')

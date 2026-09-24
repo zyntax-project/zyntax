@@ -1001,6 +1001,25 @@ fn raising(t: &Types) -> Vec<Decl> {
             ret_void(),
         ],
     ));
+    // Calling nil a lookup found for a method or a field: the message
+    // names it, as the reference's does. `how` is 0 for a method, 1 for
+    // a field.
+    let callee = local("callee", string());
+    let how = local("how", i64());
+    d.push(define_cold(
+        "zl_raise_call_nil",
+        &[&callee, &how],
+        unit(),
+        vec![
+            lua_error(concat(vec![
+                text("attempt to call a nil value ("),
+                if_expr(eq(how.e(), int(0)), text("method '"), text("field '")),
+                callee.e(),
+                text("')"),
+            ])),
+            ret_void(),
+        ],
+    ));
     // The pending type error with the description of the operand it is
     // about, `left` or `right`, appended; the note is consumed. A
     // call's error is described at a call site only, and an

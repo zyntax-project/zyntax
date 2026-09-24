@@ -1,0 +1,5 @@
+false	late_method.lua:5: attempt to call a nil value (method 'late')
+false	late_method.lua:5: attempt to call a nil value (method 'late')
+true	6
+13
+false	late_method.lua:13: attempt to call a nil value (method 'late')

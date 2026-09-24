@@ -1,0 +1,4 @@
+1
+2
+1
+false	order.lua:13: attempt to call a nil value (method 'm')

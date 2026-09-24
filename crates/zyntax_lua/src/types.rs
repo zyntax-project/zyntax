@@ -249,11 +249,13 @@ pub fn arith_event(op: &BinOp) -> Option<&'static str> {
 
 /// The metamethods the typed dispatch handles: a table operand's
 /// handler is called directly when the types know it, so the runtime
-/// never reaches it with values of its own.
+/// never reaches it with values of its own. An `__index` handler is
+/// called with the table and a constant key, both recorded against
+/// it; a read under a key not known at compile time makes it escape.
 pub fn typed_event(event: &str) -> bool {
     matches!(
         event,
-        "__add" | "__sub" | "__mul" | "__div" | "__mod" | "__pow" | "__idiv" | "__unm"
+        "__add" | "__sub" | "__mul" | "__div" | "__mod" | "__pow" | "__idiv" | "__unm" | "__index"
     )
 }
 
@@ -279,11 +281,17 @@ pub enum Hop {
     /// Through the `__index` field of the table, of this shape, which
     /// holds a table.
     Index(ShapeId),
+    /// The `__index` field of the table, of shape `.0`, holds function
+    /// `.1`: the lookup ends in calling it with the table the last
+    /// `Meta` hop started from and the name.
+    Handler(ShapeId, FuncId),
 }
 
 /// Where a lookup of a name may end: the field of a table of shape
 /// `shape`, reached by `hops`, holding `ty`; `sure` when the field is
-/// always there.
+/// always there. A lookup whose last hop is a `Handler` ends in the
+/// handler's call instead: `shape` is then the table it is called
+/// with, and `ty` its first result.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Lookup {
     pub hops: Vec<Hop>,
@@ -385,11 +393,13 @@ impl Inferred {
     /// the call lets the lookup go on past it; the call site tells
     /// them apart by the value it finds. `None` when a field on the
     /// way is not a function, or the chain leads where the types do
-    /// not follow.
+    /// not follow. An `__index` function ends the chain with its first
+    /// result, when that is a function.
     pub fn resolve_method(&self, k: ShapeId, name: &str) -> Option<Vec<Ty>> {
         let mut table = match self.shape(k).field("__index") {
             Some((_, Ty::Shape(t))) => t,
             Some((_, Ty::Unknown)) => return Some(vec![Ty::Unknown]),
+            Some((_, Ty::Func(f))) => return Some(vec![self.handler_method(f)?]),
             _ => return None,
         };
         let mut out = Vec::new();
@@ -414,9 +424,31 @@ impl Inferred {
             if !info.unknown_meta && info.classes.is_empty() {
                 break;
             }
-            table = self.index_behind(table)?;
+            match self.index_behind(table)? {
+                Ty::Shape(next) => table = next,
+                Ty::Func(f) => {
+                    out.push(self.handler_method(f)?);
+                    break;
+                }
+                _ => return None,
+            }
         }
         Some(out)
+    }
+
+    /// The first result of an `__index` function, what a lookup
+    /// through it yields.
+    pub fn handler_first(&self, f: FuncId) -> Ty {
+        self.sig(f).map_or(Ty::Unknown, |s| s.returns.first())
+    }
+
+    /// An `__index` function's first result as a method: a function,
+    /// or not settled yet; None for anything else.
+    fn handler_method(&self, f: FuncId) -> Option<Ty> {
+        match self.handler_first(f) {
+            ty @ (Ty::Func(_) | Ty::Unknown) => Some(ty),
+            _ => None,
+        }
     }
 
     /// Where reading `name` from a table of shape `k` may end, as the
@@ -426,6 +458,12 @@ impl Inferred {
     /// (a metatable they do not know, an `__index` that is not a
     /// table, a class with several metatables); an empty list when
     /// the name is nowhere along it.
+    ///
+    /// Complete when it answers: every class of `k` and every table
+    /// behind each `__index` is known, each with at most one
+    /// metatable, so a table of shape `k` either ends one of the
+    /// listed lookups or holds nothing under `name`. An `__index`
+    /// function ends a chain in a `Handler` hop.
     pub fn lookups(&self, k: ShapeId, name: &str) -> Option<Vec<Lookup>> {
         let mut out = Vec::new();
         let mut hops = Vec::new();
@@ -449,15 +487,17 @@ impl Inferred {
         for class in &info.classes {
             let mut hops = hops.clone();
             hops.push(Hop::Meta(*class));
-            self.lookups_behind(*class, name, hops, &mut out)?;
+            self.lookups_behind(k, *class, name, hops, &mut out)?;
         }
         Some(out)
     }
 
     /// The lookups of `name` that go through the `__index` of a
-    /// metatable of shape `class`.
+    /// metatable of shape `class`, the metatable of a table of shape
+    /// `origin`.
     fn lookups_behind(
         &self,
+        origin: ShapeId,
         class: ShapeId,
         name: &str,
         mut hops: Vec<Hop>,
@@ -465,6 +505,10 @@ impl Inferred {
     ) -> Option<()> {
         let mut table = match self.shape(class).field("__index") {
             Some((_, Ty::Shape(t))) => t,
+            Some((_, Ty::Func(f))) => {
+                self.handler_lookup(origin, class, f, hops, out);
+                return Some(());
+            }
             // A metatable without `__index` answers nothing.
             None if !self.may_hold_unnamed(class, "__index") => return Some(()),
             _ => return None,
@@ -502,10 +546,54 @@ impl Inferred {
             hops.push(Hop::Meta(behind));
             table = match self.shape(behind).field("__index") {
                 Some((_, Ty::Shape(next))) => next,
+                Some((_, Ty::Func(f))) => {
+                    self.handler_lookup(table, behind, f, hops, out);
+                    return Some(());
+                }
                 _ => return None,
             };
             hops.push(Hop::Index(behind));
         }
+    }
+
+    /// The lookup ending in the `__index` function `f` of a metatable
+    /// of shape `class`, called with a table of shape `origin`.
+    fn handler_lookup(
+        &self,
+        origin: ShapeId,
+        class: ShapeId,
+        f: FuncId,
+        mut hops: Vec<Hop>,
+        out: &mut Vec<Lookup>,
+    ) {
+        hops.push(Hop::Handler(class, f));
+        out.push(Lookup {
+            hops,
+            shape: origin,
+            ty: self.handler_first(f),
+            sure: true,
+        });
+    }
+
+    /// Every `__index` function a lookup from a table of shape `k` may
+    /// call, each with the shape of the table it is called with.
+    pub fn handlers_reached(&self, k: ShapeId) -> Vec<(ShapeId, FuncId)> {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut todo = vec![k];
+        while let Some(t) = todo.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            for class in &self.shape(t).classes {
+                match self.shape(*class).field("__index") {
+                    Some((_, Ty::Func(f))) => out.push((t, f)),
+                    Some((_, Ty::Shape(next))) => todo.push(next),
+                    _ => {}
+                }
+            }
+        }
+        out
     }
 
     /// What reading a table of shape `k` under a key of type `key_ty`
@@ -550,18 +638,15 @@ impl Inferred {
         MetaTargets::Funcs(out)
     }
 
-    /// The table a lookup goes on to when a table of shape `t` lacks a
-    /// field: its one class's `__index` table, when the types know it.
-    fn index_behind(&self, t: ShapeId) -> Option<ShapeId> {
+    /// What a lookup goes on to when a table of shape `t` lacks a
+    /// field: its one class's `__index`, when the types know it.
+    fn index_behind(&self, t: ShapeId) -> Option<Ty> {
         let info = self.shape(t);
         if info.unknown_meta || info.classes.len() != 1 {
             return None;
         }
         let class = *info.classes.iter().next()?;
-        match self.shape(class).field("__index") {
-            Some((_, Ty::Shape(next))) => Some(next),
-            _ => None,
-        }
+        self.shape(class).field("__index").map(|(_, ty)| ty)
     }
 
     /// What reading field `name` of a table of shape `k` yields when
@@ -576,12 +661,25 @@ impl Inferred {
         }
         let mut ty = self.unnamed_ty(k, name);
         for class in &info.classes {
-            ty = join_read(ty, self.index_chain_ty(*class, name, 0));
+            ty = join_read(ty, self.through_index_ty(*class, name, 0));
             if ty == Ty::Any {
                 break;
             }
         }
         ty
+    }
+
+    /// What `name` yields looked up through the `__index` of a
+    /// metatable of shape `class`: the chain of its table, its
+    /// function's first result, nil without one.
+    fn through_index_ty(&self, class: ShapeId, name: &str, depth: usize) -> Ty {
+        match self.shape(class).field("__index") {
+            Some((_, Ty::Shape(next))) => self.index_chain_ty(next, name, depth + 1),
+            Some((_, Ty::Func(f))) => self.handler_first(f),
+            Some((_, Ty::Unknown)) => Ty::Unknown,
+            None if !self.may_hold_unnamed(class, "__index") => Ty::Nil,
+            _ => Ty::Any,
+        }
     }
 
     /// What `name` yields looked up in a table of shape `class` as a
@@ -605,15 +703,7 @@ impl Inferred {
         } else {
             let mut t = Ty::Nil;
             for c in &info.classes {
-                t = join_read(
-                    t,
-                    match self.shape(*c).field("__index") {
-                        Some((_, Ty::Shape(next))) => self.index_chain_ty(next, name, depth + 1),
-                        Some((_, Ty::Unknown)) => Ty::Unknown,
-                        None => Ty::Nil,
-                        Some(_) => Ty::Any,
-                    },
-                );
+                t = join_read(t, self.through_index_ty(*c, name, depth));
             }
             t
         };
@@ -837,8 +927,33 @@ impl<'a> Typer<'a> {
         let receiver = self.suffixed_ty(prefix, &suffixes[..suffixes.len() - 1]);
         match last {
             ast::Call::MethodCall(m) => self.method_returns(receiver, &ident(m.name())),
-            ast::Call::AnonymousCall(_) => self.callee_returns(receiver),
+            ast::Call::AnonymousCall(_) => match (receiver, self.field_callee(prefix, suffixes)) {
+                (Ty::Func(_) | Ty::Unknown, _) | (_, None) => self.callee_returns(receiver),
+                (_, Some((k, name))) => self.method_returns(Ty::Shape(k), &name),
+            },
             _ => Returns::Dynamic,
+        }
+    }
+
+    /// For a call `obj.name(...)`, the last of `suffixes`, on a shaped
+    /// receiver: the receiver's shape and the name. Its callee is one
+    /// of the functions `method_targets` gives, the receiver not
+    /// passed.
+    pub fn field_callee(&self, prefix: &Prefix, suffixes: &[&Suffix]) -> Option<(ShapeId, String)> {
+        let n = suffixes.len();
+        if n < 2 || !matches!(suffixes[n - 1], Suffix::Call(ast::Call::AnonymousCall(_))) {
+            return None;
+        }
+        let Suffix::Index(index) = suffixes[n - 2] else {
+            return None;
+        };
+        let name = constant_key(index)?;
+        if self.global_member(prefix, &suffixes[..n - 1]).is_some() {
+            return None;
+        }
+        match self.suffixed_ty(prefix, &suffixes[..n - 2]) {
+            Ty::Shape(k) if (k.0 as usize) < self.known.shapes.len() => Some((k, name)),
+            _ => None,
         }
     }
 
@@ -1496,10 +1611,12 @@ impl<'a> Round<'a> {
 
     /// A method called through a value: every function `name` may
     /// reach from a table of shape `k`, in the table or along its
-    /// classes' `__index` chains, escapes.
+    /// classes' `__index` chains, escapes. A chain that goes on where
+    /// the types do not follow reads the name blind.
     fn escape_method(&mut self, k: ShapeId, name: &str) {
         let mut seen = BTreeSet::new();
         let mut todo = vec![k];
+        let mut blind = false;
         while let Some(t) = todo.pop() {
             if !seen.insert(t) || t.0 as usize >= self.out.shapes.len() {
                 continue;
@@ -1507,15 +1624,22 @@ impl<'a> Round<'a> {
             let info = &self.out.shapes[t.0 as usize];
             let own = info.field(name).map(|(_, ty)| ty);
             let classes: Vec<ShapeId> = info.classes.iter().copied().collect();
+            blind |= info.unknown_meta;
             if let Some(ty) = own {
                 self.escape(ty);
             }
             for c in classes {
                 todo.push(c);
-                if let Some((_, Ty::Shape(next))) = self.out.shapes[c.0 as usize].field("__index") {
-                    todo.push(next);
+                match self.out.shapes[c.0 as usize].field("__index") {
+                    Some((_, Ty::Shape(next))) => todo.push(next),
+                    Some((_, Ty::Func(f))) => self.escape(self.known.handler_first(f)),
+                    Some(_) => blind = true,
+                    None => {}
                 }
             }
+        }
+        if blind {
+            self.blind_reads.insert(name.to_string());
         }
     }
 
@@ -1773,13 +1897,18 @@ impl<'a> Round<'a> {
             }
             let classes: Vec<ShapeId> = self.out.shapes[k].classes.iter().copied().collect();
             for c in classes {
-                if let Some((_, Ty::Shape(next))) = self.out.shapes[c.0 as usize].field("__index") {
-                    let info = &mut self.out.shapes[next.0 as usize];
-                    let joined = info.untyped_reads.union(reads);
-                    if joined != info.untyped_reads {
-                        info.untyped_reads = joined;
-                        changed = true;
+                match self.out.shapes[c.0 as usize].field("__index") {
+                    Some((_, Ty::Shape(next))) => {
+                        let info = &mut self.out.shapes[next.0 as usize];
+                        let joined = info.untyped_reads.union(reads);
+                        if joined != info.untyped_reads {
+                            info.untyped_reads = joined;
+                            changed = true;
+                        }
                     }
+                    // A handler called with a key the types do not know.
+                    Some((_, ty @ Ty::Func(_))) => changed |= self.escape_new(ty),
+                    _ => {}
                 }
             }
         }
@@ -2446,16 +2575,37 @@ impl<'a> Round<'a> {
                     }
                     // The arguments of a direct call feed the callee's
                     // parameters, and so keep their types; a callee not
-                    // typed yet may still turn out known. Anything else
-                    // takes values.
-                    let direct = matches!(receiver, Ty::Func(_) | Ty::Unknown);
+                    // typed yet may still turn out known. So do those of
+                    // a field call the lookups resolve to known
+                    // functions. Anything else takes values, and every
+                    // function a field call may reach escapes.
+                    let field = match receiver {
+                        Ty::Func(_) | Ty::Unknown => None,
+                        _ => self.typer().field_callee(prefix, &suffixes[..=i]),
+                    };
+                    let targets = field
+                        .as_ref()
+                        .and_then(|(k, name)| self.typer().method_targets(*k, name));
+                    let direct = matches!(receiver, Ty::Func(_) | Ty::Unknown) || targets.is_some();
                     self.args(args, direct);
                     if let Ty::Func(f) = receiver {
                         self.record_call(f, None, args);
                     }
+                    match (targets, field) {
+                        (Some(targets), _) => {
+                            for target in targets {
+                                if let Ty::Func(f) = target {
+                                    self.record_call(f, None, args);
+                                }
+                            }
+                        }
+                        (None, Some((k, name))) => self.escape_method(k, &name),
+                        (None, None) => {}
+                    }
                 }
                 Suffix::Call(ast::Call::MethodCall(m)) => {
                     let name = ident(m.name());
+                    self.handler_calls(receiver);
                     let targets = match receiver {
                         Ty::Shape(k) => self.typer().method_targets(k, &name),
                         Ty::Unknown => Some(Vec::new()),
@@ -2484,7 +2634,23 @@ impl<'a> Round<'a> {
                         self.value(expression);
                     }
                     match (constant_key(index), index) {
-                        (Some(name), _) => self.read_through(receiver, &name),
+                        (Some(name), _) => {
+                            self.handler_calls(receiver);
+                            self.read_through(receiver, &name);
+                            // A read whose ends join to a dynamic value
+                            // loses what they hold, unless a field call
+                            // takes it.
+                            let called = matches!(
+                                suffixes.get(i + 1),
+                                Some(Suffix::Call(ast::Call::AnonymousCall(_)))
+                            );
+                            if let Ty::Shape(k) = receiver
+                                && !called
+                                && self.typer().field_ty(receiver, &name) == Ty::Any
+                            {
+                                self.escape_method(k, &name);
+                            }
+                        }
                         (None, ast::Index::Brackets { expression, .. }) => {
                             let key_ty = self.typer().ty_of(expression);
                             self.keyed_read(receiver, key_ty);
@@ -2494,6 +2660,20 @@ impl<'a> Round<'a> {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// A constant-key lookup from `receiver`: each `__index` function
+    /// it may reach is called with the table at that step and the key.
+    fn handler_calls(&mut self, receiver: Ty) {
+        let Ty::Shape(k) = receiver else {
+            return;
+        };
+        if k.0 as usize >= self.known.shapes.len() {
+            return;
+        }
+        for (origin, f) in self.known.handlers_reached(k) {
+            self.record_call_types(f, vec![Ty::Shape(origin), Ty::Str]);
         }
     }
 
