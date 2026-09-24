@@ -397,6 +397,22 @@ pub(crate) fn int_lit(v: i64, span: Span) -> Node {
     )
 }
 
+/// The value of an integer literal node, possibly negated.
+fn int_literal_node(n: &Node) -> Option<i128> {
+    match &n.node {
+        TypedExpression::Literal(TypedLiteral::Integer(v)) => Some(*v),
+        TypedExpression::Unary(TypedUnary {
+            op: UnaryOp::Minus,
+            operand,
+        }) => int_literal_node(operand).map(|v| -v),
+        TypedExpression::Unary(TypedUnary {
+            op: UnaryOp::Plus,
+            operand,
+        }) => int_literal_node(operand),
+        _ => None,
+    }
+}
+
 pub(crate) fn str_lit(s: &str, span: Span) -> Node {
     node(
         TypedExpression::Literal(TypedLiteral::String(intern(s))),
@@ -1442,9 +1458,12 @@ impl<'m> Lowerer<'m> {
         self.zero_of(ty, span)
     }
 
-    /// Integer division and remainder trap on zero, so the divisor is
-    /// checked first and a zero raises.
+    /// Integer division and remainder trap on zero, so a divisor that is
+    /// not a non-zero literal is checked first and a zero raises.
     fn nonzero(&mut self, divisor: Node, span: Span) -> Node {
+        if int_literal_node(&divisor).is_some_and(|v| v != 0) {
+            return divisor;
+        }
         let mut pre = Vec::new();
         let held = self.hold(
             Val {
@@ -6519,7 +6538,28 @@ impl<'m> Lowerer<'m> {
             py::Operator::BitXor => BinaryOp::BitXor,
             py::Operator::BitAnd => BinaryOp::BitAnd,
         };
-        let result = binary(bin, l, r, operand_ty, span);
+        // An integer square is the operand times itself, with no loop.
+        let result = if op == py::Operator::Pow && int_literal_node(&r) == Some(2) {
+            let mut pre = Vec::new();
+            let base = self.hold(
+                Val {
+                    node: l,
+                    ty: operand_ty,
+                },
+                &mut pre,
+                span,
+            );
+            self.hoisted.extend(pre);
+            binary(
+                BinaryOp::Mul,
+                base.node.clone(),
+                base.node,
+                operand_ty,
+                span,
+            )
+        } else {
+            binary(bin, l, r, operand_ty, span)
+        };
         // `**` with a negative exponent is a float in Python even for
         // integer operands; the lowering computes it as one.
         let result = if ty == Ty::Float && operand_ty == Ty::Int {
