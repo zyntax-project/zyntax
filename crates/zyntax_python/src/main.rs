@@ -8,7 +8,20 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use zyntax_embed::{TieredConfig, TieredRuntime};
 
+/// The stack the program runs on, the same on every platform: the main
+/// thread's is 8 MB on Linux and macOS and 1 MB on Windows.
+const STACK_BYTES: usize = 1 << 30;
+
 fn main() -> ExitCode {
+    std::thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(run)
+        .expect("the program's thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+fn run() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let command = args.next();
     // ZYPY_LLVM=1 selects LLVM tier-up; use it for checked benchmark runs.
