@@ -208,7 +208,7 @@ impl Slot {
             Ty::Bool => SlotKind::Bool,
             Ty::Str => SlotKind::Str,
             Ty::Table | Ty::Shape(_) => SlotKind::Table,
-            Ty::Number | Ty::Scalar => SlotKind::Scalar,
+            Ty::Number | Ty::Scalar | Ty::IntOrNil | Ty::FloatOrNil => SlotKind::Scalar,
             Ty::Nil | Ty::Func(_) | Ty::Any | Ty::Unknown => SlotKind::Any,
         }
     }
@@ -498,7 +498,7 @@ impl<'a> Module<'a> {
             Ty::Bool => prim(PrimitiveType::Bool),
             Ty::Int => prim(PrimitiveType::I64),
             Ty::Float => prim(PrimitiveType::F64),
-            Ty::Number | Ty::Scalar => number_type(),
+            Ty::Number | Ty::Scalar | Ty::IntOrNil | Ty::FloatOrNil => number_type(),
             Ty::Str => prim(PrimitiveType::String),
             // A table of a known shape is a table, or null for nil.
             Ty::Table | Ty::Shape(_) => self.types.table(),
@@ -922,6 +922,28 @@ fn number_type() -> Type {
         prim(PrimitiveType::I64),
         prim(PrimitiveType::F64),
     ])
+}
+
+/// Whether arithmetic or ordering on `a` and `b` takes the numbers'
+/// own operation once a nil operand has raised: each is a number of
+/// known kind or such a number or nil, and one may be nil.
+fn or_nil_operands(a: Ty, b: Ty) -> bool {
+    let known = |t: Ty| matches!(t.underlying(), Ty::Int | Ty::Float);
+    (matches!(a, Ty::IntOrNil | Ty::FloatOrNil) || matches!(b, Ty::IntOrNil | Ty::FloatOrNil))
+        && known(a)
+        && known(b)
+}
+
+/// Whether `a == b` is decided by tags and one number part: one side
+/// is an integer or nil and the other an integer, nil or the same; or
+/// the like for floats.
+fn or_nil_comparable(a: Ty, b: Ty) -> bool {
+    let fits = |x: Ty, y: Ty| match x {
+        Ty::IntOrNil => matches!(y, Ty::IntOrNil | Ty::Int | Ty::Nil),
+        Ty::FloatOrNil => matches!(y, Ty::FloatOrNil | Ty::Float | Ty::Nil),
+        _ => false,
+    };
+    fits(a, b) || fits(b, a)
 }
 
 /// The tags of a run-time scalar. A boolean's truth is its tag, so a
@@ -1411,6 +1433,68 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         } else {
             target
         };
+        // A scalar that may only be nil besides holds its number in the
+        // number's part; any other conversion is the scalar's.
+        match (v.ty, target) {
+            (Ty::IntOrNil, Ty::Int) => {
+                let (pre, n) = self.number_parts(v);
+                return block_value(pre, n.int, span);
+            }
+            (Ty::FloatOrNil, Ty::Float) => {
+                let (pre, n) = self.number_parts(v);
+                return block_value(pre, n.float, span);
+            }
+            // A dynamic value known to be the number or nil: nil, or
+            // the payload.
+            (Ty::Any, Ty::IntOrNil | Ty::FloatOrNil) => {
+                let mut pre = Vec::new();
+                let b = self.hold(v, &mut pre);
+                let is_nil = binary(
+                    BinaryOp::Eq,
+                    b.node.clone(),
+                    nil(span),
+                    prim(PrimitiveType::Bool),
+                    span,
+                );
+                let number = if target == Ty::IntOrNil {
+                    let payload = call(
+                        "zb_box_payload_i64",
+                        vec![b.node],
+                        prim(PrimitiveType::I64),
+                        span,
+                    );
+                    number_of_int(payload, span)
+                } else {
+                    let payload = call(
+                        "zb_box_payload_f64",
+                        vec![b.node],
+                        prim(PrimitiveType::F64),
+                        span,
+                    );
+                    number_of_float(payload, span)
+                };
+                let value = if_value(is_nil, scalar_of_nil(span), number, number_type(), span);
+                return block_value(pre, value, span);
+            }
+            (Ty::IntOrNil | Ty::FloatOrNil, Ty::Any) => {
+                let int = v.ty == Ty::IntOrNil;
+                let (pre, n) = self.number_parts(v);
+                let boxed = if int {
+                    call("zb_box_i64", vec![n.int.clone()], Type::Any, span)
+                } else {
+                    call("zb_box_f64", vec![n.float.clone()], Type::Any, span)
+                };
+                let value = if_value(n.has_tag(TAG_NIL, span), nil(span), boxed, Type::Any, span);
+                return block_value(pre, value, span);
+            }
+            _ => {}
+        }
+        let as_scalar = |t: Ty| if t.is_tagged() { Ty::Scalar } else { t };
+        let v = Val {
+            node: v.node,
+            ty: as_scalar(v.ty),
+        };
+        let target = as_scalar(target);
         match (v.ty, target) {
             (a, b) if a == b => v.node,
             (Ty::Unknown, _) => v.node,
@@ -2516,7 +2600,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         match v.ty {
             Ty::Bool => v.node,
             // False when nil or false: the tags below true.
-            Ty::Scalar => {
+            Ty::Scalar | Ty::IntOrNil | Ty::FloatOrNil => {
                 let (pre, n) = self.number_parts(v);
                 block_value(pre, n.is_true(span), span)
             }
@@ -2592,7 +2676,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Ty::Int => int_lit(0, span),
             Ty::Float => float_lit(0.0, span),
             Ty::Number => number_of_int(int_lit(0, span), span),
-            Ty::Scalar => scalar_of_nil(span),
+            Ty::Scalar | Ty::IntOrNil | Ty::FloatOrNil => scalar_of_nil(span),
             Ty::Bool => bool_lit(false, span),
             Ty::Str => str_lit("", span),
             Ty::Shape(_) => null(self.ir(Ty::Table), span),
@@ -3519,13 +3603,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     node: unary(UnaryOp::Minus, v.node, prim(PrimitiveType::F64), span),
                     ty: Ty::Float,
                 },
-                Ty::Number | Ty::Scalar => {
+                Ty::Number | Ty::Scalar | Ty::IntOrNil | Ty::FloatOrNil => {
                     let mut pre = Vec::new();
                     let held = self.hold(v.clone(), &mut pre);
                     let n = NumberParts::of(&held.node, span);
                     // A scalar that is not a number raises, as the
                     // dynamic value does.
-                    if v.ty == Ty::Scalar {
+                    if v.ty != Ty::Number {
                         let boxed = self.coerce(held.clone(), Ty::Any);
                         pre.push(if_(
                             n.is_numeric(span),
@@ -3898,8 +3982,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 | BinOp::GreaterThan(_)
                 | BinOp::GreaterThanEqual(_)
         );
+        if arithmetic_or_order && or_nil_operands(a.ty, b.ty) {
+            return self.or_nil_binary(op, a, b, descs, span);
+        }
         if arithmetic_or_order
-            && (a.ty == Ty::Scalar || b.ty == Ty::Scalar)
+            && (a.ty.is_tagged() || b.ty.is_tagged())
             && a.ty.is_scalar()
             && b.ty.is_scalar()
         {
@@ -4076,7 +4163,6 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         descs: &Described,
         span: Span,
     ) -> Val {
-        let bool_t = prim(PrimitiveType::Bool);
         let mut pre = Vec::new();
         let a = Val {
             node: self.coerce(a, Ty::Scalar),
@@ -4091,33 +4177,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let x = NumberParts::of(&ha.node, span);
         let y = NumberParts::of(&hb.node, span);
         let numeric = x.both_numeric(&y, span);
-        let boxed_a = self.coerce(ha.clone(), Ty::Any);
-        let boxed_b = self.coerce(hb.clone(), Ty::Any);
-        let raise = match op {
-            BinOp::LessThan(_) => call("zl_lt", vec![boxed_a, boxed_b], bool_t.clone(), span),
-            BinOp::LessThanEqual(_) => call("zl_le", vec![boxed_a, boxed_b], bool_t.clone(), span),
-            BinOp::GreaterThan(_) => call("zl_lt", vec![boxed_b, boxed_a], bool_t.clone(), span),
-            BinOp::GreaterThanEqual(_) => {
-                call("zl_le", vec![boxed_b, boxed_a], bool_t.clone(), span)
-            }
-            _ => {
-                let code = match op {
-                    BinOp::Plus(_) => OP_ADD,
-                    BinOp::Minus(_) => OP_SUB,
-                    BinOp::Star(_) => OP_MUL,
-                    BinOp::Slash(_) => OP_DIV,
-                    BinOp::Caret(_) => OP_POW,
-                    BinOp::DoubleSlash(_) => OP_IDIV,
-                    _ => OP_MOD,
-                };
-                call(
-                    "zl_arith",
-                    vec![int_lit(code, span), boxed_a, boxed_b],
-                    Type::Any,
-                    span,
-                )
-            }
-        };
+        let raise = self.scalar_raise(op, &ha, &hb, span);
         pre.push(if_(
             numeric,
             Vec::new(),
@@ -4142,6 +4202,140 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             node: block_value(pre, v.node, span),
             ty: v.ty,
         }
+    }
+
+    /// The dynamic operation on held scalars `a` and `b` that are not
+    /// both numbers: it raises, as on the dynamic values.
+    fn scalar_raise(&mut self, op: &BinOp, a: &Val, b: &Val, span: Span) -> Node {
+        let bool_t = prim(PrimitiveType::Bool);
+        let boxed_a = self.coerce(a.clone(), Ty::Any);
+        let boxed_b = self.coerce(b.clone(), Ty::Any);
+        match op {
+            BinOp::LessThan(_) => call("zl_lt", vec![boxed_a, boxed_b], bool_t, span),
+            BinOp::LessThanEqual(_) => call("zl_le", vec![boxed_a, boxed_b], bool_t, span),
+            BinOp::GreaterThan(_) => call("zl_lt", vec![boxed_b, boxed_a], bool_t, span),
+            BinOp::GreaterThanEqual(_) => call("zl_le", vec![boxed_b, boxed_a], bool_t, span),
+            _ => {
+                let code = match op {
+                    BinOp::Plus(_) => OP_ADD,
+                    BinOp::Minus(_) => OP_SUB,
+                    BinOp::Star(_) => OP_MUL,
+                    BinOp::Slash(_) => OP_DIV,
+                    BinOp::Caret(_) => OP_POW,
+                    BinOp::DoubleSlash(_) => OP_IDIV,
+                    _ => OP_MOD,
+                };
+                call(
+                    "zl_arith",
+                    vec![int_lit(code, span), boxed_a, boxed_b],
+                    Type::Any,
+                    span,
+                )
+            }
+        }
+    }
+
+    /// Arithmetic or ordering where each operand is a number of known
+    /// kind or such a number or nil: a nil operand takes the dynamic
+    /// operation, which raises; else the numbers' own operation runs.
+    fn or_nil_binary(
+        &mut self,
+        op: &BinOp,
+        a: Val,
+        b: Val,
+        descs: &Described,
+        span: Span,
+    ) -> Result<Val> {
+        let i64_t = prim(PrimitiveType::I64);
+        let bool_t = prim(PrimitiveType::Bool);
+        let mut pre = Vec::new();
+        let ha = self.hold(a, &mut pre);
+        let hb = self.hold(b, &mut pre);
+        // The tags of the sides that may be nil, and the tag each has
+        // when it is its number.
+        let mut tags = Vec::new();
+        let mut number = |h: &Val| -> Val {
+            let n = NumberParts::of(&h.node, span);
+            match h.ty {
+                Ty::IntOrNil => {
+                    tags.push((n.tag, TAG_INT));
+                    Val {
+                        node: n.int,
+                        ty: Ty::Int,
+                    }
+                }
+                Ty::FloatOrNil => {
+                    tags.push((n.tag, TAG_FLOAT));
+                    Val {
+                        node: n.float,
+                        ty: Ty::Float,
+                    }
+                }
+                _ => h.clone(),
+            }
+        };
+        let x = number(&ha);
+        let y = number(&hb);
+        // Both numbers without a short-circuit: tags are at most
+        // `TAG_FLOAT`, so a product of two says which pair they are.
+        let (tag, expected) = tags
+            .into_iter()
+            .reduce(|(p, e), (q, f)| (binary(BinaryOp::Mul, p, q, i64_t.clone(), span), e * f))
+            .expect("an operand that may be nil");
+        let numeric = binary(BinaryOp::Eq, tag, int_lit(expected, span), bool_t, span);
+        let raise = self.scalar_raise(op, &ha, &hb, span);
+        pre.push(if_(
+            numeric,
+            Vec::new(),
+            Some(vec![
+                expr_stmt(raise),
+                self.pending_check_described(span, descs),
+            ]),
+            span,
+        ));
+        let v = self.binary_vals(op, x, y, descs, span)?;
+        Ok(Val {
+            node: block_value(pre, v.node, span),
+            ty: v.ty,
+        })
+    }
+
+    /// `a == b` where one side is a number of known kind or nil and the
+    /// other that number, nil, or the same: the tags and the number's
+    /// part decide, since a scalar's unused parts are zero.
+    fn or_nil_eq(&mut self, a: Val, b: Val, span: Span) -> Node {
+        let bool_t = prim(PrimitiveType::Bool);
+        let mut pre = Vec::new();
+        let a = self.hold(a, &mut pre);
+        let b = self.hold(b, &mut pre);
+        let (a, b) = if a.ty.is_tagged() { (a, b) } else { (b, a) };
+        let (tag, part_ty) = match a.ty {
+            Ty::IntOrNil => (TAG_INT, Ty::Int),
+            _ => (TAG_FLOAT, Ty::Float),
+        };
+        let part = |n: NumberParts| if part_ty == Ty::Int { n.int } else { n.float };
+        let x = NumberParts::of(&a.node, span);
+        let eq = match b.ty {
+            Ty::Nil => x.has_tag(TAG_NIL, span),
+            t if t == part_ty => {
+                let is = x.has_tag(tag, span);
+                let same = binary(BinaryOp::Eq, part(x), b.node, bool_t.clone(), span);
+                binary(BinaryOp::And, is, same, bool_t, span)
+            }
+            _ => {
+                let y = NumberParts::of(&b.node, span);
+                let tags = binary(
+                    BinaryOp::Eq,
+                    x.tag.clone(),
+                    y.tag.clone(),
+                    bool_t.clone(),
+                    span,
+                );
+                let same = binary(BinaryOp::Eq, part(x), part(y), bool_t.clone(), span);
+                binary(BinaryOp::And, tags, same, bool_t, span)
+            }
+        };
+        block_value(pre, eq, span)
     }
 
     /// Equality of scalars: numbers compare as numbers, anything else
@@ -4435,6 +4629,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     fn equal(&mut self, a: Val, b: Val, span: Span) -> Node {
         let bool_t = prim(PrimitiveType::Bool);
+        if or_nil_comparable(a.ty, b.ty) {
+            return self.or_nil_eq(a, b, span);
+        }
         match (a.ty, b.ty) {
             (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) | (Ty::Bool, Ty::Bool) => {
                 binary(BinaryOp::Eq, a.node, b.node, bool_t, span)
@@ -4444,7 +4641,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             (x, y) if x.is_number() && y.is_number() => {
                 self.number_compare(a, b, Compare::Eq, span)
             }
-            (x, y) if (x == Ty::Scalar || y == Ty::Scalar) && x.is_scalar() && y.is_scalar() => {
+            (x, y) if (x.is_tagged() || y.is_tagged()) && x.is_scalar() && y.is_scalar() => {
                 self.scalar_eq(a, b, span)
             }
             // Tables are equal when they are the same table, `__eq`
@@ -5292,7 +5489,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     block_value(vec![expr_stmt(v.node)], bool_lit(false, span), span)
                 }
             }
-            Ty::Scalar => {
+            Ty::Scalar | Ty::IntOrNil | Ty::FloatOrNil => {
                 let (pre, n) = self.number_parts(v);
                 block_value(pre, n.has_tag(TAG_NIL, span), span)
             }
@@ -7179,23 +7376,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let f64_t = prim(PrimitiveType::F64);
         let bool_t = prim(PrimitiveType::Bool);
         let tys: Vec<Ty> = vals.iter().map(|v| v.ty).collect();
-        // A float rounds to the integer it makes when that fits, else
-        // stays a float: the result is dynamic either way, but the
-        // argument needs no box.
-        if let ("floor" | "ceil", [Ty::Float]) = (b.name, tys.as_slice()) {
-            let f = std::mem::take(vals).pop()?;
-            let node = call(
-                &format!("zl_math_{}_f", b.name),
-                vec![f.node],
-                Type::Any,
-                span,
-            );
-            let node = block_value(std::mem::take(pre), node, span);
-            return Some(Multi::Fixed(vec![Val { node, ty: Ty::Any }]));
-        }
         let ty = match types::math_result(b, &tys) {
-            Some(Ty::Int) => Ty::Int,
-            Some(Ty::Float) => Ty::Float,
+            Some(t @ (Ty::Int | Ty::Float | Ty::Number)) => t,
             _ => return None,
         };
         let ir = self.ir(ty);
@@ -7209,19 +7391,78 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 if_value(negative, negated, x, ir, span)
             }
             ("abs", Ty::Float) => call("abs", vec![arg().node], f64_t, span),
+            // Each part's own absolute value: the part the kind does
+            // not use stays zero.
+            ("abs", Ty::Number) => {
+                let (mut held, n) = self.number_parts(arg());
+                pre.append(&mut held);
+                let negative = binary(BinaryOp::Lt, n.int.clone(), int_lit(0, span), bool_t, span);
+                let negated = binary(
+                    BinaryOp::Sub,
+                    int_lit(0, span),
+                    n.int.clone(),
+                    i64_t.clone(),
+                    span,
+                );
+                let int = if_value(negative, negated, n.int, i64_t, span);
+                let float = call("abs", vec![n.float], f64_t, span);
+                number_value(n.tag, int, float, span)
+            }
             ("floor" | "ceil", Ty::Int) => arg().node,
+            // A float rounds to the integer it makes when that fits,
+            // else stays a float; an integer is itself.
+            ("floor" | "ceil", Ty::Number) => {
+                let x = arg();
+                let round = if b.name == "floor" {
+                    "floor"
+                } else {
+                    "zl_ceil_f64"
+                };
+                if x.ty == Ty::Float {
+                    let r = call(round, vec![x.node], f64_t, span);
+                    self.number_of_integral(r, pre, span)
+                } else {
+                    let (mut held, n) = self.number_parts(x);
+                    pre.append(&mut held);
+                    let r = call(round, vec![n.float.clone()], f64_t, span);
+                    let mut inner = Vec::new();
+                    let rounded = self.number_of_integral(r, &mut inner, span);
+                    let rounded = block_value(inner, rounded, span);
+                    if_value(
+                        n.is_int(span),
+                        number_value(n.tag.clone(), n.int, n.float, span),
+                        rounded,
+                        ir,
+                        span,
+                    )
+                }
+            }
             ("max" | "min", _) => {
                 // The best so far gives way when it is less than the
                 // next (`max`), or the next is less (`min`): compared
                 // with a NaN neither is, so the first stays.
                 let mut best = arg();
+                if ty == Ty::Number {
+                    let node = self.coerce(best, ty);
+                    best = self.hold(Val { node, ty }, pre);
+                }
                 for next in args {
-                    let (l, r) = if b.name == "max" {
-                        (best.node.clone(), next.node.clone())
+                    let next = if ty == Ty::Number {
+                        let node = self.coerce(next, ty);
+                        self.hold(Val { node, ty }, pre)
                     } else {
-                        (next.node.clone(), best.node.clone())
+                        next
                     };
-                    let moves = binary(BinaryOp::Lt, l, r, bool_t.clone(), span);
+                    let (l, r) = if b.name == "max" {
+                        (best.clone(), next.clone())
+                    } else {
+                        (next.clone(), best.clone())
+                    };
+                    let moves = if ty == Ty::Number {
+                        self.number_compare(l, r, Compare::Lt, span)
+                    } else {
+                        binary(BinaryOp::Lt, l.node, r.node, bool_t.clone(), span)
+                    };
                     let picked = Val {
                         node: if_value(moves, next.node, best.node, ir.clone(), span),
                         ty,
@@ -7250,6 +7491,61 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         };
         let node = block_value(std::mem::take(pre), v.node, span);
         Some(Multi::Fixed(vec![Val { node, ty }]))
+    }
+
+    /// An integral float as a number: the integer when it fits, else
+    /// the float; `pre` takes the float, held.
+    fn number_of_integral(&mut self, r: Node, pre: &mut Vec<St>, span: Span) -> Node {
+        let f64_t = prim(PrimitiveType::F64);
+        let i64_t = prim(PrimitiveType::I64);
+        let bool_t = prim(PrimitiveType::Bool);
+        let r = self
+            .hold(
+                Val {
+                    node: r,
+                    ty: Ty::Float,
+                },
+                pre,
+            )
+            .node;
+        // `-2^63 <= r < 2^63`, false for a NaN.
+        let fits = binary(
+            BinaryOp::And,
+            binary(
+                BinaryOp::Ge,
+                r.clone(),
+                float_lit(-9223372036854775808.0, span),
+                bool_t.clone(),
+                span,
+            ),
+            binary(
+                BinaryOp::Lt,
+                r.clone(),
+                float_lit(9223372036854775808.0, span),
+                bool_t.clone(),
+                span,
+            ),
+            bool_t,
+            span,
+        );
+        let fits = self
+            .hold(
+                Val {
+                    node: fits,
+                    ty: Ty::Bool,
+                },
+                pre,
+            )
+            .node;
+        let int = if_value(
+            fits.clone(),
+            cast(r.clone(), i64_t.clone(), span),
+            int_lit(0, span),
+            i64_t,
+            span,
+        );
+        let float = if_value(fits.clone(), float_lit(0.0, span), r, f64_t, span);
+        number_value(tag_of_is_int(fits, span), int, float, span)
     }
 
     /// One argument of a builtin as its parameter takes it.

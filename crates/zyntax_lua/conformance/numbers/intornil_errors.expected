@@ -1,0 +1,20 @@
+1	true	2
+2	true	3
+3	false	intornil_errors.lua:6: attempt to perform arithmetic on a nil value (field '?')
+4	true	5
+false	intornil_errors.lua:8: attempt to compare nil with number
+false	intornil_errors.lua:9: attempt to compare nil with number
+false	intornil_errors.lua:10: attempt to compare number with nil
+false	intornil_errors.lua:11: attempt to perform arithmetic on a nil value (field 'integer index')
+false	intornil_errors.lua:12: attempt to perform arithmetic on a nil value (field 'integer index')
+false	intornil_errors.lua:13: attempt to divide by zero
+true	false	true	false	true	true	true
+1.5	8	1	1	0.5	4.0	-1	true
+1	true	3.0
+2	false	intornil_errors.lua:19: attempt to perform arithmetic on a nil value (field '?')
+3	true	5.0
+true	true	false	true	1
+1	1	3	nil
+1	2	true
+false	intornil_errors.lua:29: attempt to perform arithmetic on a nil value (field 'count')
+6

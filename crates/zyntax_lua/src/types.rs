@@ -29,6 +29,11 @@ pub enum Ty {
     /// carried unboxed with a tag. Arithmetic on it raises for the
     /// first two, as on the dynamic value.
     Scalar,
+    /// An integer or nil: a scalar whose tag is only ever nil or
+    /// integer. Arithmetic on it raises for nil, else is the integer's.
+    IntOrNil,
+    /// A float or nil, as `IntOrNil` is for an integer.
+    FloatOrNil,
     Str,
     /// A table, held by pointer; never nil.
     Table,
@@ -51,6 +56,10 @@ impl Ty {
         match (self, other) {
             (Ty::Unknown, t) | (t, Ty::Unknown) => t,
             (a, b) if a == b => a,
+            (Ty::Int | Ty::IntOrNil, Ty::Nil | Ty::IntOrNil)
+            | (Ty::Nil | Ty::IntOrNil, Ty::Int | Ty::IntOrNil) => Ty::IntOrNil,
+            (Ty::Float | Ty::FloatOrNil, Ty::Nil | Ty::FloatOrNil)
+            | (Ty::Nil | Ty::FloatOrNil, Ty::Float | Ty::FloatOrNil) => Ty::FloatOrNil,
             (a, b) if a.is_number() && b.is_number() => Ty::Number,
             (a, b) if a.is_scalar() && b.is_scalar() => Ty::Scalar,
             // A shape or a function holds nil too.
@@ -64,7 +73,14 @@ impl Ty {
     pub fn may_be_nil(self) -> bool {
         matches!(
             self,
-            Ty::Nil | Ty::Scalar | Ty::Any | Ty::Unknown | Ty::Shape(_) | Ty::Func(_)
+            Ty::Nil
+                | Ty::Scalar
+                | Ty::IntOrNil
+                | Ty::FloatOrNil
+                | Ty::Any
+                | Ty::Unknown
+                | Ty::Shape(_)
+                | Ty::Func(_)
         )
     }
 
@@ -72,8 +88,31 @@ impl Ty {
     pub fn is_scalar(self) -> bool {
         matches!(
             self,
-            Ty::Nil | Ty::Bool | Ty::Int | Ty::Float | Ty::Number | Ty::Scalar
+            Ty::Nil
+                | Ty::Bool
+                | Ty::Int
+                | Ty::Float
+                | Ty::Number
+                | Ty::Scalar
+                | Ty::IntOrNil
+                | Ty::FloatOrNil
         )
+    }
+
+    /// Carried as a tagged scalar that may be nil: arithmetic and
+    /// ordering on it check the tag first.
+    pub fn is_tagged(self) -> bool {
+        matches!(self, Ty::Scalar | Ty::IntOrNil | Ty::FloatOrNil)
+    }
+
+    /// The number an integer-or-nil or float-or-nil holds when it is
+    /// not nil; any other type itself.
+    pub fn underlying(self) -> Ty {
+        match self {
+            Ty::IntOrNil => Ty::Int,
+            Ty::FloatOrNil => Ty::Float,
+            t => t,
+        }
     }
 
     /// An integer, a float, or one or the other: arithmetic on it
@@ -163,9 +202,10 @@ pub struct ShapeInfo {
     /// be a string, may reach a table of this shape: then every field
     /// takes what it stores, and a name that is no field may be held.
     pub dynamic_keys: bool,
-    /// The join of what stores under keys not known at compile time
-    /// put in a table of this shape: what a name that is no field may
-    /// hold, when `dynamic_keys`.
+    /// The join of what stores under keys not known at compile time,
+    /// that may be no number, put in a table of this shape: what a name
+    /// that is no field may hold, when `dynamic_keys`, and what a key
+    /// that is neither a string nor a number may.
     pub dyn_value: Ty,
     /// Reads out of a table of this shape whose results the types do
     /// not follow: what they may yield escapes.
@@ -179,7 +219,8 @@ pub struct ShapeInfo {
 /// function that walks the table.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Reads {
-    /// Under a key that may be a string: any field, or any name.
+    /// Under a key that may be no number: any field, any name, or
+    /// what is held under a key of another kind.
     pub names: bool,
     /// Under a key that may be a number: any element.
     pub elements: bool,
@@ -191,7 +232,7 @@ impl Reads {
     /// Reads under a key of type `key_ty`.
     pub fn under(key_ty: Ty, through_meta: bool) -> Reads {
         Reads {
-            names: key_may_be_string(key_ty),
+            names: !key_is_number(key_ty),
             elements: key_may_be_index(key_ty),
             through_meta,
         }
@@ -266,7 +307,15 @@ pub fn typed_event(event: &str) -> bool {
 fn may_handle_arith(ty: Ty) -> bool {
     !matches!(
         ty,
-        Ty::Int | Ty::Float | Ty::Number | Ty::Scalar | Ty::Bool | Ty::Nil | Ty::Str
+        Ty::Int
+            | Ty::Float
+            | Ty::Number
+            | Ty::Scalar
+            | Ty::IntOrNil
+            | Ty::FloatOrNil
+            | Ty::Bool
+            | Ty::Nil
+            | Ty::Str
     )
 }
 
@@ -330,6 +379,12 @@ pub struct Inferred {
     /// Whether `setmetatable` is applied to a receiver the types do
     /// not know: any escaping shape may get any metatable.
     pub blind_setmetatable: bool,
+    /// Whether a read of a field or element nothing typed has been
+    /// stored in yields nil, as a table with nothing stored there
+    /// does, rather than deciding nothing. Set once the rounds settle
+    /// with such reads undecided: a store of what such a read yields
+    /// is then typed from it.
+    pub settling: bool,
 }
 
 impl Inferred {
@@ -346,6 +401,16 @@ impl Inferred {
         &self.shapes[k.0 as usize]
     }
 
+    /// What a field, element or dynamic slot typed `ty` holds as a read
+    /// sees it: nothing stored is nil once the rounds are settling.
+    fn stored(&self, ty: Ty) -> Ty {
+        if self.settling && ty == Ty::Unknown {
+            Ty::Nil
+        } else {
+            ty
+        }
+    }
+
     /// Whether a table of shape `k` may hold `name` other than in a
     /// field of its shape: stored under a key not known at compile
     /// time, or through a receiver the types do not know.
@@ -357,7 +422,7 @@ impl Inferred {
 
     /// What a table of shape `k` itself holds under `name` when that
     /// is no field of its shape: nil, or what such stores put there.
-    fn unnamed_ty(&self, k: ShapeId, name: &str) -> Ty {
+    pub fn unnamed_ty(&self, k: ShapeId, name: &str) -> Ty {
         let info = self.shape(k);
         let mut ty = Ty::Nil;
         // A store under a field's name lands in its slot.
@@ -373,6 +438,13 @@ impl Inferred {
             ty = join_read(ty, *stored);
         }
         ty
+    }
+
+    /// Whether a table of shape `k` has no metatable: no handler may
+    /// be called with it or with what is stored in it.
+    pub fn plain(&self, k: ShapeId) -> bool {
+        let info = self.shape(k);
+        !info.unknown_meta && info.classes.is_empty()
     }
 
     /// Whether `#t` on a table of shape `k` is the length of its array
@@ -597,14 +669,70 @@ impl Inferred {
     }
 
     /// What reading a table of shape `k` under a key of type `key_ty`
-    /// yields: its element type, or nil, when the key cannot be a
-    /// string and the table has no metatable to ask; else anything.
+    /// not known at compile time yields, when the table has no
+    /// metatable to ask: under a number its element type, or nil; under
+    /// a key that may be anything else also what stores under such
+    /// keys put there, and, when it may be a string, any field. A table
+    /// the types lost track of may hold anything under such a key.
     pub fn element_read_ty(&self, k: ShapeId, key_ty: Ty) -> Ty {
         let info = self.shape(k);
-        if !key_is_number(key_ty) || info.unknown_meta || !info.classes.is_empty() {
+        if info.unknown_meta || !info.classes.is_empty() {
             return Ty::Any;
         }
-        join_read(info.element, Ty::Nil)
+        self.raw_keyed_ty(k, key_ty)
+    }
+
+    /// What a table of shape `k` itself holds under a key of type
+    /// `key_ty` not known at compile time, as a raw read finds it.
+    pub fn raw_keyed_ty(&self, k: ShapeId, key_ty: Ty) -> Ty {
+        let info = self.shape(k);
+        if key_is_number(key_ty) {
+            return join_read(self.stored(info.element), Ty::Nil);
+        }
+        if key_ty == Ty::Unknown {
+            return Ty::Unknown;
+        }
+        if info.escapes {
+            return Ty::Any;
+        }
+        let mut held = info.dyn_value;
+        if key_may_be_string(key_ty) {
+            for ty in info.fields.values() {
+                held = held.join(*ty);
+            }
+        }
+        if key_may_be_index(key_ty) {
+            held = held.join(info.element);
+        }
+        join_read(self.stored(held), Ty::Nil)
+    }
+
+    /// What `pairs(t)` binds as each value, for `t` of type `ty`: any
+    /// element, field or value stored under a key not known at compile
+    /// time, when the types know every one and no metatable may take
+    /// the walk over with `__pairs`. Anything otherwise.
+    pub fn pairs_value_ty(&self, ty: Ty) -> Ty {
+        let Ty::Shape(k) = ty else {
+            return if ty == Ty::Unknown {
+                Ty::Unknown
+            } else {
+                Ty::Any
+            };
+        };
+        let info = self.shape(k);
+        if info.unknown_meta
+            || info.escapes
+            || info.classes.iter().any(|c| {
+                self.shape(*c).field("__pairs").is_some() || self.may_hold_unnamed(*c, "__pairs")
+            })
+        {
+            return Ty::Any;
+        }
+        let mut held = info.element.join(info.dyn_value);
+        for ty in info.fields.values() {
+            held = held.join(*ty);
+        }
+        held
     }
 
     /// The element type a `for` over `ipairs(t)` binds, for `t` of type
@@ -690,7 +818,7 @@ impl Inferred {
             return Ty::Any;
         }
         let info = self.shape(class);
-        let own = match info.field(name) {
+        let own = match info.field(name).map(|(i, ty)| (i, self.stored(ty))) {
             Some((_, Ty::Unknown)) => return Ty::Unknown,
             Some((_, ty)) if info.always_present(name) => return ty,
             Some((_, ty)) => Some(ty),
@@ -717,12 +845,43 @@ impl Inferred {
     /// field nothing has stored in yet decides nothing yet.
     pub fn field_read_ty(&self, k: ShapeId, name: &str) -> Ty {
         let info = self.shape(k);
-        match info.field(name) {
+        match info.field(name).map(|(i, ty)| (i, self.stored(ty))) {
             Some((_, Ty::Unknown)) => Ty::Unknown,
             Some((_, ty)) if info.always_present(name) => ty,
             Some((_, ty)) => join_read(ty, self.absent_field_ty(k, name)),
             None => self.absent_field_ty(k, name),
         }
+    }
+}
+
+/// What a builtin does with the tables among its arguments, beyond
+/// looking at them: whether they may be borrowed, so a table passed
+/// keeps its shape's types.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Borrows {
+    /// It may keep its arguments or hand them to code: they escape.
+    No,
+    /// It looks at its arguments raw and keeps none: all are borrowed.
+    Raw,
+    /// It reads its first argument's elements as an index does, so a
+    /// metatable's `__index` may be called with it: borrowed when the
+    /// table has no metatable.
+    Indexed,
+    /// It walks its first argument for a generic `for`: borrowed when
+    /// the loop's bindings are typed from the table's shape.
+    Walk,
+    /// `select`: its arguments are borrowed when it counts them.
+    Count,
+}
+
+/// What the library function `b` does with its table arguments.
+fn borrows(b: &Builtin) -> Borrows {
+    match (b.lib, b.name) {
+        ("", "rawlen" | "rawequal" | "next") => Borrows::Raw,
+        ("", "unpack") | ("table", "concat" | "unpack") => Borrows::Indexed,
+        ("", "pairs" | "ipairs") => Borrows::Walk,
+        ("", "select") => Borrows::Count,
+        _ => Borrows::No,
     }
 }
 
@@ -770,27 +929,25 @@ pub fn builtin_member(scopes: &Scopes, lib: &str, name: &str) -> Option<&'static
 }
 
 /// The result of a `math` function whose arguments' types decide it:
-/// `math.abs` of an integer is an integer, `math.max` of floats a
-/// float. `None` when they do not, and the function's declared result
-/// stands; unknown when an argument is not known yet.
+/// `math.abs` of an integer is an integer, `math.max` of an integer and
+/// a float one or the other, `math.floor` of a float the integer it
+/// rounds to when that fits, else the float. `None` when they do not,
+/// and the function's declared result stands; unknown when an argument
+/// is not known yet.
 pub fn math_result(b: &Builtin, args: &[Ty]) -> Option<Ty> {
     if b.lib != "math" {
         return None;
     }
-    let numbers = |args: &[Ty]| -> Option<Ty> {
-        // All integers, or all floats.
-        let first = *args.first()?;
-        if !first.is_number() || args.iter().any(|t| *t != first) {
-            return None;
-        }
-        Some(first)
-    };
     let result = match (b.name, args) {
-        ("abs" | "max" | "min", args) => numbers(args),
+        ("max" | "min", [first, rest @ ..]) if args.iter().all(|t| t.is_number()) => {
+            Some(rest.iter().fold(*first, |acc, t| acc.join(*t)))
+        }
+        ("abs", [t]) if t.is_number() => Some(*t),
         ("floor" | "ceil", [Ty::Int]) => Some(Ty::Int),
+        ("floor" | "ceil", [Ty::Float | Ty::Number]) => Some(Ty::Number),
         ("fmod", [Ty::Int, Ty::Int]) => Some(Ty::Int),
         ("fmod", [Ty::Int | Ty::Float, Ty::Int | Ty::Float]) => Some(Ty::Float),
-        ("floor" | "ceil" | "fmod", _) => None,
+        ("max" | "min" | "abs" | "floor" | "ceil" | "fmod", _) => None,
         _ => return None,
     };
     if args.contains(&Ty::Unknown) {
@@ -916,6 +1073,15 @@ impl<'a> Typer<'a> {
                 && let Some(r) = self.metatable_call_returns(b, args)
             {
                 return r;
+            }
+            if b.lib.is_empty()
+                && b.name == "rawget"
+                && let ast::Call::AnonymousCall(ast::FunctionArgs::Parentheses {
+                    arguments, ..
+                }) = last
+                && let Some(t) = self.rawget_ty(&arguments.iter().collect::<Vec<_>>())
+            {
+                return Returns::Fixed(vec![t]);
             }
             return match b.ret {
                 Ret::Multi => Returns::Dynamic,
@@ -1044,6 +1210,28 @@ impl<'a> Typer<'a> {
         });
         out.dedup();
         Some(out)
+    }
+
+    /// What `rawget(t, k)` finds, for these arguments, when `t` is a
+    /// shaped table and the types know what it holds under `k`.
+    pub fn rawget_ty(&self, args: &[&Expression]) -> Option<Ty> {
+        let [t, key, ..] = args else {
+            return None;
+        };
+        let Ty::Shape(k) = self.ty_of(t) else {
+            return None;
+        };
+        let info = self.known.shapes.get(k.0 as usize)?;
+        let ty = match crate::scope::literal_string(key) {
+            Some(name) => match info.field(&name) {
+                Some((_, ty)) if info.always_present(&name) => ty,
+                Some((_, ty)) => join_read(ty, Ty::Nil),
+                None if info.unknown_meta => Ty::Any,
+                None => self.known.unnamed_ty(k, &name),
+            },
+            None => self.known.raw_keyed_ty(k, self.ty_of(key)),
+        };
+        (ty != Ty::Any).then_some(ty)
     }
 
     /// `setmetatable(t, m)` returns `t`; `getmetatable(t)` is anything.
@@ -1198,7 +1386,9 @@ impl<'a> Typer<'a> {
                     UnOp::Not(_) => Ty::Bool,
                     UnOp::Minus(_) => match t {
                         Ty::Int | Ty::Float | Ty::Number => t,
-                        Ty::Scalar | Ty::Nil | Ty::Bool => Ty::Number,
+                        Ty::Scalar | Ty::IntOrNil | Ty::FloatOrNil | Ty::Nil | Ty::Bool => {
+                            Ty::Number
+                        }
                         Ty::Shape(_) => self.metamethod_result("__unm", t, t).unwrap_or(Ty::Any),
                         _ => Ty::Any,
                     },
@@ -1311,6 +1501,9 @@ pub fn logical_ty(is_and: bool, a: Ty, b: Ty) -> Ty {
         a
     } else if a == Ty::Nil {
         b
+    } else if matches!(a, Ty::IntOrNil | Ty::FloatOrNil) {
+        // False only when nil: the number it holds, or `b`.
+        a.underlying().join(b)
     } else if a == Ty::Bool && b == Ty::Bool {
         Ty::Bool
     } else {
@@ -1341,7 +1534,13 @@ pub fn binary_ty(op: &BinOp, a: Ty, b: Ty) -> Ty {
         | BinOp::DoubleSlash(_) => {
             // A float operand makes a float; two integers an integer;
             // a number whose kind is not known keeps it open. A scalar
-            // that may not be a number raises, or is a number.
+            // that may not be a number raises, or is a number; one that
+            // may only be nil besides raises, or is its number.
+            let (a, b) = if a.underlying().is_number() && b.underlying().is_number() {
+                (a.underlying(), b.underlying())
+            } else {
+                (a, b)
+            };
             if !(a.is_number() && b.is_number()) {
                 if a.is_scalar() && b.is_scalar() {
                     Ty::Number
@@ -1547,10 +1746,11 @@ impl<'a> Round<'a> {
     }
 
     /// A store of `ty` under a key that is not a string into the
-    /// tables of shape `k`.
+    /// tables of shape `k`. A nil stored is no element: the element
+    /// type is what is present, and a read joins nil in.
     fn store_element(&mut self, k: ShapeId, ty: Ty) {
         let element = self.out.shapes[k.0 as usize].element;
-        let joined = self.join_into(element, ty);
+        let joined = self.join_into(element, present(ty));
         self.out.shapes[k.0 as usize].element = joined;
     }
 
@@ -1561,8 +1761,9 @@ impl<'a> Round<'a> {
             (Ty::Shape(k), Some(name)) => self.store_field(k, &name, ty),
             // Under a number the value is an element and stays typed.
             // Under a string it may land in any field, or under a name
-            // that is none; under anything else it is lost in the hash
-            // part.
+            // that is none; under anything else in the hash part: what
+            // may land there is `dyn_value`. A table with a metatable
+            // may hand the value to `__newindex` instead.
             (Ty::Shape(k), None) => {
                 if key_may_be_index(key_ty) {
                     self.store_element(k, ty);
@@ -1577,10 +1778,12 @@ impl<'a> Round<'a> {
                     for name in names {
                         self.store_field(k, &name, ty);
                     }
+                }
+                if !key_is_number(key_ty) {
                     let held = self.out.shapes[k.0 as usize].dyn_value;
                     self.out.shapes[k.0 as usize].dyn_value = self.join_into(held, ty);
                 }
-                if !key_is_number(key_ty) {
+                if !self.known.plain(k) {
                     self.escape(ty);
                 }
             }
@@ -1773,7 +1976,7 @@ impl<'a> Round<'a> {
                 let reaching = if dynamic_code {
                     Ty::Any
                 } else {
-                    self.out.blind_element
+                    present(self.out.blind_element)
                 };
                 let joined = self.join_into(element, reaching);
                 if joined != element {
@@ -2106,8 +2309,14 @@ impl<'a> Round<'a> {
                         }
                         let receiver =
                             self.typer().suffixed_ty(v.prefix(), &suffixes[..suffixes.len() - 1]);
+                        // Under a key not known at compile time, into a
+                        // table no handler may take it from.
+                        let keyed = match receiver {
+                            Ty::Shape(k) => self.known.plain(k),
+                            _ => receiver == Ty::Unknown,
+                        };
                         matches!(receiver, Ty::Shape(_) | Ty::Unknown)
-                            && matches!(suffixes.last(), Some(Suffix::Index(i)) if constant_key(i).is_some())
+                            && matches!(suffixes.last(), Some(Suffix::Index(i)) if keyed || constant_key(i).is_some())
                     }
                     _ => false,
                 });
@@ -2200,34 +2409,44 @@ impl<'a> Round<'a> {
                 }
                 self.loop_iterator = outer;
                 let names: Vec<VarId> = f.names().iter().map(|n| self.scopes.declared(n)).collect();
-                // `ipairs` gives an integer key; anything else, dynamic
-                // values.
-                let ipairs = exprs.len() == 1
-                    && matches!(exprs[0], Expression::FunctionCall(c)
-                        if self.typer().builtin_callee(c.prefix(), &c.suffixes().collect::<Vec<_>>())
-                            .is_some_and(|b| b.name == "ipairs" && b.lib.is_empty()));
-                let element = if ipairs {
-                    let table = match exprs[0] {
-                        Expression::FunctionCall(c) => match c.suffixes().last() {
-                            Some(Suffix::Call(ast::Call::AnonymousCall(
-                                ast::FunctionArgs::Parentheses { arguments, .. },
-                            ))) => arguments
-                                .iter()
-                                .next()
-                                .map(|a| self.typer().ty_of(a))
-                                .unwrap_or(Ty::Nil),
-                            _ => Ty::Any,
-                        },
-                        _ => Ty::Any,
-                    };
-                    self.known.ipairs_value_ty(table)
-                } else {
-                    Ty::Any
+                // `ipairs` gives an integer key and each element; a
+                // typed `pairs` any key and each value its shape holds;
+                // anything else, dynamic values.
+                let walk = match exprs.as_slice() {
+                    [Expression::FunctionCall(c)] => {
+                        let suffixes: Vec<&Suffix> = c.suffixes().collect();
+                        match (
+                            self.typer().builtin_callee(c.prefix(), &suffixes),
+                            suffixes.last(),
+                        ) {
+                            (
+                                Some(b),
+                                Some(Suffix::Call(ast::Call::AnonymousCall(
+                                    ast::FunctionArgs::Parentheses { arguments, .. },
+                                ))),
+                            ) if borrows(b) == Borrows::Walk => {
+                                let table = arguments
+                                    .iter()
+                                    .next()
+                                    .map(|a| self.typer().ty_of(a))
+                                    .unwrap_or(Ty::Nil);
+                                Some((b.name, table))
+                            }
+                            (Some(b), _) if borrows(b) == Borrows::Walk => Some((b.name, Ty::Any)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let (key, value) = match walk {
+                    Some(("ipairs", table)) => (Ty::Int, self.known.ipairs_value_ty(table)),
+                    Some((_, table)) => (Ty::Any, self.known.pairs_value_ty(table)),
+                    None => (Ty::Any, Ty::Any),
                 };
                 for (i, v) in names.iter().enumerate() {
                     let ty = match i {
-                        0 if ipairs => Ty::Int,
-                        1 if ipairs => element,
+                        0 => key,
+                        1 => value,
                         _ => Ty::Any,
                     };
                     self.assign_var(*v, ty);
@@ -2381,7 +2600,8 @@ impl<'a> Round<'a> {
             {
                 self.expr(args[0]);
                 self.expr(args[1]);
-                let element = self.known.shape(k).element;
+                // A hole in the array part reaches the comparator as nil.
+                let element = self.known.shape(k).element.join(Ty::Nil);
                 self.record_call_types(f, vec![element, element]);
                 return;
             }
@@ -2437,10 +2657,8 @@ impl<'a> Round<'a> {
                 },
                 _ => Ty::Str,
             };
-            // A typed `ipairs` binds each element as its type; what
-            // its iterator hands elsewhere leaves with the table,
-            // which the call takes as a value.
-            let typed = b.name == "ipairs" && self.known.ipairs_value_ty(table) != Ty::Any;
+            // A typed walk binds each element or value as its type.
+            let typed = borrows(b) == Borrows::Walk && self.typed_walk(b, prefix, table);
             if !typed {
                 self.untyped_read(table, reads);
             }
@@ -2528,10 +2746,13 @@ impl<'a> Round<'a> {
                     self.escape(*t);
                 }
             }
-            // `rawget` hands out what it finds as a dynamic value.
+            // `rawget` hands out what it finds typed from the shape, or
+            // as a dynamic value.
             _ => {
                 let key_ty = tys.get(1).copied().unwrap_or(Ty::Nil);
+                let typed = self.typer().rawget_ty(args).is_some();
                 match args.get(1).and_then(|k| crate::scope::literal_string(k)) {
+                    _ if typed => {}
                     Some(key) if !matches!(receiver, Ty::Shape(_)) => {
                         self.read_through(receiver, &key)
                     }
@@ -2570,14 +2791,16 @@ impl<'a> Round<'a> {
             let receiver = self.typer().suffixed_ty(prefix, &suffixes[..i]);
             match s {
                 Suffix::Call(ast::Call::AnonymousCall(args)) => {
-                    if let Some(b) = self.typer().builtin_callee(prefix, &suffixes[..=i]) {
+                    let builtin = self.typer().builtin_callee(prefix, &suffixes[..=i]);
+                    if let Some(b) = builtin {
                         self.library_reads_of(b, prefix, args);
                     }
                     // The arguments of a direct call feed the callee's
                     // parameters, and so keep their types; a callee not
                     // typed yet may still turn out known. So do those of
                     // a field call the lookups resolve to known
-                    // functions. Anything else takes values, and every
+                    // functions. Those a library function borrows keep
+                    // theirs. Anything else takes values, and every
                     // function a field call may reach escapes.
                     let field = match receiver {
                         Ty::Func(_) | Ty::Unknown => None,
@@ -2587,7 +2810,10 @@ impl<'a> Round<'a> {
                         .as_ref()
                         .and_then(|(k, name)| self.typer().method_targets(*k, name));
                     let direct = matches!(receiver, Ty::Func(_) | Ty::Unknown) || targets.is_some();
-                    self.args(args, direct);
+                    match builtin {
+                        Some(b) if !direct => self.builtin_args(b, prefix, args),
+                        _ => self.args(args, direct),
+                    }
                     if let Ty::Func(f) = receiver {
                         self.record_call(f, None, args);
                     }
@@ -2728,6 +2954,63 @@ impl<'a> Round<'a> {
         sig.params = params;
     }
 
+    /// The arguments of a call to the library function `b`: those it
+    /// borrows keep their types, the rest take values.
+    fn builtin_args(&mut self, b: &Builtin, prefix: &Prefix, args: &ast::FunctionArgs) {
+        let ast::FunctionArgs::Parentheses { arguments, .. } = args else {
+            return self.args(args, false);
+        };
+        let exprs: Vec<&Expression> = arguments.iter().collect();
+        let borrowed = self.borrowed_args(b, prefix, &exprs);
+        for (i, a) in exprs.iter().enumerate() {
+            if i < borrowed {
+                self.expr(a);
+            } else {
+                self.value(a);
+            }
+        }
+    }
+
+    /// How many of its leading arguments a call to `b` borrows: a
+    /// library function may borrow a table only when everything it
+    /// hands out of it is typed from the table's shape, or escapes.
+    fn borrowed_args(&self, b: &Builtin, prefix: &Prefix, exprs: &[&Expression]) -> usize {
+        let first = || match exprs.first() {
+            Some(e) => self.typer().ty_of(e),
+            None => Ty::Nil,
+        };
+        match borrows(b) {
+            Borrows::No => 0,
+            Borrows::Raw => exprs.len(),
+            Borrows::Count => {
+                let counts = exprs
+                    .first()
+                    .and_then(|e| crate::scope::literal_string(e))
+                    .is_some_and(|s| s == "#");
+                if counts { exprs.len() } else { 0 }
+            }
+            Borrows::Indexed => match first() {
+                Ty::Shape(k) if self.known.plain(k) => 1,
+                _ => 0,
+            },
+            Borrows::Walk => usize::from(self.typed_walk(b, prefix, first())),
+        }
+    }
+
+    /// Whether `pairs(t)` or `ipairs(t)`, called by `prefix`, heads a
+    /// generic `for` whose bindings are typed from `t`'s shape.
+    fn typed_walk(&self, b: &Builtin, prefix: &Prefix, table: Ty) -> bool {
+        let header = match prefix {
+            Prefix::Name(token) => self.loop_iterator == Some(crate::scope::pos_of(token)),
+            _ => false,
+        };
+        let value = match b.name {
+            "ipairs" => self.known.ipairs_value_ty(table),
+            _ => self.known.pairs_value_ty(table),
+        };
+        header && matches!(table, Ty::Shape(_)) && value != Ty::Any
+    }
+
     fn prefix(&mut self, p: &Prefix) {
         if let Prefix::Expression(e) = p {
             self.expr(e);
@@ -2835,6 +3118,12 @@ impl<'a> Round<'a> {
                             self.record_call_types(f, vec![t, t]);
                         }
                     }
+                    // `#t` with no `__len` to call looks at the table.
+                    None if matches!(unop, UnOp::Hash(_))
+                        && matches!(t, Ty::Shape(k) if self.known.plain_len(k)) =>
+                    {
+                        self.expr(expression)
+                    }
                     None => self.value(expression),
                 }
             }
@@ -2854,6 +3143,15 @@ impl<'a> Round<'a> {
             }
             _ => {}
         }
+    }
+}
+
+/// What a value of type `ty` is when it is present: nil is nothing, and
+/// a number or nil its number.
+fn present(ty: Ty) -> Ty {
+    match ty {
+        Ty::Nil => Ty::Unknown,
+        t => t.underlying(),
     }
 }
 
@@ -2879,7 +3177,7 @@ fn library_reads(b: &Builtin) -> Option<Reads> {
             elements: true,
             through_meta: false,
         }),
-        ("", "ipairs") | ("table", "unpack" | "remove" | "sort") => {
+        ("", "ipairs" | "unpack") | ("table", "unpack" | "remove" | "sort") => {
             Some(Reads::under(Ty::Int, true))
         }
         _ => None,
@@ -2910,6 +3208,8 @@ fn key_may_be_string(ty: Ty) -> bool {
             | Ty::Float
             | Ty::Number
             | Ty::Scalar
+            | Ty::IntOrNil
+            | Ty::FloatOrNil
             | Ty::Bool
             | Ty::Nil
             | Ty::Table
@@ -3170,7 +3470,7 @@ fn infer_given(
         escaping: escaping.clone(),
         ..Default::default()
     };
-    for _ in 0..16 {
+    for _ in 0..32 {
         let mut round = Round {
             scopes,
             known: &known,
@@ -3189,6 +3489,7 @@ fn infer_given(
         // their ids and their fields' order; what is stored in them,
         // their classes and what reaches them are found again.
         round.out.escaping = escaping.clone();
+        round.out.settling = known.settling;
         round.out.shape_by_keys = known.shape_by_keys.clone();
         round.out.shape_by_site = known.shape_by_site.clone();
         round.out.shapes = known
@@ -3245,7 +3546,11 @@ fn infer_given(
             );
         }
         if out == known {
-            break;
+            if known.settling {
+                break;
+            }
+            known.settling = true;
+            continue;
         }
         known = out;
     }

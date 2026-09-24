@@ -2091,18 +2091,6 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         st.push(ret(int_if_fits(call(op, vec![get_f64(y.e())], f64()))));
         d.push(define(name, &[&x], any(), st));
     }
-    // The same on a float the program knows it has.
-    for (name, op) in [
-        ("zl_math_floor_f", "floor"),
-        ("zl_math_ceil_f", "zl_ceil_f64"),
-    ] {
-        d.push(define(
-            name,
-            &[&f],
-            any(),
-            vec![ret(int_if_fits(call(op, vec![f.e()], f64())))],
-        ));
-    }
     // The absolute value the compiler has an instruction for.
     d.push(extern_fn("abs", &[("x", f64())], f64(), None));
     // `math.fmod` on two integers: the remainder rounded toward zero;
