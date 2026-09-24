@@ -2395,13 +2395,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     /// Statements storing `value`, already of the slot's stored type,
     /// into slot `slot` of table `t`, and setting its bit; a value that
-    /// may be nil clears the bit when it is.
+    /// may be nil clears the bit when it is. With `settled` the bit is
+    /// set for good (a field born with the table that nothing clears)
+    /// and left alone.
     fn slot_write(
         &mut self,
         t: &Node,
         layout: &ShapeLayout,
         slot: &Slot,
         value: Node,
+        settled: bool,
         span: Span,
     ) -> Vec<St> {
         let i64_t = prim(PrimitiveType::I64);
@@ -2441,6 +2444,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 value.clone(),
                 span,
             )),
+        }
+        if settled {
+            return out;
         }
         let present = self.present_of(t, span);
         let set = binary(
@@ -5336,7 +5342,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         span,
                     )
                 };
-                let then = self.slot_write(&t.node, layout, slot, stored.clone(), span);
+                // A field every table of the shape is born with, that
+                // nothing stores nil in and no store under a computed
+                // key reaches, keeps its bit set.
+                let settled = info.always_present(&name) && !info.dynamic_keys;
+                let then = self.slot_write(&t.node, layout, slot, stored.clone(), settled, span);
                 let boxed = self.coerce(
                     Val {
                         node: stored,
@@ -9319,7 +9329,7 @@ fn shape_hooks(module: &Module<'_>, layouts: &[ShapeLayout], span: Span) -> Vec<
                 },
                 slot.stored_ty(),
             );
-            let mut write = lowerer.slot_write(&t(), layout, slot, stored, span);
+            let mut write = lowerer.slot_write(&t(), layout, slot, stored, false, span);
             write.push(ret(Some(int_lit(0, span)), span));
             arms.push(if_(
                 slot_is(slot.bit),
