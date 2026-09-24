@@ -888,7 +888,9 @@ pub struct CompiledFunction {
 }
 
 /// A frame's register file registered with the collector as a root
-/// range for the frame's lifetime.
+/// range for as long as the frame runs interpreted. Once the frame
+/// transfers to compiled code its live-ins are the compiled frame's,
+/// and what the registers still name is no longer held by this frame.
 struct FrameRoots(*const u8);
 
 /// Storage a frame took for itself: the blocks it owns until it
@@ -938,11 +940,20 @@ impl FrameRoots {
         }
         Self(ptr)
     }
+
+    /// Stop rooting the registers: the frame has handed its live
+    /// values elsewhere.
+    fn release(&mut self) {
+        if !self.0.is_null() {
+            crate::collector::remove_root_range(self.0);
+            self.0 = std::ptr::null();
+        }
+    }
 }
 
 impl Drop for FrameRoots {
     fn drop(&mut self) {
-        crate::collector::remove_root_range(self.0);
+        self.release();
     }
 }
 
@@ -2988,12 +2999,16 @@ impl HirInterpreter {
     /// live-ins go into a frame laid out as the helper expects, and its
     /// result is the frame's result. A function returning through a
     /// destination hands `dest` over in the frame, and gets it back as
-    /// the result, the way its own return would.
+    /// the result, the way its own return would. Once the frame holds
+    /// the live-ins the registers stop being a root: a register that
+    /// died before the loop would otherwise hold its value for the rest
+    /// of the run.
     fn transfer(
         &mut self,
         helper: *const u8,
         site: &OsrSite,
         regs: &[ZyntaxValue],
+        roots: &mut FrameRoots,
         scratch: &mut Scratch,
         dest: *mut u8,
     ) -> Result<ZyntaxValue, InterpError> {
@@ -3025,6 +3040,7 @@ impl HirInterpreter {
                 }
             }
         }
+        roots.release();
         let sig = NativeSig::of_site(vec![HirType::Ptr(Box::new(HirType::U8))], site.ret.clone());
         if trace_enabled() {
             eprintln!("[interp] transfer site=0x{:x} -> {helper:?}", site.site_key);
@@ -3615,8 +3631,8 @@ impl HirInterpreter {
     ) -> Result<ZyntaxValue, InterpError> {
         let mut regs: Vec<ZyntaxValue> = vec![ZyntaxValue::Undef; cf.n_regs as usize];
         // The registers hold pointers the collector cannot see on any
-        // stack; they are a root for as long as the frame runs.
-        let _roots = FrameRoots::new(&regs);
+        // stack; they are a root for as long as the frame runs here.
+        let mut roots = FrameRoots::new(&regs);
 
         // Bind params into regs[0..n_params].
         for (i, a) in args.into_iter().enumerate() {
@@ -4484,7 +4500,14 @@ impl HirInterpreter {
                             self.waiting_marks.pop();
                             crate::osr::frame_left(bead);
                         }
-                        return self.transfer(helper as *const u8, osr_site, &regs, scratch, dest);
+                        return self.transfer(
+                            helper as *const u8,
+                            osr_site,
+                            &regs,
+                            &mut roots,
+                            scratch,
+                            dest,
+                        );
                     }
                 }
                 Op::RetVoid => {

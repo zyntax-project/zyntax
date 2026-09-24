@@ -160,3 +160,57 @@ fn a_region_returning_a_list_compiles_at_the_optimizing_tier() {
     );
     assert!(!stderr.contains("LLVM compile failed"), "{stderr}");
 }
+
+/// A frame that leaves at a loop header stops rooting its registers:
+/// a structure it finished with before the loop is reclaimed by a
+/// collection during the loop.
+#[test]
+fn a_frame_that_left_no_longer_roots_what_died_before_the_loop() {
+    if std::env::var_os("ZYNTAX_DISABLE_GC").is_some() {
+        return;
+    }
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dead_before_loop.py");
+    let output = Command::new(env!("CARGO_BIN_EXE_zypy"))
+        .arg("run")
+        .arg(script)
+        .env("ZYNTAX_TRACE_GC", "1")
+        .env("ZYNTAX_TRACE_INTERP", "1")
+        .env("ZYNTAX_GC_FLOOR_KB", "4096")
+        .output()
+        .expect("zypy starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout.trim(), "10700000", "{stderr}");
+    // Reached KB per collection, split at the last transfer, which is
+    // the outer frame's.
+    let reached = |line: &str| -> Option<u64> {
+        let rest = line.strip_prefix("[gc] #")?;
+        let (_, rest) = rest.split_once("since last, ")?;
+        let (kb, _) = rest.split_once(" KB reached")?;
+        kb.trim().parse().ok()
+    };
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for line in stderr.lines() {
+        if line.starts_with("[interp] transfer site=") {
+            before.append(&mut after);
+        } else if let Some(kb) = reached(line) {
+            after.push(kb);
+        }
+    }
+    assert!(
+        !before.is_empty() && !after.is_empty(),
+        "collections on both sides of the transfer are expected:\n{stderr}"
+    );
+    let built = before.iter().copied().max().unwrap_or(0);
+    let left = after.iter().copied().min().unwrap_or(u64::MAX);
+    assert!(
+        built >= 3 << 10,
+        "the structure was never marked: {built} KB\n{stderr}"
+    );
+    assert!(
+        left < 2 << 10,
+        "a collection after the transfer still reached {left} KB:\n{stderr}"
+    );
+}
