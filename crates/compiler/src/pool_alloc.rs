@@ -182,6 +182,8 @@ pub(crate) unsafe fn slab_layout(slab: usize) -> (usize, usize) {
 pub(crate) const SLAB_HEADER: usize = HEADER;
 /// Bytes per slab and its alignment.
 pub(crate) const SLAB_BYTES: usize = SLAB;
+/// Number of size classes.
+pub(crate) const CLASS_COUNT: usize = CLASSES;
 /// Bytes a block in `class` occupies; see [`slot_bytes`].
 pub(crate) fn class_slot_bytes(class: usize) -> usize {
     slot_bytes(class)

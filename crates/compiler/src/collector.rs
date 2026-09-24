@@ -58,7 +58,8 @@
 //!
 //! `ZYNTAX_DISABLE_GC=1` keeps it off however it was enabled; safe, the
 //! program merely leaks what it would have collected. `ZYNTAX_TRACE_GC=1`
-//! reports each collection. `ZYNTAX_GC_FLOOR_KB=<n>` sets the heap size
+//! reports each collection, `=2` what each root range reaches, `=3`
+//! which words anchored the most. `ZYNTAX_GC_FLOOR_KB=<n>` sets the heap size
 //! below which nothing is collected; a small value collects constantly,
 //! which is how a missed root is found.
 //!
@@ -208,9 +209,27 @@ fn trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("ZYNTAX_TRACE_GC").is_some())
 }
 
+fn trace_level() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("ZYNTAX_TRACE_GC")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(0)
+    })
+}
+
 fn trace_detail() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ZYNTAX_TRACE_GC").as_deref() == Ok("2"))
+    trace_level() >= 2
+}
+
+/// `ZYNTAX_TRACE_GC=3`: each collection also reports what anchored
+/// the most bytes, by root word and by the class and offset of the
+/// heap word. Marking follows each root word to the end before the
+/// next, which is slower and counts everything as reached directly in
+/// the summary line; safe otherwise.
+fn trace_attribution() -> bool {
+    trace_level() >= 3
 }
 
 fn disabled_by_env() -> bool {
@@ -562,6 +581,36 @@ fn bit(idx: usize) -> (usize, u64) {
 /// Pointers the marker remembers having marked through.
 const SEEN: usize = 4;
 
+/// Where a marked block was reached from, under the attribution trace.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Anchor {
+    /// A word outside the heap, by address: credited with everything
+    /// reached through it.
+    Root(usize),
+    /// A word of a pooled block, by the block's class and the word's
+    /// offset in it: credited with the blocks it is the first to
+    /// name.
+    Slot(usize, usize),
+    /// A word of a large block, by offset, credited as a slot is.
+    Large(usize),
+}
+
+/// What the attribution trace gathers over one collection.
+#[derive(Default)]
+struct Attribution {
+    /// Bytes credited to each anchor.
+    through: HashMap<Anchor, usize>,
+    /// The pointer a root word held and the block it reached, for the
+    /// report.
+    root_targets: HashMap<usize, (usize, usize)>,
+    /// Blocks and bytes marked per class; the last entry is the large
+    /// blocks.
+    classes: Vec<(usize, usize)>,
+}
+
+/// Anchors named in the attribution report.
+const ATTRIBUTION_TOP: usize = 12;
+
 /// One collection's working state.
 struct Marker<'a> {
     reg: &'a Registry,
@@ -586,6 +635,8 @@ struct Marker<'a> {
     /// Reached blocks whose words are still to be read: base and length.
     work: Vec<(usize, usize)>,
     marked_bytes: usize,
+    /// Present under the attribution trace.
+    attribution: Option<Box<Attribution>>,
 }
 
 impl<'a> Marker<'a> {
@@ -623,6 +674,12 @@ impl<'a> Marker<'a> {
             large_marked: HashSet::new(),
             work: Vec::new(),
             marked_bytes: 0,
+            attribution: trace_attribution().then(|| {
+                Box::new(Attribution {
+                    classes: vec![(0, 0); pool_alloc::CLASS_COUNT + 1],
+                    ..Default::default()
+                })
+            }),
         }
     }
 
@@ -675,12 +732,17 @@ impl<'a> Marker<'a> {
             bits.marks[w] |= m;
             let len = bits.slot;
             let base = slab + bits.base(idx);
+            let class = bits.class;
             if reached {
                 self.seen[seen_at] = a;
                 self.seen_at = (seen_at + 1) % SEEN;
             } else {
                 self.marked_bytes += len;
                 self.work.push((base, len));
+                if let Some(attr) = self.attribution.as_deref_mut() {
+                    attr.classes[class].0 += 1;
+                    attr.classes[class].1 += len;
+                }
             }
             return;
         }
@@ -699,6 +761,11 @@ impl<'a> Marker<'a> {
                 }
                 self.marked_bytes += total;
                 self.work.push((payload, len));
+                if let Some(attr) = self.attribution.as_deref_mut() {
+                    let last = attr.classes.len() - 1;
+                    attr.classes[last].0 += 1;
+                    attr.classes[last].1 += total;
+                }
             }
         }
     }
@@ -718,6 +785,9 @@ impl<'a> Marker<'a> {
     /// Read every aligned word in `[lo, hi)` as a possible pointer,
     /// except one back into the range itself, which is reached already.
     fn scan(&mut self, lo: usize, hi: usize) {
+        if self.attribution.is_some() {
+            return self.scan_attributing(lo, hi, None);
+        }
         let mut p = (lo + 7) & !7;
         while p + 8 <= hi {
             // SAFETY: the caller hands over memory it owns and that is
@@ -730,10 +800,131 @@ impl<'a> Marker<'a> {
         }
     }
 
+    /// [`Self::scan`] under the attribution trace. A root word that
+    /// reaches something new is followed to the end before the next
+    /// and credited with all of it; a heap word is credited with the
+    /// block it names. `block` is the class of a pooled block being
+    /// read; a root or a large block has none.
+    fn scan_attributing(&mut self, lo: usize, hi: usize, block: Option<usize>) {
+        let mut p = (lo + 7) & !7;
+        while p + 8 <= hi {
+            // SAFETY: as in `scan`.
+            let w = unsafe { std::ptr::read_volatile(p as *const usize) };
+            if w < lo || w >= hi {
+                let before = self.marked_bytes;
+                let pending = self.work.len();
+                self.consider(w);
+                if self.marked_bytes != before {
+                    let anchor = match block {
+                        Some(class) => Anchor::Slot(class, p - lo),
+                        None if self.reg.large.contains_key(&lo) => Anchor::Large(p - lo),
+                        None => Anchor::Root(p),
+                    };
+                    let target = self.work.last().map_or(0, |(base, _)| *base);
+                    if let Anchor::Root(at) = anchor {
+                        self.drain_to(pending);
+                        let attr = self.attribution.as_deref_mut().expect("attributing");
+                        attr.root_targets.insert(at, (w, target));
+                    }
+                    let reached = self.marked_bytes - before;
+                    let attr = self.attribution.as_deref_mut().expect("attributing");
+                    *attr.through.entry(anchor).or_insert(0) += reached;
+                }
+            }
+            p += 8;
+        }
+    }
+
     /// Follow what has been reached until nothing new is.
     fn drain(&mut self) {
-        while let Some((base, len)) = self.work.pop() {
-            self.scan(base, base + len);
+        self.drain_to(0);
+    }
+
+    /// Follow what was reached after the work list held `pending`
+    /// entries, leaving those for the caller that queued them.
+    fn drain_to(&mut self, pending: usize) {
+        while self.work.len() > pending {
+            let (base, len) = self.work.pop().expect("above the mark");
+            if self.attribution.is_some() {
+                let class = pool_alloc::in_a_slab_at(base).then(|| {
+                    // SAFETY: a registered slab is live.
+                    unsafe { pool_alloc::slab_layout(base & !(pool_alloc::SLAB_BYTES - 1)) }.0
+                });
+                self.scan_attributing(base, base + len, class);
+            } else {
+                self.scan(base, base + len);
+            }
+        }
+    }
+
+    /// The class of the pooled block at `block`, as a slot size, or
+    /// "large".
+    fn describe_block(block: usize) -> String {
+        if pool_alloc::in_a_slab_at(block) {
+            // SAFETY: a registered slab is live.
+            let (c, _) = unsafe { pool_alloc::slab_layout(block & !(pool_alloc::SLAB_BYTES - 1)) };
+            format!("{} B", pool_alloc::class_slot_bytes(c))
+        } else {
+            "large".to_string()
+        }
+    }
+
+    /// Print what the attribution trace gathered: the classes marked,
+    /// then the anchors credited with the most bytes.
+    fn report_attribution(&self, sp: usize) {
+        let Some(attr) = self.attribution.as_deref() else {
+            return;
+        };
+        let large = attr.classes.len() - 1;
+        let mut classes: Vec<(usize, usize, usize)> = attr
+            .classes
+            .iter()
+            .enumerate()
+            .filter(|(_, (n, _))| *n > 0)
+            .map(|(c, (n, b))| (c, *n, *b))
+            .collect();
+        classes.sort_by(|a, b| b.2.cmp(&a.2));
+        for (class, blocks, bytes) in classes.iter().take(ATTRIBUTION_TOP) {
+            if *class == large {
+                eprintln!("[gc]   large blocks: {blocks} marked, {} KB", bytes >> 10);
+            } else {
+                eprintln!(
+                    "[gc]   class {} B: {blocks} marked, {} KB",
+                    pool_alloc::class_slot_bytes(*class),
+                    bytes >> 10
+                );
+            }
+        }
+        let mut anchors: Vec<(Anchor, usize)> =
+            attr.through.iter().map(|(a, b)| (*a, *b)).collect();
+        anchors.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (anchor, bytes) in anchors.iter().take(ATTRIBUTION_TOP) {
+            match anchor {
+                Anchor::Root(at) => {
+                    let (held, block) = attr.root_targets.get(at).copied().unwrap_or((0, 0));
+                    let place = if *at >= sp {
+                        format!("stack word sp+{:#x}", at - sp)
+                    } else {
+                        format!("root word {at:#x}")
+                    };
+                    eprintln!(
+                        "[gc]   {place} holds {held:#x}, a {} block at {block:#x}: {} KB through it",
+                        Self::describe_block(block),
+                        bytes >> 10
+                    );
+                }
+                Anchor::Slot(class, offset) => eprintln!(
+                    "[gc]   class {} B offset {offset}: {} KB first named by it",
+                    pool_alloc::class_slot_bytes(*class),
+                    bytes >> 10
+                ),
+                Anchor::Large(offset) => {
+                    eprintln!(
+                        "[gc]   large block offset {offset}: {} KB first named by it",
+                        bytes >> 10
+                    )
+                }
+            }
         }
     }
 
@@ -1029,6 +1220,7 @@ fn collect_from(sp: usize) {
         let roots_at = started.elapsed();
         marker.drain();
         let marked_at = started.elapsed();
+        marker.report_attribution(sp);
         let (freed_blocks, freed_bytes, free_bytes) = marker.sweep();
         if trace() {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
