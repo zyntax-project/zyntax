@@ -589,6 +589,14 @@ struct UndoSwap {
     name: String,
     /// Entry pointer the bead held before the swap (0 if none).
     old_entry: usize,
+    /// The function's bead id.
+    bead_id: u64,
+    /// What the function's reload cell held before the reload (0 if
+    /// nothing was published).
+    old_cell: usize,
+    /// What the bead's first-call stub returned before the reload (0 if
+    /// nothing was published).
+    old_published: usize,
     old_body: Arc<HirFunction>,
     /// OSR resume points this reload published, to be unpublished.
     helper_sites: Vec<(u64, u64)>,
@@ -1349,6 +1357,9 @@ impl TieredBackend {
                         &effect_remap,
                         &effect_const_remap,
                     );
+                    // The edited body replaces the running function under
+                    // the running id, which is the key it is stored under.
+                    body.id = old_id;
 
                     if inject_fail.as_deref() == Some(name.as_str()) {
                         compile_failed.push((name, "injected compile failure (test hook)".into()));
@@ -1470,6 +1481,7 @@ impl TieredBackend {
             .collect();
         let mut undo = ReloadUndo::default();
         let mut updated_functions: Vec<(HirId, HirFunction)> = Vec::new();
+        let reload_key = self.cranelift.with_lock(|be| be.reload_key());
 
         for change in changes {
             let PreparedChange {
@@ -1484,6 +1496,8 @@ impl TieredBackend {
 
             let mut old_entry = 0usize;
             let mut old_body: Option<Arc<HirFunction>> = None;
+            let old_cell = crate::reload::call_target(reload_key, old_id);
+            let old_published = osr::published_entry(bead_id);
             if let Some(fn_entry) = self.functions.get_mut(&old_id) {
                 old_entry = fn_entry
                     .bound
@@ -1492,9 +1506,21 @@ impl TieredBackend {
                     .map(|p| p as usize)
                     .unwrap_or(0);
                 old_body = Some(fn_entry.body(old_id));
-                fn_entry.bound.bead().swap_compiled(entry_ptr as *mut ());
+                // A bead still in the interpreter holds no code to swap.
+                // It takes the edit's code now: the interpreter's copy
+                // of the body is the previous generation's.
+                if fn_entry
+                    .bound
+                    .bead()
+                    .swap_compiled(entry_ptr as *mut ())
+                    .is_none()
+                {
+                    fn_entry.bound.bead().eager_install(entry_ptr as *mut ());
+                }
                 fn_entry.function = Some(Arc::new(body.clone()));
             }
+            // A stub whose address was kept calls the edit's code too.
+            osr::set_published_entry(bead_id, entry_ptr);
 
             // A resume point is only sound where the old code's probe
             // writes the frame the edited body's helper reads: same
@@ -1570,6 +1596,9 @@ impl TieredBackend {
                 id: old_id,
                 name: name.clone(),
                 old_entry,
+                bead_id,
+                old_cell,
+                old_published,
                 old_body: old_body.unwrap_or_else(|| Arc::new(old_fn.clone())),
                 helper_sites,
                 vtable_slots,
@@ -1711,11 +1740,22 @@ impl TieredBackend {
                         .bound
                         .bead()
                         .swap_compiled(swap.old_entry as *mut ());
+                } else {
+                    // The bead had no code before the reload installed
+                    // the edit's: back to the interpreter, which runs the
+                    // restored body.
+                    fn_entry.bound.bead().reload();
                 }
                 fn_entry.function = Some(Arc::clone(&swap.old_body));
             }
+            let cell = if swap.old_cell != 0 {
+                swap.old_cell
+            } else {
+                swap.old_entry
+            };
             self.cranelift
-                .with_lock(|be| be.publish_call_target(swap.id, swap.old_entry));
+                .with_lock(|be| be.publish_call_target(swap.id, cell));
+            osr::set_published_entry(swap.bead_id, swap.old_published);
             for (bead_id, site) in swap.helper_sites {
                 osr::publish_helper(bead_id, site, ptr::null_mut());
             }

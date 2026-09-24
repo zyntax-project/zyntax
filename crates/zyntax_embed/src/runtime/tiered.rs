@@ -1554,6 +1554,7 @@ impl TieredRuntime {
         // An aborted reload changed nothing, so the handles' view of
         // shapes and machines must not move either.
         if !report.aborted {
+            self.rebind_interpreter_ticks();
             self.apply_reload_fiber_meta(fiber_decls, &report);
             if !report.state_migrations.is_empty() {
                 let plans = report.state_migrations.clone();
@@ -1575,6 +1576,21 @@ impl TieredRuntime {
         self.runtime_events.push(event);
 
         Ok(report)
+    }
+
+    /// Give the interpreter each function's entry callback anew. The
+    /// callbacks carry the body and module a promotion compiles, which
+    /// a reload or a rollback replaces. Skipped while the interpreter
+    /// is running, as at load.
+    fn rebind_interpreter_ticks(&self) {
+        let Ok(mut interp) = self.interpreter.try_lock() else {
+            return;
+        };
+        for id in self.function_ids.values().copied() {
+            if let Some(tick) = self.backend.interpreter_tick_callback(id) {
+                interp.register_tick_callback(id, tick);
+            }
+        }
     }
 
     /// Choose what a reload does with live handler state whose layout
@@ -1641,6 +1657,7 @@ impl TieredRuntime {
             .backend
             .rollback_last_reload()
             .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+        self.rebind_interpreter_ticks();
 
         // The handles' view rolls back with the code: shape entries
         // (and their generations) return to their prior state, and
@@ -2540,6 +2557,7 @@ impl TieredRuntime {
         // An aborted reload changed nothing, so the handles' view of
         // shapes and machines must not move either.
         if !report.aborted {
+            self.rebind_interpreter_ticks();
             self.apply_reload_fiber_meta(fiber_decls, &report);
             if !report.state_migrations.is_empty() {
                 let plans = report.state_migrations.clone();
