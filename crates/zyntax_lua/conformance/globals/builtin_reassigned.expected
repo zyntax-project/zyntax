@@ -1,0 +1,7 @@
+wrapped:	hi	1
+wrapped:	<5>
+wrapped:	7	1
+wrapped:	true	string
+wrapped:	T:number	function
+wrapped:	<nil>
+restored

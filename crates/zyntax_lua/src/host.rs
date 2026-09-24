@@ -1766,7 +1766,7 @@ extern "C" fn host_setlocale(locale: zrtl::StringConstPtr) -> StringPtr {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 95] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 96] = [
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$clock".as_ptr(), host_clock as *const u8),
@@ -1959,6 +1959,10 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 95] = [
     zrtl::ZrtlSymbol::new(
         c"$Lua$io_flush".as_ptr(),
         host_io::host_io_flush as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$io_flush_all".as_ptr(),
+        host_io::host_io_flush_all as *const u8,
     ),
     zrtl::ZrtlSymbol::new(
         c"$Lua$io_setvbuf".as_ptr(),

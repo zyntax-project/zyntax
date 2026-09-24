@@ -196,10 +196,13 @@ impl Scopes {
     }
 
     /// The function a global name is, when it is declared once by a
-    /// top-level `function name()` and assigned nowhere else, and no
-    /// global can be reached through the globals table.
+    /// top-level `function name()` and assigned nowhere else, no global
+    /// can be reached through the globals table, and a library value of
+    /// the name is never read before the declaration.
     pub fn known_global_function(&self, name: &str) -> Option<FuncId> {
-        if self.dynamic_globals {
+        if self.dynamic_globals
+            || (crate::types::preset_global(name) && !self.globals_initialized.contains(name))
+        {
             return None;
         }
         let f = *self.global_functions.get(name)?;
@@ -278,7 +281,7 @@ fn global_table_member(w: &Walker, v: &ast::VarExpression) -> Option<String> {
 
 /// Whether the global `name` with these suffixes is a call the types
 /// follow without taking `name` as a value: `setmetatable(t, m)` as a
-/// whole expression, `require "file"` as a whole expression (a file
+/// whole expression, `require "file"` heading an expression (a file
 /// of the program, whose own metatable calls the program's assembly
 /// accounts for), or a `debug` function that hands
 /// back no way to set a metatable (`debug.setmetatable(t, m)` again
@@ -294,15 +297,8 @@ fn metatable_call(name: &str, suffixes: &[&Suffix]) -> bool {
     };
     match (name, suffixes) {
         ("setmetatable", [call]) => parenthesized(call),
-        ("require", [Suffix::Call(ast::Call::AnonymousCall(args))]) => {
-            let file = match args {
-                ast::FunctionArgs::String(s) => literal_string_token(s),
-                ast::FunctionArgs::Parentheses { arguments, .. } => {
-                    arguments.iter().next().and_then(literal_string)
-                }
-                _ => None,
-            };
-            file.is_some_and(|f| !matches!(f.as_str(), "debug" | "_G" | "package"))
+        ("require", [Suffix::Call(ast::Call::AnonymousCall(args)), ..]) => {
+            required_name(args).is_some_and(|f| !matches!(f.as_str(), "debug" | "_G" | "package"))
         }
         (
             "debug",
@@ -323,7 +319,18 @@ fn metatable_call(name: &str, suffixes: &[&Suffix]) -> bool {
     }
 }
 
-/// The text of a string literal expression.
+/// The name `require` is called with, when it is a string literal.
+fn required_name(args: &ast::FunctionArgs) -> Option<String> {
+    match args {
+        ast::FunctionArgs::String(s) => literal_string_token(s),
+        ast::FunctionArgs::Parentheses { arguments, .. } => {
+            arguments.iter().next().and_then(literal_string)
+        }
+        _ => None,
+    }
+}
+
+/// The string a string literal expression spells, escapes decoded.
 pub fn literal_string(e: &Expression) -> Option<String> {
     let Expression::String(token) = e else {
         return None;
@@ -331,9 +338,13 @@ pub fn literal_string(e: &Expression) -> Option<String> {
     literal_string_token(token)
 }
 
+/// The string a string literal token spells, escapes decoded; none when
+/// it is not a string literal, is malformed, or is not UTF-8 text.
 pub fn literal_string_token(token: &TokenReference) -> Option<String> {
     match token.token().token_type() {
-        full_moon::tokenizer::TokenType::StringLiteral { literal, .. } => Some(literal.to_string()),
+        full_moon::tokenizer::TokenType::StringLiteral { .. } => {
+            String::from_utf8(crate::lower::string_bytes(token).ok()?).ok()
+        }
         _ => None,
     }
 }
@@ -863,6 +874,7 @@ impl Walker {
             return;
         }
         let suffixes: Vec<&Suffix> = v.suffixes().collect();
+        self.note_require(v.prefix(), &suffixes);
         self.note_metatable_callee(v.prefix(), &suffixes);
         self.prefix(v.prefix());
         for s in v.suffixes() {
@@ -870,22 +882,15 @@ impl Walker {
         }
     }
 
-    fn call(&mut self, c: &ast::FunctionCall) {
-        let suffixes: Vec<&Suffix> = c.suffixes().collect();
-        // `require "name"`: a file the program is made of.
-        if let (Prefix::Name(callee), [Suffix::Call(ast::Call::AnonymousCall(args))]) =
-            (c.prefix(), suffixes.as_slice())
+    /// `require "name"` heading a call or an index chain: a file the
+    /// program is made of, whatever is done with what it returns.
+    fn note_require(&mut self, prefix: &Prefix, suffixes: &[&Suffix]) {
+        if let (Prefix::Name(callee), [Suffix::Call(ast::Call::AnonymousCall(args)), ..]) =
+            (prefix, suffixes)
             && name_of(callee) == "require"
             && !self.shadowed("require")
         {
-            let name = match args {
-                ast::FunctionArgs::String(s) => literal_string_token(s),
-                ast::FunctionArgs::Parentheses { arguments, .. } => {
-                    arguments.iter().next().and_then(literal_string)
-                }
-                _ => None,
-            };
-            match name {
+            match required_name(args) {
                 Some(name) => {
                     if !self.out.requires.contains(&name) {
                         self.out.requires.push(name);
@@ -894,6 +899,11 @@ impl Walker {
                 None => self.out.dynamic_code = true,
             }
         }
+    }
+
+    fn call(&mut self, c: &ast::FunctionCall) {
+        let suffixes: Vec<&Suffix> = c.suffixes().collect();
+        self.note_require(c.prefix(), &suffixes);
         // `rawget(_G, "name")` and `rawset(_G, "name", v)` name the
         // global; `_G` there is not the table as a value.
         if let (Prefix::Name(callee), [Suffix::Call(ast::Call::AnonymousCall(args))]) =

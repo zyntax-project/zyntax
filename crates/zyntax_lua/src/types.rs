@@ -641,7 +641,33 @@ pub fn builtin_named(scopes: &Scopes, name: &str) -> Option<&'static Builtin> {
     if scopes.global_writes.contains_key(name) {
         return None;
     }
+    builtin_global(name)
+}
+
+/// The variable of a numeric `for` with a start and a step of these
+/// types: a float loop when either is a float, an integer loop when
+/// both are integers, else the loop's kind is decided when it starts
+/// and the variable holds either number.
+pub fn numeric_for_ty(start: Ty, step: Ty) -> Ty {
+    match (start, step) {
+        (Ty::Float, _) | (_, Ty::Float) => Ty::Float,
+        (Ty::Int, Ty::Int) => Ty::Int,
+        (Ty::Unknown, _) | (_, Ty::Unknown) => Ty::Unknown,
+        _ => Ty::Number,
+    }
+}
+
+/// The library function the global `name` holds when the program starts.
+pub fn builtin_global(name: &str) -> Option<&'static Builtin> {
     BUILTINS.iter().find(|b| b.lib.is_empty() && b.name == name)
+}
+
+/// Whether the global `name` holds a value when the program starts: a
+/// library function or table, `arg` or `_VERSION`.
+pub fn preset_global(name: &str) -> bool {
+    builtin_global(name).is_some()
+        || crate::library::stdlib::LIBS.contains(&name)
+        || matches!(name, "arg" | "_VERSION")
 }
 
 /// The library function `lib.name` is, when `lib` is the untouched
@@ -736,11 +762,18 @@ impl<'a> Typer<'a> {
             return Ty::Any;
         }
         if !self.scopes.global_writes.contains_key(name) {
-            return Ty::Nil;
+            return match name {
+                "_VERSION" => Ty::Str,
+                _ if preset_global(name) => Ty::Any,
+                _ => Ty::Nil,
+            };
         }
         let assigned = self.known.global(name);
         if self.scopes.globals_initialized.contains(name) {
             assigned
+        } else if preset_global(name) {
+            // Read before the program assigns it: the library's value.
+            Ty::Any
         } else {
             assigned.join(Ty::Nil)
         }
@@ -2115,11 +2148,7 @@ impl<'a> Round<'a> {
                 let typer = self.typer();
                 let start = typer.ty_of(f.start());
                 let step = f.step().map(|s| typer.ty_of(s)).unwrap_or(Ty::Int);
-                let ty = if start == Ty::Float || step == Ty::Float {
-                    Ty::Float
-                } else {
-                    Ty::Int
-                };
+                let ty = numeric_for_ty(start, step);
                 let v = self.scopes.declared(f.index_variable());
                 self.assign_var(v, ty);
                 self.block(f.block());

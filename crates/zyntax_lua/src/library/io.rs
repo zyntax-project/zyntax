@@ -105,6 +105,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             "$Lua$io_seek",
         ),
         ("zl_io_flush", vec![("h", i64())], i64(), "$Lua$io_flush"),
+        ("zl_io_flush_all", vec![], unit(), "$Lua$io_flush_all"),
         (
             "zl_io_setvbuf",
             vec![("h", i64()), ("mode", i64()), ("size", i64())],

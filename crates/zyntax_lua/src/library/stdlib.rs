@@ -1005,6 +1005,9 @@ pub enum Constant {
     Bytes(&'static str),
 }
 
+/// The value of the global `_VERSION`.
+pub const LUA_VERSION: &str = "Lua 5.4";
+
 /// The libraries with a table of their own.
 pub const LIBS: &[&str] = &[
     "string",
@@ -3019,6 +3022,8 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 and(not(is_nil(x.e())), is_int_box(x.e())),
                 vec![k.set(get_i64(x.e()))],
             ),
+            // `exit` flushes C's streams, not the program's own.
+            expr(call("zl_io_flush_all", vec![], unit())),
             expr(call("zb_exit", vec![cast(k.e(), i32())], unit())),
             ret_void(),
         ],
@@ -3339,7 +3344,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         )));
         st.push(expr(call(
             "zl_rawset_str",
-            vec![tb.e(), text("_VERSION"), box_str(text("Lua 5.4"))],
+            vec![tb.e(), text("_VERSION"), box_str(text(LUA_VERSION))],
             unit(),
         )));
         st.push(expr(call(

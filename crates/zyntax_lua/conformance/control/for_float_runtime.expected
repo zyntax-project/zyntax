@@ -1,0 +1,16 @@
+3.5 4.5 
+3.5 4.5 
+1 1.5 2 2.5 3 
+integer integer integer 
+2.5 3.5 
+1	2 3 4
+2	2.5 3.5
+3	3.0 4.0
+2 1 
+2.5 1.5 0.5 
+1 1.5 2 
+false	for_float_runtime.lua:34: bad 'for' initial value (number expected, got nil)
+false	for_float_runtime.lua:35: 'for' step is zero
+false	for_float_runtime.lua:36: bad 'for' limit (number expected, got table)
+3
+1

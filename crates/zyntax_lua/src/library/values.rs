@@ -534,6 +534,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         ret(get_f64(na.e())),
     ]);
     d.push(define("zl_for_float", &[&a, &what], f64(), st));
+    // Whether a `for` whose start and step are dynamic values counts in
+    // integers: both are integers, not numerals or floats.
+    d.push(define(
+        "zl_for_ints",
+        &[&a, &b],
+        boolean(),
+        vec![
+            when(or(is_nil(a.e()), is_nil(b.e())), vec![ret(bool(false))]),
+            ret(and(is_int_cat_of(a.e()), is_int_cat_of(b.e()))),
+        ],
+    ));
     // The integer limit of a `for` over integers with a float limit:
     // the last integer the loop may reach, so floored when the step
     // climbs and rounded up when it falls. Past the integers on the

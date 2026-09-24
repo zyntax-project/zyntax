@@ -1137,6 +1137,7 @@ fn raising(t: &Types) -> Vec<Decl> {
                 )],
                 unit(),
             )),
+            expr(call("zl_io_flush_all", vec![], unit())),
             expr(call("zb_exit", vec![int32(1)], unit())),
             ret_void(),
         ],

@@ -1131,7 +1131,7 @@ fn typed_function(
 
 /// The bytes of a string literal token, escapes decoded, and a byte the
 /// source could not spell as text restored from its stand-in.
-fn string_bytes(token: &TokenReference) -> std::result::Result<Vec<u8>, String> {
+pub(crate) fn string_bytes(token: &TokenReference) -> std::result::Result<Vec<u8>, String> {
     let bytes = literal_bytes(token)?;
     Ok(restore_bytes(bytes))
 }
@@ -1571,8 +1571,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 block_value(pre, n.has_tag(TAG_TRUE, span), span)
             }
             (Ty::Scalar, Ty::Nil) => block_value(vec![expr_stmt(v.node)], nil(span), span),
-            // A shaped table is a table; null is nil.
-            (Ty::Table, Ty::Shape(_)) | (Ty::Shape(_), Ty::Shape(_)) => v.node,
+            // A shaped table is a table; null is nil. Only a table slot
+            // takes a shaped value as a table, and it keeps nil as null
+            // with its present bit clear.
+            (Ty::Table, Ty::Shape(_))
+            | (Ty::Shape(_), Ty::Shape(_))
+            | (Ty::Shape(_), Ty::Table) => v.node,
             (Ty::Nil, Ty::Shape(_)) => block_value(
                 vec![expr_stmt(v.node)],
                 null(self.ir(Ty::Table), span),
@@ -3001,26 +3005,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if let Some(f) = self.scopes().known_global_function(name) {
             return Ok(self.function_value(f, span));
         }
-        if let Some(b) = types::builtin_named(self.scopes(), name) {
-            return Ok(self.builtin_value(b, span));
-        }
         if !self.scopes().global_writes.contains_key(name) {
-            if crate::library::stdlib::LIBS.contains(&name) {
-                return Ok(Val {
-                    node: call(
-                        &crate::library::stdlib::lib_table_fn(name),
-                        vec![],
-                        Type::Any,
-                        span,
-                    ),
-                    ty: Ty::Any,
-                });
-            }
-            if name == "arg" {
-                return Ok(Val {
-                    node: call("zl_arg_table", vec![], Type::Any, span),
-                    ty: Ty::Any,
-                });
+            if let Some(v) = self.preset_value(name, span) {
+                return Ok(v);
             }
             if name == "_G" || name == "_ENV" {
                 return unsupported("`_G` other than as `_G.name`", span);
@@ -3070,6 +3057,61 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         self.m.declare_module_var(symbol, ty);
         let value = self.coerce(value, ty);
         Ok(assign(var(symbol, self.ir(ty), span), value, span))
+    }
+
+    /// What the global `name` holds when the program starts, when it
+    /// holds anything.
+    fn preset_value(&mut self, name: &str, span: Span) -> Option<Val> {
+        if let Some(b) = types::builtin_global(name) {
+            return Some(self.builtin_value(b, span));
+        }
+        let node = if crate::library::stdlib::LIBS.contains(&name) {
+            call(
+                &crate::library::stdlib::lib_table_fn(name),
+                vec![],
+                Type::Any,
+                span,
+            )
+        } else if name == "arg" {
+            call("zl_arg_table", vec![], Type::Any, span)
+        } else if name == "_VERSION" {
+            return Some(Val {
+                node: str_lit(crate::library::stdlib::LUA_VERSION, span),
+                ty: Ty::Str,
+            });
+        } else {
+            return None;
+        };
+        Some(Val { node, ty: Ty::Any })
+    }
+
+    /// Statements giving each global the program assigns, and may read
+    /// before it does, the value it holds when the program starts.
+    fn preset_globals(&mut self, span: Span) -> Vec<St> {
+        let scopes = self.scopes();
+        if scopes.dynamic_globals {
+            return Vec::new();
+        }
+        let names: Vec<String> = scopes
+            .global_writes
+            .keys()
+            .filter(|name| {
+                types::preset_global(name) && !scopes.globals_initialized.contains(*name)
+            })
+            .cloned()
+            .collect();
+        let mut out = Vec::new();
+        for name in names {
+            let Some(value) = self.preset_value(&name, span) else {
+                continue;
+            };
+            let ty = self.typer().global_ty(&name);
+            let symbol = Module::global_symbol(&name);
+            self.m.declare_module_var(symbol, ty);
+            let value = self.coerce(value, ty);
+            out.push(assign(var(symbol, self.ir(ty), span), value, span));
+        }
+        out
     }
 
     /// The globals table, when the program reaches its globals through
@@ -7691,10 +7733,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     fn numeric_for(&mut self, f: &ast::NumericFor, span: Span, out: &mut Vec<St>) -> Result<()> {
         let v = self.scopes().declared(f.index_variable());
-        let loop_ty = self.var_ty(v);
         let start = self.expr(f.start())?;
         let limit = self.expr(f.end())?;
         let step = f.step().map(|s| self.expr(s)).transpose()?;
+        let loop_ty = types::numeric_for_ty(start.ty, step.as_ref().map_or(Ty::Int, |s| s.ty));
+        if !matches!(loop_ty, Ty::Int | Ty::Float) {
+            return self.numeric_for_dynamic(f, v, (start, limit, step), span, out);
+        }
         let is_float = loop_ty == Ty::Float;
         let num_ty = if is_float { Ty::Float } else { Ty::Int };
         let ir = self.ir(num_ty);
@@ -7994,6 +8039,289 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         ));
         body.extend(inner);
         body.extend(after);
+        out.push(while_(cond, body, span));
+        Ok(())
+    }
+
+    /// A numeric `for` whose start or step is not known to be an
+    /// integer or a float: an integer loop when both are integers when
+    /// it starts, else a float loop, the variable a number either way.
+    /// `values` are the start, the limit and the step, lowered in that
+    /// order.
+    fn numeric_for_dynamic(
+        &mut self,
+        f: &ast::NumericFor,
+        v: VarId,
+        values: (Val, Val, Option<Val>),
+        span: Span,
+        out: &mut Vec<St>,
+    ) -> Result<()> {
+        let i64_t = prim(PrimitiveType::I64);
+        let f64_t = prim(PrimitiveType::F64);
+        let bool_t = prim(PrimitiveType::Bool);
+        let (start, limit, step) = values;
+        let step = step.unwrap_or(Val {
+            node: int_lit(1, span),
+            ty: Ty::Int,
+        });
+        let mut boxed = Vec::new();
+        for value in [start, limit, step] {
+            let b = self.boxed(value);
+            let name = self.temp();
+            out.push(let_(name, Type::Any, b, span));
+            boxed.push(var(name, Type::Any, span));
+        }
+        let [start, limit, step] = <[Node; 3]>::try_from(boxed).expect("three values");
+        let ints = self.temp();
+        out.push(let_(
+            ints,
+            bool_t.clone(),
+            call(
+                "zl_for_ints",
+                vec![start.clone(), step.clone()],
+                bool_t.clone(),
+                span,
+            ),
+            span,
+        ));
+        let ints_v = || var(ints, bool_t.clone(), span);
+        let [ci, li, si, cf, lf, sf] = [(); 6].map(|_| self.temp());
+        for (name, ty, zero) in [
+            (ci, &i64_t, int_lit(0, span)),
+            (li, &i64_t, int_lit(0, span)),
+            (si, &i64_t, int_lit(0, span)),
+            (cf, &f64_t, float_lit(0.0, span)),
+            (lf, &f64_t, float_lit(0.0, span)),
+            (sf, &f64_t, float_lit(0.0, span)),
+        ] {
+            out.push(let_(name, ty.clone(), zero, span));
+        }
+        let int_v = |name| var(name, i64_t.clone(), span);
+        let float_v = |name| var(name, f64_t.clone(), span);
+        let converted = |this: &mut Self, helper: &str, value: &Node, what: &str, ty: Ty| {
+            let node = call(
+                helper,
+                vec![value.clone(), str_lit(what, span)],
+                this.ir(ty),
+                span,
+            );
+            this.guard(Val { node, ty }).node
+        };
+        let step_zero = |this: &mut Self, is_zero: Node| {
+            let raise = expr_stmt(call(
+                "zb_fatal",
+                vec![str_lit("error", span), str_lit("'for' step is zero", span)],
+                prim(PrimitiveType::Unit),
+                span,
+            ));
+            let leave = this.pending_check(span);
+            if_(is_zero, vec![raise, leave], None, span)
+        };
+        // Lua's order: the integer loop checks the step and then the
+        // limit; the float loop converts the limit, the step and the
+        // start, then checks the step.
+        let mut int_prep = vec![assign(
+            int_v(si),
+            converted(self, "zl_for_int", &step, "step", Ty::Int),
+            span,
+        )];
+        int_prep.push(step_zero(
+            self,
+            binary(
+                BinaryOp::Eq,
+                int_v(si),
+                int_lit(0, span),
+                bool_t.clone(),
+                span,
+            ),
+        ));
+        int_prep.push(assign(
+            int_v(ci),
+            converted(self, "zl_for_int", &start, "initial value", Ty::Int),
+            span,
+        ));
+        let lim = call(
+            "zl_for_limit",
+            vec![limit.clone(), int_v(si)],
+            i64_t.clone(),
+            span,
+        );
+        let lim = self.guard(Val {
+            node: lim,
+            ty: Ty::Int,
+        });
+        int_prep.push(assign(int_v(li), lim.node, span));
+        // A limit past the integers against the step: the counter is
+        // put past the (clamped) limit, so the loop does not run.
+        let past = if_value(
+            binary(
+                BinaryOp::Gt,
+                int_v(si),
+                int_lit(0, span),
+                bool_t.clone(),
+                span,
+            ),
+            binary(
+                BinaryOp::Add,
+                int_v(li),
+                int_lit(1, span),
+                i64_t.clone(),
+                span,
+            ),
+            binary(
+                BinaryOp::Sub,
+                int_v(li),
+                int_lit(1, span),
+                i64_t.clone(),
+                span,
+            ),
+            i64_t.clone(),
+            span,
+        );
+        int_prep.push(if_(
+            var(intern(library::FOR_SKIP), bool_t.clone(), span),
+            vec![assign(int_v(ci), past, span)],
+            None,
+            span,
+        ));
+        let mut float_prep = vec![
+            assign(
+                float_v(lf),
+                converted(self, "zl_for_float", &limit, "limit", Ty::Float),
+                span,
+            ),
+            assign(
+                float_v(sf),
+                converted(self, "zl_for_float", &step, "step", Ty::Float),
+                span,
+            ),
+            assign(
+                float_v(cf),
+                converted(self, "zl_for_float", &start, "initial value", Ty::Float),
+                span,
+            ),
+        ];
+        float_prep.push(step_zero(
+            self,
+            binary(
+                BinaryOp::Eq,
+                float_v(sf),
+                float_lit(0.0, span),
+                bool_t.clone(),
+                span,
+            ),
+        ));
+        out.push(if_(ints_v(), int_prep, Some(float_prep), span));
+        // Whether the counter is within the limit, the step's sign
+        // deciding which side.
+        let within = |counter: Node, lim: Node, st: Node, zero: Node| {
+            binary(
+                BinaryOp::Or,
+                binary(
+                    BinaryOp::And,
+                    binary(BinaryOp::Gt, st.clone(), zero.clone(), bool_t.clone(), span),
+                    binary(
+                        BinaryOp::Le,
+                        counter.clone(),
+                        lim.clone(),
+                        bool_t.clone(),
+                        span,
+                    ),
+                    bool_t.clone(),
+                    span,
+                ),
+                binary(
+                    BinaryOp::And,
+                    binary(BinaryOp::Lt, st, zero, bool_t.clone(), span),
+                    binary(BinaryOp::Ge, counter, lim, bool_t.clone(), span),
+                    bool_t.clone(),
+                    span,
+                ),
+                bool_t.clone(),
+                span,
+            )
+        };
+        let cond = if_value(
+            ints_v(),
+            within(int_v(ci), int_v(li), int_v(si), int_lit(0, span)),
+            within(float_v(cf), float_v(lf), float_v(sf), float_lit(0.0, span)),
+            bool_t.clone(),
+            span,
+        );
+        let value = if_value(
+            ints_v(),
+            number_of_int(int_v(ci), span),
+            number_of_float(float_v(cf), span),
+            number_type(),
+            span,
+        );
+        let mut body = vec![self.declare_var(
+            v,
+            Val {
+                node: value,
+                ty: Ty::Number,
+            },
+            span,
+        )];
+        body.extend(self.loop_body(f.block())?);
+        // The integer counter leaves when the step would carry it past
+        // the limit, so it never wraps: the distance and the step's
+        // size compared as unsigned values.
+        let u64_t = prim(PrimitiveType::U64);
+        let unsigned = |n: Node| cast(n, u64_t.clone(), span);
+        let short = |gap: Node, size: Node| {
+            binary(
+                BinaryOp::Lt,
+                unsigned(gap),
+                unsigned(size),
+                bool_t.clone(),
+                span,
+            )
+        };
+        let done = if_value(
+            binary(
+                BinaryOp::Gt,
+                int_v(si),
+                int_lit(0, span),
+                bool_t.clone(),
+                span,
+            ),
+            short(
+                binary(BinaryOp::Sub, int_v(li), int_v(ci), i64_t.clone(), span),
+                int_v(si),
+            ),
+            short(
+                binary(BinaryOp::Sub, int_v(ci), int_v(li), i64_t.clone(), span),
+                binary(
+                    BinaryOp::Sub,
+                    int_lit(0, span),
+                    int_v(si),
+                    i64_t.clone(),
+                    span,
+                ),
+            ),
+            bool_t.clone(),
+            span,
+        );
+        let int_step = vec![
+            if_(
+                done,
+                vec![stmt(TypedStatement::Break(None), span)],
+                None,
+                span,
+            ),
+            assign(
+                int_v(ci),
+                binary(BinaryOp::Add, int_v(ci), int_v(si), i64_t.clone(), span),
+                span,
+            ),
+        ];
+        let float_step = vec![assign(
+            float_v(cf),
+            binary(BinaryOp::Add, float_v(cf), float_v(sf), f64_t.clone(), span),
+            span,
+        )];
+        body.push(if_(ints_v(), int_step, Some(float_step), span));
         out.push(while_(cond, body, span));
         Ok(())
     }
@@ -9651,6 +9979,8 @@ pub(crate) fn program(
             module.strip_line_restores(&mut statements);
             statements
         };
+        let presets = main.preset_globals(span);
+        statements.splice(0..0, presets);
         if let Some(env) = module.env_var {
             statements.insert(
                 0,

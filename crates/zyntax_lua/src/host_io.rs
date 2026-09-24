@@ -690,6 +690,18 @@ pub(crate) extern "C" fn host_io_setvbuf(h: i64, mode: i64, size: i64) -> i64 {
     }
 }
 
+/// Every open stream's buffered output written out, standard output's
+/// too, as the process is about to exit. Failures are not reported:
+/// nothing is left to report them to.
+pub(crate) extern "C" fn host_io_flush_all() {
+    FILES.with(|files| {
+        for stream in files.borrow_mut().values_mut() {
+            let _ = stream.flush();
+        }
+    });
+    let _ = std::io::stdout().lock().flush();
+}
+
 pub(crate) extern "C" fn host_io_flush(h: i64) -> i64 {
     match with(h, |s| s.flush()) {
         Some(Ok(())) => 0,
