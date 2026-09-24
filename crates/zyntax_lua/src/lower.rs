@@ -4535,6 +4535,18 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     // ─── tables ─────────────────────────────────────────────────
 
     fn table_constructor(&mut self, t: &ast::TableConstructor, span: Span) -> Result<Val> {
+        self.table_constructor_with(t, None, span)
+    }
+
+    /// A constructor; with `meta`, the table is born with that
+    /// metatable, which the caller has checked the constructor's shape
+    /// has slots for.
+    fn table_constructor_with(
+        &mut self,
+        t: &ast::TableConstructor,
+        meta: Option<&Expression>,
+        span: Span,
+    ) -> Result<Val> {
         let fields: Vec<&ast::Field> = t.fields().iter().collect();
         let positional: Vec<&Expression> = fields
             .iter()
@@ -4555,8 +4567,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if let Some(k) = types::constructor_shape(self.m.inferred, t)
             && self.m.layout(k).is_some()
         {
-            return self.shaped_constructor(k, &fields, arr, positional.len(), span);
+            return self.shaped_constructor(k, &fields, arr, positional.len(), meta, span);
         }
+        debug_assert!(meta.is_none(), "a metatable at birth needs a slotted shape");
         let table = match arr {
             Some(arr) => call("zl_table_with_arr", vec![arr], table_t.clone(), span),
             None => call("zl_table_new", vec![], table_t.clone(), span),
@@ -4602,13 +4615,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     /// A constructor whose tables have shape `k`, laid out with its
     /// slots: the header, then each constant-key field in its slot,
     /// present when its value is not nil. Fields under other keys are
-    /// stored afterwards, as into a plain table.
+    /// stored afterwards, as into a plain table. `meta`, evaluated
+    /// after the fields, is the metatable the table is born with.
     fn shaped_constructor(
         &mut self,
         k: ShapeId,
         fields: &[&ast::Field],
         arr: Option<Node>,
         positional: usize,
+        meta: Option<&Expression>,
         span: Span,
     ) -> Result<Val> {
         let table_t = self.ir(Ty::Table);
@@ -4652,6 +4667,21 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 _ => {}
             }
         }
+        // A table the lowering has just made has no metatable to
+        // protect: `setmetatable` of it with a table (or nil) is the
+        // header's store; anything else goes through the library,
+        // which checks it.
+        let (meta, meta_checked) = match meta {
+            Some(e) => {
+                let m = self.expr(e)?;
+                let m = self.hold(m, &mut pre);
+                match m.ty {
+                    Ty::Shape(_) | Ty::Table => (m.node, None),
+                    _ => (null(table_t.clone(), span), Some(self.boxed(m))),
+                }
+            }
+            None => (null(table_t.clone(), span), None),
+        };
         // A key given twice: the last value stands, as in a plain table.
         let mut inits: Vec<TypedFieldInit> = Vec::new();
         let mut present: Node = int_lit(0, span);
@@ -4754,7 +4784,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let header = [
             ("arr", arr),
             ("hash", nil(span)),
-            ("meta", null(table_t.clone(), span)),
+            ("meta", meta),
             ("high", int_lit(positional as i64, span)),
             ("shape", int_lit(gid, span)),
             ("present", present),
@@ -4778,7 +4808,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         // The table as every holder sees it.
         let table = as_shape(object, table_t.clone(), span);
         let _ = filled;
-        if other.is_empty() {
+        if other.is_empty() && meta_checked.is_none() {
             return Ok(Val {
                 node: block_value(pre, table, span),
                 ty: Ty::Shape(k),
@@ -4789,6 +4819,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         for (key, value) in other {
             let tb = var(name, table_t.clone(), span);
             pre.push(self.raw_store(tb, key, value, span));
+        }
+        if let Some(m) = meta_checked {
+            let set = call(
+                "zl_setmetatable",
+                vec![var(name, table_t.clone(), span), m],
+                table_t.clone(),
+                span,
+            );
+            pre.push(self.guarded_stmt(set, &Described::NONE));
         }
         Ok(Val {
             node: block_value(pre, var(name, table_t, span), span),
@@ -6510,6 +6549,19 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     return Ok(Multi::None(block_value(vec![st], nil(span), span)));
                 }
             }
+        }
+        // `setmetatable` of a table a constructor is making: the table
+        // is born with its metatable.
+        if b.lib.is_empty()
+            && b.name == "setmetatable"
+            && receiver.is_none()
+            && let [first, mt] = self.args_exprs(args).as_slice()
+            && let Expression::TableConstructor(t) = first
+            && let Some(k) = types::constructor_shape(self.m.inferred, t)
+            && self.m.layout(k).is_some()
+        {
+            let v = self.table_constructor_with(t, Some(mt), span_of(first))?;
+            return Ok(Multi::Fixed(vec![v]));
         }
         let is_method = receiver.is_some();
         // `error(v, level)` above level 1 positions at the caller: the

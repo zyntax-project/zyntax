@@ -4305,9 +4305,11 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![
             when(
                 and(not(is_nil(y.e())), not(is_table(y.e()))),
-                vec![lua_error(text(
-                    "bad argument #2 to 'setmetatable' (nil or table expected)",
-                ))],
+                vec![lua_error(concat(vec![
+                    text("bad argument #2 to 'setmetatable' (nil or table expected, got "),
+                    type_name(y.e()),
+                    text(")"),
+                ]))],
             ),
             when(
                 eq(category(x.e()), int(STR)),

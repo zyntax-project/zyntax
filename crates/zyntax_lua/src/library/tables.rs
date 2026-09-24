@@ -586,9 +586,11 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![
                     when(
                         not(is_table(mt.e())),
-                        vec![lua_error(text(
-                            "bad argument #2 to 'setmetatable' (nil or table expected)",
-                        ))],
+                        vec![lua_error(concat(vec![
+                            text("bad argument #2 to 'setmetatable' (nil or table expected, got "),
+                            type_name(mt.e()),
+                            text(")"),
+                        ]))],
                     ),
                     set_field(tb.e(), "meta", unbox_table(mt.e(), t)),
                 ],
