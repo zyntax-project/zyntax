@@ -1,0 +1,9 @@
+[2, 2] ['bump']
+10 ['bump', 'rebox']
+7 ['bump', 'rebox', 'retotal']
+[1, 2, 3] [1, 2, 3] True
+[1, 2, 3, 'a', 2.5]
+['p', 1, 'q']
+TypeError
+(True, [1, 2, 1, 2]) (True, []) (False, 6) (False, 'abab') (False, 5.0)
+(True, [1, 2]) (True, ['a', 'b']) (False, 3) (False, 3.5) (False, 'ab')

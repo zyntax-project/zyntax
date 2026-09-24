@@ -1,0 +1,6 @@
+[1, 7, 3] ['container', 'index']
+{'a': 6, 'b': -1} ['container', 'index', 'get a', 'set a', 'get a', 'set a', 'get b', 'set b']
+{'k': -3} ['container', 'index', 'get a', 'set a', 'get a', 'set a', 'get b', 'set b', 'key']
+5 ['container', 'index', 'get a', 'set a', 'get a', 'set a', 'get b', 'set b', 'key', 'holder', 'holder']
+[[1, 7], [-7, 4]] ['container', 'index', 'get a', 'set a', 'get a', 'set a', 'get b', 'set b', 'key', 'holder', 'holder', 'row', 'row']
+['a', 'bc'] ['container', 'index', 'get a', 'set a', 'get a', 'set a', 'get b', 'set b', 'key', 'holder', 'holder', 'row', 'row', 'index']

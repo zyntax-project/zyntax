@@ -3412,12 +3412,7 @@ impl<'m> Lowerer<'m> {
                 };
                 self.bind(&a.target, value, span, out)?;
             }
-            py::Stmt::AugAssign(a) => {
-                let lhs = self.expr(&a.target)?;
-                let rhs = self.expr(&a.value)?;
-                let combined = self.arithmetic(a.op, lhs, rhs, &a.value, span)?;
-                self.bind(&a.target, combined, span, out)?;
-            }
+            py::Stmt::AugAssign(a) => self.aug_assign(a, span, out)?,
             py::Stmt::If(i) => {
                 self.if_chain(&i.test, &i.body, &i.elif_else_clauses, span, out)?;
             }
@@ -3780,6 +3775,231 @@ impl<'m> Lowerer<'m> {
         Ok(true)
     }
 
+    /// `target op= value`. An item or attribute target has its container
+    /// and index evaluated once and held; the held value is read,
+    /// combined with `value` and stored back through the same holds. A
+    /// name binds the combined value as an assignment does.
+    fn aug_assign(&mut self, a: &py::StmtAugAssign, span: Span, out: &mut Vec<Stmt>) -> Result<()> {
+        enum Place {
+            Item(Box<(Val, Val)>),
+            Attr(Box<Val>),
+            Target,
+        }
+        let ty = self.ty_of(&a.target);
+        let (held, place) = match &*a.target {
+            py::Expr::Subscript(sub) if !matches!(&*sub.slice, py::Expr::Slice(_)) => {
+                let seq = self.expr(&sub.value)?;
+                if !Self::stores_items(seq.ty) {
+                    return unsupported(
+                        format!("item assignment on {}", types::expr_kind(&sub.value)),
+                        &*a.target,
+                    );
+                }
+                let seq = self.hold_unless_plain(seq, &sub.value, span);
+                let index = self.index_val(seq.ty, &sub.slice)?;
+                let index = self.hold_unless_plain(index, &sub.slice, span);
+                let read = self.read_item(seq.clone(), index.clone(), ty, span)?;
+                let read = self.checked(read);
+                (
+                    self.hold_ahead(read, span),
+                    Place::Item(Box::new((seq, index))),
+                )
+            }
+            py::Expr::Attribute(attr)
+                if self
+                    .module_member_of(&attr.value, attr.attr.as_str())
+                    .is_none()
+                    && self.module.class_of_expr(&attr.value).is_none() =>
+            {
+                let object = self.expr(&attr.value)?;
+                let object = self.hold_unless_plain(object, &attr.value, span);
+                let read = self.attribute(object.clone(), attr.attr.as_str(), span)?;
+                let read = self.checked(read);
+                (self.hold_ahead(read, span), Place::Attr(Box::new(object)))
+            }
+            _ => {
+                let read = self.expr(&a.target)?;
+                (self.hold_unless_plain(read, &a.target, span), Place::Target)
+            }
+        };
+        let value = self.expr(&a.value)?;
+        let combined = self.combine_in_place(a.op, held, value, &a.value, span)?;
+        let combined = self.checked(combined);
+        match place {
+            Place::Item(held) => {
+                let (seq, index) = *held;
+                self.store_item(seq, index, combined, span, out)
+            }
+            Place::Attr(object) => {
+                let py::Expr::Attribute(attr) = &*a.target else {
+                    unreachable!()
+                };
+                let stmt = self.set_attribute(*object, attr.attr.as_str(), combined, span)?;
+                out.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(stmt)),
+                    Type::Unknown,
+                    span,
+                ));
+                Ok(())
+            }
+            Place::Target => self.bind(&a.target, combined, span, out),
+        }
+    }
+
+    /// `v`, the value of `e`, held as [`Self::hold_ahead`] holds it. A
+    /// literal or a plain local reads the same twice and stays as it
+    /// is; a cell or a global may be rebound by what runs in between.
+    fn hold_unless_plain(&mut self, v: Val, e: &py::Expr, span: Span) -> Val {
+        let plain = match e {
+            py::Expr::NumberLiteral(_) | py::Expr::StringLiteral(_) => true,
+            py::Expr::Name(n) => {
+                let name = n.id.as_str();
+                self.comp_symbols.contains_key(name)
+                    || (self.locals.vars.contains_key(name) && !self.cells.contains_key(name))
+            }
+            _ => false,
+        };
+        if plain {
+            return v;
+        }
+        self.hold_ahead(v, span)
+    }
+
+    /// `v` held in a temporary bound ahead of the statement, after
+    /// whatever `v` itself hoisted, so it is evaluated once and before
+    /// anything the statement hoists later.
+    fn hold_ahead(&mut self, v: Val, span: Span) -> Val {
+        let mut pre = Vec::new();
+        let held = self.hold(v, &mut pre, span);
+        self.hoisted.extend(pre);
+        held
+    }
+
+    /// `held op value` for an augmented assignment. A list extends or
+    /// repeats in place, so every alias of it sees the change, and is
+    /// itself the result, whether the list is typed or found behind a
+    /// dynamic value at run time; anything else is `held op value`.
+    fn combine_in_place(
+        &mut self,
+        op: py::Operator,
+        held: Val,
+        value: Val,
+        value_expr: &py::Expr,
+        span: Span,
+    ) -> Result<Val> {
+        // A dynamic value that may be a list: `+` by a sequence or a
+        // dynamic value, `*` by an integer or a dynamic value. Beside
+        // anything else it combines as `held op value` does.
+        if held.ty == Ty::Object {
+            let code = int_lit(types::arith_code(op), span);
+            let node = match (op, value.ty) {
+                (py::Operator::Add | py::Operator::Mult, Ty::Object) => {
+                    self.object_pair_arith(op, held, value, "zb_any_arith_inplace", span)
+                }
+                (py::Operator::Add, Ty::List(_) | Ty::Tuple(_)) => {
+                    let other = self.coerce(value, Ty::Object);
+                    call(
+                        "zb_any_arith_inplace",
+                        vec![code, held.node, other],
+                        Ty::Object,
+                        span,
+                    )
+                }
+                (py::Operator::Mult, Ty::Int | Ty::Bool) => {
+                    let count = self.coerce(value, Ty::Int);
+                    call(
+                        "zb_any_arith_inplace_i64",
+                        vec![code, held.node, count],
+                        Ty::Object,
+                        span,
+                    )
+                }
+                _ => return self.arithmetic(op, held, value, value_expr, span),
+            };
+            return Ok(Val {
+                node,
+                ty: Ty::Object,
+            });
+        }
+        let Ty::List(e) = held.ty else {
+            return self.arithmetic(op, held, value, value_expr, span);
+        };
+        let list_ty = held.ty;
+        let statement =
+            |n: Node| TypedNode::new(TypedStatement::Expression(Box::new(n)), Type::Unknown, span);
+        match op {
+            py::Operator::Add if matches!(value.ty, Ty::List(_) | Ty::Tuple(_) | Ty::Object) => {
+                let mut pre = Vec::new();
+                let list = self.hold(held, &mut pre, span);
+                let items = self.coerce(value, list_ty);
+                pre.push(statement(call(
+                    &list_fn("extend", e),
+                    vec![list.node.clone(), items],
+                    Ty::None,
+                    span,
+                )));
+                self.hoisted.extend(pre);
+                Ok(list)
+            }
+            // `xs *= n`: the list grows by `n - 1` copies of itself, or
+            // empties when `n` is not positive.
+            py::Operator::Mult if matches!(value.ty, Ty::Int | Ty::Bool) => {
+                let mut pre = Vec::new();
+                let list = self.hold(held, &mut pre, span);
+                let count = Val {
+                    node: self.coerce(value, Ty::Int),
+                    ty: Ty::Int,
+                };
+                let n = self.hold(count, &mut pre, span);
+                let more = binary(
+                    BinaryOp::Sub,
+                    n.node.clone(),
+                    int_lit(1, span),
+                    Ty::Int,
+                    span,
+                );
+                let copies = call(
+                    &list_fn("repeat", e),
+                    vec![list.node.clone(), more],
+                    list_ty,
+                    span,
+                );
+                let grow = call(
+                    &list_fn("extend", e),
+                    vec![list.node.clone(), copies],
+                    Ty::None,
+                    span,
+                );
+                let empty = method_call(list.node.clone(), "clear", vec![], Ty::None, span);
+                pre.push(TypedNode::new(
+                    TypedStatement::If(TypedIf {
+                        condition: Box::new(binary(
+                            BinaryOp::Le,
+                            n.node,
+                            int_lit(0, span),
+                            Ty::Bool,
+                            span,
+                        )),
+                        then_block: TypedBlock {
+                            statements: vec![statement(empty)],
+                            span,
+                        },
+                        else_block: Some(TypedBlock {
+                            statements: vec![statement(grow)],
+                            span,
+                        }),
+                        span,
+                    }),
+                    Type::Unknown,
+                    span,
+                ));
+                self.hoisted.extend(pre);
+                Ok(list)
+            }
+            _ => self.arithmetic(op, held, value, value_expr, span),
+        }
+    }
+
     /// `target = value`: a `let` the first time a name is seen in this
     /// function, an assignment afterwards; the value converted to the
     /// type inference gave the name.
@@ -3967,75 +4187,14 @@ impl<'m> Lowerer<'m> {
                     return Ok(());
                 }
                 let seq = self.expr(&sub.value)?;
-                let stmt = match seq.ty {
-                    Ty::List(e) => {
-                        let i = self.expr_as(&sub.slice, Ty::Int)?;
-                        let v = self.elem_arg(value, e);
-                        call(&list_fn("set", e), vec![seq.node, i, v], Ty::None, span)
-                    }
-                    Ty::Dict(_) => {
-                        let (k, by) = self.dict_key(&sub.slice)?;
-                        let v = self.coerce(value, Ty::Object);
-                        call(
-                            &format!("zb_dict_set{by}"),
-                            vec![seq.node, k, v],
-                            Ty::None,
-                            span,
-                        )
-                    }
-                    Ty::Object => {
-                        let i = self.expr(&sub.slice)?;
-                        let v = self.coerce(value, Ty::Object);
-                        if i.ty == Ty::Int {
-                            call(
-                                "zb_any_setitem_i64",
-                                vec![seq.node, i.node, v],
-                                Ty::None,
-                                span,
-                            )
-                        } else {
-                            let i = self.coerce(i, Ty::Object);
-                            call("zb_any_setitem", vec![seq.node, i, v], Ty::None, span)
-                        }
-                    }
-                    // An instance stores through its class's `__setitem__`.
-                    Ty::Class(k) => {
-                        let i = self.expr(&sub.slice)?;
-                        match self.dunder(k as usize, "__setitem__", seq.node, vec![i, value], span)
-                        {
-                            Some(r) => r.node,
-                            None => {
-                                return Err(Error::unsupported_span(
-                                    format!(
-                                        "item assignment on {}, which defines no __setitem__",
-                                        self.module.classes[k as usize].name
-                                    ),
-                                    span,
-                                ));
-                            }
-                        }
-                    }
-                    _ => {
-                        return unsupported(
-                            format!("item assignment on {}", types::expr_kind(&sub.value)),
-                            target,
-                        );
-                    }
-                };
-                let fallible = match &stmt.node {
-                    TypedExpression::Call(c) => self.is_fallible_callee(&c.callee),
-                    _ => false,
-                };
-                out.push(TypedNode::new(
-                    TypedStatement::Expression(Box::new(stmt)),
-                    Type::Unknown,
-                    span,
-                ));
-                if fallible {
-                    let check = self.pending_check(span);
-                    out.push(check);
+                if !Self::stores_items(seq.ty) {
+                    return unsupported(
+                        format!("item assignment on {}", types::expr_kind(&sub.value)),
+                        target,
+                    );
                 }
-                return Ok(());
+                let index = self.index_val(seq.ty, &sub.slice)?;
+                return self.store_item(seq, index, value, span, out);
             }
             // `a, b = value`: the value once, then each name an element.
             // `[a, b] = v` unpacks as `a, b = v` does.
@@ -5260,20 +5419,181 @@ impl<'m> Lowerer<'m> {
         }
     }
 
-    /// A dict key as the lookup takes it: a string as itself, for the
-    /// lookups that hash and compare a string without boxing it, and
-    /// anything else as a dynamic value. The suffix names the lookup.
     /// A dict key and the suffix of the dict functions that take it as
-    /// it is: a string or a tuple of known shape goes unboxed.
+    /// it is: a string or a tuple of known shape goes unboxed, for the
+    /// lookups that hash and compare it without boxing; anything else
+    /// is a dynamic value.
     fn dict_key(&mut self, e: &py::Expr) -> Result<(Node, String)> {
-        match self.ty_of(e) {
-            Ty::Str => Ok((self.expr_as(e, Ty::Str)?, "_str".to_string())),
-            Ty::Tuple(k) => {
-                let v = self.expr(e)?;
-                Ok((v.node, format!("_{}", types::tuple_suffix(k))))
-            }
-            _ => Ok((self.expr_as(e, Ty::Object)?, String::new())),
+        let key = self.index_val(types::dynamic_dict(), e)?;
+        Ok(self.dict_key_of(key))
+    }
+
+    /// The key `index_val` evaluated for a dict, as the lookup takes it.
+    fn dict_key_of(&mut self, key: Val) -> (Node, String) {
+        match key.ty {
+            Ty::Str => (key.node, "_str".to_string()),
+            Ty::Tuple(k) => (key.node, format!("_{}", types::tuple_suffix(k))),
+            _ => (self.coerce(key, Ty::Object), String::new()),
         }
+    }
+
+    /// The index `slice` evaluated as a container of type `container`
+    /// reads and stores by it: an int for a sequence, a dict's key as
+    /// its own type when that is a string or a shape, else as it is.
+    fn index_val(&mut self, container: Ty, slice: &py::Expr) -> Result<Val> {
+        match container {
+            Ty::List(_) | Ty::Tuple(_) | Ty::Str | Ty::Bytes => Ok(Val {
+                node: self.expr_as(slice, Ty::Int)?,
+                ty: Ty::Int,
+            }),
+            Ty::Dict(_) => match self.ty_of(slice) {
+                Ty::Str => Ok(Val {
+                    node: self.expr_as(slice, Ty::Str)?,
+                    ty: Ty::Str,
+                }),
+                Ty::Tuple(_) => self.expr(slice),
+                _ => Ok(Val {
+                    node: self.expr_as(slice, Ty::Object)?,
+                    ty: Ty::Object,
+                }),
+            },
+            _ => self.expr(slice),
+        }
+    }
+
+    /// `seq[index]` read as `ty`, `index` from `index_val`.
+    fn read_item(&mut self, seq: Val, index: Val, ty: Ty, span: Span) -> Result<Val> {
+        match seq.ty {
+            Ty::List(_) | Ty::Tuple(_) | Ty::Str | Ty::Bytes => {
+                Ok(self.index_value(seq, index.node, ty, span))
+            }
+            // The stored value is dynamic; it is read as the shape says.
+            Ty::Dict(_) => {
+                let (key, by) = self.dict_key_of(index);
+                let value = Val {
+                    node: call(
+                        &format!("zb_dict_get{by}"),
+                        vec![seq.node, key],
+                        Ty::Object,
+                        span,
+                    ),
+                    ty: Ty::Object,
+                };
+                Ok(Val {
+                    node: self.read_as(value, ty, span),
+                    ty,
+                })
+            }
+            // An instance answers through its class's `__getitem__`.
+            Ty::Class(k) => {
+                match self.dunder(k as usize, "__getitem__", seq.node, vec![index], span) {
+                    Some(r) => Ok(r),
+                    None => Err(Error::unsupported_span(
+                        format!(
+                            "subscript of {}, which defines no __getitem__",
+                            self.module.classes[k as usize].name
+                        ),
+                        span,
+                    )),
+                }
+            }
+            _ => {
+                let o = self.coerce(seq, Ty::Object);
+                let node = if index.ty == Ty::Int {
+                    call("zb_any_getitem_i64", vec![o, index.node], Ty::Object, span)
+                } else {
+                    let key = self.coerce(index, Ty::Object);
+                    call("zb_any_getitem", vec![o, key], Ty::Object, span)
+                };
+                Ok(Val {
+                    node,
+                    ty: Ty::Object,
+                })
+            }
+        }
+    }
+
+    /// Whether `seq[i] = v` is lowered for a `seq` of type `ty`: a list,
+    /// dict, instance or dynamic value.
+    fn stores_items(ty: Ty) -> bool {
+        matches!(ty, Ty::List(_) | Ty::Dict(_) | Ty::Object | Ty::Class(_))
+    }
+
+    /// `seq[index] = value`, `index` from `index_val`, into `out`.
+    fn store_item(
+        &mut self,
+        seq: Val,
+        index: Val,
+        value: Val,
+        span: Span,
+        out: &mut Vec<Stmt>,
+    ) -> Result<()> {
+        let stmt = match seq.ty {
+            Ty::List(e) => {
+                let v = self.elem_arg(value, e);
+                call(
+                    &list_fn("set", e),
+                    vec![seq.node, index.node, v],
+                    Ty::None,
+                    span,
+                )
+            }
+            Ty::Dict(_) => {
+                let (k, by) = self.dict_key_of(index);
+                let v = self.coerce(value, Ty::Object);
+                call(
+                    &format!("zb_dict_set{by}"),
+                    vec![seq.node, k, v],
+                    Ty::None,
+                    span,
+                )
+            }
+            // An instance stores through its class's `__setitem__`.
+            Ty::Class(k) => {
+                match self.dunder(
+                    k as usize,
+                    "__setitem__",
+                    seq.node,
+                    vec![index, value],
+                    span,
+                ) {
+                    Some(r) => r.node,
+                    None => {
+                        return Err(Error::unsupported_span(
+                            format!(
+                                "item assignment on {}, which defines no __setitem__",
+                                self.module.classes[k as usize].name
+                            ),
+                            span,
+                        ));
+                    }
+                }
+            }
+            _ => {
+                let o = self.coerce(seq, Ty::Object);
+                let v = self.coerce(value, Ty::Object);
+                if index.ty == Ty::Int {
+                    call("zb_any_setitem_i64", vec![o, index.node, v], Ty::None, span)
+                } else {
+                    let i = self.coerce(index, Ty::Object);
+                    call("zb_any_setitem", vec![o, i, v], Ty::None, span)
+                }
+            }
+        };
+        let fallible = match &stmt.node {
+            TypedExpression::Call(c) => self.is_fallible_callee(&c.callee),
+            _ => false,
+        };
+        out.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(stmt)),
+            Type::Unknown,
+            span,
+        ));
+        if fallible {
+            let check = self.pending_check(span);
+            out.push(check);
+        }
+        Ok(())
     }
 
     fn iterable(&mut self, v: Val, span: Span) -> Node {
@@ -5633,12 +5953,17 @@ impl<'m> Lowerer<'m> {
     // ─── Expressions ────────────────────────────────────────────────
 
     pub(crate) fn expr(&mut self, e: &py::Expr) -> Result<Val> {
-        let mut v = self.expr_unchecked(e)?;
+        let v = self.expr_unchecked(e)?;
         // Whatever a call did to an object's fields, nothing settled
         // about them before it holds after.
         if matches!(e, py::Expr::Call(_)) {
             self.nonnull_fields.clear();
         }
+        Ok(self.checked(v))
+    }
+
+    /// A lowered value as an expression yields it.
+    fn checked(&mut self, mut v: Val) -> Val {
         // A function value whose function is known is the record every
         // function value is; only a call reads the type, off the callee
         // expression itself.
@@ -5657,9 +5982,9 @@ impl<'m> Lowerer<'m> {
         };
         if fallible {
             let span = v.node.span;
-            return Ok(self.guard(v, span));
+            return self.guard(v, span);
         }
-        Ok(v)
+        v
     }
 
     /// A library result read as `ty`: a call that can raise is checked
@@ -6175,6 +6500,73 @@ impl<'m> Lowerer<'m> {
         })
     }
 
+    /// `left op right` with both sides dynamic, `op` one of `+ - * /`:
+    /// two floats compute in the caller, any other pair goes to the
+    /// dispatcher `slow`, whose result is checked.
+    fn object_pair_arith(
+        &mut self,
+        op: py::Operator,
+        left: Val,
+        right: Val,
+        slow: &str,
+        span: Span,
+    ) -> Node {
+        let code = int_lit(types::arith_code(op), span);
+        // Numeric containers lose their element type when boxed.
+        // Keep the common float operation in the caller and use
+        // the full dispatcher for every other pair of values.
+        const FLOAT_CATEGORY: i64 = 4;
+        let bin = match op {
+            py::Operator::Add => BinaryOp::Add,
+            py::Operator::Sub => BinaryOp::Sub,
+            py::Operator::Mult => BinaryOp::Mul,
+            py::Operator::Div => BinaryOp::Div,
+            _ => unreachable!(),
+        };
+        let mut pre = Vec::new();
+        let l = self.hold(left, &mut pre, span);
+        let r = self.hold(right, &mut pre, span);
+        let is_float = |v: &Val| {
+            binary(
+                BinaryOp::Eq,
+                call("zb_any_category", vec![v.node.clone()], Ty::Int, span),
+                int_lit(FLOAT_CATEGORY, span),
+                Ty::Bool,
+                span,
+            )
+        };
+        let both_float = binary(BinaryOp::And, is_float(&l), is_float(&r), Ty::Bool, span);
+        let lf = call("zb_box_get_f64", vec![l.node.clone()], Ty::Float, span);
+        let rf = call("zb_box_get_f64", vec![r.node.clone()], Ty::Float, span);
+        let fast = call(
+            "zb_box_f64",
+            vec![binary(bin, lf, rf, Ty::Float, span)],
+            Ty::Object,
+            span,
+        );
+        let slow = call(slow, vec![code, l.node, r.node], Ty::Object, span);
+        let mut slow_pre = Vec::new();
+        let slow = self.hold(
+            Val {
+                node: slow,
+                ty: Ty::Object,
+            },
+            &mut slow_pre,
+            span,
+        );
+        slow_pre.push(self.pending_check(span));
+        let chosen = self.conditional_value(
+            both_float,
+            (Vec::new(), fast),
+            (slow_pre, slow.node),
+            Ty::Object,
+            span,
+            &mut pre,
+        );
+        self.hoisted.extend(pre);
+        chosen
+    }
+
     /// `left op right`, on the operands' types.
     fn arithmetic(
         &mut self,
@@ -6442,60 +6834,7 @@ impl<'m> Lowerer<'m> {
                             | py::Operator::Div
                     ) =>
                 {
-                    // Numeric containers lose their element type when boxed.
-                    // Keep the common float operation in the caller and use
-                    // the full dispatcher for every other pair of values.
-                    const FLOAT_CATEGORY: i64 = 4;
-                    let bin = match op {
-                        py::Operator::Add => BinaryOp::Add,
-                        py::Operator::Sub => BinaryOp::Sub,
-                        py::Operator::Mult => BinaryOp::Mul,
-                        py::Operator::Div => BinaryOp::Div,
-                        _ => unreachable!(),
-                    };
-                    let mut pre = Vec::new();
-                    let l = self.hold(left, &mut pre, span);
-                    let r = self.hold(right, &mut pre, span);
-                    let is_float = |v: &Val| {
-                        binary(
-                            BinaryOp::Eq,
-                            call("zb_any_category", vec![v.node.clone()], Ty::Int, span),
-                            int_lit(FLOAT_CATEGORY, span),
-                            Ty::Bool,
-                            span,
-                        )
-                    };
-                    let both_float =
-                        binary(BinaryOp::And, is_float(&l), is_float(&r), Ty::Bool, span);
-                    let lf = call("zb_box_get_f64", vec![l.node.clone()], Ty::Float, span);
-                    let rf = call("zb_box_get_f64", vec![r.node.clone()], Ty::Float, span);
-                    let fast = call(
-                        "zb_box_f64",
-                        vec![binary(bin, lf, rf, Ty::Float, span)],
-                        Ty::Object,
-                        span,
-                    );
-                    let slow = call("zb_any_arith", vec![code, l.node, r.node], Ty::Object, span);
-                    let mut slow_pre = Vec::new();
-                    let slow = self.hold(
-                        Val {
-                            node: slow,
-                            ty: Ty::Object,
-                        },
-                        &mut slow_pre,
-                        span,
-                    );
-                    slow_pre.push(self.pending_check(span));
-                    let chosen = self.conditional_value(
-                        both_float,
-                        (Vec::new(), fast),
-                        (slow_pre, slow.node),
-                        Ty::Object,
-                        span,
-                        &mut pre,
-                    );
-                    self.hoisted.extend(pre);
-                    chosen
+                    self.object_pair_arith(op, left, right, "zb_any_arith", span)
                 }
                 _ => {
                     let l = self.coerce(left, Ty::Object);
@@ -7320,54 +7659,9 @@ impl<'m> Lowerer<'m> {
                     ty: field,
                 })
             }
-            Ty::List(_) | Ty::Tuple(_) | Ty::Str | Ty::Bytes => {
-                let index = self.expr_as(&sub.slice, Ty::Int)?;
-                Ok(self.index_value(seq, index, ty, span))
-            }
-            // The stored value is dynamic; it is read as the shape says.
-            Ty::Dict(_) => {
-                let (key, by) = self.dict_key(&sub.slice)?;
-                let value = Val {
-                    node: call(
-                        &format!("zb_dict_get{by}"),
-                        vec![seq.node, key],
-                        Ty::Object,
-                        span,
-                    ),
-                    ty: Ty::Object,
-                };
-                Ok(Val {
-                    node: self.read_as(value, ty, span),
-                    ty,
-                })
-            }
-            // An instance answers through its class's `__getitem__`.
-            Ty::Class(k) => {
-                let key = self.expr(&sub.slice)?;
-                match self.dunder(k as usize, "__getitem__", seq.node, vec![key], span) {
-                    Some(r) => Ok(r),
-                    None => Err(Error::unsupported_span(
-                        format!(
-                            "subscript of {}, which defines no __getitem__",
-                            self.module.classes[k as usize].name
-                        ),
-                        span,
-                    )),
-                }
-            }
             _ => {
-                let key = self.expr(&sub.slice)?;
-                let o = self.coerce(seq, Ty::Object);
-                let node = if key.ty == Ty::Int {
-                    call("zb_any_getitem_i64", vec![o, key.node], Ty::Object, span)
-                } else {
-                    let key = self.coerce(key, Ty::Object);
-                    call("zb_any_getitem", vec![o, key], Ty::Object, span)
-                };
-                Ok(Val {
-                    node,
-                    ty: Ty::Object,
-                })
+                let index = self.index_val(seq.ty, &sub.slice)?;
+                self.read_item(seq, index, ty, span)
             }
         }
     }

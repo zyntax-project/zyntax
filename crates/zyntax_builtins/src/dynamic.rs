@@ -1758,6 +1758,152 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ret(unbox(Kind::Any, x.e())),
         ],
     ));
+
+    // Whether every value in `items` is of category `wanted`.
+    let wanted = local("wanted", i64());
+    let items = local("items", anys.clone());
+    let at = local("i", i64());
+    let size = local("n", i64());
+    d.push(define(
+        "zb_any_items_of_category",
+        &[&items, &wanted],
+        boolean(),
+        {
+            let mut s = vec![size.decl(mcall(items.e(), "len", vec![], i64()))];
+            s.extend(for_range(
+                &at,
+                int(0),
+                size.e(),
+                vec![when(
+                    ne(category(idx(items.e(), at.e(), any())), wanted.e()),
+                    vec![ret(bool(false))],
+                )],
+            ));
+            s.push(ret(bool(true)));
+            s
+        },
+    ));
+
+    // `a += b` and `a *= n` on a boxed list of the library's own kinds:
+    // the list itself grows or empties, so every reference to it sees
+    // the change, and is the result. A list of one kind grows in place
+    // only by values of that kind; anything else computes `a op b`
+    // afresh. Operator codes are `zb_any_arith`'s.
+    let count = local("count", i64());
+    let in_place = [Kind::Any, Kind::Int, Kind::Float, Kind::Str];
+    let extend = |k: Kind| {
+        let of_kind = match k {
+            // `xs += xs`: the items are copied before the list grows.
+            Kind::Any => if_expr(
+                eq(cast(items.e(), usize()), cast(unbox(k, a.e()), usize())),
+                call("zb_list_copy_any", vec![items.e()], anys.clone()),
+                items.e(),
+            ),
+            _ => call(
+                &format!("zb_list_from_any_{}", k.suffix()),
+                vec![items.e()],
+                list_of(list_type, k.ty()),
+            ),
+        };
+        let fits = match k {
+            Kind::Int => Some(INT),
+            Kind::Float => Some(FLOAT),
+            Kind::Str => Some(STR),
+            _ => None,
+        }
+        .map(|c| {
+            call(
+                "zb_any_items_of_category",
+                vec![items.e(), int(c)],
+                boolean(),
+            )
+        });
+        when(
+            match fits {
+                Some(fits) => and(kind_is(k, a.e()), fits),
+                None => kind_is(k, a.e()),
+            },
+            vec![
+                expr(call(
+                    &format!("zb_list_extend_{}", k.suffix()),
+                    vec![unbox(k, a.e()), of_kind],
+                    unit(),
+                )),
+                ret(a.e()),
+            ],
+        )
+    };
+    let repeat = |k: Kind| {
+        let copies = call(
+            &format!("zb_list_repeat_{}", k.suffix()),
+            vec![unbox(k, a.e()), sub(count.e(), int(1))],
+            list_of(list_type, k.ty()),
+        );
+        when(
+            kind_is(k, a.e()),
+            vec![
+                if_(
+                    le(count.e(), int(0)),
+                    vec![expr(mcall(unbox(k, a.e()), "clear", vec![], unit()))],
+                    vec![expr(call(
+                        &format!("zb_list_extend_{}", k.suffix()),
+                        vec![unbox(k, a.e()), copies],
+                        unit(),
+                    ))],
+                ),
+                ret(a.e()),
+            ],
+        )
+    };
+    let is_plain_list = or(
+        or(kind_is(Kind::Any, a.e()), kind_is(Kind::Int, a.e())),
+        or(kind_is(Kind::Float, a.e()), kind_is(Kind::Str, a.e())),
+    );
+    d.push(define(
+        "zb_any_arith_inplace",
+        &[&code, &a, &b],
+        any(),
+        vec![
+            ca.decl(category(a.e())),
+            cb.decl(category(b.e())),
+            when(
+                and(is(&ca, CUSTOM), is_plain_list.clone()),
+                vec![
+                    when(eq(code.e(), int(0)), {
+                        let mut s = vec![items.decl(iter(b.e()))];
+                        s.extend(in_place.iter().map(|k| extend(*k)));
+                        s
+                    }),
+                    when(and(eq(code.e(), int(2)), is_integral(&cb)), {
+                        let mut s = vec![count.decl(number_i64(b.e(), cb.e()))];
+                        s.extend(in_place.iter().map(|k| repeat(*k)));
+                        s
+                    }),
+                ],
+            ),
+            ret(call("zb_any_arith", vec![code.e(), a.e(), b.e()], any())),
+        ],
+    ));
+    // The same with an integer count, which is never boxed.
+    d.push(define(
+        "zb_any_arith_inplace_i64",
+        &[&code, &a, &count],
+        any(),
+        vec![
+            when(
+                and(
+                    and(eq(code.e(), int(2)), eq(category(a.e()), int(CUSTOM))),
+                    is_plain_list,
+                ),
+                in_place.iter().map(|k| repeat(*k)).collect(),
+            ),
+            ret(call(
+                "zb_any_arith_i64",
+                vec![code.e(), a.e(), count.e()],
+                any(),
+            )),
+        ],
+    ));
     let repr_of = |k: Kind, x: Expr| {
         call(
             &format!("zb_list_repr_{}", k.suffix()),
