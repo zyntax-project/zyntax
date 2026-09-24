@@ -63,6 +63,19 @@
 //! below which nothing is collected; a small value collects constantly,
 //! which is how a missed root is found.
 //!
+//! ## Weak references
+//!
+//! A frontend whose language has weak references keeps them in pool
+//! storage the marker must not follow. It registers [`WeakHooks`]: the
+//! storage blocks to hold (reached, never read), a trace that marks
+//! what that storage holds strongly until nothing new is reached (an
+//! ephemeron's value once its key is), and a settle step that may
+//! resurrect objects for finalization. A sweeper registered with
+//! [`add_weak_sweeper`] then drops what died, before the sweep reuses
+//! it; [`add_after_collection`] runs code once the world runs again,
+//! which is where finalizers run. With nothing registered a collection
+//! runs none of this.
+//!
 //! The collector is process state, so it is tested from a process of
 //! its own: a program that runs under it with the floor lowered, as
 //! the Python frontend's pressure test does.
@@ -161,6 +174,12 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
 /// The thread the collector was enabled on, which is the only one it
 /// runs on.
 static OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+/// Whether a spent budget starts a collection; [`collect`] runs
+/// either way.
+static AUTOMATIC: AtomicBool = AtomicBool::new(true);
+static WEAK_HOOKS: Mutex<Vec<WeakHooks>> = Mutex::new(Vec::new());
+static WEAK_SWEEPERS: Mutex<Vec<fn(&dyn Fn(usize) -> bool)>> = Mutex::new(Vec::new());
+static AFTER_COLLECTION: Mutex<Vec<fn()>> = Mutex::new(Vec::new());
 
 /// What the collector keeps per thread, in one place so a request
 /// pays one thread-local access, not one per fact.
@@ -393,7 +412,17 @@ pub(crate) fn wants_collection() -> bool {
         return false;
     }
     let l = local();
-    l.spent >= l.budget && !l.collecting && on_owner_thread()
+    l.spent >= l.budget && !l.collecting && AUTOMATIC.load(Ordering::Relaxed) && on_owner_thread()
+}
+
+/// Whether a spent budget starts a collection. Off, the heap grows
+/// until [`collect`] is called or it is turned on again.
+pub fn set_automatic(on: bool) {
+    AUTOMATIC.store(on, Ordering::Relaxed);
+}
+
+pub fn is_automatic() -> bool {
+    AUTOMATIC.load(Ordering::Relaxed)
 }
 
 /// Memory outside the heap the collector must read for pointers: a
@@ -420,13 +449,87 @@ pub struct Stats {
     pub collections: usize,
     /// Bytes reached by the last collection.
     pub live: usize,
+    /// Bytes spent against the budget since the last collection, on
+    /// the calling thread: fresh storage and reclaimed blocks handed
+    /// out again.
+    pub allocated: usize,
 }
 
 pub fn stats() -> Stats {
+    let allocated = local().spent;
     let r = registry();
     Stats {
         collections: r.collections,
         live: r.live,
+        allocated,
+    }
+}
+
+/// Marking as a weak-reference hook sees it.
+pub trait Marking {
+    /// Whether the block `a` lands in is reached. An address the
+    /// collector does not manage (a static, an interned box, anything
+    /// outside the pool's slabs and large blocks) counts as reached.
+    fn is_marked(&self, a: usize) -> bool;
+    /// Reach the block `a` lands in, and everything it holds.
+    fn mark(&mut self, a: usize);
+}
+
+/// A frontend's weak references, as a collection consults them. Each
+/// runs on the mutator thread with the world stopped, and must not
+/// allocate or free through the pool or run program code.
+#[derive(Clone, Copy)]
+pub struct WeakHooks {
+    /// Before the roots are read: name each storage block holding
+    /// weak entries. A named block counts as reached, and its words
+    /// are left to `trace`.
+    pub hold: fn(&mut dyn FnMut(usize)),
+    /// Once marking has drained: mark what held storage keeps
+    /// strongly. Called again after anything it marks is followed,
+    /// until a round reaches nothing new.
+    pub trace: fn(&mut dyn Marking),
+    /// Once tracing settles: may mark more, as a finalizer's object is
+    /// resurrected for one cycle; tracing then resumes, and this is
+    /// called again until it marks nothing.
+    pub settle: fn(&mut dyn Marking),
+}
+
+/// Register weak-reference hooks; idempotent per `hold` function.
+pub fn add_weak_hooks(hooks: WeakHooks) {
+    let mut all = WEAK_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    if !all.iter().any(|h| std::ptr::fn_addr_eq(h.hold, hooks.hold)) {
+        all.push(hooks);
+    }
+}
+
+/// Register a weak sweeper; idempotent per function. Every collection
+/// calls each, after marking and before the sweep, on the mutator
+/// thread with the world stopped, with whether an address is reached
+/// (as [`Marking::is_marked`] answers). Running before the sweep means
+/// a dying block leaves every weak table before its storage can be
+/// handed out again.
+///
+/// A sweeper must not allocate, free through the pool, or call program
+/// code: it may only drop its own references, or rebuild its own table
+/// from memory it already owns (a rebuild that needs a new table is
+/// sized before the collection, or reuses the old one in place). A
+/// caller that allocates on a weak-table miss must probe again after
+/// the allocation, which may have collected and rebuilt the table.
+pub fn add_weak_sweeper(f: fn(&dyn Fn(usize) -> bool)) {
+    let mut all = WEAK_SWEEPERS.lock().unwrap_or_else(|e| e.into_inner());
+    if !all.iter().any(|g| std::ptr::fn_addr_eq(*g, f)) {
+        all.push(f);
+    }
+}
+
+/// Register a function to run after each collection, on the mutator
+/// thread, once the world runs again; idempotent per function. It may
+/// allocate and run program code (a collection it starts runs its
+/// hooks again), so it is where finalizers run.
+pub fn add_after_collection(f: fn()) {
+    let mut all = AFTER_COLLECTION.lock().unwrap_or_else(|e| e.into_inner());
+    if !all.iter().any(|g| std::ptr::fn_addr_eq(*g, f)) {
+        all.push(f);
     }
 }
 
@@ -560,6 +663,14 @@ impl SlabTable {
         // SAFETY: a non-null slot holds the address of bits this table
         // owns for as long as it lives.
         (!p.is_null()).then(|| unsafe { &mut *p })
+    }
+
+    /// [`Self::get`] without moving the page kept to hand.
+    fn peek(&self, slab: usize) -> Option<&SlabBits> {
+        let page = self.pages.get(&(slab / PAGE_SPAN))?;
+        let p = page[(slab % PAGE_SPAN) / pool_alloc::SLAB_BYTES];
+        // SAFETY: as in `get`.
+        (!p.is_null()).then(|| unsafe { &*p })
     }
 
     fn insert(&mut self, slab: usize, bits: Box<SlabBits>) -> &mut SlabBits {
@@ -746,27 +857,86 @@ impl<'a> Marker<'a> {
             }
             return;
         }
+        if let Some((payload, len)) = self.large_block(a)
+            && self.large_marked.insert(payload)
+        {
+            if !mapped(payload, payload + len) {
+                eprintln!(
+                    "[gc] large block {payload:#x}..{:#x} is not mapped; skipped",
+                    payload + len
+                );
+                return;
+            }
+            let total = len + pool_alloc::SLAB_HEADER;
+            self.marked_bytes += total;
+            self.work.push((payload, len));
+            if let Some(attr) = self.attribution.as_deref_mut() {
+                let last = attr.classes.len() - 1;
+                attr.classes[last].0 += 1;
+                attr.classes[last].1 += total;
+            }
+        }
+    }
+
+    /// The large block `a` lands in, by payload address and length.
+    fn large_block(&self, a: usize) -> Option<(usize, usize)> {
+        let slab = a & !(pool_alloc::SLAB_BYTES - 1);
         if !self.large_spans.contains(&slab) {
+            return None;
+        }
+        let (&payload, &total) = self.reg.large.range(..=a).next_back()?;
+        let len = total - pool_alloc::SLAB_HEADER;
+        (a < payload + len).then_some((payload, len))
+    }
+
+    /// Whether the block `a` lands in is reached: the lookup
+    /// [`Self::consider`] makes, marking nothing. What the collector
+    /// does not manage counts as reached, so it is never taken for
+    /// dead.
+    fn is_marked(&self, a: usize) -> bool {
+        if a < self.lo || a >= self.hi || crate::interned::is_interned(a) {
+            return true;
+        }
+        let slab = a & !(pool_alloc::SLAB_BYTES - 1);
+        if pool_alloc::in_a_slab_at(slab) {
+            // A slab no word has reached has nothing marked in it.
+            let Some(bits) = self.bits.peek(slab) else {
+                return false;
+            };
+            let Some(idx) = bits.block_at(a - slab) else {
+                return true;
+            };
+            let (w, m) = bit(idx);
+            return bits.marks[w] & m != 0;
+        }
+        match self.large_block(a) {
+            Some((payload, _)) => self.large_marked.contains(&payload),
+            None => true,
+        }
+    }
+
+    /// Take the block `a` lands in as reached without reading it: its
+    /// words are a weak-reference hook's to follow.
+    fn hold(&mut self, a: usize) {
+        if a < self.lo || a >= self.hi || crate::interned::is_interned(a) {
             return;
         }
-        if let Some((&payload, &total)) = self.reg.large.range(..=a).next_back() {
-            let len = total - pool_alloc::SLAB_HEADER;
-            if a < payload + len && self.large_marked.insert(payload) {
-                if !mapped(payload, payload + len) {
-                    eprintln!(
-                        "[gc] large block {payload:#x}..{:#x} is not mapped; skipped",
-                        payload + len
-                    );
-                    return;
-                }
-                self.marked_bytes += total;
-                self.work.push((payload, len));
-                if let Some(attr) = self.attribution.as_deref_mut() {
-                    let last = attr.classes.len() - 1;
-                    attr.classes[last].0 += 1;
-                    attr.classes[last].1 += total;
-                }
+        let slab = a & !(pool_alloc::SLAB_BYTES - 1);
+        if let Some(bits) = self.slab_bits(slab) {
+            let Some(idx) = bits.block_at(a - slab) else {
+                return;
+            };
+            let (w, m) = bit(idx);
+            if (bits.free[w] | bits.marks[w]) & m == 0 {
+                bits.marks[w] |= m;
+                self.marked_bytes += bits.slot;
             }
+            return;
+        }
+        if let Some((payload, len)) = self.large_block(a)
+            && self.large_marked.insert(payload)
+        {
+            self.marked_bytes += len + pool_alloc::SLAB_HEADER;
         }
     }
 
@@ -1013,6 +1183,42 @@ impl<'a> Marker<'a> {
     }
 }
 
+impl Marking for Marker<'_> {
+    fn is_marked(&self, a: usize) -> bool {
+        Marker::is_marked(self, a)
+    }
+
+    fn mark(&mut self, a: usize) {
+        self.consider(a);
+        self.drain();
+    }
+}
+
+/// Run the weak-reference hooks over a marking that has drained: trace
+/// to a fixpoint, settle, and again while settling reaches anything.
+fn settle_weak(marker: &mut Marker<'_>, hooks: &[WeakHooks]) {
+    loop {
+        loop {
+            let before = marker.marked_bytes;
+            for h in hooks {
+                (h.trace)(marker);
+            }
+            marker.drain();
+            if marker.marked_bytes == before {
+                break;
+            }
+        }
+        let before = marker.marked_bytes;
+        for h in hooks {
+            (h.settle)(marker);
+        }
+        marker.drain();
+        if marker.marked_bytes == before {
+            break;
+        }
+    }
+}
+
 /// Whether every page of `[lo, hi)` is mapped. `msync` refuses a range
 /// with a hole in it.
 #[cfg(unix)]
@@ -1161,10 +1367,19 @@ fn collect_from(sp: usize) {
     let carved = local().spent;
     update(|l| l.spent = 0);
 
+    let hooks = WEAK_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let sweepers = WEAK_SWEEPERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
     let (live, freed_blocks, freed_bytes, free_bytes, large_freed) = {
         let mut marker = Marker::new(&reg);
         let built_at = started.elapsed();
         pool_alloc::for_each_free_block(|b| marker.note_free(b));
+        for h in &hooks {
+            (h.hold)(&mut |a| marker.hold(a));
+        }
         let free_walked_at = started.elapsed();
 
         // Roots: the stacks, the globals, what the fiber runtime holds.
@@ -1219,6 +1434,16 @@ fn collect_from(sp: usize) {
         let direct = marker.marked_bytes;
         let roots_at = started.elapsed();
         marker.drain();
+        let drained_at = started.elapsed();
+        if !hooks.is_empty() {
+            settle_weak(&mut marker, &hooks);
+        }
+        if !sweepers.is_empty() {
+            let reached = |a: usize| marker.is_marked(a);
+            for f in &sweepers {
+                f(&reached);
+            }
+        }
         let marked_at = started.elapsed();
         marker.report_attribution(sp);
         let (freed_blocks, freed_bytes, free_bytes) = marker.sweep();
@@ -1231,9 +1456,17 @@ fn collect_from(sp: usize) {
                 ms(built_at),
                 ms(free_walked_at - built_at),
                 ms(roots_at - free_walked_at),
-                ms(marked_at - roots_at),
+                ms(drained_at - roots_at),
                 ms(started.elapsed() - marked_at)
             );
+            if !hooks.is_empty() || !sweepers.is_empty() {
+                eprintln!(
+                    "[gc]   {} weak hooks and {} sweepers: {:.2} ms",
+                    hooks.len(),
+                    sweepers.len(),
+                    ms(marked_at - drained_at)
+                );
+            }
         }
         let dead_large: Vec<usize> = marker
             .reg
@@ -1292,4 +1525,11 @@ fn collect_from(sp: usize) {
     }
     drop(reg);
     update(|l| l.collecting = false);
+    let after = AFTER_COLLECTION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    for f in after {
+        f();
+    }
 }
