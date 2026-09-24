@@ -36,6 +36,7 @@ mod kwargs;
 mod lower;
 mod modules;
 mod prelude;
+mod rebind;
 mod scope;
 mod shape;
 mod stdlib;
@@ -329,11 +330,13 @@ pub fn parse_program_with(
     // Sugar the frontend does not model is rewritten away before
     // anything is typed: `**kwargs` becomes keyword parameters, class
     // and static methods become module functions, a name given a class
-    // becomes the class.
+    // becomes the class, a local rebound in straight-line code becomes
+    // a fresh version.
     let mut statements: Vec<py::Stmt> = body.into_iter().collect();
     kwargs::rewrite(&mut statements)?;
     sugar::rewrite(&mut statements, &mut origins);
     aliases::rewrite(&mut statements);
+    rebind::rewrite(&mut statements);
     module.body = statements.into_iter().collect();
     lap("parse+link");
     let located = |e: Error, module: Option<&str>| match module {
@@ -647,7 +650,7 @@ pub fn parse_program_with(
     lap("specialise");
     // `ZYNTAX_TRACE_TYPES=1` prints what inference decided: each
     // function's signature and the instances made of it, each class's
-    // fields, the globals.
+    // fields, the globals, and each function's locals as it is lowered.
     if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
         let describe = |sig: &types::Sig| -> String {
             let params: Vec<String> = sig
@@ -1298,6 +1301,16 @@ fn lower_item_as(
                     locals.vars.insert(name.clone(), *ty);
                 }
             }
+        }
+        if !trusted && std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
+            let mut vars: Vec<String> = locals
+                .vars
+                .iter()
+                .filter(|(n, _)| !sig.params.iter().any(|(p, _)| p == *n))
+                .map(|(n, t)| format!("{n}: {t:?}"))
+                .collect();
+            vars.sort();
+            eprintln!("[types] locals {} {{ {} }}", fn_name, vars.join(", "));
         }
         let scope = scope::Scope::of_function(item.def);
         let mut lowerer = lower::Lowerer::new(
