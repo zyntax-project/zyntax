@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1790275738,"nonce":"dNsUqjJ7p2Cho7uT+nYhqQ4pXSQ=","status":2}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790285462,"nonce":"GBqPeRPCzVnaNFSkyMr3UG4YXoc=","message":"Landed on main as 374ecfd9a1c1 (full: 374ecfd9670dd861f5cc89534ba4c4ab9eb6c1f2); the worktree commit 2d631eb2 cited above was cherry-picked.","files":null}]}
