@@ -1,0 +1,24 @@
+5 7 0 True False True False
+[8, 1, 1, 1, 6, 1]
+[7, 0, 0, 0, 5, 1]
+get tuple 0
+get longer ValueError too many values to unpack (expected 2, got 3)
+get shorter ValueError not enough values to unpack (expected 2, got 1)
+get str 7
+get missing str KeyError 'nowhere'
+get int 0
+set tuple [7, 0, 0, 0, 5, 8]
+set longer ValueError too many values to unpack (expected 2, got 3)
+set shorter ValueError not enough values to unpack (expected 2, got 1)
+set str [9, 0, 0, 0, 5, 8]
+set int [9, 0, 4, 0, 5, 8]
+in tuple True
+in longer ValueError too many values to unpack (expected 2, got 3)
+in shorter ValueError not enough values to unpack (expected 2, got 1)
+in str True
+in int True
+add tuple [10, 0, 4, 0, 5, 8]
+add longer ValueError too many values to unpack (expected 2, got 3)
+add shorter ValueError not enough values to unpack (expected 2, got 1)
+add str [109, 0, 4, 0, 5, 8]
+add int [19, 10, 14, 10, 15, 18]

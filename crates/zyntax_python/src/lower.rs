@@ -838,6 +838,97 @@ pub(crate) fn adapter(module: &Module, name: &str, sig: &Sig) -> TypedFunction {
     }
 }
 
+/// The instance `spec` as a call of its item's own function: each
+/// argument as the item's parameter, the result as the instance's,
+/// checked for a raise as any call is. What stands for an instance
+/// whose body does not lower against its types. The instance's trusted
+/// variant, where it has one, the same. Each with what its lowering
+/// found about its raising.
+pub(crate) fn forwarders(
+    module: &Module,
+    spec: &types::SpecInfo,
+    item_sig: &Sig,
+) -> Vec<(TypedFunction, types::RaiseFact)> {
+    let span = Span::new(0, 0);
+    let mut names = vec![spec.name.clone()];
+    if module.trusted.contains(&spec.name) {
+        names.push(types::trusted_name(&spec.name));
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let scope = Scope::default();
+            let mut lowerer = Lowerer::new(
+                module,
+                &name,
+                spec.sig.clone(),
+                Locals::default(),
+                &scope,
+                Vec::new(),
+                HashMap::default(),
+            );
+            let mut params = Vec::new();
+            let mut args = Vec::new();
+            for ((p, ty), (_, item_ty)) in spec.sig.params.iter().zip(&item_sig.params) {
+                params.push(parameter(p, *ty, span));
+                args.push(lowerer.coerce(
+                    Val {
+                        node: var(intern(p), *ty, span),
+                        ty: *ty,
+                    },
+                    *item_ty,
+                ));
+            }
+            let result = Val {
+                node: call(&spec.item, args, item_sig.ret, span),
+                ty: item_sig.ret,
+            };
+            let held = lowerer.guard_named(result, &spec.item, span);
+            let mut statements = std::mem::take(&mut lowerer.hoisted);
+            if spec.sig.ret == Ty::None {
+                statements.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(held.node)),
+                    Type::Unknown,
+                    span,
+                ));
+                statements.push(TypedNode::new(
+                    TypedStatement::Return(None),
+                    Type::Unknown,
+                    span,
+                ));
+            } else {
+                let value = lowerer.coerce(held, spec.sig.ret);
+                statements.append(&mut lowerer.hoisted);
+                statements.push(TypedNode::new(
+                    TypedStatement::Return(Some(Box::new(value))),
+                    Type::Unknown,
+                    span,
+                ));
+            }
+            let fact = lowerer.raise_fact();
+            let function = TypedFunction {
+                name: intern(&name),
+                annotations: vec![strict_fp_annotation(span)],
+                effects: Vec::new(),
+                with_handlers: Vec::new(),
+                type_params: Vec::new(),
+                params,
+                return_type: ir(spec.sig.ret),
+                body: Some(TypedBlock { statements, span }),
+                visibility: Visibility::Public,
+                is_async: false,
+                is_fiber: false,
+                is_pure: false,
+                is_external: false,
+                calling_convention: zyntax_typed_ast::type_registry::CallingConvention::Default,
+                link_name: None,
+                module: None,
+            };
+            (function, fact)
+        })
+        .collect()
+}
+
 pub(crate) fn unsupported<T>(what: impl Into<String>, at: &impl Ranged) -> Result<T> {
     Err(Error::unsupported(what.into(), at))
 }
@@ -932,6 +1023,11 @@ pub(crate) struct Lowerer<'m> {
     /// pending check. A lowerer building a function by hand drains no
     /// hoisted statements; its callers check after calling it.
     pub(crate) guards: bool,
+    /// Whether the function carries its parameters' defaults. Every
+    /// call the lowering makes fills a default at the call site; an
+    /// instance made for other argument types than a default's does
+    /// not carry it, since the default may not be one of them.
+    pub(crate) callee_defaults: bool,
 }
 
 /// One `try` body's control flag: 0 fell through, 1 return, 2 break,
@@ -1020,6 +1116,7 @@ impl<'m> Lowerer<'m> {
             trusted: false,
             defaults_after_cells: 0,
             guards: true,
+            callee_defaults: true,
             cells: cells
                 .into_iter()
                 .map(|n| {
@@ -1280,6 +1377,14 @@ impl<'m> Lowerer<'m> {
                     ty: Ty::None,
                 };
                 self.coerce(none, Ty::Object)
+            }
+            // A tuple is a value struct: each field's nothing.
+            Ty::Tuple(k) => {
+                let fields = types::tuple_shape(k)
+                    .into_iter()
+                    .map(|elem| self.zero_of(tuple_field_storage(elem.settled()), span))
+                    .collect();
+                tuple_value(fields, ty, span)
             }
             other => cast(int_lit(0, span), other, span),
         }
@@ -1847,11 +1952,11 @@ impl<'m> Lowerer<'m> {
                 continue;
             }
             let default_value = match &p.default {
-                Some(d) => {
+                Some(d) if self.callee_defaults => {
                     let v = self.expr(d)?;
                     Some(Box::new(self.coerce(v, declared)))
                 }
-                None => None,
+                _ => None,
             };
             params.push(TypedParameter {
                 name,
@@ -2433,32 +2538,29 @@ impl<'m> Lowerer<'m> {
         let shape = types::tuple_shape(k);
         let target = Ty::Tuple(k);
         let anys = Ty::List(Elem::Object);
+        // A checked read raises as the unpack it stands for and yields
+        // nothing, so the elements are read only from a tuple of the
+        // length.
         let read = if trusted {
-            "zb_unbox_tuple_raw"
+            call("zb_unbox_tuple_raw", vec![v.node], anys, span)
         } else {
-            "zb_unbox_tuple"
+            call(
+                "zb_unbox_tuple_len",
+                vec![v.node, int_lit(shape.len() as i64, span)],
+                anys,
+                span,
+            )
         };
         let mut pre = Vec::new();
         let held = self.hold(
             Val {
-                node: call(read, vec![v.node], anys, span),
+                node: read,
                 ty: anys,
             },
             &mut pre,
             span,
         );
         if !trusted && self.guards {
-            pre.push(self.pending_check(span));
-            pre.push(TypedNode::new(
-                TypedStatement::Expression(Box::new(call(
-                    "zb_list_expect_len_any",
-                    vec![held.node.clone(), int_lit(shape.len() as i64, span)],
-                    Ty::None,
-                    span,
-                ))),
-                Type::Unknown,
-                span,
-            ));
             pre.push(self.pending_check(span));
         }
         if self.guards {
@@ -2487,10 +2589,47 @@ impl<'m> Lowerer<'m> {
             })
             .collect();
         let value = self.tuple_of_items(items, target, span);
+        // Where no check leaves the function, the caller checks after
+        // it: a read that raised yields a value nothing reads.
+        let value = if !trusted && !self.guards {
+            let is_tuple = binary(
+                BinaryOp::Ne,
+                as_addr(held.node.clone(), span),
+                int_lit(0, span),
+                Ty::Bool,
+                span,
+            );
+            let none = self.zero_of(target, span);
+            self.conditional_value(
+                is_tuple,
+                (Vec::new(), value),
+                (Vec::new(), none),
+                target,
+                span,
+                &mut pre,
+            )
+        } else {
+            value
+        };
         if pre.is_empty() {
             value
         } else {
             Self::block_value(pre, value, target, span)
+        }
+    }
+
+    /// Whether a value of type `ty` can equal an element of kind `e`:
+    /// a dynamic value, one of the kind, or a number in a list of
+    /// numbers, which compare by value across int, bool and float.
+    fn may_be_element(ty: Ty, e: Elem) -> bool {
+        let numeric = |t: Ty| t.is_numeric();
+        match e {
+            Elem::Object => true,
+            Elem::Int | Elem::Float => numeric(ty) || matches!(ty, Ty::Object | Ty::Unknown),
+            Elem::Array(c) => {
+                (numeric(ty) && numeric(c.item())) || matches!(ty, Ty::Object | Ty::Unknown)
+            }
+            _ => Elem::of(ty) == e || matches!(ty, Ty::Object | Ty::Unknown),
         }
     }
 
@@ -4229,14 +4368,23 @@ impl<'m> Lowerer<'m> {
                     }
                     return Ok(());
                 }
-                // A set unpacks as the list of its values.
-                let value = if value.ty == Ty::Set || matches!(value.ty, Ty::Tuple(_)) {
-                    Val {
+                // A set unpacks as the list of its values, a string as
+                // the list of its characters, a dict as whatever
+                // iterating it yields.
+                let value = match value.ty {
+                    Ty::Set | Ty::Tuple(_) => Val {
                         node: self.coerce(value, Ty::List(Elem::Object)),
                         ty: Ty::List(Elem::Object),
-                    }
-                } else {
-                    value
+                    },
+                    Ty::Str => Val {
+                        node: self.iterable(value, span),
+                        ty: Ty::List(Elem::Object),
+                    },
+                    Ty::Dict(_) => Val {
+                        node: self.coerce(value, Ty::Object),
+                        ty: Ty::Object,
+                    },
+                    _ => value,
                 };
                 // Resolve a dynamic iterable once before reading its fields.
                 let dynamic = value.ty == Ty::Object;
@@ -4419,6 +4567,38 @@ impl<'m> Lowerer<'m> {
         span: Span,
         out: &mut Vec<Stmt>,
     ) -> Result<()> {
+        // A branch the types decide is not lowered: a body written for
+        // another class need not lower against this one.
+        match types::static_isinstance(self.module, test, |e| self.ty_of(e)) {
+            Some(true) => {
+                let block = self.block(body, span)?;
+                out.push(TypedNode::new(
+                    TypedStatement::Block(block),
+                    Type::Unknown,
+                    span,
+                ));
+                return Ok(());
+            }
+            Some(false) => {
+                let Some((clause, tail)) = rest.split_first() else {
+                    return Ok(());
+                };
+                let clause_span = span_of(clause);
+                return match &clause.test {
+                    Some(t) => self.if_chain(t, &clause.body, tail, clause_span, out),
+                    None => {
+                        let block = self.block(&clause.body, clause_span)?;
+                        out.push(TypedNode::new(
+                            TypedStatement::Block(block),
+                            Type::Unknown,
+                            clause_span,
+                        ));
+                        Ok(())
+                    }
+                };
+            }
+            None => {}
+        }
         let cond = self.expr(test)?;
         let condition = Box::new(self.truthy(cond));
         out.append(&mut self.hoisted);
@@ -6986,11 +7166,25 @@ impl<'m> Lowerer<'m> {
                     )
                 } else if let Ty::List(e @ Elem::Array(c)) = right.ty {
                     self.array_search(left, right.node, e, c, "contains", span)?
-                } else if let Ty::List(e) = right.ty {
+                } else if let Ty::List(e) = right.ty
+                    && Self::may_be_element(left.ty, e)
+                {
                     let item = self.elem_arg(left, e);
                     call(
                         &list_fn("contains", e),
                         vec![right.node, item],
+                        Ty::Bool,
+                        span,
+                    )
+                } else if matches!(right.ty, Ty::List(_)) {
+                    // A value of a kind the list does not hold compares
+                    // as boxes do: never equal to an element, not a
+                    // conversion that raises.
+                    let item = self.coerce(left, Ty::Object);
+                    let items = self.coerce(right, Ty::List(Elem::Object));
+                    call(
+                        &list_fn("contains", Elem::Object),
+                        vec![items, item],
                         Ty::Bool,
                         span,
                     )
@@ -7027,6 +7221,22 @@ impl<'m> Lowerer<'m> {
                         Ty::Bool,
                         span,
                     )
+                } else if let Ty::Class(k) = right.ty
+                    && self.module.method_sig(k as usize, "__contains__").is_some()
+                {
+                    // An instance answers through its class's
+                    // `__contains__`, whose result is read for its truth.
+                    let container = self.checked_instance(right, "__contains__", span);
+                    match self.dunder(k as usize, "__contains__", container.node, vec![left], span)
+                    {
+                        Some(result) => self.truthy(result),
+                        None => {
+                            return Err(Error::unsupported_span(
+                                "`in` on an instance whose __contains__ takes another number of arguments",
+                                span,
+                            ));
+                        }
+                    }
                 } else {
                     let item = self.coerce(left, Ty::Object);
                     let container = self.coerce(right, Ty::Object);
@@ -8575,11 +8785,14 @@ impl<'m> Lowerer<'m> {
                 return self.construct(k, args, keywords, c, span);
             }
             if let Some(sig) = self.module.funcs.get(name).cloned() {
+                let (fn_name, sig) = self
+                    .pick_instance(name, &sig, 0, args, keywords)
+                    .unwrap_or((name.to_string(), sig));
                 let lowered = self.arguments(name, &sig, args, keywords, c)?;
                 if sig.ret == Ty::Gen {
                     return Ok(self.start_generator(name, &sig, lowered, Vec::new(), span));
                 }
-                let target = self.call_target(name, &sig.params, &lowered);
+                let target = self.call_target(&fn_name, &sig.params, &lowered);
                 let v = Val {
                     node: call(&target, lowered, sig.ret, span),
                     ty: sig.ret,
@@ -10131,31 +10344,26 @@ impl<'m> Lowerer<'m> {
             ty: Ty::Bool,
         };
         if let Some(&k) = self.module.class_index.get(n.id.as_str()) {
+            if let Some(answer) = types::isinstance_of_class(self.module, v.ty, k) {
+                return Ok(lit(answer));
+            }
             // The instance's class tag against `k` and every subclass.
             let tag = match v.ty {
-                Ty::Class(c) => {
-                    if !self.module.is_subclass(c as usize, k)
-                        && !self.module.is_subclass(k, c as usize)
-                    {
-                        return Ok(lit(false));
-                    }
-                    node(
-                        TypedExpression::Field(TypedFieldAccess {
-                            object: Box::new(v.node),
-                            field: intern("$class"),
-                        }),
-                        Ty::Int,
-                        span,
-                    )
-                }
-                Ty::Object => binary(
+                Ty::Class(_) => node(
+                    TypedExpression::Field(TypedFieldAccess {
+                        object: Box::new(v.node),
+                        field: intern("$class"),
+                    }),
+                    Ty::Int,
+                    span,
+                ),
+                _ => binary(
                     BinaryOp::Sub,
                     call("zb_any_kind", vec![v.node], Ty::Int, span),
                     int_lit(zyntax_builtins::INSTANCE_KIND_BASE, span),
                     Ty::Int,
                     span,
                 ),
-                _ => return Ok(lit(false)),
             };
             let mut pre = Vec::new();
             let held = self.hold(
@@ -10189,22 +10397,7 @@ impl<'m> Lowerer<'m> {
             });
         }
         let name = n.id.as_str();
-        let statically = |ty: Ty| -> Option<bool> {
-            Some(match (name, ty) {
-                ("int", Ty::Int | Ty::Bool) => true,
-                ("bool", Ty::Bool) => true,
-                ("float", Ty::Float) => true,
-                ("str", Ty::Str) => true,
-                ("bytes", Ty::Bytes) => true,
-                ("list", Ty::List(_)) => true,
-                ("tuple", Ty::Tuple(_)) => true,
-                ("dict", Ty::Dict(_)) => true,
-                ("set", Ty::Set) => true,
-                (_, Ty::Object | Ty::Unknown) => return None,
-                _ => false,
-            })
-        };
-        if let Some(answer) = statically(v.ty) {
+        if let Some(answer) = types::isinstance_of_builtin(name, v.ty) {
             return Ok(lit(answer));
         }
         let type_name = call("zb_any_type", vec![v.node], Ty::Str, span);
@@ -10505,6 +10698,25 @@ impl<'m> Lowerer<'m> {
             .filter(|n| !self.cells.contains_key(n.as_str()))
             .map(|n| intern(n))
             .collect()
+    }
+
+    /// The instance of item `name` a call passing `args` and `keywords`
+    /// to the parameters from `first` on goes to, with its signature,
+    /// when one was made for the types passed.
+    fn pick_instance(
+        &self,
+        name: &str,
+        sig: &Sig,
+        first: usize,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+    ) -> Option<(String, Sig)> {
+        if self.module.specs.is_empty() {
+            return None;
+        }
+        let tys = types::call_types(self.module, sig, first, args, keywords, |e| self.ty_of(e))?;
+        let spec = self.module.instance(name, sig, &tys)?;
+        Some((spec.name.clone(), spec.sig.clone()))
     }
 
     /// The function a call to `name` with `args` goes to: the trusted
@@ -10999,32 +11211,44 @@ impl<'m> Lowerer<'m> {
         args: Vec<Node>,
         span: Span,
     ) -> Option<Val> {
-        Some(self.invoke_targeted(k, method, receiver, args, span)?.0)
+        Some(
+            self.invoke_targeted(k, method, receiver, args, None, span)?
+                .0,
+        )
     }
 
     /// [`Self::invoke`], also naming the function called, which a
-    /// check after the call is attributed to.
+    /// check after the call is attributed to. `instance` is the
+    /// method's instance for the arguments' types, when one was made:
+    /// a call nothing dispatches goes there.
     fn invoke_targeted(
         &mut self,
         k: usize,
         method: &str,
         receiver: Node,
         args: Vec<Node>,
+        instance: Option<(String, Sig)>,
         span: Span,
     ) -> Option<(Val, String)> {
         let (sig, fn_name) = self.module.method_sig(k, method)?;
-        let params = without_self(sig).params;
+        let mut params = without_self(sig).params;
         let owner = self.module.method_owner(k, method)?;
-        let target = self.invoke_target(k, method)?;
+        let mut target = self.invoke_target(k, method)?;
+        let direct = target == fn_name;
         // A dispatched call returns what any method it may reach does.
-        let ret = if target == fn_name {
+        let mut ret = if direct {
             sig.ret
         } else {
             self.module.dispatched_ret(k, method).unwrap_or(sig.ret)
         };
+        if direct && let Some((spec_name, spec_sig)) = instance {
+            params = without_self(&spec_sig).params;
+            ret = spec_sig.ret;
+            target = spec_name;
+        }
         // A method nothing overrides may go to its trusted variant.
-        let target = if target == fn_name {
-            self.call_target(&fn_name, &params, &args)
+        let target = if direct {
+            self.call_target(&target, &params, &args)
         } else {
             target
         };
@@ -11040,7 +11264,7 @@ impl<'m> Lowerer<'m> {
         // A generator method starts its fiber, `self` in the environment
         // with the arguments; a dispatcher over overrides does that for
         // whichever it reaches.
-        if sig.ret == Ty::Gen && target == fn_name {
+        if sig.ret == Ty::Gen && direct {
             let sig = sig.clone();
             let started = self.start_generator(&fn_name, &sig, all, Vec::new(), span);
             return Some((started, fn_name));
@@ -11064,17 +11288,25 @@ impl<'m> Lowerer<'m> {
         args: Vec<Val>,
         span: Span,
     ) -> Option<Val> {
-        let (sig, _) = self.module.method_sig(k, method)?;
+        let (sig, fn_name) = self.module.method_sig(k, method)?;
         if sig.params.len() != args.len() + 1 {
             return None;
         }
-        let param_tys: Vec<Ty> = sig.params.iter().skip(1).map(|(_, t)| *t).collect();
+        // The instance for the operands' types, when one was made.
+        let mut tys = vec![Ty::Unknown];
+        tys.extend(args.iter().map(|a| a.ty));
+        let instance = self
+            .module
+            .instance(&fn_name, sig, &tys)
+            .map(|spec| (spec.name.clone(), spec.sig.clone()));
+        let param_sig = instance.as_ref().map(|(_, s)| s).unwrap_or(sig);
+        let param_tys: Vec<Ty> = param_sig.params.iter().skip(1).map(|(_, t)| *t).collect();
         let args = args
             .into_iter()
             .zip(param_tys)
             .map(|(a, t)| self.coerce(a, t))
             .collect();
-        let (v, target) = self.invoke_targeted(k, method, receiver, args, span)?;
+        let (v, target) = self.invoke_targeted(k, method, receiver, args, instance, span)?;
         if !self.guards {
             return Some(v);
         }
@@ -11152,12 +11384,16 @@ impl<'m> Lowerer<'m> {
                 span,
             ));
         };
-        let sig = without_self(sig);
+        let instance = self.pick_instance(&fn_name, sig, 1, args, keywords);
+        let sig = match &instance {
+            Some((_, spec_sig)) => without_self(spec_sig),
+            None => without_self(sig),
+        };
         let receiver = self.checked_instance(receiver, method, span);
         let lowered = self.arguments(method, &sig, args, keywords, c)?;
         if dispatched {
             let (v, target) = self
-                .invoke_targeted(k, method, receiver.node, lowered, span)
+                .invoke_targeted(k, method, receiver.node, lowered, instance, span)
                 .expect("the method was just found");
             return Ok(self.guard_named(v, &target, span));
         }
@@ -11165,6 +11401,7 @@ impl<'m> Lowerer<'m> {
             .module
             .method_owner(k, method)
             .expect("the method was just found");
+        let fn_name = instance.map(|(name, _)| name).unwrap_or(fn_name);
         let target = self.call_target(&fn_name, &sig.params, &lowered);
         let receiver = self.coerce(receiver, Ty::Class(owner as u16));
         let mut all = vec![receiver];
@@ -11256,8 +11493,11 @@ impl<'m> Lowerer<'m> {
             .module
             .method_sig(owner, method)
             .expect("the owner defines it");
+        let (fn_name, sig) = self
+            .pick_instance(&fn_name, sig, 1, args, keywords)
+            .unwrap_or((fn_name, sig.clone()));
         let ret = sig.ret;
-        let sig = without_self(sig);
+        let sig = without_self(&sig);
         let lowered = self.arguments(method, &sig, args, keywords, c)?;
         let self_name = self.sig.params[0].0.clone();
         let receiver = Val {

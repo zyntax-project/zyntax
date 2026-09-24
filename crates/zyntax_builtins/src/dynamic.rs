@@ -162,6 +162,12 @@ pub(crate) fn extern_instance_hooks() -> Vec<Decl> {
             any(),
             None,
         ),
+        extern_fn(
+            "zb_hook_instance_contains",
+            &[("x", any()), ("item", any())],
+            boolean(),
+            None,
+        ),
     ]
 }
 
@@ -259,6 +265,16 @@ pub(crate) fn default_instance_hooks(policy: &Policy) -> Vec<Decl> {
                 ),
                 ret(null(any())),
             ],
+        ),
+        define(
+            "zb_hook_instance_contains",
+            &[&x, &a],
+            boolean(),
+            vec![ret(call(
+                "zb_any_contains_iter",
+                vec![x.e(), a.e()],
+                boolean(),
+            ))],
         ),
     ]
 }
@@ -1120,11 +1136,20 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     boolean(),
                 ))],
             ),
+            // An instance answers through its class's `__contains__`.
+            when(
+                is_instance(container.e()),
+                vec![ret(call(
+                    "zb_hook_instance_contains",
+                    vec![container.e(), item.e()],
+                    boolean(),
+                ))],
+            ),
             when(
                 is(&cat, CUSTOM),
                 vec![ret(call(
-                    "zb_list_contains_any",
-                    vec![iter(container.e()), item.e()],
+                    "zb_any_contains_iter",
+                    vec![container.e(), item.e()],
                     boolean(),
                 ))],
             ),
@@ -1134,6 +1159,18 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             )),
             ret(bool(false)),
         ],
+    ));
+    // Membership by iterating: what a container with no membership
+    // test of its own answers.
+    d.push(define(
+        "zb_any_contains_iter",
+        &[&container, &item],
+        boolean(),
+        vec![ret(call(
+            "zb_list_contains_any",
+            vec![iter(container.e()), item.e()],
+            boolean(),
+        ))],
     ));
     d.push(define(
         "zb_any_len",

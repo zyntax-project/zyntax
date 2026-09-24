@@ -1591,6 +1591,45 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
     };
     let lt_hook = order_hook("zb_hook_instance_lt", "__lt__", "__gt__");
     let le_hook = order_hook("zb_hook_instance_le", "__le__", "__ge__");
+    // `item in obj`: `__contains__`, else membership by iterating.
+    let mut statements = per_class(
+        module,
+        x.clone(),
+        |c| {
+            module
+                .method_sig(c, "__contains__")
+                .is_some_and(|(sig, _)| sig.params.len() == 2)
+        },
+        |lowerer, c, obj| {
+            let (sig, _) = module.method_sig(c, "__contains__").expect("picked");
+            let item = key_arg(lowerer, sig, 1, "item");
+            let result = lowerer
+                .invoke(c, "__contains__", obj, vec![item], span)
+                .expect("picked");
+            let truth = lowerer.truthy(result);
+            vec![ret(truth, span)]
+        },
+        span,
+    );
+    statements.push(ret(
+        call(
+            "zb_any_contains_iter",
+            vec![x.clone(), var(intern("item"), Ty::Object, span)],
+            Ty::Bool,
+            span,
+        ),
+        span,
+    ));
+    let contains_hook = function(
+        "zb_hook_instance_contains",
+        vec![
+            param("x", Ty::Object, span),
+            param("item", Ty::Object, span),
+        ],
+        Ty::Bool,
+        statements,
+        span,
+    );
     // Unary `-`, `+` and `~`: the class's dunder, by code.
     let code = var(intern("code"), Ty::Int, span);
     let mut statements = Vec::new();
@@ -1651,6 +1690,7 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         eq_hook,
         lt_hook,
         le_hook,
+        contains_hook,
         unary_hook,
         hash_hook(module, span),
         arith_hook(module, span),

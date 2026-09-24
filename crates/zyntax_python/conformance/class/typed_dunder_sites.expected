@@ -1,0 +1,10 @@
+True False True True False True
+True False True True False True True False
+0 10 2.5 4
+True True True True 5.0
+True True
+True True
+True True
+False False
+TypeError
+TypeError

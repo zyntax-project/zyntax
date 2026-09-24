@@ -1,0 +1,6 @@
+square:4 square:4 square:4
+1 2 3 7
+False True True
+AttributeError 'int' object has no attribute 'area'
+['blob:0', 'circle:3', 'square:4']
+['blob:0', 'circle:3', 'square:4']

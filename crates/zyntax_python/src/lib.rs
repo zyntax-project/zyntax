@@ -431,6 +431,24 @@ pub fn parse_program_with(
     // A class attribute not fixed as a constant is a module variable.
     global_names.extend(inferred.class_attrs.globals().map(str::to_string));
     inferred.closed = types::closed_items(&module.body, &items);
+    inferred.methods = items
+        .iter()
+        .filter(|item| item.class.is_some())
+        .map(|item| item.name.clone())
+        .collect();
+    inferred.fixed_params = items
+        .iter()
+        .map(|item| {
+            let fixed = item
+                .def
+                .parameters
+                .iter_non_variadic_params()
+                .enumerate()
+                .map(|(i, p)| p.parameter.annotation.is_some() || (i == 0 && item.class.is_some()))
+                .collect();
+            (item.name.clone(), fixed)
+        })
+        .collect();
     // Every lambda and nested def, so a call through a value of one is
     // a direct call wherever the value's type is known.
     let class_index = inferred.class_index.clone();
@@ -625,19 +643,27 @@ pub fn parse_program_with(
         *ty = ty.settled();
     }
     lap(&format!("infer x{rounds}"));
+    types::specialise(&mut inferred, &items, &owned, &entry_files);
+    lap("specialise");
     // `ZYNTAX_TRACE_TYPES=1` prints what inference decided: each
-    // function's signature, each class's fields, the globals.
+    // function's signature and the instances made of it, each class's
+    // fields, the globals.
     if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
-        let mut names: Vec<&String> = inferred.funcs.keys().collect();
-        names.sort();
-        for name in names {
-            let sig = &inferred.funcs[name];
+        let describe = |sig: &types::Sig| -> String {
             let params: Vec<String> = sig
                 .params
                 .iter()
-                .map(|(n, t)| format!("{n}: {t:?}"))
+                .map(|(n, t)| format!("{n}: {}", t.describe()))
                 .collect();
-            eprintln!("[types] {name}({}) -> {:?}", params.join(", "), sig.ret);
+            format!("({}) -> {}", params.join(", "), sig.ret.describe())
+        };
+        let mut names: Vec<&String> = inferred.funcs.keys().collect();
+        names.sort();
+        for name in names {
+            eprintln!("[types] {name}{}", describe(&inferred.funcs[name]));
+            for spec in inferred.specs.iter().filter(|s| s.item == *name) {
+                eprintln!("[types]   instance {}{}", spec.name, describe(&spec.sig));
+            }
         }
         for class in &inferred.classes {
             let fields: Vec<String> = class
@@ -706,6 +732,19 @@ pub fn parse_program_with(
         .map(|item| item.name.clone())
         .collect();
     inferred.returns_instance = types::returning_instances(&inferred, &items);
+    // An instance trusts and returns what its item does, for its own
+    // signature.
+    for spec in &inferred.specs {
+        let is_method = inferred.methods.contains(&spec.item);
+        if types::has_instance_params(&spec.sig, is_method) {
+            inferred.trusted.insert(spec.name.clone());
+        }
+        if inferred.returns_instance.contains(&spec.item)
+            && matches!(spec.sig.ret, types::Ty::Class(_))
+        {
+            inferred.returns_instance.insert(spec.name.clone());
+        }
+    }
     // The functions are lowered twice. The first time teaches which of
     // them can raise; the second time, a call to one that never does is
     // not followed by a check. Only the second lowering is kept.
@@ -742,9 +781,11 @@ pub fn parse_program_with(
                 }
                 Err(_) if unreached(item) => {
                     dropped.insert(item.name.clone());
+                    continue;
                 }
                 Err(e) => return Err(e),
             }
+            out.extend(lower_specs(inferred, item, &unpack_shapes));
         }
         // What names a dropped function goes with it; nothing reached
         // does, or it would have been reached itself.
@@ -1216,56 +1257,117 @@ fn lower_items(
 ) -> Result<Vec<TypedNode<TypedDeclaration>>> {
     let mut declarations = Vec::with_capacity(items.len());
     for item in items {
-        // The item itself, and the variant trusting its instance-typed
-        // parameters where it has any.
-        let mut variants = vec![(item.name.clone(), false)];
-        if inferred.trusted.contains(&item.name) {
-            variants.push((types::trusted_name(&item.name), true));
-        }
-        for (name, trusted) in variants {
-            let sig = inferred.funcs[&item.name].clone();
-            lower::set_current_file(inferred.file_of(item.module.as_deref()));
-            let mut locals = types::infer_locals(inferred, &sig, &item.def.body);
-            if let Some(shapes) = unpack_shapes.get(&item.name) {
-                for (name, ty) in shapes {
-                    if !sig.params.iter().any(|(param, _)| param == name)
-                        && locals.vars.get(name) == Some(&types::Ty::Object)
-                    {
-                        locals.vars.insert(name.clone(), *ty);
-                    }
-                }
-            }
-            let scope = scope::Scope::of_function(item.def);
-            let mut lowerer = lower::Lowerer::new(
-                inferred,
-                &item.name,
-                sig,
-                locals,
-                &scope,
-                Vec::new(),
-                HashMap::default(),
-            );
-            lowerer.class = item.class;
-            lowerer.trusted = trusted;
-            let func = lowerer.function_named(item.def, &name).map_err(|e| {
-                match item.module.as_deref() {
-                    Some(m) => e.in_module(m),
-                    None => e,
-                }
-            })?;
-            inferred
-                .raise_facts
-                .borrow_mut()
-                .insert(name, lowerer.raise_fact());
-            declarations.push(TypedNode::new(
-                TypedDeclaration::Function(func),
-                Type::Unknown,
-                span_of(item.def),
-            ));
-            lower::set_current_file(0);
-        }
+        let sig = inferred.funcs[&item.name].clone();
+        declarations.extend(lower_item_as(
+            inferred,
+            item,
+            &item.name,
+            sig,
+            unpack_shapes,
+        )?);
     }
     Ok(declarations)
+}
+
+/// Lower `item`'s body as the function `fn_name` with signature `sig`:
+/// the item itself, or one of its per-signature instances. The
+/// function, and the variant trusting its instance-typed parameters
+/// where it has any.
+fn lower_item_as(
+    inferred: &types::Module,
+    item: &types::Item<'_>,
+    fn_name: &str,
+    sig: types::Sig,
+    unpack_shapes: &HashMap<String, HashMap<String, types::Ty>>,
+) -> Result<Vec<TypedNode<TypedDeclaration>>> {
+    let is_instance = fn_name != item.name;
+    let mut declarations = Vec::with_capacity(2);
+    let mut variants = vec![(fn_name.to_string(), false)];
+    if inferred.trusted.contains(fn_name) {
+        variants.push((types::trusted_name(fn_name), true));
+    }
+    for (name, trusted) in variants {
+        let sig = sig.clone();
+        lower::set_current_file(inferred.file_of(item.module.as_deref()));
+        let mut locals = types::infer_locals(inferred, &sig, &item.def.body);
+        if let Some(shapes) = unpack_shapes.get(&item.name) {
+            for (name, ty) in shapes {
+                if !sig.params.iter().any(|(param, _)| param == name)
+                    && locals.vars.get(name) == Some(&types::Ty::Object)
+                {
+                    locals.vars.insert(name.clone(), *ty);
+                }
+            }
+        }
+        let scope = scope::Scope::of_function(item.def);
+        let mut lowerer = lower::Lowerer::new(
+            inferred,
+            &item.name,
+            sig,
+            locals,
+            &scope,
+            Vec::new(),
+            HashMap::default(),
+        );
+        lowerer.class = item.class;
+        lowerer.trusted = trusted;
+        lowerer.callee_defaults = !is_instance;
+        let func =
+            lowerer
+                .function_named(item.def, &name)
+                .map_err(|e| match item.module.as_deref() {
+                    Some(m) => e.in_module(m),
+                    None => e,
+                })?;
+        inferred
+            .raise_facts
+            .borrow_mut()
+            .insert(name, lowerer.raise_fact());
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(func),
+            Type::Unknown,
+            span_of(item.def),
+        ));
+        lower::set_current_file(0);
+    }
+    Ok(declarations)
+}
+
+/// Lower the per-signature instances of `item`. An instance whose body
+/// does not lower against its types forwards to the item's own
+/// function instead, so its callers stand.
+fn lower_specs(
+    inferred: &types::Module,
+    item: &types::Item<'_>,
+    unpack_shapes: &HashMap<String, HashMap<String, types::Ty>>,
+) -> Vec<TypedNode<TypedDeclaration>> {
+    let mut declarations = Vec::new();
+    for spec in inferred.specs.iter().filter(|s| s.item == item.name) {
+        match lower_item_as(inferred, item, &spec.name, spec.sig.clone(), unpack_shapes) {
+            Ok(d) => declarations.extend(d),
+            Err(e) => {
+                if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
+                    eprintln!(
+                        "[types] instance {} forwards to {}: {e:?}",
+                        spec.name, item.name
+                    );
+                }
+                let forwarders = lower::forwarders(inferred, spec, &inferred.funcs[&item.name]);
+                for (f, fact) in forwarders {
+                    inferred
+                        .raise_facts
+                        .borrow_mut()
+                        .insert(f.name.resolve_global().unwrap_or_default(), fact);
+                    declarations.push(TypedNode::new(
+                        TypedDeclaration::Function(f),
+                        Type::Unknown,
+                        span_of(item.def),
+                    ));
+                }
+            }
+        }
+    }
+    declarations
 }
 
 /// The declarations of a method that failed to lower, each a function

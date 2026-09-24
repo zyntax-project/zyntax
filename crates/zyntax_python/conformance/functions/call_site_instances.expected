@@ -1,0 +1,11 @@
+3 3.5 xy [1, 2] 2
+[3, 6] [3.0] ['aa']
+[3, 1, 2] ['b', 'a', 'c'] [2.5, 1.5]
+0 1 none a
+0.5 1.5 3.5
+ZeroDivisionError nothing to divide by
+ZeroDivisionError nothing to divide by
+ZeroDivisionError nothing to divide by
+<1> <2.5> <s> <[1]> <None>
+3.0 3.0 (1, 2) 2
+3 2.5 1.25 2

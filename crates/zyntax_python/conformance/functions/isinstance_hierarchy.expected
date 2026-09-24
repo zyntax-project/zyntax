@@ -1,0 +1,8 @@
+leaf leaf 1
+branch branch of 2
+node plain 5
+none leaf 3
+2 -1 -1
+2 0 0
+['leaf 1', 'branch of 2', 'other', 'other', 'other']
+True False False

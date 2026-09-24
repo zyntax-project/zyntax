@@ -24,7 +24,7 @@ use zyntax_typed_ast::typed_ast::TypedFunction;
 /// A static type. `Unknown` is the bottom of the join and never
 /// survives inference; a name nothing assigns to is a runtime error in
 /// Python and an `Object` here.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub(crate) enum Ty {
     Int,
     Float,
@@ -514,6 +514,26 @@ impl Ty {
         }
     }
 
+    /// The type as a trace spells it: a tuple or dict shape by its
+    /// element types rather than its index.
+    pub(crate) fn describe(self) -> String {
+        let list = |tys: Vec<Ty>| {
+            tys.into_iter()
+                .map(Ty::describe)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match self {
+            Ty::Tuple(k) => format!("Tuple({})", list(tuple_shape(k))),
+            Ty::Dict(k) => {
+                let (key, value) = dict_shape(k);
+                format!("Dict({})", list(vec![key, value]))
+            }
+            Ty::List(Elem::Tuple(k)) => format!("List({})", Ty::Tuple(k).describe()),
+            other => format!("{other:?}"),
+        }
+    }
+
     /// The shape of a tuple type.
     pub(crate) fn tuple_elems(self) -> Option<Vec<Ty>> {
         match self {
@@ -592,12 +612,39 @@ pub(crate) struct Sig {
     pub(crate) defaults: Vec<Option<py::Expr>>,
 }
 
+/// One instance of an item for the argument types of a call site: the
+/// item's body lowered again against those types, under its own name.
+/// The item's own function stays the instance for the join of every
+/// call; see [`specialise`].
+#[derive(Clone, Debug)]
+pub(crate) struct SpecInfo {
+    /// The item it is an instance of, by the name the item lowers to.
+    pub(crate) item: String,
+    /// The function this instance lowers to.
+    pub(crate) name: String,
+    pub(crate) sig: Sig,
+}
+
+/// How many instances an item gets before further signatures use the
+/// item's own function.
+pub(crate) const MAX_SPECS: usize = 4;
+
 /// What the module declares: every `def` by name, and the library's
 /// `List<T>` so list types can be spelled the way the library spells
 /// them.
 #[derive(Default, Debug)]
 pub(crate) struct Module {
     pub(crate) funcs: HashMap<String, Sig>,
+    /// The functions that are methods, by the name they lower to.
+    pub(crate) methods: HashSet<String>,
+    /// For each item, which parameters keep their declared type in
+    /// every instance: a method's receiver and an annotated parameter,
+    /// whose annotation is checked on the way in.
+    pub(crate) fixed_params: HashMap<String, Vec<bool>>,
+    /// The per-signature instances of items, and their index by item
+    /// and parameter types.
+    pub(crate) specs: Vec<SpecInfo>,
+    pub(crate) spec_index: HashMap<(String, Vec<Ty>), usize>,
     /// Module-level variables a function reads or declares `global`,
     /// with the join of everything assigned to them anywhere.
     pub(crate) globals: HashMap<String, Ty>,
@@ -1605,6 +1652,135 @@ impl Module {
             })
             .collect()
     }
+
+    /// Whether the unannotated parameters of `item` are typed by its
+    /// calls: a closed item, unless it is a method a call on an unknown
+    /// receiver reaches or one the library reaches with boxes.
+    pub(crate) fn infers_params(&self, item: &Item<'_>) -> bool {
+        self.closed.contains(&item.name)
+            && !(item.class.is_some()
+                && (self.dynamic_methods.contains(item.def.name.as_str())
+                    || boxed_entry(item.def.name.as_str())))
+    }
+
+    /// The instance key of a call of item `name` passing `tys`, one
+    /// per parameter: each widened to what a parameter is typed as;
+    /// a fixed parameter (the receiver, an annotated one) as the item
+    /// declares it, see [`Self::fixed_params`]; and a type the item's
+    /// own parameter already holds as it is (a dynamic value, or an
+    /// instance of a class deriving from the parameter's) as that
+    /// parameter, so an instance only ever narrows a dynamic parameter
+    /// or a shape.
+    pub(crate) fn spec_key(&self, name: &str, sig: &Sig, tys: &[Ty]) -> Vec<Ty> {
+        let fixed = self.fixed_params.get(name);
+        tys.iter()
+            .zip(&sig.params)
+            .enumerate()
+            .map(|(i, (t, (_, own)))| {
+                let t = spec_ty(*t);
+                let held = match (t, *own) {
+                    (Ty::Object, _) => true,
+                    (Ty::Class(s), Ty::Class(b)) => self.is_subclass(s as usize, b as usize),
+                    _ => false,
+                };
+                if held || fixed.is_some_and(|f| f.get(i) == Some(&true)) {
+                    *own
+                } else {
+                    t
+                }
+            })
+            .collect()
+    }
+
+    /// The instance of item `name` a call passing `tys` goes to, when
+    /// one was made for these types.
+    pub(crate) fn instance(&self, name: &str, sig: &Sig, tys: &[Ty]) -> Option<&SpecInfo> {
+        if self.specs.is_empty() || tys.len() != sig.params.len() {
+            return None;
+        }
+        let key = self.spec_key(name, sig, tys);
+        self.spec_index
+            .get(&(name.to_string(), key))
+            .map(|&i| &self.specs[i])
+    }
+
+    /// What a call of item `name` passing `tys` returns: its instance's
+    /// result where one was made for these types, the item's otherwise.
+    pub(crate) fn instance_ret(&self, name: &str, sig: &Sig, tys: &[Ty]) -> Ty {
+        match self.instance(name, sig, tys) {
+            Some(spec) => spec.sig.ret,
+            None => sig.ret,
+        }
+    }
+}
+
+/// An argument type as an instance is keyed on it: what a parameter
+/// can be typed as. None is a dynamic value, as a parameter only
+/// passed None is, and nothing undecided keys an instance.
+pub(crate) fn spec_ty(t: Ty) -> Ty {
+    match t {
+        Ty::None | Ty::Unknown | Ty::Gen => Ty::Object,
+        other => other.settled(),
+    }
+}
+
+/// What a call passes to each parameter of `sig` from `first` on, the
+/// parameters before `first` undecided: positionals in order, keywords
+/// by name, a default for each parameter left out. `None` when the call
+/// cannot be matched to the parameters; a parameter left out with no
+/// default stays undecided, since the call fails before the body runs.
+pub(crate) fn call_types(
+    module: &Module,
+    sig: &Sig,
+    first: usize,
+    args: &[py::Expr],
+    keywords: &[py::Keyword],
+    arg_ty: impl Fn(&py::Expr) -> Ty,
+) -> Option<Vec<Ty>> {
+    let n = sig.params.len();
+    let mut given: Vec<Option<Ty>> = vec![None; n];
+    // A starred tuple of known shape is its elements, one by one.
+    let spread = spread_starred(args, &arg_ty);
+    let args: &[py::Expr] = match &spread {
+        Some(expanded) => expanded,
+        None => args,
+    };
+    if args.iter().any(|a| matches!(a, py::Expr::Starred(_)))
+        || keywords.iter().any(|k| k.arg.is_none())
+        || first + args.len() > n
+    {
+        return None;
+    }
+    for (i, a) in args.iter().enumerate() {
+        given[first + i] = Some(arg_ty(a));
+    }
+    for k in keywords {
+        let name = k.arg.as_ref().unwrap().as_str();
+        match sig.params.iter().position(|(p, _)| p == name) {
+            Some(i) if i >= first && given[i].is_none() => {
+                given[i] = Some(arg_ty(&k.value));
+            }
+            _ => return None,
+        }
+    }
+    let defaults = Typer {
+        module,
+        vars: &HashMap::default(),
+        outer: &HashMap::default(),
+    };
+    Some(
+        given
+            .into_iter()
+            .enumerate()
+            .map(
+                |(i, g)| match (g, sig.defaults.get(i).and_then(|d| d.as_ref())) {
+                    (Some(t), _) => t,
+                    (None, Some(d)) if i >= first => defaults.expr(d),
+                    (None, _) => Ty::Unknown,
+                },
+            )
+            .collect(),
+    )
 }
 
 /// One function's inferred locals.
@@ -1907,9 +2083,10 @@ pub(crate) fn closed_items(body: &[py::Stmt], items: &[Item<'_>]) -> HashSet<Str
             None => !seen.names.contains(&item.name),
             // The exception classes the library and the lowering raise
             // by name are constructed out of view.
-            // An operator method is reached from the operators on its
-            // class, which are in view, and from dynamic arithmetic,
-            // which reads the operand back as the type inferred here.
+            // An operator or item method is reached from the operators
+            // and subscripts on its class, which are in view, and from
+            // the library with boxed operands, for which its own
+            // function keeps dynamic parameters; see [`boxed_entry`].
             // Any other method is closed unless it is read as a value
             // somewhere; a call on an unknown receiver is found during
             // inference and opens it again.
@@ -1919,7 +2096,7 @@ pub(crate) fn closed_items(body: &[py::Stmt], items: &[Item<'_>]) -> HashSet<Str
                     && !crate::prelude::EXCEPTION_KINDS
                         .iter()
                         .any(|kind| item.name == method_fn(kind, "__init__")))
-                    || is_operator_method(item.def.name.as_str())
+                    || boxed_entry(item.def.name.as_str())
                     || (!item.def.name.starts_with("__")
                         && !seen.valued_methods.contains(item.def.name.as_str()))
             }
@@ -1992,13 +2169,12 @@ pub(crate) fn infer_module(
     }
     // Which parameters of each function are inferred, by position. A
     // method is, like a closed function, unless a call of a method of
-    // its name on an unknown receiver was seen last time round.
+    // its name on an unknown receiver was seen last time round, or the
+    // library reaches it with boxes.
     let mut inferring: HashMap<String, Vec<bool>> = HashMap::default();
     for item in items {
         let mut sig = declared_sig_in(&module.class_index, item.def, item.class);
-        let closed = known.closed.contains(&item.name)
-            && !(item.class.is_some() && known.dynamic_methods.contains(item.def.name.as_str()));
-        if closed {
+        if known.infers_params(item) {
             let flags: Vec<bool> = item
                 .def
                 .parameters
@@ -2148,6 +2324,7 @@ pub(crate) fn infer_module(
                         settled: false,
                         files: &[],
                         no_outer: HashMap::default(),
+                        sites: None,
                     }
                     .stmts(&item.def.body)
                 });
@@ -2180,6 +2357,7 @@ pub(crate) fn infer_module(
                     settled: false,
                     files: entry_files,
                     no_outer: HashMap::default(),
+                    sites: None,
                 }
                 .stmts(entry);
             } else {
@@ -2318,6 +2496,7 @@ pub(crate) fn infer_module(
                     settled: true,
                     files: &[],
                     no_outer: HashMap::default(),
+                    sites: None,
                 }
                 .stmts(&item.def.body)
             });
@@ -2335,6 +2514,7 @@ pub(crate) fn infer_module(
             settled: true,
             files: entry_files,
             no_outer: HashMap::default(),
+            sites: None,
         }
         .stmts(entry);
     }
@@ -2381,6 +2561,335 @@ pub(crate) fn infer_module(
     }
 }
 
+/// The name of the `n`th instance of item `name`.
+fn spec_name(name: &str, n: usize) -> String {
+    format!("{name}$s{n}")
+}
+
+/// `key` with each parameter it narrows from a dynamic one put back
+/// where the item's body would only box it: a parameter used beside
+/// dynamic operands more than once and never where its type is read
+/// costs a box at every such use in an instance, against one at the
+/// call to the item's own function.
+fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) -> Vec<Ty> {
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+    struct Uses<'a> {
+        typer: Typer<'a>,
+        /// Per narrowed parameter: uses that read its type, uses that
+        /// box it.
+        counts: HashMap<String, (usize, usize)>,
+    }
+    impl Uses<'_> {
+        fn param(&self, e: &py::Expr) -> Option<String> {
+            match e {
+                py::Expr::Name(n) if self.counts.contains_key(n.id.as_str()) => {
+                    Some(n.id.to_string())
+                }
+                _ => None,
+            }
+        }
+        fn typed(&mut self, e: &py::Expr) {
+            if let Some(p) = self.param(e) {
+                self.counts.get_mut(&p).unwrap().0 += 1;
+            }
+        }
+        /// `e` beside `other` in an operation: boxed when `other` is
+        /// dynamic.
+        fn beside(&mut self, e: &py::Expr, other: &py::Expr) {
+            if let Some(p) = self.param(e) {
+                let count = self.counts.get_mut(&p).unwrap();
+                match self.typer.expr(other) {
+                    Ty::Object => count.1 += 1,
+                    Ty::Unknown => {}
+                    _ => count.0 += 1,
+                }
+            }
+        }
+    }
+    impl<'a> Visitor<'a> for Uses<'_> {
+        fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
+            match stmt {
+                py::Stmt::AugAssign(a) => {
+                    self.beside(&a.target, &a.value);
+                    self.beside(&a.value, &a.target);
+                }
+                py::Stmt::For(f) => self.typed(&f.iter),
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'a py::Expr) {
+            match expr {
+                py::Expr::BinOp(b) => {
+                    self.beside(&b.left, &b.right);
+                    self.beside(&b.right, &b.left);
+                }
+                py::Expr::Compare(c) => {
+                    let mut left = &*c.left;
+                    for right in c.comparators.iter() {
+                        self.beside(left, right);
+                        self.beside(right, left);
+                        left = right;
+                    }
+                }
+                py::Expr::Subscript(sub) => {
+                    self.typed(&sub.value);
+                    self.beside(&sub.slice, &sub.value);
+                }
+                py::Expr::Attribute(a) => self.typed(&a.value),
+                py::Expr::UnaryOp(u) => self.typed(&u.operand),
+                py::Expr::Call(c) => self.typed(&c.func),
+                _ => {}
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let narrowed: Vec<usize> = (0..key.len())
+        .filter(|&i| sig.params[i].1 == Ty::Object && key[i] != Ty::Object)
+        .collect();
+    if narrowed.is_empty() {
+        return key;
+    }
+    let trial = Sig {
+        params: sig
+            .params
+            .iter()
+            .zip(&key)
+            .map(|((p, _), t)| (p.clone(), *t))
+            .collect(),
+        ret: Ty::Unknown,
+        defaults: sig.defaults.clone(),
+    };
+    let file = module.file_of(item.module.as_deref());
+    let counts = in_file(file, || {
+        let locals = infer_locals_open(module, &trial, &item.def.body, &[], false);
+        let mut uses = Uses {
+            typer: Typer {
+                module,
+                vars: &locals.vars,
+                outer: &HashMap::default(),
+            },
+            counts: narrowed
+                .iter()
+                .map(|&i| (sig.params[i].0.clone(), (0, 0)))
+                .collect(),
+        };
+        uses.visit_body(&item.def.body);
+        uses.counts
+    });
+    for i in narrowed {
+        if let Some(&(read, boxed)) = counts.get(&sig.params[i].0)
+            && read == 0
+            && boxed > 1
+        {
+            key[i] = sig.params[i].1;
+        }
+    }
+    key
+}
+
+/// Whether item `name` gets per-signature instances: a closed item, so
+/// its own function is the join of every call and an instance narrows
+/// it; not a constructor, which its class's constructor function calls;
+/// not a generator, whose fiber is started by name; and not a method a
+/// subclass overrides, whose calls go through the dispatcher.
+fn specialisable(module: &Module, item: &Item<'_>) -> bool {
+    if !module.closed.contains(&item.name) || item.def.name.as_str() == "__init__" {
+        return false;
+    }
+    if module.funcs[&item.name].ret == Ty::Gen {
+        return false;
+    }
+    match item.class {
+        Some(k) => module.overriders(k, item.def.name.as_str()).is_empty(),
+        None => true,
+    }
+}
+
+/// Make the per-signature instances of the items: for each call of a
+/// [`specialisable`] item with every argument typed, and the types not
+/// the item's own parameters, an instance for those types, up to
+/// [`MAX_SPECS`] per item. An instance's result is inferred from the
+/// item's body against the instance's parameters; the bodies of the
+/// instances are read for calls too, and their results refined, until
+/// no instance is added and no result changes.
+pub(crate) fn specialise(
+    module: &mut Module,
+    items: &[Item<'_>],
+    entry: &[py::Stmt],
+    entry_files: &[u32],
+) {
+    let by_name: HashMap<&str, &Item<'_>> = items
+        .iter()
+        .map(|item| (item.name.as_str(), item))
+        .collect();
+    let candidates: HashSet<String> = items
+        .iter()
+        .filter(|item| specialisable(module, item))
+        .map(|item| item.name.clone())
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let trace = std::env::var_os("ZYNTAX_TRACE_TYPES_ROUNDS").is_some();
+    let entry_sig = Sig {
+        params: Vec::new(),
+        ret: Ty::None,
+        defaults: Vec::new(),
+    };
+    let sites_of = |module: &Module, sig: &Sig, item: &Item<'_>, sites: &mut Vec<_>| {
+        let file = module.file_of(item.module.as_deref());
+        in_file(file, || {
+            let locals = infer_locals_open(module, sig, &item.def.body, &[], false);
+            let mut passed = Vec::new();
+            let mut escaped = Vec::new();
+            let mut dynamic_methods = HashSet::default();
+            Calls {
+                module,
+                vars: &locals.vars,
+                class: item.class,
+                opaque: false,
+                comp_vars: None,
+                passed: &mut passed,
+                allow_closure: false,
+                escaped: &mut escaped,
+                dynamic_methods: &mut dynamic_methods,
+                settled: true,
+                files: &[],
+                no_outer: HashMap::default(),
+                sites: Some(sites),
+            }
+            .stmts(&item.def.body)
+        });
+    };
+    // Signatures whose instance would narrow nothing worth narrowing.
+    let mut declined: HashSet<(String, Vec<Ty>)> = HashSet::default();
+    let mut rounds = 0;
+    loop {
+        rounds += 1;
+        let mut sites: Vec<(String, Vec<Ty>)> = Vec::new();
+        for item in items {
+            let sig = module.funcs[&item.name].clone();
+            sites_of(module, &sig, item, &mut sites);
+        }
+        {
+            let locals = infer_locals_open(module, &entry_sig, entry, entry_files, true);
+            let mut passed = Vec::new();
+            let mut escaped = Vec::new();
+            let mut dynamic_methods = HashSet::default();
+            Calls {
+                module,
+                vars: &locals.vars,
+                class: None,
+                opaque: false,
+                comp_vars: None,
+                passed: &mut passed,
+                allow_closure: false,
+                escaped: &mut escaped,
+                dynamic_methods: &mut dynamic_methods,
+                settled: true,
+                files: entry_files,
+                no_outer: HashMap::default(),
+                sites: Some(&mut sites),
+            }
+            .stmts(entry);
+        }
+        for i in 0..module.specs.len() {
+            let spec = module.specs[i].clone();
+            sites_of(module, &spec.sig, by_name[spec.item.as_str()], &mut sites);
+        }
+        let mut changed = false;
+        for (name, tys) in sites {
+            if !candidates.contains(&name) {
+                continue;
+            }
+            let sig = module.funcs[&name].clone();
+            let raw = module.spec_key(&name, &sig, &tys);
+            let own = |key: &[Ty]| key.iter().zip(&sig.params).all(|(k, (_, p))| k == p);
+            let raw_index = (name.clone(), raw.clone());
+            if own(&raw)
+                || module.spec_index.contains_key(&raw_index)
+                || declined.contains(&raw_index)
+            {
+                continue;
+            }
+            let key = unboxed_key(module, by_name[name.as_str()], &sig, raw);
+            if own(&key) {
+                declined.insert(raw_index);
+                continue;
+            }
+            let index = (name.clone(), key.clone());
+            if let Some(&i) = module.spec_index.get(&index) {
+                module.spec_index.insert(raw_index, i);
+                changed = true;
+                continue;
+            }
+            let n = module.specs.iter().filter(|s| s.item == name).count();
+            if n >= MAX_SPECS {
+                continue;
+            }
+            // A call passing the types as they were seen goes to the
+            // instance too.
+            module.spec_index.insert(raw_index, module.specs.len());
+            let params = sig
+                .params
+                .iter()
+                .zip(key)
+                .map(|((p, _), t)| (p.clone(), t))
+                .collect();
+            // An annotated result is the item's; any other is inferred
+            // from the body against these parameters.
+            let annotated = by_name[name.as_str()].def.returns.is_some();
+            let spec = SpecInfo {
+                item: name.clone(),
+                name: spec_name(&name, n),
+                sig: Sig {
+                    params,
+                    ret: if annotated { sig.ret } else { Ty::Unknown },
+                    defaults: sig.defaults.clone(),
+                },
+            };
+            if trace {
+                eprintln!(
+                    "[types] specialise {rounds}: {} {:?}",
+                    spec.name, spec.sig.params
+                );
+            }
+            module.spec_index.insert(index, module.specs.len());
+            module.specs.push(spec);
+            changed = true;
+        }
+        for i in 0..module.specs.len() {
+            let spec = module.specs[i].clone();
+            let item = by_name[spec.item.as_str()];
+            if item.def.returns.is_some() {
+                continue;
+            }
+            let file = module.file_of(item.module.as_deref());
+            let locals = in_file(file, || {
+                infer_locals_open(module, &spec.sig, &item.def.body, &[], false)
+            });
+            let ret = if locals.returns { locals.ret } else { Ty::None };
+            if ret != spec.sig.ret {
+                if trace {
+                    eprintln!(
+                        "[types] specialise {rounds}: {} returns {ret:?} (was {:?})",
+                        spec.name, spec.sig.ret
+                    );
+                }
+                module.specs[i].sig.ret = ret;
+                changed = true;
+            }
+        }
+        if !changed || rounds >= 32 {
+            break;
+        }
+    }
+    for spec in &mut module.specs {
+        spec.sig.ret = spec.sig.ret.settled();
+    }
+}
+
 /// The calls a body makes to the module's own functions and
 /// constructors, and what each passes to which parameter.
 struct Calls<'a> {
@@ -2411,6 +2920,10 @@ struct Calls<'a> {
     files: &'a [u32],
     /// A body typed here has no enclosing scope of its own.
     no_outer: HashMap<String, Ty>,
+    /// Where to record each call of an item with every argument typed,
+    /// as the item and the type passed to each parameter; `None` while
+    /// signatures are still being inferred.
+    sites: Option<&'a mut Vec<(String, Vec<Ty>)>>,
 }
 
 /// What a call reaches: a function of the module (or a constructor), or
@@ -2491,7 +3004,15 @@ impl Calls<'_> {
                 let (_, name) = self.module.method_sig(k as usize, a.attr.as_str())?;
                 Some((Target::Item(name), 1))
             }
-            other => self.closure_of(other).map(|k| (Target::Closure(k), 0)),
+            // `instance(...)`: its class's `__call__`.
+            other => match self.arg_ty(other) {
+                Ty::Class(k) if !matches!(other, py::Expr::Name(n) if self.module.class_index.contains_key(n.id.as_str())) =>
+                {
+                    let (_, name) = self.module.method_sig(k as usize, "__call__")?;
+                    Some((Target::Item(name), 1))
+                }
+                _ => self.closure_of(other).map(|k| (Target::Closure(k), 0)),
+            },
         }
     }
 
@@ -2549,11 +3070,16 @@ impl Calls<'_> {
                 let mut classes = vec![k];
                 classes.extend(self.module.overriders(k, method));
                 for c in classes {
-                    let Some((_, name)) = self.module.method_sig(c, method) else {
+                    let Some((sig, name)) = self.module.method_sig(c, method) else {
                         continue;
                     };
                     for (i, ty) in args.iter().enumerate() {
                         self.passed.push((Target::Item(name.clone()), i + 1, *ty));
+                    }
+                    if sig.params.len() == args.len() + 1 {
+                        let mut tys = vec![sig.params[0].1];
+                        tys.extend_from_slice(args);
+                        self.site(name, tys);
                     }
                 }
             }
@@ -2600,11 +3126,48 @@ impl Calls<'_> {
         let Ty::Class(k) = self.typer().expr(left) else {
             return;
         };
-        let Some((_, name)) = self.module.method_sig(k as usize, dunder_name(op)) else {
+        let Some((sig, name)) = self.module.method_sig(k as usize, dunder_name(op)) else {
             return;
         };
         let ty = self.arg_ty(right);
-        self.passed.push((Target::Item(name), 1, ty));
+        self.passed.push((Target::Item(name.clone()), 1, ty));
+        if sig.params.len() == 2 {
+            let this = sig.params[0].1;
+            self.site(name, vec![this, ty]);
+        }
+    }
+
+    /// `left op right` for one comparison: an ordering or equality on
+    /// an instance calls its class's method with `right`, `!=` falling
+    /// back to `__eq__`; `in` on an instance calls `__contains__` with
+    /// `left`. Recorded as a site only; these methods keep dynamic
+    /// parameters, see [`boxed_entry`].
+    fn compare_site(&mut self, op: py::CmpOp, left: &py::Expr, right: &py::Expr) {
+        let (method, receiver, arg) = match op {
+            py::CmpOp::In | py::CmpOp::NotIn => ("__contains__", right, left),
+            py::CmpOp::Eq => ("__eq__", left, right),
+            py::CmpOp::NotEq => ("__ne__", left, right),
+            py::CmpOp::Lt => ("__lt__", left, right),
+            py::CmpOp::LtE => ("__le__", left, right),
+            py::CmpOp::Gt => ("__gt__", left, right),
+            py::CmpOp::GtE => ("__ge__", left, right),
+            py::CmpOp::Is | py::CmpOp::IsNot => return,
+        };
+        let Ty::Class(k) = self.typer().expr(receiver) else {
+            return;
+        };
+        let found = match self.module.method_sig(k as usize, method) {
+            None if op == py::CmpOp::NotEq => self.module.method_sig(k as usize, "__eq__"),
+            found => found,
+        };
+        let Some((sig, name)) = found else {
+            return;
+        };
+        if sig.params.len() == 2 {
+            let this = sig.params[0].1;
+            let ty = self.arg_ty(arg);
+            self.site(name, vec![this, ty]);
+        }
     }
 
     /// Record what a call passes to each parameter from `first` on. A
@@ -2625,49 +3188,40 @@ impl Calls<'_> {
             },
         };
         let n = sig.params.len();
-        let mut given: Vec<Option<Ty>> = vec![None; n];
-        // A starred tuple of known shape is its elements, one by one.
-        let spread = spread_starred(args, |e| self.arg_ty(e));
-        let args: &[py::Expr] = match &spread {
-            Some(expanded) => expanded,
-            None => args,
+        let Some(mut tys) =
+            call_types(self.module, &sig, first, args, keywords, |e| self.arg_ty(e))
+        else {
+            for i in first..n {
+                self.passed.push((callee.clone(), i, Ty::Object));
+            }
+            return;
         };
-        let mut matched = !args.iter().any(|a| matches!(a, py::Expr::Starred(_)))
-            && keywords.iter().all(|k| k.arg.is_some())
-            && first + args.len() <= n;
-        if matched {
-            for (i, a) in args.iter().enumerate() {
-                given[first + i] = Some(self.arg_ty(a));
-            }
-            for k in keywords {
-                let name = k.arg.as_ref().unwrap().as_str();
-                match sig.params.iter().position(|(p, _)| p == name) {
-                    Some(i) if i >= first && given[i].is_none() => {
-                        given[i] = Some(self.arg_ty(&k.value));
-                    }
-                    _ => matched = false,
-                }
+        for (i, ty) in tys.iter().enumerate().skip(first) {
+            // Missing with no default: the call fails before the
+            // function runs.
+            if *ty != Ty::Unknown {
+                self.passed.push((callee.clone(), i, *ty));
             }
         }
-        for i in first..n {
-            let ty = if !matched {
-                Ty::Object
-            } else {
-                match (given[i], &sig.defaults[i]) {
-                    (Some(t), _) => t,
-                    (None, Some(d)) => Typer {
-                        module: self.module,
-                        vars: &HashMap::default(),
-                        outer: &HashMap::default(),
-                    }
-                    .expr(d),
-                    // Missing with no default: the call fails before the
-                    // function runs.
-                    (None, None) => continue,
-                }
-            };
-            self.passed.push((callee.clone(), i, ty));
+        // A receiver the call does not pass is as the method declares it.
+        for (slot, (_, declared)) in tys.iter_mut().zip(&sig.params).take(first) {
+            *slot = *declared;
         }
+        if let Target::Item(name) = callee {
+            self.site(name, tys);
+        }
+    }
+
+    /// A call of an item with every argument typed: a signature an
+    /// instance may be made for.
+    fn site(&mut self, name: String, tys: Vec<Ty>) {
+        let Some(sites) = self.sites.as_deref_mut() else {
+            return;
+        };
+        if self.opaque || tys.contains(&Ty::Unknown) {
+            return;
+        }
+        sites.push((name, tys));
     }
 }
 
@@ -2700,6 +3254,30 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
                 }
             }
             py::Stmt::ClassDef(c) => self.nested(|v| v.visit_body(&c.body)),
+            // A branch whose test the types decide against calls nothing.
+            py::Stmt::If(i) if !self.opaque => {
+                let mut tests = vec![(Some(&*i.test), &i.body)];
+                tests.extend(
+                    i.elif_else_clauses
+                        .iter()
+                        .map(|clause| (clause.test.as_ref(), &clause.body)),
+                );
+                for (test, body) in tests {
+                    let known =
+                        test.and_then(|t| static_isinstance(self.module, t, |e| self.arg_ty(e)));
+                    if let Some(t) = test {
+                        self.visit_expr(t);
+                    }
+                    match known {
+                        Some(false) => continue,
+                        Some(true) => {
+                            self.visit_body(body);
+                            break;
+                        }
+                        None => self.visit_body(body),
+                    }
+                }
+            }
             // `raise C`: the class is called with nothing.
             py::Stmt::Raise(r) => {
                 if let Some(py::Expr::Name(n)) = r.exc.as_deref()
@@ -2766,6 +3344,16 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
         {
             let key = self.arg_ty(&sub.slice);
             self.item_site("__getitem__", &sub.value, &[key]);
+        }
+        if let py::Expr::Compare(cmp) = expr
+            && !self.opaque
+            && self.sites.is_some()
+        {
+            let mut left = &*cmp.left;
+            for (op, right) in cmp.ops.iter().zip(cmp.comparators.iter()) {
+                self.compare_site(*op, left, right);
+                left = right;
+            }
         }
         match expr {
             py::Expr::Call(c) => {
@@ -4221,10 +4809,26 @@ impl Walker<'_> {
                 self.stmts(&w.body);
                 self.stmts(&w.orelse);
             }
+            // A branch whose test the types decide against is not
+            // read: what it assigns never happens here.
             py::Stmt::If(i) => {
-                self.stmts(&i.body);
-                for clause in &i.elif_else_clauses {
-                    self.stmts(&clause.body);
+                let mut tests = vec![(Some(&*i.test), &i.body)];
+                tests.extend(
+                    i.elif_else_clauses
+                        .iter()
+                        .map(|clause| (clause.test.as_ref(), &clause.body)),
+                );
+                for (test, body) in tests {
+                    let known =
+                        test.and_then(|t| static_isinstance(self.module, t, |e| self.expr(e)));
+                    match known {
+                        Some(false) => continue,
+                        Some(true) => {
+                            self.stmts(body);
+                            break;
+                        }
+                        None => self.stmts(body),
+                    }
                 }
             }
             py::Stmt::Try(t) => {
@@ -4420,6 +5024,77 @@ pub(crate) fn is_name(e: &py::Expr, name: &str) -> bool {
     matches!(e, py::Expr::Name(n) if n.id.as_str() == name)
 }
 
+/// What `isinstance(x, C)` is known to be from `x`'s static type, for
+/// `C` the module's class `k`: false when `x` is an instance of a class
+/// that neither derives from `C` nor is derived from it, or no instance
+/// at all. An instance of `C`, of a base of `C` or of a subclass may
+/// be None, a subclass instance or a base one, so nothing is known.
+pub(crate) fn isinstance_of_class(module: &Module, ty: Ty, k: usize) -> Option<bool> {
+    match ty {
+        Ty::Class(c) => {
+            let c = c as usize;
+            if module.is_subclass(c, k) || module.is_subclass(k, c) {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        Ty::Object | Ty::Unknown => None,
+        _ => Some(false),
+    }
+}
+
+/// What `isinstance(x, name)` is known to be from `x`'s static type,
+/// for `name` a builtin type.
+pub(crate) fn isinstance_of_builtin(name: &str, ty: Ty) -> Option<bool> {
+    Some(match (name, ty) {
+        ("object", _) => true,
+        ("int", Ty::Int | Ty::Bool) => true,
+        ("bool", Ty::Bool) => true,
+        ("float", Ty::Float) => true,
+        ("str", Ty::Str) => true,
+        ("bytes", Ty::Bytes) => true,
+        ("list", Ty::List(_)) => true,
+        ("tuple", Ty::Tuple(_)) => true,
+        ("dict", Ty::Dict(_)) => true,
+        ("set", Ty::Set) => true,
+        (_, Ty::Object | Ty::Unknown) => return None,
+        _ => false,
+    })
+}
+
+/// What a branch test is known to be from the static types: an
+/// `isinstance(x, T)` of a variable `x` against a class of the module
+/// or a builtin type name, possibly under `not`. `None` where nothing
+/// is known, or the test is anything else.
+pub(crate) fn static_isinstance(
+    module: &Module,
+    test: &py::Expr,
+    ty_of: impl Fn(&py::Expr) -> Ty,
+) -> Option<bool> {
+    match test {
+        py::Expr::UnaryOp(u) if matches!(u.op, py::UnaryOp::Not) => {
+            static_isinstance(module, &u.operand, ty_of).map(|b| !b)
+        }
+        py::Expr::Call(c)
+            if is_name(&c.func, "isinstance")
+                && c.arguments.args.len() == 2
+                && c.arguments.keywords.is_empty()
+                && matches!(c.arguments.args[0], py::Expr::Name(_)) =>
+        {
+            let py::Expr::Name(class) = &c.arguments.args[1] else {
+                return None;
+            };
+            let ty = ty_of(&c.arguments.args[0]);
+            match module.class_index.get(class.id.as_str()) {
+                Some(&k) => isinstance_of_class(module, ty, k),
+                None => isinstance_of_builtin(class.id.as_str(), ty),
+            }
+        }
+        _ => None,
+    }
+}
+
 /// `super()` with no arguments.
 pub(crate) fn is_super_call(e: &py::Expr) -> bool {
     matches!(e, py::Expr::Call(c) if is_name(&c.func, "super") && c.arguments.args.is_empty())
@@ -4463,6 +5138,28 @@ pub(crate) const OPERATORS: [py::Operator; 13] = [
 /// Whether `name` is the method of one of [`OPERATORS`].
 pub(crate) fn is_operator_method(name: &str) -> bool {
     OPERATORS.iter().any(|op| dunder_name(*op) == name)
+}
+
+/// The methods the library and the generated dispatchers reach with
+/// boxed arguments besides the calls in view: the operator, comparison
+/// and item methods, and `__call__`. Their own function keeps dynamic
+/// parameters whatever the calls pass; a typed call goes to an
+/// instance for its types.
+pub(crate) fn boxed_entry(name: &str) -> bool {
+    matches!(
+        name,
+        "__getitem__"
+            | "__setitem__"
+            | "__delitem__"
+            | "__contains__"
+            | "__call__"
+            | "__eq__"
+            | "__ne__"
+            | "__lt__"
+            | "__le__"
+            | "__gt__"
+            | "__ge__"
+    ) || is_operator_method(name)
 }
 
 /// The method a class defines to take part in `op`.
@@ -4829,8 +5526,11 @@ impl Typer<'_> {
                 // An instance takes part through its class's method, and
                 // the result is what that method returns.
                 if let Ty::Class(k) = l
-                    && let Some((sig, _)) = self.module.method_sig(k as usize, dunder_name(b.op))
+                    && let Some((sig, name)) = self.module.method_sig(k as usize, dunder_name(b.op))
                 {
+                    if sig.params.len() == 2 {
+                        return self.module.instance_ret(&name, sig, &[Ty::Unknown, r]);
+                    }
                     return sig.ret;
                 }
                 binop(b.op, l, r, &b.right)
@@ -4931,9 +5631,7 @@ impl Typer<'_> {
                 } else if let Ty::Dict(k) = seq {
                     dict_shape(k).1
                 } else if let Ty::Class(k) = seq {
-                    self.module
-                        .dispatched_ret(k as usize, "__getitem__")
-                        .unwrap_or(Ty::Object)
+                    self.item_read_ret(k, self.expr(&s.slice))
                 } else {
                     seq.element().unwrap_or(Ty::Object)
                 }
@@ -5108,7 +5806,7 @@ impl Typer<'_> {
             && let Some(k) = self.class_named(&a.value)
         {
             return match self.module.method_sig(k, a.attr.as_str()) {
-                Some((sig, _)) => sig.ret,
+                Some((sig, name)) => self.item_call_ret(&name, sig, 0, &c.arguments),
                 None => Ty::Object,
             };
         }
@@ -5119,16 +5817,13 @@ impl Typer<'_> {
             Ty::Bound(k) => {
                 let info = &self.module.bounds[k as usize];
                 let receiver = self.expr(&py::Expr::Name(info.receiver.clone()));
-                return self.method_ret(receiver, &info.method);
+                return self.method_call_ret(receiver, &info.method, &c.arguments);
             }
             Ty::Builtin(k) => return self.builtin_call(BUILTIN_VALUES[k as usize], c),
             // `instance(...)` is its class's `__call__`.
             Ty::Class(k) if !matches!(&*c.func, py::Expr::Name(n) if self.module.class_index.contains_key(n.id.as_str())) =>
             {
-                return self
-                    .module
-                    .dispatched_ret(k as usize, "__call__")
-                    .unwrap_or(Ty::Object);
+                return self.method_call_ret(Ty::Class(k), "__call__", &c.arguments);
             }
             _ => {}
         }
@@ -5139,7 +5834,7 @@ impl Typer<'_> {
                     return Ty::Class(*k as u16);
                 }
                 if let Some(sig) = self.module.funcs.get(name) {
-                    return sig.ret;
+                    return self.item_call_ret(name, sig, 0, &c.arguments);
                 }
                 if !self.vars.contains_key(name)
                     && !self.outer.contains_key(name)
@@ -5155,7 +5850,7 @@ impl Typer<'_> {
                     Some(Ty::Class(k)) => {
                         let base = self.module.classes[k as usize].base;
                         match base.and_then(|b| self.module.method_sig(b, a.attr.as_str())) {
-                            Some((sig, _)) => sig.ret,
+                            Some((sig, name)) => self.item_call_ret(&name, sig, 1, &c.arguments),
                             None => Ty::Object,
                         }
                     }
@@ -5175,9 +5870,60 @@ impl Typer<'_> {
                 }
             }
             // A method on a value whose type is known, or not yet.
-            py::Expr::Attribute(a) => self.method_ret(self.expr(&a.value), a.attr.as_str()),
+            py::Expr::Attribute(a) => {
+                self.method_call_ret(self.expr(&a.value), a.attr.as_str(), &c.arguments)
+            }
             _ => Ty::Object,
         }
+    }
+
+    /// What a call of item `name` returns when it passes `arguments`
+    /// to the parameters from `first` on: the result of the instance
+    /// made for the types passed, where there is one.
+    fn item_call_ret(&self, name: &str, sig: &Sig, first: usize, arguments: &py::Arguments) -> Ty {
+        if self.module.specs.is_empty() {
+            return sig.ret;
+        }
+        match call_types(
+            self.module,
+            sig,
+            first,
+            &arguments.args,
+            &arguments.keywords,
+            |e| self.expr(e),
+        ) {
+            Some(tys) => self.module.instance_ret(name, sig, &tys),
+            None => sig.ret,
+        }
+    }
+
+    /// [`Self::method_ret`] with the arguments passed: a method of a
+    /// known class nothing overrides goes to the instance made for
+    /// them, where there is one.
+    fn method_call_ret(&self, receiver: Ty, attr: &str, arguments: &py::Arguments) -> Ty {
+        if let Ty::Class(k) = receiver
+            && !self.module.specs.is_empty()
+            && let Some((sig, name)) = self.module.method_sig(k as usize, attr)
+            && self.module.dispatched_ret(k as usize, attr) == Some(sig.ret)
+        {
+            return self.item_call_ret(&name, sig, 1, arguments);
+        }
+        self.method_ret(receiver, attr)
+    }
+
+    /// What `receiver[key]` returns on an instance: the result of the
+    /// `__getitem__` instance made for the key's type, where there is one.
+    fn item_read_ret(&self, k: u16, key: Ty) -> Ty {
+        if !self.module.specs.is_empty()
+            && let Some((sig, name)) = self.module.method_sig(k as usize, "__getitem__")
+            && sig.params.len() == 2
+            && self.module.dispatched_ret(k as usize, "__getitem__") == Some(sig.ret)
+        {
+            return self.module.instance_ret(&name, sig, &[Ty::Unknown, key]);
+        }
+        self.module
+            .dispatched_ret(k as usize, "__getitem__")
+            .unwrap_or(Ty::Object)
     }
 
     /// What a call of the builtin `name` returns.

@@ -1774,10 +1774,13 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
                     "ValueError",
                     add(
                         add(
-                            text("too many values to unpack (expected "),
-                            call("zb_str_of_int", vec![n.e()], string()),
+                            add(
+                                text("too many values to unpack (expected "),
+                                call("zb_str_of_int", vec![n.e()], string()),
+                            ),
+                            text(", got "),
                         ),
-                        text(")"),
+                        add(call("zb_str_of_int", vec![have.e()], string()), text(")")),
                     ),
                 )],
             ),
@@ -2692,6 +2695,67 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 )],
             ),
             ret(call("zb_unbox_tuple_raw", vec![x.e()], anys.clone())),
+        ],
+    ));
+    // A box as the tuple of `n` elements an unpack expects: anything
+    // but a tuple, or a tuple of another length, raises as the unpack
+    // would and yields nothing.
+    let n = local("n", i64());
+    let have = local("have", i64());
+    d.push(define(
+        "zb_unbox_tuple_len",
+        &[&x, &n],
+        anys.clone(),
+        vec![
+            tag.decl(cast(call("zb_box_tag", vec![x.e()], i32()), i64())),
+            when(
+                ne(tag.e(), int(TUPLE_TAG)),
+                vec![fatal(
+                    "TypeError",
+                    add(
+                        add(
+                            text("cannot unpack non-iterable "),
+                            call("zb_any_type", vec![x.e()], string()),
+                        ),
+                        text(" object"),
+                    ),
+                )],
+            ),
+            t.decl(call("zb_unbox_tuple_raw", vec![x.e()], anys.clone())),
+            have.decl(len(t.e())),
+            when(
+                lt(have.e(), n.e()),
+                vec![fatal(
+                    "ValueError",
+                    add(
+                        add(
+                            add(
+                                text("not enough values to unpack (expected "),
+                                call("zb_str_of_int", vec![n.e()], string()),
+                            ),
+                            text(", got "),
+                        ),
+                        add(call("zb_str_of_int", vec![have.e()], string()), text(")")),
+                    ),
+                )],
+            ),
+            when(
+                gt(have.e(), n.e()),
+                vec![fatal(
+                    "ValueError",
+                    add(
+                        add(
+                            add(
+                                text("too many values to unpack (expected "),
+                                call("zb_str_of_int", vec![n.e()], string()),
+                            ),
+                            text(", got "),
+                        ),
+                        add(call("zb_str_of_int", vec![have.e()], string()), text(")")),
+                    ),
+                )],
+            ),
+            ret(t.e()),
         ],
     ));
     d.push(define(

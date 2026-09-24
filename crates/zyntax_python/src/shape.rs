@@ -464,7 +464,7 @@ pub(crate) fn infer(
             let sig = &module.funcs[&item.name];
             let profile = next_profiles.get_mut(&item.name).unwrap();
             for (i, (_, ty)) in sig.params.iter().enumerate() {
-                let mut shape = if module.closed.contains(&item.name) {
+                let mut shape = if module.infers_params(item) {
                     Shape::Bottom
                 } else {
                     Shape::Dynamic

@@ -612,6 +612,18 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
             boolean(),
             vec![ret(call("zl_le", vec![a.e(), b.e()], boolean()))],
         ),
+        // Membership in a table is by iterating it, as for any value
+        // without a membership test of its own.
+        define(
+            "zb_hook_instance_contains",
+            &[&x, &a],
+            boolean(),
+            vec![ret(call(
+                "zb_any_contains_iter",
+                vec![x.e(), a.e()],
+                boolean(),
+            ))],
+        ),
         define(
             "zb_hook_instance_unary",
             &[&code, &x],
