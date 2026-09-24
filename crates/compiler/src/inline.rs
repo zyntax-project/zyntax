@@ -739,24 +739,27 @@ const DISPATCH_INSTS: usize = 16;
 /// Whether `callee` is a loop that calls, or a dispatch. Such a callee
 /// is its loop or its arms, and the call it saves by being inlined is
 /// nothing beside them; what it costs is a copy of them at every site.
-/// Calls on its cold paths, `cold`, are not counted.
-fn loops_or_dispatches(callee: &HirFunction, callees: &Callees<'_>, cold: &HashSet<HirId>) -> bool {
+/// Calls on its cold paths count: a site copies those arms too.
+fn loops_or_dispatches(callee: &HirFunction, callees: &Callees<'_>) -> bool {
     let is_call = |inst: &HirInstruction| is_real_call(inst, callees);
-    let calls_in = |id: &HirId| {
-        callee
-            .blocks
-            .get(id)
-            .filter(|_| !cold.contains(id))
-            .map_or(0, |b| b.instructions.iter().filter(|i| is_call(i)).count())
-    };
-    let calls: usize = callee.blocks.keys().map(calls_in).sum();
+    let calls: usize = callee
+        .blocks
+        .values()
+        .map(|b| b.instructions.iter().filter(|i| is_call(i)).count())
+        .sum();
     if calls > MAX_CALLS_INLINED && count_insts(callee) > DISPATCH_INSTS {
         return true;
     }
     if calls == 0 {
         return false;
     }
-    blocks_in_loops(callee).iter().any(|b| calls_in(b) > 0)
+    let in_loops = blocks_in_loops(callee);
+    in_loops.iter().any(|b| {
+        callee
+            .blocks
+            .get(b)
+            .is_some_and(|b| b.instructions.iter().any(|i| is_call(i)))
+    })
 }
 
 /// The successors of a block, by its terminator.
@@ -1009,6 +1012,9 @@ fn inline_in_function(
     shapes: &mut HashMap<HirId, CalleeShape>,
 ) -> InlineStats {
     let mut stats = InlineStats::default();
+    // `ZYNTAX_TRACE_INLINE=1` names every inline made and every site
+    // refused for size or for where it stands.
+    let trace = std::env::var_os("ZYNTAX_TRACE_INLINE").is_some();
 
     // A callee that carries calls of its own is inlined only where it
     // runs repeatedly, inside a loop of the caller; elsewhere the call
@@ -1091,10 +1097,8 @@ fn inline_in_function(
             let shape = *shapes
                 .entry(callee_id)
                 .or_insert_with(|| shape_of(callee, callees));
-            // `ZYNTAX_TRACE_INLINE=1` names every site refused for size
-            // or for where it stands, with the callee's size.
             let refused = |why: &str| {
-                if std::env::var_os("ZYNTAX_TRACE_INLINE").is_some() {
+                if trace {
                     eprintln!(
                         "[inline] {} refuses {} ({why}, callee insts: {})",
                         caller.name.resolve_global().unwrap_or_default(),
@@ -1121,7 +1125,13 @@ fn inline_in_function(
                 stats.skipped_cold += 1;
                 continue;
             }
-            if !hot_blocks.contains(&block_id) && shape.hot.calls {
+            // Outside a loop a callee's cold arms are copied as surely
+            // as its hot path: one whose arms carry calls is held to
+            // the call-bearing size over its whole body.
+            if !hot_blocks.contains(&block_id)
+                && (shape.hot.calls
+                    || (shape.calls_anywhere && count_insts(callee) > MAX_INLINE_INSTS_WITH_CALLS))
+            {
                 refused("callee with calls outside a loop");
                 stats.skipped_cold += 1;
                 continue;
@@ -1163,7 +1173,8 @@ fn inline_in_function(
                 Some(c) => c,
                 None => continue,
             };
-            let has_calls = shapes[&job.callee_id].hot.calls;
+            let shape = shapes[&job.callee_id];
+            let has_calls = shape.hot.calls;
 
             // Caller-budget check: predict post-inline size as
             // `caller_inst_count + callee_inst_count - 1` (subtract
@@ -1173,13 +1184,15 @@ fn inline_in_function(
             let predicted = caller_inst_count
                 .saturating_add(callee_inst_count)
                 .saturating_sub(1);
-            let budget = if has_calls {
+            // The caller receives every call the callee carries, on
+            // its cold arms too.
+            let budget = if shape.calls_anywhere {
                 MAX_POST_INLINE_INSTS_WITH_CALLS
             } else {
                 MAX_POST_INLINE_INSTS
             };
             if predicted > budget {
-                if std::env::var_os("ZYNTAX_TRACE_INLINE").is_some() {
+                if trace {
                     eprintln!(
                         "[inline] {} refuses {} (caller budget: {predicted} > {budget})",
                         caller.name.resolve_global().unwrap_or_default(),
@@ -1209,8 +1222,7 @@ fn inline_in_function(
             caller_inst_count = predicted;
             caller_inline_count += 1;
             stats.inlined += 1;
-            // `ZYNTAX_TRACE_INLINE=1` names every inline made.
-            if std::env::var_os("ZYNTAX_TRACE_INLINE").is_some() {
+            if trace {
                 eprintln!(
                     "[inline] {} <- {} (hot site: {}, callee has calls: {}, callee insts: {})",
                     caller.name.resolve_global().unwrap_or_default(),
@@ -1362,17 +1374,25 @@ struct CalleeShape {
     hot: HotBody,
     /// Whether it is a loop that calls, or a dispatch.
     looping: bool,
+    /// Whether a real call sits anywhere in it, its cold paths
+    /// included: a site copies those with the rest.
+    calls_anywhere: bool,
 }
 
 fn shape_of(callee: &HirFunction, callees: &Callees<'_>) -> CalleeShape {
     let cold = blocks_leading_to_cold(callee, callees);
     let (class, hot) = classify(callee, callees, &cold);
     let looping = matches!(class, CalleeClass::OkLeaf | CalleeClass::OkMultiBlock)
-        && loops_or_dispatches(callee, callees, &cold);
+        && loops_or_dispatches(callee, callees);
+    let calls_anywhere = callee
+        .blocks
+        .values()
+        .any(|b| b.instructions.iter().any(|i| is_real_call(i, callees)));
     CalleeShape {
         class,
         hot,
         looping,
+        calls_anywhere,
     }
 }
 
@@ -3139,6 +3159,78 @@ mod tests {
         let stats = run_module(&mut module);
         assert_eq!(stats.inlined, 0, "{stats:?}");
         assert_eq!(stats.skipped_too_large, 1, "{stats:?}");
+    }
+
+    /// Fifty-odd instructions whose error arm formats its message with a
+    /// plain call before the cold one: outside a loop the arm is copied
+    /// with the rest, so the whole body is past the call-bearing size.
+    #[test]
+    fn a_callee_whose_error_arm_calls_is_charged_for_it_outside_a_loop() {
+        let cold_id = HirId::new();
+        let format_id = HirId::new();
+        let mut callee = HirFunction::new(
+            InternedString::new_global("checked"),
+            sig(vec![HirType::I64], HirType::I64),
+        );
+        let entry = HirId::new();
+        let fails = HirId::new();
+        let ok = HirId::new();
+        callee.entry_block = entry;
+        callee.blocks.clear();
+        callee.blocks.insert(entry, HirBlock::new(entry));
+        callee.blocks.insert(fails, HirBlock::new(fails));
+        callee.blocks.insert(ok, HirBlock::new(ok));
+        let x = add_value_for_param(&mut callee, 0, HirType::I64);
+        let last = push_adds(&mut callee, entry, x, 30);
+        let cmp = add_inst(&mut callee, HirType::Bool);
+        let zero = add_const(&mut callee, HirType::I64, HirConstant::I64(0));
+        let blk = callee.blocks.get_mut(&entry).unwrap();
+        blk.instructions.push(HirInstruction::Binary {
+            op: BinaryOp::Lt,
+            result: cmp,
+            ty: HirType::I64,
+            left: last,
+            right: zero,
+        });
+        blk.terminator = HirTerminator::CondBranch {
+            condition: cmp,
+            true_target: fails,
+            false_target: ok,
+        };
+        let code = push_adds(&mut callee, fails, last, 10);
+        let message = call_to(&mut callee, fails, format_id, code);
+        let failed = call_to(&mut callee, fails, cold_id, message);
+        callee.blocks.get_mut(&fails).unwrap().terminator = HirTerminator::Return {
+            values: vec![failed],
+        };
+        let fine = push_adds(&mut callee, ok, last, 10);
+        callee.blocks.get_mut(&ok).unwrap().terminator =
+            HirTerminator::Return { values: vec![fine] };
+        assert!(count_insts(&callee) > MAX_INLINE_INSTS_WITH_CALLS);
+        let callee_id = HirId::new();
+        callee.id = callee_id;
+        let caller = build_caller(callee_id);
+
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        module.functions.insert(cold_id, build_extern("fail", true));
+        module
+            .functions
+            .insert(format_id, build_extern("format", false));
+        module.functions.insert(callee_id, callee);
+        module.functions.insert(caller.id, caller);
+
+        let changing = HashMap::new();
+        let callees = Callees {
+            stable: &module.functions,
+            changing: &changing,
+        };
+        let shape = shape_of(&module.functions[&callee_id], &callees);
+        assert!(!shape.hot.calls, "the arm's calls are off the hot path");
+        assert!(shape.calls_anywhere);
+
+        let stats = run_module(&mut module);
+        assert_eq!(stats.inlined, 0, "{stats:?}");
+        assert_eq!(stats.skipped_cold, 1, "{stats:?}");
     }
 }
 
