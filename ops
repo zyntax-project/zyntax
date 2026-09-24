@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790265577,"nonce":"KcekxEK7ZUGRdC3KHpgCFHSNyIU=","message":"l1 landed on main as ff57396d (cherry-picked from 1256bd44).","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790267890,"nonce":"MSAG9nz2qo9U1G2JCILVv5N4h2M=","message":"binary_trees now beats LuaJIT on the Mac by 2.3x (258 vs 599 ms elapsed) after l2 (bf659d12).","files":null}]}
