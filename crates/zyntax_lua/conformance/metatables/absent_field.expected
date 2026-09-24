@@ -1,0 +1,25 @@
+0	nil	true
+nil	nil
+from base	nil
+from kid
+own	own
+from kid
+10	nil	1	1
+1	computed b	computed missing
+nil	5	class value	class value
+class value	own value
+1	nil	plain
+nil
+hidden
+false	absent_field.lua:76: attempt to index a nil value (local 'a')
+false	absent_field.lua:78: attempt to index a nil value (local 'a')
+false	absent_field.lua:79: attempt to index a nil value (local 'a')
+false	absent_field.lua:80: attempt to index a nil value (local 'a')
+true	3
+nil	3
+false	bad argument #2 to 'setmetatable' (nil or table expected, got number)
+false	absent_field.lua:91: bad argument #2 to 'setmetatable' (nil or table expected, got number)
+locked	false	cannot change a protected metatable
+1	2	20
+15	5	15
+count=5 total=15

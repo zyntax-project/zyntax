@@ -1017,6 +1017,16 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ret(nil()),
         ],
     ));
+    // Indexing nil where the frontend knows the receiver is nil.
+    d.push(define_cold(
+        "zl_index_nil",
+        &[],
+        any(),
+        vec![
+            type_error(text("attempt to index a nil value"), int(OPERAND_LEFT)),
+            ret(nil()),
+        ],
+    ));
     d.push(define(
         "zl_setindex_key",
         &[&o, &k, &v],

@@ -2620,8 +2620,6 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     /// `(local 'x')` and the like, the way the reference names the
     /// variable.
     fn pending_check_described(&mut self, span: Span, descs: &Described) -> St {
-        self.raised = true;
-        self.line_needed = true;
         let cond = binary(
             BinaryOp::Ne,
             Self::pending(span),
@@ -2629,6 +2627,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             prim(PrimitiveType::Bool),
             span,
         );
+        let leave = self.leave_described(span, descs);
+        let restore = self.set_line(span);
+        if_(cond, leave, Some(vec![restore]), span)
+    }
+
+    /// Leaving with the pending error, described as above.
+    fn leave_described(&mut self, span: Span, descs: &Described) -> Vec<St> {
+        self.raised = true;
+        self.line_needed = true;
         let settle = if descs.operands.iter().all(Option::is_none) {
             assign(
                 var(intern(library::VARINFO), prim(PrimitiveType::I64), span),
@@ -2657,8 +2664,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             )
         };
         let leave = self.placeholder_return(span);
-        let restore = self.set_line(span);
-        if_(cond, vec![settle, leave], Some(vec![restore]), span)
+        vec![settle, leave]
     }
 
     /// `zl_depth += 1; if zl_depth > limit { raise; leave }`: one more
@@ -4897,20 +4903,50 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 span,
             )
         };
-        // The general read, where nothing below finds the field: nil,
-        // or a metatable the types do not follow, or the receiver
-        // being nil, which raises.
-        let general = self.index_read(t.clone(), key, desc, span);
-        let mut value = if ty == Ty::Any {
-            general.node
-        } else {
-            self.coerce(general, ty)
-        };
-        // Then through the metatables, by the finder.
         let info = self.m.inferred.shape(k);
         let own = info.field(name).map(|(_, ty)| ty);
         let sure = info.always_present(name);
-        if !sure && let Some(finder) = self.finder(k, name, false, span) {
+        let slot = if own.is_some() {
+            self.slot_of(k, name)
+        } else {
+            None
+        };
+        let finder = if sure {
+            None
+        } else {
+            self.finder(k, name, false, span)
+        };
+        // Whether every place the field may be found is checked here:
+        // the table's own slot, and the finder for each lookup that
+        // goes through a metatable. Then what nothing finds is nil.
+        let closed = !sure
+            && slot.is_some()
+            && self.m.inferred.lookups(k, name).is_some_and(|lookups| {
+                finder.is_some() || lookups.iter().all(|l| l.hops.is_empty())
+            });
+        // Where nothing below finds the field. A slot the table always
+        // holds is only missed by a nil receiver, which raises; so is
+        // a closed lookup, which else gives nil; anything else takes
+        // the general read, which raises for nil and consults a
+        // metatable the types do not follow.
+        let mut value = if sure && slot.is_some() {
+            self.index_nil(desc, ty, span)
+        } else if closed {
+            let raise = self.index_nil(desc, ty, span);
+            let absent = self.coerce(
+                Val {
+                    node: nil(span),
+                    ty: Ty::Nil,
+                },
+                ty,
+            );
+            if_value(not_null(&t.node), absent, raise, self.ir(ty), span)
+        } else {
+            let general = self.index_read(t.clone(), key, desc, span);
+            self.coerce(general, ty)
+        };
+        // Then through the metatables, by the finder.
+        if let Some(finder) = finder {
             let found = self.hold(
                 Val {
                     node: call(&finder.helper, vec![t.node.clone()], table_t.clone(), span),
@@ -4922,9 +4958,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             value = if_value(not_null(&found.node), read, value, self.ir(ty), span);
         }
         // The table's own slot first.
-        if own.is_some()
-            && let Some((layout, slot)) = self.slot_of(k, name)
-        {
+        if let Some((layout, slot)) = slot {
             let fast = if sure {
                 not_null(&t.node)
             } else {
@@ -4944,6 +4978,23 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             node: block_value(pre, value, span),
             ty,
         }
+    }
+
+    /// Indexing a nil receiver: the error, raised and left through,
+    /// then a value of `ty` no one reads. The raise always leaves an
+    /// error pending, so nothing past it runs.
+    fn index_nil(&mut self, desc: Desc, ty: Ty, span: Span) -> Node {
+        let descs = Described::operand(desc);
+        let leave = self.leave_described(span, &descs);
+        let raise = vec![
+            expr_stmt(call("zl_index_nil", vec![], Type::Any, span)),
+            if_(bool_lit(true, span), leave, None, span),
+        ];
+        let unread = match ty {
+            Ty::Table => null(self.ir(Ty::Table), span),
+            _ => self.zero_of(ty, span),
+        };
+        block_value(raise, unread, span)
     }
 
     /// `obj[key]`, with `__index`; `desc` is what `obj` is called.

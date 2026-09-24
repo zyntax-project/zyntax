@@ -455,6 +455,8 @@ impl Inferred {
     ) -> Option<()> {
         let mut table = match self.shape(class).field("__index") {
             Some((_, Ty::Shape(t))) => t,
+            // A metatable without `__index` answers nothing.
+            None if !self.may_hold_unnamed(class, "__index") => return Some(()),
             _ => return None,
         };
         hops.push(Hop::Index(class));
