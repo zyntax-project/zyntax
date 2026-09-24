@@ -10023,6 +10023,43 @@ pub(crate) fn loaded_program(
     })
 }
 
+/// The entry the host reports an uncaught table error through, in the
+/// program [`error_text_program`] builds.
+pub(crate) const ERROR_TEXT_ENTRY: &str = "lua$error_text";
+
+/// A program of one function, `lua$error_text(err) -> Any`, entering
+/// the library's text for an uncaught table error. Compiled by the host
+/// only when such an error is reported, so no chunk reaches it.
+pub(crate) fn error_text_program(library: &Library) -> TypedProgram {
+    let span = Span::new(0, 0);
+    let err = intern("err");
+    let entry = typed_function(
+        ERROR_TEXT_ENTRY,
+        vec![parameter(err, Type::Any, span)],
+        Type::Any,
+        vec![ret(
+            Some(call(
+                library::ERROR_TEXT,
+                vec![var(err, Type::Any, span)],
+                Type::Any,
+                span,
+            )),
+            span,
+        )],
+        span,
+    );
+    TypedProgram {
+        declarations: vec![
+            TypedNode::new(TypedDeclaration::Function(entry), Type::Unknown, span),
+            library_import(),
+        ],
+        language: Some(intern("lua")),
+        span,
+        source_files: Vec::new(),
+        type_registry: library.type_registry.clone(),
+    }
+}
+
 /// The whole chunk as a program.
 pub(crate) fn program(
     ast: &ast::Ast,

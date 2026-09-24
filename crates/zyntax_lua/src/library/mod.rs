@@ -1136,33 +1136,63 @@ fn raising(t: &Types) -> Vec<Decl> {
             ret(v.e()),
         ],
     ));
-    // An error nothing caught, reported the way `lua` reports it, ending
-    // the program with status 1.
+    // An error nothing caught, reported by the host the way `lua`
+    // reports it, ending the program with status 1. The host formats
+    // the message itself, so the chunk's entry reaches nothing of the
+    // library's `tostring`.
+    d.push(extern_fn(
+        "zl_report_uncaught",
+        &[("err", any())],
+        unit(),
+        Some("$Lua$report_pending"),
+    ));
     d.push(define_cold(
         "zl_report_pending",
         &[],
         unit(),
         vec![
-            when(is_nil(pending()), vec![ret_void()]),
-            expr(call(
-                "zb_eprintln",
-                vec![add(
-                    text("lua: "),
-                    call(
-                        "zl_tostring",
-                        vec![call("zl_take_pending", vec![], any())],
-                        string(),
-                    ),
-                )],
-                unit(),
-            )),
-            expr(call("zl_io_flush_all", vec![], unit())),
-            expr(call("zb_exit", vec![int32(1)], unit())),
+            v.decl(pending()),
+            when(is_nil(v.e()), vec![ret_void()]),
+            set_global(PENDING, nil()),
+            set_global(OVERFLOWED, bool(false)),
+            expr(call("zl_report_uncaught", vec![v.e()], unit())),
             ret_void(),
+        ],
+    ));
+    // The text an uncaught table error reports: what its `__tostring`
+    // gives when that is a string, the error it raises if it raises one,
+    // else nil. Reached only from the host, which compiles it when such
+    // an error is reported.
+    let h = local("h", any());
+    let r = local("r", any());
+    d.push(define_cold(
+        ERROR_TEXT,
+        &[&v],
+        any(),
+        vec![
+            h.decl(call("zl_meta_of", vec![v.e(), text("__tostring")], any())),
+            when(is_nil(h.e()), vec![ret(nil())]),
+            r.decl(call(
+                "zl_first",
+                vec![call("zl_call_1", vec![h.e(), v.e()], any())],
+                any(),
+            )),
+            when(
+                not(is_nil(pending())),
+                vec![ret(call("zl_take_pending", vec![], any()))],
+            ),
+            when(
+                and(not(is_nil(r.e())), eq(category(r.e()), int(STR))),
+                vec![ret(r.e())],
+            ),
+            ret(nil()),
         ],
     ));
     d
 }
+
+/// The library function giving an uncaught table error's text.
+pub const ERROR_TEXT: &str = "zl_error_text";
 
 /// The whole library for Lua: the shared library under Lua's
 /// spellings, the table struct, and everything in this module.

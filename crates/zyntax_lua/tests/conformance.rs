@@ -7,6 +7,9 @@
 //! hand: `lua5.4` produces it, and it is pinned beside the program as
 //! `.expected` (and `.status` when the program exits non-zero) so the
 //! suite runs without Lua and every expectation is a reviewed file.
+//! A case pinned with `.message` also conforms in the first line its
+//! uncaught error writes to stderr, after the program's name: a case
+//! that exits non-zero pins one when it is first pinned.
 //!
 //! `conformance/official/` is the test suite that ships with Lua 5.4
 //! (lua.org/tests), run as `all.lua` runs each file with `_U=true`, the
@@ -54,36 +57,53 @@ fn known_failures() -> HashMap<String, String> {
 /// What one run produced.
 #[derive(Debug, PartialEq, Eq)]
 struct Outcome {
+    /// Its bytes, whatever they are: a Lua string need not be UTF-8.
     stdout: Vec<u8>,
     status: i32,
+    /// The first line of stderr, less the program's name that `lua`
+    /// puts before an uncaught error's message.
+    message: String,
+}
+
+/// The message line of what a run wrote to stderr.
+fn message_of(stderr: &str) -> String {
+    let line = stderr.lines().next().unwrap_or("");
+    match line.split_once(": ") {
+        Some((_, message)) => message.to_string(),
+        None => line.to_string(),
+    }
 }
 
 /// Run a command with a deadline. A conformance case that hangs is a
 /// failure that must be reported, not a suite that never finishes.
 fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
-    // Only stdout is compared. A piped stderr nobody reads would stall
-    // the child once it filled the pipe.
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return Outcome {
                 stdout: format!("<could not start: {e}>").into_bytes(),
                 status: -1,
+                message: String::new(),
             };
         }
     };
-    // Drained as it is written, so a program that prints more than a
-    // pipe holds does not wait on a reader that waits on its exit.
-    let reader = child.stdout.take().map(|mut s| {
-        std::thread::spawn(move || {
-            let mut out = Vec::new();
-            let _ = s.read_to_end(&mut out);
-            out
+    // Both drained as they are written, so a program that prints more
+    // than a pipe holds does not wait on a reader that waits on its
+    // exit.
+    fn drain<R: Read + Send + 'static>(s: Option<R>) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+        s.map(|mut s| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = s.read_to_end(&mut bytes);
+                bytes
+            })
         })
-    });
+    }
+    let reader = drain(child.stdout.take());
+    let errors = drain(child.stderr.take());
     let collect = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
         reader.and_then(|r| r.join().ok()).unwrap_or_default()
     };
@@ -94,15 +114,18 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
                 return Outcome {
                     stdout: collect(reader),
                     status: status.code().unwrap_or(-2),
+                    message: message_of(&String::from_utf8_lossy(&collect(errors))),
                 };
             }
             Ok(None) if start.elapsed() > limit => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = collect(reader);
+                let _ = collect(errors);
                 return Outcome {
                     stdout: format!("<timed out after {:?}>", limit).into_bytes(),
                     status: -3,
+                    message: String::new(),
                 };
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
@@ -110,6 +133,7 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
                 return Outcome {
                     stdout: format!("<wait failed: {e}>").into_bytes(),
                     status: -1,
+                    message: String::new(),
                 };
             }
         }
@@ -141,21 +165,30 @@ fn is_official(case: &Path) -> bool {
 
 /// The reference's answer, from the pinned file or from the reference
 /// interpreter when the file does not exist yet (and then written, so
-/// the next run needs neither Lua nor a decision).
-fn expected_for(case: &Path) -> Option<Outcome> {
+/// the next run needs neither Lua nor a decision), with the message
+/// pinned for it if any.
+fn expected_for(case: &Path) -> Option<(Outcome, Option<String>)> {
     let pin = case.with_extension("expected");
-    // A program that exits with a status pins it beside its output; one
-    // that exits 0 pins nothing extra.
+    // A program that exits with a status pins it and its message
+    // beside its output; one that exits 0 pins nothing extra.
     let status_pin = case.with_extension("status");
+    let message_pin = case.with_extension("message");
     if let Ok(bytes) = fs::read(&pin) {
         let status = fs::read_to_string(&status_pin)
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
-        return Some(Outcome {
-            stdout: bytes,
-            status,
-        });
+        let message = fs::read_to_string(&message_pin)
+            .ok()
+            .map(|m| m.trim_end_matches('\n').to_string());
+        return Some((
+            Outcome {
+                stdout: bytes,
+                status,
+                message: message.clone().unwrap_or_default(),
+            },
+            message,
+        ));
     }
     let mut cmd = reference();
     if is_official(case) {
@@ -173,10 +206,13 @@ fn expected_for(case: &Path) -> Option<Outcome> {
         return None;
     }
     let _ = fs::write(&pin, &got.stdout);
+    let mut message = None;
     if got.status != 0 {
         let _ = fs::write(&status_pin, got.status.to_string());
+        let _ = fs::write(&message_pin, format!("{}\n", got.message));
+        message = Some(got.message.clone());
     }
-    Some(got)
+    Some((got, message))
 }
 
 /// Whether the compile worker runs beside the program: off, every
@@ -241,23 +277,33 @@ fn category(name: &str, warm_up: WarmUp) {
 
     for case in &cases {
         let key = format!("{name}/{}", case.file_name().unwrap().to_string_lossy());
-        let Some(expected) = expected_for(case) else {
+        let Some((expected, message)) = expected_for(case) else {
             unpinned += 1;
             continue;
         };
         let got = ours_for(case, warm_up);
-        let ok = got.status == expected.status && got.stdout == expected.stdout;
+        let ok = got.status == expected.status
+            && got.stdout == expected.stdout
+            && message.as_ref().is_none_or(|m| got.message == *m);
         match (ok, known.get(&key)) {
             (true, None) => passed += 1,
             (true, Some(issue)) => fixed.push((key, issue.clone())),
             (false, Some(issue)) => known_failed.push((key, issue.clone())),
             (false, None) => {
                 regressions.push(format!(
-                    "{key}\n    expected (lua5.4, exit {}):\n{}\n    got (zylua, exit {}):\n{}",
+                    "{key}\n    expected (lua5.4, exit {}):\n{}\n    got (zylua, exit {}):\n{}{}",
                     expected.status,
                     indent(&expected.stdout),
                     got.status,
-                    indent(&got.stdout)
+                    indent(&got.stdout),
+                    if message.is_some() && got.message != expected.message {
+                        format!(
+                            "\n    message expected: {}\n    message got:      {}",
+                            expected.message, got.message
+                        )
+                    } else {
+                        String::new()
+                    }
                 ));
             }
         }
