@@ -37,6 +37,18 @@ pub(crate) fn resolve_snapshot_module(
     named_language: Option<&str>,
     module: &str,
 ) -> Result<Option<crate::CompiledImport>, String> {
+    resolve_snapshot_module_selecting(modules, importing_language, named_language, module, None)
+}
+
+/// [`resolve_snapshot_module`], keeping of the module's functions only
+/// those `named` names when that is given.
+fn resolve_snapshot_module_selecting(
+    modules: &SnapshotModules,
+    importing_language: Option<&str>,
+    named_language: Option<&str>,
+    module: &str,
+    named: Option<&std::collections::HashSet<zyntax_typed_ast::InternedString>>,
+) -> Result<Option<crate::CompiledImport>, String> {
     let language = named_language.or(importing_language);
     let Some(language) = language else {
         return Ok(None);
@@ -44,7 +56,9 @@ pub(crate) fn resolve_snapshot_module(
     let Some(snapshot) = modules.get(&(language.to_string(), module.to_string())) else {
         return Ok(None);
     };
-    snapshot.module(module).map_err(|e| e.to_string())
+    snapshot
+        .module_selecting(module, named)
+        .map_err(|e| e.to_string())
 }
 
 /// Resolve `module_path` against an ordered list of resolver callbacks.
@@ -140,6 +154,7 @@ pub(crate) fn process_imports_for_traits(
     program: &mut zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
     prelowered: &mut Vec<std::sync::Arc<zyntax_compiler::bytecode::LazyModule>>,
+    selective: bool,
 ) -> RuntimeResult<()> {
     // Track imports processed during *this* lowering. Previously
     // lived in a thread-local — that caused a silent bug where the
@@ -159,10 +174,17 @@ pub(crate) fn process_imports_for_traits(
         program,
         type_registry,
         prelowered,
+        selective,
         &mut processed,
     )
 }
 
+/// `selective`: an import that names its items, of a module that arrived
+/// lowered, brings the functions it names and none of the others; the
+/// module's types, classes and implementations come whole. Its bodies
+/// are linked from the lowered module, so what they call needs no
+/// declaration in the program.
+#[allow(clippy::too_many_arguments)]
 fn process_imports_inner(
     grammars: &std::collections::HashMap<String, std::sync::Arc<crate::grammar::LanguageGrammar>>,
     plugin_signatures: &std::collections::HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
@@ -172,9 +194,10 @@ fn process_imports_inner(
     program: &mut zyntax_typed_ast::TypedProgram,
     type_registry: &mut zyntax_typed_ast::TypeRegistry,
     prelowered: &mut Vec<std::sync::Arc<zyntax_compiler::bytecode::LazyModule>>,
+    selective: bool,
     processed: &mut std::collections::HashSet<String>,
 ) -> RuntimeResult<()> {
-    use zyntax_typed_ast::typed_ast::TypedDeclaration;
+    use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedImportItem};
 
     // Collect imports to process (can't mutate while iterating)
     let importing_language = program.language.and_then(|l| l.resolve_global());
@@ -187,12 +210,25 @@ fn process_imports_inner(
                 .and_then(|s| s.resolve_global())
                 .unwrap_or_else(|| "unknown".to_string());
             let named_language = import.language.and_then(|l| l.resolve_global());
-            imports_to_process.push((module_name, named_language));
+            let named: Option<std::collections::HashSet<zyntax_typed_ast::InternedString>> =
+                (selective && !import.items.is_empty())
+                    .then(|| {
+                        import
+                            .items
+                            .iter()
+                            .map(|item| match item {
+                                TypedImportItem::Named { name, .. } => Some(*name),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .flatten();
+            imports_to_process.push((module_name, named_language, named));
         }
     }
 
     // Process each import
-    for (module_name, named_language) in imports_to_process {
+    for (module_name, named_language, named) in imports_to_process {
         // Skip if already processed (circular import detection)
         if processed.contains(&module_name) {
             log::debug!("Skipping already processed import: {}", module_name);
@@ -202,11 +238,12 @@ fn process_imports_inner(
         // Mark as processed BEFORE recursive processing
         processed.insert(module_name.clone());
 
-        let compiled_import = match resolve_snapshot_module(
+        let compiled_import = match resolve_snapshot_module_selecting(
             snapshot_modules,
             importing_language.as_deref(),
             named_language.as_deref(),
             &module_name,
+            named.as_ref(),
         )
         .map_err(|e| {
             RuntimeError::Execution(format!(
@@ -236,6 +273,7 @@ fn process_imports_inner(
             }
             // A module that arrived lowered is linked rather than
             // lowered again; its declarations still type the caller.
+            let lowered = compiled_import.hir().is_some();
             if let Some(hir) = compiled_import.hir() {
                 if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
                     eprintln!(
@@ -249,6 +287,14 @@ fn process_imports_inner(
             // and then has no builtin aliases to inject either.
             let grammar = grammars.get(compiled_import.language());
             let mut imported_program = compiled_import.into_program();
+            if lowered && let Some(named) = &named {
+                imported_program
+                    .declarations
+                    .retain(|decl| match &decl.node {
+                        TypedDeclaration::Function(function) => named.contains(&function.name),
+                        _ => true,
+                    });
+            }
             if let Some(grammar) = grammar {
                 grammar
                     .inject_builtin_externs(&mut imported_program, Some(plugin_signatures))
@@ -332,6 +378,7 @@ fn process_imports_inner(
                 &mut imported_program,
                 type_registry,
                 prelowered,
+                selective,
                 processed,
             )?;
 

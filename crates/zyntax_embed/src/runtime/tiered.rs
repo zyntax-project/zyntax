@@ -101,6 +101,9 @@ pub struct TieredRuntime {
     /// rather than registering a grammar, alongside the ones grammars
     /// state.
     entry_points: Vec<String>,
+    /// The functions and globals compiled modules installed, which a
+    /// program joining the running module links rather than brings.
+    installed: Arc<std::collections::HashSet<HirId>>,
     /// Captured runtime semantic events (render/stream).
     runtime_events: Vec<RuntimeEvent>,
     /// Optional callback invoked whenever a runtime event is captured.
@@ -425,6 +428,7 @@ impl TieredRuntime {
             compiled_import_resolvers: Vec::new(),
             snapshot_modules: Default::default(),
             entry_points: Vec::new(),
+            installed: Arc::default(),
             runtime_events: Vec::new(),
             event_sink: None,
             builtin_aliases: indexmap::IndexMap::new(),
@@ -509,16 +513,20 @@ impl TieredRuntime {
 
     /// Compile a HIR module into the tiered runtime
     pub fn compile_module(&mut self, module: HirModule) -> RuntimeResult<()> {
-        self.compile_module_entered(module, None)
+        self.compile_module_entered(module, None, false)
     }
 
     /// Compile a module whose entry points are known, generating code
     /// only for what they reach. `None` compiles everything, for a host
     /// that may call any function by name.
+    ///
+    /// `joining` adds the module to the one running (see
+    /// [`Self::join_typed_program`]): compiled now, at the baseline.
     fn compile_module_entered(
         &mut self,
         mut module: HirModule,
         mut entered: Option<Vec<String>>,
+        joining: bool,
     ) -> RuntimeResult<()> {
         // What the entry points cannot reach is dropped before the
         // optimisers run, so they walk the program rather than the
@@ -538,6 +546,7 @@ impl TieredRuntime {
         // compiled as they are on first call.
         let mut finished: std::collections::HashSet<HirId> = std::collections::HashSet::new();
         let lazily = entered.is_some()
+            && !joining
             && !self.config.enable_hot_reload
             && std::env::var_os("ZYNTAX_DISABLE_LAZY").is_none();
         // The boxed-constant initializers to run once the module is
@@ -642,7 +651,9 @@ impl TieredRuntime {
             }
         }
 
-        self.backend.set_emit_osr_probes(self.config.enable_osr);
+        // A joining module stays at its tier, so it asks for no other.
+        self.backend
+            .set_emit_osr_probes(self.config.enable_osr && !joining);
 
         // Reachability is read after the optimisers, since inlining
         // removes calls and the set has to describe the module codegen
@@ -658,10 +669,27 @@ impl TieredRuntime {
             );
         }
 
+        // What a later joining program links: what has code or a stub.
+        let installed = Arc::make_mut(&mut self.installed);
+        installed.extend(module.globals.keys().copied());
+        installed.extend(
+            module
+                .functions
+                .iter()
+                .filter(|(id, f)| {
+                    !f.is_external && reachable.as_ref().is_none_or(|r| r.contains(id))
+                })
+                .map(|(id, _)| *id),
+        );
+
         // Compile the module (consumes it).
         let started = web_time::Instant::now();
-        self.backend
-            .compile_module_lazily(module, reachable, lazy, finished)?;
+        let compiled = self
+            .backend
+            .compile_module_lazily(module, reachable, lazy, finished, joining);
+        // What the running module compiles later asks as it always has.
+        self.backend.set_emit_osr_probes(self.config.enable_osr);
+        compiled?;
         // The backend owns the optimized HIR and native global slots. Bind
         // both into the interpreter before the initializer can run.
         //
@@ -670,9 +698,9 @@ impl TieredRuntime {
         // code, which holds the interpreter. Such a chunk is entered by
         // native pointer and runs natively, so it needs no binding, and
         // its constants are initialised natively too.
-        let (symbols, globals) = self.backend.interpreter_bindings();
         let interpreter_bound = match self.interpreter.try_lock() {
             Ok(mut interp) => {
+                let (symbols, globals) = self.backend.interpreter_bindings();
                 for (name, ptr) in symbols {
                     if let Some(sig) = self.plugin_signatures.get(&name) {
                         interp.register_symbol_typed(name, ptr, *sig);
@@ -1501,8 +1529,59 @@ impl TieredRuntime {
             );
         }
 
-        self.compile_module_entered(hir_module, entered)?;
+        self.compile_module_entered(hir_module, entered, false)?;
         let _ = self.apply_fiber_decls(fiber_decls);
+        Ok(function_names)
+    }
+
+    /// Compile `program` into the running module, for a program that
+    /// compiles pieces of itself while it runs (a Lua `load`).
+    ///
+    /// What it takes from what is installed rather than bringing again:
+    /// the functions and globals of the libraries earlier compiles
+    /// installed are called and read where they are, and an import that
+    /// names its items brings only those declarations. It is entered
+    /// through `entries` alone. Its functions are compiled now, at the
+    /// baseline, and stay there: the piece is small and about to run,
+    /// and the interpreter may be busy running its caller.
+    pub fn join_typed_program(
+        &mut self,
+        mut program: zyntax_typed_ast::TypedProgram,
+        entries: &[&str],
+    ) -> RuntimeResult<Vec<String>> {
+        capture_runtime_events_from_program(
+            &mut program,
+            &mut self.runtime_events,
+            self.event_sink.as_ref(),
+        );
+        let lowered = crate::lower::lower_typed_program(
+            program,
+            crate::lower::Inputs {
+                grammars: &self.grammars,
+                plugin_signatures: &self.plugin_signatures,
+                import_resolvers: &self.import_resolvers,
+                compiled_import_resolvers: &self.compiled_import_resolvers,
+                snapshot_modules: &self.snapshot_modules,
+                builtins: self.builtin_aliases.clone(),
+                builtin_registry: self.snapshot_builtin_registry(),
+                entry_names: entries.iter().map(|e| e.to_string()).collect(),
+                prelowered: Vec::new(),
+                linked: Arc::clone(&self.installed),
+                selective: true,
+            },
+        )?;
+        let mut hir_module = lowered.module;
+        hir_module.automatic_release = self.automatic_release;
+        apply_krio_async_lowering(&mut hir_module)?;
+        apply_krio_effect_lowering(&mut hir_module)?;
+        apply_krio_fiber_lowering(&mut hir_module);
+        let function_names: Vec<String> = hir_module
+            .functions
+            .values()
+            .filter(|f| !f.is_external)
+            .filter_map(|f| f.name.resolve_global())
+            .collect();
+        self.compile_module_entered(hir_module, lowered.entered, true)?;
         Ok(function_names)
     }
 
@@ -2625,7 +2704,7 @@ impl TieredRuntime {
             .collect();
 
         // Compile the module
-        self.compile_module_entered(hir_module, entered)?;
+        self.compile_module_entered(hir_module, entered, false)?;
         let _ = self.apply_fiber_decls(fiber_decls);
 
         Ok(function_names)
@@ -2678,6 +2757,8 @@ impl TieredRuntime {
                 builtin_registry: self.snapshot_builtin_registry(),
                 entry_names: self.entry_names(),
                 prelowered: Vec::new(),
+                linked: Arc::default(),
+                selective: false,
             },
         )?;
         Ok((lowered.module, lowered.entered))

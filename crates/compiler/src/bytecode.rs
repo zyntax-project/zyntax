@@ -77,6 +77,60 @@ pub struct LazyModule {
     bodies: std::collections::HashMap<crate::hir::HirId, Vec<u8>>,
     /// What every id in the shell was shifted by on decode.
     base: u32,
+    /// Made on first use; see [`Self::link_index`].
+    index: std::sync::OnceLock<std::sync::Arc<LinkIndex>>,
+}
+
+/// What a program linking a lowered module finds its functions and
+/// globals by.
+#[derive(Debug, Default)]
+pub struct LinkIndex {
+    /// Every function's id, by name.
+    pub functions: std::collections::HashMap<zyntax_typed_ast::InternedString, crate::hir::HirId>,
+    /// The names of the functions with a body.
+    pub bodies: std::collections::HashSet<zyntax_typed_ast::InternedString>,
+    /// Every global's id, by name.
+    pub globals: std::collections::HashMap<zyntax_typed_ast::InternedString, crate::hir::HirId>,
+    /// The boxed-constant initializers: called by the host rather than
+    /// any body, and adopted with the first function a program reaches,
+    /// since their boxes are what the bodies load.
+    pub inits: Vec<crate::hir::HirId>,
+}
+
+impl LinkIndex {
+    fn of(module: &HirModule) -> Self {
+        let mut index = Self::default();
+        for f in module.functions.values() {
+            index.functions.insert(f.name, f.id);
+            if !f.is_external {
+                index.bodies.insert(f.name);
+            }
+            if f.name
+                .resolve_global()
+                .is_some_and(|n| crate::const_boxes::is_init_function(&n))
+            {
+                index.inits.push(f.id);
+            }
+        }
+        for g in module.globals.values() {
+            index.globals.insert(g.name, g.id);
+        }
+        index
+    }
+
+    /// Several modules' indexes as one; a later module's name wins.
+    pub fn merged<'a>(indexes: impl IntoIterator<Item = &'a LinkIndex>) -> Self {
+        let mut all = Self::default();
+        for index in indexes {
+            all.functions
+                .extend(index.functions.iter().map(|(k, v)| (*k, *v)));
+            all.bodies.extend(index.bodies.iter().copied());
+            all.globals
+                .extend(index.globals.iter().map(|(k, v)| (*k, *v)));
+            all.inits.extend(index.inits.iter().copied());
+        }
+        all
+    }
 }
 
 /// The wire shape of [`Format::Split`].
@@ -95,7 +149,16 @@ impl LazyModule {
             shell: module,
             bodies: std::collections::HashMap::new(),
             base: 0,
+            index: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The module's functions and globals by name, made once.
+    pub fn link_index(&self) -> std::sync::Arc<LinkIndex> {
+        std::sync::Arc::clone(
+            self.index
+                .get_or_init(|| std::sync::Arc::new(LinkIndex::of(&self.shell))),
+        )
     }
 
     /// The shell: globals, types, externs, and a stub for each function
@@ -192,6 +255,7 @@ pub fn deserialize_module_lazy(bytes: &[u8]) -> Result<LazyModule> {
         shell: split.shell,
         bodies: split.bodies.into_iter().collect(),
         base,
+        index: std::sync::OnceLock::new(),
     })
 }
 

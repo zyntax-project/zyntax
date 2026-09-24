@@ -250,12 +250,7 @@ pub struct LoweringContext {
     /// so a declaration of one takes that id. A body is lowered for it
     /// only when the module holds a declaration without one: the module
     /// then calls whatever the program defines under the name.
-    prelowered_functions: std::collections::HashMap<InternedString, crate::hir::HirId>,
-    prelowered_bodies: std::collections::HashSet<InternedString>,
-    prelowered_globals: std::collections::HashMap<InternedString, crate::hir::HirId>,
-    /// Which prelowered module holds each function, by id, built at
-    /// the first adoption round.
-    prelowered_by_id: Option<std::collections::HashMap<crate::hir::HirId, usize>>,
+    prelowered: Arc<crate::bytecode::LinkIndex>,
     /// The module's functions and globals whose call targets an
     /// adoption round has followed; a later round follows only what
     /// arrived since.
@@ -264,10 +259,6 @@ pub struct LoweringContext {
     /// the phase trace; the clock is read only when the trace is on.
     adopted: (usize, f64),
     trace_phases: bool,
-    /// The prelowered modules' boxed-constant initializers: called by
-    /// the host, not by any body, and adopted with the first function
-    /// reached, since their boxes are what the bodies load.
-    prelowered_inits: Vec<crate::hir::HirId>,
     /// Functions dropped because their body failed analysis, keyed by
     /// the id a call site still carries, with the name and what the
     /// analysis said. A drop is only tolerable while nothing calls the
@@ -442,6 +433,10 @@ pub struct LoweringConfig {
     /// is linked to it instead of being lowered, and the modules' contents
     /// join the program's module.
     pub prelowered: Vec<Arc<crate::bytecode::LazyModule>>,
+    /// Functions and globals of the prelowered modules that are already
+    /// installed where this module is going: calls and reads reach them
+    /// there, and they are not brought into this module again.
+    pub linked: Arc<std::collections::HashSet<crate::hir::HirId>>,
 }
 
 impl std::fmt::Debug for LoweringConfig {
@@ -472,6 +467,7 @@ impl Default for LoweringConfig {
             builtins: indexmap::IndexMap::new(),
             entry_names: Vec::new(),
             prelowered: Vec::new(),
+            linked: Arc::default(),
             use_krio_async: false,
         }
     }
@@ -565,38 +561,18 @@ impl LoweringContext {
             entered: false,
             entered_names: None,
             imported: std::collections::HashSet::new(),
-            prelowered_functions: config
-                .prelowered
-                .iter()
-                .flat_map(|m| m.shell().functions.values().map(|f| (f.name, f.id)))
-                .collect(),
-            prelowered_bodies: config
-                .prelowered
-                .iter()
-                .flat_map(|m| m.shell().functions.values())
-                .filter(|f| !f.is_external)
-                .map(|f| f.name)
-                .collect(),
-            prelowered_globals: config
-                .prelowered
-                .iter()
-                .flat_map(|m| m.shell().globals.values().map(|g| (g.name, g.id)))
-                .collect(),
-            prelowered_by_id: None,
+            prelowered: match config.prelowered.as_slice() {
+                [one] => one.link_index(),
+                many => {
+                    let indexes: Vec<_> = many.iter().map(|m| m.link_index()).collect();
+                    Arc::new(crate::bytecode::LinkIndex::merged(
+                        indexes.iter().map(|i| &**i),
+                    ))
+                }
+            },
             adopt_followed: std::collections::HashSet::new(),
             adopted: (0, 0.0),
             trace_phases: std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some(),
-            prelowered_inits: config
-                .prelowered
-                .iter()
-                .flat_map(|m| m.shell().functions.values())
-                .filter(|f| {
-                    f.name
-                        .resolve_global()
-                        .is_some_and(|n| crate::const_boxes::is_init_function(&n))
-                })
-                .map(|f| f.id)
-                .collect(),
             dropped_for: std::collections::HashMap::new(),
             type_registry,
             arena,
@@ -714,7 +690,8 @@ impl LoweringContext {
     /// The id a function declared under `name` lowers to: the one a
     /// prelowered module already gave it, or a fresh one.
     fn function_id_for(&self, name: InternedString) -> crate::hir::HirId {
-        self.prelowered_functions
+        self.prelowered
+            .functions
             .get(&name)
             .copied()
             .unwrap_or_else(crate::hir::HirId::new)
@@ -722,7 +699,7 @@ impl LoweringContext {
 
     /// Whether a prelowered module already holds this function's body.
     fn is_prelowered(&self, name: InternedString) -> bool {
-        self.prelowered_bodies.contains(&name)
+        self.prelowered.bodies.contains(&name)
     }
 
     /// Bring every prelowered module's globals and types into the module
@@ -734,6 +711,9 @@ impl LoweringContext {
         for prelowered in &self.config.prelowered {
             let prelowered = prelowered.shell();
             for (id, global) in &prelowered.globals {
+                if self.config.linked.contains(id) {
+                    continue;
+                }
                 self.module.globals.insert(*id, global.clone());
             }
             for (id, ty) in &prelowered.types {
@@ -747,7 +727,9 @@ impl LoweringContext {
     fn adopt_all_prelowered(&mut self) {
         for prelowered in &self.config.prelowered {
             for (id, function) in prelowered.functions() {
-                self.module.functions.insert(id, function);
+                if !self.config.linked.contains(&id) {
+                    self.module.functions.insert(id, function);
+                }
             }
         }
     }
@@ -760,15 +742,7 @@ impl LoweringContext {
     /// never rewritten. Returns whether anything was adopted.
     fn adopt_prelowered_reached(&mut self) -> bool {
         use crate::hir::{HirCallable, HirInstruction};
-        let by_id = self.prelowered_by_id.get_or_insert_with(|| {
-            self.config
-                .prelowered
-                .iter()
-                .enumerate()
-                .flat_map(|(m, module)| module.shell().functions.keys().map(move |id| (*id, m)))
-                .collect()
-        });
-        if by_id.is_empty() {
+        if self.config.prelowered.is_empty() {
             return false;
         }
         let targets_of = |function: &crate::hir::HirFunction| -> Vec<crate::hir::HirId> {
@@ -793,7 +767,13 @@ impl LoweringContext {
                 pending.extend(targets_of(function));
             }
         }
-        pending.extend(self.prelowered_inits.iter().copied());
+        pending.extend(
+            self.prelowered
+                .inits
+                .iter()
+                .filter(|id| !self.config.linked.contains(id))
+                .copied(),
+        );
         for (id, global) in &self.module.globals {
             if self.adopt_followed.insert(*id)
                 && let Some(init) = &global.initializer
@@ -803,10 +783,15 @@ impl LoweringContext {
         }
         let mut adopted = false;
         while let Some(target) = pending.pop() {
-            if self.module.functions.contains_key(&target) {
+            if self.module.functions.contains_key(&target) || self.config.linked.contains(&target) {
                 continue;
             }
-            let Some(&m) = by_id.get(&target) else {
+            let Some(m) = self
+                .config
+                .prelowered
+                .iter()
+                .position(|module| module.has_function(target))
+            else {
                 continue;
             };
             let decoding = self.trace_phases.then(web_time::Instant::now);
@@ -3026,6 +3011,10 @@ impl LoweringContext {
                     continue;
                 }
             }
+            // Installed where the module is going.
+            if self.config.linked.contains(&target) {
+                continue;
+            }
             let Some(name) = name_of.get(&target).copied() else {
                 // A target with no name behind it cannot be built by
                 // visiting a declaration.
@@ -4701,7 +4690,14 @@ impl LoweringContext {
             .globals
             .iter()
             .filter_map(|(name, id)| {
-                let ty = self.module.globals.get(id)?.ty.clone();
+                // A linked global is where the module is going, not in it.
+                let global = self.module.globals.get(id).or_else(|| {
+                    self.config
+                        .prelowered
+                        .iter()
+                        .find_map(|m| m.shell().globals.get(id))
+                })?;
+                let ty = global.ty.clone();
                 Some((*name, (*id, ty)))
             })
             .collect()
@@ -4712,7 +4708,7 @@ impl LoweringContext {
         var: &zyntax_typed_ast::TypedVariable,
     ) -> CompilerResult<()> {
         // A prelowered module's global is already in the module.
-        if let Some(id) = self.prelowered_globals.get(&var.name).copied() {
+        if let Some(id) = self.prelowered.globals.get(&var.name).copied() {
             self.symbols.globals.insert(var.name, id);
             return Ok(());
         }

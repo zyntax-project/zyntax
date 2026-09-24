@@ -848,6 +848,7 @@ impl ZyntaxRuntime {
             program,
             type_registry,
             prelowered,
+            false,
         )
     }
 

@@ -33,6 +33,12 @@ pub(crate) struct Inputs<'a> {
     pub entry_names: Vec<String>,
     /// Modules already lowered, beyond what the program's imports bring.
     pub prelowered: Vec<Arc<zyntax_compiler::bytecode::LazyModule>>,
+    /// Functions and globals of lowered imports already installed where
+    /// the program is going, which it links rather than brings.
+    pub linked: Arc<std::collections::HashSet<zyntax_compiler::hir::HirId>>,
+    /// An import naming its items brings those functions alone (see
+    /// `import_chain::process_imports_inner`).
+    pub selective: bool,
 }
 
 /// A lowered program.
@@ -138,6 +144,7 @@ pub(crate) fn lower_typed_program(
         &mut program,
         &mut type_registry,
         &mut prelowered,
+        inputs.selective,
     )?;
 
     lap("imports", &mut at);
@@ -178,6 +185,7 @@ pub(crate) fn lower_typed_program(
         use_krio_async: cfg!(feature = "krio-async-backend"),
         entry_names: inputs.entry_names,
         prelowered,
+        linked: inputs.linked,
         ..LoweringConfig::default()
     };
 

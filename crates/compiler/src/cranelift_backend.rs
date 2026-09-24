@@ -288,8 +288,9 @@ pub struct CraneliftBackend {
     /// Mapping from HIR globals to Cranelift data IDs
     global_map: HashMap<HirId, cranelift_module::DataId>,
     /// Globals the program writes and has defined, whose storage the
-    /// collector reads for pointers once it is finalized.
-    root_globals: HashSet<HirId>,
+    /// collector is to read for pointers once it is finalized, and that
+    /// it has not been handed yet.
+    roots_to_register: Vec<HirId>,
     /// Mapping from HIR values to Cranelift values
     value_map: HashMap<HirId, Value>,
     /// Mapping from HIR blocks to Cranelift blocks
@@ -600,7 +601,7 @@ impl CraneliftBackend {
             data_desc: DataDescription::new(),
             function_map: HashMap::new(),
             global_map: HashMap::new(),
-            root_globals: HashSet::new(),
+            roots_to_register: Vec::new(),
             value_map: HashMap::new(),
             block_map: HashMap::new(),
             compiled_functions: HashMap::new(),
@@ -944,8 +945,12 @@ impl CraneliftBackend {
         self.register_root_globals();
         self.publish_stubs();
 
-        // Update function pointers after finalization
-        for (hir_id, compiled_func) in &self.compiled_functions {
+        // Update function pointers after finalization: this module's,
+        // since code already finalized does not move.
+        for hir_id in module.functions.keys() {
+            let Some(compiled_func) = self.compiled_functions.get(hir_id) else {
+                continue;
+            };
             let code_ptr = self
                 .module
                 .get_finalized_function(compiled_func.function_id);
@@ -7312,20 +7317,21 @@ impl CraneliftBackend {
             .map_err(|e| CompilerError::CodeGen(format!("Failed to define global: {}", e)))?;
         // A dispatch table holds code addresses, never heap ones.
         if !global.is_const && !matches!(&global.initializer, Some(HirConstant::VTable(_))) {
-            self.root_globals.insert(id);
+            self.roots_to_register.push(id);
         }
 
         Ok(())
     }
 
-    /// Hand the collector the storage of every mutable global, once
-    /// the module is finalized and the storage has its address.
-    fn register_root_globals(&self) {
+    /// Hand the collector the storage of every mutable global defined
+    /// since the last time, once the module is finalized and the
+    /// storage has its address.
+    fn register_root_globals(&mut self) {
         if !crate::collector::is_enabled() {
             return;
         }
-        for id in &self.root_globals {
-            if let Some(&data_id) = self.global_map.get(id) {
+        for id in std::mem::take(&mut self.roots_to_register) {
+            if let Some(&data_id) = self.global_map.get(&id) {
                 let (ptr, len) = self.module.get_finalized_data(data_id);
                 crate::collector::add_root_range(ptr, len);
             }
@@ -10426,7 +10432,7 @@ impl CraneliftBackend {
         // Clear state that depends on the old module
         self.function_map.clear();
         self.global_map.clear();
-        self.root_globals.clear();
+        self.roots_to_register.clear();
         self.compiled_functions.clear();
         self.unpublished.clear();
         // Note: hot_reload.function_pointers still has the old pointers

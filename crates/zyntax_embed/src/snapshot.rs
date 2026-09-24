@@ -234,6 +234,16 @@ impl Snapshot {
     /// with it when this compiler can use it; otherwise the module
     /// arrives parsed only and is lowered like any other import.
     pub fn module(&self, name: &str) -> Result<Option<CompiledImport>, SnapshotError> {
+        self.module_selecting(name, None)
+    }
+
+    /// [`Self::module`], keeping of its functions only those `named`
+    /// names when that is given and the module arrives lowered.
+    pub(crate) fn module_selecting(
+        &self,
+        name: &str,
+        named: Option<&std::collections::HashSet<zyntax_typed_ast::InternedString>>,
+    ) -> Result<Option<CompiledImport>, SnapshotError> {
         let Some(index) = self.modules.iter().position(|m| m.name == name) else {
             return Ok(None);
         };
@@ -270,7 +280,14 @@ impl Snapshot {
                 Ok(import.with_hir(Arc::new(hir)))
             })
             .as_ref()
-            .map(|module| Some(module.clone()))
+            .map(|module| {
+                // A module lowered here is linked, so what it does not
+                // name is not needed to lower it; one parsed only is.
+                Some(match named {
+                    Some(named) if module.hir().is_some() => module.selecting(named),
+                    _ => module.clone(),
+                })
+            })
             .map_err(|e| SnapshotError::Decode(e.clone()))
     }
 
@@ -386,6 +403,8 @@ pub fn lower_for_snapshot_releasing(
             ),
             entry_names: Vec::new(),
             prelowered,
+            linked: Arc::default(),
+            selective: false,
         },
     )
     .map_err(|e| SnapshotError::Lowering {

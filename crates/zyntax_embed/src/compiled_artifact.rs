@@ -96,6 +96,34 @@ impl CompiledImport {
         self.program
     }
 
+    /// A copy whose program keeps, of its functions, those `named`
+    /// names; everything else it declares comes whole.
+    pub(crate) fn selecting(&self, named: &std::collections::HashSet<InternedString>) -> Self {
+        use zyntax_typed_ast::TypedDeclaration;
+        let program = TypedProgram {
+            declarations: self
+                .program
+                .declarations
+                .iter()
+                .filter(|decl| match &decl.node {
+                    TypedDeclaration::Function(function) => named.contains(&function.name),
+                    _ => true,
+                })
+                .cloned()
+                .collect(),
+            language: self.program.language,
+            span: self.program.span,
+            source_files: self.program.source_files.clone(),
+            type_registry: self.program.type_registry.clone(),
+        };
+        Self {
+            language: self.language.clone(),
+            module_name: self.module_name.clone(),
+            program,
+            hir: self.hir.clone(),
+        }
+    }
+
     /// Encode an artifact for `include_bytes!` or another deployment bundle.
     pub fn encode(&self) -> Result<Vec<u8>, CompiledArtifactError> {
         let payload = CompiledImportPayload {

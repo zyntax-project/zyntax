@@ -1572,6 +1572,7 @@ pub fn compile_to_hir(
         use_krio_async: config.use_krio_async,
         entry_names: Vec::new(),
         prelowered: Vec::new(),
+        linked: Arc::default(),
     };
 
     // Create arena for string interning (needed for async transformation)

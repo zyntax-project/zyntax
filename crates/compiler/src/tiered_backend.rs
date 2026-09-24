@@ -818,19 +818,24 @@ impl TieredBackend {
         module: HirModule,
         reachable: Option<HashSet<HirId>>,
     ) -> CompilerResult<()> {
-        self.compile_module_lazily(module, reachable, HashSet::new(), HashSet::new())
+        self.compile_module_lazily(module, reachable, HashSet::new(), HashSet::new(), false)
     }
 
     /// [`Self::compile_module_reaching`] with `lazy` naming functions to
     /// compile on their first call instead of now: each gets a stub in
     /// its cell, and the first call through it optimises and compiles
     /// the body (see `dce::cold_only_function_ids` for who qualifies).
+    ///
+    /// `joining` adds a module to the one running, which stays the
+    /// module the tiers above and a reload work from; its functions stay
+    /// at the tier they are compiled at here.
     pub fn compile_module_lazily(
         &mut self,
         module: HirModule,
         reachable: Option<HashSet<HirId>>,
         lazy: HashSet<HirId>,
         finished: HashSet<HirId>,
+        joining: bool,
     ) -> CompilerResult<()> {
         if self.config.verbosity >= 1 {
             eprintln!(
@@ -941,14 +946,18 @@ impl TieredBackend {
         // earlier file and restored only the newest, which is the
         // behaviour this list exists to fix.
         let module_context = Arc::new(module);
-        self.current_module = Some(Arc::clone(&module_context));
+        if !joining || self.current_module.is_none() {
+            self.current_module = Some(Arc::clone(&module_context));
+        }
         self.loaded.push(Arc::clone(&module_context));
 
         // Hand the LLVM tier the whole module before anything promotes out
         // of it: a promotion recompiles one function, and that function's
         // callees have to come with it.
         #[cfg(feature = "llvm-backend")]
-        if let Some(llvm) = &self.llvm {
+        if let Some(llvm) = &self.llvm
+            && !joining
+        {
             // A promotion compiles one function and reaches the rest
             // through the ground tier's cells and globals.
             let key = self.cranelift.with_lock(|be| be.reload_key());
@@ -1020,7 +1029,9 @@ impl TieredBackend {
             let (all_lazy, all_finished) = (self.lazy.clone(), self.finished.clone());
             self.install_lazy_compiler(&all_lazy, &all_finished);
         }
-        self.install_promotion_requester();
+        if !joining {
+            self.install_promotion_requester();
+        }
         if trace {
             eprintln!(
                 "[OPT] codegen: registration {:8.2} ms",
