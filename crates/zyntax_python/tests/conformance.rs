@@ -281,5 +281,6 @@ categories! {
     iteration,
     modules,
     inference,
+    array,
     json,
 }

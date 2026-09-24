@@ -231,6 +231,8 @@ pub fn array_tag(storage: Kind, letter: u8) -> i64 {
 }
 /// The box category of None, the low byte of its tag.
 pub const NONE_CATEGORY: i64 = dynamic::NONE;
+/// The box category of a bytes value.
+pub const BYTES_CATEGORY: i64 = bytes::BYTES;
 
 /// The box tag of an instance of the frontend's class `index`.
 pub fn instance_tag(index: usize) -> i64 {

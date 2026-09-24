@@ -730,6 +730,12 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
         unit(),
         vec![ret_void()],
     ));
+    d.push(define(
+        "zb_hook_shaped_getslice",
+        &[&x, &start, &stop, &step, &mask],
+        any(),
+        vec![ret(nil())],
+    ));
     d
 }
 

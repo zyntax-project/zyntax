@@ -2523,6 +2523,21 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             anys.clone(),
         )
     };
+    let slice_kind = |k: Kind| {
+        let sliced = call(
+            &format!("zb_list_slice_{}", k.suffix()),
+            vec![unbox(k, x.e()), start.e(), stop.e(), step.e(), mask.e()],
+            list_of(list_type, k.ty()),
+        );
+        when(
+            kind_is(k, x.e()),
+            vec![ret(call(
+                &format!("zb_list_box_{}", k.suffix()),
+                vec![sliced],
+                any(),
+            ))],
+        )
+    };
     // `x[start:stop:step] = ys`: the values read as the list's kind.
     let ys = borrowed("ys", anys.clone());
     let assign_kind = |k: Kind| {
@@ -2620,6 +2635,19 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![ret(call(
                     "zb_box_tuple",
                     vec![slice_any(call("zb_unbox_tuple", vec![x.e()], anys.clone()))],
+                    any(),
+                ))],
+            ),
+            // A typed list's slice keeps its kind: the elements copied
+            // are the slice's, never the whole list boxed first.
+            slice_kind(Kind::Int),
+            slice_kind(Kind::Float),
+            slice_kind(Kind::Str),
+            when(
+                is_shaped(x.e()),
+                vec![ret(call(
+                    "zb_hook_shaped_getslice",
+                    vec![x.e(), start.e(), stop.e(), step.e(), mask.e()],
                     any(),
                 ))],
             ),

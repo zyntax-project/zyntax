@@ -1749,12 +1749,21 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
     let mut append = Vec::new();
     let mut repr = Vec::new();
     let mut assign_slice = Vec::new();
+    let mut getslice = Vec::new();
     // `x[a:b:c] = ys` on a list of kind `e`: the values read as `e`.
     let ys = var(intern("ys"), Ty::List(Elem::Object), span);
     let bounds: Vec<Node> = ["start", "stop", "step", "mask"]
         .iter()
         .map(|n| var(intern(n), Ty::Int, span))
         .collect();
+    // The box's whole tag: its kind above the custom category.
+    let tag = binary(
+        BinaryOp::BitOr,
+        binary(BinaryOp::Shl, kind.clone(), int_lit(8, span), Ty::Int, span),
+        int_lit(255, span),
+        Ty::Int,
+        span,
+    );
     let assign_arm = |test: Node, e: Elem, raw: Node| {
         let typed = call(
             &lower::list_fn("from_any", e),
@@ -1920,6 +1929,30 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
             )],
             span,
         ));
+        // A slice is an array of the same typecode: the storage's slice,
+        // boxed under the tag the source carries.
+        let mut slice_args = vec![raw()];
+        slice_args.extend(bounds.iter().cloned());
+        getslice.push(when(
+            is_array_of(storage),
+            vec![ret(
+                call(
+                    &format!("zb_list_box_tagged_{suffix}"),
+                    vec![
+                        typed_call(
+                            &format!("zb_list_slice_{suffix}"),
+                            slice_args,
+                            list_ty.clone(),
+                        ),
+                        tag.clone(),
+                    ],
+                    Ty::Object,
+                    span,
+                ),
+                span,
+            )],
+            span,
+        ));
         set.push(when(
             is_array_of(storage),
             vec![
@@ -2063,6 +2096,26 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
             span,
         ));
         assign_slice.push(assign_arm(is_shape(k), e, raw(k)));
+        let mut slice_args = vec![raw(k)];
+        slice_args.extend(bounds.iter().cloned());
+        getslice.push(when(
+            is_shape(k),
+            vec![ret(
+                call(
+                    &lower::list_fn("box", e),
+                    vec![call(
+                        &lower::list_fn("slice", e),
+                        slice_args,
+                        Ty::List(e),
+                        span,
+                    )],
+                    Ty::Object,
+                    span,
+                ),
+                span,
+            )],
+            span,
+        ));
         append.push(when(
             is_shape(k),
             vec![
@@ -2101,7 +2154,29 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
     repr.push(ret(str_lit("", span), span));
     assign_slice.push(unknown());
     assign_slice.push(ret_void(span));
+    getslice.push(unknown());
+    getslice.push(ret(
+        node(
+            TypedExpression::Literal(TypedLiteral::Null),
+            Ty::Object,
+            span,
+        ),
+        span,
+    ));
+    let mut getslice_params = vec![param("x", Ty::Object, span)];
+    getslice_params.extend(
+        ["start", "stop", "step", "mask"]
+            .iter()
+            .map(|n| param(n, Ty::Int, span)),
+    );
     vec![
+        function(
+            "zb_hook_shaped_getslice",
+            getslice_params,
+            Ty::Object,
+            getslice,
+            span,
+        ),
         function(
             "zb_hook_shaped_assign_slice",
             vec![

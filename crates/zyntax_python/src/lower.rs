@@ -5287,88 +5287,59 @@ impl<'m> Lowerer<'m> {
                 call(&list_fn("copy", elem), vec![source.node], target, span)
             }
             Ty::List(_) | Ty::Tuple(_) => self.coerce(source, target),
-            // A dynamic iterable, a set or a generator: its items first.
-            Ty::Set | Ty::Object | Ty::Gen => {
+            // A set or a generator: its items first.
+            Ty::Set | Ty::Gen => {
                 let items = Val {
                     node: self.iterable(source, span),
                     ty: Ty::List(Elem::Object),
                 };
                 self.coerce(items, target)
             }
-            // Bytes are the array's storage, as `frombytes` reads them:
-            // a list of zeros of the length they fill, then the copy.
-            Ty::Bytes => {
+            // A dynamic value: bytes are copied as the typed bytes are,
+            // anything else goes through its items.
+            Ty::Object => {
                 let mut pre = Vec::new();
-                let data = self.hold(source, &mut pre, span);
-                let size = call("zb_str_len", vec![data.node.clone()], Ty::Int, span);
-                let count = binary(
-                    BinaryOp::Div,
-                    size.clone(),
-                    int_lit(code.itemsize(), span),
-                    Ty::Int,
-                    span,
-                );
-                let ragged = binary(
-                    BinaryOp::Ne,
-                    binary(
-                        BinaryOp::Rem,
-                        size,
-                        int_lit(code.itemsize(), span),
-                        Ty::Int,
-                        span,
-                    ),
-                    int_lit(0, span),
+                let x = self.hold(source, &mut pre, span);
+                self.hoisted.extend(pre);
+                let is_bytes = binary(
+                    BinaryOp::Eq,
+                    call("zb_any_category", vec![x.node.clone()], Ty::Int, span),
+                    int_lit(zyntax_builtins::BYTES_CATEGORY, span),
                     Ty::Bool,
                     span,
                 );
-                let mut raise = Vec::new();
-                self.raise_named(
-                    "ValueError",
-                    str_lit("bytes length not a multiple of item size", span),
-                    span,
-                    &mut raise,
-                );
-                pre.push(TypedNode::new(
-                    TypedStatement::If(TypedIf {
-                        condition: Box::new(ragged),
-                        then_block: TypedBlock {
-                            statements: raise,
-                            span,
-                        },
-                        else_block: None,
-                        span,
-                    }),
-                    Type::Unknown,
-                    span,
-                ));
-                let zero = Val {
-                    node: int_lit(0, span),
-                    ty: Ty::Int,
+                let bytes = Val {
+                    node: call("zb_box_get_str", vec![x.node.clone()], Ty::Bytes, span),
+                    ty: Ty::Bytes,
                 };
-                let one = self.list_of(vec![zero], elem, span);
-                let zeros = call(&list_fn("repeat", elem), vec![one, count], target, span);
-                let xs = self.hold(
-                    Val {
-                        node: zeros,
-                        ty: target,
-                    },
-                    &mut pre,
+                // What a branch hoists runs only when that branch does.
+                let outer = std::mem::take(&mut self.hoisted);
+                let mut copy = Vec::new();
+                let copied = self.array_from_bytes(bytes, code, span, &mut copy);
+                let mut then_pre = std::mem::take(&mut self.hoisted);
+                then_pre.append(&mut copy);
+                let items = Val {
+                    node: self.iterable(x, span),
+                    ty: Ty::List(Elem::Object),
+                };
+                let converted = self.coerce(items, target);
+                let else_pre = std::mem::replace(&mut self.hoisted, outer);
+                let mut out = Vec::new();
+                let value = self.conditional_value(
+                    is_bytes,
+                    (then_pre, copied),
+                    (else_pre, converted),
+                    target,
                     span,
+                    &mut out,
                 );
-                pre.push(TypedNode::new(
-                    TypedStatement::Expression(Box::new(call(
-                        "zb_bytes_copy_out",
-                        vec![
-                            data.node,
-                            crate::bytes::field(xs.node.clone(), "data", Ty::Int, span),
-                        ],
-                        Ty::Int,
-                        span,
-                    ))),
-                    Type::Unknown,
-                    span,
-                ));
-                Self::block_value(pre, xs.node, target, span)
+                self.hoisted.extend(out);
+                value
+            }
+            Ty::Bytes => {
+                let mut pre = Vec::new();
+                let value = self.array_from_bytes(source, code, span, &mut pre);
+                Self::block_value(pre, value, target, span)
             }
             Ty::Str => {
                 return unsupported("array() from a string", init);
@@ -5378,6 +5349,90 @@ impl<'m> Lowerer<'m> {
             }
         };
         Ok(Val { node, ty: target })
+    }
+
+    /// The array of `code` holding `data`'s bytes as `frombytes` reads
+    /// them: a list of zeros of the length they fill, then the copy. The
+    /// statements go to `out`; the value is the list.
+    fn array_from_bytes(
+        &mut self,
+        data: Val,
+        code: crate::types::Code,
+        span: Span,
+        out: &mut Vec<Stmt>,
+    ) -> Node {
+        let elem = Elem::Array(code);
+        let target = Ty::List(elem);
+        let data = self.hold(data, out, span);
+        let size = call("zb_str_len", vec![data.node.clone()], Ty::Int, span);
+        let count = binary(
+            BinaryOp::Div,
+            size.clone(),
+            int_lit(code.itemsize(), span),
+            Ty::Int,
+            span,
+        );
+        let ragged = binary(
+            BinaryOp::Ne,
+            binary(
+                BinaryOp::Rem,
+                size,
+                int_lit(code.itemsize(), span),
+                Ty::Int,
+                span,
+            ),
+            int_lit(0, span),
+            Ty::Bool,
+            span,
+        );
+        let mut raise = Vec::new();
+        self.raise_named(
+            "ValueError",
+            str_lit("bytes length not a multiple of item size", span),
+            span,
+            &mut raise,
+        );
+        out.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(ragged),
+                then_block: TypedBlock {
+                    statements: raise,
+                    span,
+                },
+                else_block: None,
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        let zero = Val {
+            node: int_lit(0, span),
+            ty: Ty::Int,
+        };
+        let one = self.list_of(vec![zero], elem, span);
+        let zeros = call(&list_fn("repeat", elem), vec![one, count], target, span);
+        let xs = self.hold(
+            Val {
+                node: zeros,
+                ty: target,
+            },
+            out,
+            span,
+        );
+        out.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(call(
+                "zb_bytes_copy_out",
+                vec![
+                    data.node,
+                    crate::bytes::field(xs.node.clone(), "data", Ty::Int, span),
+                ],
+                Ty::Int,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        ));
+        xs.node
     }
 
     /// A call to a module's function: arguments converted to the
