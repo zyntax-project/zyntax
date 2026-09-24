@@ -1,10 +1,13 @@
-//! Class aliases. `Canvas = PpmCanvas` names the class under another
-//! name; where that name is assigned nothing else in its scope, every
-//! read of it is the class, and the program is rewritten to say so
-//! before inference. Classes are not values here, so an alias that
-//! could not be resolved this way would be a dynamic value that cannot
-//! be called.
+//! Class and builtin aliases. `Canvas = PpmCanvas` names the class
+//! under another name, `xrange = range` a builtin; where that name is
+//! assigned nothing else in its scope, every read of it is the class or
+//! builtin, and the program is rewritten to say so before inference.
+//! Classes are not values here, so an alias that could not be resolved
+//! this way would be a dynamic value that cannot be called; a builtin
+//! read through an alias is a value, but only under its own name does
+//! `for i in range(n)` count instead of building the list.
 
+use crate::types;
 use ruff_python_ast as py;
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr, walk_stmt};
 use ruff_python_ast::visitor::{Visitor, walk_stmt as walk_stmt_ref};
@@ -20,75 +23,84 @@ pub(crate) fn rewrite(body: &mut [py::Stmt]) {
             _ => None,
         })
         .collect();
-    if classes.is_empty() {
-        return;
+    // A builtin nothing in the module rebinds under its own name.
+    let mut module_stores = HashMap::default();
+    for s in body.iter() {
+        count_stores(s, &mut module_stores);
     }
+    let mut named: HashSet<String> = classes;
+    named.extend(
+        types::BUILTIN_VALUES
+            .iter()
+            .filter(|b| !module_stores.contains_key(**b))
+            .map(|b| b.to_string()),
+    );
     // Module-level aliases: names no function writes through `global`.
     let mut written_globally = HashSet::default();
     for s in body.iter() {
         globals_declared(s, &mut written_globally);
     }
-    scope(body, &classes, &written_globally);
+    scope(body, &named, &written_globally);
     for s in body.iter_mut() {
-        functions(s, &classes);
+        functions(s, &named);
     }
 }
 
 /// Every function body under `s`, innermost last.
-fn functions(s: &mut py::Stmt, classes: &HashSet<String>) {
+fn functions(s: &mut py::Stmt, named: &HashSet<String>) {
     match s {
         py::Stmt::FunctionDef(f) => {
             let mut declared = HashSet::default();
             for inner in f.body.iter() {
                 globals_declared(inner, &mut declared);
             }
-            scope(&mut f.body, classes, &declared);
+            scope(&mut f.body, named, &declared);
             for inner in f.body.iter_mut() {
-                functions(inner, classes);
+                functions(inner, named);
             }
         }
         py::Stmt::ClassDef(c) => {
             for inner in c.body.iter_mut() {
-                functions(inner, classes);
+                functions(inner, named);
             }
         }
         py::Stmt::If(i) => {
             for inner in i.body.iter_mut() {
-                functions(inner, classes);
+                functions(inner, named);
             }
             for clause in i.elif_else_clauses.iter_mut() {
                 for inner in clause.body.iter_mut() {
-                    functions(inner, classes);
+                    functions(inner, named);
                 }
             }
         }
         py::Stmt::For(f) => {
             for inner in f.body.iter_mut().chain(f.orelse.iter_mut()) {
-                functions(inner, classes);
+                functions(inner, named);
             }
         }
         py::Stmt::While(w) => {
             for inner in w.body.iter_mut().chain(w.orelse.iter_mut()) {
-                functions(inner, classes);
+                functions(inner, named);
             }
         }
         py::Stmt::With(w) => {
             for inner in w.body.iter_mut() {
-                functions(inner, classes);
+                functions(inner, named);
             }
         }
         py::Stmt::Try(t) => {
             for inner in t.body.iter_mut() {
-                functions(inner, classes);
+                functions(inner, named);
             }
             for h in t.handlers.iter_mut() {
                 let py::ExceptHandler::ExceptHandler(h) = h;
                 for inner in h.body.iter_mut() {
-                    functions(inner, classes);
+                    functions(inner, named);
                 }
             }
             for inner in t.orelse.iter_mut().chain(t.finalbody.iter_mut()) {
-                functions(inner, classes);
+                functions(inner, named);
             }
         }
         _ => {}
@@ -111,11 +123,12 @@ fn globals_declared(s: &py::Stmt, out: &mut HashSet<String>) {
     G(out).visit_stmt(s);
 }
 
-/// One scope's aliases: `x = C` statements whose `x` nothing else in
-/// the scope stores to. Nested function bodies are part of the scope
-/// for counting (a closure may write through `nonlocal`, which is in
-/// `excluded`) and for renaming, since they read the enclosing name.
-fn scope(body: &mut [py::Stmt], classes: &HashSet<String>, excluded: &HashSet<String>) {
+/// One scope's aliases: `x = C` statements, `C` a class or builtin in
+/// `named`, whose `x` nothing else in the scope stores to. Nested
+/// function bodies are part of the scope for counting (a closure may
+/// write through `nonlocal`, which is in `excluded`) and for renaming,
+/// since they read the enclosing name.
+fn scope(body: &mut [py::Stmt], named: &HashSet<String>, excluded: &HashSet<String>) {
     let mut stores: HashMap<String, usize> = HashMap::default();
     for s in body.iter() {
         count_stores(s, &mut stores);
@@ -125,8 +138,8 @@ fn scope(body: &mut [py::Stmt], classes: &HashSet<String>, excluded: &HashSet<St
         if let py::Stmt::Assign(a) = s
             && let [py::Expr::Name(target)] = a.targets.as_slice()
             && let py::Expr::Name(class) = &*a.value
-            && classes.contains(class.id.as_str())
-            && !classes.contains(target.id.as_str())
+            && named.contains(class.id.as_str())
+            && !named.contains(target.id.as_str())
             && !excluded.contains(target.id.as_str())
             && stores.get(target.id.as_str()) == Some(&1)
         {
@@ -189,8 +202,8 @@ fn count_stores(s: &py::Stmt, out: &mut HashMap<String, usize>) {
     C(out).visit_stmt(s);
 }
 
-/// Replaces reads of an alias by the class it names. A nested function
-/// whose parameter shadows the alias keeps its own name.
+/// Replaces reads of an alias by the class or builtin it names. A
+/// nested function whose parameter shadows the alias keeps its own name.
 struct Renamer {
     aliases: RefCell<HashMap<String, String>>,
 }

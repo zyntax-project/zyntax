@@ -4615,11 +4615,12 @@ impl<'m> Lowerer<'m> {
             && self.var_ty(target.id.as_str()) == Ty::Int
             && !body_writes_target
             && step_sign.is_some_and(|sign| sign != 0);
-        // A direct loop leaves the target one step past the last value
-        // it ran with; Python leaves the last value, and the start
-        // untouched when the range was empty. The bounds are held so
-        // the loop's end can be put right.
-        let (start, end, step, fixup) = if direct {
+        // A direct loop assigns the target the start and leaves it one
+        // step past the last value it ran with; Python leaves the target
+        // as it was when the range is empty, else the last value. The
+        // bounds are held so the loop runs only when the range is not
+        // empty and its end can be put right.
+        let (start, end, step, ran, fixup) = if direct {
             let held_start = self.hold(
                 Val {
                     node: start,
@@ -4691,9 +4692,11 @@ impl<'m> Lowerer<'m> {
                 Ty::Int,
                 span,
             );
+            // A `break` leaves the counter at the value it ran with,
+            // short of the end; only a run to the end steps back.
             let fixup = TypedNode::new(
                 TypedStatement::If(TypedIf {
-                    condition: Box::new(binary(BinaryOp::And, past_end, ran, Ty::Bool, span)),
+                    condition: Box::new(past_end),
                     then_block: TypedBlock {
                         statements: vec![TypedNode::new(
                             TypedStatement::Expression(Box::new(binary(
@@ -4714,9 +4717,15 @@ impl<'m> Lowerer<'m> {
                 Type::Unknown,
                 span,
             );
-            (held_start.node, held_end.node, step_node, Some(fixup))
+            (
+                held_start.node,
+                held_end.node,
+                step_node,
+                Some(ran),
+                Some(fixup),
+            )
         } else {
-            (start, end, step, None)
+            (start, end, step, None, None)
         };
         let name = if direct {
             let name = self.local_symbol(target.id.as_str());
@@ -4773,12 +4782,30 @@ impl<'m> Lowerer<'m> {
             )),
             body,
         });
-        if pre.is_empty() && fixup.is_none() {
-            return Ok(loop_stmt);
-        }
+        let Some(ran) = ran else {
+            if pre.is_empty() {
+                return Ok(loop_stmt);
+            }
+            let mut statements = pre;
+            statements.push(TypedNode::new(loop_stmt, Type::Unknown, span));
+            return Ok(TypedStatement::Block(TypedBlock { statements, span }));
+        };
+        let mut guarded = vec![TypedNode::new(loop_stmt, Type::Unknown, span)];
+        guarded.extend(fixup);
         let mut statements = pre;
-        statements.push(TypedNode::new(loop_stmt, Type::Unknown, span));
-        statements.extend(fixup);
+        statements.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(ran),
+                then_block: TypedBlock {
+                    statements: guarded,
+                    span,
+                },
+                else_block: None,
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
         Ok(TypedStatement::Block(TypedBlock { statements, span }))
     }
 
@@ -8191,6 +8218,16 @@ impl<'m> Lowerer<'m> {
                     }
                     _ => {}
                 }
+                let callee = self.expr(&c.func)?;
+                return self.call_value(callee, args, keywords, c, span);
+            }
+            // `range` given arguments it does not take is called through
+            // its value, whose call raises the TypeError when it runs.
+            if name == "range"
+                && !self.module.funcs.contains_key(name)
+                && !self.module.class_index.contains_key(name)
+                && !self.builtin_takes(name, c)
+            {
                 let callee = self.expr(&c.func)?;
                 return self.call_value(callee, args, keywords, c, span);
             }
