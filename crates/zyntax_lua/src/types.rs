@@ -1523,7 +1523,8 @@ impl<'a> Round<'a> {
 
     /// What reaches the shapes the types lost track of: a table of an
     /// escaping shape may take the stores made through receivers the
-    /// types do not know, get any metatable set that way, and have
+    /// types do not know, get any metatable set that way or through a
+    /// `setmetatable` the types do not follow, and have
     /// its fields read and its methods called that way. What such a
     /// table holds escapes with it; its classes are reached through
     /// `getmetatable`.
@@ -1597,7 +1598,9 @@ impl<'a> Round<'a> {
                         _ => {}
                     }
                 }
-                if self.out.blind_setmetatable && !self.out.shapes[k].unknown_meta {
+                if (self.out.blind_setmetatable || self.scopes.unseen_metatables || dynamic_code)
+                    && !self.out.shapes[k].unknown_meta
+                {
                     self.out.shapes[k].unknown_meta = true;
                     changed = true;
                 }

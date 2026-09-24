@@ -152,6 +152,12 @@ pub struct Scopes {
     /// `loadfile`, `dofile`, or `require` of a name that is not a
     /// literal. What that code defines is not known here.
     pub dynamic_code: bool,
+    /// Whether a metatable may be set where the types do not follow:
+    /// `setmetatable` or the `debug` library reached as a value, not
+    /// called by name, or the globals table or `package` used, from
+    /// which either can be fetched. Set by the program's assembly too
+    /// when another of its files may set one.
+    pub unseen_metatables: bool,
     /// Whether `#` on a table may be whatever a `__len` metamethod
     /// returns, of any type: some source of the program names one, or
     /// code loaded while it runs might. Set by the program's assembly
@@ -270,6 +276,53 @@ fn global_table_member(w: &Walker, v: &ast::VarExpression) -> Option<String> {
     }
 }
 
+/// Whether the global `name` with these suffixes is a call the types
+/// follow without taking `name` as a value: `setmetatable(t, m)` as a
+/// whole expression, `require "file"` as a whole expression (a file
+/// of the program, whose own metatable calls the program's assembly
+/// accounts for), or a `debug` function that hands
+/// back no way to set a metatable (`debug.setmetatable(t, m)` again
+/// only as a whole expression).
+fn metatable_call(name: &str, suffixes: &[&Suffix]) -> bool {
+    let parenthesized = |s: &Suffix| {
+        matches!(
+            s,
+            Suffix::Call(ast::Call::AnonymousCall(
+                ast::FunctionArgs::Parentheses { .. }
+            ))
+        )
+    };
+    match (name, suffixes) {
+        ("setmetatable", [call]) => parenthesized(call),
+        ("require", [Suffix::Call(ast::Call::AnonymousCall(args))]) => {
+            let file = match args {
+                ast::FunctionArgs::String(s) => literal_string_token(s),
+                ast::FunctionArgs::Parentheses { arguments, .. } => {
+                    arguments.iter().next().and_then(literal_string)
+                }
+                _ => None,
+            };
+            file.is_some_and(|f| !matches!(f.as_str(), "debug" | "_G" | "package"))
+        }
+        (
+            "debug",
+            [
+                Suffix::Index(ast::Index::Dot { name: member, .. }),
+                call,
+                rest @ ..,
+            ],
+        ) => {
+            parenthesized(call)
+                && match name_of(member).as_str() {
+                    "setmetatable" => rest.is_empty(),
+                    "getmetatable" | "traceback" | "getinfo" | "sethook" | "gethook" => true,
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
 /// The text of a string literal expression.
 pub fn literal_string(e: &Expression) -> Option<String> {
     let Expression::String(token) = e else {
@@ -298,12 +351,17 @@ struct Frame {
 struct Walker {
     out: Scopes,
     frames: Vec<Frame>,
+    /// The name tokens, by offset, that are the callee of a call the
+    /// types follow as a metatable function (`setmetatable(t, m)`,
+    /// `debug.setmetatable(t, m)`): not a use of it as a value.
+    metatable_callees: HashSet<usize>,
 }
 
 pub fn resolve(ast: &ast::Ast) -> Scopes {
     let mut w = Walker {
         out: Scopes::default(),
         frames: Vec::new(),
+        metatable_callees: HashSet::new(),
     };
     w.out.funcs.push(FuncInfo {
         params: Vec::new(),
@@ -439,8 +497,33 @@ impl Walker {
         {
             self.out.dynamic_code = true;
         }
+        if let Binding::Global(name) = &binding
+            && !self.metatable_callees.contains(&pos_of(token))
+        {
+            self.global_value(name);
+        }
         self.out.names.insert(pos_of(token), binding.clone());
         binding
+    }
+
+    /// The global `name` taken as a value: when it is a way to set a
+    /// metatable, metatables may be set where the types do not see.
+    fn global_value(&mut self, name: &str) {
+        if Scopes::is_globals_name(name)
+            || matches!(name, "setmetatable" | "debug" | "package" | "require")
+        {
+            self.out.unseen_metatables = true;
+        }
+    }
+
+    /// A name called in a way the types follow as a metatable call is
+    /// not a use of it as a value.
+    fn note_metatable_callee(&mut self, prefix: &Prefix, suffixes: &[&Suffix]) {
+        if let Prefix::Name(callee) = prefix
+            && metatable_call(&name_of(callee), suffixes)
+        {
+            self.metatable_callees.insert(pos_of(callee));
+        }
     }
 
     /// Whether a local of this name is in scope.
@@ -774,10 +857,13 @@ impl Walker {
                     .names
                     .insert(pos_of(token), Binding::Global(name_of(token)));
             }
+            self.global_value(&name);
             self.out.mentioned.insert(name.clone());
             self.out.globals.insert(name);
             return;
         }
+        let suffixes: Vec<&Suffix> = v.suffixes().collect();
+        self.note_metatable_callee(v.prefix(), &suffixes);
         self.prefix(v.prefix());
         for s in v.suffixes() {
             self.suffix(s);
@@ -825,6 +911,9 @@ impl Walker {
             self.use_name(callee);
             let binding = self.lookup(&name_of(g));
             self.out.names.insert(pos_of(g), binding);
+            if name == "rawget" {
+                self.global_value(&member);
+            }
             self.out.mentioned.insert(member.clone());
             self.out.globals.insert(member.clone());
             if name == "rawset" {
@@ -835,6 +924,7 @@ impl Walker {
             }
             return;
         }
+        self.note_metatable_callee(c.prefix(), &suffixes);
         self.prefix(c.prefix());
         for s in suffixes {
             self.suffix(s);
@@ -945,4 +1035,53 @@ fn returns_functions(block: &Block) -> bool {
         Stmt::GenericFor(f) => returns_functions(f.block()),
         _ => true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    fn unseen(source: &str) -> bool {
+        let ast = full_moon::parse_fallible(source, full_moon::LuaVersion::lua54())
+            .into_result()
+            .expect("parses");
+        super::resolve(&ast).unseen_metatables
+    }
+
+    #[test]
+    fn metatable_calls_by_name_are_followed() {
+        for source in [
+            "local t = setmetatable({}, {})",
+            "setmetatable(t, mt)",
+            "debug.setmetatable(t, mt)",
+            "debug.getmetatable(t).x = 1",
+            "print(debug.traceback())",
+            "local m = require \"lib.mod\"",
+            "local m = require(\"lib.mod\")",
+            "local _G = {}; _G.x = setmetatable({}, {})",
+        ] {
+            assert!(!unseen(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn metatable_functions_taken_as_values_are_not() {
+        for source in [
+            "local sm = setmetatable",
+            "pcall(setmetatable, t, mt)",
+            "(setmetatable)(t, mt)",
+            "local x = setmetatable(t, mt).f",
+            "setmetatable(t, mt):m()",
+            "local d = debug",
+            "debug.setmetatable(t, mt).f = 1",
+            "debug.getupvalue(f, 1)",
+            "local f = _G.setmetatable",
+            "local f = rawget(_G, \"setmetatable\")",
+            "local g = _G",
+            "local d = package.loaded.debug",
+            "local d = require \"debug\"",
+            "local f = require(\"lib.mod\").f",
+            "local r = require",
+        ] {
+            assert!(unseen(source), "{source}");
+        }
+    }
 }

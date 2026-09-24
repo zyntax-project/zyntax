@@ -17,9 +17,8 @@ false	absent_field.lua:79: attempt to index a nil value (local 'a')
 false	absent_field.lua:80: attempt to index a nil value (local 'a')
 true	3
 nil	3
-false	bad argument #2 to 'setmetatable' (nil or table expected, got number)
-false	absent_field.lua:91: bad argument #2 to 'setmetatable' (nil or table expected, got number)
-locked	false	cannot change a protected metatable
+false	absent_field.lua:90: bad argument #2 to 'setmetatable' (nil or table expected, got number)
+locked	false	absent_field.lua:92: cannot change a protected metatable
 1	2	20
 15	5	15
 count=5 total=15

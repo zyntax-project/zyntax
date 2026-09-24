@@ -1,0 +1,13 @@
+1	7	7	nil
+2	true
+2	via pcall f
+2	false	bad argument #2 to 'setmetatable' (nil or table expected, got number)
+2	locked	false	cannot change a protected metatable
+3	nil
+3	9	9
+4	nil
+4	3
+5	3
+5	42
+6	61	62	63	64
+7	71	71

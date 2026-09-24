@@ -87,10 +87,9 @@ local p = setmetatable({x = 1, y = 2}, Point)
 print(getmetatable(p) == Point, p:sum())
 local q = setmetatable({x = 3}, nil)
 print(getmetatable(q), q.x)
-print(pcall(setmetatable, {x = 1}, 5))
 print(pcall(function() return setmetatable({x = 1}, 5) end))
 local guarded = setmetatable({x = 1}, {__metatable = "locked"})
-print(getmetatable(guarded), pcall(setmetatable, guarded, {}))
+print(getmetatable(guarded), pcall(function() return setmetatable(guarded, {}) end))
 local n = 0
 local function count() n = n + 1; return n end
 local r = setmetatable({a = count(), b = count()}, (function() n = n * 10; return Point end)())

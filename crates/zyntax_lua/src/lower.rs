@@ -9524,6 +9524,21 @@ pub(crate) fn program(
             m.scopes.dynamic_globals = true;
         }
     }
+    // A table one file hands another may get its metatable there, where
+    // the first file's types do not see it.
+    let sets_metatables = |s: &Scopes| {
+        s.unseen_metatables || s.globals.contains("setmetatable") || s.globals.contains("debug")
+    };
+    if (!loaded.is_empty() || !all_found)
+        && (!all_found
+            || sets_metatables(&scopes)
+            || loaded.iter().any(|m| sets_metatables(&m.scopes)))
+    {
+        scopes.unseen_metatables = true;
+        for m in &mut loaded {
+            m.scopes.unseen_metatables = true;
+        }
+    }
     let len_meta = len_meta_possible(source, &scopes, &loaded, all_found);
     scopes.len_meta = len_meta;
     for m in &mut loaded {
