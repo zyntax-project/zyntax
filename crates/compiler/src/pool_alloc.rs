@@ -407,9 +407,24 @@ pub unsafe extern "C" fn zyntax_alloc(size: usize) -> *mut u8 {
         head
     });
     if !reused.is_null() {
+        clear_tail(reused, class);
         return reused;
     }
-    alloc_slow(class, size)
+    let block = alloc_slow(class, size);
+    if !block.is_null() && in_a_slab(block) {
+        clear_tail(block, class);
+    }
+    block
+}
+
+/// Zero the last sixteen bytes of a block of `class`, which is where
+/// the bytes between a request and its class lie. The collector reads
+/// a block to the end of its class, so a word there that the program
+/// never writes must not be left naming what the block's previous
+/// occupant held. One aligned store, whatever the request was.
+#[inline(always)]
+unsafe fn clear_tail(block: *mut u8, class: usize) {
+    std::ptr::write_bytes(block.add(slot_bytes(class) - STEP), 0, STEP);
 }
 
 /// Nothing to reuse means the heap grows. The collector gets its say
@@ -757,7 +772,9 @@ unsafe fn usable_size(ptr: *mut u8) -> Option<usize> {
 
 /// Resize a block from [`zyntax_alloc`] to `new_size` bytes, keeping
 /// its contents up to the smaller of the two sizes. A block that already
-/// has room is returned as it is; a null pointer allocates.
+/// has room is returned as it is; a null pointer allocates. The room a
+/// resize gains holds whatever its bytes held before: a caller whose
+/// block the collector reads clears what it does not fill.
 ///
 /// # Safety
 /// `ptr` must be null or have come from [`zyntax_alloc`], and must not
@@ -1228,6 +1245,22 @@ mod tests {
                 assert_eq!(p, first, "every round should reuse the one block");
                 zyntax_free(p);
             }
+        }
+    }
+
+    /// The bytes between a request and its class read as zero, whatever
+    /// the block held before: the collector reads a block to the end
+    /// of its class.
+    #[test]
+    fn the_tail_of_a_request_is_zero() {
+        unsafe {
+            let p = zyntax_alloc(24);
+            std::ptr::write_bytes(p, 0xAB, 32);
+            zyntax_free(p);
+            let q = zyntax_alloc(24);
+            assert_eq!(q, p, "the block comes back");
+            assert_eq!(*(q.add(24) as *const u64), 0, "the tail was not cleared");
+            zyntax_free(q);
         }
     }
 }

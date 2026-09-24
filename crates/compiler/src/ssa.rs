@@ -6452,12 +6452,23 @@ impl SsaBuilder {
                 let data_alloc_ty = HirType::Array(Box::new(elem_ty.clone()), num_elements as u64);
                 let data_ptr = if growable {
                     let bytes = self.i64_const((capacity * elem_size.max(1)) as i64);
-                    self.emit_intrinsic(
+                    let data = self.emit_intrinsic(
                         block_id,
                         crate::hir::Intrinsic::Malloc,
                         vec![bytes],
                         &HirType::Ptr(Box::new(elem_ty.clone())),
-                    )
+                    );
+                    // The slots past the elements hold whatever the
+                    // block held before, and the collector reads the
+                    // buffer to its capacity. Spare slots narrower than
+                    // a word are four at most and lie in the sixteen
+                    // bytes the pool clears at the block's end.
+                    for i in num_elements..capacity {
+                        let off = self.i64_const((i * elem_size) as i64);
+                        let slot = self.emit_byte_gep(block_id, data, off, elem_ty.clone());
+                        self.list_clear_slot(block_id, slot, &elem_ty);
+                    }
+                    data
                 } else {
                     let data_ptr = self.create_value(
                         HirType::Ptr(Box::new(elem_ty.clone())),
@@ -11272,6 +11283,66 @@ impl SsaBuilder {
         self.emit_store(block, p, len);
     }
 
+    /// Zero the element slot at `slot`, one word at a time. A list's
+    /// buffer is read to its capacity by the collector, so a slot the
+    /// list no longer holds must name nothing. An element narrower
+    /// than a word cannot hold a pointer and is left as it is.
+    fn list_clear_slot(&mut self, block: HirId, slot: HirId, elem: &HirType) {
+        let size = hir_ty_size(elem);
+        if size < 8 {
+            return;
+        }
+        let zero = self.i64_const(0);
+        for word in 0..size / 8 {
+            let off = self.i64_const((word * 8) as i64);
+            let at = self.emit_byte_gep(block, slot, off, HirType::I64);
+            self.emit_store(block, at, zero);
+        }
+    }
+
+    /// Zero the vacated slots `[from, to)` of `data`, none when
+    /// `to <= from`; see [`Self::list_clear_slot`].
+    fn list_clear_slots(
+        &mut self,
+        block: HirId,
+        data: HirId,
+        from: HirId,
+        to: HirId,
+        elem: &HirType,
+    ) {
+        if hir_ty_size(elem) >= 8 {
+            self.list_zero_slots(block, data, from, to, elem);
+        }
+    }
+
+    /// Zero every byte of the slots `[from, to)` of `data`, none when
+    /// `to <= from`, whatever the element's width: capacity a list has
+    /// not yet written must not carry a previous occupant's words.
+    fn list_zero_slots(
+        &mut self,
+        block: HirId,
+        data: HirId,
+        from: HirId,
+        to: HirId,
+        elem: &HirType,
+    ) {
+        use crate::hir::BinaryOp as B;
+        let start = self.emit_elem_gep(block, data, from, elem.clone());
+        let count = self.emit_bin(block, B::Sub, &HirType::I64, to, from);
+        let zero = self.i64_const(0);
+        let some = self.emit_bin(block, B::Gt, &HirType::I64, count, zero);
+        let count = self.emit_select(block, some, count, zero, &HirType::I64);
+        let size = self.i64_const(hir_ty_size(elem).max(1) as i64);
+        let bytes = self.emit_bin(block, B::Mul, &HirType::I64, count, size);
+        let byte = self.create_value(HirType::U8, HirValueKind::Constant(HirConstant::U8(0)));
+        self.emit_intrinsic(
+            block,
+            crate::hir::Intrinsic::Memset,
+            vec![start, byte, bytes],
+            &HirType::Void,
+        );
+    }
+
     fn new_block(&mut self) -> HirId {
         let id = HirId::new();
         self.function.blocks.insert(id, HirBlock::new(id));
@@ -11314,8 +11385,18 @@ impl SsaBuilder {
     }
 
     /// Make room for `needed` elements, growing the block geometrically.
-    /// `block` is left after the growth branch.
-    fn list_reserve(&mut self, block: &mut HirId, list: HirId, needed: HirId, elem: &HirType) {
+    /// The caller writes the slots below `filled` straight after; the
+    /// growth zeroes the capacity it gains above them, which holds
+    /// whatever the block held before. `block` is left after the growth
+    /// branch.
+    fn list_reserve(
+        &mut self,
+        block: &mut HirId,
+        list: HirId,
+        needed: HirId,
+        filled: HirId,
+        elem: &HirType,
+    ) {
         use crate::hir::BinaryOp as B;
         let start = *block;
         let cap_ptr = self.list_field_ptr(start, list, 16);
@@ -11341,6 +11422,9 @@ impl SsaBuilder {
             vec![data, bytes],
             &HirType::Ptr(Box::new(elem.clone())),
         );
+        let past = self.emit_bin(grow, B::Gt, &HirType::I64, filled, cap);
+        let from = self.emit_select(grow, past, filled, cap, &HirType::I64);
+        self.list_zero_slots(grow, new_data, from, new_cap, elem);
         self.emit_store(grow, list, new_data);
         let cap_ptr = self.list_field_ptr(grow, list, 16);
         self.emit_store(grow, cap_ptr, new_cap);
@@ -11379,7 +11463,7 @@ impl SsaBuilder {
         let len = self.list_len(cur, list);
         let one = self.i64_const(1);
         let needed = self.emit_bin(cur, B::Add, &HirType::I64, len, one);
-        self.list_reserve(&mut cur, list, needed, &elem);
+        self.list_reserve(&mut cur, list, needed, needed, &elem);
         let data = self.list_data(cur, list, &elem);
         let slot = self.emit_elem_gep(cur, data, len, elem);
         self.emit_store(cur, slot, val);
@@ -11405,7 +11489,8 @@ impl SsaBuilder {
         let last = self.emit_bin(cur, B::Sub, &HirType::I64, len, one);
         let data = self.list_data(cur, list, &elem);
         let slot = self.emit_elem_gep(cur, data, last, elem.clone());
-        let value = self.emit_load(cur, slot, elem);
+        let value = self.emit_load(cur, slot, elem.clone());
+        self.list_clear_slot(cur, slot, &elem);
         self.list_set_len(cur, list, last);
         self.settle(block, cur);
         Ok(value)
@@ -11432,7 +11517,7 @@ impl SsaBuilder {
         let len = self.list_len(cur, list);
         let one = self.i64_const(1);
         let needed = self.emit_bin(cur, B::Add, &HirType::I64, len, one);
-        self.list_reserve(&mut cur, list, needed, &elem);
+        self.list_reserve(&mut cur, list, needed, needed, &elem);
         let data = self.list_data(cur, list, &elem);
         let from = self.emit_elem_gep(cur, data, idx, elem.clone());
         let after = self.emit_bin(cur, B::Add, &HirType::I64, idx, one);
@@ -11484,6 +11569,8 @@ impl SsaBuilder {
             &HirType::Void,
         );
         let shorter = self.emit_bin(cur, B::Sub, &HirType::I64, len, one);
+        let vacated = self.emit_elem_gep(cur, data, shorter, elem.clone());
+        self.list_clear_slot(cur, vacated, &elem);
         self.list_set_len(cur, list, shorter);
         self.settle(block, cur);
         Ok(value)
@@ -11494,10 +11581,15 @@ impl SsaBuilder {
         &mut self,
         block: HirId,
         receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        elem_ty: &Type,
     ) -> CompilerResult<HirId> {
+        let elem = self.convert_type(elem_ty);
         let mut cur = block;
         let list = self.translate_operand(&mut cur, receiver)?;
         let zero = self.i64_const(0);
+        let len = self.list_len(cur, list);
+        let data = self.list_data(cur, list, &elem);
+        self.list_clear_slots(cur, data, zero, len, &elem);
         self.list_set_len(cur, list, zero);
         self.settle(block, cur);
         Ok(self.create_undef(HirType::Void))
@@ -11516,7 +11608,8 @@ impl SsaBuilder {
         let list = self.translate_operand(&mut cur, receiver)?;
         let n = self.translate_operand(&mut cur, wanted)?;
         let n = self.coerce_scalar_to(cur, n, &HirType::I64);
-        self.list_reserve(&mut cur, list, n, &elem);
+        let len = self.list_len(cur, list);
+        self.list_reserve(&mut cur, list, n, len, &elem);
         self.settle(block, cur);
         Ok(self.create_undef(HirType::Void))
     }
@@ -11538,7 +11631,7 @@ impl SsaBuilder {
         let len = self.list_len(cur, list);
         let more = self.list_len(cur, ys);
         let needed = self.emit_bin(cur, B::Add, &HirType::I64, len, more);
-        self.list_reserve(&mut cur, list, needed, &elem);
+        self.list_reserve(&mut cur, list, needed, needed, &elem);
         let data = self.list_data(cur, list, &elem);
         let to = self.emit_elem_gep(cur, data, len, elem.clone());
         let from = self.list_data(cur, ys, &elem);
@@ -11574,7 +11667,7 @@ impl SsaBuilder {
         let byte = self.translate_operand(&mut cur, byte)?;
         let byte = self.coerce_scalar_to(cur, byte, &HirType::U8);
         let len = self.list_len(cur, list);
-        self.list_reserve(&mut cur, list, n, &elem);
+        self.list_reserve(&mut cur, list, n, n, &elem);
         // Fill what the new length uncovers; a shorter length fills
         // nothing, the count being clamped at zero.
         let data = self.list_data(cur, list, &elem);
@@ -11591,6 +11684,8 @@ impl SsaBuilder {
             vec![from, byte, bytes],
             &HirType::Void,
         );
+        // A shorter length vacates the slots past it.
+        self.list_clear_slots(cur, data, n, len, &elem);
         self.list_set_len(cur, list, n);
         self.settle(block, cur);
         Ok(self.create_undef(HirType::Void))
@@ -11601,12 +11696,17 @@ impl SsaBuilder {
         &mut self,
         block: HirId,
         receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        elem_ty: &Type,
         wanted: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
     ) -> CompilerResult<HirId> {
+        let elem = self.convert_type(elem_ty);
         let mut cur = block;
         let list = self.translate_operand(&mut cur, receiver)?;
         let n = self.translate_operand(&mut cur, wanted)?;
         let n = self.coerce_scalar_to(cur, n, &HirType::I64);
+        let len = self.list_len(cur, list);
+        let data = self.list_data(cur, list, &elem);
+        self.list_clear_slots(cur, data, n, len, &elem);
         self.list_set_len(cur, list, n);
         self.settle(block, cur);
         Ok(self.create_undef(HirType::Void))
@@ -11633,10 +11733,11 @@ impl SsaBuilder {
             block,
             crate::hir::Intrinsic::Malloc,
             vec![bytes],
-            &HirType::Ptr(Box::new(elem)),
+            &HirType::Ptr(Box::new(elem.clone())),
         );
-        self.emit_store(block, list, data);
         let zero = self.i64_const(0);
+        self.list_zero_slots(block, data, zero, cap, &elem);
+        self.emit_store(block, list, data);
         self.list_set_len(block, list, zero);
         let cap_ptr = self.list_field_ptr(block, list, 16);
         self.emit_store(block, cap_ptr, cap);

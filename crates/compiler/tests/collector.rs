@@ -23,6 +23,20 @@ fn a_reached_large_block_is_read_to_its_end_and_keeps_what_it_holds() {
     // SAFETY: blocks of the pool, written within their bounds; the
     // root range is a static that outlives the collection.
     unsafe {
+        // A word past a request, left by the block's previous occupant,
+        // names nothing: the chain it pointed at is reclaimed.
+        let held = block_with_a_stale_tail();
+        scrub_stack();
+        collector::collect();
+        assert_eq!(collector::stats().collections, 1);
+        let live = collector::stats().live;
+        assert!(
+            live < CHAIN * 32 / 2,
+            "the chain behind the stale tail word was kept: {live} bytes live"
+        );
+        assert_eq!(*(held as *const usize), SENTINEL);
+        zyntax_free(held);
+
         let large = zyntax_alloc(LARGE);
         assert!(!large.is_null());
         std::ptr::write_bytes(large, 0, LARGE);
@@ -38,7 +52,7 @@ fn a_reached_large_block_is_read_to_its_end_and_keeps_what_it_holds() {
         collector::collect();
 
         let stats = collector::stats();
-        assert_eq!(stats.collections, 1);
+        assert_eq!(stats.collections, 2);
         assert!(
             stats.live >= LARGE + 32,
             "the large block and what it holds were not reached: {} bytes live",
@@ -51,8 +65,42 @@ fn a_reached_large_block_is_read_to_its_end_and_keeps_what_it_holds() {
         zyntax_free(large);
         HOLD = 0;
         collector::collect();
-        assert_eq!(collector::stats().collections, 2);
+        assert_eq!(collector::stats().collections, 3);
         zyntax_free(small);
     }
     collector::disable();
+}
+
+/// Blocks in a chain that only a stale word names.
+const CHAIN: usize = 4096;
+
+/// Overwrite the stack below the caller, where the frames that built
+/// the chain left its addresses; the collection reads that far down.
+#[inline(never)]
+fn scrub_stack() {
+    let mut scratch = [0u8; 64 << 10];
+    std::hint::black_box(&mut scratch);
+}
+
+/// A 24-byte request served from a block whose last word, past the
+/// request, named a chain of [`CHAIN`] blocks. The chain's addresses
+/// never reach the caller's frame.
+#[inline(never)]
+fn block_with_a_stale_tail() -> *mut u8 {
+    // SAFETY: blocks of the pool, written within their slots.
+    unsafe {
+        let mut head = 0usize;
+        for _ in 0..CHAIN {
+            let node = zyntax_alloc(32);
+            *(node as *mut usize) = head;
+            head = node as usize;
+        }
+        let stale = zyntax_alloc(32);
+        *(stale.add(24) as *mut usize) = head;
+        zyntax_free(stale);
+        let block = zyntax_alloc(24);
+        assert_eq!(block, stale, "the freed block serves the request");
+        *(block as *mut usize) = SENTINEL;
+        std::hint::black_box(block)
+    }
 }

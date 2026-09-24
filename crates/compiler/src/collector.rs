@@ -19,6 +19,13 @@
 //! it, not the block: compiled code keeps a buffer's base live for as
 //! long as it indexes into it, so the end alone never has to.
 //!
+//! A reached block is read to the end of its size class, so every
+//! word of a block the program has not written must be zero: the pool
+//! clears the bytes past a request, and a list clears the capacity it
+//! allocates or gains and the slots it vacates. A word left from a
+//! block's previous occupant would otherwise keep alive whatever that
+//! occupant held.
+//!
 //! Compiled code keeps every live pointer in a stack slot or a
 //! callee-saved register at a call, and a collection only ever starts
 //! inside an allocation call, so spilling the callee-saved registers

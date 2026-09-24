@@ -480,7 +480,7 @@ impl BuiltinClass for ListClass {
             }
             "clear" => {
                 arity(0)?;
-                ssa.emit_list_clear(block_id, receiver).map(Some)
+                ssa.emit_list_clear(block_id, receiver, elem).map(Some)
             }
             "reserve" => {
                 arity(1)?;
@@ -489,7 +489,7 @@ impl BuiltinClass for ListClass {
             }
             "truncate" => {
                 arity(1)?;
-                ssa.emit_list_truncate(block_id, receiver, &args[0])
+                ssa.emit_list_truncate(block_id, receiver, elem, &args[0])
                     .map(Some)
             }
             "append_all" => {
