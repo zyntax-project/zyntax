@@ -5421,6 +5421,27 @@ impl Typer<'_> {
         (inner.expr(key), inner.expr(value))
     }
 
+    /// The key and value types of the pairs `e` yields, for a dict
+    /// built from them: a comprehension or list of two-element tuples.
+    fn pair_elem(&self, e: &py::Expr) -> Option<[Ty; 2]> {
+        let elem = match e {
+            py::Expr::ListComp(py::ExprListComp {
+                generators, elt, ..
+            })
+            | py::Expr::Generator(py::ExprGenerator {
+                generators, elt, ..
+            }) => self.comprehension_elem(generators, elt),
+            other => self.expr(other).element()?,
+        };
+        if elem == Ty::Unknown {
+            return Some([Ty::Unknown, Ty::Unknown]);
+        }
+        match elem.tuple_elems()?.as_slice() {
+            [k, v] => Some([*k, *v]),
+            _ => None,
+        }
+    }
+
     /// The variables in scope inside a comprehension: this scope's, with
     /// each generator's target bound to what one round of it yields,
     /// where a later generator sees the earlier targets.
@@ -5953,10 +5974,15 @@ impl Typer<'_> {
                 Ty::Unknown if !args.is_empty() => Ty::Unknown,
                 _ => Ty::Object,
             },
+            // From pairs of a known shape, the dict a comprehension of
+            // them would make.
             "dict" => match arg(0) {
                 Ty::Dict(k) => Ty::Dict(k),
                 Ty::Unknown => dict_of(Ty::Unknown, Ty::Unknown),
-                _ => dynamic_dict(),
+                _ => match args.first().map(|a| self.pair_elem(a)) {
+                    Some(Some([k, v])) => dict_of(k, v),
+                    _ => dynamic_dict(),
+                },
             },
             "set" | "frozenset" => Ty::Set,
             // Pairs and mapped values are dynamic; the lists are eager.
