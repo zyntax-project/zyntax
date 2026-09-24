@@ -1,0 +1,8 @@
+6
+1	8
+handler
+1	10
+2	20
+4
+2
+false	attempt to index a number value (local 'b')

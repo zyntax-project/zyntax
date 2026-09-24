@@ -159,11 +159,51 @@ pub struct ShapeInfo {
     /// Whether a table of this shape is lost into a dynamic value or
     /// the library, where stores the types do not see may reach it.
     pub escapes: bool,
-    /// Whether a store with a key not known at compile time may reach
-    /// a table of this shape: then no field's type is known.
+    /// Whether a store with a key not known at compile time, that may
+    /// be a string, may reach a table of this shape: then every field
+    /// takes what it stores, and a name that is no field may be held.
     pub dynamic_keys: bool,
+    /// The join of what stores under keys not known at compile time
+    /// put in a table of this shape: what a name that is no field may
+    /// hold, when `dynamic_keys`.
+    pub dyn_value: Ty,
+    /// Reads out of a table of this shape whose results the types do
+    /// not follow: what they may yield escapes.
+    pub untyped_reads: Reads,
     /// The line the first constructor is on, for naming.
     pub line: usize,
+}
+
+/// Reads out of a table that hand what they find to code the types do
+/// not follow: under keys not known at compile time, or by a library
+/// function that walks the table.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Reads {
+    /// Under a key that may be a string: any field, or any name.
+    pub names: bool,
+    /// Under a key that may be a number: any element.
+    pub elements: bool,
+    /// Going on through `__index` where the table lacks the key.
+    pub through_meta: bool,
+}
+
+impl Reads {
+    /// Reads under a key of type `key_ty`.
+    pub fn under(key_ty: Ty, through_meta: bool) -> Reads {
+        Reads {
+            names: key_may_be_string(key_ty),
+            elements: key_may_be_index(key_ty),
+            through_meta,
+        }
+    }
+
+    pub fn union(self, other: Reads) -> Reads {
+        Reads {
+            names: self.names || other.names,
+            elements: self.elements || other.elements,
+            through_meta: self.through_meta || other.through_meta,
+        }
+    }
 }
 
 impl ShapeInfo {
@@ -298,6 +338,35 @@ impl Inferred {
         &self.shapes[k.0 as usize]
     }
 
+    /// Whether a table of shape `k` may hold `name` other than in a
+    /// field of its shape: stored under a key not known at compile
+    /// time, or through a receiver the types do not know.
+    pub fn may_hold_unnamed(&self, k: ShapeId, name: &str) -> bool {
+        let info = self.shape(k);
+        info.field(name).is_none()
+            && (info.dynamic_keys || (info.escapes && self.blind_stores.contains_key(name)))
+    }
+
+    /// What a table of shape `k` itself holds under `name` when that
+    /// is no field of its shape: nil, or what such stores put there.
+    fn unnamed_ty(&self, k: ShapeId, name: &str) -> Ty {
+        let info = self.shape(k);
+        let mut ty = Ty::Nil;
+        // A store under a field's name lands in its slot.
+        if info.field(name).is_some() {
+            return ty;
+        }
+        if info.dynamic_keys {
+            ty = join_read(ty, info.dyn_value);
+        }
+        if info.escapes
+            && let Some(stored) = self.blind_stores.get(name)
+        {
+            ty = join_read(ty, *stored);
+        }
+        ty
+    }
+
     /// The functions `name` may resolve to for a table whose metatable
     /// has shape `k`, looked up as Lua does when the table itself
     /// lacks it: in the metatable's `__index` table, then in that
@@ -328,6 +397,7 @@ impl Inferred {
                     }
                 }
                 Some(_) => return None,
+                None if self.may_hold_unnamed(table, name) => return None,
                 None => {}
             }
             // Behind this table: nothing, when it has no metatable.
@@ -363,7 +433,7 @@ impl Inferred {
             }
             hops.push(Hop::Absent(k));
         }
-        if info.unknown_meta {
+        if info.unknown_meta || self.may_hold_unnamed(k, name) {
             return None;
         }
         for class in &info.classes {
@@ -406,6 +476,9 @@ impl Inferred {
                     return Some(());
                 }
                 hops.push(Hop::Absent(table));
+            }
+            if self.may_hold_unnamed(table, name) {
+                return None;
             }
             if !info.unknown_meta && info.classes.is_empty() {
                 return Some(());
@@ -480,15 +553,16 @@ impl Inferred {
     }
 
     /// What reading field `name` of a table of shape `k` yields when
-    /// the field is absent: what its metatables' `__index` chains hold,
-    /// nil when it has no metatable, anything when the types do not
-    /// know what it has.
+    /// the field is absent: what the table holds under a name that is
+    /// no field, else what its metatables' `__index` chains hold, nil
+    /// when it has no metatable, anything when the types do not know
+    /// what it has.
     pub fn absent_field_ty(&self, k: ShapeId, name: &str) -> Ty {
         let info = self.shape(k);
         if info.unknown_meta {
             return Ty::Any;
         }
-        let mut ty = Ty::Nil;
+        let mut ty = self.unnamed_ty(k, name);
         for class in &info.classes {
             ty = join_read(ty, self.index_chain_ty(*class, name, 0));
             if ty == Ty::Any {
@@ -510,6 +584,7 @@ impl Inferred {
             Some((_, Ty::Unknown)) => return Ty::Unknown,
             Some((_, ty)) if info.always_present(name) => return ty,
             Some((_, ty)) => Some(ty),
+            None if self.may_hold_unnamed(class, name) => Some(self.unnamed_ty(class, name)),
             None => None,
         };
         // The field may be absent: what lies behind it.
@@ -791,6 +866,7 @@ impl<'a> Typer<'a> {
                 }
             }
             Some(_) => return None,
+            None if self.known.may_hold_unnamed(k, name) => return None,
             None => {}
         }
         if info.unknown_meta {
@@ -1190,6 +1266,15 @@ struct Round<'a> {
     /// types do not know: a function of that name in a shape the
     /// program may reach through such a receiver escapes.
     blind_reads: HashSet<String>,
+    /// Reads under keys not known at compile time, or walks by the
+    /// library, through receivers the types do not know: they reach
+    /// every escaping shape.
+    blind_keyed_reads: Reads,
+    /// The call a generic `for` being walked takes its iterator from,
+    /// by the position of its callee's name: a library iterator it
+    /// returns is called by the loop alone, with the table it was
+    /// given.
+    loop_iterator: Option<usize>,
     /// Whether `getmetatable` is applied to a receiver the types do
     /// not know, or whether its result is a class: classes escape.
     blind_getmetatable: bool,
@@ -1314,16 +1399,28 @@ impl<'a> Round<'a> {
     fn store_through(&mut self, receiver: Ty, key: Option<String>, key_ty: Ty, ty: Ty) {
         match (receiver, key) {
             (Ty::Shape(k), Some(name)) => self.store_field(k, &name, ty),
-            // Under a number the value is an element and stays typed;
-            // under anything else it is lost in the hash part.
+            // Under a number the value is an element and stays typed.
+            // Under a string it may land in any field, or under a name
+            // that is none; under anything else it is lost in the hash
+            // part.
             (Ty::Shape(k), None) => {
                 if key_may_be_index(key_ty) {
                     self.store_element(k, ty);
                 }
-                if !key_is_number(key_ty) {
-                    if key_may_be_string(key_ty) {
-                        self.out.shapes[k.0 as usize].dynamic_keys = true;
+                if key_may_be_string(key_ty) {
+                    self.out.shapes[k.0 as usize].dynamic_keys = true;
+                    let names: Vec<String> = self.out.shapes[k.0 as usize]
+                        .fields
+                        .keys()
+                        .cloned()
+                        .collect();
+                    for name in names {
+                        self.store_field(k, &name, ty);
                     }
+                    let held = self.out.shapes[k.0 as usize].dyn_value;
+                    self.out.shapes[k.0 as usize].dyn_value = self.join_into(held, ty);
+                }
+                if !key_is_number(key_ty) {
                     self.escape(ty);
                 }
             }
@@ -1385,6 +1482,33 @@ impl<'a> Round<'a> {
         }
     }
 
+    /// `receiver[key]` for a key of type `key_ty` not known at compile
+    /// time: unless the types know what it yields, what it may yield
+    /// escapes.
+    fn keyed_read(&mut self, receiver: Ty, key_ty: Ty) {
+        if let Ty::Shape(k) = receiver
+            && self.known.element_read_ty(k, key_ty) != Ty::Any
+        {
+            return;
+        }
+        self.untyped_read(receiver, Reads::under(key_ty, true));
+    }
+
+    /// Reads out of `receiver` whose results the types do not follow:
+    /// noted on its shape, or, through a receiver the types do not
+    /// know, against every escaping shape.
+    fn untyped_read(&mut self, receiver: Ty, reads: Reads) {
+        match receiver {
+            Ty::Shape(k) => {
+                let info = &mut self.out.shapes[k.0 as usize];
+                info.untyped_reads = info.untyped_reads.union(reads);
+            }
+            // A string's reads reach the string library, not a table.
+            Ty::Unknown | Ty::Str => {}
+            _ => self.blind_keyed_reads = self.blind_keyed_reads.union(reads),
+        }
+    }
+
     /// What reaches the shapes the types lost track of: a table of an
     /// escaping shape may take the stores made through receivers the
     /// types do not know, get any metatable set that way, and have
@@ -1393,35 +1517,47 @@ impl<'a> Round<'a> {
     /// `getmetatable`.
     fn settle_shapes(&mut self) {
         let dynamic_code = self.scopes.dynamic_code;
-        // A function under a metamethod's name is called by the
-        // runtime, with dynamic values, wherever its table serves as a
-        // metatable: it escapes, unless the event is one the typed
-        // dispatch handles and no table of the shapes it is the
-        // metatable of ever reaches the runtime's own dispatch, that
-        // is, none of them escapes (nor the class itself).
-        for k in 0..self.out.shapes.len() {
-            let metamethods: Vec<(String, Ty)> = self.out.shapes[k]
-                .fields
-                .iter()
-                .filter(|(name, _)| name.starts_with("__"))
-                .map(|(name, ty)| (name.clone(), *ty))
-                .collect();
-            let class = ShapeId(k as u32);
-            let reached = self.out.shapes[k].escapes
-                || self
-                    .out
-                    .shapes
-                    .iter()
-                    .any(|s| s.escapes && s.classes.contains(&class));
-            for (name, ty) in metamethods {
-                if reached || !typed_event(&name) {
-                    self.escape(ty);
-                }
-            }
+        // The library's readers are reached through the globals table,
+        // or by code the chunk does not contain.
+        if dynamic_code || self.scopes.dynamic_globals {
+            self.loose_reader();
         }
         loop {
             let mut changed = false;
+            // A function under a metamethod's name is called by the
+            // runtime, with dynamic values, wherever its table serves
+            // as a metatable: it escapes, unless the event is one the
+            // typed dispatch handles and no table of the shapes it is
+            // the metatable of ever reaches the runtime's own dispatch,
+            // that is, none of them escapes (nor the class itself).
             for k in 0..self.out.shapes.len() {
+                let metamethods: Vec<(String, Ty)> = self.out.shapes[k]
+                    .fields
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("__"))
+                    .map(|(name, ty)| (name.clone(), *ty))
+                    .collect();
+                let class = ShapeId(k as u32);
+                let reached = self.out.shapes[k].escapes
+                    || self
+                        .out
+                        .shapes
+                        .iter()
+                        .any(|s| s.escapes && s.classes.contains(&class));
+                for (name, ty) in metamethods {
+                    // An `__index` table is looked up in, not handed
+                    // out: it escapes with the tables whose lookups
+                    // reach it, below.
+                    if name == "__index" && matches!(ty, Ty::Shape(_)) {
+                        continue;
+                    }
+                    if reached || !typed_event(&name) {
+                        changed |= self.escape_new(ty);
+                    }
+                }
+            }
+            for k in 0..self.out.shapes.len() {
+                changed |= self.settle_reads(k);
                 if !self.out.shapes[k].escapes {
                     continue;
                 }
@@ -1473,7 +1609,7 @@ impl<'a> Round<'a> {
                     changed = true;
                 }
                 if joined != Ty::Any && !matches!(joined, Ty::Unknown) {
-                    self.escape(joined);
+                    changed |= self.escape_new(joined);
                 }
                 if self.blind_getmetatable || dynamic_code {
                     let classes: Vec<ShapeId> =
@@ -1485,9 +1621,15 @@ impl<'a> Round<'a> {
                         }
                     }
                 }
-                // Its classes' methods are reached through it.
+                // Its classes' methods are reached through it, and the
+                // tables its lookups go on to.
                 let classes: Vec<ShapeId> = self.out.shapes[k].classes.iter().copied().collect();
                 for c in classes {
+                    if let Some((_, ty @ Ty::Shape(_))) =
+                        self.out.shapes[c.0 as usize].field("__index")
+                    {
+                        changed |= self.escape_new(ty);
+                    }
                     let methods: Vec<(String, Ty)> = self.out.shapes[c.0 as usize]
                         .fields
                         .iter()
@@ -1528,12 +1670,83 @@ impl<'a> Round<'a> {
                             changed = true;
                         }
                     }
+                    let held = self.out.shapes[k].dyn_value;
+                    if held != Ty::Any {
+                        self.escape(held);
+                        self.out.shapes[k].dyn_value = Ty::Any;
+                        changed = true;
+                    }
                 }
             }
             if !changed {
                 break;
             }
         }
+    }
+
+    /// What the untyped reads of a table of shape `k` may yield
+    /// escapes, and those that go on through `__index` reach the
+    /// tables behind it; an escaping shape takes the reads made
+    /// through receivers the types do not know. Whether anything
+    /// changed.
+    fn settle_reads(&mut self, k: usize) -> bool {
+        let mut changed = false;
+        if self.out.shapes[k].escapes {
+            let reads = self.out.shapes[k]
+                .untyped_reads
+                .union(self.blind_keyed_reads);
+            if reads != self.out.shapes[k].untyped_reads {
+                self.out.shapes[k].untyped_reads = reads;
+                changed = true;
+            }
+        }
+        let reads = self.out.shapes[k].untyped_reads;
+        let mut held = Vec::new();
+        if reads.names {
+            held.extend(self.out.shapes[k].fields.values().copied());
+            held.push(self.out.shapes[k].dyn_value);
+        }
+        if reads.elements {
+            held.push(self.out.shapes[k].element);
+        }
+        for ty in held {
+            changed |= self.escape_new(ty);
+        }
+        if reads.through_meta && (reads.names || reads.elements) {
+            // A metatable the types do not follow was lost to them, and
+            // its `__index` with it: the reads reach every escaping
+            // shape.
+            if self.out.shapes[k].unknown_meta {
+                let blind = self.blind_keyed_reads.union(reads);
+                if blind != self.blind_keyed_reads {
+                    self.blind_keyed_reads = blind;
+                    changed = true;
+                }
+            }
+            let classes: Vec<ShapeId> = self.out.shapes[k].classes.iter().copied().collect();
+            for c in classes {
+                if let Some((_, Ty::Shape(next))) = self.out.shapes[c.0 as usize].field("__index") {
+                    let info = &mut self.out.shapes[next.0 as usize];
+                    let joined = info.untyped_reads.union(reads);
+                    if joined != info.untyped_reads {
+                        info.untyped_reads = joined;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// `escape`, and whether it made the function or shape escape.
+    fn escape_new(&mut self, ty: Ty) -> bool {
+        let new = match ty {
+            Ty::Func(f) => !self.out.escaping.contains(&f),
+            Ty::Shape(k) => !self.out.shapes[k.0 as usize].escapes,
+            _ => false,
+        };
+        self.escape(ty);
+        new
     }
 
     /// Whether the function's parameters take anything: decided by the
@@ -1799,9 +2012,16 @@ impl<'a> Round<'a> {
             Stmt::GenericFor(f) => {
                 let exprs: Vec<&Expression> = f.expressions().iter().collect();
                 // The iterator is called by the loop, through its value.
+                let outer = self.loop_iterator.take();
+                if let [Expression::FunctionCall(c)] = exprs.as_slice()
+                    && let Prefix::Name(token) = c.prefix()
+                {
+                    self.loop_iterator = Some(crate::scope::pos_of(token));
+                }
                 for e in &exprs {
                     self.value(e);
                 }
+                self.loop_iterator = outer;
                 let names: Vec<VarId> = f.names().iter().map(|n| self.scopes.declared(n)).collect();
                 // `ipairs` gives an integer key; anything else, dynamic
                 // values.
@@ -1823,7 +2043,7 @@ impl<'a> Round<'a> {
                         },
                         _ => Ty::Any,
                     };
-                    self.out.ipairs_value_ty(table)
+                    self.known.ipairs_value_ty(table)
                 } else {
                     Ty::Any
                 };
@@ -1981,12 +2201,12 @@ impl<'a> Round<'a> {
                 && args.len() == 2
                 && let Ty::Shape(k) = self.typer().ty_of(args[0])
                 && let Ty::Func(f) = self.typer().ty_of(args[1])
-                && !self.out.shapes[k.0 as usize].unknown_meta
-                && self.out.shapes[k.0 as usize].classes.is_empty()
+                && !self.known.shape(k).unknown_meta
+                && self.known.shape(k).classes.is_empty()
             {
                 self.expr(args[0]);
                 self.expr(args[1]);
-                let element = self.out.shapes[k.0 as usize].element;
+                let element = self.known.shape(k).element;
                 self.record_call_types(f, vec![element, element]);
                 return;
             }
@@ -2000,11 +2220,21 @@ impl<'a> Round<'a> {
                     "insert" if tys.len() >= 2 => {
                         self.store_through(tys[0], None, Ty::Int, tys[tys.len() - 1]);
                     }
+                    // What it reads of a table with a metatable may come
+                    // through `__index`.
                     "move" if tys.len() >= 4 => {
                         let element = match tys[0] {
-                            Ty::Shape(k) => self.out.shapes[k.0 as usize].element,
+                            Ty::Shape(k)
+                                if !self.known.shape(k).unknown_meta
+                                    && self.known.shape(k).classes.is_empty() =>
+                            {
+                                self.known.shape(k).element
+                            }
                             Ty::Unknown => Ty::Unknown,
-                            _ => Ty::Any,
+                            source => {
+                                self.untyped_read(source, Reads::under(Ty::Int, true));
+                                Ty::Any
+                            }
                         };
                         let into = tys.get(4).copied().unwrap_or(tys[0]);
                         self.store_through(into, None, Ty::Int, element);
@@ -2015,6 +2245,58 @@ impl<'a> Round<'a> {
             }
         }
         self.chain(c.prefix(), &suffixes);
+    }
+
+    /// What a direct call of the library function `b` reads out of
+    /// its table argument and hands out untyped.
+    fn library_reads_of(&mut self, b: &Builtin, prefix: &Prefix, args: &ast::FunctionArgs) {
+        if let Some(reads) = library_reads(b) {
+            let table = match args {
+                ast::FunctionArgs::Parentheses { arguments, .. } => match arguments.iter().next() {
+                    Some(first) => self.typer().ty_of(first),
+                    None => Ty::Nil,
+                },
+                ast::FunctionArgs::TableConstructor(t) => match constructor_shape(self.known, t) {
+                    Some(k) => Ty::Shape(k),
+                    None => Ty::Table,
+                },
+                _ => Ty::Str,
+            };
+            // A typed `ipairs` binds each element as its type; what
+            // its iterator hands elsewhere leaves with the table,
+            // which the call takes as a value.
+            let typed = b.name == "ipairs" && self.known.ipairs_value_ty(table) != Ty::Any;
+            if !typed {
+                self.untyped_read(table, reads);
+            }
+        }
+        // The iterator `pairs` or `ipairs` returns reads whatever
+        // table it is given; outside a loop's header, any.
+        let header = match prefix {
+            Prefix::Name(token) => self.loop_iterator == Some(crate::scope::pos_of(token)),
+            _ => false,
+        };
+        if b.lib.is_empty() && matches!(b.name, "pairs" | "ipairs") && !header {
+            self.loose_reader();
+        }
+    }
+
+    /// A library function that reads the tables it is given is held
+    /// as a value: whatever it is called with, it may hand out as
+    /// dynamic values what a table of any escaping shape holds.
+    fn loose_reader(&mut self) {
+        self.blind_keyed_reads = self.blind_keyed_reads.union(Reads {
+            names: true,
+            elements: true,
+            through_meta: true,
+        });
+    }
+
+    /// Whether the global `name` is a library function that reads a
+    /// table it is given, or the library table holding such functions.
+    fn is_reader(&self, name: &str) -> bool {
+        builtin_named(self.scopes, name).is_some_and(|b| library_reads(b).is_some())
+            || (name == "table" && !self.scopes.global_writes.contains_key(name))
     }
 
     /// `setmetatable`, `getmetatable`, `rawset`, `rawget`: what they do
@@ -2071,9 +2353,14 @@ impl<'a> Round<'a> {
                     self.escape(*t);
                 }
             }
+            // `rawget` hands out what it finds as a dynamic value.
             _ => {
-                if let Some(key) = args.get(1).and_then(|k| crate::scope::literal_string(k)) {
-                    self.read_through(receiver, &key);
+                let key_ty = tys.get(1).copied().unwrap_or(Ty::Nil);
+                match args.get(1).and_then(|k| crate::scope::literal_string(k)) {
+                    Some(key) if !matches!(receiver, Ty::Shape(_)) => {
+                        self.read_through(receiver, &key)
+                    }
+                    _ => self.untyped_read(receiver, Reads::under(key_ty, false)),
                 }
                 for t in tys.iter().skip(1) {
                     self.escape(*t);
@@ -2087,10 +2374,30 @@ impl<'a> Round<'a> {
     /// field read or method call goes through is noted.
     fn chain(&mut self, prefix: &Prefix, suffixes: &[&Suffix]) {
         self.prefix(prefix);
+        // A reader taken out of the `table` library as a value.
+        if let Prefix::Name(token) = prefix
+            && let Some(Binding::Global(g)) = self.scopes.binding(token)
+            && g == "table"
+            && self.is_reader(g)
+            && let Some(Suffix::Index(index)) = suffixes.first()
+            && !(suffixes.len() >= 2
+                && self
+                    .typer()
+                    .builtin_callee(prefix, &suffixes[..2])
+                    .is_some())
+            && constant_key(index).is_none_or(|m| {
+                builtin_member(self.scopes, "table", &m).is_some_and(|b| library_reads(b).is_some())
+            })
+        {
+            self.loose_reader();
+        }
         for (i, s) in suffixes.iter().enumerate() {
             let receiver = self.typer().suffixed_ty(prefix, &suffixes[..i]);
             match s {
                 Suffix::Call(ast::Call::AnonymousCall(args)) => {
+                    if let Some(b) = self.typer().builtin_callee(prefix, &suffixes[..=i]) {
+                        self.library_reads_of(b, prefix, args);
+                    }
                     // The arguments of a direct call feed the callee's
                     // parameters, and so keep their types; a callee not
                     // typed yet may still turn out known. Anything else
@@ -2130,8 +2437,13 @@ impl<'a> Round<'a> {
                     if let ast::Index::Brackets { expression, .. } = index {
                         self.value(expression);
                     }
-                    if let Some(name) = constant_key(index) {
-                        self.read_through(receiver, &name);
+                    match (constant_key(index), index) {
+                        (Some(name), _) => self.read_through(receiver, &name),
+                        (None, ast::Index::Brackets { expression, .. }) => {
+                            let key_ty = self.typer().ty_of(expression);
+                            self.keyed_read(receiver, key_ty);
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -2307,6 +2619,13 @@ impl<'a> Round<'a> {
                 let suffixes: Vec<&Suffix> = v.suffixes().collect();
                 self.chain(v.prefix(), &suffixes);
             }
+            Expression::Var(Var::Name(token)) => {
+                if let Some(Binding::Global(name)) = self.scopes.binding(token)
+                    && self.is_reader(name)
+                {
+                    self.loose_reader();
+                }
+            }
             _ => {}
         }
     }
@@ -2319,6 +2638,25 @@ fn join_read(a: Ty, b: Ty) -> Ty {
         Ty::Unknown
     } else {
         a.join(b)
+    }
+}
+
+/// What a library function reads out of the table it takes first and
+/// hands to its caller, or to a function it calls, as dynamic values:
+/// `pairs` and `next` every field and element, raw; `ipairs`,
+/// `table.unpack`, `table.remove` and `table.sort` elements, through
+/// `__index`. None for one that hands out nothing of a table.
+fn library_reads(b: &Builtin) -> Option<Reads> {
+    match (b.lib, b.name) {
+        ("", "pairs" | "next") => Some(Reads {
+            names: true,
+            elements: true,
+            through_meta: false,
+        }),
+        ("", "ipairs") | ("table", "unpack" | "remove" | "sort") => {
+            Some(Reads::under(Ty::Int, true))
+        }
+        _ => None,
     }
 }
 
@@ -2546,6 +2884,8 @@ pub fn infer(scopes: &Scopes, ast: &ast::Ast) -> Inferred {
                 func: CHUNK,
                 returns: None,
                 blind_reads: HashSet::new(),
+                blind_keyed_reads: Reads::default(),
+                loop_iterator: None,
                 blind_getmetatable: false,
             },
             named: HashMap::new(),
@@ -2612,6 +2952,8 @@ fn infer_given(
             func: CHUNK,
             returns: None,
             blind_reads: HashSet::new(),
+            blind_keyed_reads: Reads::default(),
+            loop_iterator: None,
             blind_getmetatable: false,
         };
         // The signatures from the last round carry over so a recursive
@@ -2681,7 +3023,7 @@ fn trace_types(scopes: &Scopes, known: &Inferred) {
     if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
         for (i, shape) in known.shapes.iter().enumerate() {
             eprintln!(
-                "[types] shape {i}@{}: {:?} born={} element={:?} classes={:?}{}{}{}",
+                "[types] shape {i}@{}: {:?} born={} element={:?} classes={:?}{}{}{}{}",
                 shape.line,
                 shape.fields,
                 shape.born,
@@ -2694,9 +3036,22 @@ fn trace_types(scopes: &Scopes, known: &Inferred) {
                     ""
                 },
                 if shape.dynamic_keys {
-                    " dynamic-keys"
+                    format!(" dynamic-keys={:?}", shape.dyn_value)
                 } else {
-                    ""
+                    String::new()
+                },
+                match shape.untyped_reads {
+                    Reads {
+                        names: false,
+                        elements: false,
+                        ..
+                    } => String::new(),
+                    r => format!(
+                        " untyped-reads{}{}{}",
+                        if r.names { ":names" } else { "" },
+                        if r.elements { ":elements" } else { "" },
+                        if r.through_meta { ":meta" } else { "" },
+                    ),
                 },
             );
         }
