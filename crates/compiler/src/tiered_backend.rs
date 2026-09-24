@@ -2990,6 +2990,40 @@ impl TieredBackend {
             })
             .collect();
 
+        // After every install at the optimizing tier, whichever path
+        // made it, the sites frames asked at meanwhile get its resume
+        // points.
+        #[cfg(feature = "llvm-backend")]
+        {
+            let hook = llvm.as_ref().map(|llvm| {
+                let llvm = Arc::clone(llvm);
+                let late = Arc::clone(&late);
+                let promoted_regions = Arc::clone(&promoted_regions);
+                let outlined_regions = Arc::clone(&outlined_regions);
+                let modules: HashMap<u64, (HirId, Arc<HirModule>)> = by_bead
+                    .iter()
+                    .map(|(bead, (id, _, _, module, _))| (*bead, (*id, Arc::clone(module))))
+                    .collect();
+                Box::new(move |bead_id: u64, body: &Arc<HirFunction>| {
+                    let Some((func_id, module_arc)) = modules.get(&bead_id) else {
+                        return;
+                    };
+                    let sites = late.lock().unwrap().installed(bead_id);
+                    if sites.is_empty() {
+                        return;
+                    }
+                    let bodies = late_resume_bodies(
+                        Some(Arc::clone(body)),
+                        None,
+                        &late_regions(bead_id, &promoted_regions, &outlined_regions),
+                        *func_id,
+                    );
+                    spawn_late_resume_points(&llvm, bodies, module_arc, bead_id, sites, &late);
+                }) as OptimizingInstallHook
+            });
+            *optimizing_install_hook().write().unwrap() = hook;
+        }
+
         let optimized_bodies = Arc::clone(&self.optimized_bodies);
         let interp_bodies = Arc::clone(&self.interp_bodies);
         let queue = self.compile_queue.clone();
@@ -3007,10 +3041,21 @@ impl TieredBackend {
                 return false;
             };
             // A compiled frame at a header the bead's promotion made no
-            // resume point for. One is made now if the optimizing tier
-            // has installed, off this thread, which is the frame's own;
-            // else the install makes it when it lands.
-            if let osr::Requester::Resume { site } = from {
+            // resume point for, or asking first after an install another
+            // path made. One is made now if the optimizing tier has
+            // installed, off this thread, which is the frame's own; else
+            // the install makes it when it lands.
+            let late_site = match from {
+                osr::Requester::Resume { site } => Some(site),
+                #[cfg(feature = "llvm-backend")]
+                osr::Requester::Compiled { site }
+                    if site != osr::NO_SITE && late.lock().unwrap().is_installed(bead_id) =>
+                {
+                    Some(site)
+                }
+                _ => None,
+            };
+            if let Some(site) = late_site {
                 #[cfg(feature = "llvm-backend")]
                 if let Some(llvm) = &llvm
                     && late.lock().unwrap().claim_if_installed(bead_id, site)
@@ -3021,26 +3066,13 @@ impl TieredBackend {
                     let bodies = late_resume_bodies(
                         body,
                         module_arc.functions.get(func_id),
-                        promoted_regions
-                            .lock()
-                            .unwrap()
-                            .get(&bead_id)
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]),
+                        &late_regions(bead_id, &promoted_regions, &outlined_regions),
                         *func_id,
                     );
-                    let llvm = Arc::clone(llvm);
-                    let module_arc = Arc::clone(module_arc);
-                    let spawned = std::thread::Builder::new()
-                        .name("zyntax-resume-points".into())
-                        .stack_size(64 << 20)
-                        .spawn(move || {
-                            publish_late_resume_point(&llvm, &bodies, &module_arc, bead_id, site);
-                        });
-                    if spawned.is_err() {
-                        late.lock().unwrap().release(bead_id, site);
-                    }
+                    spawn_late_resume_points(llvm, bodies, module_arc, bead_id, vec![site], &late);
                 }
+                #[cfg(not(feature = "llvm-backend"))]
+                let _ = site;
                 return true;
             }
             // An interpreted frame's request compiles the baseline and its
@@ -3232,8 +3264,6 @@ impl TieredBackend {
             #[cfg(feature = "llvm-backend")]
             let llvm = llvm.clone();
             #[cfg(feature = "llvm-backend")]
-            let late_for_install = Arc::clone(&late);
-            #[cfg(feature = "llvm-backend")]
             let promoted_regions = Arc::clone(&promoted_regions);
             let outlined_regions = Arc::clone(&outlined_regions);
             // The compile itself runs on a broker thread, so raising the
@@ -3286,24 +3316,6 @@ impl TieredBackend {
                 if !entry.is_null() {
                     let key = cranelift.with_lock(|be| be.reload_key());
                     crate::reload::set_call_target(key, func_id, entry as usize);
-                }
-                // Frames that asked at a header while the install was in
-                // flight get their resume points now; later ones ask for
-                // theirs themselves.
-                #[cfg(feature = "llvm-backend")]
-                if let Some(llvm) = &llvm {
-                    let sites = late_for_install.lock().unwrap().installed(bead_id);
-                    if !sites.is_empty() {
-                        let bodies = late_resume_bodies(
-                            Some(Arc::clone(&func_arc)),
-                            None,
-                            &regions,
-                            func_id,
-                        );
-                        for site in sites {
-                            publish_late_resume_point(llvm, &bodies, &module_arc, bead_id, site);
-                        }
-                    }
                 }
                 entry
             });
@@ -3619,10 +3631,6 @@ fn clamp_to_u32(v: u64) -> u32 {
     }
 }
 
-/// Calls across the LLVM/Cranelift boundary stay indirect. A large
-/// list-entry body made of such calls offers LLVM little headroom. An
-/// intrinsic lowers in place and a cold callee is off the hot path, so
-/// neither is a boundary call.
 /// Resume points asked for at a header after the bead's promotion was:
 /// which beads have a promotion queued, which the optimizing tier has
 /// installed, and which sites a late resume point is being made for, so
@@ -3647,6 +3655,10 @@ impl LateResumePoints {
         self.claimed.remove(&(bead_id, site));
     }
 
+    fn is_installed(&self, bead_id: u64) -> bool {
+        self.installed.contains(&bead_id)
+    }
+
     /// The bead's optimizing tier is installed; the sites asked at
     /// meanwhile that still have no resume point, claimed for the
     /// caller.
@@ -3657,6 +3669,89 @@ impl LateResumePoints {
             .filter(|site| osr::helper_for(bead_id, *site).is_null())
             .filter(|site| self.claimed.insert((bead_id, *site)))
             .collect()
+    }
+}
+
+/// Run after the optimizing tier compiled a bead's body, from every path
+/// that installs one: the bead id and the body compiled.
+#[cfg(feature = "llvm-backend")]
+type OptimizingInstallHook = Box<dyn Fn(u64, &Arc<HirFunction>) + Send + Sync>;
+
+#[cfg(feature = "llvm-backend")]
+fn optimizing_install_hook() -> &'static RwLock<Option<OptimizingInstallHook>> {
+    static H: std::sync::OnceLock<RwLock<Option<OptimizingInstallHook>>> =
+        std::sync::OnceLock::new();
+    H.get_or_init(|| RwLock::new(None))
+}
+
+/// The regions of `bead_id` a late resume point can be made in: those
+/// promoted with the bead and those outlined for its frames since.
+#[cfg(feature = "llvm-backend")]
+#[allow(clippy::type_complexity)]
+fn late_regions(
+    bead_id: u64,
+    promoted: &Mutex<HashMap<u64, Vec<(HirId, Arc<HirFunction>)>>>,
+    outlined: &Mutex<HashMap<u64, Vec<(HirId, Arc<HirFunction>)>>>,
+) -> Vec<(HirId, Arc<HirFunction>)> {
+    let mut regions = promoted
+        .lock()
+        .unwrap()
+        .get(&bead_id)
+        .cloned()
+        .unwrap_or_default();
+    regions.extend(
+        outlined
+            .lock()
+            .unwrap()
+            .get(&bead_id)
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    regions
+}
+
+/// Make and publish the optimizing tier's resume points at `sites`, which
+/// the caller claimed, on a thread of their own: the asking frame's
+/// thread and the promoter's do not wait for them. A site whose tag names
+/// none of `bodies` (a probe with no layout) gets none. Sites no thread
+/// could be had for are released to a later request.
+#[cfg(feature = "llvm-backend")]
+fn spawn_late_resume_points(
+    llvm: &Arc<ZyntaxLlvmBackend>,
+    bodies: Vec<(HirId, Arc<HirFunction>)>,
+    module_arc: &Arc<HirModule>,
+    bead_id: u64,
+    mut sites: Vec<u64>,
+    late: &Mutex<LateResumePoints>,
+) {
+    sites.retain(|site| {
+        let (tag, _, _) = osr::decode_osr_site(*site);
+        let found = bodies.iter().any(|(_, f)| osr::body_tag(f) == tag);
+        if !found && osr::osr_trace_enabled() {
+            eprintln!("[osr] bead={bead_id} site=0x{site:x}: no body for a late resume point");
+        }
+        found
+    });
+    if sites.is_empty() {
+        return;
+    }
+    let llvm = Arc::clone(llvm);
+    let module_arc = Arc::clone(module_arc);
+    let made = sites.clone();
+    let spawned = std::thread::Builder::new()
+        .name("zyntax-resume-points".into())
+        .stack_size(64 << 20)
+        .spawn(move || {
+            for site in made {
+                publish_late_resume_point(&llvm, &bodies, &module_arc, bead_id, site);
+            }
+        });
+    if spawned.is_err() {
+        let mut late = late.lock().unwrap();
+        for site in sites {
+            late.release(bead_id, site);
+        }
     }
 }
 
@@ -3691,9 +3786,6 @@ fn publish_late_resume_point(
 ) {
     let (tag, _, _) = osr::decode_osr_site(site);
     let Some((id, body)) = bodies.iter().find(|(_, f)| osr::body_tag(f) == tag) else {
-        if osr::osr_trace_enabled() {
-            eprintln!("[osr] bead={bead_id} site=0x{site:x}: no body for a late resume point");
-        }
         return;
     };
     let def = ZyntaxFunctionDef {
@@ -3717,6 +3809,10 @@ fn publish_late_resume_point(
     }
 }
 
+/// Calls across the LLVM/Cranelift boundary stay indirect. A large
+/// list-entry body made of such calls offers LLVM little headroom. An
+/// intrinsic lowers in place and a cold callee is off the hot path, so
+/// neither is a boundary call.
 fn llvm_list_entry_has_headroom(f: &HirFunction, module: &HirModule) -> bool {
     use crate::abi::{Pass, function_abi};
     use crate::hir::{HirCallable, HirInstruction};
@@ -4072,6 +4168,7 @@ pub fn compile_at_tier(
     {
         if let Some(llvm) = llvm {
             let resume = def.clone();
+            let asked = crate::osr::wanted_resume_points(bead_id, &resume.function);
             // A compile that panics is a compile that failed: the
             // promoter thread carries every later promotion.
             let compiled =
@@ -4086,12 +4183,12 @@ pub fn compile_at_tier(
                     // A loop the LLVM tier was asked for a resume point
                     // at and made none for would keep its running frame
                     // where it is; the Cranelift tier fills the slot
-                    // instead.
-                    let missing: Vec<u64> =
-                        crate::osr::wanted_resume_points(bead_id, &resume.function)
-                            .into_iter()
-                            .filter(|site| crate::osr::helper_for(bead_id, *site).is_null())
-                            .collect();
+                    // instead. Sites asked at while it compiled get the
+                    // LLVM tier's own from the install hook.
+                    let missing: Vec<u64> = asked
+                        .into_iter()
+                        .filter(|site| crate::osr::helper_for(bead_id, *site).is_null())
+                        .collect();
                     if !missing.is_empty() {
                         for (site, code) in cranelift.resume_points(&resume) {
                             if missing.contains(&site) && !code.is_null() {
@@ -4104,6 +4201,9 @@ pub fn compile_at_tier(
                                 crate::osr::publish_helper(bead_id, site, code);
                             }
                         }
+                    }
+                    if let Some(hook) = optimizing_install_hook().read().unwrap().as_ref() {
+                        hook(bead_id, func_arc);
                     }
                     p
                 }

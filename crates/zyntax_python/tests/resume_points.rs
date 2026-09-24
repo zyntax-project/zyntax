@@ -214,3 +214,64 @@ fn a_frame_that_left_no_longer_roots_what_died_before_the_loop() {
         "a collection after the transfer still reached {left} KB:\n{stderr}"
     );
 }
+
+/// A frame reaches a second long loop after its function was promoted,
+/// through a region outlined only then: the region's late resume point
+/// is made at the optimizing tier and the frame moves into it.
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn a_region_outlined_after_the_promotion_gets_a_late_resume_point() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/late_region.py");
+    let output = Command::new(env!("CARGO_BIN_EXE_zypy"))
+        .arg("run")
+        .arg(script)
+        .env("ZYPY_LLVM", "1")
+        .env("ZYNTAX_OSR_TRACE", "1")
+        .output()
+        .expect("zypy starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout.trim(), "1550062952", "{stderr}");
+    let site = stderr
+        .lines()
+        .find(|l| l.contains("late resume point (llvm)"))
+        .and_then(|l| l.split("site=").nth(1))
+        .and_then(|s| s.split(':').next())
+        .unwrap_or_else(|| panic!("no late resume point was made:\n{stderr}"));
+    assert!(
+        stderr.lines().any(|l| l.contains("FIRST TRANSFER")
+            && l.contains(&format!("site {site} "))
+            && l.ends_with("(llvm)")),
+        "the frame never moved into the late resume point:\n{stderr}"
+    );
+}
+
+/// A frame asks at a loop header while the promotion its function's
+/// call count raised is compiling, or after it landed: it gets the
+/// optimizing tier's resume point, never the baseline's, every time.
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn a_site_asked_during_an_entry_count_promotion_gets_the_optimizing_tier() {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/entry_count_in_flight.py");
+    let mut transfers = 0;
+    for _ in 0..20 {
+        let output = Command::new(env!("CARGO_BIN_EXE_zypy"))
+            .arg("run")
+            .arg(&script)
+            .env("ZYPY_LLVM", "1")
+            .env("ZYNTAX_OSR_TRACE", "1")
+            .output()
+            .expect("zypy starts");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stdout.trim(), "600296790 3013", "{stderr}");
+        for line in stderr.lines().filter(|l| l.contains("FIRST TRANSFER")) {
+            assert!(line.ends_with("(llvm)"), "{line}\n{stderr}");
+            transfers += 1;
+        }
+    }
+    assert!(transfers > 0, "no frame moved to a resume point in 20 runs");
+}
