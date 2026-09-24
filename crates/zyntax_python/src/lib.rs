@@ -509,7 +509,9 @@ pub fn parse_program_with(
     // A global's type is the join of every assignment to it: the
     // module's own, then those under `global` in each function. The
     // module's own are retyped each round, as the functions they call
-    // become known; nothing settles as dynamic before the end.
+    // become known; nothing settles as dynamic before the end, so a
+    // round's value decided from an operand not yet typed is refined
+    // by the next round's rather than joined with it.
     for name in &global_names {
         inferred.globals.insert(name.clone(), types::Ty::Unknown);
     }
@@ -609,7 +611,7 @@ pub fn parse_program_with(
             let sig = inferred.funcs[&item.name].clone();
             let file = inferred.file_of(item.module.as_deref());
             let locals = types::in_file(file, || {
-                types::infer_locals(&inferred, &sig, &item.def.body)
+                types::infer_locals_open(&inferred, &sig, &item.def.body, &[], false)
             });
             writes.extend(locals.global_writes.iter().map(|(n, t)| (n.clone(), *t)));
         }

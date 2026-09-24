@@ -1992,7 +1992,8 @@ pub(crate) struct Inferred {
     pub(crate) funcs: HashMap<String, Sig>,
     pub(crate) classes: Vec<ClassInfo>,
     pub(crate) closures: Vec<ClosureInfo>,
-    /// The entry body's locals, against the signatures above.
+    /// The entry body's locals, against the signatures above, with
+    /// what is undecided left so.
     pub(crate) entry: Locals,
     pub(crate) list_params: HashMap<String, Vec<ListFact>>,
     pub(crate) dynamic_methods: HashSet<String>,
@@ -2533,8 +2534,10 @@ pub(crate) fn infer_module(
             }
         }
     }
+    // The entry's locals stay open: what they say about a global is
+    // joined across rounds, and a value decided from less than the
+    // next round knows must refine there rather than pin the join.
     normalize_layouts(&mut module.classes);
-    settle(&mut entry_locals);
     Inferred {
         funcs: module.funcs,
         classes: module.classes,
@@ -3520,7 +3523,7 @@ pub(crate) fn infer_locals_entry(
 /// [`infer_locals`] leaving what is undecided undecided, for the
 /// module-wide fixed point: a value another function has yet to type
 /// must not settle as dynamic here and poison every join it reaches.
-fn infer_locals_open(
+pub(crate) fn infer_locals_open(
     module: &Module,
     sig: &Sig,
     body: &[py::Stmt],
@@ -4926,8 +4929,9 @@ pub(crate) fn bind_target(vars: &mut HashMap<String, Ty>, target: &py::Expr, ty:
 
 /// What each of `targets` receives when a value of type `ty` is
 /// unpacked into them: the shape's own elements from a tuple of that
-/// arity, the element type of a list or string, and a dynamic value
-/// otherwise or wherever a starred target takes a slice.
+/// arity, the element type of a list or string, undecided from a value
+/// still undecided, and a dynamic value otherwise or wherever a starred
+/// target takes a slice.
 pub(crate) fn unpacked(ty: Ty, targets: &[py::Expr]) -> Vec<Ty> {
     let starred = targets.iter().any(|t| matches!(t, py::Expr::Starred(_)));
     let each = match ty {
@@ -4940,6 +4944,8 @@ pub(crate) fn unpacked(ty: Ty, targets: &[py::Expr]) -> Vec<Ty> {
         }
         Ty::List(e) if !starred => e.ty(),
         Ty::Str if !starred => Ty::Str,
+        // Not yet typed: what the targets get is decided with it.
+        Ty::Unknown => Ty::Unknown,
         _ => Ty::Object,
     };
     vec![each; targets.len()]
@@ -5922,6 +5928,8 @@ impl Typer<'_> {
             "range" => Ty::List(Elem::Int),
             "len" | "int" | "ord" | "hash" | "id" => Ty::Int,
             "next" => Ty::Object,
+            // Of an operand not yet typed, undecided: what it is made of
+            // is decided by the round that types the operand.
             "sorted" | "reversed" | "list" => match arg(0) {
                 // An array's elements make a list of what they read as.
                 Ty::List(Elem::Array(c)) => Ty::List(Elem::of(c.item())),
@@ -5932,6 +5940,7 @@ impl Typer<'_> {
                 // A list of a dict is its keys.
                 Ty::Dict(k) => Ty::List(Elem::of(dict_shape(k).0)),
                 Ty::Set | Ty::Gen => Ty::List(Elem::Object),
+                Ty::Unknown if !args.is_empty() => Ty::Unknown,
                 _ => match args.first() {
                     Some(py::Expr::Call(c)) if is_name(&c.func, "range") => Ty::List(Elem::Int),
                     _ => Ty::List(Elem::Object),
@@ -5941,6 +5950,7 @@ impl Typer<'_> {
             // sequence, which is not a shape.
             "tuple" => match arg(0) {
                 Ty::Tuple(k) => Ty::Tuple(k),
+                Ty::Unknown if !args.is_empty() => Ty::Unknown,
                 _ => Ty::Object,
             },
             "dict" => match arg(0) {
@@ -5959,8 +5969,10 @@ impl Typer<'_> {
                     t @ Ty::Tuple(_) => match t.element() {
                         Some(Ty::Int | Ty::Bool) => Ty::Int,
                         Some(Ty::Float) => Ty::Float,
+                        Some(Ty::Unknown) => Ty::Unknown,
                         _ => Ty::Object,
                     },
+                    Ty::Unknown => Ty::Unknown,
                     _ => Ty::Object,
                 };
                 match args.get(1) {
@@ -5970,6 +5982,7 @@ impl Typer<'_> {
                         (Ty::Int | Ty::Float, Ty::Float) | (Ty::Float, Ty::Int | Ty::Bool) => {
                             Ty::Float
                         }
+                        (Ty::Unknown, _) | (_, Ty::Unknown) => Ty::Unknown,
                         _ => Ty::Object,
                     },
                 }
@@ -5977,6 +5990,7 @@ impl Typer<'_> {
             "min" | "max" if args.len() == 1 => match arg(0) {
                 Ty::List(e) => e.ty(),
                 t @ Ty::Tuple(_) => Elem::of(t.element().unwrap_or(Ty::Object)).ty(),
+                Ty::Unknown => Ty::Unknown,
                 _ => Ty::Object,
             },
             "divmod" => {
