@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790264911,"nonce":"RX6Q5HqAehn0HmkFoLjPqcgSgXs=","message":"Fixed in 5d6e99dad (worktree-wf_b2063457-04f-10). With ZYPY_LLVM=1, json_bench on the NUC now logs '[osr] llvm install tier=1 functions=6' for the serialiser where dea6d08b logged the verifier failure.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1790264911,"nonce":"/Qb2kNafO24fUYA1/l4EYiltb6M=","status":2}]}
