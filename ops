@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1790290034,"nonce":"AIJdonwU8rp0D5JyKnrEw3ngYHo=","added":["conformance","area:python","area:lua"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790290035,"nonce":"IyydBM9jqFS9jeUzY4L6AtsHwv0=","message":"rebound_locals.py made portable in d1293adb; the other three remain.","files":null}]}
