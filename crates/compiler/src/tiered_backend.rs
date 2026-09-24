@@ -332,6 +332,18 @@ impl CompileQueue {
         }
     }
 
+    /// Ask for the compile that replaces `bead_id`'s quick baseline,
+    /// ahead of every other request: the function is running now, the
+    /// functions queued behind it may never be called. Never stale.
+    fn request_replacement(&self, bead_id: u64) {
+        let mut compile = self.compile.lock().unwrap();
+        if !self.queued.lock().unwrap().insert(bead_id) {
+            compile.retain(|job| job.0 != bead_id);
+        }
+        compile.push_front((bead_id, None, std::time::Instant::now()));
+        self.ready.notify_one();
+    }
+
     /// The counter the interpreter keeps for `bead_id`'s calls.
     fn count_of(&self, bead_id: u64) -> Arc<std::sync::atomic::AtomicU32> {
         Arc::clone(
@@ -454,6 +466,79 @@ impl CompileQueue {
 
     fn wake(&self) {
         self.ready.notify_all();
+    }
+}
+
+/// See [`TieredBackend::first_compiles`].
+type FirstCompiles = (
+    Mutex<HashMap<u64, Option<(usize, bool)>>>,
+    std::sync::Condvar,
+);
+
+/// The first compile a stub makes of a loop-free program function: the
+/// body the interpreter runs (the module's as lowered, with its releases
+/// placed) at tier 0, with none of the per-function pipeline. The worker
+/// then optimises the body and compiles it again, replacing this code.
+/// A function with a loop takes the pipeline at once: a frame running
+/// this code could not enter the resume points made for the optimised
+/// body, while a loop-free frame returns and the next call takes the
+/// replacement.
+///
+/// The quick code is published to the stub and the bead, never to the
+/// call cell: a closure reads the cell once, when it is made, and would
+/// keep the quick code for good. The cell keeps the stub, which reads
+/// the published entry on every call, until the replacement lands.
+struct QuickBaseline {
+    /// The program's own lazy functions; a finished one arrived optimised.
+    lazy: HashSet<HirId>,
+    interp_bodies: Arc<Mutex<HashMap<HirId, Arc<HirFunction>>>>,
+    #[allow(clippy::type_complexity)]
+    make_interp_body: Option<Arc<dyn Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync>>,
+    /// What each quick baseline's call cell held when it was published:
+    /// the replacement takes the cell only from that.
+    cells: Mutex<HashMap<u64, usize>>,
+    /// When each quick baseline was published, kept under
+    /// `ZYNTAX_TRACE_LAZY` alone.
+    published_at: Mutex<HashMap<u64, std::time::Instant>>,
+}
+
+impl QuickBaseline {
+    /// The body to compile quickly for `func_id`, shared with the
+    /// interpreter; `None` for a function with a loop or one that is
+    /// not the program's own.
+    fn body(&self, bead_id: u64, func_id: HirId, module: &HirModule) -> Option<Arc<HirFunction>> {
+        if !self.lazy.contains(&func_id)
+            || !osr::find_loop_headers(module.functions.get(&func_id)?).is_empty()
+        {
+            return None;
+        }
+        if let Some(body) = self.interp_bodies.lock().unwrap().get(&func_id) {
+            return Some(Arc::clone(body));
+        }
+        let body = self.make_interp_body.as_ref()?(bead_id)?;
+        Some(Arc::clone(
+            self.interp_bodies
+                .lock()
+                .unwrap()
+                .entry(func_id)
+                .or_insert(body),
+        ))
+    }
+
+    fn note_published(&self, bead_id: u64) {
+        self.published_at
+            .lock()
+            .unwrap()
+            .insert(bead_id, std::time::Instant::now());
+    }
+
+    /// How long ago `bead_id`'s quick baseline was published, once.
+    fn published_since(&self, bead_id: u64) -> Option<std::time::Duration> {
+        self.published_at
+            .lock()
+            .unwrap()
+            .remove(&bead_id)
+            .map(|at| at.elapsed())
     }
 }
 
@@ -605,6 +690,13 @@ pub struct TieredBackend {
     /// waiting on code, ahead of its own order. `None` without the
     /// thread, and every request then compiles on the asking thread.
     compile_queue: Option<Arc<CompileQueue>>,
+    /// Each lazy function compiled once: the entry once published, with
+    /// whether it is a quick baseline the worker is to replace, or the
+    /// mark of a compile under way, which a second call waits out.
+    /// Different functions compile side by side; the backend's own lock
+    /// keeps them apart where it must. Kept across modules, so a quick
+    /// baseline made before a later module is still replaced.
+    first_compiles: Arc<FirstCompiles>,
 
     /// Runtime FFI symbols registered post-construction.
     runtime_symbols: Arc<RwLock<Vec<RuntimeSymbol>>>,
@@ -697,6 +789,7 @@ impl TieredBackend {
             warm_up: None,
             warm_up_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compile_queue: None,
+            first_compiles: Arc::new((Mutex::new(HashMap::new()), std::sync::Condvar::new())),
             runtime_symbols: Arc::new(RwLock::new(Vec::new())),
             config,
         })
@@ -2235,13 +2328,16 @@ impl TieredBackend {
                 let c = &*ctx;
                 // The baseline was compiled at load; the ladder above it
                 // compiles anew, from the body the first-call compile
-                // optimised when there is one.
+                // optimised when there is one. A quick baseline has none
+                // until its replacement: the body is optimised now.
                 if tier == 0 {
                     if let Some(p) = c.cranelift.with_lock(|be| be.get_function_ptr(c.func_id)) {
                         return p as *mut ();
                     }
                 }
                 let optimized = optimized_bodies.lock().unwrap().get(&c.func_id).cloned();
+                let optimized = optimized
+                    .or_else(|| lazy.then(|| osr::lazy_optimized_body(c.bead_id)).flatten());
                 let body = match (&c.swapped, optimized) {
                     (Some(f), _) => Arc::clone(f),
                     (None, Some(f)) => f,
@@ -2460,12 +2556,7 @@ impl TieredBackend {
         let reload_key = self.cranelift.with_lock(|be| be.reload_key());
         let lazy: HashSet<HirId> = lazy.difference(finished).copied().collect();
         let finished = finished.clone();
-        // Compiled once: the entry once published, or the mark of a
-        // compile under way, which a second call waits out. Different
-        // functions compile side by side; the backend's own lock keeps
-        // them apart where it must.
-        let done: Arc<(Mutex<HashMap<u64, Option<usize>>>, std::sync::Condvar)> =
-            Arc::new((Mutex::new(HashMap::new()), std::sync::Condvar::new()));
+        let done = Arc::clone(&self.first_compiles);
         // What the per-function finishing passes read from the module.
         let (externs, pure_fns) = match self.functions.values().next() {
             Some(e) => (
@@ -2708,8 +2799,20 @@ impl TieredBackend {
         let bead_of: HashMap<HirId, u64> =
             by_bead.iter().map(|(b, (id, _, _))| (*id, *b)).collect();
         let published = Arc::clone(&done);
-        let compile_lazy_function = move |bead_id: u64| -> *const u8 {
+        let quick_baseline = QuickBaseline {
+            lazy: lazy.clone(),
+            interp_bodies: Arc::clone(&self.interp_bodies),
+            make_interp_body: self.make_interp_body.clone(),
+            cells: Mutex::new(HashMap::new()),
+            published_at: Mutex::new(HashMap::new()),
+        };
+        // `quick`: the caller is a stub, off the warm-up threads, and
+        // takes a quick baseline for a loop-free function. A call
+        // without it that finds a quick baseline replaces it.
+        let compile_lazy_function = move |bead_id: u64, quick: bool| -> *const u8 {
             let trace = std::env::var_os("ZYNTAX_TRACE_LAZY").is_some();
+            // The quick baseline this compile replaces.
+            let mut replacing: Option<usize> = None;
             {
                 let (table, published) = &*done;
                 let mut table = table.lock().unwrap();
@@ -2717,7 +2820,11 @@ impl TieredBackend {
                 let mut did_wait = false;
                 loop {
                     match table.get(&bead_id) {
-                        Some(Some(entry)) => {
+                        Some(Some((entry, true))) if !quick => {
+                            replacing = Some(*entry);
+                            break;
+                        }
+                        Some(Some((entry, _))) => {
                             if trace && did_wait {
                                 eprintln!(
                                     "[lazy] {} waited {:.2} ms for bead {bead_id}",
@@ -2739,14 +2846,17 @@ impl TieredBackend {
                 }
             }
             // Whatever this compile comes to, the mark is replaced and
-            // the waiters woken.
-            let publish = |entry: usize| {
+            // the waiters woken. A replacement that fails leaves the
+            // quick baseline where it is.
+            let publish = |entry: usize, quick: bool| {
                 let (table, published) = &*done;
                 let mut table = table.lock().unwrap();
                 if entry == 0 {
-                    table.remove(&bead_id);
+                    if replacing.is_none() {
+                        table.remove(&bead_id);
+                    }
                 } else {
-                    table.insert(bead_id, Some(entry));
+                    table.insert(bead_id, Some((entry, quick)));
                     osr::set_published_entry(bead_id, entry);
                 }
                 published.notify_all();
@@ -2756,7 +2866,7 @@ impl TieredBackend {
                 if trace {
                     eprintln!("[lazy] bead {bead_id} is not a function this compiler knows");
                 }
-                return publish(0);
+                return publish(0, false);
             };
             // What this function calls will be called from its native code
             // as soon as it runs, through stubs that compile on the spot:
@@ -2764,7 +2874,9 @@ impl TieredBackend {
             // what a library function only takes the address of: a
             // library builder fills a whole table with functions the
             // program may never call. Nor a cold callee.
-            if let Some(queue) = queue_for_callees.lock().unwrap().as_ref()
+            let queue = queue_for_callees.lock().unwrap().clone();
+            if let Some(queue) = &queue
+                && replacing.is_none()
                 && let Some(f) = module_arc.functions.get(func_id)
             {
                 let closures = !finished.contains(func_id);
@@ -2784,11 +2896,55 @@ impl TieredBackend {
                 }
             }
             let lazy_started = std::time::Instant::now();
+            let optimized = optimized_bodies.lock().unwrap().contains_key(func_id);
+            if quick
+                && !optimized
+                && let Some(queue) = &queue
+                && let Some(body) = quick_baseline.body(bead_id, *func_id, module_arc)
+            {
+                let entry = compile_at_tier(
+                    0,
+                    bound.bead(),
+                    *func_id,
+                    bead_id,
+                    &body,
+                    module_arc,
+                    &cranelift,
+                    #[cfg(feature = "llvm-backend")]
+                    llvm.as_ref(),
+                    tier2_backend,
+                    verbosity,
+                );
+                if !entry.is_null() {
+                    quick_baseline
+                        .cells
+                        .lock()
+                        .unwrap()
+                        .insert(bead_id, crate::reload::call_target(reload_key, *func_id));
+                    bound.bead().eager_install(entry);
+                    if trace {
+                        quick_baseline.note_published(bead_id);
+                    }
+                    publish(entry as usize, true);
+                    queue.request_replacement(bead_id);
+                    if trace {
+                        eprintln!(
+                            "[lazy] quick baseline {} in {:.2} ms on {}",
+                            body.name.resolve_global().unwrap_or_default(),
+                            lazy_started.elapsed().as_secs_f64() * 1e3,
+                            std::thread::current().name().unwrap_or("?")
+                        );
+                    }
+                    return entry as *const u8;
+                }
+                // What the backend refused as lowered goes through the
+                // pipeline below.
+            }
             let Some(body) = optimize_body(bead_id) else {
                 if trace {
                     eprintln!("[lazy] bead {bead_id} ({func_id:?}) has no body to compile");
                 }
-                return publish(0);
+                return publish(0, false);
             };
             let body_at = lazy_started.elapsed();
             let entry = compile_at_tier(
@@ -2812,24 +2968,56 @@ impl TieredBackend {
                         body.name.resolve_global().unwrap_or_default()
                     );
                 }
-                return publish(0);
+                return publish(0, false);
             }
-            crate::reload::set_call_target(reload_key, *func_id, entry as usize);
-            bound.bead().eager_install(entry);
+            match replacing {
+                // What a tier above installed meanwhile stays.
+                Some(quick_entry) => {
+                    if let Some(cell) = quick_baseline.cells.lock().unwrap().remove(&bead_id) {
+                        crate::reload::replace_call_target(
+                            reload_key,
+                            *func_id,
+                            cell,
+                            entry as usize,
+                        );
+                    }
+                    if bound.bead().compiled() == Some(quick_entry as *mut ()) {
+                        bound.bead().swap_compiled(entry);
+                    }
+                }
+                None => {
+                    crate::reload::set_call_target(reload_key, *func_id, entry as usize);
+                    bound.bead().eager_install(entry);
+                }
+            }
             // A body with a loop is kept for the resume points an
             // interpreted frame of it may still ask for; without one, or
             // a tier above, the compile was its last reader.
             if !keeps_bodies && osr::find_loop_headers(&body).is_empty() {
                 optimized_bodies.lock().unwrap().remove(func_id);
             }
-            publish(entry as usize);
+            publish(entry as usize, false);
             // `ZYNTAX_TRACE_LAZY=1` names each first-call compile with
-            // the time it took, the wait for the backend included, and
-            // the thread that did it.
+            // the time it took, the wait for the backend included, what
+            // kind of body it was, and the thread that did it; and each
+            // quick baseline replaced, with how long it served.
             if trace {
+                let name = body.name.resolve_global().unwrap_or_default();
+                if let Some(since) = quick_baseline.published_since(bead_id) {
+                    eprintln!(
+                        "[lazy] replaced quick baseline {name} {:.2} ms after it was published",
+                        since.as_secs_f64() * 1e3
+                    );
+                }
+                let kind = if finished.contains(func_id) {
+                    "finished"
+                } else if osr::find_loop_headers(&body).is_empty() {
+                    "loop-free"
+                } else {
+                    "loops"
+                };
                 eprintln!(
-                    "[lazy] compiled {} in {:.2} ms (body {:.2}, compile {:.2}) on {}",
-                    body.name.resolve_global().unwrap_or_default(),
+                    "[lazy] compiled {name} in {:.2} ms (body {:.2}, compile {:.2}, {kind}) on {}",
                     lazy_started.elapsed().as_secs_f64() * 1e3,
                     body_at.as_secs_f64() * 1e3,
                     (compiled_at - body_at).as_secs_f64() * 1e3,
@@ -2862,6 +3050,12 @@ impl TieredBackend {
             osr::set_compile_worker_busy(Some(Arc::clone(&queue.busy)));
             self.compile_queue = Some(Arc::clone(&queue));
             *queue_cell.lock().unwrap() = Some(Arc::clone(&queue));
+            // Quick baselines the worker before this one had not replaced.
+            for (bead_id, compiled) in self.first_compiles.0.lock().unwrap().iter() {
+                if let Some((_, true)) = compiled {
+                    queue.request_replacement(*bead_id);
+                }
+            }
             self.warm_up = std::thread::Builder::new()
                 .name("zyntax-warm-up".into())
                 .stack_size(16 << 20)
@@ -2881,7 +3075,7 @@ impl TieredBackend {
                             Some(Job::Compile(bead_id, count, at)) => {
                                 idle_since = None;
                                 if queue.still_wanted(bead_id, count, at) {
-                                    compile(bead_id);
+                                    compile(bead_id, false);
                                 } else if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
                                     eprintln!(
                                         "[lazy] dropped compile of bead {bead_id}: no calls since"
@@ -2914,14 +3108,15 @@ impl TieredBackend {
         // stub again: the entry is answered from the table then, with
         // no thread.
         osr::set_lazy_compiler(move |bead_id| {
-            if let Some(Some(entry)) = published.0.lock().unwrap().get(&bead_id) {
+            if let Some(Some((entry, _))) = published.0.lock().unwrap().get(&bead_id) {
                 return *entry as *const u8;
             }
+            let quick = !ON_WARM_UP.with(|on| on.get());
             std::thread::scope(|scope| {
                 std::thread::Builder::new()
                     .name("zyntax-first-call-compile".into())
                     .stack_size(16 << 20)
-                    .spawn_scoped(scope, || compile_lazy_function(bead_id) as usize)
+                    .spawn_scoped(scope, || compile_lazy_function(bead_id, quick) as usize)
                     .map(|handle| handle.join().unwrap_or(0))
                     .unwrap_or(0) as *const u8
             })

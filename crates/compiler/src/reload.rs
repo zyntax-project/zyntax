@@ -62,6 +62,16 @@ pub fn set_call_target(backend: u64, func: HirId, ptr: usize) {
     unsafe { &*(addr as *const AtomicUsize) }.store(ptr, Ordering::Release);
 }
 
+/// Publish `ptr` as the entry of `func` if the cell still holds
+/// `current`; whether it did.
+pub fn replace_call_target(backend: u64, func: HirId, current: usize, ptr: usize) -> bool {
+    let addr = call_cell_addr(backend, func);
+    // SAFETY: as in `set_call_target`.
+    unsafe { &*(addr as *const AtomicUsize) }
+        .compare_exchange(current, ptr, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
 /// Current entry of `func`, or 0 if none was ever published.
 pub fn call_target(backend: u64, func: HirId) -> usize {
     let addr = call_cell_addr(backend, func);
