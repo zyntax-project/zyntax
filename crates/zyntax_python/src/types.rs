@@ -2174,6 +2174,8 @@ pub(crate) fn infer_module(
     let mut inferring: HashMap<String, Vec<bool>> = HashMap::default();
     for item in items {
         let mut sig = declared_sig_in(&module.class_index, item.def, item.class);
+        // An inferred parameter starts undecided; a default counts as
+        // a value it takes at each call that leaves it out.
         if known.infers_params(item) {
             let flags: Vec<bool> = item
                 .def
@@ -2182,25 +2184,9 @@ pub(crate) fn infer_module(
                 .enumerate()
                 .map(|(i, p)| p.parameter.annotation.is_none() && !(i == 0 && item.class.is_some()))
                 .collect();
-            // A default is one of the values the parameter takes,
-            // whether or not a call leaves it out.
-            let defaults: Vec<Ty> = sig
-                .defaults
-                .iter()
-                .map(|d| match d {
-                    Some(d) => Typer {
-                        module: &module,
-                        vars: &HashMap::default(),
-                        outer: &HashMap::default(),
-                    }
-                    .expr(d),
-                    None => Ty::Unknown,
-                })
-                .collect();
-            for ((flag, (_, ty)), default) in flags.iter().zip(sig.params.iter_mut()).zip(defaults)
-            {
+            for (flag, (_, ty)) in flags.iter().zip(sig.params.iter_mut()) {
                 if *flag {
-                    *ty = default;
+                    *ty = Ty::Unknown;
                 }
             }
             inferring.insert(item.name.clone(), flags);

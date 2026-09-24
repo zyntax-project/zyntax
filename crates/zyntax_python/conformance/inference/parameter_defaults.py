@@ -1,5 +1,5 @@
-# A default is one of the values a parameter takes, whether or not any
-# call leaves it out.
+# A default is one of the values a parameter takes at each call that
+# leaves it out.
 
 def add_option(name, action="store", kind=None, default=None, dest=None):
     if dest is None:

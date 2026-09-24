@@ -1951,8 +1951,13 @@ impl<'m> Lowerer<'m> {
                 ));
                 continue;
             }
+            // A default the parameter's type does not admit is one no
+            // call leaves out: every call fills its arguments itself.
             let default_value = match &p.default {
-                Some(d) if self.callee_defaults => {
+                Some(d)
+                    if self.callee_defaults
+                        && self.module.join_classes(declared, self.ty_of(d)) == declared =>
+                {
                     let v = self.expr(d)?;
                     Some(Box::new(self.coerce(v, declared)))
                 }
