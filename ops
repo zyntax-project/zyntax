@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1790361394,"nonce":"BoDFIym40lLpijWdsgnjMYCInpE=","added":["bug","area:compiler"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790361425,"nonce":"e54+bQtC87WSvdppDXZKWRfb3/A=","message":"The with-scope exit edge issue named above is 812731d26b7d79dd4598bfff7f3e033fbf3609bafa896b04725fb03396bc6124; one emitter should serve both.","files":null}]}
