@@ -100,6 +100,13 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             string(),
             Some("$Foreign$type"),
         ),
+        // The length of the bytes `x` is a buffer of, -1 when none.
+        extern_fn(
+            "zb_foreign_bytes_len",
+            &[("x", any())],
+            i64(),
+            Some("$Foreign$bytes_len"),
+        ),
         extern_fn(
             "zb_foreign_hash",
             &[("x", any())],

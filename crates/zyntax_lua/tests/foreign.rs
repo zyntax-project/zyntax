@@ -20,6 +20,8 @@ enum Obj {
     },
     /// A method as a value: its receiver comes first.
     Method(String),
+    /// A buffer of bytes, which the program reads in place.
+    Blob(Vec<u8>),
 }
 
 struct State {
@@ -81,6 +83,7 @@ fn type_of(obj: &Obj) -> &'static str {
         Obj::Function(_) => "function",
         Obj::Point { .. } => "Point",
         Obj::Method(_) => "method",
+        Obj::Blob(_) => "blob",
     }
 }
 
@@ -91,6 +94,7 @@ impl Foreign for Stand {
         match (object(word), name) {
             (Obj::Shapes, "Point") => Ok(make(Obj::Function("Point"))),
             (Obj::Shapes, "same") => Ok(make(Obj::Function("same"))),
+            (Obj::Shapes, "blob") => Ok(make(Obj::Function("blob"))),
             (Obj::Shapes, "version") => Ok(foreign::int(3)),
             (Obj::Log, "record") => Ok(make(Obj::Function("record"))),
             (Obj::Point { x, .. }, "x") => Ok(foreign::float(x)),
@@ -125,6 +129,10 @@ impl Foreign for Stand {
                 x: number(args[0])?,
                 y: number(args[1])?,
             })),
+            // An i32 of 1, then an f32 of 1.5.
+            Obj::Function("blob") => Ok(make(Obj::Blob(
+                [1i32.to_le_bytes(), 1.5f32.to_le_bytes()].concat(),
+            ))),
             Obj::Function("same") => match unsafe { foreign::read(args[0]) } {
                 Value::Foreign(w) => Ok(again(w)),
                 _ => Err(ForeignError::new("TypeError", "same() takes a point")),
@@ -203,6 +211,13 @@ impl Foreign for Stand {
     fn release(&self, word: usize) {
         STATE.lock().unwrap().held[word - 1] -= 1;
     }
+
+    fn bytes(&self, word: usize) -> Option<(*const u8, usize)> {
+        match &STATE.lock().unwrap().objects[word - 1] {
+            Obj::Blob(bytes) => Some((bytes.as_ptr(), bytes.len())),
+            _ => None,
+        }
+    }
 }
 
 const PROGRAM: &str = r#"
@@ -224,6 +239,12 @@ seen[p] = "seen"
 log.record(seen[shapes.same(p)])
 log.record(require("shapes") == shapes)
 log.record(debug.setuservalue(p, 1), debug.getuservalue(p), pcall(debug.setuservalue, p))
+local b = shapes.blob()
+log.record(#b, string.len(b), string.byte(b, 1), string.byte(b, -1))
+log.record(string.unpack("<i4f", b))
+log.record(string.sub(b, 1, 4) == string.pack("<i4", 1))
+log.record(pcall(string.len, shapes))
+log.record(string.len("abc"), ("xyz"):byte(2))
 "#;
 
 #[test]
@@ -266,6 +287,14 @@ fn a_program_uses_the_embedders_objects() {
         records[9],
         "nil\tnil\tfalse\tbad argument #2 to 'debug.setuservalue' (value expected)"
     );
+    // A buffer is read in place by the string library.
+    assert_eq!(records[10..13], ["8\t8\t1\t63", "1\t1.5\t9", "true"]);
+    assert!(
+        records[13].starts_with("false\t") && records[13].contains("string expected, got userdata"),
+        "{}",
+        records[13]
+    );
+    assert_eq!(records[14], "3\t121");
     assert!(
         s.held.iter().all(|&n| n >= 0),
         "an object was released more often than boxed: {:?}",

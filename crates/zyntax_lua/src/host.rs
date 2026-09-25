@@ -1125,6 +1125,52 @@ extern "C" fn host_byte_at(s: zrtl::StringConstPtr, i: i64) -> i64 {
     if a < b { bytes[a] as i64 } else { -1 }
 }
 
+/// The bytes a string holds, or a foreign object is a buffer of, read in
+/// place: what `string.len`, `sub`, `byte` and `unpack` read when their
+/// subject is not a string by its static type.
+unsafe fn source_bytes<'a>(v: *const DynamicBox) -> &'a [u8] {
+    if let Some(bytes) = unsafe { zyntax_embed::foreign::bytes_of(v as *mut DynamicBox) } {
+        return bytes;
+    }
+    match unsafe { v.as_ref() } {
+        Some(b) if b.tag.category() == TypeCategory::String => unsafe {
+            bytes_of(b.data as zrtl::StringConstPtr)
+        },
+        _ => &[],
+    }
+}
+
+extern "C" fn host_len_any(v: *const DynamicBox) -> i64 {
+    unsafe { source_bytes(v) }.len() as i64
+}
+
+extern "C" fn host_sub_any(v: *const DynamicBox, i: i64, j: i64) -> StringPtr {
+    let bytes = unsafe { source_bytes(v) };
+    let (a, b) = byte_range(bytes.len(), i, j);
+    zrtl::string::string_from_bytes(&bytes[a..b])
+}
+
+extern "C" fn host_byte_at_any(v: *const DynamicBox, i: i64) -> i64 {
+    let bytes = unsafe { source_bytes(v) };
+    let (a, b) = byte_range(bytes.len(), i, i);
+    if a < b { bytes[a] as i64 } else { -1 }
+}
+
+extern "C" fn host_unpack_any(fmt: zrtl::StringConstPtr, v: *const DynamicBox, pos: i64) -> i64 {
+    let (fmt, data) = unsafe { (bytes_of(fmt), source_bytes(v)) };
+    match crate::pack::unpack(fmt, data, pos.max(0) as usize) {
+        Ok((values, next)) => {
+            let n = values.len() as i64;
+            UNPACKED.with(|u| *u.borrow_mut() = (values, next));
+            n
+        }
+        Err(e) => {
+            PACK_ERROR.with(|err| *err.borrow_mut() = e);
+            -1
+        }
+    }
+}
+
 extern "C" fn host_from_byte(b: i64) -> StringPtr {
     zrtl::string::string_from_bytes(&[b as u8])
 }
@@ -1982,7 +2028,7 @@ fn table_error_text(err: *const DynamicBox) -> Result<Option<Vec<u8>>, String> {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 100] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 104] = [
     zrtl::ZrtlSymbol::new(c"$Lua$cpath".as_ptr(), host_cpath as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
@@ -2001,6 +2047,10 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 100] = [
     zrtl::ZrtlSymbol::new(c"$Lua$word".as_ptr(), host_word as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$sub".as_ptr(), host_sub as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$byte_at".as_ptr(), host_byte_at as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$len_any".as_ptr(), host_len_any as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$sub_any".as_ptr(), host_sub_any as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$byte_at_any".as_ptr(), host_byte_at_any as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$unpack_any".as_ptr(), host_unpack_any as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$from_byte".as_ptr(), host_from_byte as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$reverse".as_ptr(), host_reverse as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$rep".as_ptr(), host_rep as *const u8),

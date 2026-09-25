@@ -28,6 +28,11 @@ pub enum Param {
     Float,
     /// A string: a string or a number.
     Str,
+    /// The bytes to read of a string, a number, or a foreign object that
+    /// is a buffer of bytes, read in place. A string by its static type
+    /// goes to the typed implementation; anything else to its `$any`
+    /// form (see [`any_form`]), which reads the subject either way.
+    Bytes,
     /// A table.
     Table,
     /// An integer, or this when absent or nil.
@@ -204,14 +209,14 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "string",
         name: "len",
         func: "zl_string_len",
-        params: &[Str],
+        params: &[Bytes],
         ret: Ret::Int,
     },
     Builtin {
         lib: "string",
         name: "sub",
         func: "zl_string_sub",
-        params: &[Str, OptInt(1), OptInt(-1)],
+        params: &[Bytes, OptInt(1), OptInt(-1)],
         ret: Ret::Str,
     },
     Builtin {
@@ -246,7 +251,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "string",
         name: "byte",
         func: "zl_string_byte",
-        params: &[Str, OptInt(1), OptInt(i64::MIN)],
+        params: &[Bytes, OptInt(1), OptInt(i64::MIN)],
         ret: Ret::Multi,
     },
     Builtin {
@@ -281,7 +286,7 @@ pub const BUILTINS: &[Builtin] = &[
         lib: "string",
         name: "unpack",
         func: "zl_string_unpack",
-        params: &[Str, Str, OptInt(1)],
+        params: &[Str, Bytes, OptInt(1)],
         ret: Ret::Multi,
     },
     Builtin {
@@ -1095,6 +1100,12 @@ pub fn builtin_index(b: &Builtin) -> usize {
 }
 
 /// The name of a builtin's value wrapper.
+/// The implementation of a builtin with a [`Param::Bytes`] parameter
+/// that reads its subject as a string or a buffer.
+pub fn any_form(func: &str) -> String {
+    format!("{func}$any")
+}
+
 pub fn wrapper_name(b: &Builtin) -> String {
     if b.lib.is_empty() {
         format!("zl_v_{}", b.name)
@@ -1221,6 +1232,36 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ),
             arg_error(&what, "string", got_of(&x)),
             ret(text("")),
+        ],
+    ));
+    // The subject of a function that reads bytes: a string as it is, a
+    // number as its text, a foreign object that is a buffer as itself.
+    d.push(define(
+        "zl_arg_bytes",
+        &[&x, &what],
+        any(),
+        vec![
+            when(is_nil(x.e()), vec![arg_error(&what, "string", got_of(&x))]),
+            when(eq(category(x.e()), int(STR)), vec![ret(x.e())]),
+            when(
+                or(
+                    or(
+                        eq(category(x.e()), int(INT)),
+                        eq(category(x.e()), int(UINT)),
+                    ),
+                    eq(category(x.e()), int(FLOAT)),
+                ),
+                vec![ret(box_str(call("zl_number_str", vec![x.e()], string())))],
+            ),
+            when(
+                and(
+                    zyntax_builtins::foreign::is_foreign(x.e()),
+                    ge(call("zb_foreign_bytes_len", vec![x.e()], i64()), int(0)),
+                ),
+                vec![ret(x.e())],
+            ),
+            arg_error(&what, "string", got_of(&x)),
+            ret(nil()),
         ],
     ));
     // An optional integer: the default when absent.
@@ -1925,6 +1966,31 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             i64(),
             "$Lua$unpack",
         ),
+        // The same over a string or a buffer (`Param::Bytes`).
+        (
+            "zl_string_len$any",
+            vec![("s", any())],
+            i64(),
+            "$Lua$len_any",
+        ),
+        (
+            "zl_string_sub$any",
+            vec![("s", any()), ("i", i64()), ("j", i64())],
+            string(),
+            "$Lua$sub_any",
+        ),
+        (
+            "zl_byte_at$any",
+            vec![("s", any()), ("i", i64())],
+            i64(),
+            "$Lua$byte_at_any",
+        ),
+        (
+            "zl_unpack_raw$any",
+            vec![("fmt", string()), ("s", any()), ("pos", i64())],
+            i64(),
+            "$Lua$unpack_any",
+        ),
         (
             "zl_unpack_kind",
             vec![("i", i64())],
@@ -2044,39 +2110,50 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         vec![ret(call("zb_str_len", vec![s.e()], i64()))],
     ));
     // `string.byte(s, i, j)`: the bytes at `i..=j`, `j` being `i` when
-    // absent.
-    d.push(define(
-        "zl_string_byte",
-        &[&s, &i, &j],
-        any(),
-        vec![
-            when(eq(j.e(), int(i64::MIN)), vec![j.set(i.e())]),
-            n.decl(call("zb_str_len", vec![s.e()], i64())),
-            when(
-                lt(i.e(), int(0)),
-                vec![i.set(add(add(n.e(), i.e()), int(1)))],
-            ),
-            when(
-                lt(j.e(), int(0)),
-                vec![j.set(add(add(n.e(), j.e()), int(1)))],
-            ),
-            when(lt(i.e(), int(1)), vec![i.set(int(1))]),
-            when(gt(j.e(), n.e()), vec![j.set(n.e())]),
-            out.decl(list(vec![], anys.clone())),
-            k.decl(i.e()),
-            while_(
-                le(k.e(), j.e()),
-                vec![
-                    push(
-                        out.e(),
-                        box_i64(call("zl_byte_at", vec![s.e(), k.e()], i64())),
-                    ),
-                    k.add_assign(int(1)),
-                ],
-            ),
-            ret(call("zb_box_tuple", vec![out.e()], any())),
-        ],
-    ));
+    // absent; its `$any` form reads a string or a buffer.
+    let subject_any = kept("s", any());
+    for (name, subject, len_of, byte_at) in [
+        ("zl_string_byte", &s, "zb_str_len", "zl_byte_at"),
+        (
+            "zl_string_byte$any",
+            &subject_any,
+            "zl_string_len$any",
+            "zl_byte_at$any",
+        ),
+    ] {
+        d.push(define(
+            name,
+            &[subject, &i, &j],
+            any(),
+            vec![
+                when(eq(j.e(), int(i64::MIN)), vec![j.set(i.e())]),
+                n.decl(call(len_of, vec![subject.e()], i64())),
+                when(
+                    lt(i.e(), int(0)),
+                    vec![i.set(add(add(n.e(), i.e()), int(1)))],
+                ),
+                when(
+                    lt(j.e(), int(0)),
+                    vec![j.set(add(add(n.e(), j.e()), int(1)))],
+                ),
+                when(lt(i.e(), int(1)), vec![i.set(int(1))]),
+                when(gt(j.e(), n.e()), vec![j.set(n.e())]),
+                out.decl(list(vec![], anys.clone())),
+                k.decl(i.e()),
+                while_(
+                    le(k.e(), j.e()),
+                    vec![
+                        push(
+                            out.e(),
+                            box_i64(call(byte_at, vec![subject.e(), k.e()], i64())),
+                        ),
+                        k.add_assign(int(1)),
+                    ],
+                ),
+                ret(call("zb_box_tuple", vec![out.e()], any())),
+            ],
+        ));
+    }
     d.push(define(
         "zl_string_char",
         &[&args],
@@ -3033,65 +3110,76 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     // `string.unpack(fmt, s, pos)`: the position is Lua's, relative
     // from the end when negative; the values come back one by one.
     let data = kept("data", string());
+    let data_any = kept("data", any());
     let pos = local("pos", i64());
-    d.push(define(
-        "zl_string_unpack",
-        &[&s, &data, &pos],
-        any(),
-        vec![
-            n.decl(call("zb_str_len", vec![data.e()], i64())),
-            when(
-                lt(pos.e(), int(0)),
-                vec![pos.set(if_expr(
-                    lt(pos.e(), sub(int(0), n.e())),
-                    int(1),
-                    add(add(n.e(), pos.e()), int(1)),
-                ))],
-            ),
-            when(eq(pos.e(), int(0)), vec![pos.set(int(1))]),
-            k.decl(call(
-                "zl_unpack_raw",
-                vec![s.e(), data.e(), sub(pos.e(), int(1))],
-                i64(),
-            )),
-            when(
-                lt(k.e(), int(0)),
-                vec![lua_error(call("zl_pack_error", vec![], string()))],
-            ),
-            out.decl(list(vec![], anys.clone())),
-            i.decl(int(0)),
-            while_(
-                lt(i.e(), k.e()),
-                vec![
-                    j.decl(call("zl_unpack_kind", vec![i.e()], i64())),
-                    when(
-                        eq(j.e(), int(0)),
-                        vec![push(
-                            out.e(),
-                            box_i64(call("zl_unpack_int", vec![i.e()], i64())),
-                        )],
-                    ),
-                    when(
-                        eq(j.e(), int(1)),
-                        vec![push(
-                            out.e(),
-                            box_f64(call("zl_unpack_float", vec![i.e()], f64())),
-                        )],
-                    ),
-                    when(
-                        eq(j.e(), int(2)),
-                        vec![push(
-                            out.e(),
-                            box_str(call("zl_unpack_str", vec![i.e()], string())),
-                        )],
-                    ),
-                    i.add_assign(int(1)),
-                ],
-            ),
-            push(out.e(), box_i64(call("zl_unpack_next", vec![], i64()))),
-            ret(call("zb_box_tuple", vec![out.e()], any())),
-        ],
-    ));
+    for (name, data, len_of, raw) in [
+        ("zl_string_unpack", &data, "zb_str_len", "zl_unpack_raw"),
+        (
+            "zl_string_unpack$any",
+            &data_any,
+            "zl_string_len$any",
+            "zl_unpack_raw$any",
+        ),
+    ] {
+        d.push(define(
+            name,
+            &[&s, data, &pos],
+            any(),
+            vec![
+                n.decl(call(len_of, vec![data.e()], i64())),
+                when(
+                    lt(pos.e(), int(0)),
+                    vec![pos.set(if_expr(
+                        lt(pos.e(), sub(int(0), n.e())),
+                        int(1),
+                        add(add(n.e(), pos.e()), int(1)),
+                    ))],
+                ),
+                when(eq(pos.e(), int(0)), vec![pos.set(int(1))]),
+                k.decl(call(
+                    raw,
+                    vec![s.e(), data.e(), sub(pos.e(), int(1))],
+                    i64(),
+                )),
+                when(
+                    lt(k.e(), int(0)),
+                    vec![lua_error(call("zl_pack_error", vec![], string()))],
+                ),
+                out.decl(list(vec![], anys.clone())),
+                i.decl(int(0)),
+                while_(
+                    lt(i.e(), k.e()),
+                    vec![
+                        j.decl(call("zl_unpack_kind", vec![i.e()], i64())),
+                        when(
+                            eq(j.e(), int(0)),
+                            vec![push(
+                                out.e(),
+                                box_i64(call("zl_unpack_int", vec![i.e()], i64())),
+                            )],
+                        ),
+                        when(
+                            eq(j.e(), int(1)),
+                            vec![push(
+                                out.e(),
+                                box_f64(call("zl_unpack_float", vec![i.e()], f64())),
+                            )],
+                        ),
+                        when(
+                            eq(j.e(), int(2)),
+                            vec![push(
+                                out.e(),
+                                box_str(call("zl_unpack_str", vec![i.e()], string())),
+                            )],
+                        ),
+                        i.add_assign(int(1)),
+                    ],
+                ),
+                push(out.e(), box_i64(call("zl_unpack_next", vec![], i64()))),
+                ret(call("zb_box_tuple", vec![out.e()], any())),
+            ],
+        ));
+    }
 
     // ─── os and io ──────────────────────────────────────────────
     d.extend(os_declarations(t));
@@ -3165,7 +3253,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         for (idx, p) in b.params.iter().enumerate() {
             let expected = match p {
                 Param::Int | Param::Float => " (number expected, got no value)".to_string(),
-                Param::Str => " (string expected, got no value)".to_string(),
+                Param::Str | Param::Bytes => " (string expected, got no value)".to_string(),
                 Param::Table => " (table expected, got no value)".to_string(),
                 Param::Value => " (value expected)".to_string(),
                 Param::Expected(kind) => format!(" ({kind} expected, got no value)"),
@@ -3185,6 +3273,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 Param::Int => call("zl_arg_int", vec![arg, what], i64()),
                 Param::Float => call("zl_arg_float", vec![arg, what], f64()),
                 Param::Str => call("zl_arg_str", vec![arg, what], string()),
+                Param::Bytes => call("zl_arg_bytes", vec![arg, what], any()),
                 Param::Table => call("zl_as_table", vec![arg, what], table.clone()),
                 Param::OptInt(v) => call("zl_arg_opt_int", vec![arg, int(*v), what], i64()),
                 Param::OptStr(v) => call("zl_arg_opt_str", vec![arg, text(v), what], string()),
@@ -3196,7 +3285,12 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ),
             });
         }
-        let result = call(b.func, call_args, ret_type(b.ret, t));
+        let func = if b.params.contains(&Param::Bytes) {
+            any_form(b.func)
+        } else {
+            b.func.to_string()
+        };
+        let result = call(&func, call_args, ret_type(b.ret, t));
         if b.lib == "debug" {
             st.push(set_global(debug::QUALIFY, bool(true)));
         }

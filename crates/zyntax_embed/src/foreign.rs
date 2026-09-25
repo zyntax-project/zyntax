@@ -80,6 +80,13 @@ pub trait Foreign: Send + Sync {
 
     /// The program released its box of `object`.
     fn release(&self, object: usize);
+
+    /// The bytes `object` is a buffer of, which the program reads in
+    /// place: their address and length, valid while the program holds
+    /// `object`. `None` for an object that is not one.
+    fn bytes(&self, _object: usize) -> Option<(*const u8, usize)> {
+        None
+    }
 }
 
 static INSTALLED: OnceLock<Box<dyn Foreign>> = OnceLock::new();
@@ -120,6 +127,20 @@ extern "C" fn drop_foreign(word: *mut u8) {
 /// `any` must be null or a live box.
 pub unsafe fn word(any: Any) -> Option<usize> {
     (!any.is_null() && (*any).tag.0 == FOREIGN_TAG).then(|| (*any).data as usize)
+}
+
+/// The bytes the foreign object `any` is a buffer of, read in place;
+/// `None` for any other value.
+///
+/// # Safety
+/// `any` must be null or a live box, held while the bytes are read.
+pub unsafe fn bytes_of<'a>(any: Any) -> Option<&'a [u8]> {
+    let (p, len) = installed()?.bytes(unsafe { word(any) }?)?;
+    Some(if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(p, len) }
+    })
 }
 
 /// A dynamic value as the embedder reads it.
@@ -323,6 +344,14 @@ unsafe extern "C" fn foreign_import(name: StringConstPtr) -> Any {
     }
 }
 
+/// The length of the bytes `x` is a buffer of, or -1 when it is none.
+unsafe extern "C" fn foreign_bytes_len(x: Any) -> i64 {
+    match unsafe { bytes_of(x) } {
+        Some(bytes) => bytes.len() as i64,
+        None => -1,
+    }
+}
+
 /// The kind of the error the last operation reported, or null when it
 /// reported none.
 extern "C" fn foreign_error_kind() -> StringPtr {
@@ -339,7 +368,7 @@ extern "C" fn foreign_error_message() -> StringPtr {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"foreign".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 11] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 12] = [
     zrtl::ZrtlSymbol::new(c"$Foreign$get".as_ptr(), foreign_get as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$set".as_ptr(), foreign_set as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$call".as_ptr(), foreign_call as *const u8),
@@ -349,6 +378,10 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 11] = [
     zrtl::ZrtlSymbol::new(c"$Foreign$eq".as_ptr(), foreign_eq as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$hash".as_ptr(), foreign_hash as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$import".as_ptr(), foreign_import as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$bytes_len".as_ptr(),
+        foreign_bytes_len as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(
         c"$Foreign$error_kind".as_ptr(),
         foreign_error_kind as *const u8,

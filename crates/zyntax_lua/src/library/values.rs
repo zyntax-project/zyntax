@@ -1316,7 +1316,8 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             )),
         ],
     ));
-    // `#x`: a string's bytes, a table's border or its `__len`.
+    // `#x`: a string's bytes, a table's border or its `__len`, a
+    // buffer's bytes.
     d.push(define(
         "zl_len_any",
         &[&x],
@@ -1327,6 +1328,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 vec![ret(box_i64(call(
                     "zb_str_len",
                     vec![get_str(x.e())],
+                    i64(),
+                )))],
+            ),
+            when(
+                and(
+                    zyntax_builtins::foreign::is_foreign(x.e()),
+                    ge(call("zb_foreign_bytes_len", vec![x.e()], i64()), int(0)),
+                ),
+                vec![ret(box_i64(call(
+                    "zb_foreign_bytes_len",
+                    vec![x.e()],
                     i64(),
                 )))],
             ),

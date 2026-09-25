@@ -8209,6 +8209,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             None => None,
         };
         let mut lowered = Vec::with_capacity(b.params.len());
+        let mut any_bytes = false;
         let mut consumed = 0;
         for (i, p) in b.params.iter().enumerate() {
             if let Param::Rest = p {
@@ -8280,7 +8281,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 (false, i) => format!("bad argument #{} to '{}'", i + 1, b.name),
             };
             let what = str_lit(&what, span);
-            lowered.push(self.builtin_arg(p, v, what, span));
+            let arg = self.builtin_arg(p, v, what, span);
+            any_bytes |= *p == Param::Bytes && arg.ty == Type::Any;
+            lowered.push(arg);
         }
         // Arguments past the parameters run for their effects.
         if consumed != usize::MAX {
@@ -8304,7 +8307,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
             }
         }
-        let value = call(b.func, lowered, ret_ir, span);
+        let func = if any_bytes {
+            crate::library::stdlib::any_form(b.func)
+        } else {
+            b.func.to_string()
+        };
+        let value = call(&func, lowered, ret_ir, span);
         let raises = self.call_can_raise(&value);
         let ty = match b.ret {
             Ret::Unit => Ty::Nil,
@@ -8634,6 +8642,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 Some(v) => {
                     let b = self.boxed(v);
                     call("zl_arg_str", vec![b, what], str_t, span)
+                }
+                None => call("zl_arg_str_missing", vec![what], str_t, span),
+            },
+            // A string by its type is the typed implementation's; any
+            // other value, possibly a buffer, is its `$any` form's.
+            Param::Bytes => match v {
+                Some(v) if v.ty == Ty::Str => v.node,
+                Some(v) if v.ty.is_number() => self.text_of(v),
+                Some(v) => {
+                    let b = self.boxed(v);
+                    call("zl_arg_bytes", vec![b, what], Type::Any, span)
                 }
                 None => call("zl_arg_str_missing", vec![what], str_t, span),
             },
