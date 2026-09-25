@@ -69,7 +69,7 @@ This document describes the architecture for adding GPU compute support to Zynta
 
 ## Feature Flag
 
-**Superseded (2026-09-25).** The 2025-12 plan was a `compute` feature pulling in `cuda-sys` and an `llvm-sys/nvptx` feature. Neither exists: `llvm-sys` has no `nvptx` feature, `cuda-sys` 0.3 is obsolete, and no `compute` feature was ever added. The plan below replaces it.
+**Superseded (2026-09-25).** The 2025-12 plan was a `compute` feature pulling in `cuda-sys` and an `llvm-sys/nvptx` feature. Neither exists: `llvm-sys` has no `nvptx` feature, `cuda-sys` never went past 0.2.0, and no `compute` feature was ever added. The plan below replaces it.
 
 PTX emission needs no new feature. The compiler already depends on inkwell 0.7.1 with `llvm21-1` and default features on (`crates/compiler/Cargo.toml`, under `llvm-backend`). inkwell's default `target-all` includes `target-nvptx`, so `Target::initialize_nvptx` is available in every `llvm-backend` build. PTX is text and can be emitted, verified and golden-tested on any machine.
 
@@ -1968,7 +1968,7 @@ impl UnifiedMemory {
 │  compute(A, B) @kernel(matmul) @device("cuda:0") @workgroup(16, 16) {       │
 │      for i in 0..M {                                                        │
 │          for j in 0..N {                                                    │
-│              var sum = 0.0                                                  │
+│              mut sum = 0.0                                                  │
 │              for k in 0..K {                                                │
 │                  sum = sum + A[i * K + k] * B[k * N + j]                    │
 │              }                                                              │
