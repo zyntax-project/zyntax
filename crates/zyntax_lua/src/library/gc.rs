@@ -1,13 +1,14 @@
 //! Garbage collection as a program sees it: what `setmetatable` tells
 //! the host about weak and finalizable tables, `collectgarbage`, the
-//! finalizer runner, the compaction of weak tables a collection left
-//! tombstones in, and `warn`.
+//! finalizer runner, the compaction of weak tables a collection
+//! changed, and `warn`.
 
 use super::*;
 
-/// How many weak tables hold tombstones of dead keys, as the host last
-/// reported it; a store of a new key into the hash part of a table
-/// compacts that table first while this is not zero.
+/// How many weak tables a collection changed and nothing compacted
+/// since, as the host last reported it; a store of a new key into the
+/// hash part of a table compacts that table first while this is not
+/// zero.
 pub const GC_DIRTY: &str = "zl_gc_dirty";
 
 /// `collectgarbage` options, by the number the host knows them by.
@@ -150,13 +151,17 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 int(0),
                 call("zl_gc_flags", vec![mt.e()], i64()),
             )),
+            // A dirty table that stops being weak is no longer counted.
             when(
                 or(ne(f.e(), int(0)), ne(old.e(), null(table.clone()))),
-                vec![expr(call(
-                    "zl_gc_note",
-                    vec![cast(tb.e(), i64()), f.e(), code_of("zl_gc_finalize")],
-                    unit(),
-                ))],
+                vec![
+                    expr(call(
+                        "zl_gc_note",
+                        vec![cast(tb.e(), i64()), f.e(), code_of("zl_gc_finalize")],
+                        unit(),
+                    )),
+                    set_global(GC_DIRTY, call("zl_gc_dirty_count", vec![], i64())),
+                ],
             ),
             ret_void(),
         ],
@@ -242,7 +247,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     ));
 
     // A weak table's dict rebuilt without the tombstones a collection
-    // left for its dead keys.
+    // left for its dead keys, or the entries whose values are nil.
     let dead = int(zyntax_builtins::instance_tag(DEAD_KEY_KIND));
     d.push(define(
         "zl_gc_compact",
@@ -258,11 +263,12 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 lt(i.e(), n.e()),
                 vec![
                     y.decl(at(h.e(), add(mul(i.e(), int(2)), int(1)))),
+                    e.decl(at(h.e(), add(mul(i.e(), int(2)), int(2)))),
                     when(
-                        ne(tag_of(y.e()), dead.clone()),
+                        and(ne(tag_of(y.e()), dead.clone()), not(is_nil(e.e()))),
                         vec![expr(call(
                             "zb_dict_insert",
-                            vec![nd.e(), y.e(), at(h.e(), add(mul(i.e(), int(2)), int(2)))],
+                            vec![nd.e(), y.e(), e.e()],
                             unit(),
                         ))],
                     ),
@@ -273,11 +279,11 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ret_void(),
         ],
     ));
-    // Before a store into `t`'s hash part while some weak table holds
-    // tombstones: a store of a new key (one absent, or present with a
-    // nil value) into a table holding them compacts it first. A store
-    // to a key present leaves the positions alone, so a traversal in
-    // progress goes on.
+    // Before a store into `t`'s hash part while some weak table is
+    // dirty: a store of a new key (one absent, or present with a nil
+    // value) into a dirty table compacts it first. A store to a key
+    // present leaves the positions alone, so a traversal in progress
+    // goes on.
     let k = kept("k", any());
     let v = kept("v", any());
     let may_compact = |present: Expr| {

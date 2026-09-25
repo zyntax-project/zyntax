@@ -3,14 +3,18 @@
 //!
 //! `setmetatable` reports a table whose metatable holds `__mode` or
 //! `__gc` at that moment. A weak table's entry storage is held from
-//! the marker, and this module's trace marks what it keeps strongly:
-//! every key and value that is not a collectable object, a weak key's
-//! value once its key is reached (an ephemeron), a weak value once it
-//! is reached elsewhere. When tracing settles, weak values that died
-//! are cleared, then every unreached object marked for finalization is
-//! resurrected and queued; once tracing settles again, dead weak keys
-//! become tombstones. The finalizers run after the collection, outside
-//! it, in the reverse of the order their objects were marked.
+//! the marker, and this module's trace marks what it keeps strongly,
+//! as the reference's traversals do: nothing of an entry whose value
+//! is nil; of any other, every key and value that is not a
+//! collectable object, a strong key, a weak key's value once its key
+//! is reached (an ephemeron), a weak value once it is reached
+//! elsewhere. When tracing settles, weak values that died are cleared,
+//! then every unreached object marked for finalization is resurrected
+//! and queued; once tracing settles again, collectable keys nothing
+//! reached become tombstones. So a strong key whose value died stays
+//! for that collection and goes in the next, as in the reference. The
+//! finalizers run after the collection, outside it, in the reverse of
+//! the order their objects were marked.
 //!
 //! A dead key cannot leave its dict while the world is stopped, since
 //! reindexing hashes through the library. Its box is rewritten in
@@ -18,8 +22,9 @@
 //! naming an address outside the heap, which no lookup matches, with
 //! a nil value, which no traversal shows. Tombstones keep every
 //! entry's position, so a traversal a collection interrupts goes on
-//! where it was. The library compacts a table holding tombstones when
-//! a new key is next stored in it, which Lua already makes the end of
+//! where it was. A table the collection changed is dirty: the library
+//! compacts it, dropping its tombstones and nil-valued entries, when a
+//! new key is next stored in it, which Lua already makes the end of
 //! any traversal of that table.
 //!
 //! A shaped table is never weak: its slots are words of the table
@@ -94,6 +99,8 @@ struct State {
     weak: BTreeMap<usize, Weak>,
     /// How many tables of `weak` are dirty.
     dirty: usize,
+    /// The count of dirty tables the program last read.
+    published: usize,
     /// Objects marked for finalization, in the order they were marked.
     finalizable: Vec<usize>,
     marked: BTreeSet<usize>,
@@ -126,6 +133,7 @@ enum Warn {
 static STATE: Mutex<State> = Mutex::new(State {
     weak: BTreeMap::new(),
     dirty: 0,
+    published: 0,
     finalizable: Vec::new(),
     marked: BTreeSet::new(),
     pending: VecDeque::new(),
@@ -238,7 +246,7 @@ fn trace(m: &mut dyn Marking) {
                 m.mark(index as usize);
                 let (whole, rest) = pairs.as_chunks::<2>();
                 for &[k, v] in whole {
-                    if !alive(m, k, w.mode & WEAK_KEYS != 0) {
+                    if v.is_null() || !alive(m, k, w.mode & WEAK_KEYS != 0) {
                         continue;
                     }
                     m.mark(k as usize);
@@ -269,7 +277,7 @@ fn settle(m: &mut dyn Marking) {
     match s.phase {
         Phase::Marking => {
             s.phase = Phase::Resurrected;
-            clear_dead_values(&s.weak, m);
+            clear_dead_values(&mut s.weak, m);
             // Every unreached finalizable object comes back for one
             // cycle, its finalizer due; the last marked runs first.
             let mut due = Vec::new();
@@ -304,25 +312,25 @@ fn settle(m: &mut dyn Marking) {
     }
 }
 
-/// The last step: dead weak keys become tombstones, and weak values
-/// of tables reached only through what was resurrected are cleared.
+/// The last step: dead keys become tombstones, and weak values of
+/// tables reached only through what was resurrected are cleared.
 fn clear_dead_keys(s: &mut State, m: &mut dyn Marking) {
     s.phase = Phase::Done;
-    let dead_keys = tombstone_dead_keys(&mut s.weak, m);
+    let keys = tombstone_dead_keys(&mut s.weak, m);
+    clear_dead_values(&mut s.weak, m);
     s.dirty = s.weak.values().filter(|w| w.dirty).count();
-    clear_dead_values(&s.weak, m);
-    for k in dead_keys {
+    for k in keys {
         m.mark(k);
     }
 }
 
 /// Clear every weak value of a reached table whose object is not.
-fn clear_dead_values(weak: &BTreeMap<usize, Weak>, m: &dyn Marking) {
+fn clear_dead_values(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking) {
     let dead = |b: *mut BoxHeader| {
         // SAFETY: an element of a reached table is null or a live box.
         unsafe { referent(b) }.is_some_and(|r| !m.is_marked(r))
     };
-    for (&t, w) in weak {
+    for (&t, w) in weak.iter_mut() {
         if w.mode & WEAK_VALUES == 0 || !m.is_marked(t) {
             continue;
         }
@@ -338,6 +346,7 @@ fn clear_dead_values(weak: &BTreeMap<usize, Weak>, m: &dyn Marking) {
             {
                 if dead(pair[1]) {
                     pair[1] = std::ptr::null_mut();
+                    w.dirty = true;
                 }
             }
         }
@@ -363,12 +372,14 @@ fn clear_dead_values(weak: &BTreeMap<usize, Weak>, m: &dyn Marking) {
     }
 }
 
-/// Turn every dead weak key of a reached table into a tombstone with a
-/// nil value; the tombstones' boxes, which the tables still name.
+/// Turn every collectable key of a reached table that nothing reached
+/// (a dead weak key, or a key of an entry whose value is nil) into a
+/// tombstone with a nil value. Returns the key boxes the tables still
+/// name that tracing left unmarked, the tombstones among them.
 fn tombstone_dead_keys(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking) -> Vec<usize> {
     let mut boxes = Vec::new();
     for (&t, w) in weak.iter_mut() {
-        if w.mode & WEAK_KEYS == 0 || !m.is_marked(t) {
+        if !m.is_marked(t) {
             continue;
         }
         // SAFETY: reached, so live; the world is stopped.
@@ -399,6 +410,9 @@ fn tombstone_dead_keys(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking) -> Vec
                     boxes.push(k as usize);
                     w.dirty = true;
                 }
+                // A number or string key of a nil value, or a key whose
+                // object lives on: kept until the table is compacted.
+                _ if !k.is_null() && !m.is_marked(k as usize) => boxes.push(k as usize),
                 _ => {}
             }
         }
@@ -414,12 +428,12 @@ fn sweep(reached: &dyn Fn(usize) -> bool) {
 }
 
 /// Run the library's runner after a collection that queued finalizers
-/// or left tombstones: it runs the finalizers, unless one is running,
-/// and tells the program which tables to compact.
+/// or changed how many tables are dirty: it runs the finalizers, unless
+/// one is running, and tells the program that count.
 fn after_collection() {
     let runner = {
         let s = state();
-        if (s.pending.is_empty() && s.dirty == 0) || s.runner == 0 {
+        if (s.pending.is_empty() && s.dirty == s.published) || s.runner == 0 {
             return;
         }
         s.runner
@@ -496,12 +510,14 @@ pub(crate) extern "C" fn host_gc_close() -> i64 {
     s.pending.len() as i64
 }
 
-/// How many weak tables hold tombstones.
+/// How many weak tables are dirty, which the program now knows.
 pub(crate) extern "C" fn host_gc_dirty_count() -> i64 {
-    state().dirty as i64
+    let mut s = state();
+    s.published = s.dirty;
+    s.dirty as i64
 }
 
-/// Whether `t` holds tombstones, which the caller now compacts.
+/// Whether `t` is dirty, which the caller now compacts.
 pub(crate) extern "C" fn host_gc_take_dirty(t: i64) -> i64 {
     let mut s = state();
     let Some(w) = s.weak.get_mut(&(t as usize)) else {

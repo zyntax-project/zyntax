@@ -1,0 +1,10 @@
+before	10	10
+after 1	5	10
+after 2	0	5
+after 3	0	0
+finalized key	3
+finalized key	2
+finalized key	1
+keys collected	0
+string keys	5	true	true
+end of program
