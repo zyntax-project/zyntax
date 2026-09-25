@@ -19,6 +19,11 @@
 //! reported and does not fail the suite. A listed case that PASSES fails
 //! the suite, so the list cannot go stale. An unlisted case that fails
 //! is a regression and fails the suite.
+//!
+//! An entry may end with a platform family, `unix` or `windows`: the
+//! case's pinned output holds only there, because the reference's own
+//! answer differs elsewhere. On that family the case runs as any other
+//! and must pass; on any other it is not run and is reported as skipped.
 
 use std::collections::HashMap;
 use std::fs;
@@ -31,8 +36,15 @@ fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance")
 }
 
-/// `category/file.py` -> git-bug id, from KNOWN_FAILURES.
-fn known_failures() -> HashMap<String, String> {
+/// One KNOWN_FAILURES entry: the issue, and the platform family the
+/// case's pinned output is limited to when the entry names one.
+struct Listed {
+    issue: String,
+    only_on: Option<String>,
+}
+
+/// `category/file.py` -> its entry, from KNOWN_FAILURES.
+fn known_failures() -> HashMap<String, Listed> {
     let mut out = HashMap::new();
     let Ok(text) = fs::read_to_string(root().join("KNOWN_FAILURES")) else {
         return out;
@@ -44,10 +56,32 @@ fn known_failures() -> HashMap<String, String> {
         }
         let mut parts = line.split_whitespace();
         if let (Some(case), Some(issue)) = (parts.next(), parts.next()) {
-            out.insert(case.to_string(), issue.to_string());
+            let only_on = parts.next().map(str::to_string);
+            if let Some(family) = &only_on {
+                assert!(
+                    matches!(family.as_str(), "unix" | "windows"),
+                    "KNOWN_FAILURES: `{case}` names platform `{family}`; the families are `unix` and `windows`"
+                );
+            }
+            out.insert(
+                case.to_string(),
+                Listed {
+                    issue: issue.to_string(),
+                    only_on,
+                },
+            );
         }
     }
     out
+}
+
+/// Whether this build targets the platform family `family`.
+fn on_family(family: &str) -> bool {
+    match family {
+        "unix" => cfg!(unix),
+        "windows" => cfg!(windows),
+        _ => false,
+    }
 }
 
 /// What one run produced.
@@ -197,17 +231,37 @@ fn category(name: &str, warm_up: WarmUp) {
     let mut known_failed: Vec<(String, String)> = Vec::new();
     let mut regressions: Vec<String> = Vec::new();
     let mut fixed: Vec<(String, String)> = Vec::new();
+    let mut skipped: Vec<(String, String, String)> = Vec::new();
     let mut unpinned = 0;
 
     for case in &cases {
         let key = format!("{name}/{}", case.file_name().unwrap().to_string_lossy());
+        // A case pinned for one platform family is not run on another;
+        // on its own family the entry is not a known failure.
+        let listed = match known.get(&key) {
+            Some(Listed {
+                issue,
+                only_on: Some(family),
+            }) => {
+                if !on_family(family) {
+                    skipped.push((key, family.clone(), issue.clone()));
+                    continue;
+                }
+                None
+            }
+            Some(Listed {
+                issue,
+                only_on: None,
+            }) => Some(issue),
+            None => None,
+        };
         let Some(expected) = expected_for(case) else {
             unpinned += 1;
             continue;
         };
         let got = ours_for(case, warm_up);
         let ok = got.status == expected.status && got.stdout == expected.stdout;
-        match (ok, known.get(&key)) {
+        match (ok, listed) {
             (true, None) => passed += 1,
             (true, Some(issue)) => fixed.push((key, issue.clone())),
             (false, Some(issue)) => known_failed.push((key, issue.clone())),
@@ -228,13 +282,17 @@ fn category(name: &str, warm_up: WarmUp) {
         WarmUp::On => " (warm-up on)",
     };
     println!(
-        "conformance/{name}{mode}: {passed} pass, {} known failing, {} regression(s), {} newly passing, {unpinned} unpinned",
+        "conformance/{name}{mode}: {passed} pass, {} known failing, {} regression(s), {} newly passing, {} skipped on this platform, {unpinned} unpinned",
         known_failed.len(),
         regressions.len(),
-        fixed.len()
+        fixed.len(),
+        skipped.len()
     );
     for (k, issue) in &known_failed {
         println!("  known failing: {k}  ({issue})");
+    }
+    for (k, family, issue) in &skipped {
+        println!("  skipped: {k}, pinned for {family} only  ({issue})");
     }
 
     let mut problems = Vec::new();

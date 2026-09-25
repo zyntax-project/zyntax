@@ -2,6 +2,11 @@
 # One per line: <category>/<file>.py <issue id>.
 # A listed case that starts passing fails the suite until it is removed here
 # and its issue is closed; an unlisted case that fails is a regression.
+#
+# An entry may add a platform family, `unix` or `windows`, after its issue:
+# <category>/<file>.py <issue id> <family>. The case's pinned output then
+# holds only on that family; there it runs as any other case and must pass,
+# and elsewhere it is skipped and reported as skipped.
 
 int/big_values.py                            dd86335
 inference/container_shapes.py               222758d

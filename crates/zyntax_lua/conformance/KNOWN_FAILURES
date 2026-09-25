@@ -2,6 +2,11 @@
 # One per line: <category>/<file>.lua <issue id>.
 # A listed case that starts passing fails the suite until it is removed here
 # and its issue is closed; an unlisted case that fails is a regression.
+#
+# An entry may add a platform family, `unix` or `windows`, after its issue:
+# <category>/<file>.lua <issue id> <family>. The case's pinned output then
+# holds only on that family; there it runs as any other case and must pass,
+# and elsewhere it is skipped and reported as skipped.
 
 official/attrib.lua           4da50c2
 official/calls.lua            4da50c2
@@ -20,3 +25,7 @@ official/locals.lua           4da50c2
 official/pm.lua               4da50c2
 official/strings.lua          4da50c2
 errors/library_names.lua      0903215
+
+# The host's C library and shell, as the reference sees them on POSIX.
+stdlib/os.lua                 37d662b   unix
+stdlib/files.lua              37d662b   unix

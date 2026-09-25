@@ -29,7 +29,9 @@ class Table(object):
 
 
 def main():
-    print(os.path.join("a", "b.txt"), os.path.dirname("x/y/z.py"), os.path.basename("x/y/z.py"))
+    # The separator join inserts is the platform's; the case asks that
+    # it inserts one.
+    print(os.path.join("a", "b.txt").replace("\\", "/"), os.path.dirname("x/y/z.py"), os.path.basename("x/y/z.py"))
     print(os.path.exists("no_such_file_here"), os.path.join("a/", "b"))
     print(hashlib.md5(b"hello world").hexdigest(), len(hashlib.md5(b"").digest()))
     print(hashlib.md5("héllo".encode("utf-8")).hexdigest(), b"\x01\xab".hex())
