@@ -32,9 +32,10 @@
 //! is a regression and fails the suite.
 //!
 //! An entry may end with a platform family, `unix`, `windows`, `macos`
-//! or `linux`: the case's pinned output holds only there, because the reference's own
-//! answer differs elsewhere. On that family the case runs as any other
-//! and must pass; on any other it is not run and is reported as skipped.
+//! or `linux`: the case's pinned output holds only there, because the
+//! reference's own answer differs elsewhere. On that family the case
+//! runs as any other and must pass; on any other it is not run and is
+//! reported as skipped.
 //!
 //! ## C modules
 //!
