@@ -10267,6 +10267,64 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 ),
                 span,
             ),
+            // A collection since the step found this position cleared
+            // a weak value there: the walk goes on from the next live
+            // position, found and read with nothing between that can
+            // collect.
+            if_(
+                binary(
+                    BinaryOp::Eq,
+                    var(value, Type::Any, span),
+                    nil(span),
+                    bool_t.clone(),
+                    span,
+                ),
+                vec![
+                    assign(
+                        var(pos, i64_t.clone(), span),
+                        call(
+                            "zl_next_pos",
+                            vec![
+                                tv(),
+                                binary(
+                                    BinaryOp::Add,
+                                    var(pos, i64_t.clone(), span),
+                                    int_lit(1, span),
+                                    i64_t.clone(),
+                                    span,
+                                ),
+                            ],
+                            i64_t.clone(),
+                            span,
+                        ),
+                        span,
+                    ),
+                    if_(
+                        binary(
+                            BinaryOp::Lt,
+                            var(pos, i64_t.clone(), span),
+                            int_lit(0, span),
+                            bool_t.clone(),
+                            span,
+                        ),
+                        vec![leave()],
+                        None,
+                        span,
+                    ),
+                    assign(
+                        var(value, Type::Any, span),
+                        call(
+                            "zl_pos_value",
+                            vec![tv(), var(pos, i64_t.clone(), span)],
+                            Type::Any,
+                            span,
+                        ),
+                        span,
+                    ),
+                ],
+                None,
+                span,
+            ),
             assign(
                 var(key, Type::Any, span),
                 call(
