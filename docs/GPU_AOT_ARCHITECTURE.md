@@ -192,13 +192,13 @@ zyntax compile --backend cuda source.zyn
 │  ┌────────────────────────────┐  │  │  ┌────────────────────────────┐  │
 │  │ Cranelift JIT              │  │  │  │ LLVM NVPTX Backend         │  │
 │  │  • Baseline tier           │  │  │  │  • Target: nvptx64-nvidia  │  │
-│  │  • Native SIMD (HIR vectors)│  │  │  │  • PTX emission            │  │
+│  │  • Native SIMD (HIR ops)   │  │  │  │  • PTX emission            │  │
 │  │  • Fast compilation        │  │  │  │  • Kernel metadata         │  │
 │  └────────────────────────────┘  │  │  └────────────────────────────┘  │
 │  ┌────────────────────────────┐  │  │  ┌────────────────────────────┐  │
 │  │ LLVM x86/ARM Backend       │  │  │  │ CUDA Driver Runtime        │  │
 │  │  • Optimizing tier         │  │  │  │  • Kernel loading          │  │
-│  │  • Native SIMD (HIR vectors)│  │  │  │  • Memory management       │  │
+│  │  • Native SIMD (HIR ops)   │  │  │  │  • Memory management       │  │
 │  │  • LLVM O3 and its passes  │  │  │  │  • Stream synchronization  │  │
 │  └────────────────────────────┘  │  │  └────────────────────────────┘  │
 └──────────────────────────────────┘  └──────────────────────────────────┘
