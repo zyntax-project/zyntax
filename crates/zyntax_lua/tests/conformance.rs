@@ -259,6 +259,9 @@ fn expected_for(case: &Path) -> Option<(Outcome, Option<String>)> {
 enum WarmUp {
     Off,
     On,
+    /// Off, and the collector runs at nearly every allocation, so weak
+    /// tables are swept in the middle of whatever the program is doing.
+    Stressed,
 }
 
 fn ours_for(case: &Path, warm_up: WarmUp) -> Outcome {
@@ -270,6 +273,9 @@ fn ours_for(case: &Path, warm_up: WarmUp) -> Outcome {
         match warm_up {
             WarmUp::Off => cmd.env("ZYNTAX_DISABLE_WARM_UP", "1"),
             WarmUp::On => cmd.env_remove("ZYNTAX_DISABLE_WARM_UP"),
+            WarmUp::Stressed => cmd
+                .env("ZYNTAX_DISABLE_WARM_UP", "1")
+                .env("ZYNTAX_GC_FLOOR_KB", "1"),
         };
         cmd.arg("run");
         if is_official(case) {
@@ -366,6 +372,7 @@ fn category(name: &str, warm_up: WarmUp) {
     let mode = match warm_up {
         WarmUp::Off => "",
         WarmUp::On => " (warm-up on)",
+        WarmUp::Stressed => " (collector stressed)",
     };
     println!(
         "conformance/{name}{mode}: {passed} pass, {} known failing, {} regression(s), {} newly passing, {} skipped on this platform, {unpinned} unpinned",
@@ -454,6 +461,12 @@ macro_rules! categories {
             )*
         }
     };
+}
+
+/// The gc category once more with the collector stressed.
+#[test]
+fn gc_stressed() {
+    category("gc", WarmUp::Stressed);
 }
 
 categories! {

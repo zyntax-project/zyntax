@@ -113,6 +113,9 @@ struct State {
     finalizing: bool,
     /// `collectgarbage("stop")` is in force.
     stopped: bool,
+    /// The collection running is the program's own `collectgarbage`,
+    /// which no list operation of the program is in the middle of.
+    explicit: bool,
     generational: bool,
     /// `setpause` and `setstepmul`, stored in quarters as the
     /// reference stores them.
@@ -141,6 +144,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     runner: 0,
     finalizing: false,
     stopped: false,
+    explicit: false,
     generational: true,
     pause: 200 / 4,
     stepmul: 100 / 4,
@@ -277,7 +281,8 @@ fn settle(m: &mut dyn Marking) {
     match s.phase {
         Phase::Marking => {
             s.phase = Phase::Resurrected;
-            clear_dead_values(&mut s.weak, m);
+            let trim = s.explicit;
+            clear_dead_values(&mut s.weak, m, trim);
             // Every unreached finalizable object comes back for one
             // cycle, its finalizer due; the last marked runs first.
             let mut due = Vec::new();
@@ -317,15 +322,19 @@ fn settle(m: &mut dyn Marking) {
 fn clear_dead_keys(s: &mut State, m: &mut dyn Marking) {
     s.phase = Phase::Done;
     let keys = tombstone_dead_keys(&mut s.weak, m);
-    clear_dead_values(&mut s.weak, m);
+    clear_dead_values(&mut s.weak, m, s.explicit);
     s.dirty = s.weak.values().filter(|w| w.dirty).count();
     for k in keys {
         m.mark(k);
     }
 }
 
-/// Clear every weak value of a reached table whose object is not.
-fn clear_dead_values(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking) {
+/// Clear every weak value of a reached table whose object is not. With
+/// `trim`, an array part left ending in nil is shortened to a border;
+/// otherwise its length stays, since code that allocates in the middle
+/// of an operation on that list (an append growing it) holds its length
+/// across the allocation.
+fn clear_dead_values(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking, trim: bool) {
     let dead = |b: *mut BoxHeader| {
         // SAFETY: an element of a reached table is null or a live box.
         unsafe { referent(b) }.is_some_and(|r| !m.is_marked(r))
@@ -357,7 +366,10 @@ fn clear_dead_values(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking) {
                     *v = std::ptr::null_mut();
                 }
             }
-            // The array part never ends in nil: its length stays a
+            if !trim {
+                continue;
+            }
+            // The array part then ends in no nil: its length is a
             // border, and `high` remembers how long it was.
             let items = unsafe { elements(list) };
             let mut len = items.len();
@@ -548,8 +560,10 @@ pub(crate) extern "C" fn host_gc(op: i64, arg: i64) -> i64 {
         // reference's generational mode never reports.
         "collect" | "step" => {
             let ended = !s.generational;
+            s.explicit = true;
             drop(s);
             collector::collect();
+            state().explicit = false;
             ended as i64
         }
         "count" => {
