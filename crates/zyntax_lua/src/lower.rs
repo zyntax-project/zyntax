@@ -165,6 +165,24 @@ struct Module<'a> {
     /// The sort made for each (shape, comparator) `table.sort` is
     /// called with.
     sorts: RefCell<HashMap<(ShapeId, FuncId), String>>,
+    /// What the debug library is told of the chunk, when the program
+    /// keeps its call stack.
+    debug: Option<DebugInfo>,
+}
+
+/// What a chunk of a program that keeps its call stack records: the
+/// records the host reads (see `host_debug`), and how many call sites
+/// are numbered so far.
+#[derive(Default)]
+struct DebugInfo {
+    /// Whether frames spill their locals at each call, for
+    /// `debug.getlocal`.
+    locals: bool,
+    /// Whether a call may change the caller's locals, which it reads
+    /// back afterwards.
+    setlocal: bool,
+    records: RefCell<Vec<String>>,
+    sites: std::cell::Cell<i64>,
 }
 
 /// How a shape's tables are laid out: the table header, then one slot
@@ -617,6 +635,26 @@ impl<'a> Module<'a> {
         !info.top_level && !info.captures.is_empty()
     }
 
+    /// The number a function's values carry, unique across the
+    /// program's chunks: the chunk's number above the low 32 bits.
+    fn func_key(&self, f: FuncId) -> i64 {
+        (self.chunk_index << 32) | f.0 as i64
+    }
+
+    /// A record for the debug library's host, when the program keeps
+    /// its call stack.
+    fn debug_record(&self, fields: &[String]) {
+        if let Some(debug) = &self.debug {
+            debug.records.borrow_mut().push(
+                fields
+                    .iter()
+                    .map(|f| sanitize(f))
+                    .collect::<Vec<_>>()
+                    .join("\x1f"),
+            );
+        }
+    }
+
     /// The record code's name for a function.
     fn code_name(&self, f: FuncId) -> String {
         format!("{}$fn", self.entry_name(f))
@@ -676,6 +714,24 @@ struct Lowerer<'m, 'a> {
     depth: usize,
     /// The depth of each enclosing loop's body.
     loop_depths: Vec<usize>,
+    /// Whether this is a function of the program that keeps a frame on
+    /// the debug library's stack: set by the lowering of a function or
+    /// chunk body in a program that keeps one, never for a helper.
+    frames: bool,
+    /// The locals in scope, in the order Lua numbers them.
+    live: Vec<Live>,
+    /// The lines statements of this function start on.
+    lines: std::collections::BTreeSet<i64>,
+    /// The span of the call a `return` makes as a tail call.
+    tail_span: Option<Span>,
+}
+
+/// A local in scope, as `debug.getlocal` numbers them: a variable, or
+/// the hidden state of a `for` loop.
+#[derive(Clone, Copy)]
+enum Live {
+    Var(VarId),
+    ForState,
 }
 
 /// A target of a multiple assignment: a name or a global, stored as
@@ -1445,6 +1501,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             counts_depth: false,
             depth: 0,
             loop_depths: Vec::new(),
+            frames: false,
+            live: Vec::new(),
+            lines: std::collections::BTreeSet::new(),
+            tail_span: None,
         }
     }
 
@@ -2284,6 +2344,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     },
                 ],
                 None,
+                &None,
                 span,
             );
             let first = match multi {
@@ -2964,18 +3025,29 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     /// pending: whoever called it checks next.
     fn placeholder_return(&mut self, span: Span) -> St {
         if !self.tbc.is_empty() {
-            let mut statements = Vec::new();
+            // The error has left the function when its `<close>`
+            // variables are closed: its frame goes first.
+            let mut statements = self.debug_call("zl_dbg_leave", Vec::new(), span);
             self.closes_from(1, Some(Self::pending(span)), span, &mut statements);
-            statements.push(self.placeholder_return_plain(span));
+            statements.push(self.placeholder_return_plain(span, false));
             return stmt(TypedStatement::Block(TypedBlock { statements, span }), span);
         }
-        self.placeholder_return_plain(span)
+        self.placeholder_return_plain(span, true)
     }
 
-    fn placeholder_return_plain(&mut self, span: Span) -> St {
+    /// Leaving with the placeholder, the depth uncounted and, when
+    /// `pop`, the frame popped.
+    fn placeholder_return_plain(&mut self, span: Span, pop: bool) -> St {
         let leave = self.placeholder_value(span);
-        if self.counts_depth {
-            let statements = vec![depth_step(-1, span), leave];
+        if self.counts_depth || (self.frames && pop) {
+            let mut statements = Vec::new();
+            if self.counts_depth {
+                statements.push(depth_step(-1, span));
+            }
+            if pop {
+                statements.extend(self.debug_call("zl_dbg_leave", Vec::new(), span));
+            }
+            statements.push(leave);
             return stmt(TypedStatement::Block(TypedBlock { statements, span }), span);
         }
         leave
@@ -3117,6 +3189,326 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             int_lit(line, span),
             span,
         )
+    }
+
+    // ─── the debug library's view ───────────────────────────────
+
+    /// `zl_line = <line>`, then the line and count hooks when a hook
+    /// is set: a statement starts.
+    fn debug_line(&mut self, line: i64, span: Span) -> Vec<St> {
+        let i64_t = prim(PrimitiveType::I64);
+        self.lines.insert(line & ((1i64 << library::LINE_BITS) - 1));
+        vec![
+            assign(
+                var(intern(library::LINE), i64_t.clone(), span),
+                int_lit(line, span),
+                span,
+            ),
+            self.if_hooked(
+                vec![expr_stmt(call(
+                    "zl_dbg_line",
+                    vec![int_lit(line, span)],
+                    prim(PrimitiveType::Unit),
+                    span,
+                ))],
+                span,
+            ),
+        ]
+    }
+
+    /// `statements` when a hook is set.
+    fn if_hooked(&self, statements: Vec<St>, span: Span) -> St {
+        let i64_t = prim(PrimitiveType::I64);
+        if_(
+            binary(
+                BinaryOp::Ne,
+                var(intern(library::debug::HOOK_MASK), i64_t.clone(), span),
+                int_lit(0, span),
+                prim(PrimitiveType::Bool),
+                span,
+            ),
+            statements,
+            None,
+            span,
+        )
+    }
+
+    /// A call of a library function the debug library's hooks and
+    /// frames go through, when this function keeps a frame.
+    fn debug_call(&self, name: &str, args: Vec<Node>, span: Span) -> Vec<St> {
+        if !self.frames {
+            return Vec::new();
+        }
+        vec![expr_stmt(call(name, args, prim(PrimitiveType::Unit), span))]
+    }
+
+    /// A loop is about to run its body again: the line its head is on
+    /// runs (`zl_dbg_loop`), or for a `while`, the jump back lands on
+    /// its head (`back`).
+    fn debug_loop_back(&self, head: Span, back: bool, span: Span) -> Vec<St> {
+        if !self.frames {
+            return Vec::new();
+        }
+        let line = self.m.line_of(head);
+        let name = if back {
+            "zl_dbg_loop_head"
+        } else {
+            "zl_dbg_loop"
+        };
+        vec![self.if_hooked(
+            vec![expr_stmt(call(
+                name,
+                vec![int_lit(line, span)],
+                prim(PrimitiveType::Unit),
+                span,
+            ))],
+            span,
+        )]
+    }
+
+    /// A loop whose head is on `head` was left; `end_line` is told to
+    /// a line hook as the line after it, for a generic `for`.
+    fn debug_loop_exit(&self, head: Span, end_line: Option<i64>, span: Span) -> Vec<St> {
+        if !self.frames {
+            return Vec::new();
+        }
+        let line = self.m.line_of(head);
+        let mut hooked = vec![expr_stmt(call(
+            "zl_dbg_loop_exit",
+            vec![int_lit(line, span)],
+            prim(PrimitiveType::Unit),
+            span,
+        ))];
+        if let Some(end) = end_line {
+            hooked.push(expr_stmt(call(
+                "zl_dbg_line",
+                vec![int_lit(end, span)],
+                prim(PrimitiveType::Unit),
+                span,
+            )));
+        }
+        vec![self.if_hooked(hooked, span)]
+    }
+
+    /// `zl_dbg_enter(key)`: this function's frame, pushed.
+    fn debug_enter(&self, f: FuncId, span: Span) -> St {
+        expr_stmt(call(
+            "zl_dbg_enter",
+            vec![int_lit(self.m.func_key(f), span)],
+            prim(PrimitiveType::Unit),
+            span,
+        ))
+    }
+
+    /// What the debug library is told of this function: where it is,
+    /// its parameters and upvalues, the lines its statements start on
+    /// and its parameters' names.
+    fn debug_function_records(&mut self, id: FuncId, line: i64, last_line: i64) {
+        let mask = (1i64 << library::LINE_BITS) - 1;
+        let info = self.scopes().func(id).clone();
+        let mut f = vec![
+            "F".to_string(),
+            id.0.to_string(),
+            (line & mask).to_string(),
+            (last_line & mask).to_string(),
+            info.params.len().to_string(),
+            if info.is_vararg { "1" } else { "0" }.to_string(),
+        ];
+        f.extend(info.upvalues.iter().map(|u| match u {
+            crate::scope::Upvalue::Var(v) => self.scopes().var(*v).name.clone(),
+            crate::scope::Upvalue::Env => "_ENV".to_string(),
+        }));
+        self.m.debug_record(&f);
+        let mut lines = std::mem::take(&mut self.lines);
+        if id != CHUNK {
+            lines.insert(last_line & mask);
+        }
+        let mut a = vec!["A".to_string(), id.0.to_string()];
+        a.extend(lines.iter().map(|l| l.to_string()));
+        self.m.debug_record(&a);
+        let mut l = vec!["L".to_string(), id.0.to_string(), "0".to_string()];
+        l.extend(
+            info.params
+                .iter()
+                .map(|v| self.scopes().var(*v).name.clone()),
+        );
+        self.m.debug_record(&l);
+    }
+
+    /// The names of the locals in scope, as `debug.getlocal` gives them.
+    fn live_names(&self) -> Vec<String> {
+        self.live
+            .iter()
+            .map(|l| match l {
+                Live::Var(v) => self.scopes().var(*v).name.clone(),
+                Live::ForState => "(for state)".to_string(),
+            })
+            .collect()
+    }
+
+    /// A call site of this function, numbered for the debug library,
+    /// with what the callee is called there (`desc`); the locals in
+    /// scope recorded for `debug.getlocal`. None when this function
+    /// keeps no frame.
+    fn debug_site(&mut self, desc: &Desc, span: Span) -> Option<i64> {
+        self.debug_site_as(desc, "", span)
+    }
+
+    /// [`Self::debug_site`] for a callee a traceback names `global`
+    /// whatever the site calls it (a library function), unless that is
+    /// empty.
+    fn debug_site_as(&mut self, desc: &Desc, global: &str, span: Span) -> Option<i64> {
+        if !self.frames {
+            return None;
+        }
+        let m = self.m;
+        let debug = m.debug.as_ref()?;
+        let k = debug.sites.get() + 1;
+        debug.sites.set(k);
+        let (namewhat, name) = match desc.as_deref().and_then(|d| d.split_once(" '")) {
+            Some((what, rest)) => (what.to_string(), rest.trim_end_matches('\'').to_string()),
+            None => (String::new(), String::new()),
+        };
+        let global = if !global.is_empty() {
+            global.to_string()
+        } else if namewhat == "global" {
+            name.clone()
+        } else {
+            String::new()
+        };
+        m.debug_record(&["S".to_string(), k.to_string(), namewhat, name, global]);
+        if debug.locals {
+            let mut record = vec!["L".to_string(), self.func.0.to_string(), k.to_string()];
+            record.extend(self.live_names());
+            m.debug_record(&record);
+        }
+        let tail = if self.tail_span == Some(span) {
+            library::debug::TAIL_SITE
+        } else {
+            0
+        };
+        Some((m.chunk_index << 32) | k | tail)
+    }
+
+    /// What a call site does before its call, the arguments evaluated:
+    /// the locals spilled (for `debug.getlocal`) and the site stored.
+    /// The spill list's variable is returned, for [`Self::after_call`].
+    fn before_call(
+        &mut self,
+        desc: &Desc,
+        span: Span,
+        pre: &mut Vec<St>,
+    ) -> Option<InternedString> {
+        let site = self.debug_site(desc, span)?;
+        let spill = self.spill(site, span, pre);
+        pre.push(assign(
+            var(
+                intern(library::debug::DBG_SITE),
+                prim(PrimitiveType::I64),
+                span,
+            ),
+            int_lit(site, span),
+            span,
+        ));
+        spill
+    }
+
+    /// The locals in scope (and a variadic function's extra arguments,
+    /// after them) as a list handed to the host for the frame, when
+    /// the program reads locals.
+    fn spill(&mut self, site: i64, span: Span, pre: &mut Vec<St>) -> Option<InternedString> {
+        if !self.m.debug.as_ref().is_some_and(|d| d.locals) {
+            return None;
+        }
+        let mut items = Vec::with_capacity(self.live.len() + 1);
+        for l in self.live.clone() {
+            items.push(match l {
+                Live::Var(v) => {
+                    let value = self.read_var(v, span);
+                    self.boxed(value)
+                }
+                Live::ForState => nil(span),
+            });
+        }
+        if let Some(varargs) = self.varargs
+            && self.func != CHUNK
+        {
+            items.push(call(
+                "zb_box_tuple",
+                vec![var(varargs, self.m.anys(), span)],
+                Type::Any,
+                span,
+            ));
+        }
+        let list = self.array_of(items, pre, span);
+        let name = self.temp();
+        pre.push(let_(
+            name,
+            Type::Any,
+            call("zb_list_box_any", vec![list], Type::Any, span),
+            span,
+        ));
+        pre.push(expr_stmt(call(
+            "zl_dbg_spill",
+            vec![var(name, Type::Any, span), int_lit(site, span)],
+            prim(PrimitiveType::Unit),
+            span,
+        )));
+        Some(name)
+    }
+
+    /// What a call site does once its call returned: the locals read
+    /// back from the list they were spilled to, when a callee may
+    /// have set them, and the list released.
+    fn after_call(&mut self, spill: Option<InternedString>, span: Span) -> Vec<St> {
+        let Some(spill) = spill else {
+            return Vec::new();
+        };
+        let i64_t = prim(PrimitiveType::I64);
+        let unspill = call(
+            "zl_dbg_unspill",
+            vec![var(spill, Type::Any, span)],
+            i64_t.clone(),
+            span,
+        );
+        if !self.m.debug.as_ref().is_some_and(|d| d.setlocal) {
+            return vec![expr_stmt(unspill)];
+        }
+        // Each local a callee set is read back; the others keep what
+        // the call left in them.
+        let set = self.temp();
+        let mut out = vec![let_(set, i64_t.clone(), unspill, span)];
+        for (i, l) in self.live.clone().into_iter().enumerate().take(63) {
+            let Live::Var(v) = l else {
+                continue;
+            };
+            let list = call(
+                "zb_unbox_list_raw_any",
+                vec![var(spill, Type::Any, span)],
+                self.m.anys(),
+                span,
+            );
+            let value = Val {
+                node: index(list, int_lit(i as i64, span), Type::Any, span),
+                ty: Ty::Any,
+            };
+            let was_set = binary(
+                BinaryOp::Ne,
+                binary(
+                    BinaryOp::BitAnd,
+                    var(set, i64_t.clone(), span),
+                    int_lit(1 << i, span),
+                    i64_t.clone(),
+                    span,
+                ),
+                int_lit(0, span),
+                prim(PrimitiveType::Bool),
+                span,
+            );
+            let write = self.write_var(v, value, span);
+            out.push(if_(was_set, vec![write], None, span));
+        }
+        out
     }
 
     /// Whether a call node names a library function that can raise.
@@ -3563,7 +3955,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let mut cells = Vec::with_capacity(captures.len() + 1);
         cells.push(call(
             "zb_box_i64",
-            vec![int_lit(f.0 as i64, span)],
+            vec![int_lit(self.m.func_key(f), span)],
             Type::Any,
             span,
         ));
@@ -3582,6 +3974,24 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Type::Any,
             span,
         );
+        // The debug library answers `getinfo(level, "f")` with the
+        // last value made of each function.
+        let record = if self.m.debug.is_some() {
+            let name = self.temp();
+            pre.push(let_(name, Type::Any, record, span));
+            pre.push(expr_stmt(call(
+                "zl_dbg_closure",
+                vec![
+                    int_lit(self.m.func_key(f), span),
+                    var(name, Type::Any, span),
+                ],
+                prim(PrimitiveType::Unit),
+                span,
+            )));
+            var(name, Type::Any, span)
+        } else {
+            record
+        };
         Val {
             node: block_value(pre, record, span),
             ty: Ty::Any,
@@ -4110,6 +4520,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let table_t = self.ir(Ty::Table);
         let bool_t = prim(PrimitiveType::Bool);
         let i64_t = prim(PrimitiveType::I64);
+        let metamethod = Some(format!("metamethod '{}'", event.trim_start_matches("__")));
         let mut pre = Vec::new();
         let mut value = self.coerce(generic, ty);
         for (left, class, f) in sides.into_iter().rev() {
@@ -4166,8 +4577,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 &mut pre,
             );
             let record = self.slot_read(&meta.node, layout, &slot, span);
-            let multi =
-                self.direct_call_vals(f, Some(record), Vec::new(), operands.clone(), None, span);
+            let multi = self.direct_call_vals(
+                f,
+                Some(record),
+                Vec::new(),
+                operands.clone(),
+                None,
+                &metamethod,
+                span,
+            );
             let first = match multi {
                 Multi::Fixed(vals) => vals
                     .into_iter()
@@ -6150,12 +6568,43 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             return self.suffixes_from(head, desc, suffixes, 1, &mut multi, span);
         }
         // A direct call to a known function or a builtin, possibly
-        // followed by more suffixes on its result.
+        // followed by more suffixes on its result: only the last call
+        // of a `return` is a tail call.
+        let (mut multi, first) = self.suffixed_head(prefix, suffixes, span)?;
+        if first == suffixes.len()
+            && let Some(m) = multi
+        {
+            return Ok(m);
+        }
+        let (current, desc) = match multi.take() {
+            Some(m) => (self.first_of(m, span), None),
+            None => match prefix {
+                Prefix::Name(token) => (self.read_name(token)?, self.describe_name(token)),
+                Prefix::Expression(e) => (self.expr(e)?, self.describe(e)),
+                _ => return unsupported("this prefix", span),
+            },
+        };
+        self.suffixes_from(current, desc, suffixes, first, &mut multi, span)
+    }
+
+    /// The first suffix of a chain applied as a direct call to a known
+    /// function or a builtin, when it is one: the call and how many
+    /// suffixes it took.
+    fn suffixed_head(
+        &mut self,
+        prefix: &Prefix,
+        suffixes: &[&Suffix],
+        span: Span,
+    ) -> Result<(Option<Multi>, usize)> {
         let mut multi: Option<Multi> = None;
         let mut first = 0;
+        let tail = self.tail_span;
         if let Some(Suffix::Call(ast::Call::AnonymousCall(args))) = suffixes.first()
             && let Some(f) = self.typer().known_callee(prefix)
         {
+            if suffixes.len() > 1 {
+                self.tail_span = None;
+            }
             // A global declared once as this function is the function,
             // and so is a local that holds a function from its
             // declaration on; any other name holds its value, which may
@@ -6178,7 +6627,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     Prefix::Name(token) if self.m.takes_env(f) => Some(self.read_name(token)?),
                     _ => None,
                 };
-                multi = Some(self.direct_call(f, record, None, args, span)?);
+                let desc = match prefix {
+                    Prefix::Name(token) => self.describe_name(token),
+                    _ => None,
+                };
+                multi = Some(self.direct_call(f, record, None, args, desc, span)?);
             } else {
                 let callee = match prefix {
                     Prefix::Name(token) => self.read_name(token)?,
@@ -6204,6 +6657,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     span,
                 ));
             }
+            self.tail_span = tail;
             first = 1;
         }
         if multi.is_none() {
@@ -6214,26 +6668,18 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     else {
                         unreachable!("a builtin callee ends in a call");
                     };
-                    multi = Some(self.builtin_call(b, None, args, span)?);
+                    if suffixes.len() > n {
+                        self.tail_span = None;
+                    }
+                    let called = self.builtin_call(b, None, args, span);
+                    self.tail_span = tail;
+                    multi = Some(called?);
                     first = n;
                     break;
                 }
             }
         }
-        if first == suffixes.len()
-            && let Some(m) = multi
-        {
-            return Ok(m);
-        }
-        let (current, desc) = match multi.take() {
-            Some(m) => (self.first_of(m, span), None),
-            None => match prefix {
-                Prefix::Name(token) => (self.read_name(token)?, self.describe_name(token)),
-                Prefix::Expression(e) => (self.expr(e)?, self.describe(e)),
-                _ => return unsupported("this prefix", span),
-            },
-        };
-        self.suffixes_from(current, desc, suffixes, first, &mut multi, span)
+        Ok((multi, first))
     }
 
     /// The suffixes from `first` on, applied to `current`, which `desc`
@@ -6289,7 +6735,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     desc = Self::describe_suffix(s);
                 }
                 Suffix::Call(ast::Call::AnonymousCall(args)) => {
-                    let m = self.value_call(current.clone(), None, args, desc, span)?;
+                    let tail = self.tail_span.take_if(|_| !last);
+                    let m = self.value_call(current.clone(), None, args, desc, span);
+                    self.tail_span = self.tail_span.or(tail);
+                    let m = m?;
                     if last {
                         return Ok(m);
                     }
@@ -6297,7 +6746,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     desc = None;
                 }
                 Suffix::Call(ast::Call::MethodCall(mc)) => {
-                    let m = self.method_call(current.clone(), mc, desc, span)?;
+                    let tail = self.tail_span.take_if(|_| !last);
+                    let m = self.method_call(current.clone(), mc, desc, span);
+                    self.tail_span = self.tail_span.or(tail);
+                    let m = m?;
                     if last {
                         return Ok(m);
                     }
@@ -6433,6 +6885,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         record: Option<Val>,
         receiver: Option<Val>,
         args: &ast::FunctionArgs,
+        desc: Desc,
         span: Span,
     ) -> Result<Multi> {
         // The function's value is read before its arguments run.
@@ -6440,11 +6893,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let record = record.map(|r| self.hold(r, &mut pre));
         let (mut arg_pre, vals, tail) = self.call_values(receiver, args, span)?;
         pre.append(&mut arg_pre);
-        Ok(self.direct_call_vals(f, record, pre, vals, tail, span))
+        Ok(self.direct_call_vals(f, record, pre, vals, tail, &desc, span))
     }
 
     /// [`Self::direct_call`] with the arguments evaluated: `vals`, and
     /// `tail` when the last supplies several values.
+    #[allow(clippy::too_many_arguments)]
     fn direct_call_vals(
         &mut self,
         f: FuncId,
@@ -6452,6 +6906,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         mut pre: Vec<St>,
         vals: Vec<Val>,
         tail: Option<Node>,
+        desc: &Desc,
         span: Span,
     ) -> Multi {
         let info = self.scopes().func(f);
@@ -6528,6 +6983,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if is_vararg {
             let mut items = Vec::with_capacity(extras.len());
             for v in extras {
+                // Evaluated ahead of the call site's own work.
+                let v = if self.frames {
+                    self.hold(v, &mut pre)
+                } else {
+                    v
+                };
                 items.push(self.boxed(v));
             }
             let list = self.array_of(items, &mut pre, span);
@@ -6560,26 +7021,30 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 pre.push(expr_stmt(v.node));
             }
         }
+        let spill = self.before_call(desc, span, &mut pre);
         let value = call(
             &self.m.entry_name(f),
             lowered,
             self.m.return_ir(&sig.returns),
             span,
         );
+        let after = self.after_call(spill, span);
         let raises = self.m.raises(f);
         if raises {
             self.raise_callees.insert(f);
         }
-        self.call_result(value, &sig.returns, pre, raises, span)
+        self.call_result(value, &sig.returns, pre, after, raises, span)
     }
 
     /// The values a typed entry returned, checked for an error when the
     /// callee may raise.
+    /// `after` runs once the call returned, ahead of its check.
     fn call_result(
         &mut self,
         value: Node,
         returns: &Returns,
         pre: Vec<St>,
+        after: Vec<St>,
         raises: bool,
         span: Span,
     ) -> Multi {
@@ -6587,6 +7052,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Returns::Fixed(types) if types.is_empty() => {
                 let mut pre = pre;
                 pre.push(expr_stmt(value));
+                pre.extend(after);
                 if raises {
                     pre.push(self.pending_check(span));
                 }
@@ -6595,9 +7061,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Returns::Fixed(types) if types.len() == 1 => {
                 let ty = types[0].settled();
                 let mut pre = pre;
-                let value = if raises {
+                let value = if raises || !after.is_empty() {
                     let held = self.hold(Val { node: value, ty }, &mut pre);
-                    pre.push(self.pending_check(span));
+                    pre.extend(after);
+                    if raises {
+                        pre.push(self.pending_check(span));
+                    }
                     held.node
                 } else {
                     value
@@ -6612,6 +7081,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 let name = self.temp();
                 let mut pre = pre;
                 pre.push(let_(name, self.m.anys(), value, span));
+                pre.extend(after);
                 if raises {
                     pre.push(self.pending_check(span));
                 }
@@ -6641,6 +7111,20 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 Multi::Fixed(vals)
             }
             Returns::Dynamic | Returns::Unknown => {
+                let mut pre = pre;
+                let value = if after.is_empty() {
+                    value
+                } else {
+                    let held = self.hold(
+                        Val {
+                            node: value,
+                            ty: Ty::Any,
+                        },
+                        &mut pre,
+                    );
+                    pre.extend(after);
+                    held.node
+                };
                 let value = if raises {
                     self.guard(Val {
                         node: value,
@@ -6714,7 +7198,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         desc: Desc,
         span: Span,
     ) -> Multi {
-        let f = if pre.is_empty() {
+        // A call site that keeps the debug library's record evaluates
+        // everything ahead of storing its number.
+        let frames = self.frames;
+        let f = if pre.is_empty() && !frames {
             f
         } else {
             self.hold(
@@ -6726,44 +7213,84 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             )
             .node
         };
-        let descs = Described::callee(desc);
-        if tail.is_none() && vals.len() <= zyntax_builtins::functions::MAX_CALL_ARITY {
+        let vals: Vec<Val> = if frames {
+            vals.into_iter().map(|v| self.hold(v, &mut pre)).collect()
+        } else {
+            vals
+        };
+        let tail = match tail {
+            Some(t) if frames => Some(
+                self.hold(
+                    Val {
+                        node: t,
+                        ty: Ty::Any,
+                    },
+                    &mut pre,
+                )
+                .node,
+            ),
+            t => t,
+        };
+        let descs = Described::callee(desc.clone());
+        let called = if tail.is_none() && vals.len() <= zyntax_builtins::functions::MAX_CALL_ARITY {
             let mut lowered = vec![f];
             let n = vals.len();
             for v in vals {
                 lowered.push(self.boxed(v));
             }
-            let v = self.guard_described(
+            call(&format!("zl_apply_{n}"), lowered, Type::Any, span)
+        } else {
+            let mut items = Vec::with_capacity(vals.len());
+            for v in vals {
+                items.push(self.boxed(v));
+            }
+            let list = self.array_of(items, &mut pre, span);
+            let list = match tail {
+                None => list,
+                Some(tail) => {
+                    let name = self.temp();
+                    pre.push(let_(name, self.m.anys(), list, span));
+                    pre.push(expr_stmt(call(
+                        "zl_append_values",
+                        vec![var(name, self.m.anys(), span), tail],
+                        prim(PrimitiveType::Unit),
+                        span,
+                    )));
+                    var(name, self.m.anys(), span)
+                }
+            };
+            call("zl_apply_packed", vec![f, list], Type::Any, span)
+        };
+        let spill = self.before_call(&desc, span, &mut pre);
+        let mut after = self.after_call(spill, span);
+        // A callee of the library's enters no frame to take the site.
+        if frames {
+            after.push(assign(
+                var(
+                    intern(library::debug::DBG_SITE),
+                    prim(PrimitiveType::I64),
+                    span,
+                ),
+                int_lit(0, span),
+                span,
+            ));
+        }
+        let called = if after.is_empty() {
+            called
+        } else {
+            let held = self.hold(
                 Val {
-                    node: call(&format!("zl_apply_{n}"), lowered, Type::Any, span),
+                    node: called,
                     ty: Ty::Any,
                 },
-                &descs,
+                &mut pre,
             );
-            return Multi::Dynamic(block_value(pre, v.node, span));
-        }
-        let mut items = Vec::with_capacity(vals.len());
-        for v in vals {
-            items.push(self.boxed(v));
-        }
-        let list = self.array_of(items, &mut pre, span);
-        let list = match tail {
-            None => list,
-            Some(tail) => {
-                let name = self.temp();
-                pre.push(let_(name, self.m.anys(), list, span));
-                pre.push(expr_stmt(call(
-                    "zl_append_values",
-                    vec![var(name, self.m.anys(), span), tail],
-                    prim(PrimitiveType::Unit),
-                    span,
-                )));
-                var(name, self.m.anys(), span)
-            }
+            pre.extend(after);
+            held.node
         };
         let v = self.guard_described(
             Val {
-                node: call("zl_apply_packed", vec![f, list], Type::Any, span),
+                node: called,
                 ty: Ty::Any,
             },
             &descs,
@@ -6969,8 +7496,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                             ty: Ty::Str,
                         },
                     ];
-                    let multi =
-                        self.direct_call_vals(f, Some(record), Vec::new(), args, None, span);
+                    let multi = self.direct_call_vals(
+                        f,
+                        Some(record),
+                        Vec::new(),
+                        args,
+                        None,
+                        &Some("metamethod 'index'".to_string()),
+                        span,
+                    );
                     let ty = ty.settled();
                     let first = self.first_of(multi, span);
                     let first = self.coerce(first, ty);
@@ -7005,6 +7539,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         };
         let raise = self.call_nil(name, kind, span);
         let mut value = self.yield_as(Multi::None(raise), &shape, span);
+        let callee_desc = Some(match kind {
+            CallKind::Method => format!("method '{name}'"),
+            CallKind::Field => format!("field '{name}'"),
+        });
         for (i, (_, end)) in which.ends.iter().enumerate().rev() {
             let arm = match *end {
                 End::Slot(Ty::Func(f)) => {
@@ -7014,6 +7552,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         Vec::new(),
                         vals.clone(),
                         tail.clone(),
+                        &callee_desc,
                         span,
                     );
                     self.yield_as(multi, &shape, span)
@@ -7022,7 +7561,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     ty: Ty::Func(g), ..
                 } => {
                     let callee = through[i].clone().expect("a handler end's value is held");
-                    self.handler_arm(callee, g, name, &shape, &vals, &tail, span)
+                    self.handler_arm(callee, g, name, &shape, &vals, &tail, &callee_desc, span)
                 }
                 _ => unreachable!("a which call's ends hold functions"),
             };
@@ -7048,6 +7587,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         shape: &Yield,
         vals: &[Val],
         tail: &Option<Node>,
+        desc: &Desc,
         span: Span,
     ) -> Node {
         let multi = self.direct_call_vals(
@@ -7056,6 +7596,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Vec::new(),
             vals.to_vec(),
             tail.clone(),
+            desc,
             span,
         );
         let then = self.yield_as(multi, shape, span);
@@ -7131,7 +7672,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     Some(code) => binary(
                         BinaryOp::Eq,
                         code.node.clone(),
-                        int_lit(f.0 as i64, span),
+                        int_lit(self.m.func_key(*f), span),
                         bool_t.clone(),
                         span,
                     ),
@@ -7187,7 +7728,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Vec::new(),
             vals.clone(),
             tail.clone(),
-            desc,
+            desc.clone(),
             span,
         );
         let mut value = self.yield_as(fallback, &shape, span);
@@ -7198,6 +7739,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 Vec::new(),
                 vals.clone(),
                 tail.clone(),
+                &desc,
                 span,
             );
             let then = self.yield_as(arm, &shape, span);
@@ -7690,7 +8232,21 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Ret::Multi => Ty::Any,
             r => types::ret_ty(r),
         };
-        let v = Val { node: value, ty };
+        let after = self.around_builtin(b, is_method, span, &mut pre);
+        let v = if after.is_empty() {
+            Val { node: value, ty }
+        } else if b.ret == Ret::Unit {
+            pre.push(expr_stmt(value));
+            pre.extend(after);
+            if raises {
+                pre.push(self.pending_check(span));
+            }
+            return Ok(Multi::None(block_value(pre, nil(span), span)));
+        } else {
+            let held = self.hold(Val { node: value, ty }, &mut pre);
+            pre.extend(after);
+            held
+        };
         let v = if raises { self.guard(v) } else { v };
         Ok(match b.ret {
             Ret::Unit => Multi::None(block_value(pre, v.node, span)),
@@ -7700,6 +8256,65 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 ty: v.ty,
             }]),
         })
+    }
+
+    /// What a call of a library function does around it in a function
+    /// that keeps a frame: one that may call the program back is a
+    /// frame of its own, named as the reference names it; before one
+    /// that reads the caller's locals, or calls something that may,
+    /// the locals are spilled. Pushes what comes before the call onto
+    /// `pre` and returns what comes after it.
+    fn around_builtin(
+        &mut self,
+        b: &Builtin,
+        is_method: bool,
+        span: Span,
+        pre: &mut Vec<St>,
+    ) -> Vec<St> {
+        if !self.frames {
+            return Vec::new();
+        }
+        // The debug library's own functions are the level 0 it
+        // describes, not a frame of the stack.
+        let reentrant = self.m.reentrant.contains(b.func) && b.lib != "debug";
+        let reads_frame = b.lib == "debug" && matches!(b.name, "getlocal" | "setlocal");
+        if !reentrant && !reads_frame {
+            return Vec::new();
+        }
+        let global = if b.lib.is_empty() {
+            b.name.to_string()
+        } else {
+            format!("{}.{}", b.lib, b.name)
+        };
+        let namewhat = if is_method {
+            "method"
+        } else if b.lib.is_empty() {
+            "global"
+        } else {
+            "field"
+        };
+        let desc = Some(format!("{namewhat} '{}'", b.name));
+        let Some(site) = self.debug_site_as(&desc, &global, span) else {
+            return Vec::new();
+        };
+        let spill = self.spill(site, span, pre);
+        let mut after = Vec::new();
+        if reentrant {
+            pre.push(expr_stmt(call(
+                "zl_dbg_enter_c",
+                vec![int_lit(site, span)],
+                prim(PrimitiveType::Unit),
+                span,
+            )));
+            after.push(expr_stmt(call(
+                "zl_dbg_leave",
+                vec![],
+                prim(PrimitiveType::Unit),
+                span,
+            )));
+        }
+        after.extend(self.after_call(spill, span));
+        after
     }
 
     /// A `math` call whose arguments' types decide its result, as the
@@ -8021,7 +8636,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             let at = out.len();
             self.line_needed = false;
             self.stmt(s, &mut out)?;
-            self.record_line(span_of(s), at, &mut out);
+            self.record_stmt_line(Some(s), span_of(s), at, &mut out);
             if out.len() >= crate::scope::SEGMENT_STATEMENTS {
                 segments.push(std::mem::take(&mut out));
             }
@@ -8037,7 +8652,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
                 _ => return unsupported("this statement", span),
             }
-            self.record_line(span, at, &mut out);
+            self.record_stmt_line(None, span, at, &mut out);
         }
         if !out.is_empty() || segments.is_empty() {
             segments.push(out);
@@ -8047,12 +8662,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     fn block(&mut self, block: &Block) -> Result<Vec<St>> {
         self.depth += 1;
+        let live = self.live.len();
         let mut out = Vec::new();
         for s in block.stmts() {
             let at = out.len();
             self.line_needed = false;
             self.stmt(s, &mut out)?;
-            self.record_line(span_of(s), at, &mut out);
+            self.record_stmt_line(Some(s), span_of(s), at, &mut out);
         }
         match block.last_stmt() {
             Some(last) => {
@@ -8072,7 +8688,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     }
                     _ => return unsupported("this statement", span),
                 }
-                self.record_line(span, at, &mut out);
+                self.record_stmt_line(None, span, at, &mut out);
             }
             None => {
                 let span = span_of(block);
@@ -8081,6 +8697,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
         self.tbc.retain(|(d, _)| *d < self.depth);
         self.depth -= 1;
+        self.live.truncate(live);
         Ok(out)
     }
 
@@ -8109,6 +8726,29 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
     }
 
+    /// The line a statement starts, stored ahead of it. A function
+    /// that keeps a frame stores every statement's line, the one its
+    /// code runs on (a function definition's is its `end`'s), and
+    /// tells the hooks; a block's own line runs nothing.
+    fn record_stmt_line(&mut self, s: Option<&Stmt>, span: Span, at: usize, out: &mut Vec<St>) {
+        if !self.frames {
+            self.record_line(span, at, out);
+            return;
+        }
+        let line = match s {
+            Some(Stmt::Do(_) | Stmt::Repeat(_)) => {
+                self.line_needed = false;
+                return;
+            }
+            Some(Stmt::LocalFunction(f)) => self.m.line_of(span_of(f.body().end_token())),
+            Some(Stmt::FunctionDeclaration(f)) => self.m.line_of(span_of(f.body().end_token())),
+            _ => self.m.line_of(span),
+        };
+        self.line_needed = false;
+        let statements = self.debug_line(line, span);
+        out.splice(at..at, statements);
+    }
+
     /// A statement that checks for an error stores its line first, for
     /// the position the error's message carries.
     fn record_line(&mut self, span: Span, at: usize, out: &mut Vec<St>) {
@@ -8121,8 +8761,21 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     fn return_stmt(&mut self, exprs: &[&Expression], span: Span, out: &mut Vec<St>) -> Result<()> {
-        self.return_values(exprs, span, out)?;
-        if self.tbc.is_empty() && !self.counts_depth {
+        // `return f(...)` is a tail call.
+        let tail = match exprs {
+            [e @ Expression::FunctionCall(_)] => Some(span_of(*e)),
+            [e @ Expression::Var(Var::Expression(v))]
+                if matches!(v.suffixes().last(), Some(Suffix::Call(_))) =>
+            {
+                Some(span_of(*e))
+            }
+            _ => None,
+        };
+        let outer_tail = std::mem::replace(&mut self.tail_span, tail);
+        let values = self.return_values(exprs, span, out);
+        self.tail_span = outer_tail;
+        values?;
+        if self.tbc.is_empty() && !self.counts_depth && !self.frames {
             return Ok(());
         }
         // The values are computed before anything is closed.
@@ -8143,6 +8796,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if self.counts_depth {
             out.push(depth_step(-1, span));
         }
+        out.extend(self.debug_call("zl_dbg_leave", Vec::new(), span));
         out.push(ret(value, span));
         Ok(())
     }
@@ -8241,6 +8895,26 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     fn stmt(&mut self, s: &Stmt, out: &mut Vec<St>) -> Result<()> {
+        self.stmt_of(s, out)?;
+        // The locals a declaration makes are in scope from the next
+        // statement on.
+        match s {
+            Stmt::LocalAssignment(l) => {
+                for name in l.names() {
+                    let v = self.scopes().declared(name);
+                    self.live.push(Live::Var(v));
+                }
+            }
+            Stmt::LocalFunction(f) => {
+                let v = self.scopes().declared(f.name());
+                self.live.push(Live::Var(v));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn stmt_of(&mut self, s: &Stmt, out: &mut Vec<St>) -> Result<()> {
         let span = span_of(s);
         match s {
             Stmt::LocalAssignment(l) => {
@@ -8335,13 +9009,18 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Stmt::While(w) => {
                 let cond = self.expr(w.condition())?;
                 let cond = self.truthy(cond);
-                let body = self.loop_body(w.block())?;
+                let mut body = self.loop_body(w.block())?;
+                body.extend(self.debug_loop_back(span_of(w.while_token()), true, span));
                 out.push(while_(cond, body, span));
             }
             Stmt::Repeat(r) => {
                 // `repeat body until c` is a loop leaving once `c` holds;
                 // the condition sees the body's locals.
                 let mut body = self.loop_body(r.block())?;
+                if self.frames {
+                    let line = self.m.line_of(span_of(r.until_token()));
+                    body.extend(self.debug_line(line, span));
+                }
                 let cond = self.expr(r.until())?;
                 let cond = self.truthy(cond);
                 body.push(if_(
@@ -8350,6 +9029,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     None,
                     span,
                 ));
+                body.extend(self.debug_call("zl_dbg_back", Vec::new(), span));
                 out.push(while_(bool_lit(true, span), body, span));
             }
             Stmt::NumericFor(f) => self.numeric_for(f, span, out)?,
@@ -8574,6 +9254,18 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         self.loop_depths.push(self.depth + 1);
         let body = self.block(block);
         self.loop_depths.pop();
+        body
+    }
+
+    /// A `for` loop's body: `states` hidden locals of the loop, then
+    /// its variables, in scope.
+    fn for_body(&mut self, block: &Block, states: usize, vars: &[VarId]) -> Result<Vec<St>> {
+        let live = self.live.len();
+        self.live
+            .extend(std::iter::repeat_n(Live::ForState, states));
+        self.live.extend(vars.iter().map(|v| Live::Var(*v)));
+        let body = self.loop_body(block);
+        self.live.truncate(live);
         body
     }
 
@@ -8831,7 +9523,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             },
             span,
         )];
-        let inner = self.loop_body(f.block())?;
+        let mut inner = self.for_body(f.block(), 3, &[v])?;
+        inner.extend(self.debug_loop_back(span_of(f.for_token()), false, span));
         let mut after = Vec::new();
         if bounded {
             // Whether the step fits between the counter and the limit:
@@ -8886,6 +9579,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         body.extend(inner);
         body.extend(after);
         out.push(while_(cond, body, span));
+        out.extend(self.debug_loop_exit(span_of(f.for_token()), None, span));
         Ok(())
     }
 
@@ -9193,9 +9887,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 if let (1, None) = (arg_exprs.len(), self.literal_arg(args, span)?) {
                     let t = self.expr(arg_exprs[0])?;
                     return if b.name == "ipairs" {
-                        self.ipairs_loop(&names, t, f.block(), span, out)
+                        self.ipairs_loop(&names, t, f, span, out)
                     } else {
-                        self.pairs_loop(&names, t, f.block(), span, out)
+                        self.pairs_loop(&names, t, f, span, out)
                     };
                 }
             }
@@ -9206,7 +9900,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             && types::builtin_named(self.scopes(), "next").is_some()
         {
             let t = self.expr(table)?;
-            return self.pairs_loop(&names, t, f.block(), span, out);
+            return self.pairs_loop(&names, t, f, span, out);
         }
         // The general protocol: `f, s, control`, then `f(s, control)`
         // until its first value is nil.
@@ -9288,8 +9982,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 span,
             ));
         }
-        body.extend(self.loop_body(f.block())?);
+        body.extend(self.for_body(f.block(), 4, &names)?);
+        body.extend(self.debug_loop_back(span_of(f.for_token()), false, span));
         out.push(while_(bool_lit(true, span), body, span));
+        let end = self.m.line_of(span_of(f.end_token()));
+        out.extend(self.debug_loop_exit(span_of(f.for_token()), Some(end), span));
         Ok(())
     }
 
@@ -9298,10 +9995,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         &mut self,
         names: &[VarId],
         t: Val,
-        block: &Block,
+        f: &ast::GenericFor,
         span: Span,
         out: &mut Vec<St>,
     ) -> Result<()> {
+        let block = f.block();
         let i64_t = prim(PrimitiveType::I64);
         let tname = self.temp();
         let counter = self.temp();
@@ -9360,7 +10058,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             let n = self.nil_val(span);
             body.push(self.declare_var(*v, n, span));
         }
-        let inner = self.loop_body(block)?;
+        let mut inner = self.for_body(block, 4, names)?;
+        inner.extend(self.debug_loop_back(span_of(f.for_token()), false, span));
         let increment = assign(
             var(counter, i64_t.clone(), span),
             binary(
@@ -9373,6 +10072,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             span,
         );
         self.push_loop_with_increment(body, inner, increment, span, out);
+        let end = self.m.line_of(span_of(f.end_token()));
+        out.extend(self.debug_loop_exit(span_of(f.for_token()), Some(end), span));
         Ok(())
     }
 
@@ -9385,10 +10086,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         &mut self,
         names: &[VarId],
         t: Val,
-        block: &Block,
+        f: &ast::GenericFor,
         span: Span,
         out: &mut Vec<St>,
     ) -> Result<()> {
+        let block = f.block();
         let i64_t = prim(PrimitiveType::I64);
         let bool_t = prim(PrimitiveType::Bool);
         let table_t = self.ir(Ty::Table);
@@ -9584,7 +10286,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             };
             body.push(self.declare_var(*v, val, span));
         }
-        let inner = self.loop_body(block)?;
+        let mut inner = self.for_body(block, 4, names)?;
+        inner.extend(self.debug_loop_back(span_of(f.for_token()), false, span));
         let step = assign(
             var(pos, i64_t.clone(), span),
             call(
@@ -9611,6 +10314,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         whole.extend(inner);
         whole.push(advance);
         out.push(while_(bool_lit(true, span), whole, span));
+        let end = self.m.line_of(span_of(f.end_token()));
+        out.extend(self.debug_loop_exit(span_of(f.for_token()), Some(end), span));
         Ok(())
     }
 
@@ -9646,6 +10351,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let sig = self.m.sig(id);
         let has_env = self.m.takes_env(id);
         let mut child = Lowerer::new(self.m, id);
+        child.frames = self.m.debug.is_some();
+        child.live = info.params.iter().map(|v| Live::Var(*v)).collect();
         let mut params = Vec::new();
         let mut statements = Vec::new();
         if has_env {
@@ -9689,13 +10396,26 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if child.entry_line {
             statements.push(entry_line_save(span));
         }
+        if child.frames {
+            statements.push(child.debug_enter(id, span));
+        }
         if child.counts_depth {
             statements.push(child.stack_check(span));
         }
         statements.extend(body_statements);
-        // Falling off the end returns nothing.
+        // Falling off the end returns nothing, from the line of `end`.
+        let last_line = self.m.line_of(span_of(body.end_token()));
         if types::falls_through(body.block()) {
+            if child.frames {
+                statements.extend(child.debug_line(last_line, span));
+            }
             child.return_stmt(&[], span, &mut statements)?;
+        }
+        if child.frames {
+            let line = self
+                .m
+                .line_of(span_of(body.parameters_parentheses().tokens().0));
+            child.debug_function_records(id, line, last_line);
         }
         self.m.strip_line_restores(&mut statements);
         let entry = self.m.entry_name(id);
@@ -10059,6 +10779,12 @@ fn entry_line_save(span: Span) -> St {
     )
 }
 
+/// A field of a record for the debug library's host: no record or
+/// field separator inside.
+fn sanitize(field: &str) -> String {
+    field.replace(['\n', '\x1f'], "?")
+}
+
 /// The chunk name as positions spell it (`luaO_chunkid`): a file name
 /// longer than the reference's buffer keeps its tail after `...`.
 fn chunk_id(file: &str) -> String {
@@ -10203,7 +10929,9 @@ fn chunk_module(
     declarations: &mut Vec<TypedNode<TypedDeclaration>>,
     hooks: &mut Vec<ShapeLayout>,
     registry: &mut zyntax_typed_ast::TypeRegistry,
-) -> Result<String> {
+    debug: DebugMode,
+    debug_names: (&str, &str),
+) -> Result<(String, Option<St>)> {
     let mut module = Module {
         scopes,
         inferred,
@@ -10223,6 +10951,7 @@ fn chunk_module(
         finders: RefCell::new(HashMap::new()),
         reentrant_helpers: RefCell::new(HashSet::new()),
         sorts: RefCell::new(HashMap::new()),
+        debug: debug.info(),
         layouts: shape_layouts(inferred, chunk_index, slots),
     };
     let span = Span::new(0, source.len());
@@ -10230,7 +10959,11 @@ fn chunk_module(
         let mut main = Lowerer::new(module, CHUNK);
         main.returns = Returns::Dynamic;
         main.varargs = Some(intern("$varargs"));
+        main.frames = module.debug.is_some();
         let mut statements = main.block(ast.nodes())?;
+        if main.frames {
+            statements.insert(0, main.debug_enter(CHUNK, span));
+        }
         if main.entry_line {
             statements.insert(0, entry_line_save(span));
         }
@@ -10246,6 +10979,9 @@ fn chunk_module(
         }
         if types::falls_through(ast.nodes()) {
             main.return_stmt(&[], span, &mut statements)?;
+        }
+        if main.frames {
+            main.debug_function_records(CHUNK, 0, 0);
         }
         module.strip_line_restores(&mut statements);
         module.facts.borrow_mut().insert(
@@ -10272,6 +11008,10 @@ fn chunk_module(
     module.finders.borrow_mut().clear();
     module.reentrant_helpers.borrow_mut().clear();
     module.sorts.borrow_mut().clear();
+    if let Some(debug) = &module.debug {
+        debug.records.borrow_mut().clear();
+        debug.sites.set(0);
+    }
     let statements = lower(&module)?;
     let chunk_name = format!("lua${tag}chunk");
     let code_name = format!("{chunk_name}$fn");
@@ -10306,12 +11046,141 @@ fn chunk_module(
         )],
         span,
     ));
+    let register = module
+        .debug
+        .is_some()
+        .then(|| debug_register(&module, debug_names, span));
     if let Some(env) = env_var {
         module.declare_module_var(env, Ty::Any);
     }
     declare(&module, declarations);
     module.declare_shapes(declarations, registry, hooks);
-    Ok(code_name)
+    Ok((code_name, register))
+}
+
+/// Whether a program keeps its call stack for the debug library, and
+/// what else it records for it.
+#[derive(Clone, Copy, Default)]
+struct DebugMode {
+    on: bool,
+    locals: bool,
+    setlocal: bool,
+}
+
+impl DebugMode {
+    fn of(scopes: &Scopes) -> Self {
+        DebugMode {
+            on: scopes.debug,
+            locals: scopes.debug_getlocal || scopes.debug_setlocal,
+            setlocal: scopes.debug_setlocal,
+        }
+    }
+
+    fn join(self, other: DebugMode) -> Self {
+        DebugMode {
+            on: self.on || other.on,
+            locals: self.locals || other.locals,
+            setlocal: self.setlocal || other.setlocal,
+        }
+    }
+
+    fn info(self) -> Option<DebugInfo> {
+        self.on.then(|| DebugInfo {
+            locals: self.locals,
+            setlocal: self.setlocal,
+            ..Default::default()
+        })
+    }
+
+    /// Kept for the chunks `load` compiles while the program runs.
+    fn remember(self) {
+        let bits = self.on as u8 | (self.locals as u8) << 1 | (self.setlocal as u8) << 2;
+        PROGRAM_DEBUG.store(bits, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn program() -> Self {
+        let bits = PROGRAM_DEBUG.load(std::sync::atomic::Ordering::Relaxed);
+        DebugMode {
+            on: bits & 1 != 0,
+            locals: bits & 2 != 0,
+            setlocal: bits & 4 != 0,
+        }
+    }
+}
+
+/// The debug mode of the program running, for chunks it loads.
+static PROGRAM_DEBUG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The call registering a chunk with the debug library: its number,
+/// its source and short names, what its lowering recorded, and its
+/// upvalue accessor, which is added to its functions.
+fn debug_register(module: &Module<'_>, (source, short): (&str, &str), span: Span) -> St {
+    let accessor = upvalue_accessor(module, span);
+    let name = upvalue_accessor_name(&module.tag);
+    module.functions.borrow_mut().push(accessor);
+    let meta = module
+        .debug
+        .as_ref()
+        .map(|d| d.records.borrow().join("\n"))
+        .unwrap_or_default();
+    expr_stmt(call(
+        "zl_dbg_register",
+        vec![
+            int_lit(module.chunk_index, span),
+            str_lit(source, span),
+            str_lit(short, span),
+            str_lit(&meta, span),
+            call(
+                "zl_func_of",
+                vec![
+                    code_of(&name, span),
+                    int_lit(library::debug::UP_ARITY, span),
+                ],
+                Type::Any,
+                span,
+            ),
+        ],
+        prim(PrimitiveType::Unit),
+        span,
+    ))
+}
+
+/// Statements returning a chunk as a function value: its record code,
+/// variadic, and its key, kept for the debug library when the program
+/// keeps its call stack.
+fn chunk_value(code_name: &str, chunk_index: i64, debug: bool, anys: Type, span: Span) -> Vec<St> {
+    let key = chunk_index << 32;
+    let record = call(
+        "zb_func_new",
+        vec![
+            code_of(code_name, span),
+            int_lit(VARIADIC_ARITY, span),
+            node(
+                TypedExpression::Array(vec![call(
+                    "zb_box_i64",
+                    vec![int_lit(key, span)],
+                    Type::Any,
+                    span,
+                )]),
+                anys,
+                span,
+            ),
+        ],
+        Type::Any,
+        span,
+    );
+    let name = intern("$chunk");
+    let mut out = vec![let_(name, Type::Any, record, span)];
+    if debug {
+        out.push(expr_stmt(call(
+            "zl_dbg_closure",
+            vec![int_lit(key, span), var(name, Type::Any, span)],
+            prim(PrimitiveType::Unit),
+            span,
+        )));
+    }
+    out.push(ret(Some(var(name, Type::Any, span)), span));
+    out
 }
 
 /// The import every program links the library through.
@@ -10325,6 +11194,252 @@ fn library_import() -> TypedNode<TypedDeclaration> {
         }),
         Type::Unknown,
         Span::new(0, 0),
+    )
+}
+
+/// The name of a chunk's upvalue accessor.
+fn upvalue_accessor_name(tag: &str) -> String {
+    format!("lua${tag}dbg$upvalues")
+}
+
+/// A chunk's upvalue accessor, as a function value's code: given a
+/// function's key, the function, the upvalue's number, a value and
+/// what is asked (`debug::UP_*`), it reads or writes the upvalue where
+/// the function keeps it (a cell or a copy in its record, a module
+/// variable, the environment), gives its identity, joins it to
+/// another's cell or hands over its own.
+fn upvalue_accessor(module: &Module<'_>, span: Span) -> TypedFunction {
+    use crate::library::debug::{UP_CELL, UP_GET, UP_ID, UP_JOIN, UP_SET, UPVALUE_ID_KIND};
+    use crate::scope::Upvalue;
+    let i64_t = prim(PrimitiveType::I64);
+    let bool_t = prim(PrimitiveType::Bool);
+    let anys = module.anys();
+    let arg = |i: usize| var(intern(&format!("a{i}")), Type::Any, span);
+    let int_of = |x: Node| call("zb_box_get_i64", vec![x], i64_t.clone(), span);
+    let is = |x: Node, v: i64| binary(BinaryOp::Eq, x, int_lit(v, span), bool_t.clone(), span);
+    let fid = || var(intern("fid"), i64_t.clone(), span);
+    let n = || var(intern("n"), i64_t.clone(), span);
+    let how = || var(intern("how"), i64_t.clone(), span);
+    let rec = || var(intern("rec"), anys.clone(), span);
+    let value = arg(3);
+    let mut lowerer = Lowerer::new(module, CHUNK);
+    // A constant identity for an upvalue with no cell: one per
+    // variable of the chunk, never an address.
+    // An upvalue's identity as a value: an instance of its own kind,
+    // equal to another exactly when the two identities are.
+    let upvalue_id = |identity: Node| {
+        call(
+            "zb_box_instance_raw",
+            vec![
+                identity,
+                int32_lit(zyntax_builtins::instance_tag(UPVALUE_ID_KIND) as i32, span),
+            ],
+            Type::Any,
+            span,
+        )
+    };
+    let constant_id = |k: i64| upvalue_id(int_lit(((module.chunk_index + 1) << 40) | k, span));
+    let mut body = vec![
+        let_(
+            intern("fid"),
+            i64_t.clone(),
+            binary(
+                BinaryOp::BitAnd,
+                int_of(arg(0)),
+                int_lit(0xffff_ffff, span),
+                i64_t.clone(),
+                span,
+            ),
+            span,
+        ),
+        let_(
+            intern("rec"),
+            anys.clone(),
+            call("zb_unbox_list_raw_any", vec![arg(1)], anys.clone(), span),
+            span,
+        ),
+        let_(intern("n"), i64_t.clone(), int_of(arg(2)), span),
+        let_(intern("how"), i64_t.clone(), int_of(arg(4)), span),
+    ];
+    for (k, info) in module.scopes.funcs.iter().enumerate() {
+        if info.upvalues.is_empty() {
+            continue;
+        }
+        let mut arms = Vec::new();
+        for (i, up) in info.upvalues.iter().enumerate() {
+            let mut answers: Vec<St> = Vec::new();
+            match up {
+                Upvalue::Var(v) => {
+                    let vinfo = module.scopes.var(*v);
+                    if vinfo.is_module_var() {
+                        let ty = module.inferred.var(*v).settled();
+                        let symbol = module.module_local_symbol(*v);
+                        let read = lowerer.coerce(
+                            Val {
+                                node: var(symbol, module.ir(ty), span),
+                                ty,
+                            },
+                            Ty::Any,
+                        );
+                        let stored = lowerer.coerce(
+                            Val {
+                                node: value.clone(),
+                                ty: Ty::Any,
+                            },
+                            ty,
+                        );
+                        answers.push(if_(
+                            is(how(), UP_GET),
+                            vec![ret(Some(read), span)],
+                            None,
+                            span,
+                        ));
+                        answers.push(if_(
+                            is(how(), UP_SET),
+                            vec![assign(var(symbol, module.ir(ty), span), stored, span)],
+                            None,
+                            span,
+                        ));
+                        answers.push(if_(
+                            is(how(), UP_ID),
+                            vec![ret(Some(constant_id(v.0 as i64 + 1)), span)],
+                            None,
+                            span,
+                        ));
+                    } else if let Some(j) = info.captures.iter().position(|c| c == v) {
+                        let slot = || {
+                            index(
+                                rec(),
+                                int_lit((RECORD_CELLS_AT + j) as i64, span),
+                                Type::Any,
+                                span,
+                            )
+                        };
+                        if vinfo.needs_cell() {
+                            let cell = || {
+                                index(
+                                    call("zb_unbox_list_raw_any", vec![slot()], anys.clone(), span),
+                                    int_lit(0, span),
+                                    Type::Any,
+                                    span,
+                                )
+                            };
+                            answers.push(if_(
+                                is(how(), UP_GET),
+                                vec![ret(Some(cell()), span)],
+                                None,
+                                span,
+                            ));
+                            answers.push(if_(
+                                is(how(), UP_SET),
+                                vec![assign(cell(), value.clone(), span)],
+                                None,
+                                span,
+                            ));
+                            answers.push(if_(
+                                is(how(), UP_ID),
+                                vec![ret(
+                                    Some(upvalue_id(call(
+                                        "zb_unbox_instance_raw",
+                                        vec![slot()],
+                                        i64_t.clone(),
+                                        span,
+                                    ))),
+                                    span,
+                                )],
+                                None,
+                                span,
+                            ));
+                            answers.push(if_(
+                                binary(
+                                    BinaryOp::And,
+                                    is(how(), UP_JOIN),
+                                    binary(
+                                        BinaryOp::Ne,
+                                        value.clone(),
+                                        nil(span),
+                                        bool_t.clone(),
+                                        span,
+                                    ),
+                                    bool_t.clone(),
+                                    span,
+                                ),
+                                vec![assign(slot(), value.clone(), span)],
+                                None,
+                                span,
+                            ));
+                            answers.push(if_(
+                                is(how(), UP_CELL),
+                                vec![ret(Some(slot()), span)],
+                                None,
+                                span,
+                            ));
+                        } else {
+                            answers.push(if_(
+                                is(how(), UP_GET),
+                                vec![ret(Some(slot()), span)],
+                                None,
+                                span,
+                            ));
+                            answers.push(if_(
+                                is(how(), UP_SET),
+                                vec![assign(slot(), value.clone(), span)],
+                                None,
+                                span,
+                            ));
+                            answers.push(if_(
+                                is(how(), UP_ID),
+                                vec![ret(Some(constant_id(v.0 as i64 + 1)), span)],
+                                None,
+                                span,
+                            ));
+                        }
+                    }
+                }
+                Upvalue::Env => {
+                    let env = match module.env_var {
+                        Some(env) => var(env, Type::Any, span),
+                        None => call("zl_globals_value", vec![], Type::Any, span),
+                    };
+                    answers.push(if_(
+                        is(how(), UP_GET),
+                        vec![ret(Some(env), span)],
+                        None,
+                        span,
+                    ));
+                    if let Some(env) = module.env_var {
+                        answers.push(if_(
+                            is(how(), UP_SET),
+                            vec![assign(var(env, Type::Any, span), value.clone(), span)],
+                            None,
+                            span,
+                        ));
+                    }
+                    answers.push(if_(
+                        is(how(), UP_ID),
+                        vec![ret(Some(constant_id(0)), span)],
+                        None,
+                        span,
+                    ));
+                }
+            }
+            answers.push(ret(Some(nil(span)), span));
+            arms.push(if_(is(n(), i as i64 + 1), answers, None, span));
+        }
+        body.push(if_(is(fid(), k as i64), arms, None, span));
+    }
+    body.push(ret(Some(nil(span)), span));
+    let mut params = vec![parameter(intern("env"), anys, span)];
+    params.extend(
+        (0..library::debug::UP_ARITY as usize)
+            .map(|i| parameter(intern(&format!("a{i}")), Type::Any, span)),
+    );
+    typed_function(
+        &upvalue_accessor_name(&module.tag),
+        params,
+        Type::Any,
+        body,
+        span,
     )
 }
 
@@ -10660,7 +11775,9 @@ fn loaded_declarations(
     // chunk's shapes, and it defines none of its own.
     let mut registry = library.type_registry.clone();
     let mut hooks = Vec::new();
-    let code_name = chunk_module(
+    // A chunk of a program that keeps its call stack keeps it too.
+    let debug = DebugMode::of(scopes).join(DebugMode::program());
+    let (code_name, register) = chunk_module(
         scopes,
         inferred,
         ast,
@@ -10675,35 +11792,35 @@ fn loaded_declarations(
         &mut declarations,
         &mut hooks,
         &mut registry,
+        debug,
+        (chunk_name, chunk_name),
     )?;
     let span = Span::new(0, source.len());
     let env = intern("env");
+    let mut statements = vec![expr_stmt(call(
+        "zl_chunk_add",
+        vec![str_lit(chunk_name, span), int_lit(index, span)],
+        prim(PrimitiveType::Unit),
+        span,
+    ))];
+    statements.extend(register);
+    statements.push(assign(
+        var(env_var, Type::Any, span),
+        var(env, Type::Any, span),
+        span,
+    ));
+    statements.extend(chunk_value(
+        &code_name,
+        index,
+        debug.on,
+        library.types.anys(),
+        span,
+    ));
     let init = typed_function(
         &format!("lua${tag}init"),
         vec![parameter(env, Type::Any, span)],
         Type::Any,
-        vec![
-            expr_stmt(call(
-                "zl_chunk_add",
-                vec![str_lit(chunk_name, span), int_lit(index, span)],
-                prim(PrimitiveType::Unit),
-                span,
-            )),
-            assign(
-                var(env_var, Type::Any, span),
-                var(env, Type::Any, span),
-                span,
-            ),
-            ret(
-                Some(call(
-                    "zl_func_of",
-                    vec![code_of(&code_name, span), int_lit(VARIADIC_ARITY, span)],
-                    Type::Any,
-                    span,
-                )),
-                span,
-            ),
-        ],
+        statements,
         span,
     );
     declarations.push(TypedNode::new(
@@ -10802,6 +11919,12 @@ pub(crate) fn program(
         .collect();
     crate::trace_phase("infer", started);
     let started = std::time::Instant::now();
+    // Every file of a program that reaches the debug library keeps the
+    // call stack, and so does every chunk it loads.
+    let debug = loaded.iter().fold(DebugMode::of(&scopes), |d, m| {
+        d.join(DebugMode::of(&m.scopes))
+    });
+    debug.remember();
     let line_starts = line_starts_of(source);
     // A program that assigns `_ENV` has an environment of its own,
     // the globals table until then.
@@ -10828,6 +11951,7 @@ pub(crate) fn program(
         finders: RefCell::new(HashMap::new()),
         reentrant_helpers: RefCell::new(HashSet::new()),
         sorts: RefCell::new(HashMap::new()),
+        debug: debug.info(),
         layouts: shape_layouts(&inferred, 0, true),
     };
     let span = Span::new(0, source.len());
@@ -10835,6 +11959,7 @@ pub(crate) fn program(
     // the second checks after calls to those alone.
     let lower_chunk = |module: &Module<'_>| -> Result<Vec<St>> {
         let mut main = Lowerer::new(module, CHUNK);
+        main.frames = module.debug.is_some();
         main.returns = Returns::Fixed(Vec::new());
         // `...` at the main chunk: the script's arguments, in a module
         // variable since a segment is a function of its own.
@@ -10901,6 +12026,10 @@ pub(crate) fn program(
         };
         let presets = main.preset_globals(span);
         statements.splice(0..0, presets);
+        if main.frames {
+            statements.insert(0, main.debug_enter(CHUNK, span));
+            main.debug_function_records(CHUNK, 0, 0);
+        }
         if let Some(env) = module.env_var {
             statements.insert(
                 0,
@@ -10943,6 +12072,10 @@ pub(crate) fn program(
     module.finders.borrow_mut().clear();
     module.reentrant_helpers.borrow_mut().clear();
     module.sorts.borrow_mut().clear();
+    if let Some(debug) = &module.debug {
+        debug.records.borrow_mut().clear();
+        debug.sites.set(0);
+    }
     crate::trace_phase("lower 1", started);
     let started = std::time::Instant::now();
     let statements = lower_chunk(&module)?;
@@ -10957,6 +12090,10 @@ pub(crate) fn program(
     if let Some(env) = module.env_var {
         module.declare_module_var(env, Ty::Any);
     }
+    let register = debug.on.then(|| {
+        let source_name = format!("@{file}");
+        debug_register(&module, (&source_name, &chunk_id(module.chunk)), span)
+    });
     let mut declarations = Vec::new();
     declare(&module, &mut declarations);
     let mut registry = library.type_registry.clone();
@@ -10978,6 +12115,7 @@ pub(crate) fn program(
     // enters through `package.preload`, and named in positions by its
     // number.
     let mut preloads: Vec<St> = Vec::new();
+    preloads.extend(register);
     for (k, m) in loaded.iter().enumerate() {
         let tag = format!("m${}$", m.name.replace('.', "$"));
         let env_var = m
@@ -10985,7 +12123,10 @@ pub(crate) fn program(
             .global_writes
             .contains_key("_ENV")
             .then(|| intern(&format!("lua${tag}env")));
-        let code_name = chunk_module(
+        // Positions name the file as `require` found it.
+        let found_as = format!("./{}.lua", m.name.replace('.', "/"));
+        let source_name = format!("@{found_as}");
+        let (code_name, register) = chunk_module(
             &m.scopes,
             &module_inferred[k],
             &m.ast,
@@ -11000,9 +12141,9 @@ pub(crate) fn program(
             &mut declarations,
             &mut hooks,
             &mut registry,
+            debug,
+            (&source_name, &chunk_id(&found_as)),
         )?;
-        // Positions name the file as `require` found it.
-        let found_as = format!("./{}.lua", m.name.replace('.', "/"));
         preloads.push(expr_stmt(call(
             "zl_chunk_add",
             vec![
@@ -11012,17 +12153,41 @@ pub(crate) fn program(
             prim(PrimitiveType::Unit),
             span,
         )));
-        preloads.push(expr_stmt(call(
-            "zl_preload_module",
+        preloads.extend(register);
+        // The chunk as a function value, under its key.
+        let key = (k as i64 + 1) << 32;
+        let record = call(
+            "zb_func_new",
             vec![
-                str_lit(&m.name, span),
-                call(
-                    "zl_func_of",
-                    vec![code_of(&code_name, span), int_lit(VARIADIC_ARITY, span)],
-                    Type::Any,
+                code_of(&code_name, span),
+                int_lit(VARIADIC_ARITY, span),
+                node(
+                    TypedExpression::Array(vec![call(
+                        "zb_box_i64",
+                        vec![int_lit(key, span)],
+                        Type::Any,
+                        span,
+                    )]),
+                    module.anys(),
                     span,
                 ),
             ],
+            Type::Any,
+            span,
+        );
+        let chunk_var = intern(&format!("$chunk{k}"));
+        preloads.push(let_(chunk_var, Type::Any, record, span));
+        if debug.on {
+            preloads.push(expr_stmt(call(
+                "zl_dbg_closure",
+                vec![int_lit(key, span), var(chunk_var, Type::Any, span)],
+                prim(PrimitiveType::Unit),
+                span,
+            )));
+        }
+        preloads.push(expr_stmt(call(
+            "zl_preload_module",
+            vec![str_lit(&m.name, span), var(chunk_var, Type::Any, span)],
             prim(PrimitiveType::Unit),
             span,
         )));

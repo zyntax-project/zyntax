@@ -361,19 +361,19 @@ pub const BUILTINS: &[Builtin] = &[
         params: &[Str, Str],
         ret: Ret::Multi,
     },
-    // ─── debug: what a program can be told without a debugger ───
+    // ─── debug ───
     Builtin {
         lib: "debug",
         name: "traceback",
         func: "zl_debug_traceback",
-        params: &[Any, Any],
+        params: &[Rest],
         ret: Ret::Any,
     },
     Builtin {
         lib: "debug",
         name: "getinfo",
         func: "zl_debug_getinfo",
-        params: &[Any, Any],
+        params: &[Rest],
         ret: Ret::Any,
     },
     Builtin {
@@ -388,7 +388,7 @@ pub const BUILTINS: &[Builtin] = &[
         name: "gethook",
         func: "zl_debug_gethook",
         params: &[Rest],
-        ret: Ret::Any,
+        ret: Ret::Multi,
     },
     Builtin {
         lib: "debug",
@@ -414,23 +414,72 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         lib: "debug",
         name: "getlocal",
-        func: "zl_debug_none",
+        func: "zl_debug_getlocal",
         params: &[Rest],
-        ret: Ret::Any,
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "debug",
+        name: "setlocal",
+        func: "zl_debug_setlocal",
+        params: &[Rest],
+        ret: Ret::Multi,
     },
     Builtin {
         lib: "debug",
         name: "getupvalue",
-        func: "zl_debug_none",
+        func: "zl_debug_getupvalue",
+        params: &[Rest],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "debug",
+        name: "setupvalue",
+        func: "zl_debug_setupvalue",
+        params: &[Rest],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "debug",
+        name: "upvalueid",
+        func: "zl_debug_upvalueid",
         params: &[Rest],
         ret: Ret::Any,
     },
     Builtin {
         lib: "debug",
-        name: "upvalueid",
-        func: "zl_debug_none",
+        name: "upvaluejoin",
+        func: "zl_debug_upvaluejoin",
+        params: &[Rest],
+        ret: Ret::Unit,
+    },
+    Builtin {
+        lib: "debug",
+        name: "getuservalue",
+        func: "zl_debug_getuservalue",
+        params: &[Rest],
+        ret: Ret::Multi,
+    },
+    Builtin {
+        lib: "debug",
+        name: "setuservalue",
+        func: "zl_debug_setuservalue",
         params: &[Rest],
         ret: Ret::Any,
+    },
+    Builtin {
+        lib: "debug",
+        name: "setcstacklimit",
+        func: "zl_debug_setcstacklimit",
+        params: &[Rest],
+        ret: Ret::Int,
+    },
+    Builtin {
+        lib: "debug",
+        name: "debug",
+        func: "zl_debug_debug",
+        params: &[],
+        ret: Ret::Unit,
     },
     // ─── utf8 ───
     Builtin {
@@ -1288,7 +1337,10 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ),
                 vec![ret(text("function"))],
             ),
-            when(is_file(x.e()), vec![ret(text("userdata"))]),
+            when(
+                or(is_file(x.e()), is_upvalue_id(x.e())),
+                vec![ret(text("userdata"))],
+            ),
             ret(type_name(x.e())),
         ],
     ));
@@ -4156,128 +4208,6 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     ));
 
     // ─── debug ──────────────────────────────────────────────────
-    // The message itself: there is no stack to print.
-    d.push(define(
-        "zl_debug_traceback",
-        &[&x, &y],
-        any(),
-        vec![
-            when(
-                and(not(is_nil(x.e())), ne(category(x.e()), int(STR))),
-                vec![ret(x.e())],
-            ),
-            when(is_nil(x.e()), vec![ret(box_str(text("stack traceback:")))]),
-            ret(box_str(add(get_str(x.e()), text("\nstack traceback:")))),
-        ],
-    ));
-    // What is known of the running function: its chunk and line.
-    d.push(define(
-        "zl_debug_getinfo",
-        &[&x, &y],
-        any(),
-        vec![
-            tb.decl(call("zl_table_new", vec![], table.clone())),
-            expr(call(
-                "zl_rawset_str",
-                vec![
-                    tb.e(),
-                    text("currentline"),
-                    box_i64(bitand(
-                        read_global(LINE, i64()),
-                        int((1i64 << LINE_BITS) - 1),
-                    )),
-                ],
-                unit(),
-            )),
-            expr(call(
-                "zl_rawset_str",
-                vec![
-                    tb.e(),
-                    text("short_src"),
-                    box_str(call(
-                        "zl_chunk_of",
-                        vec![read_global(LINE, i64())],
-                        string(),
-                    )),
-                ],
-                unit(),
-            )),
-            expr(call(
-                "zl_rawset_str",
-                vec![
-                    tb.e(),
-                    text("source"),
-                    box_str(add(
-                        text("@"),
-                        call("zl_chunk_of", vec![read_global(LINE, i64())], string()),
-                    )),
-                ],
-                unit(),
-            )),
-            expr(call(
-                "zl_rawset_str",
-                vec![tb.e(), text("what"), box_str(text("Lua"))],
-                unit(),
-            )),
-            expr(call(
-                "zl_rawset_str",
-                vec![tb.e(), text("namewhat"), box_str(text(""))],
-                unit(),
-            )),
-            expr(call(
-                "zl_rawset_str",
-                vec![tb.e(), text("linedefined"), box_i64(int(0))],
-                unit(),
-            )),
-            expr(call(
-                "zl_rawset_str",
-                vec![tb.e(), text("lastlinedefined"), box_i64(int(0))],
-                unit(),
-            )),
-            expr(call(
-                "zl_rawset_str",
-                vec![tb.e(), text("nups"), box_i64(int(0))],
-                unit(),
-            )),
-            expr(call(
-                "zl_rawset_str",
-                vec![tb.e(), text("nparams"), box_i64(int(0))],
-                unit(),
-            )),
-            expr(call(
-                "zl_rawset_str",
-                vec![tb.e(), text("isvararg"), box_bool(bool(true))],
-                unit(),
-            )),
-            expr(call(
-                "zl_rawset_str",
-                vec![tb.e(), text("istailcall"), box_bool(bool(false))],
-                unit(),
-            )),
-            when(
-                is_func(x.e()),
-                vec![expr(call(
-                    "zl_rawset_str",
-                    vec![tb.e(), text("func"), x.e()],
-                    unit(),
-                ))],
-            ),
-            ret(box_table(tb.e())),
-        ],
-    ));
-    d.push(define(
-        "zl_debug_sethook",
-        &[&args],
-        unit(),
-        vec![ret_void()],
-    ));
-    d.push(define(
-        "zl_debug_gethook",
-        &[&args],
-        any(),
-        vec![ret(nil())],
-    ));
-    d.push(define("zl_debug_none", &[&args], any(), vec![ret(nil())]));
     d.push(define(
         "zl_debug_getmetatable",
         &[&x],
@@ -4287,7 +4217,14 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 eq(category(x.e()), int(STR)),
                 vec![ret(call("zl_string_metatable", vec![], any()))],
             ),
-            when(not(is_table(x.e())), vec![ret(nil())]),
+            when(
+                is_file(x.e()),
+                vec![ret(call("zl_file_metatable", vec![], any()))],
+            ),
+            when(
+                not(is_table(x.e())),
+                vec![ret(call("zl_type_meta", vec![x.e()], any()))],
+            ),
             tb.decl(unbox_table(x.e(), t)),
             when(
                 eq(meta_of(tb.e(), t), null(table.clone())),
@@ -4313,14 +4250,25 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 eq(category(x.e()), int(STR)),
                 vec![assign_global("zl_string_meta", y.e()), ret(x.e())],
             ),
+            // A protected metatable is no protection from the debug
+            // library.
             when(
                 is_table(x.e()),
-                vec![expr(call(
-                    "zl_setmetatable",
-                    vec![unbox_table(x.e(), t), y.e()],
-                    table.clone(),
-                ))],
+                vec![if_(
+                    is_nil(y.e()),
+                    vec![set_field(
+                        unbox_table(x.e(), t),
+                        "meta",
+                        null(table.clone()),
+                    )],
+                    vec![set_field(
+                        unbox_table(x.e(), t),
+                        "meta",
+                        unbox_table(y.e(), t),
+                    )],
+                )],
             ),
+            expr(call("zl_set_type_meta", vec![x.e(), y.e()], boolean())),
             ret(x.e()),
         ],
     ));

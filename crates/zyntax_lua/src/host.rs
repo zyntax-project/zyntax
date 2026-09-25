@@ -1652,6 +1652,9 @@ extern "C" fn host_load(
         n.set(k + 1);
         LOAD_CHUNKS_FROM + k
     });
+    // The reference's `source`: the name given, else the text itself.
+    let raw = if name.is_empty() { source } else { name };
+    crate::host_debug::note_load_source(index, String::from_utf8_lossy(raw).into_owned());
     match crate::load_chunk(&text, &chunk_name, index, env) {
         Ok(record) => record,
         Err(message) => {
@@ -1781,6 +1784,11 @@ extern "C" fn host_report_pending(err: *const DynamicBox) {
     let mut out = b"lua: ".to_vec();
     out.extend(uncaught_text(err));
     out.push(b'\n');
+    // A program that keeps its call stack shows where the error was raised.
+    if let Some(trace) = crate::host_debug::uncaught_traceback() {
+        out.extend(trace.into_bytes());
+        out.push(b'\n');
+    }
     host_io::host_io_flush_all();
     let _ = std::io::stderr().write_all(&out);
     // SAFETY: `_exit` does not return, and the streams are flushed.
@@ -2083,6 +2091,7 @@ pub(crate) fn static_plugin() -> zrtl::StaticPlugin {
     let symbols = ALL.get_or_init(|| {
         let provided: std::collections::HashSet<&str> = SYMBOLS
             .iter()
+            .chain(crate::host_debug::SYMBOLS.iter())
             .filter_map(|s| {
                 // SAFETY: every entry's name is a C string literal.
                 unsafe { std::ffi::CStr::from_ptr(s.name) }.to_str().ok()
@@ -2090,6 +2099,7 @@ pub(crate) fn static_plugin() -> zrtl::StaticPlugin {
             .collect();
         let mut all: Vec<zrtl::ZrtlSymbol> = SYMBOLS
             .iter()
+            .chain(crate::host_debug::SYMBOLS.iter())
             .map(|s| zrtl::ZrtlSymbol::new(s.name, s.ptr))
             .collect();
         for name in crate::fallible::HOST_EXTERNS {

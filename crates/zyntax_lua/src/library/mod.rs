@@ -10,6 +10,7 @@
 
 pub mod calls;
 pub mod coroutines;
+pub mod debug;
 pub mod io;
 pub mod patterns;
 pub mod stdlib;
@@ -285,6 +286,15 @@ pub fn is_thread(x: Expr) -> Expr {
 }
 pub fn is_file(x: Expr) -> Expr {
     and(ne(x.clone(), nil()), eq(tag_of(x), int(file_tag())))
+}
+pub fn is_upvalue_id(x: Expr) -> Expr {
+    and(
+        ne(x.clone(), nil()),
+        eq(
+            tag_of(x),
+            int(zyntax_builtins::instance_tag(debug::UPVALUE_ID_KIND)),
+        ),
+    )
 }
 pub fn is_func(x: Expr) -> Expr {
     and(
@@ -563,6 +573,10 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
                     is_file(x.e()),
                     vec![ret(call("zl_file_str", vec![x.e()], string()))],
                 ),
+                when(
+                    is_upvalue_id(x.e()),
+                    vec![ret(add(text("userdata: 0x"), hex(addr(x.e()))))],
+                ),
                 ret(add(text("table: 0x"), hex(addr(x.e())))),
             ],
         ),
@@ -580,6 +594,7 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
             vec![
                 when(is_thread(x.e()), vec![ret(text("thread"))]),
                 when(is_file(x.e()), vec![ret(text("FILE*"))]),
+                when(is_upvalue_id(x.e()), vec![ret(text("userdata"))]),
                 ret(text("table")),
             ],
         ),
@@ -835,6 +850,19 @@ pub fn pending() -> Expr {
     read_global(PENDING, any())
 }
 
+/// An error was just raised: a program that keeps its call stack notes
+/// where, for the report of an error nothing catches.
+fn note_raise() -> Stmt {
+    when(
+        read_global(debug::DBG_ON, boolean()),
+        vec![expr(call(
+            "zl_dbg_note_raise",
+            vec![read_global(LINE, i64())],
+            unit(),
+        ))],
+    )
+}
+
 /// Raising: the first error stands until it is taken; a message gets
 /// the running statement's position, an error value is kept as it is.
 fn raising(t: &Types) -> Vec<Decl> {
@@ -966,6 +994,7 @@ fn raising(t: &Types) -> Vec<Decl> {
                 vec![set_global(PENDING, nil_error())],
                 vec![set_global(PENDING, v.e())],
             ),
+            note_raise(),
             ret_void(),
         ],
     ));
@@ -981,6 +1010,7 @@ fn raising(t: &Types) -> Vec<Decl> {
                 PENDING,
                 box_str(call("zl_position", vec![message.e()], string())),
             ),
+            note_raise(),
             ret_void(),
         ],
     ));
@@ -998,6 +1028,7 @@ fn raising(t: &Types) -> Vec<Decl> {
                 PENDING,
                 box_str(call("zl_position", vec![message.e()], string())),
             ),
+            note_raise(),
             ret_void(),
         ],
     ));
@@ -1215,6 +1246,7 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     lib.declarations.extend(utf8::declarations(&t));
     lib.declarations.extend(io::declarations(&t));
     lib.declarations.extend(stdlib::declarations(policy, &t));
+    lib.declarations.extend(debug::declarations(&t));
     lib.declarations.push(func_code_decl(&t));
     for d in &mut lib.declarations {
         if let TypedDeclaration::Function(f) = &mut d.node {

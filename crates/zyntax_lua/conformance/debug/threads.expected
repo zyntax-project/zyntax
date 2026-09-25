@@ -1,0 +1,21 @@
+true	1
+stack traceback:
+	[C]: in function 'coroutine.yield'
+	threads.lua:4: in local 'inner'
+	threads.lua:6: in function <threads.lua:2>
+with a message
+stack traceback:
+	[C]: in function 'coroutine.yield'
+	threads.lua:4: in local 'inner'
+	threads.lua:6: in function <threads.lua:2>
+from level 1
+stack traceback:
+	threads.lua:4: in local 'inner'
+	threads.lua:6: in function <threads.lua:2>
+4	3	Lua
+C
+true	done
+stack traceback:
+inside
+stack traceback:
+	threads.lua:20: in function <threads.lua:19>

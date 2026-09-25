@@ -473,5 +473,6 @@ categories! {
     utf8,
     modules,
     load,
+    debug,
     official,
 }

@@ -3501,6 +3501,15 @@ fn infer_given(
         // their classes and what reaches them are found again.
         round.out.escaping = escaping.clone();
         round.out.settling = known.settling;
+        // A variable the debug library may rebind holds anything; a
+        // numeric loop's counter keeps the loop's kind.
+        if scopes.debug_rebinds || scopes.debug_setlocal {
+            for (i, v) in scopes.vars.iter().enumerate() {
+                if (scopes.debug_setlocal || v.captured) && !v.loop_counter {
+                    round.out.vars.insert(VarId(i as u32), Ty::Any);
+                }
+            }
+        }
         round.out.shape_by_keys = known.shape_by_keys.clone();
         round.out.shape_by_site = known.shape_by_site.clone();
         round.out.shapes = known

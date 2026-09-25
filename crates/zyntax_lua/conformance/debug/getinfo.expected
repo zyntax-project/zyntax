@@ -1,0 +1,58 @@
+f at level 1
+	activelines	21,22,23
+	currentline	22
+	istailcall	false
+	isvararg	true
+	lastlinedefined	23
+	linedefined	20
+	name	f
+	namewhat	local
+	nparams	2
+	nups	1
+	short_src	getinfo.lua
+	source	@getinfo.lua
+	what	Lua
+f as a value
+	activelines	21,22,23
+	isvararg	true
+	lastlinedefined	23
+	linedefined	20
+	nparams	2
+	nups	1
+	short_src	getinfo.lua
+	source	@getinfo.lua
+	what	Lua
+print
+	currentline	-1
+	ftransfer	0
+	func	function
+	istailcall	false
+	isvararg	true
+	lastlinedefined	-1
+	linedefined	-1
+	namewhat	
+	nparams	0
+	ntransfer	0
+	nups	0
+	short_src	[C]
+	source	=[C]
+	what	C
+main chunk
+	currentline	34
+	lastlinedefined	0
+	linedefined	0
+	short_src	getinfo.lua
+	source	@getinfo.lua
+	what	main
+named	local
+named	field
+m	method
+glob	global
+50
+nil		true
+nil
+getinfo
+false	invalid option '>'
+false	invalid option
+true
+true

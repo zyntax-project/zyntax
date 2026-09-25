@@ -1,0 +1,11 @@
+straight	13 19 20 21 22 14
+numeric for	13 25 26 27 26 27 26 27 26 29 30 14
+while	13 33 34 35 34 35 34 35 34 37 38 14
+repeat	13 41 43 44 43 44 45 46 14
+if	13 49 50 51 55 56 14
+calls	13 61 62 60 63 64 14
+call and return	r-1 c66 c67 r67 r66 c-1
+nil
+true	crl	3
+nil
+true

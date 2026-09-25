@@ -644,7 +644,20 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 is_file(o.e()),
                 vec![ret(call("zl_file_metatable", vec![], any()))],
             ),
-            when(not(is_table(o.e())), vec![ret(nil())]),
+            when(
+                not(is_table(o.e())),
+                vec![
+                    mt.decl(call("zl_type_meta", vec![o.e()], any())),
+                    when(is_nil(mt.e()), vec![ret(nil())]),
+                    handler.decl(call(
+                        "zl_rawget_str",
+                        vec![unbox_table(mt.e(), t), text("__metatable")],
+                        any(),
+                    )),
+                    when(not(is_nil(handler.e())), vec![ret(handler.e())]),
+                    ret(mt.e()),
+                ],
+            ),
             tb.decl(unbox_table(o.e(), t)),
             when(
                 eq(meta_of(tb.e(), t), null(table.clone())),
@@ -674,15 +687,28 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             )),
         ],
     ));
-    // The event of a dynamic value: a table's metatable field; nil for
-    // anything else. (Strings answer to the string library, which
+    // The event in the metatable of `o`'s type, set by
+    // `debug.setmetatable`: nil when none.
+    let type_event = |o: &Local| {
+        vec![
+            mt.decl(call("zl_type_meta", vec![o.e()], any())),
+            when(is_nil(mt.e()), vec![ret(nil())]),
+            ret(call(
+                "zl_rawget_str",
+                vec![unbox_table(mt.e(), t), event.e()],
+                any(),
+            )),
+        ]
+    };
+    // The event of a dynamic value: its metatable's field, nil when it
+    // has none. (Strings answer to the string library, which
     // `zl_index` handles itself.)
     d.push(define(
         "zl_meta_of",
         &[&o, &event],
         any(),
         vec![
-            when(is_nil(o.e()), vec![ret(nil())]),
+            when(is_nil(o.e()), type_event(&o)),
             // Strings and files have metatables of their own.
             when(
                 eq(category(o.e()), int(STR)),
@@ -706,7 +732,8 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     any(),
                 ))],
             ),
-            when(not(is_table(o.e())), vec![ret(nil())]),
+            // Any other value that is not a table, its type's.
+            when(not(is_table(o.e())), type_event(&o)),
             ret(call(
                 "zl_meta",
                 vec![unbox_table(o.e(), t), event.e()],
@@ -924,6 +951,48 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
 
     // The same on a dynamic value: a table is indexed as above, a
     // string through the string library, anything else is an error.
+    // A value of another type is indexed through its type's metatable
+    // (`debug.setmetatable`), when it has one with the event.
+    let mm = kept("mm", any());
+    let type_index = |o: &Local, key: Expr| {
+        block_of(vec![
+            mm.decl(call("zl_meta_of", vec![o.e(), text("__index")], any())),
+            when(
+                not(is_nil(mm.e())),
+                vec![
+                    when(
+                        is_func(mm.e()),
+                        vec![ret(call(
+                            "zl_first",
+                            vec![call("zl_call_2", vec![mm.e(), o.e(), key.clone()], any())],
+                            any(),
+                        ))],
+                    ),
+                    ret(call("zl_index", vec![mm.e(), key], any())),
+                ],
+            ),
+        ])
+    };
+    let type_newindex = |o: &Local, key: Expr| {
+        block_of(vec![
+            mm.decl(call("zl_meta_of", vec![o.e(), text("__newindex")], any())),
+            when(
+                not(is_nil(mm.e())),
+                vec![
+                    if_(
+                        is_func(mm.e()),
+                        vec![expr(call(
+                            "zl_call_3",
+                            vec![mm.e(), o.e(), key.clone(), v.e()],
+                            any(),
+                        ))],
+                        vec![expr(call("zl_setindex", vec![mm.e(), key, v.e()], unit()))],
+                    ),
+                    ret_void(),
+                ],
+            ),
+        ])
+    };
     let not_indexable = |o: &Local| {
         type_error(
             concat(vec![
@@ -955,6 +1024,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 is_file(o.e()),
                 vec![ret(call("zl_file_member", vec![o.e(), k.e()], any()))],
             ),
+            type_index(&o, k.e()),
             not_indexable(&o),
             ret(nil()),
         ],
@@ -988,6 +1058,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     any(),
                 ))],
             ),
+            type_index(&o, box_str(s.e())),
             not_indexable(&o),
             ret(nil()),
         ],
@@ -1013,6 +1084,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 is_file(o.e()),
                 vec![ret(call("zl_file_member", vec![o.e(), k.e()], any()))],
             ),
+            type_index(&o, k.e()),
             not_indexable(&o),
             ret(nil()),
         ],
@@ -1061,6 +1133,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 ))],
             ),
             when(eq(category(o.e()), int(STR)), vec![ret(nil())]),
+            type_index(&o, box_i64(i.e())),
             not_indexable(&o),
             ret(nil()),
         ],
@@ -1081,6 +1154,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     ret_void(),
                 ],
             ),
+            type_newindex(&o, k.e()),
             not_indexable(&o),
             ret_void(),
         ],
@@ -1101,6 +1175,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     ret_void(),
                 ],
             ),
+            type_newindex(&o, box_str(s.e())),
             not_indexable(&o),
             ret_void(),
         ],
@@ -1121,6 +1196,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     ret_void(),
                 ],
             ),
+            type_newindex(&o, box_i64(i.e())),
             not_indexable(&o),
             ret_void(),
         ],

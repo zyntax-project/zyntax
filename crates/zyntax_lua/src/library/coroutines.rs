@@ -132,6 +132,18 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         ))
     };
     let record_of = |co: Expr| call("zb_unbox_list_raw_any", vec![co], anys.clone());
+    // The fiber handle of a coroutine, or 0 for the main thread (nil).
+    let handle_of = |co: Expr| {
+        if_expr(
+            is_nil(co.clone()),
+            int(0),
+            call(
+                "zb_box_get_i64",
+                vec![at(record_of(co), int(HANDLE))],
+                i64(),
+            ),
+        )
+    };
     let status_of = |rec: Expr| call("zb_box_get_i64", vec![at(rec, int(STATUS))], i64());
     let set_status = |rec: Expr, s: i64| set_idx(rec, int(STATUS), box_i64(int(s)));
     let code_of = |name: &str| {
@@ -356,11 +368,13 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             depth.decl(read_global(DEPTH, i64())),
             ccalls.decl(read_global(CCALLS, i64())),
             set_global(CCALLS, add(ccalls.e(), int(1))),
+            expr(call("zl_dbg_switch", vec![handle.e()], unit())),
             step.decl(call(
                 "zl_fiber_resume_with",
                 vec![handle.e(), at(rec.e(), int(SLOT))],
                 i64(),
             )),
+            expr(call("zl_dbg_switch", vec![handle_of(prev.e())], unit())),
             set_global(DEPTH, depth.e()),
             set_global(CCALLS, ccalls.e()),
             set_current(prev.e()),
@@ -390,6 +404,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             set_status(rec.e(), DEAD),
             expr(call("zl_fiber_free", vec![handle.e()], unit())),
+            expr(call("zl_dbg_drop", vec![handle.e()], unit())),
             // The body raised: the error comes back as the result, and
             // is kept for a close to report.
             when(
@@ -573,16 +588,19 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             // itself does not.
             depth.decl(read_global(DEPTH, i64())),
             ccalls.decl(read_global(CCALLS, i64())),
+            expr(call("zl_dbg_switch", vec![handle.e()], unit())),
             expr(call(
                 "zl_fiber_resume_with",
                 vec![handle.e(), at(rec.e(), int(SLOT))],
                 i64(),
             )),
+            expr(call("zl_dbg_switch", vec![handle_of(prev.e())], unit())),
             set_global(DEPTH, depth.e()),
             set_global(CCALLS, ccalls.e()),
             set_current(prev.e()),
             set_status(rec.e(), DEAD),
             expr(call("zl_fiber_free", vec![handle.e()], unit())),
+            expr(call("zl_dbg_drop", vec![handle.e()], unit())),
             when(
                 is_closing(pending()),
                 vec![

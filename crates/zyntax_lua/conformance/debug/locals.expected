@@ -1,0 +1,12 @@
+a=1 b=2 c=3 names={} i=5
+x	5
+y	10
+y
+100
+a	b	nil
+(vararg)	(vararg)	second
+before	0
+(for state)
+k	10
+key	value	1
+false	level out of range

@@ -1,0 +1,65 @@
+at the top
+stack traceback:
+	traceback.lua:2: in main chunk
+	[C]: in ?
+from a local
+stack traceback:
+	traceback.lua:5: in local 'leaf'
+	traceback.lua:7: in main chunk
+	[C]: in ?
+through a field
+stack traceback:
+	traceback.lua:5: in upvalue 'leaf'
+	traceback.lua:10: in field 'field'
+	traceback.lua:11: in main chunk
+	[C]: in ?
+through a field
+stack traceback:
+	traceback.lua:5: in upvalue 'leaf'
+	traceback.lua:10: in field 'field'
+	traceback.lua:13: in function 'global_fn'
+	traceback.lua:14: in main chunk
+	[C]: in ?
+in a method
+stack traceback:
+	traceback.lua:17: in method 'method'
+	traceback.lua:18: in main chunk
+	[C]: in ?
+through an upvalue
+stack traceback:
+	traceback.lua:5: in upvalue 'leaf'
+	traceback.lua:20: in upvalue 'up'
+	traceback.lua:21: in local 'outer'
+	traceback.lua:22: in main chunk
+	[C]: in ?
+under pcall
+stack traceback:
+	traceback.lua:24: in function <traceback.lua:24>
+	[C]: in function 'pcall'
+	traceback.lua:24: in main chunk
+	[C]: in ?
+true
+tail called
+stack traceback:
+	traceback.lua:26: in function <traceback.lua:26>
+	(...tail calls...)
+	traceback.lua:28: in main chunk
+	[C]: in ?
+42
+stack traceback:
+	traceback.lua:31: in main chunk
+	[C]: in ?
+table
+stack traceback:
+	traceback.lua:33: in main chunk
+	[C]: in ?
+stack traceback:
+	traceback.lua:34: in main chunk
+	[C]: in ?
+level 2
+stack traceback:
+	traceback.lua:38: in local 'one'
+	traceback.lua:39: in main chunk
+	[C]: in ?
+past the stack
+stack traceback:

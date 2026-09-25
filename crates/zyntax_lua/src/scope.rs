@@ -43,6 +43,9 @@ pub struct VarInfo {
     pub self_captured: bool,
     /// What its declaration assigns it, as far as that tells a function.
     pub init: Init,
+    /// The variable of a numeric `for`: a fresh copy of the loop's
+    /// counter each iteration, whose type is the loop's kind.
+    pub loop_counter: bool,
 }
 
 /// The value a `local` declaration gives a variable, when it is known
@@ -81,6 +84,11 @@ pub struct FuncInfo {
     /// Variables of enclosing functions this one (or one nested in it)
     /// reads or writes, excluding module variables. In a stable order.
     pub captures: Vec<VarId>,
+    /// Its upvalues as Lua numbers them: every variable of an enclosing
+    /// function it or a nested function reaches, module variables
+    /// included, and the environment when it reaches a global, in the
+    /// order of their first mention.
+    pub upvalues: Vec<Upvalue>,
     /// The line the function starts on, for naming.
     pub line: usize,
     /// What the function is called, for symbol names.
@@ -94,6 +102,14 @@ pub struct FuncInfo {
     /// Every way out of its body returns a function expression as its
     /// first value: a call to it that returns yields a function.
     pub returns_function: bool,
+}
+
+/// An upvalue of a function: a variable of an enclosing function, or
+/// the environment globals are read through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Upvalue {
+    Var(VarId),
+    Env,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -172,6 +188,18 @@ pub struct Scopes {
     /// whole test file: every outermost local is then a module
     /// variable, reachable from any segment.
     pub split_chunk: bool,
+    /// Whether the chunk reaches the `debug` library.
+    pub debug: bool,
+    /// Whether the `debug` library may rebind a variable the types do
+    /// not see: it is reached as a value, or `setupvalue`,
+    /// `upvaluejoin` or `setlocal` is called. Every captured variable
+    /// is then dynamic and shared through a cell.
+    pub debug_rebinds: bool,
+    /// Whether `debug.setlocal` may be called: every local is then
+    /// dynamic.
+    pub debug_setlocal: bool,
+    /// Whether `debug.getlocal` may be called.
+    pub debug_getlocal: bool,
 }
 
 /// Outermost statements per chunk segment, and the count past which a
@@ -366,6 +394,14 @@ struct Walker {
     /// types follow as a metatable function (`setmetatable(t, m)`,
     /// `debug.setmetatable(t, m)`): not a use of it as a value.
     metatable_callees: HashSet<usize>,
+    /// The name tokens, by offset, of `debug` called as
+    /// `debug.name(...)`.
+    debug_calls: HashSet<usize>,
+    /// The locals declared as `require "debug"`: the library by another
+    /// name.
+    debug_aliases: HashSet<VarId>,
+    /// Whether the expression being walked initializes such a local.
+    requiring_debug: bool,
 }
 
 pub fn resolve(ast: &ast::Ast) -> Scopes {
@@ -373,11 +409,15 @@ pub fn resolve(ast: &ast::Ast) -> Scopes {
         out: Scopes::default(),
         frames: Vec::new(),
         metatable_callees: HashSet::new(),
+        debug_calls: HashSet::new(),
+        debug_aliases: HashSet::new(),
+        requiring_debug: false,
     };
     w.out.funcs.push(FuncInfo {
         params: Vec::new(),
         is_vararg: true,
         captures: Vec::new(),
+        upvalues: vec![Upvalue::Env],
         line: 0,
         name: "main".to_string(),
         escapes: false,
@@ -412,6 +452,18 @@ pub fn resolve(ast: &ast::Ast) -> Scopes {
             }
         }
     }
+    // A variable the debug library may rebind is written where no
+    // statement shows it: shared through a cell, never known to hold
+    // one function. A loop's counter is a copy made each iteration; its
+    // kind stays the loop's.
+    if w.out.debug_rebinds || w.out.debug_setlocal {
+        let all = w.out.debug_setlocal;
+        for v in &mut w.out.vars {
+            if (all || v.captured) && !v.loop_counter {
+                v.assigned = true;
+            }
+        }
+    }
     w.out
 }
 
@@ -438,6 +490,7 @@ impl Walker {
             attribute,
             self_captured: false,
             init: Init::Other,
+            loop_counter: false,
         });
         self.frame().blocks.last_mut().unwrap().insert(name, id);
         self.out.decls.insert(pos_of(token), id);
@@ -455,6 +508,12 @@ impl Walker {
                         return Binding::Local(id);
                     }
                     self.out.vars[id.0 as usize].captured = true;
+                    for inner in &self.frames[level + 1..] {
+                        let f = &mut self.out.funcs[inner.id.0 as usize];
+                        if !f.upvalues.contains(&Upvalue::Var(id)) {
+                            f.upvalues.push(Upvalue::Var(id));
+                        }
+                    }
                     let module_var = self.out.vars[id.0 as usize].is_module_var();
                     if !module_var {
                         // Every function between the use and the
@@ -479,6 +538,12 @@ impl Walker {
                 Binding::Local(id) => return Binding::Field(id, name.to_string(), false),
                 Binding::Upvalue(id) => return Binding::Field(id, name.to_string(), true),
                 _ => {}
+            }
+        }
+        for frame in &self.frames[1..] {
+            let f = &mut self.out.funcs[frame.id.0 as usize];
+            if !f.upvalues.contains(&Upvalue::Env) {
+                f.upvalues.push(Upvalue::Env);
             }
         }
         self.out.globals.insert(name.to_string());
@@ -513,13 +578,99 @@ impl Walker {
         {
             self.global_value(name);
         }
+        let library = match &binding {
+            Binding::Global(name) => name == "debug",
+            Binding::Local(v) | Binding::Upvalue(v) => self.debug_aliases.contains(v),
+            Binding::Field(..) => false,
+        };
+        if library {
+            self.out.debug = true;
+            if !self.debug_calls.contains(&pos_of(token)) {
+                self.debug_value();
+            }
+        }
         self.out.names.insert(pos_of(token), binding.clone());
         binding
+    }
+
+    /// The local a name resolves to where the walk is, without noting
+    /// a capture.
+    fn visible_local(&self, name: &str) -> Option<VarId> {
+        self.frames
+            .iter()
+            .rev()
+            .flat_map(|frame| frame.blocks.iter().rev())
+            .find_map(|block| block.get(name).copied())
+    }
+
+    /// Whether `e` is `require "debug"`, `require` being the global.
+    fn requires_debug(&self, e: &Expression) -> bool {
+        let Expression::FunctionCall(c) = e else {
+            return false;
+        };
+        let suffixes: Vec<&Suffix> = c.suffixes().collect();
+        let (Prefix::Name(callee), [Suffix::Call(ast::Call::AnonymousCall(args))]) =
+            (c.prefix(), suffixes.as_slice())
+        else {
+            return false;
+        };
+        let name = match args {
+            ast::FunctionArgs::String(s) => literal_string_token(s),
+            ast::FunctionArgs::Parentheses { arguments, .. } => {
+                arguments.iter().next().and_then(literal_string)
+            }
+            _ => None,
+        };
+        name_of(callee) == "require"
+            && !self.shadowed("require")
+            && name.as_deref() == Some("debug")
+    }
+
+    /// The `debug` library reached as a value: any of its functions
+    /// may be called.
+    fn debug_value(&mut self) {
+        self.out.debug = true;
+        self.out.debug_rebinds = true;
+        self.out.debug_setlocal = true;
+        self.out.debug_getlocal = true;
+    }
+
+    /// `debug.name(...)`: a call of one of the library's functions by
+    /// name, which is no use of the library as a value.
+    fn note_debug_call(&mut self, prefix: &Prefix, suffixes: &[&Suffix]) {
+        let Prefix::Name(token) = prefix else {
+            return;
+        };
+        let name = name_of(token);
+        let library = match self.visible_local(&name) {
+            Some(v) => self.debug_aliases.contains(&v),
+            None => name == "debug",
+        };
+        if !library {
+            return;
+        }
+        if let [
+            Suffix::Index(ast::Index::Dot { name: member, .. }),
+            Suffix::Call(_),
+            ..,
+        ] = suffixes
+        {
+            self.debug_calls.insert(pos_of(token));
+            match name_of(member).as_str() {
+                "setupvalue" | "upvaluejoin" => self.out.debug_rebinds = true,
+                "setlocal" => self.out.debug_setlocal = true,
+                "getlocal" => self.out.debug_getlocal = true,
+                _ => {}
+            }
+        }
     }
 
     /// The global `name` taken as a value: when it is a way to set a
     /// metatable, metatables may be set where the types do not see.
     fn global_value(&mut self, name: &str) {
+        if name == "debug" && !self.shadowed("debug") {
+            self.out.debug = true;
+        }
         if Scopes::is_globals_name(name)
             || matches!(name, "setmetatable" | "debug" | "package" | "require")
         {
@@ -549,6 +700,10 @@ impl Walker {
         match &binding {
             Binding::Local(id) | Binding::Upvalue(id) => {
                 self.out.vars[id.0 as usize].assigned = true;
+                // What the library is known through becomes anything.
+                if self.debug_aliases.contains(id) {
+                    self.debug_value();
+                }
             }
             Binding::Global(name) => {
                 // `_ENV = t` replaces the environment: every global is
@@ -712,9 +867,19 @@ impl Walker {
                 }
             }
             Stmt::LocalAssignment(l) => {
+                // `local d = require "debug"`: `d` is the library, and
+                // its calls by name are no use of it as a value.
+                let alias = l.names().len() == 1
+                    && l.expressions().len() == 1
+                    && l.expressions()
+                        .iter()
+                        .next()
+                        .is_some_and(|e| self.requires_debug(e));
+                self.requiring_debug = alias;
                 for e in l.expressions() {
                     self.expr(e);
                 }
+                self.requiring_debug = false;
                 let attributes: Vec<Option<String>> = l
                     .attributes()
                     .map(|a| a.map(|a| name_of(a.name())))
@@ -725,6 +890,9 @@ impl Walker {
                     let var = self.declare(name, attribute);
                     let init = exprs.get(i).map_or(Init::Other, |e| self.init_of(e));
                     self.out.vars[var.0 as usize].init = init;
+                    if alias {
+                        self.debug_aliases.insert(var);
+                    }
                 }
             }
             Stmt::LocalFunction(f) => {
@@ -743,7 +911,8 @@ impl Walker {
                     self.expr(step);
                 }
                 self.frame().blocks.push(HashMap::new());
-                self.declare(f.index_variable(), None);
+                let v = self.declare(f.index_variable(), None);
+                self.out.vars[v.0 as usize].loop_counter = true;
                 self.block(f.block());
                 self.frame().blocks.pop();
             }
@@ -790,6 +959,7 @@ impl Walker {
             params: Vec::new(),
             is_vararg: false,
             captures: Vec::new(),
+            upvalues: Vec::new(),
             line,
             name,
             escapes: false,
@@ -816,6 +986,7 @@ impl Walker {
                 attribute: None,
                 self_captured: false,
                 init: Init::Other,
+                loop_counter: false,
             });
             self.frame().blocks.last_mut().unwrap().insert(name, vid);
             params.push(vid);
@@ -869,6 +1040,9 @@ impl Walker {
                     .insert(pos_of(token), Binding::Global(name_of(token)));
             }
             self.global_value(&name);
+            if name == "debug" {
+                self.debug_value();
+            }
             self.out.mentioned.insert(name.clone());
             self.out.globals.insert(name);
             return;
@@ -876,6 +1050,7 @@ impl Walker {
         let suffixes: Vec<&Suffix> = v.suffixes().collect();
         self.note_require(v.prefix(), &suffixes);
         self.note_metatable_callee(v.prefix(), &suffixes);
+        self.note_debug_call(v.prefix(), &suffixes);
         self.prefix(v.prefix());
         for s in v.suffixes() {
             self.suffix(s);
@@ -890,7 +1065,15 @@ impl Walker {
             && name_of(callee) == "require"
             && !self.shadowed("require")
         {
-            match required_name(args) {
+            let name = required_name(args);
+            if name.as_deref() == Some("debug") {
+                if self.requiring_debug {
+                    self.out.debug = true;
+                } else {
+                    self.debug_value();
+                }
+            }
+            match name {
                 Some(name) => {
                     if !self.out.requires.contains(&name) {
                         self.out.requires.push(name);
@@ -935,6 +1118,7 @@ impl Walker {
             return;
         }
         self.note_metatable_callee(c.prefix(), &suffixes);
+        self.note_debug_call(c.prefix(), &suffixes);
         self.prefix(c.prefix());
         for s in suffixes {
             self.suffix(s);
@@ -1095,5 +1279,61 @@ mod tests {
         ] {
             assert!(unseen(source), "{source}");
         }
+    }
+
+    fn scopes(source: &str) -> super::Scopes {
+        let ast = full_moon::parse_fallible(source, full_moon::LuaVersion::lua54())
+            .into_result()
+            .expect("parses");
+        super::resolve(&ast)
+    }
+
+    #[test]
+    fn debug_calls_by_name_rebind_only_what_they_name() {
+        for source in [
+            "print(debug.traceback())",
+            "debug.getinfo(1)",
+            "local d = require \"debug\"; d.getinfo(1)",
+        ] {
+            let s = scopes(source);
+            assert!(s.debug, "{source}");
+            assert!(!s.debug_rebinds && !s.debug_setlocal, "{source}");
+        }
+        assert!(scopes("debug.setupvalue(f, 1, 2)").debug_rebinds);
+        assert!(scopes("debug.upvaluejoin(f, 1, g, 1)").debug_rebinds);
+        assert!(scopes("debug.setlocal(1, 1, 2)").debug_setlocal);
+        assert!(scopes("debug.getlocal(1, 1)").debug_getlocal);
+        assert!(!scopes("local debug = {}; debug.traceback()").debug);
+        assert!(!scopes("print(1)").debug);
+    }
+
+    #[test]
+    fn the_debug_library_as_a_value_may_rebind_anything() {
+        for source in [
+            "local d = debug",
+            "local f = debug.setupvalue",
+            "local d = require \"debug\"; local e = d",
+            "local d = require \"debug\"; d = nil",
+            "print(require \"debug\")",
+            "local x = _G.debug",
+        ] {
+            let s = scopes(source);
+            assert!(s.debug_rebinds && s.debug_setlocal, "{source}");
+        }
+    }
+
+    #[test]
+    fn upvalues_are_numbered_by_first_mention() {
+        let s = scopes("local a, b; local function f() print(b); return a end");
+        let f = s.funcs.iter().find(|f| f.name == "f").expect("f");
+        let names: Vec<String> = f
+            .upvalues
+            .iter()
+            .map(|u| match u {
+                super::Upvalue::Var(v) => s.var(*v).name.clone(),
+                super::Upvalue::Env => "_ENV".to_string(),
+            })
+            .collect();
+        assert_eq!(names, ["_ENV", "b", "a"]);
     }
 }

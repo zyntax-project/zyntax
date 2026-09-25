@@ -1,0 +1,12 @@
+nil	nil	nil
+true
+10
+true	true
+x#7	y#1.5
+nil
+a boolean	nil
+nil has y
+false	metatables.lua:8: attempt to index a nil value (local 'v')
+unknown	locked	true
+false	cannot change a protected metatable
+true	1

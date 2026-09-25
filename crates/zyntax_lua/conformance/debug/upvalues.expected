@@ -1,0 +1,20 @@
+a	1
+b	two
+
+_ENV	true
+a	1
+b	two
+n	2
+n	0
+n
+11
+
+true
+false
+userdata
+1	2
+true
+false	invalid upvalue index
+false	function expected, got number
+
+_ENV	true
