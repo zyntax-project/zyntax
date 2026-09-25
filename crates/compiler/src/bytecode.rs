@@ -544,7 +544,8 @@ fn lazy_module(bytes: Cow<'static, [u8]>, checked: bool) -> Result<LazyModule> {
 /// Bytecode file header
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BytecodeHeader {
-    /// Magic number: "ZBC\0" (0x5A424300)
+    /// Magic number 0x5A424300, written little-endian: the file starts
+    /// with the bytes 00 43 42 5A ("\0CBZ").
     pub magic: u32,
     /// Major version
     pub major_version: u16,
@@ -563,7 +564,7 @@ pub struct BytecodeHeader {
 }
 
 impl BytecodeHeader {
-    const MAGIC: u32 = 0x5A424300; // "ZBC\0"
+    const MAGIC: u32 = 0x5A424300; // on disk, little-endian: 00 43 42 5A ("\0CBZ")
     // Moves with any change to a payload's layout, so a payload in an
     // older layout is refused with VersionMismatch and a cache loader
     // recompiles rather than misreading it.
