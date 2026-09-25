@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790307378,"nonce":"7R0lz4SMURYWKox9H4CkdJtLOs0=","message":"Fixed in d2f852c1f0c13e2d8f91927f57f891eaea800199. Unix output unchanged (Lua conformance passes on the Mac); the Windows path is compile-checked only, load/files.lua on the Windows job is its first real test.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1790307378,"nonce":"/C0cBr0vZ/4+05wRShIt4D1BU0Q=","status":2}]}
