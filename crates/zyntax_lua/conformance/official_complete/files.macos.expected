@@ -1,0 +1,10 @@
+testing i/o
++
++
++
++
++
+testing large files (> BUFSIZ)
+testing popen/pclose and execute
+
+(some error messages are expected now)

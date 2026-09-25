@@ -3,7 +3,7 @@ testing numbers and math lib
 testing order (floats cannot represent all integers)
 testing -0 and NaN
 testing 'math.random'
-random seeds: 1789821549, 4339572168
-float random range in 37100 calls: [0.000004, 0.999996]
-integer random range in 38400 calls: [minint + 7ppm, maxint - 52ppm]
+random seeds: 1790337134, 4315817816
+float random range in 21200 calls: [0.000007, 0.999997]
+integer random range in 64000 calls: [minint + 41ppm, maxint - 23ppm]
 OK

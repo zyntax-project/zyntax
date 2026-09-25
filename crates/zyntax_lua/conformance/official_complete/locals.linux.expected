@@ -1,0 +1,6 @@
+testing local variables and environments
++
+testing to-be-closed variables
+testing errors in __close
+to-be-closed variables in coroutines
+OK

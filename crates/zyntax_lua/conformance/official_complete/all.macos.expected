@@ -1,0 +1,16 @@
+
+	Starting Tests
+random seeds: 1790331202, 4315457368
+current path:
+****/opt/homebrew/share/lua/5.4/?.lua;/opt/homebrew/share/lua/5.4/?/init.lua;/opt/homebrew/lib/lua/5.4/?.lua;/opt/homebrew/lib/lua/5.4/?/init.lua;./?.lua;./?/init.lua****
+
+    ---- total memory: 44.7K, max memory: 44.7K ----
+
+time: 1.4e-05 (+1.4e-05)
+
+***** FILE 'main.lua'*****
+testing stand-alone interpreter
+progname: /opt/homebrew/opt/lua@5.4/bin/lua5.4
+Lua 5.4.9  Copyright (C) 1994-2026 Lua.org, PUC-Rio
+(temporary program file used in these tests: /tmp/lua_4lV8pm)
+testing warnings

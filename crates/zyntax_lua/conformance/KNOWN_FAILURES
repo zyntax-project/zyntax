@@ -1,26 +1,56 @@
 # A conformance case expected to fail, and the git-bug issue tracking it.
-# One per line: <category>/<file>.lua <issue id>.
+# One per line: <category>/<file>.lua <issue id>. The whole-suite runs of
+# tests/official_suite.rs are listed as official_suite/<case>.
 # A listed case that starts passing fails the suite until it is removed here
 # and its issue is closed; an unlisted case that fails is a regression.
+# An official file's issue is the first thing that stops it.
 #
-# An entry may add a platform family, `unix` or `windows`, after its issue:
-# <category>/<file>.lua <issue id> <family>. The case's pinned output then
-# holds only on that family; there it runs as any other case and must pass,
-# and elsewhere it is skipped and reported as skipped.
+# An entry may add a platform family, `unix`, `windows`, `macos` or `linux`,
+# after its issue: <category>/<file>.lua <issue id> <family>. The case's
+# pinned output then holds only on that family; there it runs as any other
+# case and must pass, and elsewhere it is skipped and reported as skipped.
 
-official/calls.lua            4da50c2
-official/closure.lua          4da50c2
-official/constructs.lua       4da50c2
-official/coroutine.lua        4da50c2
-official/db.lua               4da50c2
-official/errors.lua           4da50c2
-official/files.lua            4da50c2
-official/gc.lua               4da50c2
-official/gengc.lua            4da50c2
-official/literals.lua         4da50c2
-official/locals.lua           4da50c2
-official/pm.lua               4da50c2
-official/strings.lua          4da50c2
+# The official files, each run in the configuration all.lua derives from _U.
+official/all.lua              94023a3
+official/calls.lua            94023a3
+official/closure.lua          558e28e
+official/coroutine.lua        c33bf81
+official/db.lua               94023a3
+official/errors.lua           8fd93ba
+official/files.lua            8fd93ba
+official/gc.lua               558e28e
+official/gengc.lua            558e28e
+official/literals.lua         98b70eb
+official/locals.lua           8fd93ba
+official/pm.lua               3e444f9
+official/strings.lua          3e444f9
+
+# The official files in lua.org's complete configuration (release, unix,
+# the C test libraries built; skipped otherwise).
+official_complete/all.lua        94023a3
+official_complete/big.lua        298dff8
+official_complete/calls.lua      94023a3
+official_complete/closure.lua    558e28e
+official_complete/constructs.lua 6709b37
+official_complete/coroutine.lua  c33bf81
+official_complete/db.lua         94023a3
+official_complete/errors.lua     8fd93ba
+official_complete/files.lua      8fd93ba
+official_complete/gc.lua         558e28e
+official_complete/gengc.lua      558e28e
+official_complete/literals.lua   98b70eb
+official_complete/locals.lua     8fd93ba
+official_complete/main.lua       49075da
+official_complete/pm.lua         3e444f9
+official_complete/strings.lua    3e444f9
+official_complete/verybig.lua    298dff8
+
+# The whole suite, run by all.lua (tests/official_suite.rs, release only).
+official_suite/basic_all        94023a3
+official_suite/basic_all_llvm   94023a3
+official_suite/complete_all     94023a3
+official_suite/main_lua         49075da
+
 errors/library_names.lua      0903215
 
 # C modules load where the executable exports the C API: not on Windows yet.

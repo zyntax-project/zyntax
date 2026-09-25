@@ -1,7 +1,5 @@
 testing strings and string library
 testing 'format %a %A'
-'collate' locale not found
-'ctype' locale not found
 
  >>> testC not active: skipping 'pushfstring' tests <<<
 

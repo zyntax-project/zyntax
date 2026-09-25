@@ -3,12 +3,6 @@ testing errors
  >>> testC not active: skipping tests for messages in C <<<
 
 +
-testing stack overflow
-(expected stack overflow after 999962 calls)
-(expected stack overflow after 999962 calls)
-(expected stack overflow after 999962 calls)
-+
-+
 testing tokens in error messages
 +
 OK

@@ -1,0 +1,15 @@
+testing i/o
++
++
++
++
++
+testing large files (> BUFSIZ)
+testing popen/pclose and execute
+
+(some error messages are expected now)
++
+testing date/time
+  8-byte time_t
+test done on 25/09/2026, at 11:15:34
+Lua 5.4

@@ -2,8 +2,8 @@ testing (parts of) table library
 testing unpack
 testing pack
 testing sort
-sorting 50000 random elements in 18.23 msec.
-re-sorting 50000 sorted elements in 10.66 msec.
-Invert-sorting other 50000 elements in 35.27 msec., with 874973 comparisons
-sorting 50000 equal elements in 20.64 msec.
+sorting 5000 random elements in 1.43 msec.
+re-sorting 5000 sorted elements in 0.86 msec.
+Invert-sorting other 5000 elements in 2.65 msec., with 64601 comparisons
+sorting 5000 equal elements in 2.91 msec.
 OK

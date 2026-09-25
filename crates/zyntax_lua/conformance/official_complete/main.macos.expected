@@ -1,0 +1,5 @@
+testing stand-alone interpreter
+progname: /opt/homebrew/opt/lua@5.4/bin/lua5.4
+Lua 5.4.9  Copyright (C) 1994-2026 Lua.org, PUC-Rio
+(temporary program file used in these tests: /tmp/lua_tTyKoQ)
+testing warnings

@@ -1,0 +1,9 @@
+testing numbers and math lib
+64-bit integers, 53-bit (mantissa) floats
+testing order (floats cannot represent all integers)
+testing -0 and NaN
+testing 'math.random'
+random seeds: 1790331235, 4311721816
+float random range in 21200 calls: [0.000006, 0.999910]
+integer random range in 38400 calls: [minint + 102ppm, maxint - 58ppm]
+OK

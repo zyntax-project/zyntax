@@ -1,0 +1,12 @@
+testing stand-alone interpreter
+progname: /home/raikage/LO-harness-suite/lua-rl/lua-5.4.9/src/lua
+Lua 5.4.9  Copyright (C) 1994-2026 Lua.org, PUC-Rio
+(temporary program file used in these tests: /tmp/lua_0ybuRi)
+testing warnings
++
+testing Ctrl C
+(if test fails now, it may leave a Lua script running in background, pid 2660035)
+done
+(if test fails now, it may leave a Lua script running in background, pid 2660038)
+done (with 2 kills)
+OK

@@ -1,0 +1,17 @@
+testing incremental garbage collection
+creating many objects
+functions with errors
+long strings
+steps
+steps (2)
+clearing tables
+weak tables
++
+
+ >>> testC not active: skipping userdata GC tests <<<
+
+long list
+self-referenced threads
+OK
+>>> closing state <<<
+

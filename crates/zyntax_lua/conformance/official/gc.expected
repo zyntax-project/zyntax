@@ -10,7 +10,6 @@ weak tables
 
  >>> testC not active: skipping userdata GC tests <<<
 
-long list
 self-referenced threads
 OK
 >>> closing state <<<

@@ -1,0 +1,8 @@
+testing require
+package config: /|;|?|!|-|
+testing 'require' message
++
++
+testing assignments, logical operators, and constructors
++
+OK
