@@ -115,7 +115,7 @@ crate-type = ["cdylib"]
 zyntax_embed = { path = "../crates/zyntax_embed" }
 ```
 
-See [Chapter 14: Runtime Plugins](https://github.com/darmie/zyntax/wiki/14-Runtime-Plugins) in The Zyn Book for complete documentation.
+See [Chapter 14: Runtime Plugins](https://github.com/zyntax-project/zyntax/wiki/14-Runtime-Plugins) in The Zyn Book for complete documentation.
 
 ## Plugin Architecture
 

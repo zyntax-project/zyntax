@@ -2,8 +2,8 @@
 
 > Compiler frontend infrastructure with tiered JIT compilation and native code generation
 
-[![CI](https://github.com/darmie/zyntax/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/darmie/zyntax/actions/workflows/ci.yml)
-[![ZynML Tests](https://img.shields.io/github/actions/workflow/status/darmie/zyntax/ci.yml?branch=main&label=zynml%20tests)](https://github.com/darmie/zyntax/actions/workflows/ci.yml)
+[![CI](https://github.com/zyntax-project/zyntax/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zyntax-project/zyntax/actions/workflows/ci.yml)
+[![ZynML Tests](https://img.shields.io/github/actions/workflow/status/darmie/zyntax/ci.yml?branch=main&label=zynml%20tests)](https://github.com/zyntax-project/zyntax/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
@@ -56,7 +56,7 @@ interpreter and Cranelift run it. The LLVM build needs LLVM 21 (see
 [Contributing](#contributing)); leave out `--features llvm-backend` for a build
 without it.
 
-New to Zyn grammars: **[The Zyn Book](https://github.com/darmie/zyntax/wiki)**.
+New to Zyn grammars: **[The Zyn Book](https://github.com/zyntax-project/zyntax/wiki)**.
 
 ---
 
@@ -87,7 +87,7 @@ ladder.
 
 ## Documentation
 
-- **[The Zyn Book](https://github.com/darmie/zyntax/wiki)**: grammars, the CLI, the typed AST, packaging, embedding, plugins
+- **[The Zyn Book](https://github.com/zyntax-project/zyntax/wiki)**: grammars, the CLI, the typed AST, packaging, embedding, plugins
 - **[Architecture](docs/ARCHITECTURE.md)**: layers, IR, backends
 - **[Zyn grammar spec](docs/ZYN_GRAMMAR_SPEC.md)**: syntax and semantic actions
 - **[Embedding SDK](book/12-embedding-sdk.md)**: running Zyntax inside a Rust program
@@ -144,4 +144,4 @@ The Cranelift project, LLVM, the Lua and Python projects, and the Rust community
 
 ## Contact
 
-[Issues](https://github.com/darmie/zyntax/issues) · [Discussions](https://github.com/darmie/zyntax/discussions)
+[Issues](https://github.com/zyntax-project/zyntax/issues) · [Discussions](https://github.com/zyntax-project/zyntax/discussions)
