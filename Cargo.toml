@@ -19,6 +19,7 @@ members = [
     "crates/passes/krio_adapter",
     "sdk/zrtl",
     "sdk/zrtl_macros",
+    "sdk/zrtl_native",
     "examples/imagepipe",
 ]
 

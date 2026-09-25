@@ -1,0 +1,21 @@
+[package]
+name = "zrtl_native"
+version = "0.1.0"
+edition = "2024"
+description = "Native interop for Zyntax runtimes: loading shared libraries, resolving their symbols, and an error exit that crosses only foreign frames"
+license = "Apache-2.0"
+repository = "https://github.com/darmie/zyntax"
+# Dependents find include/zrtl_native.h through DEP_ZRTL_NATIVE_INCLUDE.
+links = "zrtl_native"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+krio-fiber = { git = "https://github.com/darmie/krio.git", package = "krio-fiber", rev = "286f5e0710e20772179fc2ca96f6fda8d13e3a70" }
+
+[lints]
+workspace = true
