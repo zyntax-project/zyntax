@@ -181,6 +181,12 @@ fn count_insts(function: &HirFunction) -> usize {
     function.blocks.values().map(|b| b.instructions.len()).sum()
 }
 
+/// Whether `function` is small enough that some call to it may be
+/// inlined.
+pub(crate) fn may_inline(function: &HirFunction) -> bool {
+    count_insts(function) <= MAX_INLINE_INSTS_MULTI_BLOCK
+}
+
 /// Inline every eligible direct call within `module`. Iterates a
 /// fixed-point: inlining one call can expose a now-eligible callee
 /// (when the now-inlined body's prior nested call shape was a
