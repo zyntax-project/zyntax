@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1790327904,"nonce":"4D5LvAZhj5wHw2/f73j0UWqaZF8=","added":["debt","area:lua"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790329887,"nonce":"pHWIBvTToR4UVw2lqa6fMkcu62M=","message":"User decision (2026-09-25): a forwarder lua54.dll next to zylua.exe on Windows is allowed; it carries no API code and forwards every export to the executable.","files":null}]}
