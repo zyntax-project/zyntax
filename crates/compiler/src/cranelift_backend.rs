@@ -500,13 +500,30 @@ struct StructLayout {
 /// verifies the CLIF between Cranelift's own passes as well as before
 /// them. Both safe to run with.
 fn host_isa() -> Arc<dyn cranelift_codegen::isa::TargetIsa> {
+    configured_isa(cranelift_native::builder().unwrap(), cfg!(windows))
+}
+
+/// The ISA for the target `triple` names, configured as [`host_isa`]
+/// configures the host's. Code compiled for another target is for
+/// inspection and must never be run.
+fn isa_for_triple(triple: &str) -> CompilerResult<Arc<dyn cranelift_codegen::isa::TargetIsa>> {
+    let builder = cranelift_codegen::isa::lookup_by_name(triple)
+        .map_err(|e| CompilerError::Backend(format!("no Cranelift ISA for {triple}: {e}")))?;
+    let windows = builder.triple().operating_system.to_string() == "windows";
+    Ok(configured_isa(builder, windows))
+}
+
+fn configured_isa(
+    isa_builder: cranelift_codegen::isa::Builder,
+    windows: bool,
+) -> Arc<dyn cranelift_codegen::isa::TargetIsa> {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
     flag_builder.set("is_pic", "false").unwrap();
     // A Windows thread's stack is committed a page at a time by touching
     // the guard page below it, so a frame larger than a page has to
     // probe each page in order or it faults past the guard.
-    if cfg!(windows) {
+    if windows {
         flag_builder.set("enable_probestack", "true").unwrap();
         flag_builder.set("probestack_strategy", "inline").unwrap();
     }
@@ -535,8 +552,7 @@ fn host_isa() -> Arc<dyn cranelift_codegen::isa::TargetIsa> {
     if let Ok(algorithm) = std::env::var("ZYNTAX_REGALLOC") {
         flag_builder.set("regalloc_algorithm", &algorithm).unwrap();
     }
-    cranelift_native::builder()
-        .unwrap()
+    isa_builder
         .finish(settings::Flags::new(flag_builder))
         .unwrap()
 }
@@ -548,16 +564,25 @@ impl CraneliftBackend {
     /// * `additional_symbols` - Frontend-specific runtime symbols to register
     ///   Format: (symbol_name, function_pointer)
     pub fn with_runtime_symbols(additional_symbols: &[(&str, *const u8)]) -> CompilerResult<Self> {
-        Self::new_internal(Some(additional_symbols))
+        Self::new_internal(host_isa(), Some(additional_symbols))
     }
 
     /// Create a new Cranelift backend
     pub fn new() -> CompilerResult<Self> {
-        Self::new_internal(None)
+        Self::new_internal(host_isa(), None)
     }
 
-    fn new_internal(additional_symbols: Option<&[(&str, *const u8)]>) -> CompilerResult<Self> {
-        let isa = host_isa();
+    /// A backend that compiles for the target `triple` names instead of
+    /// the host, to inspect the code it would get there. Its functions
+    /// compile but must never be called.
+    pub fn for_target(triple: &str) -> CompilerResult<Self> {
+        Self::new_internal(isa_for_triple(triple)?, None)
+    }
+
+    fn new_internal(
+        isa: Arc<dyn cranelift_codegen::isa::TargetIsa>,
+        additional_symbols: Option<&[(&str, *const u8)]>,
+    ) -> CompilerResult<Self> {
         let isa_shared = Arc::clone(&isa);
 
         // Create JIT module and register runtime functions
@@ -1467,9 +1492,6 @@ impl CraneliftBackend {
         }
         let ptr_ty = self.module.target_config().pointer_type();
         let mut callee = self.module.make_signature();
-        if sig.fast {
-            callee.call_conv = CallConv::Fast;
-        }
         if sig.destination {
             callee.params.push(AbiParam::new(ptr_ty));
         }
@@ -7049,6 +7071,14 @@ impl CraneliftBackend {
             }
         }
 
+        // A debug build refuses a call whose known callee is declared
+        // with another convention.
+        if cfg!(debug_assertions)
+            && let Some(mismatch) = self.call_convention_mismatch(&self.codegen_context.func)
+        {
+            panic!("{mismatch}");
+        }
+
         // Verification capture: enable disasm generation + snapshot the CLIF
         // before the module consumes the context.
         let clif_snapshot = if self.capture_ir {
@@ -7371,17 +7401,8 @@ impl CraneliftBackend {
             .copied()
             .or_else(|| self.returns_through_destination(id, function));
 
-        // Set calling convention. `module.make_signature()` starts with the
-        // ISA default, which is the native ABI for host externs: SystemV on
-        // Unix x86_64, WindowsFastcall on x86_64-msvc, AppleAarch64 on ARM
-        // macOS, etc. Keep both C and System on that default so calls into
-        // Rust `extern "C"`/ZRTL symbols use the platform ABI.
-        cranelift_sig.call_conv = match function.calling_convention {
-            crate::hir::CallingConvention::C => cranelift_sig.call_conv,
-            crate::hir::CallingConvention::Fast => CallConv::Fast,
-            crate::hir::CallingConvention::System => cranelift_sig.call_conv,
-            crate::hir::CallingConvention::WebKit => CallConv::Fast,
-        };
+        // The convention stays the ISA default `make_signature` gives,
+        // whatever the HIR asks for: see `crate::abi`.
 
         // The destination for a returned aggregate leads the declared
         // parameters, so a caller can pass it without knowing anything
@@ -7407,6 +7428,115 @@ impl CraneliftBackend {
         }
 
         Ok(cranelift_sig)
+    }
+
+    /// The first `call_indirect` in `func` whose target is a known
+    /// function, one whose address it takes or whose call cell it
+    /// reads, and whose convention is not the one that function is
+    /// declared with. A caller and callee that disagree pass arguments
+    /// and preserve registers differently on a target where the two
+    /// conventions differ, even where they coincide on this one.
+    fn call_convention_mismatch(&self, func: &codegen::ir::Function) -> Option<String> {
+        use codegen::ir::InstructionData;
+        let sites: Vec<_> = func
+            .layout
+            .blocks()
+            .flat_map(|block| func.layout.block_insts(block))
+            .filter_map(|inst| match &func.dfg.insts[inst] {
+                InstructionData::CallIndirect { sig_ref, args, .. } => args
+                    .first(&func.dfg.value_lists)
+                    .map(|target| (inst, func.dfg.signatures[*sig_ref].call_conv, target)),
+                _ => None,
+            })
+            .collect();
+        if sites.is_empty() {
+            return None;
+        }
+        let sources = block_param_sources(func);
+        for (inst, site, target) in sites {
+            let mut seen = HashSet::new();
+            let mut callees = Vec::new();
+            self.known_callees(func, target, &sources, &mut seen, &mut callees);
+            if let Some((name, conv)) = callees.into_iter().find(|(_, conv)| *conv != site) {
+                return Some(format!(
+                    "{inst} in `{}` calls `{name}` with the {site} convention, \
+                     but `{name}` is compiled with {conv}",
+                    func.name
+                ));
+            }
+        }
+        None
+    }
+
+    /// The functions `value` may be the address of, with the convention
+    /// each is declared with: a `func_addr`, a load from a call cell,
+    /// and whatever a `select` or a block parameter carries.
+    fn known_callees(
+        &self,
+        func: &codegen::ir::Function,
+        value: Value,
+        sources: &HashMap<(Block, usize), Vec<Value>>,
+        seen: &mut HashSet<Value>,
+        out: &mut Vec<(String, CallConv)>,
+    ) {
+        use codegen::ir::{ExternalName, InstructionData, Opcode, ValueDef};
+        let value = func.dfg.resolve_aliases(value);
+        if !seen.insert(value) {
+            return;
+        }
+        let declared = |id: FuncId| {
+            let decl = self.module.declarations().get_function_decl(id);
+            (
+                decl.name.clone().unwrap_or_else(|| format!("{id}")),
+                decl.signature.call_conv,
+            )
+        };
+        match func.dfg.value_def(value) {
+            ValueDef::Result(inst, _) => match &func.dfg.insts[inst] {
+                InstructionData::FuncAddr { func_ref, .. } => {
+                    if let ExternalName::User(name) = &func.dfg.ext_funcs[*func_ref].name {
+                        let index = func.params.user_named_funcs()[*name].index;
+                        out.push(declared(FuncId::from_u32(index)));
+                    }
+                }
+                InstructionData::Load {
+                    opcode: Opcode::Load,
+                    arg,
+                    offset,
+                    ..
+                } if i32::from(*offset) == 0 => {
+                    let ValueDef::Result(def, _) = func.dfg.value_def(*arg) else {
+                        return;
+                    };
+                    let InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                    } = &func.dfg.insts[def]
+                    else {
+                        return;
+                    };
+                    let owner = crate::reload::cell_owner(self.reload_key, imm.bits() as usize);
+                    if let Some(&id) = owner.and_then(|hir| self.function_map.get(&hir)) {
+                        out.push(declared(id));
+                    }
+                }
+                InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args,
+                } => {
+                    for v in &args[1..] {
+                        self.known_callees(func, *v, sources, seen, out);
+                    }
+                }
+                _ => {}
+            },
+            ValueDef::Param(block, index) => {
+                for v in sources.get(&(block, index)).into_iter().flatten() {
+                    self.known_callees(func, *v, sources, seen, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// How many bytes `function` writes through a caller-provided
@@ -10391,8 +10521,7 @@ impl CraneliftBackend {
             }
         }
 
-        let isa = host_isa();
-        self.isa = Arc::clone(&isa);
+        let isa = Arc::clone(&self.isa);
 
         // Create new JIT module with all symbols
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -11041,6 +11170,29 @@ impl HirType {
             _ => false,
         }
     }
+}
+
+/// Each block parameter of `func`, with the values its predecessors'
+/// branches pass for it.
+fn block_param_sources(
+    func: &cranelift_codegen::ir::Function,
+) -> HashMap<(Block, usize), Vec<Value>> {
+    let mut sources: HashMap<(Block, usize), Vec<Value>> = HashMap::new();
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            let dests = func.dfg.insts[inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+            for call in dests {
+                let target = call.block(&func.dfg.value_lists);
+                for (i, arg) in call.args(&func.dfg.value_lists).enumerate() {
+                    if let BlockArg::Value(v) = arg {
+                        sources.entry((target, i)).or_default().push(v);
+                    }
+                }
+            }
+        }
+    }
+    sources
 }
 
 #[cfg(test)]

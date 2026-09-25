@@ -48,10 +48,26 @@ pub fn call_cell_addr(backend: u64, func: HirId) -> usize {
         return cell.as_ref() as *const AtomicUsize as usize;
     }
     let mut map = cells().write().unwrap();
-    let cell = map
-        .entry((backend, func))
-        .or_insert_with(|| Box::new(AtomicUsize::new(0)));
+    let cell = map.entry((backend, func)).or_insert_with(|| {
+        let cell = Box::new(AtomicUsize::new(0));
+        let addr = cell.as_ref() as *const AtomicUsize as usize;
+        owners().write().unwrap().insert(addr, (backend, func));
+        cell
+    });
     cell.as_ref() as *const AtomicUsize as usize
+}
+
+fn owners() -> &'static RwLock<HashMap<usize, (u64, HirId)>> {
+    static OWNERS: OnceLock<RwLock<HashMap<usize, (u64, HirId)>>> = OnceLock::new();
+    OWNERS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// The function whose call cell of `backend` is at `addr`, if one is.
+pub fn cell_owner(backend: u64, addr: usize) -> Option<HirId> {
+    match owners().read().unwrap().get(&addr) {
+        Some(&(b, func)) if b == backend => Some(func),
+        _ => None,
+    }
 }
 
 /// Publish `ptr` as the current entry of `func`.

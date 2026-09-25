@@ -1009,9 +1009,6 @@ pub struct NativeSig {
     pub params: Vec<HirType>,
     pub ret: HirType,
     pub destination: bool,
-    /// The callee uses the backend's internal convention rather than
-    /// the platform's.
-    pub fast: bool,
 }
 
 impl NativeSig {
@@ -1033,10 +1030,6 @@ impl NativeSig {
                 .cloned()
                 .unwrap_or(HirType::Void),
             destination: abi.destination.is_some(),
-            fast: matches!(
-                function.calling_convention,
-                crate::hir::CallingConvention::Fast | crate::hir::CallingConvention::WebKit
-            ),
         }
     }
 
@@ -1047,7 +1040,6 @@ impl NativeSig {
             params,
             ret,
             destination: false,
-            fast: false,
         }
     }
 }

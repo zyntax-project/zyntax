@@ -15969,7 +15969,7 @@ impl SsaBuilder {
             values: IndexMap::new(),
             previous_version: None,
             is_external: false,
-            calling_convention: crate::hir::CallingConvention::Fast,
+            calling_convention: crate::hir::CallingConvention::C,
             attributes: crate::hir::FunctionAttributes::default(),
             link_name: None,
         };

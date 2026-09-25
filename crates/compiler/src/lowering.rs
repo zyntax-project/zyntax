@@ -4117,11 +4117,6 @@ impl LoweringContext {
         // 0xC0000005 access violation. Defaulting every user function
         // to `C` removes the coincidence — the ABI matches the
         // transmute everywhere.
-        //
-        // Internal compiler-generated helpers (lambdas, async state
-        // machines, OSR trampolines) built via `HirFunction::new`
-        // still default to `Fast` at construction time; this only
-        // changes the lowering of user `TypedFunction`s.
         hir_func.calling_convention = crate::hir::CallingConvention::C;
 
         let annotated = |name: &str| {

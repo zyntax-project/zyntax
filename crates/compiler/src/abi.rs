@@ -20,6 +20,12 @@
 //!   address it already lives at; a function whose address is taken, or
 //!   an extern, returns a struct directly, since its callers cannot be
 //!   made to pass a destination.
+//!
+//! Every compiled function takes the target's C convention, whatever
+//! convention its HIR names. Its address can reach an indirect call, a
+//! call cell, the interpreter's thunk or a host calling it as
+//! `extern "C"`, and none of those knows which function it calls, so a
+//! convention chosen per function is one some caller gets wrong.
 
 use crate::hir::{HirFunction, HirStructType, HirType};
 
