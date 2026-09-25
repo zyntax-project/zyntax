@@ -10255,10 +10255,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 None,
                 span,
             ),
+            // The value first: making the key may collect, which clears
+            // a weak value nothing holds yet.
             assign(
-                var(key, Type::Any, span),
+                var(value, Type::Any, span),
                 call(
-                    "zl_pos_key",
+                    "zl_pos_value",
                     vec![tv(), var(pos, i64_t.clone(), span)],
                     Type::Any,
                     span,
@@ -10266,9 +10268,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 span,
             ),
             assign(
-                var(value, Type::Any, span),
+                var(key, Type::Any, span),
                 call(
-                    "zl_pos_value",
+                    "zl_pos_key",
                     vec![tv(), var(pos, i64_t.clone(), span)],
                     Type::Any,
                     span,

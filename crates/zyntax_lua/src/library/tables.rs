@@ -1522,6 +1522,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     ));
     // `next(t, k)`: the key and value after `k`, as two values, or
     // nothing.
+    let found = local("found", any());
     d.push(define(
         "zl_next",
         &[&tb, &k],
@@ -1537,11 +1538,11 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 lt(pos.e(), int(0)),
                 vec![ret(list(vec![nil()], anys.clone()))],
             ),
+            // The value is read first and held: making the key may
+            // collect, which clears a weak value nothing holds.
+            found.decl(call("zl_pos_value", vec![tb.e(), pos.e()], any())),
             ret(list(
-                vec![
-                    call("zl_pos_key", vec![tb.e(), pos.e()], any()),
-                    call("zl_pos_value", vec![tb.e(), pos.e()], any()),
-                ],
+                vec![call("zl_pos_key", vec![tb.e(), pos.e()], any()), found.e()],
                 anys.clone(),
             )),
         ],
