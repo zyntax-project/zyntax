@@ -265,6 +265,13 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         lib: "string",
+        name: "dump",
+        func: "zl_string_dump",
+        params: &[Expected("function"), Any],
+        ret: Ret::Str,
+    },
+    Builtin {
+        lib: "string",
         name: "packsize",
         func: "zl_string_packsize",
         params: &[Str],
@@ -3553,10 +3560,79 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     // function giving pieces of it, compiled while the program runs;
     // the function value, or nil and the message.
     d.push(extern_fn(
-        "zl_load_raw",
+        "zl_load_host",
         &[("source", string()), ("name", string()), ("env", any())],
         any(),
         Some("$Lua$load"),
+    ));
+    d.push(extern_fn(
+        "zl_load_wraps",
+        &[],
+        boolean(),
+        Some("$Lua$load_wraps"),
+    ));
+    d.push(extern_fn(
+        "zl_dump_raw",
+        &[("key", i64()), ("strip", boolean())],
+        string(),
+        Some("$Lua$dump"),
+    ));
+    let source = kept("source", string());
+    let name = kept("name", string());
+    let env = kept("env", any());
+    // A chunk compiled: its function value, or nil with the message
+    // for `zl_load_error`. A binary chunk holding a function compiles
+    // to a chunk returning it, which is called for it.
+    d.push(define(
+        "zl_load_raw",
+        &[&source, &name, &env],
+        any(),
+        vec![
+            y.decl(call(
+                "zl_load_host",
+                vec![source.e(), name.e(), env.e()],
+                any(),
+            )),
+            when(
+                and(not(is_nil(y.e())), call("zl_load_wraps", vec![], boolean())),
+                vec![y.set(call(
+                    "zl_first",
+                    vec![call("zl_call_0", vec![y.e()], any())],
+                    any(),
+                ))],
+            ),
+            ret(y.e()),
+        ],
+    ));
+    // `string.dump(f, strip)`: the binary chunk `load` reads back.
+    let strip = kept("strip", any());
+    d.push(define(
+        "zl_string_dump",
+        &[&x, &strip],
+        string(),
+        vec![
+            when(
+                not(is_func(x.e())),
+                vec![lua_error(concat(vec![
+                    text("bad argument #1 to 'dump' (function expected, got "),
+                    type_name(x.e()),
+                    text(")"),
+                ]))],
+            ),
+            s.decl(call(
+                "zl_dump_raw",
+                vec![
+                    call("zl_func_id", vec![x.e()], i64()),
+                    call("zl_truthy", vec![strip.e()], boolean()),
+                ],
+                string(),
+            )),
+            when(
+                eq(s.e(), null(string())),
+                vec![lua_error(text("unable to dump given function"))],
+            ),
+            ret(s.e()),
+        ],
     ));
     d.push(extern_fn(
         "zl_searchpath",
@@ -3596,6 +3672,43 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             vec![chunk_env.set(call("zl_value_at", vec![given.e(), int(1)], any()))],
         )
     };
+    let read_piece = || {
+        block_of(vec![
+            piece.set(call(
+                "zl_first",
+                vec![call("zl_call_0", vec![chunk.e()], any())],
+                any(),
+            )),
+            when(
+                not(is_nil(pending())),
+                vec![
+                    expr(call("zl_buf_close", vec![], string())),
+                    ret(call(
+                        "zb_box_tuple",
+                        vec![list(
+                            vec![nil(), call("zl_take_pending", vec![], any())],
+                            anys.clone(),
+                        )],
+                        any(),
+                    )),
+                ],
+            ),
+            when(
+                and(
+                    not(is_nil(piece.e())),
+                    or(
+                        eq(category(piece.e()), int(INT)),
+                        eq(category(piece.e()), int(FLOAT)),
+                    ),
+                ),
+                vec![piece.set(box_str(call(
+                    "zl_arg_str",
+                    vec![piece.e(), text("")],
+                    string(),
+                )))],
+            ),
+        ])
+    };
     d.push(define(
         "zl_load",
         &[&chunk, &chunk_name, &mode, &given],
@@ -3632,13 +3745,12 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                             text(")"),
                         ]))],
                     ),
-                    // The reader gives pieces until nil or an empty string.
+                    // The reader gives pieces until nil or an empty string;
+                    // a number is its string. An error it raises is what
+                    // `load` returns.
                     expr(call("zl_buf_open", vec![], unit())),
-                    piece.decl(call(
-                        "zl_first",
-                        vec![call("zl_call_0", vec![chunk.e()], any())],
-                        any(),
-                    )),
+                    piece.decl(nil()),
+                    read_piece(),
                     while_(
                         and(
                             not(is_nil(piece.e())),
@@ -3649,11 +3761,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                         ),
                         vec![
                             expr(call("zl_buf_push", vec![get_str(piece.e())], unit())),
-                            piece.set(call(
-                                "zl_first",
-                                vec![call("zl_call_0", vec![chunk.e()], any())],
-                                any(),
-                            )),
+                            read_piece(),
                         ],
                     ),
                     s.set(call("zl_buf_close", vec![], string())),
@@ -3705,22 +3813,15 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         ],
     ));
     // What `mode` says about a chunk: a chunk starting with an escape
-    // byte is binary, which no mode without `b` allows and which
-    // cannot be loaded here at all; a text chunk needs `t`. The
+    // byte is binary, which needs `b`; a text chunk needs `t`. The
     // message when the chunk is refused, or nil.
     d.push(define(
         "zl_load_mode_error",
         &[&s, &mode],
         any(),
         vec![
-            k.decl(int(0)),
-            when(
-                gt(call("zb_str_len", vec![s.e()], i64()), int(0)),
-                vec![k.set(cast(
-                    call("zb_str_code_at", vec![s.e(), int(0)], i32()),
-                    i64(),
-                ))],
-            ),
+            // The first byte: a binary chunk is not UTF-8 past its header.
+            k.decl(call("zl_byte_at", vec![s.e(), int(1)], i64())),
             cname.decl(text("bt")),
             when(
                 and(not(is_nil(mode.e())), eq(category(mode.e()), int(STR))),
@@ -3755,10 +3856,6 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     cname.e(),
                     text("')"),
                 ])))],
-            ),
-            when(
-                eq(k.e(), int(27)),
-                vec![ret(box_str(text("binary chunks cannot be loaded")))],
             ),
             ret(nil()),
         ],

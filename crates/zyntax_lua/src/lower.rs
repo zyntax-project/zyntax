@@ -133,6 +133,9 @@ struct Module<'a> {
     env_var: Option<InternedString>,
     /// Byte offsets where each line starts, for positions.
     line_starts: Vec<usize>,
+    /// Loaded from a binary chunk without debug information: its
+    /// statements are on no line and its variables have no names.
+    stripped: bool,
     /// The library functions that can raise.
     fallible: HashSet<&'static str>,
     /// The library functions that may run the program's code before
@@ -479,12 +482,21 @@ impl<'a> Module<'a> {
         }
     }
 
-    /// The line a span starts on, counted from one.
+    /// The line a span starts on, counted from one, as positions and
+    /// hooks see it: no line in a stripped chunk.
     fn line_of(&self, span: Span) -> i64 {
-        let line = self
-            .line_starts
-            .partition_point(|&start| start <= span.start) as i64;
+        let line = if self.stripped {
+            library::STRIPPED_LINE
+        } else {
+            self.source_line(span)
+        };
         (self.chunk_index << library::LINE_BITS) | line
+    }
+
+    /// The line a span starts on in the source, stripped or not.
+    fn source_line(&self, span: Span) -> i64 {
+        self.line_starts
+            .partition_point(|&start| start <= span.start) as i64
     }
 
     /// Whether a program function may raise, as far as is known.
@@ -3307,10 +3319,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     /// What the debug library is told of this function: where it is,
     /// its parameters and upvalues, the lines its statements start on
-    /// and its parameters' names.
+    /// and its parameters' names. A stripped function has no active
+    /// lines, no parameter names and upvalues named `(no name)`.
     fn debug_function_records(&mut self, id: FuncId, line: i64, last_line: i64) {
         let mask = (1i64 << library::LINE_BITS) - 1;
         let info = self.scopes().func(id).clone();
+        let stripped = self.m.stripped;
         let mut f = vec![
             "F".to_string(),
             id.0.to_string(),
@@ -3320,31 +3334,38 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             if info.is_vararg { "1" } else { "0" }.to_string(),
         ];
         f.extend(info.upvalues.iter().map(|u| match u {
+            _ if stripped => "(no name)".to_string(),
             crate::scope::Upvalue::Var(v) => self.scopes().var(*v).name.clone(),
             crate::scope::Upvalue::Env => "_ENV".to_string(),
         }));
         self.m.debug_record(&f);
         let mut lines = std::mem::take(&mut self.lines);
-        if id != CHUNK {
+        if stripped {
+            lines.clear();
+        } else if id != CHUNK {
             lines.insert(last_line & mask);
         }
         let mut a = vec!["A".to_string(), id.0.to_string()];
         a.extend(lines.iter().map(|l| l.to_string()));
         self.m.debug_record(&a);
         let mut l = vec!["L".to_string(), id.0.to_string(), "0".to_string()];
-        l.extend(
-            info.params
-                .iter()
-                .map(|v| self.scopes().var(*v).name.clone()),
-        );
+        if !stripped {
+            l.extend(
+                info.params
+                    .iter()
+                    .map(|v| self.scopes().var(*v).name.clone()),
+            );
+        }
         self.m.debug_record(&l);
     }
 
-    /// The names of the locals in scope, as `debug.getlocal` gives them.
+    /// The names of the locals in scope, as `debug.getlocal` gives them:
+    /// `(temporary)` each in a stripped chunk.
     fn live_names(&self) -> Vec<String> {
         self.live
             .iter()
             .map(|l| match l {
+                _ if self.m.stripped => "(temporary)".to_string(),
                 Live::Var(v) => self.scopes().var(*v).name.clone(),
                 Live::ForState => "(for state)".to_string(),
             })
@@ -3602,23 +3623,30 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     // an upvalue, a global, a field, a constant or a method. These give
     // the same name for an expression, appended by the site's check.
 
+    /// A stripped chunk knows no local's name, calls every upvalue `?`
+    /// and cannot tell the environment from another table.
     fn describe_name(&self, token: &TokenReference) -> Desc {
         let name = ident(token);
+        let stripped = self.m.stripped;
         Some(match self.scopes().binding(token) {
+            Some(Binding::Local(_)) if stripped => return None,
+            Some(Binding::Upvalue(_)) if stripped => "upvalue '?'".to_string(),
             Some(Binding::Local(_)) => format!("local '{name}'"),
             Some(Binding::Upvalue(_)) => format!("upvalue '{name}'"),
+            _ if stripped => format!("field '{name}'"),
             _ => format!("global '{name}'"),
         })
     }
 
     /// The `_ENV` a free name is a field of, described as the variable
     /// it is at the use: what an index error on it names.
-    fn env_var_desc(upvalue: bool) -> Desc {
-        Some(if upvalue {
-            "upvalue '_ENV'".to_string()
-        } else {
-            "local '_ENV'".to_string()
-        })
+    fn env_var_desc(&self, upvalue: bool) -> Desc {
+        match (upvalue, self.m.stripped) {
+            (true, false) => Some("upvalue '_ENV'".to_string()),
+            (true, true) => Some("upvalue '?'".to_string()),
+            (false, false) => Some("local '_ENV'".to_string()),
+            (false, true) => None,
+        }
     }
 
     fn describe(&self, e: &Expression) -> Desc {
@@ -3652,6 +3680,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             && let Prefix::Name(token) = prefix
             && ident(token) == "_ENV"
             && let Suffix::Index(ast::Index::Dot { name, .. }) = last
+            && !self.m.stripped
         {
             return Some(format!("global '{}'", ident(name)));
         }
@@ -3741,7 +3770,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             node: str_lit(name, span),
             ty: Ty::Str,
         };
-        self.index_write(obj, key, value, Self::env_var_desc(upvalue), span)
+        self.index_write(obj, key, value, self.env_var_desc(upvalue), span)
     }
 
     fn write_var(&mut self, v: VarId, value: Val, span: Span) -> St {
@@ -3798,7 +3827,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     node: str_lit(&name, span),
                     ty: Ty::Str,
                 };
-                Ok(self.field_read(env, key, &name, Self::env_var_desc(upvalue), span))
+                Ok(self.field_read(env, key, &name, self.env_var_desc(upvalue), span))
             }
         }
     }
@@ -3821,7 +3850,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 ty: Ty::Str,
             };
             let g = self.globals_table(span);
-            let desc = self.m.env_var.map(|_| "upvalue '_ENV'".to_string());
+            let desc = self.m.env_var.and_then(|_| self.env_var_desc(true));
             return Ok(self.index_read(g, key, desc, span));
         }
         if let Some(f) = self.scopes().known_global_function(name) {
@@ -3860,7 +3889,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 ty: Ty::Str,
             };
             let g = self.globals_table(span);
-            let desc = self.m.env_var.map(|_| "upvalue '_ENV'".to_string());
+            let desc = self.m.env_var.and_then(|_| self.env_var_desc(true));
             return Ok(self.index_write(g, key, value, desc, span));
         }
         if self.scopes().known_global_function(name).is_some() {
@@ -10530,7 +10559,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if child.frames {
             let line = self
                 .m
-                .line_of(span_of(body.parameters_parentheses().tokens().0));
+                .source_line(span_of(body.parameters_parentheses().tokens().0));
+            let last_line = self.m.source_line(span_of(body.end_token()));
             child.debug_function_records(id, line, last_line);
         }
         self.m.strip_line_restores(&mut statements);
@@ -10949,7 +10979,9 @@ fn load_required(first: &[String], main_file: &str) -> Result<(Vec<Loaded>, bool
         }
         let relative = format!("{}.lua", name.replace('.', "/"));
         let path = dir.join(&relative);
-        let Ok(bytes) = std::fs::read(&path) else {
+        // A binary chunk is left to `require` at run time, which
+        // reads it back.
+        let Some(bytes) = std::fs::read(&path).ok().filter(|b| !crate::is_binary(b)) else {
             all_found = false;
             continue;
         };
@@ -11047,6 +11079,7 @@ fn chunk_module(
     registry: &mut zyntax_typed_ast::TypeRegistry,
     debug: DebugMode,
     debug_names: (&str, &str),
+    stripped: bool,
 ) -> Result<(String, Option<St>)> {
     let mut module = Module {
         scopes,
@@ -11057,6 +11090,7 @@ fn chunk_module(
         chunk_index,
         env_var,
         line_starts: line_starts_of(source),
+        stripped,
         fallible: crate::fallible::FALLIBLE.iter().copied().collect(),
         reentrant: crate::fallible::REENTRANT.iter().copied().collect(),
         raising: None,
@@ -11181,6 +11215,8 @@ struct DebugMode {
     on: bool,
     locals: bool,
     setlocal: bool,
+    /// Upvalues may be set or joined: captures are shared through cells.
+    rebinds: bool,
 }
 
 impl DebugMode {
@@ -11189,6 +11225,7 @@ impl DebugMode {
             on: scopes.debug,
             locals: scopes.debug_getlocal || scopes.debug_setlocal,
             setlocal: scopes.debug_setlocal,
+            rebinds: scopes.debug_rebinds,
         }
     }
 
@@ -11197,6 +11234,7 @@ impl DebugMode {
             on: self.on || other.on,
             locals: self.locals || other.locals,
             setlocal: self.setlocal || other.setlocal,
+            rebinds: self.rebinds || other.rebinds,
         }
     }
 
@@ -11210,7 +11248,10 @@ impl DebugMode {
 
     /// Kept for the chunks `load` compiles while the program runs.
     fn remember(self) {
-        let bits = self.on as u8 | (self.locals as u8) << 1 | (self.setlocal as u8) << 2;
+        let bits = self.on as u8
+            | (self.locals as u8) << 1
+            | (self.setlocal as u8) << 2
+            | (self.rebinds as u8) << 3;
         PROGRAM_DEBUG.store(bits, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -11220,6 +11261,7 @@ impl DebugMode {
             on: bits & 1 != 0,
             locals: bits & 2 != 0,
             setlocal: bits & 4 != 0,
+            rebinds: bits & 8 != 0,
         }
     }
 }
@@ -11836,16 +11878,19 @@ pub(crate) fn loaded_program(
     source: &str,
     chunk_name: &str,
     index: i64,
+    stripped: bool,
     library: &Library,
 ) -> Result<TypedProgram> {
-    let mut scopes = crate::scope::resolve(ast);
+    let mut scopes = crate::scope::resolve_loaded(ast, DebugMode::program().rebinds);
     scopes.dynamic_globals = true;
     scopes.len_meta = true;
     // The chunk is a function value, called by whoever `load` gave it to.
     scopes.funcs[CHUNK.0 as usize].escapes = true;
     let inferred = types::infer(&scopes, ast);
     NAMED.with(|named| *named.borrow_mut() = Some(Default::default()));
-    let lowered = loaded_declarations(&scopes, &inferred, ast, source, chunk_name, index, library);
+    let lowered = loaded_declarations(
+        &scopes, &inferred, ast, source, chunk_name, index, stripped, library,
+    );
     let named = NAMED
         .with(|named| named.borrow_mut().take())
         .unwrap_or_default();
@@ -11874,6 +11919,7 @@ pub(crate) fn loaded_program(
 }
 
 /// The declarations of a loaded chunk: its functions and its `init`.
+#[allow(clippy::too_many_arguments)]
 fn loaded_declarations(
     scopes: &Scopes,
     inferred: &Inferred,
@@ -11881,6 +11927,7 @@ fn loaded_declarations(
     source: &str,
     chunk_name: &str,
     index: i64,
+    stripped: bool,
     library: &Library,
 ) -> Result<(
     Vec<TypedNode<TypedDeclaration>>,
@@ -11893,8 +11940,11 @@ fn loaded_declarations(
     // chunk's shapes, and it defines none of its own.
     let mut registry = library.type_registry.clone();
     let mut hooks = Vec::new();
-    // A chunk of a program that keeps its call stack keeps it too.
+    // A chunk of a program that keeps its call stack keeps it too, and
+    // a chunk that reaches the debug library has the chunks loaded
+    // after it keep what it may ask of their functions.
     let debug = DebugMode::of(scopes).join(DebugMode::program());
+    debug.remember();
     let (code_name, register) = chunk_module(
         scopes,
         inferred,
@@ -11912,6 +11962,7 @@ fn loaded_declarations(
         &mut registry,
         debug,
         (chunk_name, chunk_name),
+        stripped,
     )?;
     let span = Span::new(0, source.len());
     let env = intern("env");
@@ -12076,6 +12127,7 @@ pub(crate) fn program(
         chunk_index: 0,
         env_var,
         line_starts,
+        stripped: false,
         fallible: crate::fallible::FALLIBLE.iter().copied().collect(),
         reentrant: crate::fallible::REENTRANT.iter().copied().collect(),
         raising: None,
@@ -12261,6 +12313,7 @@ pub(crate) fn program(
         // Positions name the file as `require` found it.
         let found_as = format!("./{}.lua", m.name.replace('.', "/"));
         let source_name = format!("@{found_as}");
+        crate::dump::note_chunk(k as i64 + 1, &m.source, &source_name, false);
         let (code_name, register) = chunk_module(
             &m.scopes,
             &module_inferred[k],
@@ -12278,6 +12331,7 @@ pub(crate) fn program(
             &mut registry,
             debug,
             (&source_name, &chunk_id(&found_as)),
+            false,
         )?;
         preloads.push(expr_stmt(call(
             "zl_chunk_add",

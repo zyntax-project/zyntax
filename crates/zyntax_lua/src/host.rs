@@ -1658,6 +1658,8 @@ extern "C" fn host_utf8_next(s: zrtl::StringConstPtr, n: i64, lax: bool) -> i64 
 thread_local! {
     static LOAD_ERROR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     static LOADS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    /// The chunk the last load compiled returns the function it loaded.
+    static LOAD_WRAPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Chunks `load` compiles carry numbers from here, past any file the
@@ -1704,29 +1706,81 @@ fn chunk_name(name: &[u8]) -> String {
 }
 
 /// `load(source, name)`: the chunk as a function value, or null with
-/// the message held for `$Lua$load_error`.
+/// the message held for `$Lua$load_error`. A binary chunk (see
+/// [`crate::dump`]) is read back; when it holds a function rather than
+/// a main chunk, the value is a chunk returning that function, which
+/// `$Lua$load_wraps` then says.
 extern "C" fn host_load(
     source: zrtl::StringConstPtr,
     name: zrtl::StringConstPtr,
     env: *const DynamicBox,
 ) -> *const DynamicBox {
     let (source, name) = unsafe { (bytes_of(source), bytes_of(name)) };
-    let chunk_name = chunk_name(name);
-    let text = crate::source_text(source);
     let index = LOADS.with(|n| {
         let k = n.get();
         n.set(k + 1);
         LOAD_CHUNKS_FROM + k
     });
-    // The reference's `source`: the name given, else the text itself.
-    let raw = if name.is_empty() { source } else { name };
-    crate::host_debug::note_load_source(index, crate::source_text(raw).into_owned());
-    match crate::load_chunk(&text, &chunk_name, index, env) {
+    LOAD_WRAPS.with(|w| w.set(false));
+    let loaded = if source.first() == Some(&crate::dump::SIGNATURE[0]) {
+        load_binary(source, name, index, env)
+    } else {
+        // The reference's `source`: the name given, else the text itself.
+        let raw = if name.is_empty() { source } else { name };
+        let raw = crate::source_text(raw).into_owned();
+        crate::host_debug::note_load_source(index, raw.clone());
+        let text = crate::source_text(source);
+        crate::load_chunk(&text, (&chunk_name(name), &raw), index, env, false)
+    };
+    match loaded {
         Ok(record) => record,
         Err(message) => {
             LOAD_ERROR.with(|e| *e.borrow_mut() = message);
             std::ptr::null()
         }
+    }
+}
+
+/// A binary chunk compiled from the source it holds, under the source
+/// name it holds; refused as `lundump.c` refuses it.
+fn load_binary(
+    bytes: &[u8],
+    name: &[u8],
+    index: i64,
+    env: *const DynamicBox,
+) -> Result<*const DynamicBox, String> {
+    let undumped = crate::dump::undump(bytes).map_err(|why| {
+        format!(
+            "{}: bad binary format ({why})",
+            crate::dump::error_name(name)
+        )
+    })?;
+    crate::host_debug::note_load_source(index, undumped.source.clone());
+    let text = crate::dump::wrapper_text(&undumped, false);
+    let short = chunk_name(undumped.source.as_bytes());
+    let record = crate::load_chunk(
+        &text,
+        (&short, &undumped.source),
+        index,
+        env,
+        undumped.stripped,
+    )?;
+    LOAD_WRAPS.with(|w| w.set(!undumped.main));
+    Ok(record)
+}
+
+/// Whether the chunk the last load compiled returns the function the
+/// binary chunk held, rather than being it.
+extern "C" fn host_load_wraps() -> bool {
+    LOAD_WRAPS.with(|w| w.replace(false))
+}
+
+/// `string.dump(f, strip)` of the function with key `key`, or null when
+/// no chunk of the program defines it.
+extern "C" fn host_dump(key: i64, strip: bool) -> StringPtr {
+    match crate::dump::dump(key, strip) {
+        Some(bytes) => zrtl::string::string_from_bytes(&bytes),
+        None => std::ptr::null_mut(),
     }
 }
 
@@ -1737,13 +1791,17 @@ extern "C" fn host_read_file(path: zrtl::StringConstPtr) -> StringPtr {
     match std::fs::read(&path) {
         Ok(bytes) => {
             // A byte order mark is skipped, then a leading `#` line, as
-            // `lua` skips a shebang.
+            // `lua` skips a shebang; its line break stays for the lines
+            // of a text chunk, and goes before a binary one.
             let bytes = bytes
                 .strip_prefix(b"\xEF\xBB\xBF")
                 .map_or(&bytes[..], |rest| rest)
                 .to_vec();
             let bytes = if bytes.first() == Some(&b'#') {
                 match bytes.iter().position(|&b| b == b'\n') {
+                    Some(nl) if bytes.get(nl + 1) == Some(&crate::dump::SIGNATURE[0]) => {
+                        &bytes[nl + 1..]
+                    }
                     Some(nl) => &bytes[nl..],
                     None => &[][..],
                 }
@@ -1924,7 +1982,7 @@ fn table_error_text(err: *const DynamicBox) -> Result<Option<Vec<u8>>, String> {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 98] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 100] = [
     zrtl::ZrtlSymbol::new(c"$Lua$cpath".as_ptr(), host_cpath as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
@@ -2005,6 +2063,8 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 98] = [
     zrtl::ZrtlSymbol::new(c"$Lua$utf8_next".as_ptr(), host_utf8_next as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$load".as_ptr(), host_load as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$load_error".as_ptr(), host_load_error as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$load_wraps".as_ptr(), host_load_wraps as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Lua$dump".as_ptr(), host_dump as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Lua$report_pending".as_ptr(),
         host_report_pending as *const u8,

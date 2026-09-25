@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use full_moon::ast::{self, Block, Expression, FunctionBody, Prefix, Stmt, Suffix, Var};
+use full_moon::node::Node;
 use full_moon::tokenizer::TokenReference;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -92,6 +93,12 @@ pub struct FuncInfo {
     pub upvalues: Vec<Upvalue>,
     /// The line the function starts on, for naming.
     pub line: usize,
+    /// Its body's bytes in the source: from its parameter list's `(`
+    /// to the end of its `end`. Empty for the main chunk.
+    pub body: (usize, usize),
+    /// Declared as `function a:b()`, with `self` as a first parameter
+    /// the body does not spell.
+    pub method: bool,
     /// What the function is called, for symbol names.
     pub name: String,
     /// Whether the function is used as a value anywhere, so it needs a
@@ -134,6 +141,8 @@ pub struct Scopes {
     pub decls: HashMap<usize, VarId>,
     /// Every function body, by the byte offset of its parameter list.
     pub func_at: HashMap<usize, FuncId>,
+    /// The source bytes of each folded constant's value.
+    pub const_inits: HashMap<VarId, (usize, usize)>,
     /// How many times each global is assigned, anywhere.
     pub global_writes: BTreeMap<String, usize>,
     /// Globals declared by `function name()` at the chunk's outermost
@@ -421,7 +430,14 @@ struct Walker {
 }
 
 pub fn resolve(ast: &ast::Ast) -> Scopes {
-    let scopes = walk(ast, false);
+    resolve_loaded(ast, false)
+}
+
+/// [`resolve`] for a chunk `load` compiles: `rebinds` says the program
+/// loading it may join or set upvalues, which then holds for the
+/// chunk's captures as for the program's.
+pub fn resolve_loaded(ast: &ast::Ast, rebinds: bool) -> Scopes {
+    let mut scopes = walk(ast, false, rebinds);
     // A module variable is one variable for every function reaching
     // it, which `debug.upvaluejoin` cannot rebind for one closure, and
     // which a frame's spilled locals cannot hold by reference: a chunk
@@ -430,12 +446,12 @@ pub fn resolve(ast: &ast::Ast) -> Scopes {
     // which share them.
     let reaches = scopes.debug_rebinds || scopes.debug_setlocal || scopes.debug_getlocal;
     if reaches && !scopes.split_chunk && scopes.vars.iter().any(|v| v.is_module_var()) {
-        return walk(ast, true);
+        scopes = walk(ast, true, rebinds);
     }
     scopes
 }
 
-fn walk(ast: &ast::Ast, no_module_vars: bool) -> Scopes {
+fn walk(ast: &ast::Ast, no_module_vars: bool, rebinds: bool) -> Scopes {
     let mut w = Walker {
         out: Scopes::default(),
         frames: Vec::new(),
@@ -453,6 +469,8 @@ fn walk(ast: &ast::Ast, no_module_vars: bool) -> Scopes {
         captures: Vec::new(),
         upvalues: vec![Upvalue::Env],
         line: 0,
+        body: (0, 0),
+        method: false,
         name: "main".to_string(),
         escapes: false,
         top_level: true,
@@ -490,6 +508,7 @@ fn walk(ast: &ast::Ast, no_module_vars: bool) -> Scopes {
     // statement shows it: shared through a cell, never known to hold
     // one function. An upvalue's identity is its cell's address, so a
     // chunk that asks for one gives each captured variable a cell too.
+    w.out.debug_rebinds |= rebinds;
     if w.out.debug_rebinds || w.out.debug_setlocal || w.out.upvalue_ids {
         let all = w.out.debug_setlocal;
         for v in &mut w.out.vars {
@@ -1000,6 +1019,9 @@ impl Walker {
                         && self.is_constant(exprs[i]);
                     let var = self.declare(name, attribute);
                     self.out.vars[var.0 as usize].folded = folded;
+                    if folded && let Some((a, b)) = exprs[i].range() {
+                        self.out.const_inits.insert(var, (a.bytes(), b.bytes()));
+                    }
                     let init = exprs.get(i).map_or(Init::Other, |e| self.init_of(e));
                     self.out.vars[var.0 as usize].init = init;
                     if alias {
@@ -1070,12 +1092,15 @@ impl Walker {
             .token()
             .start_position()
             .line();
+        let end = body.end_token().token().end_position().bytes();
         self.out.funcs.push(FuncInfo {
             params: Vec::new(),
             is_vararg: false,
             captures: Vec::new(),
             upvalues: Vec::new(),
             line,
+            body: (pos, end),
+            method: is_method,
             name,
             escapes: false,
             top_level: false,

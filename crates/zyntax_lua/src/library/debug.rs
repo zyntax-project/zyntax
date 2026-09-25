@@ -79,6 +79,15 @@ const TYPE_METAS: [(&str, &str); 5] = [
     ("function", "zl_meta_function"),
     ("thread", "zl_meta_thread"),
 ];
+/// The line a line hook is told of: nil in a stripped chunk.
+fn hook_line(line: Expr) -> Expr {
+    if_expr(
+        stripped_line(line.clone()),
+        nil(),
+        box_i64(bitand(line, int((1i64 << LINE_BITS) - 1))),
+    )
+}
+
 pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let anys = t.anys();
     let table = t.table();
@@ -583,10 +592,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 ),
                 vec![expr(call(
                     "zl_dbg_hook",
-                    vec![
-                        text("line"),
-                        box_i64(bitand(line.e(), int((1i64 << LINE_BITS) - 1))),
-                    ],
+                    vec![text("line"), hook_line(line.e())],
                     unit(),
                 ))],
             ),
@@ -618,10 +624,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             vec![expr(call(
                 "zl_dbg_hook",
-                vec![
-                    text("line"),
-                    box_i64(bitand(line, int((1i64 << LINE_BITS) - 1))),
-                ],
+                vec![text("line"), hook_line(line)],
                 unit(),
             ))],
         )

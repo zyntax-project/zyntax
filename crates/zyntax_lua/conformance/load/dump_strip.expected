@@ -1,0 +1,24 @@
+2
+=?	?	Lua	3	6
+-1	nil
+false	?:-1: attempt to perform arithmetic on a table value
+false	?:-1: attempt to perform arithmetic on a table value
+false	?:-1: attempt to call a nil value (field 'undefinedname')
+false	?:-1: attempt to index a nil value (field 'x')
+false	boom
+(no name)	true
+(no name)	99
+(temporary)	12
+-1
+(no name)	12
+(no name)	13
+?	true	true
+nil
+?	true	true
+13
+2	nil
+true
+8
+true	true
+true
+80	=?	=?

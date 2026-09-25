@@ -18,6 +18,7 @@
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::{InternedString, PrimitiveType, Type, TypedProgram};
 
+mod dump;
 mod host;
 mod host_debug;
 mod host_gc;
@@ -246,12 +247,15 @@ pub(crate) fn runtime() -> Option<&'static mut zyntax_embed::TieredRuntime> {
 }
 
 /// Compile `source` as a chunk of the running program: the function
-/// value it is, or the message a syntax error gives.
+/// value it is, or the message a syntax error gives. `raw_name` is the
+/// reference's `source` for it; a chunk `stripped` of debug
+/// information has no lines or variable names.
 pub(crate) fn load_chunk(
     source: &str,
-    chunk_name: &str,
+    (chunk_name, raw_name): (&str, &str),
     index: i64,
     env: *const zrtl::DynamicBox,
+    stripped: bool,
 ) -> std::result::Result<*const zrtl::DynamicBox, String> {
     let started = std::time::Instant::now();
     let (ast, source) =
@@ -261,8 +265,9 @@ pub(crate) fn load_chunk(
     let library = library().map_err(|e| e.to_string())?;
     trace_phase("load:lib", started);
     let started = std::time::Instant::now();
-    let program = lower::loaded_program(&ast, &source, chunk_name, index, library)
+    let program = lower::loaded_program(&ast, &source, chunk_name, index, stripped, library)
         .map_err(|e| e.one_line(chunk_name, &source))?;
+    dump::note_chunk(index, &source, raw_name, stripped);
     trace_phase("load:lower", started);
     let started = std::time::Instant::now();
     let runtime = runtime().ok_or("no runtime to load into")?;
@@ -385,6 +390,20 @@ pub fn source_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Whether a file's bytes, past any `#` line, are a binary chunk.
+pub fn is_binary(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&dump::SIGNATURE[0])
+}
+
+/// A binary chunk run as a program: the text it holds, calling the
+/// function it holds with the script's arguments when it is not a main
+/// chunk; or the message refusing it, the chunk named `file`.
+pub fn binary_source(bytes: &[u8], file: &str) -> std::result::Result<String, String> {
+    let undumped =
+        dump::undump(bytes).map_err(|why| format!("{file}: bad binary format ({why})"))?;
+    Ok(dump::wrapper_text(&undumped, true))
+}
+
 /// The private-use character standing for byte `b` in a source that
 /// is not UTF-8.
 pub(crate) fn escaped_byte(b: u8) -> char {
@@ -463,6 +482,7 @@ pub fn parse_program(source: &str, file: &str) -> Result<TypedProgram> {
     let started = std::time::Instant::now();
     let (ast, normal) = parse_chunk(source, MAIN_LEVEL)?;
     trace_phase("full_moon", started);
+    dump::note_chunk(0, &source, &format!("@{file}"), false);
     let started = std::time::Instant::now();
     let library = library()?;
     trace_phase("library", started);

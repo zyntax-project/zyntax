@@ -97,11 +97,24 @@ fn run() -> ExitCode {
                         .position(|&b| b == b'\n')
                         .unwrap_or(bytes.len());
                     bytes.drain(..end);
+                    // A binary chunk follows the line with nothing between.
+                    if zyntax_lua::is_binary(&bytes[bytes.len().min(1)..]) {
+                        bytes.drain(..1);
+                    }
                 }
-                (
-                    prelude + &zyntax_lua::source_text(&bytes),
-                    path.display().to_string(),
-                )
+                let file = path.display().to_string();
+                let text = if zyntax_lua::is_binary(&bytes) {
+                    match zyntax_lua::binary_source(&bytes, &file) {
+                        Ok(text) => text,
+                        Err(message) => {
+                            eprintln!("zylua: {message}");
+                            return ExitCode::from(1);
+                        }
+                    }
+                } else {
+                    zyntax_lua::source_text(&bytes).into_owned()
+                };
+                (prelude + &text, file)
             }
             Err(e) => {
                 eprintln!("zylua: cannot read {}: {e}", path.display());

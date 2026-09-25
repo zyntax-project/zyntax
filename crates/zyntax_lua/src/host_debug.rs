@@ -445,8 +445,12 @@ fn levels(
     out
 }
 
+/// A stored line's line in its chunk: -1 in a stripped chunk.
 fn line_part(line: i64) -> i64 {
-    line & 0xffff_ffff
+    match line & crate::library::STRIPPED_LINE {
+        crate::library::STRIPPED_LINE => -1,
+        l => l,
+    }
 }
 
 fn chunk_part(key_or_line: i64) -> i64 {

@@ -1,0 +1,24 @@
+10
+true
+true	true
+1	nil	
+2	nil	binary string: bad binary format (not a binary chunk)
+3	nil	binary string: bad binary format (not a binary chunk)
+4	nil	binary string: bad binary format (not a binary chunk)
+5	nil	binary string: bad binary format (version mismatch)
+6	nil	binary string: bad binary format (format mismatch)
+7	nil	binary string: bad binary format (corrupted chunk)
+8	nil	binary string: bad binary format (corrupted chunk)
+9	nil	binary string: bad binary format (corrupted chunk)
+10	nil	binary string: bad binary format (corrupted chunk)
+11	nil	binary string: bad binary format (corrupted chunk)
+12	nil	binary string: bad binary format (corrupted chunk)
+13	nil	binary string: bad binary format (Instruction size mismatch)
+14	nil	binary string: bad binary format (lua_Integer size mismatch)
+15	nil	binary string: bad binary format (lua_Number size mismatch)
+nil	binary string: bad binary format (integer format mismatch)
+nil	binary string: bad binary format (float format mismatch)
+every truncation refused	true
+nil	binary string: bad binary format (truncated chunk)
+nil	chunk: bad binary format (truncated chunk)
+nil	file.luac: bad binary format (truncated chunk)

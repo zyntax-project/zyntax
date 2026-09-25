@@ -1,0 +1,12 @@
+10	10	2	true
+true
+3	K
+7	10
+_ENV	nil	true
+set
+true	_ENV	nil
+5
+55
+true	1
+120
+false	dump_scopes.lua:76: attempt to index a nil value (field 'a')

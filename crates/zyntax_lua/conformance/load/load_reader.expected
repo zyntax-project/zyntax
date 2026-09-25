@@ -1,0 +1,14 @@
+nil	true
+nil	true
+57
+1.5
+3
+
+nil	true
+nil	true
+01234567890123456789012345678901234567890123456789
+1	1
+nil	attempt to load a binary chunk (mode is 't')
+15
+15
+nil	(load):1: unexpected symbol near '*'

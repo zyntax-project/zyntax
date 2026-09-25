@@ -852,6 +852,14 @@ pub const CCALLS_LIMIT: i64 = 200;
 #[allow(dead_code)]
 pub const MAX_DEPTH: i64 = 200_000;
 pub const LINE_BITS: i64 = 32;
+/// The line every statement of a chunk loaded without debug
+/// information is on: positions show it as `-1`.
+pub const STRIPPED_LINE: i64 = (1 << LINE_BITS) - 1;
+
+/// Whether a stored line is in a chunk without debug information.
+pub fn stripped_line(line: Expr) -> Expr {
+    eq(bitand(line, int(STRIPPED_LINE)), int(STRIPPED_LINE))
+}
 /// The globals table, set before the chunk runs when the program
 /// reaches its globals through one.
 pub const GLOBALS: &str = "zl_G";
@@ -1042,10 +1050,14 @@ fn raising(t: &Types) -> Vec<Decl> {
             ret(concat(vec![
                 call("zl_chunk_of", vec![line.e()], string()),
                 text(":"),
-                call(
-                    "zb_str_of_int",
-                    vec![bitand(line.e(), int((1i64 << LINE_BITS) - 1))],
-                    string(),
+                if_expr(
+                    stripped_line(line.e()),
+                    text("-1"),
+                    call(
+                        "zb_str_of_int",
+                        vec![bitand(line.e(), int((1i64 << LINE_BITS) - 1))],
+                        string(),
+                    ),
                 ),
                 text(": "),
                 message.e(),
@@ -1193,10 +1205,14 @@ fn raising(t: &Types) -> Vec<Decl> {
         &[&v, &level],
         unit(),
         vec![
+            // A stripped chunk's line is none to `error`.
             if_(
                 and(
                     and(not(is_nil(v.e())), eq(category(v.e()), int(STR))),
-                    gt(level.e(), int(0)),
+                    and(
+                        gt(level.e(), int(0)),
+                        not(stripped_line(read_global(LINE, i64()))),
+                    ),
                 ),
                 vec![expr(call(
                     "zl_raise_value",
@@ -1218,7 +1234,7 @@ fn raising(t: &Types) -> Vec<Decl> {
             if_(
                 and(
                     and(not(is_nil(v.e())), eq(category(v.e()), int(STR))),
-                    gt(line.e(), int(0)),
+                    and(gt(line.e(), int(0)), not(stripped_line(line.e()))),
                 ),
                 vec![expr(call(
                     "zl_raise_value",
