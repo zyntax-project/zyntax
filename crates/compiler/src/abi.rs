@@ -9,6 +9,8 @@
 //!
 //! * a scalar, a pointer, a vector and a function pointer travel as
 //!   themselves;
+//! * a `Void` parameter travels as a byte nothing reads, so the
+//!   parameters after it keep their registers;
 //! * a struct of one scalar field travels as that scalar;
 //! * any other struct, and an array, travels as the address of its
 //!   storage;

@@ -275,3 +275,47 @@ fn a_site_asked_during_an_entry_count_promotion_gets_the_optimizing_tier() {
     }
     assert!(transfers > 0, "no frame moved to a resume point in 20 runs");
 }
+
+/// A frame leaves into a region the optimizing tier compiled, whose
+/// parameters include a loop value of no type: every parameter after it
+/// reaches the region where the region reads it, and the list the
+/// region returns is the one the frame filled. The frame asks while
+/// its loop is warm, which takes the warm-up worker; whether the region
+/// is promoted before the frame leaves is up to timing, so the program
+/// runs until it has been, each run answering as CPython does.
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn a_region_taking_a_void_loop_value_gets_the_parameters_after_it() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/void_loop_value.py");
+    let mut entered = false;
+    for _ in 0..5 {
+        let output = Command::new(env!("CARGO_BIN_EXE_zypy"))
+            .arg("run")
+            .arg(&script)
+            .env("ZYPY_LLVM", "1")
+            .env("ZYNTAX_OSR_TRACE", "1")
+            .env_remove("ZYNTAX_DISABLE_WARM_UP")
+            .output()
+            .expect("zypy starts");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stdout.trim(), "71 900854.0", "{stderr}");
+        let site = stderr
+            .lines()
+            .find(|l| l.starts_with("[osr] main site=") && l.ends_with("outlined resume point"))
+            .and_then(|l| l.split("site=").nth(1))
+            .and_then(|s| s.split(':').next());
+        let promoted = stderr.find("(main$resume0) at tier 1");
+        if let (Some(site), Some(promoted)) = (site, promoted)
+            && stderr[promoted..].contains(&format!("interpreted frame leaves at site={site} "))
+        {
+            entered = true;
+            break;
+        }
+    }
+    assert!(
+        entered,
+        "in 5 runs the frame never entered the region after its promotion"
+    );
+}

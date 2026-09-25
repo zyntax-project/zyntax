@@ -642,9 +642,12 @@ impl<'ctx> LLVMBackend<'ctx> {
     }
 
     /// The register form of a value of `ty` that travels as itself: a
-    /// struct of one scalar field is that scalar.
+    /// struct of one scalar field is that scalar, and `Void` the byte
+    /// Cranelift passes for it, which nothing reads. Without that byte
+    /// every later parameter would sit one register early.
     fn direct_type(&self, ty: &HirType) -> CompilerResult<BasicTypeEnum<'ctx>> {
         match ty {
+            HirType::Void => Ok(self.context.i8_type().into()),
             HirType::Struct(s) => match crate::abi::struct_carried_as_its_field(s) {
                 Some(field) => self.translate_type(field),
                 None => self.translate_type(ty),
@@ -1058,6 +1061,9 @@ impl<'ctx> LLVMBackend<'ctx> {
                 {
                     self.wrap_in_struct(raw, &param.ty)?
                 }
+                // The body holds a `Void` as the empty struct, whatever
+                // the parameter arrived as.
+                HirType::Void => self.translate_type(&param.ty)?.const_zero(),
                 _ => raw,
             };
             params.push(value);
@@ -1462,7 +1468,13 @@ impl<'ctx> LLVMBackend<'ctx> {
             let want: BasicTypeEnum<'ctx> = (*want).try_into().map_err(|_| {
                 CompilerError::CodeGen(format!("OSR re-entry parameter {i} is not a value"))
             })?;
-            let Some(slot) = slots.get(i).copied().flatten() else {
+            // Nothing reads a `Void`, so none is loaded from the frame.
+            let Some(slot) = slots
+                .get(i)
+                .copied()
+                .flatten()
+                .filter(|slot| layout.live_in_types.get(*slot) != Some(&HirType::Void))
+            else {
                 args.push(want.const_zero().into());
                 continue;
             };
@@ -4776,6 +4788,10 @@ impl<'ctx> LLVMBackend<'ctx> {
             None => None,
         };
         for ((arg, ty), pass) in args.iter().zip(&callee.params).zip(&callee.abi.params) {
+            if *pass == Pass::Direct && *ty == HirType::Void {
+                arg_values.push(self.direct_type(ty)?.const_zero().into());
+                continue;
+            }
             let value = self.get_value(*arg)?;
             match pass {
                 Pass::Pointer => {
