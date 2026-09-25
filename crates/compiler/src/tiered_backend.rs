@@ -317,6 +317,321 @@ fn tier_body(
     module.functions.get(&func_id).map(|f| Arc::new(f.clone()))
 }
 
+impl OptimizedBodies {
+    /// An empty cell in place of `id`'s, if that cell still holds `body`:
+    /// a cell a reload filled since keeps the reload's body. The next
+    /// request for the body makes it again, once, in the new cell.
+    fn release(&self, id: HirId, body: &Arc<HirFunction>) -> bool {
+        let mut cells = self.0.write().unwrap();
+        let holds = cells
+            .get(&id)
+            .and_then(|cell| cell.get())
+            .is_some_and(|held| Arc::ptr_eq(held, body));
+        if holds {
+            cells.insert(id, BodyCell::default());
+        }
+        holds
+    }
+}
+
+/// Whether the optimised body of a function is kept once every tier
+/// that compiles it has: a body small enough to be inlined is what a
+/// caller optimised later inlines.
+fn kept_for_inlining(body: &HirFunction) -> bool {
+    crate::inline::may_inline(body)
+}
+
+/// A body at least this many instructions long whose first interpreted
+/// frame returns before the function has native code is let go then:
+/// such a body is mostly run once, and costs more kept than made again.
+const RUN_ONCE_INSTRUCTIONS: usize = 512;
+
+/// What the interpreter was given of one lazy function.
+#[derive(Default)]
+struct FrameBodies {
+    /// The body made for the interpreter's first runs, while it is kept:
+    /// until the function has native code, or, for a large body, until
+    /// its first frame returns. A frame running it holds it besides.
+    interp: Option<Arc<HirFunction>>,
+    /// The body `interp` held last, while anyone holds it.
+    interp_weak: std::sync::Weak<HirFunction>,
+    /// The tier body last handed to the interpreter, while a frame
+    /// running it holds it.
+    tier_weak: std::sync::Weak<HirFunction>,
+    /// An interp body was made; one made after it was let go is kept
+    /// until the function has native code.
+    made: bool,
+    remade: bool,
+}
+
+impl FrameBodies {
+    /// The interp body, while anyone holds it.
+    fn interp(&self) -> Option<Arc<HirFunction>> {
+        self.interp.clone().or_else(|| self.interp_weak.upgrade())
+    }
+}
+
+/// The interp bodies of the lazy functions, by function id.
+type InterpBodies = Mutex<HashMap<HirId, FrameBodies>>;
+
+/// The interp body of `func_id`: the one held, else one made now.
+#[allow(clippy::type_complexity)]
+fn interp_body(
+    bodies: &InterpBodies,
+    func_id: HirId,
+    bead_id: u64,
+    make: Option<&Arc<dyn Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync>>,
+) -> Option<Arc<HirFunction>> {
+    if let Some(body) = bodies
+        .lock()
+        .unwrap()
+        .get(&func_id)
+        .and_then(FrameBodies::interp)
+    {
+        return Some(body);
+    }
+    let body = make?(bead_id)?;
+    let mut bodies = bodies.lock().unwrap();
+    let entry = bodies.entry(func_id).or_default();
+    if let Some(body) = entry.interp() {
+        return Some(body);
+    }
+    entry.remade |= entry.made;
+    entry.made = true;
+    entry.interp_weak = Arc::downgrade(&body);
+    entry.interp = Some(Arc::clone(&body));
+    Some(body)
+}
+
+/// Let `func_id`'s interp body go; a frame running it keeps it alive
+/// for as long as it runs.
+fn release_interp_body(bodies: &InterpBodies, func_id: HirId) {
+    if let Some(entry) = bodies.lock().unwrap().get_mut(&func_id) {
+        entry.interp = None;
+    }
+}
+
+fn instruction_count(f: &HirFunction) -> usize {
+    f.blocks.values().map(|b| b.instructions.len()).sum()
+}
+
+/// The functions `f` calls directly.
+fn direct_callees(f: &HirFunction) -> impl Iterator<Item = HirId> + '_ {
+    use crate::hir::{HirCallable, HirInstruction, HirTerminator};
+    f.blocks.values().flat_map(|b| {
+        let calls = b.instructions.iter().filter_map(|inst| match inst {
+            HirInstruction::Call {
+                callee: HirCallable::Function(target),
+                ..
+            } => Some(*target),
+            _ => None,
+        });
+        let invoke = match &b.terminator {
+            HirTerminator::Invoke {
+                callee: HirCallable::Function(target),
+                ..
+            } => Some(*target),
+            _ => None,
+        };
+        calls.chain(invoke)
+    })
+}
+
+/// A module the program's lazy functions are optimised in, one at a
+/// time: the module's declarations and extern functions, and of its
+/// defined functions those an optimised body reaches through direct
+/// calls, each copied in when first reached. Every function in it has
+/// its direct callees in it too, which is all any pass reads of a
+/// function other than the one it optimises; what the passes know of
+/// the module as a whole comes from [`Facts`].
+struct Scratch {
+    module: HirModule,
+    /// The functions of `module` through the pipeline in it.
+    done: HashSet<HirId>,
+}
+
+impl Scratch {
+    /// The scratch of `module` in `slots`, made if none is.
+    fn of<'a>(slots: &'a mut HashMap<usize, Scratch>, module: &Arc<HirModule>) -> &'a mut Scratch {
+        let key = Arc::as_ptr(module) as usize;
+        slots.entry(key).or_insert_with(|| {
+            let started = web_time::Instant::now();
+            let externs = module
+                .functions
+                .iter()
+                .filter(|(_, f)| f.is_external)
+                .map(|(id, f)| {
+                    let mut f = f.clone();
+                    f.attributes.optimized = true;
+                    f.attributes.deferred = true;
+                    (*id, f)
+                })
+                .collect();
+            let scratch = HirModule {
+                id: module.id,
+                name: module.name,
+                functions: externs,
+                globals: module.globals.clone(),
+                types: module.types.clone(),
+                imports: module.imports.clone(),
+                exports: module.exports.clone(),
+                version: module.version,
+                dependencies: module.dependencies.clone(),
+                effects: module.effects.clone(),
+                handlers: module.handlers.clone(),
+                automatic_release: module.automatic_release,
+            };
+            if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                eprintln!(
+                    "[lazy] scratch module made in {:.2} ms on {}",
+                    started.elapsed().as_secs_f64() * 1e3,
+                    std::thread::current().name().unwrap_or("?")
+                );
+            }
+            Scratch {
+                module: scratch,
+                done: HashSet::new(),
+            }
+        })
+    }
+
+    /// Copy in `roots` and every function they reach through direct
+    /// calls that is not in yet, each marked through the pipeline and
+    /// deferred, so a pass that walks the module touches the one being
+    /// optimised alone. A program function whose cell is filled goes in
+    /// as its cell holds it, so a body optimised later inlines it as
+    /// every tier runs it; one that arrived optimised stays as it
+    /// arrived, box readers and all, as the release pass reads it.
+    fn reach(
+        &mut self,
+        roots: impl IntoIterator<Item = HirId>,
+        module: &HirModule,
+        bodies: &OptimizedBodies,
+        program: &HashSet<HirId>,
+    ) {
+        let mut work: Vec<HirId> = roots.into_iter().collect();
+        while let Some(id) = work.pop() {
+            if self.module.functions.contains_key(&id) {
+                continue;
+            }
+            let Some(lowered) = module.functions.get(&id) else {
+                continue;
+            };
+            let optimized = program.contains(&id).then(|| bodies.get(id)).flatten();
+            let mut f = match optimized {
+                Some(body) => {
+                    self.done.insert(id);
+                    (*body).clone()
+                }
+                None => lowered.clone(),
+            };
+            f.attributes.optimized = true;
+            f.attributes.deferred = true;
+            work.extend(direct_callees(&f));
+            self.module.functions.insert(id, f);
+        }
+    }
+}
+
+/// The scratch modules of one lazy compiler, and the optimisations under
+/// way in them. They are let go once none is under way and no compile
+/// is waiting, and made again as asked.
+#[derive(Default)]
+struct Scratches {
+    slots: Mutex<HashMap<usize, Scratch>>,
+    pending: std::sync::atomic::AtomicUsize,
+}
+
+impl Scratches {
+    /// Note an optimisation about to use a scratch, until the returned
+    /// guard drops; `quiet` answers whether no compile is waiting.
+    fn enter<'a>(&'a self, quiet: &'a (dyn Fn() -> bool + Send + Sync)) -> ScratchUse<'a> {
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ScratchUse {
+            scratches: self,
+            quiet,
+        }
+    }
+
+    /// Let every scratch go, once the optimisation in one, if any, is
+    /// done.
+    fn clear(&self) {
+        let gone = std::mem::take(&mut *self.slots.lock().unwrap());
+        drop(gone);
+    }
+
+    /// Let every scratch go if no optimisation is under way.
+    fn release_if_unused(&self) {
+        let mut slots = self.slots.lock().unwrap();
+        if self.pending.load(std::sync::atomic::Ordering::SeqCst) != 0 || slots.is_empty() {
+            return;
+        }
+        let gone = std::mem::take(&mut *slots);
+        drop(slots);
+        drop(gone);
+    }
+}
+
+struct ScratchUse<'a> {
+    scratches: &'a Scratches,
+    quiet: &'a (dyn Fn() -> bool + Send + Sync),
+}
+
+impl Drop for ScratchUse<'_> {
+    fn drop(&mut self) {
+        let last = self
+            .scratches
+            .pending
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1;
+        if last && (self.quiet)() {
+            self.scratches.release_if_unused();
+        }
+    }
+}
+
+/// What the passes know of each module as a whole, built once, by the
+/// first thread that needs it: the release pass's facts, and the call
+/// cycles the inliner keeps within. A linked library's functions carry
+/// their facts, so the build covers the program's own.
+#[derive(Default)]
+struct Facts {
+    facts: Mutex<HashMap<usize, Arc<crate::drop_insert::ModuleFacts>>>,
+    caches: Mutex<HashMap<usize, Arc<crate::OptCache>>>,
+}
+
+impl Facts {
+    fn of(&self, module: &Arc<HirModule>) -> Arc<crate::drop_insert::ModuleFacts> {
+        let key = Arc::as_ptr(module) as usize;
+        let mut built = self.facts.lock().unwrap();
+        Arc::clone(built.entry(key).or_insert_with(|| {
+            let started = web_time::Instant::now();
+            let facts = Arc::new(crate::drop_insert::facts_of(module));
+            if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                eprintln!(
+                    "[lazy] release facts built in {:.2} ms on {}",
+                    started.elapsed().as_secs_f64() * 1e3,
+                    std::thread::current().name().unwrap_or("?")
+                );
+            }
+            facts
+        }))
+    }
+
+    /// The pipeline's cache for `module`, over the module as lowered:
+    /// inlining keeps every function's reach, so its call cycles hold
+    /// for the bodies optimised since.
+    fn cache(&self, module: &Arc<HirModule>) -> Arc<crate::OptCache> {
+        let key = Arc::as_ptr(module) as usize;
+        if let Some(cache) = self.caches.lock().unwrap().get(&key) {
+            return Arc::clone(cache);
+        }
+        let cache = Arc::new(crate::OptCache::with_facts(self.of(module), module));
+        Arc::clone(self.caches.lock().unwrap().entry(key).or_insert(cache))
+    }
+}
+
 /// What the tier above answered a bead's promotion request with, kept
 /// per bead and tier so the answer is not worked out again.
 #[derive(Clone, Copy)]
@@ -391,6 +706,15 @@ impl CompileQueue {
     /// Whether the worker would take a request now.
     fn idle(&self) -> bool {
         !self.busy.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether the worker is in no job and no request waits for it.
+    fn quiet(&self) -> bool {
+        if !self.idle() {
+            return false;
+        }
+        let promote = self.promote.lock().unwrap().is_empty();
+        promote && self.compile.lock().unwrap().is_empty()
     }
 
     /// Whether a compile of `bead_id` was asked for already.
@@ -567,7 +891,7 @@ type FirstCompiles = (
 struct QuickBaseline {
     /// The program's own lazy functions; a finished one arrived optimised.
     lazy: HashSet<HirId>,
-    interp_bodies: Arc<Mutex<HashMap<HirId, Arc<HirFunction>>>>,
+    interp_bodies: Arc<InterpBodies>,
     #[allow(clippy::type_complexity)]
     make_interp_body: Option<Arc<dyn Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync>>,
     /// What each quick baseline's call cell held when it was published:
@@ -588,17 +912,12 @@ impl QuickBaseline {
         {
             return None;
         }
-        if let Some(body) = self.interp_bodies.lock().unwrap().get(&func_id) {
-            return Some(Arc::clone(body));
-        }
-        let body = self.make_interp_body.as_ref()?(bead_id)?;
-        Some(Arc::clone(
-            self.interp_bodies
-                .lock()
-                .unwrap()
-                .entry(func_id)
-                .or_insert(body),
-        ))
+        interp_body(
+            &self.interp_bodies,
+            func_id,
+            bead_id,
+            self.make_interp_body.as_ref(),
+        )
     }
 
     fn note_published(&self, bead_id: u64) {
@@ -744,9 +1063,12 @@ pub struct TieredBackend {
     optimize_extra: Option<Arc<dyn Fn(u64, HirFunction, bool) -> HirFunction + Send + Sync>>,
     /// The body the interpreter runs a lazy function's first calls on:
     /// the module's, as lowered, with its releases placed (see
-    /// [`Self::interpreter_body_source`]). Made at the first run and
-    /// kept: the sites a frame on it asks at are this body's.
-    interp_bodies: Arc<Mutex<HashMap<HirId, Arc<HirFunction>>>>,
+    /// [`Self::interpreter_body_source`]). Made at the first run, and
+    /// found by a frame running it for as long as it runs: the sites the
+    /// frame asks at are this body's.
+    interp_bodies: Arc<InterpBodies>,
+    /// The current lazy compiler's scratch modules.
+    scratches: Arc<Scratches>,
     /// Makes an entry of `interp_bodies` for a bead. Installed with the
     /// lazy compiler.
     #[allow(clippy::type_complexity)]
@@ -880,6 +1202,7 @@ impl TieredBackend {
             static_hot: HashMap::new(),
             optimize_extra: None,
             interp_bodies: Arc::new(Mutex::new(HashMap::new())),
+            scratches: Arc::new(Scratches::default()),
             make_interp_body: None,
             current_module: None,
             loaded: Vec::new(),
@@ -1836,6 +2159,8 @@ impl TieredBackend {
         // The promotion requester captured each function's body when it
         // was installed; reinstall so a later promotion compiles the
         // edited bodies rather than the ones it captured.
+        // A scratch holds the bodies it copied in before the swap.
+        self.scratches.clear();
         self.install_promotion_requester();
 
         // A reload that changed nothing keeps the previous undo record:
@@ -1918,6 +2243,7 @@ impl TieredBackend {
             }
         }
 
+        self.scratches.clear();
         self.install_promotion_requester();
         Ok(restored)
     }
@@ -2580,19 +2906,54 @@ impl TieredBackend {
         let finished = self.finished.clone();
         Box::new(move |id: HirId| {
             let bead = beads.get(&id)?;
-            if let Some(body) = optimized_bodies.get(id) {
+            let tier = match optimized_bodies.get(id) {
+                Some(body) => Some(body),
+                None if finished.contains(&id) => Some(osr::lazy_optimized_body(*bead)?),
+                None => None,
+            };
+            if let Some(body) = tier {
+                interp_bodies
+                    .lock()
+                    .unwrap()
+                    .entry(id)
+                    .or_default()
+                    .tier_weak = Arc::downgrade(&body);
                 return Some(body);
             }
-            if finished.contains(&id) {
-                return osr::lazy_optimized_body(*bead);
+            interp_body(&interp_bodies, id, *bead, make_interp_body.as_ref())
+        })
+    }
+
+    /// What the interpreter tells when the first frame run from a body
+    /// [`Self::interpreter_body_source`] gave returns: the interp body is
+    /// let go once the function has native code, or then for a large
+    /// body the first time, which is mostly run once. Answers whether
+    /// it was.
+    pub fn interpreter_frame_exit_hook(&self) -> Box<dyn FnMut(HirId) -> bool + Send> {
+        let beads: HashMap<HirId, TieredBound> = self
+            .functions
+            .iter()
+            .filter(|(id, _)| self.lazy.contains(id))
+            .map(|(id, e)| (*id, e.bound.clone()))
+            .collect();
+        let interp_bodies = Arc::clone(&self.interp_bodies);
+        Box::new(move |id: HirId| {
+            let Some(bound) = beads.get(&id) else {
+                return false;
+            };
+            let mut bodies = interp_bodies.lock().unwrap();
+            let Some(entry) = bodies.get_mut(&id) else {
+                return false;
+            };
+            let Some(body) = &entry.interp else {
+                return false;
+            };
+            let native = bound.bead().compiled().is_some();
+            if native || (!entry.remade && instruction_count(body) >= RUN_ONCE_INSTRUCTIONS) {
+                entry.interp = None;
+                return true;
             }
-            if let Some(body) = interp_bodies.lock().unwrap().get(&id) {
-                return Some(Arc::clone(body));
-            }
-            let body = make_interp_body.as_ref()?(*bead)?;
-            Some(Arc::clone(
-                interp_bodies.lock().unwrap().entry(id).or_insert(body),
-            ))
+            false
         })
     }
 
@@ -2771,91 +3132,24 @@ impl TieredBackend {
             None => (HashMap::new(), HashSet::new()),
         };
         // The program's own bodies were left as lowered. Each is
-        // optimised on its own at its first compile, in one scratch copy
-        // of the module: a body optimised earlier is what a later one
+        // optimised on its own at its first compile, in a scratch module
+        // (see [`Scratch`]): a body optimised earlier is what a later one
         // inlines, and what the passes know about the module as a whole
         // is built once, since optimising a body changes none of it.
-        struct Scratch {
-            module: HirModule,
-            cache: crate::OptCache,
-            /// The functions of `module` through the pipeline in it.
-            done: HashSet<HirId>,
-        }
-        // One scratch per module: a program that compiles a chunk of
-        // itself has bodies in more than one.
-        impl Scratch {
-            /// The scratch of `module` in `slots`, made if none is: every
-            /// function marked through the pipeline and deferred, so a
-            /// pass that walks the module touches the one being optimised
-            /// alone. A program function whose cell is filled goes in as
-            /// its cell holds it, so a body optimised later inlines it as
-            /// every tier runs it; one that arrived optimised stays as it
-            /// arrived, box readers and all, as the release pass reads it.
-            fn of<'a>(
-                slots: &'a mut HashMap<usize, Scratch>,
-                module: &Arc<HirModule>,
-                facts: &Facts,
-                bodies: &OptimizedBodies,
-                program: &HashSet<HirId>,
-            ) -> &'a mut Scratch {
-                let key = Arc::as_ptr(module) as usize;
-                slots.entry(key).or_insert_with(|| {
-                    let started = web_time::Instant::now();
-                    let facts = facts.of(module);
-                    let mut module: HirModule = (**module).clone();
-                    let mut done = HashSet::new();
-                    for (id, f) in module.functions.iter_mut() {
-                        if program.contains(id)
-                            && let Some(body) = bodies.get(*id)
-                        {
-                            *f = (*body).clone();
-                            done.insert(*id);
-                        }
-                        f.attributes.optimized = true;
-                        f.attributes.deferred = true;
-                    }
-                    let cache = crate::OptCache::with_facts(facts, &module);
-                    if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
-                        eprintln!(
-                            "[lazy] scratch module made in {:.2} ms on {}",
-                            started.elapsed().as_secs_f64() * 1e3,
-                            std::thread::current().name().unwrap_or("?")
-                        );
-                    }
-                    Scratch {
-                        module,
-                        cache,
-                        done,
-                    }
-                })
-            }
-        }
-        /// What the release pass knows of each module, built once, by
-        /// the first thread that needs it. A linked library's functions
-        /// carry their facts, so the build covers the program's own.
-        #[derive(Default)]
-        struct Facts(Mutex<HashMap<usize, Arc<crate::drop_insert::ModuleFacts>>>);
-        impl Facts {
-            fn of(&self, module: &Arc<HirModule>) -> Arc<crate::drop_insert::ModuleFacts> {
-                let key = Arc::as_ptr(module) as usize;
-                let mut built = self.0.lock().unwrap();
-                Arc::clone(built.entry(key).or_insert_with(|| {
-                    let started = web_time::Instant::now();
-                    let facts = Arc::new(crate::drop_insert::facts_of(module));
-                    if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
-                        eprintln!(
-                            "[lazy] release facts built in {:.2} ms on {}",
-                            started.elapsed().as_secs_f64() * 1e3,
-                            std::thread::current().name().unwrap_or("?")
-                        );
-                    }
-                    facts
-                }))
-            }
-        }
         let facts: Arc<Facts> = Arc::new(Facts::default());
-        let optimized: Arc<Mutex<HashMap<usize, Scratch>>> = Arc::new(Mutex::new(HashMap::new()));
+        let optimized: Arc<Scratches> = Arc::new(Scratches::default());
+        self.scratches = Arc::clone(&optimized);
         let scratch_shared = Arc::clone(&optimized);
+        // The queue is made after the closures below, which read it
+        // through this cell once it exists.
+        let queue_for_callees: Arc<Mutex<Option<Arc<CompileQueue>>>> = Arc::new(Mutex::new(None));
+        let queue_cell = Arc::clone(&queue_for_callees);
+        // Whether no compile waits for the worker, which would take a
+        // scratch again.
+        let quiet: Arc<dyn Fn() -> bool + Send + Sync> = {
+            let queue = Arc::clone(&queue_for_callees);
+            Arc::new(move || queue.lock().unwrap().as_ref().is_none_or(|q| q.quiet()))
+        };
         // The optimised body outlives the baseline compile for the tier
         // above it; a ladder that ends at the baseline drops it then.
         #[cfg(feature = "llvm-backend")]
@@ -2897,6 +3191,7 @@ impl TieredBackend {
             let finished = finished.clone();
             let lazy = lazy.clone();
             let finish = Arc::clone(&finish);
+            let quiet = Arc::clone(&quiet);
             move |bead_id: u64| -> Option<Arc<HirFunction>> {
                 let (func_id, module_arc) = by_bead.get(&bead_id)?;
                 let cell = optimized_bodies.cell(*func_id)?;
@@ -2918,9 +3213,10 @@ impl TieredBackend {
                     }
                     // The scratch is held until the body is in the cell's
                     // hands, so no other caller sees it half made.
-                    let mut optimized = optimized.lock().unwrap();
-                    let scratch =
-                        Scratch::of(&mut optimized, module_arc, &facts, &optimized_bodies, &lazy);
+                    let _using = optimized.enter(&*quiet);
+                    let mut slots = optimized.slots.lock().unwrap();
+                    let scratch = Scratch::of(&mut slots, module_arc);
+                    scratch.reach([*func_id], module_arc, &optimized_bodies, &lazy);
                     if !scratch.done.contains(func_id) {
                         let f = scratch
                             .module
@@ -2941,7 +3237,10 @@ impl TieredBackend {
                                 &format!("{name}-lowered"),
                             );
                         }
-                        crate::run_interp_safe_opts_cached(&mut scratch.module, &scratch.cache);
+                        crate::run_interp_safe_opts_cached(
+                            &mut scratch.module,
+                            &facts.cache(module_arc),
+                        );
                         scratch.done.insert(*func_id);
                     }
                     let f = scratch
@@ -2988,6 +3287,7 @@ impl TieredBackend {
             let optimized_bodies = Arc::clone(&optimized_bodies);
             let finish = Arc::clone(&finish);
             let lazy = lazy.clone();
+            let quiet = Arc::clone(&quiet);
             move |bead_id: u64, mut f: HirFunction, already_optimized: bool| -> HirFunction {
                 if already_optimized {
                     finish(&mut f);
@@ -3000,12 +3300,14 @@ impl TieredBackend {
                 let Some(module_arc) = by_bead.get(&bead_id) else {
                     return f;
                 };
-                let mut optimized = optimized.lock().unwrap();
-                let scratch =
-                    Scratch::of(&mut optimized, module_arc, &facts, &optimized_bodies, &lazy);
+                let _using = optimized.enter(&*quiet);
+                let mut slots = optimized.slots.lock().unwrap();
+                let scratch = Scratch::of(&mut slots, module_arc);
+                let callees: Vec<HirId> = direct_callees(&f).collect();
+                scratch.reach(callees, module_arc, &optimized_bodies, &lazy);
                 let id = f.id;
                 scratch.module.functions.insert(id, f);
-                crate::run_interp_safe_opts_cached(&mut scratch.module, &scratch.cache);
+                crate::run_interp_safe_opts_cached(&mut scratch.module, &facts.cache(module_arc));
                 // No pass removes a function, so it is there to take back.
                 let mut f = scratch
                     .module
@@ -3049,10 +3351,6 @@ impl TieredBackend {
         }));
         // What compiling a function on its first call does, once off the
         // caller's stack.
-        // The queue is made after this closure, which reads it through
-        // this cell once it exists.
-        let queue_for_callees: Arc<Mutex<Option<Arc<CompileQueue>>>> = Arc::new(Mutex::new(None));
-        let queue_cell = Arc::clone(&queue_for_callees);
         let bead_of: HashMap<HirId, u64> =
             by_bead.iter().map(|(b, (id, _, _))| (*id, *b)).collect();
         let published = Arc::clone(&done);
@@ -3191,6 +3489,7 @@ impl TieredBackend {
                         quick_baseline.note_published(bead_id);
                     }
                     publish(entry as usize, true);
+                    release_interp_body(&quick_baseline.interp_bodies, *func_id);
                     queue.request_replacement(bead_id);
                     if trace {
                         eprintln!(
@@ -3267,13 +3566,6 @@ impl TieredBackend {
                     bound.bead().eager_install(entry);
                 }
             }
-            // A body with a loop is kept for the resume points an
-            // interpreted frame of it may still ask for; without one, or
-            // a tier above, the compile was its last reader, and its
-            // cell is let go for an empty one.
-            if !keeps_bodies && osr::find_loop_headers(&body).is_empty() {
-                optimized_bodies.replace(*func_id, BodyCell::default());
-            }
             publish(entry as usize, false);
             // A promotion held for the quick baseline goes ahead now
             // that its optimised body exists. Taken after the publish,
@@ -3287,6 +3579,15 @@ impl TieredBackend {
             }
             if keeps_bodies && static_hot.contains(&bead_id) {
                 promote_static_hot(bead_id, &body);
+            }
+            // Calls from here on run the code. A frame still interpreting
+            // holds the body it runs, and finds it by that, so the interp
+            // body goes. A ladder that ends here had its last reader of
+            // the optimised body in this compile, but for a caller
+            // optimised later that inlines it.
+            release_interp_body(&quick_baseline.interp_bodies, *func_id);
+            if !keeps_bodies && !kept_for_inlining(&body) {
+                optimized_bodies.release(*func_id, &body);
             }
             // `ZYNTAX_TRACE_LAZY=1` names each first-call compile with
             // the time it took, the wait for the backend included, what
@@ -3352,7 +3653,6 @@ impl TieredBackend {
                 .stack_size(16 << 20)
                 .spawn(move || {
                     ON_WARM_UP.with(|on| on.set(true));
-                    let mut idle_since: Option<web_time::Instant> = None;
                     loop {
                         if stop.load(std::sync::atomic::Ordering::Acquire) {
                             return;
@@ -3360,11 +3660,9 @@ impl TieredBackend {
                         queue.busy.store(true, std::sync::atomic::Ordering::Release);
                         match queue.take() {
                             Some(Job::Promote(bead_id, site)) => {
-                                idle_since = None;
                                 queue.run_promotions(bead_id, site);
                             }
                             Some(Job::Compile(bead_id, count, at)) => {
-                                idle_since = None;
                                 if queue.still_wanted(bead_id, count, at) {
                                     compile(bead_id, false);
                                 } else if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
@@ -3374,13 +3672,10 @@ impl TieredBackend {
                                 }
                             }
                             None => {
-                                // A quiet spell: the scratch modules the
+                                // Nothing waits: the scratch modules the
                                 // program's functions are optimised in are
                                 // let go, and made again if asked.
-                                let since = *idle_since.get_or_insert_with(web_time::Instant::now);
-                                if since.elapsed() > std::time::Duration::from_millis(250) {
-                                    scratch_shared.lock().unwrap().clear();
-                                }
+                                scratch_shared.release_if_unused();
                                 queue
                                     .busy
                                     .store(false, std::sync::atomic::Ordering::Release);
@@ -3547,10 +3842,19 @@ impl TieredBackend {
                     .iter()
                     .map(|(bead, (id, _, _, module, _))| (*bead, (*id, Arc::clone(module))))
                     .collect();
+                let bodies = Arc::clone(&self.optimized_bodies);
                 Box::new(move |bead_id: u64, body: &Arc<HirFunction>| {
                     let Some((func_id, module_arc)) = modules.get(&bead_id) else {
                         return;
                     };
+                    // The top of the ladder: a loop-free body has no
+                    // frame left to ask anything of it, but for a
+                    // caller optimised later that inlines it. A body
+                    // with a loop is kept for the resume points a frame
+                    // of the baseline may still ask for.
+                    if osr::find_loop_headers(body).is_empty() && !kept_for_inlining(body) {
+                        bodies.release(*func_id, body);
+                    }
                     let sites = late.lock().unwrap().installed(bead_id);
                     if sites.is_empty() {
                         return;
@@ -3698,7 +4002,7 @@ impl TieredBackend {
                     .lock()
                     .unwrap()
                     .get(&func_id)
-                    .cloned()
+                    .and_then(FrameBodies::interp)
                     .filter(|f| osr::body_tag(f) == body_tag)
                     .map(|f| (f, false))
                     .or_else(|| {
@@ -3732,7 +4036,9 @@ impl TieredBackend {
                                 &module_arc,
                                 ordinal,
                                 &|f| optimize(bead_id, f, optimized),
-                                &outlined_regions,
+                                // Kept for the tier above, when there
+                                // is one.
+                                optimizing.then_some(&*outlined_regions),
                             );
                             if !attempted {
                                 outlined_at.lock().unwrap().remove(&key);
@@ -3750,9 +4056,15 @@ impl TieredBackend {
                         );
                     }
                     // A frame on neither runs the tier body, which is
-                    // made by now.
+                    // made by now, and which the frame holds.
                     (None, _) => {
-                        if let Some(body) = body_now() {
+                        let held = interp_bodies
+                            .lock()
+                            .unwrap()
+                            .get(&func_id)
+                            .and_then(|b| b.tier_weak.upgrade())
+                            .filter(|f| osr::body_tag(f) == body_tag);
+                        if let Some(body) = held.or_else(body_now) {
                             publish_baseline_resume_points(
                                 &cranelift,
                                 func_id,
@@ -3764,6 +4076,14 @@ impl TieredBackend {
                         }
                     }
                 }
+            }
+            // A bead with its baseline, and with the tier above's answer
+            // in, has nothing left to ask of its body, which may have
+            // been let go.
+            if bound.bead().compiled().is_some()
+                && (!optimizing || outcomes.lock().unwrap().contains_key(&(bead_id, tier_idx)))
+            {
+                return true;
             }
             let Some(func_arc) = body_now() else {
                 return false;
@@ -4504,8 +4824,9 @@ fn ensure_baseline(
 /// `optimize` and compiled as a function of its own (see
 /// [`osr::outline`]); the site gets the adapter that enters it. Where the
 /// region cannot stand alone, the baseline's own resume point instead.
-/// The region goes into `regions` under the bead before the site is
-/// published, for the tier above to give the frame resume points of its
+/// The region goes into `regions`, given when there is a tier above,
+/// under the bead before the site is published, for that tier to give
+/// the frame resume points of its
 /// own (see [`promote_outlined_region`]): the frame may ask for that
 /// promotion from the region the moment it is in it. Whether the region
 /// was attempted: false when there was no such loop or no frame waits.
@@ -4518,7 +4839,7 @@ fn publish_outlined_resume_point(
     module_arc: &Arc<HirModule>,
     asked_at: u64,
     optimize: &(dyn Fn(HirFunction) -> HirFunction + Send + Sync),
-    regions: &Mutex<HashMap<u64, Vec<(HirId, Arc<HirFunction>)>>>,
+    regions: Option<&Mutex<HashMap<u64, Vec<(HirId, Arc<HirFunction>)>>>>,
 ) -> bool {
     let def = ZyntaxFunctionDef {
         id: func_id,
@@ -4571,12 +4892,14 @@ fn publish_outlined_resume_point(
         publish_baseline_resume_points(cranelift, func_id, bead_id, func_arc, module_arc, asked_at);
         return true;
     };
-    regions
-        .lock()
-        .unwrap()
-        .entry(bead_id)
-        .or_default()
-        .push((region_id, Arc::new(region)));
+    if let Some(regions) = regions {
+        regions
+            .lock()
+            .unwrap()
+            .entry(bead_id)
+            .or_default()
+            .push((region_id, Arc::new(region)));
+    }
     for (site, code) in sites {
         let code = code as *mut ();
         if !code.is_null() && osr::helper_for(bead_id, site).is_null() {
