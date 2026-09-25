@@ -87,6 +87,7 @@ fn run(case: Case, complete: bool) {
     if let Some(Listed {
         only_on: Some(family),
         issue,
+        ..
     }) = &listed
         && !on_family(family)
     {
@@ -119,7 +120,9 @@ fn run(case: Case, complete: bool) {
         && has_line(&got.stdout, FINAL_OK) == has_line(&expected.stdout, FINAL_OK)
         && last_line(&got.stdout) == last_line(&expected.stdout)
         && message.as_deref().is_none_or(|m| got.message == m);
-    let issue = listed.map(|l| l.issue);
+    let issue = listed
+        .filter(|l| l.fails_on.as_deref().is_none_or(on_family))
+        .map(|l| l.issue);
     println!(
         "{key}: {} in {elapsed:.1?} (exit {}, reference exit {})",
         match (ok, &issue) {

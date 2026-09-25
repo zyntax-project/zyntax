@@ -50,6 +50,8 @@ pub fn official_libs() -> Result<(), String> {
 pub struct Listed {
     pub issue: String,
     pub only_on: Option<String>,
+    /// The family the case is known to fail on; elsewhere it must pass.
+    pub fails_on: Option<String>,
 }
 
 /// The platform families an entry may name.
@@ -62,8 +64,9 @@ pub fn known_failures() -> HashMap<String, Listed> {
         .unwrap_or_default()
 }
 
-/// The entries of a KNOWN_FAILURES text: `<case> <issue> [family]` per
-/// line, `#` starting a comment line.
+/// The entries of a KNOWN_FAILURES text: `<case> <issue> [family]` or
+/// `<case> <issue> failing-on <family>` per line, `#` starting a comment
+/// line.
 pub fn parse_known_failures(text: &str) -> HashMap<String, Listed> {
     let mut out = HashMap::new();
     for line in text.lines() {
@@ -73,8 +76,11 @@ pub fn parse_known_failures(text: &str) -> HashMap<String, Listed> {
         }
         let mut parts = line.split_whitespace();
         if let (Some(case), Some(issue)) = (parts.next(), parts.next()) {
-            let only_on = parts.next().map(str::to_string);
-            if let Some(family) = &only_on {
+            let (only_on, fails_on) = match parts.next() {
+                Some("failing-on") => (None, parts.next().map(str::to_string)),
+                family => (family.map(str::to_string), None),
+            };
+            if let Some(family) = only_on.as_ref().or(fails_on.as_ref()) {
                 assert!(
                     FAMILIES.contains(&family.as_str()),
                     "KNOWN_FAILURES: `{case}` names platform `{family}`; the families are {FAMILIES:?}"
@@ -85,6 +91,7 @@ pub fn parse_known_failures(text: &str) -> HashMap<String, Listed> {
                 Listed {
                     issue: issue.to_string(),
                     only_on,
+                    fails_on,
                 },
             );
         }

@@ -35,7 +35,8 @@
 //! or `linux`: the case's pinned output holds only there, because the
 //! reference's own answer differs elsewhere. On that family the case
 //! runs as any other and must pass; on any other it is not run and is
-//! reported as skipped.
+//! reported as skipped. An entry that ends with `failing-on <family>`
+//! is known to fail on that family only, and must pass on the others.
 //!
 //! ## C modules
 //!
@@ -221,6 +222,7 @@ fn category(name: &str, warm_up: WarmUp) {
             Some(Listed {
                 issue,
                 only_on: Some(family),
+                ..
             }) => {
                 if !on_family(family) {
                     skipped.push((key, format!("pinned for {family} only  ({issue})")));
@@ -230,8 +232,10 @@ fn category(name: &str, warm_up: WarmUp) {
             }
             Some(Listed {
                 issue,
-                only_on: None,
-            }) => Some(issue),
+                fails_on: Some(family),
+                ..
+            }) => on_family(family).then_some(issue),
+            Some(Listed { issue, .. }) => Some(issue),
             None => None,
         };
         if let Some(Err(reason)) = &c_modules
@@ -358,16 +362,19 @@ fn families_parse() {
          official/b.lua 2222222   macos\n\
          official/c.lua 3333333 linux\n\
          stdlib/d.lua 4444444 unix\n\
-         stdlib/e.lua 5555555 windows\n",
+         stdlib/e.lua 5555555 windows\n\
+         official/f.lua 6666666 failing-on linux\n",
     );
     let family = |case: &str| known[case].only_on.as_deref();
-    assert_eq!(known.len(), 5);
+    assert_eq!(known.len(), 6);
     assert_eq!(known["official/a.lua"].issue, "1111111");
     assert_eq!(family("official/a.lua"), None);
     assert_eq!(family("official/b.lua"), Some("macos"));
     assert_eq!(family("official/c.lua"), Some("linux"));
     assert_eq!(family("stdlib/d.lua"), Some("unix"));
     assert_eq!(family("stdlib/e.lua"), Some("windows"));
+    assert_eq!(family("official/f.lua"), None);
+    assert_eq!(known["official/f.lua"].fails_on.as_deref(), Some("linux"));
     assert_eq!(on_family("macos"), cfg!(target_os = "macos"));
     assert_eq!(on_family("linux"), cfg!(target_os = "linux"));
     assert_eq!(on_family("unix"), cfg!(unix));

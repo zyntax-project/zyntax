@@ -9,6 +9,8 @@
 # after its issue: <category>/<file>.lua <issue id> <family>. The case's
 # pinned output then holds only on that family; there it runs as any other
 # case and must pass, and elsewhere it is skipped and reported as skipped.
+# An entry that ends with `failing-on <family>` is known to fail on that
+# family only; everywhere else the case runs and must pass.
 
 # The official files, each run in the configuration all.lua derives from _U.
 official/all.lua              558e28e
@@ -16,7 +18,7 @@ official/closure.lua          558e28e
 official/coroutine.lua        c33bf81
 official/db.lua               cecfe69
 official/errors.lua           8fd93ba
-official/files.lua            8fd93ba
+official/files.lua            5485e5d   failing-on linux
 official/gc.lua               558e28e
 official/gengc.lua            558e28e
 official/literals.lua         98b70eb
