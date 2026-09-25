@@ -739,9 +739,27 @@ const DISPATCH_INSTS: usize = 16;
 /// Whether `callee` is a loop that calls, or a dispatch. Such a callee
 /// is its loop or its arms, and the call it saves by being inlined is
 /// nothing beside them; what it costs is a copy of them at every site.
-/// Calls on its cold paths count: a site copies those arms too.
+/// Calls on its cold paths count: a site copies those arms too. So do
+/// the allocations of a callee that calls anyway: they are work its
+/// calls come with, where in a leaf they are a constructor's.
 fn loops_or_dispatches(callee: &HirFunction, callees: &Callees<'_>) -> bool {
-    let is_call = |inst: &HirInstruction| is_real_call(inst, callees);
+    let calls_anyway = callee
+        .blocks
+        .values()
+        .any(|b| b.instructions.iter().any(|i| is_real_call(i, callees)));
+    let is_call = |inst: &HirInstruction| {
+        is_real_call(inst, callees)
+            || calls_anyway
+                && matches!(
+                    inst,
+                    HirInstruction::Call {
+                        callee: HirCallable::Intrinsic(
+                            crate::hir::Intrinsic::Malloc | crate::hir::Intrinsic::Free
+                        ),
+                        ..
+                    }
+                )
+    };
     let calls: usize = callee
         .blocks
         .values()
@@ -3250,6 +3268,67 @@ mod tests {
         let stats = run_module(&mut module);
         assert_eq!(stats.inlined, 0, "{stats:?}");
         assert_eq!(stats.skipped_cold, 1, "{stats:?}");
+    }
+
+    /// `n` allocations, then `calls` plain calls, then adds past the
+    /// dispatch size.
+    fn allocating(n: usize, calls: usize, helper_id: HirId) -> HirFunction {
+        let mut f = HirFunction::new(
+            InternedString::new_global("allocating"),
+            sig(vec![HirType::I64], HirType::I64),
+        );
+        let entry = HirId::new();
+        f.entry_block = entry;
+        f.blocks.clear();
+        f.blocks.insert(entry, HirBlock::new(entry));
+        let x = add_value_for_param(&mut f, 0, HirType::I64);
+        let size = add_const(&mut f, HirType::I64, HirConstant::I64(8));
+        for _ in 0..n {
+            let ptr = add_inst(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+            let blk = f.blocks.get_mut(&entry).unwrap();
+            blk.instructions.push(HirInstruction::Call {
+                result: Some(ptr),
+                callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc),
+                args: vec![size],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            });
+            blk.instructions.push(HirInstruction::Store {
+                value: x,
+                ptr,
+                align: 8,
+                volatile: false,
+            });
+        }
+        let mut last = x;
+        for _ in 0..calls {
+            last = call_to(&mut f, entry, helper_id, last);
+        }
+        let last = push_adds(&mut f, entry, last, 12);
+        f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Return { values: vec![last] };
+        f
+    }
+
+    /// A constructor is its allocations and stores, whatever their
+    /// number; a callee that calls four times and allocates twice is a
+    /// dispatch.
+    #[test]
+    fn allocations_count_toward_the_dispatch_test_only_where_the_callee_calls() {
+        let helper_id = HirId::new();
+        let leaf_id = HirId::new();
+        let busy_id = HirId::new();
+        let mut functions = IndexMap::new();
+        functions.insert(helper_id, build_extern("helper", false));
+        functions.insert(leaf_id, allocating(6, 0, helper_id));
+        functions.insert(busy_id, allocating(2, 4, helper_id));
+        let changing = HashMap::new();
+        let callees = Callees {
+            stable: &functions,
+            changing: &changing,
+        };
+        assert!(!loops_or_dispatches(&functions[&leaf_id], &callees));
+        assert!(loops_or_dispatches(&functions[&busy_id], &callees));
     }
 }
 
