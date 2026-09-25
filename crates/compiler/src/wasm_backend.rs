@@ -1833,6 +1833,26 @@ impl<'a> FunctionEmitter<'a> {
                 out.push(self.local_set(*result)?);
                 Ok(())
             }
+            // A scalar select; the condition is a bool widened to i64.
+            HirInstruction::Select {
+                result,
+                ty,
+                condition,
+                true_val,
+                false_val,
+            } if !matches!(
+                ty,
+                HirType::Vector(..) | HirType::Struct(_) | HirType::Union(_)
+            ) =>
+            {
+                out.push(self.local_get(*true_val)?);
+                out.push(self.local_get(*false_val)?);
+                out.push(self.local_get(*condition)?);
+                out.push(WasmInst::I32WrapI64);
+                out.push(WasmInst::Select);
+                out.push(self.local_set(*result)?);
+                Ok(())
+            }
             other => Err(WasmEmitError::Unsupported(format!(
                 "instruction {:?}",
                 std::mem::discriminant(other)
@@ -2622,6 +2642,69 @@ mod tests {
         let m = WasmBackend::new()
             .compile_function(&func)
             .expect("emit two-block chain");
+        m.validate_full().expect("module structurally valid");
+    }
+
+    /// `def pick_select(cond: bool): f64 { return cond ? 1.5 : 2.5 }`
+    /// as one `Select` of two float constants.
+    #[test]
+    fn emits_scalar_select() {
+        let cond_id = HirId::new();
+        let sig = HirFunctionSignature {
+            params: vec![HirParam {
+                id: cond_id,
+                name: InternedString::new_global("cond"),
+                ty: HirType::Bool,
+                attributes: ParamAttributes::default(),
+                ownership: ParamOwnership::default(),
+            }],
+            returns: vec![HirType::F64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut func = HirFunction::new(InternedString::new_global("pick_select"), sig);
+        func.values.insert(
+            cond_id,
+            HirValue {
+                id: cond_id,
+                ty: HirType::Bool,
+                kind: HirValueKind::Parameter(0),
+                uses: HashSet::new(),
+                span: None,
+            },
+        );
+        let yes = add_value(
+            &mut func,
+            HirType::F64,
+            HirValueKind::Constant(HirConstant::F64(1.5)),
+        );
+        let no = add_value(
+            &mut func,
+            HirType::F64,
+            HirValueKind::Constant(HirConstant::F64(2.5)),
+        );
+        let picked = add_value(&mut func, HirType::F64, HirValueKind::Instruction);
+        let entry = func.blocks.get_mut(&func.entry_block).unwrap();
+        entry.instructions.push(HirInstruction::Select {
+            result: picked,
+            ty: HirType::F64,
+            condition: cond_id,
+            true_val: yes,
+            false_val: no,
+        });
+        entry.terminator = HirTerminator::Return {
+            values: vec![picked],
+        };
+
+        let m = WasmBackend::new()
+            .compile_function(&func)
+            .expect("emit select");
         m.validate_full().expect("module structurally valid");
     }
 

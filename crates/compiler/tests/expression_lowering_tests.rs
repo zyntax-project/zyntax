@@ -1439,20 +1439,19 @@ fn test_if_expression_lowering() {
 
     let module = result.unwrap();
 
-    // Verify the function was created successfully with proper control flow!
     let func = module.functions.values().next().unwrap();
 
-    // ✅ CFG refactoring (Gap #4) is now complete!
-    // If expressions should create multiple blocks for control flow
-    assert!(
-        func.blocks.len() >= 3,
-        "If expression should create at least 3 blocks (entry, then, else, merge), got {}",
-        func.blocks.len()
-    );
-
-    // Verify there's a phi node in one of the blocks (for merging if result)
+    // Two constant arms need no branch: both are evaluated where the
+    // condition is and one is selected.
+    let has_select = func.blocks.values().any(|block| {
+        block
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, HirInstruction::Select { .. }))
+    });
+    assert!(has_select, "Expected a select for an if of two constants");
     let has_phi = func.blocks.values().any(|block| !block.phis.is_empty());
-    assert!(has_phi, "Expected phi node for if expression merge");
+    assert!(!has_phi, "A selected if expression needs no phi");
 }
 
 #[test]

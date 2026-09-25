@@ -6000,6 +6000,22 @@ impl SsaBuilder {
                 // branch on a value defined in one of them.
                 let cond_block_id = self.continuation_block.take().unwrap_or(block_id);
 
+                // Two small scalar arms that cannot trap or act are both
+                // evaluated where the condition is, and one is selected.
+                if Self::speculatable_scalar(&expr.ty)
+                    && self.speculatable(then_branch, &mut 8)
+                    && self.speculatable(else_branch, &mut 8)
+                {
+                    let then_val = self.translate_expression(cond_block_id, then_branch)?;
+                    let else_val = self.translate_expression(cond_block_id, else_branch)?;
+                    let ty = self.convert_type(&expr.ty);
+                    let result = self.emit_select(cond_block_id, cond_val, then_val, else_val, &ty);
+                    if cond_block_id != block_id {
+                        self.continuation_block = Some(cond_block_id);
+                    }
+                    return Ok(result);
+                }
+
                 // Create blocks for then/else/merge
                 let then_block_id = HirId::new();
                 let else_block_id = HirId::new();
@@ -10881,6 +10897,93 @@ impl SsaBuilder {
         self.add_use(left, result);
         self.add_use(right, result);
         result
+    }
+
+    /// Whether a value of type `ty` is a scalar a select can pick.
+    fn speculatable_scalar(ty: &Type) -> bool {
+        use zyntax_typed_ast::PrimitiveType as P;
+        matches!(
+            ty,
+            Type::Primitive(
+                P::I8
+                    | P::I16
+                    | P::I32
+                    | P::I64
+                    | P::U8
+                    | P::U16
+                    | P::U32
+                    | P::U64
+                    | P::ISize
+                    | P::USize
+                    | P::F32
+                    | P::F64
+                    | P::Bool
+            )
+        )
+    }
+
+    /// Whether `expr` may be evaluated whether or not control would
+    /// reach it: a scalar made of constants, variables, constant parts
+    /// of tuple variables, non-trapping casts and non-trapping
+    /// arithmetic and comparisons, in at most `budget` nodes. Such an
+    /// expression creates no block, calls nothing, stores nothing and
+    /// reads memory only through a variable's own slot.
+    fn speculatable(
+        &self,
+        expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        budget: &mut u32,
+    ) -> bool {
+        use zyntax_typed_ast::PrimitiveType as P;
+        use zyntax_typed_ast::typed_ast::{
+            BinaryOp as B, TypedExpression as E, TypedLiteral as L, UnaryOp as U,
+        };
+        if *budget == 0 || !Self::speculatable_scalar(&expr.ty) {
+            return false;
+        }
+        *budget -= 1;
+        let is_float = |ty: &Type| matches!(ty, Type::Primitive(P::F32 | P::F64));
+        match &expr.node {
+            E::Literal(lit) => matches!(lit, L::Integer(_) | L::Float(_) | L::Bool(_)),
+            E::Variable(_) => true,
+            E::Index(ix) => {
+                matches!(ix.object.node, E::Variable(_))
+                    && matches!(ix.index.node, E::Literal(L::Integer(_)))
+                    && matches!(self.resolve_expr_type(&ix.object), Type::Tuple(_))
+            }
+            // A float converted to an integer may trap.
+            E::Cast(c) => {
+                (!is_float(&c.expr.ty) || is_float(&c.target_type))
+                    && Self::speculatable_scalar(&c.target_type)
+                    && self.speculatable(&c.expr, budget)
+            }
+            E::Binary(b) => {
+                matches!(
+                    b.op,
+                    B::Add
+                        | B::Sub
+                        | B::Mul
+                        | B::BitAnd
+                        | B::BitOr
+                        | B::BitXor
+                        | B::Eq
+                        | B::Ne
+                        | B::Lt
+                        | B::Le
+                        | B::Gt
+                        | B::Ge
+                ) && self.speculatable(&b.left, budget)
+                    && self.speculatable(&b.right, budget)
+            }
+            E::Unary(u) => {
+                matches!(u.op, U::Minus | U::Not) && self.speculatable(&u.operand, budget)
+            }
+            E::If(i) => {
+                self.speculatable(&i.condition, budget)
+                    && self.speculatable(&i.then_branch, budget)
+                    && self.speculatable(&i.else_branch, budget)
+            }
+            _ => false,
+        }
     }
 
     fn emit_select(
