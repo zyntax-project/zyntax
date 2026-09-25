@@ -403,8 +403,8 @@ Memory safety through borrow checking:
 fn longest<'a>(x: &'a str, y: &'a str) -> &'a str
 ```
 
-### Dependent Types
-Value-dependent types (basic):
+### Const Generics
+Fixed-size arrays and const type parameters, with sizes evaluated at compile time:
 ```rust
 Array<T, N: usize>  // size in type
 ```

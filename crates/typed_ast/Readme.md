@@ -18,6 +18,7 @@ The TypedAST crate provides a language-agnostic typed abstract syntax tree and c
 
 ### Advanced Type Features
 - **Generics**: Type parameters with variance and bounds
+- **Const Generics**: Fixed-size arrays and const type parameters, evaluated at compile time
 - **Traits/Interfaces**: Abstract behavior definitions with associated types
 - **Lifetimes**: Borrow checking and ownership analysis
 - **Type Inference**: Hindley-Milner with extensions
@@ -117,7 +118,7 @@ Type
 ├── Pointer (raw or smart pointers)
 ├── Union (sum types)
 ├── Intersection (combined types)
-├── Dependent (value-dependent types)
+├── Const (const generic parameters and const-constrained types)
 └── Effect (computational effects)
 ```
 

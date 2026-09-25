@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use zyntax_typed_ast::AstArena;
 use zyntax_typed_ast::const_evaluator::{ConstConstraint, ConstEvalContext, ConstEvaluator};
-use zyntax_typed_ast::multi_paradigm_checker::Paradigm;
 use zyntax_typed_ast::type_registry::{
     ConstBinaryOp, ConstValue, NullabilityKind, PrimitiveType, Type, TypeId,
 };
@@ -145,35 +144,6 @@ fn test_const_constraints() {
             assert_eq!(constraints.len(), 2);
         }
         _ => panic!("Expected And constraint"),
-    }
-}
-
-/// Test const generics with multi-paradigm checker
-#[test]
-fn test_const_generics_with_multi_paradigm() {
-    // Enable dependent types with const generics
-    let paradigm = Paradigm::Dependent {
-        const_generics: true,
-        refinement_types: false,
-    };
-
-    // Create a type that uses const generics
-    let array_type = Type::Array {
-        element_type: Box::new(Type::Primitive(PrimitiveType::I32)),
-        size: Some(ConstValue::Int(10)),
-        nullability: NullabilityKind::NonNull,
-    };
-
-    // Test that the checker accepts const generic types
-    assert!(array_type.supports_const_generics());
-
-    // Verify the paradigm configuration
-    match paradigm {
-        Paradigm::Dependent {
-            const_generics: true,
-            ..
-        } => {}
-        _ => panic!("Expected dependent paradigm with const generics enabled"),
     }
 }
 

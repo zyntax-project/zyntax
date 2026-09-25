@@ -55,15 +55,6 @@ pub enum Constraint {
         span: Span,
     },
 
-    /// Dependent type constraints
-
-    /// Refinement type constraint: value must satisfy predicate
-    RefinementSatisfies {
-        value: Type,
-        predicate: crate::dependent_types::RefinementPredicate,
-        span: Span,
-    },
-
     /// Dependent function constraint: argument satisfies parameter constraint
     DependentCall {
         func_type: Type,
@@ -84,23 +75,6 @@ pub enum Constraint {
     SingletonEquals {
         value_type: Type,
         constant: ConstValue,
-        span: Span,
-    },
-
-    /// Index constraint for type families: `F[args] = result_type`
-    TypeFamilyApplication {
-        family: Type,
-        indices: Vec<crate::dependent_types::DependentIndex>,
-        result_type: Type,
-        span: Span,
-    },
-
-    /// Conditional type constraint: if condition then type1 else type2
-    ConditionalType {
-        condition: crate::dependent_types::RefinementPredicate,
-        then_type: Type,
-        else_type: Type,
-        result_type: Type,
         span: Span,
     },
 }
@@ -576,12 +550,6 @@ impl ConstraintSolver {
             } => self.solve_higher_ranked_bound(lifetimes, ty, bound, span),
 
             // Dependent type constraints
-            Constraint::RefinementSatisfies {
-                value,
-                predicate,
-                span,
-            } => self.solve_refinement_satisfies(value, predicate, span),
-
             Constraint::DependentCall {
                 func_type,
                 arg_value,
@@ -601,21 +569,6 @@ impl ConstraintSolver {
                 constant,
                 span,
             } => self.solve_singleton_equals(value_type, constant, span),
-
-            Constraint::TypeFamilyApplication {
-                family,
-                indices,
-                result_type,
-                span,
-            } => self.solve_type_family_application(family, indices, result_type, span),
-
-            Constraint::ConditionalType {
-                condition,
-                then_type,
-                else_type,
-                result_type,
-                span,
-            } => self.solve_conditional_type(condition, then_type, else_type, result_type, span),
         }
     }
 
@@ -2480,16 +2433,6 @@ impl ConstraintSolver {
             }
 
             // Dependent type constraints
-            Constraint::RefinementSatisfies {
-                value,
-                predicate,
-                span,
-            } => Constraint::RefinementSatisfies {
-                value: subst.apply(&value),
-                predicate, // Predicates don't contain type variables directly
-                span,
-            },
-
             Constraint::DependentCall {
                 func_type,
                 arg_value,
@@ -2521,32 +2464,6 @@ impl ConstraintSolver {
             } => Constraint::SingletonEquals {
                 value_type: subst.apply(&value_type),
                 constant, // Constants don't contain type variables
-                span,
-            },
-
-            Constraint::TypeFamilyApplication {
-                family,
-                indices,
-                result_type,
-                span,
-            } => Constraint::TypeFamilyApplication {
-                family: subst.apply(&family),
-                indices, // Indices may need substitution but are complex
-                result_type: subst.apply(&result_type),
-                span,
-            },
-
-            Constraint::ConditionalType {
-                condition,
-                then_type,
-                else_type,
-                result_type,
-                span,
-            } => Constraint::ConditionalType {
-                condition, // Predicates don't contain type variables directly
-                then_type: subst.apply(&then_type),
-                else_type: subst.apply(&else_type),
-                result_type: subst.apply(&result_type),
                 span,
             },
         }
@@ -3006,18 +2923,6 @@ impl ConstraintSolver {
             }
 
             // Dependent type constraints
-            Constraint::RefinementSatisfies {
-                value,
-                predicate,
-                span: _,
-            } => {
-                format!(
-                    "{} satisfies refinement {:?}",
-                    self.format_type(value),
-                    predicate
-                )
-            }
-
             Constraint::DependentCall {
                 func_type,
                 arg_value,
@@ -3057,36 +2962,6 @@ impl ConstraintSolver {
                 span: _,
             } => {
                 format!("{} == {:?}", self.format_type(value_type), constant)
-            }
-
-            Constraint::TypeFamilyApplication {
-                family,
-                indices,
-                result_type,
-                span: _,
-            } => {
-                format!(
-                    "{}[{:?}] = {}",
-                    self.format_type(family),
-                    indices,
-                    self.format_type(result_type)
-                )
-            }
-
-            Constraint::ConditionalType {
-                condition,
-                then_type,
-                else_type,
-                result_type,
-                span: _,
-            } => {
-                format!(
-                    "if {:?} then {} else {} = {}",
-                    condition,
-                    self.format_type(then_type),
-                    self.format_type(else_type),
-                    self.format_type(result_type)
-                )
             }
         }
     }
@@ -4047,46 +3922,6 @@ impl ConstraintSolver {
 
     // ===== DEPENDENT TYPE CONSTRAINT SOLVERS =====
 
-    /// Solve refinement predicate constraint
-    fn solve_refinement_satisfies(
-        &mut self,
-        value: Type,
-        predicate: crate::dependent_types::RefinementPredicate,
-        span: Span,
-    ) -> Result<ConstraintResult, Vec<SolverError>> {
-        let value = self.subst.apply(&value);
-
-        match &value {
-            Type::TypeVar(_) => {
-                // Defer until the type variable is resolved
-                Ok(ConstraintResult::Deferred)
-            }
-            _ => {
-                // TODO: This is where SMT solver integration would happen
-                // For now, we'll assume all refinement predicates are satisfiable
-                // In a full implementation, this would:
-                // 1. Convert the predicate to SMT-LIB format
-                // 2. Call an external SMT solver (Z3, CVC4, etc.)
-                // 3. Return based on satisfiability result
-
-                match self.check_predicate_satisfiability(&value, &predicate) {
-                    Ok(true) => Ok(ConstraintResult::Solved),
-                    Ok(false) => {
-                        self.errors.push(SolverError::UnsolvableConstraint(
-                            Constraint::RefinementSatisfies {
-                                value,
-                                predicate,
-                                span,
-                            },
-                        ));
-                        Err(self.errors.clone())
-                    }
-                    Err(_) => Ok(ConstraintResult::Deferred), // Could not determine, defer
-                }
-            }
-        }
-    }
-
     /// Solve dependent function call constraint
     fn solve_dependent_call(
         &mut self,
@@ -4189,87 +4024,7 @@ impl ConstraintSolver {
         }
     }
 
-    /// Solve type family application constraint
-    fn solve_type_family_application(
-        &mut self,
-        family: Type,
-        indices: Vec<crate::dependent_types::DependentIndex>,
-        result_type: Type,
-        span: Span,
-    ) -> Result<ConstraintResult, Vec<SolverError>> {
-        let family = self.subst.apply(&family);
-        let result_type = self.subst.apply(&result_type);
-
-        // TODO: Implement type family evaluation
-        // This would require:
-        // 1. A type-level computation engine
-        // 2. Evaluation of type family applications F[args]
-        // 3. Generating equality constraints with the result
-
-        // For now, defer the constraint
-        Ok(ConstraintResult::Deferred)
-    }
-
-    /// Solve conditional type constraint
-    fn solve_conditional_type(
-        &mut self,
-        condition: crate::dependent_types::RefinementPredicate,
-        then_type: Type,
-        else_type: Type,
-        result_type: Type,
-        span: Span,
-    ) -> Result<ConstraintResult, Vec<SolverError>> {
-        let then_type = self.subst.apply(&then_type);
-        let else_type = self.subst.apply(&else_type);
-        let result_type = self.subst.apply(&result_type);
-
-        // TODO: Evaluate the condition and choose appropriate type
-        // This would require predicate evaluation capability
-
-        // For now, generate constraints for both branches
-        Ok(ConstraintResult::NewConstraints(vec![
-            // Could be either branch - this is a simplification
-            // Real implementation would evaluate the condition
-            Constraint::Equal(then_type, result_type.clone(), span),
-            // Or generate a union type constraint
-        ]))
-    }
-
     // ===== HELPER METHODS FOR DEPENDENT TYPES =====
-
-    /// Check if a refinement predicate is satisfiable for a given type
-    /// Uses SMT solver integration when available
-    fn check_predicate_satisfiability(
-        &self,
-        value_type: &Type,
-        predicate: &crate::dependent_types::RefinementPredicate,
-    ) -> Result<bool, String> {
-        // Try to use SMT solver for satisfiability checking
-        let mut smt_solver = crate::smt_solver::SmtSolver::new();
-
-        if smt_solver.is_available() {
-            let context = std::collections::HashMap::new(); // TODO: build actual context
-            match smt_solver.check_predicate_satisfiable(predicate, value_type, &context) {
-                Ok(crate::smt_solver::SmtResult::Satisfiable) => Ok(true),
-                Ok(crate::smt_solver::SmtResult::Unsatisfiable) => Ok(false),
-                Ok(crate::smt_solver::SmtResult::Unknown) => {
-                    // If SMT solver can't determine, assume satisfiable for safety
-                    Ok(true)
-                }
-                Ok(crate::smt_solver::SmtResult::Error(_)) => {
-                    // Fall back to conservative assumption
-                    Ok(true)
-                }
-                Err(_) => {
-                    // Fall back to conservative assumption
-                    Ok(true)
-                }
-            }
-        } else {
-            // No SMT solver available, assume satisfiable for safety
-            Ok(true)
-        }
-    }
 
     /// Resolve a path through a type definition
     fn resolve_type_path(
@@ -4319,252 +4074,6 @@ impl ConstraintSolver {
             ConstValue::FunctionCall { .. } => Type::Any, // Would need function signature
             ConstValue::BinaryOp { .. } => Type::Any, // Would need operand types
             ConstValue::UnaryOp { .. } => Type::Any, // Would need operand type
-        }
-    }
-
-    // ===== DEPENDENT TYPE TO CONSTRAINT TRANSLATION =====
-
-    /// Convert a dependent type into constraints that can be solved
-    pub fn generate_dependent_type_constraints(
-        &mut self,
-        dependent_type: &crate::dependent_types::DependentType,
-        target_type: Type,
-        span: Span,
-    ) -> Vec<Constraint> {
-        use crate::dependent_types::DependentType;
-
-        match dependent_type {
-            DependentType::Refinement {
-                base_type,
-                predicate,
-                ..
-            } => {
-                let mut constraints = vec![
-                    // First, ensure the target type matches the base type
-                    Constraint::Equal(target_type.clone(), (**base_type).clone(), span),
-                ];
-
-                // Then add the refinement constraint
-                constraints.push(Constraint::RefinementSatisfies {
-                    value: target_type,
-                    predicate: predicate.clone(),
-                    span,
-                });
-
-                constraints
-            }
-
-            DependentType::DependentFunction {
-                param_name,
-                param_type,
-                return_type,
-                ..
-            } => {
-                // For dependent functions (x: T) -> U(x), we need to handle application
-                // This is complex and would need type-level substitution
-                vec![
-                    Constraint::Equal(target_type, Type::Primitive(PrimitiveType::Unit), span), // Placeholder
-                ]
-            }
-
-            DependentType::DependentPair {
-                first_type,
-                second_type,
-                ..
-            } => {
-                // For dependent pairs (x: T, U(x)), create tuple constraint
-                // Note: This is simplified - real implementation would handle the dependency
-                let tuple_type = Type::Tuple(vec![
-                    (**first_type).clone(),
-                    // For now, just get the base type of the dependent second type
-                    self.extract_base_type(second_type),
-                ]);
-                vec![Constraint::Equal(target_type, tuple_type, span)]
-            }
-
-            DependentType::PathDependent {
-                path, type_name, ..
-            } => {
-                // For path-dependent types, we would need to resolve the path
-                // This is simplified - real implementation would traverse the path
-                let _ = (path, type_name); // Use parameters to avoid warnings
-
-                vec![Constraint::Equal(
-                    target_type,
-                    Type::Primitive(PrimitiveType::Unit), // Placeholder
-                    span,
-                )]
-            }
-
-            DependentType::Singleton { value, .. } => {
-                vec![Constraint::SingletonEquals {
-                    value_type: target_type,
-                    constant: value.clone(),
-                    span,
-                }]
-            }
-
-            DependentType::IndexedFamily {
-                family_name,
-                indices,
-                ..
-            } => {
-                vec![Constraint::TypeFamilyApplication {
-                    family: Type::Named {
-                        id: crate::type_registry::TypeId::new(0), // Placeholder
-                        type_args: vec![],
-                        const_args: vec![],
-                        variance: vec![],
-                        nullability: crate::type_registry::NullabilityKind::default(),
-                    },
-                    indices: indices.clone(),
-                    result_type: target_type,
-                    span,
-                }]
-            }
-
-            DependentType::Conditional {
-                condition,
-                then_type,
-                else_type,
-                ..
-            } => {
-                // For conditional types, we would need to evaluate the condition
-                // This is simplified - real implementation would handle type-level conditionals
-                let _ = (condition, then_type, else_type); // Use parameters to avoid warnings
-
-                vec![Constraint::Equal(
-                    target_type,
-                    Type::Primitive(PrimitiveType::Unit), // Placeholder
-                    span,
-                )]
-            }
-
-            DependentType::Recursive { .. } => {
-                // Recursive types need special handling, defer for now
-                vec![]
-            }
-
-            DependentType::Existential {
-                var_name,
-                var_type,
-                body,
-                ..
-            } => {
-                // Existential types ∃(x: T). U(x) need witness generation
-                // For now, just use the body type
-                vec![Constraint::Equal(
-                    target_type,
-                    self.extract_base_type(body),
-                    span,
-                )]
-            }
-
-            DependentType::Universal {
-                var_name,
-                var_type,
-                body,
-                ..
-            } => {
-                // Universal types ∀(x: T). U(x) need polymorphic instantiation
-                // For now, just use the body type
-                vec![Constraint::Equal(
-                    target_type,
-                    self.extract_base_type(body),
-                    span,
-                )]
-            }
-
-            DependentType::Base(base_type) => {
-                // Regular non-dependent type
-                vec![Constraint::Equal(target_type, base_type.clone(), span)]
-            }
-        }
-    }
-
-    /// Generate constraints for dependent type well-formedness checking
-    pub fn generate_wellformedness_constraints(
-        &mut self,
-        dependent_type: &crate::dependent_types::DependentType,
-        span: Span,
-    ) -> Vec<Constraint> {
-        // This would check that:
-        // 1. All free variables are bound in context
-        // 2. All predicates are well-typed
-        // 3. All type families are properly applied
-
-        // For now, return empty constraint set (assumes well-formed input)
-        vec![]
-    }
-
-    /// Convert a refinement predicate into SMT-solvable constraints
-    pub fn lower_refinement_predicate(
-        &mut self,
-        predicate: &crate::dependent_types::RefinementPredicate,
-        value_type: &Type,
-        span: Span,
-    ) -> Vec<Constraint> {
-        use crate::dependent_types::RefinementPredicate;
-
-        match predicate {
-            RefinementPredicate::And(left, right) => {
-                let mut constraints = self.lower_refinement_predicate(left, value_type, span);
-                constraints.extend(self.lower_refinement_predicate(right, value_type, span));
-                constraints
-            }
-
-            RefinementPredicate::Or(left, right) => {
-                // For disjunctions, we need more sophisticated constraint generation
-                // This is a simplification - real implementation would need choice constraints
-                vec![Constraint::RefinementSatisfies {
-                    value: value_type.clone(),
-                    predicate: predicate.clone(),
-                    span,
-                }]
-            }
-
-            RefinementPredicate::Not(inner) => {
-                vec![Constraint::RefinementSatisfies {
-                    value: value_type.clone(),
-                    predicate: predicate.clone(),
-                    span,
-                }]
-            }
-
-            RefinementPredicate::Comparison { op, left, right } => {
-                // Convert comparison into constraint solver format
-                vec![Constraint::RefinementSatisfies {
-                    value: value_type.clone(),
-                    predicate: predicate.clone(),
-                    span,
-                }]
-            }
-
-            // Note: TypeMembership variant doesn't exist in RefinementPredicate
-            _ => {
-                // For other predicates, create a refinement satisfaction constraint
-                vec![Constraint::RefinementSatisfies {
-                    value: value_type.clone(),
-                    predicate: predicate.clone(),
-                    span,
-                }]
-            }
-        }
-    }
-
-    /// Extract the base type from a dependent type (helper method)
-    fn extract_base_type(&self, dependent_type: &crate::dependent_types::DependentType) -> Type {
-        use crate::dependent_types::DependentType;
-
-        match dependent_type {
-            DependentType::Refinement { base_type, .. } => (**base_type).clone(),
-            DependentType::DependentFunction { return_type, .. } => {
-                self.extract_base_type(return_type)
-            }
-            DependentType::DependentPair { first_type, .. } => (**first_type).clone(), // Simplified
-            DependentType::Singleton { base_type, .. } => (**base_type).clone(),
-            DependentType::Base(ty) => ty.clone(),
-            _ => Type::Any, // Fallback for complex dependent types
         }
     }
 }

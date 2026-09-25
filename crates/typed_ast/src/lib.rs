@@ -63,7 +63,6 @@ pub mod advanced_analysis;
 pub mod ast_convert;
 pub mod constraint_solver;
 pub mod import_resolver;
-pub mod smt_solver;
 pub mod type_checker;
 pub mod type_inference;
 pub mod type_registry;
@@ -73,7 +72,6 @@ pub mod typed_builder;
 // Universal Type System - supporting multiple language paradigms
 // pub(crate) mod universal_type_system; // Internal use only - deprecated
 pub mod const_evaluator;
-pub mod dependent_types;
 pub mod effect_system;
 pub mod gradual_type_checker;
 pub mod linear_types;
@@ -280,12 +278,6 @@ pub use gradual_type_checker::{
 };
 
 pub use const_evaluator::{ConstEvalError, ConstEvalResult, ConstEvaluator};
-
-pub use dependent_types::{
-    ArithmeticOp, ComparisonOp, DependentIndex, DependentType, DependentTypeChecker,
-    DependentTypeError, DependentTypeResult, ParamKind, RefinementExpr, RefinementFunction,
-    RefinementPredicate, TypeFamily, TypeFamilyParam, TypePath, UnaryOp as RefinementUnaryOp,
-};
 
 pub use linear_types::{
     BorrowChecker, BorrowId, BorrowInfo, BorrowKind, BorrowingRules, CleanupBehavior,

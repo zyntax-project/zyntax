@@ -10,7 +10,7 @@ use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::type_registry::{
     AsyncKind, CallingConvention, ConstValue, Mutability, NullabilityKind, ParamInfo,
     PrimitiveType as RegistryPrimitive, Type, TypeDefinition, TypeId, TypeKind, TypeMetadata,
-    TypeVar, TypeVarId, TypeVarKind, Visibility,
+    Visibility,
 };
 use zyntax_typed_ast::typed_ast::*;
 
@@ -404,40 +404,8 @@ fn test_caching_performance_integration() {
 }
 
 #[test]
-fn test_constraint_solver_integration() {
-    let mut checker = TypeChecker::with_paradigm(Paradigm::Dependent {
-        const_generics: true,
-        refinement_types: false,
-    });
-
-    // Create expression with type variable that needs constraint solving
-    let type_var = Type::TypeVar(TypeVar {
-        id: TypeVarId::next(),
-        name: Some(InternedString::from_symbol(
-            string_interner::DefaultSymbol::try_from_usize(4).unwrap(),
-        )),
-        kind: TypeVarKind::Type,
-    });
-
-    let expr = create_test_expression(type_var);
-
-    // This should use the constraint solver to resolve the type variable
-    let result = checker.check_expression(&expr);
-    assert!(
-        result.is_ok(),
-        "Constraint solver integration should handle type variables"
-    );
-}
-
-#[test]
-fn test_advanced_type_features_integration() {
-    let mut checker = TypeChecker::with_paradigms(vec![
-        Paradigm::Nominal,
-        Paradigm::Dependent {
-            const_generics: true,
-            refinement_types: true,
-        },
-    ]);
+fn test_fixed_size_array_type_checking() {
+    let mut checker = TypeChecker::with_paradigm(Paradigm::Nominal);
 
     // Create array with const generic size
     let const_sized_array = Type::Array {
@@ -448,7 +416,7 @@ fn test_advanced_type_features_integration() {
 
     let expr = create_test_expression(const_sized_array.clone());
     let result = checker.check_expression(&expr);
-    assert!(result.is_ok(), "Advanced type features should be supported");
+    assert!(result.is_ok(), "Fixed-size array types should type check");
 
     let checked_type = result.unwrap();
     assert_eq!(checked_type, const_sized_array);

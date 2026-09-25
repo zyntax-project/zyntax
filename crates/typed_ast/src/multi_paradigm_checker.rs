@@ -2,7 +2,7 @@
 //!
 //! A unified type checker that uses the optimized TypeRegistry as its foundation
 //! and optionally enables advanced features like structural typing, gradual typing,
-//! dependent types, linear types, and effect systems when needed.
+//! linear types, and effect systems when needed.
 //!
 //! ## Design Philosophy
 //!
@@ -26,7 +26,6 @@
 //! ]);
 //! ```
 
-use crate::constraint_solver::ConstraintSolver;
 use crate::error::AstError;
 use crate::source::Span;
 use crate::type_inference::{InferenceContext, InferenceError};
@@ -34,14 +33,13 @@ use crate::type_registry::{Type, TypeDefinition, TypeId, TypeRegistry};
 use crate::typed_ast::{TypedExpression, TypedFunction, TypedProgram};
 
 // Advanced checkers (lazy-loaded)
+use crate::StructuralMode;
 use crate::const_evaluator::ConstEvaluator;
-use crate::dependent_types::DependentTypeChecker;
 use crate::effect_system::EffectSystem;
 use crate::gradual_type_checker::GradualTypeChecker;
 use crate::linear_types::LinearTypeChecker;
 use crate::nominal_type_checker::NominalTypeChecker;
 use crate::structural_type_checker::StructuralTypeChecker;
-use crate::{AstArena, StructuralMode};
 
 use std::collections::HashMap;
 
@@ -65,14 +63,6 @@ pub enum Paradigm {
         any_propagation: GradualMode,
         /// Generate runtime type checks
         runtime_checks: bool,
-    },
-
-    /// Dependent types (Agda/Idris) - types that depend on values
-    Dependent {
-        /// Enable const generics
-        const_generics: bool,
-        /// Enable refinement types
-        refinement_types: bool,
     },
 
     /// Linear types - resource management and memory safety
@@ -169,7 +159,6 @@ pub struct TypeChecker {
     /// Battle-tested foundation - always present for optimization
     core_registry: TypeRegistry,
     core_inference: InferenceContext,
-    core_solver: ConstraintSolver,
 
     /// Configuration
     config: TypeCheckerConfig,
@@ -180,7 +169,6 @@ pub struct TypeChecker {
     gradual_checker: Option<GradualTypeChecker>,
     linear_checker: Option<LinearTypeChecker>,
     effect_system: Option<EffectSystem>,
-    dependent_checker: Option<DependentTypeChecker>,
     const_evaluator: Option<ConstEvaluator>,
 
     /// Unified caching layer
@@ -221,9 +209,6 @@ pub enum TypeCheckError {
 
     /// Errors from effect system
     Effects(crate::effect_system::EffectError),
-
-    /// Errors from dependent types
-    Dependent(crate::dependent_types::DependentTypeError),
 
     /// Errors from nominal type checking
     Nominal(crate::nominal_type_checker::NominalTypeError),
@@ -271,14 +256,12 @@ impl TypeChecker {
         Self {
             core_registry: TypeRegistry::new(),
             core_inference: InferenceContext::new(Box::new(TypeRegistry::new())),
-            core_solver: ConstraintSolver::new(),
             config,
             nominal_checker: None,
             structural_checker: None,
             gradual_checker: None,
             linear_checker: None,
             effect_system: None,
-            dependent_checker: None,
             const_evaluator: None,
             type_cache: HashMap::new(),
             inference_cache: HashMap::new(),
@@ -577,51 +560,6 @@ impl TypeChecker {
                     // Return the original Type
                     current_type
                 }
-                Paradigm::Dependent {
-                    const_generics,
-                    refinement_types,
-                } => {
-                    // For dependent types, we need to check if the expression involves
-                    // dependent types and perform appropriate checking
-                    let checker = self.get_or_create_dependent_checker();
-
-                    // Check if the current type involves dependent types
-                    if let Some(dependent_type) = self.extract_dependent_type(&current_type) {
-                        // Generate constraints for dependent type checking
-                        let span = crate::source::Span::new(0, 0); // TODO: get actual span
-                        let constraints = self.core_solver.generate_dependent_type_constraints(
-                            &dependent_type,
-                            current_type.clone(),
-                            span,
-                        );
-
-                        // Add constraints to the solver
-                        for constraint in constraints {
-                            self.core_solver.add_constraint(constraint);
-                        }
-
-                        // Check well-formedness if enabled
-                        if *refinement_types {
-                            let _wellformedness_constraints = self
-                                .core_solver
-                                .generate_wellformedness_constraints(&dependent_type, span);
-                            // TODO: Add wellformedness constraints to solver
-                        }
-                    }
-
-                    // Handle const generics if enabled
-                    if *const_generics {
-                        if let Some(const_constraints) =
-                            self.extract_const_constraints(&current_type)
-                        {
-                            for constraint in const_constraints {
-                                self.core_solver.add_constraint(constraint);
-                            }
-                        }
-                    }
-
-                    current_type
-                }
                 _ => {
                     // Other paradigms are program-level, not expression-level
                     current_type
@@ -646,33 +584,18 @@ impl TypeChecker {
             }
         }
 
-        // Auto-detect additional paradigms based on expression type features
-        let ty = &expr.ty;
-        match ty {
-            // Dependent types: const-dependent or array with known size
-            Type::ConstDependent { .. } => {
-                let dep = Paradigm::Dependent {
-                    const_generics: true,
-                    refinement_types: true,
-                };
-                if !paradigms.contains(&dep) {
-                    paradigms.push(dep);
-                }
+        // Dynamic or Any types suggest gradual typing
+        if matches!(expr.ty, Type::Dynamic | Type::Any) {
+            let grad = Paradigm::Gradual {
+                any_propagation: GradualMode::Lenient,
+                runtime_checks: true,
+            };
+            if !paradigms
+                .iter()
+                .any(|p| matches!(p, Paradigm::Gradual { .. }))
+            {
+                paradigms.push(grad);
             }
-            // Dynamic or Any types suggest gradual typing
-            Type::Dynamic | Type::Any => {
-                let grad = Paradigm::Gradual {
-                    any_propagation: GradualMode::Lenient,
-                    runtime_checks: true,
-                };
-                if !paradigms
-                    .iter()
-                    .any(|p| matches!(p, Paradigm::Gradual { .. }))
-                {
-                    paradigms.push(grad);
-                }
-            }
-            _ => {}
         }
 
         paradigms
@@ -735,14 +658,6 @@ impl TypeChecker {
             self.effect_system = Some(EffectSystem::new());
         }
         self.effect_system.as_mut().unwrap()
-    }
-
-    /// Lazy-load dependent type checker
-    fn get_or_create_dependent_checker(&mut self) -> &mut DependentTypeChecker {
-        if self.dependent_checker.is_none() {
-            self.dependent_checker = Some(DependentTypeChecker::new());
-        }
-        self.dependent_checker.as_mut().unwrap()
     }
 
     /// Lazy-load const evaluator
@@ -924,132 +839,6 @@ impl TypeChecker {
     //         }
     //     }
     // }
-
-    /// Extract dependent type information from a regular type
-    fn extract_dependent_type(&self, ty: &Type) -> Option<crate::dependent_types::DependentType> {
-        use crate::dependent_types::DependentType;
-        use crate::type_registry::Type;
-
-        match ty {
-            Type::ConstDependent {
-                base_type,
-                constraint,
-            } => {
-                // Convert ConstDependent type to refinement type
-                let predicate = self.const_constraint_to_predicate(constraint);
-                Some(DependentType::Refinement {
-                    base_type: base_type.clone(),
-                    variable: AstArena::new().intern_string("x"), // Placeholder variable
-                    predicate,
-                    span: crate::source::Span::new(0, 0),
-                })
-            }
-
-            // Add more type conversions as needed
-            _ => None,
-        }
-    }
-
-    /// Extract const generic constraints from a type
-    fn extract_const_constraints(
-        &self,
-        ty: &Type,
-    ) -> Option<Vec<crate::constraint_solver::Constraint>> {
-        use crate::constraint_solver::Constraint;
-        use crate::type_registry::Type;
-
-        match ty {
-            Type::ConstDependent { constraint, .. } => {
-                // Convert const constraint to solver constraint
-                // This is simplified - real implementation would be more sophisticated
-                Some(vec![])
-            }
-
-            Type::Array {
-                size: Some(size_const),
-                ..
-            } => {
-                // Array size constraints
-                let span = crate::source::Span::new(0, 0);
-                Some(vec![Constraint::SingletonEquals {
-                    value_type: Type::Primitive(crate::type_registry::PrimitiveType::USize),
-                    constant: size_const.clone(),
-                    span,
-                }])
-            }
-
-            _ => None,
-        }
-    }
-
-    /// Convert const constraint to refinement predicate
-    fn const_constraint_to_predicate(
-        &self,
-        constraint: &crate::type_registry::ConstConstraint,
-    ) -> crate::dependent_types::RefinementPredicate {
-        use crate::dependent_types::RefinementPredicate;
-        use crate::type_registry::ConstConstraint;
-
-        match constraint {
-            ConstConstraint::Equal(value) => RefinementPredicate::Comparison {
-                op: crate::dependent_types::ComparisonOp::Equal,
-                left: Box::new(crate::dependent_types::RefinementExpr::Variable(
-                    AstArena::new().intern_string("x"),
-                )),
-                right: Box::new(crate::dependent_types::RefinementExpr::Constant(
-                    value.clone(),
-                )),
-            },
-            ConstConstraint::Range { min, max } => {
-                // Create a range predicate: min <= x <= max
-                let min_pred = RefinementPredicate::Comparison {
-                    op: crate::dependent_types::ComparisonOp::LessEqual,
-                    left: Box::new(crate::dependent_types::RefinementExpr::Constant(
-                        min.clone(),
-                    )),
-                    right: Box::new(crate::dependent_types::RefinementExpr::Variable(
-                        AstArena::new().intern_string("x"),
-                    )),
-                };
-
-                let max_pred = RefinementPredicate::Comparison {
-                    op: crate::dependent_types::ComparisonOp::LessEqual,
-                    left: Box::new(crate::dependent_types::RefinementExpr::Variable(
-                        AstArena::new().intern_string("x"),
-                    )),
-                    right: Box::new(crate::dependent_types::RefinementExpr::Constant(
-                        max.clone(),
-                    )),
-                };
-
-                RefinementPredicate::And(Box::new(min_pred), Box::new(max_pred))
-            }
-            ConstConstraint::Predicate(_) => {
-                // For complex predicates, use a placeholder
-                RefinementPredicate::Constant(true)
-            }
-            ConstConstraint::And(const_constraints) => {
-                let predicates: Vec<_> = const_constraints
-                    .iter()
-                    .map(|c| self.const_constraint_to_predicate(c))
-                    .collect();
-                predicates
-                    .into_iter()
-                    .reduce(|acc, p| RefinementPredicate::And(Box::new(acc), Box::new(p)))
-                    .unwrap_or(RefinementPredicate::Constant(true))
-            }
-            ConstConstraint::Or(const_constraints) => {
-                let predicates: Vec<_> = const_constraints
-                    .iter()
-                    .map(|c| self.const_constraint_to_predicate(c))
-                    .collect();
-                predicates
-                    .into_iter()
-                    .reduce(|acc, p| RefinementPredicate::Or(Box::new(acc), Box::new(p)))
-                    .unwrap_or(RefinementPredicate::Constant(false))
-            }
-        }
-    }
 }
 
 impl Default for TypeChecker {
@@ -1105,14 +894,10 @@ impl TypeChecker {
         })
     }
 
-    /// Create a type checker for Haskell/Agda-like languages
+    /// Create a type checker for Haskell-like languages
     pub fn for_functional_like() -> Self {
         Self::with_paradigms(vec![
             Paradigm::Nominal,
-            Paradigm::Dependent {
-                const_generics: true,
-                refinement_types: true,
-            },
             Paradigm::Effects {
                 inference: true,
                 handlers: true,
