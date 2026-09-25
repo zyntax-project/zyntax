@@ -23,21 +23,118 @@ thread_local! {
 
 /// The failure just seen, kept as `name: reason`, or the reason alone
 /// when the operation names no file, as the reference reports them.
+/// Only ever follows a C library call, so `errno` holds the failure.
 fn fail(name: Option<&str>) -> i64 {
-    let err = std::io::Error::last_os_error();
-    let code = err.raw_os_error().unwrap_or(0) as i64;
-    let reason = err
-        .to_string()
-        .split(" (os error")
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let n = last_errno();
+    let reason = strerror(n);
     let message = match name {
         Some(name) => format!("{name}: {reason}"),
         None => reason,
     };
-    OS_ERROR.with(|e| *e.borrow_mut() = (message, code));
+    OS_ERROR.with(|e| *e.borrow_mut() = (message, i64::from(n)));
+    i64::from(n)
+}
+
+#[cfg(unix)]
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn last_errno() -> i32 {
+    unsafe extern "C" {
+        fn _errno() -> *mut libc::c_int;
+    }
+    // SAFETY: the C runtime's per-thread `errno` cell.
+    unsafe { *_errno() }
+}
+
+// ─── failures as the C library words them ───────────────────────────
+
+/// A failure the C library would report as the `errno` it holds.
+#[derive(Debug)]
+struct Errno(i32);
+
+impl std::fmt::Display for Errno {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&strerror(self.0))
+    }
+}
+
+impl std::error::Error for Errno {}
+
+/// An I/O error standing for `errno` `n`.
+pub(crate) fn errno_error(n: i32) -> std::io::Error {
+    std::io::Error::other(Errno(n))
+}
+
+/// A failure as the reference reports it: the `errno` the C library
+/// would have set for it and `strerror`'s text for that number. An
+/// error that carries no number keeps its own text, with 0.
+pub(crate) fn c_error(err: &std::io::Error) -> (i64, String) {
+    if let Some(Errno(n)) = err.get_ref().and_then(|e| e.downcast_ref::<Errno>()) {
+        return (i64::from(*n), strerror(*n));
+    }
+    match err.raw_os_error() {
+        Some(code) => {
+            let n = errno_of(code);
+            (i64::from(n), strerror(n))
+        }
+        None => (0, err.to_string()),
+    }
+}
+
+/// On Unix an OS error code is the `errno`.
+#[cfg(unix)]
+fn errno_of(code: i32) -> i32 {
     code
+}
+
+/// On Windows an OS error code is a system error code, which the C
+/// runtime turns into an `errno` by this table (its `_dosmaperr`).
+#[cfg(windows)]
+fn errno_of(code: i32) -> i32 {
+    use libc::{
+        E2BIG, EACCES, EAGAIN, EBADF, ECHILD, EEXIST, EINVAL, EMFILE, ENOENT, ENOEXEC, ENOMEM,
+        ENOSPC, ENOTEMPTY, EPIPE, EXDEV,
+    };
+    match code {
+        2 | 3 | 15 | 18 | 53 | 67 | 161 | 206 => ENOENT,
+        4 => EMFILE,
+        5 | 16 | 65 | 82 | 83 | 108 | 132 | 158 | 167 => EACCES,
+        6 | 114 | 130 => EBADF,
+        7 | 8 | 9 | 1816 => ENOMEM,
+        10 => E2BIG,
+        11 => ENOEXEC,
+        17 => EXDEV,
+        80 | 183 => EEXIST,
+        89 | 164 | 215 => EAGAIN,
+        109 => EPIPE,
+        112 => ENOSPC,
+        128 | 129 => ECHILD,
+        145 => ENOTEMPTY,
+        19..=36 => EACCES,
+        188..=202 => ENOEXEC,
+        _ => EINVAL,
+    }
+}
+
+/// `strerror(n)`. Rust words an OS error with it on Unix.
+#[cfg(unix)]
+fn strerror(n: i32) -> String {
+    let text = std::io::Error::from_raw_os_error(n).to_string();
+    text.split(" (os error").next().unwrap_or("").to_string()
+}
+
+/// `strerror(n)`, from the C runtime: Rust words an OS error on
+/// Windows with the system's text instead.
+#[cfg(windows)]
+fn strerror(n: i32) -> String {
+    // SAFETY: the C runtime returns a NUL-terminated string it owns,
+    // copied out before anything else can call it on this thread.
+    unsafe { std::ffi::CStr::from_ptr(libc::strerror(n)) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub(crate) extern "C" fn host_os_error() -> StringPtr {

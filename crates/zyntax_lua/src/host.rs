@@ -1684,12 +1684,7 @@ extern "C" fn host_read_file(path: zrtl::StringConstPtr) -> StringPtr {
             zrtl::string::string_from_bytes(bytes)
         }
         Err(e) => {
-            let reason = e
-                .to_string()
-                .split(" (os error")
-                .next()
-                .unwrap_or("")
-                .to_string();
+            let (_, reason) = host_os::c_error(&e);
             LOAD_ERROR.with(|err| *err.borrow_mut() = format!("cannot open {path}: {reason}"));
             std::ptr::null_mut()
         }

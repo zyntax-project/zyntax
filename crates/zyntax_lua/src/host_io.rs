@@ -187,7 +187,7 @@ impl Stream {
                 Some(stdin) => stdin.write_all(bytes),
                 None => Ok(()),
             },
-            _ => Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+            _ => Err(crate::host_os::errno_error(libc::EBADF)),
         }
     }
 
@@ -222,7 +222,7 @@ impl Stream {
     fn seek(&mut self, whence: i64, offset: i64) -> std::io::Result<u64> {
         self.drain()?;
         let Inner::Disk(f) = &mut self.inner else {
-            return Err(std::io::Error::from_raw_os_error(libc::ESPIPE));
+            return Err(crate::host_os::errno_error(libc::ESPIPE));
         };
         let unread = (self.ahead.len() - self.at) as i64;
         let from = match whence {
@@ -246,13 +246,7 @@ thread_local! {
 }
 
 fn note(err: &std::io::Error, name: Option<&str>) -> i64 {
-    let code = err.raw_os_error().unwrap_or(0) as i64;
-    let reason = err
-        .to_string()
-        .split(" (os error")
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let (code, reason) = crate::host_os::c_error(err);
     let message = match name {
         Some(name) => format!("{name}: {reason}"),
         None => reason.clone(),
