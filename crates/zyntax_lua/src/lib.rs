@@ -482,7 +482,7 @@ pub fn parse_program(source: &str, file: &str) -> Result<TypedProgram> {
     let started = std::time::Instant::now();
     let (ast, normal) = parse_chunk(source, MAIN_LEVEL)?;
     trace_phase("full_moon", started);
-    dump::note_chunk(0, &source, &format!("@{file}"), false);
+    dump::note_chunk(0, source, &format!("@{file}"), false);
     let started = std::time::Instant::now();
     let library = library()?;
     trace_phase("library", started);

@@ -12,7 +12,6 @@
 
 # The official files, each run in the configuration all.lua derives from _U.
 official/all.lua              94023a3
-official/calls.lua            94023a3
 official/closure.lua          558e28e
 official/coroutine.lua        c33bf81
 official/db.lua               94023a3
@@ -29,7 +28,6 @@ official/strings.lua          3e444f9
 # the C test libraries built; skipped otherwise).
 official_complete/all.lua        94023a3
 official_complete/big.lua        298dff8
-official_complete/calls.lua      94023a3
 official_complete/closure.lua    558e28e
 official_complete/constructs.lua 6709b37
 official_complete/coroutine.lua  c33bf81

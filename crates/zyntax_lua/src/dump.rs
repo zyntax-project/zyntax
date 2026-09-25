@@ -28,11 +28,7 @@ const VERSION: u8 = 0x54;
 const FORMAT: u8 = 0;
 const DATA: &[u8] = b"\x19\x93\r\n\x1a\n";
 /// The sizes of an instruction, a `lua_Integer` and a `lua_Number`.
-const SIZES: [(u8, &str); 3] = [
-    (4, "Instruction"),
-    (8, "lua_Integer"),
-    (8, "lua_Number"),
-];
+const SIZES: [(u8, &str); 3] = [(4, "Instruction"), (8, "lua_Integer"), (8, "lua_Number")];
 /// `LUAC_INT` and `LUAC_NUM`, which tell the byte order and the float
 /// format.
 const LUAC_INT: i64 = 0x5678;
