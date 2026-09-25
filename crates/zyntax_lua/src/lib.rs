@@ -324,7 +324,7 @@ pub(crate) const LOAD_LEVEL: usize = 2;
 
 /// `text` as the source it was read from: each private-use character
 /// [`source_text`] made of a byte that was not UTF-8 is that byte again.
-fn source_bytes(text: &str) -> std::borrow::Cow<'_, [u8]> {
+pub(crate) fn source_bytes(text: &str) -> std::borrow::Cow<'_, [u8]> {
     let escaped = |c: char| (ESCAPED_BYTES..ESCAPED_BYTES + 256).contains(&(c as u32));
     if !text.chars().any(escaped) {
         return std::borrow::Cow::Borrowed(text.as_bytes());

@@ -170,7 +170,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         type_error(
             concat(vec![
                 text("attempt to call a "),
-                type_name(f.e()),
+                obj_type_name(f.e()),
                 text(" value"),
             ]),
             int(OPERAND_LEFT | VARINFO_CALL),
@@ -300,50 +300,80 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         st.push(ret(nil()));
         st
     }));
-    // One entry per argument count: the common case, a record of that
-    // arity, is a tag check and the call.
+    // A method call, `obj:name(...)`, through a value that is not a
+    // program function of the site's arity: a library function reached
+    // this way is told so, as it names its first argument `self`. A
+    // library function's record is variadic and has no cells; a
+    // function of the program's always has its key.
+    d.push(define(
+        "zl_apply_method_packed",
+        &[&f, &args],
+        any(),
+        vec![
+            when(
+                is_func(f.e()),
+                vec![
+                    rec.decl(call("zb_unbox_list_raw_any", vec![f.e()], anys.clone())),
+                    arity.decl(call("zb_box_get_i64", vec![at(rec.e(), int(1))], i64())),
+                    when(
+                        and(eq(arity.e(), int(VARIADIC_ARITY)), eq(len(rec.e()), int(2))),
+                        vec![set_global(METHOD_CALL, bool(true))],
+                    ),
+                ],
+            ),
+            ret(call("zl_apply_packed", vec![f.e(), args.e()], any())),
+        ],
+    ));
+    // One entry per argument count, for a plain call and a method call:
+    // the common case, a record of that arity, is a tag check and the
+    // call; anything else goes through the packed entry.
     let params: Vec<Local> = (0..MAX_CALL_ARITY)
         .map(|i| {
             let name: &'static str = Box::leak(format!("a{i}").into_boxed_str());
             kept(name, any())
         })
         .collect();
-    for n in 0..=MAX_CALL_ARITY {
-        let code_ty = code_type(t.list_type, n);
-        let fp = local("fp", code_ty.clone());
-        let mut sig: Vec<&Local> = vec![&f];
-        sig.extend(params[..n].iter());
-        let mut direct = vec![rec.e()];
-        direct.extend(params[..n].iter().map(|p| p.e()));
-        d.push(define(
-            &format!("zl_apply_{n}"),
-            &sig,
-            any(),
-            vec![
-                when(
-                    is_func(f.e()),
-                    vec![
-                        rec.decl(call("zb_unbox_list_raw_any", vec![f.e()], anys.clone())),
-                        arity.decl(call("zb_box_get_i64", vec![at(rec.e(), int(1))], i64())),
-                        when(
-                            eq(arity.e(), int(n as i64)),
-                            vec![
-                                fp.decl(call(&fp_name(n), vec![at(rec.e(), int(0))], code_ty)),
-                                ret(call("fp", direct, any())),
-                            ],
-                        ),
-                    ],
-                ),
-                ret(call(
-                    "zl_apply_packed",
-                    vec![
-                        f.e(),
-                        list(params[..n].iter().map(|p| p.e()).collect(), anys.clone()),
-                    ],
-                    any(),
-                )),
-            ],
-        ));
+    for (entry, packed) in [
+        ("zl_apply", "zl_apply_packed"),
+        ("zl_apply_method", "zl_apply_method_packed"),
+    ] {
+        for n in 0..=MAX_CALL_ARITY {
+            let code_ty = code_type(t.list_type, n);
+            let fp = local("fp", code_ty.clone());
+            let mut sig: Vec<&Local> = vec![&f];
+            sig.extend(params[..n].iter());
+            let mut direct = vec![rec.e()];
+            direct.extend(params[..n].iter().map(|p| p.e()));
+            d.push(define(
+                &format!("{entry}_{n}"),
+                &sig,
+                any(),
+                vec![
+                    when(
+                        is_func(f.e()),
+                        vec![
+                            rec.decl(call("zb_unbox_list_raw_any", vec![f.e()], anys.clone())),
+                            arity.decl(call("zb_box_get_i64", vec![at(rec.e(), int(1))], i64())),
+                            when(
+                                eq(arity.e(), int(n as i64)),
+                                vec![
+                                    fp.decl(call(&fp_name(n), vec![at(rec.e(), int(0))], code_ty)),
+                                    ret(call("fp", direct, any())),
+                                ],
+                            ),
+                        ],
+                    ),
+                    ret(call(
+                        packed,
+                        vec![
+                            f.e(),
+                            list(params[..n].iter().map(|p| p.e()).collect(), anys.clone()),
+                        ],
+                        any(),
+                    )),
+                ],
+            ));
+        }
     }
     // The same from the library: a metamethod, an iterator, a
     // comparator, a handler. These nest on the reference's C stack,

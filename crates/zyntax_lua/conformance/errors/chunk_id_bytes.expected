@@ -1,0 +1,8 @@
+[string "ÿa = 1"]:1: unexpected symbol near '<\255>'
+þname:1: unexpected symbol near '<\255>'
+false	[string "ýchunk"]:1: z
+@üf
+üf
+mû
+stack traceback:
+48

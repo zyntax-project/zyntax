@@ -451,7 +451,7 @@ pub fn declarations(t: &Types) -> Vec<Decl> {
                 )),
                 vec![lua_error(concat(vec![
                     text("bad argument #3 to 'gsub' (string/function/table expected, got "),
-                    type_name(repl.e()),
+                    arg_type_name(repl.e()),
                     text(")"),
                 ]))],
             ),

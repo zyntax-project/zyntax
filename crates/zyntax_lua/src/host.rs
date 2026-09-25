@@ -1603,23 +1603,26 @@ const LOAD_CHUNKS_FROM: i64 = 1 << 20;
 
 /// The chunk name as `luaO_chunkid` spells it within `LUA_IDSIZE`:
 /// `=name` as given, `@name` as given or its end, anything else as
-/// `[string "..."]` cut at the first line.
+/// `[string "..."]` cut at the first line. The name's bytes are kept:
+/// one that is not UTF-8 is carried as its stand-in character (see
+/// `source_text`) and is that byte again in every message.
 fn chunk_name(name: &[u8]) -> String {
     const IDSIZE: usize = 60;
+    let text = |b: &[u8]| crate::source_text(b).into_owned();
     if let Some(rest) = name.strip_prefix(b"=") {
         let shown = if name.len() <= IDSIZE {
             rest
         } else {
             &rest[..IDSIZE - 1]
         };
-        return String::from_utf8_lossy(shown).into_owned();
+        return text(shown);
     }
     if let Some(rest) = name.strip_prefix(b"@") {
         if name.len() <= IDSIZE {
-            return String::from_utf8_lossy(rest).into_owned();
+            return text(rest);
         }
         let keep = IDSIZE - "...".len() - 1;
-        return format!("...{}", String::from_utf8_lossy(&rest[rest.len() - keep..]));
+        return format!("...{}", text(&rest[rest.len() - keep..]));
     }
     let room = IDSIZE - "[string \"".len() - "...\"]".len() - 1;
     let first_line = name.split(|&b| b == b'\n').next().unwrap_or(b"");
@@ -1629,7 +1632,7 @@ fn chunk_name(name: &[u8]) -> String {
     } else {
         first_line
     };
-    let shown = String::from_utf8_lossy(shown);
+    let shown = text(shown);
     if cut {
         format!("[string \"{shown}...\"]")
     } else {
@@ -1654,7 +1657,7 @@ extern "C" fn host_load(
     });
     // The reference's `source`: the name given, else the text itself.
     let raw = if name.is_empty() { source } else { name };
-    crate::host_debug::note_load_source(index, String::from_utf8_lossy(raw).into_owned());
+    crate::host_debug::note_load_source(index, crate::source_text(raw).into_owned());
     match crate::load_chunk(&text, &chunk_name, index, env) {
         Ok(record) => record,
         Err(message) => {
@@ -1695,7 +1698,7 @@ extern "C" fn host_read_file(path: zrtl::StringConstPtr) -> StringPtr {
 }
 
 extern "C" fn host_load_error() -> StringPtr {
-    LOAD_ERROR.with(|e| zrtl::string::string_from_bytes(e.borrow().as_bytes()))
+    LOAD_ERROR.with(|e| zrtl::string::string_from_bytes(&crate::source_bytes(&e.borrow())))
 }
 
 /// `package.searchpath`: the first template of `path` that names a

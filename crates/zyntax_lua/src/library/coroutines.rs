@@ -216,7 +216,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     text("bad argument #1 to '"),
                     what.e(),
                     text("' (function expected, got "),
-                    type_name(f.e()),
+                    arg_type_name(f.e()),
                     text(")"),
                 ]))],
             ),
@@ -273,7 +273,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             text(&format!(
                 "bad argument #1 to '{what}' (thread expected, got "
             )),
-            type_name(co.e()),
+            arg_type_name(co.e()),
             text(")"),
         ]))
     };

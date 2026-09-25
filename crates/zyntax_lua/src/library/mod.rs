@@ -43,6 +43,9 @@ pub const CLOSING_KIND: usize = 4;
 /// A weak table's key whose object the collector took: a tombstone no
 /// lookup matches, under a nil value, until the table is compacted.
 pub const DEAD_KEY_KIND: usize = 5;
+/// A light userdata: its payload is the pointer word, which is its
+/// identity for equality and as a table key.
+pub const LIGHT_KIND: usize = 6;
 
 pub fn table_tag() -> i64 {
     zyntax_builtins::instance_tag(TABLE_KIND)
@@ -292,14 +295,11 @@ pub fn is_thread(x: Expr) -> Expr {
 pub fn is_file(x: Expr) -> Expr {
     and(ne(x.clone(), nil()), eq(tag_of(x), int(file_tag())))
 }
-pub fn is_upvalue_id(x: Expr) -> Expr {
-    and(
-        ne(x.clone(), nil()),
-        eq(
-            tag_of(x),
-            int(zyntax_builtins::instance_tag(debug::UPVALUE_ID_KIND)),
-        ),
-    )
+pub fn light_tag() -> i64 {
+    zyntax_builtins::instance_tag(LIGHT_KIND)
+}
+pub fn is_light(x: Expr) -> Expr {
+    and(ne(x.clone(), nil()), eq(tag_of(x), int(light_tag())))
 }
 pub fn is_func(x: Expr) -> Expr {
     and(
@@ -318,7 +318,7 @@ pub fn metamethod_call_check(h: Expr, event: Expr) -> Stmt {
             ),
             vec![lua_error(concat(vec![
                 text("attempt to call a "),
-                type_name(h),
+                obj_type_name(h),
                 text(" value (metamethod '"),
                 event.clone(),
                 text("')"),
@@ -557,6 +557,17 @@ pub fn concat(parts: Vec<Expr>) -> Expr {
 pub fn type_name(x: Expr) -> Expr {
     call("zb_any_type", vec![x], string())
 }
+/// The type a runtime error names (`luaT_objtypename`): a table's
+/// metatable's `__name` when it is a string, else the type's name.
+pub fn obj_type_name(x: Expr) -> Expr {
+    call("zl_objtypename", vec![x], string())
+}
+/// The type a bad argument's `got` names (`luaL_typeerror`): the
+/// metatable's `__name` when it is a string, then `light userdata`,
+/// then the type's name.
+pub fn arg_type_name(x: Expr) -> Expr {
+    call("zl_argtypename", vec![x], string())
+}
 
 /// A Lua error: reported through the hook, which never returns.
 pub fn lua_error(message: Expr) -> Stmt {
@@ -595,7 +606,7 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
                     vec![ret(call("zl_file_str", vec![x.e()], string()))],
                 ),
                 when(
-                    is_upvalue_id(x.e()),
+                    is_light(x.e()),
                     vec![ret(add(text("userdata: 0x"), hex(addr(x.e()))))],
                 ),
                 ret(add(text("table: 0x"), hex(addr(x.e())))),
@@ -615,7 +626,7 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
             vec![
                 when(is_thread(x.e()), vec![ret(text("thread"))]),
                 when(is_file(x.e()), vec![ret(text("FILE*"))]),
-                when(is_upvalue_id(x.e()), vec![ret(text("userdata"))]),
+                when(is_light(x.e()), vec![ret(text("userdata"))]),
                 ret(text("table")),
             ],
         ),
@@ -782,6 +793,13 @@ pub const PENDING: &str = "zl_pending";
 /// Whether the pending error is a stack overflow: a message handler
 /// cannot run on one, as the reference has no stack left for it.
 pub const OVERFLOWED: &str = "zl_overflowed";
+/// A message handler is running for a stack overflow: another
+/// overflow while it runs is an error in error handling.
+pub const HANDLING_OVERFLOW: &str = "zl_handling_overflow";
+/// A library function is being entered by a method call through a
+/// value (`obj:name()`): set by the call site, read and cleared by the
+/// function's wrapper on entry, so its first argument is `self`.
+pub const METHOD_CALL: &str = "zl_method_call";
 /// How many times a message handler that raises is called again on
 /// its own error before that is 'error in error handling'.
 pub const HANDLER_RETRIES: i64 = 200;
@@ -903,15 +921,30 @@ fn raising(t: &Types) -> Vec<Decl> {
         global_var(VARINFO, i64()),
         global_var(FOR_SKIP, boolean()),
         global_var(OVERFLOWED, boolean()),
+        global_var(HANDLING_OVERFLOW, boolean()),
+        global_var(METHOD_CALL, boolean()),
         global_var(ARR_EMPTY, any()),
     ];
     // Entered below the floor: the error every deeper call would raise.
+    // Under a message handler for an overflow it is an error in error
+    // handling, a value with no position.
     d.push(define_cold(
         "zl_stack_overflow",
         &[],
         unit(),
         vec![
             set_global(OVERFLOWED, bool(true)),
+            when(
+                read_global(HANDLING_OVERFLOW, boolean()),
+                vec![
+                    expr(call(
+                        "zl_raise_value",
+                        vec![box_str(text("error in error handling"))],
+                        unit(),
+                    )),
+                    ret_void(),
+                ],
+            ),
             lua_error(text("stack overflow")),
             ret_void(),
         ],
@@ -1284,6 +1317,7 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     lib.declarations.extend(foreign::declarations(&t));
     lib.declarations.extend(gc::declarations(&t));
     lib.declarations.push(func_code_decl(&t));
+    lib.declarations.extend(type_names());
     for d in &mut lib.declarations {
         if let TypedDeclaration::Function(f) = &mut d.node {
             f.annotations.push(strict_fp());
@@ -1426,6 +1460,43 @@ pub fn callee_names(stmt: &Stmt, out: &mut std::collections::BTreeSet<String>) {
         }
         _ => {}
     }
+}
+
+/// The names the error messages give a value's type, built only when
+/// an error is raised. A `__name` is read raw and used only when it is
+/// a string.
+fn type_names() -> Vec<Decl> {
+    let x = kept("x", any());
+    let h = kept("h", any());
+    let named = |h: &Local| and(not(is_nil(h.e())), eq(category(h.e()), int(STR)));
+    vec![
+        define_cold(
+            "zl_objtypename",
+            &[&x],
+            string(),
+            vec![
+                when(
+                    is_table(x.e()),
+                    vec![
+                        h.decl(call("zl_meta_of", vec![x.e(), text("__name")], any())),
+                        when(named(&h), vec![ret(get_str(h.e()))]),
+                    ],
+                ),
+                ret(type_name(x.e())),
+            ],
+        ),
+        define_cold(
+            "zl_argtypename",
+            &[&x],
+            string(),
+            vec![
+                h.decl(call("zl_meta_of", vec![x.e(), text("__name")], any())),
+                when(named(&h), vec![ret(get_str(h.e()))]),
+                when(is_light(x.e()), vec![ret(text("light userdata"))]),
+                ret(type_name(x.e())),
+            ],
+        ),
+    ]
 }
 
 /// `zl_func_id(f)`: the number of the program function a function

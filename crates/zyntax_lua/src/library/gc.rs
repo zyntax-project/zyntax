@@ -430,7 +430,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                             lua_error(concat(vec![
                                 bad_arg_at(add(i.e(), int(1)), "warn"),
                                 text(" (string expected, got "),
-                                type_name(y.e()),
+                                arg_type_name(y.e()),
                                 text(")"),
                             ])),
                             ret_void(),

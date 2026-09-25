@@ -20,8 +20,10 @@ unsafe fn bytes_of(s: zrtl::StringConstPtr) -> &'static [u8] {
     unsafe { zrtl::string_as_bytes(s) }
 }
 
+/// A string handed back to the program: a stand-in character for a
+/// byte that is not UTF-8 (see `source_text`) is that byte again.
 fn string_out(s: &str) -> StringPtr {
-    zrtl::string::string_from_bytes(s.as_bytes())
+    zrtl::string::string_from_bytes(&crate::source_bytes(s))
 }
 
 /// A frame's key: the chunk's number above the low 32 bits, the
@@ -162,8 +164,8 @@ pub(crate) extern "C" fn host_dbg_chunk(
     let (source, short_src, meta) =
         unsafe { (bytes_of(source), bytes_of(short_src), bytes_of(meta)) };
     let mut chunk = ChunkMeta {
-        source: String::from_utf8_lossy(source).into_owned(),
-        short_src: String::from_utf8_lossy(short_src).into_owned(),
+        source: crate::source_text(source).into_owned(),
+        short_src: crate::source_text(short_src).into_owned(),
         ..Default::default()
     };
     let meta = String::from_utf8_lossy(meta);
@@ -549,7 +551,7 @@ pub(crate) extern "C" fn host_dbg_traceback(
         let levels = levels(&s, thread, line, ("traceback", "field", "debug.traceback"));
         let mut out = String::new();
         if has_message {
-            out.push_str(&String::from_utf8_lossy(message));
+            out.push_str(&crate::source_text(message));
             out.push('\n');
         }
         out.push_str("stack traceback:");

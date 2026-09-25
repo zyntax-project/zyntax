@@ -1,0 +1,15 @@
+false	bad_self.lua:9: calling 'sub' on bad self (string expected, got table)
+false	bad_self.lua:10: calling 'rep' on bad self (string expected, got table)
+false	bad_self.lua:11: calling 'byte' on bad self (string expected, got table)
+false	bad_self.lua:13: calling 'upper' on bad self (string expected, got table)
+false	bad_self.lua:14: calling 'sub' on bad self (string expected, got table)
+false	bad_self.lua:16: calling 'len' on bad self (string expected, got table)
+false	bad_self.lua:19: bad argument #1 to 'sub' (number expected, got table)
+false	bad_self.lua:21: bad argument #1 to 'sub' (number expected, got table)
+false	bad_self.lua:23: bad argument #1 to 'rep' (number expected, got table)
+false	false	#1
+false	false	#2
+false	false	#2
+false	false	#2
+false	false	#2
+1,2,3

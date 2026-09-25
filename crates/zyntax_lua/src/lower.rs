@@ -7220,12 +7220,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             return Ok(Multi::None(block_value(pre, nil(span), span)));
         }
         let f = self.boxed(callee);
+        let method = receiver.is_some();
         let (pre, vals, tail) = self.call_values(receiver, args, span)?;
-        Ok(self.value_call_vals(f, pre, vals, tail, desc, span))
+        Ok(self.value_call_vals(f, pre, vals, tail, desc, method, span))
     }
 
     /// [`Self::value_call`] with the callee boxed and the arguments
-    /// evaluated.
+    /// evaluated. A `method` call enters through the method-site
+    /// entries, which tell a library function its first argument is
+    /// `self`.
+    #[allow(clippy::too_many_arguments)]
     fn value_call_vals(
         &mut self,
         f: Node,
@@ -7233,8 +7237,14 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         vals: Vec<Val>,
         tail: Option<Node>,
         desc: Desc,
+        method: bool,
         span: Span,
     ) -> Multi {
+        let entry = if method {
+            "zl_apply_method"
+        } else {
+            "zl_apply"
+        };
         // A call site that keeps the debug library's record evaluates
         // everything ahead of storing its number.
         let frames = self.frames;
@@ -7275,7 +7285,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             for v in vals {
                 lowered.push(self.boxed(v));
             }
-            call(&format!("zl_apply_{n}"), lowered, Type::Any, span)
+            call(&format!("{entry}_{n}"), lowered, Type::Any, span)
         } else {
             let mut items = Vec::with_capacity(vals.len());
             for v in vals {
@@ -7296,7 +7306,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     var(name, self.m.anys(), span)
                 }
             };
-            call("zl_apply_packed", vec![f, list], Type::Any, span)
+            call(&format!("{entry}_packed"), vec![f, list], Type::Any, span)
         };
         let spill = self.before_call(&desc, span, &mut pre);
         let mut after = self.after_call(spill, span);
@@ -7766,6 +7776,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             vals.clone(),
             tail.clone(),
             desc.clone(),
+            false,
             span,
         );
         let mut value = self.yield_as(fallback, &shape, span);
@@ -11314,7 +11325,7 @@ fn upvalue_accessor_name(tag: &str) -> String {
 /// variable, the environment), gives its identity, joins it to
 /// another's cell or hands over its own.
 fn upvalue_accessor(module: &Module<'_>, span: Span) -> TypedFunction {
-    use crate::library::debug::{UP_CELL, UP_GET, UP_ID, UP_JOIN, UP_SET, UPVALUE_ID_KIND};
+    use crate::library::debug::{UP_CELL, UP_GET, UP_ID, UP_JOIN, UP_SET};
     use crate::scope::Upvalue;
     let i64_t = prim(PrimitiveType::I64);
     let bool_t = prim(PrimitiveType::Bool);
@@ -11330,15 +11341,12 @@ fn upvalue_accessor(module: &Module<'_>, span: Span) -> TypedFunction {
     let mut lowerer = Lowerer::new(module, CHUNK);
     // A constant identity for an upvalue with no cell: one per
     // variable of the chunk, never an address.
-    // An upvalue's identity as a value: an instance of its own kind,
-    // equal to another exactly when the two identities are.
+    // An upvalue's identity as a value: a light userdata, equal to
+    // another exactly when the two identities are.
     let upvalue_id = |identity: Node| {
         call(
             "zb_box_instance_raw",
-            vec![
-                identity,
-                int32_lit(zyntax_builtins::instance_tag(UPVALUE_ID_KIND) as i32, span),
-            ],
+            vec![identity, int32_lit(library::light_tag() as i32, span)],
             Type::Any,
             span,
         )
@@ -11904,7 +11912,10 @@ fn loaded_declarations(
     let env = intern("env");
     let mut statements = vec![expr_stmt(call(
         "zl_chunk_add",
-        vec![str_lit(chunk_name, span), int_lit(index, span)],
+        vec![
+            string_literal(crate::source_bytes(chunk_name).into_owned(), span),
+            int_lit(index, span),
+        ],
         prim(PrimitiveType::Unit),
         span,
     ))];

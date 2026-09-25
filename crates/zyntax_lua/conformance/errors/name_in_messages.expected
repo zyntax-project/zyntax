@@ -1,0 +1,23 @@
+My Type: ADDR
+false	name_in_messages.lua:12: attempt to perform arithmetic on a My Type value (global 'XX')
+false	name_in_messages.lua:13: attempt to perform arithmetic on a My Type value (global 'XX')
+false	name_in_messages.lua:14: attempt to perform arithmetic on a My Type value (global 'XX')
+false	name_in_messages.lua:15: attempt to perform bitwise operation on a My Type value (global 'XX')
+false	name_in_messages.lua:16: attempt to perform bitwise operation on a My Type value (global 'XX')
+false	name_in_messages.lua:17: attempt to compare table with My Type
+false	name_in_messages.lua:18: attempt to compare two My Type values
+false	name_in_messages.lua:19: attempt to compare My Type with table
+false	name_in_messages.lua:20: attempt to compare My Type with FILE*
+false	name_in_messages.lua:21: attempt to concatenate a My Type value (global 'XX')
+false	name_in_messages.lua:22: attempt to concatenate a My Type value (global 'XX')
+false	name_in_messages.lua:23: attempt to call a My Type value (global 'XX')
+false	name_in_messages.lua:24: bad argument #1 to 'sin' (number expected, got My Type)
+false	name_in_messages.lua:25: bad argument #1 to 'rep' (number expected, got My Type)
+false	name_in_messages.lua:26: bad argument #2 to 'setmetatable' (nil or table expected, got FILE*)
+false	name_in_messages.lua:27: bad 'for' initial value (number expected, got My Type)
+false	name_in_messages.lua:28: bad 'for' limit (number expected, got My Type)
+false	name_in_messages.lua:29: attempt to perform arithmetic on a table value (upvalue 'YY')
+false	name_in_messages.lua:30: attempt to compare two table values
+false	name_in_messages.lua:31: bad argument #1 to 'sin' (number expected, got table)
+false	name_in_messages.lua:32: bad argument #1 to 'sin' (number expected, got FILE*)
+false	name_in_messages.lua:33: attempt to perform bitwise operation on a FILE* value (field 'stdin')

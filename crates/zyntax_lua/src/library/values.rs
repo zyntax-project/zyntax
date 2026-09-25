@@ -424,7 +424,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     type_error(
                         concat(vec![
                             text("attempt to concatenate a "),
-                            type_name(x.e()),
+                            obj_type_name(x.e()),
                             text(" value"),
                         ]),
                         bad.e(),
@@ -472,7 +472,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     type_error(
                         concat(vec![
                             text("attempt to perform bitwise operation on a "),
-                            type_name(x.e()),
+                            obj_type_name(x.e()),
                             text(" value"),
                         ]),
                         bad.e(),
@@ -495,7 +495,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             type_error(
                 concat(vec![
                     text("attempt to perform arithmetic on a "),
-                    type_name(x.e()),
+                    obj_type_name(x.e()),
                     text(" value"),
                 ]),
                 bad.e(),
@@ -537,7 +537,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     text("bad 'for' "),
                     what.e(),
                     text(" (number expected, got "),
-                    type_name(x.e()),
+                    obj_type_name(x.e()),
                     text(")"),
                 ]))],
             ),
@@ -625,7 +625,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 is_nil(na.e()),
                 vec![lua_error(concat(vec![
                     text("bad 'for' limit (number expected, got "),
-                    type_name(a.e()),
+                    obj_type_name(a.e()),
                     text(")"),
                 ]))],
             ),
@@ -931,7 +931,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 is_nil(na.e()),
                 vec![lua_error(concat(vec![
                     text("attempt to perform bitwise operation on a "),
-                    type_name(a.e()),
+                    obj_type_name(a.e()),
                     text(" value"),
                 ]))],
             ),
@@ -958,7 +958,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 is_nil(na.e()),
                 vec![lua_error(concat(vec![
                     text("attempt to perform arithmetic on a "),
-                    type_name(a.e()),
+                    obj_type_name(a.e()),
                     text(" value"),
                 ]))],
             ),
@@ -1161,17 +1161,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     let compare_error = |a: &Local, b: &Local| {
         vec![
             if_(
-                str_eq(type_name(a.e()), type_name(b.e())),
+                str_eq(obj_type_name(a.e()), obj_type_name(b.e())),
                 vec![lua_error(concat(vec![
                     text("attempt to compare two "),
-                    type_name(a.e()),
+                    obj_type_name(a.e()),
                     text(" values"),
                 ]))],
                 vec![lua_error(concat(vec![
                     text("attempt to compare "),
-                    type_name(a.e()),
+                    obj_type_name(a.e()),
                     text(" with "),
-                    type_name(b.e()),
+                    obj_type_name(b.e()),
                 ]))],
             ),
             ret(bool(false)),
@@ -1284,7 +1284,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             type_error(
                 concat(vec![
                     text("attempt to concatenate a "),
-                    type_name(x.e()),
+                    obj_type_name(x.e()),
                     text(" value"),
                 ]),
                 int(OPERAND_LEFT),
@@ -1364,7 +1364,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             type_error(
                 concat(vec![
                     text("attempt to get length of a "),
-                    type_name(x.e()),
+                    obj_type_name(x.e()),
                     text(" value"),
                 ]),
                 int(OPERAND_LEFT),

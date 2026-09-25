@@ -148,7 +148,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![lua_error(concat(vec![
                     what.e(),
                     text(" (FILE* expected, got "),
-                    type_name(x.e()),
+                    arg_type_name(x.e()),
                     text(")"),
                 ]))],
             ),
@@ -287,8 +287,9 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ],
         ));
     }
-    // `io.input([f])` and `io.output([f])`: a name opens the file,
-    // a file becomes the default; the default is answered.
+    // `io.input([f])` and `io.output([f])`: a name (a string or a
+    // number) opens the file, an open file becomes the default,
+    // anything else is refused as no file; the default is answered.
     for (fname, var, mode, what) in [
         ("zl_io_input", "zl_io_in", "r", "input"),
         ("zl_io_output", "zl_io_out", "w", "output"),
@@ -301,6 +302,22 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 when(
                     and(not(is_nil(x.e())), not(is_file(x.e()))),
                     vec![
+                        when(
+                            not(or(
+                                or(
+                                    eq(category(x.e()), int(STR)),
+                                    eq(category(x.e()), int(FLOAT)),
+                                ),
+                                or(
+                                    eq(category(x.e()), int(INT)),
+                                    eq(category(x.e()), int(UINT)),
+                                ),
+                            )),
+                            vec![
+                                expr(call("zl_file_check", vec![x.e(), bad_arg(1, what)], i64())),
+                                ret(nil()),
+                            ],
+                        ),
                         name.decl(call("zl_arg_str", vec![x.e(), bad_arg(1, what)], string())),
                         h.decl(call("zl_io_open", vec![name.e(), text(mode)], i64())),
                         when(
@@ -320,7 +337,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     is_file(x.e()),
                     vec![
                         expr(call("zl_file_check", vec![x.e(), bad_arg(1, what)], i64())),
-                        set_global(var, x.e()),
+                        when(
+                            call("zl_file_is_open", vec![x.e()], boolean()),
+                            vec![set_global(var, x.e())],
+                        ),
                     ],
                 ),
                 when(
@@ -424,7 +444,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                                 vec![lua_error(concat(vec![
                                     bad_arg_at(i.e(), "read"),
                                     text(" (string expected, got "),
-                                    type_name(a.e()),
+                                    arg_type_name(a.e()),
                                     text(")"),
                                 ]))],
                             ),
@@ -536,7 +556,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                         vec![lua_error(concat(vec![
                             bad_arg_at(i.e(), "write"),
                             text(" (string expected, got "),
-                            type_name(a.e()),
+                            arg_type_name(a.e()),
                             text(")"),
                         ]))],
                     ),
@@ -926,7 +946,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 not(is_file(x.e())),
                 vec![lua_error(concat(vec![
                     text("bad argument #1 to '__tostring' (FILE* expected, got "),
-                    type_name(x.e()),
+                    arg_type_name(x.e()),
                     text(")"),
                 ]))],
             ),

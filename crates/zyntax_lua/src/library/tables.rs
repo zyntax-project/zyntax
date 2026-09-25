@@ -630,7 +630,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                         not(is_table(mt.e())),
                         vec![lua_error(concat(vec![
                             text("bad argument #2 to 'setmetatable' (nil or table expected, got "),
-                            type_name(mt.e()),
+                            arg_type_name(mt.e()),
                             text(")"),
                         ]))],
                     ),
@@ -1052,7 +1052,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         type_error(
             concat(vec![
                 text("attempt to index a "),
-                type_name(o.e()),
+                obj_type_name(o.e()),
                 text(" value"),
             ]),
             int(OPERAND_LEFT),
@@ -1331,7 +1331,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     lua_error(concat(vec![
                         what.e(),
                         text(" (table expected, got "),
-                        type_name(o.e()),
+                        arg_type_name(o.e()),
                         text(")"),
                     ])),
                     ret(call("zl_table_new", vec![], table.clone())),

@@ -1153,7 +1153,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             text(")"),
         ]))
     };
-    let got_of = |x: &Local| type_name(x.e());
+    let got_of = |x: &Local| arg_type_name(x.e());
     d.push(define(
         "zl_arg_int",
         &[&x, &what],
@@ -1345,7 +1345,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 vec![ret(text("function"))],
             ),
             when(
-                or(is_file(x.e()), is_upvalue_id(x.e())),
+                or(is_file(x.e()), is_light(x.e())),
                 vec![ret(text("userdata"))],
             ),
             ret(type_name(x.e())),
@@ -1364,7 +1364,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 or(is_nil(x.e()), ne(category(x.e()), int(STR))),
                 vec![lua_error(concat(vec![
                     text("bad argument #1 to 'tonumber' (string expected, got "),
-                    type_name(x.e()),
+                    arg_type_name(x.e()),
                     text(")"),
                 ]))],
             ),
@@ -1526,7 +1526,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 not(is_table(x.e())),
                 vec![lua_error(concat(vec![
                     text("bad argument #1 to 'for iterator' (table expected, got "),
-                    type_name(x.e()),
+                    arg_type_name(x.e()),
                     text(")"),
                 ]))],
             ),
@@ -1608,7 +1608,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ),
             lua_error(concat(vec![
                 text("bad argument #1 to 'rawlen' (table or string expected, got "),
-                type_name(x.e()),
+                arg_type_name(x.e()),
                 text(")"),
             ])),
             ret(int(0)),
@@ -1709,6 +1709,8 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         ))
     };
     let hdepth = local("hdepth", i64());
+    let overflow = local("overflow", boolean());
+    let handling = local("handling", boolean());
     d.push(define(
         "zl_xpcall",
         &[&x, &handler, &args],
@@ -1718,7 +1720,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 not(is_func(handler.e())),
                 vec![lua_error(concat(vec![
                     text("bad argument #2 to 'xpcall' (function expected, got "),
-                    type_name(handler.e()),
+                    arg_type_name(handler.e()),
                     text(")"),
                 ]))],
             ),
@@ -1730,6 +1732,8 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 not(is_nil(pending())),
                 vec![
                     k.decl(int(0)),
+                    overflow.decl(read_global(OVERFLOWED, boolean())),
+                    handling.decl(read_global(HANDLING_OVERFLOW, boolean())),
                     err.decl(call("zl_take_pending", vec![], any())),
                     while_(
                         bool(true),
@@ -1752,11 +1756,13 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                                     set_global(debug::DBG_SITE, int(0)),
                                 ],
                             ),
+                            set_global(HANDLING_OVERFLOW, or(handling.e(), overflow.e())),
                             err.set(call(
                                 "zl_first",
                                 vec![call("zl_call_1", vec![handler.e(), err.e()], any())],
                                 any(),
                             )),
+                            set_global(HANDLING_OVERFLOW, handling.e()),
                             when(
                                 ge(hdepth.e(), int(0)),
                                 vec![
@@ -2140,7 +2146,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     text(&format!(
                         "bad argument #1 to '{what}' (number expected, got "
                     )),
-                    if_expr(is_nil(x.e()), text("no value"), type_name(x.e())),
+                    if_expr(is_nil(x.e()), text("no value"), arg_type_name(x.e())),
                     text(")"),
                 ]))],
             ),
@@ -3117,16 +3123,35 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     ));
     // ─── the value wrappers and the library tables ──────────────
     let packed = kept("packed", any());
+    let method = local("method", boolean());
     for b in BUILTINS {
         // Each argument as the implementation takes it, from the
-        // packed list; the result boxed.
-        let mut st = vec![args.decl(call("zl_values", vec![packed.e()], anys.clone()))];
+        // packed list; the result boxed. Whether the call is a method
+        // call is taken first, so nothing the function calls sees it.
+        let mut st = vec![
+            method.decl(read_global(METHOD_CALL, boolean())),
+            when(method.e(), vec![set_global(METHOD_CALL, bool(false))]),
+            args.decl(call("zl_values", vec![packed.e()], anys.clone())),
+        ];
         // Called as a value, the function is named as the reference
-        // finds it in its library's table: `string.rep`.
+        // finds it in its library's table: `string.rep`. Called as a
+        // method, by its name, not counting `self`.
         let qualified = if b.lib.is_empty() || HIDDEN_LIBS.contains(&b.lib) {
             b.name.to_string()
         } else {
             format!("{}.{}", b.lib, b.name)
+        };
+        let bad_arg = |n: usize, rest: &str| {
+            let as_method = if n == 1 {
+                format!("calling '{}' on bad self{rest}", b.name)
+            } else {
+                format!("bad argument #{} to '{}'{rest}", n - 1, b.name)
+            };
+            if_expr(
+                method.e(),
+                text(&as_method),
+                text(&format!("bad argument #{n} to '{qualified}'{rest}")),
+            )
         };
         // A required argument not passed at all.
         for (idx, p) in b.params.iter().enumerate() {
@@ -3140,16 +3165,13 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             };
             st.push(when(
                 lt(len(args.e()), int(idx as i64 + 1)),
-                vec![
-                    lua_error(add(bad_arg(idx + 1, &qualified), text(&expected))),
-                    ret(nil()),
-                ],
+                vec![lua_error(bad_arg(idx + 1, &expected)), ret(nil())],
             ));
         }
         let mut call_args = Vec::new();
         for (idx, p) in b.params.iter().enumerate() {
             let arg = call("zl_value_at", vec![args.e(), int(idx as i64 + 1)], any());
-            let what = bad_arg(idx + 1, &qualified);
+            let what = bad_arg(idx + 1, "");
             call_args.push(match p {
                 Param::Any | Param::Value | Param::Expected(_) => arg,
                 Param::Int => call("zl_arg_int", vec![arg, what], i64()),
@@ -3588,7 +3610,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                         not(is_func(chunk.e())),
                         vec![lua_error(concat(vec![
                             text("bad argument #1 to 'load' (function expected, got "),
-                            type_name(chunk.e()),
+                            arg_type_name(chunk.e()),
                             text(")"),
                         ]))],
                     ),
@@ -4267,7 +4289,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 and(not(is_nil(y.e())), not(is_table(y.e()))),
                 vec![lua_error(concat(vec![
                     text("bad argument #2 to 'setmetatable' (nil or table expected, got "),
-                    type_name(y.e()),
+                    arg_type_name(y.e()),
                     text(")"),
                 ]))],
             ),
@@ -4446,7 +4468,7 @@ fn os_declarations(t: &Types) -> Vec<Decl> {
                 not(is_table(x.e())),
                 vec![lua_error(concat(vec![
                     text("bad argument #1 to 'time' (table expected, got "),
-                    type_name(x.e()),
+                    arg_type_name(x.e()),
                     text(")"),
                 ]))],
             ),

@@ -1,0 +1,13 @@
+false	io_input_filestar.lua:5: bad argument #1 to 'input' (FILE* expected, got My Type)
+false	io_input_filestar.lua:6: bad argument #1 to 'input' (FILE* expected, got table)
+false	io_input_filestar.lua:7: bad argument #1 to 'input' (FILE* expected, got boolean)
+false	io_input_filestar.lua:8: bad argument #1 to 'input' (FILE* expected, got function)
+false	io_input_filestar.lua:9: bad argument #1 to 'output' (FILE* expected, got My Type)
+false	io_input_filestar.lua:10: bad argument #1 to 'output' (FILE* expected, got table)
+false	io_input_filestar.lua:11: bad argument #1 to 'output' (FILE* expected, got boolean)
+false	io_input_filestar.lua:12: bad argument #1 to 'output' (FILE* expected, got function)
+true	true
+false	io_input_filestar.lua:14: cannot open file '/nonexistent/zylua/file' (No such file or directory)
+false	io_input_filestar.lua:17: attempt to use a closed file
+false	io_input_filestar.lua:18: attempt to use a closed file
+file	file

@@ -1,0 +1,33 @@
+-- A metatable's string __name is the type every runtime message and
+-- every bad argument names; a __name that is not a string is ignored.
+local function try(f, ...)
+  local ok, err = pcall(f, ...)
+  print(ok, err)
+end
+
+XX = setmetatable({}, {__name = "My Type"})
+local YY = setmetatable({}, {__name = 42})
+
+print((tostring(XX):gsub("0x%x+", "ADDR")))
+try(function () return XX + 1 end)
+try(function () return 1 - XX end)
+try(function () return XX // 2 end)
+try(function () return ~XX end)
+try(function () return XX & 1 end)
+try(function () return {} < XX end)
+try(function () return XX < XX end)
+try(function () return XX <= {} end)
+try(function () return XX < io.stdin end)
+try(function () return XX .. "a" end)
+try(function () return "a" .. XX end)
+try(function () return XX() end)
+try(function () return math.sin(XX) end)
+try(function () return ("x"):rep(XX) end)
+try(function () return setmetatable({}, io.stdin) end)
+try(function () for i = XX, 10 do end end)
+try(function () for i = 1, XX do end end)
+try(function () return YY + 1 end)
+try(function () return YY < YY end)
+try(function () return math.sin(YY) end)
+try(function () return math.sin(io.stdin) end)
+try(function () return ~io.stdin end)

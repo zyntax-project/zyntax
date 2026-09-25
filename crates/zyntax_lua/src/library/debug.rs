@@ -79,10 +79,6 @@ const TYPE_METAS: [(&str, &str); 5] = [
     ("function", "zl_meta_function"),
     ("thread", "zl_meta_thread"),
 ];
-/// The kind of an upvalue's identity: an instance whose address is
-/// the identity.
-pub const UPVALUE_ID_KIND: usize = 5;
-
 pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let anys = t.anys();
     let table = t.table();
@@ -996,7 +992,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                         text(" to '"),
                         fname("getinfo"),
                         text("' (string expected, got "),
-                        type_name(z.e()),
+                        arg_type_name(z.e()),
                         text(")"),
                     ]))],
                 ),
@@ -1202,7 +1198,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             not(is_func(x.e())),
             vec![lua_error(concat(vec![
                 bad(number, what, " (function expected, got "),
-                type_name(x.e()),
+                arg_type_name(x.e()),
                 text(")"),
             ]))],
         )
@@ -1804,19 +1800,62 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     d.push(define("zl_fail", &[], any(), vec![ret(nil())]));
 
     // ─── the rest ───────────────────────────────────────────────
-    // A userdata's user values: this implementation makes no
-    // userdata that has them.
+    // A userdata's user values. The optional `n` is checked first.
+    // The only full userdata is a foreign object, which has no user
+    // values: a get answers fail, a set answers fail once it has its
+    // value, and a set on anything else refuses its first argument.
+    let opt_n = |number: usize, what: &str| {
+        expr(call(
+            "zl_arg_opt_int",
+            vec![
+                call("zl_value_at", vec![args.e(), int(number as i64)], any()),
+                int(1),
+                bad(number, what, ""),
+            ],
+            i64(),
+        ))
+    };
     d.push(define(
         "zl_debug_getuservalue",
         &[&args],
         any(),
-        vec![ret(pair(nil(), box_bool(bool(false))))],
+        vec![
+            qual.decl(read_global(QUALIFY, boolean())),
+            set_global(QUALIFY, bool(false)),
+            opt_n(2, "getuservalue"),
+            ret(call("zl_fail", vec![], any())),
+        ],
     ));
     d.push(define(
         "zl_debug_setuservalue",
         &[&args],
         any(),
-        vec![ret(call("zl_fail", vec![], any()))],
+        vec![
+            qual.decl(read_global(QUALIFY, boolean())),
+            set_global(QUALIFY, bool(false)),
+            opt_n(3, "setuservalue"),
+            x.decl(call("zl_value_at", vec![args.e(), int(1)], any())),
+            when(
+                zyntax_builtins::foreign::is_foreign(x.e()),
+                vec![
+                    when(
+                        lt(len(args.e()), int(2)),
+                        vec![lua_error(bad(2, "setuservalue", " (value expected)"))],
+                    ),
+                    ret(call("zl_fail", vec![], any())),
+                ],
+            ),
+            lua_error(concat(vec![
+                bad(1, "setuservalue", " (userdata expected, got "),
+                if_expr(
+                    lt(len(args.e()), int(1)),
+                    text("no value"),
+                    arg_type_name(x.e()),
+                ),
+                text(")"),
+            ])),
+            ret(call("zl_fail", vec![], any())),
+        ],
     ));
     // `debug.debug()`: each line of the standard input run as a
     // chunk, until `cont` or the input's end; errors are reported and

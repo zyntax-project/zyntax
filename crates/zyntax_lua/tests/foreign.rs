@@ -223,6 +223,7 @@ local seen = {}
 seen[p] = "seen"
 log.record(seen[shapes.same(p)])
 log.record(require("shapes") == shapes)
+log.record(debug.setuservalue(p, 1), debug.getuservalue(p), pcall(debug.setuservalue, p))
 "#;
 
 #[test]
@@ -259,7 +260,12 @@ fn a_program_uses_the_embedders_objects() {
     );
     assert!(records[6].starts_with("false\t"), "{}", records[6]);
     // `require` gives the module it loaded before: the same value.
-    assert_eq!(records[7..], ["seen", "true"]);
+    assert_eq!(records[7..9], ["seen", "true"]);
+    // A foreign object is a full userdata with no user values.
+    assert_eq!(
+        records[9],
+        "nil\tnil\tfalse\tbad argument #2 to 'debug.setuservalue' (value expected)"
+    );
     assert!(
         s.held.iter().all(|&n| n >= 0),
         "an object was released more often than boxed: {:?}",
