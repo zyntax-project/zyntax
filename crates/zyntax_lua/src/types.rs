@@ -3033,8 +3033,9 @@ impl<'a> Round<'a> {
         }
     }
 
-    /// A constructor: its tables have a shape, and a constant-key
-    /// field's value joins the shape's field. The rest are values.
+    /// A constructor: its tables have a shape, a constant-key field's
+    /// value joins the shape's field, and a positional or other keyed
+    /// value stores as through an index.
     fn table(&mut self, t: &ast::TableConstructor) {
         let shape = self.shape_for(t);
         let count = t.fields().len();
@@ -3047,9 +3048,19 @@ impl<'a> Round<'a> {
                             let ty = self.typer().ty_of(value);
                             self.store_field(shape, &name, ty);
                         }
+                        // Any other key stores as `t[k] = v` does: into
+                        // the element, dyn_value or named fields its
+                        // type may reach.
                         None => {
                             self.value(key);
-                            self.value(value);
+                            if self.known.plain(shape) {
+                                self.expr(value);
+                            } else {
+                                self.value(value);
+                            }
+                            let key_ty = self.typer().ty_of(key);
+                            let ty = self.typer().ty_of(value);
+                            self.store_through(Ty::Shape(shape), None, key_ty, ty);
                         }
                     }
                 }
