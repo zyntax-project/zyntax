@@ -258,6 +258,7 @@ pub fn register_runtime(
         zrtl_string::static_plugin(),
         zrtl_math::static_plugin(),
         host::static_plugin(),
+        zyntax_embed::foreign::static_plugin(),
     ])
 }
 

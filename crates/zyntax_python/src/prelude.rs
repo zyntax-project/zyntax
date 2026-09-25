@@ -16,6 +16,8 @@ pub(crate) const EXCEPTION_KINDS: &[&str] = &[
     "StopIteration",
     "AssertionError",
     "NameError",
+    "ModuleNotFoundError",
+    "ImportError",
     "OverflowError",
     "Exception",
 ];
@@ -48,6 +50,10 @@ class TypeError(Exception):
 class AttributeError(Exception):
     pass
 class NameError(Exception):
+    pass
+class ImportError(Exception):
+    pass
+class ModuleNotFoundError(ImportError):
     pass
 class RuntimeError(Exception):
     pass

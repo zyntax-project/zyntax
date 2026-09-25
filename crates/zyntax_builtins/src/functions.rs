@@ -191,6 +191,18 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             &params,
             any(),
             vec![
+                // A foreign object is called by the embedder.
+                when(
+                    crate::foreign::is_foreign(f.e()),
+                    vec![ret(call(
+                        "zb_foreign_call",
+                        vec![
+                            f.e(),
+                            list(args[..n].iter().map(|a| a.e()).collect(), anys.clone()),
+                        ],
+                        any(),
+                    ))],
+                ),
                 rec.decl(call("zb_func_unbox", vec![f.e()], anys.clone())),
                 arity.decl(call(
                     "zb_box_get_i64",

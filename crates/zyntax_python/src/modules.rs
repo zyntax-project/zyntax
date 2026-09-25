@@ -42,6 +42,25 @@ struct UserImports {
     modules: HashMap<String, String>,
     /// Local name to the qualified name it stands for.
     names: HashMap<String, String>,
+    /// The bindings of modules the program does not have, which are the
+    /// embedding program's: `name = __import__("a.b")`, run where the
+    /// module starts.
+    foreign: Vec<py::Stmt>,
+}
+
+/// `local = __import__("module")`, or its `member`.
+fn foreign_binding(local: &str, module: &str, member: Option<&str>) -> py::Stmt {
+    let source = match member {
+        Some(member) => format!("{local} = __import__({module:?}).{member}"),
+        None => format!("{local} = __import__({module:?})"),
+    };
+    ruff_python_parser::parse_module(&source)
+        .expect("a binding parses")
+        .into_syntax()
+        .body
+        .into_iter()
+        .next()
+        .expect("one statement")
 }
 
 /// A program linked into one body.
@@ -65,7 +84,8 @@ pub(crate) fn link(main: Vec<py::Stmt>, resolve: &Resolver<'_>) -> Result<Linked
         reads: names_read(&main),
     };
     let mut main = main;
-    let imports = linker.link_imports(&mut main)?;
+    let mut imports = linker.link_imports(&mut main)?;
+    main.splice(0..0, std::mem::take(&mut imports.foreign));
     let main_scope = Scope::of_body(Vec::new(), &main);
     Qualifier::new(None, &main_scope, imports).run(&mut main);
     let mut statements = linker.out;
@@ -109,11 +129,23 @@ impl Linker<'_> {
                             .as_ref()
                             .map(|a| a.id.as_str())
                             .unwrap_or(module);
-                        if source_of(self.resolve, module).is_none()
-                            && !self
+                        if source_of(self.resolve, module).is_none() {
+                            // Not the program's: the embedding program's,
+                            // bound by the name it is read through.
+                            if self
                                 .reads
                                 .contains(local.split('.').next().unwrap_or(local))
-                        {
+                            {
+                                if alias.asname.is_none() && module.contains('.') {
+                                    return Err(Error::unsupported(
+                                        format!(
+                                            "`import {module}` of a module the program does not have; `import {module} as name` binds it"
+                                        ),
+                                        &alias.range(),
+                                    ));
+                                }
+                                imports.foreign.push(foreign_binding(local, module, None));
+                            }
                             ours = true;
                             continue;
                         }
@@ -174,9 +206,14 @@ impl Linker<'_> {
                         if source_of(self.resolve, &submodule).is_some() {
                             self.load(&submodule, at)?;
                             imports.modules.insert(local, submodule);
-                        } else {
+                        } else if source_of(self.resolve, &module).is_some() {
                             self.load(&module, at)?;
                             imports.names.insert(local, qualified(&module, name));
+                        } else if self.reads.contains(&local) {
+                            // A member of the embedding program's module.
+                            imports
+                                .foreign
+                                .push(foreign_binding(&local, &module, Some(name)));
                         }
                     }
                     *stmt = pass(stmt.range());
@@ -267,7 +304,7 @@ impl Linker<'_> {
         let outer_reads = std::mem::replace(&mut self.reads, names_read(&body));
         let imports = self.link_imports(&mut body);
         self.reads = outer_reads;
-        let imports = imports.map_err(|e| e.in_module(module))?;
+        let mut imports = imports.map_err(|e| e.in_module(module))?;
         // `__name__` is the module's own; the assignment binds it at
         // module level so the qualifier renames every read of it.
         let mut with_name: Vec<py::Stmt> =
@@ -277,6 +314,7 @@ impl Linker<'_> {
                 .body
                 .into_iter()
                 .collect();
+        with_name.append(&mut imports.foreign);
         with_name.append(&mut body);
         let mut body = with_name;
         let scope = Scope::of_body(Vec::new(), &body);

@@ -159,6 +159,10 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ],
             ),
             when(is_nil(x.e()), vec![ret(text("nil"))]),
+            when(
+                zyntax_builtins::foreign::is_foreign(x.e()),
+                vec![ret(call("zb_foreign_str", vec![x.e()], string()))],
+            ),
             cat.decl(category(x.e())),
             when(is_cat(&cat, STR), vec![ret(get_str(x.e()))]),
             when(
@@ -1094,6 +1098,19 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 vec![ret(num_eq(a.e(), b.e()))],
             ),
             when(eq(a.e(), b.e()), vec![ret(bool(true))]),
+            when(
+                or(
+                    zyntax_builtins::foreign::is_foreign(a.e()),
+                    zyntax_builtins::foreign::is_foreign(b.e()),
+                ),
+                vec![ret(and(
+                    and(
+                        zyntax_builtins::foreign::is_foreign(a.e()),
+                        zyntax_builtins::foreign::is_foreign(b.e()),
+                    ),
+                    call("zb_foreign_eq", vec![a.e(), b.e()], boolean()),
+                ))],
+            ),
             when(
                 and(is_cat(&ca, STR), is_cat(&cb, STR)),
                 vec![ret(str_eq(get_str(a.e()), get_str(b.e())))],

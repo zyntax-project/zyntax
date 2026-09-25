@@ -6,6 +6,7 @@
 
 use crate::build::*;
 use crate::bytes::BYTES;
+use crate::foreign::is_foreign;
 use crate::{
     DICT_TAG, FILE_TAG, FUNC_TAG, INSTANCE_KIND_BASE, Kind, Policy, SET_TAG, TUPLE_TAG, list_of,
 };
@@ -545,6 +546,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 is(&cat, CUSTOM),
                 vec![
+                    when(is_foreign(x.e()), vec![ret(text(names.object))]),
                     when(
                         is_instance(x.e()),
                         vec![ret(call("zb_hook_instance_type", vec![x.e()], string()))],
@@ -597,7 +599,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 and(
                     is(&cat, CUSTOM),
-                    and(ne(kind(x.e()), int(FUNC_TAG >> 8)), not(is_instance(x.e()))),
+                    and(
+                        and(ne(kind(x.e()), int(FUNC_TAG >> 8)), not(is_instance(x.e()))),
+                        not(is_foreign(x.e())),
+                    ),
                 ),
                 vec![ret(ne(call("zb_seq_len_any", vec![x.e()], i64()), int(0)))],
             ),
@@ -627,6 +632,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 is(&cat, BYTES),
                 vec![ret(call("zb_bytes_repr", vec![get_str(x.e())], string()))],
+            ),
+            when(
+                is_foreign(x.e()),
+                vec![ret(call("zb_foreign_str", vec![x.e()], string()))],
             ),
             when(
                 is(&cat, CUSTOM),
@@ -671,6 +680,13 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 or(is(&ca, NONE), is(&cb, NONE)),
                 vec![ret(eq(ca.e(), cb.e()))],
+            ),
+            when(
+                or(is_foreign(a.e()), is_foreign(b.e())),
+                vec![ret(and(
+                    and(is_foreign(a.e()), is_foreign(b.e())),
+                    call("zb_foreign_eq", vec![a.e(), b.e()], boolean()),
+                ))],
             ),
             when(
                 or(is(&ca, STR), is(&cb, STR)),
@@ -917,6 +933,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 is(&cat, BYTES),
                 vec![ret(call("zb_bytes_hash", vec![get_str(x.e())], i64()))],
+            ),
+            when(
+                is_foreign(x.e()),
+                vec![ret(call("zb_foreign_hash", vec![x.e()], i64()))],
             ),
             when(
                 is_instance(x.e()),

@@ -3964,7 +3964,34 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ],
                 string(),
             )),
-            // Not there: `package.cpath` is searched as well, for the
+            // Not there: a module of the embedder's, a foreign object.
+            when(
+                eq(path.e(), null(string())),
+                vec![
+                    y.set(call("zb_foreign_import", vec![name.e()], any())),
+                    when(not(is_nil(pending())), vec![ret(nil())]),
+                    when(
+                        not(is_nil(y.e())),
+                        vec![
+                            expr(call(
+                                "zl_rawset_str",
+                                vec![
+                                    unbox_table(call("zl_package_loaded", vec![], any()), t),
+                                    name.e(),
+                                    y.e(),
+                                ],
+                                unit(),
+                            )),
+                            ret(call(
+                                "zb_box_tuple",
+                                vec![list(vec![y.e(), box_str(text(":foreign:"))], anys.clone())],
+                                any(),
+                            )),
+                        ],
+                    ),
+                ],
+            ),
+            // Nor that: `package.cpath` is searched as well, for the
             // message's sake; a C module found cannot be loaded here.
             when(
                 eq(path.e(), null(string())),

@@ -14,6 +14,7 @@ pub mod build;
 mod bytes;
 mod dicts;
 mod dynamic;
+pub mod foreign;
 mod format;
 pub mod functions;
 mod io;
@@ -212,6 +213,9 @@ pub const FUNC_TAG: i64 = ((LIST_KINDS + 4) << 8) | 255;
 pub const CODE_TAG: i64 = ((LIST_KINDS + 5) << 8) | 255;
 /// The box tag of an open file: the record `bytes` keeps for it.
 pub const FILE_TAG: i64 = ((LIST_KINDS + 6) << 8) | 255;
+/// The box tag of a foreign object: a value of the program that embeds
+/// the runtime, reached through it (see [`foreign`]).
+pub const FOREIGN_TAG: i64 = ((LIST_KINDS + 7) << 8) | 255;
 /// Kinds from here up are instances of a frontend's classes, in the
 /// order the frontend numbers them.
 pub const INSTANCE_KIND_BASE: i64 = 32;
@@ -268,6 +272,7 @@ pub fn library(policy: &Policy) -> Library {
     declarations.extend(random::declarations(list_type));
     declarations.extend(bytes::declarations(list_type));
     declarations.extend(json::declarations(list_type));
+    declarations.extend(foreign::declarations(list_type));
     // The hooks a frontend defines are declared here as externs, so the
     // library lowers on its own; the frontend's definition takes the
     // declaration's place when the two meet in a program.

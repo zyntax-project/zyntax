@@ -189,6 +189,19 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     anys.clone(),
                 ))],
             ),
+            // A foreign object is called by the embedder, through the
+            // caller with the object in front of the arguments.
+            when(
+                zyntax_builtins::foreign::is_foreign(f.e()),
+                vec![
+                    expr(mcall(args.e(), "insert_at", vec![int(0), f.e()], unit())),
+                    ret(call(
+                        "zb_unbox_list_raw_any",
+                        vec![call("zl_foreign_caller", vec![], any())],
+                        anys.clone(),
+                    )),
+                ],
+            ),
             // A value of another type is called through its type's
             // `__call` (`debug.setmetatable`).
             when(

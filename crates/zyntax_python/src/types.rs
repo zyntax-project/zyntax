@@ -5958,6 +5958,8 @@ impl Typer<'_> {
         let arg = |i: usize| args.get(i).map(|a| self.expr(a)).unwrap_or(Ty::Unknown);
         match name {
             "print" => Ty::None,
+            // A module of the embedding program's.
+            "__import__" => Ty::Object,
             // A range is iterated as ints.
             "range" => Ty::List(Elem::Int),
             "len" | "int" | "ord" | "hash" | "id" => Ty::Int,

@@ -1027,6 +1027,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 ))],
             ),
             when(
+                zyntax_builtins::foreign::is_foreign(o.e()),
+                vec![ret(call("zl_foreign_index", vec![o.e(), k.e()], any()))],
+            ),
+            when(
                 eq(category(o.e()), int(STR)),
                 vec![ret(call("zl_string_member", vec![o.e(), k.e()], any()))],
             ),
@@ -1051,6 +1055,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     vec![unbox_table(o.e(), t), s.e()],
                     any(),
                 ))],
+            ),
+            when(
+                zyntax_builtins::foreign::is_foreign(o.e()),
+                vec![ret(call("zb_foreign_get", vec![o.e(), s.e()], any()))],
             ),
             when(
                 eq(category(o.e()), int(STR)),
@@ -1085,6 +1093,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     vec![unbox_table(o.e(), t), k.e()],
                     any(),
                 ))],
+            ),
+            when(
+                zyntax_builtins::foreign::is_foreign(o.e()),
+                vec![ret(call("zl_foreign_index", vec![o.e(), k.e()], any()))],
             ),
             when(
                 eq(category(o.e()), int(STR)),
@@ -1125,6 +1137,17 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     ret_void(),
                 ],
             ),
+            when(
+                zyntax_builtins::foreign::is_foreign(o.e()),
+                vec![
+                    expr(call(
+                        "zl_foreign_setindex",
+                        vec![o.e(), k.e(), v.e()],
+                        unit(),
+                    )),
+                    ret_void(),
+                ],
+            ),
             not_indexable(&o),
             ret_void(),
         ],
@@ -1139,6 +1162,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![ret(call(
                     "zl_table_geti",
                     vec![unbox_table(o.e(), t), i.e()],
+                    any(),
+                ))],
+            ),
+            when(
+                zyntax_builtins::foreign::is_foreign(o.e()),
+                vec![ret(call(
+                    "zl_foreign_index",
+                    vec![o.e(), box_i64(i.e())],
                     any(),
                 ))],
             ),
@@ -1159,6 +1190,17 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     expr(call(
                         "zl_table_setindex",
                         vec![unbox_table(o.e(), t), k.e(), v.e()],
+                        unit(),
+                    )),
+                    ret_void(),
+                ],
+            ),
+            when(
+                zyntax_builtins::foreign::is_foreign(o.e()),
+                vec![
+                    expr(call(
+                        "zl_foreign_setindex",
+                        vec![o.e(), k.e(), v.e()],
                         unit(),
                     )),
                     ret_void(),
@@ -1185,6 +1227,13 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     ret_void(),
                 ],
             ),
+            when(
+                zyntax_builtins::foreign::is_foreign(o.e()),
+                vec![
+                    expr(call("zb_foreign_set", vec![o.e(), s.e(), v.e()], unit())),
+                    ret_void(),
+                ],
+            ),
             type_newindex(&o, box_str(s.e())),
             not_indexable(&o),
             ret_void(),
@@ -1201,6 +1250,17 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     expr(call(
                         "zl_table_seti",
                         vec![unbox_table(o.e(), t), i.e(), v.e()],
+                        unit(),
+                    )),
+                    ret_void(),
+                ],
+            ),
+            when(
+                zyntax_builtins::foreign::is_foreign(o.e()),
+                vec![
+                    expr(call(
+                        "zl_foreign_setindex",
+                        vec![o.e(), box_i64(i.e()), v.e()],
                         unit(),
                     )),
                     ret_void(),

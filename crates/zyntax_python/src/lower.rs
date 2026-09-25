@@ -8998,6 +8998,18 @@ impl<'m> Lowerer<'m> {
                     let node = self.str_of(v);
                     return Ok(Val { node, ty: Ty::Str });
                 }
+                // The module the embedding program has by that name: what
+                // an import of a module the program does not have becomes
+                // (`modules`). The name is the whole dotted path, and the
+                // module itself comes back whatever `fromlist` holds.
+                "__import__" if !args.is_empty() => {
+                    let module = self.expr_as(&args[0], Ty::Str)?;
+                    let v = Val {
+                        node: call("zb_foreign_module", vec![module], Ty::Object, span),
+                        ty: Ty::Object,
+                    };
+                    return Ok(self.guard(v, span));
+                }
                 "repr" => {
                     let v = self.expr(&args[0])?;
                     let node = self.repr_of(v);

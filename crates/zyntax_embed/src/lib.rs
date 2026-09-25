@@ -66,6 +66,7 @@ mod effect_runtime;
 mod error;
 #[cfg(feature = "native")]
 mod fiber;
+pub mod foreign;
 mod grammar;
 mod grammar2;
 /// Cooperative-async future table. Browser-runtime parking layer

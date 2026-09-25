@@ -11,7 +11,7 @@ use crate::lower::{
     without_self,
 };
 use crate::scope::Scope;
-use crate::types::{ClassInfo, Locals, Module, Sig, Ty, method_fn};
+use crate::types::{ClassInfo, Elem, Locals, Module, Sig, Ty, method_fn};
 use crate::{Error, Result, intern};
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
@@ -960,6 +960,11 @@ fn attribute_error(x: Node, attr: &str, span: Span) -> TypedNode<TypedStatement>
     )
 }
 
+/// Whether `x` is a foreign object: a value of the embedding program's.
+fn is_foreign(x: Node, span: Span) -> Node {
+    call("zb_is_foreign", vec![x], Ty::Bool, span)
+}
+
 /// `raise TypeError("'<type>'" + what)`.
 fn type_error_stmt(x: Node, what: &str, span: Span) -> TypedNode<TypedStatement> {
     let message = binary(
@@ -1006,6 +1011,19 @@ fn getattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
         },
         span,
     );
+    statements.push(when(
+        is_foreign(x.clone(), span),
+        vec![ret(
+            call(
+                "zb_foreign_get",
+                vec![x.clone(), str_lit(attr, span)],
+                Ty::Object,
+                span,
+            ),
+            span,
+        )],
+        span,
+    ));
     statements.push(attribute_error(x.clone(), attr, span));
     statements.push(ret(x, span));
     function(
@@ -1088,6 +1106,26 @@ fn setattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
         },
         span,
     );
+    statements.push(when(
+        is_foreign(x.clone(), span),
+        vec![
+            stmt(
+                call(
+                    "zb_foreign_set",
+                    vec![
+                        x.clone(),
+                        str_lit(attr, span),
+                        var(intern("v"), Ty::Object, span),
+                    ],
+                    Ty::None,
+                    span,
+                ),
+                span,
+            ),
+            TypedNode::new(TypedStatement::Return(None), Type::Unknown, span),
+        ],
+        span,
+    ));
     statements.push(attribute_error(x, attr, span));
     function(
         &setattr_name(attr),
@@ -1147,6 +1185,26 @@ fn dynamic_call(module: &Module, method: &str, arity: usize, span: Span) -> Type
         span,
     );
     statements.extend(builtin_arms(module, method, arity, x.clone(), span));
+    let args = (0..arity)
+        .map(|i| var(intern(&format!("a{i}")), Ty::Object, span))
+        .collect();
+    statements.push(when(
+        is_foreign(x.clone(), span),
+        vec![ret(
+            call(
+                "zb_foreign_invoke",
+                vec![
+                    x.clone(),
+                    str_lit(method, span),
+                    node(TypedExpression::Array(args), Ty::List(Elem::Object), span),
+                ],
+                Ty::Object,
+                span,
+            ),
+            span,
+        )],
+        span,
+    ));
     statements.push(attribute_error(x.clone(), method, span));
     statements.push(ret(x, span));
     function(

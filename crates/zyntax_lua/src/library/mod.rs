@@ -11,6 +11,7 @@
 pub mod calls;
 pub mod coroutines;
 pub mod debug;
+pub mod foreign;
 pub mod io;
 pub mod patterns;
 pub mod stdlib;
@@ -1263,6 +1264,7 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     lib.declarations.extend(io::declarations(&t));
     lib.declarations.extend(stdlib::declarations(policy, &t));
     lib.declarations.extend(debug::declarations(&t));
+    lib.declarations.extend(foreign::declarations(&t));
     lib.declarations.push(func_code_decl(&t));
     for d in &mut lib.declarations {
         if let TypedDeclaration::Function(f) = &mut d.node {
