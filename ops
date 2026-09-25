@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1790361393,"nonce":"45R+TB1TvMcUHwC5yyhRGXoN45Q=","added":["bug","area:compiler"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790361425,"nonce":"A7297fwRMJQnuykcWRvlEMj+hU8=","message":"The fiber-drop half of the shared exit-edge emitter is 1e74c68a113719046d075411cba8bf8977d7e78bb3ef42ddaa5564db8dc464a6.","files":null}]}
