@@ -710,6 +710,10 @@ pub struct TieredBackend {
     /// keeps them apart where it must. Kept across modules, so a quick
     /// baseline made before a later module is still replaced.
     first_compiles: Arc<FirstCompiles>,
+    /// Promotions asked for by a quick baseline's frames, held until its
+    /// replacement lands: the tier above compiles the optimised body,
+    /// which the replacement is the first to make.
+    held_promotions: Arc<Mutex<HashMap<u64, osr::Requester>>>,
 
     /// Runtime FFI symbols registered post-construction.
     runtime_symbols: Arc<RwLock<Vec<RuntimeSymbol>>>,
@@ -804,6 +808,7 @@ impl TieredBackend {
             warm_up_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compile_queue: None,
             first_compiles: Arc::new((Mutex::new(HashMap::new()), std::sync::Condvar::new())),
+            held_promotions: Arc::new(Mutex::new(HashMap::new())),
             runtime_symbols: Arc::new(RwLock::new(Vec::new())),
             config,
         })
@@ -2869,6 +2874,7 @@ impl TieredBackend {
         let bead_of: HashMap<HirId, u64> =
             by_bead.iter().map(|(b, (id, _, _))| (*id, *b)).collect();
         let published = Arc::clone(&done);
+        let held_promotions = Arc::clone(&self.held_promotions);
         let quick_baseline = QuickBaseline {
             lazy: lazy.clone(),
             interp_bodies: Arc::clone(&self.interp_bodies),
@@ -2972,6 +2978,7 @@ impl TieredBackend {
                 && let Some(queue) = &queue
                 && let Some(body) = quick_baseline.body(bead_id, *func_id, module_arc)
             {
+                let cell = crate::reload::call_target(reload_key, *func_id);
                 let entry = compile_at_tier(
                     0,
                     bound.bead(),
@@ -2986,11 +2993,17 @@ impl TieredBackend {
                     verbosity,
                 );
                 if !entry.is_null() {
-                    quick_baseline
-                        .cells
-                        .lock()
-                        .unwrap()
-                        .insert(bead_id, crate::reload::call_target(reload_key, *func_id));
+                    // The backend publishes what it compiles to the cell;
+                    // the cell gets back the stub it held.
+                    if cell != 0 {
+                        crate::reload::replace_call_target(
+                            reload_key,
+                            *func_id,
+                            entry as usize,
+                            cell,
+                        );
+                    }
+                    quick_baseline.cells.lock().unwrap().insert(bead_id, cell);
                     bound.bead().eager_install(entry);
                     if trace {
                         quick_baseline.note_published(bead_id);
@@ -3017,6 +3030,7 @@ impl TieredBackend {
                 return publish(0, false);
             };
             let body_at = lazy_started.elapsed();
+            let cell_before = crate::reload::call_target(reload_key, *func_id);
             let entry = compile_at_tier(
                 0,
                 bound.bead(),
@@ -3041,13 +3055,24 @@ impl TieredBackend {
                 return publish(0, false);
             }
             match replacing {
-                // What a tier above installed meanwhile stays.
+                // What a tier above installed meanwhile stays: a cell
+                // that held neither the stub nor the quick code gets
+                // back what the backend's publication of this compile
+                // replaced.
                 Some(quick_entry) => {
-                    if let Some(cell) = quick_baseline.cells.lock().unwrap().remove(&bead_id) {
+                    let stub = quick_baseline.cells.lock().unwrap().remove(&bead_id);
+                    if cell_before != 0 && cell_before != quick_entry && Some(cell_before) != stub {
                         crate::reload::replace_call_target(
                             reload_key,
                             *func_id,
-                            cell,
+                            entry as usize,
+                            cell_before,
+                        );
+                    } else if let Some(stub) = stub {
+                        crate::reload::replace_call_target(
+                            reload_key,
+                            *func_id,
+                            stub,
                             entry as usize,
                         );
                     }
@@ -3067,6 +3092,16 @@ impl TieredBackend {
                 optimized_bodies.lock().unwrap().remove(func_id);
             }
             publish(entry as usize, false);
+            // A promotion held for the quick baseline goes ahead now
+            // that its optimised body exists. Taken after the publish,
+            // so a request made since found the replacement and went
+            // ahead on its own.
+            let held = held_promotions.lock().unwrap().remove(&bead_id);
+            if replacing.is_some()
+                && let Some(from) = held
+            {
+                osr::run_promotion(bead_id, from);
+            }
             if keeps_bodies && static_hot.contains(&bead_id) {
                 promote_static_hot(bead_id, &body);
             }
@@ -3174,6 +3209,9 @@ impl TieredBackend {
                 .ok();
         }
 
+        // `ZYNTAX_DISABLE_QUICK_BASELINE=1` gives every first call the
+        // optimised body; safe to run with.
+        let quick_off = std::env::var_os("ZYNTAX_DISABLE_QUICK_BASELINE").is_some();
         // The stub runs on whatever stack the first call was made from,
         // which may be a fiber's, far too small for a compile. The
         // compile runs on a thread with room and the caller waits. A
@@ -3184,7 +3222,7 @@ impl TieredBackend {
             if let Some(Some((entry, _))) = published.0.lock().unwrap().get(&bead_id) {
                 return *entry as *const u8;
             }
-            let quick = !ON_WARM_UP.with(|on| on.get());
+            let quick = !quick_off && !ON_WARM_UP.with(|on| on.get());
             std::thread::scope(|scope| {
                 std::thread::Builder::new()
                     .name("zyntax-first-call-compile".into())
@@ -3338,6 +3376,8 @@ impl TieredBackend {
         let optimized_bodies = Arc::clone(&self.optimized_bodies);
         let interp_bodies = Arc::clone(&self.interp_bodies);
         let queue = self.compile_queue.clone();
+        let first_compiles = Arc::clone(&self.first_compiles);
+        let held_promotions = Arc::clone(&self.held_promotions);
         // What the tier above answered for each bead. A request repeated
         // while the compile is queued, after it landed or after the tier
         // refused the body costs the asking frame this lookup and no
@@ -3418,6 +3458,22 @@ impl TieredBackend {
                 // No thread to be had: the frame's own thread does the
                 // work below, as it did before there was a worker.
                 while queue.next_promotion(bead_id).is_some() {}
+            }
+            // A quick baseline has no optimised body yet: the request
+            // waits for the replacement, which runs it once that body
+            // exists. Checked under the table's lock, which the
+            // replacement publishes under before it takes the held ones.
+            if *lazy && swapped.is_none() {
+                let table = first_compiles.0.lock().unwrap();
+                if matches!(table.get(&bead_id), Some(Some((_, true)))) {
+                    held_promotions.lock().unwrap().insert(bead_id, from);
+                    if osr::osr_trace_enabled() {
+                        eprintln!(
+                            "[osr] bead={bead_id}: promotion held for its quick baseline's replacement"
+                        );
+                    }
+                    return true;
+                }
             }
             // The body: the one a reload swapped in, else the one the
             // first-call compile optimised, else the module's.
