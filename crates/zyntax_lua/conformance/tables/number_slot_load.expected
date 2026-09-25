@@ -1,0 +1,6 @@
+integer/float	2	1.0
+2	integer	1.0	float	3.0
+float/integer	4.5	2.0
+4.5	float	2.0	float	6.5
+float/float	9.007199254741e+15	-0.0
+9.007199254741e+15	float	-inf	9.007199254741e+15

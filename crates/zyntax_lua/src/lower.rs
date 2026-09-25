@@ -178,12 +178,21 @@ struct ShapeLayout {
     slots: Vec<Slot>,
 }
 
+/// A table slot. A `Number` slot is two words, `s{bit}i` and
+/// `s{bit}f`, with its kind in bit `kbit` of the header's `present`
+/// word. While its presence bit is set, the kind bit is set exactly
+/// when the value is the integer in `i` and clear exactly when it is
+/// the float in `f`; the other word is unspecified (a float store
+/// writes `f` alone), so every reader selects its word by the kind.
 #[derive(Clone)]
 struct Slot {
     name: String,
     /// The slot's bit in the header's `present` word.
     bit: usize,
     kind: SlotKind,
+    /// A `Number` slot's kind bit in the `present` word, above every
+    /// presence bit.
+    kbit: Option<usize>,
 }
 
 /// What a slot stores.
@@ -194,6 +203,8 @@ enum SlotKind {
     Bool,
     Str,
     Table,
+    /// An integer or a float: two fields and a kind bit.
+    Number,
     /// A tagged scalar: three fields.
     Scalar,
     /// A boxed value, null for nil.
@@ -208,7 +219,8 @@ impl Slot {
             Ty::Bool => SlotKind::Bool,
             Ty::Str => SlotKind::Str,
             Ty::Table | Ty::Shape(_) => SlotKind::Table,
-            Ty::Number | Ty::Scalar | Ty::IntOrNil | Ty::FloatOrNil => SlotKind::Scalar,
+            Ty::Number => SlotKind::Number,
+            Ty::Scalar | Ty::IntOrNil | Ty::FloatOrNil => SlotKind::Scalar,
             Ty::Nil | Ty::Func(_) | Ty::Any | Ty::Unknown => SlotKind::Any,
         }
     }
@@ -221,6 +233,7 @@ impl Slot {
             SlotKind::Bool => Ty::Bool,
             SlotKind::Str => Ty::Str,
             SlotKind::Table => Ty::Table,
+            SlotKind::Number => Ty::Number,
             SlotKind::Scalar => Ty::Scalar,
             SlotKind::Any => Ty::Any,
         }
@@ -236,6 +249,10 @@ impl Slot {
             SlotKind::Str => vec![(base, prim(PrimitiveType::String))],
             SlotKind::Table => vec![(base, table_ty.clone())],
             SlotKind::Any => vec![(base, Type::Any)],
+            SlotKind::Number => vec![
+                (format!("{base}i"), prim(PrimitiveType::I64)),
+                (format!("{base}f"), prim(PrimitiveType::F64)),
+            ],
             SlotKind::Scalar => vec![
                 (format!("{base}t"), prim(PrimitiveType::I64)),
                 (format!("{base}i"), prim(PrimitiveType::I64)),
@@ -246,6 +263,11 @@ impl Slot {
 
     fn mask(&self) -> i64 {
         1i64 << self.bit
+    }
+
+    /// The mask of a `Number` slot's kind bit.
+    fn kmask(&self) -> i64 {
+        1i64 << self.kbit.expect("a number slot has a kind bit")
     }
 }
 
@@ -291,8 +313,11 @@ enum End {
 
 /// The layouts of a chunk's shapes: a shape with fields, and not too
 /// many, gets slots. With `slots` off (a chunk compiled at run time,
-/// whose shapes the program's hooks do not know), none does.
+/// whose shapes the program's hooks do not know), none does. Number
+/// slots take kind bits from bit 63 down while those stay above the
+/// presence bits; a Number slot left without one is a Scalar slot.
 fn shape_layouts(inferred: &Inferred, chunk_index: i64, slots: bool) -> Vec<Option<ShapeLayout>> {
+    let trace = std::env::var_os("ZYNTAX_TRACE_TYPES").is_some();
     inferred
         .shapes
         .iter()
@@ -302,20 +327,38 @@ fn shape_layouts(inferred: &Inferred, chunk_index: i64, slots: bool) -> Vec<Opti
                 return None;
             }
             let gid = (chunk_index << 20) + k as i64 + 1;
+            let mut kbits = (info.fields.len()..64).rev();
+            let slots = info
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(bit, (name, ty))| {
+                    let mut kind = Slot::kind_of(ty.settled());
+                    let kbit = match kind {
+                        SlotKind::Number => kbits.next(),
+                        _ => None,
+                    };
+                    if kind == SlotKind::Number && kbit.is_none() {
+                        if trace {
+                            eprintln!(
+                                "[types] shape {k}: field {name} has no kind bit, a scalar slot"
+                            );
+                        }
+                        kind = SlotKind::Scalar;
+                    }
+                    Slot {
+                        name: name.clone(),
+                        bit,
+                        kind,
+                        kbit,
+                    }
+                })
+                .collect();
             Some(ShapeLayout {
                 id: TypeId::next(),
                 name: format!("LuaTable${gid}"),
                 gid,
-                slots: info
-                    .fields
-                    .iter()
-                    .enumerate()
-                    .map(|(bit, (name, ty))| Slot {
-                        name: name.clone(),
-                        bit,
-                        kind: Slot::kind_of(ty.settled()),
-                    })
-                    .collect(),
+                slots,
             })
         })
         .collect()
@@ -914,8 +957,9 @@ fn ret(value: Option<Node>, span: Span) -> St {
 /// Statements followed by a value, as one expression.
 /// A scalar whose kind is decided at run time: a tag, the integer it
 /// holds and the float it holds. A value struct, so it lives in
-/// registers; the fields the kind does not use are left zero. A
-/// number is one whose tag is never nil or boolean.
+/// registers; the field the tag does not select is unspecified, so
+/// every reader selects by the tag. A number is one whose tag is never
+/// nil or boolean.
 fn number_type() -> Type {
     Type::Tuple(vec![
         prim(PrimitiveType::I64),
@@ -1074,7 +1118,27 @@ impl NumberParts {
         )
     }
 
-    /// The value as a float, whichever number it holds.
+    /// Whether two numbers are both integers, without a short-circuit:
+    /// the tags of numbers are `TAG_INT` and `TAG_FLOAT`, and only two
+    /// `TAG_INT`s or together to `TAG_INT`.
+    fn both_int(&self, other: &NumberParts, span: Span) -> Node {
+        binary(
+            BinaryOp::Eq,
+            binary(
+                BinaryOp::BitOr,
+                self.tag.clone(),
+                other.tag.clone(),
+                prim(PrimitiveType::I64),
+                span,
+            ),
+            int_lit(TAG_INT, span),
+            prim(PrimitiveType::Bool),
+            span,
+        )
+    }
+
+    /// The value as a float, whichever number it holds: both arms are
+    /// plain reads, so this is a select.
     fn as_float(&self, span: Span) -> Node {
         if_value(
             self.is_int(span),
@@ -2446,6 +2510,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let shaped = as_shape(t.clone(), self.m.shape_ty(layout), span);
         let base = format!("s{}", slot.bit);
         let node = match slot.kind {
+            SlotKind::Number => return self.number_slot_read(t, layout, slot, Ty::Number, span),
             SlotKind::Scalar => number_value(
                 field(
                     shaped.clone(),
@@ -2470,24 +2535,103 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
     }
 
-    /// Statements storing `value`, already of the slot's stored type,
-    /// into slot `slot` of table `t`, and setting its bit; a value that
-    /// may be nil clears the bit when it is. With `settled` the bit is
-    /// set for good (a field born with the table that nothing clears)
-    /// and left alone.
-    fn slot_write(
+    /// The value in slot `slot` of table `t` read as `ty`: a Number
+    /// slot's float word alone for `Float` and its integer word alone
+    /// for `Int`, which the caller knows the slot to hold; else as the
+    /// slot stores it.
+    fn slot_read_as(&self, t: &Node, layout: &ShapeLayout, slot: &Slot, ty: Ty, span: Span) -> Val {
+        match slot.kind {
+            SlotKind::Number => self.number_slot_read(t, layout, slot, ty, span),
+            _ => self.slot_read(t, layout, slot, span),
+        }
+    }
+
+    /// A word of Number slot `slot` of table `t`: `i` or `f`.
+    fn number_slot_word(
+        &self,
+        t: &Node,
+        layout: &ShapeLayout,
+        slot: &Slot,
+        word: char,
+        span: Span,
+    ) -> Node {
+        let shaped = as_shape(t.clone(), self.m.shape_ty(layout), span);
+        let ty = match word {
+            'i' => prim(PrimitiveType::I64),
+            _ => prim(PrimitiveType::F64),
+        };
+        field(shaped, &format!("s{}{word}", slot.bit), ty, span)
+    }
+
+    /// Number slot `slot` of table `t` read as `ty`: one word for
+    /// `Float` or `Int`, else the number its kind bit tells.
+    fn number_slot_read(
+        &self,
+        t: &Node,
+        layout: &ShapeLayout,
+        slot: &Slot,
+        ty: Ty,
+        span: Span,
+    ) -> Val {
+        let i64_t = prim(PrimitiveType::I64);
+        match ty {
+            Ty::Float => Val {
+                node: self.number_slot_word(t, layout, slot, 'f', span),
+                ty: Ty::Float,
+            },
+            Ty::Int => Val {
+                node: self.number_slot_word(t, layout, slot, 'i', span),
+                ty: Ty::Int,
+            },
+            _ => {
+                let is_int = binary(
+                    BinaryOp::Ne,
+                    binary(
+                        BinaryOp::BitAnd,
+                        self.present_of(t, span),
+                        int_lit(slot.kmask(), span),
+                        i64_t,
+                        span,
+                    ),
+                    int_lit(0, span),
+                    prim(PrimitiveType::Bool),
+                    span,
+                );
+                Val {
+                    node: number_value(
+                        tag_of_is_int(is_int, span),
+                        self.number_slot_word(t, layout, slot, 'i', span),
+                        self.number_slot_word(t, layout, slot, 'f', span),
+                        span,
+                    ),
+                    ty: Ty::Number,
+                }
+            }
+        }
+    }
+
+    /// Statements storing `value` into slot `slot` of table `t`, and
+    /// setting its bit; a value that may be nil clears the bit when it
+    /// is. With `settled` the bit is set for good (a field born with
+    /// the table that nothing clears) and left alone. A Number slot
+    /// takes a value of its own type, `Int` or `Float`, as it is.
+    fn slot_store(
         &mut self,
         t: &Node,
         layout: &ShapeLayout,
         slot: &Slot,
-        value: Node,
+        value: Val,
         settled: bool,
         span: Span,
     ) -> Vec<St> {
+        if slot.kind == SlotKind::Number {
+            return self.number_slot_store(t, layout, slot, value, settled, span);
+        }
         let i64_t = prim(PrimitiveType::I64);
         let shaped = as_shape(t.clone(), self.m.shape_ty(layout), span);
         let base = format!("s{}", slot.bit);
         let mut out = Vec::new();
+        let value = self.coerce(value, slot.stored_ty());
         let value = self
             .hold(
                 Val {
@@ -2550,6 +2694,136 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         out
     }
 
+    /// Statements storing `value` into Number slot `slot` of table `t`:
+    /// a float writes `f` and clears the kind bit, an integer writes
+    /// `i` and sets it, a number of run-time kind writes both words
+    /// and sets the bit from its tag. The presence bit is set unless
+    /// `settled`.
+    fn number_slot_store(
+        &mut self,
+        t: &Node,
+        layout: &ShapeLayout,
+        slot: &Slot,
+        value: Val,
+        settled: bool,
+        span: Span,
+    ) -> Vec<St> {
+        let i64_t = prim(PrimitiveType::I64);
+        let mut out = Vec::new();
+        let int_word = self.number_slot_word(t, layout, slot, 'i', span);
+        let float_word = self.number_slot_word(t, layout, slot, 'f', span);
+        let present = self.present_of(t, span);
+        let or = |a: Node, b: Node| binary(BinaryOp::BitOr, a, b, i64_t.clone(), span);
+        let with_mask = |p: Node| {
+            if settled {
+                p
+            } else {
+                or(p, int_lit(slot.mask(), span))
+            }
+        };
+        let without_kind = |p: Node| {
+            binary(
+                BinaryOp::BitAnd,
+                p,
+                int_lit(!slot.kmask(), span),
+                i64_t.clone(),
+                span,
+            )
+        };
+        match value.ty {
+            Ty::Float => {
+                out.push(assign(float_word, value.node, span));
+                out.push(assign(
+                    present.clone(),
+                    without_kind(with_mask(present.clone())),
+                    span,
+                ));
+            }
+            Ty::Int => {
+                out.push(assign(int_word, value.node, span));
+                let bits = or(present.clone(), int_lit(slot.kmask(), span));
+                out.push(assign(present.clone(), with_mask(bits), span));
+            }
+            _ => {
+                let value = Val {
+                    node: self.coerce(value, Ty::Number),
+                    ty: Ty::Number,
+                };
+                let (pre, n) = self.number_parts(value);
+                out.extend(pre);
+                let kind = if_value(
+                    n.is_int(span),
+                    int_lit(slot.kmask(), span),
+                    int_lit(0, span),
+                    i64_t.clone(),
+                    span,
+                );
+                out.push(assign(int_word, n.int, span));
+                out.push(assign(float_word, n.float, span));
+                let bits = or(without_kind(with_mask(present.clone())), kind);
+                out.push(assign(present, bits, span));
+            }
+        }
+        out
+    }
+
+    /// A new table's Number slot `slot` holding `value`, or nothing:
+    /// its `present` bits and its two words' initializers, plain reads.
+    fn number_slot_init(
+        &mut self,
+        slot: &Slot,
+        value: Option<Val>,
+        pre: &mut Vec<St>,
+        span: Span,
+    ) -> (Node, Vec<TypedFieldInit>) {
+        let i64_t = prim(PrimitiveType::I64);
+        let (bits, int, float) = match value.map(|v| self.slot_value(v, slot)) {
+            None => (int_lit(0, span), int_lit(0, span), float_lit(0.0, span)),
+            Some(v) if v.ty == Ty::Int => (
+                int_lit(slot.mask() | slot.kmask(), span),
+                self.hold(v, pre).node,
+                float_lit(0.0, span),
+            ),
+            Some(v) if v.ty == Ty::Float => (
+                int_lit(slot.mask(), span),
+                int_lit(0, span),
+                self.hold(v, pre).node,
+            ),
+            Some(v) => {
+                let (held, n) = self.number_parts(v);
+                pre.extend(held);
+                let kind = if_value(
+                    n.is_int(span),
+                    int_lit(slot.mask() | slot.kmask(), span),
+                    int_lit(slot.mask(), span),
+                    i64_t.clone(),
+                    span,
+                );
+                (kind, n.int, n.float)
+            }
+        };
+        let words = [("i", int), ("f", float)]
+            .into_iter()
+            .map(|(suffix, value)| TypedFieldInit {
+                name: intern(&format!("s{}{suffix}", slot.bit)),
+                value: Box::new(value),
+            })
+            .collect();
+        (bits, words)
+    }
+
+    /// `v` as a store into `slot` takes it: an integer or a float as it
+    /// is for a Number slot, else of the slot's stored type.
+    fn slot_value(&mut self, v: Val, slot: &Slot) -> Val {
+        match (slot.kind, v.ty) {
+            (SlotKind::Number, Ty::Int | Ty::Float | Ty::Number) => v,
+            _ => Val {
+                node: self.coerce(v, slot.stored_ty()),
+                ty: slot.stored_ty(),
+            },
+        }
+    }
+
     /// Whether a value of the slot's stored type is nil, when it can be.
     fn slot_nil(&self, value: &Node, slot: &Slot, span: Span) -> Option<Node> {
         let bool_t = prim(PrimitiveType::Bool);
@@ -2569,10 +2843,62 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     /// The parts of a number, held first unless it is a plain read.
     fn number_parts(&mut self, v: Val) -> (Vec<St>, NumberParts) {
-        let span = v.node.span;
         let mut pre = Vec::new();
-        let held = self.hold(v, &mut pre);
-        (pre, NumberParts::of(&held.node, span))
+        let parts = self.number_parts_into(v, &mut pre);
+        (pre, parts)
+    }
+
+    /// The parts of number `v`, with what computes them pushed on
+    /// `pre`. A number built in place, alone or at the end of a block,
+    /// is held part by part, so no aggregate is made only to be taken
+    /// apart.
+    fn number_parts_into(&mut self, v: Val, pre: &mut Vec<St>) -> NumberParts {
+        let span = v.node.span;
+        let ty = v.ty;
+        match v.node.node {
+            TypedExpression::Block(mut block)
+                if matches!(
+                    block.statements.last().map(|s| &s.node),
+                    Some(TypedStatement::Expression(_))
+                ) =>
+            {
+                let Some(St {
+                    node: TypedStatement::Expression(tail),
+                    ..
+                }) = block.statements.pop()
+                else {
+                    unreachable!("the block ends in an expression")
+                };
+                pre.extend(block.statements);
+                self.number_parts_into(Val { node: *tail, ty }, pre)
+            }
+            TypedExpression::Tuple(parts) if parts.len() == 3 => {
+                let mut held = parts.into_iter().zip([Ty::Int, Ty::Int, Ty::Float]);
+                let mut next = || {
+                    let (node, ty) = held.next().expect("three parts");
+                    self.hold(Val { node, ty }, pre).node
+                };
+                NumberParts {
+                    tag: next(),
+                    int: next(),
+                    float: next(),
+                }
+            }
+            node => {
+                let held = self.hold(
+                    Val {
+                        node: Node {
+                            node,
+                            ty: v.node.ty,
+                            span,
+                        },
+                        ty,
+                    },
+                    pre,
+                );
+                NumberParts::of(&held.node, span)
+            }
+        }
     }
 
     /// A list literal whose items are plain reads: any other item is
@@ -4393,15 +4719,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let i64_t = prim(PrimitiveType::I64);
         let f64_t = prim(PrimitiveType::F64);
         let bool_t = prim(PrimitiveType::Bool);
-        let both_int = |x: &NumberParts, y: &NumberParts| {
-            binary(
-                BinaryOp::And,
-                x.is_int(span),
-                y.is_int(span),
-                prim(PrimitiveType::Bool),
-                span,
-            )
-        };
+        let both_int = |x: &NumberParts, y: &NumberParts| x.both_int(y, span);
         let a = Val {
             node: self.coerce(a, Ty::Number),
             ty: Ty::Number,
@@ -4570,21 +4888,18 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 span,
             )
         };
-        let mixed = if_value(
-            x.is_int(span),
-            x_int,
-            if_value(y.is_int(span), y_int, floats, bool_t.clone(), span),
+        // Two numbers of one kind compare by a select; an integer
+        // against a float takes the exact helper.
+        let same = if_value(x.is_int(span), ints, floats, bool_t.clone(), span);
+        let mixed = if_value(x.is_int(span), x_int, y_int, bool_t.clone(), span);
+        let same_kind = binary(
+            BinaryOp::Eq,
+            x.tag.clone(),
+            y.tag.clone(),
             bool_t.clone(),
             span,
         );
-        let both = binary(
-            BinaryOp::And,
-            x.is_int(span),
-            y.is_int(span),
-            bool_t.clone(),
-            span,
-        );
-        if_value(both, ints, mixed, bool_t, span)
+        if_value(same_kind, same, mixed, bool_t, span)
     }
 
     /// The text a string or number contributes to `..`.
@@ -4938,6 +5253,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 .rev()
                 .find(|(s, _)| s.bit == slot.bit)
                 .map(|(_, v)| v.clone());
+            if slot.kind == SlotKind::Number {
+                let (bits, words) = self.number_slot_init(slot, value, &mut pre, span);
+                present = binary(BinaryOp::BitOr, present, bits, i64_t.clone(), span);
+                inits.extend(words);
+                continue;
+            }
             let stored = match value {
                 Some(v) => {
                     filled.push(slot.bit);
@@ -5168,6 +5489,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         // a closed lookup, which else gives nil; anything else takes
         // the general read, which raises for nil and consults a
         // metatable the types do not follow.
+        let slot_desc = desc.clone();
         let mut value = if sure && slot.is_some() {
             self.index_nil(desc, ty, span)
         } else if closed {
@@ -5197,7 +5519,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             value = if_value(not_null(&found.node), read, value, self.ir(ty), span);
         }
         // The table's own slot first.
-        if let Some((layout, slot)) = slot {
+        if let Some((layout, slot)) = &slot
+            && sure
+            && slot.kind == SlotKind::Number
+            && ty == Ty::Number
+        {
+            value = self.sure_number_read(&t.node, layout, slot, slot_desc, span);
+        } else if let Some((layout, slot)) = slot {
             let fast = if sure {
                 not_null(&t.node)
             } else {
@@ -5209,7 +5537,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     span,
                 )
             };
-            let from_slot = self.slot_read(&t.node, layout, &slot, span);
+            let from_slot = self.slot_read_as(&t.node, layout, &slot, ty, span);
             let from_slot = self.coerce(from_slot, ty);
             value = if_value(fast, from_slot, value, self.ir(ty), span);
         }
@@ -5217,6 +5545,35 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             node: block_value(pre, value, span),
             ty,
         }
+    }
+
+    /// Number slot `slot` of table `t`, which every table of its shape
+    /// holds: a nil `t` raises in computing the tag, ahead of the two
+    /// words' reads, so the number is built from its parts with no
+    /// merge of whole numbers.
+    fn sure_number_read(
+        &mut self,
+        t: &Node,
+        layout: &ShapeLayout,
+        slot: &Slot,
+        desc: Desc,
+        span: Span,
+    ) -> Node {
+        let read = self.number_slot_read(t, layout, slot, Ty::Number, span);
+        let TypedExpression::Tuple(parts) = read.node.node else {
+            unreachable!("a number slot reads as its three parts")
+        };
+        let [tag, int, float]: [Node; 3] = parts.try_into().expect("three parts");
+        let not_null = binary(
+            BinaryOp::Ne,
+            t.clone(),
+            null(self.ir(Ty::Table), span),
+            prim(PrimitiveType::Bool),
+            span,
+        );
+        let raise = self.index_nil(desc, Ty::Int, span);
+        let tag = if_value(not_null, tag, raise, prim(PrimitiveType::I64), span);
+        number_value(tag, int, float, span)
     }
 
     /// Indexing a nil receiver: the error, raised and left through,
@@ -5526,16 +5883,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 let bool_t = prim(PrimitiveType::Bool);
                 let mut pre = Vec::new();
                 let t = self.hold(obj, &mut pre);
-                let stored = self.coerce(value, slot.stored_ty());
-                let stored = self
-                    .hold(
-                        Val {
-                            node: stored,
-                            ty: slot.stored_ty(),
-                        },
-                        &mut pre,
-                    )
-                    .node;
+                let stored = self.slot_value(value, slot);
+                let stored = self.hold(stored, &mut pre);
                 let not_null = binary(
                     BinaryOp::Ne,
                     t.node.clone(),
@@ -5579,14 +5928,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 // nothing stores nil in and no store under a computed
                 // key reaches, keeps its bit set.
                 let settled = info.always_present(&name) && !info.dynamic_keys;
-                let then = self.slot_write(&t.node, layout, slot, stored.clone(), settled, span);
-                let boxed = self.coerce(
-                    Val {
-                        node: stored,
-                        ty: slot.stored_ty(),
-                    },
-                    Ty::Any,
-                );
+                let then = self.slot_store(&t.node, layout, slot, stored.clone(), settled, span);
+                let boxed = self.coerce(stored, Ty::Any);
                 let boxed_t = self.coerce(t, Ty::Any);
                 let k = self.constant_key(&key).expect("a constant key");
                 let els = vec![
@@ -10130,6 +10473,19 @@ fn shape_hooks(module: &Module<'_>, layouts: &[ShapeLayout], span: Span) -> Vec<
                     span,
                 ),
                 SlotKind::Float => is_cat(library::FLOAT),
+                SlotKind::Number => binary(
+                    BinaryOp::Or,
+                    binary(
+                        BinaryOp::Or,
+                        is_cat(library::INT),
+                        is_cat(library::UINT),
+                        bool_t.clone(),
+                        span,
+                    ),
+                    is_cat(library::FLOAT),
+                    bool_t.clone(),
+                    span,
+                ),
                 SlotKind::Bool => is_cat(library::BOOL),
                 SlotKind::Str => is_cat(library::STR),
                 SlotKind::Table => binary(
@@ -10152,14 +10508,11 @@ fn shape_hooks(module: &Module<'_>, layouts: &[ShapeLayout], span: Span) -> Vec<
                 ),
                 SlotKind::Any => bool_lit(true, span),
             };
-            let stored = lowerer.coerce(
-                Val {
-                    node: v(),
-                    ty: Ty::Any,
-                },
-                slot.stored_ty(),
-            );
-            let mut write = lowerer.slot_write(&t(), layout, slot, stored, false, span);
+            let stored = Val {
+                node: v(),
+                ty: Ty::Any,
+            };
+            let mut write = lowerer.slot_store(&t(), layout, slot, stored, false, span);
             write.push(ret(Some(int_lit(0, span)), span));
             arms.push(if_(
                 slot_is(slot.bit),

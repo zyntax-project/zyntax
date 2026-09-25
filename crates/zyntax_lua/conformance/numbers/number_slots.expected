@@ -1,0 +1,27 @@
+p.x	1	integer	1	1
+p.y	2.5	float	2.5	0x1.4p+1
+q.x	0.5	float	0.5	0x1p-1
+q.y	3	integer	3	3
+p.x	2	integer	2	2
+p.y	5.0	float	5.0	0x1.4p+2
+q.x	1.5	float	1.5	0x1.8p+0
+q.y	6	integer	6	6
+int	7	integer	7	7
+float	7.0	float	7.0	0x1.cp+2
+true	true	float
+int again	7	integer	7	7
+false	number_slots.lua:45: attempt to divide by zero
+false	number_slots.lua:46: attempt to perform 'n%0'
+inf	-inf	true
+integer 1 integer 2 
+-9223372036854775808	true	integer
+9223372036854775807	true
+9.2233720368548e+18	float	true	9223372036854775808.0
+-0.0	-inf	-0.0
+0	inf	0
+5.0	-1	12	1.0	0.75	0	3
+false	true	true	true	true	false
+false	true
+true	false	true	true
+true	false	false	true
+22.5	15.0	float	float

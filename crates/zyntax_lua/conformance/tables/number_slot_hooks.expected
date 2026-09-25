@@ -1,0 +1,13 @@
+x=3:integer y=4.5:float	x=1.5:float y=2:integer
+29.25	6.25
+v	1.5
+v	2
+nil
+3	integer	4.5	float
+2.25	float	8	integer	69.0625
+5	integer	2	2.5	x=5:integer y=8:integer
+10	integer	0.5	float
+10.0	float	1	integer
+10.0	float	1	integer
+9007199254740992 9.0072e+15 9.007199254741e+15 -0.0	9.007199254741e+15|-0.0	-inf
+-9223372036854775808	-7	-9223372036854775808|-7	integer
