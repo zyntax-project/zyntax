@@ -1,6 +1,6 @@
 # Zyntax
 
-> Compiler infrastructure with tiered JIT compilation and native code generation, and the Python, Lua and ZynML implementations built on it
+> Compiler infrastructure with tiered JIT compilation and native code generation
 
 [![CI](https://github.com/darmie/zyntax/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/darmie/zyntax/actions/workflows/ci.yml)
 [![ZynML Tests](https://img.shields.io/github/actions/workflow/status/darmie/zyntax/ci.yml?branch=main&label=zynml%20tests)](https://github.com/darmie/zyntax/actions/workflows/ci.yml)
