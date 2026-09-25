@@ -11989,19 +11989,33 @@ pub(crate) fn error_text_program(library: &Library) -> TypedProgram {
     }
 }
 
+/// What a program is entered for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Entry {
+    /// Running the chunk, as `lua` runs a script: an error nothing caught
+    /// ends the program, and the state closes when the chunk returns.
+    Program,
+    /// Opening the state for a host (`HOST_ENTRY`): the globals kept in
+    /// the globals table, where the C API reaches them, and nothing run
+    /// or closed.
+    Host,
+}
+
 /// The whole chunk as a program.
 pub(crate) fn program(
     ast: &ast::Ast,
     source: &str,
     file: &str,
     library: &Library,
+    entry_kind: Entry,
 ) -> Result<TypedProgram> {
     let started = std::time::Instant::now();
     let mut scopes = crate::scope::resolve(ast);
     let (mut loaded, all_found) = load_required(&scopes.requires, file)?;
     // Files share their globals through the table, as does code run
     // at run time, which may write any global the program reads.
-    let shared = !loaded.is_empty()
+    let shared = entry_kind == Entry::Host
+        || !loaded.is_empty()
         || !all_found
         || scopes.dynamic_code
         || loaded.iter().any(|m| m.scopes.dynamic_code);
@@ -12367,18 +12381,23 @@ pub(crate) fn program(
         },
     ]);
     entry_body.extend(preloads);
-    entry_body.extend([
-        expr_stmt(call(CHUNK_FN, vec![], prim(PrimitiveType::Unit), span)),
-        expr_stmt(call(
-            "zl_report_pending",
-            vec![],
-            prim(PrimitiveType::Unit),
-            span,
-        )),
-        ret(None, span),
-    ]);
+    if entry_kind == Entry::Program {
+        entry_body.extend([
+            expr_stmt(call(CHUNK_FN, vec![], prim(PrimitiveType::Unit), span)),
+            expr_stmt(call(
+                "zl_report_pending",
+                vec![],
+                prim(PrimitiveType::Unit),
+                span,
+            )),
+        ]);
+    }
+    entry_body.push(ret(None, span));
     let entry = typed_function(
-        ENTRY,
+        match entry_kind {
+            Entry::Program => ENTRY,
+            Entry::Host => crate::HOST_ENTRY,
+        },
         Vec::new(),
         prim(PrimitiveType::Unit),
         entry_body,

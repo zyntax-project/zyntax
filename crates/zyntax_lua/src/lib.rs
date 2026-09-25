@@ -146,6 +146,11 @@ type Result<T> = std::result::Result<T, Error>;
 /// by calling this.
 pub const ENTRY: &str = "lua$main";
 
+/// The function that opens the state for a host embedding the runtime,
+/// which then loads and calls chunks through the C API (see
+/// [`open_host`]).
+pub const HOST_ENTRY: &str = "lua$host";
+
 /// The built-in library, declared and lowered when this crate was
 /// built. A program imports it; the runtime links the HIR and lowers
 /// only the program.
@@ -461,7 +466,36 @@ pub fn parse_program(source: &str, file: &str) -> Result<TypedProgram> {
     let started = std::time::Instant::now();
     let library = library()?;
     trace_phase("library", started);
-    lower::program(&ast, &normal, file, library).map_err(|e| e.in_original(source))
+    lower::program(&ast, &normal, file, library, lower::Entry::Program)
+        .map_err(|e| e.in_original(source))
+}
+
+/// Open the state of `runtime` for a host, as `luaL_newstate` does for a
+/// C host: the library and a program of no statements compiled, the
+/// globals kept in the globals table, and the C API made ready. The host
+/// then loads a chunk with the global `load` and runs it with a
+/// protected call, through the C API on the returned `lua_State`. The
+/// runtime is [`register_runtime`]'s, and keeps its address while the
+/// state is open; once per runtime.
+pub fn open_host(
+    runtime: &mut zyntax_embed::TieredRuntime,
+) -> std::result::Result<zyntax_lua_capi::state::L, String> {
+    let (ast, source) = parse_chunk("", MAIN_LEVEL).map_err(|e| e.to_string())?;
+    let library = library().map_err(|e| e.to_string())?;
+    let program = lower::program(&ast, &source, "=host", library, lower::Entry::Host)
+        .map_err(|e| e.to_string())?;
+    runtime.declare_entry_points([HOST_ENTRY]);
+    set_runtime(runtime);
+    runtime
+        .compile_typed_program(program)
+        .map_err(|e| e.to_string())?;
+    let entry = runtime
+        .function_pointer(HOST_ENTRY)
+        .ok_or("the host program has no entry")?;
+    // SAFETY: the entry was compiled just above, taking and returning nothing.
+    let open: extern "C" fn() = unsafe { std::mem::transmute(entry) };
+    open();
+    zyntax_lua_capi::host_state()
 }
 
 /// `ZYNTAX_TRACE_LOWER_PHASES=1` times the frontend's steps on stderr.

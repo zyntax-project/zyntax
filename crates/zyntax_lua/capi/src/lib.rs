@@ -109,6 +109,16 @@ fn prepare() -> Result<(), String> {
     Ok(())
 }
 
+/// The main thread's State for a host that embeds the running program,
+/// the API made ready first: the `lua_State` a C host would have from
+/// `luaL_newstate`. The program must keep its globals in the globals
+/// table (`zyntax_lua::open_host` opens one that does).
+pub fn host_state() -> Result<state::L, String> {
+    ready()?;
+    // SAFETY: the main State is made once the API is ready, and lives on.
+    Ok(unsafe { (*main_state()).l() })
+}
+
 /// The main thread's State.
 pub(crate) fn main_state() -> *mut State {
     MAIN.load(std::sync::atomic::Ordering::Acquire)
