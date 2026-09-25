@@ -32,7 +32,9 @@ use crate::hir::{HirFunction, HirId, HirModule};
 #[derive(Clone)]
 pub struct ZyntaxFunctionDef {
     pub id: HirId,
-    pub function: HirFunction,
+    /// Shared with whatever handed it over: a tier compiles the body it
+    /// is given, not a copy made on the way.
+    pub function: std::sync::Arc<HirFunction>,
     /// Module-level effect, handler, global, and callee context required when
     /// a single hot function is recompiled outside the initial bulk pass.
     pub module: std::sync::Arc<HirModule>,
@@ -426,6 +428,7 @@ mod llvm_impl {
             if sites.is_empty() {
                 return Vec::new();
             }
+            crate::opt_audit::note_llvm_body(def.id, &def.function);
             self.with_lock(|backend| {
                 backend.set_compile_tier(def.tier);
                 backend.set_module_context(std::sync::Arc::clone(&def.module));
@@ -470,6 +473,7 @@ mod llvm_impl {
             // Resume points where a frame can take one: the sites frames
             // asked at, and an outlined region's own header.
             let sites = crate::osr::wanted_resume_points(def.bead_id, &def.function);
+            crate::opt_audit::note_llvm_body(def.id, &def.function);
             self.with_lock(|backend| {
                 backend.set_compile_tier(tier);
                 backend.set_module_context(std::sync::Arc::clone(&def.module));
