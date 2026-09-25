@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790357419,"nonce":"ugbAsfIBiqV89F/7xXgF/vVKGhE=","message":"Fixed on main by 277fe761; tests in c5be8886 (crates/zyntax_cli/tests/llvm_aot_zynml.rs: 2 pass, 4 ignored against their own issues). Passed on the Mac with the llvm-backend feature.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1790357419,"nonce":"LZd4429uX2b73sn7/pROtKfnIIQ=","status":2}]}
