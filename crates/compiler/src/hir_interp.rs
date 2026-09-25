@@ -5285,6 +5285,26 @@ fn call_jit_dispatch(d: JitDispatch, args: &[ZyntaxValue]) -> ZyntaxValue {
         };
     }
 
+    // Windows assigns registers by position: the arguments go in their
+    // declared order, each through its own class.
+    if cfg!(target_os = "windows") {
+        let mut words = [0u64; 8];
+        let (mut next_i, mut next_f) = (0, 0);
+        for (k, word) in words.iter_mut().enumerate().take(n_capped) {
+            if (d.float_mask >> k) & 1 == 1 {
+                *word = f64_args[next_f].to_bits();
+                next_f += 1;
+            } else {
+                *word = i64_args[next_i] as u64;
+                next_i += 1;
+            }
+        }
+        // SAFETY: the install filter admits only shapes of up to eight
+        // parameters, each an integer or an `f64`.
+        let raw = unsafe { call_positional::<i64>(d.ptr, n_capped, d.float_mask, &words) };
+        return ZyntaxValue::Int(raw.unwrap_or(0));
+    }
+
     // Mixed / all-float dispatch. Covers (n_i64, n_f64) pairs up to
     // a total of 4 arguments — enough for every JIT'd ZynML function
     // we hit today (nbody's `advance` is (2,1), mandelbrot's
@@ -5423,6 +5443,57 @@ unsafe fn call_extern_mixed<R: Copy>(
             let g: extern "C" fn(f64, f64, f64, f64) -> R = core::mem::transmute(ptr);
             Some(g(f[0], f[1], f[2], f[3]))
         }
+        _ => None,
+    }
+}
+
+/// Dispatch into a native function under the Windows x64 convention,
+/// which assigns argument registers by position: parameter `k < 4`
+/// travels in RCX, RDX, R8 or R9 when it is an integer and in XMM0 to
+/// XMM3 when it is a float, and every later parameter takes an 8-byte
+/// stack slot, a float as its bits. `words[k]` holds parameter `k`'s
+/// bits and bit `k` of `float_mask` marks it an `f64`. The return comes
+/// back in RAX, or in XMM0 for a float `R`.
+///
+/// Safety: `ptr` must be a function taking exactly `n` such parameters
+/// and returning `R`, on Windows x64.
+unsafe fn call_positional<R: Copy>(
+    ptr: *const u8,
+    n: usize,
+    float_mask: u8,
+    words: &[u64; 8],
+) -> Option<R> {
+    // `@pick` chooses the register class of each of the first four
+    // positions from the mask; `@call` then calls through that exact
+    // signature, with the stack words after it.
+    macro_rules! positional {
+        (@u64 $s:expr) => { u64 };
+        (@call [$(($t:ty, $v:expr))*] [$($s:expr),*]) => {{
+            let g: extern "C" fn($($t,)* $(positional!(@u64 $s),)*) -> R =
+                core::mem::transmute(ptr);
+            Some(g($($v,)* $($s,)*))
+        }};
+        (@pick [$($acc:tt)*] [] [$($s:expr),*]) => {
+            positional!(@call [$($acc)*] [$($s),*])
+        };
+        (@pick [$($acc:tt)*] [$k:literal $($ks:literal)*] [$($s:expr),*]) => {
+            if float_mask & (1 << $k) != 0 {
+                positional!(@pick [$($acc)* (f64, f64::from_bits(words[$k]))] [$($ks)*] [$($s),*])
+            } else {
+                positional!(@pick [$($acc)* (i64, words[$k] as i64)] [$($ks)*] [$($s),*])
+            }
+        };
+    }
+    match n {
+        0 => positional!(@pick [] [] []),
+        1 => positional!(@pick [] [0] []),
+        2 => positional!(@pick [] [0 1] []),
+        3 => positional!(@pick [] [0 1 2] []),
+        4 => positional!(@pick [] [0 1 2 3] []),
+        5 => positional!(@pick [] [0 1 2 3] [words[4]]),
+        6 => positional!(@pick [] [0 1 2 3] [words[4], words[5]]),
+        7 => positional!(@pick [] [0 1 2 3] [words[4], words[5], words[6]]),
+        8 => positional!(@pick [] [0 1 2 3] [words[4], words[5], words[6], words[7]]),
         _ => None,
     }
 }
@@ -5598,10 +5669,45 @@ fn call_extern_symbol_typed(
         }
     }
 
-    if cfg!(target_os = "windows") && n_i64 != 0 && n_f64 != 0 {
-        return Err(InterpError::UnsupportedInstruction(
-            "mixed integer/float extern ABI on Windows".to_string(),
-        ));
+    // Windows assigns registers by position, so the arguments go in
+    // their declared order, each through its own class.
+    if cfg!(target_os = "windows") {
+        let mut words = [0u64; 8];
+        let mut float_mask = 0u8;
+        let (mut next_i, mut next_f) = (0, 0);
+        for (idx, word) in words.iter_mut().enumerate().take(pcount) {
+            if sig.params[idx].category() == TypeCategory::Float {
+                *word = f[next_f].to_bits();
+                float_mask |= 1 << idx;
+                next_f += 1;
+            } else {
+                *word = i[next_i] as u64;
+                next_i += 1;
+            }
+        }
+        // SAFETY: the signature supplies each parameter's class in
+        // order, and the dispatcher has an arm for every shape of up to
+        // eight parameters.
+        return unsafe {
+            match ret_cat {
+                TypeCategory::Void => {
+                    call_positional::<()>(ptr, pcount, float_mask, &words).unwrap();
+                    Ok(ZyntaxValue::Void)
+                }
+                TypeCategory::Float if sig.return_type.type_id() == TypeTag::F32.type_id() => {
+                    Ok(ZyntaxValue::F32(
+                        call_positional::<f32>(ptr, pcount, float_mask, &words).unwrap(),
+                    ))
+                }
+                TypeCategory::Float => Ok(ZyntaxValue::Float(
+                    call_positional::<f64>(ptr, pcount, float_mask, &words).unwrap(),
+                )),
+                _ => Ok(value_from_i64_as(
+                    &ret_hir,
+                    call_positional::<i64>(ptr, pcount, float_mask, &words).unwrap(),
+                )),
+            }
+        };
     }
 
     if pcount > 4 {
@@ -5796,6 +5902,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(actual, ZyntaxValue::Float(6.0));
+    }
+
+    /// Windows x64 places arguments by position: a float first, integers
+    /// and floats interleaved, and floats past the fourth on the stack.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn typed_extern_places_mixed_arguments_by_position_on_windows() {
+        use crate::zrtl::{MAX_PARAMS, TypeTag, ZrtlSigFlags, ZrtlSymbolSig};
+
+        extern "C" fn six(a: f64, b: i64, c: f64, d: i64, e: f64, f: i64) -> f64 {
+            a + b as f64 * 10.0 + c * 100.0 + d as f64 * 1000.0 + e * 10000.0 + f as f64 * 1e5
+        }
+        let mut params = [TypeTag::VOID; MAX_PARAMS];
+        params[..6].copy_from_slice(&[
+            TypeTag::F64,
+            TypeTag::I64,
+            TypeTag::F64,
+            TypeTag::I64,
+            TypeTag::F64,
+            TypeTag::I64,
+        ]);
+        let sig = ZrtlSymbolSig {
+            param_count: 6,
+            flags: ZrtlSigFlags::NONE,
+            return_type: TypeTag::F64,
+            params,
+        };
+        let actual = call_extern_symbol_typed(
+            six as *const u8,
+            &[
+                ZyntaxValue::Float(1.0),
+                ZyntaxValue::Int(2),
+                ZyntaxValue::Float(3.0),
+                ZyntaxValue::Int(4),
+                ZyntaxValue::Float(5.0),
+                ZyntaxValue::Int(6),
+            ],
+            &sig,
+        )
+        .unwrap();
+        assert_eq!(actual, ZyntaxValue::Float(654_321.0));
     }
 
     #[test]
