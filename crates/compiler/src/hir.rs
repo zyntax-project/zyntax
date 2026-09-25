@@ -1327,6 +1327,54 @@ impl HirInstruction {
         }
     }
 
+    /// The value this instruction defines, to rename in place. Covers
+    /// exactly the variants [`HirInstruction::result_id`] does.
+    pub fn result_id_mut(&mut self) -> Option<&mut HirId> {
+        match self {
+            HirInstruction::Binary { result, .. }
+            | HirInstruction::Unary { result, .. }
+            | HirInstruction::Alloca { result, .. }
+            | HirInstruction::Load { result, .. }
+            | HirInstruction::GetElementPtr { result, .. }
+            | HirInstruction::Cast { result, .. }
+            | HirInstruction::Select { result, .. }
+            | HirInstruction::ExtractValue { result, .. }
+            | HirInstruction::InsertValue { result, .. }
+            | HirInstruction::Atomic { result, .. }
+            | HirInstruction::CreateUnion { result, .. }
+            | HirInstruction::GetUnionDiscriminant { result, .. }
+            | HirInstruction::ExtractUnionValue { result, .. }
+            | HirInstruction::CreateTraitObject { result, .. }
+            | HirInstruction::UpcastTraitObject { result, .. }
+            | HirInstruction::CreateClosure { result, .. }
+            | HirInstruction::CreateRef { result, .. }
+            | HirInstruction::Deref { result, .. }
+            | HirInstruction::Move { result, .. }
+            | HirInstruction::Copy { result, .. }
+            | HirInstruction::CaptureContinuation { result, .. }
+            | HirInstruction::VectorSplat { result, .. }
+            | HirInstruction::VectorExtractLane { result, .. }
+            | HirInstruction::VectorInsertLane { result, .. }
+            | HirInstruction::VectorHorizontalReduce { result, .. }
+            | HirInstruction::VectorLoad { result, .. }
+            | HirInstruction::VectorUnaryOp { result, .. }
+            | HirInstruction::VectorMinMax { result, .. }
+            | HirInstruction::VectorDot { result, .. }
+            | HirInstruction::AsyncLoadSlot { result, .. }
+            | HirInstruction::FiberNew { result, .. }
+            | HirInstruction::FiberResume { result, .. }
+            | HirInstruction::FiberResumeWith { result, .. }
+            | HirInstruction::FiberTransfer { result, .. } => Some(result),
+            HirInstruction::Call { result, .. }
+            | HirInstruction::IndirectCall { result, .. }
+            | HirInstruction::TraitMethodCall { result, .. }
+            | HirInstruction::CallClosure { result, .. }
+            | HirInstruction::PerformEffect { result, .. }
+            | HirInstruction::HandleEffect { result, .. } => result.as_mut(),
+            _ => None,
+        }
+    }
+
     /// Get all operand HirIds used by this instruction
     pub fn operands(&self) -> Vec<HirId> {
         let mut ops = Vec::new();

@@ -2139,73 +2139,17 @@ fn replace_uses_across_function(func: &mut HirFunction, subs: &HashMap<HirId, Hi
 }
 
 fn substitute_operands(inst: &mut HirInstruction, subs: &HashMap<HirId, HirId>) {
-    // Substitute the instruction's RESULT (defining HirId) as well as
-    // its operands. Both are necessary for cloned instructions: the
-    // subs map's image (`fresh_id`s minted up-front) is what the
-    // caller's `values` table was populated with, so the cloned
-    // instruction's result has to land at the fresh id to match.
-    //
-    // For the standard inliner this is a no-op-equivalent — the
-    // callee's HirIds are disjoint from the caller's, so the result
-    // gets a fresh id either way (the difference was invisible
-    // because downstream codegen iterates instructions in
-    // declaration order and didn't notice the duplicate caller-side
-    // HirId).
-    //
-    // For the recursive inliner this is load-bearing: the snapshot
-    // shares every HirId with the live function (it IS a clone), so
-    // without result-substitution the cloned instructions land in
-    // the caller carrying the live function's HirIds — duplicate
-    // SSA defs. The LLVM backend's value_map keyed on HirId then
-    // overwrites the live definition with the cloned one, every
-    // operand referencing the original now resolves to the cloned
-    // value, and fib(40) returns Int(38) instead of Int(102334155).
-    let map_result = |id: &mut HirId| {
-        if let Some(&new) = subs.get(id) {
-            *id = new;
-        }
-    };
-    match inst {
-        HirInstruction::Binary { result, .. }
-        | HirInstruction::Unary { result, .. }
-        | HirInstruction::Cast { result, .. }
-        | HirInstruction::Load { result, .. }
-        | HirInstruction::GetElementPtr { result, .. }
-        | HirInstruction::ExtractValue { result, .. }
-        | HirInstruction::InsertValue { result, .. }
-        | HirInstruction::Alloca { result, .. }
-        | HirInstruction::Select { result, .. }
-        | HirInstruction::Atomic { result, .. }
-        // Every vector instruction that defines a value. Leaving these
-        // out let the definition keep the id it had in the callee while
-        // its uses moved to the fresh one, so an inlined
-        // `vstore v, p` wrote a value nothing had computed.
-        | HirInstruction::VectorSplat { result, .. }
-        | HirInstruction::VectorExtractLane { result, .. }
-        | HirInstruction::VectorInsertLane { result, .. }
-        | HirInstruction::VectorHorizontalReduce { result, .. }
-        | HirInstruction::VectorLoad { result, .. }
-        | HirInstruction::VectorUnaryOp { result, .. }
-        | HirInstruction::VectorMinMax { result, .. }
-        | HirInstruction::VectorDot { result, .. } => map_result(result),
-        HirInstruction::Call { result, .. } | HirInstruction::IndirectCall { result, .. } => {
-            if let Some(r) = result {
-                map_result(r);
-            }
-        }
-        _ => {}
+    // A cloned instruction defines the fresh id its result maps to, the
+    // one the caller's `values` table holds and its uses were given. The
+    // recursive inliner's snapshot shares every id with the live body,
+    // so an unrenamed result would be a second definition of it.
+    if let Some(result) = inst.result_id_mut()
+        && let Some(&new) = subs.get(result)
+    {
+        *result = new;
     }
 
-    // Operand substitution delegates to the canonical, exhaustive
-    // `HirInstruction::replace_uses`. The hand-rolled match this
-    // replaced covered only ~11 variants and fell through for the rest —
-    // silently skipping AsyncSaveSlot / AsyncLoadSlot / PerformEffect /
-    // FiberNew / CreateClosure operands. Inlining a callee whose result
-    // was later saved across a suspend (`AsyncSaveSlot { value:
-    // call_result }`) therefore left the save pointing at the orphaned
-    // call-result id; codegen skips a save of an unmapped value, so the
-    // reloaded slot read 0 after resume. Delegating keeps this in lock-
-    // step with the operand set for every current and future variant.
+    // Operands go through `replace_uses`, which covers every variant.
     if !subs.is_empty() {
         let idx: IndexMap<HirId, HirId> = subs.iter().map(|(&k, &v)| (k, v)).collect();
         inst.replace_uses(&idx);
@@ -2425,6 +2369,81 @@ mod tests {
             })
             .expect("Add present");
         assert_eq!(add_left, mul_result, "Add must use Mul's result");
+    }
+
+    #[test]
+    fn an_inlined_closure_defines_the_value_its_uses_read() {
+        // mk() { create_closure target, [] }, caller() { mk() }: the
+        // caller's return must read the value the cloned CreateClosure
+        // defines.
+        let target = HirId::new();
+        let mut callee = HirFunction::new(
+            InternedString::new_global("mk"),
+            sig(vec![], HirType::USize),
+        );
+        let entry = HirId::new();
+        callee.entry_block = entry;
+        callee.blocks.clear();
+        callee.blocks.insert(entry, HirBlock::new(entry));
+        let c = add_inst(&mut callee, HirType::USize);
+        let blk = callee.blocks.get_mut(&entry).unwrap();
+        blk.instructions.push(HirInstruction::CreateClosure {
+            result: c,
+            closure_ty: HirType::USize,
+            function: target,
+            captures: vec![],
+        });
+        blk.terminator = HirTerminator::Return { values: vec![c] };
+        let callee_id = HirId::new();
+        callee.id = callee_id;
+
+        let mut caller = HirFunction::new(
+            InternedString::new_global("caller"),
+            sig(vec![], HirType::USize),
+        );
+        let entry = HirId::new();
+        caller.entry_block = entry;
+        caller.blocks.clear();
+        caller.blocks.insert(entry, HirBlock::new(entry));
+        let r = add_inst(&mut caller, HirType::USize);
+        let blk = caller.blocks.get_mut(&entry).unwrap();
+        blk.instructions.push(HirInstruction::Call {
+            result: Some(r),
+            callee: HirCallable::Function(callee_id),
+            args: vec![],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        blk.terminator = HirTerminator::Return { values: vec![r] };
+        let caller_id = caller.id;
+
+        let mut module = HirModule::new(InternedString::new_global("test_mod"));
+        module.functions.insert(callee_id, callee);
+        module.functions.insert(caller_id, caller);
+        let stats = run_module(&mut module);
+        assert_eq!(stats.inlined, 1, "{stats:?}");
+
+        let caller = &module.functions[&caller_id];
+        let entry = &caller.blocks[&caller.entry_block];
+        let defined = entry
+            .instructions
+            .iter()
+            .find_map(|i| match i {
+                HirInstruction::CreateClosure {
+                    result, function, ..
+                } => {
+                    assert_eq!(*function, target, "the closure's function is not a value");
+                    Some(*result)
+                }
+                _ => None,
+            })
+            .expect("the CreateClosure is cloned into the caller");
+        assert_ne!(defined, c, "the clone defines a fresh id");
+        let HirTerminator::Return { values } = &entry.terminator else {
+            panic!("caller returns");
+        };
+        assert_eq!(values, &vec![defined]);
     }
 
     #[test]
