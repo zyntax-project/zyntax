@@ -10,6 +10,10 @@
 
 use super::*;
 
+/// How many `__index` or `__newindex` handlers one access looks up
+/// before it takes them for a loop, as the reference does.
+const MAXTAGLOOP: i64 = 2000;
+
 pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let anys = t.anys();
     let table = t.table();
@@ -868,22 +872,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
 
     // ─── indexing with events ───────────────────────────────────
     // `t[k]` on a table: the raw value, or what `__index` says when
-    // that is nil. A table handler is indexed in turn, a function
-    // handler is called with the table and the key.
+    // that is nil. A function handler is called with the table and the
+    // key; any other handler is indexed in turn, by the chain below.
     let index_miss = |raw: Expr, key: Expr| {
         vec![
             x.decl(raw),
             when(not(is_nil(x.e())), vec![ret(x.e())]),
             handler.decl(call("zl_meta", vec![tb.e(), text("__index")], any())),
             when(is_nil(handler.e()), vec![ret(nil())]),
-            when(
-                is_table(handler.e()),
-                vec![ret(call(
-                    "zl_table_index",
-                    vec![unbox_table(handler.e(), t), key.clone()],
-                    any(),
-                ))],
-            ),
             when(
                 is_func(handler.e()),
                 vec![
@@ -899,14 +895,86 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     )),
                 ],
             ),
-            x.set(call("zl_index", vec![handler.e(), key], any())),
-            when(
-                not(is_nil(read_global(PENDING, any()))),
-                vec![set_global(VARINFO, int(0))],
-            ),
-            ret(x.e()),
+            ret(call("zl_index_chain", vec![handler.e(), key], any())),
         ]
     };
+    // The handlers after the first, as a loop: `cur` is the value the
+    // last handler named and `n` how many handlers have been looked up.
+    // A table is read raw before its own handler is looked up; a value
+    // with no handler of its own is indexed as itself, which is an
+    // error for most. The reference gives up after `MAXTAGLOOP`.
+    let cur = kept("cur", any());
+    let raw_of = local("raw_of", table.clone());
+    let raw_get = || call("zl_rawget", vec![raw_of.e(), k.e()], any());
+    let raw_set = || expr(call("zl_rawset", vec![raw_of.e(), k.e(), v.e()], unit()));
+    let too_long = |event: &str| {
+        when(
+            ge(n.e(), int(MAXTAGLOOP)),
+            vec![lua_error(text(&format!(
+                "'{event}' chain too long; possible loop"
+            )))],
+        )
+    };
+    d.push(define(
+        "zl_index_chain",
+        &[&o, &k],
+        any(),
+        vec![
+            cur.decl(o.e()),
+            n.decl(int(1)),
+            x.decl(nil()),
+            handler.decl(nil()),
+            while_(
+                le(n.e(), int(MAXTAGLOOP)),
+                vec![
+                    if_(
+                        is_table(cur.e()),
+                        vec![
+                            raw_of.decl(unbox_table(cur.e(), t)),
+                            x.set(raw_get()),
+                            when(not(is_nil(x.e())), vec![ret(x.e())]),
+                            too_long("__index"),
+                            handler.set(call("zl_meta", vec![raw_of.e(), text("__index")], any())),
+                            when(is_nil(handler.e()), vec![ret(nil())]),
+                        ],
+                        vec![
+                            too_long("__index"),
+                            handler.set(if_expr(
+                                or(eq(category(cur.e()), int(STR)), is_file(cur.e())),
+                                nil(),
+                                call("zl_meta_of", vec![cur.e(), text("__index")], any()),
+                            )),
+                            when(
+                                is_nil(handler.e()),
+                                vec![
+                                    x.set(call("zl_index", vec![cur.e(), k.e()], any())),
+                                    when(
+                                        not(is_nil(read_global(PENDING, any()))),
+                                        vec![set_global(VARINFO, int(0))],
+                                    ),
+                                    ret(x.e()),
+                                ],
+                            ),
+                        ],
+                    ),
+                    when(
+                        is_func(handler.e()),
+                        vec![
+                            metamethod_site(text("index")),
+                            ret(call(
+                                "zl_first",
+                                vec![call("zl_call_2", vec![handler.e(), cur.e(), k.e()], any())],
+                                any(),
+                            )),
+                        ],
+                    ),
+                    cur.set(handler.e()),
+                    n.add_assign(int(1)),
+                ],
+            ),
+            ret(nil()),
+        ],
+    ));
     d.push(define(
         "zl_table_index",
         &[&tb, &k],
@@ -938,7 +1006,9 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         index_miss(call("zl_rawget_key", vec![tb.e(), k.e()], any()), k.e()),
     ));
     // `t[k] = v` on a table: the raw store, unless the key is absent
-    // and `__newindex` says otherwise.
+    // and `__newindex` says otherwise. A function handler is called
+    // with the table, the key and the value; any other handler is
+    // stored into in turn, by the chain below.
     let newindex = |present: Expr, store: Stmt, key: Expr| {
         vec![
             when(
@@ -948,17 +1018,6 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             when(not(is_nil(present)), vec![store.clone(), ret_void()]),
             handler.decl(call("zl_meta", vec![tb.e(), text("__newindex")], any())),
             when(is_nil(handler.e()), vec![store, ret_void()]),
-            when(
-                is_table(handler.e()),
-                vec![
-                    expr(call(
-                        "zl_table_setindex",
-                        vec![unbox_table(handler.e(), t), key.clone(), v.e()],
-                        unit(),
-                    )),
-                    ret_void(),
-                ],
-            ),
             when(
                 is_func(handler.e()),
                 vec![
@@ -971,14 +1030,81 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     ret_void(),
                 ],
             ),
-            expr(call("zl_setindex", vec![handler.e(), key, v.e()], unit())),
-            when(
-                not(is_nil(read_global(PENDING, any()))),
-                vec![set_global(VARINFO, int(0))],
-            ),
+            expr(call(
+                "zl_newindex_chain",
+                vec![handler.e(), key, v.e()],
+                unit(),
+            )),
             ret_void(),
         ]
     };
+    // The handlers after the first, as [`zl_index_chain`] walks them:
+    // a table with the key present, or with no handler of its own, is
+    // stored into raw. The bound is checked before a table without a
+    // metatable is stored into, as the reference checks it.
+    d.push(define(
+        "zl_newindex_chain",
+        &[&o, &k, &v],
+        unit(),
+        vec![
+            cur.decl(o.e()),
+            n.decl(int(1)),
+            handler.decl(nil()),
+            while_(
+                le(n.e(), int(MAXTAGLOOP)),
+                vec![
+                    if_(
+                        is_table(cur.e()),
+                        vec![
+                            raw_of.decl(unbox_table(cur.e(), t)),
+                            when(not(is_nil(raw_get())), vec![raw_set(), ret_void()]),
+                            too_long("__newindex"),
+                            handler.set(call(
+                                "zl_meta",
+                                vec![raw_of.e(), text("__newindex")],
+                                any(),
+                            )),
+                            when(is_nil(handler.e()), vec![raw_set(), ret_void()]),
+                        ],
+                        vec![
+                            too_long("__newindex"),
+                            handler.set(call(
+                                "zl_meta_of",
+                                vec![cur.e(), text("__newindex")],
+                                any(),
+                            )),
+                            when(
+                                is_nil(handler.e()),
+                                vec![
+                                    expr(call("zl_setindex", vec![cur.e(), k.e(), v.e()], unit())),
+                                    when(
+                                        not(is_nil(read_global(PENDING, any()))),
+                                        vec![set_global(VARINFO, int(0))],
+                                    ),
+                                    ret_void(),
+                                ],
+                            ),
+                        ],
+                    ),
+                    when(
+                        is_func(handler.e()),
+                        vec![
+                            metamethod_site(text("newindex")),
+                            expr(call(
+                                "zl_call_3",
+                                vec![handler.e(), cur.e(), k.e(), v.e()],
+                                any(),
+                            )),
+                            ret_void(),
+                        ],
+                    ),
+                    cur.set(handler.e()),
+                    n.add_assign(int(1)),
+                ],
+            ),
+            ret_void(),
+        ],
+    ));
     d.push(define(
         "zl_table_setindex",
         &[&tb, &k, &v],
@@ -1042,7 +1168,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                             )),
                         ],
                     ),
-                    ret(call("zl_index", vec![mm.e(), key], any())),
+                    ret(call("zl_index_chain", vec![mm.e(), key], any())),
                 ],
             ),
         ])
@@ -1063,7 +1189,11 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                                 any(),
                             )),
                         ],
-                        vec![expr(call("zl_setindex", vec![mm.e(), key, v.e()], unit()))],
+                        vec![expr(call(
+                            "zl_newindex_chain",
+                            vec![mm.e(), key, v.e()],
+                            unit(),
+                        ))],
                     ),
                     ret_void(),
                 ],

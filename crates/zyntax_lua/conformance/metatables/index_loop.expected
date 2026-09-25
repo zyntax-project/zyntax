@@ -1,0 +1,15 @@
+false	index_loop.lua:11: '__index' chain too long; possible loop
+false	index_loop.lua:12: '__newindex' chain too long; possible loop
+false	index_loop.lua:17: '__newindex' chain too long; possible loop
+nil
+false	index_loop.lua:21: '__index' chain too long; possible loop
+false	index_loop.lua:22: '__newindex' chain too long; possible loop
+false	index_loop.lua:28: '__index' chain too long; possible loop
+false	index_loop.lua:29: '__index' chain too long; possible loop
+false	index_loop.lua:30: '__newindex' chain too long; possible loop
+hello	nil
+3
+found
+7
+x!
+false	index_loop.lua:63: '__index' chain too long; possible loop

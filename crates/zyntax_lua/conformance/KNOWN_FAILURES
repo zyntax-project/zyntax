@@ -14,7 +14,6 @@ official/constructs.lua       4da50c2
 official/coroutine.lua        4da50c2
 official/db.lua               4da50c2
 official/errors.lua           4da50c2
-official/events.lua           4da50c2
 official/files.lua            4da50c2
 official/gc.lua               4da50c2
 official/gengc.lua            4da50c2
