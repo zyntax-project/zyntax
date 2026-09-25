@@ -16,8 +16,11 @@
 //! reindexing hashes through the library. Its box is rewritten in
 //! place as a tombstone: an instance of [`library::DEAD_KEY_KIND`]
 //! naming an address outside the heap, which no lookup matches, with
-//! a nil value, which no traversal shows. `collectgarbage` compacts
-//! the tables holding tombstones afterwards, from the library.
+//! a nil value, which no traversal shows. Tombstones keep every
+//! entry's position, so a traversal a collection interrupts goes on
+//! where it was. The library compacts a table holding tombstones when
+//! a new key is next stored in it, which Lua already makes the end of
+//! any traversal of that table.
 //!
 //! A shaped table is never weak: its slots are words of the table
 //! itself, which the marker reads, so the types keep every table that
@@ -89,6 +92,8 @@ enum Phase {
 
 struct State {
     weak: BTreeMap<usize, Weak>,
+    /// How many tables of `weak` are dirty.
+    dirty: usize,
     /// Objects marked for finalization, in the order they were marked.
     finalizable: Vec<usize>,
     marked: BTreeSet<usize>,
@@ -120,6 +125,7 @@ enum Warn {
 
 static STATE: Mutex<State> = Mutex::new(State {
     weak: BTreeMap::new(),
+    dirty: 0,
     finalizable: Vec::new(),
     marked: BTreeSet::new(),
     pending: VecDeque::new(),
@@ -230,9 +236,8 @@ fn trace(m: &mut dyn Marking) {
             let items = unsafe { elements(list) };
             if let Some((&index, pairs)) = items.split_first() {
                 m.mark(index as usize);
-                let mut chunks = pairs.chunks_exact(2);
-                for pair in &mut chunks {
-                    let (k, v) = (pair[0], pair[1]);
+                let (whole, rest) = pairs.as_chunks::<2>();
+                for &[k, v] in whole {
                     if !alive(m, k, w.mode & WEAK_KEYS != 0) {
                         continue;
                     }
@@ -242,7 +247,7 @@ fn trace(m: &mut dyn Marking) {
                     }
                 }
                 // A key pushed without its value yet.
-                for &k in chunks.remainder() {
+                for &k in rest {
                     m.mark(k as usize);
                 }
             }
@@ -304,6 +309,7 @@ fn settle(m: &mut dyn Marking) {
 fn clear_dead_keys(s: &mut State, m: &mut dyn Marking) {
     s.phase = Phase::Done;
     let dead_keys = tombstone_dead_keys(&mut s.weak, m);
+    s.dirty = s.weak.values().filter(|w| w.dirty).count();
     clear_dead_values(&s.weak, m);
     for k in dead_keys {
         m.mark(k);
@@ -324,7 +330,12 @@ fn clear_dead_values(weak: &BTreeMap<usize, Weak>, m: &dyn Marking) {
         let t = unsafe { &mut *(t as *mut TableHeader) };
         if let Some(list) = unsafe { list_of(t.hash) } {
             let items = unsafe { elements(list) };
-            for pair in items.get_mut(1..).unwrap_or_default().chunks_exact_mut(2) {
+            for pair in items
+                .get_mut(1..)
+                .unwrap_or_default()
+                .as_chunks_mut::<2>()
+                .0
+            {
                 if dead(pair[1]) {
                     pair[1] = std::ptr::null_mut();
                 }
@@ -366,7 +377,12 @@ fn tombstone_dead_keys(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking) -> Vec
             continue;
         };
         let items = unsafe { elements(list) };
-        for pair in items.get_mut(1..).unwrap_or_default().chunks_exact_mut(2) {
+        for pair in items
+            .get_mut(1..)
+            .unwrap_or_default()
+            .as_chunks_mut::<2>()
+            .0
+        {
             let k = pair[0];
             // SAFETY: a key of a reached table is a live box.
             match unsafe { referent(k) } {
@@ -394,13 +410,16 @@ fn tombstone_dead_keys(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking) -> Vec
 fn sweep(reached: &dyn Fn(usize) -> bool) {
     let mut s = state();
     s.weak.retain(|&t, _| reached(t));
+    s.dirty = s.weak.values().filter(|w| w.dirty).count();
 }
 
-/// Run the finalizers a collection queued, unless one is running.
+/// Run the library's runner after a collection that queued finalizers
+/// or left tombstones: it runs the finalizers, unless one is running,
+/// and tells the program which tables to compact.
 fn after_collection() {
     let runner = {
         let s = state();
-        if s.pending.is_empty() || s.finalizing || s.runner == 0 {
+        if (s.pending.is_empty() && s.dirty == 0) || s.runner == 0 {
             return;
         }
         s.runner
@@ -436,8 +455,8 @@ pub(crate) extern "C" fn host_gc_note(t: i64, flags: i64, runner: i64) {
     if weak != 0 && !shaped {
         let dirty = s.weak.get(&t).is_some_and(|w| w.dirty);
         s.weak.insert(t, Weak { mode: weak, dirty });
-    } else {
-        s.weak.remove(&t);
+    } else if s.weak.remove(&t).is_some_and(|w| w.dirty) {
+        s.dirty -= 1;
     }
     if flags & FINALIZE != 0 && s.marked.insert(t) {
         s.finalizable.push(t);
@@ -477,16 +496,22 @@ pub(crate) extern "C" fn host_gc_close() -> i64 {
     s.pending.len() as i64
 }
 
-/// The next weak table holding tombstones, or 0.
-pub(crate) extern "C" fn host_gc_next_dirty() -> i64 {
+/// How many weak tables hold tombstones.
+pub(crate) extern "C" fn host_gc_dirty_count() -> i64 {
+    state().dirty as i64
+}
+
+/// Whether `t` holds tombstones, which the caller now compacts.
+pub(crate) extern "C" fn host_gc_take_dirty(t: i64) -> i64 {
     let mut s = state();
-    match s.weak.iter_mut().find(|(_, w)| w.dirty) {
-        Some((&t, w)) => {
-            w.dirty = false;
-            t as i64
-        }
-        None => 0,
+    let Some(w) = s.weak.get_mut(&(t as usize)) else {
+        return 0;
+    };
+    if !std::mem::take(&mut w.dirty) {
+        return 0;
     }
+    s.dirty -= 1;
+    1
 }
 
 /// `collectgarbage(opt, arg)` by the option's number, in the order
@@ -503,10 +528,13 @@ pub(crate) extern "C" fn host_gc(op: i64, arg: i64) -> i64 {
         .copied()
         .unwrap_or("")
     {
+        // A step is a whole cycle: whether it ended one, which the
+        // reference's generational mode never reports.
         "collect" | "step" => {
+            let ended = !s.generational;
             drop(s);
             collector::collect();
-            1
+            ended as i64
         }
         "count" => {
             let stats = collector::stats();
@@ -563,7 +591,7 @@ pub(crate) extern "C" fn host_warn(message: zrtl::StringConstPtr, tocont: bool) 
     }
 }
 
-pub(crate) static SYMBOLS: [zrtl::ZrtlSymbol; 7] = [
+pub(crate) static SYMBOLS: [zrtl::ZrtlSymbol; 8] = [
     zrtl::ZrtlSymbol::new(c"$Lua$gc".as_ptr(), host_gc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$gc_note".as_ptr(), host_gc_note as *const u8),
     zrtl::ZrtlSymbol::new(
@@ -576,8 +604,12 @@ pub(crate) static SYMBOLS: [zrtl::ZrtlSymbol; 7] = [
     ),
     zrtl::ZrtlSymbol::new(c"$Lua$gc_close".as_ptr(), host_gc_close as *const u8),
     zrtl::ZrtlSymbol::new(
-        c"$Lua$gc_next_dirty".as_ptr(),
-        host_gc_next_dirty as *const u8,
+        c"$Lua$gc_dirty_count".as_ptr(),
+        host_gc_dirty_count as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$gc_take_dirty".as_ptr(),
+        host_gc_take_dirty as *const u8,
     ),
     zrtl::ZrtlSymbol::new(c"$Lua$warn".as_ptr(), host_warn as *const u8),
 ];

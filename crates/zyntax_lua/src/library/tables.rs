@@ -271,6 +271,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 and(is_nil(v.e()), is_nil(hash_field(tb.e()))),
                 vec![ret_void()],
             ),
+            when(
+                ne(read_global(super::gc::GC_DIRTY, i64()), int(0)),
+                vec![expr(call(
+                    "zl_gc_before_insert",
+                    vec![tb.e(), k.e(), v.e()],
+                    unit(),
+                ))],
+            ),
             expr(call(
                 "zb_dict_set",
                 vec![
@@ -410,6 +418,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 and(is_nil(v.e()), is_nil(hash_field(tb.e()))),
                 vec![ret_void()],
             ),
+            when(
+                ne(read_global(super::gc::GC_DIRTY, i64()), int(0)),
+                vec![expr(call(
+                    "zl_gc_before_insert",
+                    vec![tb.e(), box_i64(i.e()), v.e()],
+                    unit(),
+                ))],
+            ),
             expr(call(
                 "zb_dict_set",
                 vec![
@@ -440,6 +456,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             when(
                 and(is_nil(v.e()), is_nil(hash_field(tb.e()))),
                 vec![ret_void()],
+            ),
+            when(
+                ne(read_global(super::gc::GC_DIRTY, i64()), int(0)),
+                vec![expr(call(
+                    "zl_gc_before_insert_str",
+                    vec![tb.e(), s.e(), v.e()],
+                    unit(),
+                ))],
             ),
             expr(call(
                 "zb_dict_set_str",
@@ -506,6 +530,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             when(
                 and(is_nil(v.e()), is_nil(hash_field(tb.e()))),
                 vec![ret_void()],
+            ),
+            when(
+                ne(read_global(super::gc::GC_DIRTY, i64()), int(0)),
+                vec![expr(call(
+                    "zl_gc_before_insert",
+                    vec![tb.e(), k.e(), v.e()],
+                    unit(),
+                ))],
             ),
             expr(call(
                 "zb_dict_set",
