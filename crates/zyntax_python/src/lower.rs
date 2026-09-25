@@ -2595,7 +2595,10 @@ impl<'m> Lowerer<'m> {
             .collect();
         let value = self.tuple_of_items(items, target, span);
         // Where no check leaves the function, the caller checks after
-        // it: a read that raised yields a value nothing reads.
+        // it: a read that raised yields a value nothing reads. `pre`
+        // stays inside the block value here, so the choice is an `if`
+        // expression: an `if` statement inside a block expression does
+        // not carry its assignments past itself.
         let value = if !trusted && !self.guards {
             let is_tuple = binary(
                 BinaryOp::Ne,
@@ -2605,13 +2608,14 @@ impl<'m> Lowerer<'m> {
                 span,
             );
             let none = self.zero_of(target, span);
-            self.conditional_value(
-                is_tuple,
-                (Vec::new(), value),
-                (Vec::new(), none),
+            node(
+                TypedExpression::If(TypedIfExpr {
+                    condition: Box::new(is_tuple),
+                    then_branch: Box::new(value),
+                    else_branch: Box::new(none),
+                }),
                 target,
                 span,
-                &mut pre,
             )
         } else {
             value
