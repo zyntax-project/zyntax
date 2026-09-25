@@ -1,0 +1,24 @@
+[package]
+name = "zyntax_lua_capi"
+version = "0.1.0"
+edition = "2024"
+description = "The Lua 5.4 C API for zylua, as a ZRTL plugin linked into the executable"
+# Dependents find the export list through DEP_ZL_CAPI_EXPORTS and the
+# vendored headers through DEP_ZL_CAPI_INCLUDE.
+links = "zl_capi"
+
+[features]
+# Suppress the unmangled `_zrtl_info` / `_zrtl_symbols` exports, which
+# every plugin defines under the same names. zylua links this crate and
+# enables it.
+linked-into-host = []
+
+[dependencies]
+zrtl = { path = "../../../sdk/zrtl" }
+zrtl_native = { path = "../../../sdk/zrtl_native" }
+
+[build-dependencies]
+cc = "1"
+
+[lints]
+workspace = true

@@ -13,6 +13,7 @@ members = [
     "crates/pattern_engine",
     "crates/zyntax_python",
     "crates/zyntax_lua",
+    "crates/zyntax_lua/capi",
     "crates/zyntax_builtins",
     "crates/passes/normalization",
     "crates/passes/algebraic_effects",
