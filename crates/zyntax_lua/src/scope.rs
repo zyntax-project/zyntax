@@ -38,6 +38,10 @@ pub struct VarInfo {
     /// Declared by `local function`.
     pub is_function: bool,
     pub attribute: Option<String>,
+    /// A `<const>` local whose value is known where it is declared: Lua
+    /// keeps no slot for it, so the debug library sees it neither as a
+    /// local nor as an upvalue.
+    pub folded: bool,
     /// A `local function` whose body refers to itself by value: its
     /// record cannot hold a copy of itself, so it goes through a cell.
     pub self_captured: bool,
@@ -507,6 +511,7 @@ impl Walker {
             outermost,
             is_function: false,
             attribute,
+            folded: false,
             self_captured: false,
             init: Init::Other,
         });
@@ -526,10 +531,12 @@ impl Walker {
                         return Binding::Local(id);
                     }
                     self.out.vars[id.0 as usize].captured = true;
-                    for inner in &self.frames[level + 1..] {
-                        let f = &mut self.out.funcs[inner.id.0 as usize];
-                        if !f.upvalues.contains(&Upvalue::Var(id)) {
-                            f.upvalues.push(Upvalue::Var(id));
+                    if !self.out.vars[id.0 as usize].folded {
+                        for inner in &self.frames[level + 1..] {
+                            let f = &mut self.out.funcs[inner.id.0 as usize];
+                            if !f.upvalues.contains(&Upvalue::Var(id)) {
+                                f.upvalues.push(Upvalue::Var(id));
+                            }
                         }
                     }
                     let module_var = self.out.vars[id.0 as usize].is_module_var();
@@ -943,9 +950,17 @@ impl Walker {
                     .map(|a| a.map(|a| name_of(a.name())))
                     .collect();
                 let exprs: Vec<&Expression> = l.expressions().iter().collect();
+                let names = l.names().len();
                 for (i, name) in l.names().iter().enumerate() {
                     let attribute = attributes.get(i).cloned().flatten();
+                    // Only the last of as many names as values can be
+                    // folded, as in the reference compiler.
+                    let folded = attribute.as_deref() == Some("const")
+                        && i + 1 == names
+                        && exprs.len() == names
+                        && self.is_constant(exprs[i]);
                     let var = self.declare(name, attribute);
+                    self.out.vars[var.0 as usize].folded = folded;
                     let init = exprs.get(i).map_or(Init::Other, |e| self.init_of(e));
                     self.out.vars[var.0 as usize].init = init;
                     if alias {
@@ -1045,6 +1060,7 @@ impl Walker {
                 outermost: false,
                 is_function: false,
                 attribute: None,
+                folded: false,
                 self_captured: false,
                 init: Init::Other,
             });
@@ -1068,6 +1084,50 @@ impl Walker {
         self.out.funcs[id.0 as usize].returns_function =
             !crate::types::falls_through(body.block()) && returns_functions(body.block());
         id
+    }
+
+    /// Whether `e` is a value Lua computes where it compiles it: a nil,
+    /// boolean, number or string literal, a folded `<const>` local, or
+    /// unary `-` and binary `+`, `-`, `*` over number literals.
+    fn is_constant(&self, e: &Expression) -> bool {
+        fn numeric(e: &Expression) -> bool {
+            match e {
+                Expression::Number(_) => true,
+                Expression::UnaryOperator {
+                    unop: ast::UnOp::Minus(_),
+                    expression,
+                } => numeric(expression),
+                Expression::BinaryOperator { lhs, binop, rhs } => {
+                    matches!(
+                        binop,
+                        ast::BinOp::Plus(_) | ast::BinOp::Minus(_) | ast::BinOp::Star(_)
+                    ) && numeric(lhs)
+                        && numeric(rhs)
+                }
+                _ => false,
+            }
+        }
+        match e {
+            Expression::String(_) => true,
+            Expression::Symbol(t) => {
+                matches!(t.token().to_string().trim(), "nil" | "true" | "false")
+            }
+            Expression::Var(Var::Name(t)) => self.folded(t),
+            _ => numeric(e),
+        }
+    }
+
+    /// Whether `token` names a folded `<const>` local here.
+    fn folded(&self, token: &TokenReference) -> bool {
+        let name = name_of(token);
+        for frame in self.frames.iter().rev() {
+            for block in frame.blocks.iter().rev() {
+                if let Some(&id) = block.get(&name) {
+                    return self.out.vars[id.0 as usize].folded;
+                }
+            }
+        }
+        false
     }
 
     /// What a declaration's expression tells of the value, once the

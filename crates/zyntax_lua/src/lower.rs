@@ -8929,7 +8929,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Stmt::LocalAssignment(l) => {
                 for name in l.names() {
                     let v = self.scopes().declared(name);
-                    self.live.push(Live::Var(v));
+                    if !self.scopes().var(v).folded {
+                        self.live.push(Live::Var(v));
+                    }
                 }
             }
             Stmt::LocalFunction(f) => {
