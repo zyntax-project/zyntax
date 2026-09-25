@@ -503,6 +503,13 @@ fn host_isa() -> Arc<dyn cranelift_codegen::isa::TargetIsa> {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
     flag_builder.set("is_pic", "false").unwrap();
+    // A Windows thread's stack is committed a page at a time by touching
+    // the guard page below it, so a frame larger than a page has to
+    // probe each page in order or it faults past the guard.
+    if cfg!(windows) {
+        flag_builder.set("enable_probestack", "true").unwrap();
+        flag_builder.set("probestack_strategy", "inline").unwrap();
+    }
     // `ZYNTAX_FRAME_POINTERS=1` keeps frame pointers in generated code so
     // a sampling profiler can walk through it; safe, costs a register.
     if std::env::var_os("ZYNTAX_FRAME_POINTERS").is_some() {
