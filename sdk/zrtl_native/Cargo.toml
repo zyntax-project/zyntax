@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Native interop for Zyntax runtimes: loading shared libraries, resolving their symbols, and an error exit that crosses only foreign frames"
 license = "Apache-2.0"
-repository = "https://github.com/darmie/zyntax"
+repository = "https://github.com/zyntax-project/zyntax"
 # Dependents find include/zrtl_native.h through DEP_ZRTL_NATIVE_INCLUDE.
 links = "zrtl_native"
 

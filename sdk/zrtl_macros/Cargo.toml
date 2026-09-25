@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Procedural macros for creating ZRTL (Zyntax Runtime Library) plugins"
 license = "Apache-2.0"
-repository = "https://github.com/darmie/zyntax"
+repository = "https://github.com/zyntax-project/zyntax"
 keywords = ["compiler", "jit", "runtime", "macros", "proc-macro"]
 categories = ["development-tools::procedural-macro-helpers", "compilers"]
 

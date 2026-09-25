@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Rust SDK for embedding Zyntax as a JIT runtime with bidirectional value interop"
 license = "Apache-2.0"
-repository = "https://github.com/darmie/zyntax"
+repository = "https://github.com/zyntax-project/zyntax"
 keywords = ["compiler", "jit", "runtime", "embedding", "interop"]
 categories = ["compilers", "development-tools"]
 

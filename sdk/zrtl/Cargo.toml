@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Zyntax Runtime Library - Types and utilities for ZRTL plugins"
 license = "Apache-2.0"
-repository = "https://github.com/darmie/zyntax"
+repository = "https://github.com/zyntax-project/zyntax"
 keywords = ["compiler", "jit", "runtime", "ffi", "interop"]
 categories = ["development-tools::ffi", "compilers"]
 
