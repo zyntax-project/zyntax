@@ -192,14 +192,14 @@ zyntax compile --backend cuda source.zyn
 │  ┌────────────────────────────┐  │  │  ┌────────────────────────────┐  │
 │  │ Cranelift JIT              │  │  │  │ LLVM NVPTX Backend         │  │
 │  │  • Baseline tier           │  │  │  │  • Target: nvptx64-nvidia  │  │
-│  │  • Fast compilation        │  │  │  │  • PTX emission            │  │
-│  │  • Low-latency paths       │  │  │  │  • Kernel metadata         │  │
+│  │  • Native SIMD (HIR vectors)│  │  │  │  • PTX emission            │  │
+│  │  • Fast compilation        │  │  │  │  • Kernel metadata         │  │
 │  └────────────────────────────┘  │  │  └────────────────────────────┘  │
 │  ┌────────────────────────────┐  │  │  ┌────────────────────────────┐  │
 │  │ LLVM x86/ARM Backend       │  │  │  │ CUDA Driver Runtime        │  │
-│  │  • Optimized tier          │  │  │  │  • Kernel loading          │  │
-│  │  • Vectorization passes    │  │  │  │  • Memory management       │  │
-│  │  • SIMD vectorization      │  │  │  │  • Stream synchronization  │  │
+│  │  • Optimizing tier         │  │  │  │  • Kernel loading          │  │
+│  │  • Native SIMD (HIR vectors)│  │  │  │  • Memory management       │  │
+│  │  • LLVM O3 and its passes  │  │  │  │  • Stream synchronization  │  │
 │  └────────────────────────────┘  │  │  └────────────────────────────┘  │
 └──────────────────────────────────┘  └──────────────────────────────────┘
               │                                     │
@@ -213,7 +213,7 @@ zyntax compile --backend cuda source.zyn
               └──────────────────────────────────┘
 ```
 
-**Status:** layers 1 and 2 describe planned additions; none of their types exist. The tier ladder today is interpreter, then Cranelift (`OptimizationTier::Baseline`), then LLVM (`Optimized`), in `crates/compiler/src/tiered_backend.rs`. CPU SIMD is HIR `Vector` instructions lowered by every backend, not a Cranelift-only path.
+**Status:** layers 1 and 2 describe planned additions; none of their types exist. The tier ladder today is interpreter, then Cranelift (`OptimizationTier::Baseline`), then LLVM (`Optimized`), in `crates/compiler/src/tiered_backend.rs`. CPU SIMD is HIR `Vector` instructions, which Cranelift, LLVM, wasm and the interpreter each lower natively; the vectorising passes (`auto_vectorize`, `loop_vectorize`, `reduction_vectorize`) run on HIR before either CPU tier compiles it, so both tiers emit SIMD.
 
 ---
 
