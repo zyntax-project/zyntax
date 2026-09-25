@@ -10,12 +10,75 @@ use zrtl::{DynamicBox, StringPtr, TypeCategory, TypeTag};
 use crate::{host_io, host_os};
 
 static ARGS: OnceLock<Vec<String>> = OnceLock::new();
+static IGNORE_ENV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The program's arguments, `arg` in Lua's terms: the interpreter,
 /// then the script's path, then the rest. Set once per process; a
 /// later call keeps the first.
 pub fn set_args(args: Vec<String>) {
     let _ = ARGS.set(args);
+}
+
+/// Whether the program ignores the environment's `LUA_*` variables, as
+/// `lua -E` does.
+pub fn set_ignore_env(on: bool) {
+    IGNORE_ENV.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Where `require` looks for C libraries when nothing says otherwise.
+#[cfg(windows)]
+const CPATH_DEFAULT: &str = "!\\?.dll;!\\..\\lib\\lua\\5.4\\?.dll;!\\loadall.dll;.\\?.dll";
+#[cfg(not(windows))]
+const CPATH_DEFAULT: &str = "/usr/local/lib/lua/5.4/?.so;/usr/local/lib/lua/5.4/loadall.so;./?.so";
+
+/// `package.cpath` as the reference sets it: `LUA_CPATH_5_4`, else
+/// `LUA_CPATH`, else the default, with a `;;` in the variable standing
+/// for the default; the default alone when `ignore_env` (`-E`).
+fn cpath_value(ignore_env: bool, var: impl Fn(&str) -> Option<String>) -> String {
+    let default = cpath_default();
+    let path = if ignore_env {
+        None
+    } else {
+        var("LUA_CPATH_5_4").or_else(|| var("LUA_CPATH"))
+    };
+    let Some(path) = path else {
+        return default;
+    };
+    let Some(mark) = path.find(";;") else {
+        return path;
+    };
+    let mut out = String::new();
+    if mark > 0 {
+        out.push_str(&path[..mark]);
+        out.push(';');
+    }
+    out.push_str(&default);
+    if mark + 2 < path.len() {
+        out.push(';');
+        out.push_str(&path[mark + 2..]);
+    }
+    out
+}
+
+/// The default, with `!` standing for the executable's directory on
+/// Windows.
+fn cpath_default() -> String {
+    if cfg!(windows)
+        && let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.display().to_string()))
+    {
+        return CPATH_DEFAULT.replace('!', &dir);
+    }
+    CPATH_DEFAULT.to_string()
+}
+
+extern "C" fn host_cpath() -> StringPtr {
+    let value = cpath_value(
+        IGNORE_ENV.load(std::sync::atomic::Ordering::Relaxed),
+        |name| std::env::var(name).ok(),
+    );
+    zrtl::string::string_from_bytes(value.as_bytes())
 }
 
 extern "C" fn host_argc() -> i64 {
@@ -1861,7 +1924,8 @@ fn table_error_text(err: *const DynamicBox) -> Result<Option<Vec<u8>>, String> {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 97] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 98] = [
+    zrtl::ZrtlSymbol::new(c"$Lua$cpath".as_ptr(), host_cpath as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$clock".as_ptr(), host_clock as *const u8),
@@ -2126,6 +2190,45 @@ pub(crate) fn static_plugin() -> zrtl::StaticPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpath_follows_the_environment_as_the_reference_does() {
+        let d = cpath_default();
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(cpath_value(false, env(&[])), d);
+        assert_eq!(
+            cpath_value(false, env(&[("LUA_CPATH", "a/?.so")])),
+            "a/?.so"
+        );
+        assert_eq!(
+            cpath_value(
+                false,
+                env(&[("LUA_CPATH", "a/?.so"), ("LUA_CPATH_5_4", "b/?.so")])
+            ),
+            "b/?.so"
+        );
+        assert_eq!(cpath_value(false, env(&[("LUA_CPATH", ";;")])), d);
+        assert_eq!(
+            cpath_value(false, env(&[("LUA_CPATH", "a/?.so;;")])),
+            format!("a/?.so;{d}")
+        );
+        assert_eq!(
+            cpath_value(false, env(&[("LUA_CPATH", ";;b/?.so")])),
+            format!("{d};b/?.so")
+        );
+        assert_eq!(
+            cpath_value(false, env(&[("LUA_CPATH", "a;;b")])),
+            format!("a;{d};b")
+        );
+        assert_eq!(cpath_value(true, env(&[("LUA_CPATH", "a/?.so")])), d);
+    }
 
     #[test]
     fn floats_print_as_lua_prints_them() {

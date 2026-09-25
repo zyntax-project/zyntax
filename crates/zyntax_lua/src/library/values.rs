@@ -124,6 +124,54 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     };
     let is_func = |x: Expr| eq(tag_of(x), int(zyntax_builtins::FUNC_TAG));
     let is_code = |x: Expr| eq(tag_of(x), int(zyntax_builtins::CODE_TAG));
+    // A table's or a full userdata's text: its `__tostring`, else its
+    // `__name` and address, else its type and address.
+    let described = |x: &Local| -> Vec<Stmt> {
+        vec![
+            h.decl(call("zl_meta_of", vec![x.e(), text("__tostring")], any())),
+            when(
+                not(is_nil(h.e())),
+                vec![
+                    r.decl(call(
+                        "zl_first",
+                        vec![call("zl_call_1", vec![h.e(), x.e()], any())],
+                        any(),
+                    )),
+                    when(
+                        and(
+                            not(is_nil(r.e())),
+                            or(
+                                eq(category(r.e()), int(INT)),
+                                or(
+                                    eq(category(r.e()), int(UINT)),
+                                    eq(category(r.e()), int(FLOAT)),
+                                ),
+                            ),
+                        ),
+                        vec![ret(call("zl_number_str", vec![r.e()], string()))],
+                    ),
+                    when(
+                        or(is_nil(r.e()), ne(category(r.e()), int(STR))),
+                        vec![lua_error(text("'__tostring' must return a string"))],
+                    ),
+                    ret(get_str(r.e())),
+                ],
+            ),
+            h.set(call("zl_meta_of", vec![x.e(), text("__name")], any())),
+            when(
+                eq(category(h.e()), int(STR)),
+                vec![ret(add(
+                    add(get_str(h.e()), text(": 0x")),
+                    call(
+                        "zb_str_of_int_radix",
+                        vec![call("zb_unbox_instance_raw", vec![x.e()], i64()), int32(16)],
+                        string(),
+                    ),
+                ))],
+            ),
+            ret(call("zb_hook_instance_str", vec![x.e()], string())),
+        ]
+    };
     d.push(define(
         "zl_tostring",
         &[&x],
@@ -173,53 +221,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 is_cat(&cat, BOOL),
                 vec![ret(if_expr(get_bool(x.e()), text("true"), text("false")))],
             ),
-            when(
-                is_table(x.e()),
-                vec![
-                    h.decl(call("zl_meta_of", vec![x.e(), text("__tostring")], any())),
-                    when(
-                        not(is_nil(h.e())),
-                        vec![
-                            r.decl(call(
-                                "zl_first",
-                                vec![call("zl_call_1", vec![h.e(), x.e()], any())],
-                                any(),
-                            )),
-                            when(
-                                and(
-                                    not(is_nil(r.e())),
-                                    or(
-                                        eq(category(r.e()), int(INT)),
-                                        or(
-                                            eq(category(r.e()), int(UINT)),
-                                            eq(category(r.e()), int(FLOAT)),
-                                        ),
-                                    ),
-                                ),
-                                vec![ret(call("zl_number_str", vec![r.e()], string()))],
-                            ),
-                            when(
-                                or(is_nil(r.e()), ne(category(r.e()), int(STR))),
-                                vec![lua_error(text("'__tostring' must return a string"))],
-                            ),
-                            ret(get_str(r.e())),
-                        ],
-                    ),
-                    h.set(call("zl_meta_of", vec![x.e(), text("__name")], any())),
-                    when(
-                        eq(category(h.e()), int(STR)),
-                        vec![ret(add(
-                            add(get_str(h.e()), text(": 0x")),
-                            call(
-                                "zb_str_of_int_radix",
-                                vec![call("zb_unbox_instance_raw", vec![x.e()], i64()), int32(16)],
-                                string(),
-                            ),
-                        ))],
-                    ),
-                    ret(call("zb_hook_instance_str", vec![x.e()], string())),
-                ],
-            ),
+            when(or(is_table(x.e()), is_userdata(x.e())), described(&x)),
             when(
                 or(is_thread(x.e()), is_file(x.e())),
                 vec![ret(call("zb_hook_instance_str", vec![x.e()], string()))],

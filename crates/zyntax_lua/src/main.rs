@@ -23,7 +23,7 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: zylua [run] [--pretty-errors] [-e stat] [file.lua [args...]]";
+const USAGE: &str = "usage: zylua [run] [--pretty-errors] [-E] [-e stat] [file.lua [args...]]";
 
 fn run() -> ExitCode {
     let mut args = std::env::args().skip(1).peekable();
@@ -47,6 +47,9 @@ fn run() -> ExitCode {
     loop {
         match next.as_deref() {
             Some("--pretty-errors") => pretty = true,
+            // `-E` ignores the environment's `LUA_*` variables, as
+            // `lua -E` does.
+            Some("-E") => zyntax_lua::set_ignore_env(true),
             Some("-e") => match args.next() {
                 Some(stat) => {
                     prelude.push_str(&stat);

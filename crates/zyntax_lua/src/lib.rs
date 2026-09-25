@@ -32,7 +32,7 @@ mod policy;
 mod scope;
 mod types;
 
-pub use host::set_args;
+pub use host::{set_args, set_ignore_env};
 pub use parse::SyntaxError;
 use policy::LIBRARY_MODULE;
 pub use policy::POLICY;
@@ -273,7 +273,53 @@ pub fn register_runtime(
         zrtl_math::static_plugin(),
         host::static_plugin(),
         zyntax_embed::foreign::static_plugin(),
-    ])
+        zyntax_lua_capi::static_plugin(),
+    ])?;
+    zyntax_lua_capi::install(zyntax_lua_capi::Hooks {
+        resolve: resolve_bridge,
+        add_root: zyntax_compiler::collector::add_root_range,
+        tags: zyntax_lua_capi::Tags {
+            table: library::table_tag() as u32,
+            thread: library::thread_tag() as u32,
+            function: zyntax_builtins::FUNC_TAG as u32,
+            code: zyntax_builtins::CODE_TAG as u32,
+            userdata: library::userdata_tag() as u32,
+            light: library::light_tag() as u32,
+        },
+    });
+    Ok(())
+}
+
+/// Compile the C API's bridge into the running program, the first time
+/// a native library opens, and hand over its entries' addresses.
+fn resolve_bridge() -> std::result::Result<zyntax_lua_capi::bridge::Resolved, String> {
+    use zyntax_lua_capi::bridge::{ENTRIES, Resolved, VERSION, entry_name};
+    let lib = library().map_err(|e| e.to_string())?;
+    let defined = library::capi::bridge_entry_names(&lib.types);
+    let expected: Vec<(String, usize)> = ENTRIES
+        .iter()
+        .map(|(name, arity)| (entry_name(name), *arity))
+        .collect();
+    if defined != expected {
+        return Err("the library's C API bridge does not match the plugin's".to_string());
+    }
+    let started = std::time::Instant::now();
+    let runtime = runtime().ok_or("no runtime to compile the C API bridge into")?;
+    let program =
+        library::capi::bridge_program(&lib.types, lib.type_registry.clone(), LIBRARY_MODULE);
+    let names: Vec<&str> = expected.iter().map(|(n, _)| n.as_str()).collect();
+    runtime
+        .join_typed_program(program, &names)
+        .map_err(|e| e.to_string())?;
+    let entries = names
+        .iter()
+        .map(|n| runtime.function_pointer(n).unwrap_or(std::ptr::null()))
+        .collect();
+    trace_phase("capi:bridge", started);
+    Ok(Resolved {
+        version: VERSION,
+        entries,
+    })
 }
 
 /// Parse Lua source and rewrite it into a `TypedProgram`. `file` names
@@ -396,4 +442,41 @@ pub(crate) fn intern(s: &str) -> InternedString {
 
 pub(crate) fn prim(p: PrimitiveType) -> Type {
     Type::Primitive(p)
+}
+
+#[cfg(test)]
+mod capi_tests {
+    use super::*;
+
+    /// The library defines the bridge the plugin reads, entry for entry.
+    #[test]
+    fn the_bridge_matches_the_plugin() {
+        use zyntax_lua_capi::bridge::{ENTRIES, entry_name};
+        let lib = library().expect("the library");
+        let defined = library::capi::bridge_entry_names(&lib.types);
+        let expected: Vec<(String, usize)> = ENTRIES
+            .iter()
+            .map(|(name, arity)| (entry_name(name), *arity))
+            .collect();
+        assert_eq!(defined, expected);
+        assert_eq!(zyntax_lua_capi::bridge::LINE_BITS, library::LINE_BITS);
+    }
+
+    #[test]
+    fn userdata_kinds_follow_the_library_kinds() {
+        let kinds = [
+            library::TABLE_KIND,
+            library::THREAD_KIND,
+            library::NIL_ERROR_KIND,
+            library::FILE_KIND,
+            library::CLOSING_KIND,
+            library::DEAD_KEY_KIND,
+            library::LIGHT_KIND,
+            library::USERDATA_KIND,
+        ];
+        let mut sorted = kinds.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), kinds.len(), "every kind is distinct");
+    }
 }

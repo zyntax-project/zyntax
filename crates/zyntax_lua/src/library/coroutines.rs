@@ -27,6 +27,9 @@ const SLOT: i64 = 3;
 const ERR: i64 = 4;
 const STARTED: i64 = 5;
 pub(super) const DEAD_HOOK: i64 = 6;
+/// The slot a coroutine that has run C code keeps that code's State
+/// in, nil-padded to it; a coroutine that never has lacks it.
+pub(super) const STATE_SLOT: i64 = DEAD_HOOK + 1;
 
 /// Statuses, as the record stores them.
 const SUSPENDED: i64 = 0;

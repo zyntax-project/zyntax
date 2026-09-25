@@ -167,7 +167,10 @@ pub struct Scopes {
     pub dynamic_globals: bool,
     /// Whether the chunk runs code it does not contain: `load`,
     /// `loadfile`, `dofile`, or `require` of a name that is not a
-    /// literal. What that code defines is not known here.
+    /// literal; or may load C code, which reaches the globals through
+    /// the globals table: `package.loadlib`, `package.searchers`,
+    /// `package` or `require` as a value. What that code defines is not
+    /// known here.
     pub dynamic_code: bool,
     /// Whether a metatable may be set where the types do not follow:
     /// `setmetatable` or the `debug` library reached as a value, not
@@ -406,6 +409,8 @@ struct Walker {
     debug_aliases: HashSet<VarId>,
     /// Whether the expression being walked initializes such a local.
     requiring_debug: bool,
+    /// The name tokens, by offset, of `require` called by name.
+    require_calls: HashSet<usize>,
     /// Whether the chunk's outermost locals are kept as any function's
     /// locals rather than module variables.
     no_module_vars: bool,
@@ -435,6 +440,7 @@ fn walk(ast: &ast::Ast, no_module_vars: bool) -> Scopes {
         tables_indexed: HashSet::new(),
         debug_aliases: HashSet::new(),
         requiring_debug: false,
+        require_calls: HashSet::new(),
         no_module_vars,
     };
     w.out.funcs.push(FuncInfo {
@@ -599,6 +605,12 @@ impl Walker {
             self.out.dynamic_code = true;
         }
         if let Binding::Global(name) = &binding
+            && ((name == "package" && !self.tables_indexed.contains(&pos_of(token)))
+                || (name == "require" && !self.require_calls.contains(&pos_of(token))))
+        {
+            self.out.dynamic_code = true;
+        }
+        if let Binding::Global(name) = &binding
             && !self.metatable_callees.contains(&pos_of(token))
         {
             self.global_value(name);
@@ -653,6 +665,14 @@ impl Walker {
         };
         if safe {
             self.tables_indexed.insert(pos_of(token));
+        }
+        if name == "package"
+            && matches!(
+                key(suffixes.first()).as_deref(),
+                Some("loadlib" | "searchers")
+            )
+        {
+            self.out.dynamic_code = true;
         }
     }
 
@@ -1186,6 +1206,7 @@ impl Walker {
             && name_of(callee) == "require"
             && !self.shadowed("require")
         {
+            self.require_calls.insert(pos_of(callee));
             let name = required_name(args);
             if name.as_deref() == Some("debug") {
                 if self.requiring_debug {

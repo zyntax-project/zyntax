@@ -12329,9 +12329,26 @@ pub(crate) fn program(
             span,
         ),
         if scopes.dynamic_globals {
-            assign(
-                var(intern(library::GLOBALS), module.ir(Ty::Table), span),
-                call("zl_globals_table", vec![], module.ir(Ty::Table), span),
+            stmt(
+                TypedStatement::Block(TypedBlock {
+                    statements: vec![
+                        assign(
+                            var(intern(library::GLOBALS), module.ir(Ty::Table), span),
+                            call("zl_globals_table", vec![], module.ir(Ty::Table), span),
+                            span,
+                        ),
+                        assign(
+                            var(
+                                intern(library::capi::SHARED),
+                                prim(PrimitiveType::I64),
+                                span,
+                            ),
+                            int_lit(1, span),
+                            span,
+                        ),
+                    ],
+                    span,
+                }),
                 span,
             )
         } else {

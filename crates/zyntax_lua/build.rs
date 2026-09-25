@@ -12,28 +12,40 @@ use std::path::PathBuf;
 use zyntax_embed::{SnapshotBuilder, lower_for_snapshot_releasing};
 use zyntax_typed_ast::{InternedString, Span, TypedProgram};
 
+// What the runtime alone uses of the library (the C API's bridge) is
+// dead here.
+#[allow(dead_code)]
 #[path = "src/library/mod.rs"]
 mod library;
 #[path = "src/policy.rs"]
 mod policy;
 
-/// Link flags for the binary: on macOS the executable exports no
-/// symbol but `main` and loads no dylib nothing binds to. The JIT
-/// resolves the runtime's symbols from the tables it is handed, never
-/// through the executable's exports, and every symbol dyld need not
-/// coalesce or bind is time before `main`. Linux exports nothing from
-/// an executable by default and drops unused dylibs on its own.
+/// Link flags for the binary: it exports the Lua C API, which C
+/// libraries it opens bind to, and on macOS nothing else but `main`,
+/// with no dylib loaded that nothing binds to. The JIT resolves the
+/// runtime's symbols from the tables it is handed, never through the
+/// executable's exports, and every symbol dyld need not coalesce or
+/// bind is time before `main`. Windows exports nothing yet: a C module
+/// there cannot bind to the executable.
 fn emit_link_flags(out: &std::path::Path) -> Result<(), BuildError> {
-    if env::var("CARGO_CFG_TARGET_OS")? != "macos" {
+    let os = env::var("CARGO_CFG_TARGET_OS")?;
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let list = env::var("DEP_ZL_CAPI_EXPORTS")?;
+    println!("cargo:rerun-if-changed={list}");
+    let names: Vec<String> = fs::read_to_string(&list)?
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if os == "windows" {
         return Ok(());
     }
-    let exports = out.join("exported_symbols.txt");
-    fs::write(&exports, "_main\n")?;
-    println!(
-        "cargo:rustc-link-arg-bins=-Wl,-exported_symbols_list,{}",
-        exports.display()
-    );
-    println!("cargo:rustc-link-arg-bins=-Wl,-dead_strip_dylibs");
+    for arg in zrtl_native::build::export_link_args(&os, &target_env, &names, out)? {
+        println!("cargo:rustc-link-arg-bins={arg}");
+    }
+    if os == "macos" {
+        println!("cargo:rustc-link-arg-bins=-Wl,-dead_strip_dylibs");
+    }
     Ok(())
 }
 

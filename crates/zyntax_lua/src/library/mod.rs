@@ -9,6 +9,7 @@
 //! library once for the snapshot the crate carries.
 
 pub mod calls;
+pub mod capi;
 pub mod coroutines;
 pub mod debug;
 pub mod foreign;
@@ -44,8 +45,11 @@ pub const CLOSING_KIND: usize = 4;
 /// lookup matches, under a nil value, until the table is compacted.
 pub const DEAD_KEY_KIND: usize = 5;
 /// A light userdata: its payload is the pointer word, which is its
-/// identity for equality and as a table key.
+/// identity for equality and as a table key. C code's light userdata
+/// and `debug.upvalueid`'s identities are this kind.
 pub const LIGHT_KIND: usize = 6;
+/// A full userdata: the address of a block the C API lays out.
+pub const USERDATA_KIND: usize = 7;
 
 pub fn table_tag() -> i64 {
     zyntax_builtins::instance_tag(TABLE_KIND)
@@ -61,6 +65,12 @@ pub fn file_tag() -> i64 {
 }
 pub fn closing_tag() -> i64 {
     zyntax_builtins::instance_tag(CLOSING_KIND)
+}
+pub fn userdata_tag() -> i64 {
+    zyntax_builtins::instance_tag(USERDATA_KIND)
+}
+pub fn light_tag() -> i64 {
+    zyntax_builtins::instance_tag(LIGHT_KIND)
 }
 pub fn is_closing(x: Expr) -> Expr {
     and(ne(x.clone(), nil()), eq(tag_of(x), int(closing_tag())))
@@ -295,11 +305,23 @@ pub fn is_thread(x: Expr) -> Expr {
 pub fn is_file(x: Expr) -> Expr {
     and(ne(x.clone(), nil()), eq(tag_of(x), int(file_tag())))
 }
-pub fn light_tag() -> i64 {
-    zyntax_builtins::instance_tag(LIGHT_KIND)
-}
+/// A light userdata.
 pub fn is_light(x: Expr) -> Expr {
     and(ne(x.clone(), nil()), eq(tag_of(x), int(light_tag())))
+}
+/// A full userdata.
+pub fn is_userdata(x: Expr) -> Expr {
+    and(ne(x.clone(), nil()), eq(tag_of(x), int(userdata_tag())))
+}
+/// A full or a light userdata.
+pub fn is_any_userdata(x: Expr) -> Expr {
+    and(
+        ne(x.clone(), nil()),
+        or(
+            eq(tag_of(x.clone()), int(userdata_tag())),
+            eq(tag_of(x), int(light_tag())),
+        ),
+    )
 }
 pub fn is_func(x: Expr) -> Expr {
     and(
@@ -606,7 +628,11 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
                     vec![ret(call("zl_file_str", vec![x.e()], string()))],
                 ),
                 when(
-                    is_light(x.e()),
+                    is_table(x.e()),
+                    vec![ret(add(text("table: 0x"), hex(addr(x.e()))))],
+                ),
+                when(
+                    is_any_userdata(x.e()),
                     vec![ret(add(text("userdata: 0x"), hex(addr(x.e()))))],
                 ),
                 ret(add(text("table: 0x"), hex(addr(x.e())))),
@@ -624,9 +650,10 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
             &[&x],
             string(),
             vec![
+                when(is_table(x.e()), vec![ret(text("table"))]),
                 when(is_thread(x.e()), vec![ret(text("thread"))]),
                 when(is_file(x.e()), vec![ret(text("FILE*"))]),
-                when(is_light(x.e()), vec![ret(text("userdata"))]),
+                when(is_any_userdata(x.e()), vec![ret(text("userdata"))]),
                 ret(text("table")),
             ],
         ),
@@ -1316,6 +1343,7 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     lib.declarations.extend(debug::declarations(&t));
     lib.declarations.extend(foreign::declarations(&t));
     lib.declarations.extend(gc::declarations(&t));
+    lib.declarations.extend(capi::declarations());
     lib.declarations.push(func_code_decl(&t));
     lib.declarations.extend(type_names());
     for d in &mut lib.declarations {

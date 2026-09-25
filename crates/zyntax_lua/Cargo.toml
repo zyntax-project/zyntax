@@ -22,6 +22,8 @@ zrtl = { path = "../../sdk/zrtl" }
 zrtl_io = { path = "../../plugins/zrtl_io", features = ["linked-into-host"] }
 zrtl_string = { path = "../../plugins/zrtl_string", features = ["linked-into-host"] }
 zrtl_math = { path = "../../plugins/zrtl_math", features = ["linked-into-host"] }
+# The Lua C API, linked in: C modules bind to the executable's exports.
+zyntax_lua_capi = { path = "capi", features = ["linked-into-host"] }
 # Lua 5.4 only; the version is pinned again at parse time.
 full_moon = { version = "2.2", default-features = false, features = ["lua54"] }
 thiserror = "1"
@@ -29,6 +31,7 @@ indexmap = "2"
 libc = "0.2"
 
 [build-dependencies]
+zrtl_native = { path = "../../sdk/zrtl_native" }
 zyntax_typed_ast = { path = "../typed_ast" }
 zyntax_embed = { path = "../zyntax_embed", default-features = false, features = ["parse-only"] }
 zyntax_compiler = { path = "../compiler", default-features = false }

@@ -1047,7 +1047,6 @@ pub const CONSTANTS: &[(&str, &str, Constant)] = &[
         "path",
         Constant::Bytes("2e2f3f2e6c75613b2e2f3f2f696e69742e6c7561"),
     ),
-    ("package", "cpath", Constant::Bytes("")),
     // The directory separator, path separator, template mark, and the
     // rest, each on its own line.
     ("package", "config", Constant::Bytes("2f0a3b0a3f0a210a2d0a")),
@@ -3296,6 +3295,17 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ],
                 unit(),
             )));
+            // `LUA_CPATH_5_4`, `LUA_CPATH` or the default, as the
+            // host reads them.
+            st.push(expr(call(
+                "zl_rawset_str",
+                vec![
+                    tb.e(),
+                    text("cpath"),
+                    box_str(call("zl_cpath_default", vec![], string())),
+                ],
+                unit(),
+            )));
             // The searchers are built in; the table is there for a
             // program to check or replace, and must stay a table.
             st.push(expr(call(
@@ -3562,6 +3572,12 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         &[],
         string(),
         Some("$Lua$load_error"),
+    ));
+    d.push(extern_fn(
+        "zl_cpath_default",
+        &[],
+        string(),
+        Some("$Lua$cpath"),
     ));
     let chunk = kept("chunk", any());
     let chunk_name = kept("chunk_name", any());
@@ -3864,6 +3880,23 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             )),
         ]
     };
+    let cpath = kept("cpath", string());
+    let file = kept("file", string());
+    let cmsg = kept("cmsg", string());
+    let status = local("status", i64());
+    let dot = local("dot", i64());
+    // A C library found whose open function would not load: the error
+    // `require` raises for it.
+    let load_failed = |file: &Local| {
+        lua_error(concat(vec![
+            text("error loading module '"),
+            name.e(),
+            text("' from file '"),
+            file.e(),
+            text("':\n\t"),
+            call("zl_c_error", vec![], string()),
+        ]))
+    };
     d.push(define(
         "zl_require",
         &[&name],
@@ -3955,35 +3988,10 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 ],
                 string(),
             )),
-            // Not there: a module of the embedder's, a foreign object.
-            when(
-                eq(path.e(), null(string())),
-                vec![
-                    y.set(call("zb_foreign_import", vec![name.e()], any())),
-                    when(not(is_nil(pending())), vec![ret(nil())]),
-                    when(
-                        not(is_nil(y.e())),
-                        vec![
-                            expr(call(
-                                "zl_rawset_str",
-                                vec![
-                                    unbox_table(call("zl_package_loaded", vec![], any()), t),
-                                    name.e(),
-                                    y.e(),
-                                ],
-                                unit(),
-                            )),
-                            ret(call(
-                                "zb_box_tuple",
-                                vec![list(vec![y.e(), box_str(text(":foreign:"))], anys.clone())],
-                                any(),
-                            )),
-                        ],
-                    ),
-                ],
-            ),
-            // Nor that: `package.cpath` is searched as well, for the
-            // message's sake; a C module found cannot be loaded here.
+            // Not there: a C library along `package.cpath` whose open
+            // function is the module's, then, for a dotted name, one
+            // named after the name's root that holds the module's open
+            // function among others.
             when(
                 eq(path.e(), null(string())),
                 vec![
@@ -4012,25 +4020,97 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                         ),
                         vec![lua_error(text("'package.cpath' must be a string"))],
                     ),
-                    path.set(call(
+                    cpath.decl(call("zl_arg_str", vec![handler.e(), text("")], string())),
+                    file.decl(call(
                         "zl_searchpath",
-                        vec![
-                            name.e(),
-                            call("zl_arg_str", vec![handler.e(), text("")], string()),
-                            text("."),
-                            text("/"),
-                        ],
+                        vec![name.e(), cpath.e(), text("."), text("/")],
                         string(),
                     )),
+                    when(ne(file.e(), null(string())), {
+                        let mut st = vec![
+                            status.decl(call("zl_c_loadfunc", vec![file.e(), name.e()], i64())),
+                            when(ne(status.e(), int(0)), vec![load_failed(&file)]),
+                            handler.set(call("zl_c_loaded", vec![], any())),
+                        ];
+                        st.extend(loader_run(file.e()));
+                        st
+                    }),
+                    cmsg.decl(call("zl_load_error", vec![], string())),
+                    dot.decl(call(
+                        "zl_find_plain",
+                        vec![name.e(), text("."), int(1)],
+                        i64(),
+                    )),
                     when(
-                        ne(path.e(), null(string())),
-                        vec![lua_error(concat(vec![
-                            text("error loading module '"),
-                            name.e(),
-                            text("' from file '"),
-                            path.e(),
-                            text("':\n\tC modules cannot be loaded"),
-                        ]))],
+                        gt(dot.e(), int(0)),
+                        vec![
+                            file.set(call(
+                                "zl_searchpath",
+                                vec![
+                                    call(
+                                        "zl_string_sub",
+                                        vec![name.e(), int(1), sub(dot.e(), int(1))],
+                                        string(),
+                                    ),
+                                    cpath.e(),
+                                    text("."),
+                                    text("/"),
+                                ],
+                                string(),
+                            )),
+                            if_(
+                                ne(file.e(), null(string())),
+                                vec![
+                                    status.decl(call(
+                                        "zl_c_loadfunc",
+                                        vec![file.e(), name.e()],
+                                        i64(),
+                                    )),
+                                    when(eq(status.e(), int(0)), {
+                                        let mut st =
+                                            vec![handler.set(call("zl_c_loaded", vec![], any()))];
+                                        st.extend(loader_run(file.e()));
+                                        st
+                                    }),
+                                    when(eq(status.e(), int(1)), vec![load_failed(&file)]),
+                                    cmsg.set(concat(vec![
+                                        cmsg.e(),
+                                        text("\n\tno module '"),
+                                        name.e(),
+                                        text("' in file '"),
+                                        file.e(),
+                                        text("'"),
+                                    ])),
+                                ],
+                                vec![cmsg.set(concat(vec![
+                                    cmsg.e(),
+                                    text("\n\t"),
+                                    call("zl_load_error", vec![], string()),
+                                ]))],
+                            ),
+                        ],
+                    ),
+                    // Nor there: a module of the embedder's, a foreign object.
+                    y.set(call("zb_foreign_import", vec![name.e()], any())),
+                    when(not(is_nil(pending())), vec![ret(nil())]),
+                    when(
+                        not(is_nil(y.e())),
+                        vec![
+                            expr(call(
+                                "zl_rawset_str",
+                                vec![
+                                    unbox_table(call("zl_package_loaded", vec![], any()), t),
+                                    name.e(),
+                                    y.e(),
+                                ],
+                                unit(),
+                            )),
+                            ret(call(
+                                "zb_box_tuple",
+                                vec![list(vec![y.e(), box_str(text(":foreign:"))], anys.clone())],
+                                any(),
+                            )),
+                        ],
                     ),
                     lua_error(concat(vec![
                         text("module '"),
@@ -4040,7 +4120,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                         text("']\n\t"),
                         acc.e(),
                         text("\n\t"),
-                        call("zl_load_error", vec![], string()),
+                        cmsg.e(),
                     ])),
                 ],
             ),
@@ -4105,26 +4185,48 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             )),
         ],
     ));
-    // `package.loadlib(path, name)`: no C library can be loaded here,
-    // which is told the way a build without dynamic libraries tells it.
+    // `package.loadlib(path, name)`: the C function `name` of the
+    // library at `path`, or true for `*`, which makes its symbols
+    // global; else nil, the message, and whether the library would not
+    // open or has no such function.
     d.push(define(
         "zl_package_loadlib",
         &[&path, &name],
         any(),
-        vec![ret(call(
-            "zb_box_tuple",
-            vec![list(
-                vec![
-                    nil(),
-                    box_str(text(
-                        "dynamic libraries not enabled; check your Lua installation",
-                    )),
-                    box_str(text("absent")),
-                ],
-                anys.clone(),
-            )],
-            any(),
-        ))],
+        vec![
+            status.decl(call("zl_c_loadlib", vec![path.e(), name.e()], i64())),
+            when(
+                eq(status.e(), int(0)),
+                vec![ret(call("zl_c_loaded", vec![], any()))],
+            ),
+            when(
+                eq(status.e(), int(1)),
+                vec![ret(call(
+                    "zb_box_tuple",
+                    vec![list(
+                        vec![
+                            nil(),
+                            box_str(call("zl_c_error", vec![], string())),
+                            box_str(text("open")),
+                        ],
+                        anys.clone(),
+                    )],
+                    any(),
+                ))],
+            ),
+            ret(call(
+                "zb_box_tuple",
+                vec![list(
+                    vec![
+                        nil(),
+                        box_str(call("zl_c_error", vec![], string())),
+                        box_str(text("init")),
+                    ],
+                    anys.clone(),
+                )],
+                any(),
+            )),
+        ],
     ));
     // `package.searchpath(name, path [, sep [, rep]])`: the file found,
     // or nil and the list of files tried.
@@ -4270,7 +4372,13 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             ),
             when(
                 not(is_table(x.e())),
-                vec![ret(call("zl_type_meta", vec![x.e()], any()))],
+                vec![
+                    when(
+                        is_userdata(x.e()),
+                        vec![ret(call("zl_ud_meta", vec![x.e()], any()))],
+                    ),
+                    ret(call("zl_type_meta", vec![x.e()], any())),
+                ],
             ),
             tb.decl(unbox_table(x.e(), t)),
             when(
@@ -4314,6 +4422,13 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                         unbox_table(y.e(), t),
                     )],
                 )],
+            ),
+            when(
+                is_userdata(x.e()),
+                vec![
+                    expr(call("zl_ud_set_meta", vec![x.e(), y.e()], unit())),
+                    ret(x.e()),
+                ],
             ),
             expr(call("zl_set_type_meta", vec![x.e(), y.e()], boolean())),
             ret(x.e()),

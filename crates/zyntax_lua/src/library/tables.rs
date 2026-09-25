@@ -692,7 +692,11 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             when(
                 not(is_table(o.e())),
                 vec![
-                    mt.decl(call("zl_type_meta", vec![o.e()], any())),
+                    mt.decl(if_expr(
+                        is_userdata(o.e()),
+                        call("zl_ud_meta", vec![o.e()], any()),
+                        call("zl_type_meta", vec![o.e()], any()),
+                    )),
                     when(is_nil(mt.e()), vec![ret(nil())]),
                     handler.decl(call(
                         "zl_rawget_str",
@@ -777,8 +781,26 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     any(),
                 ))],
             ),
-            // Any other value that is not a table, its type's.
-            when(not(is_table(o.e())), type_event(&o)),
+            // Any other value that is not a table, its type's; a full
+            // userdata, its own.
+            when(
+                not(is_table(o.e())),
+                vec![
+                    when(
+                        is_userdata(o.e()),
+                        vec![
+                            mt.decl(call("zl_ud_meta", vec![o.e()], any())),
+                            when(is_nil(mt.e()), vec![ret(nil())]),
+                            ret(call(
+                                "zl_rawget_str",
+                                vec![unbox_table(mt.e(), t), event.e()],
+                                any(),
+                            )),
+                        ],
+                    ),
+                    block_of(type_event(&o)),
+                ],
+            ),
             ret(call(
                 "zl_meta",
                 vec![unbox_table(o.e(), t), event.e()],
