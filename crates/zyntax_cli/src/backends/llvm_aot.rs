@@ -104,7 +104,7 @@ pub fn compile_llvm(
     module: HirModule,
     output: Option<PathBuf>,
     opt_level: u8,
-    _entry_point: Option<&str>,
+    entry_point: Option<&str>,
     _pack_symbols: &[(&'static str, *const u8)],
     static_libs: &[PathBuf],
     verbose: bool,
@@ -129,6 +129,7 @@ pub fn compile_llvm(
     // Create LLVM context and backend
     let context = Context::create();
     let mut backend = LLVMBackend::new(&context, "zyntax_aot");
+    backend.set_entry_names(entry_point.into_iter().map(str::to_string).collect());
 
     if verbose {
         info!("Compiling HIR to LLVM IR...");
