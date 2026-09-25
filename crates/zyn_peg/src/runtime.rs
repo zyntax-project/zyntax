@@ -658,7 +658,7 @@ pub trait AstHostFunctions {
     /// Create an enum variant
     fn create_variant(&mut self, name: &str) -> NodeHandle;
 
-    // ========== Class/OOP Declarations (Haxe) ==========
+    // ========== Class Declarations ==========
 
     /// Create a class declaration with type parameters and members
     fn create_class(
@@ -5700,7 +5700,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                     Some(RuntimeValue::String(s)) => {
                         // Map language-specific type names to internal primitive names
                         match s.as_str() {
-                            // Haxe types
+                            // Capitalised source type names
                             "Int" => "i32".to_string(),
                             "Float" => "f64".to_string(),
                             "Bool" => "bool".to_string(),
@@ -6381,7 +6381,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                 });
                 let inclusive = match args.get("inclusive") {
                     Some(RuntimeValue::Bool(b)) => *b,
-                    _ => false, // Haxe 0...5 is exclusive (0 to 4)
+                    _ => false, // Exclusive by default: 0...5 yields 0 through 4
                 };
                 let handle = self.host.create_range(start, end, inclusive);
                 Ok(RuntimeValue::Node(handle))
@@ -6865,7 +6865,7 @@ impl<'a, H: AstHostFunctions> CommandInterpreter<'a, H> {
                 Ok(RuntimeValue::Node(handle))
             }
 
-            // ===== CLASS/OOP SUPPORT (Haxe) =====
+            // ===== CLASS, MODULE AND TRAIT DECLARATIONS =====
             "class" => {
                 let name = match args.get("name") {
                     Some(RuntimeValue::String(s)) => s.clone(),

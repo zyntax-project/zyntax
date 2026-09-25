@@ -1,8 +1,8 @@
 //! Python source reaches native code through the same pipeline as
 //! everything else.
 //!
-//! The frontend hands the runtime a `TypedProgram`, the way the Haxe
-//! path does; nothing downstream knows it came from Python. So a
+//! The frontend hands the runtime a `TypedProgram`, the way the Lua
+//! frontend does; nothing downstream knows it came from Python. So a
 //! function that computes something is the whole test of the seam:
 //! parsing, the rewrite to typed nodes, type inference over `Unknown`,
 //! lowering, and the compiled result agreeing with arithmetic.

@@ -6976,7 +6976,7 @@ impl CraneliftBackend {
 
                     HirTerminator::Unreachable => {
                         // For void-returning functions, emit a return instead of trap
-                        // This handles Haxe/other languages where main() returns Void and has no explicit return
+                        // This handles languages where a void function has no explicit return
                         if function.signature.returns.is_empty()
                             || function
                                 .signature

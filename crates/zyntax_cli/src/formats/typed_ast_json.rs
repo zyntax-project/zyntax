@@ -888,15 +888,14 @@ fn typed_ast_to_hir(program: &TypedProgram) -> Result<HirModule, Box<dyn std::er
                     let c_string = format!("{}\0", string_val);
                     let c_str_ptr = self.builder.string_constant(&c_string);
 
-                    // Convert C string to Haxe runtime string using $String$fromCString
-                    // This ensures string literals have the proper runtime representation
+                    // Wrap the C string with $String$fromCString so the literal
+                    // has the runtime's string representation
                     let from_cstring_name = self.builder.intern("$String$fromCString");
                     let from_cstring_fn = self.builder.get_function_by_name(from_cstring_name);
 
-                    // Call $String$fromCString(c_str_ptr) to create a Haxe string
-                    let haxe_string = self.builder.call(from_cstring_fn, vec![c_str_ptr])
+                    let runtime_string = self.builder.call(from_cstring_fn, vec![c_str_ptr])
                         .ok_or_else(|| format!("Failed to generate call to $String$fromCString"))?;
-                    Ok(haxe_string)
+                    Ok(runtime_string)
                 }
                 _ => Err(format!("Unsupported literal: {:?}", lit).into()),
             }

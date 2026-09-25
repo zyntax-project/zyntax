@@ -22,7 +22,7 @@ pest_meta = "2.8"
 # - JIT mode: Loads .zrtl (dynamic library) from zpack for runtime symbol lookup
 # - AOT mode: Extracts .a (static library) from zpack for linker symbol resolution
 #
-# Example: zyntax compile --pack haxe-runtime.zpack --source main.hx
+# Example: zyntax compile --jit --pack runtime.zpack --grammar zig.zyn --source main.zig
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }

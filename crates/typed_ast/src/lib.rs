@@ -3,8 +3,8 @@
 //! # Zyntax TypedAST
 //!
 //! A robust TypedAST that serves as the common intermediate representation
-//! for multiple statically-typed languages including Rust, Java, C#,
-//! TypeScript, and Haxe.
+//! for every Zyntax frontend: ZynML, Python, Lua and ZynPEG grammar-defined
+//! languages.
 //!
 //! ## Overview
 //!

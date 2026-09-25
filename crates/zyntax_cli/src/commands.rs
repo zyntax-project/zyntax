@@ -13,7 +13,6 @@ use zyntax_typed_ast::{ImportContext, ModuleArchitecture};
 /// Convert CLI ModuleArch to typed_ast ModuleArchitecture
 fn to_module_architecture(resolver: ModuleArch, cache_dir: &PathBuf) -> ModuleArchitecture {
     match resolver {
-        ModuleArch::Haxe => ModuleArchitecture::haxe(),
         ModuleArch::Java => ModuleArchitecture::java(),
         ModuleArch::Rust => ModuleArchitecture::rust(),
         ModuleArch::Python => ModuleArchitecture::python(),
@@ -268,10 +267,9 @@ pub fn version() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ZynPEG Grammar  - Grammar-based parsing for custom languages");
     println!();
     println!("{}", "Module Resolver Architectures:".green().bold());
-    println!("  haxe       - Java/Haxe style (com.example.Class)");
-    println!("  java       - Java packages");
+    println!("  java       - Java packages (com.example.Class)");
     println!("  rust       - Rust style (mod.rs)");
-    println!("  python     - Python style (__init__.py)");
+    println!("  python     - Python style (__init__.py, default)");
     println!("  typescript - TypeScript/Node (index.ts)");
     println!("  go         - Go style (domain-based imports)");
     println!("  deno       - Deno style (URL imports)");

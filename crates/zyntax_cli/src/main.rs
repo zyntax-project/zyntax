@@ -12,7 +12,7 @@
 //! - LLVM AOT - Optimized compilation for production
 //!
 //! Import Resolution:
-//! - Multiple module architectures (Haxe, Java, Rust, Python, TypeScript, Go, Deno)
+//! - Multiple module architectures (Python, Java, Rust, TypeScript, Go, Deno)
 //! - Incremental compilation with ZBC caching
 
 mod backends;

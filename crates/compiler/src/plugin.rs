@@ -8,20 +8,20 @@
 //!
 //! ```rust
 //! use zyntax_compiler::plugin::RuntimePlugin;
-//! # extern "C" fn my_array_create() {}
-//! # extern "C" fn my_array_push() {}
+//! # extern "C" fn io_print() {}
+//! # extern "C" fn io_println() {}
 //!
-//! pub struct HaxeRuntimePlugin;
+//! pub struct IoRuntimePlugin;
 //!
-//! impl RuntimePlugin for HaxeRuntimePlugin {
+//! impl RuntimePlugin for IoRuntimePlugin {
 //!     fn name(&self) -> &str {
-//!         "haxe"
+//!         "io"
 //!     }
 //!
 //!     fn runtime_symbols(&self) -> Vec<(&'static str, *const u8)> {
 //!         vec![
-//!             ("$Array$create", my_array_create as *const u8),
-//!             ("$Array$push", my_array_push as *const u8),
+//!             ("$IO$print", io_print as *const u8),
+//!             ("$IO$println", io_println as *const u8),
 //!         ]
 //!     }
 //! }
@@ -32,7 +32,7 @@
 /// Frontend implementations create a type implementing this trait to provide
 /// their runtime symbols to the JIT compiler.
 pub trait RuntimePlugin: Send + Sync {
-    /// Returns the name of this frontend (e.g., "haxe", "python", "javascript")
+    /// Returns the name of this frontend (e.g., "zynml", "python", "lua")
     fn name(&self) -> &str;
 
     /// Returns the runtime symbols this frontend provides

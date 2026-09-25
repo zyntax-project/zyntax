@@ -787,8 +787,7 @@ typedef struct {
  * ============================================================
  *
  * The iterator protocol allows runtime functions to iterate over
- * collections in a type-safe manner. It follows the Haxe/JavaScript
- * pattern with hasNext() + next() methods.
+ * collections in a type-safe manner, with hasNext() + next() methods.
  *
  * Two variants are provided:
  * 1. ZrtlIterator - Generic iterator using DynamicBox values

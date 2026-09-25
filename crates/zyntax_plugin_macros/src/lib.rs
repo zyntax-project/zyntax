@@ -5,7 +5,7 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    ItemFn, LitBool, Token,
+    ItemFn, Token,
     parse::{Parse, ParseStream},
     parse_macro_input,
 };
@@ -34,8 +34,7 @@ pub fn runtime_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
 
-    // Use export_name to set the exact symbol name for both JIT and AOT linking
-    // This ensures the function is exported as exactly "$haxe$trace$int" (or whatever name)
+    // export_name keeps the symbol string verbatim (e.g. "$IO$println") for JIT and AOT linking
     let expanded = quote! {
         #(#attrs)*
         #[unsafe(export_name = #symbol_name)]
@@ -46,142 +45,6 @@ pub fn runtime_export(attr: TokenStream, item: TokenStream) -> TokenStream {
             crate::RuntimeSymbol {
                 name: #symbol_name,
                 ptr: crate::FunctionPtr::new(#func_name as *const u8),
-            }
-        }
-    };
-
-    TokenStream::from(expanded)
-}
-
-/// Parser for method metadata attributes
-struct MethodArgs {
-    symbol: String,
-    haxe_type: String,
-    haxe_name: String,
-    is_property: bool,
-    mutates: bool,
-    returns_self: bool,
-}
-
-impl Parse for MethodArgs {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut symbol = String::new();
-        let mut haxe_type = String::new();
-        let mut haxe_name = String::new();
-        let mut is_property = false;
-        let mut mutates = false;
-        let mut returns_self = false;
-
-        while !input.is_empty() {
-            let ident: syn::Ident = input.parse()?;
-            let _ = input.parse::<Token![=]>()?;
-
-            match ident.to_string().as_str() {
-                "symbol" => {
-                    let lit: syn::LitStr = input.parse()?;
-                    symbol = lit.value();
-                }
-                "haxe_type" => {
-                    let lit: syn::LitStr = input.parse()?;
-                    haxe_type = lit.value();
-                }
-                "haxe_method" => {
-                    let lit: syn::LitStr = input.parse()?;
-                    haxe_name = lit.value();
-                    is_property = false;
-                }
-                "haxe_property" => {
-                    let lit: syn::LitStr = input.parse()?;
-                    haxe_name = lit.value();
-                    is_property = true;
-                }
-                "mutates" => {
-                    let lit: LitBool = input.parse()?;
-                    mutates = lit.value;
-                }
-                "returns_self" => {
-                    let lit: LitBool = input.parse()?;
-                    returns_self = lit.value;
-                }
-                _ => {
-                    // Skip unknown fields
-                    let _: syn::Expr = input.parse()?;
-                }
-            }
-
-            // Optional trailing comma
-            let _ = input.parse::<Token![,]>();
-        }
-
-        Ok(MethodArgs {
-            symbol,
-            haxe_type,
-            haxe_name,
-            is_property,
-            mutates,
-            returns_self,
-        })
-    }
-}
-
-/// Attribute macro for runtime functions with method mapping metadata
-///
-/// This exports the function AND registers metadata for automatic method mapping.
-///
-/// # Example
-///
-/// Not compiled as a doctest: the expansion refers to items
-/// `runtime_plugin!` generates in the plugin crate.
-///
-/// ```ignore
-/// #[runtime_method(
-///     symbol = "$Array$length",
-///     haxe_type = "Array",
-///     haxe_property = "length"
-/// )]
-/// pub extern "C" fn Array_length(arr: *const i32) -> i32 { ... }
-/// ```
-#[proc_macro_attribute]
-pub fn runtime_method(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as MethodArgs);
-    let func = parse_macro_input!(item as ItemFn);
-
-    let func_name = &func.sig.ident;
-    let vis = &func.vis;
-    let attrs = &func.attrs;
-    let sig = &func.sig;
-    let block = &func.block;
-
-    let symbol_name = &args.symbol;
-    let haxe_type = &args.haxe_type;
-    let haxe_name = &args.haxe_name;
-    let is_property = args.is_property;
-    let mutates = args.mutates;
-    let returns_self = args.returns_self;
-
-    // Use export_name to set the exact symbol name for both JIT and AOT linking
-    let expanded = quote! {
-        #(#attrs)*
-        #[unsafe(export_name = #symbol_name)]
-        #vis #sig #block
-
-        // Register the runtime symbol for JIT lookup
-        inventory::submit! {
-            crate::RuntimeSymbol {
-                name: #symbol_name,
-                ptr: crate::FunctionPtr::new(#func_name as *const u8),
-            }
-        }
-
-        // Register the method mapping metadata
-        inventory::submit! {
-            crate::MethodMapping {
-                symbol: #symbol_name,
-                haxe_type: #haxe_type,
-                haxe_name: #haxe_name,
-                is_property: #is_property,
-                mutates: #mutates,
-                returns_self: #returns_self,
             }
         }
     };
@@ -231,7 +94,7 @@ impl Parse for PluginArgs {
 ///
 /// ```ignore
 /// runtime_plugin! {
-///     name: "haxe",
+///     name: "stdlib",
 /// }
 /// ```
 #[proc_macro]
@@ -271,18 +134,6 @@ pub fn runtime_plugin(input: TokenStream) -> TokenStream {
 
         inventory::collect!(RuntimeSymbol);
 
-        /// Method mapping metadata for automatic Haxe → runtime mapping
-        pub struct MethodMapping {
-            pub symbol: &'static str,
-            pub haxe_type: &'static str,
-            pub haxe_name: &'static str,
-            pub is_property: bool,
-            pub mutates: bool,
-            pub returns_self: bool,
-        }
-
-        inventory::collect!(MethodMapping);
-
         /// Plugin implementation
         pub struct #plugin_struct_name;
 
@@ -302,21 +153,6 @@ pub fn runtime_plugin(input: TokenStream) -> TokenStream {
         /// Get the plugin instance for registration
         pub fn get_plugin() -> Box<dyn zyntax_compiler::plugin::RuntimePlugin> {
             Box::new(#plugin_struct_name)
-        }
-
-        /// Get all method mappings for compiler integration
-        pub fn get_method_mappings() -> Vec<MethodMapping> {
-            inventory::iter::<MethodMapping>
-                .into_iter()
-                .map(|m| MethodMapping {
-                    symbol: m.symbol,
-                    haxe_type: m.haxe_type,
-                    haxe_name: m.haxe_name,
-                    is_property: m.is_property,
-                    mutates: m.mutates,
-                    returns_self: m.returns_self,
-                })
-                .collect()
         }
     };
 

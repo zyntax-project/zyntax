@@ -65,7 +65,7 @@ error_field = {
 
 format_expr = { "format!" ~ "(" ~ string_literal ~ ("," ~ rust_expr)* ~ ")" }
 
-// @builtin { trace: "$haxe$trace$int", print: "$io$print" }
+// @builtin { print: "$IO$print", println: "$IO$println" }
 // Supports three types of mappings:
 // - Functions (default): `println: "$IO$println"`
 // - Methods (prefix @): `@sum: "tensor_sum"` transforms x.sum() -> tensor_sum(x)

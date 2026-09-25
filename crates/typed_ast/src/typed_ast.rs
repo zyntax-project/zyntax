@@ -7,7 +7,7 @@
 //! - Every node carries source location (Span) information
 //! - Variable declarations include mutability information
 //! - Built incrementally to avoid compilation errors
-//! - Supports languages like Rust, Java, C#, TypeScript, and Haxe
+//! - Shared by every frontend: ZynML, Python, Lua and ZynPEG grammars
 
 use crate::arena::InternedString;
 use crate::source::{SourceFile, Span};
@@ -96,12 +96,12 @@ pub enum TypedDeclaration {
 /// External type declaration - represents types defined outside the compilation unit
 ///
 /// This is used for language-specific extern types like:
-/// - Haxe's String, Array, Map classes
+/// - Runtime-backed classes such as ZynML's Tensor or String
 /// - C's opaque struct types
 /// - FFI type declarations
 ///
 /// The runtime_prefix is used to map methods to runtime symbols:
-/// e.g., runtime_prefix = "$haxe$String" means method "length" -> "$haxe$String$length"
+/// e.g., runtime_prefix = "$String" means method "length" -> "$String$length"
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TypedExtern {
     /// External class with methods mapped to runtime symbols
@@ -120,7 +120,7 @@ pub struct TypedExternClass {
     /// Class name (e.g., "String", "Array")
     pub name: InternedString,
     /// Runtime symbol prefix for method resolution
-    /// e.g., "$haxe$String" -> method "length" becomes "$haxe$String$length"
+    /// e.g., "$String" -> method "length" becomes "$String$length"
     pub runtime_prefix: InternedString,
     /// Type parameters for generic extern classes (e.g., `Array<T>`)
     #[serde(default)]

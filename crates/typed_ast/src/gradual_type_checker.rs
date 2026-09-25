@@ -1,6 +1,6 @@
 //! Gradual Type System Checker
 //!
-//! Implements Python/Haxe/TypeScript style gradual typing where types can be
+//! Implements Python/TypeScript style gradual typing where types can be
 //! checked statically or dynamically, with smooth interoperability between
 //! typed and untyped code.
 

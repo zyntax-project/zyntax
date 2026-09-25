@@ -606,7 +606,7 @@ impl<'arena> HirBuilder<'arena> {
         result
     }
 
-    /// Calls an external symbol by name (e.g., "$haxe$trace$int")
+    /// Calls an external symbol by name (e.g., "$IO$println")
     pub fn call_symbol(&mut self, symbol: &str, args: Vec<HirId>) -> Option<HirId> {
         let result = Some(HirId::new());
         self.emit(HirInstruction::Call {

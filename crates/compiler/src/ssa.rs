@@ -4923,7 +4923,7 @@ impl SsaBuilder {
                             return self
                                 .translate_enum_constructor(block_id, &name_str, args, &expr.ty);
                         } else if name_str.starts_with('$') {
-                            // Check if this is an external runtime symbol (e.g., "$haxe$trace$int")
+                            // Check if this is an external runtime symbol (e.g., "$IO$println")
                             // External symbols start with '$' and are resolved at link time
                             (
                                 crate::hir::HirCallable::Symbol(name_str),

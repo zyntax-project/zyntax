@@ -49,7 +49,7 @@
 //!
 //! ```bash
 //! # JIT execution with runtime from ZPack
-//! zyntax compile --jit --pack haxe-runtime.zpack source.json
+//! zyntax compile --jit --pack my_runtime.zpack source.json
 //! ```
 //!
 //! # Workflow
@@ -60,7 +60,7 @@
 //!
 //! ```bash
 //! # Compile source to bytecode
-//! zyntax compile --emit-bytecode --output modules/ src/*.hx
+//! zyntax compile --emit-bytecode --output modules/ src/*.json
 //!
 //! # Compile runtime for each platform
 //! clang -shared -fPIC -o lib/x86_64-apple-darwin/runtime.zrtl runtime.c
@@ -69,7 +69,7 @@
 //! zyntax pack --manifest manifest.json --output my_runtime.zpack
 //!
 //! # Use the zpack
-//! zyntax compile --pack my_runtime.zpack --source main.hx
+//! zyntax compile --pack my_runtime.zpack --grammar zig.zyn --source main.zig
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -116,7 +116,7 @@ pub struct ZPackManifest {
     /// Package format version
     pub version: u32,
 
-    /// Package name (e.g., "haxe-std")
+    /// Package name (e.g., "my-runtime")
     pub name: String,
 
     /// Package version (semver)
@@ -134,7 +134,7 @@ pub struct ZPackManifest {
     #[serde(default)]
     pub license: Option<String>,
 
-    /// Source language this was compiled from (e.g., "haxe", "zig")
+    /// Source language this was compiled from (e.g., "zynml", "zig")
     pub source_language: String,
 
     /// Entry point module (relative to modules/)
@@ -184,7 +184,7 @@ impl Default for ZPackManifest {
             description: String::new(),
             authors: Vec::new(),
             license: None,
-            source_language: "haxe".to_string(),
+            source_language: String::new(),
             entry_point: None,
             dependencies: HashMap::new(),
             targets: Vec::new(),
@@ -784,7 +784,7 @@ mod tests {
         let manifest = ZPackManifest {
             name: "test-pack".to_string(),
             package_version: "1.0.0".to_string(),
-            source_language: "haxe".to_string(),
+            source_language: "zynml".to_string(),
             targets: vec!["x86_64-apple-darwin".to_string()],
             modules: vec!["std/Array".to_string(), "main".to_string()],
             ..Default::default()

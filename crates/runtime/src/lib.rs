@@ -5,8 +5,8 @@
 //! This library provides **language-agnostic** runtime primitives that can be used
 //! by any language frontend targeting Zyntax.
 //!
-//! Language-specific runtime implementations (like Haxe's Array, String, etc.)
-//! should go in their respective frontend directories (e.g., reflaxe.zyntax/runtime/).
+//! Language-specific runtimes live with their frontend (for example the
+//! host modules in `crates/zyntax_lua`) or in a ZRTL plugin under `plugins/`.
 //!
 //! All exported functions use C calling convention for compatibility with JIT-compiled code.
 //!

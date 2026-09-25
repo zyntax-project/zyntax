@@ -18,14 +18,12 @@ pub struct Cli {
 /// Module resolver architecture type for import resolution
 #[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq)]
 pub enum ModuleArch {
-    /// Java/Haxe style: com.example.MyClass -> com/example/MyClass.hx
-    #[default]
-    Haxe,
-    /// Java style packages
+    /// Java style: com.example.MyClass -> com/example/MyClass.java
     Java,
     /// Rust style with mod.rs
     Rust,
     /// Python style with __init__.py
+    #[default]
     Python,
     /// TypeScript/Node style with index files
     Typescript,
@@ -84,7 +82,7 @@ pub enum Commands {
 
         // === Import Resolution Options ===
         /// Module resolver architecture for import resolution
-        #[arg(long = "resolver", value_enum, default_value = "haxe")]
+        #[arg(long = "resolver", value_enum, default_value = "python")]
         resolver: ModuleArch,
 
         /// Source root directory for resolving imports (can be specified multiple times)
@@ -142,7 +140,7 @@ pub enum Commands {
         opt_level: u8,
 
         /// Module resolver architecture for import resolution
-        #[arg(long = "resolver", value_enum, default_value = "haxe")]
+        #[arg(long = "resolver", value_enum, default_value = "python")]
         resolver: ModuleArch,
 
         /// Source root directory for resolving imports
@@ -214,8 +212,8 @@ pub enum PackAction {
         #[arg(long, default_value = "0.1.0")]
         version: String,
 
-        /// Source language (e.g., "haxe", "zig")
-        #[arg(long, default_value = "haxe")]
+        /// Source language (e.g., "zynml", "zig")
+        #[arg(long, default_value = "zynml")]
         language: String,
 
         /// HIR bytecode modules to include (.zbc files or directories)

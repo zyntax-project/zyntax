@@ -1656,15 +1656,15 @@ impl ZyntaxRuntime {
     ///
     /// # Arguments
     /// * `base_path` - The base directory to search for modules
-    /// * `extension` - The file extension (without the dot), e.g., "zig", "hx", "py"
+    /// * `extension` - The file extension (without the dot), e.g., "zig", "zynml", "py"
     ///
     /// # Example
     /// ```ignore
     /// // For Zig source files
     /// runtime.add_filesystem_resolver("./src", "zig");
     ///
-    /// // For Haxe source files
-    /// runtime.add_filesystem_resolver("./src", "hx");
+    /// // For ZynML source files
+    /// runtime.add_filesystem_resolver("./src", "zynml");
     /// ```
     pub fn add_filesystem_resolver<P: AsRef<std::path::Path> + Send + Sync + 'static>(
         &mut self,
@@ -1787,7 +1787,7 @@ impl ZyntaxRuntime {
     /// for extension-based language detection.
     ///
     /// # Arguments
-    /// * `language` - The language identifier (e.g., "zig", "python", "haxe")
+    /// * `language` - The language identifier (e.g., "zig", "python", "zynml")
     /// * `grammar` - The compiled language grammar
     ///
     /// # Example

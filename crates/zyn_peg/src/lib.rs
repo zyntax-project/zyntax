@@ -89,7 +89,7 @@ pub struct TypeHelpers {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BuiltinMappings {
     /// Map of function name -> runtime symbol name
-    /// e.g., "trace" -> "$haxe$trace$int"
+    /// e.g., "println" -> "$IO$println"
     #[serde(default)]
     pub functions: std::collections::HashMap<String, String>,
     /// Map of method name -> list of builtin function names

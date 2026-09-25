@@ -325,7 +325,7 @@ pub struct HirFunction {
     pub is_external: bool,
     pub calling_convention: CallingConvention,
     pub attributes: FunctionAttributes,
-    /// Override symbol name for linking (e.g., "$haxe$trace$int" for extern trace)
+    /// Override symbol name for linking (e.g., "$IO$println")
     pub link_name: Option<String>,
 }
 
@@ -2403,7 +2403,7 @@ pub enum HirCallable {
     Indirect(HirId),
     /// Intrinsic function
     Intrinsic(Intrinsic),
-    /// External symbol call (e.g., "$haxe$trace$int" for runtime functions)
+    /// External symbol call (e.g., "$IO$println" for runtime functions)
     /// The symbol name is looked up in the runtime symbol registry at link time
     Symbol(String),
     /// Get function address as a pointer value (for passing functions as arguments)

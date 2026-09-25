@@ -2105,7 +2105,7 @@ impl<'ctx> LLVMBackend<'ctx> {
 
             HirTerminator::Unreachable => {
                 // For void-returning functions, emit a return instead of unreachable/trap
-                // This handles Haxe/other languages where main() returns Void and has no explicit return
+                // This handles languages where a void function has no explicit return
                 if let Some(func) = self.current_function {
                     let return_type = func.get_type().get_return_type();
                     if return_type.is_none() {
@@ -5193,7 +5193,7 @@ impl<'ctx> LLVMBackend<'ctx> {
             }
             HirCallable::Intrinsic(intrinsic) => self.compile_intrinsic(*intrinsic, args),
             HirCallable::Symbol(symbol_name) => {
-                // Call external runtime symbol by name (e.g., "$haxe$trace$int")
+                // Call external runtime symbol by name (e.g., "$IO$println")
                 // Check if any parameters need auto-boxing based on symbol signature
                 let sig_info = self.symbol_signatures.get(symbol_name).cloned();
 

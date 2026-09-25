@@ -474,7 +474,7 @@ unsafe impl Send for TypeMeta {}
 
 /// Dynamic value: tagged union of (type_meta_ptr, value_ptr)
 ///
-/// This is the runtime representation of Haxe's Dynamic type.
+/// Runtime representation of a dynamically typed value.
 /// The value_ptr points to heap-allocated memory containing the actual value.
 /// The type_meta_ptr points to type metadata (can be static or heap-allocated).
 ///

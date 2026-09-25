@@ -5,8 +5,8 @@
 //!
 //! ## Overview
 //!
-//! Languages like Haxe, Rust, Java, etc. have different module systems:
-//! - Haxe: `import haxe.ds.StringMap;`
+//! Languages like Python, Rust, Java, etc. have different module systems:
+//! - Python: `from collections import OrderedDict`
 //! - Rust: `use std::collections::HashMap;`
 //! - Java: `import java.util.HashMap;`
 //!
@@ -213,7 +213,7 @@ impl std::error::Error for ImportError {}
 /// Module file architecture defines how module paths map to filesystem paths
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModuleArchitecture {
-    /// Java/Haxe style: com.example.MyClass -> com/example/MyClass.hx
+    /// Java style: com.example.MyClass -> com/example/MyClass.java
     /// Package path directly maps to directory structure
     DotSeparatedPackages {
         /// File extension for source files
@@ -337,20 +337,11 @@ pub struct CompiledModuleCache {
 
 impl Default for ModuleArchitecture {
     fn default() -> Self {
-        ModuleArchitecture::DotSeparatedPackages {
-            extension: "hx".to_string(),
-        }
+        Self::python()
     }
 }
 
 impl ModuleArchitecture {
-    /// Create a Haxe-style module architecture
-    pub fn haxe() -> Self {
-        ModuleArchitecture::DotSeparatedPackages {
-            extension: "hx".to_string(),
-        }
-    }
-
     /// Create a Java-style module architecture
     pub fn java() -> Self {
         ModuleArchitecture::DotSeparatedPackages {
@@ -422,7 +413,7 @@ impl ModuleArchitecture {
     pub fn module_to_paths(&self, module_path: &[String], base_path: &PathBuf) -> Vec<PathBuf> {
         match self {
             ModuleArchitecture::DotSeparatedPackages { extension } => {
-                // com.example.MyClass -> base/com/example/MyClass.hx
+                // com.example.MyClass -> base/com/example/MyClass.<extension>
                 let mut path = base_path.clone();
                 for segment in module_path {
                     path = path.join(segment);
@@ -530,7 +521,7 @@ pub struct ImportContext {
     pub search_paths: Vec<PathBuf>,
     /// Already imported modules (to detect cycles)
     pub imported_modules: Vec<Vec<String>>,
-    /// Module aliases (e.g., from package.json or haxelib)
+    /// Module aliases (e.g., from package.json or an import map)
     pub module_aliases: HashMap<String, Vec<String>>,
     /// Whether to allow runtime/extern imports
     pub allow_extern: bool,
@@ -1001,8 +992,7 @@ impl ImportManager {
 /// Entry point resolution based on module architecture
 ///
 /// Different languages have different conventions for specifying entry points:
-/// - Haxe: `ClassName.staticMethod` (e.g., `Test.main`)
-/// - Java: `package.ClassName.main` (e.g., `com.example.Main.main`)
+/// - Java: `ClassName.method` or `package.ClassName.main` (e.g., `com.example.Main.main`)
 /// - Rust: `module::function` (e.g., `main` or `app::main`)
 /// - Python: `module.function` (e.g., `main.run`)
 /// - Go: `package.Function` (e.g., `main.main`)
@@ -1016,11 +1006,6 @@ impl EntryPointResolver {
     /// Create a new entry point resolver with the given architecture
     pub fn new(architecture: ModuleArchitecture) -> Self {
         Self { architecture }
-    }
-
-    /// Create a Haxe-style resolver
-    pub fn haxe() -> Self {
-        Self::new(ModuleArchitecture::haxe())
     }
 
     /// Create a Java-style resolver
@@ -1042,9 +1027,8 @@ impl EntryPointResolver {
     pub fn resolve_candidates(&self, entry_point: &str) -> Vec<String> {
         match &self.architecture {
             ModuleArchitecture::DotSeparatedPackages { .. } => {
-                // Haxe/Java style: Test.main -> ["Test_main", "Test.main", "main"]
-                // The underscore variant is commonly used in compiled output
-                self.resolve_haxe_style(entry_point)
+                // Java style: Test.main -> ["Test_main", "Test.main", "main"]
+                self.resolve_class_method_style(entry_point)
             }
             ModuleArchitecture::RustStyle { .. } => {
                 // Rust style: module::main -> ["module::main", "main"]
@@ -1087,13 +1071,14 @@ impl EntryPointResolver {
         }
     }
 
-    /// Resolve Haxe-style entry point (ClassName.methodName)
-    fn resolve_haxe_style(&self, entry_point: &str) -> Vec<String> {
+    /// Resolve a `ClassName.methodName` entry point, preferring the
+    /// `ClassName_methodName` symbol that lowering gives class methods.
+    fn resolve_class_method_style(&self, entry_point: &str) -> Vec<String> {
         let parts: Vec<&str> = entry_point.split('.').collect();
         let mut candidates = Vec::new();
 
         if parts.len() >= 2 {
-            // Primary: ClassName_methodName (most common in compiled output)
+            // Primary: ClassName_methodName
             candidates.push(parts.join("_"));
             // Also try: ClassName.methodName (as-is)
             candidates.push(entry_point.to_string());
@@ -1224,8 +1209,8 @@ mod tests {
     fn test_import_manager() {
         let resolver = BuiltinResolver::new().register_type(
             vec![
-                "haxe".to_string(),
-                "ds".to_string(),
+                "std".to_string(),
+                "collections".to_string(),
                 "StringMap".to_string(),
             ],
             Type::Primitive(crate::PrimitiveType::I64), // Placeholder type
@@ -1238,8 +1223,8 @@ mod tests {
         let import = TypedImport {
             language: None,
             module_path: vec![
-                arena.intern_string("haxe"),
-                arena.intern_string("ds"),
+                arena.intern_string("std"),
+                arena.intern_string("collections"),
                 arena.intern_string("StringMap"),
             ],
             items: vec![TypedImportItem::Named {
@@ -1252,5 +1237,17 @@ mod tests {
         let result = manager.process_import(&import, &context);
         assert!(result.is_ok());
         assert!(manager.is_imported("StringMap"));
+    }
+
+    #[test]
+    fn a_dotted_entry_point_also_names_the_lowered_class_method() {
+        assert_eq!(
+            EntryPointResolver::java().resolve_candidates("Test.main"),
+            ["Test_main", "Test.main", "main"]
+        );
+        assert_eq!(
+            EntryPointResolver::new(ModuleArchitecture::default()).resolve_candidates("Test.main"),
+            ["Test.main", "Test_main", "main"]
+        );
     }
 }
