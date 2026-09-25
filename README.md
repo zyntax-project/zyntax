@@ -3,7 +3,7 @@
 > Compiler frontend infrastructure with tiered JIT compilation and native code generation
 
 [![CI](https://github.com/zyntax-project/zyntax/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zyntax-project/zyntax/actions/workflows/ci.yml)
-[![ZynML Tests](https://img.shields.io/github/actions/workflow/status/darmie/zyntax/ci.yml?branch=main&label=zynml%20tests)](https://github.com/zyntax-project/zyntax/actions/workflows/ci.yml)
+[![ZynML Tests](https://img.shields.io/github/actions/workflow/status/zyntax-project/zyntax/ci.yml?branch=main&label=zynml%20tests)](https://github.com/zyntax-project/zyntax/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
