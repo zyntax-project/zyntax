@@ -25,10 +25,10 @@ pub fn effect_decl_to_vtable() -> DeclRewrite {
         }),
         move |matched, _bindings, _builder| {
             if let TypedDeclaration::Effect(effect) = &matched.node {
-                if let Ok(mut s) = built.lock() {
-                    if !s.insert(effect.name) {
-                        return RewriteOutput::Unchanged;
-                    }
+                if let Ok(mut s) = built.lock()
+                    && !s.insert(effect.name)
+                {
+                    return RewriteOutput::Unchanged;
                 }
                 let op_table = build_op_table(effect);
                 // Phase H, M1: KEEP the Effect declaration alongside

@@ -131,12 +131,11 @@ mod tests {
             .declarations
             .iter()
             .find(|d| matches!(&d.node, TypedDeclaration::Class(_)))
+            && let TypedDeclaration::Class(class) = &class_decl.node
         {
-            if let TypedDeclaration::Class(class) = &class_decl.node {
-                assert_eq!(class.name.resolve_global().unwrap(), "State$OpTable");
-                assert_eq!(class.fields.len(), 1);
-                assert_eq!(class.fields[0].name.resolve_global().unwrap(), "get_fn");
-            }
+            assert_eq!(class.name.resolve_global().unwrap(), "State$OpTable");
+            assert_eq!(class.fields.len(), 1);
+            assert_eq!(class.fields[0].name.resolve_global().unwrap(), "get_fn");
         }
     }
 

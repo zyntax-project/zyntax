@@ -37,28 +37,26 @@ fn flatten_nested_blocks() -> StmtRewrite {
         "flatten_nested_blocks",
         Priority::NORMALIZATION,
         Pattern::new("nested_block", |node, _ctx| {
-            if let TypedStatement::Block(outer) = &node.node {
-                if outer.statements.len() == 1 {
-                    if let TypedStatement::Block(_) = &outer.statements[0].node {
-                        return Some(Bindings::new());
-                    }
-                }
+            if let TypedStatement::Block(outer) = &node.node
+                && outer.statements.len() == 1
+                && let TypedStatement::Block(_) = &outer.statements[0].node
+            {
+                return Some(Bindings::new());
             }
             None
         }),
         |matched, _bindings, _builder| {
-            if let TypedStatement::Block(outer) = &matched.node {
-                if let Some(inner_stmt) = outer.statements.first() {
-                    if let TypedStatement::Block(inner) = &inner_stmt.node {
-                        // Replace the outer block wrapping a single inner block
-                        // with just the inner block
-                        return RewriteOutput::ReplaceStmt(TypedNode::new(
-                            TypedStatement::Block(inner.clone()),
-                            matched.ty.clone(),
-                            matched.span,
-                        ));
-                    }
-                }
+            if let TypedStatement::Block(outer) = &matched.node
+                && let Some(inner_stmt) = outer.statements.first()
+                && let TypedStatement::Block(inner) = &inner_stmt.node
+            {
+                // Replace the outer block wrapping a single inner block
+                // with just the inner block
+                return RewriteOutput::ReplaceStmt(TypedNode::new(
+                    TypedStatement::Block(inner.clone()),
+                    matched.ty.clone(),
+                    matched.span,
+                ));
             }
             RewriteOutput::Unchanged
         },
@@ -139,12 +137,12 @@ fn fstring_to_concat() -> ExprRewrite {
         "fstring_to_concat",
         Priority::NORMALIZATION,
         Pattern::new("fstring_call", |node, _ctx| {
-            if let TypedExpression::Call(call) = &node.node {
-                if let TypedExpression::Variable(name) = &call.callee.node {
-                    let n = name.resolve_global().unwrap_or_default();
-                    if n == "__fstring__" {
-                        return Some(Bindings::new());
-                    }
+            if let TypedExpression::Call(call) = &node.node
+                && let TypedExpression::Variable(name) = &call.callee.node
+            {
+                let n = name.resolve_global().unwrap_or_default();
+                if n == "__fstring__" {
+                    return Some(Bindings::new());
                 }
             }
             None

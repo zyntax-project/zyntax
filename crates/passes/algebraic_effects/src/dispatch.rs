@@ -27,10 +27,10 @@ pub fn handler_decl_to_impl() -> DeclRewrite {
         }),
         move |matched, _bindings, _builder| {
             if let TypedDeclaration::EffectHandler(handler) = &matched.node {
-                if let Ok(mut s) = expanded.lock() {
-                    if !s.insert(handler.name) {
-                        return RewriteOutput::Unchanged;
-                    }
+                if let Ok(mut s) = expanded.lock()
+                    && !s.insert(handler.name)
+                {
+                    return RewriteOutput::Unchanged;
                 }
                 let declarations = build_handler_declarations(handler);
                 // Phase H, M1: KEEP the EffectHandler declaration so

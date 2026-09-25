@@ -72,20 +72,16 @@ fn make_program_with_literal(value: i128) -> TypedProgram {
 /// Find the first integer literal in the program
 fn find_int_literal(program: &TypedProgram) -> Option<i128> {
     for decl in &program.declarations {
-        if let TypedDeclaration::Function(func) = &decl.node {
-            if let Some(body) = &func.body {
-                for stmt in &body.statements {
-                    if let TypedStatement::Expression(expr) = &stmt.node {
-                        if let TypedExpression::Call(call) = &expr.node {
-                            if let Some(arg) = call.positional_args.first() {
-                                if let TypedExpression::Literal(TypedLiteral::Integer(v)) =
-                                    &arg.node
-                                {
-                                    return Some(*v);
-                                }
-                            }
-                        }
-                    }
+        if let TypedDeclaration::Function(func) = &decl.node
+            && let Some(body) = &func.body
+        {
+            for stmt in &body.statements {
+                if let TypedStatement::Expression(expr) = &stmt.node
+                    && let TypedExpression::Call(call) = &expr.node
+                    && let Some(arg) = call.positional_args.first()
+                    && let TypedExpression::Literal(TypedLiteral::Integer(v)) = &arg.node
+                {
+                    return Some(*v);
                 }
             }
         }
