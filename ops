@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790362400,"nonce":"g3xgCVyJ0erPlW3mT3igoWDhZGI=","message":"Fixed on main by 60f3600d (LO-small-semantics). Lua conformance passes on both tiers (Mac, NUC); NUC A/B of op_overload, method_call, records and start-up is flat within the spread.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1790362400,"nonce":"WaJmoYLDIA5WL3iKo4SKwaSZGec=","status":2}]}
