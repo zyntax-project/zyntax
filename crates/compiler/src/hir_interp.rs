@@ -2727,6 +2727,11 @@ pub struct HirInterpreter {
     /// The beads of the running frames that asked for resume points,
     /// innermost last; `run` reports each frame gone as it returns.
     waiting_marks: Vec<u64>,
+    /// While the collector clears dead frames: the stack below `run`'s
+    /// frame as it calls `run_frame`, and the most stack a `run_frame`
+    /// frame has taken below that.
+    run_top: usize,
+    frame_extent: usize,
     /// Thunks already made, by shape.
     thunks: HashMap<NativeSig, usize>,
     /// The call shape of each function called so far, with the thunk
@@ -2858,6 +2863,8 @@ impl HirInterpreter {
             bead_source: None,
             address_source: None,
             waiting_marks: Vec::new(),
+            run_top: 0,
+            frame_extent: 0,
             thunks: HashMap::new(),
             shapes: IdMap::default(),
             address_taken: HashMap::new(),
@@ -3275,6 +3282,7 @@ impl HirInterpreter {
         args: &[ZyntaxValue],
         dest: *mut u8,
     ) -> Result<ZyntaxValue, InterpError> {
+        crate::collector::note_frame_depth();
         if thunk == 0 {
             // No native tier to make a thunk: the fixed set of shapes.
             if !jit_dispatch_supported(&sig.params, &sig.ret) {
@@ -3608,6 +3616,12 @@ impl HirInterpreter {
     ) -> Result<ZyntaxValue, InterpError> {
         let mut scratch = Scratch::new();
         let marks = self.waiting_marks.len();
+        // The frame starts on cleared stack, so a slot it never writes
+        // holds no word an earlier frame left there.
+        if crate::collector::clears_dead_frames() {
+            crate::collector::clear_stack_below(self.frame_extent);
+            self.run_top = crate::collector::stack_mark();
+        }
         let result = self.run_frame(module, cf, args, func_id, dest, &mut scratch);
         if let Err(e) = &result
             && trace_enabled()
@@ -3650,6 +3664,14 @@ impl HirInterpreter {
         dest: *mut u8,
         scratch: &mut Scratch,
     ) -> Result<ZyntaxValue, InterpError> {
+        if crate::collector::clears_dead_frames() {
+            crate::collector::note_frame_depth();
+            // A frame on another stack (a fiber's) measures nothing.
+            let taken = self.run_top.wrapping_sub(crate::collector::stack_mark());
+            if taken < 1 << 20 {
+                self.frame_extent = self.frame_extent.max(taken);
+            }
+        }
         let mut regs: Vec<ZyntaxValue> = vec![ZyntaxValue::Undef; cf.n_regs as usize];
         // The registers hold pointers the collector cannot see on any
         // stack; they are a root for as long as the frame runs here.
@@ -4573,6 +4595,7 @@ impl HirInterpreter {
                         _ => core::ptr::null_mut(),
                     };
                     let ret = self.call_by_id(module, *fn_id, arg_vals, callee_dest);
+                    crate::collector::clear_dead_frames();
                     for b in boxes {
                         self.memory.free(b);
                     }
@@ -4665,6 +4688,7 @@ impl HirInterpreter {
                             value_from_i64_as(&shape.ret, raw)
                         }
                     };
+                    crate::collector::clear_dead_frames();
 
                     if *has_dst {
                         let v = match result_val {
@@ -4787,6 +4811,7 @@ impl HirInterpreter {
                             core::ptr::null_mut(),
                         )?
                     };
+                    crate::collector::clear_dead_frames();
                     if *has_dst {
                         let v = match result {
                             ZyntaxValue::Int(i) => value_from_i64_as(&shape.ret, i),
@@ -5517,6 +5542,7 @@ fn call_extern_symbol_typed(
     use crate::hir::HirType;
     use crate::zrtl::{MAX_PARAMS, TypeCategory, TypeTag, ZrtlSigFlags};
 
+    crate::collector::note_frame_depth();
     let pcount = sig.param_count as usize;
     if pcount != args.len() || pcount > MAX_PARAMS || pcount > 8 {
         return Err(InterpError::UnsupportedInstruction(format!(
@@ -5619,6 +5645,7 @@ fn call_extern_symbol_typed(
 }
 
 fn call_extern_symbol(ptr: *const u8, args: &[ZyntaxValue]) -> i64 {
+    crate::collector::note_frame_depth();
     let raw_args: Vec<i64> = args.iter().map(|v| value_to_i64(v).unwrap_or(0)).collect();
     unsafe {
         match raw_args.len() {

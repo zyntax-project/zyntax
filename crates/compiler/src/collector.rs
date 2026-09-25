@@ -182,6 +182,8 @@ static AUTOMATIC: AtomicBool = AtomicBool::new(true);
 static WEAK_HOOKS: Mutex<Vec<WeakHooks>> = Mutex::new(Vec::new());
 static WEAK_SWEEPERS: Mutex<Vec<fn(&dyn Fn(usize) -> bool)>> = Mutex::new(Vec::new());
 static AFTER_COLLECTION: Mutex<Vec<fn()>> = Mutex::new(Vec::new());
+/// Weak hooks are registered: when a collection runs is observable.
+static CLEARS_DEAD_FRAMES: AtomicBool = AtomicBool::new(false);
 
 /// What the collector keeps per thread, in one place so a request
 /// pays one thread-local access, not one per fact.
@@ -515,6 +517,118 @@ pub fn add_weak_hooks(hooks: WeakHooks) {
     if !all.iter().any(|h| std::ptr::fn_addr_eq(h.hold, hooks.hold)) {
         all.push(hooks);
     }
+    CLEARS_DEAD_FRAMES.store(true, Ordering::Relaxed);
+}
+
+/// Whether a runtime whose frames leave words behind when they return
+/// (an interpreter's native temporaries) clears them: once weak hooks
+/// are registered, a stale word read as a root delays a finalizer or
+/// keeps a weak entry, which the program can see. Without them it only
+/// delays the reuse of storage, and nothing is cleared.
+#[inline]
+pub fn clears_dead_frames() -> bool {
+    CLEARS_DEAD_FRAMES.load(Ordering::Relaxed)
+}
+
+thread_local! {
+    /// The lowest stack address a noted frame has reached since the
+    /// last [`clear_dead_frames`] below it.
+    static DEEPEST_FRAME: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Note that the caller's frame reaches this deep, for the next
+/// [`clear_dead_frames`] of a frame above it.
+#[inline]
+pub fn note_frame_depth() {
+    if clears_dead_frames() {
+        note_frame_depth_now();
+    }
+}
+
+#[inline(never)]
+fn note_frame_depth_now() {
+    let mark = stack_mark();
+    let (lo, hi) = host_stack();
+    // A frame on another stack (a fiber's) is not the thread's to clear.
+    if (lo..hi).contains(&mark) {
+        DEEPEST_FRAME.with(|d| d.set(d.get().min(mark)));
+    }
+}
+
+/// After a call returns: zero the stack below the caller's frame down
+/// to the deepest noted frame, which has returned. A frame that later
+/// takes that stack and never writes some slot would otherwise hand the
+/// word left there to the collector as a root. The caller's own frame
+/// is noted, for the frame above it to clear once it returns.
+#[inline]
+pub fn clear_dead_frames() {
+    if clears_dead_frames() {
+        clear_dead_frames_now();
+    }
+}
+
+#[inline(never)]
+fn clear_dead_frames_now() {
+    let here = stack_mark();
+    let (lo, hi) = host_stack();
+    if !(lo..hi).contains(&here) {
+        return;
+    }
+    let low = DEEPEST_FRAME.with(|d| d.replace(here));
+    // Every noted mark lies on this stack; the bounds keep one clear
+    // short however deep the stack once went, and its last chunk off
+    // the guard page.
+    if low < here && here - low <= MAX_CLEARED_STACK && low >= lo + STACK_CLEAR_RESERVE {
+        clear_stack_chunk(low);
+    }
+}
+
+/// Before a frame of `bytes` is made below the caller: zero that much
+/// stack, which a frame that returned earlier (compiled code, which
+/// notes nothing) may have left words in.
+#[inline]
+pub fn clear_stack_below(bytes: usize) {
+    if clears_dead_frames() && bytes > 0 {
+        clear_stack_below_now(bytes);
+    }
+}
+
+#[inline(never)]
+fn clear_stack_below_now(bytes: usize) {
+    let here = stack_mark();
+    let (lo, hi) = host_stack();
+    if (lo..hi).contains(&here)
+        && bytes <= MAX_CLEARED_STACK
+        && here.saturating_sub(bytes) >= lo + STACK_CLEAR_RESERVE
+    {
+        clear_stack_chunk(here - bytes);
+    }
+}
+
+/// An address just below the caller's frame.
+#[inline(never)]
+pub fn stack_mark() -> usize {
+    let word = 0usize;
+    std::hint::black_box(&word) as *const usize as usize
+}
+
+/// The most stack [`clear_dead_frames`] zeroes at once.
+const MAX_CLEARED_STACK: usize = 4 << 20;
+/// Stack [`clear_dead_frames`] leaves free below the deepest address it
+/// clears to, for its own last chunk.
+const STACK_CLEAR_RESERVE: usize = 64 << 10;
+
+/// One chunk of [`clear_dead_frames`], then the next below it. The chunk
+/// is read again after the recursive call, so the call is not a tail
+/// call and each level keeps a frame of its own.
+#[inline(never)]
+fn clear_stack_chunk(low: usize) {
+    let mut chunk = [0usize; 128];
+    std::hint::black_box(&mut chunk);
+    if chunk.as_ptr() as usize > low {
+        clear_stack_chunk(low);
+    }
+    std::hint::black_box(&mut chunk);
 }
 
 /// Register a weak sweeper; idempotent per function. Every collection
@@ -1421,45 +1535,60 @@ fn mapped(_lo: usize, _hi: usize) -> bool {
 
 /// The highest address of the calling thread's stack.
 fn host_stack_top() -> usize {
+    host_stack().1
+}
+
+/// The calling thread's stack, lowest and highest address; (0, 0) when
+/// it cannot be found.
+fn host_stack() -> (usize, usize) {
     thread_local! {
-        static TOP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static STACK: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
     }
-    TOP.with(|t| {
-        if t.get() == 0 {
-            t.set(query_stack_top());
+    STACK.with(|t| match t.get() {
+        Some(range) => range,
+        None => {
+            let range = query_stack();
+            t.set(Some(range));
+            range
         }
-        t.get()
     })
 }
 
 #[cfg(target_os = "macos")]
-fn query_stack_top() -> usize {
+fn query_stack() -> (usize, usize) {
     // SAFETY: querying the calling thread.
-    unsafe { libc::pthread_get_stackaddr_np(libc::pthread_self()) as usize }
+    let (top, size) = unsafe {
+        let me = libc::pthread_self();
+        (
+            libc::pthread_get_stackaddr_np(me) as usize,
+            libc::pthread_get_stacksize_np(me),
+        )
+    };
+    (top.saturating_sub(size), top)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn query_stack_top() -> usize {
+fn query_stack() -> (usize, usize) {
     // SAFETY: the attribute is initialised by getattr and destroyed
     // after the read; every pointer handed in is to a live local.
     unsafe {
         let mut attr: libc::pthread_attr_t = std::mem::zeroed();
         if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
-            return 0;
+            return (0, 0);
         }
         let mut addr: *mut libc::c_void = std::ptr::null_mut();
         let mut size: libc::size_t = 0;
         let rc = libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
         libc::pthread_attr_destroy(&mut attr);
         if rc != 0 {
-            return 0;
+            return (0, 0);
         }
-        addr as usize + size
+        (addr as usize, addr as usize + size)
     }
 }
 
 #[cfg(windows)]
-fn query_stack_top() -> usize {
+fn query_stack() -> (usize, usize) {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize);
@@ -1467,12 +1596,12 @@ fn query_stack_top() -> usize {
     let (mut low, mut high) = (0usize, 0usize);
     // SAFETY: both pointers are to live locals.
     unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
-    high
+    (low, high)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn query_stack_top() -> usize {
-    0
+fn query_stack() -> (usize, usize) {
+    (0, 0)
 }
 
 /// Run a collection now, on the calling thread.
