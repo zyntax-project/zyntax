@@ -48,7 +48,7 @@ pub const UP_CELL: i64 = 4;
 pub const UP_ARITY: i64 = 5;
 
 const HOOK_FN: &str = "zl_hook_fn";
-const HOOK_COUNT_EVERY: &str = "zl_hook_count";
+const HOOK_COUNT_EVERY: &str = "zl_dbg_hook_every";
 const HOOK_LEFT: &str = "zl_hook_left";
 const HOOK_BUSY: &str = "zl_hook_busy";
 /// Set by a library function's value wrapper for the `debug` function

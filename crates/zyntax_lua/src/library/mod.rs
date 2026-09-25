@@ -1601,3 +1601,34 @@ fn fallible_functions(declarations: &[Decl]) -> std::collections::BTreeSet<Strin
     }
     fallible
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each library global names one storage cell: two declarations
+    /// under one name would share it and overwrite each other. The
+    /// shape hooks' globals are among those checked.
+    #[test]
+    fn library_global_names_are_distinct() {
+        let (lib, _) = library(&crate::POLICY);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut duplicates = Vec::new();
+        for d in &lib.declarations {
+            if let TypedDeclaration::Variable(v) = &d.node
+                && let Some(name) = v.name.resolve_global()
+                && !seen.insert(name.clone())
+            {
+                duplicates.push(name);
+            }
+        }
+        assert!(
+            duplicates.is_empty(),
+            "library globals declared twice: {duplicates:?}"
+        );
+        for hook in SHAPE_HOOKS {
+            let global = hook_global(hook);
+            assert!(seen.contains(&global), "{global} is not declared");
+        }
+    }
+}
