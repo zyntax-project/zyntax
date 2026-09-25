@@ -51,6 +51,20 @@ const HOOK_FN: &str = "zl_hook_fn";
 const HOOK_COUNT_EVERY: &str = "zl_hook_count";
 const HOOK_LEFT: &str = "zl_hook_left";
 const HOOK_BUSY: &str = "zl_hook_busy";
+/// Set by a library function's value wrapper for the `debug` function
+/// it calls: its argument errors name it as its library's field,
+/// `debug.getinfo`, as the reference names a function it finds no
+/// call site's name for.
+pub const QUALIFY: &str = "zl_dbg_qualify";
+/// Whether `debug.setmetatable` ever gave a type other than tables and
+/// strings a metatable: until then no such value has one to consult.
+pub const TYPE_METAS_ON: &str = "zl_type_metas_on";
+/// The hooks of the threads not running, by handle: each a list of the
+/// hook, its mask, its count and what is left of the count. The
+/// `zl_hook_*` globals hold the running thread's.
+const HOOKS: &str = "zl_hooks";
+/// The running thread's handle, 0 for the main one.
+const HOOK_THREAD: &str = "zl_hook_thread";
 /// The last function value made for each of the program's functions,
 /// by key: what `getinfo(level, "f")` answers.
 const FUNCS: &str = "zl_dbg_funcs";
@@ -105,6 +119,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         global_var(HOOK_COUNT_EVERY, i64()),
         global_var(HOOK_LEFT, i64()),
         global_var(HOOK_BUSY, boolean()),
+        global_var(HOOKS, any()),
+        global_var(QUALIFY, boolean()),
+        global_var(TYPE_METAS_ON, boolean()),
+        global_var(HOOK_THREAD, i64()),
         global_var(FUNCS, any()),
         global_var(UPS, any()),
     ];
@@ -136,7 +154,32 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             unit(),
             "$Lua$dbg_switch",
         ),
-        host("zl_dbg_drop_raw", &[("h", i64())], unit(), "$Lua$dbg_drop"),
+        host(
+            "zl_dbg_drop_raw",
+            &[("h", i64()), ("failed", boolean())],
+            unit(),
+            "$Lua$dbg_drop",
+        ),
+        host(
+            "zl_dbg_new_thread_raw",
+            &[("h", i64())],
+            unit(),
+            "$Lua$dbg_new_thread",
+        ),
+        host("zl_dbg_handler_enter", &[], i64(), "$Lua$dbg_handler_enter"),
+        host(
+            "zl_dbg_handler_leave",
+            &[("depth", i64())],
+            unit(),
+            "$Lua$dbg_handler_leave",
+        ),
+        host("zl_dbg_raise_line", &[], i64(), "$Lua$dbg_raise_line"),
+        host(
+            "zl_dbg_mm_site",
+            &[("event", string())],
+            i64(),
+            "$Lua$dbg_mm_site",
+        ),
         host(
             "zl_dbg_line_raw",
             &[("line", i64()), ("back", boolean())],
@@ -150,7 +193,6 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             unit(),
             "$Lua$dbg_note_raise",
         ),
-        host("zl_dbg_raised", &[], string(), "$Lua$dbg_raised"),
         host(
             "zl_dbg_set_line_raw",
             &[("line", i64())],
@@ -352,6 +394,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         &[&x, &y],
         boolean(),
         vec![
+            set_global(TYPE_METAS_ON, bool(true)),
             when(
                 is_nil(x.e()),
                 vec![set_global(TYPE_METAS[0].1, y.e()), ret(bool(true))],
@@ -615,7 +658,156 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ret_void(),
         ],
     ));
-    // The running thread becomes the one with handle `k`.
+    // Slot `i` of the spill list `x` when `debug.setlocal` wrote it
+    // (bit `i` of `n`), else the local's value `y` as the call left it.
+    d.push(define(
+        "zl_dbg_pick",
+        &[&x, &n, &i, &y],
+        any(),
+        vec![
+            when(
+                ne(bitand(n.e(), shl(int(1), i.e())), int(0)),
+                vec![ret(at(
+                    call("zb_unbox_list_raw_any", vec![x.e()], anys.clone()),
+                    i.e(),
+                ))],
+            ),
+            ret(y.e()),
+        ],
+    ));
+    // The running thread's hook is kept as thread `k`'s.
+    // The running thread's hook as a value: a list of the hook, its
+    // mask, its count and what is left of the count; nil for none.
+    // A mask without a function is a hook inherited from the thread's
+    // creator: `gethook` reports it, nothing calls it.
+    d.push(define(
+        "zl_dbg_hook_pack",
+        &[],
+        any(),
+        vec![
+            when(
+                and(
+                    is_nil(read_global(HOOK_FN, any())),
+                    eq(read_global(HOOK_MASK, i64()), int(0)),
+                ),
+                vec![ret(nil())],
+            ),
+            ret(call(
+                "zb_list_box_any",
+                vec![list(
+                    vec![
+                        read_global(HOOK_FN, any()),
+                        box_i64(read_global(HOOK_MASK, i64())),
+                        box_i64(read_global(HOOK_COUNT_EVERY, i64())),
+                        box_i64(read_global(HOOK_LEFT, i64())),
+                    ],
+                    anys.clone(),
+                )],
+                any(),
+            )),
+        ],
+    ));
+    // The hook `x` packed becomes the running thread's.
+    let hook_field = |i: i64| {
+        at(
+            call("zb_unbox_list_raw_any", vec![x.e()], anys.clone()),
+            int(i),
+        )
+    };
+    d.push(define(
+        "zl_dbg_hook_use",
+        &[&x],
+        unit(),
+        vec![
+            if_(
+                is_nil(x.e()),
+                vec![
+                    set_global(HOOK_FN, nil()),
+                    set_global(HOOK_MASK, int(0)),
+                    set_global(HOOK_COUNT_EVERY, int(0)),
+                    set_global(HOOK_LEFT, int(0)),
+                ],
+                vec![
+                    set_global(HOOK_FN, hook_field(0)),
+                    set_global(
+                        HOOK_MASK,
+                        call("zb_box_get_i64", vec![hook_field(1)], i64()),
+                    ),
+                    set_global(
+                        HOOK_COUNT_EVERY,
+                        call("zb_box_get_i64", vec![hook_field(2)], i64()),
+                    ),
+                    set_global(
+                        HOOK_LEFT,
+                        call("zb_box_get_i64", vec![hook_field(3)], i64()),
+                    ),
+                ],
+            ),
+            ret_void(),
+        ],
+    ));
+    // The running thread's hook is kept as thread `k`'s.
+    d.push(define("zl_dbg_hook_save", &[&k], unit(), {
+        let mut st = table_of(HOOKS);
+        st.extend([
+            expr(call(
+                "zl_rawseti",
+                vec![
+                    unbox_table(read_global(HOOKS, any()), t),
+                    k.e(),
+                    call("zl_dbg_hook_pack", vec![], any()),
+                ],
+                unit(),
+            )),
+            ret_void(),
+        ]);
+        st
+    }));
+    // Thread `k`'s hook becomes the running one.
+    d.push(define(
+        "zl_dbg_hook_load",
+        &[&k],
+        unit(),
+        vec![
+            x.decl(nil()),
+            when(
+                not(is_nil(read_global(HOOKS, any()))),
+                vec![x.set(call(
+                    "zl_rawgeti",
+                    vec![unbox_table(read_global(HOOKS, any()), t), k.e()],
+                    any(),
+                ))],
+            ),
+            expr(call("zl_dbg_hook_use", vec![x.e()], unit())),
+            ret_void(),
+        ],
+    ));
+    // A thread is made with handle `k`: what a dead thread with that
+    // handle left goes, and the new one has the running thread's hook
+    // mask and count, without its function.
+    d.push(define(
+        "zl_dbg_new_thread",
+        &[&k],
+        unit(),
+        vec![
+            when(
+                read_global(DBG_ON, boolean()),
+                vec![expr(call("zl_dbg_new_thread_raw", vec![k.e()], unit()))],
+            ),
+            when(
+                ne(read_global(HOOK_MASK, i64()), int(0)),
+                vec![
+                    x.decl(read_global(HOOK_FN, any())),
+                    set_global(HOOK_FN, nil()),
+                    expr(call("zl_dbg_hook_save", vec![k.e()], unit())),
+                    set_global(HOOK_FN, x.e()),
+                ],
+            ),
+            ret_void(),
+        ],
+    ));
+    // The running thread becomes the one with handle `k`, with its
+    // stack and its hook.
     d.push(define(
         "zl_dbg_switch",
         &[&k],
@@ -626,19 +818,68 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![
                     set_global(DBG_SITE, int(0)),
                     expr(call("zl_dbg_switch_raw", vec![k.e(), line_now()], unit())),
+                    when(
+                        or(
+                            not(is_nil(read_global(HOOKS, any()))),
+                            ne(read_global(HOOK_MASK, i64()), int(0)),
+                        ),
+                        vec![
+                            expr(call(
+                                "zl_dbg_hook_save",
+                                vec![read_global(HOOK_THREAD, i64())],
+                                unit(),
+                            )),
+                            expr(call("zl_dbg_hook_load", vec![k.e()], unit())),
+                        ],
+                    ),
+                    set_global(HOOK_THREAD, k.e()),
                 ],
             ),
             ret_void(),
         ],
     ));
+    // Thread `k` is done, killed by an error when `failed`: a hook it
+    // had moves to its record `r`, whose handle may be another
+    // thread's from now on.
+    let r = kept("r", anys.clone());
+    let failed = local("failed", boolean());
     d.push(define(
         "zl_dbg_drop",
-        &[&k],
+        &[&k, &r, &failed],
         unit(),
         vec![
             when(
                 read_global(DBG_ON, boolean()),
-                vec![expr(call("zl_dbg_drop_raw", vec![k.e()], unit()))],
+                vec![expr(call(
+                    "zl_dbg_drop_raw",
+                    vec![k.e(), failed.e()],
+                    unit(),
+                ))],
+            ),
+            when(
+                not(is_nil(read_global(HOOKS, any()))),
+                vec![
+                    x.decl(call(
+                        "zl_rawgeti",
+                        vec![unbox_table(read_global(HOOKS, any()), t), k.e()],
+                        any(),
+                    )),
+                    when(
+                        not(is_nil(x.e())),
+                        vec![
+                            expr(call(
+                                "zb_list_extend_any",
+                                vec![r.e(), list(vec![x.e()], anys.clone())],
+                                unit(),
+                            )),
+                            expr(call(
+                                "zl_rawseti",
+                                vec![unbox_table(read_global(HOOKS, any()), t), k.e(), nil()],
+                                unit(),
+                            )),
+                        ],
+                    ),
+                ],
             ),
             ret_void(),
         ],
@@ -661,8 +902,27 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     };
     let arg = |i: Expr| call("zl_value_at", vec![args.e(), add(first.e(), i)], any());
 
+    // What an argument error calls the function `what`: `debug.what`
+    // when it was called as a value.
+    let qual = local("qual", boolean());
+    let fname = |what: &str| if_expr(qual.e(), text(&format!("debug.{what}")), text(what));
+    let bad = |n: usize, what: &str, rest: &str| {
+        concat(vec![
+            text(&format!("bad argument #{n} to '")),
+            fname(what),
+            text(&format!("'{rest}")),
+        ])
+    };
+    let qualify = || {
+        vec![
+            qual.decl(read_global(QUALIFY, boolean())),
+            set_global(QUALIFY, bool(false)),
+        ]
+    };
+
     // `debug.traceback([thread,] [message [, level]])`.
-    let mut st = thread_arg(&args, &thread, &first);
+    let mut st = qualify();
+    st.extend(thread_arg(&args, &thread, &first));
     st.extend([
         y.decl(arg(int(1))),
         when(
@@ -687,7 +947,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             not(is_nil(z.e())),
             vec![level.set(call(
                 "zl_arg_int",
-                vec![z.e(), text("bad argument #2 to 'traceback'")],
+                vec![z.e(), bad(2, "traceback", "")],
                 i64(),
             ))],
         ),
@@ -711,7 +971,8 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     d.push(define("zl_debug_traceback", &[&args], any(), st));
 
     // `debug.getinfo([thread,] f | level [, what])`.
-    let mut st = thread_arg(&args, &thread, &first);
+    let mut st = qualify();
+    st.extend(thread_arg(&args, &thread, &first));
     st.extend([
         y.decl(arg(int(1))),
         z.decl(arg(int(2))),
@@ -720,16 +981,21 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             not(is_nil(z.e())),
             vec![
                 when(
-                    ne(category(z.e()), int(STR)),
+                    and(
+                        ne(category(z.e()), int(STR)),
+                        is_nil(call("zl_arith_operand", vec![z.e()], any())),
+                    ),
                     vec![lua_error(concat(vec![
                         text("bad argument #"),
                         call("zb_str_of_int", vec![add(first.e(), int(2))], string()),
-                        text(" to 'getinfo' (string expected, got "),
+                        text(" to '"),
+                        fname("getinfo"),
+                        text("' (string expected, got "),
                         type_name(z.e()),
                         text(")"),
                     ]))],
                 ),
-                what.set(get_str(z.e())),
+                what.set(call("zl_tostring", vec![z.e()], string())),
             ],
         ),
         kind.decl(call("zl_dbg_check_options", vec![what.e()], i64())),
@@ -738,7 +1004,9 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             vec![lua_error(concat(vec![
                 text("bad argument #"),
                 call("zb_str_of_int", vec![add(first.e(), int(2))], string()),
-                text(" to 'getinfo' (invalid option"),
+                text(" to '"),
+                fname("getinfo"),
+                text("' (invalid option"),
                 if_expr(eq(kind.e(), int(2)), text(" '>')"), text(")")),
             ]))],
         ),
@@ -751,16 +1019,27 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ))],
             vec![
                 when(
-                    is_nil(call("zl_arith_operand", vec![y.e()], any())),
+                    lt(len(args.e()), add(first.e(), int(1))),
                     vec![lua_error(concat(vec![
                         text("bad argument #"),
                         call("zb_str_of_int", vec![add(first.e(), int(1))], string()),
-                        text(" to 'getinfo' (function or level expected)"),
+                        text(" to '"),
+                        fname("getinfo"),
+                        text("' (number expected, got no value)"),
                     ]))],
                 ),
                 level.decl(call(
                     "zl_arg_int",
-                    vec![y.e(), text("bad argument #1 to 'getinfo'")],
+                    vec![
+                        y.e(),
+                        concat(vec![
+                            text("bad argument #"),
+                            call("zb_str_of_int", vec![add(first.e(), int(1))], string()),
+                            text(" to '"),
+                            fname("getinfo"),
+                            text("'"),
+                        ]),
+                    ],
                     i64(),
                 )),
                 when(
@@ -917,20 +1196,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         when(
             not(is_func(x.e())),
             vec![lua_error(concat(vec![
-                text(&format!(
-                    "bad argument #{number} to '{what}' (function expected, got "
-                )),
+                bad(number, what, " (function expected, got "),
                 type_name(x.e()),
                 text(")"),
             ]))],
         )
     };
     let int_arg = |x: Expr, what: &str, number: usize| {
-        call(
-            "zl_arg_int",
-            vec![x, text(&format!("bad argument #{number} to '{what}'"))],
-            i64(),
-        )
+        call("zl_arg_int", vec![x, bad(number, what, "")], i64())
     };
     let none = || call("zl_none", vec![], any());
     let pair = |a: Expr, b: Expr| call("zb_box_tuple", vec![list(vec![a, b], anys.clone())], any());
@@ -940,6 +1213,8 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         &[&args],
         any(),
         vec![
+            qual.decl(read_global(QUALIFY, boolean())),
+            set_global(QUALIFY, bool(false)),
             f.decl(call("zl_value_at", vec![args.e(), int(1)], any())),
             function_arg(&f, "getupvalue", 1),
             n.decl(int_arg(
@@ -968,6 +1243,8 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         &[&args],
         any(),
         vec![
+            qual.decl(read_global(QUALIFY, boolean())),
+            set_global(QUALIFY, bool(false)),
             f.decl(call("zl_value_at", vec![args.e(), int(1)], any())),
             function_arg(&f, "setupvalue", 1),
             n.decl(int_arg(
@@ -977,9 +1254,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             )),
             when(
                 lt(len(args.e()), int(3)),
-                vec![lua_error(text(
-                    "bad argument #3 to 'setupvalue' (value expected)",
-                ))],
+                vec![lua_error(bad(3, "setupvalue", " (value expected)"))],
             ),
             name.decl(call("zl_dbg_upvalue_name_of", vec![f.e(), n.e()], string())),
             when(
@@ -1005,6 +1280,8 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         &[&args],
         any(),
         vec![
+            qual.decl(read_global(QUALIFY, boolean())),
+            set_global(QUALIFY, bool(false)),
             f.decl(call("zl_value_at", vec![args.e(), int(1)], any())),
             function_arg(&f, "upvalueid", 1),
             n.decl(int_arg(
@@ -1036,17 +1313,21 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 ),
                 int(0),
             ),
-            vec![lua_error(text(&format!(
-                "bad argument #{number} to 'upvaluejoin' (invalid upvalue index)"
-            )))],
+            vec![lua_error(bad(
+                number,
+                "upvaluejoin",
+                " (invalid upvalue index)",
+            ))],
         )
     };
     let lua_function = |f: Expr, number: usize| {
         when(
             lt(call("zl_func_id", vec![f], i64()), int(0)),
-            vec![lua_error(text(&format!(
-                "bad argument #{number} to 'upvaluejoin' (Lua function expected)"
-            )))],
+            vec![lua_error(bad(
+                number,
+                "upvaluejoin",
+                " (Lua function expected)",
+            ))],
         )
     };
     let g = kept("g", any());
@@ -1056,6 +1337,8 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         &[&args],
         unit(),
         vec![
+            qual.decl(read_global(QUALIFY, boolean())),
+            set_global(QUALIFY, bool(false)),
             f.decl(call("zl_value_at", vec![args.e(), int(1)], any())),
             function_arg(&f, "upvaluejoin", 1),
             n.decl(int_arg(
@@ -1070,10 +1353,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 "upvaluejoin",
                 4,
             )),
-            lua_function(f.e(), 1),
-            lua_function(g.e(), 3),
             check_index(f.e(), n.e(), 2),
             check_index(g.e(), m.e(), 4),
+            lua_function(f.e(), 1),
+            lua_function(g.e(), 3),
             x.decl(call(
                 "zl_dbg_upvalue",
                 vec![g.e(), m.e(), nil(), int(UP_CELL)],
@@ -1101,9 +1384,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             depth.decl(call("zl_dbg_frame_depth", vec![level.e()], i64())),
             when(
                 lt(depth.e(), int(0)),
-                vec![lua_error(text(&format!(
-                    "bad argument #1 to '{who}' (level out of range)"
-                )))],
+                vec![lua_error(bad(1, who, " (level out of range)"))],
             ),
             name.decl(text("")),
             x.decl(nil()),
@@ -1160,10 +1441,19 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         ));
     };
     // `debug.getlocal([thread,] level | f, n)`.
-    let mut st = thread_arg(&args, &thread, &first);
+    let mut st = qualify();
+    st.extend(thread_arg(&args, &thread, &first));
     st.extend([
         y.decl(arg(int(1))),
         z.decl(nil()),
+        when(
+            lt(len(args.e()), add(first.e(), int(2))),
+            vec![lua_error(bad(
+                2,
+                "getlocal",
+                " (number expected, got no value)",
+            ))],
+        ),
         n.decl(int_arg(arg(int(2)), "getlocal", 2)),
         i.decl(int(0)),
         j.decl(int(0)),
@@ -1190,7 +1480,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         ),
         level.decl(call(
             "zl_arg_int",
-            vec![y.e(), text("bad argument #1 to 'getlocal'")],
+            vec![y.e(), bad(1, "getlocal", "")],
             i64(),
         )),
     ]);
@@ -1215,7 +1505,8 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     ]);
     d.push(define("zl_debug_getlocal", &[&args], any(), st));
     // `debug.setlocal([thread,] level, n, v)`: the name, or fail.
-    let mut st = thread_arg(&args, &thread, &first);
+    let mut st = qualify();
+    st.extend(thread_arg(&args, &thread, &first));
     st.extend([
         y.decl(nil()),
         z.decl(nil()),
@@ -1223,9 +1514,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         n.decl(int_arg(arg(int(2)), "setlocal", 2)),
         when(
             lt(len(args.e()), add(first.e(), int(3))),
-            vec![lua_error(text(
-                "bad argument #3 to 'setlocal' (value expected)",
-            ))],
+            vec![lua_error(bad(3, "setlocal", " (value expected)"))],
         ),
         when(
             ne(thread.e(), int(-1)),
@@ -1257,7 +1546,57 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     // ─── hooks ──────────────────────────────────────────────────
     // `debug.sethook([thread,] [hook, mask [, count]])`: no hook turns
     // hooks off.
-    let mut st = thread_arg(&args, &thread, &first);
+    let mut st = qualify();
+    st.extend(thread_arg(&args, &thread, &first));
+    let other = local("other", boolean());
+    // The thread argument `x`'s record, and whether it is dead: its
+    // handle may then be another thread's.
+    let thread_record = || call("zb_unbox_list_raw_any", vec![x.e()], anys.clone());
+    let thread_dead = || {
+        eq(
+            call(
+                "zb_box_get_i64",
+                vec![at(thread_record(), int(coroutines::STATUS))],
+                i64(),
+            ),
+            int(coroutines::DEAD),
+        )
+    };
+    // A hook for another thread is set as the running one's, then
+    // kept as that thread's (a dead one's in its record) while the
+    // running one's comes back.
+    let other_tail = || {
+        when(
+            other.e(),
+            vec![
+                if_(
+                    thread_dead(),
+                    vec![if_(
+                        gt(len(thread_record()), int(coroutines::DEAD_HOOK)),
+                        vec![set_idx(
+                            thread_record(),
+                            int(coroutines::DEAD_HOOK),
+                            call("zl_dbg_hook_pack", vec![], any()),
+                        )],
+                        vec![expr(call(
+                            "zb_list_extend_any",
+                            vec![
+                                thread_record(),
+                                list(vec![call("zl_dbg_hook_pack", vec![], any())], anys.clone()),
+                            ],
+                            unit(),
+                        ))],
+                    )],
+                    vec![expr(call("zl_dbg_hook_save", vec![thread.e()], unit()))],
+                ),
+                expr(call(
+                    "zl_dbg_hook_load",
+                    vec![read_global(HOOK_THREAD, i64())],
+                    unit(),
+                )),
+            ],
+        )
+    };
     let has_char = |s: Expr, c: &str| ge(call("zb_str_index_of", vec![s, text(c)], i64()), int(0));
     // The hook is told of `sethook`'s own call and return, as of any
     // function's: its call under the hook it replaces, its return
@@ -1278,6 +1617,18 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     };
     st.extend([
         own_event(HOOK_CALL, "call"),
+        other.decl(and(
+            ne(thread.e(), int(-1)),
+            ne(thread.e(), read_global(HOOK_THREAD, i64())),
+        )),
+        when(
+            other.e(),
+            vec![expr(call(
+                "zl_dbg_hook_save",
+                vec![read_global(HOOK_THREAD, i64())],
+                unit(),
+            ))],
+        ),
         f.decl(arg(int(1))),
         y.decl(arg(int(2))),
         z.decl(arg(int(3))),
@@ -1287,19 +1638,23 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 set_global(HOOK_MASK, int(0)),
                 set_global(HOOK_FN, nil()),
                 set_global(HOOK_COUNT_EVERY, int(0)),
+                other_tail(),
                 ret_void(),
             ],
         ),
         function_arg(&f, "sethook", 1),
         name.decl(call(
             "zl_arg_str",
-            vec![y.e(), text("bad argument #2 to 'sethook'")],
+            vec![y.e(), bad(2, "sethook", "")],
             string(),
         )),
         k.decl(int(0)),
         when(
             not(is_nil(z.e())),
-            vec![k.set(int_arg(z.e(), "sethook", 3))],
+            vec![
+                k.set(int_arg(z.e(), "sethook", 3)),
+                when(not(is_nil(pending())), vec![ret_void()]),
+            ],
         ),
         m.decl(int(0)),
         when(
@@ -1323,19 +1678,62 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         set_global(HOOK_LEFT, k.e()),
         set_global(HOOK_MASK, if_expr(eq(m.e(), int(0)), int(0), m.e())),
         when(eq(m.e(), int(0)), vec![set_global(HOOK_FN, nil())]),
+        other_tail(),
         own_event(HOOK_RETURN, "return"),
         ret_void(),
     ]);
     d.push(define("zl_debug_sethook", &[&args], unit(), st));
     // `debug.gethook([thread])`: the hook, its mask and its count, or
     // fail when none is set.
+    let mut st = thread_arg(&args, &thread, &first);
+    st.extend([
+        when(
+            and(
+                ne(thread.e(), int(-1)),
+                ne(thread.e(), read_global(HOOK_THREAD, i64())),
+            ),
+            vec![
+                expr(call(
+                    "zl_dbg_hook_save",
+                    vec![read_global(HOOK_THREAD, i64())],
+                    unit(),
+                )),
+                if_(
+                    thread_dead(),
+                    vec![expr(call(
+                        "zl_dbg_hook_use",
+                        vec![if_expr(
+                            gt(len(thread_record()), int(coroutines::DEAD_HOOK)),
+                            at(thread_record(), int(coroutines::DEAD_HOOK)),
+                            nil(),
+                        )],
+                        unit(),
+                    ))],
+                    vec![expr(call("zl_dbg_hook_load", vec![thread.e()], unit()))],
+                ),
+                y.decl(call("zl_dbg_gethook_now", vec![], any())),
+                expr(call(
+                    "zl_dbg_hook_load",
+                    vec![read_global(HOOK_THREAD, i64())],
+                    unit(),
+                )),
+                ret(y.e()),
+            ],
+        ),
+        ret(call("zl_dbg_gethook_now", vec![], any())),
+    ]);
+    d.push(define("zl_debug_gethook", &[&args], any(), st));
+    // The running thread's hook, its mask and its count, or fail.
     d.push(define(
-        "zl_debug_gethook",
-        &[&args],
+        "zl_dbg_gethook_now",
+        &[],
         any(),
         vec![
             when(
-                is_nil(read_global(HOOK_FN, any())),
+                and(
+                    is_nil(read_global(HOOK_FN, any())),
+                    eq(read_global(HOOK_MASK, i64()), int(0)),
+                ),
                 vec![ret(call("zl_fail", vec![], any()))],
             ),
             name.decl(text("")),

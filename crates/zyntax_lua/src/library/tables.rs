@@ -819,15 +819,18 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             when(
                 is_func(handler.e()),
-                vec![ret(call(
-                    "zl_first",
-                    vec![call(
-                        "zl_call_2",
-                        vec![handler.e(), box_table(tb.e()), key.clone()],
+                vec![
+                    metamethod_site(text("index")),
+                    ret(call(
+                        "zl_first",
+                        vec![call(
+                            "zl_call_2",
+                            vec![handler.e(), box_table(tb.e()), key.clone()],
+                            any(),
+                        )],
                         any(),
-                    )],
-                    any(),
-                ))],
+                    )),
+                ],
             ),
             x.set(call("zl_index", vec![handler.e(), key], any())),
             when(
@@ -892,6 +895,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             when(
                 is_func(handler.e()),
                 vec![
+                    metamethod_site(text("newindex")),
                     expr(call(
                         "zl_call_3",
                         vec![handler.e(), box_table(tb.e()), key.clone(), v.e()],
@@ -962,11 +966,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![
                     when(
                         is_func(mm.e()),
-                        vec![ret(call(
-                            "zl_first",
-                            vec![call("zl_call_2", vec![mm.e(), o.e(), key.clone()], any())],
-                            any(),
-                        ))],
+                        vec![
+                            metamethod_site(text("index")),
+                            ret(call(
+                                "zl_first",
+                                vec![call("zl_call_2", vec![mm.e(), o.e(), key.clone()], any())],
+                                any(),
+                            )),
+                        ],
                     ),
                     ret(call("zl_index", vec![mm.e(), key], any())),
                 ],
@@ -981,11 +988,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![
                     if_(
                         is_func(mm.e()),
-                        vec![expr(call(
-                            "zl_call_3",
-                            vec![mm.e(), o.e(), key.clone(), v.e()],
-                            any(),
-                        ))],
+                        vec![
+                            metamethod_site(text("newindex")),
+                            expr(call(
+                                "zl_call_3",
+                                vec![mm.e(), o.e(), key.clone(), v.e()],
+                                any(),
+                            )),
+                        ],
                         vec![expr(call("zl_setindex", vec![mm.e(), key, v.e()], unit()))],
                     ),
                     ret_void(),

@@ -1701,6 +1701,7 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             any(),
         ))
     };
+    let hdepth = local("hdepth", i64());
     d.push(define(
         "zl_xpcall",
         &[&x, &handler, &args],
@@ -1726,11 +1727,36 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     while_(
                         bool(true),
                         vec![
+                            // In a program that keeps its call stack,
+                            // the handler runs on the stack the error
+                            // was raised on.
+                            hdepth.decl(int(-1)),
+                            when(
+                                read_global(debug::DBG_ON, boolean()),
+                                vec![
+                                    hdepth.set(call("zl_dbg_handler_enter", vec![], i64())),
+                                    when(
+                                        ge(hdepth.e(), int(0)),
+                                        vec![set_global(
+                                            LINE,
+                                            call("zl_dbg_raise_line", vec![], i64()),
+                                        )],
+                                    ),
+                                    set_global(debug::DBG_SITE, int(0)),
+                                ],
+                            ),
                             err.set(call(
                                 "zl_first",
                                 vec![call("zl_call_1", vec![handler.e(), err.e()], any())],
                                 any(),
                             )),
+                            when(
+                                ge(hdepth.e(), int(0)),
+                                vec![
+                                    expr(call("zl_dbg_handler_leave", vec![hdepth.e()], unit())),
+                                    set_global(LINE, int(0)),
+                                ],
+                            ),
                             when(is_nil(pending()), vec![failed(err.e())]),
                             when(
                                 or(
@@ -3128,6 +3154,9 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             });
         }
         let result = call(b.func, call_args, ret_type(b.ret, t));
+        if b.lib == "debug" {
+            st.push(set_global(debug::QUALIFY, bool(true)));
+        }
         st.push(match b.ret {
             Ret::Unit => expr(result),
             Ret::Bool => ret(box_bool(result)),

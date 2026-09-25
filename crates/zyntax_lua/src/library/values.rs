@@ -129,6 +129,35 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
         &[&x],
         string(),
         vec![
+            // A value of a type `debug.setmetatable` gave a metatable:
+            // its `__tostring`.
+            when(
+                and(
+                    read_global(debug::TYPE_METAS_ON, boolean()),
+                    and(
+                        not(is_table(x.e())),
+                        or(is_nil(x.e()), ne(category(x.e()), int(STR))),
+                    ),
+                ),
+                vec![
+                    h.decl(call("zl_meta_of", vec![x.e(), text("__tostring")], any())),
+                    when(
+                        not(is_nil(h.e())),
+                        vec![
+                            r.decl(call(
+                                "zl_first",
+                                vec![call("zl_call_1", vec![h.e(), x.e()], any())],
+                                any(),
+                            )),
+                            when(
+                                or(is_nil(r.e()), ne(category(r.e()), int(STR))),
+                                vec![lua_error(text("'__tostring' must return a string"))],
+                            ),
+                            ret(get_str(r.e())),
+                        ],
+                    ),
+                ],
+            ),
             when(is_nil(x.e()), vec![ret(text("nil"))]),
             cat.decl(category(x.e())),
             when(is_cat(&cat, STR), vec![ret(get_str(x.e()))]),
@@ -1300,6 +1329,19 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                         ],
                     ),
                     ret(box_i64(call("zl_len", vec![unbox_table(x.e(), t)], i64()))),
+                ],
+            ),
+            // Another type's `__len`, from `debug.setmetatable`.
+            h.decl(call("zl_meta_of", vec![x.e(), text("__len")], any())),
+            when(
+                not(is_nil(h.e())),
+                vec![
+                    metamethod_call_check(h.e(), text("len")),
+                    ret(call(
+                        "zl_first",
+                        vec![call("zl_call_2", vec![h.e(), x.e(), x.e()], any())],
+                        any(),
+                    )),
                 ],
             ),
             type_error(

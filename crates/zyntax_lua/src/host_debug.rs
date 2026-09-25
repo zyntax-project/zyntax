@@ -31,6 +31,14 @@ const C_KEY: i64 = -1;
 pub const TAIL_SITE: i64 = crate::library::debug::TAIL_SITE;
 /// The site a hook is called from.
 const HOOK_SITE: i64 = crate::library::debug::HOOK_SITE;
+/// The sites of metamethod calls: this less the event's place in
+/// `MM_EVENTS`.
+const MM_SITE: i64 = -1000;
+/// The events a metamethod call site names, by place.
+const MM_EVENTS: &[&str] = &[
+    "index", "newindex", "call", "len", "eq", "lt", "le", "concat", "unm", "add", "sub", "mul",
+    "div", "mod", "pow", "idiv", "band", "bor", "bxor", "shl", "shr", "bnot", "close",
+];
 
 /// What the lowering records of one of a chunk's functions.
 #[derive(Default, Clone)]
@@ -90,6 +98,18 @@ struct Frame {
 struct Parked {
     frames: Vec<Frame>,
     line: i64,
+    /// The thread died of an error: its frames are where it was raised.
+    dead: bool,
+}
+
+/// The stack of the running thread when an error was last raised,
+/// kept for the report should nothing catch it, for the handler
+/// `xpcall` runs at the raise, and for a thread the error kills.
+#[derive(Default)]
+struct Raise {
+    thread: i64,
+    frames: Vec<Frame>,
+    line: i64,
 }
 
 #[derive(Default)]
@@ -104,8 +124,8 @@ struct State {
     active: bool,
     /// The record `getinfo` answers from.
     info: Info,
-    /// The traceback of the last error raised.
-    raised: String,
+    /// The last error raised.
+    raise: Raise,
 }
 
 thread_local! {
@@ -242,17 +262,60 @@ pub(crate) extern "C" fn host_dbg_switch(to: i64, line: i64) {
         }
         let frames = std::mem::take(&mut s.frames);
         let from = s.current;
-        s.parked.insert(from, Parked { frames, line });
+        s.parked.insert(
+            from,
+            Parked {
+                frames,
+                line,
+                dead: false,
+            },
+        );
         s.frames = s.parked.remove(&to).map(|p| p.frames).unwrap_or_default();
         s.current = to;
     });
 }
 
-/// A thread that is done: its stack goes.
-pub(crate) extern "C" fn host_dbg_drop(handle: i64) {
+/// A thread that is done: its stack goes, unless an error killed it
+/// (`failed`), when its stack is the one the error was raised on.
+pub(crate) extern "C" fn host_dbg_drop(handle: i64, failed: bool) {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.parked.remove(&handle);
+        if failed && s.raise.thread == handle {
+            let frames = unwound(&s.raise.frames);
+            let line = s.raise.line;
+            s.parked.insert(
+                handle,
+                Parked {
+                    frames,
+                    line,
+                    dead: true,
+                },
+            );
+        }
+    });
+}
+
+/// A thread was made with handle `handle`: what a dead thread with
+/// that handle left goes.
+pub(crate) extern "C" fn host_dbg_new_thread(handle: i64) {
     STATE.with(|s| {
         s.borrow_mut().parked.remove(&handle);
     });
+}
+
+/// Frames that have returned, as a stack to describe: the lists their
+/// locals were spilled to are not theirs any more.
+fn unwound(frames: &[Frame]) -> Vec<Frame> {
+    frames
+        .iter()
+        .map(|f| Frame {
+            spill: 0,
+            spill_site: 0,
+            set_mask: 0,
+            ..*f
+        })
+        .collect()
 }
 
 /// A statement at `line` starts in the running frame: whether a line
@@ -332,7 +395,7 @@ fn levels(
             line: -1,
             c_name: Some(asking),
         });
-    } else if !frames.is_empty() {
+    } else if !frames.is_empty() && !s.parked.get(&thread).is_some_and(|p| p.dead) {
         out.push(Level {
             key: C_KEY,
             site: 0,
@@ -409,6 +472,14 @@ fn name_of(s: &State, level: &Level) -> (String, String, String) {
     }
     if level.site == HOOK_SITE {
         return ("?".to_string(), "hook".to_string(), String::new());
+    }
+    if level.site <= MM_SITE {
+        let event = usize::try_from(MM_SITE - level.site)
+            .ok()
+            .and_then(|i| MM_EVENTS.get(i));
+        if let Some(event) = event {
+            return (event.to_string(), "metamethod".to_string(), String::new());
+        }
     }
     match site_of(s, level.site) {
         Some(site) => (
@@ -505,30 +576,90 @@ fn traceback_from_top(s: &State, line: i64) -> String {
     out
 }
 
-/// An error was raised at `line`: where it was, kept for the report
-/// should nothing catch it.
+/// An error was raised at `line`: the stack it was raised on is kept.
 pub(crate) extern "C" fn host_dbg_note_raise(line: i64) {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         if s.active {
-            let text = traceback_from_top(&s, line);
-            s.raised = text;
+            let State {
+                raise,
+                frames,
+                current,
+                ..
+            } = &mut *s;
+            raise.frames.clear();
+            raise.frames.extend_from_slice(frames);
+            raise.line = line;
+            raise.thread = *current;
         }
     });
 }
 
-/// The traceback of the last raise, for the report of an error nothing
-/// caught; none when the program keeps no call stack.
+/// The traceback of the stack the last error was raised on, for the
+/// report of an error nothing caught; none when the program keeps no
+/// call stack.
 pub(crate) fn uncaught_traceback() -> Option<String> {
+    STATE.with(|s| s.borrow().active).then(raised_traceback)
+}
+
+/// The traceback of the stack the last error was raised on.
+fn raised_traceback() -> String {
     STATE.with(|s| {
-        let s = s.borrow();
-        s.active.then(|| s.raised.clone())
+        let mut s = s.borrow_mut();
+        let raised = unwound(&s.raise.frames);
+        let line = s.raise.line;
+        let running = std::mem::replace(&mut s.frames, raised);
+        let text = traceback_from_top(&s, line);
+        s.frames = running;
+        text
     })
 }
 
-/// The traceback noted at the last raise.
-pub(crate) extern "C" fn host_dbg_raised() -> StringPtr {
-    STATE.with(|s| string_out(&s.borrow().raised))
+/// A message handler is about to run for the error last raised: the
+/// frames the error unwound, above the running ones, are put back so
+/// the handler runs where the error was raised. The depth to cut the
+/// stack back to afterwards, or -1 when nothing was put back.
+pub(crate) extern "C" fn host_dbg_handler_enter() -> i64 {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let depth = s.frames.len();
+        let fits = s.active
+            && s.raise.thread == s.current
+            && s.raise.frames.len() > depth
+            && s.raise.frames[..depth]
+                .iter()
+                .zip(&s.frames)
+                .all(|(a, b)| a.key == b.key && a.entry_line == b.entry_line);
+        if !fits {
+            return -1;
+        }
+        let above = unwound(&s.raise.frames[depth..]);
+        s.frames.extend(above);
+        depth as i64
+    })
+}
+
+/// The site of a call of the metamethod for `event`.
+pub(crate) extern "C" fn host_dbg_mm_site(event: zrtl::StringConstPtr) -> i64 {
+    let event = unsafe { bytes_of(event) };
+    MM_EVENTS
+        .iter()
+        .position(|e| e.as_bytes() == event)
+        .map_or(0, |i| MM_SITE - i as i64)
+}
+
+/// The line the last error was raised at.
+pub(crate) extern "C" fn host_dbg_raise_line() -> i64 {
+    STATE.with(|s| s.borrow().raise.line)
+}
+
+/// The handler returned: the stack is cut back to `depth`.
+pub(crate) extern "C" fn host_dbg_handler_leave(depth: i64) {
+    STATE.with(|s| {
+        if let Ok(depth) = usize::try_from(depth) {
+            s.borrow_mut().frames.truncate(depth);
+        }
+    });
 }
 
 // ─── getinfo ────────────────────────────────────────────────────────
@@ -896,7 +1027,7 @@ pub(crate) extern "C" fn host_dbg_frame_key(depth: i64) -> i64 {
 }
 
 /// The host symbols of the debug library.
-pub(crate) static SYMBOLS: [zrtl::ZrtlSymbol; 31] = [
+pub(crate) static SYMBOLS: [zrtl::ZrtlSymbol; 35] = [
     zrtl::ZrtlSymbol::new(c"$Lua$dbg_chunk".as_ptr(), host_dbg_chunk as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$dbg_enter".as_ptr(), host_dbg_enter as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$dbg_leave".as_ptr(), host_dbg_leave as *const u8),
@@ -916,7 +1047,23 @@ pub(crate) static SYMBOLS: [zrtl::ZrtlSymbol; 31] = [
         c"$Lua$dbg_note_raise".as_ptr(),
         host_dbg_note_raise as *const u8,
     ),
-    zrtl::ZrtlSymbol::new(c"$Lua$dbg_raised".as_ptr(), host_dbg_raised as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$dbg_handler_enter".as_ptr(),
+        host_dbg_handler_enter as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$dbg_handler_leave".as_ptr(),
+        host_dbg_handler_leave as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$dbg_raise_line".as_ptr(),
+        host_dbg_raise_line as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$dbg_new_thread".as_ptr(),
+        host_dbg_new_thread as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(c"$Lua$dbg_mm_site".as_ptr(), host_dbg_mm_site as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Lua$dbg_check_options".as_ptr(),
         host_dbg_check_options as *const u8,

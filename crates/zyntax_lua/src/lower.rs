@@ -3475,38 +3475,31 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             return vec![expr_stmt(unspill)];
         }
         // Each local a callee set is read back; the others keep what
-        // the call left in them.
+        // the call left in them. Straight-line, as the call may sit in
+        // an expression.
         let set = self.temp();
         let mut out = vec![let_(set, i64_t.clone(), unspill, span)];
         for (i, l) in self.live.clone().into_iter().enumerate().take(63) {
             let Live::Var(v) = l else {
                 continue;
             };
-            let list = call(
-                "zb_unbox_list_raw_any",
-                vec![var(spill, Type::Any, span)],
-                self.m.anys(),
-                span,
-            );
+            let current = self.read_var(v, span);
+            let current = self.boxed(current);
             let value = Val {
-                node: index(list, int_lit(i as i64, span), Type::Any, span),
-                ty: Ty::Any,
-            };
-            let was_set = binary(
-                BinaryOp::Ne,
-                binary(
-                    BinaryOp::BitAnd,
-                    var(set, i64_t.clone(), span),
-                    int_lit(1 << i, span),
-                    i64_t.clone(),
+                node: call(
+                    "zl_dbg_pick",
+                    vec![
+                        var(spill, Type::Any, span),
+                        var(set, i64_t.clone(), span),
+                        int_lit(i as i64, span),
+                        current,
+                    ],
+                    Type::Any,
                     span,
                 ),
-                int_lit(0, span),
-                prim(PrimitiveType::Bool),
-                span,
-            );
-            let write = self.write_var(v, value, span);
-            out.push(if_(was_set, vec![write], None, span));
+                ty: Ty::Any,
+            };
+            out.push(self.write_var(v, value, span));
         }
         out
     }
@@ -7985,7 +7978,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     prim(PrimitiveType::Unit),
                     span,
                 );
+                let after = self.around_builtin(b, is_method, span, &mut pre);
                 pre.push(expr_stmt(call));
+                pre.extend(after);
                 pre.push(self.pending_check(span));
                 return Ok(Multi::None(block_value(pre, nil(span), span)));
             }
@@ -8275,10 +8270,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             return Vec::new();
         }
         // The debug library's own functions are the level 0 it
-        // describes, not a frame of the stack.
-        let reentrant = self.m.reentrant.contains(b.func) && b.lib != "debug";
+        // describes, not a frame of the stack. `error` is the level an
+        // error is raised at.
+        let own_frame = (self.m.reentrant.contains(b.func) && b.lib != "debug")
+            || (b.lib.is_empty() && b.name == "error");
         let reads_frame = b.lib == "debug" && matches!(b.name, "getlocal" | "setlocal");
-        if !reentrant && !reads_frame {
+        if !own_frame && !reads_frame {
             return Vec::new();
         }
         let global = if b.lib.is_empty() {
@@ -8299,7 +8296,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         };
         let spill = self.spill(site, span, pre);
         let mut after = Vec::new();
-        if reentrant {
+        if own_frame {
             pre.push(expr_stmt(call(
                 "zl_dbg_enter_c",
                 vec![int_lit(site, span)],

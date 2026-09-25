@@ -305,18 +305,34 @@ pub fn is_func(x: Expr) -> Expr {
 /// `h`, a metamethod for `event`, checked to be callable before it is
 /// called: the error names the event, as the reference's does.
 pub fn metamethod_call_check(h: Expr, event: Expr) -> Stmt {
-    when(
-        and(
-            not(is_func(h.clone())),
-            is_nil(call("zl_meta_of", vec![h.clone(), text("__call")], any())),
+    block_of(vec![
+        when(
+            and(
+                not(is_func(h.clone())),
+                is_nil(call("zl_meta_of", vec![h.clone(), text("__call")], any())),
+            ),
+            vec![lua_error(concat(vec![
+                text("attempt to call a "),
+                type_name(h),
+                text(" value (metamethod '"),
+                event.clone(),
+                text("')"),
+            ]))],
         ),
-        vec![lua_error(concat(vec![
-            text("attempt to call a "),
-            type_name(h),
-            text(" value (metamethod '"),
-            event,
-            text("')"),
-        ]))],
+        metamethod_site(event),
+    ])
+}
+
+/// The call about to be made is of the metamethod for `event`
+/// (`index`, `add`, ...): a program that keeps its call stack names the
+/// frame after it.
+pub fn metamethod_site(event: Expr) -> Stmt {
+    when(
+        read_global(debug::DBG_ON, boolean()),
+        vec![set_global(
+            debug::DBG_SITE,
+            call("zl_dbg_mm_site", vec![event], i64()),
+        )],
     )
 }
 fn is_nil_error(x: Expr) -> Expr {

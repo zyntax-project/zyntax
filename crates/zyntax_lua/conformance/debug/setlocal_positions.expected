@@ -1,0 +1,16 @@
+local	2	a
+condition	3
+argument	a	4
+constructor	5	1
+assignment	6
+while	7
+statement	8
+returned	8
+b
+str
+5	b
+70	1
+x1	nil
+x2	nil
+x3	nil
+0.0 0.125 0.25 

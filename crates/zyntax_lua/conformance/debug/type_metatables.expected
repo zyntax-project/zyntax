@@ -1,0 +1,8 @@
+42	42
+T	F
+x!
+cat
+1
+true	false	type_metatables.lua:15: attempt to get length of a boolean value (upvalue 'T')
+nil has y
+false	type_metatables.lua:20: attempt to index a nil value (upvalue 'n')

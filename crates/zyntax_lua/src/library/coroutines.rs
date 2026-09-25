@@ -18,19 +18,21 @@ use zyntax_typed_ast::{Type, Visibility};
 
 /// The record's slots. `ERR` keeps the error a coroutine died of for
 /// the close that reports it; `STARTED` says the body has run, so a
-/// close has something to unwind.
-const HANDLE: i64 = 0;
-const STATUS: i64 = 1;
+/// close has something to unwind. A dead coroutine that had a debug
+/// hook keeps it in one more slot, `DEAD_HOOK`.
+pub(super) const HANDLE: i64 = 0;
+pub(super) const STATUS: i64 = 1;
 const BODY: i64 = 2;
 const SLOT: i64 = 3;
 const ERR: i64 = 4;
 const STARTED: i64 = 5;
+pub(super) const DEAD_HOOK: i64 = 6;
 
 /// Statuses, as the record stores them.
 const SUSPENDED: i64 = 0;
 const RUNNING: i64 = 1;
 const NORMAL: i64 = 2;
-const DEAD: i64 = 3;
+pub(super) const DEAD: i64 = 3;
 
 /// The packed step a resume returns: the tag in the low two bits.
 const STEP_YIELDED: i64 = 0;
@@ -243,6 +245,16 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     i64(),
                 )),
             ),
+            // A new thread starts with its creator's debug hook.
+            expr(call(
+                "zl_dbg_new_thread",
+                vec![call(
+                    "zb_box_get_i64",
+                    vec![at(rec.e(), int(HANDLE))],
+                    i64(),
+                )],
+                unit(),
+            )),
             ret(co.e()),
         ],
     ));
@@ -404,7 +416,11 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             set_status(rec.e(), DEAD),
             expr(call("zl_fiber_free", vec![handle.e()], unit())),
-            expr(call("zl_dbg_drop", vec![handle.e()], unit())),
+            expr(call(
+                "zl_dbg_drop",
+                vec![handle.e(), rec.e(), not(is_nil(pending()))],
+                unit(),
+            )),
             // The body raised: the error comes back as the result, and
             // is kept for a close to report.
             when(
@@ -600,7 +616,11 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             set_current(prev.e()),
             set_status(rec.e(), DEAD),
             expr(call("zl_fiber_free", vec![handle.e()], unit())),
-            expr(call("zl_dbg_drop", vec![handle.e()], unit())),
+            expr(call(
+                "zl_dbg_drop",
+                vec![handle.e(), rec.e(), bool(false)],
+                unit(),
+            )),
             when(
                 is_closing(pending()),
                 vec![

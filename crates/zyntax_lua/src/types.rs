@@ -3502,10 +3502,10 @@ fn infer_given(
         round.out.escaping = escaping.clone();
         round.out.settling = known.settling;
         // A variable the debug library may rebind holds anything; a
-        // numeric loop's counter keeps the loop's kind.
+        // numeric loop keeps its own kind for its counter.
         if scopes.debug_rebinds || scopes.debug_setlocal {
             for (i, v) in scopes.vars.iter().enumerate() {
-                if (scopes.debug_setlocal || v.captured) && !v.loop_counter {
+                if scopes.debug_setlocal || v.captured {
                     round.out.vars.insert(VarId(i as u32), Ty::Any);
                 }
             }

@@ -43,9 +43,6 @@ pub struct VarInfo {
     pub self_captured: bool,
     /// What its declaration assigns it, as far as that tells a function.
     pub init: Init,
-    /// The variable of a numeric `for`: a fresh copy of the loop's
-    /// counter each iteration, whose type is the loop's kind.
-    pub loop_counter: bool,
 }
 
 /// The value a `local` declaration gives a variable, when it is known
@@ -397,21 +394,42 @@ struct Walker {
     /// The name tokens, by offset, of `debug` called as
     /// `debug.name(...)`.
     debug_calls: HashSet<usize>,
+    /// The name tokens, by offset, of `_G`, `_ENV` or `package` indexed
+    /// by a literal key that is not the way to the `debug` library.
+    tables_indexed: HashSet<usize>,
     /// The locals declared as `require "debug"`: the library by another
     /// name.
     debug_aliases: HashSet<VarId>,
     /// Whether the expression being walked initializes such a local.
     requiring_debug: bool,
+    /// Whether the chunk's outermost locals are kept as any function's
+    /// locals rather than module variables.
+    no_module_vars: bool,
 }
 
 pub fn resolve(ast: &ast::Ast) -> Scopes {
+    let scopes = walk(ast, false);
+    // A module variable is one variable for every function reaching
+    // it, which `debug.upvaluejoin` cannot rebind for one closure: a
+    // chunk that may join upvalues captures its outermost locals as
+    // any function's, unless it runs as segments, which share them.
+    if scopes.debug_rebinds && !scopes.split_chunk && scopes.vars.iter().any(|v| v.is_module_var())
+    {
+        return walk(ast, true);
+    }
+    scopes
+}
+
+fn walk(ast: &ast::Ast, no_module_vars: bool) -> Scopes {
     let mut w = Walker {
         out: Scopes::default(),
         frames: Vec::new(),
         metatable_callees: HashSet::new(),
         debug_calls: HashSet::new(),
+        tables_indexed: HashSet::new(),
         debug_aliases: HashSet::new(),
         requiring_debug: false,
+        no_module_vars,
     };
     w.out.funcs.push(FuncInfo {
         params: Vec::new(),
@@ -454,12 +472,11 @@ pub fn resolve(ast: &ast::Ast) -> Scopes {
     }
     // A variable the debug library may rebind is written where no
     // statement shows it: shared through a cell, never known to hold
-    // one function. A loop's counter is a copy made each iteration; its
-    // kind stays the loop's.
+    // one function.
     if w.out.debug_rebinds || w.out.debug_setlocal {
         let all = w.out.debug_setlocal;
         for v in &mut w.out.vars {
-            if (all || v.captured) && !v.loop_counter {
+            if all || v.captured {
                 v.assigned = true;
             }
         }
@@ -478,7 +495,7 @@ impl Walker {
     fn declare(&mut self, token: &TokenReference, attribute: Option<String>) -> VarId {
         let name = name_of(token);
         let func = self.current();
-        let outermost = func == CHUNK && self.frame().blocks.len() == 1;
+        let outermost = func == CHUNK && self.frame().blocks.len() == 1 && !self.no_module_vars;
         let id = VarId(self.out.vars.len() as u32);
         self.out.vars.push(VarInfo {
             name: name.clone(),
@@ -490,7 +507,6 @@ impl Walker {
             attribute,
             self_captured: false,
             init: Init::Other,
-            loop_counter: false,
         });
         self.frame().blocks.last_mut().unwrap().insert(name, id);
         self.out.decls.insert(pos_of(token), id);
@@ -589,8 +605,46 @@ impl Walker {
                 self.debug_value();
             }
         }
+        // The globals table or `package` as a value, or indexed by what
+        // may be "debug": the library may be reached through it.
+        if let Binding::Global(name) = &binding
+            && (Scopes::is_globals_name(name) || name == "package")
+            && !self.tables_indexed.contains(&pos_of(token))
+        {
+            self.debug_value();
+        }
         self.out.names.insert(pos_of(token), binding.clone());
         binding
+    }
+
+    /// `_G`, `_ENV` or `package` indexed: whether the keys are literals
+    /// that do not lead to the `debug` library (`_G.x`, `package.path`,
+    /// `package.loaded.x`), noted for [`Self::use_name`].
+    fn note_table_index(&mut self, prefix: &Prefix, suffixes: &[&Suffix]) {
+        let Prefix::Name(token) = prefix else {
+            return;
+        };
+        let name = name_of(token);
+        if !Scopes::is_globals_name(&name) && name != "package" {
+            return;
+        }
+        let key = |s: Option<&&Suffix>| match s {
+            Some(Suffix::Index(ast::Index::Dot { name, .. })) => Some(name_of(name)),
+            Some(Suffix::Index(ast::Index::Brackets { expression, .. })) => {
+                literal_string(expression)
+            }
+            _ => None,
+        };
+        let safe = match key(suffixes.first()) {
+            Some(k) if name == "package" && k == "loaded" => {
+                key(suffixes.get(1)).is_some_and(|k| k != "debug")
+            }
+            Some(k) => k != "debug",
+            None => false,
+        };
+        if safe {
+            self.tables_indexed.insert(pos_of(token));
+        }
     }
 
     /// The local a name resolves to where the walk is, without noting
@@ -821,7 +875,9 @@ impl Walker {
                     let id = self.function(f.body(), is_method, fname.clone());
                     match &binding {
                         Binding::Global(name)
-                            if top && !self.out.global_functions.contains_key(name) =>
+                            if top
+                                && !self.out.global_functions.contains_key(name)
+                                && self.out.func(id).captures.is_empty() =>
                         {
                             self.out.global_functions.insert(name.clone(), id);
                             self.out.funcs[id.0 as usize].top_level = true;
@@ -901,7 +957,11 @@ impl Walker {
                 let id = self.function(f.body(), false, name_of(f.name()));
                 self.out.vars[var.0 as usize].init = Init::Function(id);
                 self.out.local_functions.insert(var, id);
-                let top = self.current() == CHUNK && self.frame().blocks.len() == 1;
+                // A top-level function captures nothing but module
+                // variables.
+                let top = self.current() == CHUNK
+                    && self.frame().blocks.len() == 1
+                    && self.out.func(id).captures.is_empty();
                 self.out.funcs[id.0 as usize].top_level = top;
             }
             Stmt::NumericFor(f) => {
@@ -911,8 +971,7 @@ impl Walker {
                     self.expr(step);
                 }
                 self.frame().blocks.push(HashMap::new());
-                let v = self.declare(f.index_variable(), None);
-                self.out.vars[v.0 as usize].loop_counter = true;
+                self.declare(f.index_variable(), None);
                 self.block(f.block());
                 self.frame().blocks.pop();
             }
@@ -986,7 +1045,6 @@ impl Walker {
                 attribute: None,
                 self_captured: false,
                 init: Init::Other,
-                loop_counter: false,
             });
             self.frame().blocks.last_mut().unwrap().insert(name, vid);
             params.push(vid);
@@ -1051,6 +1109,7 @@ impl Walker {
         self.note_require(v.prefix(), &suffixes);
         self.note_metatable_callee(v.prefix(), &suffixes);
         self.note_debug_call(v.prefix(), &suffixes);
+        self.note_table_index(v.prefix(), &suffixes);
         self.prefix(v.prefix());
         for s in v.suffixes() {
             self.suffix(s);
@@ -1079,7 +1138,11 @@ impl Walker {
                         self.out.requires.push(name);
                     }
                 }
-                None => self.out.dynamic_code = true,
+                // A name only known when it runs may be "debug".
+                None => {
+                    self.out.dynamic_code = true;
+                    self.debug_value();
+                }
             }
         }
     }
@@ -1119,6 +1182,7 @@ impl Walker {
         }
         self.note_metatable_callee(c.prefix(), &suffixes);
         self.note_debug_call(c.prefix(), &suffixes);
+        self.note_table_index(c.prefix(), &suffixes);
         self.prefix(c.prefix());
         for s in suffixes {
             self.suffix(s);
@@ -1305,6 +1369,14 @@ mod tests {
         assert!(scopes("debug.getlocal(1, 1)").debug_getlocal);
         assert!(!scopes("local debug = {}; debug.traceback()").debug);
         assert!(!scopes("print(1)").debug);
+        for source in [
+            "print(_G.x, _G[\"y\"])",
+            "_G.x = 1",
+            "print(package.path, package.loaded.string)",
+            "local _ENV = {print = print}; print(1)",
+        ] {
+            assert!(!scopes(source).debug, "{source}");
+        }
     }
 
     #[test]
@@ -1316,6 +1388,13 @@ mod tests {
             "local d = require \"debug\"; d = nil",
             "print(require \"debug\")",
             "local x = _G.debug",
+            "print(_G.debug.getinfo(1))",
+            "print(_ENV[\"debug\"].traceback())",
+            "local d = _G[\"deb\" .. \"ug\"]",
+            "for k, v in pairs(_G) do end",
+            "print(package.loaded.debug)",
+            "local m = package.loaded[name]",
+            "local m = require(name)",
         ] {
             let s = scopes(source);
             assert!(s.debug_rebinds && s.debug_setlocal, "{source}");
@@ -1335,5 +1414,16 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["_ENV", "b", "a"]);
+    }
+
+    #[test]
+    fn a_chunk_that_may_join_upvalues_has_no_module_variables() {
+        let joins =
+            scopes("local a = 1; local function f() return a end; debug.upvaluejoin(f, 1, f, 1)");
+        assert!(joins.vars.iter().all(|v| !v.is_module_var()));
+        let f = joins.funcs.iter().find(|f| f.name == "f").expect("f");
+        assert!(!f.top_level && !f.captures.is_empty());
+        let plain = scopes("local a = 1; local function f() return a end; print(f())");
+        assert!(plain.vars.iter().any(|v| v.is_module_var()));
     }
 }

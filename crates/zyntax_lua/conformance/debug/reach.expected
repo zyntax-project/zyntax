@@ -1,0 +1,11 @@
+v	1
+v
+changed
+v
+3
+v	3
+99
+t
+stack traceback:
+	reach.lua:18: in main chunk
+	[C]: in ?

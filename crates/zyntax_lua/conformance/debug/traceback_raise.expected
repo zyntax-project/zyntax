@@ -1,0 +1,30 @@
+traceback_raise.lua:3: x
+stack traceback:
+	[C]: in function 'error'
+	traceback_raise.lua:3: in upvalue 'deep'
+	traceback_raise.lua:4: in upvalue 'deep'
+	traceback_raise.lua:4: in function <traceback_raise.lua:2>
+	[C]: in function 'xpcall'
+	traceback_raise.lua:6: in main chunk
+	[C]: in ?
+false	traceback_raise.lua:3: x at depth 8 line -1
+levels after	3
+traceback_raise.lua:22: idx a
+stack traceback:
+	[C]: in function 'error'
+	traceback_raise.lua:22: in metamethod 'index'
+	traceback_raise.lua:23: in function <traceback_raise.lua:23>
+	[C]: in function 'xpcall'
+	traceback_raise.lua:23: in main chunk
+	[C]: in ?
+stack traceback:
+	[C]: in function 'coroutine.yield'
+	traceback_raise.lua:27: in function <traceback_raise.lua:26>
+false	traceback_raise.lua:28: boom
+stack traceback:
+	[C]: in function 'error'
+	traceback_raise.lua:28: in function <traceback_raise.lua:26>
+dead
+stack traceback:
+	traceback_raise.lua:28: in function <traceback_raise.lua:26>
+levels after	3
