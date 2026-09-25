@@ -35,7 +35,7 @@ official_complete/constructs.lua 6709b37
 official_complete/coroutine.lua  c33bf81
 official_complete/db.lua         cecfe69
 official_complete/errors.lua     8fd93ba
-official_complete/files.lua      8fd93ba
+official_complete/files.lua      5485e5d   failing-on linux
 official_complete/gc.lua         558e28e
 official_complete/gengc.lua      558e28e
 official_complete/literals.lua   98b70eb
