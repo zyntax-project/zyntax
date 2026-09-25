@@ -1845,7 +1845,7 @@ fn table_error_text(err: *const DynamicBox) -> Result<Option<Vec<u8>>, String> {
             let library = crate::library().map_err(|e| e.to_string())?;
             runtime.declare_entry_points([ERROR_TEXT_ENTRY]);
             runtime
-                .compile_typed_program(error_text_program(&library))
+                .compile_typed_program(error_text_program(library))
                 .map_err(|e| e.to_string())?;
             runtime
                 .function_pointer(ERROR_TEXT_ENTRY)
