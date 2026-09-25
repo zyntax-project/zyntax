@@ -7,17 +7,74 @@
 
 mod resident;
 
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::Duration;
 use zynml::ZynML;
 
+/// How long one kernel may run before the probe fails on it: many
+/// times what any kernel takes on Linux or macOS, so it fires only on
+/// one that does not return.
+const KERNEL_LIMIT: Duration = Duration::from_secs(120);
+
+/// Runs kernels one at a time on a thread of its own, so the test
+/// thread can give up on one that does not return and name it. The one
+/// thread runs every kernel of a test, as the test thread itself did,
+/// so the allocator's thread-local free lists carry over between them.
+struct Prober {
+    jobs: Sender<PathBuf>,
+    done: Receiver<std::thread::Result<()>>,
+}
+
+impl Prober {
+    fn new() -> Prober {
+        let (jobs, queue) = mpsc::channel::<PathBuf>();
+        let (report, done) = mpsc::channel();
+        // No stack size of its own: it gets the one the harness gives
+        // its test threads, which `RUST_MIN_STACK` sets.
+        std::thread::Builder::new()
+            .name("kernel probe".into())
+            .spawn(move || {
+                for path in queue {
+                    let ran = std::panic::catch_unwind(AssertUnwindSafe(|| run_kernel(&path)));
+                    if report.send(ran).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn the probe thread");
+        Prober { jobs, done }
+    }
+
+    /// Run one kernel, failing the test with its name when it does not
+    /// return within [`KERNEL_LIMIT`]. The name goes straight to the
+    /// process's stderr first, past the test harness's capture, so it
+    /// is in the log however the run ends.
+    fn run(&self, path: &Path) {
+        use std::io::Write;
+        let name = path.file_stem().unwrap_or_default().to_string_lossy();
+        let _ = writeln!(std::io::stderr(), "[probe] {name}");
+        self.jobs
+            .send(path.to_path_buf())
+            .expect("the probe thread has gone");
+        match self.done.recv_timeout(KERNEL_LIMIT) {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "kernel `{name}` did not return within {} s",
+                KERNEL_LIMIT.as_secs()
+            ),
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("the probe thread ended while running `{name}`")
+            }
+        }
+    }
+}
+
 /// Load and run one kernel the way one harness iteration does, then
-/// drop it. The name goes straight to the process's stderr, past the
-/// test harness's capture, so a kernel that never returns is named in
-/// the log rather than lost with the rest of the output.
+/// drop it.
 fn run_kernel(path: &Path) {
-    use std::io::Write;
-    let name = path.file_stem().unwrap_or_default().to_string_lossy();
-    let _ = writeln!(std::io::stderr(), "[probe] {name}");
     let Ok(src) = std::fs::read_to_string(path) else {
         return;
     };
@@ -64,13 +121,14 @@ fn kernels() -> Vec<PathBuf> {
 #[test]
 fn a_second_pass_does_not_cost_what_the_first_did() {
     let files = kernels();
+    let probe = Prober::new();
     let before_first = resident::mb();
     for f in &files {
-        run_kernel(f);
+        probe.run(f);
     }
     let after_first = resident::mb();
     for f in &files {
-        run_kernel(f);
+        probe.run(f);
     }
     let after_second = resident::mb();
     println!("\n  after pass 1: {after_first} MB");
@@ -106,7 +164,7 @@ fn a_second_pass_does_not_cost_what_the_first_did() {
     let mut prev = resident::mb();
     for f in &files {
         let name = f.file_stem().unwrap().to_string_lossy().to_string();
-        run_kernel(f);
+        probe.run(f);
         let now = resident::mb();
         let d = now as i64 - prev as i64;
         if d != 0 {
@@ -118,6 +176,7 @@ fn a_second_pass_does_not_cost_what_the_first_did() {
 
 #[test]
 fn report_memory_per_kernel() {
+    let probe = Prober::new();
     let base = resident::mb();
     println!("\n  {:<34}{:>10}{:>10}", "kernel", "after MB", "delta MB");
     println!("  {}", "-".repeat(54));
@@ -125,7 +184,7 @@ fn report_memory_per_kernel() {
     let mut rows: Vec<(String, u64)> = Vec::new();
     for f in kernels() {
         let name = f.file_stem().unwrap().to_string_lossy().to_string();
-        run_kernel(&f);
+        probe.run(&f);
         let now = resident::mb();
         println!("  {:<34}{:>10}{:>10}", name, now, now as i64 - prev as i64);
         rows.push((name, now.saturating_sub(prev)));
