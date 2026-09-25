@@ -4,7 +4,7 @@
 //! Each program under `pressure/` allocates something on every step of
 //! a loop and keeps only a scalar, so everything it makes is garbage by
 //! the next step. It takes the step count on the command line and is
-//! run twice, at a small count and at one a hundred times larger; the
+//! run twice, at a small count and at one many times larger; the
 //! difference in peak resident memory between the two is what the run
 //! failed to release. A bounded program grows by a slab or two; a leak
 //! grows by the count.
@@ -31,6 +31,13 @@ use std::process::{Command, Stdio};
 /// Steps for the short and the long run.
 const SMALL: u64 = 2_000;
 const LARGE: u64 = 400_000;
+/// Steps for the two runs with the LLVM tier on. Its first install
+/// brings in LLVM's code and state, a fixed footprint larger than the
+/// allowance, on a background thread some time after a function turns
+/// hot; the short run is long enough that every promotion either run
+/// makes has landed in both.
+const SMALL_LLVM: u64 = 100_000;
+const LARGE_LLVM: u64 = 1_000_000;
 /// Growth a bounded program is allowed between the two: the slabs its
 /// allocator takes, the code the long run compiles that the short one
 /// interprets, and the bodies kept for later tiers, all of which stop
@@ -119,6 +126,14 @@ fn peak_memory_does_not_grow_with_the_step_count() {
         .collect();
     programs.sort();
 
+    // zypy tiers up to LLVM only when built with it and asked to.
+    let llvm = cfg!(feature = "llvm-backend") && std::env::var_os("ZYPY_LLVM").is_some();
+    let (small_steps, large_steps) = if llvm {
+        (SMALL_LLVM, LARGE_LLVM)
+    } else {
+        (SMALL, LARGE)
+    };
+
     let mut failures = Vec::new();
     let mut known_count = 0;
     for program in &programs {
@@ -127,15 +142,6 @@ fn peak_memory_does_not_grow_with_the_step_count() {
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        // LLVM promotes the dict and tree helpers after the short run;
-        // compare executions that have both reached the same tier.
-        let (small_steps, large_steps) = if matches!(name.as_str(), "dicts.py" | "tree.py")
-            && std::env::var_os("ZYPY_LLVM").is_some()
-        {
-            (200_000, 2_000_000)
-        } else {
-            (SMALL, LARGE)
-        };
         let (small_status, small) = run(program, small_steps);
         let (large_status, large) = run(program, large_steps);
         if small_status != 0 || large_status != 0 {
