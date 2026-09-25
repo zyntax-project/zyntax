@@ -1,0 +1,26 @@
+false	boom 42
+false	errors.lua:6: boom 7
+false	errors.lua:9: boom 2
+false	table	3
+false	nil
+false	12.5
+true	5
+false	errors.lua:19: from lua
+false	table	1
+false	errors.lua:22: attempt to index a nil value (local 't')
+2	errors.lua:23: caught in c
+0	1	2	3
+2	plain
+2	handled: with handler
+0	fine
+false	boom 42
+false	boom 5
+2	deep
+2	inner	after
+false	crowded
+stack is clean
+true	42
+false
+boom 5
+10
+false	errors.lua:48: boom 9

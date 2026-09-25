@@ -1,0 +1,24 @@
+true
+function	42	true
+nil	string	init
+nil	string	open
+nil	string	open
+cload	cload	./cload.so	./cload.so
+true	1
+cload.sub	cload.sub	./cload.so	./cload.so
+v2 as cload-v2 from ./cload-v2.so	./cload-v2.so
+false	cannot open cload.bad
+nil
+false error loading module 'cnoopen' from file './cnoopen.so':
+false
+module 'cload.missing' not found:
+	no field package.preload['cload.missing']
+	no file './cload/missing.lua'
+	no file './cload/missing.so'
+	no module 'cload.missing' in file './cload.so'
+false
+module 'nowhere.at.all' not found:
+	no field package.preload['nowhere.at.all']
+	no file './nowhere/at/all.lua'
+	no file './nowhere/at/all.so'
+	no file './nowhere.so'

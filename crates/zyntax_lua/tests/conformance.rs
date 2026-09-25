@@ -30,6 +30,17 @@
 //! case's pinned output holds only there, because the reference's own
 //! answer differs elsewhere. On that family the case runs as any other
 //! and must pass; on any other it is not run and is reported as skipped.
+//!
+//! ## C modules
+//!
+//! `conformance/capi/` and `official/attrib.lua` load C modules, built
+//! from the sources beside them before the category runs (see
+//! `common/c_modules.rs`); the reference is pinned with the same
+//! libraries built. Where they cannot be built, those cases are
+//! reported as skipped with the reason, never as passing.
+
+#[path = "common/c_modules.rs"]
+mod c_modules;
 
 use std::collections::HashMap;
 use std::fs;
@@ -302,6 +313,24 @@ fn category(name: &str, warm_up: WarmUp) {
     if name == "official" {
         let _ = fs::create_dir_all(dir.join("libs").join("P1"));
     }
+    // The C modules the category's cases load, and why they are not
+    // there when they cannot be built.
+    let c_modules: Option<Result<(), String>> = match name {
+        "official" => Some(c_modules::build(
+            &dir.join("libs"),
+            c_modules::OFFICIAL_LIBS,
+        )),
+        "capi" => {
+            let sources = c_modules::sources_in(&dir);
+            let pairs: Vec<(&str, &str)> = sources
+                .iter()
+                .map(|(l, s)| (l.as_str(), s.as_str()))
+                .collect();
+            Some(c_modules::build(&dir, &pairs))
+        }
+        _ => None,
+    };
+    let needs_c = |key: &str| name == "capi" || key == "official/attrib.lua";
     let known = known_failures();
     let mut cases: Vec<PathBuf> = fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("no conformance category `{name}` at {}: {e}", dir.display()))
@@ -316,6 +345,7 @@ fn category(name: &str, warm_up: WarmUp) {
     let mut regressions: Vec<String> = Vec::new();
     let mut fixed: Vec<(String, String)> = Vec::new();
     let mut skipped: Vec<(String, String, String)> = Vec::new();
+    let mut unbuilt: Vec<(String, String)> = Vec::new();
     let mut unpinned = 0;
 
     for case in &cases {
@@ -339,6 +369,12 @@ fn category(name: &str, warm_up: WarmUp) {
             }) => Some(issue),
             None => None,
         };
+        if let Some(Err(reason)) = &c_modules
+            && needs_c(&key)
+        {
+            unbuilt.push((key, reason.clone()));
+            continue;
+        }
         let Some((expected, message)) = expected_for(case) else {
             unpinned += 1;
             continue;
@@ -379,13 +415,16 @@ fn category(name: &str, warm_up: WarmUp) {
         known_failed.len(),
         regressions.len(),
         fixed.len(),
-        skipped.len()
+        skipped.len() + unbuilt.len()
     );
     for (k, issue) in &known_failed {
         println!("  known failing: {k}  ({issue})");
     }
     for (k, family, issue) in &skipped {
         println!("  skipped: {k}, pinned for {family} only  ({issue})");
+    }
+    for (k, reason) in &unbuilt {
+        println!("  skipped: {k}, its C modules are not built: {reason}");
     }
 
     let mut problems = Vec::new();
@@ -488,5 +527,6 @@ categories! {
     load,
     debug,
     gc,
+    capi,
     official,
 }

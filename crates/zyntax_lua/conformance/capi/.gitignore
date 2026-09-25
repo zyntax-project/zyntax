@@ -1,0 +1,5 @@
+# The C modules the harness builds from the sources here.
+*.so
+*.dll
+*.dylib
+*.tmp

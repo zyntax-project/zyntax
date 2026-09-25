@@ -1,0 +1,27 @@
+number,number,string,nil,boolean,table,function,function;8
+0
+4	5	9	4	nil	nil	6
+[str|-42|1099511627776|3.5|2.0|x|€|%]	one and two	1e+100
+true	42	true	42.0	true	true	2	2	true	true
+true	3	true	3.0	false	true	3	3	true	true
+false	0	true	3.5	false	true	3	3	true	true
+true	16	true	16.0	false	true	4	4	true	true
+true	12	true	12.0	false	true	4	4	true	true
+false	0	false	0.0	false	true	3	3	true	true
+false	0	false	0.0	false	false	nil	nil	nil	false
+a	20	10	30	40	100	2	2
+hello	99
+99
+3	3.5	-5	2	1024.0	1	1	0	0	ab123.5	7
+1	2	3	tag
+true	true
+true	true	true
+42
+second
+true
+true	true	true	true	true
+20	red	nil	Box(20)	25	40
+userdata	true	true	8
+false	false	0
+true	true	userdata
+Box
