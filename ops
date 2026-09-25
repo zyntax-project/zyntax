@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1790331437,"nonce":"sf+b3R6F+tWLdet/wIPgUDz7SQI=","added":["area:lua","bug"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790371261,"nonce":"IArnoPjS/aRCjCdctDB1nLHsQ4Q=","message":"Fixed on main by 8a2447f8: a reader that raises makes load fail with its error, and a number piece is taken as a string; pinned in load/load_reader.lua.","files":null}]}
