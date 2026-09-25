@@ -1066,6 +1066,8 @@ mod tests {
             "print(debug.traceback())",
             "local m = require \"lib.mod\"",
             "local m = require(\"lib.mod\")",
+            "local f = require(\"lib.mod\").f",
+            "require(\"lib.mod\").run()",
             "local _G = {}; _G.x = setmetatable({}, {})",
         ] {
             assert!(!unseen(source), "{source}");
@@ -1088,7 +1090,7 @@ mod tests {
             "local g = _G",
             "local d = package.loaded.debug",
             "local d = require \"debug\"",
-            "local f = require(\"lib.mod\").f",
+            "local f = require(\"debug\").setmetatable",
             "local r = require",
         ] {
             assert!(unseen(source), "{source}");
