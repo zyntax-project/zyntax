@@ -778,8 +778,12 @@ impl Walker {
             .any(|frame| frame.blocks.iter().any(|block| block.contains_key(name)))
     }
 
-    fn assign_name(&mut self, token: &TokenReference) {
+    /// The name `token` as an assignment's target: the global it
+    /// writes, if any, which the caller records once the assigned
+    /// values are walked.
+    fn assign_name(&mut self, token: &TokenReference) -> Option<String> {
         let binding = self.lookup(&name_of(token));
+        let mut global = None;
         match &binding {
             Binding::Local(id) | Binding::Upvalue(id) => {
                 self.out.vars[id.0 as usize].assigned = true;
@@ -794,11 +798,12 @@ impl Walker {
                 if name == "_ENV" {
                     self.out.dynamic_globals = true;
                 }
-                self.global_write(name.clone());
+                global = Some(name.clone());
             }
             Binding::Field(..) => {}
         }
         self.out.names.insert(pos_of(token), binding);
+        global
     }
 
     /// A global assigned here; the first mention of a global being an
@@ -852,12 +857,14 @@ impl Walker {
     fn stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Assignment(a) => {
-                for e in a.expressions() {
-                    self.expr(e);
-                }
+                // The targets resolve before the values, as the
+                // reference's parser reads them, so upvalues are
+                // numbered in its order; a global counts as written
+                // only after the values that may read it.
+                let mut writes = Vec::new();
                 for target in a.variables() {
                     match target {
-                        Var::Name(token) => self.assign_name(token),
+                        Var::Name(token) => writes.extend(self.assign_name(token)),
                         Var::Expression(v) => match global_table_member(self, v) {
                             Some(name) => {
                                 if let Prefix::Name(token) = v.prefix() {
@@ -865,12 +872,18 @@ impl Walker {
                                         .names
                                         .insert(pos_of(token), Binding::Global(name_of(token)));
                                 }
-                                self.global_write(name);
+                                writes.push(name);
                             }
                             None => self.var_expression(v),
                         },
                         _ => {}
                     }
+                }
+                for e in a.expressions() {
+                    self.expr(e);
+                }
+                for name in writes {
+                    self.global_write(name);
                 }
             }
             Stmt::Do(d) => self.block(d.block()),
@@ -1497,6 +1510,21 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["_ENV", "b", "a"]);
+    }
+
+    #[test]
+    fn assignment_targets_are_captured_before_values() {
+        let s = scopes("local a, b, t; local function k() a = b; t[b] = a end");
+        let k = s.funcs.iter().find(|f| f.name == "k").expect("k");
+        let names: Vec<String> = k
+            .upvalues
+            .iter()
+            .filter_map(|u| match u {
+                super::Upvalue::Var(v) => Some(s.var(*v).name.clone()),
+                super::Upvalue::Env => None,
+            })
+            .collect();
+        assert_eq!(names, ["a", "b", "t"]);
     }
 
     #[test]
