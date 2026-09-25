@@ -310,7 +310,7 @@ pub struct HirModule {
 }
 
 /// HIR function with CFG and SSA form
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HirFunction {
     pub id: HirId,
     pub name: InternedString,
@@ -2765,7 +2765,56 @@ impl HirFunction {
         let before = self.values.len();
         self.values
             .retain(|id, v| named.contains(id) || matches!(v.kind, HirValueKind::Parameter(_)));
+        // Construction can build many more values and blocks than it
+        // keeps; the tables give the slack back once most of it is dead.
+        if self.values.len() < self.values.capacity() / 2 {
+            self.values.shrink_to_fit();
+        }
+        if self.blocks.len() < self.blocks.capacity() / 2 {
+            self.blocks.shrink_to_fit();
+        }
         before - self.values.len()
+    }
+}
+
+/// A copy of `map` with capacity for its entries only, in the same order.
+/// `IndexMap::clone` reserves up to the source's capacity instead.
+fn clone_exact<K: Clone + std::hash::Hash + Eq, V: Clone>(map: &IndexMap<K, V>) -> IndexMap<K, V> {
+    let mut out = IndexMap::with_capacity(map.len());
+    out.extend(map.iter().map(|(k, v)| (k.clone(), v.clone())));
+    out
+}
+
+impl Clone for HirFunction {
+    fn clone(&self) -> Self {
+        let Self {
+            id,
+            name,
+            signature,
+            entry_block,
+            blocks,
+            locals,
+            values,
+            previous_version,
+            is_external,
+            calling_convention,
+            attributes,
+            link_name,
+        } = self;
+        Self {
+            id: *id,
+            name: *name,
+            signature: signature.clone(),
+            entry_block: *entry_block,
+            blocks: clone_exact(blocks),
+            locals: clone_exact(locals),
+            values: clone_exact(values),
+            previous_version: *previous_version,
+            is_external: *is_external,
+            calling_convention: *calling_convention,
+            attributes: attributes.clone(),
+            link_name: link_name.clone(),
+        }
     }
 }
 
@@ -2815,5 +2864,87 @@ impl HirBlock {
     /// Set the terminator
     pub fn set_terminator(&mut self, term: HirTerminator) {
         self.terminator = term;
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    fn function_with_param() -> (HirFunction, HirId) {
+        let sig = HirFunctionSignature {
+            params: vec![HirParam {
+                id: HirId::new(),
+                name: InternedString::new_global("p"),
+                ty: HirType::I64,
+                attributes: ParamAttributes::default(),
+                ownership: Default::default(),
+            }],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut f = HirFunction::new(InternedString::new_global("f"), sig);
+        let param = f.create_value(HirType::I64, HirValueKind::Parameter(0));
+        (f, param)
+    }
+
+    /// Many values and blocks built, few kept: the sweep leaves tables
+    /// sized to what they hold, keeps the order and the parameter.
+    #[test]
+    fn a_sweep_gives_back_the_capacity_of_what_it_dropped() {
+        let (mut f, param) = function_with_param();
+        let made: Vec<HirId> = (0..4096)
+            .map(|i| f.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(i))))
+            .collect();
+        let kept: Vec<HirId> = made.iter().step_by(512).copied().collect();
+        let blocks: Vec<HirId> = (0..1024).map(|_| f.create_block()).collect();
+        let entry = f.entry_block;
+        f.blocks
+            .retain(|id, _| *id == entry || *id == blocks[7] || *id == blocks[900]);
+        f.blocks[&entry].terminator = HirTerminator::Return {
+            values: kept.clone(),
+        };
+
+        f.sweep_unreferenced_values();
+
+        let order: Vec<HirId> = f.values.keys().copied().collect();
+        let mut expected = vec![param];
+        expected.extend(&kept);
+        assert_eq!(order, expected);
+        assert!(f.values.capacity() <= 2 * f.values.len());
+        assert!(f.blocks.capacity() <= 2 * f.blocks.len());
+        assert_eq!(
+            f.blocks.keys().copied().collect::<Vec<_>>(),
+            vec![entry, blocks[7], blocks[900]]
+        );
+    }
+
+    /// A clone holds exactly its entries and serializes like its source.
+    #[test]
+    fn a_clone_carries_no_slack() {
+        let (mut f, _) = function_with_param();
+        for i in 0..1000 {
+            f.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(i)));
+            f.create_block();
+        }
+        f.values.truncate(10);
+        f.blocks.truncate(5);
+        assert!(f.values.capacity() > f.values.len());
+
+        let g = f.clone();
+        assert_eq!(g.values.capacity(), g.values.len());
+        assert_eq!(g.blocks.capacity(), g.blocks.len());
+        assert_eq!(g.locals.capacity(), g.locals.len());
+        assert_eq!(
+            postcard::to_allocvec(&f).unwrap(),
+            postcard::to_allocvec(&g).unwrap()
+        );
     }
 }
