@@ -1805,12 +1805,14 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                 call("zl_table_len", vec![tb.e()], i64()),
                 call("zl_arg_int", vec![last.e(), bad_arg(3, "unpack")], i64()),
             )),
-            // The reference's stack holds a million values.
+            // The reference's stack holds a million values, of which
+            // the caller's frame and its minimum reserve take twenty:
+            // `j - i + 1 + 20 > 1_000_000` is refused.
             when(
                 and(
                     le(i.e(), j.e()),
                     or(
-                        ge(sub(cast(j.e(), u64()), cast(i.e(), u64())), int(1_000_000)),
+                        ge(sub(cast(j.e(), u64()), cast(i.e(), u64())), int(999_980)),
                         lt(sub(j.e(), i.e()), int(0)),
                     ),
                 ),
