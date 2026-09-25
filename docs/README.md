@@ -7,7 +7,7 @@ This directory contains architectural and educational documentation for the Zynt
 ### Core Architecture
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - Overall compiler architecture and design
 - **[BYTECODE_FORMAT_SPEC.md](BYTECODE_FORMAT_SPEC.md)** - Bytecode format specification
-- **[ASYNC_RUNTIME_DESIGN.md](ASYNC_RUNTIME_DESIGN.md)** - Async/await runtime design
+- **[ASYNC_EFFECTS_FIBERS.md](ASYNC_EFFECTS_FIBERS.md)** - Async, effects and fibers: architecture and implementation
 - **[PLUGIN_ARCHITECTURE.md](PLUGIN_ARCHITECTURE.md)** - Plugin system architecture
 - **[tiered-compilation.md](tiered-compilation.md)** - Tiered compilation strategy
 - **[EMBEDDING_SDK.md](EMBEDDING_SDK.md)** - Embedding Zyntax in Rust applications (zyntax_embed)

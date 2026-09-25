@@ -546,7 +546,7 @@ Issues are tracked with [git-bug](https://github.com/git-bug/git-bug) and live i
 
 **Implementation Guides**:
 - [HIR_BUILDER_EXAMPLE.md](HIR_BUILDER_EXAMPLE.md) - HIR construction
-- [ASYNC_RUNTIME_DESIGN.md](ASYNC_RUNTIME_DESIGN.md) - Async runtime internals
+- [ASYNC_EFFECTS_FIBERS.md](ASYNC_EFFECTS_FIBERS.md) - Async, effects and fibers: architecture and implementation
 - [tiered-compilation.md](tiered-compilation.md) - Tiered JIT design
 - [BYTECODE_FORMAT_SPEC.md](BYTECODE_FORMAT_SPEC.md) - Bytecode specification
 

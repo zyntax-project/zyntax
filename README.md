@@ -91,7 +91,7 @@ ladder.
 - **[Architecture](docs/ARCHITECTURE.md)**: layers, IR, backends
 - **[Zyn grammar spec](docs/ZYN_GRAMMAR_SPEC.md)**: syntax and semantic actions
 - **[Embedding SDK](book/12-embedding-sdk.md)**: running Zyntax inside a Rust program
-- **[Fibers, effects and async](docs/FIBER_EFFECT_ASYNC_COMPOSITION.md)**
+- **[Async, effects and fibers](docs/ASYNC_EFFECTS_FIBERS.md)**
 - **[Bytecode format](docs/BYTECODE_FORMAT_SPEC.md)**
 
 ---
