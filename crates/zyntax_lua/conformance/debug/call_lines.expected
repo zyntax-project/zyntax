@@ -1,0 +1,17 @@
+a
+stack traceback:
+	call_lines.lua:3: in main chunk
+	[C]: in ?
+false	call_lines.lua:6: x
+stack traceback:
+	[C]: in function 'error'
+	call_lines.lua:6: in function <call_lines.lua:5>
+	[C]: in function 'xpcall'
+	call_lines.lua:5: in main chunk
+	[C]: in ?
+true	b
+stack traceback:
+	call_lines.lua:10: in main chunk
+	[C]: in ?
+16	1	17
+22

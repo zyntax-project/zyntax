@@ -3415,8 +3415,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     /// What a call site does before its call, the arguments evaluated:
-    /// the locals spilled (for `debug.getlocal`) and the site stored.
-    /// The spill list's variable is returned, for [`Self::after_call`].
+    /// the locals spilled (for `debug.getlocal`), the site stored, and
+    /// the line the call starts on, which the arguments may have moved
+    /// the frame off. The spill list's variable is returned, for
+    /// [`Self::after_call`].
     fn before_call(
         &mut self,
         desc: &Desc,
@@ -3425,6 +3427,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     ) -> Option<InternedString> {
         let site = self.debug_site(desc, span)?;
         let spill = self.spill(site, span, pre);
+        pre.push(self.set_line(span));
         pre.push(assign(
             var(
                 intern(library::debug::DBG_SITE),
@@ -8299,6 +8302,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         if !self.frames {
             return Vec::new();
         }
+        // The frame is at the line the call starts on while it runs.
+        pre.push(self.set_line(span));
         // The debug library's own functions are the level 0 it
         // describes, not a frame of the stack. `error` is the level an
         // error is raised at.
