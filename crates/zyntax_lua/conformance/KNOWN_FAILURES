@@ -17,7 +17,6 @@ official/errors.lua           4da50c2
 official/files.lua            4da50c2
 official/gc.lua               4da50c2
 official/gengc.lua            4da50c2
-official/goto.lua             4da50c2
 official/literals.lua         4da50c2
 official/locals.lua           4da50c2
 official/pm.lua               4da50c2

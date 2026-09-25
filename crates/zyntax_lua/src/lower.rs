@@ -11339,8 +11339,6 @@ fn upvalue_accessor(module: &Module<'_>, span: Span) -> TypedFunction {
     let rec = || var(intern("rec"), anys.clone(), span);
     let value = arg(3);
     let mut lowerer = Lowerer::new(module, CHUNK);
-    // A constant identity for an upvalue with no cell: one per
-    // variable of the chunk, never an address.
     // An upvalue's identity as a value: a light userdata, equal to
     // another exactly when the two identities are.
     let upvalue_id = |identity: Node| {
@@ -11351,6 +11349,8 @@ fn upvalue_accessor(module: &Module<'_>, span: Span) -> TypedFunction {
             span,
         )
     };
+    // An identity for an upvalue with no cell: one per variable of the
+    // chunk, never an address.
     let constant_id = |k: i64| upvalue_id(int_lit(((module.chunk_index + 1) << 40) | k, span));
     let mut body = vec![
         let_(
@@ -11488,6 +11488,11 @@ fn upvalue_accessor(module: &Module<'_>, span: Span) -> TypedFunction {
                                 span,
                             ));
                         } else {
+                            // A chunk that names `debug.upvalueid` keeps
+                            // every capture in a cell, so a copy is asked
+                            // its identity only from another chunk: it
+                            // answers the variable's, one for all its
+                            // closure instances.
                             answers.push(if_(
                                 is(how(), UP_GET),
                                 vec![ret(Some(slot()), span)],

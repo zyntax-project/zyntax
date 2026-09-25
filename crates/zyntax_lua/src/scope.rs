@@ -204,6 +204,10 @@ pub struct Scopes {
     pub debug_setlocal: bool,
     /// Whether `debug.getlocal` may be called.
     pub debug_getlocal: bool,
+    /// Whether `debug.upvalueid` is called by name: every captured
+    /// variable then lives in a cell, whose address is its identity
+    /// for each closure instance.
+    pub upvalue_ids: bool,
 }
 
 /// Outermost statements per chunk segment, and the count past which a
@@ -484,8 +488,9 @@ fn walk(ast: &ast::Ast, no_module_vars: bool) -> Scopes {
     }
     // A variable the debug library may rebind is written where no
     // statement shows it: shared through a cell, never known to hold
-    // one function.
-    if w.out.debug_rebinds || w.out.debug_setlocal {
+    // one function. An upvalue's identity is its cell's address, so a
+    // chunk that asks for one gives each captured variable a cell too.
+    if w.out.debug_rebinds || w.out.debug_setlocal || w.out.upvalue_ids {
         let all = w.out.debug_setlocal;
         for v in &mut w.out.vars {
             if all || v.captured {
@@ -743,6 +748,7 @@ impl Walker {
                 "setupvalue" | "upvaluejoin" => self.out.debug_rebinds = true,
                 "setlocal" => self.out.debug_setlocal = true,
                 "getlocal" => self.out.debug_getlocal = true,
+                "upvalueid" => self.out.upvalue_ids = true,
                 _ => {}
             }
         }
@@ -1463,6 +1469,8 @@ mod tests {
         assert!(scopes("debug.upvaluejoin(f, 1, g, 1)").debug_rebinds);
         assert!(scopes("debug.setlocal(1, 1, 2)").debug_setlocal);
         assert!(scopes("debug.getlocal(1, 1)").debug_getlocal);
+        let ids = scopes("print(debug.upvalueid(f, 1))");
+        assert!(ids.upvalue_ids && !ids.debug_rebinds && !ids.debug_setlocal);
         assert!(!scopes("local debug = {}; debug.traceback()").debug);
         assert!(!scopes("print(1)").debug);
         for source in [
