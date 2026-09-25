@@ -18,7 +18,9 @@
 use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::{InternedString, PrimitiveType, Type, TypedProgram};
 
+mod annotation;
 mod dump;
+mod exports;
 mod host;
 mod host_debug;
 mod host_gc;
@@ -33,6 +35,10 @@ mod policy;
 mod scope;
 mod types;
 
+pub use annotation::LuaType;
+pub use exports::{
+    DeclaredClass, Exported, ExportedFunction, ExportedTable, Exports, Signature, is_metafield,
+};
 pub use host::{set_args, set_ignore_env};
 pub use parse::SyntaxError;
 use policy::LIBRARY_MODULE;
@@ -62,6 +68,13 @@ pub enum Error {
     /// The built-in library this crate was built with cannot be read.
     #[error("the built-in library is unreadable: {0}")]
     Library(String),
+    /// An annotation that does not fit what its statement declares, at
+    /// the comment.
+    #[error("{message} (at byte offset {})", span.0)]
+    Annotation {
+        message: String,
+        span: (usize, usize),
+    },
 }
 
 impl Error {
@@ -84,6 +97,9 @@ impl Error {
                 format!("{chunk}:{}: {what} is not supported yet", line_of(span.0))
             }
             Error::Library(message) => format!("the built-in library is unreadable: {message}"),
+            Error::Annotation { message, span } => {
+                format!("{chunk}:{}: {message}", line_of(span.0))
+            }
         }
     }
 
@@ -108,6 +124,10 @@ impl Error {
                 span: (at(span.0), at(span.1)),
             },
             e @ Error::Library(_) => e,
+            Error::Annotation { message, span } => Error::Annotation {
+                message,
+                span: (at(span.0), at(span.1)),
+            },
         }
     }
 
@@ -130,6 +150,7 @@ impl Error {
             Error::Library(message) => {
                 return format!("error: the built-in library is unreadable: {message}\n");
             }
+            Error::Annotation { message, span } => (message.clone(), "this annotation", *span),
         };
         // A span has to cover something to be shown; an empty one at the
         // end of the file is drawn on its last byte.
@@ -488,6 +509,15 @@ pub fn parse_program(source: &str, file: &str) -> Result<TypedProgram> {
     trace_phase("library", started);
     lower::program(&ast, &normal, file, library, lower::Entry::Program)
         .map_err(|e| e.in_original(source))
+}
+
+/// What a module whose chunk is `source` exports, by Lua's convention:
+/// the value the chunk returns, as the types of a chunk `load` compiles
+/// know it. Nothing is compiled or run.
+pub fn exports(source: &str) -> Result<Exports> {
+    let (ast, _) = parse_chunk(source, LOAD_LEVEL)?;
+    let (scopes, inferred) = lower::loaded_types(&ast);
+    exports::of(&scopes, &inferred).map_err(|e| e.in_original(source))
 }
 
 /// Open the state of `runtime` for a host, as `luaL_newstate` does for a

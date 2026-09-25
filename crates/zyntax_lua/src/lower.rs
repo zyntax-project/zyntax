@@ -12202,12 +12202,7 @@ pub(crate) fn loaded_program(
     stripped: bool,
     library: &Library,
 ) -> Result<TypedProgram> {
-    let mut scopes = crate::scope::resolve_loaded(ast, DebugMode::program().rebinds);
-    scopes.dynamic_globals = true;
-    scopes.len_meta = true;
-    // The chunk is a function value, called by whoever `load` gave it to.
-    scopes.funcs[CHUNK.0 as usize].escapes = true;
-    let inferred = types::infer(&scopes, ast);
+    let (scopes, inferred) = loaded_types(ast);
     NAMED.with(|named| *named.borrow_mut() = Some(Default::default()));
     let lowered = loaded_declarations(
         &scopes, &inferred, ast, source, chunk_name, index, stripped, library,
@@ -12237,6 +12232,17 @@ pub(crate) fn loaded_program(
         )],
         type_registry: registry,
     })
+}
+
+/// The scopes and types of a chunk `load` compiles.
+pub(crate) fn loaded_types(ast: &ast::Ast) -> (Scopes, Inferred) {
+    let mut scopes = crate::scope::resolve_loaded(ast, DebugMode::program().rebinds);
+    scopes.dynamic_globals = true;
+    scopes.len_meta = true;
+    // The chunk is a function value, called by whoever `load` gave it to.
+    scopes.funcs[CHUNK.0 as usize].escapes = true;
+    let inferred = types::infer(&scopes, ast);
+    (scopes, inferred)
 }
 
 /// The declarations of a loaded chunk: its functions and its `init`.

@@ -352,6 +352,9 @@ pub struct Lookup {
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct Inferred {
     pub funcs: HashMap<FuncId, Sig>,
+    /// What the chunk's `return` statements return; `None` when it has
+    /// none.
+    pub chunk: Option<Returns>,
     pub vars: HashMap<VarId, Ty>,
     pub globals: HashMap<String, Ty>,
     /// Functions that may be called through a value the types do not
@@ -3556,13 +3559,15 @@ fn infer_given(
             );
         }
         round.block(ast.nodes());
+        let chunk = round.returns.take();
         // A chunk used as a value hands what it returns to callers the
         // types do not see.
         if round.is_escaping(CHUNK)
-            && let Some(returns) = round.returns.take()
+            && let Some(returns) = &chunk
         {
-            round.escape_returns(&returns);
+            round.escape_returns(returns);
         }
+        round.out.chunk = chunk;
         round.settle_shapes();
         let out = round.out;
         if std::env::var_os("ZYNTAX_TRACE_ROUNDS").is_some() {

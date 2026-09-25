@@ -14,6 +14,8 @@ use full_moon::ast::{self, Block, Expression, FunctionBody, Prefix, Stmt, Suffix
 use full_moon::node::Node;
 use full_moon::tokenizer::TokenReference;
 
+use crate::annotation::{Annotation, LuaType};
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct VarId(pub u32);
 
@@ -217,6 +219,45 @@ pub struct Scopes {
     /// variable then lives in a cell, whose address is its identity
     /// for each closure instance.
     pub upvalue_ids: bool,
+    /// What the chunk's annotations declare.
+    pub declared: Declared,
+}
+
+/// What a chunk's LuaLS annotations declare (see [`crate::annotation`]),
+/// registered with what each annotated statement declares.
+#[derive(Default, Debug)]
+pub struct Declared {
+    /// An annotated function's `@param` types by parameter name, and
+    /// its `@return` types.
+    pub funcs: HashMap<FuncId, Signature>,
+    /// The `@class` a statement binding a variable or global gives it,
+    /// with the `@field`s of the class's instances.
+    pub classes: HashMap<Holder, Class>,
+    /// The `@type` of a field a statement stores into a variable's or a
+    /// global's table.
+    pub fields: HashMap<(Holder, String), LuaType>,
+    /// Annotations that do not fit their statement: the comment's span
+    /// and why.
+    pub problems: Vec<((usize, usize), String)>,
+}
+
+/// What an annotated statement binds.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Holder {
+    Var(VarId),
+    Global(String),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Signature {
+    pub params: Vec<(String, LuaType)>,
+    pub returns: Vec<LuaType>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Class {
+    pub name: String,
+    pub fields: Vec<(String, LuaType)>,
 }
 
 /// Outermost statements per chunk segment, and the count past which a
@@ -880,6 +921,150 @@ impl Walker {
     }
 
     fn stmt(&mut self, stmt: &Stmt) {
+        let notes = crate::annotation::before(stmt);
+        self.stmt_of(stmt);
+        if !notes.is_empty() {
+            self.register(stmt, notes);
+        }
+    }
+
+    /// Register the annotations before `stmt` with what it declares,
+    /// once it is resolved.
+    fn register(&mut self, stmt: &Stmt, notes: Vec<((usize, usize), Annotation)>) {
+        // What the statement declares: a function, and the variable or
+        // global, or the field of one, it binds.
+        let (function, holder, field) = match stmt {
+            Stmt::FunctionDeclaration(f) => (
+                self.out.func_at.get(&body_pos(f.body())).copied(),
+                None,
+                None,
+            ),
+            Stmt::LocalFunction(f) => (
+                self.out.func_at.get(&body_pos(f.body())).copied(),
+                None,
+                None,
+            ),
+            Stmt::LocalAssignment(l) => {
+                let holder = l
+                    .names()
+                    .iter()
+                    .next()
+                    .and_then(|n| self.out.decls.get(&pos_of(n)))
+                    .map(|&v| Holder::Var(v));
+                let function = l
+                    .expressions()
+                    .iter()
+                    .next()
+                    .and_then(|e| self.function_of(e));
+                (function, holder, None)
+            }
+            Stmt::Assignment(a) => {
+                let function = a
+                    .expressions()
+                    .iter()
+                    .next()
+                    .and_then(|e| self.function_of(e));
+                match a.variables().iter().next() {
+                    Some(Var::Name(token)) => (function, self.holder(token), None),
+                    Some(Var::Expression(v)) => {
+                        let suffixes: Vec<&Suffix> = v.suffixes().collect();
+                        match (v.prefix(), suffixes.as_slice()) {
+                            (
+                                Prefix::Name(token),
+                                [Suffix::Index(ast::Index::Dot { name, .. })],
+                            ) => (function, self.holder(token), Some(name_of(name))),
+                            _ => (function, None, None),
+                        }
+                    }
+                    _ => (function, None, None),
+                }
+            }
+            _ => (None, None, None),
+        };
+        let mut signature = Signature::default();
+        let mut class: Option<Class> = None;
+        for (span, note) in notes {
+            match note {
+                Annotation::Param(name, ty) => match function {
+                    Some(id) if self.names_param(id, &name) => signature.params.push((name, ty)),
+                    Some(_) => self.out.declared.problems.push((
+                        span,
+                        format!("@param `{name}` names no parameter of the function"),
+                    )),
+                    None => self
+                        .out
+                        .declared
+                        .problems
+                        .push((span, "@param annotates no function".to_owned())),
+                },
+                Annotation::Return(types) => signature.returns.extend(types),
+                Annotation::Class(name) => match (&holder, &field) {
+                    (Some(_), None) => {
+                        class = Some(Class {
+                            name,
+                            fields: Vec::new(),
+                        })
+                    }
+                    _ => self
+                        .out
+                        .declared
+                        .problems
+                        .push((span, "@class annotates no variable or global".to_owned())),
+                },
+                Annotation::Field(name, ty) => match &mut class {
+                    Some(c) => c.fields.push((name, ty)),
+                    None => self
+                        .out
+                        .declared
+                        .problems
+                        .push((span, "@field comes before any @class".to_owned())),
+                },
+                Annotation::Type(ty) => {
+                    if let (Some(h), Some(f)) = (&holder, &field) {
+                        self.out.declared.fields.insert((h.clone(), f.clone()), ty);
+                    }
+                }
+            }
+        }
+        if let Some(id) = function
+            && (!signature.params.is_empty() || !signature.returns.is_empty())
+        {
+            self.out.declared.funcs.insert(id, signature);
+        }
+        if let (Some(c), Some(h)) = (class, holder) {
+            self.out.declared.classes.insert(h, c);
+        }
+    }
+
+    /// The function an expression is, when it is a function literal.
+    fn function_of(&self, e: &Expression) -> Option<FuncId> {
+        match e {
+            Expression::Function(f) => self.out.func_at.get(&body_pos(f.body())).copied(),
+            Expression::Parentheses { expression, .. } => self.function_of(expression),
+            _ => None,
+        }
+    }
+
+    /// The variable or global a name resolved to.
+    fn holder(&self, token: &TokenReference) -> Option<Holder> {
+        match self.out.names.get(&pos_of(token))? {
+            Binding::Local(v) | Binding::Upvalue(v) => Some(Holder::Var(*v)),
+            Binding::Global(name) => Some(Holder::Global(name.clone())),
+            Binding::Field(..) => None,
+        }
+    }
+
+    /// Whether function `id` has a parameter `name`, `...` for its
+    /// variable arguments.
+    fn names_param(&self, id: FuncId, name: &str) -> bool {
+        let info = self.out.func(id);
+        if name == "..." {
+            return info.is_vararg;
+        }
+        info.params.iter().any(|&v| self.out.var(v).name == name)
+    }
+
+    fn stmt_of(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Assignment(a) => {
                 // The targets resolve before the values, as the
