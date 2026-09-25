@@ -2674,6 +2674,15 @@ impl std::error::Error for InterpError {}
 // Interpreter (dispatch loop)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The body a function's bytecode was made from, when the body source
+/// gave it. Held weakly: the runtime decides how long it lives, and a
+/// running frame of a function with loops holds it besides.
+struct SourceBody {
+    body: std::sync::Weak<HirFunction>,
+    /// The bytecode has loop headers a frame can ask resume points at.
+    loops: bool,
+}
+
 pub struct HirInterpreter {
     symbols: HashMap<String, SymbolEntry>,
     pub profile: IdMap<ProfileSample>,
@@ -2697,6 +2706,13 @@ pub struct HirInterpreter {
     /// Where a function's body comes from when the runtime keeps one
     /// apart from the module's: see [`Self::set_body_source`].
     body_source: Option<Box<dyn FnMut(HirId) -> Option<std::sync::Arc<HirFunction>> + Send>>,
+    /// The body each function's bytecode was made from, for those the
+    /// body source gave: see [`SourceBody`].
+    source_bodies: IdMap<SourceBody>,
+    /// Told when the first frame run from a body the body source gave
+    /// returns; see [`Self::set_frame_exit_hook`].
+    #[allow(clippy::type_complexity)]
+    frame_exit_hook: Option<Box<dyn FnMut(HirId) -> bool + Send>>,
     /// Compiles, or finds, the thunk that calls native code of a given
     /// shape: `fn(target, words, out)`. Installed by a runtime with a
     /// native tier; without one, calls into native code use the fixed
@@ -2850,6 +2866,8 @@ impl HirInterpreter {
             uncompilable: IdMap::default(),
             tick_callbacks: IdMap::default(),
             body_source: None,
+            source_bodies: IdMap::default(),
+            frame_exit_hook: None,
             thunk_source: None,
             entry_source: None,
             bead_source: None,
@@ -2980,6 +2998,14 @@ impl HirInterpreter {
         self.body_source = Some(source);
     }
 
+    /// Called with a function's id when the first frame run from a body
+    /// the body source gave returns. Answers whether the runtime let that
+    /// body go; the bytecode made from it goes too then, and the next
+    /// call asks the body source again.
+    pub fn set_frame_exit_hook(&mut self, hook: Box<dyn FnMut(HirId) -> bool + Send>) {
+        self.frame_exit_hook = Some(hook);
+    }
+
     /// Drop the bridge and every tick callback. They hold the native
     /// tiers' backends, which the runtime shuts down after them.
     pub fn clear_native_bridge(&mut self) {
@@ -2987,6 +3013,7 @@ impl HirInterpreter {
         self.thunk_source = None;
         self.entry_source = None;
         self.bead_source = None;
+        self.frame_exit_hook = None;
     }
 
     /// Install the bridge to a native tier: `thunk` compiles the caller
@@ -3520,6 +3547,26 @@ impl HirInterpreter {
             }
         }
 
+        // A frame of a function with loops holds the body its bytecode
+        // was made from, so a request for resume points it makes finds
+        // that body while it runs. Bytecode whose body nobody holds any
+        // more is made again from the body the source gives now.
+        let mut held: Option<std::sync::Arc<HirFunction>> = None;
+        let mut stale = false;
+        if let Some(source) = self.source_bodies.get(&func_id)
+            && source.loops
+        {
+            held = source.body.upgrade();
+            stale = held.is_none();
+        }
+        // Whether this frame made the bytecode from a body the source
+        // gave: the runtime is told when it returns.
+        let mut first = false;
+        if stale {
+            self.source_bodies.remove(&func_id);
+            self.cache.remove(&func_id);
+        }
+
         // Compile-on-first-use, and refuse-once. What the interpreter
         // cannot run, native code runs, when there is native code.
         if !self.cache.contains_key(&func_id) {
@@ -3551,6 +3598,21 @@ impl HirInterpreter {
             let taken = self.is_address_taken(module, func_id);
             match compile_function_with(module, &mut self.memory, func, taken) {
                 Ok(cf) => {
+                    // A recursive call compiles the body again while
+                    // the frame that made the entry runs.
+                    if let Some(body) = &shared {
+                        let loops = !cf.osr_sites.is_empty();
+                        self.source_bodies.entry(func_id).or_insert_with(|| {
+                            first = true;
+                            SourceBody {
+                                body: std::sync::Arc::downgrade(body),
+                                loops,
+                            }
+                        });
+                        if loops {
+                            held = Some(std::sync::Arc::clone(body));
+                        }
+                    }
                     self.cache.insert(func_id, cf);
                 }
                 Err(InterpError::UnsupportedInstruction(why)) => {
@@ -3574,8 +3636,18 @@ impl HirInterpreter {
         // calls. The map ownership returns at the end.
         let cf = self.cache.remove(&func_id).unwrap();
         let result = self.run(module, &cf, args, func_id, dest);
-        // Put the (immutable) compiled function back.
-        self.cache.insert(func_id, cf);
+        drop(held);
+        let released = first
+            && self
+                .frame_exit_hook
+                .as_mut()
+                .is_some_and(|hook| hook(func_id));
+        if released {
+            self.source_bodies.remove(&func_id);
+        } else {
+            // Put the (immutable) compiled function back.
+            self.cache.insert(func_id, cf);
+        }
         result
     }
 
