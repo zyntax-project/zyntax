@@ -75,7 +75,7 @@ impl Error {
     /// read: `chunk:line: message`. `chunk` is the chunk's name as a
     /// message shows it.
     pub fn one_line(&self, chunk: &str, source: &str) -> String {
-        let line_of = |at: usize| source[..at.min(source.len())].matches('\n').count() + 1;
+        let line_of = |at: usize| parse::line_at(source, at);
         match self {
             Error::Rejected(e) => e.with_chunk(chunk),
             Error::Syntax { message, span } => format!("{chunk}:{}: {message}", line_of(span.0)),
@@ -83,6 +83,30 @@ impl Error {
                 format!("{chunk}:{}: {what} is not supported yet", line_of(span.0))
             }
             Error::Library(message) => format!("the built-in library is unreadable: {message}"),
+        }
+    }
+
+    /// The error positioned in `original` rather than in the text
+    /// [`parse_chunk`] made of it, whose line breaks are all `\n`.
+    pub(crate) fn in_original(self, original: &str) -> Self {
+        if !original.contains('\r') {
+            return self;
+        }
+        let at = |offset: usize| parse::original_offset(original, offset);
+        match self {
+            Error::Rejected(mut e) => {
+                e.offset = at(e.offset);
+                Error::Rejected(e)
+            }
+            Error::Syntax { message, span } => Error::Syntax {
+                message,
+                span: (at(span.0), at(span.1)),
+            },
+            Error::Unsupported { what, span } => Error::Unsupported {
+                what,
+                span: (at(span.0), at(span.1)),
+            },
+            e @ Error::Library(_) => e,
         }
     }
 
@@ -388,17 +412,31 @@ pub(crate) fn source_bytes(text: &str) -> std::borrow::Cow<'_, [u8]> {
 }
 
 /// Read a chunk: refused as the reference refuses it, then parsed. The
-/// text the tree was parsed from comes with it, since a form `full_moon`
-/// does not take is rewritten into one it does, lines unmoved.
+/// text the tree was parsed from comes with it: every line break in it
+/// is a `\n`, and a form `full_moon` does not take is rewritten into
+/// one it does, lines unmoved. An error's position is in `text`.
 pub(crate) fn parse_chunk(
     text: &str,
     level: usize,
 ) -> Result<(full_moon::ast::Ast, std::borrow::Cow<'_, str>)> {
-    let bytes = source_bytes(text);
+    let Some(normal) = parse::with_newline_breaks(text) else {
+        return parse_normal(std::borrow::Cow::Borrowed(text), level);
+    };
+    parse_normal(std::borrow::Cow::Owned(normal), level).map_err(|e| e.in_original(text))
+}
+
+/// [`parse_chunk`] on a text whose line breaks are all `\n`.
+fn parse_normal(
+    text: std::borrow::Cow<'_, str>,
+    level: usize,
+) -> Result<(full_moon::ast::Ast, std::borrow::Cow<'_, str>)> {
+    let bytes = source_bytes(&text);
     let checked = parse::check(&bytes, level).map_err(Error::Rejected)?;
-    let text = match parse::with_breaks_closed(&bytes, &checked) {
+    let rewritten = parse::with_breaks_closed(&bytes, &checked);
+    drop(bytes);
+    let text = match rewritten {
         Some(rewritten) => std::borrow::Cow::Owned(source_text(&rewritten).into_owned()),
-        None => std::borrow::Cow::Borrowed(text),
+        None => text,
     };
     match full_moon::parse_fallible(&text, full_moon::LuaVersion::lua54()).into_result() {
         Ok(ast) => Ok((ast, text)),
@@ -418,12 +456,12 @@ pub(crate) fn parse_chunk(
 
 pub fn parse_program(source: &str, file: &str) -> Result<TypedProgram> {
     let started = std::time::Instant::now();
-    let (ast, source) = parse_chunk(source, MAIN_LEVEL)?;
+    let (ast, normal) = parse_chunk(source, MAIN_LEVEL)?;
     trace_phase("full_moon", started);
     let started = std::time::Instant::now();
     let library = library()?;
     trace_phase("library", started);
-    lower::program(&ast, &source, file, library)
+    lower::program(&ast, &normal, file, library).map_err(|e| e.in_original(source))
 }
 
 /// `ZYNTAX_TRACE_LOWER_PHASES=1` times the frontend's steps on stderr.

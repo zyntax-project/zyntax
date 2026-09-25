@@ -1,0 +1,15 @@
+true	true	2
+true	true	4
+true	true	3
+true	true	5
+true	true	5
+true	true	4
+true	true	4
+true	true	2
+true	true	true
+true	true	true
+true	true	true
+true	true	true
+nil	crlf:4: unexpected symbol near '='
+nil	crlf:3: unexpected symbol near '='
+nil	crlf:1: unfinished string near ''a'
