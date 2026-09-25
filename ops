@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790378985,"nonce":"icT68MZQ4jlzCq1clrZMTRVH89E=","message":"Fixed on main by 53836408: debug.getlocal reads a loop's (for state) slots as lua5.4 does (generic: iterator, state, control, closing; numeric: its three internal slots); pinned in debug/for_state_values.lua.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1790378985,"nonce":"vXbyKjkdomvIyNnACgf/ScHUtLI=","status":2}]}
