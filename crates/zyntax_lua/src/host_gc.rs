@@ -473,11 +473,14 @@ fn tombstone_dead_keys(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking) -> Vec
     boxes
 }
 
-/// Drop what the collection did not reach from the registries.
+/// Drop what the collection did not reach from the registries. The
+/// program's own collection ends here, so one that its finalizers
+/// start is an automatic one, which trims nothing.
 fn sweep(reached: &dyn Fn(usize) -> bool) {
     let mut s = state();
     s.weak.retain(|&t, _| reached(t));
     s.dirty = s.weak.values().filter(|w| w.dirty).count();
+    s.explicit = false;
 }
 
 /// Run the library's runner after a collection that queued finalizers
@@ -604,6 +607,7 @@ pub(crate) extern "C" fn host_gc(op: i64, arg: i64) -> i64 {
             s.explicit = true;
             drop(s);
             collector::collect();
+            // Cleared by the sweep, unless no collection ran.
             state().explicit = false;
             ended as i64
         }
