@@ -52,9 +52,28 @@ fn disassemble(src: &str, name: &str) -> Option<String> {
         .filter(|d| !d.is_empty())
 }
 
+/// Whether the running x86_64 host has `feature`; the backend selects
+/// instructions by what the host has.
+#[allow(unreachable_code)]
+fn host_has(feature: &str) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return match feature {
+            "avx" => std::arch::is_x86_feature_detected!("avx"),
+            "fma" => std::arch::is_x86_feature_detected!("fma"),
+            _ => false,
+        };
+    }
+    false
+}
+
 /// Assert the disassembly contains whichever mnemonic this architecture
 /// uses for the shape. Skips where no disassembly is available rather
 /// than asserting on nothing.
+///
+/// The x86_64 mnemonic is the AVX form. A host without AVX gets the SSE
+/// form, which is the same name without the `v`; a host without FMA has
+/// no fused instruction to reach.
 fn assert_folds(src: &str, name: &str, aarch64: &str, x86_64: &str) {
     let Some(disasm) = disassemble(src, name) else {
         eprintln!("no disassembly from this build; nothing to assert for {name}");
@@ -63,7 +82,15 @@ fn assert_folds(src: &str, name: &str, aarch64: &str, x86_64: &str) {
     let wanted = if cfg!(target_arch = "aarch64") {
         aarch64
     } else if cfg!(target_arch = "x86_64") {
-        x86_64
+        if x86_64.starts_with("vfmadd") && !host_has("fma") {
+            eprintln!("this host has no FMA; nothing to assert for {name}");
+            return;
+        }
+        if host_has("avx") {
+            x86_64
+        } else {
+            x86_64.strip_prefix('v').unwrap_or(x86_64)
+        }
     } else {
         eprintln!("no expected mnemonic recorded for this architecture");
         return;
