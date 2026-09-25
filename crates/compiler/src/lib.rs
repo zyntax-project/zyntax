@@ -72,8 +72,6 @@ pub mod memory_optimization; // Memory-aware optimizations
 pub mod memory_pass;
 pub mod monomorphize;
 pub mod move_insert; // Owning parameters become `Move` the borrow check can see
-#[doc(hidden)]
-pub mod opt_audit; // Per-function counts of optimiser runs, for tests
 pub mod optimization;
 pub mod parallel_dispatch; // A loop with independent iterations becomes a band dispatch
 pub mod parallel_safe; // Which counted loops have independent iterations
@@ -1972,7 +1970,6 @@ fn run_interp_safe_opts_with(
     {
         return stats;
     }
-    opt_audit::note_pipeline(module);
 
     // Alloca → Malloc promotion runs ONCE up front, before the
     // fixed-point sweep. Two reasons it goes here:
