@@ -410,11 +410,13 @@ struct Walker {
 pub fn resolve(ast: &ast::Ast) -> Scopes {
     let scopes = walk(ast, false);
     // A module variable is one variable for every function reaching
-    // it, which `debug.upvaluejoin` cannot rebind for one closure: a
-    // chunk that may join upvalues captures its outermost locals as
-    // any function's, unless it runs as segments, which share them.
-    if scopes.debug_rebinds && !scopes.split_chunk && scopes.vars.iter().any(|v| v.is_module_var())
-    {
+    // it, which `debug.upvaluejoin` cannot rebind for one closure, and
+    // which a frame's spilled locals cannot hold by reference: a chunk
+    // that may join upvalues or read or set locals captures its
+    // outermost locals as any function's, unless it runs as segments,
+    // which share them.
+    let reaches = scopes.debug_rebinds || scopes.debug_setlocal || scopes.debug_getlocal;
+    if reaches && !scopes.split_chunk && scopes.vars.iter().any(|v| v.is_module_var()) {
         return walk(ast, true);
     }
     scopes

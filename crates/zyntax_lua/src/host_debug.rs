@@ -52,6 +52,9 @@ struct FuncMeta {
     /// The locals of each call site, by the site's number: what a
     /// frame stopped at that site holds, in order.
     locals: HashMap<i64, Vec<String>>,
+    /// The locals of each call site kept in cells, a bit each by slot:
+    /// the spill holds their cells.
+    cells: HashMap<i64, i64>,
 }
 
 /// What a call site calls the function it calls: `local`, `global`,
@@ -148,7 +151,8 @@ pub(crate) fn note_load_source(index: i64, raw: String) {
 ///
 /// `F fid line last nparams vararg up1 up2 …`, `A fid line…` (active
 /// lines), `S site namewhat name global`, `L fid site name…` (the
-/// locals a frame of `fid` stopped at `site` holds).
+/// locals a frame of `fid` stopped at `site` holds), `C fid site mask`
+/// (which of those are spilled as their cells).
 pub(crate) extern "C" fn host_dbg_chunk(
     index: i64,
     source: zrtl::StringConstPtr,
@@ -205,6 +209,12 @@ pub(crate) extern "C" fn host_dbg_chunk(
                     .or_default()
                     .locals
                     .insert(site, names);
+            }
+            Some("C") => {
+                let fid = int(fields.next());
+                let site = int(fields.next());
+                let mask = int(fields.next());
+                chunk.funcs.entry(fid).or_default().cells.insert(site, mask);
             }
             _ => {}
         }
@@ -923,7 +933,7 @@ pub(crate) extern "C" fn host_dbg_spill(list: *const zrtl::DynamicBox, site: i64
     STATE.with(|s| {
         if let Some(top) = s.borrow_mut().frames.last_mut() {
             top.spill = list as usize;
-            top.spill_site = site & 0xffff_ffff;
+            top.spill_site = site & 0xffff_ffff & !TAIL_SITE;
         }
     });
 }
@@ -996,6 +1006,26 @@ pub(crate) extern "C" fn host_dbg_local_name(depth: i64, n: i64) -> StringPtr {
     })
 }
 
+/// Whether local `n` (from 1) of the frame at stack depth `depth` was
+/// spilled as its cell: 1 when it was, else 0.
+pub(crate) extern "C" fn host_dbg_local_cell(depth: i64, n: i64) -> i64 {
+    STATE.with(|s| {
+        let s = s.borrow();
+        let Some(frame) = usize::try_from(depth - 1)
+            .ok()
+            .and_then(|k| s.frames.get(k))
+        else {
+            return 0;
+        };
+        if frame.spill == 0 || !(1..=63).contains(&n) {
+            return 0;
+        }
+        func_of(&s, frame.key)
+            .and_then(|(_, f)| f.cells.get(&frame.spill_site))
+            .map_or(0, |mask| (mask >> (n - 1)) & 1)
+    })
+}
+
 /// How many named locals the frame at stack depth `depth` holds.
 pub(crate) extern "C" fn host_dbg_local_count(depth: i64) -> i64 {
     STATE.with(|s| local_names(&s.borrow(), depth).map_or(0, |n| n.len() as i64))
@@ -1027,7 +1057,7 @@ pub(crate) extern "C" fn host_dbg_frame_key(depth: i64) -> i64 {
 }
 
 /// The host symbols of the debug library.
-pub(crate) static SYMBOLS: [zrtl::ZrtlSymbol; 35] = [
+pub(crate) static SYMBOLS: [zrtl::ZrtlSymbol; 36] = [
     zrtl::ZrtlSymbol::new(c"$Lua$dbg_chunk".as_ptr(), host_dbg_chunk as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$dbg_enter".as_ptr(), host_dbg_enter as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$dbg_leave".as_ptr(), host_dbg_leave as *const u8),
@@ -1129,6 +1159,10 @@ pub(crate) static SYMBOLS: [zrtl::ZrtlSymbol; 35] = [
     zrtl::ZrtlSymbol::new(
         c"$Lua$dbg_local_count".as_ptr(),
         host_dbg_local_count as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$dbg_local_cell".as_ptr(),
+        host_dbg_local_cell as *const u8,
     ),
     zrtl::ZrtlSymbol::new(
         c"$Lua$dbg_param_name".as_ptr(),

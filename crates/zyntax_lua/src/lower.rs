@@ -3346,6 +3346,21 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             .collect()
     }
 
+    /// The live locals kept in cells, a bit each by slot (the first 63
+    /// slots): a spill holds such a local's cell, not its value, so a
+    /// `debug.setlocal` reaches the closures sharing it at once.
+    fn live_cells(&mut self) -> i64 {
+        let mut mask = 0i64;
+        for (i, l) in self.live.clone().into_iter().enumerate().take(63) {
+            if let Live::Var(v) = l
+                && matches!(self.storage_of(v), Storage::Cell(..))
+            {
+                mask |= 1 << i;
+            }
+        }
+        mask
+    }
+
     /// A call site of this function, numbered for the debug library,
     /// with what the callee is called there (`desc`); the locals in
     /// scope recorded for `debug.getlocal`. None when this function
@@ -3381,6 +3396,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             let mut record = vec!["L".to_string(), self.func.0.to_string(), k.to_string()];
             record.extend(self.live_names());
             m.debug_record(&record);
+            let cells = self.live_cells();
+            if cells != 0 {
+                m.debug_record(&[
+                    "C".to_string(),
+                    self.func.0.to_string(),
+                    k.to_string(),
+                    cells.to_string(),
+                ]);
+            }
         }
         let tail = if self.tail_span == Some(span) {
             library::debug::TAIL_SITE
@@ -3421,8 +3445,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             return None;
         }
         let mut items = Vec::with_capacity(self.live.len() + 1);
-        for l in self.live.clone() {
+        let cells = self.live_cells();
+        for (i, l) in self.live.clone().into_iter().enumerate() {
             items.push(match l {
+                Live::Var(v) if i < 63 && cells & (1 << i) != 0 => self.capture_value(v, span),
                 Live::Var(v) => {
                     let value = self.read_var(v, span);
                     self.boxed(value)
@@ -3476,13 +3502,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
         // Each local a callee set is read back; the others keep what
         // the call left in them. Straight-line, as the call may sit in
-        // an expression.
+        // an expression. A local in a cell was set through it.
         let set = self.temp();
         let mut out = vec![let_(set, i64_t.clone(), unspill, span)];
+        let cells = self.live_cells();
         for (i, l) in self.live.clone().into_iter().enumerate().take(63) {
             let Live::Var(v) = l else {
                 continue;
             };
+            if cells & (1 << i) != 0 {
+                continue;
+            }
             let current = self.read_var(v, span);
             let current = self.boxed(current);
             let value = Val {

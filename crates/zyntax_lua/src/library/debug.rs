@@ -315,6 +315,12 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             "$Lua$dbg_local_count",
         ),
         host(
+            "zl_dbg_local_cell",
+            &[("depth", i64()), ("n", i64())],
+            i64(),
+            "$Lua$dbg_local_cell",
+        ),
+        host(
             "zl_dbg_param_name",
             &[("key", i64()), ("n", i64())],
             string(),
@@ -675,7 +681,6 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ret(y.e()),
         ],
     ));
-    // The running thread's hook is kept as thread `k`'s.
     // The running thread's hook as a value: a list of the hook, its
     // mask, its count and what is left of the count; nil for none.
     // A mask without a function is a hook inherited from the thread's
@@ -1495,13 +1500,22 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             eq(i.e(), int(-1)),
             vec![ret(pair(box_str(name.e()), z.e()))],
         ),
-        ret(pair(
-            box_str(name.e()),
-            at(
-                call("zb_unbox_list_raw_any", vec![x.e()], anys.clone()),
-                i.e(),
-            ),
+        y.set(at(
+            call("zb_unbox_list_raw_any", vec![x.e()], anys.clone()),
+            i.e(),
         )),
+        // A local kept in a cell was spilled as the cell.
+        when(
+            ne(
+                call("zl_dbg_local_cell", vec![depth.e(), n.e()], i64()),
+                int(0),
+            ),
+            vec![y.set(at(
+                call("zb_unbox_list_raw_any", vec![y.e()], anys.clone()),
+                int(0),
+            ))],
+        ),
+        ret(pair(box_str(name.e()), y.e())),
     ]);
     d.push(define("zl_debug_getlocal", &[&args], any(), st));
     // `debug.setlocal([thread,] level, n, v)`: the name, or fail.
@@ -1533,12 +1547,35 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             vec![ret(call("zl_fail", vec![], any()))],
         ),
-        set_idx(
-            call("zb_unbox_list_raw_any", vec![x.e()], anys.clone()),
-            i.e(),
-            arg(int(3)),
+        // A local kept in a cell is set through it, where every closure
+        // sharing it sees the value; any other is read back by its
+        // frame when the call it stopped at returns.
+        if_(
+            ne(
+                call("zl_dbg_local_cell", vec![depth.e(), n.e()], i64()),
+                int(0),
+            ),
+            vec![set_idx(
+                call(
+                    "zb_unbox_list_raw_any",
+                    vec![at(
+                        call("zb_unbox_list_raw_any", vec![x.e()], anys.clone()),
+                        i.e(),
+                    )],
+                    anys.clone(),
+                ),
+                int(0),
+                arg(int(3)),
+            )],
+            vec![
+                set_idx(
+                    call("zb_unbox_list_raw_any", vec![x.e()], anys.clone()),
+                    i.e(),
+                    arg(int(3)),
+                ),
+                expr(call("zl_dbg_mark_set", vec![depth.e(), i.e()], unit())),
+            ],
         ),
-        expr(call("zl_dbg_mark_set", vec![depth.e(), i.e()], unit())),
         ret(box_str(name.e())),
     ]);
     d.push(define("zl_debug_setlocal", &[&args], any(), st));
