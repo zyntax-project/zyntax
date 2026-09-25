@@ -253,8 +253,13 @@ let (embeddings, metadata) = (
 // Conditional with `?:`
 let output = confidence > 0.9 ? high_conf_path() : low_conf_path()
 
-// --- GPU Compute Dispatch ---
-// Custom math kernels dispatched to GPU (or CPU fallback)
+// --- GPU Compute Dispatch (target syntax) ---
+// Custom math kernels, run as CPU SIMD or on a GPU chosen by @device.
+// Status 2026-09-25: only the in-place elementwise form
+// (`for i in r { arr[i] = arr[i] OP scalar }`) and a directly yielded value
+// lower today, on CPU SIMD; reduce(+) has no operator slot yet, and @device
+// and @async are parsed and ignored. Kernels are a typed subset: a body the
+// compiler cannot lower is a compile error. See 09-gpu-compute-system.md.
 
 // Simple element-wise compute
 let result = compute(tensor) {
@@ -334,13 +339,13 @@ let result = compute(data) @device("cuda:0") {
     ...
 }
 
-// Automatic device selection with fallback
-let result = compute(data) @device("auto") {  // GPU if available, else CPU
+// Automatic device selection by size (small kernels on CPU SIMD)
+let result = compute(data) @device("auto") {
     @kernel custom
     ...
 }
 
-// Async compute (returns future)
+// Async compute (on Zyntax fibers and async)
 let future_result = compute(data) @async {
     @kernel expensive_op
     ...
@@ -461,7 +466,7 @@ fn compute_statistics(data: tensor) -> stats:
 // --- Configuration ---
 
 config {
-    device: "cpu",              // or "cuda", "metal"
+    device: "cpu",              // target: or "cuda", "metal" (no device config is implemented)
     precision: "float32",       // or "float16", "int8"
     batch_size: 32,
     cache_dir: "~/.zynml/cache",

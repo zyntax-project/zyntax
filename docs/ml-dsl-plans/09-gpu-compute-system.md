@@ -1,8 +1,49 @@
 # ZynML GPU Compute System
 
-**Status**: Future Work
+**Status**: CPU SIMD half partly built; GPU half not built (checked 2026-09-25)
 **Priority**: High (after core ZynML stabilization)
 **Complexity**: Very High
+
+## Status and direction (September 2026)
+
+Checked against the code on 2026-09-25 (HEAD `a900deba`). This document is the kernel surface, the Apple (Metal) design and the benchmark plan. The NVIDIA design is [GPU_AOT_ARCHITECTURE.md](../GPU_AOT_ARCHITECTURE.md), which carries the same decisions. Sections below that no longer hold carry a **Superseded** or **Status** note in place.
+
+### Built
+
+- **Grammar.** `compute(args) @modifiers { block }` (`compute_expr` in `crates/zynml/ml.zyn`), with each modifier a general annotation, and the in-body directive `@kernel <identifier>` plus `yield`. The arguments are the kernel's inputs.
+- **`@kernel elementwise`, one shape.** A body of exactly `for i in r { arr[i] = arr[i] OP scalar }` over a compute argument lowers (`emit_elementwise_simd_loop`, `crates/compiler/src/ssa.rs`) to a 4-lane vector load, splat, op and store loop with a scalar remainder.
+- **`@kernel reduce`, partially.** With a `yield` directly in the body the result is the last yielded value; nothing accumulates, and there is no operator slot (`reduce(+)` cannot be written).
+- **First-class SIMD.** `HirType::Vector` and the HIR vector instructions lower natively on Cranelift, LLVM, wasm and the interpreter; `target_vector.rs` gives the host width, and the vectorization passes cover ordinary loops.
+- **Parallel loops**, behind `ZYNTAX_PARALLEL_LOOPS=1`, not yet tied to `compute()`.
+- **Accelerate GEMM.** `zrtl_tensor`'s `tensor_matmul_2d` calls Accelerate `cblas_sgemm` on Apple, a portable loop elsewhere.
+
+### Not built
+
+- GPU code generation and GPU runtimes of every kind: no MSL, PTX, SPIR-V or WGSL, no Metal, CUDA, Vulkan or WebGPU dependency.
+- Kernel type checking (the type checker gives `compute` a fresh type variable), the `@device`, `@workgroup` and `@kernel(x)` modifiers (parsed and never read), device management, async compute and the memory API.
+- Every other body and kernel kind (`matmul`, `conv2d`, `fused`, `attention`, `out[i] = f(x[i])`, multi-input, broadcast, a `yield` inside a loop) lowers to a call of `$Zyntax$compute`, which is not defined. That is a bug, tracked in git-bug, and becomes a compile error.
+- The `zyntax` module in Python and Lua.
+
+### Decided direction
+
+1. **Kernels are a Zyntax capability.** See "The `zyntax` kernel surface" below. ZynML reaches kernels natively; every other frontend through a `zyntax` module.
+2. **Kernels are a typed subset.** A kernel body types to fixed-width scalars, vectors and buffers. Dynamic code inside a kernel is a compile error that names what is unsupported; it never falls back to a runtime dispatch or to boxed values.
+3. **HIR is the kernel IR.** `compute()` lowers straight to HIR, which already carries first-class vectors on all four CPU backends. There is no separate Compute IR (the CIR section below is superseded).
+4. **Metal is the first GPU backend,** because the Mac (M1 Pro) is the only GPU available. Design in "Metal Backend" below: MSL generated from HIR, compiled at run time by the Metal framework, which needs no Xcode, Metal toolchain or C compiler on the user's machine.
+5. **GEMM-shaped kernels on Apple dispatch to system accelerators,** following the `zrtl_tensor` decision that FFI exists only for hardware generated code cannot reach: Accelerate (AMX) for small and medium matrices, MPS for large ones. Elementwise, reduction and fused kernels stay generated code.
+6. **NVIDIA** goes HIR, LLVM IR, in-process NVPTX, PTX, loaded through `cudarc`, with a CUDA Tile IR track for tile kernels later (GPU_AOT_ARCHITECTURE.md). No NVIDIA GPU is available to test on, so it follows Metal.
+7. **The portable path (Vulkan, WebGPU) is deferred.** When it returns, HIR lowers to naga IR, one emitter for SPIR-V, WGSL and MSL, and Linux runs Vulkan through `ash`.
+8. **Benchmarks** replace the old target table: see "Performance Targets".
+
+### The `zyntax` kernel surface
+
+Fibers, effects, handlers and kernels are Zyntax capabilities, and each frontend exposes them through a `zyntax` module in its own idiom:
+
+- **ZynML**: natively, `compute(args) @kernel(...) @device(...) { ... }` and the in-body `@kernel` directive.
+- **Python (zypy)**: `from zyntax import kernel`, then `@kernel` on a function whose body is the typed subset. Surfaces only zypy provides need no CPython support.
+- **Lua**: a `zyntax` table (`zyntax.kernel(fn)`).
+
+The module is opt-in. All three hand the compiler the same thing: a typed kernel body lowered to HIR, then to a CPU SIMD loop or a GPU backend by `@device`.
 
 ## Overview
 
@@ -11,7 +52,7 @@ The `compute()` construct in ZynML provides a unified way to express parallel co
 - **SIMD CPU** (AVX2, AVX-512, NEON)
 - **Accelerators** (TPU, NPU, future hardware)
 
-The same kernel code works across all backends with automatic optimization.
+The goal is that the same kernel code works across all backends. **Status:** only CPU SIMD exists, for the shapes listed in the status section. TPU and NPU backends are not planned; on Apple the neural hardware is reached through system frameworks, per the `zrtl_tensor` decision.
 
 ## Design Goals
 
@@ -19,10 +60,12 @@ The same kernel code works across all backends with automatic optimization.
 2. **Explicit Parallelism** - Clear parallel structure, no magic
 3. **Composable** - Kernels can be fused automatically
 4. **Type Safe** - Catch dimension errors at compile time
-5. **Debuggable** - Fall back to CPU for debugging
+5. **Debuggable** - Run a kernel on the CPU for debugging by choosing `@device("cpu")`; never a silent fallback
 6. **Performant** - Match hand-written CUDA/Metal performance
 
 ## Syntax Design
+
+**Status:** this section is the target syntax. Today the grammar takes `compute(args) @annotation... { block }` and, inside the block, `@kernel <identifier>` with no parameters, so `reduce(+)`, `reduce(max, axis=1)`, `@shared`, `@broadcast` and `@tile` have no slot yet, and there is no implicit `out`. Only the in-place elementwise shape and the direct-yield reduce lower. Everything else currently calls an undefined runtime function, a tracked bug; until those forms are built they will be compile errors.
 
 ### Basic Compute Expression
 
@@ -293,6 +336,8 @@ let rotated = compute(x, cos_cache, sin_cache) {
 
 ### Device Management
 
+**Status:** not built. `@device` is parsed and ignored, so `@device("metal")` produces CPU SIMD code today. `@device("auto")` will mean a size-based choice at compile time (small kernels to the CPU SIMD path, large ones to the GPU), which is a stated rule, not a fallback.
+
 ```zynml
 // Query available devices
 let devices = compute_devices()
@@ -340,6 +385,8 @@ let result = compute(data) @device(["cuda:0", "cuda:1"]) @parallel(model) {
 
 ### Async Execution
 
+**Status:** not built. `@async` will reuse Zyntax's fibers and async (the same `await`) rather than introduce a separate future type.
+
 ```zynml
 // Synchronous (default)
 let result = compute(data) {
@@ -380,6 +427,8 @@ let result = await future timeout 1000ms else default_value
 
 ### Memory Management
 
+**Status:** not built. On Apple unified memory, tensor storage is allocated page-aligned so Metal can wrap it without a copy (`storageModeShared`); explicit device copies matter only on discrete GPUs.
+
 ```zynml
 // Explicit device memory allocation
 let gpu_tensor = allocate(shape=[1024, 1024], dtype=float32, device="cuda:0")
@@ -419,23 +468,27 @@ ZynML compute() block
          │
          ▼
 ┌───────────────────┐
-│   Compute IR      │  ← Device-independent intermediate representation
-│   (CIR)           │
+│   HIR             │  ← first-class vectors; the one kernel IR
+│   (kernel subset) │
 └────────┬──────────┘
          │
          ├─────────────────┬─────────────────┬─────────────────┐
          ▼                 ▼                 ▼                 ▼
 ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
 │  CUDA        │  │  Metal       │  │  Vulkan      │  │  CPU SIMD    │
-│  Backend     │  │  Backend     │  │  Compute     │  │  Backend     │
-│  (PTX)       │  │  (MSL)       │  │  (SPIR-V)    │  │  (Cranelift) │
+│  Backend     │  │  Backend     │  │  (deferred)  │  │  (HIR Vector │
+│  (NVPTX)     │  │  (MSL)       │  │  (naga IR)   │  │  4 backends) │
 └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
        │                 │                 │                 │
        ▼                 ▼                 ▼                 ▼
    NVIDIA GPU       Apple GPU         Any GPU            CPU
 ```
 
+**Status:** only the CPU SIMD column exists: HIR `Vector` instructions lowered by Cranelift, LLVM, wasm and the interpreter. Metal is next, NVIDIA follows, Vulkan is deferred.
+
 ### Compute IR (CIR)
+
+**Superseded (2026-09-25):** there is no CIR, and none is planned. `compute()` lowers directly to HIR (`crates/compiler/src/ssa.rs`), and HIR is the kernel IR every backend lowers from. The sketch is kept because its operation list is a useful checklist for what the HIR kernel subset must cover.
 
 ```rust
 // Compute Intermediate Representation
@@ -555,6 +608,8 @@ pub enum MathFn {
 
 #### CUDA Backend
 
+**Superseded (2026-09-25):** PTX is not written by hand. It comes from HIR through LLVM IR and the in-process NVPTX target of the LLVM 21 the compiler already links, and `cudarc` loads it; the driver JIT-compiles PTX on load, so the "Compile PTX to cubin" step below does not exist on that path. Design in [GPU_AOT_ARCHITECTURE.md](../GPU_AOT_ARCHITECTURE.md).
+
 ```rust
 pub struct CudaBackend {
     context: CudaContext,
@@ -617,6 +672,16 @@ impl ComputeBackend for CudaBackend {
 ```
 
 #### Metal Backend
+
+**Status (2026-09-25): not built; the design below is decided, with these corrections.**
+
+- **Emitter.** MSL source generated from the HIR kernel subset, in `crates/compiler` beside the other backends, language-neutral. LLVM has no Apple GPU (AIR) target, so MSL is the route; candle, PyTorch Inductor's MPS backend and CubeCL compile the same way, which keeps the benchmark comparison like for like.
+- **Compile.** `MTLDevice newLibraryWithSource:options:error:` then `newComputePipelineStateWithFunction:`. This uses the OS's own Metal compiler service: verified on the M1 Pro under macOS 26.6.2 on 2026-09-25 with no Metal toolchain installed (`xcrun metal` was missing). The offline `metal` compiler and AIR/metallib emission are not used: the toolchain cannot be redistributed, and direct AIR emission depends on reverse-engineered formats that broke on a macOS release. Revisit only if cold compile time dominates time to first result; Metal's on-disk cache already makes repeat compiles fast, and `MTLBinaryArchive` is the documented next step.
+- **Binding.** The host side (device, queue, buffers, launch) lives in a runtime crate on `objc2-metal` and `objc2-metal-performance-shaders` 0.3.x, linked with a `cfg(target_vendor = "apple")` `build.rs` line the way `zrtl_tensor` links Accelerate. The `metal` crate (metal-rs) used in the sketch is deprecated in favour of objc2-metal; wgpu and candle have moved.
+- **Pipeline cache.** Pipeline states are cached by kernel hash; the sketch below builds one per `execute`.
+- **Batching.** Dispatches encode into one open command buffer, committed and waited on only when the host reads a result. A synchronous commit-and-wait per dispatch, as in the sketch, costs about two orders of magnitude more than a batched dispatch on the M1 Pro (measured 2026-09-25).
+- **GEMM.** Chosen by size: Accelerate CBLAS (AMX) for small and medium matrices, `MPSMatrixMultiplication` encoded into the same command buffer for large ones (on the M1 Pro, fp32, measured 2026-09-25, Accelerate led at n=512 and MPS from n=1024). A generated `simdgroup_matrix` MSL GEMM, as candle and MLX use, covers fused epilogues MPS cannot express. `zrtl_tensor` moves from the deprecated `cblas_sgemm` symbol to the `$NEWLAPACK` CBLAS symbols. Classic BNNS is deprecated since macOS 15 and not used; MPSGraph only for convolution parity with PyTorch MPS, which is built on it.
+- **Metal 4 tensor ops** (`MetalPerformancePrimitives` `matmul2d`) compile on the M1 Pro under macOS 26 but reach Neural Accelerators only on M5 and A19 GPUs. They are a later tier gated on device family, not a promise of tensor-core speed on the M1 Pro.
 
 ```rust
 pub struct MetalBackend {
@@ -690,6 +755,8 @@ impl ComputeBackend for MetalBackend {
 
 #### CPU SIMD Backend
 
+**Superseded (2026-09-25):** CPU SIMD was built differently. There is no `CpuSimdBackend` or `SimdLevel`: kernel bodies lower to HIR `Vector` instructions in `ssa.rs`, and Cranelift, LLVM, wasm and the interpreter each lower those natively. Width comes from `target_vector.rs`, except that the elementwise kernel loop still hard-codes 4 lanes (tracked in git-bug). Matmul is not generated on the CPU; on Apple it goes to Accelerate through `zrtl_tensor`.
+
 ```rust
 pub struct CpuSimdBackend {
     // Uses existing Cranelift infrastructure
@@ -748,88 +815,94 @@ impl ComputeBackend for CpuSimdBackend {
 
 ## Dependencies
 
-### Rust Crates
+**Superseded (2026-09-25):** the 2025-12 list (`cuda-runtime`/`cuda-driver` 0.3, `metal` 0.27, `vulkano` 0.34, `wgpu` 0.19, and `cpu`/`cuda`/`metal`/`vulkan`/`webgpu` features) was never added to any `Cargo.toml` and is years out of date. The planned dependencies, versions as of 2026-09-25:
 
 ```toml
-[dependencies]
-# Core
-zyntax-compiler = { path = "../crates/compiler" }
+# Metal (Apple only), host side of the Metal backend
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2-metal = "0.3"
+objc2-metal-performance-shaders = "0.3"
 
-# CUDA (optional)
-[target.'cfg(target_os = "linux")'.dependencies]
-cuda-runtime = { version = "0.3", optional = true }
-cuda-driver = { version = "0.3", optional = true }
+# NVIDIA, behind the compiler's opt-in `cuda` feature (see GPU_AOT_ARCHITECTURE.md)
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12090"] }
 
-# Metal (Apple only)
-[target.'cfg(target_os = "macos")'.dependencies]
-metal = { version = "0.27", optional = true }
+# Tile IR emission for the NVIDIA tile track (later)
+cutile-ir = { version = "0.3", optional = true }
 
-# Vulkan (cross-platform)
-vulkano = { version = "0.34", optional = true }
-vulkano-shaders = { version = "0.34", optional = true }
-
-# WebGPU (for browser/wasm)
-wgpu = { version = "0.19", optional = true }
-
-[features]
-default = ["cpu"]
-cpu = []
-cuda = ["cuda-runtime", "cuda-driver"]
-metal = ["dep:metal"]
-vulkan = ["vulkano", "vulkano-shaders"]
-webgpu = ["wgpu"]
-all-backends = ["cpu", "cuda", "metal", "vulkan"]
+# Portable path (deferred): naga for IR and its SPIR-V/WGSL/MSL writers, ash for Vulkan.
+# Not vulkano-shaders, which compiles GLSL through shaderc (a C++ toolchain).
 ```
+
+PTX emission needs no dependency: inkwell's default `target-all` already enables NVPTX in the `llvm-backend` build.
 
 ## Implementation Phases
 
-### Phase 1: CPU SIMD Backend (Weeks 1-4)
+**Status (2026-09-25):** the 2025-12 week schedule is superseded; phases keep their order without dates. Checked against the code.
+
+### Phase 1: CPU SIMD Backend
 - [x] Existing `zrtl_simd` operations
-- [ ] Compute IR design
-- [ ] Elementwise kernels
-- [ ] Reduction kernels
-- [ ] Integration with Cranelift
+- ~~Compute IR design~~ (superseded: HIR is the kernel IR)
+- [x] First-class HIR vectors on Cranelift, LLVM, wasm and the interpreter
+- [ ] Elementwise kernels: one in-place shape done; `out[i] = f(x[i])`, multi-input and broadcast not done; lane count hard-coded to 4
+- [ ] Reduction kernels: partial; returns the last direct `yield`, no accumulation, no operator
+- [ ] Value-checked `compute()` tests on all four backends (today only Cranelift checks values; the ZynML tests only compile)
 
-### Phase 2: Compute Syntax (Weeks 5-6)
-- [ ] Grammar extension for `compute()`
+### Phase 2: Compute Syntax
+- [x] Grammar extension for `compute()`
 - [ ] Type checking for kernels
-- [ ] Lowering to Compute IR
+- [ ] Lowering reads `@kernel(x)`, `@device`, `@workgroup`
+- [ ] Unsupported kernel shapes are compile errors, not calls to `$Zyntax$compute`
+- [ ] `zyntax` kernel module in Python and Lua
 
-### Phase 3: CUDA Backend (Weeks 7-10)
-- [ ] PTX code generation
-- [ ] CUDA runtime integration
+### Phase 3: Metal Backend (next GPU step)
+- [ ] MSL code generation from HIR
+- [ ] Metal runtime on objc2-metal: pipeline cache, batched command buffer
+- [ ] GEMM dispatch: Accelerate and MPS by size; generated simdgroup_matrix GEMM for fused epilogues
+- [ ] Shared memory (threadgroup) support
+- [ ] Benchmark harness (see Performance Targets)
+
+### Phase 4: CUDA Backend (needs an sm_80+ Linux machine)
+- [ ] PTX via LLVM NVPTX
+- [ ] `cudarc` runtime integration
 - [ ] Memory management
-- [ ] Async execution
+- [ ] Async execution on Zyntax fibers
+- [ ] Tile IR track through `cutile-ir`
 
-### Phase 4: Metal Backend (Weeks 11-14)
-- [ ] MSL code generation
-- [ ] Metal runtime integration
-- [ ] Shared memory support
-
-### Phase 5: Advanced Features (Weeks 15-18)
+### Phase 5: Advanced Features
 - [ ] Kernel fusion
 - [ ] Auto-tuning
 - [ ] Multi-GPU support
 - [ ] Flash attention kernel
 
-### Phase 6: WebGPU Backend (Weeks 19-22)
-- [ ] WGSL code generation
-- [ ] Browser integration
-- [ ] ZynBook GPU support
+### Phase 6: Portable Backend (deferred)
+- [ ] naga IR emission from HIR (SPIR-V, WGSL, MSL writers)
+- [ ] Vulkan through `ash` on Linux
+- [ ] Browser integration and ZynBook GPU support (WGSL)
+
+Deferred because there is no discrete GPU to benchmark on, wgpu adds per-dispatch overhead that native Metal does not, and WGSL has no stable simdgroup-matrix support, so this path cannot meet the PyTorch MPS and candle Metal targets.
 
 ## Performance Targets
 
-### vs PyTorch (CUDA)
+**Superseded (2026-09-25):** the 2025-12 table of ratios against PyTorch on CUDA (1.1x matmul, 1.5x attention, 2 to 3x fused) was never measured, and no CUDA hardware is available to measure it.
 
-| Operation | ZynML Target | PyTorch |
-|-----------|--------------|---------|
-| MatMul (4096x4096) | 1.1x | 1.0x |
-| Softmax (seq=2048) | 1.0x | 1.0x |
-| Attention (BERT-base) | 1.5x | 1.0x (with Flash) |
-| Conv2d (ResNet block) | 1.0x | 1.0x |
-| Custom fused kernel | 2-3x | Manual CUDA |
+Kernels are benchmarked against:
+
+1. **PyTorch**, eager and `torch.compile`.
+2. **The Python kernel ecosystem**: numba, JAX/XLA, Taichi, numpy, and Triton where a CUDA GPU exists.
+3. **Rust's candle.**
+
+| Where | Zyntax runs | Compared against |
+|-------|-------------|------------------|
+| CPU, Mac (M1 Pro) | CPU SIMD kernels, Accelerate for GEMM | PyTorch CPU, numba, JAX, Taichi, numpy, candle CPU |
+| CPU, NUC (x86_64 Linux) | CPU SIMD kernels | PyTorch CPU, numba, JAX, Taichi, numpy, candle CPU |
+| GPU, Mac | Metal kernels, MPS for large GEMM | PyTorch MPS, candle Metal |
+| GPU, NVIDIA (when available) | PTX kernels | PyTorch CUDA, Triton, candle CUDA |
+
+Workloads: elementwise (saxpy, GELU), reductions (sum, softmax, layernorm), GEMM, convolution, attention, and LLM prefill and decode. Every row reports steady-state kernel time and time to first result (compile and JIT included), from interleaved runs with their spread. Numbers live with the benchmark results, dated, not in this document.
 
 ### Memory Efficiency
+
+Design targets, none built:
 
 | Operation | ZynML | PyTorch |
 |-----------|-------|---------|
@@ -936,4 +1009,4 @@ pipeline transformer_block(x: tensor[batch, seq, hidden], layer: int) -> tensor[
     return output
 ```
 
-This provides a complete, GPU-accelerated transformer block written entirely in ZynML!
+This is the target: a complete, GPU-accelerated transformer block written entirely in ZynML. **Status:** no part of it compiles to a kernel today; `matmul` and `fused` kernels lower to the undefined runtime dispatch described in the status section.

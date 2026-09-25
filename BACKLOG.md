@@ -1,6 +1,6 @@
 # Zyntax Compiler - Development Backlog
 
-**Last Updated**: November 27, 2025
+**Last Updated**: November 27, 2025 (GPU section revised 2026-09-25)
 **Current Status**: Production-Ready Core (100% tests passing, 71/71 Zig tests)
 
 **Recent Progress**:
@@ -232,40 +232,22 @@ No Rust compilation required for grammar users! Dynamic interpretation of JSON a
 - [ ] Implement optimization passes
 - [ ] Cross-platform testing
 
-### 3. GPU AOT Backend - NVPTX via LLVM (MEDIUM PRIORITY) 📋 PLANNING
-**Status**: Architecture documented, implementation planned for Q1-Q2 2026
-**Location**: `docs/GPU_AOT_ARCHITECTURE.md`
-**Feature Flag**: `compute` (opt-in)
+### 3. GPU Kernels (MEDIUM PRIORITY)
+**Status (2026-09-25)**: GPU code generation is not built. The Q1-Q2 2026 plan passed with no GPU work, and the `compute` feature flag it named was never added (`cargo build --features compute` fails). The direction was revised on 2026-09-25: `@kernel` is a Zyntax capability every frontend reaches through a `zyntax` module (ZynML natively, Python `from zyntax import kernel`, a Lua `zyntax` table); kernels are a typed subset with no dynamic fallback; Metal comes first on the Mac, with Accelerate/MPS for GEMM-shaped kernels; NVIDIA goes through LLVM NVPTX and a `cudarc` driver binding.
 
-**Goal**: Compile GPU kernels from HIR to NVPTX via LLVM IR for high-performance compute workloads (ZynML, QuantDSL, ImagePipe).
+**Built**: ZynML `compute()` grammar, `@kernel elementwise` for one in-place shape and a partial `@kernel reduce`, on CPU SIMD through HIR vectors on all four backends.
 
-**Key Features**:
-- NVPTX target via LLVM (`nvptx64-nvidia-cuda`)
-- GPU primitives in HIR (ThreadIdx, BlockIdx, SyncThreads, SharedMemAlloc, WarpShuffle)
-- Kernel metadata in TypedAST (@kernel, @device, @workgroup annotations)
-- Critical path CPU optimizations for ultra-low-latency execution
-- CUDA driver runtime integration
+**Design**:
+- [GPU AOT Architecture](docs/GPU_AOT_ARCHITECTURE.md) - NVIDIA design, status and direction
+- [GPU Compute System](docs/ml-dsl-plans/09-gpu-compute-system.md) - kernel surface, Metal design, benchmark plan
+- [ZynML Unified DSL](docs/ml-dsl-plans/00-unified-ml-dsl.md) - DSL with compute() target syntax
 
-**Building with GPU Support**:
-```bash
-cargo build --release --features compute
-```
-
-**Implementation Phases**:
-
-| Phase | Description | Effort |
-|-------|-------------|--------|
-| Phase 1 | TypedAST kernel metadata, HIR GPU primitives, NVPTX target setup | 3 weeks |
-| Phase 2 | Thread indexing, synchronization, shared memory, atomics, warp ops | 3 weeks |
-| Phase 3 | Tensor cores, async copy, critical path optimizer, SIMD codegen | 3 weeks |
-| Phase 4 | CUDA runtime, memory pool, unified memory, DSL integration | 3 weeks |
-
-**Milestone**: End-to-end ZynML `compute()` working with GPU by Q2 2026.
-
-**Related Docs**:
-- [GPU AOT Architecture](docs/GPU_AOT_ARCHITECTURE.md) - Full technical specification
-- [ZynML Unified DSL](docs/ml-dsl-plans/00-unified-ml-dsl.md) - DSL with compute() syntax
-- [GPU Compute System](docs/ml-dsl-plans/09-gpu-compute-system.md) - Compute IR design
+**Work items** live in git-bug (`git-bug bug show <id>`):
+- `13983a22693b250bbf4b91f5dca193b3ba0df4bbc094722791e0d3c7cf170811` unmatched `compute()` bodies call an undefined runtime function
+- `ab79beb59e7f172037869210d65eb668770a80c9099ddfc7dc373e3d6e796988` `@kernel reduce` returns the last yield
+- `a127ddefe45d10932af8f3b2d4816181ce0d2d40ba3ddcc6465976286d00b2bf` compute modifiers are parsed and never read
+- `77df2243b3427cedf9c0e9c5f79f88efd67a61f842ca54ba845f44065c95e3cb` elementwise kernel loop hard-codes 4 lanes
+- `4eb2f34e13c8a37737b22e0b241a03d66d5deaee863217dd5c5efe85c25c02f5` GPU backends and the `zyntax` kernel module
 
 ### 4. Bytecode Interpreter (LOW PRIORITY)
 **Status**: Specification complete
@@ -605,7 +587,7 @@ Stack-unwinding exceptions for Haxe/Java-style languages. Required for Reflaxe i
 | **HIGH** | Ecosystem | Reflaxe/Haxe Integration | 3-4 weeks | Massive |
 | **HIGH** | Testing | Fix remaining 4 test failures | 1-2 days | High |
 | **MEDIUM** | Compiler | LLVM AOT Backend (CPU) | 2 weeks | High |
-| **MEDIUM** | Compiler | GPU AOT Backend (NVPTX) | 12 weeks | High |
+| **MEDIUM** | Compiler | GPU kernels (Metal first, then NVPTX); see section 3 | Not estimated | High |
 | **MEDIUM** | Language | Exception Handling | 1 week | Medium |
 | **MEDIUM** | Stdlib | I/O and File System | 1-2 weeks | High |
 | **LOW** | Tooling | LSP Support | 2-3 weeks | Medium |
@@ -630,7 +612,7 @@ Stack-unwinding exceptions for Haxe/Java-style languages. Required for Reflaxe i
 ### Milestone 2: Production Features (Q1 2026)
 
 - LLVM AOT backend completion (CPU)
-- GPU AOT backend Phase 1-2 (NVPTX target, HIR primitives)
+- ~~GPU AOT backend Phase 1-2 (NVPTX target, HIR primitives)~~ (not done; superseded 2026-09-25, see section 3)
 - Exception handling (try/catch/finally)
 - Complete I/O and networking stdlib
 - Advanced pattern matching
@@ -639,8 +621,8 @@ Stack-unwinding exceptions for Haxe/Java-style languages. Required for Reflaxe i
 ### Milestone 3: Ecosystem & GPU Integration (Q2 2026)
 
 - Complete Reflaxe/Haxe integration
-- GPU AOT backend Phase 3-4 (tensor cores, CUDA runtime, DSL integration)
-- ZynML `compute()` end-to-end working with GPU
+- ~~GPU AOT backend Phase 3-4 (tensor cores, CUDA runtime, DSL integration)~~ (not done; superseded 2026-09-25, see section 3)
+- ~~ZynML `compute()` end-to-end working with GPU~~ (not done; superseded 2026-09-25, see section 3)
 - Run 100+ Haxe projects through Zyntax
 - Performance benchmarks vs other targets
 - 100% test pass rate

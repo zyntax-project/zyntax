@@ -1,139 +1,139 @@
 # GPU AOT Architecture: NVPTX via LLVM IR
 
-**Status**: 📋 Planning
-**Target**: Q1-Q2 2026
-**Dependencies**: LLVM Backend, HIR Extensions, TypedAST Kernel Metadata
-**Feature Flag**: `compute`
+**Status**: Not built; direction revised 2026-09-25
+**Dependencies**: LLVM Backend (`llvm-backend` feature), HIR first-class vectors, kernel typing
+**Feature Flag**: none today. PTX emission rides `llvm-backend`; the CUDA driver binding will be its own opt-in feature (see Feature Flag below)
+
+---
+
+## Status and direction (September 2026)
+
+Checked against the code on 2026-09-25 (HEAD `a900deba`). This document is the NVIDIA design. The Apple (Metal) path, the kernel surface and the benchmark plan are in [09-gpu-compute-system.md](ml-dsl-plans/09-gpu-compute-system.md); the two share this section's decisions. Where a section below no longer holds it carries a **Superseded** or **Status** note in place.
+
+### Built
+
+- ZynML `compute(args) @modifiers { block }` grammar (`crates/zynml/ml.zyn`, `compute_expr`), lowered in `crates/compiler/src/ssa.rs`.
+- `@kernel elementwise` for one shape: `for i in r { arr[i] = arr[i] OP scalar }` over a compute argument, lowered by `emit_elementwise_simd_loop` to a 4-lane vector loop with a scalar remainder.
+- `@kernel reduce`, partially: with a `yield` directly in the body, the result is the last yielded value. Nothing accumulates yet.
+- First-class `HirType::Vector` and the HIR vector instructions, lowered natively on Cranelift, LLVM, wasm and the interpreter. Host vector width comes from `target_vector.rs`; the `auto_vectorize`, `loop_vectorize` and `reduction_vectorize` passes vectorize ordinary loops.
+- Parallel loops (`parallel_safe.rs`, `parallel_dispatch.rs`), off unless `ZYNTAX_PARALLEL_LOOPS=1`, and not tied to `compute()`.
+
+### Not built
+
+- GPU code generation of any kind: no NVPTX, MSL, SPIR-V or WGSL emission, no GPU runtime, no driver binding. The LLVM tier initializes only the host target. The one GPU name in the tree is the unused `LoweringTarget::Nvptx` variant in `pattern_engine`.
+- No `compute` Cargo feature, and none of the typed-AST or HIR kernel types in Parts 1 and 2.
+- `@device`, `@workgroup` and `@kernel(x)` modifiers are parsed into `TypedComputeExpr` and never read. Kernel bodies are not type checked.
+- A `compute()` body outside the recognised shapes lowers to a call of `$Zyntax$compute`, which is not defined anywhere. That is a bug, not a design (see Tracking).
+- No `zyntax` module in the Python or Lua frontends.
+
+### Decided direction
+
+1. **Kernels are a Zyntax capability, not a ZynML feature.** Fibers, effects, handlers and kernels reach every language through a `zyntax` module in that language's idiom: Python `from zyntax import kernel`, a `zyntax` table in Lua, ZynML natively through `compute()` and `@kernel`. The module is opt-in, and surfaces that only zypy provides need no CPython support. The compiler side (kernel lowering from HIR, backends, runtime) is language-neutral, so each frontend only maps its typed subset onto HIR.
+2. **Kernels are a typed subset.** A kernel body types to fixed-width scalars, vectors and buffers. Dynamic code inside a kernel is a compile error that names what is unsupported; it never falls back to a runtime dispatch or to boxed values.
+3. **HIR is the kernel IR.** Kernel bodies lower to HIR with first-class vectors, and every GPU backend lowers from HIR. There is no separate compute IR.
+4. **Apple first, through Metal.** The Mac (M1 Pro) is the only GPU available to test on. Metal Shading Language is generated from HIR and compiled at run time by the Metal framework, which needs no Xcode, Metal toolchain or C compiler on the user's machine. GEMM-shaped kernels dispatch to Accelerate (AMX) for small and medium sizes and to MPS for large ones, following the `zrtl_tensor` decision that FFI exists only for system accelerators generated code cannot reach. Design in 09-gpu-compute-system.md.
+5. **NVIDIA through LLVM NVPTX.** HIR goes to LLVM IR on the existing LLVM 21 backend, then through an in-process NVPTX target machine (`nvptx64-nvidia-cuda`, `sm_80` floor) to PTX, which the CUDA driver JIT-compiles on load. The driver binding is `cudarc` with dynamic loading, behind an opt-in feature. Tile-level kernels (GEMM, attention, fused norms) get a second lowering to CUDA Tile IR bytecode through `cutile-ir` once the SIMT path works. Why: the NVPTX target is already linked (inkwell's default `target-all`), emitting PTX needs no CUDA toolkit, and NVIDIA's own `cuda-oxide` ends in the same LLVM NVPTX backend. What CUDA Rust contributes is in Part 5, "NVIDIA CUDA Rust (2026-09-08)".
+6. **The portable path is deferred.** Vulkan and WebGPU wait: there is no discrete GPU to benchmark on, wgpu adds per-dispatch API overhead native Metal does not have, and WGSL has no stable simdgroup-matrix support. When the path is taken up, HIR lowers to naga IR (one emitter for SPIR-V, WGSL and MSL) and Linux runs Vulkan through `ash`. LLVM's `spirv64` target is not the route: it emits OpenCL-flavour SPIR-V, which Vulkan rejects.
+7. **Benchmarks.** Kernels are measured against PyTorch (eager and `torch.compile`), then the Python kernel ecosystem (numba, JAX/XLA, Taichi, numpy, and Triton where a CUDA GPU exists), then Rust's candle. CPU on the Mac (M1 Pro) and the NUC (x86_64 Linux); GPU on the Mac through Metal against PyTorch MPS and candle Metal. Steady-state kernel time and time to first result (compile included) are both reported. Workloads: elementwise (saxpy, GELU), reductions (sum, softmax, layernorm), GEMM, convolution, attention, and LLM prefill and decode.
+
+Open: whether GEMM-shaped kernels on NVIDIA dispatch to cuBLAS/cuBLASLt (through `cudarc`'s dynamic loading) the way they dispatch to Accelerate on Apple. Not decided.
+
+### Test hardware
+
+Neither the Mac nor the NUC (Intel Iris Xe graphics) has an NVIDIA GPU (checked 2026-09-25). Emitted PTX and Tile IR are golden-tested on both machines, since LLVM emits PTX without a GPU. Executing NVIDIA kernels and running the CUDA benchmarks needs an `sm_80` or newer Linux machine.
+
+### Tracking
+
+git-bug issues (show with `git-bug bug show <id>`):
+
+- `13983a22693b250bbf4b91f5dca193b3ba0df4bbc094722791e0d3c7cf170811`: unmatched `compute()` bodies call the undefined `$Zyntax$compute`.
+- `ab79beb59e7f172037869210d65eb668770a80c9099ddfc7dc373e3d6e796988`: `@kernel reduce` returns the last yield.
+- `a127ddefe45d10932af8f3b2d4816181ce0d2d40ba3ddcc6465976286d00b2bf`: compute modifiers are parsed and never read.
+- `77df2243b3427cedf9c0e9c5f79f88efd67a61f842ca54ba845f44065c95e3cb`: the elementwise loop hard-codes 4 lanes.
+- `4eb2f34e13c8a37737b22e0b241a03d66d5deaee863217dd5c5efe85c25c02f5`: GPU backends and the `zyntax` kernel module.
 
 ---
 
 ## Executive Summary
 
-This document describes the architecture for adding GPU compute support to Zyntax via NVPTX (NVIDIA PTX) code generation through LLVM IR. The design extends the existing LLVM backend to emit GPU kernels alongside CPU code, enabling high-performance compute workloads for DSLs like QuantDSL, ZynML, and ImagePipe.
+This document describes the architecture for adding GPU compute support to Zyntax via NVPTX (NVIDIA PTX) code generation through LLVM IR. The design extends the existing LLVM backend to emit GPU kernels alongside CPU code, for kernels written in any Zyntax frontend: ZynML natively, and Python and Lua through the `zyntax` module.
 
 **Key Goals:**
 - Compile GPU kernels from HIR to NVPTX via LLVM IR
-- Zero-allocation critical CPU paths for ultra-low-latency execution
-- First-class GPU primitives in TypedAST and HIR
+- ~~Zero-allocation critical CPU paths for ultra-low-latency execution~~ (superseded: out of GPU scope, see Part 4)
+- GPU primitives in HIR, fed by kernel typing of the frontend's typed subset
 - Seamless integration with existing tiered JIT compilation
 - Support for heterogeneous CPU+GPU workloads
 
 ---
 
-## Feature Flag: `compute`
+## Feature Flag
 
-GPU compute support is **opt-in** via the `compute` Cargo feature flag. This keeps the default build lightweight and avoids CUDA/LLVM dependencies for users who don't need GPU support.
+**Superseded (2026-09-25).** The 2025-12 plan was a `compute` feature pulling in `cuda-sys` and an `llvm-sys/nvptx` feature. Neither exists: `llvm-sys` has no `nvptx` feature, `cuda-sys` 0.3 is obsolete, and no `compute` feature was ever added. The plan below replaces it.
 
-### Building with GPU Compute Support
+PTX emission needs no new feature. The compiler already depends on inkwell 0.7.1 with `llvm21-1` and default features on (`crates/compiler/Cargo.toml`, under `llvm-backend`). inkwell's default `target-all` includes `target-nvptx`, so `Target::initialize_nvptx` is available in every `llvm-backend` build. PTX is text and can be emitted, verified and golden-tested on any machine.
 
-```bash
-# Build compiler with GPU compute support
-cargo build --release -p zyntax_compiler --features compute
-
-# Build CLI with GPU compute support
-cargo build --release -p zyntax_cli --features compute
-
-# Build embed runtime with GPU compute support
-cargo build --release -p zyntax_embed --features compute
-
-# Build all crates with GPU compute support
-cargo build --release --features compute
-
-# Run tests with GPU compute support
-cargo test --features compute
-```
-
-### Cargo.toml Configuration
+Loading and launching PTX needs a CUDA driver binding, which is the only new opt-in:
 
 ```toml
-# In crates/zyntax_compiler/Cargo.toml
+# crates/compiler/Cargo.toml (package zyntax_compiler), planned
 [features]
-default = []
-compute = ["cuda-sys", "llvm-sys/nvptx"]
+cuda = ["llvm-backend", "dep:cudarc"]
 
 [dependencies]
-cuda-sys = { version = "0.3", optional = true }
-
-# In crates/zyntax_cli/Cargo.toml
-[features]
-default = []
-compute = ["zyntax_compiler/compute"]
-
-# In crates/zyntax_embed/Cargo.toml
-[features]
-default = []
-compute = ["zyntax_compiler/compute"]
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12090"] }
 ```
+
+`cudarc` with `dynamic-loading` needs no CUDA library at build time; it ships pregenerated bindings and `dlopen`s `libcuda` at run time. The feature therefore builds on macOS and on machines without CUDA, and a build with it runs everywhere, reporting "no CUDA driver" where there is none. The exact `cuda-NNNNN` binding set is chosen when the backend is built (versions as of 2026-09-25).
 
 ### Conditional Compilation
 
-All GPU-related code is gated behind `#[cfg(feature = "compute")]`:
+The NVPTX emitter compiles under `llvm-backend`; only the runtime is gated on `cuda`:
 
 ```rust
-// In crates/compiler/src/lib.rs
-#[cfg(feature = "compute")]
-pub mod llvm_nvptx_backend;
+// In crates/compiler/src/lib.rs (planned)
+#[cfg(feature = "llvm-backend")]
+pub mod llvm_nvptx_backend;   // HIR -> PTX text
 
-#[cfg(feature = "compute")]
-pub mod cuda_runtime;
-
-#[cfg(feature = "compute")]
-pub mod cuda_memory;
-
-// GPU instructions are always defined in HIR (for type checking)
-// but only compiled when the feature is enabled
-impl HirInstruction {
-    #[cfg(not(feature = "compute"))]
-    pub fn is_gpu_instruction(&self) -> bool {
-        false
-    }
-
-    #[cfg(feature = "compute")]
-    pub fn is_gpu_instruction(&self) -> bool {
-        matches!(self,
-            HirInstruction::ThreadIdx { .. } |
-            HirInstruction::BlockIdx { .. } |
-            HirInstruction::SyncThreads |
-            // ... other GPU instructions
-        )
-    }
-}
+#[cfg(feature = "cuda")]
+pub mod cuda_runtime;         // PTX load, buffers, launch
 ```
+
+**Status:** none of these modules exist, and HIR has no GPU instructions. The 2025-12 text here said "GPU instructions are always defined in HIR" and sketched `HirInstruction::is_gpu_instruction`; neither exists.
 
 ### Runtime Detection
 
-When the `compute` feature is enabled, the runtime checks for CUDA availability:
+With the `cuda` feature, the runtime asks the driver for a device and reports its absence as a developer-facing error, never by silently running the kernel elsewhere:
 
 ```rust
-#[cfg(feature = "compute")]
-pub fn gpu_available() -> bool {
-    CudaRuntime::new().is_ok()
+#[cfg(feature = "cuda")]
+pub fn cuda_available() -> bool {
+    cudarc::driver::CudaContext::new(0).is_ok()
 }
 
-#[cfg(not(feature = "compute"))]
-pub fn gpu_available() -> bool {
+#[cfg(not(feature = "cuda"))]
+pub fn cuda_available() -> bool {
     false
 }
 ```
 
 ### CLI Usage
 
-```bash
-# Without compute feature: GPU backends are not available
-zyntax compile --backend llvm source.zyn  # CPU only
+**Status:** the CLI accepts only `cranelift` and `llvm` backends (`crates/zyntax_cli/src/backends/mod.rs`). The planned GPU flags are:
 
-# With compute feature: GPU backends are available
-zyntax compile --backend nvptx source.zyn  # Compiles to PTX
-zyntax compile --backend cuda source.zyn   # Compiles and runs on GPU
+```bash
+# Emit PTX for inspection (llvm-backend build)
+zyntax compile --backend nvptx source.zyn
+
+# Compile and run kernels on an NVIDIA GPU (cuda feature)
+zyntax compile --backend cuda source.zyn
 ```
 
 ### Why Opt-In?
 
-1. **Binary Size**: CUDA runtime and LLVM NVPTX support add ~50MB to binary size
-2. **Build Dependencies**: Requires CUDA Toolkit installed on build machine
-3. **Runtime Dependencies**: Requires NVIDIA driver and CUDA runtime on target machine
-4. **Build Time**: LLVM with NVPTX target significantly increases compile time
-5. **Portability**: Default build works everywhere without GPU dependencies
+1. **Runtime dependency**: launching kernels needs the NVIDIA driver (`libcuda`) on the target machine. PTX emission does not, and the build machine needs neither the CUDA toolkit nor extra LLVM targets.
+2. **Platform**: CUDA runs on Linux (and Windows) with `sm_80` or newer for the paths this design uses; the Mac and the NUC cannot execute it.
+3. **Portability**: the default build carries no GPU runtime code.
 
 ---
 
@@ -142,7 +142,7 @@ zyntax compile --backend cuda source.zyn   # Compiles and runs on GPU
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           Language Frontends                                 │
-│                    (ZynML, QuantDSL, ImagePipe, etc.)                       │
+│        (ZynML natively; Python, Lua via the `zyntax` kernel module)          │
 └────────────────────────────────┬────────────────────────────────────────────┘
                                  │
                                  ▼
@@ -191,14 +191,14 @@ zyntax compile --backend cuda source.zyn   # Compiles and runs on GPU
 │                                  │  │                                  │
 │  ┌────────────────────────────┐  │  │  ┌────────────────────────────┐  │
 │  │ Cranelift JIT              │  │  │  │ LLVM NVPTX Backend         │  │
-│  │  • Tier 0/1 baseline       │  │  │  │  • Target: nvptx64-nvidia  │  │
+│  │  • Baseline tier           │  │  │  │  • Target: nvptx64-nvidia  │  │
 │  │  • Fast compilation        │  │  │  │  • PTX emission            │  │
 │  │  • Low-latency paths       │  │  │  │  • Kernel metadata         │  │
 │  └────────────────────────────┘  │  │  └────────────────────────────┘  │
 │  ┌────────────────────────────┐  │  │  ┌────────────────────────────┐  │
 │  │ LLVM x86/ARM Backend       │  │  │  │ CUDA Driver Runtime        │  │
-│  │  • Tier 2 hot paths        │  │  │  │  • Kernel loading          │  │
-│  │  • Critical path opts      │  │  │  │  • Memory management       │  │
+│  │  • Optimized tier          │  │  │  │  • Kernel loading          │  │
+│  │  • Vectorization passes    │  │  │  │  • Memory management       │  │
 │  │  • SIMD vectorization      │  │  │  │  • Stream synchronization  │  │
 │  └────────────────────────────┘  │  │  └────────────────────────────┘  │
 └──────────────────────────────────┘  └──────────────────────────────────┘
@@ -213,9 +213,13 @@ zyntax compile --backend cuda source.zyn   # Compiles and runs on GPU
               └──────────────────────────────────┘
 ```
 
+**Status:** layers 1 and 2 describe planned additions; none of their types exist. The tier ladder today is interpreter, then Cranelift (`OptimizationTier::Baseline`), then LLVM (`Optimized`), in `crates/compiler/src/tiered_backend.rs`. CPU SIMD is HIR `Vector` instructions lowered by every backend, not a Cranelift-only path.
+
 ---
 
 ## Part 1: TypedAST Kernel Metadata Extensions
+
+**Status (2026-09-25): not built.** `KernelMetadata`, `ExecutionConstraints`, `CompileTarget`, `DeviceTarget`, `TensorShape`, `AddressSpace` and the GPU type variants below do not exist. `TypedFunction` carries only generic `annotations`, and nothing reads a function-level `@kernel`. The kernel metadata that does exist sits on the expression: `TypedComputeExpr { args, modifiers, kernel_attrs, body }` in `crates/typed_ast/src/typed_ast.rs`, built by the zyn_peg interpreter, and no pass reads `modifiers` or `kernel_attrs` yet. Kernel metadata will come from typing the kernel subset each frontend hands over (ZynML `compute()`, Python and Lua `@kernel` through the `zyntax` module), so the shapes below are a sketch of what that typing must record, not a fixed API.
 
 ### 1.1 Kernel Annotation System
 
@@ -273,15 +277,15 @@ pub enum KernelType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceTarget {
-    /// CPU execution (fallback or SIMD)
+    /// CPU execution (SIMD vectors, parallel loops)
     Cpu,
     /// NVIDIA GPU via CUDA/PTX
     Cuda { compute_capability: (u32, u32) },
     /// AMD GPU via ROCm/HIP
     Rocm,
-    /// Apple GPU via Metal
+    /// Apple GPU via Metal (MSL source, not LLVM; see 09-gpu-compute-system.md)
     Metal,
-    /// Vulkan compute (cross-platform)
+    /// Vulkan compute (deferred; Vulkan SPIR-V, not LLVM's OpenCL-flavour spirv64)
     Vulkan,
     /// Automatic device selection
     Auto,
@@ -304,7 +308,9 @@ pub struct KernelHints {
 
 ### 1.2 Critical Path Annotations
 
-For ultra-low-latency CPU code (e.g., order execution in QuantDSL):
+**Superseded (2026-09-25):** low-latency CPU constraints are out of GPU scope and not planned here. Kept for reference.
+
+For ultra-low-latency CPU code:
 
 ```rust
 /// Execution path constraints for low-latency code
@@ -420,6 +426,8 @@ pub enum AddressSpace {
 ---
 
 ## Part 2: HIR GPU Primitives
+
+**Status (2026-09-25): not built.** `HirInstruction` has no GPU variants, and `HirFunction` has no `kernel_info` and `HirModule` no `gpu_metadata` (see the struct definitions in `crates/compiler/src/hir.rs`). What HIR does have is first-class vectors: `HirType::Vector(elem, lanes)` and the vector instructions (splat, lane extract and insert, horizontal reduce, load, store, unary, min/max, dot), lowered natively on Cranelift, LLVM, wasm and the interpreter. The GPU primitives below extend that HIR; they are the design, and HIR remains the one kernel IR every GPU backend (NVPTX here, MSL in 09-gpu-compute-system.md) lowers from.
 
 ### 2.1 GPU Instruction Set
 
@@ -804,8 +812,9 @@ pub struct GpuModuleMetadata {
     /// Target GPU architectures
     pub target_archs: Vec<GpuArch>,
 
-    /// PTX version to emit
-    pub ptx_version: (u32, u32),  // e.g., (7, 5) for PTX 7.5
+    /// Minimum PTX version, if a feature needs more than the SM's floor.
+    /// Normally None: LLVM picks the minimum PTX ISA for the chosen SM.
+    pub ptx_version: Option<(u32, u32)>,
 
     /// CUDA compute capability
     pub compute_capability: (u32, u32),  // e.g., (8, 0) for sm_80
@@ -828,6 +837,13 @@ pub struct GpuModuleMetadata {
 
 ## Part 3: LLVM NVPTX Backend
 
+**Status (2026-09-25): not built; the approach holds.** Checked with the LLVM the compiler links (21.1.8) and no CUDA toolkit installed: an `nvptx64-nvidia-cuda` module compiles to PTX (`.target sm_80`). The code below is updated for LLVM 21:
+
+- Kernels are marked with the `ptx_kernel` calling convention alone. The `!nvvm.annotations` `"kernel"` entry is a legacy form LLVM only auto-upgrades.
+- Launch bounds are function attributes: `"nvvm.maxntid"`, `"nvvm.reqntid"`, `"nvvm.minctasm"` and `"nvvm.maxnreg"`. The old `"maxntidx"` annotation is upgraded to `"nvvm.maxntid"`.
+- The PTX version is not hand-mapped. LLVM chooses the minimum PTX ISA for the SM (`sm_89` gets PTX 7.8 even when `+ptx75` is requested). The 2025-12 table here mapped `sm_89` to PTX 7.5, sent Blackwell to PTX 6.0 and included Volta. Pass `+ptxNN` only when a feature needs a newer ISA than the SM's floor; PTX 9.0 targets need LLVM 22.
+- `sm_80` is the floor, matching NVIDIA's CUDA Rust tracks.
+
 ### 3.1 Target Initialization
 
 ```rust
@@ -845,22 +861,8 @@ pub struct NvptxBackend<'ctx> {
     /// NVPTX target machine
     target_machine: TargetMachine,
 
-    /// Compute capability (e.g., 80 for sm_80)
+    /// Compute capability (e.g., 80 for sm_80; 80 is the floor)
     compute_capability: u32,
-
-    /// PTX version (e.g., 75 for ptx75)
-    ptx_version: u32,
-
-    /// Kernel metadata for nvvm annotations
-    kernel_metadata: Vec<KernelNvvmAnnotation>,
-}
-
-#[derive(Debug, Clone)]
-struct KernelNvvmAnnotation {
-    function_name: String,
-    is_kernel: bool,
-    max_threads: Option<u32>,
-    min_blocks: Option<u32>,
 }
 
 impl<'ctx> NvptxBackend<'ctx> {
@@ -877,23 +879,23 @@ impl<'ctx> NvptxBackend<'ctx> {
         let target = Target::from_triple(&triple)
             .map_err(|e| CompilerError::CodeGen(format!("NVPTX target error: {}", e)))?;
 
-        // Determine PTX version from compute capability
-        let ptx_version = match compute_capability {
-            80..=89 => 75,  // Ampere: PTX 7.5
-            90..=99 => 80,  // Hopper: PTX 8.0
-            70..=79 => 63,  // Volta: PTX 6.3
-            _ => 60,        // Default: PTX 6.0
-        };
+        if compute_capability < 80 {
+            return Err(CompilerError::CodeGen(format!(
+                "NVPTX backend needs compute capability 8.0 or newer, got sm_{}",
+                compute_capability
+            )));
+        }
 
-        // Create target machine
+        // Create target machine. No +ptxNN feature: LLVM selects the
+        // minimum PTX ISA that supports the chosen SM.
         let cpu = format!("sm_{}", compute_capability);
-        let features = format!("+ptx{}", ptx_version);
+        let features = "";
 
         let target_machine = target
             .create_target_machine(
                 &triple,
                 &cpu,
-                &features,
+                features,
                 OptimizationLevel::Aggressive,
                 RelocMode::Default,
                 CodeModel::Default,
@@ -907,8 +909,6 @@ impl<'ctx> NvptxBackend<'ctx> {
             base,
             target_machine,
             compute_capability,
-            ptx_version,
-            kernel_metadata: Vec::new(),
         })
     }
 
@@ -916,9 +916,6 @@ impl<'ctx> NvptxBackend<'ctx> {
     pub fn compile_to_ptx(&mut self, hir_module: &HirModule) -> CompilerResult<String> {
         // Compile HIR to LLVM IR using base backend
         self.compile_module(hir_module)?;
-
-        // Add NVVM kernel annotations
-        self.add_nvvm_annotations()?;
 
         // Set correct data layout and triple
         self.set_nvptx_metadata()?;
@@ -955,18 +952,16 @@ impl<'ctx> NvptxBackend<'ctx> {
         // Create function with correct calling convention for kernels
         let fn_value = self.base.declare_function(id, func)?;
 
-        // Set NVPTX kernel calling convention
+        // The ptx_kernel calling convention is what marks a kernel entry
         fn_value.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMPTXKernelCallConv as u32);
 
-        // Record for nvvm.annotations
-        self.kernel_metadata.push(KernelNvvmAnnotation {
-            function_name: func.name.resolve_global().unwrap_or_default(),
-            is_kernel: true,
-            max_threads: func.kernel_info.as_ref()
-                .and_then(|k| k.launch_bounds.map(|b| b.max_threads_per_block)),
-            min_blocks: func.kernel_info.as_ref()
-                .and_then(|k| k.launch_bounds.and_then(|b| b.min_blocks_per_sm)),
-        });
+        // Launch bounds are string function attributes
+        if let Some(bounds) = func.kernel_info.as_ref().and_then(|k| k.launch_bounds) {
+            self.add_launch_bound(fn_value, "nvvm.maxntid", bounds.max_threads_per_block);
+            if let Some(min_blocks) = bounds.min_blocks_per_sm {
+                self.add_launch_bound(fn_value, "nvvm.minctasm", min_blocks);
+            }
+        }
 
         // Compile function body with GPU instruction support
         self.compile_function_body(id, func)?;
@@ -974,37 +969,10 @@ impl<'ctx> NvptxBackend<'ctx> {
         Ok(())
     }
 
-    fn add_nvvm_annotations(&mut self) -> CompilerResult<()> {
-        let module = self.base.module();
-        let context = module.get_context();
-
-        // Create nvvm.annotations metadata
-        for annotation in &self.kernel_metadata {
-            // Get function
-            if let Some(func) = module.get_function(&annotation.function_name) {
-                // Create metadata: !{ptr @func, !"kernel", i32 1}
-                let kernel_md = context.metadata_node(&[
-                    func.as_global_value().as_pointer_value().into(),
-                    context.metadata_string("kernel").into(),
-                    context.i32_type().const_int(1, false).into(),
-                ]);
-
-                // Add to nvvm.annotations
-                module.add_named_metadata("nvvm.annotations", &kernel_md);
-
-                // Add maxntidx if specified
-                if let Some(max_threads) = annotation.max_threads {
-                    let maxntid_md = context.metadata_node(&[
-                        func.as_global_value().as_pointer_value().into(),
-                        context.metadata_string("maxntidx").into(),
-                        context.i32_type().const_int(max_threads as u64, false).into(),
-                    ]);
-                    module.add_named_metadata("nvvm.annotations", &maxntid_md);
-                }
-            }
-        }
-
-        Ok(())
+    fn add_launch_bound(&self, fn_value: FunctionValue<'ctx>, key: &str, value: u32) {
+        let context = self.base.module().get_context();
+        let attr = context.create_string_attribute(key, &value.to_string());
+        fn_value.add_attribute(AttributeLoc::Function, attr);
     }
 
     fn set_nvptx_metadata(&mut self) -> CompilerResult<()> {
@@ -1149,14 +1117,20 @@ impl<'ctx> NvptxBackend<'ctx> {
     }
 
     fn compile_sync_threads(&mut self) -> CompilerResult<()> {
-        // llvm.nvvm.barrier0
+        // __syncthreads: LLVM 21 names it llvm.nvvm.barrier.cta.sync.aligned.all
+        // (barrier 0); llvm.nvvm.barrier0 is only auto-upgraded to it.
         let context = self.base.context;
         let void_ty = context.void_type();
+        let i32_ty = context.i32_type();
 
-        let intrinsic_ty = void_ty.fn_type(&[], false);
-        let intrinsic = self.base.module().add_function("llvm.nvvm.barrier0", intrinsic_ty, None);
+        let intrinsic_ty = void_ty.fn_type(&[i32_ty.into()], false);
+        let intrinsic = self.base.module().add_function(
+            "llvm.nvvm.barrier.cta.sync.aligned.all",
+            intrinsic_ty,
+            None,
+        );
 
-        self.base.builder.build_call(intrinsic, &[], "")?;
+        self.base.builder.build_call(intrinsic, &[i32_ty.const_zero().into()], "")?;
         Ok(())
     }
 
@@ -1219,12 +1193,15 @@ impl<'ctx> NvptxBackend<'ctx> {
             _ => return Err(CompilerError::CodeGen("Unsupported GPU atomic op".into())),
         };
 
-        // Use appropriate memory ordering based on scope
-        let ordering = match scope {
-            GpuAtomicScope::Block => LLVMAtomicOrdering::LLVMAcquireRelease,
-            GpuAtomicScope::Device => LLVMAtomicOrdering::LLVMSequentiallyConsistent,
-            GpuAtomicScope::System => LLVMAtomicOrdering::LLVMSequentiallyConsistent,
+        // Scope and ordering are independent in LLVM NVPTX: scope is a
+        // syncscope ("block", "device", or the default system scope),
+        // ordering is the atomic's own memory order.
+        let syncscope = match scope {
+            GpuAtomicScope::Block => "block",
+            GpuAtomicScope::Device => "device",
+            GpuAtomicScope::System => "",
         };
+        let ordering = LLVMAtomicOrdering::LLVMMonotonic; // relaxed unless the HIR op asks for more
 
         let result_val = self.base.builder.build_atomicrmw(
             rmw_op,
@@ -1232,6 +1209,9 @@ impl<'ctx> NvptxBackend<'ctx> {
             val.into_int_value(),
             ordering,
         )?;
+        // inkwell has no syncscope argument; set it through llvm-sys
+        // (LLVMSetAtomicSyncScopeID with LLVMGetSyncScopeID(syncscope)).
+        self.set_sync_scope(result_val, syncscope);
 
         self.base.value_map.insert(result, result_val.into());
         Ok(())
@@ -1289,9 +1269,11 @@ impl<'ctx> NvptxBackend<'ctx> {
 
 ## Part 4: Low-Latency CPU Backend Optimizations
 
+**Superseded (2026-09-25).** None of this part was built, and it is out of GPU scope. `CriticalPathOptimizer`, `compile_critical_path` and `SimdCodegen` do not exist, and the legacy per-pass `PassManager::add_*_pass` calls in 4.2 are gone in LLVM 21, which has only the new pass manager. CPU SIMD for kernels is covered by what is built instead: HIR `Vector` instructions on every backend, host width from `TargetVector::host` (`crates/compiler/src/target_vector.rs`), and the `auto_vectorize`, `loop_vectorize`, `reduction_vectorize` and `fma_contract` passes. The text is kept for reference only.
+
 ### 4.1 Critical Path Compiler Mode
 
-For ultra-low-latency execution (e.g., QuantDSL order execution):
+For ultra-low-latency execution:
 
 ```rust
 // In crates/compiler/src/critical_path.rs
@@ -1593,6 +1575,41 @@ impl SimdCodegen {
 ---
 
 ## Part 5: CUDA Driver Runtime Integration
+
+**Status (2026-09-25): not built. The driver binding is decided (5.0); the hand-written wrapper in 5.1 and 5.2 is superseded by it** and kept only as a map of the responsibilities the runtime carries (module cache, streams, memory pool).
+
+### 5.0 Driver binding: cudarc
+
+The runtime uses `cudarc` (MIT OR Apache-2.0) with `dynamic-loading`, behind the `cuda` feature:
+
+- **Context**: `CudaContext::new(ordinal)`, which retains the device's primary context. Do not call `cuCtxCreate` directly; it exists in several versioned driver entry points.
+- **Module load**: PTX text from the NVPTX backend (or a cubin, or a Tile IR bytecode image) through `CudaContext::load_module`, backed by `cuModuleLoadData`. The driver JIT-compiles PTX on load, so no toolkit is needed at run time.
+- **Function lookup**: `CudaModule::load_function(name)`.
+- **Launch**: the raw `result::launch_kernel(f, grid, block, smem, stream, &mut [*mut c_void])`, with the argument array built from the kernel's HIR signature. The typed `launch_builder` is for hand-written host code.
+- **Libraries**: `cudarc` wraps cuBLAS and cuBLASLt under the same loading model, should the cuBLAS question in the status section be settled in its favour.
+
+Why `cudarc`: it builds on macOS and on machines without CUDA (pregenerated bindings for CUDA 11.4 through 13.x), needs only `libcuda` at run time, and its load and launch API has the same shape as NVIDIA's `cuda_core`, so a later switch is cheap.
+
+### 5.0.1 NVIDIA CUDA Rust (2026-09-08)
+
+NVIDIA announced CUDA Rust on 2026-09-08 as two tracks for writing GPU kernels in Rust. Facts below were read on 2026-09-25; both projects are early (cuda-oxide calls itself alpha, cutile-rs "early stage") and their requirements moved within weeks of the announcement.
+
+- **cuda-oxide** (NVlabs/cuda-oxide, Apache-2.0): a custom rustc codegen backend for the SIMT model. `#[kernel]` functions go from Rust MIR through Pliron IR dialects (`dialect-mir`, `dialect-nvvm`, `dialect-ptx`) to LLVM IR, then through an external `llc -march=nvptx64` to PTX. Needs a pinned nightly (the announcement said nightly-2026-04-03; the repository has since moved to nightly-2026-08-28), CUDA Toolkit 13.0+ and driver R580+ (the announcement said CUDA 12.x+), clang-21/libclang, Linux, and `sm_80` or newer. Host crates: `cuda_host` (`#[cuda_module]` typed loading) and `cuda_device` stay in cuda-oxide and are not on crates.io.
+- **cutile-rs** (NVlabs/cutile-rs, Apache-2.0, crates.io): the tile model on stable Rust 1.89+. Kernels compile through CUDA Tile IR, recommended with CUDA 13.3; Linux and `sm_80` or newer. It now also hosts `cuda_core` (`CudaContext`, `DeviceBuffer`, `LaunchConfig1D`, `load_module_from_ptx_src`, `launch_kernel`), shared by both tracks, and `cutile-ir`, a pure Rust Tile IR builder and bytecode writer with no LLVM or C++ dependency.
+- NVIDIA plans interop with CUDA C++ and CUDA Python.
+
+What Zyntax reuses and what it does not:
+
+| Piece | Decision | Why |
+|-------|----------|-----|
+| cuda-oxide's rustc front end | Not used | Zyntax kernels are not Rust source; HIR is the kernel IR. |
+| `cuda-oxide-codegen` (its rustc-independent PTX backend) | Not used | Its input is a Rust-MIR-shaped Pliron dialect pinned to one git revision and documented as not a stable interchange format; it is unpublished and shells out to `llc` and `opt`. Zyntax already has the same LLVM NVPTX backend in process. |
+| `cuda_core` host crate | Not now; `cudarc` instead | Its `cuda-bindings` dependency runs bindgen against a CUDA 13 toolkit and libclang at build time, which the light build cannot require. It is a fork of cudarc's driver layer with the same load and launch shape, so switching later is cheap if NVIDIA's interop settles on it. |
+| `cutile-ir` | Used, for the tile track | CUDA Tile IR is a documented, versioned bytecode that conforming drivers load. A second lowering from HIR to Tile IR serves GEMM, attention and fused norms after the SIMT path works. Driver-JIT of bytecode must be verified on real hardware first, since cutile-rs itself only compiles through the toolkit's `tileiras`. |
+| cuda-oxide's NVVM intrinsic catalog and PTX-floor table | Reference | Which NVVM intrinsics exist per SM and which minimum PTX each target needs, for when Zyntax grows tensor-core kernels (TMA, wgmma, mbarrier). |
+| cutile-rs's disjoint-partition safety model | Reference | The design reference for how `@kernel` outputs are split across threads without data races. |
+
+Open before transcendental math in NVIDIA kernels: `libdevice` (`__nv_expf` and the rest) ships with the CUDA toolkit, not the driver. Either Zyntax generates those functions from NVVM approximate intrinsics plus refinement, or it links `libdevice.10.bc` when a toolkit is found; NVIDIA's redistribution terms decide whether it can be bundled.
 
 ### 5.1 Runtime Module Management
 
@@ -1942,9 +1959,11 @@ impl UnifiedMemory {
 
 ### 6.1 DSL Kernel Generation Pipeline
 
+**Status (2026-09-25):** the grammar parses the source form shown below (`compute_expr` in `crates/zynml/ml.zyn`), but lowering ignores `@kernel(matmul)`, `@device` and `@workgroup`: the block is classified Generic and becomes a call of the undefined `$Zyntax$compute`, a bug tracked in git-bug. The pipeline below is the target. Python and Lua kernels enter the same pipeline at the typed-AST step through the `zyntax` module. On the CPU side the path is HIR vector instructions plus `parallel_dispatch` (behind `ZYNTAX_PARALLEL_LOOPS=1` today), not OpenMP, and a kernel on a device the build cannot reach is a compile or launch error, not a silent CPU run.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           DSL Source (ZynML/QuantDSL)                        │
+│             Kernel source (ZynML compute, or @kernel via `zyntax`)           │
 │                                                                              │
 │  compute(A, B) @kernel(matmul) @device("cuda:0") {                          │
 │      @workgroup(16, 16)                                                      │
@@ -1961,7 +1980,7 @@ impl UnifiedMemory {
 │                        ZynPEG Grammar Actions                                │
 │                                                                              │
 │  Parse @kernel, @device, @workgroup annotations                             │
-│  Generate TypedAST with KernelMetadata                                       │
+│  Type the kernel subset; record kernel kind, device, workgroup               │
 └────────────────────────────────┬────────────────────────────────────────────┘
                                  │
                                  ▼
@@ -1976,11 +1995,11 @@ impl UnifiedMemory {
               ┌──────────────────┴──────────────────┐
               ▼                                     ▼
 ┌──────────────────────────────────┐  ┌──────────────────────────────────┐
-│  CPU Backend (Fallback)          │  │  NVPTX Backend                   │
+│  CPU Backend (@device("cpu"))    │  │  NVPTX Backend                   │
 │                                  │  │                                  │
 │  Generate vectorized loops       │  │  Generate PTX via LLVM IR        │
-│  Use SIMD intrinsics             │  │  Add nvvm.annotations            │
-│  OpenMP parallelization          │  │  Emit to PTX string              │
+│  HIR Vector instructions         │  │  ptx_kernel CC, nvvm.maxntid     │
+│  parallel_dispatch bands         │  │  Emit to PTX string              │
 └──────────────────────────────────┘  └────────────────┬─────────────────┘
                                                        │
                                                        ▼
@@ -1994,6 +2013,8 @@ impl UnifiedMemory {
 ```
 
 ### 6.2 Kernel Fusion Optimization
+
+**Status (2026-09-25): not built.** No `kernel_fusion.rs` exists.
 
 ```rust
 // In crates/compiler/src/kernel_fusion.rs
@@ -2052,51 +2073,59 @@ impl KernelFusionPass {
 
 ## Part 7: Implementation Roadmap
 
-### Phase 1: Foundation (Weeks 1-3)
+**Superseded (2026-09-25):** the 2025-12 roadmap scheduled twelve weeks across Q1 and Q2 2026; none of it was built. The phases keep their order, without dates, and follow the Metal backend (09-gpu-compute-system.md) because NVIDIA execution needs hardware the project does not have yet. Everything below is not started unless marked.
 
-| Task | Description | Effort |
+### Phase 0: Kernel front end (shared with Metal)
+
+| Task | Description | Status |
 |------|-------------|--------|
-| TypedAST Extensions | Add kernel metadata, execution constraints | 1 week |
-| HIR GPU Primitives | Add GPU instructions to HirInstruction enum | 1 week |
-| NVPTX Target Setup | Initialize LLVM NVPTX target, create backend struct | 0.5 week |
-| Basic PTX Emission | Compile simple kernel to PTX | 0.5 week |
+| Kernel typing | Type `compute()` bodies and `@kernel` functions as the typed subset; dynamic code is a compile error | Not started (the type checker returns a fresh type variable for `compute`) |
+| Read the modifiers | Lowering consumes `@kernel(x)`, `@device`, `@workgroup` | Not started (parsed and dropped) |
+| No runtime dispatch | Unrecognised kernel shapes become compile errors instead of calls to `$Zyntax$compute` | Bug, tracked in git-bug |
+| `zyntax` module | `from zyntax import kernel` in Python, a `zyntax` table in Lua | Not started |
 
-**Milestone:** Compile and execute simple arithmetic kernel via CUDA driver.
+### Phase 1: Foundation
 
-### Phase 2: Core Backend (Weeks 4-6)
+| Task | Description |
+|------|-------------|
+| HIR GPU Primitives | Add thread/block indexing, barriers, shared memory to HIR |
+| NVPTX Target Setup | `Target::initialize_nvptx`, `nvptx64-nvidia-cuda`, `sm_80` floor, under `llvm-backend` |
+| Basic PTX Emission | Compile a simple kernel to PTX; golden-test the PTX on the Mac and the NUC |
 
-| Task | Description | Effort |
-|------|-------------|--------|
-| Thread Indexing | Implement ThreadIdx/BlockIdx/BlockDim/GridDim | 0.5 week |
-| Synchronization | Implement SyncThreads, barriers | 0.5 week |
-| Shared Memory | Implement SharedMemAlloc, address spaces | 1 week |
-| Atomic Operations | Implement GPU atomics with scopes | 0.5 week |
-| Warp Primitives | Implement shuffle, vote, match | 0.5 week |
+**Milestone:** PTX for an elementwise kernel, verified by LLVM, with no GPU present.
 
-**Milestone:** Parallel reduction kernel working correctly.
+### Phase 2: Core Backend
 
-### Phase 3: Advanced Features (Weeks 7-9)
+| Task | Description |
+|------|-------------|
+| Thread Indexing | ThreadIdx/BlockIdx/BlockDim/GridDim through `llvm.nvvm.read.ptx.sreg.*` |
+| Synchronization | `llvm.nvvm.barrier.cta.sync.aligned.all` |
+| Shared Memory | Address space 3 allocations |
+| Atomic Operations | `atomicrmw` with syncscope |
+| Warp Primitives | shuffle, vote, match |
 
-| Task | Description | Effort |
-|------|-------------|--------|
-| Tensor Cores | Implement MMA operations | 1 week |
-| Async Copy | Implement async global→shared copy | 0.5 week |
-| Critical Path Optimizer | CPU low-latency optimizations | 1 week |
-| SIMD Codegen | Auto-vectorization for CPU fallback | 0.5 week |
+**Milestone:** parallel reduction kernel correct on an `sm_80`+ Linux machine.
 
-**Milestone:** Matrix multiplication using tensor cores.
+### Phase 3: Runtime Integration
 
-### Phase 4: Runtime Integration (Weeks 10-12)
+| Task | Description |
+|------|-------------|
+| CUDA Runtime | `cudarc` context, module load from PTX, function lookup, raw launch |
+| Memory | Device buffers, pinned host memory, a pool |
+| Streams | Async execution tied to Zyntax fibers and async, not a separate future type |
+| DSL Integration | ZynML `compute()` and `zyntax` `@kernel` reach the backend |
 
-| Task | Description | Effort |
-|------|-------------|--------|
-| CUDA Runtime | cuModule/cuFunction management | 1 week |
-| Memory Pool | Efficient GPU memory allocation | 0.5 week |
-| Unified Memory | Pinned memory, memory registration | 0.5 week |
-| Stream Management | Async execution, synchronization | 0.5 week |
-| DSL Integration | Connect ZynML compute() to backend | 0.5 week |
+**Milestone:** end-to-end `@kernel` on an NVIDIA GPU, benchmarked per the status section.
 
-**Milestone:** End-to-end ZynML compute() working with GPU.
+### Phase 4: Advanced Features
+
+| Task | Description |
+|------|-------------|
+| Tile IR track | HIR to CUDA Tile IR bytecode through `cutile-ir` for GEMM, attention, fused norms |
+| Tensor Cores | MMA operations on the SIMT path where Tile IR does not serve |
+| Async Copy | Global to shared staging |
+| ~~Critical Path Optimizer~~ | Superseded: out of GPU scope (Part 4) |
+| ~~SIMD Codegen~~ | Superseded: CPU SIMD is built as HIR vectors and the vectorization passes |
 
 ---
 
@@ -2119,8 +2148,12 @@ declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.z()
 ```
 
 ### Synchronization
+
+In LLVM 21, `@llvm.nvvm.barrier0()` is auto-upgraded to `@llvm.nvvm.barrier.cta.sync.aligned.all(i32 0)`; emit the new name.
+
 ```llvm
-declare void @llvm.nvvm.barrier0()
+declare void @llvm.nvvm.barrier.cta.sync.aligned.all(i32)
+declare void @llvm.nvvm.barrier0()  ; legacy, auto-upgraded
 declare void @llvm.nvvm.barrier.sync(i32)
 declare void @llvm.nvvm.membar.cta()
 declare void @llvm.nvvm.membar.gl()
@@ -2155,36 +2188,9 @@ declare {float, float, float, float, float, float, float, float}
 
 ## Appendix B: Performance Targets
 
-### Kernel Launch Latency
-| Operation | Target |
-|-----------|--------|
-| PTX load (cached) | < 1μs |
-| Kernel launch | < 5μs |
-| Empty kernel round-trip | < 10μs |
-| Grid synchronization | < 100μs |
+**Superseded (2026-09-25):** the 2025-12 appendix listed undated A100 and PCIe figures and CPU latency targets as fact. They were not measured and do not apply to the machines available: the Mac is unified memory with no host-to-device copy for shared buffers, and neither the Mac nor the NUC has an NVIDIA GPU.
 
-### Memory Bandwidth
-| Operation | Target |
-|-----------|--------|
-| H2D (pinned) | > 12 GB/s (PCIe 4.0) |
-| D2H (pinned) | > 12 GB/s (PCIe 4.0) |
-| Device memory | > 900 GB/s (A100) |
-| Shared memory | > 19 TB/s (A100) |
-
-### Compute Throughput
-| Operation | Target (A100) |
-|-----------|---------------|
-| FP32 | 19.5 TFLOPS |
-| FP16 | 156 TFLOPS (tensor cores) |
-| INT8 | 624 TOPS (tensor cores) |
-
-### Critical Path CPU Latency
-| Operation | Target |
-|-----------|--------|
-| Order submission | < 500ns |
-| Signal evaluation | < 1μs |
-| Risk check | < 100ns |
-| Position update | < 200ns |
+Kernels are judged by the benchmark matrix in the status section: PyTorch eager and `torch.compile`, then numba, JAX/XLA, Taichi, numpy and Triton, then candle; CPU on the Mac and the NUC, GPU on the Mac through Metal; steady state and time to first result both reported. NVIDIA rows (PyTorch CUDA, Triton, candle CUDA) are added when an `sm_80`+ Linux machine is available. Numbers go in benchmark results with their date and machine, not in this document.
 
 ---
 
@@ -2197,9 +2203,14 @@ declare {float, float, float, float, float, float, float, float}
 - [Tensor Core Programming](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#wmma)
 - [Triton Language](https://github.com/openai/triton) - Reference for DSL design
 - [Halide](https://halide-lang.org/) - Reference for scheduling DSL
+- [Introducing CUDA Rust: two tracks for writing GPU kernels](https://developer.nvidia.com/blog/introducing-cuda-rust-two-tracks-for-writing-gpu-kernels/) (NVIDIA, 2026-09-08)
+- [NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-oxide) - SIMT kernels in Rust through Pliron and LLVM NVPTX
+- [NVlabs/cutile-rs](https://github.com/NVlabs/cutile-rs) - tile kernels through CUDA Tile IR; hosts `cuda_core` and `cutile-ir`
+- [CUDA Tile IR](https://docs.nvidia.com/cuda/tile-ir/latest/) and [NVIDIA/cuda-tile](https://github.com/NVIDIA/cuda-tile)
+- [cudarc](https://github.com/chelsea0x3b/cudarc) - CUDA driver binding with dynamic loading
 
 ---
 
-*Last Updated: December 2025*
-*Version: 1.0*
-*Status: Planning*
+*Last Updated: 2026-09-25*
+*Version: 1.1*
+*Status: Not built; direction revised 2026-09-25 (see Status and direction)*

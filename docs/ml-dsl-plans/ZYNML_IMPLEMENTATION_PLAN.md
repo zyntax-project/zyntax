@@ -11,7 +11,7 @@ This document outlines the implementation roadmap for ZynML, a unified domain-sp
 | Plugin | Status | ML Relevance |
 |--------|--------|--------------|
 | `zrtl_simd` | ✅ Complete | **Critical** - SIMD-accelerated ML ops |
-| `zrtl_tensor` | ✅ Complete | **Critical** - Core tensor data structure |
+| `zrtl_tensor` | ✅ Complete (role narrowing, see below) | **Critical** - Core tensor data structure; system-accelerator FFI |
 | `zrtl_vector` | ✅ Complete | **Critical** - Vector search & embeddings |
 | `zrtl_audio` | ✅ Complete | **High** - Audio ML preprocessing |
 | `zrtl_text` | ✅ Complete | **High** - Tokenization & text processing |
@@ -68,6 +68,8 @@ ML Operations in zrtl_simd:
 **Status: COMPLETE** (8 tests passing)
 
 The foundational data structure for all ML operations, now SIMD-optimized.
+
+**Role (decided 2026-08-19):** tensor arithmetic belongs in generated code, and `zrtl_tensor` keeps only FFI to system accelerators that generated code cannot reach: Accelerate/AMX, BNNS, MPS, CoreML and their equivalents on other platforms. Today that is one entry point, `tensor_matmul_2d`, which calls Accelerate `cblas_sgemm` on Apple (behind `$Tensor$matmul` and `$Tensor$matmul_2d`) and a portable loop elsewhere. The hand-written math listed below is due to move into ZynML and the `@kernel` path. GPU kernels are designed in [09-gpu-compute-system.md](09-gpu-compute-system.md) and [GPU_AOT_ARCHITECTURE.md](../GPU_AOT_ARCHITECTURE.md).
 
 **Implemented Features:**
 - Multi-dimensional tensor with arbitrary shapes (up to 8 dims)
@@ -288,7 +290,9 @@ hnsw_create, hnsw_free, hnsw_add, hnsw_len, hnsw_search
 | zrtl_vector HNSW index | ✅ | ✓ |
 | zrtl_vector normalization | ✅ | ✓ |
 
-### Phase 4: ZynML Grammar & Compiler 🔲 NOT STARTED
+### Phase 4: ZynML Grammar & Compiler
+
+**Superseded (2026-09-25):** this phase is under way. `crates/zynml/ml.zyn` exists, and ZynML compiles and runs through the tiered JIT (`crates/zynml/ROADMAP.md` tracks it). The table records the 2025-12 state.
 
 | Task | Status |
 |------|--------|
@@ -348,9 +352,9 @@ dim = NUMBER | "?" | IDENT ;
 // Pipe operator for data flow
 pipe_expr = expr ("|>" IDENT ("(" args ")")?)* ;
 
-// Compute block for GPU kernels
-compute_block = "compute" "(" device ")" "{" stmts "}" ;
-device = "cuda" (":" NUMBER)? | "cpu" ;
+// Compute expression (as built in crates/zynml/ml.zyn): the arguments are
+// the kernel's inputs; the device is a modifier, e.g. @device("metal")
+compute_expr = "compute" "(" args? ")" annotation* block ;
 
 // Model definition
 model_def = "model" IDENT "{" layer_defs "}" ;
@@ -370,11 +374,10 @@ let mel = audio.load("speech.wav")
 // Load Whisper model
 let whisper = model.load("openai/whisper-tiny")
 
-// Run inference
-compute(cuda) {
-    let features = whisper.encoder(mel)
-    let tokens = whisper.decoder.generate(features, max_len=256)
-}
+// Run inference. Model calls are ordinary code; compute() is for kernels
+// (a typed subset), and its device is chosen with @device(...), not an argument.
+let features = whisper.encoder(mel)
+let tokens = whisper.decoder.generate(features, max_len=256)
 
 // Decode output
 let text = tokenizer.decode(tokens)
@@ -389,7 +392,7 @@ print(text)
 2. **Type System**: Implement tensor type inference and shape propagation
 3. **Code Generation**: Lower ZynML to ZRTL plugin calls
 4. **Examples**: Build end-to-end examples (MNIST, Whisper, RAG)
-5. **GPU Support**: Add CUDA backend for compute blocks
+5. **GPU Support**: the Zyntax `@kernel` offering, shared by ZynML, Python and Lua. Metal first on Apple, with Accelerate/MPS for GEMM-shaped kernels; NVIDIA through LLVM NVPTX. See [09-gpu-compute-system.md](09-gpu-compute-system.md) and [GPU_AOT_ARCHITECTURE.md](../GPU_AOT_ARCHITECTURE.md)
 
 ---
 
@@ -406,6 +409,6 @@ print(text)
 
 ---
 
-*Document created: December 2024*
-*Last updated: December 2024*
+*Document created: December 2025*
+*Last updated: 2026-09-25 (GPU and zrtl_tensor notes only)*
 *Status: Phase 1-3 Complete, Phase 4 Pending*
