@@ -1,0 +1,15 @@
+z sees	nil
+y sees	@z
+x1 sees	@y
+x sees	@y
+false	@x
+z sees	4	true
+y sees	@z
+x1 sees	@y
+x sees	@x1
+false	@x1
+a3 sees	nil
+a1 sees	attempt to call a number value
+false	12
+false	202
+qux x xx:101 x0:202

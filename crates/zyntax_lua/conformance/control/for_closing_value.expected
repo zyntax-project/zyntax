@@ -1,0 +1,8 @@
+normal end	true
+false	boom
+a:nil b:nil c:boom d:nil
+numopen	0
+body:nil state:nil
+tail sees	false	true
+o1 closed
+done

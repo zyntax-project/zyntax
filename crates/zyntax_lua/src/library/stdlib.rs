@@ -3183,17 +3183,15 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
 
     // ─── os and io ──────────────────────────────────────────────
     d.extend(os_declarations(t));
-    let y_close = kept("close", any());
+    // `os.exit(code, close)`: with `close` true, the state is closed
+    // first: an error nothing catches unwinds the main thread, closing
+    // its variables, and the host runs the finalizers and exits once it
+    // is out.
     d.push(define(
         "zl_os_exit",
-        &[&x, &y_close],
+        &[&x, &y],
         unit(),
         vec![
-            // Closing the state first runs every pending finalizer.
-            when(
-                call("zl_truthy", vec![y_close.e()], boolean()),
-                vec![expr(call("zl_gc_at_exit", vec![], unit()))],
-            ),
             k.decl(int(0)),
             when(
                 and(not(is_nil(x.e())), eq(category(x.e()), int(BOOL))),
@@ -3202,6 +3200,13 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             when(
                 and(not(is_nil(x.e())), is_int_box(x.e())),
                 vec![k.set(get_i64(x.e()))],
+            ),
+            when(
+                call("zl_truthy", vec![y.e()], boolean()),
+                vec![
+                    expr(call("zl_raise_value", vec![exit_marker(k.e())], unit())),
+                    ret_void(),
+                ],
             ),
             // `exit` flushes C's streams, not the program's own.
             expr(call("zl_io_flush_all", vec![], unit())),

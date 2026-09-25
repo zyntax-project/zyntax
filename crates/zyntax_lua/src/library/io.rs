@@ -874,6 +874,9 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 ],
                 any(),
             )),
+            // A file `io.lines` opened is the loop's closing value; any
+            // other gives the iterator alone.
+            when(not(closing.e()), vec![ret(y.e())]),
             ret(call(
                 "zb_box_tuple",
                 vec![list(vec![y.e(), nil(), nil(), x.e()], anys.clone())],

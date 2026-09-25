@@ -82,6 +82,32 @@ pub fn closing_marker() -> Expr {
         any(),
     )
 }
+/// `os.exit(code, true)` in flight: the closing kind, so nothing catches
+/// it, with `code` above the low two bits (10, where a coroutine's close
+/// has 01). The host exits with `code` once it reaches the entry.
+pub fn exit_marker(code: Expr) -> Expr {
+    call(
+        "zb_box_instance_raw",
+        vec![
+            bitor(shl(code, int(2)), int(2)),
+            int32(closing_tag() as i32),
+        ],
+        any(),
+    )
+}
+pub fn is_exiting(x: Expr) -> Expr {
+    and(
+        is_closing(x.clone()),
+        eq(bitand(exit_payload(x), int(3)), int(2)),
+    )
+}
+/// The status an exit marker carries.
+pub fn exit_code(x: Expr) -> Expr {
+    shr(exit_payload(x), int(2))
+}
+fn exit_payload(x: Expr) -> Expr {
+    call("zb_unbox_instance_raw", vec![x], i64())
+}
 
 /// The types the library is written against: `List<Any>` and the
 /// table struct.
@@ -362,7 +388,7 @@ pub fn metamethod_site(event: Expr) -> Stmt {
         )],
     )
 }
-fn is_nil_error(x: Expr) -> Expr {
+pub fn is_nil_error(x: Expr) -> Expr {
     and(ne(x.clone(), nil()), eq(tag_of(x), int(nil_error_tag())))
 }
 fn nil_error() -> Expr {
@@ -817,6 +843,9 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
 /// here; every function that may raise leaves with a placeholder once
 /// it sees the value set, until a `pcall` takes it.
 pub const PENDING: &str = "zl_pending";
+/// While `os.exit` closes the state, the error the last closing method
+/// raised, which the next one receives, or nil.
+pub const EXIT_ERROR: &str = "zl_exit_error";
 /// Whether the pending error is a stack overflow: a message handler
 /// cannot run on one, as the reference has no stack left for it.
 pub const OVERFLOWED: &str = "zl_overflowed";
@@ -958,6 +987,7 @@ fn raising(t: &Types) -> Vec<Decl> {
         global_var(OVERFLOWED, boolean()),
         global_var(HANDLING_OVERFLOW, boolean()),
         global_var(METHOD_CALL, boolean()),
+        global_var(EXIT_ERROR, any()),
         global_var(ARR_EMPTY, any()),
     ];
     // Entered below the floor: the error every deeper call would raise.
@@ -1291,6 +1321,18 @@ fn raising(t: &Types) -> Vec<Decl> {
             when(
                 is_nil(v.e()),
                 vec![expr(call("zl_gc_at_exit", vec![], unit())), ret_void()],
+            ),
+            // `os.exit(code, true)`: the main thread's variables are
+            // closed; the finalizers run and the program exits.
+            when(
+                is_exiting(v.e()),
+                vec![
+                    set_global(PENDING, nil()),
+                    expr(call("zl_gc_at_exit", vec![], unit())),
+                    expr(call("zl_io_flush_all", vec![], unit())),
+                    expr(call("zb_exit", vec![cast(exit_code(v.e()), i32())], unit())),
+                    ret_void(),
+                ],
             ),
             set_global(PENDING, nil()),
             set_global(OVERFLOWED, bool(false)),

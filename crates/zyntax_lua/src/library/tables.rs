@@ -816,7 +816,6 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     // ─── to-be-closed variables ─────────────────────────────────
     // A `<close>` variable holds nil, false, or a value with `__close`.
     let name = kept("name", string());
-    let err = kept("err", any());
     d.push(define(
         "zl_closable",
         &[&o, &name],
@@ -837,32 +836,75 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ret_void(),
         ],
     ));
-    // Leaving its block: `__close(value, error)`, the error nil on a
-    // normal exit.
+    // Leaving its block: `__close(value, error)`, the error the one in
+    // flight or nil. It is put aside while the handler runs, which may
+    // raise one of its own that replaces it, and put back otherwise.
+    // Closed by `coroutine.close`, the handler sees no error. While
+    // the state closes for `os.exit`, only the main thread's variables
+    // are closed, each seeing the error the last handler raised, and
+    // nothing a handler raises stops the exit.
     d.push(define(
         "zl_close",
-        &[&o, &err],
+        &[&o],
         unit(),
         vec![
             when(
                 not(call("zl_truthy", vec![o.e()], boolean())),
                 vec![ret_void()],
             ),
-            x.decl(call("zl_meta_of", vec![o.e(), text("__close")], any())),
+            handler.decl(pending()),
             when(
-                is_nil(x.e()),
-                vec![lua_error(text("attempt to close non-closable variable"))],
+                is_exiting(handler.e()),
+                vec![
+                    when(
+                        is_nil(read_global(super::coroutines::CURRENT, any())),
+                        vec![
+                            set_global(PENDING, read_global(EXIT_ERROR, any())),
+                            expr(call("zl_close", vec![o.e()], unit())),
+                            set_global(EXIT_ERROR, pending()),
+                        ],
+                    ),
+                    set_global(PENDING, handler.e()),
+                    ret_void(),
+                ],
+            ),
+            set_global(PENDING, nil()),
+            x.decl(call("zl_meta_of", vec![o.e(), text("__close")], any())),
+            // Closed while unwinding, the handler is called from no Lua
+            // frame: the message has no position and names no event.
+            when(
+                and(
+                    not(is_nil(handler.e())),
+                    and(
+                        not(is_func(x.e())),
+                        is_nil(call("zl_meta_of", vec![x.e(), text("__call")], any())),
+                    ),
+                ),
+                vec![
+                    expr(call(
+                        "zl_raise_value",
+                        vec![box_str(concat(vec![
+                            text("attempt to call a "),
+                            type_name(x.e()),
+                            text(" value"),
+                        ]))],
+                        unit(),
+                    )),
+                    ret_void(),
+                ],
             ),
             metamethod_call_check(x.e(), text("close")),
-            // On an error exit the error is in flight: it is put aside
-            // while the handler runs, which may raise one of its own
-            // that replaces it, and put back otherwise. Closed by
-            // `coroutine.close`, the handler sees no error.
-            handler.decl(pending()),
-            set_global(PENDING, nil()),
             expr(call(
                 "zl_call_2",
-                vec![x.e(), o.e(), if_expr(is_closing(err.e()), nil(), err.e())],
+                vec![
+                    x.e(),
+                    o.e(),
+                    if_expr(
+                        or(is_closing(handler.e()), is_nil_error(handler.e())),
+                        nil(),
+                        handler.e(),
+                    ),
+                ],
                 any(),
             )),
             when(is_nil(pending()), vec![set_global(PENDING, handler.e())]),

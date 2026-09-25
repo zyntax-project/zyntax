@@ -1,0 +1,28 @@
+1	show	function
+2	x	number
+3	(for state)	function
+4	(for state)	table
+5	(for state)	number
+6	(for state)	nil
+7	k	number
+8	v	number
+1	show	function
+2	x	number
+3	(for state)	number
+4	(for state)	number
+5	(for state)	number
+6	i	number
+numeric	1 2 1
+numeric	2 1 1
+numeric	3 0 1
+down	10 2 -4
+down	6 1 -4
+down	2 0 -4
+float	1.5 2.5 0.5
+float	2.0 2.5 0.5
+float	2.5 2.5 0.5
+dynamic	1 1 1
+dynamic	2 0 1
+ipairs	(for state)	function	table	1	nil
+ipairs	(for state)	function	table	2	nil
+generic closing	(for state)	true

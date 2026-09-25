@@ -1,0 +1,8 @@
+false	close_missing_metamethod.lua:7: attempt to call a nil value (metamethod 'close')
+false	close_missing_metamethod.lua:13: attempt to call a nil value (metamethod 'close')
+false	close_missing_metamethod.lua:26: attempt to call a nil value (metamethod 'close')
+false	close_missing_metamethod.lua:35: attempt to call a number value (metamethod 'close')
+false	close_missing_metamethod.lua:48: attempt to call a nil value (metamethod 'close')
+false	close_missing_metamethod.lua:62: attempt to call a nil value (metamethod 'close')
+false	close_missing_metamethod.lua:74: attempt to call a nil value (metamethod 'close')
+false	close_missing_metamethod.lua:84: attempt to call a nil value (metamethod 'close')

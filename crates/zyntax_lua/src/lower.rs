@@ -722,33 +722,51 @@ struct Lowerer<'m, 'a> {
     /// The `<close>` variables in scope, each with the depth of the
     /// block declaring it, innermost last. Leaving a block closes its
     /// variables in reverse order.
-    tbc: Vec<(usize, VarId)>,
+    tbc: Vec<(usize, Closable)>,
     /// Whether this function counts itself in the call depth: every
     /// program function does, so that recursion without end is an
     /// error to catch; a chunk does not.
     counts_depth: bool,
     /// How many blocks are open, the function's body counting as one.
     depth: usize,
-    /// The depth of each enclosing loop's body.
-    loop_depths: Vec<usize>,
+    /// The depth of each enclosing loop's body, and where the loop
+    /// ends: a `break` closes from that line.
+    loop_depths: Vec<(usize, Span)>,
     /// Whether this is a function of the program that keeps a frame on
     /// the debug library's stack: set by the lowering of a function or
     /// chunk body in a program that keeps one, never for a helper.
     frames: bool,
     /// The locals in scope, in the order Lua numbers them.
     live: Vec<Live>,
+    /// The values of the hidden `for` locals in scope, boxed, which
+    /// [`Live::ForState`] indexes.
+    for_states: Vec<Node>,
     /// The lines statements of this function start on.
     lines: std::collections::BTreeSet<i64>,
     /// The span of the call a `return` makes as a tail call.
     tail_span: Option<Span>,
+    /// The `end` of a function's body, where the variables its
+    /// outermost block declares are closed.
+    end_span: Option<Span>,
 }
 
 /// A local in scope, as `debug.getlocal` numbers them: a variable, or
-/// the hidden state of a `for` loop.
+/// the hidden state of a `for` loop, its value in `for_states`.
 #[derive(Clone, Copy)]
 enum Live {
     Var(VarId),
-    ForState,
+    ForState(usize),
+}
+
+/// What leaving a block closes: a `<close>` variable, or the closing
+/// value of a generic `for`, held in a temporary. A loop's closing
+/// value is entered at its body's depth but outlives each pass of the
+/// body: the loop closes it once it ends, and only a jump out of the
+/// loop past that closes it on the way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Closable {
+    Var(VarId),
+    Loop(InternedString),
 }
 
 /// A target of a multiple assignment: a name or a global, stored as
@@ -1520,8 +1538,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             loop_depths: Vec::new(),
             frames: false,
             live: Vec::new(),
+            for_states: Vec::new(),
             lines: std::collections::BTreeSet::new(),
             tail_span: None,
+            end_span: None,
         }
     }
 
@@ -3045,7 +3065,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             // The error has left the function when its `<close>`
             // variables are closed: its frame goes first.
             let mut statements = self.debug_call("zl_dbg_leave", Vec::new(), span);
-            self.closes_from(1, Some(Self::pending(span)), span, &mut statements);
+            self.closes_from(1, span, &mut statements);
             statements.push(self.placeholder_return_plain(span, false));
             return stmt(TypedStatement::Block(TypedBlock { statements, span }), span);
         }
@@ -3367,7 +3387,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             .map(|l| match l {
                 _ if self.m.stripped => "(temporary)".to_string(),
                 Live::Var(v) => self.scopes().var(*v).name.clone(),
-                Live::ForState => "(for state)".to_string(),
+                Live::ForState(_) => "(for state)".to_string(),
             })
             .collect()
     }
@@ -3470,7 +3490,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     /// after them) as a list handed to the host for the frame, when
     /// the program reads locals.
     fn spill(&mut self, site: i64, span: Span, pre: &mut Vec<St>) -> Option<InternedString> {
-        if !self.m.debug.as_ref().is_some_and(|d| d.locals) {
+        if !self.debug_locals() {
             return None;
         }
         let mut items = Vec::with_capacity(self.live.len() + 1);
@@ -3482,7 +3502,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     let value = self.read_var(v, span);
                     self.boxed(value)
                 }
-                Live::ForState => nil(span),
+                Live::ForState(i) => self.for_states[i].clone(),
             });
         }
         if let Some(varargs) = self.varargs
@@ -4329,7 +4349,19 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         n: usize,
         span: Span,
     ) -> Result<(Vec<St>, Vec<Val>)> {
-        let (mut pre, vals, tail) = self.expr_list(exprs)?;
+        let listed = self.expr_list(exprs)?;
+        Ok(self.adjust(listed, n, span))
+    }
+
+    /// An expression list's values, as [`Self::expr_list`] gives them,
+    /// adjusted to `n`.
+    fn adjust(
+        &mut self,
+        listed: (Vec<St>, Vec<Val>, Option<Node>),
+        n: usize,
+        span: Span,
+    ) -> (Vec<St>, Vec<Val>) {
+        let (mut pre, vals, tail) = listed;
         let mut out: Vec<Val> = Vec::with_capacity(n);
         for v in vals {
             if out.len() < n {
@@ -4369,7 +4401,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         while out.len() < n {
             out.push(self.nil_val(span));
         }
-        Ok((pre, out))
+        (pre, out)
     }
 
     // ─── operators ──────────────────────────────────────────────
@@ -8755,6 +8787,14 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 _ => return unsupported("this statement", span),
             }
             self.record_stmt_line(None, span, at, &mut out);
+        } else {
+            let span = span_of(block);
+            self.closes_checked(
+                1,
+                true,
+                Span::new(span.end.saturating_sub(1), span.end),
+                &mut out,
+            );
         }
         if !out.is_empty() || segments.is_empty() {
             segments.push(out);
@@ -8780,8 +8820,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 match last {
                     ast::LastStmt::Break(_) => {
                         // The loop's body and everything within it is left.
-                        let loop_depth = self.loop_depths.last().copied().unwrap_or(1);
-                        self.closes_from(loop_depth, None, span, &mut out);
+                        let (loop_depth, end) =
+                            self.loop_depths.last().copied().unwrap_or((1, span));
+                        self.closes_checked(loop_depth, false, end, &mut out);
                         out.push(stmt(TypedStatement::Break(None), span));
                     }
                     ast::LastStmt::Return(r) => {
@@ -8793,39 +8834,85 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 self.record_stmt_line(None, span, at, &mut out);
             }
             None => {
-                let span = span_of(block);
-                self.closes_from(self.depth, None, span, &mut out);
+                // A function's body closes at its `end`, any other
+                // block at its last token.
+                let end = match self.end_span.filter(|_| self.depth == 1) {
+                    Some(end) => end,
+                    None => {
+                        let span = span_of(block);
+                        Span::new(span.end.saturating_sub(1), span.end)
+                    }
+                };
+                self.closes_checked(self.depth, false, end, &mut out);
             }
         }
-        self.tbc.retain(|(d, _)| *d < self.depth);
+        let depth = self.depth;
+        self.tbc
+            .retain(|(d, c)| *d < depth || (*d == depth && matches!(c, Closable::Loop(_))));
         self.depth -= 1;
         self.live.truncate(live);
         Ok(out)
     }
 
-    /// Close every `<close>` variable declared at `depth` or deeper,
-    /// innermost first, with `error` (the pending error on an error
-    /// exit) or nil. The variables stay in scope for the paths that
-    /// go on.
-    fn closes_from(&mut self, depth: usize, error: Option<Node>, span: Span, out: &mut Vec<St>) {
-        let vars: Vec<VarId> = self
-            .tbc
+    /// What leaving to `depth` closes, innermost first: everything
+    /// entered at `depth` or deeper, a loop's closing value at `depth`
+    /// itself only when `loops` (the jump leaves that loop).
+    fn closing(&self, depth: usize, loops: bool) -> Vec<(usize, Closable)> {
+        self.tbc
             .iter()
             .rev()
-            .filter(|(d, _)| *d >= depth)
-            .map(|(_, v)| *v)
-            .collect();
-        for v in vars {
-            let value = self.read_var(v, span);
-            let value = self.boxed(value);
-            let err = error.clone().unwrap_or_else(|| nil(span));
+            .filter(|(d, c)| {
+                *d > depth || (*d == depth && (loops || matches!(c, Closable::Var(_))))
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Close everything entered at `depth` or deeper, innermost first.
+    /// Each handler sees the error pending, if any. The entries stay in
+    /// scope for the paths that go on.
+    fn closes_from(&mut self, depth: usize, span: Span, out: &mut Vec<St>) {
+        let entries = self.closing(depth, true);
+        self.emit_closes(&entries, span, out);
+    }
+
+    fn emit_closes(&mut self, entries: &[(usize, Closable)], span: Span, out: &mut Vec<St>) {
+        if !entries.is_empty() {
+            // A handler may raise, and its error is this function's.
+            self.raised = true;
+        }
+        for (_, c) in entries {
+            let value = match *c {
+                Closable::Var(v) => {
+                    let value = self.read_var(v, span);
+                    self.boxed(value)
+                }
+                Closable::Loop(name) => var(name, Type::Any, span),
+            };
             out.push(expr_stmt(call(
                 "zl_close",
-                vec![value, err],
+                vec![value],
                 prim(PrimitiveType::Unit),
                 span,
             )));
         }
+    }
+
+    /// The closes of a jump or a block's end, on the line of `at`. When
+    /// a handler raised, the error then leaves at once, closing only
+    /// what is still open.
+    fn closes_checked(&mut self, depth: usize, loops: bool, at: Span, out: &mut Vec<St>) {
+        let entries = self.closing(depth, loops);
+        if entries.is_empty() {
+            return;
+        }
+        out.push(self.set_line(at));
+        self.emit_closes(&entries, at, out);
+        let scope = self.tbc.clone();
+        self.tbc.retain(|e| !entries.contains(e));
+        let check = self.pending_check(at);
+        self.tbc = scope;
+        out.push(check);
     }
 
     /// The line a statement starts, stored ahead of it. A function
@@ -8863,8 +8950,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     fn return_stmt(&mut self, exprs: &[&Expression], span: Span, out: &mut Vec<St>) -> Result<()> {
-        // `return f(...)` is a tail call.
+        // `return f(...)` is a tail call, unless something is to be
+        // closed after it.
         let tail = match exprs {
+            _ if !self.tbc.is_empty() => None,
             [e @ Expression::FunctionCall(_)] => Some(span_of(*e)),
             [e @ Expression::Var(Var::Expression(v))]
                 if matches!(v.suffixes().last(), Some(Suffix::Call(_))) =>
@@ -8894,7 +8983,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             out.push(let_(name, ty.clone(), *value, span));
             var(name, ty, span)
         });
-        self.closes_from(1, None, span, out);
+        self.closes_from(1, span, out);
         if self.counts_depth {
             out.push(depth_step(-1, span));
         }
@@ -9049,7 +9138,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         );
                         let st = self.guarded_stmt(check, &Described::NONE);
                         out.push(st);
-                        self.tbc.push((self.depth, id));
+                        self.tbc.push((self.depth, Closable::Var(id)));
                     }
                 }
             }
@@ -9113,14 +9202,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Stmt::While(w) => {
                 let cond = self.expr(w.condition())?;
                 let cond = self.truthy(cond);
-                let mut body = self.loop_body(w.block())?;
+                let mut body = self.loop_body(w.block(), span_of(w.end_token()))?;
                 body.extend(self.debug_loop_back(span_of(w.while_token()), true, span));
                 out.push(while_(cond, body, span));
             }
             Stmt::Repeat(r) => {
                 // `repeat body until c` is a loop leaving once `c` holds;
                 // the condition sees the body's locals.
-                let mut body = self.loop_body(r.block())?;
+                // A `break` closes from the condition's last token.
+                let until = span_of(r.until());
+                let until = Span::new(until.end.saturating_sub(1), until.end);
+                let mut body = self.loop_body(r.block(), until)?;
                 if self.frames {
                     let line = self.m.line_of(span_of(r.until_token()));
                     body.extend(self.debug_line(line, span));
@@ -9224,7 +9316,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     });
                 };
                 let target_depth = self.scopes().label_depths[&id];
-                self.closes_from(target_depth + 1, None, span, out);
+                self.closes_checked(target_depth + 1, true, span, out);
                 out.push(stmt(TypedStatement::Goto(label_name(id)), span));
             }
             Stmt::Label(l) => {
@@ -9354,23 +9446,40 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     /// A loop body. A label ending it is where a `goto` continues to,
     /// and lands ahead of whatever the loop does after the body.
-    fn loop_body(&mut self, block: &Block) -> Result<Vec<St>> {
-        self.loop_depths.push(self.depth + 1);
+    fn loop_body(&mut self, block: &Block, end: Span) -> Result<Vec<St>> {
+        self.loop_depths.push((self.depth + 1, end));
         let body = self.block(block);
         self.loop_depths.pop();
         body
     }
 
-    /// A `for` loop's body: `states` hidden locals of the loop, then
-    /// its variables, in scope.
-    fn for_body(&mut self, block: &Block, states: usize, vars: &[VarId]) -> Result<Vec<St>> {
+    /// A `for` loop's body: the loop's hidden locals, `states` their
+    /// values boxed (read only by `debug.getlocal`), then its
+    /// variables, in scope. `end` is the loop's `end`.
+    fn for_body(
+        &mut self,
+        block: &Block,
+        states: Vec<Node>,
+        vars: &[VarId],
+        end: Span,
+    ) -> Result<Vec<St>> {
         let live = self.live.len();
-        self.live
-            .extend(std::iter::repeat_n(Live::ForState, states));
+        let held = self.for_states.len();
+        for state in states {
+            self.live.push(Live::ForState(self.for_states.len()));
+            self.for_states.push(state);
+        }
         self.live.extend(vars.iter().map(|v| Live::Var(*v)));
-        let body = self.loop_body(block);
+        let body = self.loop_body(block, end);
         self.live.truncate(live);
+        self.for_states.truncate(held);
         body
+    }
+
+    /// Whether the program reads locals through the debug library, so
+    /// call sites spill them.
+    fn debug_locals(&self) -> bool {
+        self.m.debug.as_ref().is_some_and(|d| d.locals)
     }
 
     fn numeric_for(&mut self, f: &ast::NumericFor, span: Span, out: &mut Vec<St>) -> Result<()> {
@@ -9627,7 +9736,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             },
             span,
         )];
-        let mut inner = self.for_body(f.block(), 3, &[v])?;
+        let states = self.numeric_states((counter_v(), lim_v(), st_v()), is_float, span);
+        let mut inner = self.for_body(f.block(), states, &[v], span_of(f.end_token()))?;
         inner.extend(self.debug_loop_back(span_of(f.for_token()), false, span));
         let mut after = Vec::new();
         if bounded {
@@ -9685,6 +9795,84 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         out.push(while_(cond, body, span));
         out.extend(self.debug_loop_exit(span_of(f.for_token()), None, span));
         Ok(())
+    }
+
+    /// A numeric loop's hidden locals as Lua keeps them, for
+    /// `debug.getlocal`: the index, then for an integer loop the
+    /// iterations left after this one and for a float loop the limit,
+    /// then the step. `parts` are the counter, the limit and the step.
+    fn numeric_states(
+        &mut self,
+        parts: (Node, Node, Node),
+        is_float: bool,
+        span: Span,
+    ) -> Vec<Node> {
+        if !self.debug_locals() {
+            return vec![nil(span); 3];
+        }
+        let (counter, lim, st) = parts;
+        let num_ty = if is_float { Ty::Float } else { Ty::Int };
+        let rest = if is_float {
+            lim
+        } else {
+            Self::iterations_left(counter.clone(), lim, st.clone(), span)
+        };
+        [counter, rest, st]
+            .into_iter()
+            .map(|node| self.boxed(Val { node, ty: num_ty }))
+            .collect()
+    }
+
+    /// How many more times an integer loop runs, counted as Lua counts
+    /// it: the distance to the limit over the step's size, unsigned.
+    fn iterations_left(counter: Node, lim: Node, st: Node, span: Span) -> Node {
+        let i64_t = prim(PrimitiveType::I64);
+        let u64_t = prim(PrimitiveType::U64);
+        let bool_t = prim(PrimitiveType::Bool);
+        let up = binary(BinaryOp::Gt, st.clone(), int_lit(0, span), bool_t, span);
+        let distance = if_value(
+            up.clone(),
+            binary(
+                BinaryOp::Sub,
+                lim.clone(),
+                counter.clone(),
+                i64_t.clone(),
+                span,
+            ),
+            binary(BinaryOp::Sub, counter, lim, i64_t.clone(), span),
+            i64_t.clone(),
+            span,
+        );
+        // `-(step + 1) + 1`, so the smallest integer step does not wrap.
+        let down = binary(
+            BinaryOp::Add,
+            cast(
+                binary(
+                    BinaryOp::Sub,
+                    int_lit(-1, span),
+                    st.clone(),
+                    i64_t.clone(),
+                    span,
+                ),
+                u64_t.clone(),
+                span,
+            ),
+            cast(int_lit(1, span), u64_t.clone(), span),
+            u64_t.clone(),
+            span,
+        );
+        let size = if_value(up, cast(st, u64_t.clone(), span), down, u64_t.clone(), span);
+        cast(
+            binary(
+                BinaryOp::Div,
+                cast(distance, u64_t.clone(), span),
+                size,
+                u64_t,
+                span,
+            ),
+            i64_t,
+            span,
+        )
     }
 
     /// A numeric `for` whose start or step is not known to be an
@@ -9907,7 +10095,35 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             },
             span,
         )];
-        body.extend(self.loop_body(f.block())?);
+        let states = if self.debug_locals() {
+            let parts = [
+                (int_v(ci), float_v(cf)),
+                (
+                    Self::iterations_left(int_v(ci), int_v(li), int_v(si), span),
+                    float_v(lf),
+                ),
+                (int_v(si), float_v(sf)),
+            ];
+            parts
+                .into_iter()
+                .map(|(int, float)| {
+                    let node = if_value(
+                        ints_v(),
+                        number_of_int(int, span),
+                        number_of_float(float, span),
+                        number_type(),
+                        span,
+                    );
+                    self.boxed(Val {
+                        node,
+                        ty: Ty::Number,
+                    })
+                })
+                .collect()
+        } else {
+            vec![nil(span); 3]
+        };
+        body.extend(self.for_body(f.block(), states, &[v], span_of(f.end_token()))?);
         // The integer counter leaves when the step would carry it past
         // the limit, so it never wraps: the distance and the step's
         // size compared as unsigned values.
@@ -10006,9 +10222,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             let t = self.expr(table)?;
             return self.pairs_loop(&names, t, f, span, out);
         }
-        // The general protocol: `f, s, control`, then `f(s, control)`
-        // until its first value is nil.
-        let (pre, vals) = self.adjusted(&exprs, 3, span)?;
+        // The general protocol: `f, s, control` and a closing value,
+        // then `f(s, control)` until its first value is nil. A closing
+        // value comes from a fourth expression that is not nil, or from
+        // the last expression's values when fewer are written.
+        let listed = self.expr_list(&exprs)?;
+        let (_, fixed, tail) = &listed;
+        let closes = match fixed.get(3) {
+            Some(v) => v.ty != Ty::Nil,
+            None => tail.is_some(),
+        };
+        let (pre, vals) = self.adjust(listed, if closes { 4 } else { 3 }, span);
         out.extend(pre);
         let mut it = vals.into_iter();
         let (fv, sv, cv) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
@@ -10021,6 +10245,26 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         out.push(let_(fname, Type::Any, fb, span));
         out.push(let_(sname, Type::Any, sb, span));
         out.push(let_(cname, Type::Any, cb, span));
+        // The closing value is checked once, before the first call, and
+        // closed however the loop is left.
+        let closing = match it.next() {
+            Some(value) => {
+                let name = self.temp();
+                let value = self.boxed(value);
+                out.push(let_(name, Type::Any, value, span));
+                let check = call(
+                    "zl_closable",
+                    vec![var(name, Type::Any, span), str_lit("(for state)", span)],
+                    prim(PrimitiveType::Unit),
+                    span,
+                );
+                let st = self.guarded_stmt(check, &Described::NONE);
+                out.push(st);
+                self.tbc.push((self.depth + 1, Closable::Loop(name)));
+                Some(name)
+            }
+            None => None,
+        };
         let vals_name = self.temp();
         let step = call(
             "zl_call_2",
@@ -10086,9 +10330,19 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 span,
             ));
         }
-        body.extend(self.for_body(f.block(), 4, &names)?);
+        let states = vec![
+            var(fname, Type::Any, span),
+            var(sname, Type::Any, span),
+            var(cname, Type::Any, span),
+            closing.map_or_else(|| nil(span), |name| var(name, Type::Any, span)),
+        ];
+        body.extend(self.for_body(f.block(), states, &names, span_of(f.end_token()))?);
         body.extend(self.debug_loop_back(span_of(f.for_token()), false, span));
         out.push(while_(bool_lit(true, span), body, span));
+        if closing.is_some() {
+            self.closes_checked(self.depth + 1, true, span_of(f.end_token()), out);
+            self.tbc.pop();
+        }
         let end = self.m.line_of(span_of(f.end_token()));
         out.extend(self.debug_loop_exit(span_of(f.for_token()), Some(end), span));
         Ok(())
@@ -10162,7 +10416,40 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             let n = self.nil_val(span);
             body.push(self.declare_var(*v, n, span));
         }
-        let mut inner = self.for_body(block, 4, names)?;
+        // What `ipairs(t)` would have given: its iterator, `t`, and the
+        // index as the control.
+        let states = if self.debug_locals() {
+            let t = self.boxed(Val {
+                node: var(tname, self.ir(t_ty), span),
+                ty: t_ty,
+            });
+            let iter = self.temp();
+            let triple = call(
+                "zl_values",
+                vec![call("zl_ipairs", vec![t.clone()], Type::Any, span)],
+                self.m.anys(),
+                span,
+            );
+            out.push(let_(
+                iter,
+                Type::Any,
+                call(
+                    "zl_value_at",
+                    vec![triple, int_lit(1, span)],
+                    Type::Any,
+                    span,
+                ),
+                span,
+            ));
+            let index = self.boxed(Val {
+                node: var(counter, i64_t.clone(), span),
+                ty: Ty::Int,
+            });
+            vec![var(iter, Type::Any, span), t, index, nil(span)]
+        } else {
+            vec![nil(span); 4]
+        };
+        let mut inner = self.for_body(block, states, names, span_of(f.end_token()))?;
         inner.extend(self.debug_loop_back(span_of(f.for_token()), false, span));
         let increment = assign(
             var(counter, i64_t.clone(), span),
@@ -10276,24 +10563,32 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 assign(var(cname, Type::Any, span), value_at(triple, 3), span),
             ]
         };
-        out.push(if_(
-            walked(),
-            vec![
-                assign(
-                    var(pos, i64_t.clone(), span),
-                    call(
-                        "zl_next_pos",
-                        vec![tv(), int_lit(0, span)],
-                        i64_t.clone(),
-                        span,
-                    ),
+        let mut walk = vec![
+            assign(
+                var(pos, i64_t.clone(), span),
+                call(
+                    "zl_next_pos",
+                    vec![tv(), int_lit(0, span)],
+                    i64_t.clone(),
                     span,
                 ),
-                assign(var(seen, i64_t.clone(), span), array_len(), span),
-            ],
-            Some(from_handler),
-            span,
-        ));
+                span,
+            ),
+            assign(var(seen, i64_t.clone(), span), array_len(), span),
+        ];
+        // The walk keeps what `pairs(t)` would have given, `next` and
+        // `t`, where `debug.getlocal` reads the loop's state.
+        if self.debug_locals() {
+            let next = crate::library::stdlib::BUILTINS
+                .iter()
+                .find(|b| b.lib.is_empty() && b.name == "next")
+                .expect("the base library has next");
+            let next = self.builtin_value(next, span).node;
+            let t = self.box_table(tv());
+            walk.push(assign(var(fname, Type::Any, span), next, span));
+            walk.push(assign(var(sname, Type::Any, span), t, span));
+        }
+        out.push(if_(walked(), walk, Some(from_handler), span));
         // Each iteration's key and value.
         let (key, value) = (self.temp(), self.temp());
         let mut body = vec![
@@ -10450,7 +10745,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             };
             body.push(self.declare_var(*v, val, span));
         }
-        let mut inner = self.for_body(block, 4, names)?;
+        let states = vec![
+            var(fname, Type::Any, span),
+            var(sname, Type::Any, span),
+            var(key, Type::Any, span),
+            nil(span),
+        ];
+        let mut inner = self.for_body(block, states, names, span_of(f.end_token()))?;
         inner.extend(self.debug_loop_back(span_of(f.for_token()), false, span));
         let step = assign(
             var(pos, i64_t.clone(), span),
@@ -10556,6 +10857,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         // recursion is an error to catch; every return uncounts it. One
         // whose depth is bounded by the text keeps no count.
         child.counts_depth = !self.m.is_bounded(id);
+        child.end_span = Some(span_of(body.end_token()));
         let body_statements = child.block(body.block())?;
         if child.entry_line {
             statements.push(entry_line_save(span));

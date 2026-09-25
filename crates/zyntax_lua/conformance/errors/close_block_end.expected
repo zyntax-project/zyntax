@@ -1,0 +1,10 @@
+x123 sees	nil
+x1 sees	close_block_end.lua:11: @X
+false	close_block_end.lua:8: @Y
+false	close_block_end.lua:20: in break
+pass	1
+false	close_block_end.lua:29: in pass 1
+false	close_block_end.lua:38: in goto
+step	1
+step	2
+false	close_block_end.lua:48: closing value

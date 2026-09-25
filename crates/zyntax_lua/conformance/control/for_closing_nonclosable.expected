@@ -1,0 +1,4 @@
+false	for_closing_nonclosable.lua:4: variable '(for state)' got a non-closable value
+false	for_closing_nonclosable.lua:8: variable '(for state)' got a non-closable value
+false	for_closing_nonclosable.lua:12: variable '(for state)' got a non-closable value
+iterator ran	false

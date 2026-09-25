@@ -424,6 +424,9 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![handle.e(), rec.e(), not(is_nil(pending()))],
                 unit(),
             )),
+            // `os.exit` with the state to close leaves the coroutine
+            // and goes on unwinding in the resumer.
+            when(is_exiting(pending()), vec![ret(nil())]),
             // The body raised: the error comes back as the result, and
             // is kept for a close to report.
             when(
@@ -624,6 +627,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![handle.e(), rec.e(), bool(false)],
                 unit(),
             )),
+            when(is_exiting(pending()), vec![ret(nil())]),
             when(
                 is_closing(pending()),
                 vec![
@@ -659,6 +663,9 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 ],
                 any(),
             )),
+            // An error still pending after the resume, an exit in
+            // flight, goes on unwinding.
+            when(not(is_nil(pending())), vec![ret(nil())]),
             results.decl(call("zl_values", vec![x.e()], anys.clone())),
             when(
                 not(call("zl_truthy", vec![at(results.e(), int(0))], boolean())),

@@ -1,0 +1,8 @@
+one	file
+after break	closed file
+one	file
+after error	false	closed file
+returned	two	closed file
+to the end	3	closed file
+counts	4	1
+f:lines leaves it open	file
