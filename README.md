@@ -1,6 +1,6 @@
 # Zyntax
 
-> Compiler infrastructure with tiered JIT compilation and native code generation
+> Compiler frontend infrastructure with tiered JIT compilation and native code generation
 
 [![CI](https://github.com/darmie/zyntax/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/darmie/zyntax/actions/workflows/ci.yml)
 [![ZynML Tests](https://img.shields.io/github/actions/workflow/status/darmie/zyntax/ci.yml?branch=main&label=zynml%20tests)](https://github.com/darmie/zyntax/actions/workflows/ci.yml)
@@ -11,7 +11,7 @@
 
 ## Overview
 
-Zyntax is a compiler infrastructure written in Rust. A language frontend hands it
+Zyntax is a compiler frontend infrastructure written in Rust. A language frontend hands it
 a typed AST; Zyntax lowers that to an SSA IR, optimises it once, starts running
 it in an interpreter, and compiles each function to native code as it proves
 hot.
