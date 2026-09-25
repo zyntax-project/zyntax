@@ -21,7 +21,7 @@ Checked against the code on 2026-09-25 (HEAD `a900deba`). This document is the k
 
 - GPU code generation and GPU runtimes of every kind: no MSL, PTX, SPIR-V or WGSL, no Metal, CUDA, Vulkan or WebGPU dependency.
 - Kernel type checking (the type checker gives `compute` a fresh type variable), the `@device`, `@workgroup` and `@kernel(x)` modifiers (parsed and never read), device management, async compute and the memory API.
-- Every other body and kernel kind (`matmul`, `conv2d`, `fused`, `attention`, `out[i] = f(x[i])`, multi-input, broadcast, a `yield` inside a loop) lowers to a call of `$Zyntax$compute`, which is not defined. That is a bug, tracked in git-bug, and becomes a compile error.
+- Every other body and kernel kind (`matmul`, `conv2d`, `fused`, `attention`, `out[i] = f(x[i])`, multi-input, broadcast, a `yield` inside a loop) is not lowered as a kernel. A body not marked `@kernel elementwise` with a `yield` directly in it returns the last yielded value; every other one lowers to a call of `$Zyntax$compute`, which is not defined. Both are bugs, tracked in git-bug, and become compile errors.
 - The `zyntax` module in Python and Lua.
 
 ### Decided direction
@@ -65,7 +65,7 @@ The goal is that the same kernel code works across all backends. **Status:** onl
 
 ## Syntax Design
 
-**Status:** this section is the target syntax. Today the grammar takes `compute(args) @annotation... { block }` and, inside the block, `@kernel <identifier>` with no parameters, so `reduce(+)`, `reduce(max, axis=1)`, `@shared`, `@broadcast` and `@tile` have no slot yet, and there is no implicit `out`. Only the in-place elementwise shape and the direct-yield reduce lower. Everything else currently calls an undefined runtime function, a tracked bug; until those forms are built they will be compile errors.
+**Status:** this section is the target syntax. Today the grammar takes `compute(args) @annotation... { block }` and, inside the block, `@kernel <identifier>` with no parameters, so `reduce(+)`, `reduce(max, axis=1)`, `@shared`, `@broadcast` and `@tile` have no slot yet, and there is no implicit `out`. Only the in-place elementwise shape lowers to a kernel. A body not marked `@kernel elementwise` with a `yield` directly in it returns the last yielded value; any other body calls an undefined runtime function. Both are tracked bugs; until those forms are built they will be compile errors.
 
 ### Basic Compute Expression
 
@@ -336,7 +336,7 @@ let rotated = compute(x, cos_cache, sin_cache) {
 
 ### Device Management
 
-**Status:** not built. `@device` is parsed and ignored, so `@device("metal")` produces CPU SIMD code today. `@device("auto")` will mean a size-based choice at compile time (small kernels to the CPU SIMD path, large ones to the GPU), which is a stated rule, not a fallback.
+**Status:** not built. `@device` is parsed and ignored, so `@device("metal")` changes nothing: the in-place elementwise shape still becomes CPU SIMD code, and any other body takes the paths described in the status section. `@device("auto")` will mean a size-based choice at compile time (small kernels to the CPU SIMD path, large ones to the GPU), which is a stated rule, not a fallback.
 
 ```zynml
 // Query available devices
@@ -823,6 +823,7 @@ impl ComputeBackend for CpuSimdBackend {
 objc2-metal = "0.3"
 objc2-metal-performance-shaders = "0.3"
 
+[dependencies]
 # NVIDIA, behind the compiler's opt-in `cuda` feature (see GPU_AOT_ARCHITECTURE.md)
 cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12090"] }
 
@@ -1009,4 +1010,4 @@ pipeline transformer_block(x: tensor[batch, seq, hidden], layer: int) -> tensor[
     return output
 ```
 
-This is the target: a complete, GPU-accelerated transformer block written entirely in ZynML. **Status:** no part of it compiles to a kernel today; `matmul` and `fused` kernels lower to the undefined runtime dispatch described in the status section.
+This is the target: a complete, GPU-accelerated transformer block written entirely in ZynML. **Status:** no part of it compiles to a kernel today; `matmul` and `fused` kernels take the unsupported-body paths described in the status section (the last direct `yield`, or the undefined runtime dispatch).

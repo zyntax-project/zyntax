@@ -243,7 +243,7 @@ No Rust compilation required for grammar users! Dynamic interpretation of JSON a
 - [ZynML Unified DSL](docs/ml-dsl-plans/00-unified-ml-dsl.md) - DSL with compute() target syntax
 
 **Work items** live in git-bug (`git-bug bug show <id>`):
-- `13983a22693b250bbf4b91f5dca193b3ba0df4bbc094722791e0d3c7cf170811` unmatched `compute()` bodies call an undefined runtime function
+- `13983a22693b250bbf4b91f5dca193b3ba0df4bbc094722791e0d3c7cf170811` unmatched `compute()` bodies call an undefined runtime function or return their last direct `yield`
 - `ab79beb59e7f172037869210d65eb668770a80c9099ddfc7dc373e3d6e796988` `@kernel reduce` returns the last yield
 - `a127ddefe45d10932af8f3b2d4816181ce0d2d40ba3ddcc6465976286d00b2bf` compute modifiers are parsed and never read
 - `77df2243b3427cedf9c0e9c5f79f88efd67a61f842ca54ba845f44065c95e3cb` elementwise kernel loop hard-codes 4 lanes

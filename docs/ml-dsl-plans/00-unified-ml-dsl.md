@@ -256,10 +256,12 @@ let output = confidence > 0.9 ? high_conf_path() : low_conf_path()
 // --- GPU Compute Dispatch (target syntax) ---
 // Custom math kernels, run as CPU SIMD or on a GPU chosen by @device.
 // Status 2026-09-25: only the in-place elementwise form
-// (`for i in r { arr[i] = arr[i] OP scalar }`) and a directly yielded value
-// lower today, on CPU SIMD; reduce(+) has no operator slot yet, and @device
-// and @async are parsed and ignored. Kernels are a typed subset: a body the
-// compiler cannot lower is a compile error. See 09-gpu-compute-system.md.
+// (`for i in r { arr[i] = arr[i] OP scalar }`) lowers to a kernel, on CPU
+// SIMD. Another body returns its last directly yielded value, or otherwise
+// calls an undefined runtime function (tracked bugs). reduce(+) has no
+// operator slot yet, and @device and @async are parsed and ignored. Kernels
+// are a typed subset: a body the compiler cannot lower is to be a compile
+// error. See 09-gpu-compute-system.md.
 
 // Simple element-wise compute
 let result = compute(tensor) {

@@ -20,10 +20,10 @@ Checked against the code on 2026-09-25 (HEAD `a900deba`). This document is the N
 
 ### Not built
 
-- GPU code generation of any kind: no NVPTX, MSL, SPIR-V or WGSL emission, no GPU runtime, no driver binding. The LLVM tier initializes only the host target. The one GPU name in the tree is the unused `LoweringTarget::Nvptx` variant in `pattern_engine`.
+- GPU code generation of any kind: no NVPTX, MSL, SPIR-V or WGSL emission, no GPU runtime, no driver binding. The LLVM tier initializes only the host target. The one GPU name in the tree is the `LoweringTarget::Nvptx` variant in `pattern_engine`, which one pattern-engine test selects and nothing lowers to.
 - No `compute` Cargo feature, and none of the typed-AST or HIR kernel types in Parts 1 and 2.
 - `@device`, `@workgroup` and `@kernel(x)` modifiers are parsed into `TypedComputeExpr` and never read. Kernel bodies are not type checked.
-- A `compute()` body outside the recognised shapes lowers to a call of `$Zyntax$compute`, which is not defined anywhere. That is a bug, not a design (see Tracking).
+- A `compute()` body outside the recognised shapes either returns its last directly yielded value, when it is not marked `@kernel elementwise` and has a `yield` directly in the body, or lowers to a call of `$Zyntax$compute`, which is not defined anywhere. Both are bugs, not design (see Tracking).
 - No `zyntax` module in the Python or Lua frontends.
 
 ### Decided direction
@@ -46,7 +46,7 @@ Neither the Mac nor the NUC (Intel Iris Xe graphics) has an NVIDIA GPU (checked 
 
 git-bug issues (show with `git-bug bug show <id>`):
 
-- `13983a22693b250bbf4b91f5dca193b3ba0df4bbc094722791e0d3c7cf170811`: unmatched `compute()` bodies call the undefined `$Zyntax$compute`.
+- `13983a22693b250bbf4b91f5dca193b3ba0df4bbc094722791e0d3c7cf170811`: unmatched `compute()` bodies call the undefined `$Zyntax$compute` or return their last direct `yield`.
 - `ab79beb59e7f172037869210d65eb668770a80c9099ddfc7dc373e3d6e796988`: `@kernel reduce` returns the last yield.
 - `a127ddefe45d10932af8f3b2d4816181ce0d2d40ba3ddcc6465976286d00b2bf`: compute modifiers are parsed and never read.
 - `77df2243b3427cedf9c0e9c5f79f88efd67a61f842ca54ba845f44065c95e3cb`: the elementwise loop hard-codes 4 lanes.
@@ -837,7 +837,7 @@ pub struct GpuModuleMetadata {
 
 ## Part 3: LLVM NVPTX Backend
 
-**Status (2026-09-25): not built; the approach holds.** Checked with the LLVM the compiler links (21.1.8) and no CUDA toolkit installed: an `nvptx64-nvidia-cuda` module compiles to PTX (`.target sm_80`). The code below is updated for LLVM 21:
+**Status (2026-09-25): not built; the approach holds.** Checked with Homebrew LLVM 21 (21.1.8 `llc`/`opt`; the compiler links 21.1.2 through the `llvm-config` on `PATH`) and no CUDA toolkit installed: an `nvptx64-nvidia-cuda` module compiles to PTX (`.target sm_80`). The code below is updated for LLVM 21:
 
 - Kernels are marked with the `ptx_kernel` calling convention alone. The `!nvvm.annotations` `"kernel"` entry is a legacy form LLVM only auto-upgrades.
 - Launch bounds are function attributes: `"nvvm.maxntid"`, `"nvvm.reqntid"`, `"nvvm.minctasm"` and `"nvvm.maxnreg"`. The old `"maxntidx"` annotation is upgraded to `"nvvm.maxntid"`.
@@ -1959,20 +1959,23 @@ impl UnifiedMemory {
 
 ### 6.1 DSL Kernel Generation Pipeline
 
-**Status (2026-09-25):** the grammar parses the source form shown below (`compute_expr` in `crates/zynml/ml.zyn`), but lowering ignores `@kernel(matmul)`, `@device` and `@workgroup`: the block is classified Generic and becomes a call of the undefined `$Zyntax$compute`, a bug tracked in git-bug. The pipeline below is the target. Python and Lua kernels enter the same pipeline at the typed-AST step through the `zyntax` module. On the CPU side the path is HIR vector instructions plus `parallel_dispatch` (behind `ZYNTAX_PARALLEL_LOOPS=1` today), not OpenMP, and a kernel on a device the build cannot reach is a compile or launch error, not a silent CPU run.
+**Status (2026-09-25):** the source form below is written in the syntax the grammar accepts today: modifiers after the argument list, a braced single-variable `for`, and plain assignment (ZynML has no `+=`). It parses, but lowering ignores `@kernel(matmul)`, `@device` and `@workgroup`. The block is classified Generic, and because it has no direct `yield` it becomes a call of the undefined `$Zyntax$compute`, so running it fails on the Cranelift tier with an unresolved-symbol panic; that is a bug tracked in git-bug. The in-body `@workgroup(16, 16)` directive and the two-variable `for i in 0..M, j in 0..N:` loop of the 2025-12 draft do not parse: the only in-body directive is `@kernel <identifier>`, and `for` takes one variable and a braced block. The pipeline below is the target. Python and Lua kernels enter the same pipeline at the typed-AST step through the `zyntax` module. On the CPU side the path is HIR vector instructions plus `parallel_dispatch` (behind `ZYNTAX_PARALLEL_LOOPS=1` today), not OpenMP, and a kernel on a device the build cannot reach is a compile or launch error, not a silent CPU run.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│             Kernel source (ZynML compute, or @kernel via `zyntax`)           │
-│                                                                              │
-│  compute(A, B) @kernel(matmul) @device("cuda:0") {                          │
-│      @workgroup(16, 16)                                                      │
-│      for i in 0..M, j in 0..N:                                              │
-│          var sum = 0.0                                                       │
-│          for k in 0..K:                                                      │
-│              sum += A[i, k] * B[k, j]                                       │
-│          out[i, j] = sum                                                     │
-│  }                                                                           │
+│             Kernel source (ZynML compute, or @kernel via `zyntax`)          │
+│                                                                             │
+│  compute(A, B) @kernel(matmul) @device("cuda:0") @workgroup(16, 16) {       │
+│      for i in 0..M {                                                        │
+│          for j in 0..N {                                                    │
+│              var sum = 0.0                                                  │
+│              for k in 0..K {                                                │
+│                  sum = sum + A[i * K + k] * B[k * N + j]                    │
+│              }                                                              │
+│              out[i * N + j] = sum                                           │
+│          }                                                                  │
+│      }                                                                      │
+│  }                                                                          │
 └────────────────────────────────┬────────────────────────────────────────────┘
                                  │
                                  ▼
