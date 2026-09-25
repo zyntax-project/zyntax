@@ -241,6 +241,82 @@ struct FunctionEntry {
     bead_id: u64,
 }
 
+/// A function's optimised body; see [`OptimizedBodies`].
+type BodyCell = Arc<std::sync::OnceLock<Arc<HirFunction>>>;
+
+/// Each lazy function's optimised body, beside the lowered one its
+/// module holds. A cell is filled at most once per load or reload, by
+/// the first caller to reach it while any other waits, and every compile
+/// of the function at any tier reads its HIR from its cell or from the
+/// body a reload swapped in. A cell is replaced whole, by a reload or to
+/// let its body go, and never refilled in place.
+#[derive(Default)]
+struct OptimizedBodies(RwLock<HashMap<HirId, BodyCell>>);
+
+impl OptimizedBodies {
+    fn cell(&self, id: HirId) -> Option<BodyCell> {
+        self.0.read().unwrap().get(&id).cloned()
+    }
+
+    /// The body in `id`'s cell, if it is filled.
+    fn get(&self, id: HirId) -> Option<Arc<HirFunction>> {
+        self.0.read().unwrap().get(&id)?.get().cloned()
+    }
+
+    /// An empty cell for each of `ids` that has none; a cell already
+    /// there is kept, filled or not.
+    fn add(&self, ids: impl IntoIterator<Item = HirId>) {
+        let mut cells = self.0.write().unwrap();
+        for id in ids {
+            cells.entry(id).or_default();
+        }
+    }
+
+    /// `cell` in place of `id`'s, handing back the one it replaced.
+    fn replace(&self, id: HirId, cell: BodyCell) -> Option<BodyCell> {
+        self.0.write().unwrap().insert(id, cell)
+    }
+
+    /// Put back what [`Self::replace`] handed back.
+    fn restore(&self, id: HirId, cell: Option<BodyCell>) {
+        let mut cells = self.0.write().unwrap();
+        match cell {
+            Some(cell) => cells.insert(id, cell),
+            None => cells.remove(&id),
+        };
+    }
+
+    fn filled(body: Arc<HirFunction>) -> BodyCell {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(body);
+        Arc::new(cell)
+    }
+}
+
+/// The HIR every tier compiles of `func_id`: the body a reload swapped
+/// in, else its optimised body, made now if a lazy function has none
+/// yet, else the module's, which an eager function was optimised in at
+/// load.
+fn tier_body(
+    func_id: HirId,
+    bead_id: u64,
+    swapped: Option<&Arc<HirFunction>>,
+    bodies: &OptimizedBodies,
+    lazy: bool,
+    module: &HirModule,
+) -> Option<Arc<HirFunction>> {
+    if let Some(f) = swapped {
+        return Some(Arc::clone(f));
+    }
+    if let Some(f) = bodies.get(func_id) {
+        return Some(f);
+    }
+    if lazy && let Some(f) = osr::lazy_optimized_body(bead_id) {
+        return Some(f);
+    }
+    module.functions.get(&func_id).map(|f| Arc::new(f.clone()))
+}
+
 /// What the tier above answered a bead's promotion request with, kept
 /// per bead and tier so the answer is not worked out again.
 #[derive(Clone, Copy)]
@@ -598,6 +674,11 @@ struct UndoSwap {
     /// nothing was published).
     old_published: usize,
     old_body: Arc<HirFunction>,
+    /// The body a reload before this one swapped in, if one had.
+    old_function: Option<Arc<HirFunction>>,
+    /// The function's optimised-body cell before the reload, if it had
+    /// one.
+    old_body_cell: Option<BodyCell>,
     /// OSR resume points this reload published, to be unpublished.
     helper_sites: Vec<(u64, u64)>,
     /// Dispatch-table slots this reload patched: (slot address, value
@@ -642,10 +723,9 @@ pub struct TieredBackend {
     /// in their cell; the interpreter reaches their baseline the same
     /// way, so one compile is made of each.
     lazy: HashSet<HirId>,
-    /// The body the first-call compile optimised for each function it
-    /// compiled, which a later tier compiles again rather than the
-    /// module's unoptimised one.
-    optimized_bodies: Arc<Mutex<HashMap<HirId, Arc<HirFunction>>>>,
+    /// Each lazy function's optimised body, made once and compiled by
+    /// every tier in place of the module's unoptimised one.
+    optimized_bodies: Arc<OptimizedBodies>,
     /// Of the lazy functions, those that arrived optimised (a linked
     /// snapshot's), across every module compiled so far: the interpreter
     /// takes their body from the optimiser, which has little to do to
@@ -657,9 +737,11 @@ pub struct TieredBackend {
     /// code, and asks for the optimizing tier as soon as it has some.
     static_hot: HashMap<HirId, bool>,
     /// The optimiser for a function that is not the module's: an
-    /// outlined resume point, optimised in the scratch module of the
-    /// bead it belongs to. Installed with the lazy compiler.
-    optimize_extra: Option<Arc<dyn Fn(u64, HirFunction) -> HirFunction + Send + Sync>>,
+    /// outlined resume point of the bead it belongs to, and whether it
+    /// was cut from a body through the pipeline already, which it then
+    /// does not go through again. Installed with the lazy compiler.
+    #[allow(clippy::type_complexity)]
+    optimize_extra: Option<Arc<dyn Fn(u64, HirFunction, bool) -> HirFunction + Send + Sync>>,
     /// The body the interpreter runs a lazy function's first calls on:
     /// the module's, as lowered, with its releases placed (see
     /// [`Self::interpreter_body_source`]). Made at the first run and
@@ -793,7 +875,7 @@ impl TieredBackend {
             _llvm_context,
             functions: HashMap::new(),
             lazy: HashSet::new(),
-            optimized_bodies: Arc::new(Mutex::new(HashMap::new())),
+            optimized_bodies: Arc::new(OptimizedBodies::default()),
             finished: HashSet::new(),
             static_hot: HashMap::new(),
             optimize_extra: None,
@@ -1039,6 +1121,25 @@ impl TieredBackend {
         if !lazy.is_empty() {
             let (all_lazy, all_finished) = (self.lazy.clone(), self.finished.clone());
             self.install_lazy_compiler(&all_lazy, &all_finished);
+        }
+        // A promotion that compiles its callee closure takes each
+        // callee's tier body.
+        #[cfg(feature = "llvm-backend")]
+        if let Some(llvm) = &self.llvm {
+            let bodies = Arc::clone(&self.optimized_bodies);
+            let beads: HashMap<HirId, u64> = self
+                .functions
+                .iter()
+                .filter(|(id, _)| self.lazy.contains(id))
+                .map(|(id, e)| (*id, e.bead_id))
+                .collect();
+            llvm.with_lock(|be| {
+                be.set_body_source(Arc::new(move |id| {
+                    bodies
+                        .get(id)
+                        .or_else(|| beads.get(&id).and_then(|b| osr::lazy_optimized_body(*b)))
+                }))
+            });
         }
         if !joining {
             self.install_promotion_requester();
@@ -1519,6 +1620,8 @@ impl TieredBackend {
 
             let mut old_entry = 0usize;
             let mut old_body: Option<Arc<HirFunction>> = None;
+            let mut old_function: Option<Arc<HirFunction>> = None;
+            let mut old_body_cell: Option<BodyCell> = None;
             let old_cell = crate::reload::call_target(reload_key, old_id);
             let old_published = osr::published_entry(bead_id);
             if let Some(fn_entry) = self.functions.get_mut(&old_id) {
@@ -1540,7 +1643,14 @@ impl TieredBackend {
                 {
                     fn_entry.bound.bead().eager_install(entry_ptr as *mut ());
                 }
-                fn_entry.function = Some(Arc::new(body.clone()));
+                // The edit's body is what every tier compiles from now
+                // on, the interpreter's getter included, which reads the
+                // cell.
+                let swapped = Arc::new(body.clone());
+                old_function = fn_entry.function.replace(Arc::clone(&swapped));
+                old_body_cell = self
+                    .optimized_bodies
+                    .replace(old_id, OptimizedBodies::filled(swapped));
             }
             // A stub whose address was kept calls the edit's code too.
             osr::set_published_entry(bead_id, entry_ptr);
@@ -1623,6 +1733,8 @@ impl TieredBackend {
                 old_cell,
                 old_published,
                 old_body: old_body.unwrap_or_else(|| Arc::new(old_fn.clone())),
+                old_function,
+                old_body_cell,
                 helper_sites,
                 vtable_slots,
             });
@@ -1769,7 +1881,8 @@ impl TieredBackend {
                     // restored body.
                     fn_entry.bound.bead().reload();
                 }
-                fn_entry.function = Some(Arc::clone(&swap.old_body));
+                fn_entry.function = swap.old_function.clone();
+                self.optimized_bodies.restore(swap.id, swap.old_body_cell);
             }
             let cell = if swap.old_cell != 0 {
                 swap.old_cell
@@ -2401,24 +2514,23 @@ impl TieredBackend {
             let code = adapter.on_invoke(&bound, move |tier, bead| {
                 let c = &*ctx;
                 // The baseline was compiled at load; the ladder above it
-                // compiles anew, from the body the first-call compile
-                // optimised when there is one. A quick baseline has none
-                // until its replacement: the body is optimised now.
+                // compiles anew, from the function's tier body. A quick
+                // baseline has none until its replacement: the body is
+                // optimised now, once, for both.
                 if tier == 0 {
                     if let Some(p) = c.cranelift.with_lock(|be| be.get_function_ptr(c.func_id)) {
                         return p as *mut ();
                     }
                 }
-                let optimized = optimized_bodies.lock().unwrap().get(&c.func_id).cloned();
-                let optimized = optimized
-                    .or_else(|| lazy.then(|| osr::lazy_optimized_body(c.bead_id)).flatten());
-                let body = match (&c.swapped, optimized) {
-                    (Some(f), _) => Arc::clone(f),
-                    (None, Some(f)) => f,
-                    (None, None) => match c.module.functions.get(&c.func_id) {
-                        Some(f) => Arc::new(f.clone()),
-                        None => return ptr::null_mut(),
-                    },
+                let Some(body) = tier_body(
+                    c.func_id,
+                    c.bead_id,
+                    c.swapped.as_ref(),
+                    &optimized_bodies,
+                    lazy,
+                    &c.module,
+                ) else {
+                    return ptr::null_mut();
                 };
                 let entry = compile_at_tier(
                     tier,
@@ -2468,8 +2580,8 @@ impl TieredBackend {
         let finished = self.finished.clone();
         Box::new(move |id: HirId| {
             let bead = beads.get(&id)?;
-            if let Some(body) = optimized_bodies.lock().unwrap().get(&id) {
-                return Some(Arc::clone(body));
+            if let Some(body) = optimized_bodies.get(id) {
+                return Some(body);
             }
             if finished.contains(&id) {
                 return osr::lazy_optimized_body(*bead);
@@ -2567,8 +2679,11 @@ impl TieredBackend {
             None => return,
         };
 
-        // Build a closure beadie can call from any tier broker thread.
-        let func_arc = entry.body(func_id);
+        // Build a closure beadie can call from any tier broker thread. The
+        // body is looked up when a compile needs it, not per call.
+        let swapped = entry.function.clone();
+        let bodies = Arc::clone(&self.optimized_bodies);
+        let lazy = self.lazy.contains(&func_id);
         let module_arc = Arc::clone(&entry.module);
         let bead_id = entry.bead_id;
         let cranelift = Arc::clone(&self.cranelift);
@@ -2578,6 +2693,16 @@ impl TieredBackend {
         let verbosity = self.config.verbosity;
 
         let closure = move |tier_idx: usize, bead: &Arc<Bead>| -> *mut () {
+            let Some(func_arc) = tier_body(
+                func_id,
+                bead_id,
+                swapped.as_ref(),
+                &bodies,
+                lazy,
+                &module_arc,
+            ) else {
+                return ptr::null_mut();
+            };
             compile_at_tier(
                 tier_idx,
                 bead,
@@ -2653,6 +2778,8 @@ impl TieredBackend {
         struct Scratch {
             module: HirModule,
             cache: crate::OptCache,
+            /// The functions of `module` through the pipeline in it.
+            done: HashSet<HirId>,
         }
         // One scratch per module: a program that compiles a chunk of
         // itself has bodies in more than one.
@@ -2660,18 +2787,30 @@ impl TieredBackend {
             /// The scratch of `module` in `slots`, made if none is: every
             /// function marked through the pipeline and deferred, so a
             /// pass that walks the module touches the one being optimised
-            /// alone.
+            /// alone. A program function whose cell is filled goes in as
+            /// its cell holds it, so a body optimised later inlines it as
+            /// every tier runs it; one that arrived optimised stays as it
+            /// arrived, box readers and all, as the release pass reads it.
             fn of<'a>(
                 slots: &'a mut HashMap<usize, Scratch>,
                 module: &Arc<HirModule>,
                 facts: &Facts,
+                bodies: &OptimizedBodies,
+                program: &HashSet<HirId>,
             ) -> &'a mut Scratch {
                 let key = Arc::as_ptr(module) as usize;
                 slots.entry(key).or_insert_with(|| {
                     let started = web_time::Instant::now();
                     let facts = facts.of(module);
                     let mut module: HirModule = (**module).clone();
-                    for f in module.functions.values_mut() {
+                    let mut done = HashSet::new();
+                    for (id, f) in module.functions.iter_mut() {
+                        if program.contains(id)
+                            && let Some(body) = bodies.get(*id)
+                        {
+                            *f = (*body).clone();
+                            done.insert(*id);
+                        }
                         f.attributes.optimized = true;
                         f.attributes.deferred = true;
                     }
@@ -2683,7 +2822,11 @@ impl TieredBackend {
                             std::thread::current().name().unwrap_or("?")
                         );
                     }
-                    Scratch { module, cache }
+                    Scratch {
+                        module,
+                        cache,
+                        done,
+                    }
                 })
             }
         }
@@ -2719,11 +2862,30 @@ impl TieredBackend {
         let keeps_bodies = matches!(tier2_backend, Tier2Backend::LLVM);
         #[cfg(not(feature = "llvm-backend"))]
         let keeps_bodies = false;
+        // What a body that arrived optimised (a linked snapshot's) still
+        // needs, the module's own pass having skipped it: box readers to
+        // loads, then what those loads let move. Incremental; never the
+        // pipeline.
+        let finish = {
+            let externs = externs.clone();
+            let pure_fns = pure_fns.clone();
+            move |f: &mut HirFunction| {
+                crate::opt_audit::note_finishing(f.id);
+                let boxed = crate::boxes::run_function(f, &externs);
+                if boxed.expanded + boxed.made + boxed.released + boxed.shared > 0 {
+                    crate::licm::run(f);
+                    crate::cse::eliminate_with(f, &pure_fns);
+                }
+            }
+        };
+        let finish: Arc<dyn Fn(&mut HirFunction) + Send + Sync> = Arc::new(finish);
         // The body of a lazy function as every tier runs it: the
         // interpreter, the baseline and the tier above compile one body,
-        // so a frame in any of them can move to the next. Made once, at
-        // the first call or the first compile, whichever comes first,
-        // and kept in `optimized_bodies` from then.
+        // so a frame in any of them can move to the next. Made in the
+        // function's cell by the first call or compile to ask, whichever
+        // comes first; any other asking meanwhile waits for it.
+        self.optimized_bodies
+            .add(by_bead.values().map(|(id, _, _)| *id));
         let optimize_body = {
             let by_bead: HashMap<u64, (HirId, Arc<HirModule>)> = by_bead
                 .iter()
@@ -2734,68 +2896,72 @@ impl TieredBackend {
             let facts = Arc::clone(&facts);
             let finished = finished.clone();
             let lazy = lazy.clone();
-            let externs = externs.clone();
-            let pure_fns = pure_fns.clone();
+            let finish = Arc::clone(&finish);
             move |bead_id: u64| -> Option<Arc<HirFunction>> {
                 let (func_id, module_arc) = by_bead.get(&bead_id)?;
-                if let Some(body) = optimized_bodies.lock().unwrap().get(func_id) {
+                let cell = optimized_bodies.cell(*func_id)?;
+                if let Some(body) = cell.get() {
                     return Some(Arc::clone(body));
                 }
-                let body = if finished.contains(func_id) {
-                    // Optimised with its snapshot; what the module's own
-                    // pass would have done to it, done to it alone: box
-                    // readers to loads, then what those loads let move.
-                    let mut f = module_arc.functions.get(func_id)?.clone();
-                    f.attributes.deferred = false;
-                    let boxed = crate::boxes::run_function(&mut f, &externs);
-                    if boxed.expanded + boxed.made + boxed.released + boxed.shared > 0 {
-                        crate::licm::run(&mut f);
-                        crate::cse::eliminate_with(&mut f, &pure_fns);
+                let finished = finished.contains(func_id);
+                if !module_arc.functions.contains_key(func_id)
+                    || (!finished && !lazy.contains(func_id))
+                {
+                    return None;
+                }
+                let body = cell.get_or_init(|| {
+                    if finished {
+                        let mut f = module_arc.functions[func_id].clone();
+                        f.attributes.deferred = false;
+                        finish(&mut f);
+                        return Arc::new(f);
                     }
-                    Arc::new(f)
-                } else {
-                    if !lazy.contains(func_id) {
-                        return None;
-                    }
+                    // The scratch is held until the body is in the cell's
+                    // hands, so no other caller sees it half made.
                     let mut optimized = optimized.lock().unwrap();
-                    let scratch = Scratch::of(&mut optimized, module_arc, &facts);
-                    let f = scratch.module.functions.get_mut(func_id)?;
-                    f.attributes.optimized = false;
-                    f.attributes.deferred = false;
-                    // `ZYNTAX_DUMP_HIR_DIR` gets the body before and after
-                    // its own optimisation, as `fn-<name>-lowered.hir` and
-                    // `fn-<name>-body.hir`.
-                    let name = f.name.resolve_global().unwrap_or_default();
-                    if std::env::var_os("ZYNTAX_DUMP_HIR_DIR").is_some() {
-                        let lowered = f.clone();
-                        crate::hir_dump::dump_function_to_dir(
-                            &lowered,
-                            &scratch.module,
-                            &format!("{name}-lowered"),
-                        );
+                    let scratch =
+                        Scratch::of(&mut optimized, module_arc, &facts, &optimized_bodies, &lazy);
+                    if !scratch.done.contains(func_id) {
+                        let f = scratch
+                            .module
+                            .functions
+                            .get_mut(func_id)
+                            .expect("the scratch is a copy of the function's module");
+                        f.attributes.optimized = false;
+                        f.attributes.deferred = false;
+                        // `ZYNTAX_DUMP_HIR_DIR` gets the body before and
+                        // after its own optimisation, as
+                        // `fn-<name>-lowered.hir` and `fn-<name>-body.hir`.
+                        if std::env::var_os("ZYNTAX_DUMP_HIR_DIR").is_some() {
+                            let name = f.name.resolve_global().unwrap_or_default();
+                            let lowered = f.clone();
+                            crate::hir_dump::dump_function_to_dir(
+                                &lowered,
+                                &scratch.module,
+                                &format!("{name}-lowered"),
+                            );
+                        }
+                        crate::run_interp_safe_opts_cached(&mut scratch.module, &scratch.cache);
+                        scratch.done.insert(*func_id);
                     }
-                    crate::run_interp_safe_opts_cached(&mut scratch.module, &scratch.cache);
-                    let f = scratch.module.functions.get_mut(func_id)?;
+                    let f = scratch
+                        .module
+                        .functions
+                        .get_mut(func_id)
+                        .expect("no pass removes a function");
                     f.attributes.optimized = true;
                     f.attributes.deferred = true;
                     let mut body = f.clone();
                     body.attributes.deferred = false;
+                    let name = body.name.resolve_global().unwrap_or_default();
                     crate::hir_dump::dump_function_to_dir(
                         &body,
                         &scratch.module,
                         &format!("{name}-body"),
                     );
                     Arc::new(body)
-                };
-                // Another thread may have made it meanwhile; the first
-                // one in stays, so every tier reads the same body.
-                Some(Arc::clone(
-                    optimized_bodies
-                        .lock()
-                        .unwrap()
-                        .entry(*func_id)
-                        .or_insert(body),
-                ))
+                });
+                Some(Arc::clone(body))
             }
         };
         let optimize_body: Arc<dyn Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync> =
@@ -2806,8 +2972,12 @@ impl TieredBackend {
             move |bead_id| optimize_body(bead_id)
         });
         // A function of the module's making that is not in it, an
-        // outlined resume point: optimised in the same scratch, alongside
-        // the bodies it may inline, and taken out again.
+        // outlined resume point. Cut from a body already through the
+        // pipeline, it takes what the cut calls for alone: the finishing
+        // passes a body that arrived optimised takes, and the cleanup of
+        // the entry the cut made. Cut from a lowered body, it is
+        // optimised in the same scratch, alongside the bodies it may
+        // inline, and taken out again.
         self.optimize_extra = Some(Arc::new({
             let by_bead: HashMap<u64, Arc<HirModule>> = by_bead
                 .iter()
@@ -2815,12 +2985,24 @@ impl TieredBackend {
                 .collect();
             let optimized = Arc::clone(&optimized);
             let facts = Arc::clone(&facts);
-            move |bead_id: u64, f: HirFunction| -> HirFunction {
+            let optimized_bodies = Arc::clone(&optimized_bodies);
+            let finish = Arc::clone(&finish);
+            let lazy = lazy.clone();
+            move |bead_id: u64, mut f: HirFunction, already_optimized: bool| -> HirFunction {
+                if already_optimized {
+                    finish(&mut f);
+                    crate::cfg_simplify::run(&mut f);
+                    crate::phi_prune::run_function(&mut f);
+                    f.attributes.optimized = false;
+                    f.attributes.deferred = false;
+                    return f;
+                }
                 let Some(module_arc) = by_bead.get(&bead_id) else {
                     return f;
                 };
                 let mut optimized = optimized.lock().unwrap();
-                let scratch = Scratch::of(&mut optimized, module_arc, &facts);
+                let scratch =
+                    Scratch::of(&mut optimized, module_arc, &facts, &optimized_bodies, &lazy);
                 let id = f.id;
                 scratch.module.functions.insert(id, f);
                 crate::run_interp_safe_opts_cached(&mut scratch.module, &scratch.cache);
@@ -2972,7 +3154,7 @@ impl TieredBackend {
                 }
             }
             let lazy_started = web_time::Instant::now();
-            let optimized = optimized_bodies.lock().unwrap().contains_key(func_id);
+            let optimized = optimized_bodies.get(*func_id).is_some();
             if quick
                 && !optimized
                 && let Some(queue) = &queue
@@ -3087,9 +3269,10 @@ impl TieredBackend {
             }
             // A body with a loop is kept for the resume points an
             // interpreted frame of it may still ask for; without one, or
-            // a tier above, the compile was its last reader.
+            // a tier above, the compile was its last reader, and its
+            // cell is let go for an empty one.
             if !keeps_bodies && osr::find_loop_headers(&body).is_empty() {
-                optimized_bodies.lock().unwrap().remove(func_id);
+                optimized_bodies.replace(*func_id, BodyCell::default());
             }
             publish(entry as usize, false);
             // A promotion held for the quick baseline goes ahead now
@@ -3338,6 +3521,17 @@ impl TieredBackend {
                 )
             })
             .collect();
+        // Of those, the functions that arrived optimised.
+        let finished_beads: HashSet<u64> = self
+            .functions
+            .iter()
+            .filter(|(id, _)| self.finished.contains(id))
+            .map(|(_, e)| e.bead_id)
+            .collect();
+        // The loops a region was outlined at, by (bead, body tag, loop
+        // ordinal): each is outlined, and optimised, once.
+        let outlined_at: Arc<Mutex<HashSet<(u64, u16, u64)>>> =
+            Arc::new(Mutex::new(HashSet::new()));
 
         // After every install at the optimizing tier, whichever path
         // made it, the sites frames asked at meanwhile get its resume
@@ -3411,9 +3605,7 @@ impl TieredBackend {
                 if let Some(llvm) = &llvm
                     && late.lock().unwrap().claim_if_installed(bead_id, site)
                 {
-                    let body = swapped
-                        .clone()
-                        .or_else(|| optimized_bodies.lock().unwrap().get(func_id).cloned());
+                    let body = swapped.clone().or_else(|| optimized_bodies.get(*func_id));
                     let bodies = late_resume_bodies(
                         body,
                         module_arc.functions.get(func_id),
@@ -3475,19 +3667,19 @@ impl TieredBackend {
                     return true;
                 }
             }
-            // The body: the one a reload swapped in, else the one the
-            // first-call compile optimised, else the module's.
-            let optimized = optimized_bodies.lock().unwrap().get(func_id).cloned();
-            let func_arc = match (swapped, optimized) {
-                (Some(f), _) => Arc::clone(f),
-                (None, Some(f)) => f,
-                (None, None) => match module_arc.functions.get(func_id) {
-                    Some(f) => Arc::new(f.clone()),
-                    None => return false,
-                },
-            };
             let module_arc = Arc::clone(module_arc);
             let func_id = *func_id;
+            // The body every tier compiles, made now if it was not yet.
+            let body_now = || {
+                tier_body(
+                    func_id,
+                    bead_id,
+                    swapped.as_ref(),
+                    &optimized_bodies,
+                    *lazy,
+                    &module_arc,
+                )
+            };
             // An interpreted frame can enter no code mid-loop without a
             // resume point, and the baseline's body has only probes. Its
             // resume points come first, before the body: the frame is
@@ -3498,21 +3690,23 @@ impl TieredBackend {
             if let osr::Requester::Interpreted { site } = from {
                 let (body_tag, ordinal, _) = osr::decode_osr_site(site);
                 // The frame runs the body its tag names: the one the
-                // interpreter made for the first runs, or the module's
-                // as lowered, when it started before any optimised body
-                // existed; else that one.
-                let unoptimized = interp_bodies
+                // interpreter made for the first runs, or the module's,
+                // when it started before any optimised body existed; else
+                // the tier body. The module's is through the pipeline
+                // already for a function that arrived optimised.
+                let untiered = interp_bodies
                     .lock()
                     .unwrap()
                     .get(&func_id)
                     .cloned()
                     .filter(|f| osr::body_tag(f) == body_tag)
+                    .map(|f| (f, false))
                     .or_else(|| {
                         module_arc
                             .functions
                             .get(&func_id)
                             .filter(|f| osr::body_tag(f) == body_tag)
-                            .map(|f| Arc::new(f.clone()))
+                            .map(|f| (Arc::new(f.clone()), finished_beads.contains(&bead_id)))
                     });
                 // `ZYNTAX_DISABLE_OUTLINE=1` gives such a frame the
                 // baseline's resume point instead, to bisect; safe to
@@ -3520,24 +3714,32 @@ impl TieredBackend {
                 let outline = optimize_extra
                     .as_ref()
                     .filter(|_| std::env::var_os("ZYNTAX_DISABLE_OUTLINE").is_none());
-                match (unoptimized, outline) {
-                    // A frame on an unoptimised body leaves into the
-                    // region optimised on its own: the body itself was
-                    // never optimised, and need not be for this call.
-                    (Some(body), Some(optimize)) => {
-                        let optimize = Arc::clone(optimize);
-                        publish_outlined_resume_point(
-                            &cranelift,
-                            func_id,
-                            bead_id,
-                            &body,
-                            &module_arc,
-                            ordinal,
-                            &*optimize,
-                            &outlined_regions,
-                        );
+                match (untiered, outline) {
+                    // A frame on a body other than the tier body leaves
+                    // into the region optimised on its own: the body
+                    // itself need not be for this call. A loop another
+                    // request outlined already has its resume point, or
+                    // is getting it.
+                    (Some((body, optimized)), Some(optimize)) => {
+                        let key = (bead_id, body_tag, ordinal);
+                        if outlined_at.lock().unwrap().insert(key) {
+                            let optimize = Arc::clone(optimize);
+                            let attempted = publish_outlined_resume_point(
+                                &cranelift,
+                                func_id,
+                                bead_id,
+                                &body,
+                                &module_arc,
+                                ordinal,
+                                &|f| optimize(bead_id, f, optimized),
+                                &outlined_regions,
+                            );
+                            if !attempted {
+                                outlined_at.lock().unwrap().remove(&key);
+                            }
+                        }
                     }
-                    (Some(body), None) => {
+                    (Some((body, _)), None) => {
                         publish_baseline_resume_points(
                             &cranelift,
                             func_id,
@@ -3547,16 +3749,25 @@ impl TieredBackend {
                             ordinal,
                         );
                     }
-                    (None, _) => publish_baseline_resume_points(
-                        &cranelift,
-                        func_id,
-                        bead_id,
-                        &func_arc,
-                        &module_arc,
-                        ordinal,
-                    ),
+                    // A frame on neither runs the tier body, which is
+                    // made by now.
+                    (None, _) => {
+                        if let Some(body) = body_now() {
+                            publish_baseline_resume_points(
+                                &cranelift,
+                                func_id,
+                                bead_id,
+                                &body,
+                                &module_arc,
+                                ordinal,
+                            );
+                        }
+                    }
                 }
             }
+            let Some(func_arc) = body_now() else {
+                return false;
+            };
             // The baseline, so the promotion has something to promote and
             // the next call has code.
             if !ensure_baseline(
@@ -3591,18 +3802,6 @@ impl TieredBackend {
                 }
                 return true;
             }
-            // The tier above compiles the body the baseline was optimised
-            // from, which a first-call compile just made when the request
-            // came from the interpreter.
-            let func_arc = match swapped {
-                Some(_) => func_arc,
-                None => optimized_bodies
-                    .lock()
-                    .unwrap()
-                    .get(&func_id)
-                    .cloned()
-                    .unwrap_or(func_arc),
-            };
             #[cfg(feature = "llvm-backend")]
             if !crate::abi::llvm_entry_abi_supported(&func_arc, false) {
                 if osr::osr_trace_enabled() {
@@ -3733,16 +3932,24 @@ impl TieredBackend {
             .get(&func_id)
             .ok_or_else(|| CompilerError::Backend(format!("Function {:?} not found", func_id)))?;
 
-        let func_arc = entry.body(func_id);
-        let module_arc = Arc::clone(&entry.module);
+        let lazy = self.lazy.contains(&func_id);
         let bead_id = entry.bead_id;
+        let func_arc = tier_body(
+            func_id,
+            bead_id,
+            entry.function.as_ref(),
+            &self.optimized_bodies,
+            lazy,
+            &entry.module,
+        )
+        .ok_or_else(|| CompilerError::Backend(format!("Function {:?} has no body", func_id)))?;
+        let module_arc = Arc::clone(&entry.module);
         let cranelift = Arc::clone(&self.cranelift);
         #[cfg(feature = "llvm-backend")]
         let llvm = self.llvm.as_ref().map(Arc::clone);
         let tier2_backend = self.config.tier2_backend;
         let verbosity = self.config.verbosity;
         let tier_idx = target_tier.index();
-        let lazy = self.lazy.contains(&func_id);
         if !ensure_baseline(
             &entry.bound,
             func_id,
@@ -4166,7 +4373,7 @@ fn publish_late_resume_point(
     };
     let def = ZyntaxFunctionDef {
         id: *id,
-        function: (**body).clone(),
+        function: Arc::clone(body),
         module: Arc::clone(module_arc),
         tier: OptimizationTier::Optimized.index(),
         bead_id,
@@ -4300,7 +4507,8 @@ fn ensure_baseline(
 /// The region goes into `regions` under the bead before the site is
 /// published, for the tier above to give the frame resume points of its
 /// own (see [`promote_outlined_region`]): the frame may ask for that
-/// promotion from the region the moment it is in it.
+/// promotion from the region the moment it is in it. Whether the region
+/// was attempted: false when there was no such loop or no frame waits.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn publish_outlined_resume_point(
     cranelift: &Arc<ZyntaxCraneliftBackend>,
@@ -4309,12 +4517,12 @@ fn publish_outlined_resume_point(
     func_arc: &Arc<HirFunction>,
     module_arc: &Arc<HirModule>,
     asked_at: u64,
-    optimize: &(dyn Fn(u64, HirFunction) -> HirFunction + Send + Sync),
+    optimize: &(dyn Fn(HirFunction) -> HirFunction + Send + Sync),
     regions: &Mutex<HashMap<u64, Vec<(HirId, Arc<HirFunction>)>>>,
-) {
+) -> bool {
     let def = ZyntaxFunctionDef {
         id: func_id,
-        function: (**func_arc).clone(),
+        function: Arc::clone(func_arc),
         module: Arc::clone(module_arc),
         tier: OptimizationTier::Baseline.index(),
         bead_id,
@@ -4323,7 +4531,7 @@ fn publish_outlined_resume_point(
         .get(asked_at as usize)
         .copied()
     else {
-        return;
+        return false;
     };
     if !osr::frame_waiting(bead_id) {
         if osr::osr_trace_enabled() {
@@ -4332,7 +4540,7 @@ fn publish_outlined_resume_point(
                 func_arc.name.resolve_global().unwrap_or_default()
             );
         }
-        return;
+        return false;
     }
     let outlined = std::thread::scope(|scope| {
         std::thread::Builder::new()
@@ -4340,7 +4548,7 @@ fn publish_outlined_resume_point(
             .stack_size(16 << 20)
             .spawn_scoped(scope, || {
                 cranelift
-                    .outlined_resume_point_at(&def, header, &|f| optimize(bead_id, f))
+                    .outlined_resume_point_at(&def, header, optimize)
                     .map(|out| {
                         let sites: Vec<(u64, usize)> = out
                             .sites
@@ -4361,7 +4569,7 @@ fn publish_outlined_resume_point(
             );
         }
         publish_baseline_resume_points(cranelift, func_id, bead_id, func_arc, module_arc, asked_at);
-        return;
+        return true;
     };
     regions
         .lock()
@@ -4381,6 +4589,7 @@ fn publish_outlined_resume_point(
             osr::publish_helper(bead_id, site, code);
         }
     }
+    true
 }
 
 /// The optimizing tier's resume points for an outlined region: the
@@ -4410,7 +4619,7 @@ fn promote_outlined_region(
     crate::hir_dump::dump_function_to_dir(region, module_arc, &format!("{name}-tier{tier_idx}"));
     let def = ZyntaxFunctionDef {
         id: region_id,
-        function: (**region).clone(),
+        function: Arc::clone(region),
         module: Arc::clone(module_arc),
         tier: tier_idx,
         bead_id,
@@ -4450,7 +4659,7 @@ fn publish_baseline_resume_points(
 ) {
     let def = ZyntaxFunctionDef {
         id: func_id,
-        function: (**func_arc).clone(),
+        function: Arc::clone(func_arc),
         module: Arc::clone(module_arc),
         tier: OptimizationTier::Baseline.index(),
         bead_id,
@@ -4548,7 +4757,7 @@ pub fn compile_at_tier(
 ) -> *mut () {
     let def = ZyntaxFunctionDef {
         id: func_id,
-        function: (**func_arc).clone(),
+        function: Arc::clone(func_arc),
         module: Arc::clone(module_arc),
         tier: tier_idx,
         bead_id,
