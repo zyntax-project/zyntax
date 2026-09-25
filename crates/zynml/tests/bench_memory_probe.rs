@@ -5,21 +5,10 @@
 //! does, one at a time, and reports resident size after each, so the
 //! growth can be attributed to a kernel rather than to the harness.
 
+mod resident;
+
 use std::path::{Path, PathBuf};
 use zynml::ZynML;
-
-/// Resident size of this process, in MB.
-fn rss_mb() -> u64 {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .expect("ps");
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<u64>()
-        .unwrap_or(0)
-        / 1024
-}
 
 /// Load and run one kernel the way one harness iteration does, then
 /// drop it. The name goes straight to the process's stderr, past the
@@ -75,15 +64,15 @@ fn kernels() -> Vec<PathBuf> {
 #[test]
 fn a_second_pass_does_not_cost_what_the_first_did() {
     let files = kernels();
-    let before_first = rss_mb();
+    let before_first = resident::mb();
     for f in &files {
         run_kernel(f);
     }
-    let after_first = rss_mb();
+    let after_first = resident::mb();
     for f in &files {
         run_kernel(f);
     }
-    let after_second = rss_mb();
+    let after_second = resident::mb();
     println!("\n  after pass 1: {after_first} MB");
     println!("  after pass 2: {after_second} MB");
     let growth = after_second as i64 - after_first as i64;
@@ -114,11 +103,11 @@ fn a_second_pass_does_not_cost_what_the_first_did() {
 
     // Attribute what is left, now that first-time costs are paid.
     println!("\n  third pass, per kernel:");
-    let mut prev = rss_mb();
+    let mut prev = resident::mb();
     for f in &files {
         let name = f.file_stem().unwrap().to_string_lossy().to_string();
         run_kernel(f);
-        let now = rss_mb();
+        let now = resident::mb();
         let d = now as i64 - prev as i64;
         if d != 0 {
             println!("    {name:<34}{d:>6} MB");
@@ -129,7 +118,7 @@ fn a_second_pass_does_not_cost_what_the_first_did() {
 
 #[test]
 fn report_memory_per_kernel() {
-    let base = rss_mb();
+    let base = resident::mb();
     println!("\n  {:<34}{:>10}{:>10}", "kernel", "after MB", "delta MB");
     println!("  {}", "-".repeat(54));
     let mut prev = base;
@@ -137,7 +126,7 @@ fn report_memory_per_kernel() {
     for f in kernels() {
         let name = f.file_stem().unwrap().to_string_lossy().to_string();
         run_kernel(&f);
-        let now = rss_mb();
+        let now = resident::mb();
         println!("  {:<34}{:>10}{:>10}", name, now, now as i64 - prev as i64);
         rows.push((name, now.saturating_sub(prev)));
         prev = now;

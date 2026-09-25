@@ -6,19 +6,10 @@
 //! the region: a parked timer, a latched completion, or a
 //! handler/performer pairing all mean something can still poll it.
 
+mod resident;
+
 use zynml::{Grammar2, ZYNML_GRAMMAR};
 use zyntax_embed::ZyntaxRuntime;
-
-fn rss_kb() -> i64 {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .expect("ps");
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0)
-}
 
 /// Many completed tasks must not accumulate. The body has enough locals
 /// across its await to make the slot array worth measuring.
@@ -56,12 +47,12 @@ async def work(): i64 {
         let p = rt.call_async("work", &[]).expect("spawn");
         assert_eq!(p.await_raw().expect("resolve").as_i64(), Some(36));
     }
-    let base = rss_kb();
+    let base = resident::kb();
     for _ in 0..50_000 {
         let p = rt.call_async("work", &[]).expect("spawn");
         assert_eq!(p.await_raw().expect("resolve").as_i64(), Some(36));
     }
-    let grew = rss_kb() - base;
+    let grew = resident::kb() - base;
     eprintln!("RSS delta over 50k completed tasks: {grew}kB");
     assert!(
         grew < 2_000,

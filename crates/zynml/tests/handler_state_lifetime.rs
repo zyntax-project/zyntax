@@ -10,6 +10,8 @@
 //! readable for exactly as long as something is installed against it,
 //! and that releasing twice or out of order does not fault.
 
+mod resident;
+
 use zynml::{Grammar2, ZYNML_GRAMMAR};
 use zyntax_embed::{NativeSignature, NativeType, TieredConfig, TieredRuntime, ZyntaxValue};
 
@@ -174,17 +176,6 @@ fn shutdown_reclaims_outstanding_state() {
 /// regression rather than merely tolerating one.
 #[test]
 fn repeated_installs_do_not_grow_the_process() {
-    fn rss_kb() -> i64 {
-        let out = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-            .output()
-            .expect("ps");
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0)
-    }
-
     const BIG: &str = r#"
 effect E { def bump(): i64 }
 handler Big for E {
@@ -217,13 +208,13 @@ def tick(): i64 { return bump() }
         rt.call_function("tick", &[], &sig()).ok();
         rt.pop_effect_handler(frame);
     }
-    let base = rss_kb();
+    let base = resident::kb();
     for _ in 0..200_000 {
         let frame = rt.push_effect_handler(big).expect("push");
         rt.call_function("tick", &[], &sig()).ok();
         rt.pop_effect_handler(frame);
     }
-    let grew = rss_kb() - base;
+    let grew = resident::kb() - base;
     assert!(
         grew < 2_000,
         "200k installs grew RSS by {grew}kB; the state is not being released"
