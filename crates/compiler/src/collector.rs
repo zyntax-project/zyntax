@@ -61,7 +61,9 @@
 //! reports each collection, `=2` what each root range reaches, `=3`
 //! which words anchored the most. `ZYNTAX_GC_FLOOR_KB=<n>` sets the heap size
 //! below which nothing is collected; a small value collects constantly,
-//! which is how a missed root is found.
+//! which is how a missed root is found. `ZYNTAX_GC_EXPLAIN=1` records
+//! which word first reached each block, for [`Marking::why`]; safe,
+//! slower.
 //!
 //! ## Weak references
 //!
@@ -249,6 +251,13 @@ fn trace_detail() -> bool {
 /// the summary line; safe otherwise.
 fn trace_attribution() -> bool {
     trace_level() >= 3
+}
+
+/// `ZYNTAX_GC_EXPLAIN=1`: marking records which word first reached
+/// each block, so [`Marking::why`] can answer.
+pub fn explaining() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZYNTAX_GC_EXPLAIN").is_some())
 }
 
 fn disabled_by_env() -> bool {
@@ -473,6 +482,12 @@ pub trait Marking {
     fn is_marked(&self, a: usize) -> bool;
     /// Reach the block `a` lands in, and everything it holds.
     fn mark(&mut self, a: usize);
+    /// Under `ZYNTAX_GC_EXPLAIN`, the chain of words by which the block
+    /// `a` lands in was reached, from the root: a stack word by the
+    /// function whose frame holds it. None otherwise.
+    fn why(&self, _a: usize) -> Option<String> {
+        None
+    }
 }
 
 /// A frontend's weak references, as a collection consults them. Each
@@ -748,6 +763,14 @@ struct Marker<'a> {
     marked_bytes: usize,
     /// Present under the attribution trace.
     attribution: Option<Box<Attribution>>,
+    /// Under `ZYNTAX_GC_EXPLAIN`: each reached block's base, and the
+    /// address of the word that first reached it (0 for a block a weak
+    /// hook or the fiber runtime named).
+    origins: Option<HashMap<usize, usize>>,
+    /// The address of the word being read, while `origins` is kept.
+    reading: usize,
+    /// The stack range the roots are read from.
+    stack: (usize, usize),
 }
 
 impl<'a> Marker<'a> {
@@ -791,6 +814,9 @@ impl<'a> Marker<'a> {
                     ..Default::default()
                 })
             }),
+            origins: explaining().then(HashMap::new),
+            reading: 0,
+            stack: (0, 0),
         }
     }
 
@@ -850,6 +876,9 @@ impl<'a> Marker<'a> {
             } else {
                 self.marked_bytes += len;
                 self.work.push((base, len));
+                if let Some(o) = self.origins.as_mut() {
+                    o.insert(base, self.reading);
+                }
                 if let Some(attr) = self.attribution.as_deref_mut() {
                     attr.classes[class].0 += 1;
                     attr.classes[class].1 += len;
@@ -870,6 +899,9 @@ impl<'a> Marker<'a> {
             let total = len + pool_alloc::SLAB_HEADER;
             self.marked_bytes += total;
             self.work.push((payload, len));
+            if let Some(o) = self.origins.as_mut() {
+                o.insert(payload, self.reading);
+            }
             if let Some(attr) = self.attribution.as_deref_mut() {
                 let last = attr.classes.len() - 1;
                 attr.classes[last].0 += 1;
@@ -958,6 +990,9 @@ impl<'a> Marker<'a> {
         if self.attribution.is_some() {
             return self.scan_attributing(lo, hi, None);
         }
+        if self.origins.is_some() {
+            return self.scan_recording(lo, hi);
+        }
         let mut p = (lo + 7) & !7;
         while p + 8 <= hi {
             // SAFETY: the caller hands over memory it owns and that is
@@ -968,6 +1003,69 @@ impl<'a> Marker<'a> {
             }
             p += 8;
         }
+    }
+
+    /// [`Self::scan`] noting, for each block it reaches first, the
+    /// word that reached it.
+    fn scan_recording(&mut self, lo: usize, hi: usize) {
+        let mut p = (lo + 7) & !7;
+        while p + 8 <= hi {
+            // SAFETY: as in `scan`.
+            let w = unsafe { std::ptr::read_volatile(p as *const usize) };
+            if w < lo || w >= hi {
+                self.reading = p;
+                self.consider(w);
+            }
+            p += 8;
+        }
+        self.reading = 0;
+    }
+
+    /// The base of the block `a` lands in, reached or not.
+    fn block_of(&self, a: usize) -> Option<usize> {
+        let slab = a & !(pool_alloc::SLAB_BYTES - 1);
+        if let Some(bits) = self.bits.peek(slab) {
+            return bits.block_at(a - slab).map(|idx| slab + bits.base(idx));
+        }
+        self.large_block(a).map(|(payload, _)| payload)
+    }
+
+    /// The chain [`Marking::why`] reports.
+    fn explain(&self, a: usize) -> Option<String> {
+        use std::fmt::Write;
+        let origins = self.origins.as_ref()?;
+        let mut at = self.block_of(a)?;
+        let mut out = format!("{at:#x}");
+        // A chain is acyclic, since each block is reached once; the
+        // bound only keeps a report short.
+        for _ in 0..64 {
+            let Some(&word) = origins.get(&at) else {
+                out.push_str(" (not reached)");
+                break;
+            };
+            if word == 0 {
+                out.push_str(" <- a weak hook or the fiber runtime");
+                break;
+            }
+            if let Some(block) = self.block_of(word) {
+                let _ = write!(out, " <- {block:#x}+{}", word - block);
+                at = block;
+                continue;
+            }
+            let (lo, hi) = self.stack;
+            if (lo..hi).contains(&word) {
+                let _ = write!(
+                    out,
+                    " <- stack word sp+{:#x} in {}",
+                    word - lo,
+                    frame_owning(word, hi)
+                );
+            } else {
+                let _ = write!(out, " <- root word {word:#x} ({})", symbol_at(word));
+            }
+            break;
+        }
+        Some(out)
     }
 
     /// [`Self::scan`] under the attribution trace. A root word that
@@ -1100,7 +1198,6 @@ impl<'a> Marker<'a> {
 
     /// Put every unreached block back on the free lists, the lists
     /// being rebuilt from nothing so a block is on one exactly once.
-    /// Returns the blocks and bytes that were not free before.
     /// Returns the blocks and bytes that were not free before, and the
     /// bytes on the free lists afterwards.
     fn sweep(&mut self) -> (usize, usize, usize) {
@@ -1192,6 +1289,83 @@ impl Marking for Marker<'_> {
         self.consider(a);
         self.drain();
     }
+
+    fn why(&self, a: usize) -> Option<String> {
+        self.explain(a)
+    }
+}
+
+/// The function whose frame holds the stack word at `word`, found by
+/// the frame-pointer chain from here up to `top`: the frame above the
+/// saved frame pointer at `fp` belongs to the caller its return address
+/// lands in.
+#[inline(never)]
+fn frame_owning(word: usize, top: usize) -> String {
+    let mut fp: usize;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: reads the frame-pointer register.
+    unsafe {
+        std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: reads the frame-pointer register.
+    unsafe {
+        std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        fp = 0;
+    }
+    let here = &fp as *const usize as usize;
+    // A chain that leaves the stack, goes down or is misaligned ends
+    // the walk: a frame without a frame pointer breaks it.
+    let mut low = here;
+    while fp >= low && fp % 8 == 0 && fp + 16 <= top {
+        // SAFETY: inside the live stack, checked above.
+        let (next, ret) = unsafe { (*(fp as *const usize), *((fp + 8) as *const usize)) };
+        if (fp + 16..next.saturating_add(16)).contains(&word) || (next <= fp && word >= fp + 16) {
+            return format!(
+                "the frame of {}, {:#x} above its stack pointer",
+                symbol_at(ret),
+                word - (fp + 16)
+            );
+        }
+        low = fp + 16;
+        fp = next;
+    }
+    "a frame the frame-pointer chain does not reach".to_string()
+}
+
+/// The symbol `a` lands in and the offset into it, or the image and
+/// the offset into that when the symbol is not exported, or the bare
+/// address (code the JIT made).
+fn symbol_at(a: usize) -> String {
+    #[cfg(unix)]
+    {
+        // SAFETY: dladdr fills the struct or returns 0.
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        if unsafe { libc::dladdr(a as *const libc::c_void, &mut info) } != 0 {
+            let name = |p: *const libc::c_char| {
+                // SAFETY: dladdr hands back NUL-terminated strings.
+                unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy()
+            };
+            if !info.dli_sname.is_null() {
+                return format!(
+                    "{}+{:#x}",
+                    name(info.dli_sname),
+                    a - info.dli_saddr as usize
+                );
+            }
+            if !info.dli_fname.is_null() {
+                return format!(
+                    "{}+{:#x}",
+                    name(info.dli_fname),
+                    a - info.dli_fbase as usize
+                );
+            }
+        }
+    }
+    format!("{a:#x}")
 }
 
 /// Run the weak-reference hooks over a marking that has drained: trace
@@ -1375,6 +1549,7 @@ fn collect_from(sp: usize) {
 
     let (live, freed_blocks, freed_bytes, free_bytes, large_freed) = {
         let mut marker = Marker::new(&reg);
+        marker.stack = (sp, host_top);
         let built_at = started.elapsed();
         pool_alloc::for_each_free_block(|b| marker.note_free(b));
         for h in &hooks {

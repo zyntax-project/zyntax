@@ -281,6 +281,9 @@ fn settle(m: &mut dyn Marking) {
     match s.phase {
         Phase::Marking => {
             s.phase = Phase::Resurrected;
+            if s.explicit && collector::explaining() {
+                report_survivors(&s, m);
+            }
             let trim = s.explicit;
             clear_dead_values(&mut s.weak, m, trim);
             // Every unreached finalizable object comes back for one
@@ -314,6 +317,44 @@ fn settle(m: &mut dyn Marking) {
         }
         Phase::Resurrected => clear_dead_keys(&mut s, m),
         Phase::Done => {}
+    }
+}
+
+/// Under `ZYNTAX_GC_EXPLAIN`, in the program's own collection: how
+/// each object that a collection of the reference would take was
+/// reached, an object marked for finalization or the key of an entry
+/// whose value was nil before this collection.
+fn report_survivors(s: &State, m: &dyn Marking) {
+    let report = |what: &str, o: usize| {
+        if m.is_marked(o)
+            && let Some(why) = m.why(o)
+        {
+            eprintln!("[gc] {what} {o:#x} reached: {why}");
+        }
+    };
+    for &o in &s.finalizable {
+        report("finalizable object", o);
+    }
+    for &t in s.weak.keys() {
+        if !m.is_marked(t) {
+            continue;
+        }
+        // SAFETY: reached, so live; the world is stopped.
+        let t = unsafe { &*(t as *const TableHeader) };
+        let Some(list) = (unsafe { list_of(t.hash) }) else {
+            continue;
+        };
+        for &[k, v] in unsafe { elements(list) }
+            .get(1..)
+            .unwrap_or_default()
+            .as_chunks::<2>()
+            .0
+        {
+            // SAFETY: a key of a reached table is a live box.
+            if let (true, Some(r)) = (v.is_null(), unsafe { referent(k) }) {
+                report("key of a nil value", r);
+            }
+        }
     }
 }
 
