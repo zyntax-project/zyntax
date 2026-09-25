@@ -12,10 +12,9 @@ ZynParser is a proof-of-concept demonstrating how PEG grammars (via pest) can be
 - **PEG Grammar**: Calculator grammar (calculator.pest) for arithmetic expressions
 - **TypedAST Generation**: Parse trees automatically convert to Zyntax TypedAST
 - **Type Inference**: Simple type inference for binary operations
-- **All Tests Passing**: 16/16 tests (calculator + zig basics)
 
 ### Phase 2 (Zig Subset) - 95% Complete ✅
-- **Full Zig Grammar**: Functions, structs, control flow, types (20/21 tests passing)
+- **Full Zig Grammar**: Functions, structs, control flow, types
 - **Array Support**: Array literals `[_]T{...}`, sized arrays `[N]T`, indexing
 - **String Literals**: `"Hello, World!"` lowered to global `*i8` constants
 - **Optional Types**: `?T` syntax parses and builds to TypedAST

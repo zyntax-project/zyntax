@@ -4,10 +4,7 @@
 
 Zyntax uses a plugin-based architecture for runtime symbol registration. This keeps the core compiler completely language-agnostic while allowing different language implementations to provide their runtime symbols.
 
-**Note on Terminology**:
-
-- **Haxe → Zyntax**: Uses `reflaxe.zyntax` convention (Reflaxe is a Haxe library for creating compiler targets)
-- **Other language implementations**: Would use their own directory structure (e.g., `python_compiler/runtime/`, `js_compiler/runtime/`, etc.)
+A language runtime lives with its frontend, in whatever directory structure that frontend uses.
 
 ## Architecture
 
@@ -21,11 +18,11 @@ Zyntax uses a plugin-based architecture for runtime symbol registration. This ke
 └──────────────────────────────────────────────────────────┘
                           ↓
 ┌──────────────────────────────────────────────────────────┐
-│  Language Runtime (e.g., reflaxe.zyntax/runtime/)        │
+│  Language Runtime (e.g., mylang_compiler/runtime/)       │
 │  ┌────────────────────────────────────────────┐         │
-│  │  Plugin: "haxe"                             │         │
+│  │  Plugin: "mylang"                           │         │
 │  │  Symbols: $Array$create, $String$concat...  │         │
-│  │  Note: Other languages use own structure    │         │
+│  │  Lives with its frontend                    │         │
 │  └────────────────────────────────────────────┘         │
 └──────────────────────────────────────────────────────────┘
                           ↓
@@ -54,13 +51,12 @@ Zyntax uses a plugin-based architecture for runtime symbol registration. This ke
 ## Key Design Principles
 
 1. **Core compiler is 100% language-agnostic**
-   - No Haxe, Python, or any frontend-specific code in `crates/compiler/`
-   - No conditional compilation (`#[cfg(feature = "haxe_runtime")]`)
+   - No Python, Lua, or any frontend-specific code in `crates/compiler/`
+   - No conditional compilation (`#[cfg(feature = "mylang_runtime")]`)
    - Provides generic APIs, not frontend implementations
 
 2. **Language runtimes are standalone**
-   - Haxe: Lives in `reflaxe.zyntax/runtime/` (reflaxe is Haxe-specific)
-   - Other languages: Use their own directory structure
+   - Each lives with its frontend, in that frontend's directory structure
    - Not part of core Zyntax workspace
    - Can be developed independently
 
@@ -76,21 +72,19 @@ Zyntax uses a plugin-based architecture for runtime symbol registration. This ke
 
 ## Creating a New Language Runtime
 
-**Important**: The `reflaxe.*` naming convention is specific to Haxe's Reflaxe library. Other language compilers targeting Zyntax should use their own appropriate directory structure.
-
 ### Step 1: Create the Runtime Crate
 
-Example for a hypothetical Python compiler:
+Example for a hypothetical MyLang compiler:
 
 ```bash
-mkdir -p python_compiler/runtime/src
+mkdir -p mylang_compiler/runtime/src
 ```
 
-Create `python_compiler/runtime/Cargo.toml`:
+Create `mylang_compiler/runtime/Cargo.toml`:
 
 ```toml
 [package]
-name = "python_zyntax_runtime"
+name = "mylang_runtime"
 version = "0.1.0"
 edition = "2021"
 
@@ -106,21 +100,21 @@ inventory = "0.3"
 
 ### Step 2: Declare the Plugin
 
-Create `python_compiler/runtime/src/lib.rs`:
+Create `mylang_compiler/runtime/src/lib.rs`:
 
 ```rust
 use zyntax_plugin_macros::{runtime_plugin, runtime_export};
 
 // Declare this as a Zyntax runtime plugin
 runtime_plugin! {
-    name: "python",
+    name: "mylang",
 }
 ```
 
 This macro generates:
 
 - `RuntimeSymbol` struct for symbol registration
-- `PythonPlugin` struct implementing `RuntimePlugin` trait
+- `MylangPlugin` struct implementing `RuntimePlugin` trait
 - `get_plugin()` function to retrieve the plugin instance
 
 ### Step 3: Export Runtime Functions
@@ -153,7 +147,7 @@ Add to `crates/zyntax_cli/Cargo.toml`:
 
 ```toml
 [dependencies]
-python_zyntax_runtime = { path = "../../python_compiler/runtime" }
+mylang_runtime = { path = "../../mylang_compiler/runtime" }
 ```
 
 Register in `crates/zyntax_cli/src/backends/cranelift_jit.rs`:
@@ -165,9 +159,9 @@ pub fn compile_jit(...) -> Result<...> {
     // Register stdlib
     registry.register(zyntax_runtime::get_plugin())?;
 
-    // Register Python plugin
-    registry.register(python_zyntax_runtime::get_plugin())
-        .map_err(|e| format!("Failed to register Python plugin: {}", e))?;
+    // Register the MyLang plugin
+    registry.register(mylang_runtime::get_plugin())
+        .map_err(|e| format!("Failed to register MyLang plugin: {}", e))?;
 
     // Collect symbols and pass to backend
     let runtime_symbols = registry.collect_symbols();
@@ -185,7 +179,7 @@ The `runtime_plugin!` macro uses Rust's `inventory` crate for compile-time regis
 
 ```rust
 runtime_plugin! {
-    name: "haxe",
+    name: "mylang",
 }
 ```
 
@@ -199,11 +193,11 @@ pub struct RuntimeSymbol {
 
 inventory::collect!(RuntimeSymbol);
 
-pub struct HaxePlugin;
+pub struct MylangPlugin;
 
-impl zyntax_compiler::plugin::RuntimePlugin for HaxePlugin {
+impl zyntax_compiler::plugin::RuntimePlugin for MylangPlugin {
     fn name(&self) -> &str {
-        "haxe"
+        "mylang"
     }
 
     fn runtime_symbols(&self) -> Vec<(&'static str, *const u8)> {
@@ -215,7 +209,7 @@ impl zyntax_compiler::plugin::RuntimePlugin for HaxePlugin {
 }
 
 pub fn get_plugin() -> Box<dyn zyntax_compiler::plugin::RuntimePlugin> {
-    Box::new(HaxePlugin)
+    Box::new(MylangPlugin)
 }
 ```
 
@@ -246,15 +240,15 @@ inventory::submit! {
 }
 ```
 
-## Example: Haxe Runtime
+## Example: an Array Runtime
 
-See `reflaxe.zyntax/runtime/src/lib.rs` for a complete example:
+A runtime exporting a small array type. `crates/runtime/src/lib.rs` is a complete in-tree plugin.
 
 ```rust
 use zyntax_plugin_macros::{runtime_plugin, runtime_export};
 
 runtime_plugin! {
-    name: "haxe",
+    name: "mylang",
 }
 
 #[runtime_export("$Array$create")]
@@ -298,10 +292,10 @@ cargo build --release
 
 Expected output:
 ```
-info: Registered plugins: ["stdlib", "haxe"]
+info: Registered plugins: ["stdlib", "mylang"]
 info: Compiling functions...
 info: Running main function...
-Hello from Haxe!
+Hello from MyLang!
 42
 ```
 
@@ -364,9 +358,9 @@ impl RuntimePlugin for MyPlugin {
 Before (hardcoded in CLI):
 
 ```rust
-let haxe_symbols: &[(&str, *const u8)] = &[
-    ("$Array$create", haxe_zyntax_runtime::Array_create as *const u8),
-    ("$Array$push", haxe_zyntax_runtime::Array_push as *const u8),
+let mylang_symbols: &[(&str, *const u8)] = &[
+    ("$Array$create", mylang_runtime::Array_create as *const u8),
+    ("$Array$push", mylang_runtime::Array_push as *const u8),
     // ... manual list
 ];
 ```
@@ -375,7 +369,7 @@ After (plugin-based):
 
 ```rust
 let mut registry = PluginRegistry::new();
-registry.register(haxe_zyntax_runtime::get_plugin())?;
+registry.register(mylang_runtime::get_plugin())?;
 let symbols = registry.collect_symbols(); // Auto-collected!
 ```
 

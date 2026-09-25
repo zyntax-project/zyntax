@@ -315,7 +315,6 @@ This approach:
 ## Status
 
 **Completed**: ✅ HIR Builder implementation (708 lines)
-**Tests**: ✅ 2/2 passing
 **Next Step**: Use HIR Builder to implement Gap 10 (Standard Library)
 
 ---

@@ -73,10 +73,10 @@ The `manifest.json` describes the package:
 ```json
 {
   "version": 1,
-  "name": "haxe-runtime",
+  "name": "mylang-runtime",
   "package_version": "1.0.0",
-  "description": "Haxe standard library runtime for Zyntax",
-  "source_language": "haxe",
+  "description": "MyLang standard library runtime for Zyntax",
+  "source_language": "mylang",
   "targets": [
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
@@ -89,7 +89,7 @@ The `manifest.json` describes the package:
   ],
   "exports": [
     {
-      "name": "$haxe$trace$int",
+      "name": "$mylang$trace$int",
       "signature": "fn(i32) -> void",
       "doc": "Print an integer to stdout"
     }
@@ -104,10 +104,10 @@ Use the `zyntax pack create` command:
 ```bash
 # Create a ZPack with modules and runtime
 zyntax pack create \
-  --output haxe-runtime.zpack \
-  --name haxe-runtime \
+  --output mylang-runtime.zpack \
+  --name mylang-runtime \
   --version 1.0.0 \
-  --language haxe \
+  --language mylang \
   --module modules/std/ \
   --runtime x86_64-apple-darwin:lib/darwin/runtime.zrtl \
   --runtime x86_64-unknown-linux-gnu:lib/linux/runtime.zrtl \
@@ -136,14 +136,14 @@ Load a ZPack for JIT execution:
 
 ```bash
 # Single pack
-zyntax compile --jit --pack haxe-runtime.zpack \
-  --grammar haxe.zyn --source main.hx
+zyntax compile --jit --pack mylang-runtime.zpack \
+  --grammar mylang.zyn --source main.mylang
 
 # Multiple packs (combined)
 zyntax compile --jit \
-  --pack haxe-runtime.zpack \
+  --pack mylang-runtime.zpack \
   --pack my-extensions.zpack \
-  --grammar haxe.zyn --source main.hx
+  --grammar mylang.zyn --source main.mylang
 ```
 
 ## Building Runtime Libraries
@@ -189,8 +189,8 @@ $<language>$<type>$<operation>
 
 Examples:
 
-- `$haxe$trace$int` - Haxe trace function for integers
-- `$haxe$Array$push` - Array push method
+- `$mylang$trace$int` - MyLang trace function for integers
+- `$mylang$Array$push` - Array push method
 - `$zig$print` - Zig print function
 
 ### Example Runtime (C)
@@ -201,12 +201,12 @@ Examples:
 #include <stdint.h>
 
 // Trace function for integers
-void haxe_trace_int(int32_t value) {
+void mylang_trace_int(int32_t value) {
     printf("%d\n", value);
 }
 
 // Trace function for strings
-void haxe_trace_string(const char* value) {
+void mylang_trace_string(const char* value) {
     printf("%s\n", value);
 }
 
@@ -215,9 +215,9 @@ typedef struct {
     void** data;
     int32_t length;
     int32_t capacity;
-} HaxeArray;
+} MyLangArray;
 
-void haxe_array_push(HaxeArray* arr, void* value) {
+void mylang_array_push(MyLangArray* arr, void* value) {
     // Implementation...
 }
 ```
@@ -227,8 +227,8 @@ When compiled, use `export_name` attributes or linker scripts to set the exact s
 ```c
 // Using GCC/Clang attributes
 __attribute__((visibility("default")))
-void __attribute__((alias("haxe_trace_int")))
-    $haxe$trace$int(int32_t);
+void __attribute__((alias("mylang_trace_int")))
+    $mylang$trace$int(int32_t);
 ```
 
 Or with Rust using the `zrtl_macros` crate:
@@ -237,14 +237,14 @@ Or with Rust using the `zrtl_macros` crate:
 use zrtl_macros::{zrtl_plugin, zrtl_export};
 
 // Define the plugin (required once per library)
-zrtl_plugin!("haxe_runtime");
+zrtl_plugin!("mylang_runtime");
 
-#[zrtl_export("$haxe$trace$int")]
+#[zrtl_export("$mylang$trace$int")]
 pub extern "C" fn trace_int(value: i32) {
     println!("{}", value);
 }
 
-#[zrtl_export("$haxe$trace$string")]
+#[zrtl_export("$mylang$trace$string")]
 pub extern "C" fn trace_string(s: *const std::ffi::c_char) {
     let c_str = unsafe { std::ffi::CStr::from_ptr(s) };
     println!("{}", c_str.to_string_lossy());
@@ -278,12 +278,12 @@ crate-type = ["staticlib"]
 ```bash
 # 1. Compile source to executable with linked runtime
 zyntax compile --backend llvm \
-  --grammar haxe.zyn --source main.hx \
+  --grammar mylang.zyn --source main.mylang \
   -o myapp --lib runtime
 
 # 2. Or manually link (two-step process)
 zyntax compile --backend llvm \
-  --grammar haxe.zyn --source main.hx \
+  --grammar mylang.zyn --source main.mylang \
   -o myapp.o --emit-obj
 cc myapp.o -L/usr/local/lib -lruntime -o myapp
 ```
@@ -330,9 +330,9 @@ The `--lib` flag accepts multiple formats:
 
 ```bash
 zyntax compile --backend llvm \
-  --grammar haxe.zyn --source main.hx \
+  --grammar mylang.zyn --source main.mylang \
   -o myapp \
-  --lib haxe-runtime \
+  --lib mylang-runtime \
   --lib myextensions \
   --lib pthread
 ```
@@ -358,7 +358,7 @@ Users can run on any supported platform:
 ```bash
 # Works on any platform with matching runtime in the pack
 zyntax compile --jit --pack universal-runtime.zpack \
-  --grammar haxe.zyn --source main.hx
+  --grammar mylang.zyn --source main.mylang
 ```
 
 ### Strategy 2: Platform-Specific Builds (AOT)
@@ -368,19 +368,19 @@ Build separate executables for each target:
 ```bash
 # macOS x86_64
 zyntax compile --backend llvm \
-  --grammar haxe.zyn --source main.hx \
+  --grammar mylang.zyn --source main.mylang \
   -o myapp-darwin-x64 \
   --lib darwin-x64/libruntime.a
 
 # macOS ARM64
 zyntax compile --backend llvm \
-  --grammar haxe.zyn --source main.hx \
+  --grammar mylang.zyn --source main.mylang \
   -o myapp-darwin-arm64 \
   --lib darwin-arm64/libruntime.a
 
 # Linux x86_64
 zyntax compile --backend llvm \
-  --grammar haxe.zyn --source main.hx \
+  --grammar mylang.zyn --source main.mylang \
   -o myapp-linux-x64 \
   --lib linux-x64/libruntime.a
 ```
@@ -429,11 +429,11 @@ zyntax cache clear
 
 # Use a custom cache directory
 zyntax compile --cache-dir ./my-cache \
-  --grammar haxe.zyn --source main.hx
+  --grammar mylang.zyn --source main.mylang
 
 # Disable caching
 zyntax compile --no-cache \
-  --grammar haxe.zyn --source main.hx
+  --grammar mylang.zyn --source main.mylang
 ```
 
 ### How Caching Works
@@ -444,7 +444,7 @@ zyntax compile --no-cache \
 
 ## Example: Complete Distribution Workflow
 
-Here's a complete example of building and distributing a Haxe-based application:
+Here's a complete example of building and distributing a MyLang application:
 
 ### 1. Build the Runtime
 
@@ -459,11 +459,11 @@ done
 
 ```bash
 zyntax pack create \
-  --output dist/haxe-runtime.zpack \
-  --name haxe-runtime \
+  --output dist/mylang-runtime.zpack \
+  --name mylang-runtime \
   --version 1.0.0 \
-  --language haxe \
-  --description "Haxe runtime for Zyntax" \
+  --language mylang \
+  --description "MyLang runtime for Zyntax" \
   --runtime x86_64-apple-darwin:runtime/darwin-x64/runtime.zrtl \
   --runtime aarch64-apple-darwin:runtime/darwin-arm64/runtime.zrtl \
   --runtime x86_64-unknown-linux-gnu:runtime/linux-x64/runtime.zrtl
@@ -474,13 +474,13 @@ zyntax pack create \
 ```bash
 # For each platform
 zyntax compile --backend llvm \
-  --grammar grammars/haxe.zyn --source src/Main.hx \
+  --grammar grammars/mylang.zyn --source src/main.mylang \
   -o dist/myapp-darwin-x64 \
   --lib runtime/darwin-x64/libruntime.a \
   -O3
 
 zyntax compile --backend llvm \
-  --grammar grammars/haxe.zyn --source src/Main.hx \
+  --grammar grammars/mylang.zyn --source src/main.mylang \
   -o dist/myapp-linux-x64 \
   --lib runtime/linux-x64/libruntime.a \
   -O3
@@ -490,7 +490,7 @@ zyntax compile --backend llvm \
 
 ```text
 dist/
-├── haxe-runtime.zpack      # For JIT users
+├── mylang-runtime.zpack      # For JIT users
 ├── myapp-darwin-x64        # Native binary (macOS Intel)
 ├── myapp-darwin-arm64      # Native binary (macOS ARM)
 ├── myapp-linux-x64         # Native binary (Linux)
@@ -503,11 +503,11 @@ dist/
 
 ```bash
 # Download the zpack
-curl -O https://example.com/dist/haxe-runtime.zpack
+curl -O https://example.com/dist/mylang-runtime.zpack
 
 # Run directly with grammar and source
-zyntax compile --jit --pack haxe-runtime.zpack \
-  --grammar haxe.zyn --source script.hx
+zyntax compile --jit --pack mylang-runtime.zpack \
+  --grammar mylang.zyn --source script.mylang
 ```
 
 **AOT users:**
@@ -633,7 +633,7 @@ fn load_runtime_plugins() -> Result<Vec<(&'static str, *const u8)>, Box<dyn std:
     let mut registry = ZrtlRegistry::new();
 
     // Load individual plugins
-    registry.load_plugin("./runtime/haxe_runtime.zrtl")?;
+    registry.load_plugin("./runtime/mylang_runtime.zrtl")?;
     registry.load_plugin("./runtime/math_extensions.zrtl")?;
 
     // Or load all plugins from a directory
@@ -787,7 +787,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_opt_level(2);
 
     // Load runtime plugins
-    compiler.load_zrtl("./runtime/haxe.zrtl")?;
+    compiler.load_zrtl("./runtime/mylang.zrtl")?;
     compiler.register_plugin(Box::new(MyRuntimePlugin))?;
 
     // Parse and compile your program
@@ -1118,4 +1118,4 @@ inventory = "0.3"
 4. **Library search** - `--lib foo` searches standard paths for `libfoo.a`
 5. **Fat ZPacks** - Include multiple platform runtimes for universal distribution
 6. **RuntimePlugin trait** - Embed Zyntax in your Rust application with custom runtime symbols
-7. **DynamicValue** - Type-safe FFI for Haxe's `Dynamic` type and generic containers
+7. **DynamicValue** - Type-safe FFI for dynamically typed values and generic containers

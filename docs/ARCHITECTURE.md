@@ -9,7 +9,7 @@ Zyntax is a multi-layer compiler infrastructure designed to support multiple pro
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Language Frontends                          │
-│         (Rust, Haxe, TypeScript, Java, C#, etc.)               │
+│         (ZynML, Python, Lua, grammar-defined DSLs)              │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
@@ -148,7 +148,6 @@ The TypedAST layer abstracts language-specific features:
 | Language | Type System | Ownership | Async |
 |----------|------------|-----------|-------|
 | Rust | Nominal + Traits | Ownership + Lifetimes | async/await |
-| Haxe | Nominal + Structural | GC | No |
 | TypeScript | Structural | GC | async/await |
 | Java/C# | Nominal + Interfaces | GC | async/await |
 
@@ -378,7 +377,6 @@ Implemented as HIR modules compiled with the program:
 - 50+ adapter methods (map, filter, fold, etc.)
 - Zero-cost abstractions
 
-**Current Status**: 93/100 stdlib functions compile successfully
 
 ---
 
@@ -509,8 +507,6 @@ All memory safety enforced at **compile time**:
 
 ## Testing & Validation
 
-**Current Status**: 280/284 tests passing (98.6%)
-
 ### Test Categories
 
 1. **Unit Tests**: Individual component testing
@@ -522,8 +518,8 @@ All memory safety enforced at **compile time**:
 
 ```
 crates/compiler/tests/
-├── end_to_end_simple.rs       # 5/5 passing
-├── end_to_end_comprehensive.rs # 9/9 passing
+├── end_to_end_simple.rs
+├── end_to_end_comprehensive.rs
 ├── cranelift_backend_tests.rs
 ├── hir_builder_tests.rs
 └── stdlib_tests.rs
@@ -531,19 +527,9 @@ crates/compiler/tests/
 
 ---
 
-## Future Roadmap
+## Issue Tracking
 
-See [../BACKLOG.md](../BACKLOG.md) for detailed roadmap.
-
-### Priority #1: Reflaxe/Haxe Integration
-Create `reflaxe.Zyntax` backend to tap into Haxe's mature ecosystem, providing instant access to thousands of production libraries.
-
-### Planned Features
-- Exception handling (try/catch/finally)
-- LLVM AOT backend completion
-- I/O and networking stdlib
-- Language Server Protocol (LSP)
-- Package manager
+Issues are tracked with [git-bug](https://github.com/git-bug/git-bug) and live in the repository under `refs/bugs/*`. Run `git-bug pull` to fetch them, then `git-bug bug --status open` to list open work; filter with `--label bug`, `--label perf` or an area such as `--label area:compiler`, and read one with `git-bug bug show <id>`.
 
 ---
 
@@ -566,8 +552,6 @@ Create `reflaxe.Zyntax` backend to tap into Haxe's mature ecosystem, providing i
 
 **Project Info**:
 - [../README.md](../README.md) - Project overview
-- [../BACKLOG.md](../BACKLOG.md) - Development roadmap
-- [../PRODUCTION_READY_STATUS.md](../PRODUCTION_READY_STATUS.md) - Feature matrix
 
 ---
 

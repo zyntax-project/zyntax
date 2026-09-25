@@ -150,11 +150,11 @@ runtime.register_grammar("python", LanguageGrammar::compile_zyn_file("grammars/p
 runtime.register_grammar("calc", LanguageGrammar::compile_zyn_file("grammars/calc.zyn")?);
 
 // Or use convenience methods
-runtime.register_grammar_file("haxe", "grammars/haxe.zyn")?;
+runtime.register_grammar_file("mylang", "grammars/mylang.zyn")?;
 runtime.register_grammar_zpeg("lua", "grammars/lua.zpeg")?;
 
 // Query registered languages
-println!("Languages: {:?}", runtime.languages());       // ["zig", "python", "calc", "haxe", "lua"]
+println!("Languages: {:?}", runtime.languages());       // ["zig", "python", "calc", "mylang", "lua"]
 println!("Has Python: {}", runtime.has_language("python")); // true
 ```
 

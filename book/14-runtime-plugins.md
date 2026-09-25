@@ -7,7 +7,7 @@ The Zyntax Runtime Library (ZRTL) provides native functionality to languages bui
 ```text
 ┌─────────────────────────────────────────────────────────┐
 │                    Your Language                        │
-│              (Haxe, Zig, Custom DSL)                    │
+│              (ZynML, Python, Lua, custom DSLs)          │
 └─────────────────────────────────────────────────────────┘
                           │
                           ▼

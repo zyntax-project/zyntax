@@ -4,9 +4,8 @@
 
 [![CI](https://github.com/darmie/zyntax/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/darmie/zyntax/actions/workflows/ci.yml)
 [![ZynML Tests](https://img.shields.io/github/actions/workflow/status/darmie/zyntax/ci.yml?branch=main&label=zynml%20tests)](https://github.com/darmie/zyntax/actions/workflows/ci.yml)
-[![Test Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](./crates/zyn_parser/tests)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
 ---
 
@@ -38,11 +37,11 @@ cargo build --release
 
 - **Tiered JIT Compilation**: 3-tier optimization (Baseline → Standard → Optimized)
 
-- **Advanced Type System**: Generics, traits, lifetimes, dependent types
+- **Advanced Type System**: Generics, traits, lifetimes
 
 - **Async/Await Runtime**: Zero-cost futures with complete executor infrastructure
 
-- **Production-Ready stdlib**: Vec, String, HashMap, Iterator (93/100 functions compile)
+- **Production-Ready stdlib**: Vec, String, HashMap, Iterator
 
 - **Multi-Backend**: Cranelift JIT (fast) + LLVM AOT/JIT (optimized, fully working)
 
@@ -99,51 +98,18 @@ zyntax compile program.json --backend llvm --jit
 
 ## 📦 ZBC Bytecode Format
 
-**ZBC (Zyntax ByteCode)** is a portable, architecture-independent bytecode format designed for efficient serialization and distribution of compiled programs.
+A **ZBC (Zyntax ByteCode)** file (`.zbc`) holds one HIR module: a 44-byte header (magic, format version 3.0, payload encoding, CRC-32 of the payload) followed by the module in one of four encodings:
 
-### Key Features
+- **Postcard**: compact binary; what ZPack archives and HIR caches write
+- **JSON**: readable, for debugging
+- **Bincode**: fixed-width binary
+- **Split**: Postcard with each function encoded on its own, so a reader decodes only the functions it reaches; used by language snapshots
 
-- **Portable**: Architecture-independent binary format
-- **Compact**: Efficient binary encoding with compression
-- **Type-Preserving**: Maintains full type information for verification
-- **Module-Based**: Supports separate compilation and linking
-- **Version-Safe**: Built-in format versioning for compatibility
+A reader accepts a file only when its major version matches the reader's and its checksum is intact. The payload is the serde encoding of the HIR types in `crates/compiler/src/hir.rs`, so only a build with the same HIR declarations as the writer's can read a file.
 
-### Format Overview
+`zyntax compile program.zbc` compiles a module from a file; ZPack archives carry modules as `modules/<path>.zbc`.
 
-```text
-┌─────────────────────────────────────┐
-│      ZBC File Header                │
-│  - Magic number: 0x5A42_4300       │
-│  - Version: 1.0                     │
-│  - Metadata section offset          │
-└─────────────────────────────────────┘
-┌─────────────────────────────────────┐
-│      Type Definitions               │
-│  - Structs, enums, traits          │
-│  - Generic type parameters          │
-└─────────────────────────────────────┘
-┌─────────────────────────────────────┐
-│      Function Definitions           │
-│  - Signature with parameter types   │
-│  - HIR instruction stream           │
-│  - SSA value numbering              │
-└─────────────────────────────────────┘
-┌─────────────────────────────────────┐
-│      Constant Pool                  │
-│  - String literals                  │
-│  - Numeric constants                │
-└─────────────────────────────────────┘
-```
-
-### Use Cases
-
-1. **Distribution**: Ship pre-compiled modules to users
-2. **Caching**: Cache compiled TypedAST for faster rebuilds
-3. **Cross-Platform**: Compile once, run on any Zyntax-supported platform
-4. **Integration**: Load modules from multiple source languages
-
-See [Bytecode Format Specification](./docs/BYTECODE_FORMAT_SPEC.md) for complete details.
+See the [Bytecode Format Specification](./docs/BYTECODE_FORMAT_SPEC.md) for the byte layout, the encodings and the version history.
 
 ---
 
@@ -168,7 +134,7 @@ See [Bytecode Format Specification](./docs/BYTECODE_FORMAT_SPEC.md) for complete
 Zyn grammars define both syntax (what patterns to match) and semantics (what AST nodes to create). This enables:
 
 - **Custom Language Frontends**: Define your own language syntax and compile to native code
-- **Runtime Grammar Loading**: No Rust recompilation needed—load grammars dynamically
+- **Runtime Grammar Loading**: No Rust recompilation needed; load grammars dynamically
 - **Seamless Integration**: Output TypedAST that flows through Zyntax's HIR and backend pipeline
 - **Interactive Development**: Test grammar changes instantly with the built-in REPL
 
@@ -311,24 +277,6 @@ zyntax repl --grammar mylang.zyn
 
 **Status:** ✅ **Production-ready** - Full compilation pipeline with REPL support
 
-### ✅ Haxe Integration (via Reflaxe)
-
-Compile Haxe code to native executables using the [reflaxe.zyntax](./reflaxe.zyntax/README.md) backend:
-
-```bash
-# Install dependencies
-haxelib install reflaxe 4.0.0-beta
-haxelib dev reflaxe.zyntax ./reflaxe.zyntax
-
-# Compile Haxe to native
-haxe -lib reflaxe.zyntax -main Main -D zyntax-output=out
-zyntax compile out/*.json -o myprogram --run
-```
-
-**Status:** 🚧 In development - JSON AST generation complete, HIR conversion in progress
-
-See [Haxe Integration Guide](./docs/HAXE_INTEGRATION.md) for details.
-
 ### ✅ HIR Builder API - Programmatic Code Generation
 
 Build HIR modules directly from Rust code. Perfect for:
@@ -454,7 +402,7 @@ cargo test --test end_to_end_simple
 ┌─────────────────────────────────────────────────────────────┐
 │              Zyntax TypedAST Layer                          │
 │  • Multi-paradigm type checking (structural/nominal/gradual)│
-│  • Generics, traits, lifetimes, dependent types             │
+│  • Generics, traits, lifetimes                              │
 │  • Advanced analysis (ownership, escape, lifetimes)         │
 │  • Rich diagnostics with span tracking                      │
 └────────────────────────┬────────────────────────────────────┘
@@ -499,14 +447,6 @@ cargo test --test end_to_end_simple
 
 ## 🔥 Current Status
 
-### Test Results (98.6% Pass Rate)
-```
-✅ 280/284 tests passing
-✅ All end-to-end comprehensive tests passing (9/9)
-✅ All end-to-end simple tests passing (5/5)
-✅ Standard library: 93/100 functions compile successfully
-```
-
 ### What's Working
 
 #### ✅ Core Compiler Pipeline
@@ -519,7 +459,6 @@ cargo test --test end_to_end_simple
 - **Generics**: Type parameters with bounds `fn foo<T: Clone>(x: T)`
 - **Traits**: Interface definitions with associated types
 - **Lifetimes**: Borrow checker with lifetime inference
-- **Dependent Types**: Basic refinement types and indexed families
 - **Multi-paradigm**: Structural, nominal, and gradual typing
 
 #### ✅ Language Features
@@ -581,8 +520,6 @@ cargo test --test end_to_end_simple
 - **[HIR Builder Example](docs/HIR_BUILDER_EXAMPLE.md)** - How to construct HIR programmatically
 - **[Async Runtime Design](docs/ASYNC_RUNTIME_DESIGN.md)** - Async/await internals
 - **[Bytecode Spec](docs/BYTECODE_FORMAT_SPEC.md)** - Bytecode serialization format
-- **[Backlog](BACKLOG.md)** - Development roadmap and tasks
-- **[Production Status](PRODUCTION_READY_STATUS.md)** - Detailed feature matrix
 
 ---
 
@@ -612,51 +549,8 @@ Multiple Languages → TypedAST → Shared Runtime
 ### 4. Research Platform
 Experiment with advanced type system features:
 - Effect systems
-- Dependent types
 - Linear types
 - Algebraic effects
-
----
-
-## 🚧 Roadmap
-
-See [BACKLOG.md](BACKLOG.md) for detailed tasks.
-
-### Q4 2025 (Current): Core Stabilization ✅ COMPLETE
-
-- ✅ Zig parser with full control flow support (continue, break, while loops)
-- ✅ Fix SSA variable reads for unsealed blocks (continue statement bug)
-- ✅ Logical operators with short-circuit evaluation
-- ✅ Array types, indexing, and array index assignment
-- ✅ String literals (lowered to global `*i8`)
-- ✅ 71/71 Zig E2E tests passing (100%)
-- ✅ Zig-style error handling (try/catch/orelse on error unions)
-- ✅ Pattern matching (if let, switch, Some/None/Ok/Err)
-- ✅ Generic functions with monomorphization
-- ✅ Switch expressions with multi-case patterns and else clause
-- ✅ Pattern matching grammar (literals, wildcards, ranges, structs, enums, errors, pointers)
-
-### Q1 2026: Production Features
-
-- ✅ LLVM AOT/JIT backend core complete (functions, structs, generics, control flow)
-- ✅ Switch expression pattern matching in LLVM backend
-- 🔄 Haxe-style exception handling (throw/catch/finally with stack unwinding)
-- 🔄 Complete I/O and networking standard library
-- 🔄 String operations (needs stdlib integration via plugin system)
-
-### Q2 2026: Ecosystem & Integration
-
-- 🔄 Complete Reflaxe/Haxe integration
-- 🔄 Run Haxe standard library through Zyntax
-- 🔄 Performance benchmarking vs existing targets
-- 🔄 100% test pass rate
-
-### Q3 2026: Developer Experience
-
-- 🔄 Language Server Protocol (LSP) implementation
-- 🔄 Package manager
-- 🔄 Comprehensive documentation and tutorials
-- 🔄 VSCode/IntelliJ integration
 
 ---
 
@@ -664,7 +558,9 @@ See [BACKLOG.md](BACKLOG.md) for detailed tasks.
 
 Contributions are welcome! Here's how to get started:
 
-1. **Pick a task** from [BACKLOG.md](BACKLOG.md)
+Issues are tracked with [git-bug](https://github.com/git-bug/git-bug) and live in the repository under `refs/bugs/*`. Run `git-bug pull` to fetch them, then `git-bug bug --status open` to list open work; filter with `--label bug`, `--label perf` or an area such as `--label area:compiler`, and read one with `git-bug bug show <id>`.
+
+1. **Pick an open issue** with `git-bug bug --status open`
 2. **Check documentation** in [docs/](docs/)
 3. **Run tests** to understand the system: `cargo test`
 4. **Implement incrementally** with test coverage
@@ -673,11 +569,11 @@ Contributions are welcome! Here's how to get started:
 ### Development Setup
 
 ```bash
-# Install Rust (1.70+)
+# Install Rust (1.85+)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
-git clone https://github.com/yourusername/zyntax.git
+git clone https://github.com/darmie/zyntax.git
 cd zyntax
 cargo build
 
@@ -738,8 +634,8 @@ This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENS
 
 ## 📞 Contact
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/zyntax/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/zyntax/discussions)
+- **Issues**: [GitHub Issues](https://github.com/darmie/zyntax/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/darmie/zyntax/discussions)
 
 ---
 

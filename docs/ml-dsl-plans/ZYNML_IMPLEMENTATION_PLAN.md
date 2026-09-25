@@ -65,7 +65,7 @@ ML Operations in zrtl_simd:
 
 ### 1. `zrtl_tensor` - Core Tensor Operations ✅
 
-**Status: COMPLETE** (8 tests passing)
+**Status: COMPLETE**
 
 The foundational data structure for all ML operations, now SIMD-optimized.
 
@@ -117,7 +117,7 @@ tensor_to_dtype
 
 ### 2. `zrtl_audio` - Audio Processing ✅
 
-**Status: COMPLETE** (4 tests passing)
+**Status: COMPLETE**
 
 Essential for speech/audio ML models, now SIMD-optimized.
 
@@ -152,7 +152,7 @@ audio_stft, audio_stft_free, audio_mel_spectrogram
 
 ### 3. `zrtl_text` - Text & Tokenization ✅
 
-**Status: COMPLETE** (7 tests passing)
+**Status: COMPLETE**
 
 Essential for NLP/LLM applications.
 
@@ -177,7 +177,7 @@ text_normalize_whitespace, text_chunk_by_sentences, text_chunk_by_tokens
 
 ### 4. `zrtl_model` - Model Loading & Serialization ✅
 
-**Status: COMPLETE** (3 tests passing)
+**Status: COMPLETE**
 
 Load and save ML model weights in SafeTensors format.
 
@@ -207,7 +207,7 @@ model_get_tensor_info, model_get_tensor_f32, model_tensor_free
 
 ### 5. `zrtl_vector` - Vector Search & Embeddings ✅
 
-**Status: COMPLETE** (6 tests passing, including HNSW)
+**Status: COMPLETE**
 
 For RAG, semantic search, and embedding operations. Fully SIMD-optimized.
 
@@ -258,37 +258,37 @@ hnsw_create, hnsw_free, hnsw_add, hnsw_len, hnsw_search
 
 ### Phase 1: Core Foundation ✅ COMPLETE
 
-| Task | Status | Tests |
-|------|--------|-------|
-| zrtl_tensor handle and memory layout | ✅ | 8/8 |
-| zrtl_tensor creation functions | ✅ | ✓ |
-| zrtl_tensor shape operations | ✅ | ✓ |
-| zrtl_tensor SIMD optimization | ✅ | ✓ |
-| zrtl_audio loading (symphonia) | ✅ | 4/4 |
-| zrtl_audio resampling (rubato) | ✅ | ✓ |
-| zrtl_audio STFT/mel spectrogram | ✅ | ✓ |
-| zrtl_audio SIMD optimization | ✅ | ✓ |
+| Task | Status |
+|--------|--------|
+| zrtl_tensor handle and memory layout | ✅ |
+| zrtl_tensor creation functions | ✅ |
+| zrtl_tensor shape operations | ✅ |
+| zrtl_tensor SIMD optimization | ✅ |
+| zrtl_audio loading (symphonia) | ✅ |
+| zrtl_audio resampling (rubato) | ✅ |
+| zrtl_audio STFT/mel spectrogram | ✅ |
+| zrtl_audio SIMD optimization | ✅ |
 
 ### Phase 2: Text & Models ✅ COMPLETE
 
-| Task | Status | Tests |
-|------|--------|-------|
-| zrtl_text BPE tokenizer | ✅ | 7/7 |
-| zrtl_text preprocessing | ✅ | ✓ |
-| zrtl_text chunking for RAG | ✅ | ✓ |
-| zrtl_model SafeTensors loading | ✅ | 3/3 |
-| zrtl_model memory mapping | ✅ | ✓ |
-| zrtl_model dtype conversion | ✅ | ✓ |
+| Task | Status |
+|--------|--------|
+| zrtl_text BPE tokenizer | ✅ |
+| zrtl_text preprocessing | ✅ |
+| zrtl_text chunking for RAG | ✅ |
+| zrtl_model SafeTensors loading | ✅ |
+| zrtl_model memory mapping | ✅ |
+| zrtl_model dtype conversion | ✅ |
 
 ### Phase 3: Vector Search ✅ COMPLETE
 
-| Task | Status | Tests |
-|------|--------|-------|
-| zrtl_vector similarity functions | ✅ | 6/6 |
-| zrtl_vector SIMD optimization | ✅ | ✓ |
-| zrtl_vector Flat index | ✅ | ✓ |
-| zrtl_vector HNSW index | ✅ | ✓ |
-| zrtl_vector normalization | ✅ | ✓ |
+| Task | Status |
+|--------|--------|
+| zrtl_vector similarity functions | ✅ |
+| zrtl_vector SIMD optimization | ✅ |
+| zrtl_vector Flat index | ✅ |
+| zrtl_vector HNSW index | ✅ |
+| zrtl_vector normalization | ✅ |
 
 ### Phase 4: ZynML Grammar & Compiler
 
@@ -301,20 +301,6 @@ hnsw_create, hnsw_free, hnsw_add, hnsw_len, hnsw_search
 | Pipe operator semantics | 🔲 |
 | Semantic analysis | 🔲 |
 | Code generation | 🔲 |
-
----
-
-## Test Summary
-
-| Plugin | Tests | Status |
-|--------|-------|--------|
-| `zrtl_simd` | 26 | ✅ All passing |
-| `zrtl_tensor` | 8 | ✅ All passing |
-| `zrtl_audio` | 4 | ✅ All passing |
-| `zrtl_text` | 7 | ✅ All passing |
-| `zrtl_model` | 3 | ✅ All passing |
-| `zrtl_vector` | 6 | ✅ All passing |
-| **Total** | **54** | ✅ **All passing** |
 
 ---
 
@@ -401,7 +387,6 @@ print(text)
 | Metric | Target | Current |
 |--------|--------|---------|
 | ML Plugin count | 5 | ✅ 5 complete |
-| Test coverage | >80% | ✅ 54 tests |
 | SIMD functions | 30+ | ✅ 40+ functions |
 | Vector search | Working | ✅ Flat + HNSW |
 | Audio processing | Working | ✅ STFT + Mel |

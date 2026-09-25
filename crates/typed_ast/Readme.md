@@ -13,7 +13,6 @@ The TypedAST crate provides a language-agnostic typed abstract syntax tree and c
 - **Nominal Types**: Classes, interfaces, structs with explicit names
 - **Structural Types**: Duck typing, shape-based compatibility
 - **Gradual Types**: Optional static typing with dynamic fallback
-- **Dependent Types**: Types that depend on values (basic refinements)
 - **Linear Types**: Resource management and uniqueness tracking
 - **Effect Types**: Computational effect tracking
 
@@ -30,7 +29,6 @@ Supports type systems from multiple languages:
 - **Rust**: Ownership, lifetimes, traits, generics
 - **Java/C#**: Classes, interfaces, generics, nullable types
 - **TypeScript**: Structural typing, union types, intersection types
-- **Haxe**: Multi-paradigm typing, type parameters
 - **Swift**: Protocols, associated types, value types
 
 ## Architecture
@@ -38,7 +36,7 @@ Supports type systems from multiple languages:
 ```
 ┌──────────────────────────────────────────────────┐
 │         Language Frontends                       │
-│    (Rust, Haxe, TypeScript, etc.)               │
+│    (ZynML, Python, Lua, etc.)                    │
 └──────────────────┬───────────────────────────────┘
                    │
                    ▼

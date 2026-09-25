@@ -82,7 +82,7 @@ After comprehensive analysis of Rust parser generators:
 - ✅ Document integration patterns
 - ✅ **Lowering API integration** - Using official LoweringContext
 
-**Status**: ✅ **100% Complete** - All 16 tests passing
+**Status**: ✅ **100% Complete**
 - pest grammar parsing: ✅ Working
 - TypedAST generation: ✅ Working
 - Lowering pipeline: ✅ Working (LoweringContext::lower_program)
@@ -778,15 +778,12 @@ binary_op = { expr ~ operator ~ expr }
 ```
         ┌──────────────────┐
         │  E2E Tests       │  ← Full pipeline: source → native
-        │  (100 tests)     │
         └──────────────────┘
             ┌──────────────────────┐
             │  Integration Tests   │  ← Parse → TypedAST → HIR
-            │  (500 tests)         │
             └──────────────────────┘
                 ┌──────────────────────────┐
                 │  Unit Tests              │  ← Individual grammar rules
-                │  (2000 tests)            │
                 └──────────────────────────┘
 ```
 
@@ -1055,12 +1052,10 @@ Execution
 ### Phase 1 (POC)
 - ✅ Calculator language parses and executes
 - ✅ TypedAST correctly generated
-- ✅ 100% test pass rate
 - ✅ Documentation complete
 
 ### Phase 2 (Full Language)
 - ✅ Python subset >90% coverage
-- ✅ 1000+ test cases passing
 - ✅ Real programs compile and run
 - ✅ Performance targets met
 

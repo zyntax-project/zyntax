@@ -1,7 +1,6 @@
 # Zig Parser Feature Coverage
 
 **Status**: Production Ready
-**Test Coverage**: 12/13 tests passing (1 ignored)
 **Last Updated**: November 16, 2025
 
 ---
@@ -165,7 +164,7 @@ The Zyntax Zig parser (`zyn_parser`) implements a comprehensive subset of Zig la
 
 ## Test Coverage
 
-### Passing Tests (12/12 non-ignored)
+### Tests
 
 1. **test_zig_jit_simple_function** - Basic function with parameters
 2. **test_zig_jit_arithmetic** - Arithmetic expression evaluation

@@ -439,8 +439,8 @@ let result = builder.call(callee_func_id, vec![arg1, arg2]);
 ### Calling External Symbols
 
 ```rust
-// Call runtime symbol by name (e.g., "$haxe$trace$int")
-let result = builder.call_symbol("$haxe$trace$int", vec![value]);
+// Call a runtime symbol by name
+let result = builder.call_symbol("$IO$println_i64", vec![value]);
 ```
 
 ### Intrinsics

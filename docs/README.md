@@ -19,14 +19,13 @@ This directory contains architectural and educational documentation for the Zynt
 
 ### Language Integrations
 Located in [language-integrations/](language-integrations/) directory:
-- **Haxe Integration** - Haxe language integration documentation
 - **Zyn Parser** - Zig language parser implementation
 
 ## Other Documentation
 
 ### Project Root
-- **[../Readme.md](../Readme.md)** - Main project README
-- **[../BACKLOG.md](../BACKLOG.md)** - Development backlog and task tracking
+- **[../README.md](../README.md)** - Main project README
+- **Issues** - tracked in git-bug under `refs/bugs/*`: `git-bug pull`, then `git-bug bug --status open`
 
 ### Session Archives
 Session-specific documentation is archived in `session-archive/` (untracked by git).

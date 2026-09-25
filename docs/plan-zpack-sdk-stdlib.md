@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This plan outlines the work needed to make ZPack and the Runtime SDK robust enough for real-world native standard library development. The goal is to enable frontend implementers (like Haxe, Python, etc.) to build comprehensive standard libraries with:
+This plan outlines the work needed to make ZPack and the Runtime SDK robust enough for real-world native standard library development. The goal is to enable frontend implementers (ZynML, Python, Lua, or a custom language) to build comprehensive standard libraries with:
 
 1. **Type-safe FFI** between generated code and native runtime
 2. **Generic container support** (Array<T>, Map<K,V>, etc.)
@@ -29,18 +29,16 @@ This plan outlines the work needed to make ZPack and the Runtime SDK robust enou
 2. **Object/struct field access** - Partial: `ZrtlFieldDescriptor` exists but no runtime reflection API
 3. **Method dispatch** - No vtable or interface dispatch support in SDK
 4. ~~Memory lifecycle hooks~~ - ✅ EXISTS: `DropFn`, dropper callbacks in `TypeMeta`/`DynamicBox`
-5. **String interop** - Inconsistent: `ZrtlString` (ptr/len/cap) vs reflaxe (length-prefixed i32)
-6. ~~Error handling~~ - ✅ EXISTS: `ZRTL_CAT_RESULT`, `ZrtlOptional`, `zrtl_gbox_result()`
-7. **Iterator protocol** - No standard iteration interface in SDK
-8. **Async runtime** - Compiler has async support but SDK has no runtime hooks
-9. **Debugging support** - No DWARF generation for runtime functions
-10. **Testing infrastructure** - No runtime test harness or `ZRTL_TEST` macros
+5. ~~Error handling~~ - ✅ EXISTS: `ZRTL_CAT_RESULT`, `ZrtlOptional`, `zrtl_gbox_result()`
+6. **Iterator protocol** - No standard iteration interface in SDK
+7. **Async runtime** - Compiler has async support but SDK has no runtime hooks
+8. **Debugging support** - No DWARF generation for runtime functions
+9. **Testing infrastructure** - No runtime test harness or `ZRTL_TEST` macros
 
 ### Actual Gaps (Verified)
 
 | Gap | Priority | Description |
 |-----|----------|-------------|
-| **String format inconsistency** | High | reflaxe uses `i32 length + bytes`, SDK defines `ZrtlString {ptr, len, cap}` |
 | **Method dispatch in SDK** | Medium | No vtable support for interface calls from runtime functions |
 | **Iterator protocol** | Medium | No standard `next()`/`hasNext()` interface |
 | **Async runtime hooks** | Low | SDK doesn't expose async executor integration |
@@ -90,8 +88,6 @@ typedef struct {
 **Tasks**:
 - [ ] Finalize canonical type layouts in `zrtl.h`
 - [ ] Update `DynamicValue` in Rust to use same layouts
-- [ ] Migrate `reflaxe.zyntax/runtime` to use canonical types
-- [ ] Migrate `haxe_zyntax_runtime` to use canonical types
 - [ ] Add conversion helpers in SDK
 
 ### 1.2 Type Registry & Reflection
@@ -326,9 +322,9 @@ pub struct TraitObject {
 - [ ] Add `TraitObject` to ZRTL
 - [ ] Implement interface dispatch in HIR lowering
 
-### 3.3 Dynamic Dispatch (for Haxe Dynamic)
+### 3.3 Dynamic Dispatch (for dynamically typed values)
 
-**Problem**: Haxe's `Dynamic` type needs runtime method lookup.
+**Problem**: a dynamically typed value needs runtime method lookup.
 
 **Solution**: Method table attached to object metadata:
 
@@ -516,24 +512,24 @@ ZRTL_METHOD(MyPoint, distance, f64,
 ```bash
 # Pack a runtime
 zyntax pack create \
-    --name haxe-std \
+    --name mylang-std \
     --version 1.0.0 \
-    --language haxe \
+    --language mylang \
     --runtime lib/darwin-arm64/runtime.zrtl \
     --runtime lib/linux-x64/runtime.zrtl \
-    --output haxe-std.zpack
+    --output mylang-std.zpack
 
 # Inspect a pack
-zyntax pack info haxe-std.zpack
+zyntax pack info mylang-std.zpack
 
 # Extract contents
-zyntax pack extract haxe-std.zpack --output ./extracted/
+zyntax pack extract mylang-std.zpack --output ./extracted/
 
 # List symbols
-zyntax pack symbols haxe-std.zpack
+zyntax pack symbols mylang-std.zpack
 
 # Verify pack integrity
-zyntax pack verify haxe-std.zpack
+zyntax pack verify mylang-std.zpack
 ```
 
 **Tasks**:
@@ -635,7 +631,6 @@ fn bench_array_push(c: &mut Criterion) {
 **Tasks**:
 - [ ] Set up criterion benchmarks
 - [ ] Benchmark all core operations
-- [ ] Compare with HashLink/Haxe-interp
 - [ ] Track regressions in CI
 
 ---
@@ -713,7 +708,7 @@ Step-by-step guide covering:
 
 ## Success Criteria
 
-1. **Haxe standard library compiles and runs** - All basic types work
+1. **A frontend's standard library compiles and runs** - All basic types work
 2. **No memory leaks in test suite** - Valgrind/ASan clean
 3. **Cross-platform builds** - macOS, Linux, Windows all work
 4. **Performance parity** - Within 2x of HashLink for benchmarks

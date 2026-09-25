@@ -1,7 +1,7 @@
 # Compiler - HIR and Code Generation
 
 **Version**: 1.0.0
-**Status**: Production-Ready (98.6% tests passing)
+**Status**: Production-Ready
 
 ## Overview
 
@@ -58,8 +58,6 @@ cargo test --package zyntax_compiler
 cargo test --test end_to_end_comprehensive
 cargo test --test end_to_end_simple
 ```
-
-**Status**: 280/284 tests passing (98.6%)
 
 ## Usage Example
 

@@ -508,7 +508,7 @@ Then compiled using the standard pattern matching pipeline.
 
 Located in `crates/compiler/tests/pattern_matching_tests.rs`:
 
-1. **Pattern Compilation Tests** (15 tests)
+1. **Pattern Compilation Tests**
    - `test_simple_constant_pattern_match`
    - `test_union_variant_pattern_match`
    - `test_wildcard_pattern_match`

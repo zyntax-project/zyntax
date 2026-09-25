@@ -51,7 +51,7 @@ zyntax compile --source fibonacci.zig --grammar crates/zyn_parser/src/zig.pest -
 ```
 
 **Currently Supported Grammars:**
-- `zig` - Zig language subset (71/71 E2E tests passing)
+- `zig` - Zig language subset
 
 **Adding New Grammars:**
 1. Create a `.zyn` grammar file in `crates/zyn_peg/grammars/`
@@ -83,7 +83,7 @@ zyntax compile module.zbc --backend jit
 
 ```rust
 use zyntax_compiler::hir_builder::HirBuilder;
-use zyntax_compiler::bytecode::serialize_module_to_file;
+use zyntax_compiler::bytecode::{Format, serialize_module_to_file};
 use zyntax_typed_ast::AstArena;
 
 let mut arena = AstArena::new();
@@ -99,15 +99,14 @@ let main_fn = builder.begin_function("main")
 let module = builder.finish();
 
 // Serialize to .zbc file
-serialize_module_to_file(&module, "module.zbc")?;
+serialize_module_to_file(&module, Format::Postcard, std::path::Path::new("module.zbc"))?;
 ```
 
 ### 3. TypedAST JSON (`.json` files)
 
-Language-agnostic typed AST in JSON format. Used by language frontends like Reflaxe/Haxe.
+Language-agnostic typed AST in JSON format, for frontends that build a typed AST outside Zyntax.
 
 **When to use:**
-- Haxe compilation via Reflaxe.Zyntax
 - Custom language frontends
 - Debugging and inspection
 - Cross-language interop
@@ -115,7 +114,7 @@ Language-agnostic typed AST in JSON format. Used by language frontends like Refl
 **Example:**
 
 ```bash
-# Compile TypedAST JSON (from Haxe)
+# Compile TypedAST JSON
 zyntax compile output/*.json -o myprogram
 
 # Explicit format specification
@@ -170,16 +169,6 @@ info: Monomorphization complete
 info: Lowered to HIR with 2 functions
 info: Compiling with Jit backend (opt level 2)...
 success: Compilation successful
-```
-
-### Compile Haxe to Native
-
-```bash
-# Step 1: Compile Haxe to TypedAST JSON
-haxe -lib reflaxe.zyntax -main Main -D zyntax-output=out
-
-# Step 2: Compile JSON to native
-zyntax compile out/*.json -o myprogram --run
 ```
 
 ### Compile HIR Bytecode
@@ -276,7 +265,6 @@ zyntax compile input.zbc --backend llvm -o myprogram -O3
 ## See Also
 
 - [ZynPEG Grammar Conventions](../zyn_peg/GRAMMAR_CONVENTIONS.md)
-- [Haxe Integration Guide](../../docs/HAXE_INTEGRATION.md)
 - [HIR Builder API](../compiler/README.md)
 - [TypedAST Documentation](../typed_ast/README.md)
 - [Bytecode Specification](../../docs/BYTECODE_FORMAT_SPEC.md)
