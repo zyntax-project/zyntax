@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1790299017,"nonce":"l6XDL2Wwz0Uke7In9WxBlLu/8sk=","added":["perf","area:compiler"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790300311,"nonce":"U4vtwuwE0r1Sriehr/P8telXSX4=","message":"Numbers on a quiet NUC (load about 2, median of 7, nbody.lua): aggregate_scalarize 28.1 ms on main at 678f49eb, 5.3 ms with ce42fd95; 0.7 ms for the Float-field variant.","files":null}]}
