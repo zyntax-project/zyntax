@@ -3713,6 +3713,61 @@ impl SsaBuilder {
         }
     }
 
+    /// A cast between an integer and a growable list's header, which
+    /// goes through the pointer to the header: int -> `Ptr(List)` ->
+    /// `List`, or `List` -> `Ptr(List)` -> int. The integer is the
+    /// address of the very header the list value names, so a list cast
+    /// back and grown is the one every holder of the address sees.
+    /// `None` for any other pair.
+    fn list_header_cast(
+        &mut self,
+        block_id: HirId,
+        operand: HirId,
+        source_ty: &HirType,
+        target_ty: &HirType,
+    ) -> Option<HirId> {
+        let is_int = |ty: &HirType| {
+            matches!(
+                ty,
+                HirType::I64 | HirType::U64 | HirType::USize | HirType::ISize
+            )
+        };
+        let header = |ty: &HirType| matches!(ty, HirType::Struct(_)) && is_list_header(ty);
+        let step = |this: &mut Self, op: CastOp, value: HirId, ty: HirType| {
+            let result = this.create_value(ty.clone(), HirValueKind::Instruction);
+            this.add_instruction(
+                block_id,
+                HirInstruction::Cast {
+                    op,
+                    result,
+                    ty,
+                    operand: value,
+                },
+            );
+            this.add_use(value, result);
+            result
+        };
+        if is_int(source_ty) && header(target_ty) {
+            let ptr = step(
+                self,
+                CastOp::IntToPtr,
+                operand,
+                HirType::Ptr(Box::new(target_ty.clone())),
+            );
+            return Some(step(self, CastOp::Bitcast, ptr, target_ty.clone()));
+        }
+        if header(source_ty) && is_int(target_ty) {
+            let ptr = step(
+                self,
+                CastOp::Bitcast,
+                operand,
+                HirType::Ptr(Box::new(source_ty.clone())),
+            );
+            return Some(step(self, CastOp::PtrToInt, ptr, target_ty.clone()));
+        }
+        None
+    }
+
     fn select_cast_op(&self, source_ty: &HirType, target_ty: &HirType) -> CastOp {
         use CastOp::*;
 
@@ -6846,6 +6901,12 @@ impl SsaBuilder {
                     .map(|v| v.ty.clone())
                     .unwrap_or_else(|| self.convert_type(&typed_source));
                 let target_ty = self.convert_type(&cast.target_type);
+                if let Some(result) =
+                    self.list_header_cast(block_id, operand_val, &source_ty, &target_ty)
+                {
+                    self.settle(started, block_id);
+                    return Ok(result);
+                }
                 let result = self.create_value(target_ty.clone(), HirValueKind::Instruction);
                 let cast_op = self.select_cast_op(&source_ty, &target_ty);
 

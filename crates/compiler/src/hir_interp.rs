@@ -5028,6 +5028,13 @@ fn eval_cast(op: CastOp, o: ZyntaxValue, ty: &HirType) -> Result<ZyntaxValue, In
     let raw_i64 = value_to_i64(&o);
     let raw_f64 = value_to_f64(&o);
     match op {
+        // A list header is named by its address, whichever of the header
+        // or the pointer to it the type says: the cast moves the address.
+        CastOp::Bitcast if crate::ssa::is_list_header(ty) => match (&o, raw_i64) {
+            (ZyntaxValue::Pointer(_), _) => Ok(o),
+            (_, Some(n)) => Ok(ZyntaxValue::Pointer(n as *mut u8)),
+            _ => Ok(o),
+        },
         CastOp::Trunc | CastOp::ZExt | CastOp::SExt | CastOp::Bitcast => {
             if let Some(n) = raw_i64 {
                 Ok(value_from_i64_as(ty, n))
