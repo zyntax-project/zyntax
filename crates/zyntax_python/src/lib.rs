@@ -685,6 +685,15 @@ fn parse_program_once(
     for ty in inferred.globals.values_mut() {
         *ty = ty.settled();
     }
+    // A record shape inference demoted is typed again as a dict before
+    // anything is lowered.
+    records::demote_globals(&inferred);
+    if records::any_demoted() {
+        return Err(Error::unsupported_span(
+            "a dict literal used as a record",
+            Span::new(0, 0),
+        ));
+    }
     lap(&format!("infer x{rounds}"));
     types::specialise(&mut inferred, &items, &owned, &entry_files);
     lap("specialise");

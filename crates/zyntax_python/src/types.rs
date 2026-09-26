@@ -3610,6 +3610,116 @@ impl Calls<'_> {
         }
     }
 
+    /// Demote the record shapes `expr` uses as something only a dict
+    /// answers: the edges the lowering would otherwise meet first, found
+    /// here so a program whose shapes all demote is lowered once.
+    fn record_edges(&self, expr: &py::Expr) {
+        use crate::records::{demote_in_inference as demote, is_record};
+        match expr {
+            py::Expr::Compare(cmp) => {
+                if cmp
+                    .ops
+                    .iter()
+                    .any(|op| !matches!(op, py::CmpOp::Is | py::CmpOp::IsNot))
+                {
+                    demote(self.module, self.arg_ty(&cmp.left));
+                    for c in &cmp.comparators {
+                        demote(self.module, self.arg_ty(c));
+                    }
+                }
+            }
+            py::Expr::Attribute(a) => {
+                if let Ty::Class(k) = self.arg_ty(&a.value)
+                    && is_record(k as usize)
+                {
+                    demote(self.module, Ty::Class(k));
+                }
+            }
+            py::Expr::Subscript(sub) => {
+                if let Ty::Class(k) = self.arg_ty(&sub.value)
+                    && is_record(k as usize)
+                {
+                    let fits = matches!(&*sub.slice, py::Expr::StringLiteral(lit)
+                        if crate::records::field_of(k as usize, lit.value.to_str()).is_some());
+                    if !fits {
+                        demote(self.module, Ty::Class(k));
+                    }
+                }
+            }
+            py::Expr::FString(f) => {
+                for e in f.value.elements() {
+                    if let Some(i) = e.as_interpolation() {
+                        demote(self.module, self.arg_ty(&i.expression));
+                    }
+                }
+            }
+            py::Expr::Call(c) => {
+                let args = c
+                    .arguments
+                    .args
+                    .iter()
+                    .map(|a| match a {
+                        py::Expr::Starred(s) => &*s.value,
+                        a => a,
+                    })
+                    .chain(c.arguments.keywords.iter().map(|k| &k.value));
+                match &*c.func {
+                    py::Expr::Name(n) => {
+                        let name = n.id.as_str();
+                        if matches!(name, "globals" | "locals" | "vars" | "exec" | "eval") {
+                            crate::records::escape_globals();
+                        }
+                        if self.module.funcs.contains_key(name)
+                            || self.module.class_index.contains_key(name)
+                            || self.vars.contains_key(name)
+                        {
+                            return;
+                        }
+                        let walks = matches!(
+                            name,
+                            "len" | "enumerate" | "zip" | "reversed" | "iter" | "list" | "tuple"
+                        );
+                        for a in args {
+                            match self.arg_ty(a) {
+                                Ty::List(Elem::Class(k)) if walks && is_record(k as usize) => {}
+                                ty => demote(self.module, ty),
+                            }
+                        }
+                    }
+                    py::Expr::Attribute(a) => {
+                        let receiver = match &*a.value {
+                            py::Expr::Name(n)
+                                if self.module.imports.contains_key(n.id.as_str()) =>
+                            {
+                                Ty::Object
+                            }
+                            e => self.arg_ty(e),
+                        };
+                        match receiver {
+                            Ty::List(Elem::Class(k))
+                                if is_record(k as usize)
+                                    && matches!(
+                                        a.attr.as_str(),
+                                        "index" | "count" | "remove" | "sort" | "__contains__"
+                                    ) =>
+                            {
+                                demote(self.module, Ty::Class(k));
+                            }
+                            Ty::Object => {
+                                for a in args {
+                                    demote(self.module, self.arg_ty(a));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn arg_ty(&self, e: &py::Expr) -> Ty {
         if self.opaque {
             return Ty::Object;
@@ -3922,6 +4032,9 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
 
     fn visit_expr(&mut self, expr: &'ast py::Expr) {
         use ruff_python_ast::visitor::walk_expr;
+        if !self.opaque && crate::records::any() {
+            self.record_edges(expr);
+        }
         // A closure value anywhere but a callee, a binding or a return
         // has left the inference's sight.
         let allowed = std::mem::take(&mut self.allow_closure);

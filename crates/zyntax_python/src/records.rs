@@ -38,6 +38,9 @@ thread_local! {
     /// Typing that happens before a body's locals are bound notes no
     /// field writes while this is above zero.
     static QUIET: Cell<u32> = const { Cell::new(0) };
+    /// Whether the program reads its globals as a dict (`globals()`,
+    /// `exec`): every record a global holds then reaches a box.
+    static GLOBALS_ESCAPE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Field writes are not noted while one of these is alive.
@@ -136,6 +139,7 @@ pub(crate) fn collect(
     WRITES.with(|w| w.borrow_mut().clear());
     DEMOTED.with(|d| d.borrow_mut().clear());
     WATCH.with(|w| w.set(false));
+    GLOBALS_ESCAPE.with(|g| g.set(false));
     classes
 }
 
@@ -190,6 +194,35 @@ pub(crate) fn take_writes() -> Vec<(usize, String, Ty)> {
 
 pub(crate) fn watch(on: bool) {
     WATCH.with(|w| w.set(on));
+}
+
+/// Whether the program has any record shape.
+pub(crate) fn any() -> bool {
+    RECORDS.with(|r| !r.borrow().is_empty())
+}
+
+pub(crate) fn escape_globals() {
+    GLOBALS_ESCAPE.with(|g| g.set(true));
+}
+
+/// Demote the records the globals hold, when the program reads them as
+/// a dict.
+pub(crate) fn demote_globals(module: &types::Module) {
+    if GLOBALS_ESCAPE.with(|g| g.get()) {
+        for ty in module.globals.values() {
+            demote_in_inference(module, *ty);
+        }
+    }
+}
+
+/// Demote every record a value of `ty` holds or is: an edge inference
+/// found.
+pub(crate) fn demote_in_inference(module: &types::Module, ty: Ty) {
+    if !any() {
+        return;
+    }
+    let mut seen = HashSet::default();
+    reach(module, ty, &mut seen);
 }
 
 /// Demote every record a value of `ty` holds or is, when the program's
