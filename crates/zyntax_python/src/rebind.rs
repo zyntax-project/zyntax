@@ -337,74 +337,6 @@ impl Transformer for Renamer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::rewrite;
-    use ruff_python_ast as py;
-
-    fn names_in(src: &str) -> Vec<String> {
-        let mut module = ruff_python_parser::parse_module(src).unwrap().into_syntax();
-        let mut body: Vec<py::Stmt> = module.body.drain(..).collect();
-        rewrite(&mut body);
-        struct Names(Vec<String>);
-        impl<'a> ruff_python_ast::visitor::Visitor<'a> for Names {
-            fn visit_expr(&mut self, e: &'a py::Expr) {
-                if let py::Expr::Name(n) = e {
-                    self.0.push(n.id.to_string());
-                }
-                ruff_python_ast::visitor::walk_expr(self, e);
-            }
-        }
-        let mut names = Names(Vec::new());
-        for s in &body {
-            ruff_python_ast::visitor::Visitor::visit_stmt(&mut names, s);
-        }
-        names.0
-    }
-
-    #[test]
-    fn a_straight_line_rebinding_is_a_fresh_version() {
-        let names = names_in("def f(data):\n    data = g(data)\n    return h(data)\n");
-        assert_eq!(names, ["g", "data", "data$1", "h", "data$1"]);
-    }
-
-    #[test]
-    fn a_rebinding_in_a_loop_keeps_its_name() {
-        let names = names_in("def f(x):\n    for i in r:\n        x = g(x)\n    return x\n");
-        assert!(names.iter().all(|n| !n.contains('$')), "{names:?}");
-    }
-
-    #[test]
-    fn a_rebinding_a_later_read_can_reach_keeps_its_name() {
-        let names = names_in("def f(x, c):\n    if c:\n        x = g(x)\n    return x\n");
-        assert!(names.iter().all(|n| !n.contains('$')), "{names:?}");
-        let names =
-            names_in("def f(x, c):\n    if c:\n        x = g(x)\n        return x\n    return 0\n");
-        assert_eq!(names, ["c", "g", "x", "x$1", "x$1"]);
-    }
-
-    #[test]
-    fn a_name_a_later_body_reads_keeps_one_binding() {
-        for src in [
-            "def f(x):\n    k = lambda: x\n    x = g(x)\n    return k()\n",
-            "def f(x):\n    k = (x for _ in r)\n    x = g(x)\n    return list(k)\n",
-            "def f(x):\n    def k():\n        return x\n    x = g(x)\n    return k()\n",
-        ] {
-            let names = names_in(src);
-            assert!(names.iter().all(|n| !n.contains('$')), "{src}: {names:?}");
-        }
-        // The outermost iterable is read where the expression is.
-        let names = names_in("def f(x):\n    x = g(x)\n    return list(y for y in x)\n");
-        assert!(names.contains(&"x$1".to_string()), "{names:?}");
-    }
-
-    #[test]
-    fn a_second_rebinding_is_the_next_version() {
-        let names = names_in("def f(x):\n    x = g(x)\n    x = h(x)\n    return x\n");
-        assert_eq!(names, ["g", "x", "x$1", "h", "x$1", "x$2", "x$2"]);
-    }
-}
-
 /// Module functions whose name is bound again: by another statement of
 /// the module body (an assignment, a loop, an import, another `def`)
 /// or under `global` in some function. Each `def f` of such a name
@@ -552,4 +484,72 @@ pub(crate) fn rebound_defs(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<St
     }
     *body = out;
     *origins = out_origins;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite;
+    use ruff_python_ast as py;
+
+    fn names_in(src: &str) -> Vec<String> {
+        let mut module = ruff_python_parser::parse_module(src).unwrap().into_syntax();
+        let mut body: Vec<py::Stmt> = module.body.drain(..).collect();
+        rewrite(&mut body);
+        struct Names(Vec<String>);
+        impl<'a> ruff_python_ast::visitor::Visitor<'a> for Names {
+            fn visit_expr(&mut self, e: &'a py::Expr) {
+                if let py::Expr::Name(n) = e {
+                    self.0.push(n.id.to_string());
+                }
+                ruff_python_ast::visitor::walk_expr(self, e);
+            }
+        }
+        let mut names = Names(Vec::new());
+        for s in &body {
+            ruff_python_ast::visitor::Visitor::visit_stmt(&mut names, s);
+        }
+        names.0
+    }
+
+    #[test]
+    fn a_straight_line_rebinding_is_a_fresh_version() {
+        let names = names_in("def f(data):\n    data = g(data)\n    return h(data)\n");
+        assert_eq!(names, ["g", "data", "data$1", "h", "data$1"]);
+    }
+
+    #[test]
+    fn a_rebinding_in_a_loop_keeps_its_name() {
+        let names = names_in("def f(x):\n    for i in r:\n        x = g(x)\n    return x\n");
+        assert!(names.iter().all(|n| !n.contains('$')), "{names:?}");
+    }
+
+    #[test]
+    fn a_rebinding_a_later_read_can_reach_keeps_its_name() {
+        let names = names_in("def f(x, c):\n    if c:\n        x = g(x)\n    return x\n");
+        assert!(names.iter().all(|n| !n.contains('$')), "{names:?}");
+        let names =
+            names_in("def f(x, c):\n    if c:\n        x = g(x)\n        return x\n    return 0\n");
+        assert_eq!(names, ["c", "g", "x", "x$1", "x$1"]);
+    }
+
+    #[test]
+    fn a_name_a_later_body_reads_keeps_one_binding() {
+        for src in [
+            "def f(x):\n    k = lambda: x\n    x = g(x)\n    return k()\n",
+            "def f(x):\n    k = (x for _ in r)\n    x = g(x)\n    return list(k)\n",
+            "def f(x):\n    def k():\n        return x\n    x = g(x)\n    return k()\n",
+        ] {
+            let names = names_in(src);
+            assert!(names.iter().all(|n| !n.contains('$')), "{src}: {names:?}");
+        }
+        // The outermost iterable is read where the expression is.
+        let names = names_in("def f(x):\n    x = g(x)\n    return list(y for y in x)\n");
+        assert!(names.contains(&"x$1".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_second_rebinding_is_the_next_version() {
+        let names = names_in("def f(x):\n    x = g(x)\n    x = h(x)\n    return x\n");
+        assert_eq!(names, ["g", "x", "x$1", "h", "x$1", "x$2", "x$2"]);
+    }
 }
