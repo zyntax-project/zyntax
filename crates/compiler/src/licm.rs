@@ -54,16 +54,14 @@
 //!
 //! ## Limits we currently accept
 //!
-//! No dominance check before hoisting from a conditionally-executed
-//! sub-block — hoisting `r = a + b` from inside an `if` to preheader
-//! means `r` is computed unconditionally instead of conditionally.
-//! For pure non-trapping ops this is a perf trade-off (extra work
-//! when the conditional path wouldn't have been taken), not a
-//! correctness issue. For Loads of invariant pointers, the loaded
-//! value is the same in either case and the pointer is constant for
-//! the loop's lifetime, so the worst case is an extra memory read.
-//! A future tightening could re-add the rayzor-style "block dominates
-//! every exiting block" guard when we have callers that need it.
+//! No dominance check before hoisting a pure non-trapping op from a
+//! conditionally-executed sub-block — hoisting `r = a + b` from inside
+//! an `if` to preheader means `r` is computed unconditionally instead
+//! of conditionally, extra work but not a different answer. A Load
+//! can trap: the pointer a branch guards (an index read only once a
+//! test says there is one) may be invalid off that branch, so a Load
+//! leaves the loop only from a block that dominates every latch, one
+//! each continuing iteration runs.
 //!
 //! ## Algorithm sketch
 //!
@@ -179,7 +177,7 @@ fn run_with(func: &mut HirFunction, pure: &HashSet<HirId>) -> LicmStats {
             }
         };
 
-        stats.hoisted += hoist_loop(func, lp, preheader, pure, &shared);
+        stats.hoisted += hoist_loop(func, lp, preheader, pure, &shared, &dt);
     }
 
     stats
@@ -282,6 +280,7 @@ fn hoist_loop(
     preheader: HirId,
     pure: &HashSet<HirId>,
     shared: &Shared,
+    dt: &DominatorTree,
 ) -> usize {
     // Seed invariant set with every value defined outside the loop
     // body: one that lives in no block, or an instruction or phi
@@ -457,6 +456,13 @@ fn hoist_loop(
                 // every Store, then ask whether ranges may overlap.
                 if let HirInstruction::Load { ptr, ty, .. } = inst {
                     if impure_call_in_loop {
+                        continue;
+                    }
+                    // A load a branch guards may read through a pointer
+                    // that is only valid on that branch (a null index
+                    // behind a nonzero test): only one every iteration
+                    // runs leaves the loop.
+                    if !lp.latches.iter().all(|l| dt.dominates(block_id, *l)) {
                         continue;
                     }
                     let load_loc = extract_mem_loc(
@@ -1208,6 +1214,43 @@ mod tests {
         assert_eq!(stats.hoisted, 1);
         assert!(f.blocks[&body].instructions.is_empty());
         assert_eq!(f.blocks[&entry].instructions.len(), 1);
+    }
+
+    #[test]
+    fn does_not_hoist_a_load_a_branch_guards() {
+        // body: if c { r = *p } → latch
+        // `p` may be valid only when `c` holds (an index read once a
+        // test says there is one), so the load stays behind the test.
+        let (mut f, _entry, header, body, _exit) = mk_func();
+        let guarded = HirId::new();
+        let latch = HirId::new();
+        for id in [guarded, latch] {
+            f.blocks.insert(id, HirBlock::new(id));
+        }
+        let c = add_param(&mut f, HirType::Bool, 1);
+        f.blocks.get_mut(&body).unwrap().terminator = HirTerminator::CondBranch {
+            condition: c,
+            true_target: guarded,
+            false_target: latch,
+        };
+        f.blocks.get_mut(&guarded).unwrap().terminator = HirTerminator::Branch { target: latch };
+        f.blocks.get_mut(&latch).unwrap().terminator = HirTerminator::Branch { target: header };
+        let p = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
+        let r = add_inst(&mut f, HirType::I64);
+        f.blocks
+            .get_mut(&guarded)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Load {
+                result: r,
+                ty: HirType::I64,
+                ptr: p,
+                align: 8,
+                volatile: false,
+            });
+        let stats = run(&mut f);
+        assert_eq!(stats.hoisted, 0, "a guarded load stays in the loop");
+        assert_eq!(f.blocks[&guarded].instructions.len(), 1);
     }
 
     #[test]
