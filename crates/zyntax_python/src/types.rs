@@ -2151,10 +2151,11 @@ impl Module {
     /// that field's list through a receiver of no known class, since such
     /// a store may put anything in.
     pub(crate) fn denest(&self, field: &str, ty: Ty) -> Ty {
+        let lists = self.dynamic_fields.contains(field)
+            || self.dynamic_fields.contains(&lists_only_key(field));
         match ty {
-            Ty::List(Elem::List(_) | Elem::Dict(_) | Elem::Set(_))
-                if self.dynamic_fields.contains(field) =>
-            {
+            Ty::List(Elem::List(_)) if lists => Ty::List(Elem::Object),
+            Ty::List(Elem::Dict(_) | Elem::Set(_)) if self.dynamic_fields.contains(field) => {
                 Ty::List(Elem::Object)
             }
             Ty::Dict(_) if self.dynamic_fields.contains(field) => dynamic_dict(),
@@ -2165,15 +2166,22 @@ impl Module {
 
     /// Record that `field` is changed through a receiver of no known
     /// class, and take the list of lists out of every class's field of
-    /// that name. Whether it was not known before.
-    fn note_dynamic_field(&mut self, field: &str) -> bool {
-        if !self.dynamic_fields.insert(field.to_string()) {
+    /// that name, and with `lists_only` false the dicts and sets too.
+    /// Whether it was not known before.
+    fn note_dynamic_field(&mut self, field: &str, lists_only: bool) -> bool {
+        let key = if lists_only {
+            lists_only_key(field)
+        } else {
+            field.to_string()
+        };
+        if !self.dynamic_fields.insert(key) {
             return false;
         }
         let denested = |ty: Ty| match ty {
-            Ty::List(Elem::List(_) | Elem::Dict(_) | Elem::Set(_)) => Ty::List(Elem::Object),
-            Ty::Dict(_) => dynamic_dict(),
-            Ty::Set(k) => dynamic_set(set_shape(k).1),
+            Ty::List(Elem::List(_)) => Ty::List(Elem::Object),
+            Ty::List(Elem::Dict(_) | Elem::Set(_)) if !lists_only => Ty::List(Elem::Object),
+            Ty::Dict(_) if !lists_only => dynamic_dict(),
+            Ty::Set(k) if !lists_only => dynamic_set(set_shape(k).1),
             other => other,
         };
         for class in &mut self.classes {
@@ -2377,7 +2385,27 @@ pub(crate) struct Locals {
     /// Fields whose list this body changes through a receiver of no
     /// known class (`o.cells[0] = v`, `o.cells.append(v)`), with whether
     /// the receiver is still untyped; see [`dynamic_field_stores`].
-    pub(crate) dynamic_field_stores: Vec<(String, bool)>,
+    pub(crate) dynamic_field_stores: Vec<FieldStore>,
+}
+
+/// A field changed through a receiver of no known class, as
+/// [`dynamic_field_stores`] finds it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FieldStore {
+    pub(crate) field: String,
+    /// The receiver is still untyped.
+    pub(crate) untyped: bool,
+    /// The receiver is a method's own `self`, read from outside the
+    /// class: the method's own inference types what it stores, so only
+    /// the lists of lists an ancestor may hold of another kind are in
+    /// question.
+    pub(crate) own: bool,
+}
+
+/// The key under which [`Module::note_dynamic_field`] records a field
+/// whose lists of lists alone are dynamic.
+fn lists_only_key(field: &str) -> String {
+    format!("{field}$lists")
 }
 
 /// Whether an annotation asks for a dynamic value: `Any`, `typing.Any`
@@ -2792,7 +2820,7 @@ pub(crate) fn infer_module(
         // Fields changed through receivers not yet typed this round: of
         // no known class, if they are still untyped once nothing else
         // changes.
-        let mut untyped_stores: Vec<String> = Vec::new();
+        let mut untyped_stores: Vec<(String, bool)> = Vec::new();
         let mut escaped: Vec<u16> = Vec::new();
         let mut dynamic_methods = HashSet::default();
         // Field writes per item, so an item inferred again this round
@@ -2849,11 +2877,11 @@ pub(crate) fn infer_module(
                         changed = true;
                     }
                 }
-                for (field, untyped) in &locals.dynamic_field_stores {
-                    if *untyped {
-                        untyped_stores.push(field.clone());
+                for store in &locals.dynamic_field_stores {
+                    if store.untyped {
+                        untyped_stores.push((store.field.clone(), store.own));
                     } else {
-                        changed |= module.note_dynamic_field(field);
+                        changed |= module.note_dynamic_field(&store.field, store.own);
                     }
                 }
                 // What a method assigns to `self.x` types the field on its
@@ -2905,11 +2933,11 @@ pub(crate) fn infer_module(
             } else if !entry_done {
                 entry_done = true;
                 entry_locals = infer_locals_open(&module, &entry_sig, entry, entry_files, true);
-                for (field, untyped) in &entry_locals.dynamic_field_stores {
-                    if *untyped {
-                        untyped_stores.push(field.clone());
+                for store in &entry_locals.dynamic_field_stores {
+                    if store.untyped {
+                        untyped_stores.push((store.field.clone(), store.own));
                     } else {
-                        changed |= module.note_dynamic_field(field);
+                        changed |= module.note_dynamic_field(&store.field, store.own);
                     }
                 }
                 for (k, field, ty) in &entry_locals.other_field_writes {
@@ -3047,8 +3075,8 @@ pub(crate) fn infer_module(
             }
         }
         if !changed {
-            for field in &untyped_stores {
-                changed |= module.note_dynamic_field(field);
+            for (field, own) in &untyped_stores {
+                changed |= module.note_dynamic_field(field, *own);
             }
         }
         if !changed {
@@ -4393,7 +4421,7 @@ fn infer_locals_with(
 /// store through a known class is checked against the field's kind
 /// where it is made. Nested bodies are read with this body's names,
 /// their own as dynamic.
-pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<(String, bool)> {
+pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<FieldStore> {
     use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     const CHANGERS: &[&str] = &[
         "append",
@@ -4418,17 +4446,27 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
     ];
     struct Stores<'t, 'm> {
         typer: &'t Typer<'m>,
-        out: Vec<(String, bool)>,
+        out: Vec<FieldStore>,
+        /// The receiver parameter of each method being read, innermost
+        /// last.
+        receivers: Vec<String>,
     }
     impl Stores<'_, '_> {
         /// `o.f` for `o` of no known class.
         fn through_unknown(&mut self, e: &py::Expr) {
             if let py::Expr::Attribute(a) = e {
-                match self.typer.expr(&a.value) {
-                    Ty::Object => self.out.push((a.attr.to_string(), false)),
-                    Ty::Unknown => self.out.push((a.attr.to_string(), true)),
-                    _ => {}
-                }
+                let untyped = match self.typer.expr(&a.value) {
+                    Ty::Object => false,
+                    Ty::Unknown => true,
+                    _ => return,
+                };
+                let own = matches!(&*a.value, py::Expr::Name(n)
+                    if self.receivers.last().is_some_and(|r| r == n.id.as_str()));
+                self.out.push(FieldStore {
+                    field: a.attr.to_string(),
+                    untyped,
+                    own,
+                });
             }
         }
         fn target(&mut self, t: &py::Expr) {
@@ -4444,9 +4482,38 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
     impl<'a> Visitor<'a> for Stores<'_, '_> {
         fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
             match stmt {
-                // A class's methods are inferred as their own bodies, with
-                // their receiver typed.
-                py::Stmt::ClassDef(_) => return,
+                // A class's methods, each with its receiver named.
+                py::Stmt::ClassDef(c) => {
+                    for s in &c.body {
+                        if let py::Stmt::FunctionDef(f) = s {
+                            let receiver = f
+                                .parameters
+                                .posonlyargs
+                                .iter()
+                                .chain(&f.parameters.args)
+                                .next()
+                                .map(|p| p.parameter.name.to_string())
+                                .unwrap_or_default();
+                            self.receivers.push(receiver);
+                            for s in &f.body {
+                                self.visit_stmt(s);
+                            }
+                            self.receivers.pop();
+                        } else {
+                            self.visit_stmt(s);
+                        }
+                    }
+                    return;
+                }
+                // A nested function has a receiver of its own, or none.
+                py::Stmt::FunctionDef(f) => {
+                    self.receivers.push(String::new());
+                    for s in &f.body {
+                        self.visit_stmt(s);
+                    }
+                    self.receivers.pop();
+                    return;
+                }
                 py::Stmt::Assign(a) => a.targets.iter().for_each(|t| self.target(t)),
                 py::Stmt::AugAssign(a) => self.target(&a.target),
                 py::Stmt::AnnAssign(a) => self.target(&a.target),
@@ -4469,6 +4536,7 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
     let mut stores = Stores {
         typer,
         out: Vec::new(),
+        receivers: Vec::new(),
     };
     for s in body {
         stores.visit_stmt(s);
