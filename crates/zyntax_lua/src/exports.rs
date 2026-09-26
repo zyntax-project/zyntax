@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::annotation::LuaType;
+use crate::annotation::{LuaType, Returned};
 use crate::scope::{FuncId, Holder, Scopes};
 use crate::types::{Inferred, ShapeId, Ty};
 use crate::{Error, Result};
@@ -43,12 +43,13 @@ pub struct ExportedFunction {
 }
 
 /// A function's declared types: one per parameter in order (`any` where
-/// none is declared), the type of `...`, and the results.
+/// none is declared), the type of `...`, and the results, each with the
+/// name its `@return` gives it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Signature {
     pub params: Vec<LuaType>,
     pub variadic: Option<LuaType>,
-    pub returns: Vec<LuaType>,
+    pub returns: Vec<Returned>,
 }
 
 /// A table a chunk returns, or reaches through the fields of one.

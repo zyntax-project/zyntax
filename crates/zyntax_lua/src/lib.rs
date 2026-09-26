@@ -35,7 +35,7 @@ mod policy;
 mod scope;
 mod types;
 
-pub use annotation::LuaType;
+pub use annotation::{LuaType, Returned};
 pub use exports::{
     DeclaredClass, Exported, ExportedFunction, ExportedTable, Exports, Signature, is_metafield,
 };

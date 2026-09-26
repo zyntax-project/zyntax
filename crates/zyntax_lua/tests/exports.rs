@@ -5,9 +5,16 @@
 //! types its LuaLS annotations declare.
 
 use zyntax_lua::{
-    DeclaredClass, Error, Exported, ExportedFunction, Exports, LuaType, Signature, exports,
-    is_metafield,
+    DeclaredClass, Error, Exported, ExportedFunction, Exports, LuaType, Returned, Signature,
+    exports, is_metafield,
 };
+
+fn returned(ty: LuaType, name: Option<&str>) -> Returned {
+    Returned {
+        ty,
+        name: name.map(str::to_owned),
+    }
+}
 
 fn function(params: &[&str], variadic: bool) -> Exported {
     Exported::Function(ExportedFunction {
@@ -174,6 +181,10 @@ end
 ---@param ... string
 function Counter.each(f, ...) end
 
+---@return integer count
+---@return string label the name
+function Counter:state() return self.n, self.label end
+
 return { Counter = Counter }
 "#,
     )
@@ -191,7 +202,7 @@ return { Counter = Counter }
         })
     );
     let names: Vec<&str> = counter.fields.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["LIMIT", "new", "bump", "each"]);
+    assert_eq!(names, ["LIMIT", "new", "bump", "each", "state"]);
     assert_eq!(counter.fields[0].1, Exported::Value(Some(LuaType::Integer)));
     let signature = |i: usize| match &counter.fields[i].1 {
         Exported::Function(f) => f.signature.clone().expect("annotated"),
@@ -202,7 +213,7 @@ return { Counter = Counter }
         Signature {
             params: vec![LuaType::Integer],
             variadic: None,
-            returns: vec![LuaType::Named("Counter".into())],
+            returns: vec![returned(LuaType::Named("Counter".into()), None)],
         }
     );
     // `self` has no annotation of its own.
@@ -211,7 +222,7 @@ return { Counter = Counter }
         Signature {
             params: vec![LuaType::Any, LuaType::Integer],
             variadic: None,
-            returns: vec![LuaType::Integer],
+            returns: vec![returned(LuaType::Integer, None)],
         }
     );
     assert_eq!(
@@ -224,6 +235,14 @@ return { Counter = Counter }
             variadic: Some(LuaType::String),
             returns: vec![],
         }
+    );
+    // Several results, each with its name.
+    assert_eq!(
+        signature(4).returns,
+        [
+            returned(LuaType::Integer, Some("count")),
+            returned(LuaType::String, Some("label"))
+        ]
     );
 }
 

@@ -38,13 +38,21 @@ pub enum LuaType {
     Other(String),
 }
 
+/// One of a function's results: its type, and the name its `@return`
+/// gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Returned {
+    pub ty: LuaType,
+    pub name: Option<String>,
+}
+
 /// One `---@` line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Annotation {
     Class(String),
     Field(String, LuaType),
     Param(String, LuaType),
-    Return(Vec<LuaType>),
+    Return(Vec<Returned>),
     Type(LuaType),
 }
 
@@ -102,24 +110,27 @@ fn parse(line: &str) -> Option<Annotation> {
         }
         "return" => {
             // `@return integer count, string name`
-            let mut types = Vec::new();
+            let mut returned = Vec::new();
             let mut at = rest;
             loop {
                 let (ty, after) = Reader::new(at).whole()?;
-                types.push(ty);
                 // An optional name, then a comma for another.
                 let after = after.trim_start();
-                let after = after
-                    .strip_prefix(|c: char| c.is_alphabetic() || c == '_')
-                    .map(|_| after.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_'))
-                    .unwrap_or(after)
-                    .trim_start();
-                match after.strip_prefix(',') {
+                let name_len = if after.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+                    after
+                        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .unwrap_or(after.len())
+                } else {
+                    0
+                };
+                let name = (name_len > 0).then(|| after[..name_len].to_owned());
+                returned.push(Returned { ty, name });
+                match after[name_len..].trim_start().strip_prefix(',') {
                     Some(next) => at = next.trim_start(),
                     None => break,
                 }
             }
-            Annotation::Return(types)
+            Annotation::Return(returned)
         }
         "type" => Annotation::Type(Reader::new(rest).whole()?.0),
         _ => return None,
@@ -350,7 +361,23 @@ mod tests {
         );
         assert_eq!(
             one("return integer count, string name"),
-            Annotation::Return(vec![LuaType::Integer, LuaType::String])
+            Annotation::Return(vec![
+                Returned {
+                    ty: LuaType::Integer,
+                    name: Some("count".into())
+                },
+                Returned {
+                    ty: LuaType::String,
+                    name: Some("name".into())
+                },
+            ])
+        );
+        assert_eq!(
+            one("return boolean # whether it held"),
+            Annotation::Return(vec![Returned {
+                ty: LuaType::Boolean,
+                name: None
+            }])
         );
         assert_eq!(one("type number"), Annotation::Type(LuaType::Number));
         assert_eq!(parse("diagnostic disable"), None);

@@ -14,7 +14,7 @@ use full_moon::ast::{self, Block, Expression, FunctionBody, Prefix, Stmt, Suffix
 use full_moon::node::Node;
 use full_moon::tokenizer::TokenReference;
 
-use crate::annotation::{Annotation, LuaType};
+use crate::annotation::{Annotation, LuaType, Returned};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct VarId(pub u32);
@@ -251,7 +251,7 @@ pub enum Holder {
 #[derive(Clone, Debug, Default)]
 pub struct Signature {
     pub params: Vec<(String, LuaType)>,
-    pub returns: Vec<LuaType>,
+    pub returns: Vec<Returned>,
 }
 
 #[derive(Clone, Debug)]
