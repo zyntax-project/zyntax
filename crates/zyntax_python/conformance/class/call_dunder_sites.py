@@ -21,8 +21,15 @@ class Holder(object):
         self.f = f
 
     def at(self, t):
+        return self.f(t)
+
+    def through_local(self, t):
         f = self.f
         return f(t)
+
+
+def triple(x):
+    return 3 * x
 
 
 line = Line(1.0, 3.0)
@@ -30,7 +37,9 @@ print(line(0), line(0.5), line(1))
 lines = [Line(0, 10), Line(2.0, 4.0)]
 print([lines[i](0.25) for i in range(len(lines))])
 h = Holder(Line(5, 7))
-print(h.at(2), h.at(0.5))
+print(h.at(2), h.f(0.5), h.through_local(1))
+holders = [Holder(Doubled(1, 2)), Holder(triple), Holder(lambda v: v - 1)]
+print([x.at(4) for x in holders])
 
 
 def run(spl, ts):

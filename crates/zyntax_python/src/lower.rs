@@ -12228,6 +12228,26 @@ impl<'m> Lowerer<'m> {
                 };
                 return Ok(self.guard_named(v, &target, span));
             }
+            // A field holding a callable: the field's value is called.
+            // The result is dynamic, as inference types such a call.
+            if dispatched
+                && self.module.classes[k]
+                    .fields
+                    .iter()
+                    .any(|(f, _)| f == method)
+            {
+                let callee = self.attribute(receiver, method, span)?;
+                let v = match callee.ty {
+                    Ty::Class(j) => {
+                        self.method_on(j as usize, callee, "__call__", args, keywords, c, span)?
+                    }
+                    _ => self.call_value(callee, args, keywords, c, span)?,
+                };
+                return Ok(Val {
+                    node: self.coerce(v, Ty::Object),
+                    ty: Ty::Object,
+                });
+            }
             return Err(Error::unsupported_span(
                 format!(
                     "method `{method}` of {}, which defines none",
