@@ -131,6 +131,10 @@ pub(crate) enum Elem {
     /// element is the inner list itself, never a copy, so every holder
     /// sees one list.
     List(u16),
+    /// Dicts, or sets, of the shape at this index of their shape table,
+    /// held by address as an inner list is.
+    Dict(u16),
+    Set(u16),
     Object,
 }
 
@@ -250,6 +254,8 @@ impl Elem {
             Ty::Class(k) => Elem::Class(k),
             Ty::Tuple(k) => Elem::Tuple(k),
             Ty::List(e) if e != Elem::Object => Elem::List(list_shape_of(e)),
+            Ty::Dict(k) => Elem::Dict(k),
+            Ty::Set(k) => Elem::Set(k),
             _ => Elem::Object,
         }
     }
@@ -264,6 +270,8 @@ impl Elem {
             Elem::Tuple(k) => Ty::Tuple(k),
             Elem::Array(c) => c.item(),
             Elem::List(k) => Ty::List(list_shape(k)),
+            Elem::Dict(k) => Ty::Dict(k),
+            Elem::Set(k) => Ty::Set(k),
             Elem::Object => Ty::Object,
         }
     }
@@ -286,6 +294,8 @@ impl Elem {
             Elem::Tuple(k) => tuple_suffix(k),
             Elem::Array(c) => c.storage().suffix().to_string(),
             Elem::List(k) => format!("l{k}"),
+            Elem::Dict(k) => format!("kd{k}"),
+            Elem::Set(k) => format!("ks{k}"),
             Elem::Object => "any".to_string(),
         }
     }
@@ -297,7 +307,7 @@ impl Elem {
             Elem::Float => zyntax_builtins::Kind::Float.list_tag(),
             Elem::Str => zyntax_builtins::Kind::Str.list_tag(),
             Elem::Class(_) => zyntax_builtins::Kind::Ptr.list_tag(),
-            Elem::Tuple(_) | Elem::List(_) => {
+            Elem::Tuple(_) | Elem::List(_) | Elem::Dict(_) | Elem::Set(_) => {
                 zyntax_builtins::lists::shape_list_tag(note_elem_list(self))
             }
             Elem::Array(c) => c.tag(),
@@ -384,11 +394,28 @@ thread_local! {
     /// generated with the program and numbers its box tag. The library's
     /// own dict, of dynamic keys and values, is not among them.
     static DICT_STORES: std::cell::RefCell<Vec<(Ty, Ty)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// A dict shape of each store, and a set shape of each set store, as
+    /// a set and as a frozenset where one exists: what the hooks lower
+    /// each store's arms against.
+    static DICT_STORE_SHAPES: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SET_STORE_SHAPES: std::cell::RefCell<Vec<[Option<u16>; 2]>> = const { std::cell::RefCell::new(Vec::new()) };
     /// How the sets the lowering used store their elements, by index:
     /// each numbers the box tags of its sets and frozensets, and gets its
     /// functions generated unless its elements are dynamic, which the
     /// library's own set holds.
     static SET_STORES: std::cell::RefCell<Vec<Ty>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The dict shapes, and the set shapes, inference joined: a union-find
+    /// over their indices, each shape's parent. Shapes one value may take
+    /// on share one store, so a dict read as either is one dict.
+    static DICT_CLASSES: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SET_CLASSES: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Whether joins still merge shapes: until the lowering that keeps
+    /// its output starts.
+    static CLASSES_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// How many dict and set shapes there were when the classes closed:
+    /// a shape made after is a class of its own until it is settled into
+    /// one.
+    static CLOSED_AT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((usize::MAX, usize::MAX)) };
     /// The storage kinds of the arrays the lowering used, as positions
     /// in `Kind::ALL`. A kind the library does not carry gets its list
     /// functions generated with the program; every kind gets its arms
@@ -406,6 +433,12 @@ pub(crate) fn reset_tuple_shapes() {
     SET_SHAPES.with(|t| t.borrow_mut().clear());
     DICT_STORES.with(|t| t.borrow_mut().clear());
     SET_STORES.with(|t| t.borrow_mut().clear());
+    DICT_STORE_SHAPES.with(|t| t.borrow_mut().clear());
+    SET_STORE_SHAPES.with(|t| t.borrow_mut().clear());
+    DICT_CLASSES.with(|t| t.borrow_mut().clear());
+    SET_CLASSES.with(|t| t.borrow_mut().clear());
+    CLASSES_OPEN.with(|c| c.set(true));
+    CLOSED_AT.with(|c| c.set((usize::MAX, usize::MAX)));
     ARRAY_KINDS.with(|t| t.borrow_mut().clear());
 }
 
@@ -446,8 +479,122 @@ pub(crate) fn dict_of(key: Ty, value: Ty) -> Ty {
         }
         let k = u16::try_from(table.len()).expect("fewer than 65536 dict shapes in a program");
         table.push((key, value));
+        DICT_CLASSES.with(|c| c.borrow_mut().push(k));
         Ty::Dict(k)
     })
+}
+
+/// The representative of shape `k` in `classes`.
+fn class_root(classes: &std::cell::RefCell<Vec<u16>>, k: u16) -> u16 {
+    let mut table = classes.borrow_mut();
+    let mut root = k;
+    while table[root as usize] != root {
+        root = table[root as usize];
+    }
+    let mut at = k;
+    while table[at as usize] != root {
+        let next = table[at as usize];
+        table[at as usize] = root;
+        at = next;
+    }
+    root
+}
+
+/// Merge the classes of two shapes of `classes`, while joins merge.
+fn merge_classes(
+    classes: &'static std::thread::LocalKey<std::cell::RefCell<Vec<u16>>>,
+    a: u16,
+    b: u16,
+) {
+    if CLASSES_OPEN.with(|c| c.get()) {
+        force_merge(classes, a, b);
+    }
+}
+
+/// Merge the classes of two shapes whatever the phase: for a shape
+/// settled from another, which adds nothing to what its class holds.
+fn force_merge(
+    classes: &'static std::thread::LocalKey<std::cell::RefCell<Vec<u16>>>,
+    a: u16,
+    b: u16,
+) {
+    classes.with(|c| {
+        let (ra, rb) = (class_root(c, a), class_root(c, b));
+        if ra != rb {
+            let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+            c.borrow_mut()[hi as usize] = lo;
+        }
+    });
+}
+
+/// The shapes in dict shape `k`'s class.
+fn dict_class(k: u16) -> Vec<u16> {
+    DICT_CLASSES.with(|c| {
+        let root = class_root(c, k);
+        let n = c.borrow().len() as u16;
+        (0..n).filter(|&i| class_root(c, i) == root).collect()
+    })
+}
+
+/// The shapes in set shape `k`'s class.
+fn set_class(k: u16) -> Vec<u16> {
+    SET_CLASSES.with(|c| {
+        let root = class_root(c, k);
+        let n = c.borrow().len() as u16;
+        (0..n).filter(|&i| class_root(c, i) == root).collect()
+    })
+}
+
+/// What the shapes in dict shape `k`'s class hold, joined.
+fn dict_class_holds(k: u16) -> (Ty, Ty) {
+    dict_class(k)
+        .into_iter()
+        .fold((Ty::Unknown, Ty::Unknown), |(ka, va), i| {
+            let (kb, vb) = dict_shape(i);
+            (ka.join(kb), va.join(vb))
+        })
+}
+
+/// What the shapes in set shape `k`'s class hold, joined.
+fn set_class_holds(k: u16) -> Ty {
+    set_class(k)
+        .into_iter()
+        .fold(Ty::Unknown, |e, i| e.join(set_shape(i).0))
+}
+
+/// Stop joins from merging shape classes: the lowering that keeps its
+/// output reads the classes as they now stand. The stores an earlier
+/// lowering noted are forgotten, since they read classes still growing.
+pub(crate) fn close_shape_classes() {
+    // Every shape with its settled form, until settling makes no shape.
+    loop {
+        let (dicts, sets) = (
+            DICT_SHAPES.with(|t| t.borrow().len()),
+            SET_SHAPES.with(|t| t.borrow().len()),
+        );
+        for k in 0..dicts as u16 {
+            let _ = Ty::Dict(k).settled();
+        }
+        for k in 0..sets as u16 {
+            let _ = Ty::Set(k).settled();
+        }
+        if DICT_SHAPES.with(|t| t.borrow().len()) == dicts
+            && SET_SHAPES.with(|t| t.borrow().len()) == sets
+        {
+            break;
+        }
+    }
+    CLOSED_AT.with(|c| {
+        c.set((
+            DICT_SHAPES.with(|t| t.borrow().len()),
+            SET_SHAPES.with(|t| t.borrow().len()),
+        ))
+    });
+    CLASSES_OPEN.with(|c| c.set(false));
+    DICT_STORES.with(|t| t.borrow_mut().clear());
+    SET_STORES.with(|t| t.borrow_mut().clear());
+    DICT_STORE_SHAPES.with(|t| t.borrow_mut().clear());
+    SET_STORE_SHAPES.with(|t| t.borrow_mut().clear());
 }
 
 /// The key and value types of dict shape `k`.
@@ -470,6 +617,7 @@ pub(crate) fn set_of(elem: Ty, frozen: bool) -> Ty {
         }
         let k = u16::try_from(table.len()).expect("fewer than 65536 set shapes in a program");
         table.push((elem, frozen));
+        SET_CLASSES.with(|c| c.borrow_mut().push(k));
         Ty::Set(k)
     })
 }
@@ -517,22 +665,17 @@ pub(crate) fn table_stored(ty: Ty, key: bool) -> Ty {
         Ty::List(e) if !key => Ty::List(e),
         // A table held in a table: its store comes first, so the store
         // holding it is declared after it.
-        Ty::Dict(k) if !key => {
-            let (kk, kv) = dict_shape(k);
-            let inner = dict_of(table_stored(kk, true), table_stored(kv, false));
-            if let Ty::Dict(i) = inner {
-                dict_store(i);
+        // A table held in a table, as its class stores it: its store
+        // comes first, so the store holding it is declared after it.
+        Ty::Dict(k) if !key => match dict_store(k) {
+            None => dynamic_dict(),
+            Some(i) => {
+                let (sk, sv) = dict_stores()[i as usize];
+                dict_of(sk, sv)
             }
-            inner
-        }
+        },
         Ty::Set(k) => match set_shape(k) {
-            (e, frozen) if frozen || !key => {
-                let inner = set_of(table_stored(e, true), frozen);
-                if let Ty::Set(i) = inner {
-                    set_store(i);
-                }
-                inner
-            }
+            (_, frozen) if frozen || !key => set_of(set_store(k).1, frozen),
             _ => Ty::Object,
         },
         _ => Ty::Object,
@@ -542,7 +685,8 @@ pub(crate) fn table_stored(ty: Ty, key: bool) -> Ty {
 /// The store of dict shape `k`: its index among [`dict_stores`], or
 /// None for the library's dict of dynamic keys and values.
 pub(crate) fn dict_store(k: u16) -> Option<u16> {
-    let (key, value) = dict_shape(k);
+    // What every shape of the class holds.
+    let (key, value) = dict_class_holds(k);
     let stored = (table_stored(key, true), table_stored(value, false));
     if stored == (Ty::Object, Ty::Object) {
         return None;
@@ -554,8 +698,30 @@ pub(crate) fn dict_store(k: u16) -> Option<u16> {
         }
         let i = u16::try_from(table.len()).expect("fewer than 65536 dict stores in a program");
         table.push(stored);
+        DICT_STORE_SHAPES.with(|r| r.borrow_mut().push(k));
         i
     }))
+}
+
+/// The store of dict type `ty`, as [`dict_store`] names it.
+pub(crate) fn dict_store_of(ty: Ty) -> Option<u16> {
+    match ty {
+        Ty::Dict(k) => dict_store(k),
+        other => unreachable!("a dict type, not {other:?}"),
+    }
+}
+
+/// A dict shape of store `i`.
+pub(crate) fn dict_store_shape(i: u16) -> Ty {
+    Ty::Dict(DICT_STORE_SHAPES.with(|r| r.borrow()[i as usize]))
+}
+
+/// A set shape of store `i`, as a set or as a frozenset, where one was
+/// seen.
+pub(crate) fn set_store_shape(i: u16, frozen: bool) -> Option<Ty> {
+    SET_STORE_SHAPES
+        .with(|r| r.borrow()[i as usize][frozen as usize])
+        .map(Ty::Set)
 }
 
 /// The dict stores the lowering used, by index.
@@ -566,7 +732,7 @@ pub(crate) fn dict_stores() -> Vec<(Ty, Ty)> {
 /// The store of set shape `k`: its index among [`set_stores`], and how
 /// it stores its elements.
 pub(crate) fn set_store(k: u16) -> (u16, Ty) {
-    let stored = table_stored(set_shape(k).0, true);
+    let stored = table_stored(set_class_holds(k), true);
     let i = SET_STORES.with(|t| {
         let mut table = t.borrow_mut();
         if let Some(i) = table.iter().position(|s| *s == stored) {
@@ -575,7 +741,15 @@ pub(crate) fn set_store(k: u16) -> (u16, Ty) {
         let i = u16::try_from(table.len()).expect("fewer than 32768 set stores in a program");
         assert!(i < 0x8000, "fewer than 32768 set stores in a program");
         table.push(stored);
+        SET_STORE_SHAPES.with(|r| r.borrow_mut().push([None, None]));
         i
+    });
+    let frozen = set_shape(k).1 as usize;
+    SET_STORE_SHAPES.with(|r| {
+        let mut shapes = r.borrow_mut();
+        if shapes[i as usize][frozen].is_none() {
+            shapes[i as usize][frozen] = Some(k);
+        }
     });
     (i, stored)
 }
@@ -743,7 +917,12 @@ impl Ty {
             // Two dicts join key with key and value with value.
             (Ty::Dict(a), Ty::Dict(b)) => {
                 let ((ka, va), (kb, vb)) = (dict_shape(a), dict_shape(b));
-                dict_of(ka.join(kb), va.join(vb))
+                let joined = dict_of(ka.join(kb), va.join(vb));
+                if let Ty::Dict(j) = joined {
+                    merge_classes(&DICT_CLASSES, a, b);
+                    merge_classes(&DICT_CLASSES, a, j);
+                }
+                joined
             }
             // Two sets join element with element; a set and a frozenset
             // are two types.
@@ -752,7 +931,12 @@ impl Ty {
                 if fa != fb {
                     return Ty::Object;
                 }
-                set_of(ea.join(eb), fa)
+                let joined = set_of(ea.join(eb), fa);
+                if let Ty::Set(j) = joined {
+                    merge_classes(&SET_CLASSES, a, b);
+                    merge_classes(&SET_CLASSES, a, j);
+                }
+                joined
             }
             // Two lists of shapes are one list seen before and after
             // its elements were typed; of two shapes decided apart
@@ -787,6 +971,10 @@ impl Ty {
             (Ty::List(Elem::List(a)), Ty::List(Elem::List(b))) => {
                 Ty::List(list_shape(a)).refined_by(Ty::List(list_shape(b)))
             }
+            (Ty::List(Elem::Dict(a)), Ty::List(Elem::Dict(b))) => {
+                Ty::Dict(a).refined_by(Ty::Dict(b))
+            }
+            (Ty::List(Elem::Set(a)), Ty::List(Elem::Set(b))) => Ty::Set(a).refined_by(Ty::Set(b)),
             _ => false,
         }
     }
@@ -812,6 +1000,8 @@ impl Ty {
             },
             Ty::List(Elem::Tuple(k)) => format!("List({})", Ty::Tuple(k).describe()),
             Ty::List(Elem::List(k)) => format!("List({})", Ty::List(list_shape(k)).describe()),
+            Ty::List(Elem::Dict(k)) => format!("List({})", Ty::Dict(k).describe()),
+            Ty::List(Elem::Set(k)) => format!("List({})", Ty::Set(k).describe()),
             Ty::List(Elem::Array(c)) => format!("Array({})", c.letter()),
             Ty::Num(m) => {
                 let names: Vec<&str> = [
@@ -844,16 +1034,42 @@ impl Ty {
         match self {
             Ty::Unknown => Ty::Object,
             Ty::Tuple(k) => tuple_of(tuple_shape(k).into_iter().map(Ty::settled).collect()),
+            // What is undecided in a dict or set is what its class holds
+            // there: the shapes one value takes on stay one class.
             Ty::Dict(k) => {
                 let (key, value) = dict_shape(k);
-                dict_of(key.settled(), value.settled())
+                let (class_key, class_value) = dict_class_holds(k);
+                let decided = |t: Ty, class: Ty| match t {
+                    Ty::Unknown => class.settled(),
+                    t => t.settled(),
+                };
+                let settled = dict_of(decided(key, class_key), decided(value, class_value));
+                if let Ty::Dict(s) = settled
+                    && (CLASSES_OPEN.with(|c| c.get())
+                        || s as usize >= CLOSED_AT.with(|c| c.get().0))
+                {
+                    force_merge(&DICT_CLASSES, k, s);
+                }
+                settled
             }
             Ty::Set(k) => {
                 let (elem, frozen) = set_shape(k);
-                set_of(elem.settled(), frozen)
+                let settled = match elem {
+                    Ty::Unknown => set_of(set_class_holds(k).settled(), frozen),
+                    e => set_of(e.settled(), frozen),
+                };
+                if let Ty::Set(s) = settled
+                    && (CLASSES_OPEN.with(|c| c.get())
+                        || s as usize >= CLOSED_AT.with(|c| c.get().1))
+                {
+                    force_merge(&SET_CLASSES, k, s);
+                }
+                settled
             }
             Ty::List(Elem::Tuple(k)) => Ty::List(Elem::of(Ty::Tuple(k).settled())),
             Ty::List(Elem::List(k)) => Ty::List(Elem::of(Ty::List(list_shape(k)).settled())),
+            Ty::List(Elem::Dict(k)) => Ty::List(Elem::of(Ty::Dict(k).settled())),
+            Ty::List(Elem::Set(k)) => Ty::List(Elem::of(Ty::Set(k).settled())),
             other => other,
         }
     }
@@ -1936,9 +2152,13 @@ impl Module {
     /// a store may put anything in.
     pub(crate) fn denest(&self, field: &str, ty: Ty) -> Ty {
         match ty {
-            Ty::List(Elem::List(_)) if self.dynamic_fields.contains(field) => {
+            Ty::List(Elem::List(_) | Elem::Dict(_) | Elem::Set(_))
+                if self.dynamic_fields.contains(field) =>
+            {
                 Ty::List(Elem::Object)
             }
+            Ty::Dict(_) if self.dynamic_fields.contains(field) => dynamic_dict(),
+            Ty::Set(k) if self.dynamic_fields.contains(field) => dynamic_set(set_shape(k).1),
             other => other,
         }
     }
@@ -1950,16 +2170,22 @@ impl Module {
         if !self.dynamic_fields.insert(field.to_string()) {
             return false;
         }
+        let denested = |ty: Ty| match ty {
+            Ty::List(Elem::List(_) | Elem::Dict(_) | Elem::Set(_)) => Ty::List(Elem::Object),
+            Ty::Dict(_) => dynamic_dict(),
+            Ty::Set(k) => dynamic_set(set_shape(k).1),
+            other => other,
+        };
         for class in &mut self.classes {
             for (name, ty) in &mut class.fields {
-                if name == field && matches!(ty, Ty::List(Elem::List(_))) {
-                    *ty = Ty::List(Elem::Object);
+                if name == field {
+                    *ty = denested(*ty);
                 }
             }
         }
         for ((_, name), ty) in &mut self.field_lists {
-            if name == field && matches!(ty, Ty::List(Elem::List(_))) {
-                *ty = Ty::List(Elem::Object);
+            if name == field {
+                *ty = denested(*ty);
             }
         }
         true
@@ -4042,14 +4268,15 @@ fn infer_locals_with(
     locals
 }
 
-/// The fields whose list `body` changes through a receiver of no known
-/// class: an element or slice stored or deleted (`o.cells[0] = v`), or a
-/// method that changes a list called (`o.cells.append(v)`), with whether
-/// the receiver is still untyped. Such a store may put anything in any
-/// class's field of that name, so none of them holds its elements typed
-/// by address (see [`Module::denest`]); a store through a known class
-/// is checked against the field's kind where it is made. Nested bodies
-/// are read with this body's names, their own as dynamic.
+/// The fields whose list, dict or set `body` changes through a receiver
+/// of no known class: an element or slice stored or deleted
+/// (`o.cells[0] = v`), or a method that changes one called
+/// (`o.cells.append(v)`), with whether the receiver is still untyped.
+/// Such a store may put anything in any class's field of that name, so
+/// none of them holds its values typed (see [`Module::denest`]); a
+/// store through a known class is checked against the field's kind
+/// where it is made. Nested bodies are read with this body's names,
+/// their own as dynamic.
 pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<(String, bool)> {
     use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     const CHANGERS: &[&str] = &[
@@ -4064,6 +4291,14 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
         "__setitem__",
         "__delitem__",
         "__iadd__",
+        "add",
+        "discard",
+        "update",
+        "setdefault",
+        "popitem",
+        "difference_update",
+        "intersection_update",
+        "symmetric_difference_update",
     ];
     struct Stores<'t, 'm> {
         typer: &'t Typer<'m>,
@@ -4093,6 +4328,9 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
     impl<'a> Visitor<'a> for Stores<'_, '_> {
         fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
             match stmt {
+                // A class's methods are inferred as their own bodies, with
+                // their receiver typed.
+                py::Stmt::ClassDef(_) => return,
                 py::Stmt::Assign(a) => a.targets.iter().for_each(|t| self.target(t)),
                 py::Stmt::AugAssign(a) => self.target(&a.target),
                 py::Stmt::AnnAssign(a) => self.target(&a.target),
@@ -5141,7 +5379,9 @@ impl Walker<'_> {
                     let (key, value) = dict_shape(k);
                     let written = self.expr(&sub.slice);
                     let widened = dict_of(key.join(written), value.join(ty));
-                    if widened != Ty::Dict(k) {
+                    // A field's writes are gathered afresh each round, so
+                    // one is recorded even when it widens nothing yet.
+                    if widened != Ty::Dict(k) || matches!(&*sub.value, py::Expr::Attribute(_)) {
                         self.widen_holder(&sub.value, widened);
                     }
                 }
@@ -5190,7 +5430,9 @@ impl Walker<'_> {
             (Ty::Dict(_), Ty::Dict(_)) | (Ty::Set(_), Ty::Set(_))
         ) {
             let widened = held.join(taken);
-            if widened != held && matches!(widened, Ty::Dict(_) | Ty::Set(_)) {
+            if (widened != held || matches!(source, py::Expr::Attribute(_)))
+                && matches!(widened, Ty::Dict(_) | Ty::Set(_))
+            {
                 self.widen_holder(source, widened);
             }
         }
@@ -5256,7 +5498,9 @@ impl Walker<'_> {
                     (Ty::Dict(_), Ty::Dict(_)) | (Ty::Set(_), Ty::Set(_))
                 ) {
                     let widened = passed.join(*param);
-                    if widened != passed && matches!(widened, Ty::Dict(_) | Ty::Set(_)) {
+                    if (widened != passed || matches!(arg, py::Expr::Attribute(_)))
+                        && matches!(widened, Ty::Dict(_) | Ty::Set(_))
+                    {
                         self.widen_holder(arg, widened);
                     }
                 }
@@ -5314,7 +5558,7 @@ impl Walker<'_> {
             }
             _ => return,
         };
-        if widened != receiver {
+        if widened != receiver || matches!(&*m.value, py::Expr::Attribute(_)) {
             self.widen_holder(&m.value, widened);
         }
     }

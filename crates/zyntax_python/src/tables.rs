@@ -87,6 +87,21 @@ pub(crate) fn table_tag(ty: Ty) -> i64 {
     }
 }
 
+/// The tag of the sets of `ty`'s store, frozen or not.
+pub(crate) fn table_tag_as(ty: Ty, frozen: bool) -> i64 {
+    let Ty::Set(k) = ty else {
+        unreachable!("a set type")
+    };
+    let (i, stored) = types::set_store(k);
+    if frozen && types::typed_tables() {
+        zyntax_builtins::dicts::frozen_set_shape_tag(i)
+    } else if stored == Ty::Object {
+        zyntax_builtins::SET_TAG
+    } else {
+        zyntax_builtins::dicts::set_shape_tag(i)
+    }
+}
+
 /// How dict type `ty` stores its keys and its values.
 pub(crate) fn dict_stored(ty: Ty) -> (Ty, Ty) {
     match ty {
@@ -149,6 +164,19 @@ pub(crate) fn table_ir(ty: Ty) -> Type {
     }
 }
 
+/// A dict or set of type `ty` boxed by reference under its store's tag.
+pub(crate) fn box_table_node(ty: Ty, value: Node, span: Span) -> Node {
+    if frozen_tagged(ty) {
+        return call(
+            &set_fn("box_raw", ty),
+            vec![value, int32_lit(table_tag(ty) as i32, span)],
+            Ty::Object,
+            span,
+        );
+    }
+    call(&table_fn("box", ty), vec![value], Ty::Object, span)
+}
+
 /// How a slot of a table stored as `stored` holds its value: a list,
 /// dict or set as the box of its kind, anything else as itself.
 pub(crate) fn slot_ty(stored: Ty) -> Ty {
@@ -196,16 +224,7 @@ fn not(v: Node, span: Span) -> Node {
 impl Lowerer<'_> {
     /// A dict or set boxed by reference under its store's tag.
     pub(crate) fn box_table(&mut self, v: Val, span: Span) -> Node {
-        if frozen_tagged(v.ty) {
-            let tag = table_tag(v.ty) as i32;
-            return call(
-                &set_fn("box_raw", v.ty),
-                vec![v.node, int32_lit(tag, span)],
-                Ty::Object,
-                span,
-            );
-        }
-        call(&table_fn("box", v.ty), vec![v.node], Ty::Object, span)
+        box_table_node(v.ty, v.node, span)
     }
 
     /// A dynamic value read as a dict or set of type `target`, checked
@@ -1353,10 +1372,20 @@ impl Lowerer<'_> {
         if same_store(a.ty, b.ty) {
             return call(&dict_fn("eq", a.ty), vec![a.node, b.node], Ty::Bool, span);
         }
-        let other = self.coerce(b, Ty::Object);
+        // The library's own dict has no comparison with a box: the other
+        // side's store compares, or both go through the dynamic layer.
+        let (typed, other) = if types::dict_store_of(a.ty).is_some() {
+            (a, b)
+        } else if types::dict_store_of(b.ty).is_some() {
+            (b, a)
+        } else {
+            let (x, y) = (self.coerce(a, Ty::Object), self.coerce(b, Ty::Object));
+            return call("zb_any_eq", vec![x, y], Ty::Bool, span);
+        };
+        let other = self.coerce(other, Ty::Object);
         call(
-            &dict_fn("eq_any", a.ty),
-            vec![a.node, other],
+            &dict_fn("eq_any", typed.ty),
+            vec![typed.node, other],
             Ty::Bool,
             span,
         )
@@ -1401,10 +1430,7 @@ fn when_stmt(condition: Node, then: Vec<Stmt>, span: Span) -> Stmt {
 
 /// The tag of the frozensets of `ty`'s store.
 fn frozen_tag_of(ty: Ty) -> i64 {
-    let Ty::Set(k) = ty else {
-        unreachable!("a set type")
-    };
-    table_tag(types::set_of(types::set_shape(k).0, true))
+    table_tag_as(ty, true)
 }
 
 /// Whether set type `ty` has functions of its own, generated for its

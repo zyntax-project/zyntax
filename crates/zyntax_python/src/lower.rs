@@ -99,12 +99,14 @@ pub(crate) fn class_type(k: usize) -> Type {
     }
 }
 
-/// A field holds its own scalar, or the pointer to an instance; anything
-/// else on the heap is stored boxed, so a list field is one shared
-/// header and a class's layout never depends on another's.
+/// A field holds its own scalar, the pointer to an instance, or the
+/// address of a dict's or set's entry list (a word, as a list of lists
+/// holds its inner lists); anything else on the heap is stored boxed, so
+/// a list field is one shared header.
 pub(crate) fn field_storage(ty: Ty) -> Ty {
     match ty {
         Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Class(_) => ty,
+        Ty::Dict(_) | Ty::Set(_) => Ty::Int,
         _ => Ty::Object,
     }
 }
@@ -223,6 +225,7 @@ pub(crate) fn shape_declarations(
         let e = types::elem_lists()[inner.len()];
         inner.push(match e {
             Elem::List(k) => Some(field_of(Ty::List(types::list_shape(k)))),
+            Elem::Dict(_) | Elem::Set(_) => Some(field_of(e.ty())),
             _ => None,
         });
     }
@@ -298,6 +301,11 @@ pub(crate) fn shape_declarations(
                     list_type, i as u16, &suffix, &inner,
                 ));
             }
+            (Elem::Dict(_) | Elem::Set(_), Some(inner)) => {
+                out.extend(zyntax_builtins::lists::keyed_list_declarations(
+                    list_type, i as u16, &suffix, &inner,
+                ));
+            }
             _ => {}
         }
     }
@@ -348,7 +356,7 @@ pub(crate) fn elem_ir(e: Elem) -> Type {
             types::note_elem_list(e);
             ir(Ty::Tuple(k))
         }
-        Elem::List(_) => {
+        Elem::List(_) | Elem::Dict(_) | Elem::Set(_) => {
             types::note_elem_list(e);
             addr_type()
         }
@@ -377,7 +385,9 @@ fn typed_call(name: &str, args: Vec<Node>, ty: Type, span: Span) -> Node {
 fn elem_call(op: &str, e: Elem, args: Vec<Node>, span: Span) -> Node {
     match e {
         Elem::Class(k) => cast(addr_call(&list_fn(op, e), args, span), Ty::Class(k), span),
-        Elem::List(_) => cast(addr_call(&list_fn(op, e), args, span), e.ty(), span),
+        Elem::List(_) | Elem::Dict(_) | Elem::Set(_) => {
+            cast(addr_call(&list_fn(op, e), args, span), e.ty(), span)
+        }
         Elem::Array(c) => {
             let stored = typed_call(&list_fn(op, e), args, c.storage().ty(), span);
             if c.narrows() {
@@ -430,6 +440,7 @@ pub(crate) fn box_element(e: Elem, value: Node, span: Span) -> Node {
             span,
         ),
         Elem::List(k) => box_list(types::list_shape(k), value, span),
+        Elem::Dict(_) | Elem::Set(_) => tables::box_table_node(e.ty(), value, span),
         other => unreachable!("an element boxed by its kind's functions, not {other:?}"),
     }
 }
@@ -445,6 +456,16 @@ pub(crate) fn read_element(e: Elem, v: Node, span: Span) -> Node {
             span,
         ),
         Elem::List(k) => as_addr(unbox_list(types::list_shape(k), v, span), span),
+        Elem::Dict(_) | Elem::Set(_) => {
+            let ty = e.ty();
+            let raw = call(
+                &tables::table_fn("unbox_tagged", ty),
+                vec![v, int_lit(tables::table_tag(ty), span)],
+                ty,
+                span,
+            );
+            as_addr(raw, span)
+        }
         other => unreachable!("an element read by its kind's functions, not {other:?}"),
     }
 }
@@ -2542,6 +2563,31 @@ impl<'m> Lowerer<'m> {
         }
     }
 
+    /// A field's stored value read as its type `ty`: a dict or set from
+    /// its address.
+    pub(crate) fn field_out(&mut self, stored: Node, ty: Ty, span: Span) -> Node {
+        match ty {
+            Ty::Dict(_) | Ty::Set(_) => cast(stored, ty, span),
+            _ => self.trusted(
+                Val {
+                    node: stored,
+                    ty: field_storage(ty),
+                },
+                ty,
+            ),
+        }
+    }
+
+    /// A value going into a field of type `ty`, as the field stores it.
+    pub(crate) fn field_in(&mut self, v: Val, ty: Ty) -> Node {
+        let span = v.node.span;
+        let typed = self.coerce(v, ty);
+        match ty {
+            Ty::Dict(_) | Ty::Set(_) => cast(typed, Ty::Int, span),
+            _ => self.coerce(Val { node: typed, ty }, field_storage(ty)),
+        }
+    }
+
     /// [`Self::bind`] of a value that statements already in `out`
     /// produced: whatever the binding hoists is placed in `out` just
     /// ahead of the binding's own statements, since the statement-wide
@@ -2829,7 +2875,7 @@ impl<'m> Lowerer<'m> {
         let span = v.node.span;
         let node = self.coerce(v, e.ty());
         match e {
-            Elem::Class(_) | Elem::List(_) => as_addr(node, span),
+            Elem::Class(_) | Elem::List(_) | Elem::Dict(_) | Elem::Set(_) => as_addr(node, span),
             Elem::Array(c) if c.narrows() => self.narrowed(node, c, span),
             _ => node,
         }
@@ -11454,13 +11500,7 @@ impl<'m> Lowerer<'m> {
                     stored,
                     span,
                 );
-                let node = self.trusted(
-                    Val {
-                        node: field,
-                        ty: stored,
-                    },
-                    ty,
-                );
+                let node = self.field_out(field, ty, span);
                 Ok(Val { node, ty })
             }
             Ty::Object => {
@@ -11734,8 +11774,7 @@ impl<'m> Lowerer<'m> {
                     ));
                 };
                 let stored = field_storage(ty);
-                let value = self.coerce(value, ty);
-                let value = self.coerce(Val { node: value, ty }, stored);
+                let value = self.field_in(value, ty);
                 let field = node(
                     TypedExpression::Field(TypedFieldAccess {
                         object: Box::new(object.node),

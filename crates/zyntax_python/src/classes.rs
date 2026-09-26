@@ -1006,13 +1006,7 @@ fn getattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
         |c| module.field(c, attr).is_some(),
         |lowerer, c, obj| {
             let (_, ty) = module.field(c, attr).expect("picked");
-            let value = lowerer.coerce(
-                Val {
-                    node: field(obj, attr, ty, span),
-                    ty: field_storage(ty),
-                },
-                ty,
-            );
+            let value = lowerer.field_out(field(obj, attr, ty, span), ty, span);
             let boxed = lowerer.coerce(Val { node: value, ty }, Ty::Object);
             vec![ret(boxed, span)]
         },
@@ -1095,7 +1089,7 @@ fn setattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
                 },
                 ty,
             );
-            let stored = lowerer.coerce(Val { node: value, ty }, field_storage(ty));
+            let stored = lowerer.field_in(Val { node: value, ty }, ty);
             out.extend([
                 stmt(
                     binary(
@@ -1796,19 +1790,21 @@ struct Keyed {
 fn keyed_stores() -> Vec<Keyed> {
     use crate::lower::tables;
     let mut out = Vec::new();
-    for (key, value) in crate::types::dict_stores() {
-        let ty = crate::types::dict_of(key, value);
+    for i in 0..crate::types::dict_stores().len() as u16 {
+        let ty = crate::types::dict_store_shape(i);
         out.push(Keyed {
             kind: tables::table_tag(ty) >> 8,
             ty,
         });
     }
-    for stored in crate::types::set_stores() {
+    for (i, stored) in crate::types::set_stores().into_iter().enumerate() {
         for frozen in [false, true] {
             if !frozen && stored == Ty::Object {
                 continue;
             }
-            let ty = crate::types::set_of(stored, frozen);
+            let Some(ty) = crate::types::set_store_shape(i as u16, frozen) else {
+                continue;
+            };
             out.push(Keyed {
                 kind: tables::table_tag(ty) >> 8,
                 ty,
@@ -2292,12 +2288,18 @@ fn set_operation_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
     let mut lowerer = scratch(module);
     let mut same_arith = Vec::new();
     let mut same_le = Vec::new();
-    for stored in crate::types::set_stores() {
-        let (set, frozen) = (
-            crate::types::set_of(stored, false),
-            crate::types::set_of(stored, true),
+    for i in 0..crate::types::set_stores().len() as u16 {
+        let (Some(set), Some(frozen)) = (
+            crate::types::set_store_shape(i, false).or(crate::types::set_store_shape(i, true)),
+            crate::types::set_store_shape(i, true).or(crate::types::set_store_shape(i, false)),
+        ) else {
+            continue;
+        };
+        // A store seen only one way has boxes only of that kind.
+        let kinds = (
+            tables::table_tag_as(set, false) >> 8,
+            tables::table_tag_as(frozen, true) >> 8,
         );
-        let kinds = (tables::table_tag(set) >> 8, tables::table_tag(frozen) >> 8);
         let both = binary(
             BinaryOp::And,
             either(&a, kinds),
@@ -2347,12 +2349,21 @@ fn set_operation_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
                 node: call(&set_fn(op, set), vec![ra.clone(), rb.clone()], set, span),
                 ty: set,
             };
-            let as_frozen = Val {
-                node: result.node.clone(),
-                ty: frozen,
-            };
-            let boxed = lowerer.box_table(result, span);
-            let boxed_frozen = lowerer.box_table(as_frozen, span);
+            let boxed = call(
+                &set_fn("box", set),
+                vec![result.node.clone()],
+                Ty::Object,
+                span,
+            );
+            let boxed_frozen = call(
+                &set_fn("box_raw", set),
+                vec![
+                    result.node,
+                    lower::int32_lit(kinds.1 as i32 * 256 + 255, span),
+                ],
+                Ty::Object,
+                span,
+            );
             arms.push(when(
                 binary(BinaryOp::Eq, code.clone(), int_lit(c, span), Ty::Bool, span),
                 vec![

@@ -840,6 +840,9 @@ pub fn parse_program_with(
     inferred.abstract_calls.take();
     inferred.class_adapters.take();
     inferred.counter.set(inferred.closures.borrow().len());
+    // The lowering kept reads dict and set shapes as the first one left
+    // them joined.
+    types::close_shape_classes();
     let kept = lower_all(&inferred, &mut dropped)?;
     declarations.extend(kept.into_iter().filter(|d| match &d.node {
         TypedDeclaration::Function(f) => f.name.resolve_global().is_none_or(|n| {

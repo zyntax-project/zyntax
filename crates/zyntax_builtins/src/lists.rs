@@ -896,6 +896,102 @@ pub fn nested_list_declarations(
     generated(kind_declarations(&k))
 }
 
+/// The list functions of a list whose elements are dicts, or sets, of
+/// the shape `inner` describes, each held by the address of its entry
+/// list: equality as the shape's, a set ordered by proper inclusion, a
+/// dict by nothing (the dynamic comparison raises).
+pub fn keyed_list_declarations(
+    list_type: TypeId,
+    index: u16,
+    suffix: &str,
+    inner: &Field,
+) -> Vec<Decl> {
+    let (family, inner_suffix, inner_ty, tag, frozen) = match inner {
+        Field::Dict { ty, suffix, tag } => ("dict", suffix.clone(), ty.clone(), *tag, false),
+        Field::Set {
+            ty,
+            suffix,
+            tag,
+            frozen,
+        } => ("set", suffix.clone(), ty.clone(), *tag, *frozen),
+        other => unreachable!("a dict or set element, not {other:?}"),
+    };
+    let fn_of = move |op: &str| crate::lists::keyed_fn(family, op, &inner_suffix);
+    let as_table = {
+        let ty = inner_ty.clone();
+        move |x: Expr| cast(x, ty.clone())
+    };
+    let make_box = || -> Unary {
+        let (box_raw, plain, t) = (fn_of("box_raw"), fn_of("box"), as_table.clone());
+        Box::new(move |x| {
+            if frozen {
+                call(&box_raw, vec![t(x), int32(tag as i32)], any())
+            } else {
+                call(&plain, vec![t(x)], any())
+            }
+        })
+    };
+    let boxed_of = make_box();
+    let eq_op: Binary = {
+        let (name, t) = (fn_of("eq"), as_table.clone());
+        Box::new(move |a, b| {
+            or(
+                eq(a.clone(), b.clone()),
+                call(&name, vec![t(a), t(b)], boolean()),
+            )
+        })
+    };
+    let lt_op: Binary = if family == "set" {
+        let (subset, size, t) = (fn_of("issubset"), fn_of("len"), as_table.clone());
+        Box::new(move |a, b| {
+            and(
+                lt(
+                    call(&size, vec![t(a.clone())], i64()),
+                    call(&size, vec![t(b.clone())], i64()),
+                ),
+                call(&subset, vec![t(a), t(b)], boolean()),
+            )
+        })
+    } else {
+        let (b1, b2) = (make_box(), make_box());
+        Box::new(move |a, b| call("zb_any_lt", vec![b1(a), b2(b)], boolean()))
+    };
+    let repr: Unary = {
+        let (name, size, t) = (fn_of("repr"), fn_of("len"), as_table.clone());
+        Box::new(move |x| {
+            let text_of = call(&name, vec![t(x.clone())], string());
+            if frozen {
+                if_expr(
+                    eq(call(&size, vec![t(x)], i64()), int(0)),
+                    text("frozenset()"),
+                    add(add(text("frozenset("), text_of), text(")")),
+                )
+            } else {
+                text_of
+            }
+        })
+    };
+    let read: Unary = {
+        let (name, ty) = (fn_of("unbox_tagged"), inner_ty.clone());
+        Box::new(move |x| cast(call(&name, vec![x, int(tag)], ty.clone()), usize()))
+    };
+    let elem = usize();
+    let k = KindOps {
+        kind: None,
+        suffix: suffix.to_string(),
+        tag: shape_list_tag(index),
+        list: list_of(list_type, elem.clone()),
+        strs: list_of(list_type, string()),
+        elem,
+        eq: eq_op,
+        lt: lt_op,
+        repr,
+        boxed: boxed_of,
+        read,
+    };
+    generated(kind_declarations(&k))
+}
+
 /// Mark what a frontend generates into a program as generated, so its
 /// bodies are not type checked with every program that declares them.
 pub(crate) fn generated(mut decls: Vec<Decl>) -> Vec<Decl> {
