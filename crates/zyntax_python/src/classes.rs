@@ -1344,9 +1344,9 @@ fn builtin_arms(
             ));
         }
     }
-    // A list of tuples of each shape the program has.
-    for k in crate::types::tuple_lists() {
-        let e = Elem::Tuple(k);
+    // A list of tuples of each shape the program has, and of lists of
+    // each kind.
+    for e in crate::types::elem_lists() {
         receivers.push((
             kind(e.list_tag() >> 8),
             Ty::List(e),
@@ -1772,22 +1772,22 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
     let x = var(intern("x"), Ty::Object, span);
     let i = var(intern("i"), Ty::Int, span);
     let v = var(intern("v"), Ty::Object, span);
-    let shapes: Vec<u16> = crate::types::tuple_lists().into_iter().collect();
+    let shapes: Vec<Elem> = crate::types::elem_lists();
     let kind = call("zb_any_kind", vec![x.clone()], Ty::Int, span);
-    let is_shape = |k: u16| {
+    let is_shape = |e: Elem| {
         binary(
             BinaryOp::Eq,
             kind.clone(),
-            int_lit(Elem::Tuple(k).list_tag() >> 8, span),
+            int_lit(e.list_tag() >> 8, span),
             Ty::Bool,
             span,
         )
     };
-    let raw = |k: u16| {
+    let raw = |e: Elem| {
         call(
-            &format!("zb_unbox_list_raw_{}", Elem::Tuple(k).suffix()),
+            &format!("zb_unbox_list_raw_{}", e.suffix()),
             vec![x.clone()],
-            Ty::List(Elem::Tuple(k)),
+            Ty::List(e),
             span,
         )
     };
@@ -2088,14 +2088,13 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
             span,
         ));
     }
-    for &k in &shapes {
-        let e = Elem::Tuple(k);
+    for &e in &shapes {
         repr.push(when(
-            is_shape(k),
+            is_shape(e),
             vec![ret(
                 call(
                     &format!("zb_list_repr_{}", e.suffix()),
-                    vec![raw(k)],
+                    vec![raw(e)],
                     Ty::Str,
                     span,
                 ),
@@ -2104,11 +2103,11 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
             span,
         ));
         items.push(when(
-            is_shape(k),
+            is_shape(e),
             vec![ret(
                 call(
                     &format!("zb_list_to_any_{}", e.suffix()),
-                    vec![raw(k)],
+                    vec![raw(e)],
                     Ty::List(Elem::Object),
                     span,
                 ),
@@ -2116,38 +2115,20 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
             )],
             span,
         ));
-        let element = call(
-            &format!("zb_list_get_{}", e.suffix()),
-            vec![raw(k), i.clone()],
-            Ty::Tuple(k),
-            span,
-        );
+        let element = lower::element_get(e, raw(e), i.clone(), span);
         get.push(when(
-            is_shape(k),
-            vec![ret(
-                call(
-                    &format!("zb_tuple_box_{}", e.suffix()),
-                    vec![element],
-                    Ty::Object,
-                    span,
-                ),
-                span,
-            )],
+            is_shape(e),
+            vec![ret(lower::box_element(e, element, span), span)],
             span,
         ));
-        let read = call(
-            &format!("zb_tuple_read_{}", e.suffix()),
-            vec![v.clone()],
-            Ty::Tuple(k),
-            span,
-        );
+        let read = lower::read_element(e, v.clone(), span);
         set.push(when(
-            is_shape(k),
+            is_shape(e),
             vec![
                 stmt(
                     call(
                         &format!("zb_list_set_{}", e.suffix()),
-                        vec![raw(k), i.clone(), read.clone()],
+                        vec![raw(e), i.clone(), read.clone()],
                         Ty::None,
                         span,
                     ),
@@ -2157,13 +2138,13 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
             ],
             span,
         ));
-        assign_slice.push(assign_arm(is_shape(k), e, raw(k)));
-        let mut slice_args = vec![raw(k)];
+        assign_slice.push(assign_arm(is_shape(e), e, raw(e)));
+        let mut slice_args = vec![raw(e)];
         slice_args.extend(bounds.iter().cloned());
         // A shaped list's slice is a List<Any>, like the list it came
         // from as the dynamic code sees it: a later write may be any kind.
         getslice.push(when(
-            is_shape(k),
+            is_shape(e),
             vec![ret(
                 call(
                     &lower::list_fn("box", Elem::Object),
@@ -2186,10 +2167,10 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
             span,
         ));
         append.push(when(
-            is_shape(k),
+            is_shape(e),
             vec![
                 stmt(
-                    method_call(raw(k), "push", vec![read], Ty::None, span),
+                    method_call(raw(e), "push", vec![read], Ty::None, span),
                     span,
                 ),
                 ret_void(span),

@@ -125,6 +125,11 @@ pub(crate) enum Elem {
     /// elements are stored at the typecode's width and read as the
     /// number the typecode stands for. The list is the array.
     Array(Code),
+    /// Lists (or arrays) whose elements are the kind at this index of
+    /// the list shape table, each held by its header's address: an
+    /// element is the inner list itself, never a copy, so every holder
+    /// sees one list.
+    List(u16),
     Object,
 }
 
@@ -233,7 +238,9 @@ impl Code {
 }
 
 impl Elem {
-    /// The element kind a value of `ty` is stored as.
+    /// The element kind a value of `ty` is stored as. A list of
+    /// dynamic values stays a box: only a list of a kind is held by
+    /// address.
     pub(crate) fn of(ty: Ty) -> Elem {
         match ty {
             Ty::Int => Elem::Int,
@@ -241,6 +248,7 @@ impl Elem {
             Ty::Str => Elem::Str,
             Ty::Class(k) => Elem::Class(k),
             Ty::Tuple(k) => Elem::Tuple(k),
+            Ty::List(e) if e != Elem::Object => Elem::List(list_shape_of(e)),
             _ => Elem::Object,
         }
     }
@@ -254,6 +262,7 @@ impl Elem {
             Elem::Class(k) => Ty::Class(k),
             Elem::Tuple(k) => Ty::Tuple(k),
             Elem::Array(c) => c.item(),
+            Elem::List(k) => Ty::List(list_shape(k)),
             Elem::Object => Ty::Object,
         }
     }
@@ -275,6 +284,7 @@ impl Elem {
             Elem::Class(_) => "ptr".to_string(),
             Elem::Tuple(k) => tuple_suffix(k),
             Elem::Array(c) => c.storage().suffix().to_string(),
+            Elem::List(k) => format!("l{k}"),
             Elem::Object => "any".to_string(),
         }
     }
@@ -286,7 +296,9 @@ impl Elem {
             Elem::Float => zyntax_builtins::Kind::Float.list_tag(),
             Elem::Str => zyntax_builtins::Kind::Str.list_tag(),
             Elem::Class(_) => zyntax_builtins::Kind::Ptr.list_tag(),
-            Elem::Tuple(k) => zyntax_builtins::lists::shape_list_tag(k),
+            Elem::Tuple(_) | Elem::List(_) => {
+                zyntax_builtins::lists::shape_list_tag(note_elem_list(self))
+            }
             Elem::Array(c) => c.tag(),
             Elem::Object => zyntax_builtins::Kind::Any.list_tag(),
         }
@@ -350,10 +362,15 @@ thread_local! {
     /// `Ty::Tuple` decided in one inference round names the same shape
     /// in the next and in the lowering.
     static TUPLE_SHAPES: std::cell::RefCell<Vec<Vec<Ty>>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// The shapes the lowering used as a list's element, which get the
-    /// library's list functions generated for them.
-    static TUPLE_LISTS: std::cell::RefCell<std::collections::BTreeSet<u16>> =
-        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+    /// The element kinds the library does not carry (a tuple shape, a
+    /// list shape) that the lowering used as a list's element, in the
+    /// order they were first used: each gets the list functions
+    /// generated for it, and its position numbers the kind in a boxed
+    /// list's tag.
+    static ELEM_LISTS: std::cell::RefCell<Vec<Elem>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The inner element kinds of lists held as a list's elements, by
+    /// index, interned like tuple shapes.
+    static LIST_SHAPES: std::cell::RefCell<Vec<Elem>> = const { std::cell::RefCell::new(Vec::new()) };
     /// The dict shapes of the program being compiled: key and value
     /// types, by index, interned like tuple shapes.
     static DICT_SHAPES: std::cell::RefCell<Vec<(Ty, Ty)>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -368,7 +385,8 @@ thread_local! {
 /// Forget every shape: the start of a program.
 pub(crate) fn reset_tuple_shapes() {
     TUPLE_SHAPES.with(|t| t.borrow_mut().clear());
-    TUPLE_LISTS.with(|t| t.borrow_mut().clear());
+    ELEM_LISTS.with(|t| t.borrow_mut().clear());
+    LIST_SHAPES.with(|t| t.borrow_mut().clear());
     DICT_SHAPES.with(|t| t.borrow_mut().clear());
     ARRAY_KINDS.with(|t| t.borrow_mut().clear());
 }
@@ -424,14 +442,52 @@ pub(crate) fn dynamic_dict() -> Ty {
     dict_of(Ty::Object, Ty::Object)
 }
 
-/// Record that a list of tuples of shape `k` is used.
-pub(crate) fn note_tuple_list(k: u16) {
-    TUPLE_LISTS.with(|t| t.borrow_mut().insert(k));
+/// Record that a list of elements of kind `e`, a tuple or list shape,
+/// is used, with the kinds its functions call on: an inner list's, and
+/// an inner array's storage. Its position among the noted kinds.
+pub(crate) fn note_elem_list(e: Elem) -> u16 {
+    if let Some(i) = ELEM_LISTS.with(|t| t.borrow().iter().position(|x| *x == e)) {
+        return i as u16;
+    }
+    if let Elem::List(k) = e {
+        match list_shape(k) {
+            inner @ (Elem::Tuple(_) | Elem::List(_)) => {
+                note_elem_list(inner);
+            }
+            Elem::Array(c) => note_array_kind(c.storage()),
+            _ => {}
+        }
+    }
+    ELEM_LISTS.with(|t| {
+        let mut table = t.borrow_mut();
+        let i = u16::try_from(table.len()).expect("fewer than 65536 element kinds in a program");
+        table.push(e);
+        i
+    })
 }
 
-/// The shapes noted as list elements so far.
-pub(crate) fn tuple_lists() -> std::collections::BTreeSet<u16> {
-    TUPLE_LISTS.with(|t| t.borrow().clone())
+/// The element kinds noted so far, in the order their tags number them.
+pub(crate) fn elem_lists() -> Vec<Elem> {
+    ELEM_LISTS.with(|t| t.borrow().clone())
+}
+
+/// The index of list shape `e`: the inner kind of a list held as a
+/// list's element.
+pub(crate) fn list_shape_of(e: Elem) -> u16 {
+    LIST_SHAPES.with(|t| {
+        let mut table = t.borrow_mut();
+        if let Some(k) = table.iter().position(|x| *x == e) {
+            return k as u16;
+        }
+        let k = u16::try_from(table.len()).expect("fewer than 65536 list shapes in a program");
+        table.push(e);
+        k
+    })
+}
+
+/// The inner element kind of list shape `k`.
+pub(crate) fn list_shape(k: u16) -> Elem {
+    LIST_SHAPES.with(|t| t.borrow()[k as usize])
 }
 
 /// How many shapes the program has interned.
@@ -572,6 +628,9 @@ impl Ty {
             (Ty::List(Elem::Tuple(a)), Ty::List(Elem::Tuple(b))) => {
                 Ty::Tuple(a).refined_by(Ty::Tuple(b))
             }
+            (Ty::List(Elem::List(a)), Ty::List(Elem::List(b))) => {
+                Ty::List(list_shape(a)).refined_by(Ty::List(list_shape(b)))
+            }
             _ => false,
         }
     }
@@ -592,6 +651,8 @@ impl Ty {
                 format!("Dict({})", list(vec![key, value]))
             }
             Ty::List(Elem::Tuple(k)) => format!("List({})", Ty::Tuple(k).describe()),
+            Ty::List(Elem::List(k)) => format!("List({})", Ty::List(list_shape(k)).describe()),
+            Ty::List(Elem::Array(c)) => format!("Array({})", c.letter()),
             Ty::Num(m) => {
                 let names: Vec<&str> = [
                     (Ty::NUM_INT, "int"),
@@ -628,6 +689,7 @@ impl Ty {
                 dict_of(key.settled(), value.settled())
             }
             Ty::List(Elem::Tuple(k)) => Ty::List(Elem::of(Ty::Tuple(k).settled())),
+            Ty::List(Elem::List(k)) => Ty::List(Elem::of(Ty::List(list_shape(k)).settled())),
             other => other,
         }
     }
@@ -797,6 +859,9 @@ pub(crate) struct Module {
     /// last round (`Unknown` while undecided); see [`decide_list`].
     pub(crate) list_fields: HashSet<(usize, String)>,
     pub(crate) field_lists: HashMap<(usize, String), Ty>,
+    /// Field names some body changes the list of through a receiver of
+    /// no known class; see [`dynamic_field_stores`]. Only grows.
+    pub(crate) dynamic_fields: std::collections::BTreeSet<String>,
     /// What lowering each function found about its raising, by the
     /// name it lowers to; see [`RaiseFact`].
     pub(crate) raise_facts: std::cell::RefCell<std::collections::BTreeMap<String, RaiseFact>>,
@@ -1699,6 +1764,41 @@ impl Module {
 
     /// [`Ty::join`] knowing the hierarchy: two instance types join to
     /// the nearest class both derive from, when there is one.
+    /// What a field named `field` holds when written a value of `ty`: a
+    /// list of lists is a list of dynamic values where some body changes
+    /// that field's list through a receiver of no known class, since such
+    /// a store may put anything in.
+    pub(crate) fn denest(&self, field: &str, ty: Ty) -> Ty {
+        match ty {
+            Ty::List(Elem::List(_)) if self.dynamic_fields.contains(field) => {
+                Ty::List(Elem::Object)
+            }
+            other => other,
+        }
+    }
+
+    /// Record that `field` is changed through a receiver of no known
+    /// class, and take the list of lists out of every class's field of
+    /// that name. Whether it was not known before.
+    fn note_dynamic_field(&mut self, field: &str) -> bool {
+        if !self.dynamic_fields.insert(field.to_string()) {
+            return false;
+        }
+        for class in &mut self.classes {
+            for (name, ty) in &mut class.fields {
+                if name == field && matches!(ty, Ty::List(Elem::List(_))) {
+                    *ty = Ty::List(Elem::Object);
+                }
+            }
+        }
+        for ((_, name), ty) in &mut self.field_lists {
+            if name == field && matches!(ty, Ty::List(Elem::List(_))) {
+                *ty = Ty::List(Elem::Object);
+            }
+        }
+        true
+    }
+
     pub(crate) fn join_classes(&self, a: Ty, b: Ty) -> Ty {
         if let (Ty::Class(x), Ty::Class(y)) = (a, b) {
             let mut at = Some(x as usize);
@@ -1882,6 +1982,10 @@ pub(crate) struct Locals {
     pub(crate) param_writes: HashMap<String, Ty>,
     /// Whether the body has a `return`; without one it returns None.
     pub(crate) returns: bool,
+    /// Fields whose list this body changes through a receiver of no
+    /// known class (`o.cells[0] = v`, `o.cells.append(v)`), with whether
+    /// the receiver is still untyped; see [`dynamic_field_stores`].
+    pub(crate) dynamic_field_stores: Vec<(String, bool)>,
 }
 
 /// Whether an annotation asks for a dynamic value: `Any`, `typing.Any`
@@ -2074,6 +2178,7 @@ pub(crate) struct Inferred {
     pub(crate) dynamic_methods: HashSet<String>,
     pub(crate) list_fields: HashSet<(usize, String)>,
     pub(crate) field_lists: HashMap<(usize, String), Ty>,
+    pub(crate) dynamic_fields: std::collections::BTreeSet<String>,
 }
 
 /// The items every call of which is in view: module functions never
@@ -2213,6 +2318,7 @@ pub(crate) fn infer_module(
         dynamic_methods: known.dynamic_methods.clone(),
         list_fields: known.list_fields.clone(),
         field_lists: known.field_lists.clone(),
+        dynamic_fields: known.dynamic_fields.clone(),
         files: known.files.clone(),
         imports: known.imports.clone(),
         from_names: known.from_names.clone(),
@@ -2290,6 +2396,10 @@ pub(crate) fn infer_module(
     for _ in 0..32 {
         inner_rounds += 1;
         let mut changed = false;
+        // Fields changed through receivers not yet typed this round: of
+        // no known class, if they are still untyped once nothing else
+        // changes.
+        let mut untyped_stores: Vec<String> = Vec::new();
         let mut escaped: Vec<u16> = Vec::new();
         let mut dynamic_methods = HashSet::default();
         // Field writes per item, so an item inferred again this round
@@ -2346,6 +2456,13 @@ pub(crate) fn infer_module(
                         changed = true;
                     }
                 }
+                for (field, untyped) in &locals.dynamic_field_stores {
+                    if *untyped {
+                        untyped_stores.push(field.clone());
+                    } else {
+                        changed |= module.note_dynamic_field(field);
+                    }
+                }
                 // What a method assigns to `self.x` types the field on its
                 // class, and on every class deriving from it.
                 if let Some(k) = item.class {
@@ -2353,7 +2470,8 @@ pub(crate) fn infer_module(
                         if trace_rounds && *ty == Ty::Object {
                             eprintln!("[types] inner: {} writes self.{field} as Object", item.name);
                         }
-                        changed |= widen_field(&mut module.classes, k, field, *ty);
+                        let ty = module.denest(field, *ty);
+                        changed |= widen_field(&mut module.classes, k, field, ty);
                     }
                 }
                 for (k, field, ty) in &locals.other_field_writes {
@@ -2363,7 +2481,8 @@ pub(crate) fn infer_module(
                             item.name, module.classes[*k].name
                         );
                     }
-                    changed |= widen_field(&mut module.classes, *k, field, *ty);
+                    let ty = module.denest(field, *ty);
+                    changed |= widen_field(&mut module.classes, *k, field, ty);
                 }
                 if let Some(flags) = inferring.get(&item.name) {
                     for (i, (name, _)) in sig.params.iter().enumerate() {
@@ -2393,8 +2512,16 @@ pub(crate) fn infer_module(
             } else if !entry_done {
                 entry_done = true;
                 entry_locals = infer_locals_open(&module, &entry_sig, entry, entry_files, true);
+                for (field, untyped) in &entry_locals.dynamic_field_stores {
+                    if *untyped {
+                        untyped_stores.push(field.clone());
+                    } else {
+                        changed |= module.note_dynamic_field(field);
+                    }
+                }
                 for (k, field, ty) in &entry_locals.other_field_writes {
-                    changed |= widen_field(&mut module.classes, *k, field, *ty);
+                    let ty = module.denest(field, *ty);
+                    changed |= widen_field(&mut module.classes, *k, field, ty);
                 }
                 if !field_keys.is_empty() {
                     field_sites_into(
@@ -2487,6 +2614,7 @@ pub(crate) fn infer_module(
                     .get(&field_key(k, &f))
                     .map(FieldRound::decide)
                     .unwrap_or(Ty::List(Elem::Object));
+                let decided = module.denest(&f, decided);
                 if module.field_lists.get(&(k, f.clone())) != Some(&decided) {
                     module.field_lists.insert((k, f), decided);
                     changed = true;
@@ -2520,6 +2648,11 @@ pub(crate) fn infer_module(
                         eprintln!("[types] inner: class {name} {:?}", class.fields);
                     }
                 }
+            }
+        }
+        if !changed {
+            for field in &untyped_stores {
+                changed |= module.note_dynamic_field(field);
             }
         }
         if !changed {
@@ -2622,6 +2755,7 @@ pub(crate) fn infer_module(
         dynamic_methods,
         list_fields: module.list_fields,
         field_lists: module.field_lists,
+        dynamic_fields: module.dynamic_fields,
     }
 }
 
@@ -3727,10 +3861,100 @@ fn infer_locals_with(
     if locals.returns && !terminates(body) {
         locals.ret = locals.ret.join(Ty::None);
     }
+    locals.dynamic_field_stores = dynamic_field_stores(
+        &Typer {
+            module,
+            vars: &locals.vars,
+            outer: seeds,
+        },
+        body,
+    );
     if settled {
         settle(&mut locals);
     }
     locals
+}
+
+/// The fields whose list `body` changes through a receiver of no known
+/// class: an element or slice stored or deleted (`o.cells[0] = v`), or a
+/// method that changes a list called (`o.cells.append(v)`), with whether
+/// the receiver is still untyped. Such a store may put anything in any
+/// class's field of that name, so none of them holds its elements typed
+/// by address (see [`Module::denest`]); a store through a known class
+/// is checked against the field's kind where it is made. Nested bodies
+/// are read with this body's names, their own as dynamic.
+pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<(String, bool)> {
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+    const CHANGERS: &[&str] = &[
+        "append",
+        "insert",
+        "extend",
+        "pop",
+        "remove",
+        "clear",
+        "sort",
+        "reverse",
+        "__setitem__",
+        "__delitem__",
+        "__iadd__",
+    ];
+    struct Stores<'t, 'm> {
+        typer: &'t Typer<'m>,
+        out: Vec<(String, bool)>,
+    }
+    impl Stores<'_, '_> {
+        /// `o.f` for `o` of no known class.
+        fn through_unknown(&mut self, e: &py::Expr) {
+            if let py::Expr::Attribute(a) = e {
+                match self.typer.expr(&a.value) {
+                    Ty::Object => self.out.push((a.attr.to_string(), false)),
+                    Ty::Unknown => self.out.push((a.attr.to_string(), true)),
+                    _ => {}
+                }
+            }
+        }
+        fn target(&mut self, t: &py::Expr) {
+            match t {
+                py::Expr::Subscript(sub) => self.through_unknown(&sub.value),
+                py::Expr::Tuple(tuple) => tuple.elts.iter().for_each(|e| self.target(e)),
+                py::Expr::List(list) => list.elts.iter().for_each(|e| self.target(e)),
+                py::Expr::Starred(s) => self.target(&s.value),
+                _ => {}
+            }
+        }
+    }
+    impl<'a> Visitor<'a> for Stores<'_, '_> {
+        fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
+            match stmt {
+                py::Stmt::Assign(a) => a.targets.iter().for_each(|t| self.target(t)),
+                py::Stmt::AugAssign(a) => self.target(&a.target),
+                py::Stmt::AnnAssign(a) => self.target(&a.target),
+                py::Stmt::Delete(d) => d.targets.iter().for_each(|t| self.target(t)),
+                py::Stmt::For(f) => self.target(&f.target),
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'a py::Expr) {
+            if let py::Expr::Call(c) = expr
+                && let py::Expr::Attribute(m) = &*c.func
+                && CHANGERS.contains(&m.attr.as_str())
+            {
+                self.through_unknown(&m.value);
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut stores = Stores {
+        typer,
+        out: Vec::new(),
+    };
+    for s in body {
+        stores.visit_stmt(s);
+    }
+    stores.out.sort();
+    stores.out.dedup();
+    stores.out
 }
 
 pub(crate) fn is_empty_list(e: &py::Expr) -> bool {

@@ -715,6 +715,102 @@ pub fn tuple_list_declarations(
     generated(kind_declarations(&k))
 }
 
+/// The list functions (`zb_list_*_<suffix>`) of a list whose elements
+/// are lists, kind `index` among those a frontend registers. An element
+/// is held as the address of its header, so the inner list is the one
+/// every holder sees; `inner` says how that list, of kind
+/// [`Field::List`] or [`Field::Array`], compares, prints, boxes (the
+/// same header) and is read back out of a box. Lists order
+/// lexicographically, as Python orders them.
+pub fn nested_list_declarations(
+    list_type: TypeId,
+    index: u16,
+    suffix: &str,
+    inner: &Field,
+) -> Vec<Decl> {
+    let (inner_suffix, inner_ty, array) = match inner {
+        Field::List { suffix, ty } => (suffix.clone(), ty.clone(), None),
+        Field::Array {
+            suffix,
+            ty,
+            tag,
+            letter,
+        } => (suffix.clone(), ty.clone(), Some((*tag, letter.clone()))),
+        other => unreachable!("an inner list is a list or an array, not {other:?}"),
+    };
+    let fn_of = move |op: &str| format!("zb_list_{op}_{inner_suffix}");
+    let as_list = {
+        let ty = inner_ty.clone();
+        move |x: Expr| cast(x, ty.clone())
+    };
+    let eq_name = fn_of("eq");
+    let lt_name = fn_of("lt");
+    let (eq_list, lt_list) = (as_list.clone(), as_list.clone());
+    let eq_op: Binary = Box::new(move |a, b| {
+        or(
+            eq(a.clone(), b.clone()),
+            call(&eq_name, vec![eq_list(a), eq_list(b)], boolean()),
+        )
+    });
+    let lt_op: Binary =
+        Box::new(move |a, b| call(&lt_name, vec![lt_list(a), lt_list(b)], boolean()));
+    let (repr, boxed, read): (Unary, Unary, Unary) = match array {
+        None => {
+            let (repr_name, box_name, unbox_name) = (fn_of("repr"), fn_of("box"), fn_of("unbox"));
+            let (l1, l2) = (as_list.clone(), as_list.clone());
+            let ty = inner_ty.clone();
+            (
+                Box::new(move |x| call(&repr_name, vec![l1(x)], string())),
+                Box::new(move |x| call(&box_name, vec![l2(x)], any())),
+                Box::new(move |x| cast(call(&unbox_name, vec![x], ty.clone()), usize())),
+            )
+        }
+        Some((tag, letter)) => {
+            let (items_name, box_name, unbox_name) =
+                (fn_of("items"), fn_of("box_tagged"), fn_of("unbox_tagged"));
+            let (l1, l2) = (as_list.clone(), as_list.clone());
+            let ty = inner_ty.clone();
+            let letter2 = letter.clone();
+            (
+                // `array('d', [1.0])`, and `array('d')` when empty.
+                Box::new(move |x| {
+                    if_expr(
+                        eq(mcall(l1(x.clone()), "len", vec![], i64()), int(0)),
+                        text(&format!("array('{letter}')")),
+                        call(
+                            &items_name,
+                            vec![l1(x), text(&format!("array('{letter}', [")), text("])")],
+                            string(),
+                        ),
+                    )
+                }),
+                Box::new(move |x| call(&box_name, vec![l2(x), int(tag)], any())),
+                Box::new(move |x| {
+                    cast(
+                        call(&unbox_name, vec![x, int(tag), text(&letter2)], ty.clone()),
+                        usize(),
+                    )
+                }),
+            )
+        }
+    };
+    let elem = usize();
+    let k = KindOps {
+        kind: None,
+        suffix: suffix.to_string(),
+        tag: shape_list_tag(index),
+        list: list_of(list_type, elem.clone()),
+        strs: list_of(list_type, string()),
+        elem,
+        eq: eq_op,
+        lt: lt_op,
+        repr,
+        boxed,
+        read,
+    };
+    generated(kind_declarations(&k))
+}
+
 /// Mark what a frontend generates into a program as generated, so its
 /// bodies are not type checked with every program that declares them.
 fn generated(mut decls: Vec<Decl>) -> Vec<Decl> {

@@ -539,6 +539,7 @@ pub fn parse_program_with(
             inferred.list_params.clone(),
             inferred.dynamic_methods.clone(),
             inferred.field_lists.clone(),
+            inferred.dynamic_fields.clone(),
         );
         inferred.classes = declared_classes.clone();
         let out = types::infer_module(&inferred, &items, &owned, &entry_files);
@@ -571,6 +572,7 @@ pub fn parse_program_with(
         }
         inferred.list_fields = out.list_fields;
         inferred.field_lists = out.field_lists;
+        inferred.dynamic_fields = out.dynamic_fields;
         if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
             let mut dynamic: Vec<&String> = inferred.dynamic_methods.iter().collect();
             dynamic.sort();
@@ -633,6 +635,7 @@ pub fn parse_program_with(
             inferred.list_params.clone(),
             inferred.dynamic_methods.clone(),
             inferred.field_lists.clone(),
+            inferred.dynamic_fields.clone(),
         ) == before;
         if settled && methods_settling {
             break;
@@ -678,14 +681,14 @@ pub fn parse_program_with(
             let fields: Vec<String> = class
                 .fields
                 .iter()
-                .map(|(n, t)| format!("{n}: {t:?}"))
+                .map(|(n, t)| format!("{n}: {}", t.describe()))
                 .collect();
             eprintln!("[types] class {} {{ {} }}", class.name, fields.join(", "));
         }
         let mut globals: Vec<(&String, &types::Ty)> = inferred.globals.iter().collect();
         globals.sort_by(|a, b| a.0.cmp(b.0));
         for (name, ty) in globals {
-            eprintln!("[types] global {name}: {ty:?}");
+            eprintln!("[types] global {name}: {}", ty.describe());
         }
         if !inferred.dynamic_methods.is_empty() {
             let mut dynamic: Vec<&String> = inferred.dynamic_methods.iter().collect();
@@ -1313,7 +1316,7 @@ fn lower_item_as(
                 .vars
                 .iter()
                 .filter(|(n, _)| !sig.params.iter().any(|(p, _)| p == *n))
-                .map(|(n, t)| format!("{n}: {t:?}"))
+                .map(|(n, t)| format!("{n}: {}", t.describe()))
                 .collect();
             vars.sort();
             eprintln!("[types] locals {} {{ {} }}", fn_name, vars.join(", "));

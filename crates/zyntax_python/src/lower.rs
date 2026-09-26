@@ -154,10 +154,13 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
                 letter: c.letter().to_string(),
             }
         }
-        Ty::List(e) => Field::List {
-            suffix: e.suffix(),
-            ty: ir(ty),
-        },
+        Ty::List(e) => {
+            note_list_kind(e);
+            Field::List {
+                suffix: e.suffix(),
+                ty: ir(ty),
+            }
+        }
         Ty::Tuple(k) => Field::Tuple {
             suffix: types::tuple_suffix(k),
             ty: ir(ty),
@@ -177,15 +180,36 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
 
 /// The library functions of the program's tuple shapes: every shape gets
 /// its own (equality, order, repr, boxing, reading back), and a shape
-/// the lowering used as a list's element gets the list functions too.
-/// Shapes are declared in interning order, which puts a shape after the
-/// shapes its fields name.
+/// the lowering used as a list's element gets the list functions too,
+/// as does a list the lowering held as a list's element. Shapes are
+/// declared in interning order, which puts a shape after the shapes its
+/// fields name, and element kinds in the order they were noted, which
+/// puts an inner list's after the kinds it holds.
 pub(crate) fn shape_declarations(
     module: &Module,
     list_type: zyntax_typed_ast::TypeId,
 ) -> Vec<TypedNode<zyntax_typed_ast::typed_ast::TypedDeclaration>> {
+    use zyntax_builtins::lists::Field;
     let _ = module;
-    let lists = types::tuple_lists();
+    // Every field and inner list is described first: describing one
+    // notes the kinds whose functions it calls.
+    let shapes: Vec<(String, Type, Vec<Field>)> = (0..types::tuple_shape_count() as u16)
+        .map(|k| {
+            let fields = types::tuple_shape(k)
+                .into_iter()
+                .map(|t| field_of(t.settled()))
+                .collect();
+            (types::tuple_suffix(k), ir(Ty::Tuple(k)), fields)
+        })
+        .collect();
+    let mut inner: Vec<Option<Field>> = Vec::new();
+    while inner.len() < types::elem_lists().len() {
+        let e = types::elem_lists()[inner.len()];
+        inner.push(match e {
+            Elem::List(k) => Some(field_of(Ty::List(types::list_shape(k)))),
+            _ => None,
+        });
+    }
     let mut out = Vec::new();
     // The storage kinds the library does not carry, before anything
     // that calls their functions.
@@ -196,23 +220,31 @@ pub(crate) fn shape_declarations(
             ));
         }
     }
-    for k in 0..types::tuple_shape_count() as u16 {
-        let suffix = types::tuple_suffix(k);
-        let tuple_ty = ir(Ty::Tuple(k));
-        let fields: Vec<zyntax_builtins::lists::Field> = types::tuple_shape(k)
-            .into_iter()
-            .map(|t| field_of(t.settled()))
-            .collect();
+    for (suffix, tuple_ty, fields) in &shapes {
         out.extend(zyntax_builtins::lists::tuple_declarations(
             list_type,
-            &suffix,
+            suffix,
             tuple_ty.clone(),
-            &fields,
+            fields,
         ));
-        if lists.contains(&k) {
-            out.extend(zyntax_builtins::lists::tuple_list_declarations(
-                list_type, k, &suffix, tuple_ty,
-            ));
+    }
+    for (i, (e, inner)) in types::elem_lists().into_iter().zip(inner).enumerate() {
+        let suffix = e.suffix();
+        match (e, inner) {
+            (Elem::Tuple(k), _) => {
+                out.extend(zyntax_builtins::lists::tuple_list_declarations(
+                    list_type,
+                    i as u16,
+                    &suffix,
+                    ir(Ty::Tuple(k)),
+                ));
+            }
+            (Elem::List(_), Some(inner)) => {
+                out.extend(zyntax_builtins::lists::nested_list_declarations(
+                    list_type, i as u16, &suffix, &inner,
+                ));
+            }
+            _ => {}
         }
     }
     out
@@ -259,8 +291,12 @@ pub(crate) fn elem_ir(e: Elem) -> Type {
     match e {
         Elem::Class(_) => addr_type(),
         Elem::Tuple(k) => {
-            types::note_tuple_list(k);
+            types::note_elem_list(e);
             ir(Ty::Tuple(k))
+        }
+        Elem::List(_) => {
+            types::note_elem_list(e);
+            addr_type()
         }
         Elem::Array(c) => c.storage().ty(),
         other => ir(other.ty()),
@@ -287,6 +323,7 @@ fn typed_call(name: &str, args: Vec<Node>, ty: Type, span: Span) -> Node {
 fn elem_call(op: &str, e: Elem, args: Vec<Node>, span: Span) -> Node {
     match e {
         Elem::Class(k) => cast(addr_call(&list_fn(op, e), args, span), Ty::Class(k), span),
+        Elem::List(_) => cast(addr_call(&list_fn(op, e), args, span), e.ty(), span),
         Elem::Array(c) => {
             let stored = typed_call(&list_fn(op, e), args, c.storage().ty(), span);
             if c.narrows() {
@@ -323,16 +360,88 @@ fn bind_names(vars: &mut HashMap<String, Ty>, target: &py::Expr, ty: Ty) {
     types::bind_target(vars, target, ty)
 }
 
+/// Element `i` of list `xs` of kind `e`, as the element reads.
+pub(crate) fn element_get(e: Elem, xs: Node, i: Node, span: Span) -> Node {
+    elem_call("get", e, vec![xs, i], span)
+}
+
+/// An element of a tuple or list kind, as it reads, boxed: a tuple as
+/// the tagged list of its fields, a list by reference.
+pub(crate) fn box_element(e: Elem, value: Node, span: Span) -> Node {
+    match e {
+        Elem::Tuple(_) => call(
+            &format!("zb_tuple_box_{}", e.suffix()),
+            vec![value],
+            Ty::Object,
+            span,
+        ),
+        Elem::List(k) => box_list(types::list_shape(k), value, span),
+        other => unreachable!("an element boxed by its kind's functions, not {other:?}"),
+    }
+}
+
+/// A dynamic value read back as an element of a tuple or list kind, as
+/// the list stores it, or the TypeError of the wrong kind.
+pub(crate) fn read_element(e: Elem, v: Node, span: Span) -> Node {
+    match e {
+        Elem::Tuple(k) => call(
+            &format!("zb_tuple_read_{}", e.suffix()),
+            vec![v],
+            Ty::Tuple(k),
+            span,
+        ),
+        Elem::List(k) => as_addr(unbox_list(types::list_shape(k), v, span), span),
+        other => unreachable!("an element read by its kind's functions, not {other:?}"),
+    }
+}
+
+/// A list of kind `e` boxed by reference: an array under its
+/// typecode's tag, any other list under its kind's.
+pub(crate) fn box_list(e: Elem, list: Node, span: Span) -> Node {
+    match e {
+        Elem::Array(c) => call(
+            &list_fn("box_tagged", e),
+            vec![list, int_lit(c.tag(), span)],
+            Ty::Object,
+            span,
+        ),
+        _ => call(&list_fn("box", e), vec![list], Ty::Object, span),
+    }
+}
+
+/// A box read back as a list of kind `e`, checked: an array by its
+/// typecode's tag, any other list by its kind's (a list of dynamic
+/// values converted).
+pub(crate) fn unbox_list(e: Elem, v: Node, span: Span) -> Node {
+    match e {
+        Elem::Array(c) => call(
+            &list_fn("unbox_tagged", e),
+            vec![v, int_lit(c.tag(), span), str_lit(c.letter(), span)],
+            Ty::List(e),
+            span,
+        ),
+        _ => call(&list_fn("unbox", e), vec![v], Ty::List(e), span),
+    }
+}
+
 /// `zb_list_<op>_<kind>`. A list of tuples has its functions generated
 /// for the shape, and an array's storage kind its functions and its
 /// hook arms, so both are noted.
 pub(crate) fn list_fn(op: &str, elem: Elem) -> String {
+    note_list_kind(elem);
+    format!("zb_list_{op}_{}", elem.suffix())
+}
+
+/// Record that the list functions of kind `elem` are called, where
+/// they are generated with the program.
+fn note_list_kind(elem: Elem) {
     match elem {
-        Elem::Tuple(k) => types::note_tuple_list(k),
+        Elem::Tuple(_) | Elem::List(_) => {
+            types::note_elem_list(elem);
+        }
         Elem::Array(c) => types::note_array_kind(c.storage()),
         _ => {}
     }
-    format!("zb_list_{op}_{}", elem.suffix())
 }
 
 /// Element `i` of a list the lowering built itself and so knows the
@@ -2664,7 +2773,7 @@ impl<'m> Lowerer<'m> {
         let span = v.node.span;
         let node = self.coerce(v, e.ty());
         match e {
-            Elem::Class(_) => as_addr(node, span),
+            Elem::Class(_) | Elem::List(_) => as_addr(node, span),
             Elem::Array(c) if c.narrows() => self.narrowed(node, c, span),
             _ => node,
         }
