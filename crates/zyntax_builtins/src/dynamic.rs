@@ -788,6 +788,8 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     let raw_any = |x: Expr| call("zb_unbox_list_raw_any", vec![x], anys.clone());
     let dict_ty = crate::dicts::dict_type(list_type);
     let raw_dict = |x: Expr| call("zb_dict_raw", vec![x], dict_ty.clone());
+    let set_ty = crate::dicts::set_type(list_type);
+    let raw_set = |x: Expr| call("zb_set_raw", vec![x], set_ty.clone());
     d.push(define(
         "zb_any_eq",
         &[&a, &b],
@@ -915,7 +917,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                         is_set(a.e()),
                         vec![ret(call(
                             "zb_set_eq",
-                            vec![raw_any(a.e()), raw_any(b.e())],
+                            vec![raw_set(a.e()), raw_set(b.e())],
                             boolean(),
                         ))],
                     ),
@@ -1095,7 +1097,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             // apart from one.
             when(
                 is_set(x.e()),
-                vec![ret(call("zb_set_hash", vec![raw_any(x.e())], i64()))],
+                vec![ret(call("zb_set_hash", vec![raw_set(x.e())], i64()))],
             ),
             type_error(add(text("unhashable type: "), quoted(type_name(x.e())))),
             ret(int(0)),
@@ -1134,12 +1136,12 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![ret(and(
                     call(
                         "zb_set_issubset",
-                        vec![raw_any(a.e()), raw_any(b.e())],
+                        vec![raw_set(a.e()), raw_set(b.e())],
                         boolean(),
                     ),
                     not(call(
                         "zb_set_eq",
-                        vec![raw_any(a.e()), raw_any(b.e())],
+                        vec![raw_set(a.e()), raw_set(b.e())],
                         boolean(),
                     )),
                 ))],
@@ -1185,7 +1187,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 and(is_set(a.e()), is_set(b.e())),
                 vec![ret(call(
                     "zb_set_issubset",
-                    vec![raw_any(a.e()), raw_any(b.e())],
+                    vec![raw_set(a.e()), raw_set(b.e())],
                     boolean(),
                 ))],
             ),
@@ -1270,7 +1272,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is_set(container.e()),
                 vec![ret(call(
                     "zb_set_contains",
-                    vec![raw_any(container.e()), item.e()],
+                    vec![raw_set(container.e()), item.e()],
                     boolean(),
                 ))],
             ),
@@ -1653,8 +1655,8 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                             "zb_set_box",
                             vec![call(
                                 "zb_set_sub",
-                                vec![raw_any(a.e()), raw_any(b.e())],
-                                anys.clone(),
+                                vec![raw_set(a.e()), raw_set(b.e())],
+                                set_ty.clone(),
                             )],
                             any(),
                         ))],
@@ -1665,8 +1667,8 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                             "zb_set_box",
                             vec![call(
                                 "zb_set_and",
-                                vec![raw_any(a.e()), raw_any(b.e())],
-                                anys.clone(),
+                                vec![raw_set(a.e()), raw_set(b.e())],
+                                set_ty.clone(),
                             )],
                             any(),
                         ))],
@@ -1677,8 +1679,8 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                             "zb_set_box",
                             vec![call(
                                 "zb_set_or",
-                                vec![raw_any(a.e()), raw_any(b.e())],
-                                anys.clone(),
+                                vec![raw_set(a.e()), raw_set(b.e())],
+                                set_ty.clone(),
                             )],
                             any(),
                         ))],
@@ -1689,8 +1691,8 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                             "zb_set_box",
                             vec![call(
                                 "zb_set_xor",
-                                vec![raw_any(a.e()), raw_any(b.e())],
-                                anys.clone(),
+                                vec![raw_set(a.e()), raw_set(b.e())],
+                                set_ty.clone(),
                             )],
                             any(),
                         ))],
@@ -1914,7 +1916,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is_set(x.e()),
                 vec![ret(call(
                     "zb_set_items",
-                    vec![raw_any(x.e())],
+                    vec![raw_set(x.e())],
                     anys.clone(),
                 ))],
             ),
@@ -2141,7 +2143,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ),
             when(
                 is_set(x.e()),
-                vec![ret(call("zb_set_repr", vec![raw_any(x.e())], string()))],
+                vec![ret(call("zb_set_repr", vec![raw_set(x.e())], string()))],
             ),
             ret(repr_of(Kind::Any, x.e())),
         ],
@@ -2174,7 +2176,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ),
             when(
                 is_set(x.e()),
-                vec![ret(call("zb_set_len", vec![raw_any(x.e())], i64()))],
+                vec![ret(call("zb_set_len", vec![raw_set(x.e())], i64()))],
             ),
             ret(len_of(Kind::Any, x.e())),
         ],

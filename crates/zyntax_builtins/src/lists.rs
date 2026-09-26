@@ -688,14 +688,13 @@ pub fn tuple_declarations(
         same,
     ));
     // `value in set` and the dict lookups by the value, no box made.
-    let hash_name = format!("zb_tuple_hash_{suffix}");
-    let eq_name = format!("zb_tuple_eq_boxed_{suffix}");
-    d.push(crate::dicts::set_contains_by(
-        &format!("zb_set_contains_{suffix}"),
+    d.push(crate::dicts::set_probe_by(
         list_type,
-        tuple_ty.clone(),
-        &|key| call(&hash_name, vec![key], i64()),
-        &|stored, key| call(&eq_name, vec![stored, key], boolean()),
+        &Field::Tuple {
+            suffix: suffix.to_string(),
+            ty: tuple_ty.clone(),
+        },
+        suffix,
     ));
     d.extend(crate::dicts::dict_probe_by(
         list_type,

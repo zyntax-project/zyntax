@@ -3,7 +3,10 @@
 //! library and called.
 
 use zyntax_builtins::build::*;
-use zyntax_builtins::dicts::{dict_declarations, dict_entry_type, dict_shape_tag, dict_type};
+use zyntax_builtins::dicts::{
+    dict_declarations, dict_entry_type, dict_shape_tag, dict_type, set_declarations,
+    set_entry_type, set_shape_tag,
+};
 use zyntax_builtins::lists::Field;
 use zyntax_builtins::{Policy, TypeNames, library, list_of};
 use zyntax_embed::{TieredConfig, TieredRuntime, ZyntaxValue};
@@ -108,6 +111,7 @@ fn the_tables_run() {
     let cases = [
         small_distinct_literal_lookups_hit(list_type),
         int_dict_deletes_and_compacts(list_type),
+        int_set_keeps_its_mask(list_type),
     ];
     let mut declarations = lib.declarations;
     for case in &cases {
@@ -308,5 +312,77 @@ fn int_dict_deletes_and_compacts(list_type: TypeId) -> Case {
         decls,
         entry: "t_int_dict",
         expected: 334 * 1_000_000 + survivors - 666 + 7 * 1_000_000_000,
+    }
+}
+
+/// A typed set of ints: the mask answers membership, intersection,
+/// difference and the least value while every value is small, and the
+/// table does once one is not; removals clear their bits.
+fn int_set_keeps_its_mask(list_type: TypeId) -> Case {
+    let key = Field::Int;
+    let mut decls = set_declarations(list_type, "si", set_shape_tag(0), &key);
+    let st = list_of(list_type, set_entry_type(&key));
+    let a = local("a", st.clone());
+    let b = local("b", st.clone());
+    let i = local("i", i64());
+    let r = local("r", i64());
+    let f = |op: &str, args: Vec<Expr>, ty: zyntax_typed_ast::Type| {
+        call(&format!("zb_set_{op}_si"), args, ty)
+    };
+    let has = |s: &Local, v: i64| f("contains", vec![s.e(), int(v)], boolean());
+    let count = |s: Expr| f("len", vec![s], i64());
+    let mut body = vec![
+        a.decl(f("new", vec![], st.clone())),
+        b.decl(f("new", vec![], st.clone())),
+    ];
+    // a: 0..40 step 2, b: 0..40 step 3; both masks stand.
+    body.extend(for_range(
+        &i,
+        int(0),
+        int(20),
+        vec![expr(f("add", vec![a.e(), mul(i.e(), int(2))], unit()))],
+    ));
+    body.extend(for_range(
+        &i,
+        int(0),
+        int(14),
+        vec![expr(f("add", vec![b.e(), mul(i.e(), int(3))], unit()))],
+    ));
+    body.push(r.decl(mul(count(f("and", vec![a.e(), b.e()], st.clone())), int(1))));
+    body.push(r.set(add(
+        r.e(),
+        mul(count(f("sub", vec![a.e(), b.e()], st.clone())), int(100)),
+    )));
+    body.push(r.set(add(r.e(), mul(f("mask63", vec![a.e()], i64()), int(0)))));
+    body.push(expr(f("discard", vec![a.e(), int(0)], unit())));
+    body.push(r.set(add(r.e(), mul(f("min", vec![a.e()], i64()), int(10_000)))));
+    body.push(when(has(&a, 0), vec![r.set(add(r.e(), int(1_000_000)))]));
+    // A large value ends the mask; the table answers the same.
+    body.push(expr(f("add", vec![a.e(), int(1000)], unit())));
+    body.push(when(
+        has(&a, 1000),
+        vec![r.set(add(r.e(), int(10_000_000)))],
+    ));
+    body.push(when(has(&a, 4), vec![r.set(add(r.e(), int(100_000_000)))]));
+    body.push(r.set(add(
+        r.e(),
+        mul(
+            count(f("and", vec![a.e(), b.e()], st.clone())),
+            int(1_000_000_000),
+        ),
+    )));
+    body.push(when(
+        lt(f("mask63", vec![a.e()], i64()), int(0)),
+        vec![r.set(add(r.e(), int(5)))],
+    ));
+    body.push(ret(r.e()));
+    decls.push(define("t_int_set", &[], i64(), body));
+    // Common: multiples of 6 below 40 (7); a alone: 20 - 7 = 13; min
+    // after removing 0 is 2; 0 is gone; 1000 and 4 are in; common
+    // after removing 0 is 6; the mask no longer stands.
+    Case {
+        decls,
+        entry: "t_int_set",
+        expected: 7 + 13 * 100 + 2 * 10_000 + 10_000_000 + 100_000_000 + 6 * 1_000_000_000 + 5,
     }
 }

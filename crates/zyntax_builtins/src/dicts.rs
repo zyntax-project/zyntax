@@ -73,12 +73,6 @@ pub fn set_shape_tag(index: u16) -> i64 {
 fn any_eq(a: Expr, b: Expr) -> Expr {
     call("zb_any_eq", vec![a, b], boolean())
 }
-/// Whether a stored key matches the one looked up: the same box, as a
-/// key read back from the dict or a shared constant is, before the
-/// values are compared.
-fn key_matches(stored: Expr, k: Expr) -> Expr {
-    or(eq(stored.clone(), k.clone()), any_eq(stored, k))
-}
 /// The statements that return `found` when `stored` matches `k`, whose
 /// category is `kcat`: the same box, or two strings compared as
 /// strings, or anything else compared as dynamic values.
@@ -124,7 +118,8 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     ));
     d.extend(dynamic_dict(list_type));
     d.extend(dict_probe_by(list_type, &Field::Str, "str"));
-    d.extend(set(list_type));
+    d.extend(set_declarations(list_type, "", SET_TAG, &Field::Any));
+    d.extend(dynamic_set(list_type));
     d
 }
 
@@ -231,6 +226,12 @@ fn shared(list_type: TypeId) -> Vec<Decl> {
         dict_type(list_type),
         Some("zyntax_box_pointer"),
     ));
+    d.push(extern_fn(
+        "zb_set_raw",
+        &[("x", any())],
+        set_type(list_type),
+        Some("zyntax_box_pointer"),
+    ));
     let _ = anys;
     d
 }
@@ -243,6 +244,9 @@ enum Mask {
     /// In the control entry's key word, kept up to date: bit `v` for
     /// each value `0 <= v < 63`, or -1 once any other value is added.
     Eager,
+    /// In the index's shape word, computed when asked for and forgotten
+    /// when the set changes; a set without an index is scanned.
+    Lazy,
 }
 
 /// One table shape: a dict when it has a value, else a set.
@@ -373,6 +377,14 @@ impl Table<'_> {
                     )],
                 )]
             }
+            Mask::Lazy => vec![when(
+                ne(self.ctrl(d.clone()), int(0)),
+                vec![set_idx(
+                    self.index_at(self.ctrl(d)),
+                    int(1),
+                    int(MASK_UNKNOWN),
+                )],
+            )],
         }
     }
     /// The statements updating the mask before `k` is removed.
@@ -394,6 +406,8 @@ impl Table<'_> {
                     )],
                 )]
             }
+            // Forgotten as an addition forgets it.
+            Mask::Lazy => self.note_added(d, k),
             Mask::None => Vec::new(),
         }
     }
@@ -1472,611 +1486,703 @@ pub(crate) fn dict_probe_by(list_type: TypeId, probe: &Field, suffix: &str) -> V
     out
 }
 
-/// `name(s, key) -> bool`: whether a set holds a value matching `key`,
-/// a value of `key_ty` that is not a box. `hash_of` is the key's hash
-/// as [`zb_any_hash`] would hash its boxed form, so the probe lands on
-/// the same slot; `matches(stored, key)` compares a stored box with it.
-/// A set below its table size is scanned instead.
-pub(crate) fn set_contains_by(
-    name: &str,
-    list_type: TypeId,
-    key_ty: Type,
-    hash_of: &dyn Fn(Expr) -> Expr,
-    matches: &dyn Fn(Expr, Expr) -> Expr,
-) -> Decl {
-    let anys = list_of(list_type, any());
-    let ints = list_of(list_type, i64());
-    let s = borrowed("s", anys.clone());
-    let key = borrowed("key", key_ty);
-    let n = local("n", i64());
-    let i = local("i", i64());
-    let index = local("index", ints.clone());
-    let mask = local("mask", i64());
-    let slot = local("slot", i64());
-    let entry = local("e", i64());
-    let h = local("h", i64());
-    let mut scan = vec![n.decl(len(s.e()))];
-    scan.extend(for_range(
-        &i,
-        int(1),
-        n.e(),
-        vec![when(
-            matches(at(s.e(), i.e()), key.e()),
-            vec![ret(bool(true))],
-        )],
-    ));
-    scan.push(ret(bool(false)));
-    define(
-        name,
-        &[&s, &key],
-        boolean(),
-        vec![
-            when(eq(at(s.e(), int(0)), null(any())), scan),
-            index.decl(call(
-                "zb_unbox_list_raw_i64",
-                vec![at(s.e(), int(0))],
-                ints.clone(),
-            )),
-            mask.decl(sub(div(sub(len(index.e()), int(1)), int(2)), int(1))),
-            h.decl(call("zb_hash_mix", vec![hash_of(key.e())], i64())),
-            slot.decl(bitand(h.e(), mask.e())),
-            i.decl(int(0)),
-            while_(
-                le(i.e(), mask.e()),
-                vec![
-                    entry.decl(idx(index.e(), add(mul(slot.e(), int(2)), int(1)), i64())),
-                    when(lt(entry.e(), int(0)), vec![ret(bool(false))]),
-                    when(
-                        and(
-                            eq(
-                                idx(index.e(), add(mul(slot.e(), int(2)), int(2)), i64()),
-                                h.e(),
-                            ),
-                            matches(at(s.e(), add(entry.e(), int(1))), key.e()),
-                        ),
-                        vec![ret(bool(true))],
-                    ),
-                    slot.set(bitand(add(slot.e(), int(1)), mask.e())),
-                    i.add_assign(int(1)),
-                ],
-            ),
-            ret(bool(false)),
-        ],
-    )
+/// The type of a set entry of key `key`.
+pub fn set_entry_type(key: &Field) -> Type {
+    Type::Tuple(vec![i64(), key.ty()])
 }
 
-fn set(list_type: TypeId) -> Vec<Decl> {
-    let anys = list_of(list_type, any());
-    let ints = list_of(list_type, i64());
-    // Every function edits the set in place; only boxing keeps it.
-    let s = borrowed("s", anys.clone());
-    let other = borrowed("other", anys.clone());
-    let v = kept("v", any());
-    // Lookups and removals read the value and keep nothing.
-    let value = borrowed("v", any());
+/// The type of the library's set: dynamic values.
+pub fn set_type(list_type: TypeId) -> Type {
+    list_of(list_type, set_entry_type(&Field::Any))
+}
+
+/// The functions of the set shape of `key` whose tag is `tag`:
+/// `zb_set_<op>` for the library's own shape (`suffix` empty),
+/// `zb_set_<op>_<suffix>` for one a frontend registers. A set of ints
+/// keeps the mask of its small values up to date in its control entry.
+pub fn set_declarations(list_type: TypeId, suffix: &str, tag: i64, key: &Field) -> Vec<Decl> {
+    let t = Table {
+        list_type,
+        prefix: "zb_set",
+        sfx: if suffix.is_empty() {
+            String::new()
+        } else {
+            format!("_{suffix}")
+        },
+        key,
+        value: None,
+        tag,
+        mask: match key {
+            Field::Int => Mask::Eager,
+            Field::Any if suffix.is_empty() => Mask::Lazy,
+            _ => Mask::None,
+        },
+    };
+    let mut out = table_core(&t);
+    out.extend(set_ops(&t));
+    if suffix.is_empty() {
+        out
+    } else {
+        crate::lists::generated(out)
+    }
+}
+
+fn set_ops(t: &Table) -> Vec<Decl> {
+    let lt_ = t.list_ty();
+    let anys = t.anys();
+    let s = borrowed("s", lt_.clone());
+    let other = borrowed("other", lt_.clone());
+    let key = borrowed("k", t.key.ty());
+    let k = kept("k", t.key.ty());
+    let out = local("out", lt_.clone());
+    let e = local("e", i64());
+    let h = local("h", i64());
     let i = local("i", i64());
     let n = local("n", i64());
-    let out = local("out", anys.clone());
-    let text_out = local("text", string());
-    let x = local("x", any());
-    let tag = local("tag", i64());
-    let mask = local("mask", i64());
-    let left_mask = local("left_mask", i64());
-    let right_mask = local("right_mask", i64());
-    let member = local("member", any());
-    let bit = local("bit", i64());
-    let wanted = local("wanted", i64());
-    let index = borrowed("index", ints.clone());
-    let slot = local("slot", i64());
-    let entry = local("e", i64());
+    let c = local("count", i64());
+    let en = local("en", t.entry_ty());
+    let x = local("x", t.key.ty());
+    let m = local("m", i64());
+    let mo = local("mo", i64());
+    let hashed = local("hashed", boolean());
+    let found = local("found", boolean());
+    let extra = local("extra", i64());
+    let total = local("total", i64());
     let cap = local("cap", i64());
-    let h = local("h", i64());
-    let kcat = local("kcat", i64());
-    let stored = local("stored", any());
+    let find = |s: Expr, k: Expr| t.call("find", vec![s, k], i64());
+    let masked = t.mask != Mask::None;
+    let mask_of = |s: Expr| t.call("mask63", vec![s], i64());
     let mut d = Vec::new();
 
-    // A set is laid out as a dict is: position 0 holds the hash index
-    // (None while the set is small), the values follow in insertion
-    // order, so value `e` is at position 1 + e. The table's first word
-    // caches the set's small-int mask (MASK_UNKNOWN until asked for,
-    // -1 when the values are not all small ints); then two words per
-    // slot, the entry number (-1 when empty) and the entry's hash, so
-    // growing it and copying it hash nothing again and a probe reads a
-    // value only when its hash agrees.
-    let count = |s: Expr| sub(len(s), int(1));
-    let value_at = |s: Expr, e: Expr| at(s, add(e, int(1)));
-    let index_of = |s: Expr| call("zb_unbox_list_raw_i64", vec![at(s, int(0))], ints.clone());
-    let box_index = |index: Expr| call("zb_list_box_i64", vec![index], any());
-    let entry_at = |index: Expr, slot: Expr| idx(index, add(mul(slot, int(2)), int(1)), i64());
-    let hash_at = |index: Expr, slot: Expr| idx(index, add(mul(slot, int(2)), int(2)), i64());
-    let slots_of = |index: Expr| div(sub(len(index), int(1)), int(2));
-    /// The cached mask word before it is computed.
-    const MASK_UNKNOWN: i64 = -2;
-    let forget_mask = |index: Expr| set_idx(index, int(0), int(MASK_UNKNOWN));
-    let hash = |k: Expr| call("zb_dict_key_hash", vec![k], i64());
-    let next_slot = |s: Expr, mask: Expr| bitand(add(s, int(1)), mask);
-    let unindexed = |s: Expr| eq(at(s, int(0)), null(any()));
-    let reuse = local("reuse", boolean());
-    let old = local("old", ints.clone());
-    let j = local("j", i64());
-    let contains = |s: Expr, v: Expr| call("zb_set_contains", vec![s, v], boolean());
-    let find = |s: Expr, v: Expr| call("zb_set_find", vec![s, v], i64());
-    /// Values a set holds before it takes a table.
-    const SMALL: i64 = 8;
-    /// The first table's size, for a set just past `SMALL`.
-    const FIRST_TABLE: i64 = 32;
-
-    d.push(define(
-        "zb_set_new",
-        &[],
-        anys.clone(),
+    // The live entries of `s` in order, `en` each.
+    let live_walk = |s: &Local, body: Vec<Stmt>| {
         vec![
-            out.decl(list(Vec::new(), anys.clone())),
-            push(out.e(), null(any())),
-            ret(out.e()),
-        ],
-    ));
-    d.push(define("zb_set_len", &[&s], i64(), vec![ret(count(s.e()))]));
-    // An empty table of `cap` slots: every word -1, which is the empty
-    // entry mark, and a hash no probe reads.
-    d.push(define("zb_set_index_new", &[&cap], ints.clone(), {
-        let table = local("table", ints.clone());
-        vec![
-            table.decl(list(Vec::new(), ints.clone())),
-            expr(mcall(
-                table.e(),
-                "resize_filled",
-                vec![add(mul(cap.e(), int(2)), int(1)), int(0xFF)],
-                unit(),
-            )),
-            forget_mask(table.e()),
-            ret(table.e()),
-        ]
-    }));
-    // Record entry `e`, whose hash is `h`, in `index`, which has room.
-    d.push(define(
-        "zb_set_place_hashed",
-        &[&index, &entry, &h],
-        unit(),
-        vec![
-            mask.decl(sub(slots_of(index.e()), int(1))),
-            slot.decl(bitand(h.e(), mask.e())),
+            n.decl(len(s.e())),
+            i.decl(int(1)),
             while_(
-                ge(entry_at(index.e(), slot.e()), int(0)),
-                vec![slot.set(next_slot(slot.e(), mask.e()))],
-            ),
-            set_idx(index.e(), add(mul(slot.e(), int(2)), int(1)), entry.e()),
-            set_idx(index.e(), add(mul(slot.e(), int(2)), int(2)), h.e()),
-            ret_void(),
-        ],
-    ));
-    // A fresh table of `cap` slots over every value of `s`: from the
-    // hashes the old table holds when the entries kept their positions
-    // (`reuse`), else from the values.
-    d.push(define("zb_set_reindex", &[&s, &cap, &reuse], unit(), {
-        let mut from_values = vec![n.decl(count(s.e()))];
-        from_values.extend(for_range(
-            &i,
-            int(0),
-            n.e(),
-            vec![expr(call(
-                "zb_set_place_hashed",
-                vec![index.e(), i.e(), hash(value_at(s.e(), i.e()))],
-                unit(),
-            ))],
-        ));
-        let mut from_table = vec![old.decl(index_of(s.e())), n.decl(slots_of(old.e()))];
-        from_table.extend(for_range(
-            &j,
-            int(0),
-            n.e(),
-            vec![
-                entry.decl(entry_at(old.e(), j.e())),
-                when(
-                    ge(entry.e(), int(0)),
-                    vec![expr(call(
-                        "zb_set_place_hashed",
-                        vec![index.e(), entry.e(), hash_at(old.e(), j.e())],
-                        unit(),
-                    ))],
-                ),
-            ],
-        ));
-        vec![
-            index.decl(call("zb_set_index_new", vec![cap.e()], ints.clone())),
-            if_(
-                and(reuse.e(), not(unindexed(s.e()))),
-                from_table,
-                from_values,
-            ),
-            set_idx(s.e(), int(0), box_index(index.e())),
-            ret_void(),
-        ]
-    }));
-    // A set built by appending distinct values takes its table once it
-    // is past a few of them.
-    d.push(define(
-        "zb_set_settle",
-        &[&s],
-        unit(),
-        vec![
-            when(
-                and(unindexed(s.e()), gt(count(s.e()), int(SMALL))),
+                lt(i.e(), n.e()),
                 vec![
-                    cap.decl(int(FIRST_TABLE)),
-                    while_(
-                        lt(cap.e(), mul(count(s.e()), int(2))),
-                        vec![cap.set(mul(cap.e(), int(2)))],
-                    ),
-                    expr(call(
-                        "zb_set_reindex",
-                        vec![s.e(), cap.e(), bool(false)],
-                        unit(),
-                    )),
-                ],
-            ),
-            ret_void(),
-        ],
-    ));
-    // The position of `v` in a set with a table, given its hash, or -1;
-    // and its position in any set, or -1.
-    d.push(define(
-        "zb_set_find_hashed",
-        &[&s, &value, &h],
-        i64(),
-        vec![
-            index.decl(index_of(s.e())),
-            mask.decl(sub(slots_of(index.e()), int(1))),
-            slot.decl(bitand(h.e(), mask.e())),
-            kcat.decl(call("zb_any_category", vec![v.e()], i64())),
-            i.decl(int(0)),
-            while_(le(i.e(), mask.e()), {
-                let mut matched = vec![stored.decl(value_at(s.e(), entry.e()))];
-                matched.extend(when_key_matches(&stored, &v, &kcat, add(entry.e(), int(1))));
-                vec![
-                    entry.decl(entry_at(index.e(), slot.e())),
-                    when(lt(entry.e(), int(0)), vec![ret(int(-1))]),
-                    when(eq(hash_at(index.e(), slot.e()), h.e()), matched),
-                    slot.set(next_slot(slot.e(), mask.e())),
+                    en.decl(t.entry(s.e(), i.e())),
+                    when(ne(t.hash_of(en.e()), int(TOMB)), body),
                     i.add_assign(int(1)),
-                ]
-            }),
-            ret(int(-1)),
-        ],
-    ));
-    d.push(define(
-        "zb_set_find",
-        &[&s, &value],
-        i64(),
-        vec![
-            when(
-                unindexed(s.e()),
-                vec![
-                    n.decl(len(s.e())),
-                    i.decl(int(1)),
-                    while_(
-                        lt(i.e(), n.e()),
-                        vec![
-                            when(key_matches(at(s.e(), i.e()), v.e()), vec![ret(i.e())]),
-                            i.add_assign(int(1)),
-                        ],
-                    ),
-                    ret(int(-1)),
                 ],
             ),
-            ret(call(
-                "zb_set_find_hashed",
-                vec![s.e(), v.e(), hash(v.e())],
-                i64(),
-            )),
-        ],
-    ));
-    d.push(define(
-        "zb_set_contains",
-        &[&s, &value],
-        boolean(),
-        vec![ret(ge(find(s.e(), v.e()), int(0)))],
-    ));
-    // Add a value known to be absent whose hash is `h`, growing the
-    // table first when the value would bring it to half full.
-    d.push(define(
-        "zb_set_insert_hashed",
-        &[&s, &v, &h],
-        unit(),
-        vec![
-            entry.decl(count(s.e())),
-            cap.decl(slots_of(index_of(s.e()))),
-            when(
-                gt(mul(add(entry.e(), int(1)), int(2)), cap.e()),
-                vec![expr(call(
-                    "zb_set_reindex",
-                    vec![s.e(), mul(cap.e(), int(2)), bool(true)],
-                    unit(),
-                ))],
-            ),
-            push(s.e(), v.e()),
-            expr(call(
-                "zb_set_place_hashed",
-                vec![index_of(s.e()), entry.e(), h.e()],
-                unit(),
-            )),
-            forget_mask(index_of(s.e())),
-            ret_void(),
-        ],
-    ));
-    // The hash of each value, by entry: read off the table when the set
-    // has one, else computed; a set past `SMALL` values always has one.
-    let hs = local("hs", ints.clone());
-    d.push(define("zb_set_entry_hashes", &[&s], ints.clone(), {
-        let from_values = for_range(
-            &i,
-            int(0),
-            n.e(),
-            vec![set_idx(hs.e(), i.e(), hash(value_at(s.e(), i.e())))],
-        );
-        let mut from_table = vec![index.decl(index_of(s.e())), cap.decl(slots_of(index.e()))];
-        from_table.extend(for_range(
-            &j,
-            int(0),
-            cap.e(),
-            vec![
-                entry.decl(entry_at(index.e(), j.e())),
-                when(
-                    ge(entry.e(), int(0)),
-                    vec![set_idx(hs.e(), entry.e(), hash_at(index.e(), j.e()))],
-                ),
-            ],
-        ));
-        vec![
-            n.decl(count(s.e())),
-            hs.decl(list(Vec::new(), ints.clone())),
-            expr(mcall(hs.e(), "resize_filled", vec![n.e(), int(0)], unit())),
-            if_(unindexed(s.e()), from_values, from_table),
-            ret(hs.e()),
         ]
-    }));
-    // Whether `v`, whose hash is `h`, is in `s`: by the table when there
-    // is one, else by the short scan.
-    d.push(define(
-        "zb_set_has_hashed",
-        &[&s, &value, &h],
-        boolean(),
-        vec![
-            when(unindexed(s.e()), vec![ret(ge(find(s.e(), v.e()), int(0)))]),
-            ret(ge(
-                call("zb_set_find_hashed", vec![s.e(), v.e(), h.e()], i64()),
+    };
+    // Whether the key of `en`, an entry of a set that is indexed when
+    // `hashed` (so `en` holds its mixed hash), is in `other`. `find`
+    // names the lookups to use.
+    let member_of = |other: &Local, find: &str, find_hashed: &str| {
+        if_expr(
+            eq(t.ctrl(other.e()), int(0)),
+            ge(
+                t.call(find, vec![other.e(), t.key_of(en.e())], i64()),
                 int(0),
-            )),
-        ],
-    ));
-    // A set built from distinct values whose hashes are known: the
-    // table, when the count asks for one, is filled from those hashes.
-    let out_hs = borrowed("out_hs", ints.clone());
-    d.push(define("zb_set_settle_hashed", &[&s, &out_hs], unit(), {
-        let mut place = vec![
-            cap.decl(int(FIRST_TABLE)),
-            while_(
-                lt(cap.e(), mul(n.e(), int(2))),
-                vec![cap.set(mul(cap.e(), int(2)))],
             ),
-            index.decl(call("zb_set_index_new", vec![cap.e()], ints.clone())),
+            ge(
+                t.call(
+                    find_hashed,
+                    vec![
+                        other.e(),
+                        t.key_of(en.e()),
+                        if_expr(hashed.e(), t.hash_of(en.e()), t.mixed(t.key_of(en.e()))),
+                    ],
+                    i64(),
+                ),
+                int(0),
+            ),
+        )
+    };
+    // A result built by appending distinct entries takes its index, and
+    // a set of ints its mask, once it is complete. The entries' hash
+    // words are the mixed hashes when `hashed`.
+    let settle = |out: &Local, hashed: Expr| {
+        let mut st = vec![
+            n.decl(sub(len(out.e()), int(1))),
+            when(
+                gt(n.e(), int(SMALL)),
+                vec![t.go(
+                    "rebuild",
+                    vec![
+                        out.e(),
+                        call("zb_table_cap_for", vec![n.e()], i64()),
+                        hashed,
+                    ],
+                )],
+            ),
         ];
-        place.extend(for_range(
-            &i,
-            int(0),
-            n.e(),
-            vec![expr(call(
-                "zb_set_place_hashed",
-                vec![index.e(), i.e(), idx(out_hs.e(), i.e(), i64())],
-                unit(),
-            ))],
-        ));
-        place.push(set_idx(s.e(), int(0), box_index(index.e())));
-        vec![
-            n.decl(count(s.e())),
-            when(gt(n.e(), int(SMALL)), place),
-            ret_void(),
-        ]
-    }));
-    d.push(define(
-        "zb_set_add",
-        &[&s, &v],
+        if t.mask == Mask::Eager {
+            st.push(t.go("remask", vec![out.e()]));
+        }
+        st
+    };
+
+    if masked {
+        // The mask of the small ints `s` holds: bit `v` for each value
+        // `0 <= v < 63`, or -1 when it holds anything else.
+        let scan = {
+            let fits = |v: Expr| and(ge(v.clone(), int(0)), lt(v, int(63)));
+            let mut st = vec![m.decl(int(0))];
+            let bit = match t.key {
+                Field::Int => {
+                    let v = t.key_of(en.e());
+                    vec![if_(
+                        fits(v.clone()),
+                        vec![m.set(bitor(m.e(), shl(int(1), v)))],
+                        vec![ret(int(-1))],
+                    )]
+                }
+                _ => {
+                    let stored = t.key_of(en.e());
+                    let v = call("zb_box_payload_i64", vec![stored.clone()], i64());
+                    vec![
+                        when(
+                            ne(
+                                cast(call("zb_box_tag", vec![stored], i32()), i64()),
+                                int(crate::dynamic::I64_TAG),
+                            ),
+                            vec![ret(int(-1))],
+                        ),
+                        if_(
+                            fits(v.clone()),
+                            vec![m.set(bitor(m.e(), shl(int(1), v)))],
+                            vec![ret(int(-1))],
+                        ),
+                    ]
+                }
+            };
+            st.extend(live_walk(&s, bit));
+            st.push(ret(m.e()));
+            st
+        };
+        d.push(define(&t.name("mask_scan"), &[&s], i64(), scan));
+        match t.mask {
+            Mask::Eager => {
+                d.push(define(
+                    &t.name("mask63"),
+                    &[&s],
+                    i64(),
+                    vec![ret(t.key_of(t.entry(s.e(), int(0))))],
+                ));
+                d.push(define(&t.name("remask"), &[&s], unit(), {
+                    vec![
+                        set_idx(
+                            s.e(),
+                            int(0),
+                            t.make(t.ctrl(s.e()), t.call("mask_scan", vec![s.e()], i64()), None),
+                        ),
+                        ret_void(),
+                    ]
+                }));
+            }
+            _ => {
+                // Kept in the index's shape word until the set changes;
+                // a set without an index is scanned.
+                let index = local("index", t.ints());
+                d.push(define(&t.name("mask63"), &[&s], i64(), {
+                    vec![
+                        when(
+                            eq(t.ctrl(s.e()), int(0)),
+                            vec![ret(t.call("mask_scan", vec![s.e()], i64()))],
+                        ),
+                        index.decl(t.index_at(t.ctrl(s.e()))),
+                        m.decl(idx(index.e(), int(1), i64())),
+                        when(ne(m.e(), int(MASK_UNKNOWN)), vec![ret(m.e())]),
+                        m.set(t.call("mask_scan", vec![s.e()], i64())),
+                        set_idx(index.e(), int(1), m.e()),
+                        ret(m.e()),
+                    ]
+                }));
+            }
+        }
+    }
+
+    // A value that is not there: an error path, kept out of line.
+    d.push(define_cold(
+        &t.name("missing"),
+        &[&key],
         unit(),
+        vec![fatal("KeyError", t.key_text(key.e())), ret_void()],
+    ));
+    d.push(define(&t.name("contains"), &[&s, &key], boolean(), {
+        let mut st = Vec::new();
+        if t.mask == Mask::Eager {
+            // Every value is a small int when the mask stands.
+            st.push(m.decl(t.key_of(t.entry(s.e(), int(0)))));
+            st.push(when(
+                ge(m.e(), int(0)),
+                vec![ret(and(
+                    and(ge(key.e(), int(0)), lt(key.e(), int(63))),
+                    ne(bitand(shr(m.e(), key.e()), int(1)), int(0)),
+                ))],
+            ));
+        }
+        st.push(ret(ge(find(s.e(), key.e()), int(0))));
+        st
+    }));
+    d.push(define(&t.name("add"), &[&s, &k], unit(), {
         vec![
             when(
-                unindexed(s.e()),
+                eq(t.ctrl(s.e()), int(0)),
                 vec![
                     when(
-                        lt(find(s.e(), v.e()), int(0)),
-                        vec![
-                            push(s.e(), v.e()),
-                            when(
-                                gt(count(s.e()), int(SMALL)),
-                                vec![expr(call(
-                                    "zb_set_reindex",
-                                    vec![s.e(), int(FIRST_TABLE), bool(false)],
-                                    unit(),
-                                ))],
-                            ),
-                        ],
+                        lt(find(s.e(), k.e()), int(0)),
+                        vec![t.go("insert", vec![s.e(), k.e()])],
                     ),
                     ret_void(),
                 ],
             ),
-            h.decl(hash(v.e())),
+            h.decl(t.mixed(k.e())),
             when(
                 lt(
-                    call("zb_set_find_hashed", vec![s.e(), v.e(), h.e()], i64()),
+                    t.call("find_hashed", vec![s.e(), k.e(), h.e()], i64()),
                     int(0),
                 ),
-                vec![expr(call(
-                    "zb_set_insert_hashed",
-                    vec![s.e(), v.e(), h.e()],
-                    unit(),
-                ))],
+                vec![t.go("insert_hashed", vec![s.e(), k.e(), h.e()])],
             ),
             ret_void(),
-        ],
-    ));
-    // Removal shifts the later values down, so the table is rebuilt.
-    let remove_at = |i: &Local| {
-        vec![
-            expr(mcall(s.e(), "remove_at", vec![i.e()], any())),
-            when(
-                not(unindexed(s.e())),
-                vec![expr(call(
-                    "zb_set_reindex",
-                    vec![s.e(), slots_of(index_of(s.e())), bool(false)],
-                    unit(),
-                ))],
-            ),
         ]
-    };
-    d.push(define("zb_set_discard", &[&s, &value], unit(), {
-        let mut st = vec![i.decl(find(s.e(), v.e()))];
-        st.push(when(ge(i.e(), int(0)), remove_at(&i)));
-        st.push(ret_void());
-        st
     }));
-    d.push(define("zb_set_remove", &[&s, &value], unit(), {
-        let mut st = vec![
-            i.decl(find(s.e(), v.e())),
-            when(lt(i.e(), int(0)), vec![fatal("KeyError", any_str(v.e()))]),
-        ];
-        st.extend(remove_at(&i));
-        st.push(ret_void());
-        st
-    }));
-    d.push(define(
-        "zb_set_clear",
-        &[&s],
-        unit(),
+    d.push(define(&t.name("discard"), &[&s, &key], unit(), {
         vec![
-            expr(mcall(s.e(), "clear", vec![], unit())),
-            push(s.e(), null(any())),
+            e.decl(find(s.e(), key.e())),
+            when(
+                ge(e.e(), int(0)),
+                vec![t.go("delete_at", vec![s.e(), e.e()])],
+            ),
             ret_void(),
-        ],
-    ));
-    // The values, in order, as a list of their own.
-    d.push(define("zb_set_items", &[&s], anys.clone(), {
+        ]
+    }));
+    d.push(define(&t.name("remove"), &[&s, &key], unit(), {
         vec![
-            out.decl(list(Vec::new(), anys.clone())),
-            n.decl(len(s.e())),
-            i.decl(int(1)),
+            e.decl(find(s.e(), key.e())),
+            when(
+                lt(e.e(), int(0)),
+                vec![t.go("missing", vec![key.e()]), ret_void()],
+            ),
+            t.go("delete_at", vec![s.e(), e.e()]),
+            ret_void(),
+        ]
+    }));
+    // The last value added, removed.
+    d.push(define(&t.name("pop"), &[&s], t.key.ty(), {
+        vec![
+            e.decl(sub(len(s.e()), int(1))),
             while_(
-                lt(i.e(), n.e()),
-                vec![push(out.e(), at(s.e(), i.e())), i.add_assign(int(1))],
+                and(
+                    ge(e.e(), int(1)),
+                    eq(t.hash_of(t.entry(s.e(), e.e())), int(TOMB)),
+                ),
+                vec![e.set(sub(e.e(), int(1)))],
             ),
-            ret(out.e()),
+            when(
+                lt(e.e(), int(1)),
+                vec![fatal("KeyError", text("pop from an empty set"))],
+            ),
+            x.decl(t.key_of(t.entry(s.e(), e.e()))),
+            t.go("delete_at", vec![s.e(), e.e()]),
+            ret(x.e()),
         ]
     }));
-    // A copy with a table of its own: the values keep their positions,
-    // so the table is copied rather than built again.
-    d.push(define(
-        "zb_set_copy",
-        &[&s],
-        anys.clone(),
+    // The values, in order, as a list of their own.
+    let (elem, conv) = list_elem(t.key);
+    let elems = list_of(t.list_type, elem.clone());
+    let xs = local("xs", elems.clone());
+    d.push(define(&t.name("items"), &[&s], elems.clone(), {
+        let mut st = vec![
+            xs.decl(list(Vec::new(), elems.clone())),
+            expr(mcall(xs.e(), "reserve", vec![len(s.e())], unit())),
+        ];
+        st.extend(live_walk(&s, vec![push(xs.e(), conv(t.key_of(en.e())))]));
+        st.push(ret(xs.e()));
+        st
+    }));
+    // A loop over the set by position: the count, the dead dropped
+    // first so the positions are dense, then the value at each.
+    d.push(define(&t.name("iter_len"), &[&s], i64(), {
         vec![
-            out.decl(call("zb_list_copy_any", vec![s.e()], anys.clone())),
             when(
-                not(unindexed(out.e())),
-                vec![set_idx(
-                    out.e(),
-                    int(0),
-                    box_index(call(
-                        "zb_list_copy_i64",
-                        vec![index_of(s.e())],
-                        ints.clone(),
-                    )),
+                ne(t.ctrl(s.e()), int(0)),
+                vec![when(
+                    gt(idx(t.index_at(t.ctrl(s.e())), int(0), i64()), int(0)),
+                    vec![t.go(
+                        "rebuild",
+                        vec![
+                            s.e(),
+                            sub(len(t.index_at(t.ctrl(s.e()))), int(INDEX_HEAD)),
+                            bool(true),
+                        ],
+                    )],
                 )],
             ),
-            ret(out.e()),
-        ],
-    ));
-    // A set from any list, keeping first occurrences.
-    let xs = local("xs", anys.clone());
-    d.push(define("zb_set_from", &[&xs], anys.clone(), {
-        let mut st = vec![
-            out.decl(call("zb_set_new", vec![], anys.clone())),
-            n.decl(len(xs.e())),
-        ];
-        st.extend(for_range(
-            &i,
-            int(0),
-            n.e(),
-            vec![expr(call(
-                "zb_set_add",
-                vec![out.e(), at(xs.e(), i.e())],
-                unit(),
-            ))],
-        ));
-        st.push(ret(out.e()));
-        st
-    }));
-    // The hash of a set is the same whatever order it was filled in.
-    d.push(define("zb_set_hash", &[&s], i64(), {
-        vec![
-            h.decl(int(0x2545_F491_4F6C_DD1D)),
-            n.decl(len(s.e())),
-            i.decl(int(1)),
-            while_(
-                lt(i.e(), n.e()),
-                vec![
-                    h.set(bitxor(h.e(), hash(at(s.e(), i.e())))),
-                    i.add_assign(int(1)),
-                ],
-            ),
-            ret(add(mul(h.e(), int(1_000_003)), count(s.e()))),
+            ret(sub(len(s.e()), int(1))),
         ]
     }));
+    d.push(define(&t.name("iter_at"), &[&s, &i], elem.clone(), {
+        vec![ret(conv(t.key_of(t.entry(s.e(), add(i.e(), int(1))))))]
+    }));
 
-    // Integer board positions fit in a word. -1 means the set also
-    // holds a value that needs the general equality path.
-    // Computed by a scan of the values; a set with a table keeps the
-    // answer in the table's first word until a value is added.
-    d.push(define("zb_set_mask63_scan", &[&s], i64(), {
-        let mut st = vec![mask.decl(int(0)), n.decl(len(s.e()))];
-        st.extend(for_range(
-            &i,
-            int(1),
-            n.e(),
-            vec![
-                member.decl(at(s.e(), i.e())),
-                when(
-                    ne(
-                        cast(call("zb_box_tag", vec![member.e()], i32()), i64()),
-                        int(crate::dynamic::I64_TAG),
+    // Room for `extra` more values, the index sized once rather than
+    // grown as they come.
+    d.push(define(&t.name("reserve"), &[&s, &extra], unit(), {
+        vec![
+            total.decl(add(sub(len(s.e()), int(1)), extra.e())),
+            when(
+                eq(t.ctrl(s.e()), int(0)),
+                vec![
+                    when(
+                        gt(total.e(), int(SMALL)),
+                        vec![t.go(
+                            "rebuild",
+                            vec![
+                                s.e(),
+                                call("zb_table_cap_for", vec![total.e()], i64()),
+                                bool(false),
+                            ],
+                        )],
                     ),
-                    vec![ret(int(-1))],
-                ),
-                bit.decl(call("zb_box_payload_i64", vec![member.e()], i64())),
-                when(
-                    or(lt(bit.e(), int(0)), ge(bit.e(), int(63))),
-                    vec![ret(int(-1))],
-                ),
-                mask.set(bitor(mask.e(), shl(int(1), bit.e()))),
-            ],
+                    ret_void(),
+                ],
+            ),
+            cap.decl(sub(len(t.index_at(t.ctrl(s.e()))), int(INDEX_HEAD))),
+            when(
+                gt(mul(total.e(), int(2)), cap.e()),
+                vec![t.go(
+                    "rebuild",
+                    vec![
+                        s.e(),
+                        call("zb_table_cap_for", vec![total.e()], i64()),
+                        bool(true),
+                    ],
+                )],
+            ),
+            ret_void(),
+        ]
+    }));
+    // Every value of `other` added to `s`, by the hashes `other` holds
+    // when both have an index.
+    d.push(define(&t.name("update"), &[&s, &other], unit(), {
+        let mut st = vec![
+            t.go(
+                "reserve",
+                vec![s.e(), t.call("len", vec![other.e()], i64())],
+            ),
+            hashed.decl(ne(t.ctrl(other.e()), int(0))),
+        ];
+        st.extend(live_walk(
+            &other,
+            vec![if_(
+                and(hashed.e(), ne(t.ctrl(s.e()), int(0))),
+                vec![when(
+                    lt(
+                        t.call(
+                            "find_hashed",
+                            vec![s.e(), t.key_of(en.e()), t.hash_of(en.e())],
+                            i64(),
+                        ),
+                        int(0),
+                    ),
+                    vec![t.go(
+                        "insert_hashed",
+                        vec![s.e(), t.key_of(en.e()), t.hash_of(en.e())],
+                    )],
+                )],
+                vec![t.go("add", vec![s.e(), t.key_of(en.e())])],
+            )],
         ));
-        st.push(ret(mask.e()));
+        st.push(ret_void());
         st
     }));
-    d.push(define(
-        "zb_set_mask63",
-        &[&s],
-        i64(),
+    d.push(define(&t.name("or"), &[&s, &other], lt_.clone(), {
         vec![
-            when(
-                unindexed(s.e()),
-                vec![ret(call("zb_set_mask63_scan", vec![s.e()], i64()))],
+            out.decl(t.call("copy", vec![s.e()], lt_.clone())),
+            t.go("update", vec![out.e(), other.e()]),
+            ret(out.e()),
+        ]
+    }));
+    // The values of `s` that are in `other` (`keep` true) or not, in
+    // `s`'s order. Small ints are matched by the masks when both stand;
+    // two sets whose values are of kinds nothing in the other equals
+    // share none.
+    for (op, keep) in [("and", true), ("sub", false)] {
+        d.push(define(&t.name(op), &[&s, &other], lt_.clone(), {
+            let wanted = |hit: Expr| if keep { hit } else { not(hit) };
+            let mut st = vec![out.decl(t.call("new", vec![], lt_.clone()))];
+            if masked {
+                let bit = match t.key {
+                    Field::Int => t.key_of(en.e()),
+                    _ => call("zb_box_payload_i64", vec![t.key_of(en.e())], i64()),
+                };
+                let mut fast = vec![mo.decl(mask_of(other.e()))];
+                let mut body = vec![];
+                body.push(when(
+                    wanted(ne(bitand(shr(mo.e(), bit), int(1)), int(0))),
+                    vec![push(
+                        out.e(),
+                        t.make(t.hash_of(en.e()), t.key_of(en.e()), None),
+                    )],
+                ));
+                let mut both = live_walk(&s, body);
+                both.extend(settle(&out, ne(t.ctrl(s.e()), int(0))));
+                both.push(ret(out.e()));
+                fast.push(when(ge(mo.e(), int(0)), both));
+                st.push(m.decl(mask_of(s.e())));
+                st.push(when(ge(m.e(), int(0)), fast));
+            }
+            if matches!(t.key, Field::Any) {
+                st.push(when(
+                    call("zb_set_disjoint_kinds", vec![s.e(), other.e()], boolean()),
+                    vec![ret(if keep {
+                        out.e()
+                    } else {
+                        t.call("copy", vec![s.e()], lt_.clone())
+                    })],
+                ));
+            }
+            st.push(hashed.decl(ne(t.ctrl(s.e()), int(0))));
+            st.push(expr(mcall(out.e(), "reserve", vec![len(s.e())], unit())));
+            st.extend(live_walk(
+                &s,
+                vec![when(
+                    wanted(member_of(&other, "find", "find_hashed")),
+                    vec![push(
+                        out.e(),
+                        t.make(
+                            if_expr(hashed.e(), t.hash_of(en.e()), int(0)),
+                            t.key_of(en.e()),
+                            None,
+                        ),
+                    )],
+                )],
+            ));
+            st.extend(settle(&out, hashed.e()));
+            st.push(ret(out.e()));
+            st
+        }));
+    }
+    d.push(define(&t.name("xor"), &[&s, &other], lt_.clone(), {
+        vec![
+            out.decl(t.call("sub", vec![s.e(), other.e()], lt_.clone())),
+            t.go(
+                "update",
+                vec![out.e(), t.call("sub", vec![other.e(), s.e()], lt_.clone())],
             ),
-            index.decl(index_of(s.e())),
-            mask.decl(idx(index.e(), int(0), i64())),
-            when(ne(mask.e(), int(MASK_UNKNOWN)), vec![ret(mask.e())]),
-            mask.set(call("zb_set_mask63_scan", vec![s.e()], i64())),
-            set_idx(index.e(), int(0), mask.e()),
-            ret(mask.e()),
-        ],
-    ));
+            ret(out.e()),
+        ]
+    }));
+    // How many values of `s` are in `other`: the size of their
+    // intersection, from which every other combination's size follows.
+    d.push(define(&t.name("and_len"), &[&s, &other], i64(), {
+        let mut st = vec![c.decl(int(0)), hashed.decl(ne(t.ctrl(s.e()), int(0)))];
+        st.extend(live_walk(
+            &s,
+            vec![when(
+                member_of(&other, "find", "find_hashed"),
+                vec![c.add_assign(int(1))],
+            )],
+        ));
+        st.push(ret(c.e()));
+        st
+    }));
+    let size = |s: &Local| t.call("len", vec![s.e()], i64());
+    let common = || t.call("and_len", vec![s.e(), other.e()], i64());
+    for (op, value) in [
+        ("sub_len", sub(size(&s), common())),
+        ("or_len", sub(add(size(&s), size(&other)), common())),
+        (
+            "xor_len",
+            sub(add(size(&s), size(&other)), mul(common(), int(2))),
+        ),
+    ] {
+        d.push(define(&t.name(op), &[&s, &other], i64(), vec![ret(value)]));
+    }
+    // Whether every value of `s` is in `other`. Equality compares
+    // through lookups of its own, as a dict's does.
+    let variants: &[(&str, &str, &str)] = if t.recursive_keys() {
+        &[
+            ("issubset", "find", "find_hashed"),
+            ("subset_eq", "find_eq", "find_hashed_eq"),
+        ]
+    } else {
+        &[("issubset", "find", "find_hashed")]
+    };
+    for (op, find, find_hashed) in variants {
+        d.push(define(&t.name(op), &[&s, &other], boolean(), {
+            let mut st = vec![when(gt(size(&s), size(&other)), vec![ret(bool(false))])];
+            if masked {
+                st.push(m.decl(mask_of(s.e())));
+                st.push(when(
+                    ge(m.e(), int(0)),
+                    vec![
+                        mo.decl(mask_of(other.e())),
+                        when(
+                            ge(mo.e(), int(0)),
+                            vec![ret(eq(bitand(m.e(), mo.e()), m.e()))],
+                        ),
+                    ],
+                ));
+            }
+            if matches!(t.key, Field::Any) {
+                st.push(when(
+                    call("zb_set_disjoint_kinds", vec![s.e(), other.e()], boolean()),
+                    vec![ret(bool(false))],
+                ));
+            }
+            st.push(hashed.decl(ne(t.ctrl(s.e()), int(0))));
+            st.extend(live_walk(
+                &s,
+                vec![when(
+                    not(member_of(&other, find, find_hashed)),
+                    vec![ret(bool(false))],
+                )],
+            ));
+            st.push(ret(bool(true)));
+            st
+        }));
+    }
+    let subset_eq = if t.recursive_keys() {
+        "subset_eq"
+    } else {
+        "issubset"
+    };
+    d.push(define(&t.name("eq"), &[&s, &other], boolean(), {
+        vec![ret(and(
+            eq(size(&s), size(&other)),
+            t.call(subset_eq, vec![s.e(), other.e()], boolean()),
+        ))]
+    }));
+    d.push(define(&t.name("isdisjoint"), &[&s, &other], boolean(), {
+        vec![ret(eq(common(), int(0)))]
+    }));
+    // The hash of a frozen set: the same whatever order it was filled
+    // in, from the hash words of an indexed set.
+    d.push(define(&t.name("hash"), &[&s], i64(), {
+        let mut st = vec![
+            h.decl(int(0x2545_F491_4F6C_DD1D)),
+            hashed.decl(ne(t.ctrl(s.e()), int(0))),
+        ];
+        st.extend(live_walk(
+            &s,
+            vec![h.set(bitxor(
+                h.e(),
+                if_expr(hashed.e(), t.hash_of(en.e()), t.mixed(t.key_of(en.e()))),
+            ))],
+        ));
+        st.push(ret(add(mul(h.e(), int(1_000_003)), size(&s))));
+        st
+    }));
+    let text_out = local("text", string());
+    d.push(define(&t.name("repr"), &[&s], string(), {
+        let strs = list_of(t.list_type, string());
+        let pieces = local("pieces", strs.clone());
+        let first = local("first", boolean());
+        let piece = |p: Expr| expr(mcall(pieces.e(), "push", vec![p], unit()));
+        let mut st = vec![
+            when(eq(size(&s), int(0)), vec![ret(text("set()"))]),
+            pieces.decl(list(Vec::new(), strs)),
+            piece(text("{")),
+            first.decl(bool(true)),
+        ];
+        st.extend(live_walk(
+            &s,
+            vec![
+                when(not(first.e()), vec![piece(text(", "))]),
+                first.set(bool(false)),
+                piece(t.key.repr(t.key_of(en.e()))),
+            ],
+        ));
+        st.push(piece(text("}")));
+        st.push(text_out.decl(call("zb_str_join", vec![text(""), pieces.e()], string())));
+        st.push(ret(text_out.e()));
+        st
+    }));
+    if t.mask == Mask::Eager {
+        // The least value: the lowest bit of the mask when it stands.
+        d.push(define(&t.name("min"), &[&s], i64(), {
+            let mut st = vec![
+                when(
+                    eq(size(&s), int(0)),
+                    vec![fatal("ValueError", text("min() arg is an empty sequence"))],
+                ),
+                m.decl(mask_of(s.e())),
+                when(
+                    ge(m.e(), int(0)),
+                    vec![
+                        x.decl(int(0)),
+                        while_(
+                            eq(bitand(shr(m.e(), x.e()), int(1)), int(0)),
+                            vec![x.add_assign(int(1))],
+                        ),
+                        ret(x.e()),
+                    ],
+                ),
+                found.decl(bool(false)),
+                x.decl(int(0)),
+            ];
+            st.extend(live_walk(
+                &s,
+                vec![when(
+                    or(not(found.e()), lt(t.key_of(en.e()), x.e())),
+                    vec![x.set(t.key_of(en.e())), found.set(bool(true))],
+                )],
+            ));
+            st.push(ret(x.e()));
+            st
+        }));
+    }
+    // A set from a list of its kind, first occurrences kept.
+    if elem == t.key.ty() {
+        let xs = borrowed("xs", elems.clone());
+        let from = if t.sfx.is_empty() {
+            "zb_set_from".to_string()
+        } else {
+            t.name("from_list")
+        };
+        d.push(define(&from, &[&xs], lt_.clone(), {
+            let mut st = vec![
+                out.decl(t.call("new", vec![], lt_.clone())),
+                n.decl(len(xs.e())),
+                t.go("reserve", vec![out.e(), n.e()]),
+            ];
+            st.extend(for_range(
+                &i,
+                int(0),
+                n.e(),
+                vec![t.go("add", vec![out.e(), idx(xs.e(), i.e(), elem.clone())])],
+            ));
+            st.push(ret(out.e()));
+            st
+        }));
+    }
+    let _ = anys;
+    d
+}
+
+/// The library set's own functions beyond a shape's: the kind test
+/// that lets two sets of disjoint kinds skip their values, and the box
+/// read as itself.
+fn dynamic_set(list_type: TypeId) -> Vec<Decl> {
+    let st_ = set_type(list_type);
+    let t = Table {
+        list_type,
+        prefix: "zb_set",
+        sfx: String::new(),
+        key: &Field::Any,
+        value: None,
+        tag: SET_TAG,
+        mask: Mask::Lazy,
+    };
+    let s = borrowed("s", st_.clone());
+    let other = borrowed("other", st_.clone());
+    let wanted = local("wanted", i64());
+    let n = local("n", i64());
+    let i = local("i", i64());
+    let x = local("x", any());
+    let kind = |x: Expr| call("zb_any_kind", vec![x], i64());
+    let first = |s: &Local| t.key_of(t.entry(s.e(), int(1)));
+    let mut d = Vec::new();
+    // Whether every value of `s` is of box kind `wanted`; an empty set
+    // is not.
     d.push(define("zb_set_all_kind", &[&s, &wanted], boolean(), {
         let mut st = vec![
             n.decl(len(s.e())),
@@ -2087,9 +2193,9 @@ fn set(list_type: TypeId) -> Vec<Decl> {
             int(1),
             n.e(),
             vec![when(
-                ne(
-                    call("zb_any_kind", vec![at(s.e(), i.e())], i64()),
-                    wanted.e(),
+                and(
+                    ne(t.hash_of(t.entry(s.e(), i.e())), int(TOMB)),
+                    ne(kind(t.key_of(t.entry(s.e(), i.e()))), wanted.e()),
                 ),
                 vec![ret(bool(false))],
             )],
@@ -2097,20 +2203,20 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         st.push(ret(bool(true)));
         st
     }));
+    // Two sets one of which holds only sets and the other only tuples:
+    // no value of one equals a value of the other.
     d.push(define(
         "zb_set_disjoint_kinds",
         &[&s, &other],
         boolean(),
         vec![
-            // Two sets whose first values are of one kind share it, and
-            // an empty set has no kind to be all of.
             when(
                 or(
-                    or(eq(len(s.e()), int(1)), eq(len(other.e()), int(1))),
-                    eq(
-                        call("zb_any_kind", vec![at(s.e(), int(1))], i64()),
-                        call("zb_any_kind", vec![at(other.e(), int(1))], i64()),
+                    or(
+                        eq(call("zb_set_len", vec![s.e()], i64()), int(0)),
+                        eq(call("zb_set_len", vec![other.e()], i64()), int(0)),
                     ),
+                    eq(kind(first(&s)), kind(first(&other))),
                 ),
                 vec![ret(bool(false))],
             ),
@@ -2137,351 +2243,6 @@ fn set(list_type: TypeId) -> Vec<Decl> {
             ret(bool(false)),
         ],
     ));
-
-    // Intersection, union, difference, symmetric difference. A result
-    // built from values known to be distinct is appended to and takes
-    // its table at the end.
-    let settled = |out: &Local| {
-        vec![
-            expr(call("zb_set_settle", vec![out.e()], unit())),
-            ret(out.e()),
-        ]
-    };
-    d.push(define("zb_set_and", &[&s, &other], anys.clone(), {
-        let mut st = vec![
-            out.decl(call("zb_set_new", vec![], anys.clone())),
-            n.decl(len(s.e())),
-            left_mask.decl(call("zb_set_mask63", vec![s.e()], i64())),
-            when(ge(left_mask.e(), int(0)), {
-                let mut fast = vec![right_mask.decl(call("zb_set_mask63", vec![other.e()], i64()))];
-                let mut matched = for_range(
-                    &i,
-                    int(1),
-                    n.e(),
-                    vec![
-                        member.decl(at(s.e(), i.e())),
-                        bit.decl(call("zb_box_payload_i64", vec![member.e()], i64())),
-                        when(
-                            ne(bitand(right_mask.e(), shl(int(1), bit.e())), int(0)),
-                            vec![push(out.e(), member.e())],
-                        ),
-                    ],
-                );
-                matched.extend(settled(&out));
-                fast.push(when(ge(right_mask.e(), int(0)), matched));
-                fast
-            }),
-            when(
-                call("zb_set_disjoint_kinds", vec![s.e(), other.e()], boolean()),
-                vec![ret(out.e())],
-            ),
-            hs.decl(call("zb_set_entry_hashes", vec![s.e()], ints.clone())),
-            out_hs.decl(list(Vec::new(), ints.clone())),
-            expr(mcall(out.e(), "reserve", vec![n.e()], unit())),
-            expr(mcall(out_hs.e(), "reserve", vec![n.e()], unit())),
-        ];
-        st.extend(for_range(
-            &i,
-            int(1),
-            n.e(),
-            vec![
-                h.decl(idx(hs.e(), sub(i.e(), int(1)), i64())),
-                when(
-                    call(
-                        "zb_set_has_hashed",
-                        vec![other.e(), at(s.e(), i.e()), h.e()],
-                        boolean(),
-                    ),
-                    vec![push(out.e(), at(s.e(), i.e())), push(out_hs.e(), h.e())],
-                ),
-            ],
-        ));
-        st.push(expr(call(
-            "zb_set_settle_hashed",
-            vec![out.e(), out_hs.e()],
-            unit(),
-        )));
-        st.push(ret(out.e()));
-        st
-    }));
-    // Room for `extra` more values without the table growing as they
-    // come: a table sized once for what a union adds.
-    let extra = local("extra", i64());
-    let need = local("need", i64());
-    d.push(define(
-        "zb_set_reserve",
-        &[&s, &extra],
-        unit(),
-        vec![
-            need.decl(mul(add(count(s.e()), extra.e()), int(2))),
-            when(
-                unindexed(s.e()),
-                vec![
-                    when(
-                        gt(add(count(s.e()), extra.e()), int(SMALL)),
-                        vec![
-                            cap.decl(int(FIRST_TABLE)),
-                            while_(lt(cap.e(), need.e()), vec![cap.set(mul(cap.e(), int(2)))]),
-                            expr(call(
-                                "zb_set_reindex",
-                                vec![s.e(), cap.e(), bool(false)],
-                                unit(),
-                            )),
-                        ],
-                    ),
-                    ret_void(),
-                ],
-            ),
-            cap.decl(slots_of(index_of(s.e()))),
-            when(
-                lt(cap.e(), need.e()),
-                vec![
-                    while_(lt(cap.e(), need.e()), vec![cap.set(mul(cap.e(), int(2)))]),
-                    expr(call(
-                        "zb_set_reindex",
-                        vec![s.e(), cap.e(), bool(true)],
-                        unit(),
-                    )),
-                ],
-            ),
-            ret_void(),
-        ],
-    ));
-    // Every value of `other` added to `s`, by the hashes `other` holds:
-    // into the table when `s` has one after making room, else by the
-    // short path.
-    d.push(define("zb_set_update", &[&s, &other], unit(), {
-        let mut st = vec![
-            expr(call(
-                "zb_set_reserve",
-                vec![s.e(), count(other.e())],
-                unit(),
-            )),
-            n.decl(len(other.e())),
-        ];
-        let mut by_hash = vec![hs.decl(call("zb_set_entry_hashes", vec![other.e()], ints.clone()))];
-        by_hash.extend(for_range(
-            &i,
-            int(1),
-            n.e(),
-            vec![
-                h.decl(idx(hs.e(), sub(i.e(), int(1)), i64())),
-                when(
-                    lt(
-                        call(
-                            "zb_set_find_hashed",
-                            vec![s.e(), at(other.e(), i.e()), h.e()],
-                            i64(),
-                        ),
-                        int(0),
-                    ),
-                    vec![expr(call(
-                        "zb_set_insert_hashed",
-                        vec![s.e(), at(other.e(), i.e()), h.e()],
-                        unit(),
-                    ))],
-                ),
-            ],
-        ));
-        let mut by_add = Vec::new();
-        by_add.extend(for_range(
-            &i,
-            int(1),
-            n.e(),
-            vec![expr(call(
-                "zb_set_add",
-                vec![s.e(), at(other.e(), i.e())],
-                unit(),
-            ))],
-        ));
-        st.push(if_(unindexed(s.e()), by_add, by_hash));
-        st.push(ret_void());
-        st
-    }));
-    d.push(define(
-        "zb_set_or",
-        &[&s, &other],
-        anys.clone(),
-        vec![
-            out.decl(call("zb_set_copy", vec![s.e()], anys.clone())),
-            expr(call("zb_set_update", vec![out.e(), other.e()], unit())),
-            ret(out.e()),
-        ],
-    ));
-    d.push(define("zb_set_sub", &[&s, &other], anys.clone(), {
-        let mut st = vec![
-            out.decl(call("zb_set_new", vec![], anys.clone())),
-            n.decl(len(s.e())),
-            left_mask.decl(call("zb_set_mask63", vec![s.e()], i64())),
-            when(ge(left_mask.e(), int(0)), {
-                let mut fast = vec![right_mask.decl(call("zb_set_mask63", vec![other.e()], i64()))];
-                let mut unmatched = for_range(
-                    &i,
-                    int(1),
-                    n.e(),
-                    vec![
-                        member.decl(at(s.e(), i.e())),
-                        bit.decl(call("zb_box_payload_i64", vec![member.e()], i64())),
-                        when(
-                            eq(bitand(right_mask.e(), shl(int(1), bit.e())), int(0)),
-                            vec![push(out.e(), member.e())],
-                        ),
-                    ],
-                );
-                unmatched.extend(settled(&out));
-                fast.push(when(ge(right_mask.e(), int(0)), unmatched));
-                fast
-            }),
-            when(
-                call("zb_set_disjoint_kinds", vec![s.e(), other.e()], boolean()),
-                vec![ret(call("zb_set_copy", vec![s.e()], anys.clone()))],
-            ),
-            hs.decl(call("zb_set_entry_hashes", vec![s.e()], ints.clone())),
-            out_hs.decl(list(Vec::new(), ints.clone())),
-            expr(mcall(out.e(), "reserve", vec![n.e()], unit())),
-            expr(mcall(out_hs.e(), "reserve", vec![n.e()], unit())),
-        ];
-        st.extend(for_range(
-            &i,
-            int(1),
-            n.e(),
-            vec![
-                h.decl(idx(hs.e(), sub(i.e(), int(1)), i64())),
-                when(
-                    not(call(
-                        "zb_set_has_hashed",
-                        vec![other.e(), at(s.e(), i.e()), h.e()],
-                        boolean(),
-                    )),
-                    vec![push(out.e(), at(s.e(), i.e())), push(out_hs.e(), h.e())],
-                ),
-            ],
-        ));
-        st.push(expr(call(
-            "zb_set_settle_hashed",
-            vec![out.e(), out_hs.e()],
-            unit(),
-        )));
-        st.push(ret(out.e()));
-        st
-    }));
-    d.push(define(
-        "zb_set_xor",
-        &[&s, &other],
-        anys.clone(),
-        vec![ret(call(
-            "zb_set_or",
-            vec![
-                call("zb_set_sub", vec![s.e(), other.e()], anys.clone()),
-                call("zb_set_sub", vec![other.e(), s.e()], anys.clone()),
-            ],
-            anys.clone(),
-        ))],
-    ));
-    d.push(define("zb_set_issubset", &[&s, &other], boolean(), {
-        let mut st = vec![
-            when(gt(count(s.e()), count(other.e())), vec![ret(bool(false))]),
-            left_mask.decl(call("zb_set_mask63", vec![s.e()], i64())),
-            when(
-                ge(left_mask.e(), int(0)),
-                vec![
-                    right_mask.decl(call("zb_set_mask63", vec![other.e()], i64())),
-                    when(
-                        ge(right_mask.e(), int(0)),
-                        vec![ret(eq(
-                            bitand(left_mask.e(), right_mask.e()),
-                            left_mask.e(),
-                        ))],
-                    ),
-                ],
-            ),
-            when(
-                call("zb_set_disjoint_kinds", vec![s.e(), other.e()], boolean()),
-                vec![ret(bool(false))],
-            ),
-            n.decl(len(s.e())),
-        ];
-        st.extend(for_range(
-            &i,
-            int(1),
-            n.e(),
-            vec![when(
-                not(contains(other.e(), at(s.e(), i.e()))),
-                vec![ret(bool(false))],
-            )],
-        ));
-        st.push(ret(bool(true)));
-        st
-    }));
-    d.push(define(
-        "zb_set_eq",
-        &[&s, &other],
-        boolean(),
-        vec![ret(and(
-            eq(count(s.e()), count(other.e())),
-            call("zb_set_issubset", vec![s.e(), other.e()], boolean()),
-        ))],
-    ));
-    d.push(define(
-        "zb_set_repr",
-        &[&s],
-        string(),
-        vec![
-            when(eq(count(s.e()), int(0)), vec![ret(text("set()"))]),
-            text_out.decl(call(
-                "zb_list_items_any",
-                vec![
-                    call("zb_set_items", vec![s.e()], anys.clone()),
-                    text("{"),
-                    text("}"),
-                ],
-                string(),
-            )),
-            ret(text_out.e()),
-        ],
-    ));
-    d.push(extern_fn(
-        "zb_set_raw",
-        &[("x", any())],
-        anys.clone(),
-        Some("zyntax_box_pointer"),
-    ));
-    d.push(extern_fn(
-        "zb_box_set_raw",
-        &[("s", anys.clone()), ("tag", i32())],
-        any(),
-        Some("zyntax_box_ptr"),
-    ));
-    let boxed = local("s", anys.clone());
-    d.push(define(
-        "zb_set_box",
-        &[&boxed],
-        any(),
-        vec![ret(call(
-            "zb_box_set_raw",
-            vec![boxed.e(), int32(SET_TAG as i32)],
-            any(),
-        ))],
-    ));
-    d.push(define(
-        "zb_set_unbox",
-        &[&x],
-        anys.clone(),
-        vec![
-            tag.decl(cast(call("zb_box_tag", vec![x.e()], i32()), i64())),
-            when(
-                ne(tag.e(), int(SET_TAG)),
-                vec![fatal(
-                    "TypeError",
-                    add(
-                        text("expected a set, got "),
-                        call("zb_any_type", vec![x.e()], string()),
-                    ),
-                )],
-            ),
-            ret(call("zb_unbox_list_raw_any", vec![x.e()], anys.clone())),
-        ],
-    ));
     // The box itself, once it is known to hold a set: what a slot that
     // stores sets as boxes takes from a dynamic value.
     d.push(define(
@@ -2489,9 +2250,74 @@ fn set(list_type: TypeId) -> Vec<Decl> {
         &[&x],
         any(),
         vec![
-            expr(call("zb_set_unbox", vec![x.e()], anys.clone())),
+            expr(call("zb_set_unbox", vec![x.e()], st_.clone())),
             ret(x.e()),
         ],
     ));
     d
+}
+
+/// `zb_set_contains_<suffix>`: whether the library's set holds a value
+/// equal to a key of field `probe` that is not a box. The key hashes as
+/// its box would, so the probe lands where the box's would.
+pub(crate) fn set_probe_by(list_type: TypeId, probe: &Field, suffix: &str) -> Decl {
+    let t = Table {
+        list_type,
+        prefix: "zb_set",
+        sfx: String::new(),
+        key: &Field::Any,
+        value: None,
+        tag: SET_TAG,
+        mask: Mask::Lazy,
+    };
+    let s = borrowed("s", set_type(list_type));
+    let key = borrowed("key", probe.ty());
+    let n = local("n", i64());
+    let i = local("i", i64());
+    let e = local("e", i64());
+    let en = local("en", t.entry_ty());
+    let index = local("index", list_of(list_type, i64()));
+    let mask = local("mask", i64());
+    let slot = local("slot", i64());
+    let h = local("h", i64());
+    let matches = |stored: Expr| probe.eq_boxed(stored, key.e());
+    let mut scan = vec![n.decl(len(s.e()))];
+    scan.extend(for_range(
+        &i,
+        int(1),
+        n.e(),
+        vec![when(
+            matches(t.key_of(t.entry(s.e(), i.e()))),
+            vec![ret(bool(true))],
+        )],
+    ));
+    scan.push(ret(bool(false)));
+    define(
+        &format!("zb_set_contains_{suffix}"),
+        &[&s, &key],
+        boolean(),
+        vec![
+            when(eq(t.ctrl(s.e()), int(0)), scan),
+            index.decl(t.index_at(t.ctrl(s.e()))),
+            mask.decl(sub(sub(len(index.e()), int(INDEX_HEAD)), int(1))),
+            h.decl(call("zb_hash_mix", vec![probe.hash(key.e())], i64())),
+            slot.decl(bitand(h.e(), mask.e())),
+            i.decl(int(0)),
+            while_(
+                le(i.e(), mask.e()),
+                vec![
+                    e.decl(idx(index.e(), add(slot.e(), int(INDEX_HEAD)), i64())),
+                    when(lt(e.e(), int(0)), vec![ret(bool(false))]),
+                    en.decl(t.entry(s.e(), e.e())),
+                    when(
+                        eq(t.hash_of(en.e()), h.e()),
+                        vec![when(matches(t.key_of(en.e())), vec![ret(bool(true))])],
+                    ),
+                    slot.set(bitand(add(slot.e(), int(1)), mask.e())),
+                    i.add_assign(int(1)),
+                ],
+            ),
+            ret(bool(false)),
+        ],
+    )
 }

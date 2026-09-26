@@ -268,7 +268,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
                 .collect(),
         ),
         Ty::Dict(_) => zyntax_builtins::dicts::dict_type(list_type_id()),
-        Ty::Set => list_type(Type::Any),
+        Ty::Set => zyntax_builtins::dicts::set_type(list_type_id()),
         // A file is the record the library keeps: a list of its parts.
         Ty::File(_) => list_type(Type::Any),
         Ty::Class(k) => class_type(k as usize),
@@ -4837,6 +4837,8 @@ impl<'m> Lowerer<'m> {
             }
             Ty::Str => call("zb_str_get", vec![seq.node, index], Ty::Str, span),
             Ty::Bytes => call("zb_bytes_index", vec![seq.node, index], Ty::Int, span),
+            // A set by position, as `zb_set_iter_len` left it.
+            Ty::Set => call("zb_set_iter_at", vec![seq.node, index], Ty::Object, span),
             _ => call(
                 "zb_any_getitem_i64",
                 vec![seq.node, index],
@@ -4924,6 +4926,7 @@ impl<'m> Lowerer<'m> {
         let len = match seq.ty {
             Ty::Str => call("zb_str_chars_len", vec![seq.node.clone()], Ty::Int, span),
             Ty::Bytes => call("zb_str_len", vec![seq.node.clone()], Ty::Int, span),
+            Ty::Set => call("zb_set_iter_len", vec![seq.node.clone()], Ty::Int, span),
             _ => method_call(seq.node.clone(), "len", vec![], Ty::Int, span),
         };
         let item = self.index_value(

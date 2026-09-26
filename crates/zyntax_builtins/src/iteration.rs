@@ -107,7 +107,11 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             ),
             ret(call(
                 "zb_set_box",
-                vec![call("zb_set_from", vec![frozen_items.e()], anys.clone())],
+                vec![call(
+                    "zb_set_from",
+                    vec![frozen_items.e()],
+                    crate::dicts::set_type(list_type),
+                )],
                 any(),
             )),
         ],
