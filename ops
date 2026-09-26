@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1790463316,"nonce":"VeIq0VooKGOZrkwToRAV7rJosHY=","added":["bug","area:python"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790464776,"nonce":"kLMXBMUFuO2QgNf9Lgv3skNwI0I=","message":"Fixed in 4f9480cd: a call obj.f(...) where f is a field (not a method) reads the field and calls its value (__call__ for an instance, the record otherwise).","files":null}]}
