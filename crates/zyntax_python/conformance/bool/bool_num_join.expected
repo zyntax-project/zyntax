@@ -1,0 +1,26 @@
+True True True True
+0.5 False
+1.5
+False
+False True 0
+falsy
+False True 0.0
+falsy
+False True -0.0
+falsy
+True False nan
+true
+falsy
+False True None
+falsy
+False True False
+falsy
+True False True
+true
+falsy
+True False 3
+true
+falsy
+True False 2.5
+true
+falsy

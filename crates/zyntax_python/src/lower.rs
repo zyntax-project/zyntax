@@ -29,6 +29,9 @@ use zyntax_typed_ast::{
     TypedNode, UnaryOp, Visibility,
 };
 
+#[path = "num.rs"]
+pub(crate) mod num;
+
 pub(crate) type Node = TypedNode<TypedExpression>;
 pub(crate) type Stmt = TypedNode<TypedStatement>;
 
@@ -166,6 +169,7 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         | Ty::Closure(_)
         | Ty::Bound(_)
         | Ty::Builtin(_)
+        | Ty::Num(_)
         | Ty::Object
         | Ty::Unknown => Field::Any,
     }
@@ -239,6 +243,12 @@ pub(crate) fn ir(ty: Ty) -> Type {
         // A known function value is still the record every function
         // value is.
         Ty::Closure(_) | Ty::Bound(_) | Ty::Builtin(_) | Ty::Object | Ty::Unknown => Type::Any,
+        // The tag, the int and the float: see `num`.
+        Ty::Num(_) => Type::Tuple(vec![
+            prim(PrimitiveType::I64),
+            prim(PrimitiveType::I64),
+            prim(PrimitiveType::F64),
+        ]),
     }
 }
 
@@ -2052,6 +2062,8 @@ impl<'m> Lowerer<'m> {
         match (v.ty, target) {
             (a, b) if a == b => v.node,
             (_, Ty::Unknown) => v.node,
+            (Ty::Num(_), _) => self.from_num(v, target),
+            (_, Ty::Num(_)) => self.to_num(v, target),
             // A known function value is a dynamic value already.
             (Ty::Closure(_), Ty::Object | Ty::Closure(_)) | (Ty::Object, Ty::Closure(_)) => v.node,
             (Ty::Bound(_), Ty::Object | Ty::Bound(_)) | (Ty::Object, Ty::Bound(_)) => v.node,
@@ -2910,6 +2922,7 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
             ),
             Ty::Object | Ty::Unknown => call("zb_any_truthy", vec![v.node], Ty::Bool, span),
+            Ty::Num(_) => self.num_truthy(v),
         }
     }
 
@@ -2940,6 +2953,10 @@ impl<'m> Lowerer<'m> {
     pub(crate) fn str_of(&mut self, v: Val) -> Node {
         let span = v.node.span;
         match v.ty {
+            Ty::Num(_) => {
+                let boxed = self.boxed_num(v);
+                self.str_of(boxed)
+            }
             Ty::Int => call("zb_str_of_int", vec![v.node], Ty::Str, span),
             Ty::Float => call("zb_float_repr", vec![v.node], Ty::Str, span),
             Ty::Bool => call("zb_bool_repr", vec![v.node], Ty::Str, span),
@@ -3032,6 +3049,10 @@ impl<'m> Lowerer<'m> {
                 })
             }
             Ty::Object | Ty::Unknown => call("zb_any_repr", vec![v.node], Ty::Str, span),
+            Ty::Num(_) => {
+                let boxed = self.boxed_num(v);
+                self.repr_of(boxed)
+            }
             _ => self.str_of(v),
         }
     }
@@ -3516,8 +3537,13 @@ impl<'m> Lowerer<'m> {
                     }
                 }
                 // `a = b = v` evaluates `v` once and binds each target
-                // to it, left to right.
-                let value = self.expr(&a.value)?;
+                // to it, left to right. A local takes a run-time number
+                // as itself, as inference typed it.
+                let value = if a.targets.iter().all(|t| matches!(t, py::Expr::Name(_))) {
+                    self.expr_num(&a.value)?
+                } else {
+                    self.expr(&a.value)?
+                };
                 if a.targets.len() == 1 {
                     self.bind(&a.targets[0], value, span, out)?;
                 } else {
@@ -3565,7 +3591,7 @@ impl<'m> Lowerer<'m> {
                 self.if_chain(&i.test, &i.body, &i.elif_else_clauses, span, out)?;
             }
             py::Stmt::While(w) => {
-                let cond = self.expr(&w.test)?;
+                let cond = self.expr_num(&w.test)?;
                 let condition = self.truthy(cond);
                 // A test that hoists work re-does it every pass: the loop
                 // becomes `while true { work; if not test: break; body }`.
@@ -3966,11 +3992,19 @@ impl<'m> Lowerer<'m> {
                 (self.hold_ahead(read, span), Place::Attr(Box::new(object)))
             }
             _ => {
-                let read = self.expr(&a.target)?;
+                let read = if matches!(&*a.target, py::Expr::Name(_)) {
+                    self.expr_num(&a.target)?
+                } else {
+                    self.expr(&a.target)?
+                };
                 (self.hold_unless_plain(read, &a.target, span), Place::Target)
             }
         };
-        let value = self.expr(&a.value)?;
+        let value = if matches!(&*a.target, py::Expr::Name(_)) {
+            self.expr_num(&a.value)?
+        } else {
+            self.expr(&a.value)?
+        };
         let combined = self.combine_in_place(a.op, held, value, &a.value, span)?;
         let combined = self.checked(combined);
         match place {
@@ -4608,7 +4642,7 @@ impl<'m> Lowerer<'m> {
             }
             None => {}
         }
-        let cond = self.expr(test)?;
+        let cond = self.expr_num(test)?;
         let condition = Box::new(self.truthy(cond));
         out.append(&mut self.hoisted);
         // What the test settles holds in the branch it selects.
@@ -6197,6 +6231,20 @@ impl<'m> Lowerer<'m> {
     // ─── Expressions ────────────────────────────────────────────────
 
     pub(crate) fn expr(&mut self, e: &py::Expr) -> Result<Val> {
+        let v = self.expr_num(e)?;
+        if let Ty::Num(_) = v.ty {
+            let node = self.coerce(v, Ty::Object);
+            return Ok(Val {
+                node,
+                ty: Ty::Object,
+            });
+        }
+        Ok(v)
+    }
+
+    /// `e`, a run-time number as the value struct it is rather than its
+    /// box: for the readers that compute on its parts.
+    pub(crate) fn expr_num(&mut self, e: &py::Expr) -> Result<Val> {
         let v = self.expr_unchecked(e)?;
         // Whatever a call did to an object's fields, nothing settled
         // about them before it holds after.
@@ -6207,7 +6255,7 @@ impl<'m> Lowerer<'m> {
     }
 
     /// A lowered value as an expression yields it.
-    fn checked(&mut self, mut v: Val) -> Val {
+    pub(crate) fn checked(&mut self, mut v: Val) -> Val {
         // A function value whose function is known is the record every
         // function value is; only a call reads the type, off the callee
         // expression itself.
@@ -6306,7 +6354,7 @@ impl<'m> Lowerer<'m> {
 
     fn expr_unchecked(&mut self, e: &py::Expr) -> Result<Val> {
         let span = span_of(e);
-        let ty = self.ty_of(e);
+        let ty = self.typer().expr_num(e);
         let lit = |x: TypedExpression, ty: Ty| Val {
             node: node(x, ty, span),
             ty,
@@ -6515,15 +6563,15 @@ impl<'m> Lowerer<'m> {
                 self.percent_format_bytes(&template, &b.right, span)?
             }
             py::Expr::BinOp(b) => {
-                let l = self.expr(&b.left)?;
-                let r = self.expr(&b.right)?;
+                let l = self.expr_num(&b.left)?;
+                let r = self.expr_num(&b.right)?;
                 self.arithmetic(b.op, l, r, &b.right, span)?
             }
             py::Expr::UnaryOp(u) => self.unary(u, span)?,
             py::Expr::Compare(c) => self.compare(c, span)?,
             py::Expr::BoolOp(b) => self.bool_op(b, ty, span)?,
             py::Expr::If(i) => {
-                let cond = self.expr(&i.test)?;
+                let cond = self.expr_num(&i.test)?;
                 let condition = self.truthy(cond);
                 // What a branch hoists runs only when that branch does.
                 let outer = std::mem::take(&mut self.hoisted);
@@ -6660,7 +6708,12 @@ impl<'m> Lowerer<'m> {
     }
 
     fn unary(&mut self, u: &py::ExprUnaryOp, span: Span) -> Result<Val> {
-        let operand = self.expr(&u.operand)?;
+        // `not` reads a run-time number's parts; the others its box.
+        let operand = if u.op == py::UnaryOp::Not {
+            self.expr_num(&u.operand)?
+        } else {
+            self.expr(&u.operand)?
+        };
         Ok(match u.op {
             py::UnaryOp::Not => {
                 let cond = self.truthy(operand);
@@ -6820,6 +6873,12 @@ impl<'m> Lowerer<'m> {
         right_expr: &py::Expr,
         span: Span,
     ) -> Result<Val> {
+        if let Some(ty) = num::num_binop(op, left.ty, right.ty) {
+            let node = self.num_arith(op, left, right, ty, span);
+            return Ok(Val { node, ty });
+        }
+        // Any other operation reads a run-time number as its box.
+        let (left, right) = (self.boxed_num(left), self.boxed_num(right));
         if let Ty::Class(k) = left.ty {
             let name = types::dunder_name(op);
             if let Some(r) = self.dunder(k as usize, name, left.node, vec![right], span) {
@@ -7155,6 +7214,11 @@ impl<'m> Lowerer<'m> {
 
     /// One comparison between two typed values.
     fn compare_one(&mut self, op: py::CmpOp, left: Val, right: Val, span: Span) -> Result<Node> {
+        let (left, right) = if matches!(op, py::CmpOp::Is | py::CmpOp::IsNot) {
+            (left, right)
+        } else {
+            (self.boxed_num(left), self.boxed_num(right))
+        };
         let negate = |n: Node| {
             node(
                 TypedExpression::Unary(TypedUnary {
@@ -7323,7 +7387,37 @@ impl<'m> Lowerer<'m> {
                 return Ok(if op == py::CmpOp::NotIn { negate(n) } else { n });
             }
             py::CmpOp::Is | py::CmpOp::IsNot => {
+                let (left, right) = match (left.ty, right.ty) {
+                    (Ty::Num(_), Ty::None) | (Ty::None, Ty::Num(_)) => (left, right),
+                    _ => (self.boxed_num(left), self.boxed_num(right)),
+                };
                 let n = match (left.ty, right.ty) {
+                    (Ty::Num(_), Ty::None) => {
+                        let none = Self::after_none(
+                            right.node,
+                            node(
+                                TypedExpression::Literal(TypedLiteral::Bool(true)),
+                                Ty::Bool,
+                                span,
+                            ),
+                            Ty::Bool,
+                        );
+                        let test = self.num_is_none(left);
+                        binary(BinaryOp::And, test, none, Ty::Bool, span)
+                    }
+                    (Ty::None, Ty::Num(_)) => {
+                        let none = Self::after_none(
+                            left.node,
+                            node(
+                                TypedExpression::Literal(TypedLiteral::Bool(true)),
+                                Ty::Bool,
+                                span,
+                            ),
+                            Ty::Bool,
+                        );
+                        let test = self.num_is_none(right);
+                        binary(BinaryOp::And, none, test, Ty::Bool, span)
+                    }
                     (Ty::None, Ty::None) => node(
                         TypedExpression::Literal(TypedLiteral::Bool(true)),
                         Ty::Bool,
@@ -7653,9 +7747,19 @@ impl<'m> Lowerer<'m> {
     /// hidden local first, and the whole comparison becomes a block
     /// whose value is the chain.
     fn compare(&mut self, c: &py::ExprCompare, span: Span) -> Result<Val> {
-        let mut operands = vec![self.expr(&c.left)?];
+        // `x is None` reads a run-time number's tag.
+        let identity = matches!(c.ops.as_ref(), [py::CmpOp::Is | py::CmpOp::IsNot]);
+        let mut operands = vec![if identity {
+            self.expr_num(&c.left)?
+        } else {
+            self.expr(&c.left)?
+        }];
         for x in c.comparators.iter() {
-            operands.push(self.expr(x)?);
+            operands.push(if identity {
+                self.expr_num(x)?
+            } else {
+                self.expr(x)?
+            });
         }
         let mut bindings = Vec::new();
         for operand in operands.iter_mut().take(c.ops.len()).skip(1) {
@@ -8066,7 +8170,7 @@ impl<'m> Lowerer<'m> {
         ));
         for g in generators.iter().rev() {
             for cond in g.ifs.iter().rev() {
-                let test = self.expr(cond)?;
+                let test = self.expr_num(cond)?;
                 let condition = self.truthy(test);
                 let mut with_test = std::mem::take(&mut self.hoisted);
                 with_test.push(TypedNode::new(

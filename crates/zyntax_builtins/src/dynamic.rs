@@ -432,6 +432,122 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         let v = local("v", ty);
         d.push(define(name, &[&v], any(), vec![ret(v.e())]));
     }
+    // A run-time number of a frontend (tag NONE 0, FALSE 1, TRUE 2,
+    // INT 3, FLOAT 4, then the int and the float) as the box a plain
+    // value of its kind makes, and a box read back as one. `zb_num_tag`
+    // is -1 for a box that is no number, bool or None.
+    {
+        let t = local("tag", i64());
+        let i = local("int", i64());
+        let f = local("float", f64());
+        d.push(define(
+            "zb_num_box",
+            &[&t, &i, &f],
+            any(),
+            vec![
+                when(eq(t.e(), int(0)), vec![ret(null(any()))]),
+                when(
+                    le(t.e(), int(2)),
+                    vec![ret(call("zb_box_bool", vec![eq(t.e(), int(2))], any()))],
+                ),
+                when(eq(t.e(), int(3)), vec![ret(box_i64(i.e()))]),
+                ret(box_f64(f.e())),
+            ],
+        ));
+    }
+    d.push(define(
+        "zb_num_tag",
+        &[&x],
+        i64(),
+        vec![
+            cat.decl(category(x.e())),
+            when(is(&cat, NONE), vec![ret(int(0))]),
+            when(
+                is(&cat, BOOL),
+                vec![ret(if_expr(get_bool(x.e()), int(2), int(1)))],
+            ),
+            when(is_int(&cat), vec![ret(int(3))]),
+            when(is(&cat, FLOAT), vec![ret(int(4))]),
+            ret(int(-1)),
+        ],
+    ));
+    // The tag of `x` read as a number of the kinds `mask` names (bits
+    // NONE 1, BOOL 2, INT 4, FLOAT 8), or the TypeError of reading it so.
+    {
+        let mask = local("mask", i64());
+        let t = local("t", i64());
+        d.push(define(
+            "zb_num_tag_in",
+            &[&x, &mask],
+            i64(),
+            vec![
+                t.decl(call("zb_num_tag", vec![x.e()], i64())),
+                when(
+                    and(
+                        ge(t.e(), int(0)),
+                        ne(
+                            bitand(
+                                mask.e(),
+                                if_expr(
+                                    eq(t.e(), int(0)),
+                                    int(1),
+                                    if_expr(
+                                        le(t.e(), int(2)),
+                                        int(2),
+                                        shl(int(1), sub(t.e(), int(1))),
+                                    ),
+                                ),
+                            ),
+                            int(0),
+                        ),
+                    ),
+                    vec![ret(t.e())],
+                ),
+                type_error(add(text("expected a number, not "), type_name(x.e()))),
+                ret(int(0)),
+            ],
+        ));
+    }
+    // What `%d` formats: an int or a bool as it is, a float truncated,
+    // anything else the TypeError.
+    d.push(define(
+        "zb_any_pct_int",
+        &[&x],
+        any(),
+        vec![
+            cat.decl(category(x.e())),
+            when(
+                is(&cat, FLOAT),
+                vec![ret(box_i64(cast(get_f64(x.e()), i64())))],
+            ),
+            when(is_integral(&cat), vec![ret(x.e())]),
+            type_error(add(
+                text("%d format: a real number is required, not "),
+                type_name(x.e()),
+            )),
+            ret(x.e()),
+        ],
+    ));
+    d.push(define(
+        "zb_num_int",
+        &[&x],
+        i64(),
+        vec![
+            cat.decl(category(x.e())),
+            when(is_integral(&cat), vec![ret(number_i64(x.e(), cat.e()))]),
+            ret(int(0)),
+        ],
+    ));
+    d.push(define(
+        "zb_num_float",
+        &[&x],
+        f64(),
+        vec![
+            cat.decl(category(x.e())),
+            when(is(&cat, FLOAT), vec![ret(get_f64(x.e()))]),
+            ret(float(0.0)),
+        ],
+    ));
     d.push(extern_fn(
         "zb_str_to_dynamic",
         &[("s", string())],

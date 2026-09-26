@@ -1,0 +1,12 @@
+0 0 True v0 v0
+0 1 True v0 v0
+0 2 True v0 v0
+{1: 'v0'}
+1 0 True v1 v1
+1 1 True v1 v1
+1 2 True v1 v1
+{1.0: 'v1'}
+2 0 True v2 v2
+2 1 True v2 v2
+2 2 True v2 v2
+{True: 'v2'}

@@ -6,7 +6,9 @@
 //! it. The lattice is flat: the primitives the IR can hold unboxed, and
 //! `Object` for a value the runtime owns. A name assigned two different
 //! primitives is `Object`, not their least upper bound, since `x = 1`
-//! followed by `x = 2.5` must still print `1` between the two.
+//! followed by `x = 2.5` must still print `1` between the two; a local
+//! assigned several of int, float, bool and None is instead a
+//! [`Ty::Num`], which carries the kind with the value.
 //!
 //! Inference runs to a fixed point twice: over the module's function
 //! signatures, so an unannotated return type is the join of what the
@@ -70,6 +72,10 @@ pub(crate) enum Ty {
     /// [`BUILTIN_VALUES`]: `xrange = range`. A call through the name is
     /// the builtin's call.
     Builtin(u8),
+    /// A local assigned more than one of int, float, bool and None: the
+    /// kinds its mask names (see [`Ty::num`]). A value struct of a tag,
+    /// the int and the float, as [`crate::num`] lays it out.
+    Num(u8),
     /// A dynamic value: a boxed `Any`.
     Object,
     #[default]
@@ -396,6 +402,7 @@ pub(crate) fn array_kinds() -> Vec<zyntax_builtins::Kind> {
 
 /// The dict type with these key and value types.
 pub(crate) fn dict_of(key: Ty, value: Ty) -> Ty {
+    let (key, value) = (key.boxed_view(), value.boxed_view());
     DICT_SHAPES.with(|t| {
         let mut table = t.borrow_mut();
         if let Some(k) = table.iter().position(|shape| *shape == (key, value)) {
@@ -443,7 +450,7 @@ pub(crate) fn tuple_of(elems: Vec<Ty>) -> Ty {
     let elems: Vec<Ty> = elems
         .into_iter()
         .map(|t| match t {
-            Ty::None | Ty::Gen => Ty::Object,
+            Ty::None | Ty::Gen | Ty::Num(_) => Ty::Object,
             other => other,
         })
         .collect();
@@ -464,11 +471,66 @@ pub(crate) fn tuple_shape(k: u16) -> Vec<Ty> {
 }
 
 impl Ty {
+    /// The mask bits of [`Ty::Num`].
+    pub(crate) const NUM_NONE: u8 = 1;
+    pub(crate) const NUM_BOOL: u8 = 2;
+    pub(crate) const NUM_INT: u8 = 4;
+    pub(crate) const NUM_FLOAT: u8 = 8;
+
+    /// The type whose values are the kinds `mask` names: one kind is
+    /// its own type, several a [`Ty::Num`].
+    pub(crate) fn num(mask: u8) -> Ty {
+        match mask {
+            0 => Ty::Unknown,
+            Ty::NUM_NONE => Ty::None,
+            Ty::NUM_BOOL => Ty::Bool,
+            Ty::NUM_INT => Ty::Int,
+            Ty::NUM_FLOAT => Ty::Float,
+            m => Ty::Num(m),
+        }
+    }
+
+    /// The kinds a value of this type can be, when they are among int,
+    /// float, bool and None.
+    pub(crate) fn mask(self) -> Option<u8> {
+        match self {
+            Ty::None => Some(Ty::NUM_NONE),
+            Ty::Bool => Some(Ty::NUM_BOOL),
+            Ty::Int => Some(Ty::NUM_INT),
+            Ty::Float => Some(Ty::NUM_FLOAT),
+            Ty::Num(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// A value struct of [`Ty::Num`] is read as the box it stands for
+    /// wherever the reader has no arm of its own for it.
+    pub(crate) fn boxed_view(self) -> Ty {
+        match self {
+            Ty::Num(_) => Ty::Object,
+            t => t,
+        }
+    }
+
+    /// The join of two assignments to a local: two of int, float, bool
+    /// and None make a [`Ty::Num`] of them, where [`Ty::join`] makes
+    /// them dynamic.
+    pub(crate) fn join_local(self, other: Ty) -> Ty {
+        match (self.mask(), other.mask()) {
+            (Some(a), Some(b)) if crate::lower::num::enabled() => Ty::num(a | b),
+            _ => self.join(other),
+        }
+    }
+
     /// The join of two assignments to one name.
     pub(crate) fn join(self, other: Ty) -> Ty {
         match (self, other) {
             (Ty::Unknown, t) | (t, Ty::Unknown) => t,
             (a, b) if a == b => a,
+            // A run-time number takes in another of its kinds.
+            (Ty::Num(a), b) | (b, Ty::Num(a)) if b.mask().is_some() => {
+                Ty::num(a | b.mask().unwrap_or(0))
+            }
             // An instance is a pointer, and None is the null one.
             (Ty::None, Ty::Class(k)) | (Ty::Class(k), Ty::None) => Ty::Class(k),
             // Two shapes of one arity join element by element.
@@ -530,6 +592,19 @@ impl Ty {
                 format!("Dict({})", list(vec![key, value]))
             }
             Ty::List(Elem::Tuple(k)) => format!("List({})", Ty::Tuple(k).describe()),
+            Ty::Num(m) => {
+                let names: Vec<&str> = [
+                    (Ty::NUM_INT, "int"),
+                    (Ty::NUM_FLOAT, "float"),
+                    (Ty::NUM_BOOL, "bool"),
+                    (Ty::NUM_NONE, "None"),
+                ]
+                .into_iter()
+                .filter(|(bit, _)| m & bit != 0)
+                .map(|(_, name)| name)
+                .collect();
+                format!("Num({})", names.join("|"))
+            }
             other => format!("{other:?}"),
         }
     }
@@ -3604,6 +3679,11 @@ fn infer_locals_with(
         true,
     );
     locals.narrowed = asserted_classes(body, &module.class_index);
+    let shared: HashSet<String> = scope
+        .children
+        .iter()
+        .flat_map(|(_, child)| child.free.iter().cloned())
+        .collect();
     for _ in 0..8 {
         let before = locals.clone();
         // The result is decided afresh each round, from the types known
@@ -3615,6 +3695,7 @@ fn infer_locals_with(
             locals: &mut locals,
             params: &sig.params,
             seeds,
+            shared: &shared,
             fills: &fills,
         };
         for (i, s) in body.iter().enumerate() {
@@ -4537,6 +4618,9 @@ struct Walker<'a> {
     locals: &'a mut Locals,
     params: &'a [(String, Ty)],
     seeds: &'a HashMap<String, Ty>,
+    /// Locals a nested body reads or writes: they live in cells, as
+    /// boxes, so they never become a [`Ty::Num`].
+    shared: &'a HashSet<String>,
     /// The uses of each local bound only to unkinded list literals,
     /// whose kind is decided from them at each such binding.
     fills: &'a HashMap<String, ListSites<'a>>,
@@ -4551,7 +4635,9 @@ impl Walker<'_> {
         }
     }
 
-    fn assign(&mut self, name: &str, ty: Ty) {
+    fn assign(&mut self, name: &str, value: Ty) {
+        // Only a local of this body holds a run-time number unboxed.
+        let ty = value.boxed_view();
         // A declared global or nonlocal is another scope's variable.
         if let Some(written) = self.locals.global_writes.get_mut(name) {
             *written = written.join(ty);
@@ -4592,7 +4678,12 @@ impl Walker<'_> {
             return;
         }
         let current = self.locals.vars.get(name).copied().unwrap_or(Ty::Unknown);
-        let joined = self.module.join_classes(current, ty);
+        let numeric = |t: Ty| t.mask().is_some() || t == Ty::Unknown;
+        let joined = if numeric(current) && value.mask().is_some() && !self.shared.contains(name) {
+            current.join_local(value)
+        } else {
+            self.module.join_classes(current, ty)
+        };
         self.locals.vars.insert(name.to_string(), joined);
     }
 
@@ -4716,7 +4807,13 @@ impl Walker<'_> {
     fn stmt(&mut self, s: &py::Stmt) {
         match s {
             py::Stmt::Assign(a) => {
-                let ty = self.expr(&a.value);
+                // A local takes a run-time number as itself; any other
+                // target reads it as its box.
+                let ty = if a.targets.iter().all(|t| matches!(t, py::Expr::Name(_))) {
+                    self.expr_num(&a.value)
+                } else {
+                    self.expr(&a.value)
+                };
                 for t in &a.targets {
                     if a.targets.len() == 1 && self.target_tuple_literal(t, &a.value) {
                         continue;
@@ -4774,8 +4871,11 @@ impl Walker<'_> {
                 }
             }
             py::Stmt::AugAssign(a) => {
-                let lhs = self.expr(&a.target);
-                let rhs = self.expr(&a.value);
+                let (lhs, rhs) = if matches!(&*a.target, py::Expr::Name(_)) {
+                    (self.expr_num(&a.target), self.expr_num(&a.value))
+                } else {
+                    (self.expr(&a.target), self.expr(&a.value))
+                };
                 let ty = binop(a.op, lhs, rhs, &a.value);
                 self.target(&a.target, ty);
             }
@@ -4887,12 +4987,11 @@ impl Walker<'_> {
     }
 
     fn expr(&self, e: &py::Expr) -> Ty {
-        Typer {
-            module: self.module,
-            vars: &self.locals.vars,
-            outer: self.seeds,
-        }
-        .expr(e)
+        self.typer().expr(e)
+    }
+
+    fn expr_num(&self, e: &py::Expr) -> Ty {
+        self.typer().expr_num(e)
     }
 }
 
@@ -5196,6 +5295,10 @@ pub(crate) fn reflected_dunder_name(op: py::Operator) -> &'static str {
 /// What `left op right` produces. `/` is always a float on numbers,
 /// `**` with a negative literal exponent too.
 pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
+    if let Some(ty) = crate::lower::num::num_binop(op, l, r) {
+        return ty;
+    }
+    let (l, r) = (l.boxed_view(), r.boxed_view());
     match op {
         // A `%` format.
         py::Operator::Mod if l == Ty::Str => Ty::Str,
@@ -5494,7 +5597,15 @@ impl Typer<'_> {
             || self.module.globals.contains_key(name)
     }
 
+    /// The type of `e` as a reader without an arm for [`Ty::Num`] sees
+    /// it: such a value is read as its box.
     pub(crate) fn expr(&self, e: &py::Expr) -> Ty {
+        self.expr_num(e).boxed_view()
+    }
+
+    /// The type of `e`, a [`Ty::Num`] as itself: for the readers that
+    /// compute on its parts (an assignment to a local, arithmetic).
+    pub(crate) fn expr_num(&self, e: &py::Expr) -> Ty {
         match e {
             py::Expr::NumberLiteral(n) => match &n.value {
                 py::Number::Int(_) => Ty::Int,
@@ -5534,15 +5645,19 @@ impl Typer<'_> {
                 Ty::Object
             }
             py::Expr::BinOp(b) => {
-                let l = self.expr(&b.left);
-                let r = self.expr(&b.right);
+                let l = self.expr_num(&b.left);
+                let r = self.expr_num(&b.right);
                 // An instance takes part through its class's method, and
                 // the result is what that method returns.
                 if let Ty::Class(k) = l
                     && let Some((sig, name)) = self.module.method_sig(k as usize, dunder_name(b.op))
                 {
                     if sig.params.len() == 2 {
-                        return self.module.instance_ret(&name, sig, &[Ty::Unknown, r]);
+                        return self.module.instance_ret(
+                            &name,
+                            sig,
+                            &[Ty::Unknown, r.boxed_view()],
+                        );
                     }
                     return sig.ret;
                 }

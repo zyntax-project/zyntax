@@ -536,6 +536,19 @@ impl Lowerer<'_> {
                         node: crate::lower::cast(value.node, Ty::Int, span),
                         ty: Ty::Int,
                     },
+                    // A float found at run time truncates as a typed one.
+                    Ty::Object => {
+                        let node = crate::lower::call(
+                            "zb_any_pct_int",
+                            vec![value.node],
+                            Ty::Object,
+                            span,
+                        );
+                        self.checked(Val {
+                            node,
+                            ty: Ty::Object,
+                        })
+                    }
                     _ => value,
                 }
             }
