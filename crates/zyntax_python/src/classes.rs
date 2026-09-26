@@ -425,6 +425,33 @@ pub(crate) fn raise_facts(
     }
 }
 
+/// The classes whose instance struct is exact: a pointer typed as one
+/// points at an instance of that class and never at one of another
+/// class viewed through it. That holds for a leaf class (no class
+/// derives from it) because every value typed as its instance comes
+/// from one of:
+/// - `C$new`, which builds one;
+/// - `C$unbox` and the checked unboxing in `Lowerer::coerce`, which
+///   test the box's kind against the class's range first;
+/// - the arms of `per_class` (dispatchers, hooks, class sets), each
+///   taken on its own class's kind;
+/// - `Lowerer::trusted`, reading back a box the lowering stored as that
+///   class;
+/// - a list of `Elem::Class`, whose element stores are coerced to the
+///   class first;
+/// - a cast along one chain in `Lowerer::coerce`: an upcast never
+///   targets a leaf, and a downcast records its target in
+///   `Module::downcasts`, which is left out.
+///
+/// Class 0 is left out too: the instance hook reads every instance's
+/// `$class` through it.
+pub(crate) fn exact_classes(module: &Module) -> Vec<usize> {
+    let downcasts = module.downcasts.borrow();
+    (1..module.classes.len())
+        .filter(|&k| module.classes[k].descendants == 1 && !downcasts.contains(&k))
+        .collect()
+}
+
 /// The functions every class needs: construction, unboxing, dispatch.
 /// Marked generated, so their bodies are not type checked.
 pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
@@ -506,6 +533,11 @@ fn raiser(module: &Module, class: &str, span: Span) -> TypedFunction {
     );
     f.annotations.push(TypedAnnotation {
         name: intern("cold"),
+        args: Vec::new(),
+        span,
+    });
+    f.annotations.push(TypedAnnotation {
+        name: intern("sets_error_flag"),
         args: Vec::new(),
         span,
     });
@@ -3402,6 +3434,14 @@ pub(crate) fn raise_hook(module: &Module) -> TypedFunction {
         args: Vec::new(),
         span,
     });
+    // Every path stores an exception, the unknown kinds included.
+    if module.class_index.contains_key("RuntimeError") {
+        hook.annotations.push(TypedAnnotation {
+            name: intern("sets_error_flag"),
+            args: Vec::new(),
+            span,
+        });
+    }
     hook.mark_generated();
     hook
 }
@@ -3411,27 +3451,28 @@ fn raise_hook_body(module: &Module, span: Span) -> TypedFunction {
     let kind = var(intern("kind"), Ty::Str, span);
     let message = var(intern("message"), Ty::Str, span);
     let mut statements = Vec::new();
-    for name in crate::prelude::EXCEPTION_KINDS {
-        let Some(&k) = module.class_index.get(*name) else {
-            continue;
-        };
+    let mut store = |class: &str, message: Node| -> Option<TypedNode<TypedStatement>> {
+        let &k = module.class_index.get(class)?;
         let instance = Val {
-            node: call(
-                &new_name(name),
-                vec![message.clone()],
-                Ty::Class(k as u16),
-                span,
-            ),
+            node: call(&new_name(class), vec![message], Ty::Class(k as u16), span),
             ty: Ty::Class(k as u16),
         };
         let boxed = lowerer.coerce(instance, Ty::Object);
-        let set = binary(
-            BinaryOp::Assign,
-            var(intern(lower::PENDING), Ty::Object, span),
-            boxed,
-            Ty::None,
+        Some(stmt(
+            binary(
+                BinaryOp::Assign,
+                var(intern(lower::PENDING), Ty::Object, span),
+                boxed,
+                Ty::None,
+                span,
+            ),
             span,
-        );
+        ))
+    };
+    for name in crate::prelude::EXCEPTION_KINDS {
+        let Some(set) = store(name, message.clone()) else {
+            continue;
+        };
         let matches = call(
             "zb_str_eq",
             vec![kind.clone(), str_lit(name, span)],
@@ -3441,12 +3482,28 @@ fn raise_hook_body(module: &Module, span: Span) -> TypedFunction {
         statements.push(when(
             matches,
             vec![
-                stmt(set, span),
+                set,
                 TypedNode::new(TypedStatement::Return(None), Type::Unknown, span),
             ],
             span,
         ));
     }
+    // A kind no class is named for is still an exception: a
+    // RuntimeError naming it.
+    let named = binary(
+        BinaryOp::Add,
+        binary(
+            BinaryOp::Add,
+            kind.clone(),
+            str_lit(": ", span),
+            Ty::Str,
+            span,
+        ),
+        message.clone(),
+        Ty::Str,
+        span,
+    );
+    statements.extend(store("RuntimeError", named));
     function(
         "zb_hook_raise",
         vec![

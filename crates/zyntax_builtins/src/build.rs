@@ -725,6 +725,98 @@ fn callees_of_expr(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
     }
 }
 
+/// The functions `stmt` calls by name, into `out`, with `opaque` set
+/// when it may call something no name says: a call through a value, a
+/// method call, or a construct this walk does not look into.
+pub fn named_calls_of_stmt(
+    stmt: &Stmt,
+    out: &mut std::collections::BTreeSet<String>,
+    opaque: &mut bool,
+) {
+    let block = |b: &zyntax_typed_ast::typed_ast::TypedBlock,
+                 out: &mut std::collections::BTreeSet<String>,
+                 opaque: &mut bool| {
+        for s in &b.statements {
+            named_calls_of_stmt(s, out, opaque);
+        }
+    };
+    match &stmt.node {
+        TypedStatement::Expression(e) => named_calls_of_expr(e, out, opaque),
+        TypedStatement::Let(l) => {
+            if let Some(init) = &l.initializer {
+                named_calls_of_expr(init, out, opaque);
+            }
+        }
+        TypedStatement::Return(e) | TypedStatement::Break(e) => {
+            if let Some(e) = e {
+                named_calls_of_expr(e, out, opaque);
+            }
+        }
+        TypedStatement::If(i) => {
+            named_calls_of_expr(&i.condition, out, opaque);
+            block(&i.then_block, out, opaque);
+            if let Some(e) = &i.else_block {
+                block(e, out, opaque);
+            }
+        }
+        TypedStatement::While(w) => {
+            named_calls_of_expr(&w.condition, out, opaque);
+            block(&w.body, out, opaque);
+        }
+        TypedStatement::Block(b) => block(b, out, opaque),
+        TypedStatement::Continue => {}
+        _ => *opaque = true,
+    }
+}
+
+fn named_calls_of_expr(e: &Expr, out: &mut std::collections::BTreeSet<String>, opaque: &mut bool) {
+    fn each(es: &[Expr], out: &mut std::collections::BTreeSet<String>, opaque: &mut bool) {
+        for a in es {
+            named_calls_of_expr(a, out, opaque);
+        }
+    }
+    match &e.node {
+        TypedExpression::Literal(_) | TypedExpression::Variable(_) => {}
+        TypedExpression::Call(c) => {
+            match &c.callee.node {
+                TypedExpression::Variable(n) if n.resolve_global().is_some() => {
+                    out.insert(n.resolve_global().unwrap_or_default());
+                }
+                _ => *opaque = true,
+            }
+            if !c.named_args.is_empty() {
+                *opaque = true;
+            }
+            each(&c.positional_args, out, opaque);
+        }
+        TypedExpression::Binary(b) => {
+            named_calls_of_expr(&b.left, out, opaque);
+            named_calls_of_expr(&b.right, out, opaque);
+        }
+        TypedExpression::Unary(u) => named_calls_of_expr(&u.operand, out, opaque),
+        TypedExpression::Field(f) => named_calls_of_expr(&f.object, out, opaque),
+        TypedExpression::Index(i) => {
+            named_calls_of_expr(&i.object, out, opaque);
+            named_calls_of_expr(&i.index, out, opaque);
+        }
+        TypedExpression::Cast(c) => named_calls_of_expr(&c.expr, out, opaque),
+        TypedExpression::If(i) => {
+            named_calls_of_expr(&i.condition, out, opaque);
+            named_calls_of_expr(&i.then_branch, out, opaque);
+            named_calls_of_expr(&i.else_branch, out, opaque);
+        }
+        TypedExpression::Array(items) | TypedExpression::Tuple(items) => each(items, out, opaque),
+        TypedExpression::Struct(s) => {
+            for f in &s.fields {
+                named_calls_of_expr(&f.value, out, opaque);
+            }
+        }
+        TypedExpression::Reference(r) => named_calls_of_expr(&r.expr, out, opaque),
+        TypedExpression::Dereference(d) => named_calls_of_expr(d, out, opaque),
+        _ => *opaque = true,
+    }
+}
+
 /// Every call whose result type differs from its callee's declared
 /// return type, as `caller: callee declared T, called as U`. A call
 /// node's type is what the caller's code is built against, so a

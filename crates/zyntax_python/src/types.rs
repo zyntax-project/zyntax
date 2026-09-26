@@ -1317,6 +1317,10 @@ pub(crate) struct Module {
     /// cold `py$raise$Class(message)` that builds the instance and
     /// leaves it pending; see `classes::raisers`.
     pub(crate) raisers: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Classes an instance of a base is cast down to without a check of
+    /// its class: a pointer typed as one of these may be viewing an
+    /// instance of the base, so none is declared exact.
+    pub(crate) downcasts: std::cell::RefCell<std::collections::BTreeSet<usize>>,
 }
 
 /// The name of the function raising exception class `class` with a

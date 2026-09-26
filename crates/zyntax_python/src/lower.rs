@@ -2456,6 +2456,9 @@ impl<'m> Lowerer<'m> {
                 if self.module.is_subclass(a as usize, b as usize)
                     || self.module.is_subclass(b as usize, a as usize) =>
             {
+                if a != b && self.module.is_subclass(b as usize, a as usize) {
+                    self.module.downcasts.borrow_mut().insert(b as usize);
+                }
                 cast(v.node, target, span)
             }
             // A dict iterates as its keys and a set as its elements, as

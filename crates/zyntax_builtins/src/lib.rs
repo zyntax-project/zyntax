@@ -254,6 +254,11 @@ pub struct Library {
     /// The functions that can report an error: those calling `zb_fatal`,
     /// and those calling one of them, and so on.
     pub fallible: std::collections::BTreeSet<String>,
+    /// The functions that never touch the frontend's pending error: not
+    /// fallible, and reaching no hook the frontend defines, no fiber or
+    /// foreign call and no call through a value. Their declarations
+    /// carry the `nothrow` annotation.
+    pub nothrow: std::collections::BTreeSet<String>,
 }
 
 /// The library for one language's spellings.
@@ -300,12 +305,111 @@ pub fn library(policy: &Policy) -> Library {
         build::mismatched_call_results(&declarations).join("; ")
     );
     let fallible = fallible_functions(&declarations);
+    let nothrow = nothrow_functions(&declarations, &fallible);
+    annotate(&mut declarations, |name| {
+        let mut marks = Vec::new();
+        if nothrow.contains(name) {
+            marks.push("nothrow");
+        }
+        // With exceptions on, `zb_fatal` returns after the frontend's
+        // `zb_hook_raise`, which leaves an exception pending on every
+        // path.
+        if policy.exceptions && name == "zb_fatal" {
+            marks.push("sets_error_flag");
+        }
+        marks
+    });
     Library {
         declarations,
         type_registry: b.registry,
         list_type,
         fallible,
+        nothrow,
     }
+}
+
+/// Adds the annotations `marks` names to each function declaration.
+fn annotate(declarations: &mut [Decl], marks: impl Fn(&str) -> Vec<&'static str>) {
+    use zyntax_typed_ast::typed_ast::{TypedAnnotation, TypedDeclaration};
+    for d in declarations {
+        if let TypedDeclaration::Function(f) = &mut d.node
+            && let Some(name) = f.name.resolve_global()
+        {
+            for mark in marks(&name) {
+                f.annotations.push(TypedAnnotation {
+                    name: zyntax_typed_ast::InternedString::new_global(mark),
+                    args: Vec::new(),
+                    span: zyntax_typed_ast::Span::new(0, 0),
+                });
+            }
+        }
+    }
+}
+
+/// Whether an extern is one the frontend or the host defines to run
+/// code of the program's: its hooks, fibers and foreign calls.
+fn is_hook(name: &str) -> bool {
+    name.starts_with("zb_hook_") || name.starts_with("zb_fiber_") || name.starts_with("zb_foreign_")
+}
+
+/// The greatest set of functions outside `fallible` whose every call
+/// names a function of the set or an extern that is not a hook. A
+/// function calling through a value, or through anything the walk does
+/// not see into, is left out.
+fn nothrow_functions(
+    declarations: &[Decl],
+    fallible: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use zyntax_typed_ast::typed_ast::TypedDeclaration;
+    let mut calls: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut externs: BTreeSet<String> = BTreeSet::new();
+    let mut quiet: BTreeSet<String> = BTreeSet::new();
+    for d in declarations {
+        let TypedDeclaration::Function(f) = &d.node else {
+            continue;
+        };
+        let Some(name) = f.name.resolve_global() else {
+            continue;
+        };
+        match &f.body {
+            None => {
+                if !is_hook(&name) {
+                    externs.insert(name);
+                }
+            }
+            Some(body) => {
+                let mut callees = BTreeSet::new();
+                let mut opaque = false;
+                for s in &body.statements {
+                    build::named_calls_of_stmt(s, &mut callees, &mut opaque);
+                }
+                if !opaque && !fallible.contains(&name) {
+                    quiet.insert(name.clone());
+                }
+                calls.insert(name, callees);
+            }
+        }
+    }
+    loop {
+        let demoted: Vec<String> = quiet
+            .iter()
+            .filter(|n| {
+                calls[*n]
+                    .iter()
+                    .any(|c| !quiet.contains(c) && !externs.contains(c))
+            })
+            .cloned()
+            .collect();
+        if demoted.is_empty() {
+            break;
+        }
+        for n in demoted {
+            quiet.remove(&n);
+        }
+    }
+    quiet.extend(externs);
+    quiet
 }
 
 /// Every function that reaches `zb_fatal`, through any number of calls.
@@ -431,5 +535,59 @@ mod tests {
             let mismatched = build::mismatched_call_results(&lib.declarations);
             assert!(mismatched.is_empty(), "{}", mismatched.join("\n"));
         }
+    }
+
+    #[test]
+    fn nothrow_is_derived_and_zb_fatal_sets_the_flag() {
+        let lib = library(&Policy {
+            true_text: "True",
+            false_text: "False",
+            none_text: "None",
+            single_quotes: true,
+            float_fraction: true,
+            instance_hooks: true,
+            exceptions: true,
+            bool_is_number: true,
+            type_names: TypeNames {
+                none: "NoneType",
+                bool: "bool",
+                int: "int",
+                float: "float",
+                str: "str",
+                bytes: "bytes",
+                list: "list",
+                tuple: "tuple",
+                dict: "dict",
+                set: "set",
+                frozenset: "frozenset",
+                function: "function",
+                object: "object",
+            },
+        });
+        let marks = |name: &str| -> Vec<String> {
+            lib.declarations
+                .iter()
+                .find_map(|d| match &d.node {
+                    zyntax_typed_ast::typed_ast::TypedDeclaration::Function(f)
+                        if f.name.resolve_global().as_deref() == Some(name) =>
+                    {
+                        Some(
+                            f.annotations
+                                .iter()
+                                .filter_map(|a| a.name.resolve_global())
+                                .collect(),
+                        )
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        assert!(marks("zb_fatal").iter().any(|m| m == "sets_error_flag"));
+        assert!(!lib.nothrow.contains("zb_fatal"));
+        assert!(lib.nothrow.contains("zb_float_repr"));
+        // Nothing fallible, and no hook, is nothrow.
+        assert!(lib.nothrow.is_disjoint(&lib.fallible));
+        assert!(!lib.nothrow.iter().any(|n| is_hook(n)));
+        assert!(marks("zb_float_repr").iter().any(|m| m == "nothrow"));
     }
 }

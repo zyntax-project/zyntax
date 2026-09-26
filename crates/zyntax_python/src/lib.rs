@@ -247,6 +247,8 @@ pub fn register_runtime(
     // No Python program releases anything itself, so the compiler
     // releases what it can prove dead and the collector takes the rest.
     runtime.set_automatic_release(true);
+    // The exception in flight is the pending-error global.
+    runtime.set_error_flag_global(lower::PENDING);
     runtime.set_collector(zyntax_embed::Collector::MarkSweep);
     // Programs declare no effects or handlers, and lower the same
     // without the structural cleanup.
@@ -1010,6 +1012,20 @@ fn parse_program_once(
         ));
     }
     declarations.extend(lower::shape_declarations(&inferred, library.list_type));
+    mark_nothrow(&mut declarations, &inferred.non_raising);
+    for k in classes::exact_classes(&inferred) {
+        if let Some(id) = inferred.classes[k].type_id
+            && let Some(def) = library.type_registry.get_type_by_id(id)
+        {
+            let mut def = def.clone();
+            def.metadata
+                .custom
+                .insert(intern(zyntax_embed::EXACT_STRUCT_KEY), String::new());
+            library
+                .type_registry
+                .register_type_in_module(def.module, def);
+        }
+    }
     lap("lower");
     // The library itself arrives by import: its declarations for
     // typing, its HIR to link against.
@@ -1031,6 +1047,32 @@ fn parse_program_once(
         source_files,
         type_registry: library.type_registry,
     })
+}
+
+/// Annotates `nothrow` the functions the raise facts prove leave no
+/// exception pending; one that raises by construction is never one.
+fn mark_nothrow(declarations: &mut [TypedNode<TypedDeclaration>], non_raising: &HashSet<String>) {
+    for d in declarations {
+        let TypedDeclaration::Function(f) = &mut d.node else {
+            continue;
+        };
+        let raises = f
+            .annotations
+            .iter()
+            .any(|a| a.name.resolve_global().as_deref() == Some("sets_error_flag"));
+        if !raises
+            && f.name
+                .resolve_global()
+                .is_some_and(|n| non_raising.contains(&n))
+        {
+            f.annotations
+                .push(zyntax_typed_ast::typed_ast::TypedAnnotation {
+                    name: intern("nothrow"),
+                    args: Vec::new(),
+                    span: Span::new(0, 0),
+                });
+        }
+    }
 }
 
 /// Module aliases to modules, and local names to the module and member

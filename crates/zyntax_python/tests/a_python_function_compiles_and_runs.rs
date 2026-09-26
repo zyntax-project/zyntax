@@ -261,3 +261,82 @@ def main() -> int:
         ZyntaxValue::Int(4)
     );
 }
+
+/// The annotations the lowering reads as error-flag facts: raisers set
+/// the flag, a function the raise facts prove quiet is nothrow and one
+/// that raises is not.
+#[test]
+fn error_flag_facts_are_annotated() {
+    use zyntax_typed_ast::typed_ast::TypedDeclaration;
+    let source = r#"
+def quiet(a, b):
+    return a + b
+
+def loud(n):
+    assert n > 0, "must be positive"
+    return n
+
+print(quiet(1, 2), loud(3))
+"#;
+    let program = zyntax_python::parse_program(source).expect("should lower");
+    let marks = |name: &str| -> Vec<String> {
+        program
+            .declarations
+            .iter()
+            .find_map(|d| match &d.node {
+                TypedDeclaration::Function(f)
+                    if f.name.resolve_global().as_deref() == Some(name) =>
+                {
+                    Some(
+                        f.annotations
+                            .iter()
+                            .filter_map(|a| a.name.resolve_global())
+                            .collect(),
+                    )
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no function {name}"))
+    };
+    let has = |name: &str, mark: &str| marks(name).iter().any(|m| m == mark);
+    assert!(has("py$raise$AssertionError", "sets_error_flag"));
+    assert!(has("zb_hook_raise", "sets_error_flag"));
+    assert!(has("quiet", "nothrow"));
+    assert!(!has("loud", "nothrow"));
+    assert!(!has("py$raise$AssertionError", "nothrow"));
+}
+
+/// Of a three-level hierarchy and an unrelated class, only the leaves
+/// are declared exact.
+#[test]
+fn only_leaf_classes_are_exact() {
+    let source = r#"
+class A:
+    def __init__(self, x):
+        self.x = x
+    def f(self):
+        return self.x
+class B(A):
+    def f(self):
+        return self.x + 1
+class C(B):
+    def f(self):
+        return self.x + 2
+class D:
+    def __init__(self):
+        self.y = 3
+
+print(C(1).f(), B(2).f(), A(3).f(), D().y)
+"#;
+    let program = zyntax_python::parse_program(source).expect("should lower");
+    let key = zyntax_typed_ast::InternedString::new_global(zyntax_embed::EXACT_STRUCT_KEY);
+    let mut exact: Vec<String> = program
+        .type_registry
+        .get_all_types()
+        .filter(|def| def.metadata.custom.contains_key(&key))
+        .filter_map(|def| def.name.resolve_global())
+        .filter(|n| ["A", "B", "C", "D"].contains(&n.as_str()))
+        .collect();
+    exact.sort();
+    assert_eq!(exact, ["C", "D"]);
+}
