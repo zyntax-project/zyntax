@@ -3418,10 +3418,11 @@ fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) ->
 /// not a generator, whose fiber is started by name; and not a method a
 /// subclass overrides, whose calls go through the dispatcher.
 fn specialisable(module: &Module, item: &Item<'_>) -> bool {
-    // A function named as a value keeps dynamic parameters for the
-    // calls out of view; a call through its value, or by its name, with
-    // typed arguments goes to an instance.
-    let valued = module.func_values.contains_key(&item.name)
+    // A function or method named as a value keeps dynamic parameters
+    // for the calls out of view; a call in view with typed arguments
+    // goes to an instance.
+    let valued = (module.func_values.contains_key(&item.name)
+        || (item.class.is_some() && !item.def.name.starts_with("__")))
         && item.def.parameters.vararg.is_none()
         && item.def.parameters.kwarg.is_none();
     if !(module.closed.contains(&item.name) || valued) || item.def.name.as_str() == "__init__" {
