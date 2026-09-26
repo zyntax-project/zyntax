@@ -37,6 +37,7 @@ mod lower;
 mod modules;
 mod prelude;
 mod rebind;
+mod records;
 mod scope;
 mod shape;
 mod stdlib;
@@ -277,6 +278,31 @@ pub fn parse_program_with(
     file: &str,
     modules: &modules::Resolver<'_>,
 ) -> Result<TypedProgram> {
+    // A record shape the lowering demotes is typed again as a dict, so
+    // the program is read again without it; shapes only ever leave.
+    let mut demoted: HashSet<Vec<String>> = HashSet::default();
+    loop {
+        let result = parse_program_once(source, file, modules, &demoted);
+        records::watch(false);
+        let mut found = records::demoted();
+        // A lowering that failed with records in the program is read
+        // again without them: what it refused may be a record's use.
+        if found.is_empty() && result.is_err() {
+            found = records::all_shapes();
+        }
+        if found.is_empty() {
+            return result;
+        }
+        demoted.extend(found);
+    }
+}
+
+fn parse_program_once(
+    source: &str,
+    file: &str,
+    modules: &modules::Resolver<'_>,
+    demoted: &HashSet<Vec<String>>,
+) -> Result<TypedProgram> {
     // `ZYNTAX_TRACE_LOWER_PHASES=1` times the frontend's steps on stderr,
     // the same switch the embedder's phase trace reads.
     let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
@@ -379,7 +405,12 @@ pub fn parse_program_with(
         }
     }
     let class_defs = classes::collect(&module.body, &origins)?;
-    let (class_infos, class_index) = classes::skeletons(&class_defs)?;
+    let (mut class_infos, mut class_index) = classes::skeletons(&class_defs)?;
+    // Record shapes are classes after the program's own.
+    for record in records::collect(&module.body, demoted, class_infos.len()) {
+        class_index.insert(record.name.clone(), class_infos.len());
+        class_infos.push(record);
+    }
     let mut items: Vec<types::Item<'_>> = defs
         .iter()
         .map(|(f, origin)| types::Item {
@@ -828,7 +859,9 @@ pub fn parse_program_with(
         }
         Ok(out)
     };
+    records::watch(true);
     lower_all(&inferred, &mut dropped)?;
+    records::watch(false);
     let mut facts = inferred.raise_facts.take();
     classes::raise_facts(&inferred, &mut facts);
     inferred.non_raising = types::non_raising(&facts);
@@ -843,6 +876,7 @@ pub fn parse_program_with(
     // The lowering kept reads dict and set shapes as the first one left
     // them joined.
     types::close_shape_classes();
+    records::watch(true);
     let kept = lower_all(&inferred, &mut dropped)?;
     declarations.extend(kept.into_iter().filter(|d| match &d.node {
         TypedDeclaration::Function(f) => f.name.resolve_global().is_none_or(|n| {
@@ -927,6 +961,13 @@ pub fn parse_program_with(
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(func),
             Type::Unknown,
+            Span::new(0, 0),
+        ));
+    }
+    records::watch(false);
+    if !records::demoted().is_empty() {
+        return Err(Error::unsupported_span(
+            "a dict literal used as a record",
             Span::new(0, 0),
         ));
     }

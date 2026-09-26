@@ -1,0 +1,16 @@
+{'id': 1, 'name': 'n1', 'ok': False}
+{'id': 1, 'name': 'n1', 'ok': False} {'id': 1, 'name': 'n1', 'ok': False}
+True True False
+3 True False
+id 1
+name n1
+ok False
+['id', 'name', 'ok'] [1, 'n1', False]
+True
+[{'id': 1, 'name': 'n1', 'ok': False}, 3, 'x']
+{"id": 1, "name": "n1", "ok": false}
+[{"id": 2, "name": "n2", "ok": true}, {"id": 3, "name": "n3", "ok": false}]
+True
+2 [0, 10, 20, 30]
+n1 7
+[('id', 1), ('name', 'n1'), ('ok', False)]

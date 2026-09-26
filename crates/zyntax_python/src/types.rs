@@ -2945,6 +2945,9 @@ pub(crate) fn infer_module(
             } else {
                 break;
             }
+            for (k, field, ty) in crate::records::take_writes() {
+                changed |= widen_field(&mut module.classes, k, &field, ty);
+            }
             for (callee, index, ty) in passed {
                 let slot = match &callee {
                     Target::Item(name) => {
@@ -4439,6 +4442,9 @@ pub(crate) fn list_sites<'ast>(
     names: Vec<String>,
     returns_read: bool,
 ) -> HashMap<String, ListSites<'ast>> {
+    // Sites are typed before the body binds its locals: a record's
+    // fields are typed by the walk that does.
+    let _quiet = crate::records::Quiet::new();
     use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     struct Uses<'a, 'm, 'ast> {
         module: &'m Module,
@@ -5008,6 +5014,7 @@ fn unkinded_locals(
 /// nothing is written in; `Some(Some(Unknown))` while something
 /// written in is not yet typed; else the join of what is written.
 fn written_into(module: &Module, sites: &ListSites<'_>, typer: &Typer<'_>) -> Option<Option<Ty>> {
+    let _quiet = crate::records::Quiet::new();
     if sites.kept {
         return None;
     }
@@ -5093,6 +5100,7 @@ fn field_sites_into(
     keys: &[String],
     rounds: &mut HashMap<String, FieldRound>,
 ) {
+    let _quiet = crate::records::Quiet::new();
     let sites = list_sites(module, body, vars, keys.to_vec(), false);
     let no_outer = HashMap::default();
     let typer = Typer {
@@ -5375,7 +5383,14 @@ impl Walker<'_> {
             // widens the dict's keys by the key's type and its values by
             // the value's.
             py::Expr::Subscript(sub) => {
-                if let Ty::Dict(k) = self.expr(&sub.value) {
+                let held = self.expr(&sub.value);
+                if let Ty::Class(k) = held
+                    && let py::Expr::StringLiteral(lit) = &*sub.slice
+                    && let Some(f) = crate::records::field_of(k as usize, lit.value.to_str())
+                {
+                    crate::records::note_write(k as usize, f, ty);
+                }
+                if let Ty::Dict(k) = held {
                     let (key, value) = dict_shape(k);
                     let written = self.expr(&sub.slice);
                     let widened = dict_of(key.join(written), value.join(ty));
@@ -6595,6 +6610,24 @@ impl Typer<'_> {
                     }
                 } else if let Ty::Dict(k) = seq {
                     dict_shape(k).1
+                } else if let Ty::Class(k) = seq
+                    && crate::records::is_record(k as usize)
+                {
+                    // A key of the shape reads its field; any other key
+                    // demotes the shape where it is lowered.
+                    match &*s.slice {
+                        py::Expr::StringLiteral(lit) => {
+                            match crate::records::field_of(k as usize, lit.value.to_str()) {
+                                Some(f) => self
+                                    .module
+                                    .field(k as usize, &f)
+                                    .map(|(_, t)| t)
+                                    .unwrap_or(Ty::Unknown),
+                                None => Ty::Object,
+                            }
+                        }
+                        _ => Ty::Object,
+                    }
                 } else if let Ty::Class(k) = seq {
                     self.item_read_ret(k, self.expr(&s.slice))
                 } else {
@@ -6621,6 +6654,13 @@ impl Typer<'_> {
             // A literal's shape is the join of its keys and of its values;
             // a spread brings keys and values of every kind.
             py::Expr::Dict(d) => {
+                if let Some(k) = crate::records::of_literal(d) {
+                    for (i, item) in d.items.iter().enumerate() {
+                        let ty = self.expr(&item.value);
+                        crate::records::note_write(k, crate::records::field_name(i), ty);
+                    }
+                    return Ty::Class(k as u16);
+                }
                 if d.items.iter().any(|item| item.key.is_none()) {
                     return dynamic_dict();
                 }

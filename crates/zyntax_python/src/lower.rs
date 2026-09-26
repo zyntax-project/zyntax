@@ -31,6 +31,8 @@ use zyntax_typed_ast::{
 
 #[path = "num.rs"]
 pub(crate) mod num;
+#[path = "record_lower.rs"]
+mod record_lower;
 #[path = "tables.rs"]
 pub(crate) mod tables;
 
@@ -2244,6 +2246,9 @@ impl<'m> Lowerer<'m> {
     /// `v` as a value of type `target`, converting where the two differ.
     pub(crate) fn coerce(&mut self, v: Val, target: Ty) -> Node {
         let span = v.node.span;
+        if target == Ty::Object && v.ty != Ty::Object {
+            crate::records::demote_reached(self.module, v.ty);
+        }
         match (v.ty, target) {
             (a, b) if a == b => v.node,
             (_, Ty::Unknown) => v.node,
@@ -3156,6 +3161,7 @@ impl<'m> Lowerer<'m> {
     /// `str(v)`.
     pub(crate) fn str_of(&mut self, v: Val) -> Node {
         let span = v.node.span;
+        crate::records::demote_reached(self.module, v.ty);
         match v.ty {
             Ty::Num(_) => {
                 let boxed = self.boxed_num(v);
@@ -3234,6 +3240,7 @@ impl<'m> Lowerer<'m> {
 
     /// `repr(v)`.
     pub(crate) fn repr_of(&mut self, v: Val) -> Node {
+        crate::records::demote_reached(self.module, v.ty);
         let span = v.node.span;
         match v.ty {
             Ty::Str => call("zb_str_repr", vec![v.node], Ty::Str, span),
@@ -5996,6 +6003,9 @@ impl<'m> Lowerer<'m> {
                 Ok(self.index_value(seq, index.node, ty, span))
             }
             Ty::Dict(_) => Ok(self.dict_get(seq, index, ty, span)),
+            Ty::Class(k) if crate::records::is_record(k as usize) => {
+                self.record_read(k as usize, seq, index, span)
+            }
             // An instance answers through its class's `__getitem__`.
             Ty::Class(k) => {
                 match self.dunder(k as usize, "__getitem__", seq.node, vec![index], span) {
@@ -6051,6 +6061,9 @@ impl<'m> Lowerer<'m> {
                 )
             }
             Ty::Dict(_) => self.dict_set(seq, index, value, span),
+            Ty::Class(k) if crate::records::is_record(k as usize) => {
+                self.record_store(k as usize, seq, index, value, span)?
+            }
             // An instance stores through its class's `__setitem__`.
             Ty::Class(k) => {
                 match self.dunder(
@@ -6942,6 +6955,10 @@ impl<'m> Lowerer<'m> {
                 };
                 self.comprehension(&c.generators, Produce::Dict(dict_ty, key, &c.value), span)?
             }
+            py::Expr::Dict(d) if let Some(k) = crate::records::of_literal(d) => Val {
+                node: self.record_literal(k, d, span)?,
+                ty: Ty::Class(k as u16),
+            },
             py::Expr::Dict(d) => {
                 let dict_ty = match ty {
                     Ty::Dict(_) => ty.settled(),
@@ -7490,6 +7507,8 @@ impl<'m> Lowerer<'m> {
         let (left, right) = if matches!(op, py::CmpOp::Is | py::CmpOp::IsNot) {
             (left, right)
         } else {
+            crate::records::demote_reached(self.module, left.ty);
+            crate::records::demote_reached(self.module, right.ty);
             (self.boxed_num(left), self.boxed_num(right))
         };
         let negate = |n: Node| {
@@ -9427,6 +9446,7 @@ impl<'m> Lowerer<'m> {
             }
             return unsupported("sort() with keyword arguments on a non-list", c);
         }
+        self.record_call_uses(c);
         if let py::Expr::Name(n) = &*c.func
             && let Some(v) = self.iteration_builtin(n.id.as_str(), args, keywords, ty, c, span)?
         {
@@ -11369,6 +11389,23 @@ impl<'m> Lowerer<'m> {
     /// ahead of the expression, and a variable checked once is known
     /// for the rest of the block.
     fn checked_instance(&mut self, object: Val, attr: &str, span: Span) -> Val {
+        self.checked_instance_as(
+            object,
+            "AttributeError",
+            &format!("'NoneType' object has no attribute '{attr}'"),
+            span,
+        )
+    }
+
+    /// `object`, with the raise of `exception(message)` ahead of it for
+    /// when it is None.
+    pub(crate) fn checked_instance_as(
+        &mut self,
+        object: Val,
+        exception: &str,
+        message: &str,
+        span: Span,
+    ) -> Val {
         if self.known_instance(&object.node) {
             return object;
         }
@@ -11392,15 +11429,7 @@ impl<'m> Lowerer<'m> {
             span,
         );
         let mut raise = Vec::new();
-        self.raise_named(
-            "AttributeError",
-            str_lit(
-                &format!("'NoneType' object has no attribute '{attr}'"),
-                span,
-            ),
-            span,
-            &mut raise,
-        );
+        self.raise_named(exception, str_lit(message, span), span, &mut raise);
         self.hoisted.push(TypedNode::new(
             TypedStatement::If(TypedIf {
                 condition: Box::new(is_null),
@@ -11469,6 +11498,11 @@ impl<'m> Lowerer<'m> {
         } else {
             object
         };
+        if let Ty::Class(k) = object.ty
+            && crate::records::is_record(k as usize)
+        {
+            crate::records::demote_reached(self.module, object.ty);
+        }
         if let Some(arity) = types::bound_method_arity(self.module, object.ty, attr) {
             return self.bound_method(object, attr, arity, span);
         }
@@ -11763,6 +11797,9 @@ impl<'m> Lowerer<'m> {
         };
         match object.ty {
             Ty::Class(k) => {
+                if crate::records::is_record(k as usize) {
+                    crate::records::demote_reached(self.module, object.ty);
+                }
                 let object = self.checked_instance(object, attr, span);
                 let Some((_, ty)) = self.module.field(k as usize, attr) else {
                     return Err(Error::unsupported_span(
@@ -11908,6 +11945,10 @@ impl<'m> Lowerer<'m> {
         args: Vec<Val>,
         span: Span,
     ) -> Option<Val> {
+        if crate::records::is_record(k) {
+            crate::records::demote_reached(self.module, Ty::Class(k as u16));
+            return None;
+        }
         let (sig, fn_name) = self.module.method_sig(k, method)?;
         if sig.params.len() != args.len() + 1 {
             return None;
@@ -11945,6 +11986,7 @@ impl<'m> Lowerer<'m> {
         c: &py::ExprCall,
         span: Span,
     ) -> Result<Val> {
+        crate::records::demote_reached(self.module, Ty::Class(k as u16));
         self.method_call(k, receiver, method, args, keywords, c, span, true)
     }
 
