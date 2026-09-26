@@ -2184,8 +2184,74 @@ fn keyed_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         with_unknown(json, Ty::None),
         span,
     ));
-    out.extend(set_operation_hooks(module, span));
+    // Without a set store no box reaches them; the library's set stays
+    // out of a program that makes none.
+    if crate::types::set_stores().is_empty() {
+        out.extend(set_operation_stubs(span));
+    } else {
+        out.extend(set_operation_hooks(module, span));
+    }
     out
+}
+
+/// The set operation hooks of a program with no set store: no box of
+/// one exists, so each reports the kind unknown.
+fn set_operation_stubs(span: Span) -> Vec<TypedFunction> {
+    let unknown = |ret_ty: Ty| {
+        vec![
+            stmt(
+                call(
+                    "zb_fatal",
+                    vec![
+                        str_lit("TypeError", span),
+                        str_lit("a dict or set of an unknown kind", span),
+                    ],
+                    Ty::None,
+                    span,
+                ),
+                span,
+            ),
+            ret(
+                match ret_ty {
+                    Ty::Bool => node(
+                        TypedExpression::Literal(TypedLiteral::Bool(false)),
+                        Ty::Bool,
+                        span,
+                    ),
+                    _ => node(
+                        TypedExpression::Literal(TypedLiteral::Null),
+                        Ty::Object,
+                        span,
+                    ),
+                },
+                span,
+            ),
+        ]
+    };
+    vec![
+        function(
+            "zb_hook_shaped_set_arith",
+            vec![
+                param("code", Ty::Int, span),
+                param("a", Ty::Object, span),
+                param("b", Ty::Object, span),
+            ],
+            Ty::Object,
+            unknown(Ty::Object),
+            span,
+        ),
+        function(
+            "zb_hook_shaped_set_le",
+            vec![
+                param("a", Ty::Object, span),
+                param("b", Ty::Object, span),
+                param("strict", Ty::Bool, span),
+            ],
+            Ty::Bool,
+            unknown(Ty::Bool),
+            span,
+        ),
+    ]
 }
 
 /// Whether a set type's store holds dynamic values: the library's own
