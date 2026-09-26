@@ -433,8 +433,8 @@ pub(crate) fn raise_facts(
 /// - `C$new`, which builds one;
 /// - `C$unbox` and the checked unboxing in `Lowerer::coerce`, which
 ///   test the box's kind against the class's range first;
-/// - the arms of `per_class` (dispatchers, hooks, class sets), each
-///   taken on its own class's kind;
+/// - the arms of `per_class` and of the dispatchers, each taken on
+///   the class's own kind or tag;
 /// - `Lowerer::trusted`, reading back a box the lowering stored as that
 ///   class;
 /// - a list of `Elem::Class`, whose element stores are coerced to the
@@ -774,12 +774,12 @@ fn dispatcher(
             ));
             continue;
         }
-        let mut args = vec![lowerer.coerce(
-            Val {
-                node: var(intern("self"), self_ty, span),
-                ty: self_ty,
-            },
+        // The arm is taken on the tag of `sub` or of a class deriving
+        // from it, so `self` is an instance of `sub`.
+        let mut args = vec![cast(
+            var(intern("self"), self_ty, span),
             Ty::Class(sub as u16),
+            span,
         )];
         for ((name, ty), (_, sub_ty)) in
             sig.params.iter().skip(1).zip(sub_sig.params.iter().skip(1))
@@ -852,12 +852,12 @@ pub(crate) fn abstract_dispatcher(
         if sub_sig.params.len() != sig.params.len() {
             continue;
         }
-        let mut args = vec![lowerer.coerce(
-            Val {
-                node: var(intern("self"), self_ty, span),
-                ty: self_ty,
-            },
+        // The arm is taken on the tag of `sub` or of a class deriving
+        // from it, so `self` is an instance of `sub`.
+        let mut args = vec![cast(
+            var(intern("self"), self_ty, span),
             Ty::Class(sub as u16),
+            span,
         )];
         for ((name, ty), (_, sub_ty)) in
             sig.params.iter().skip(1).zip(sub_sig.params.iter().skip(1))
