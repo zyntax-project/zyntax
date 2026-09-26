@@ -1,0 +1,5 @@
+KeyError 'replacement'
+IndexError from helper
+ValueError first
+caught in finally: from helper
+ValueError carried

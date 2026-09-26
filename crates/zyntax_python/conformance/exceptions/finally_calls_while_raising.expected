@@ -1,0 +1,21 @@
+cleanup start 2
+cleanup end 3
+cleanup start 2
+cleanup end 3
+finally tail
+IndexError caught
+cleanup start 1
+cleanup end 2
+inner finally 2
+cleanup start 11
+cleanup end 12
+outer finally 12
+ValueError: inner
+cleanup start 0
+cleanup end 1
+finally after handler 1
+ValueError: from handler
+cleanup start 7
+cleanup end 8
+module finally 8
+module IndexError

@@ -10514,6 +10514,22 @@ impl<'m> Lowerer<'m> {
             Type::Unknown,
             span,
         ));
+        // With a `finally`, the clauses run under the body's control as
+        // well, in a pass of their own: a `return`, `break`, `continue`
+        // or exception leaving a clause reaches `finally` first.
+        let has_finally = !t.finalbody.is_empty();
+        if has_finally {
+            self.redirected = false;
+            self.try_ctls.push(TryCtl {
+                flag,
+                ret: ret_slot,
+                loop_depth: 0,
+            });
+            self.escapes.push(Escape::Break);
+            for ctl in &mut self.handler_ctls {
+                ctl.loop_depth += 1;
+            }
+        }
         // Handlers, first match wins. What matching hoists is computed
         // here, after the body, not before the statement.
         let mut chain: Option<Stmt> = None;
@@ -10641,9 +10657,10 @@ impl<'m> Lowerer<'m> {
         for s in &t.orelse {
             self.stmt(s, &mut orelse)?;
         }
+        let mut clauses = Vec::new();
         if chain.is_some() || !orelse.is_empty() {
-            out.extend(before_chain);
-            out.push(TypedNode::new(
+            clauses.extend(before_chain);
+            clauses.push(TypedNode::new(
                 TypedStatement::If(TypedIf {
                     condition: Box::new(var(raised, Ty::Bool, span)),
                     then_block: TypedBlock {
@@ -10664,14 +10681,32 @@ impl<'m> Lowerer<'m> {
                 span,
             ));
         }
-        for s in &t.finalbody {
-            self.stmt(s, out)?;
+        let mut clauses_redirected = false;
+        if has_finally {
+            for ctl in &mut self.handler_ctls {
+                ctl.loop_depth -= 1;
+            }
+            self.escapes.pop();
+            self.try_ctls.pop();
+            clauses_redirected = self.redirected;
+            self.redirected = redirected_before;
+            if !clauses.is_empty() {
+                clauses.push(TypedNode::new(
+                    TypedStatement::Break(None),
+                    Type::Unknown,
+                    span,
+                ));
+                out.push(one_pass(clauses, span));
+            }
+            self.finally_body(&t.finalbody, span, out)?;
+        } else {
+            out.extend(clauses);
         }
         // Whatever no handler took leaves with the enclosing context.
         let check = self.pending_check(span);
         out.push(check);
-        // What the body asked for before it left.
-        if body_redirected {
+        // What the body or a clause asked for before it left.
+        if body_redirected || clauses_redirected {
             for code in 1..=3 {
                 let mut action = Vec::new();
                 match code {
@@ -10702,6 +10737,60 @@ impl<'m> Lowerer<'m> {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// A `finally` suite, run with no exception pending: the one in
+    /// flight is set aside and put back when the suite ends without
+    /// raising. One the suite raises replaces it, and a `return`,
+    /// `break` or `continue` leaving the suite discards it.
+    fn finally_body(&mut self, body: &[py::Stmt], span: Span, out: &mut Vec<Stmt>) -> Result<()> {
+        let saved = self.temp();
+        out.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: saved,
+                ty: ir(Ty::Object),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(var(intern(PENDING), Ty::Object, span))),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        let none = Val {
+            node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+            ty: Ty::None,
+        };
+        let cleared = self.coerce(none, Ty::Object);
+        out.push(self.set_pending(cleared, span));
+        for s in body {
+            self.stmt(s, out)?;
+        }
+        let restore = self.set_pending(var(saved, Ty::Object, span), span);
+        let nothing_raised = binary(
+            BinaryOp::Eq,
+            var(intern(PENDING), Ty::Object, span),
+            node(
+                TypedExpression::Literal(TypedLiteral::Null),
+                Ty::Object,
+                span,
+            ),
+            Ty::Bool,
+            span,
+        );
+        out.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(nothing_raised),
+                then_block: TypedBlock {
+                    statements: vec![restore],
+                    span,
+                },
+                else_block: None,
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
         Ok(())
     }
 

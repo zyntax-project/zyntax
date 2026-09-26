@@ -1,0 +1,17 @@
+handler zero
+finally 0
+-1
+finally 5
+5
+finally 0
+finally 1
+finally 2
+finally 3
+finally 4
+25
+finally h 1
+end
+finally h 5
+else 6
+finally k
+KeyError 'second'
