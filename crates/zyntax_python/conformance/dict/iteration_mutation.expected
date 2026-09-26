@@ -1,0 +1,8 @@
+RuntimeError dictionary changed size during iteration [1]
+RuntimeError dictionary changed size during iteration [1]
+RuntimeError dictionary changed size during iteration
+RuntimeError dictionary changed size during iteration ['a', 'b', 'c']
+{'a': 10, 'b': 20} 30
+RuntimeError Set changed size during iteration
+6
+18

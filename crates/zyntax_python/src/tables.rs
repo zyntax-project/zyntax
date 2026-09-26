@@ -1192,6 +1192,162 @@ impl Lowerer<'_> {
         )
     }
 
+    /// `for target in t` over a dict's keys, values or pairs (`walk`) or
+    /// a set's values, reading the entries in place. The length is taken
+    /// before the loop and compared at every step, the last included, so
+    /// a change of size through any alias raises as Python does.
+    pub(crate) fn for_table(
+        &mut self,
+        f: &py::StmtFor,
+        table: Val,
+        walk: Walk,
+        extra: Vec<Stmt>,
+        span: Span,
+    ) -> Result<zyntax_typed_ast::typed_ast::TypedStatement> {
+        use zyntax_typed_ast::typed_ast::{TypedBlock, TypedFor, TypedPattern, TypedRange};
+        let ty = table.ty;
+        let mut prologue = std::mem::take(&mut self.hoisted);
+        let t = self.hold(table, &mut prologue, span);
+        let first_len = Val {
+            node: self.table_len(t.clone(), span),
+            ty: Ty::Int,
+        };
+        let n0 = self.hold(first_len, &mut prologue, span);
+        let count = Val {
+            node: call(
+                &table_fn("pair_count", ty),
+                vec![t.node.clone()],
+                Ty::Int,
+                span,
+            ),
+            ty: Ty::Int,
+        };
+        let count = self.hold(count, &mut prologue, span);
+        let counter = self.temp();
+        let at = super::var(counter, Ty::Int, span);
+        let message = match ty {
+            Ty::Dict(_) => "dictionary changed size during iteration",
+            _ => "Set changed size during iteration",
+        };
+        let mut body = Vec::new();
+        self.in_loop(|this| -> Result<()> {
+            // The size at every step; past the last entry, only that.
+            let changed = binary(
+                BinaryOp::Ne,
+                this.table_len(t.clone(), span),
+                n0.node.clone(),
+                Ty::Bool,
+                span,
+            );
+            let mut raise = Vec::new();
+            this.raise_named("RuntimeError", str_lit(message, span), span, &mut raise);
+            body.push(when_stmt(changed, raise, span));
+            body.push(when_stmt(
+                binary(BinaryOp::Ge, at.clone(), count.node.clone(), Ty::Bool, span),
+                vec![TypedNode::new(
+                    TypedStatement::Break(None),
+                    Type::Unknown,
+                    span,
+                )],
+                span,
+            ));
+            // A live entry binds and runs the body; a deleted one is
+            // passed over.
+            let mut live = Vec::new();
+            let key_slot = slot_ty(key_stored(ty));
+            let key = call(
+                &table_fn("key_at", ty),
+                vec![t.node.clone(), at.clone()],
+                key_slot,
+                span,
+            );
+            let key = Val {
+                node: this.table_out(key, key_stored(ty), key_stored(ty), span),
+                ty: key_stored(ty),
+            };
+            let value = || {
+                let sv = dict_stored(ty).1;
+                call(
+                    &dict_fn("value_at", ty),
+                    vec![t.node.clone(), at.clone()],
+                    slot_ty(sv),
+                    span,
+                )
+            };
+            match walk {
+                Walk::Keys => this.bind_after(&f.target, key, span, &mut live)?,
+                Walk::Values => {
+                    let sv = dict_stored(ty).1;
+                    let v = value();
+                    let v = Val {
+                        node: this.table_out(v, sv, sv, span),
+                        ty: sv,
+                    };
+                    this.bind_after(&f.target, v, span, &mut live)?;
+                }
+                Walk::Items => {
+                    let py::Expr::Tuple(pair) = &*f.target else {
+                        unreachable!("a pair target for the items of a dict");
+                    };
+                    let sv = dict_stored(ty).1;
+                    let v = value();
+                    let v = Val {
+                        node: this.table_out(v, sv, sv, span),
+                        ty: sv,
+                    };
+                    this.bind_after(&pair.elts[0], key, span, &mut live)?;
+                    this.bind_after(&pair.elts[1], v, span, &mut live)?;
+                }
+            }
+            for s in &f.body {
+                this.stmt(s, &mut live)?;
+            }
+            live.extend(extra);
+            let is_live = call(
+                &table_fn("live_at", ty),
+                vec![t.node.clone(), at.clone()],
+                Ty::Bool,
+                span,
+            );
+            body.push(when_stmt(is_live, live, span));
+            Ok(())
+        })?;
+        let loop_stmt = TypedStatement::For(TypedFor {
+            pattern: Box::new(TypedNode::new(
+                TypedPattern::Identifier {
+                    name: counter,
+                    mutability: zyntax_typed_ast::Mutability::Mutable,
+                },
+                super::ir(Ty::Int),
+                span,
+            )),
+            iterator: Box::new(TypedNode::new(
+                TypedExpression::Range(TypedRange {
+                    start: Some(Box::new(int_lit(0, span))),
+                    end: Some(Box::new(binary(
+                        BinaryOp::Add,
+                        count.node,
+                        int_lit(1, span),
+                        Ty::Int,
+                        span,
+                    ))),
+                    inclusive: false,
+                }),
+                Type::Unknown,
+                span,
+            )),
+            body: TypedBlock {
+                statements: body,
+                span,
+            },
+        });
+        prologue.push(TypedNode::new(loop_stmt, Type::Unknown, span));
+        Ok(TypedStatement::Block(TypedBlock {
+            statements: prologue,
+            span,
+        }))
+    }
+
     /// Two dicts compared for equality.
     pub(crate) fn dict_equal(&mut self, a: Val, b: Val, span: Span) -> Node {
         if same_store(a.ty, b.ty) {
@@ -1215,6 +1371,32 @@ impl Lowerer<'_> {
         }
         self.set_from(v, ty, span)
     }
+}
+
+/// What a loop over a dict reads of each entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Walk {
+    Keys,
+    Values,
+    Items,
+}
+
+/// An `if` with no else.
+fn when_stmt(condition: Node, then: Vec<Stmt>, span: Span) -> Stmt {
+    use zyntax_typed_ast::typed_ast::{TypedBlock, TypedIf};
+    TypedNode::new(
+        TypedStatement::If(TypedIf {
+            condition: Box::new(condition),
+            then_block: TypedBlock {
+                statements: then,
+                span,
+            },
+            else_block: None,
+            span,
+        }),
+        Type::Unknown,
+        span,
+    )
 }
 
 /// The tag of the frozensets of `ty`'s store.

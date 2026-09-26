@@ -5109,6 +5109,41 @@ impl<'m> Lowerer<'m> {
         ))
     }
 
+    /// The dict or set a loop reads in place, and what of each entry:
+    /// `for k in d`, `d.keys()`, `d.values()`, `for k, v in d.items()`,
+    /// `for x in s`.
+    fn table_walk(&mut self, f: &py::StmtFor) -> Result<Option<(Val, tables::Walk)>> {
+        let pair = matches!(&*f.target, py::Expr::Tuple(t)
+            if t.elts.len() == 2 && !t.elts.iter().any(|e| matches!(e, py::Expr::Starred(_))));
+        let (receiver, walk) = match &*f.iter {
+            py::Expr::Call(c) if c.arguments.args.is_empty() && c.arguments.keywords.is_empty() => {
+                let py::Expr::Attribute(a) = &*c.func else {
+                    return Ok(None);
+                };
+                let walk = match a.attr.as_str() {
+                    "keys" => tables::Walk::Keys,
+                    "values" => tables::Walk::Values,
+                    "items" if pair => tables::Walk::Items,
+                    _ => return Ok(None),
+                };
+                if !matches!(self.ty_of(&a.value), Ty::Dict(_)) {
+                    return Ok(None);
+                }
+                (&*a.value, walk)
+            }
+            e if matches!(self.ty_of(e), Ty::Dict(_) | Ty::Set(_)) => (e, tables::Walk::Keys),
+            _ => return Ok(None),
+        };
+        let table = self.expr(receiver)?;
+        if !matches!(table.ty, Ty::Dict(_) | Ty::Set(_)) {
+            return Err(Error::unsupported_span(
+                "a loop over a dict or set typed otherwise when lowered",
+                span_of(receiver),
+            ));
+        }
+        Ok(Some((table, walk)))
+    }
+
     /// `for x in range(...)` as a counted loop; anything else iterates
     /// by index over a sequence. `extra` statements follow the body.
     fn for_with_body(
@@ -5140,6 +5175,11 @@ impl<'m> Lowerer<'m> {
                 (None, None) => int_lit(0, span),
             };
             return self.for_items(f, seq, Some(start), extra, span);
+        }
+        // A dict's keys, values or pairs, or a set's values, read in
+        // place.
+        if let Some((table, walk)) = self.table_walk(f)? {
+            return self.for_table(f, table, walk, extra, span);
         }
         let range = match &*f.iter {
             py::Expr::Call(c)
