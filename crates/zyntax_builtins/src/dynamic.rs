@@ -1284,6 +1284,22 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         &[&a, &b],
         boolean(),
         vec![
+            // Two numbers first, as zb_any_lt takes them.
+            ca.decl(category(a.e())),
+            cb.decl(category(b.e())),
+            when(
+                and(is_number(ca.e()), is_number(cb.e())),
+                vec![
+                    when(
+                        or(is(&ca, FLOAT), is(&cb, FLOAT)),
+                        vec![ret(le(
+                            number_f64(a.e(), ca.e()),
+                            number_f64(b.e(), cb.e()),
+                        ))],
+                    ),
+                    ret(le(number_i64(a.e(), ca.e()), number_i64(b.e(), cb.e()))),
+                ],
+            ),
             when(
                 and(is_set(a.e()), is_set(b.e())),
                 vec![ret(call(
@@ -1304,10 +1320,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 ))],
             ),
             when(
-                and(
-                    eq(category(a.e()), int(CUSTOM)),
-                    eq(category(b.e()), int(CUSTOM)),
-                ),
+                and(is(&ca, CUSTOM), is(&cb, CUSTOM)),
                 vec![when(
                     keyed_set_pair(a.e(), b.e()),
                     vec![ret(call(
