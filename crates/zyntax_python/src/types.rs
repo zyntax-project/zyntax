@@ -2445,6 +2445,11 @@ pub(crate) struct Locals {
     pub(crate) param_writes: HashMap<String, Ty>,
     /// Whether the body has a `return`; without one it returns None.
     pub(crate) returns: bool,
+    /// Whether the body has a `return []`: a fresh list that takes the
+    /// kind the body's other returns decide, once they have.
+    pub(crate) returns_empty: bool,
+    /// Whether the body has a `return` of anything else.
+    pub(crate) returns_other: bool,
     /// Fields whose list this body changes through a receiver of no
     /// known class (`o.cells[0] = v`, `o.cells.append(v)`), with whether
     /// the receiver is still untyped; see [`dynamic_field_stores`].
@@ -4424,6 +4429,8 @@ fn infer_locals_with(
         // now, as an unkinded list is.
         locals.ret = Ty::Unknown;
         locals.returns = false;
+        locals.returns_empty = false;
+        locals.returns_other = false;
         let mut walker = Walker {
             module,
             locals: &mut locals,
@@ -4456,6 +4463,16 @@ fn infer_locals_with(
         {
             break;
         }
+    }
+    // `return []` is a list of the kind the other returns give, or of
+    // dynamic values beside anything else.
+    if locals.returns_empty {
+        locals.ret = match locals.ret {
+            Ty::List(_) => locals.ret,
+            Ty::Unknown if settled || !locals.returns_other => Ty::List(Elem::Object),
+            Ty::Unknown => Ty::Unknown,
+            other => other.join(Ty::List(Elem::Object)),
+        };
     }
     // A body control can fall off the end of returns None there too.
     if locals.returns && !terminates(body) {
@@ -4640,7 +4657,7 @@ pub(crate) fn is_empty_list(e: &py::Expr) -> bool {
     matches!(e, py::Expr::List(l) if l.elts.is_empty())
 }
 
-/// `[]`, `[None]` or `[None] * n`: a list literal that says nothing
+/// `[]`, `[None]`, `[None] * n` or `n * [None]`: a list literal that says nothing
 /// about its elements' kind, which is then the kind of what the body
 /// puts in. `[None]` counts as one write of None, which any instance
 /// kind admits. Says the count of Nones to build.
@@ -4650,7 +4667,9 @@ pub(crate) fn unkinded_list(e: &py::Expr) -> Option<Option<&py::Expr>> {
         py::Expr::List(l) if l.elts.is_empty() => Some(None),
         py::Expr::List(l) if l.elts.len() == 1 && nones(l) => Some(None),
         py::Expr::BinOp(b) if b.op == py::Operator::Mult => match (&*b.left, &*b.right) {
-            (py::Expr::List(l), n) if l.elts.len() == 1 && nones(l) => Some(Some(n)),
+            (py::Expr::List(l), n) | (n, py::Expr::List(l)) if l.elts.len() == 1 && nones(l) => {
+                Some(Some(n))
+            }
             _ => None,
         },
         _ => None,
@@ -5990,12 +6009,17 @@ impl Walker<'_> {
             }
             py::Stmt::Expr(e) => self.container_write(&e.value),
             py::Stmt::Return(r) => {
+                self.locals.returns = true;
+                if r.value.as_deref().is_some_and(is_empty_list) {
+                    self.locals.returns_empty = true;
+                    return;
+                }
+                self.locals.returns_other = true;
                 let ty = match &r.value {
                     Some(v) => self.expr(v),
                     None => Ty::None,
                 };
                 self.locals.ret = self.locals.ret.join(ty);
-                self.locals.returns = true;
             }
             py::Stmt::For(f) => {
                 self.expr(&f.iter);
