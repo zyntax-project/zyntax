@@ -404,3 +404,152 @@ mod tests {
         assert_eq!(names, ["g", "x", "x$1", "h", "x$1", "x$2", "x$2"]);
     }
 }
+
+/// Module functions whose name is bound again: by another statement of
+/// the module body (an assignment, a loop, an import, another `def`)
+/// or under `global` in some function. Each `def f` of such a name
+/// becomes `def f$defN` followed by `f = f$defN`, so `f` is a module
+/// variable like any other and no call of `f` is taken to reach one
+/// `def` by its name.
+pub(crate) fn rebound_defs(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>>) {
+    #[derive(Default)]
+    struct Bindings {
+        counts: HashMap<String, usize>,
+        globals: HashSet<String>,
+        depth: usize,
+    }
+    impl Bindings {
+        fn note(&mut self, name: &str) {
+            if self.depth == 0 {
+                *self.counts.entry(name.to_string()).or_default() += 1;
+            }
+        }
+    }
+    impl<'a> Visitor<'a> for Bindings {
+        fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
+            match stmt {
+                py::Stmt::FunctionDef(f) => {
+                    self.note(f.name.as_str());
+                    for d in &f.decorator_list {
+                        self.visit_expr(&d.expression);
+                    }
+                    self.depth += 1;
+                    for s in &f.body {
+                        self.visit_stmt(s);
+                    }
+                    self.depth -= 1;
+                    return;
+                }
+                py::Stmt::ClassDef(c) => {
+                    self.note(c.name.as_str());
+                    self.depth += 1;
+                    for s in &c.body {
+                        self.visit_stmt(s);
+                    }
+                    self.depth -= 1;
+                    return;
+                }
+                py::Stmt::Global(g) => {
+                    for n in &g.names {
+                        self.globals.insert(n.to_string());
+                    }
+                }
+                py::Stmt::Import(i) => {
+                    for a in &i.names {
+                        let bound = a.asname.as_ref().unwrap_or(&a.name);
+                        self.note(bound.split('.').next().unwrap_or_default());
+                    }
+                }
+                py::Stmt::ImportFrom(i) => {
+                    for a in &i.names {
+                        self.note(a.asname.as_ref().unwrap_or(&a.name).as_str());
+                    }
+                }
+                py::Stmt::Try(t) => {
+                    for h in &t.handlers {
+                        let py::ExceptHandler::ExceptHandler(h) = h;
+                        if let Some(n) = &h.name {
+                            self.note(n.as_str());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt_ref(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'a py::Expr) {
+            match expr {
+                py::Expr::Name(n) if !matches!(n.ctx, py::ExprContext::Load) => {
+                    self.note(n.id.as_str())
+                }
+                py::Expr::Lambda(l) => {
+                    self.depth += 1;
+                    walk_expr_ref(self, &l.body);
+                    self.depth -= 1;
+                    return;
+                }
+                _ => {}
+            }
+            walk_expr_ref(self, expr);
+        }
+    }
+    let mut seen = Bindings::default();
+    for s in body.iter() {
+        seen.visit_stmt(s);
+    }
+    let rebound =
+        |name: &str| seen.counts.get(name).copied().unwrap_or(0) > 1 || seen.globals.contains(name);
+    if !body
+        .iter()
+        .any(|s| matches!(s, py::Stmt::FunctionDef(f) if rebound(f.name.as_str())))
+    {
+        return;
+    }
+    let mut next: HashMap<String, usize> = HashMap::default();
+    let mut out = Vec::with_capacity(body.len());
+    let mut out_origins = Vec::with_capacity(origins.len());
+    for (s, origin) in std::mem::take(body)
+        .into_iter()
+        .zip(std::mem::take(origins))
+    {
+        let py::Stmt::FunctionDef(mut f) = s else {
+            out.push(s);
+            out_origins.push(origin);
+            continue;
+        };
+        if !rebound(f.name.as_str()) {
+            out.push(py::Stmt::FunctionDef(f));
+            out_origins.push(origin);
+            continue;
+        }
+        let name = f.name.to_string();
+        let n = next.entry(name.clone()).or_default();
+        let renamed = format!("{name}$def{n}");
+        *n += 1;
+        let range = f.name.range;
+        f.name = py::Identifier::new(renamed.as_str(), range);
+        let load = py::Expr::Name(py::ExprName {
+            node_index: Default::default(),
+            range,
+            id: py::name::Name::new(&renamed),
+            ctx: py::ExprContext::Load,
+        });
+        let store = py::Expr::Name(py::ExprName {
+            node_index: Default::default(),
+            range,
+            id: py::name::Name::new(&name),
+            ctx: py::ExprContext::Store,
+        });
+        out.push(py::Stmt::FunctionDef(f));
+        out_origins.push(origin.clone());
+        out.push(py::Stmt::Assign(py::StmtAssign {
+            node_index: Default::default(),
+            range,
+            targets: vec![store],
+            value: Box::new(load),
+        }));
+        out_origins.push(origin);
+    }
+    *body = out;
+    *origins = out_origins;
+}

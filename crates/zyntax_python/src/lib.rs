@@ -372,6 +372,7 @@ fn parse_program_once(
     let mut statements: Vec<py::Stmt> = body.into_iter().collect();
     kwargs::rewrite(&mut statements)?;
     sugar::rewrite(&mut statements, &mut origins);
+    rebind::rebound_defs(&mut statements, &mut origins);
     aliases::rewrite(&mut statements);
     rebind::rewrite(&mut statements);
     module.body = statements.into_iter().collect();
