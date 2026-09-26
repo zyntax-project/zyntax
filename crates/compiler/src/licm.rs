@@ -58,8 +58,9 @@
 //! conditionally-executed sub-block — hoisting `r = a + b` from inside
 //! an `if` to preheader means `r` is computed unconditionally instead
 //! of conditionally, extra work but not a different answer. A Load
-//! can trap: the pointer a branch guards (an index read only once a
-//! test says there is one) may be invalid off that branch, so a Load
+//! can trap: an address a program keeps as an integer (an index read
+//! only once a test says there is one) may be invalid off the branch
+//! that tests it, so a Load through a pointer made from an integer
 //! leaves the loop only from a block that dominates every latch, one
 //! each continuing iteration runs.
 //!
@@ -157,10 +158,24 @@ fn run_with(func: &mut HirFunction, pure: &HashSet<HirId>) -> LicmStats {
         }
     }
     let addr_index = build_addr_index(func);
+    let from_integer = func
+        .blocks
+        .values()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| match inst {
+            HirInstruction::Cast {
+                op: crate::hir::CastOp::IntToPtr,
+                result,
+                ..
+            } => Some(*result),
+            _ => None,
+        })
+        .collect();
     let shared = Shared {
         outside,
         value_block,
         addr_index,
+        from_integer,
     };
 
     // Innermost-first ordering — `LoopForest::loops()` already
@@ -270,6 +285,26 @@ struct Shared {
     /// The block each instruction or phi result is defined in.
     value_block: FnvHashMap<HirId, HirId>,
     addr_index: HashMap<HirId, AddrLink>,
+    /// Pointers made from integers (`IntToPtr`): an address a program
+    /// may keep as zero when there is nothing to point at.
+    from_integer: FnvHashSet<HirId>,
+}
+
+/// Whether `ptr` is made, through address arithmetic and casts, from
+/// an integer.
+fn made_from_integer(ptr: HirId, shared: &Shared) -> bool {
+    let mut current = ptr;
+    for _ in 0..64 {
+        if shared.from_integer.contains(&current) {
+            return true;
+        }
+        current = match shared.addr_index.get(&current) {
+            Some(AddrLink::Cast(from)) => *from,
+            Some(AddrLink::Gep { base, .. }) => *base,
+            _ => return false,
+        };
+    }
+    false
 }
 
 /// Hoist invariant instructions from `lp.body` into `preheader`.
@@ -459,10 +494,13 @@ fn hoist_loop(
                         continue;
                     }
                     // A load a branch guards may read through a pointer
-                    // that is only valid on that branch (a null index
-                    // behind a nonzero test): only one every iteration
-                    // runs leaves the loop.
-                    if !lp.latches.iter().all(|l| dt.dominates(block_id, *l)) {
+                    // only that branch makes valid (an address kept as an
+                    // integer, read once a test says it is not zero): such
+                    // a load leaves the loop only when every iteration
+                    // runs it.
+                    if made_from_integer(*ptr, shared)
+                        && !lp.latches.iter().all(|l| dt.dominates(block_id, *l))
+                    {
                         continue;
                     }
                     let load_loc = extract_mem_loc(
@@ -1216,12 +1254,11 @@ mod tests {
         assert_eq!(f.blocks[&entry].instructions.len(), 1);
     }
 
-    #[test]
-    fn does_not_hoist_a_load_a_branch_guards() {
-        // body: if c { r = *p } → latch
-        // `p` may be valid only when `c` holds (an index read once a
-        // test says there is one), so the load stays behind the test.
-        let (mut f, _entry, header, body, _exit) = mk_func();
+    /// A loop whose body is `if c { r = *p }`: the load's block does not
+    /// dominate the latch. `p` is a pointer parameter, or one made from
+    /// an integer parameter in the entry block.
+    fn guarded_load(from_integer: bool) -> (HirFunction, HirId, LicmStats) {
+        let (mut f, entry, header, body, _exit) = mk_func();
         let guarded = HirId::new();
         let latch = HirId::new();
         for id in [guarded, latch] {
@@ -1235,7 +1272,24 @@ mod tests {
         };
         f.blocks.get_mut(&guarded).unwrap().terminator = HirTerminator::Branch { target: latch };
         f.blocks.get_mut(&latch).unwrap().terminator = HirTerminator::Branch { target: header };
-        let p = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
+        let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let p = if from_integer {
+            let word = add_param(&mut f, HirType::I64, 0);
+            let p = add_inst(&mut f, ptr_ty.clone());
+            f.blocks
+                .get_mut(&entry)
+                .unwrap()
+                .instructions
+                .push(HirInstruction::Cast {
+                    op: crate::hir::CastOp::IntToPtr,
+                    result: p,
+                    ty: ptr_ty,
+                    operand: word,
+                });
+            p
+        } else {
+            add_param(&mut f, ptr_ty, 0)
+        };
         let r = add_inst(&mut f, HirType::I64);
         f.blocks
             .get_mut(&guarded)
@@ -1249,8 +1303,22 @@ mod tests {
                 volatile: false,
             });
         let stats = run(&mut f);
-        assert_eq!(stats.hoisted, 0, "a guarded load stays in the loop");
+        (f, guarded, stats)
+    }
+
+    #[test]
+    fn does_not_hoist_a_guarded_load_through_an_integer() {
+        // The integer may be zero off the branch that tests it.
+        let (f, guarded, stats) = guarded_load(true);
+        assert_eq!(stats.hoisted, 0, "the guarded load stays in the loop");
         assert_eq!(f.blocks[&guarded].instructions.len(), 1);
+    }
+
+    #[test]
+    fn hoists_a_guarded_load_through_a_pointer() {
+        let (f, guarded, stats) = guarded_load(false);
+        assert_eq!(stats.hoisted, 1);
+        assert!(f.blocks[&guarded].instructions.is_empty());
     }
 
     #[test]
