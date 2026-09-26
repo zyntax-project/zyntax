@@ -142,6 +142,27 @@ fn ours_for(suite: Suite, case: &Path, warm_up: WarmUp) -> Outcome {
     // that says nothing about the program, so it is tried again.
     for attempt in 0..3 {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_zylua"));
+        // official/files.lua opens files faster than the collector closes
+        // them (5485e5d), so the child gets the hard descriptor limit.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: getrlimit and setrlimit are async-signal-safe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    let mut l = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) == 0 && l.rlim_cur < l.rlim_max
+                    {
+                        l.rlim_cur = l.rlim_max;
+                        libc::setrlimit(libc::RLIMIT_NOFILE, &l);
+                    }
+                    Ok(())
+                });
+            }
+        }
         match warm_up {
             WarmUp::Off => cmd.env("ZYNTAX_DISABLE_WARM_UP", "1"),
             WarmUp::On => cmd.env_remove("ZYNTAX_DISABLE_WARM_UP"),

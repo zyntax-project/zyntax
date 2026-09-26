@@ -16,9 +16,10 @@
 official/all.lua              558e28e
 official/closure.lua          558e28e
 official/coroutine.lua        c33bf81
+official/cstack.lua           4379825   failing-on windows
 official/db.lua               cecfe69
 official/errors.lua           8fd93ba
-official/files.lua            5485e5d   failing-on linux
+official/files.lua            bb9a2cb   failing-on windows
 official/gc.lua               558e28e
 official/gengc.lua            558e28e
 official/literals.lua         98b70eb
@@ -35,7 +36,7 @@ official_complete/constructs.lua 6709b37
 official_complete/coroutine.lua  c33bf81
 official_complete/db.lua         cecfe69
 official_complete/errors.lua     8fd93ba
-official_complete/files.lua      5485e5d   failing-on linux
+official_complete/files.lua      bb9a2cb   failing-on windows
 official_complete/gc.lua         558e28e
 official_complete/gengc.lua      558e28e
 official_complete/literals.lua   98b70eb
@@ -52,6 +53,8 @@ official_suite/complete_all     49075da
 official_suite/main_lua         49075da
 
 errors/library_names.lua      0903215
+errors/c_stack.lua            4379825   failing-on windows
+gc/finalize_after_return.lua  18b4bab   failing-on windows
 
 # C modules load where the executable exports the C API: not on Windows yet.
 official/attrib.lua           c17ca09   unix
