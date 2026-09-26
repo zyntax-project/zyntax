@@ -829,6 +829,14 @@ fn parse_program_once(
                 Err(e) => return Err(e),
             }
             out.extend(lower_specs(inferred, item, &unpack_shapes));
+            // A demoted record means the program is read again: the rest
+            // of this lowering would be discarded.
+            if records::any_demoted() {
+                return Err(Error::unsupported(
+                    "a dict literal used as a record",
+                    item.def,
+                ));
+            }
         }
         // What names a dropped function goes with it; nothing reached
         // does, or it would have been reached itself.

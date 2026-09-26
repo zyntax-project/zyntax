@@ -236,6 +236,10 @@ fn reach(module: &types::Module, ty: Ty, seen: &mut HashSet<Ty>) {
     }
 }
 
+pub(crate) fn any_demoted() -> bool {
+    DEMOTED.with(|d| !d.borrow().is_empty())
+}
+
 /// The key lists of the records the lowering demoted.
 pub(crate) fn demoted() -> Vec<Vec<String>> {
     let found: Vec<usize> = DEMOTED.with(|d| d.borrow().iter().copied().collect());
