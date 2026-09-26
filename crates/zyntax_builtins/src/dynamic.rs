@@ -125,17 +125,10 @@ fn is_keyed_set(x: Expr) -> Expr {
 }
 /// Two boxes that are sets, at least one of a shape the frontend
 /// registered: an operation on them is the frontend's hook.
+/// Asked only of two custom-category boxes, and out of line, so the
+/// number paths of the operators it guards stay as short as they were.
 fn keyed_set_pair(a: Expr, b: Expr) -> Expr {
-    let set_of = |x: Expr| {
-        and(
-            eq(category(x.clone()), int(CUSTOM)),
-            or(eq(kind(x.clone()), int(SET_TAG >> 8)), is_keyed_set(x)),
-        )
-    };
-    and(
-        and(set_of(a.clone()), set_of(b.clone())),
-        or(is_keyed_set(a), is_keyed_set(b)),
-    )
+    call("zb_any_keyed_set_pair", vec![a, b], boolean())
 }
 
 fn shaped_items(x: Expr, anys: zyntax_typed_ast::Type) -> Expr {
@@ -604,6 +597,23 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         i64(),
         vec![ret(call("zb_hook_shaped_len", vec![x.e()], i64()))],
     ));
+    // Two custom boxes that are sets, at least one of a shape the
+    // frontend registered.
+    {
+        let set_of = |x: Expr| or(eq(kind(x.clone()), int(SET_TAG >> 8)), is_keyed_set(x));
+        d.push(define_cold(
+            "zb_any_keyed_set_pair",
+            &[&a, &b],
+            boolean(),
+            vec![
+                when(
+                    not(or(is_keyed_set(a.e()), is_keyed_set(b.e()))),
+                    vec![ret(bool(false))],
+                ),
+                ret(and(set_of(a.e()), set_of(b.e()))),
+            ],
+        ));
+    }
     // Whether the box holds a dict, or a set, of a shape the frontend
     // registered.
     let kind_of = local("kind", i64());
@@ -1213,14 +1223,6 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 ],
             ),
             when(
-                keyed_set_pair(a.e(), b.e()),
-                vec![ret(call(
-                    "zb_hook_shaped_set_le",
-                    vec![a.e(), b.e(), bool(true)],
-                    boolean(),
-                ))],
-            ),
-            when(
                 and(is_set(a.e()), is_set(b.e())),
                 vec![ret(and(
                     call(
@@ -1248,11 +1250,21 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ),
             when(
                 and(is(&ca, CUSTOM), is(&cb, CUSTOM)),
-                vec![ret(call(
-                    "zb_list_lt_any",
-                    vec![iter(a.e()), iter(b.e())],
-                    boolean(),
-                ))],
+                vec![
+                    when(
+                        keyed_set_pair(a.e(), b.e()),
+                        vec![ret(call(
+                            "zb_hook_shaped_set_le",
+                            vec![a.e(), b.e(), bool(true)],
+                            boolean(),
+                        ))],
+                    ),
+                    ret(call(
+                        "zb_list_lt_any",
+                        vec![iter(a.e()), iter(b.e())],
+                        boolean(),
+                    )),
+                ],
             ),
             type_error(add(
                 add(
@@ -1273,14 +1285,6 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         boolean(),
         vec![
             when(
-                keyed_set_pair(a.e(), b.e()),
-                vec![ret(call(
-                    "zb_hook_shaped_set_le",
-                    vec![a.e(), b.e(), bool(false)],
-                    boolean(),
-                ))],
-            ),
-            when(
                 and(is_set(a.e()), is_set(b.e())),
                 vec![ret(call(
                     "zb_set_issubset",
@@ -1298,6 +1302,20 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     vec![a.e(), b.e()],
                     boolean(),
                 ))],
+            ),
+            when(
+                and(
+                    eq(category(a.e()), int(CUSTOM)),
+                    eq(category(b.e()), int(CUSTOM)),
+                ),
+                vec![when(
+                    keyed_set_pair(a.e(), b.e()),
+                    vec![ret(call(
+                        "zb_hook_shaped_set_le",
+                        vec![a.e(), b.e(), bool(false)],
+                        boolean(),
+                    ))],
+                )],
             ),
             ret(not(call("zb_any_lt", vec![b.e(), a.e()], boolean()))),
         ],
