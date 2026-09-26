@@ -226,18 +226,23 @@ pub(crate) fn shape_declarations(
             _ => None,
         });
     }
-    let mut out = Vec::new();
-    // What the dynamic layer asks of a dict or set of a shape: no
-    // program has one yet, so each reports the kind unknown. They are
-    // the program's own, as the other hooks are, so the library's calls
-    // into them link whatever the program reaches.
-    for mut decl in zyntax_builtins::lists::keyed_hook_stubs(list_type) {
-        if let zyntax_typed_ast::typed_ast::TypedDeclaration::Function(f) = &mut decl.node {
-            f.module = None;
-            f.mark_generated();
+    // The dict and set stores, each described until describing them
+    // notes no more: a store of stores notes its own.
+    let mut dict_fields: Vec<(Field, Field)> = Vec::new();
+    let mut set_fields: Vec<Field> = Vec::new();
+    loop {
+        let (dicts, sets) = (types::dict_stores(), types::set_stores());
+        if dict_fields.len() == dicts.len() && set_fields.len() == sets.len() {
+            break;
         }
-        out.push(decl);
+        for &(key, value) in &dicts[dict_fields.len()..] {
+            dict_fields.push((field_of(key), field_of(value)));
+        }
+        for &stored in &sets[set_fields.len()..] {
+            set_fields.push(field_of(stored));
+        }
     }
+    let mut out = Vec::new();
     // The storage kinds the library does not carry, before anything
     // that calls their functions.
     for kind in types::array_kinds() {
@@ -253,6 +258,28 @@ pub(crate) fn shape_declarations(
             suffix,
             tuple_ty.clone(),
             fields,
+        ));
+    }
+    // A store's functions after the tuple shapes its keys name; the
+    // library's own set is the store of dynamic values.
+    for (i, (key, value)) in dict_fields.iter().enumerate() {
+        out.extend(zyntax_builtins::dicts::dict_declarations(
+            list_type,
+            &format!("d{i}"),
+            zyntax_builtins::dicts::dict_shape_tag(i as u16),
+            key,
+            value,
+        ));
+    }
+    for (i, key) in set_fields.iter().enumerate() {
+        if matches!(key, Field::Any) {
+            continue;
+        }
+        out.extend(zyntax_builtins::dicts::set_declarations(
+            list_type,
+            &format!("s{i}"),
+            zyntax_builtins::dicts::set_shape_tag(i as u16),
+            key,
         ));
     }
     for (i, (e, inner)) in types::elem_lists().into_iter().zip(inner).enumerate() {
@@ -6461,7 +6488,63 @@ impl<'m> Lowerer<'m> {
         {
             return self.module.fallible.contains(&format!("zb_dict_{op}"));
         }
+        if let Some(fallible) = self.store_fn_fallible(name) {
+            return fallible;
+        }
         false
+    }
+
+    /// Whether function `name` of a typed dict or set store
+    /// (`zb_dict_<op>_d<i>`, `zb_set_<op>_s<i>`) can raise, when it is
+    /// one: an operation that raises on its own (a missing key, a box of
+    /// another kind) does; one that compares or hashes only numbers and
+    /// strings does not; any other raises where the library's own does.
+    fn store_fn_fallible(&self, name: &str) -> Option<bool> {
+        let (family, rest) = if let Some(rest) = name.strip_prefix("zb_dict_") {
+            ("dict", rest)
+        } else {
+            ("set", name.strip_prefix("zb_set_")?)
+        };
+        let (op, suffix) = rest.rsplit_once('_')?;
+        let letter = if family == "dict" { 'd' } else { 's' };
+        let index: usize = suffix.strip_prefix(letter)?.parse().ok()?;
+        const RAISE: &[&str] = &[
+            "get",
+            "del",
+            "pop",
+            "popitem",
+            "remove",
+            "missing",
+            "unbox",
+            "unbox_tagged",
+            "as_box_tagged",
+            "from_dyn",
+            "get_any",
+            "del_any",
+            "remove_any",
+            "eq_any",
+            "hash",
+            "min",
+        ];
+        if RAISE.contains(&op) {
+            return Some(true);
+        }
+        let scalar = |t: Ty| matches!(t, Ty::Int | Ty::Float | Ty::Str | Ty::Bool);
+        let (key, value) = if family == "dict" {
+            *types::dict_stores().get(index)?
+        } else {
+            (*types::set_stores().get(index)?, Ty::Int)
+        };
+        if op.ends_with("_any") {
+            return Some(!scalar(key));
+        }
+        if scalar(key) && (scalar(value) || !matches!(op, "eq" | "repr")) {
+            return Some(false);
+        }
+        Some(
+            self.module.fallible.contains(&format!("zb_{family}_{op}"))
+                || !matches!(op, "len" | "new" | "box" | "raw" | "box_raw" | "clear"),
+        )
     }
 
     fn expr_unchecked(&mut self, e: &py::Expr) -> Result<Val> {
@@ -8645,18 +8728,16 @@ impl<'m> Lowerer<'m> {
                     }
                     ("pop", 0) => {
                         let stored = tables::set_stored(set_ty);
-                        let popped =
-                            call(&tables::set_fn("pop", set_ty), vec![st.node], stored, span);
-                        self.read_as(
-                            Val {
-                                node: popped,
-                                ty: stored,
-                            },
-                            ty,
+                        let popped = call(
+                            &tables::set_fn("pop", set_ty),
+                            vec![st.node],
+                            tables::slot_ty(stored),
                             span,
-                        )
+                        );
+                        self.table_out(popped, stored, ty, span)
                     }
                     ("update", _) => {
+                        let outer = std::mem::take(&mut self.hoisted);
                         let mut pre = Vec::new();
                         let held = self.hold(st, &mut pre, span);
                         for a in args {
@@ -8675,6 +8756,7 @@ impl<'m> Lowerer<'m> {
                                 span,
                             ));
                         }
+                        self.hoisted = outer;
                         let none =
                             node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span);
                         Self::block_value(pre, none, Ty::None, span)
@@ -8991,6 +9073,7 @@ impl<'m> Lowerer<'m> {
                 Ty::Set(_) => ty.settled(),
                 _ => types::dynamic_set(true),
             };
+            let outer = std::mem::take(&mut self.hoisted);
             let first = self.expr(&args[0])?;
             let result = self.set_from(first, set_ty, span);
             let mut pre = std::mem::take(&mut self.hoisted);
@@ -9018,6 +9101,7 @@ impl<'m> Lowerer<'m> {
                     span,
                 ));
             }
+            self.hoisted = outer;
             let result = Self::block_value(pre, held.node, set_ty, span);
             return Ok(Val {
                 node: self.coerce(

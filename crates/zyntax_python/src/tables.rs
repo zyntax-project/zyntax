@@ -11,16 +11,16 @@
 //! store under a tag of its own.
 
 use super::{
-    Lowerer, Node, Stmt, Val, binary, call, cast, field_of, int_lit, int32_lit, list_type_id, node,
-    str_lit, var,
+    Lowerer, Node, Stmt, Val, binary, call, cast, field_of, int_lit, int32_lit, list_fn,
+    list_type_id, node, str_lit,
 };
 use crate::Result;
 use crate::types::{self, Elem, Ty};
 use ruff_python_ast as py;
 use zyntax_builtins::lists::keyed_fn;
 use zyntax_typed_ast::source::Span;
-use zyntax_typed_ast::typed_ast::{TypedExpression, TypedLet, TypedLiteral, TypedStatement};
-use zyntax_typed_ast::{BinaryOp, Mutability, Type, TypedNode};
+use zyntax_typed_ast::typed_ast::{TypedExpression, TypedLiteral, TypedStatement};
+use zyntax_typed_ast::{BinaryOp, Type, TypedNode};
 
 /// The suffix of the functions of the store of dict or set type `ty`,
 /// empty for the library's own.
@@ -149,6 +149,15 @@ pub(crate) fn table_ir(ty: Ty) -> Type {
     }
 }
 
+/// How a slot of a table stored as `stored` holds its value: a list,
+/// dict or set as the box of its kind, anything else as itself.
+pub(crate) fn slot_ty(stored: Ty) -> Ty {
+    match stored {
+        Ty::List(_) | Ty::Dict(_) | Ty::Set(_) => Ty::Object,
+        t => t,
+    }
+}
+
 /// How a key of type `key` meets a table whose keys are stored as
 /// `stored`, by the rule values of two kinds are equal by.
 enum Probe {
@@ -255,9 +264,66 @@ impl Lowerer<'_> {
         }
     }
 
-    /// A value going into a slot of a table stored as `stored`.
+    /// A value going into a slot of a table stored as `stored`: a list,
+    /// dict or set as the box of its kind, by reference; a box already,
+    /// checked to be one.
     pub(crate) fn table_in(&mut self, v: Val, stored: Ty) -> Node {
-        self.coerce(v, stored)
+        let span = v.node.span;
+        match stored {
+            Ty::List(_) | Ty::Dict(_) | Ty::Set(_) if v.ty == Ty::Object => {
+                let checked = match stored {
+                    Ty::List(e) => call(&list_fn("as_box", e), vec![v.node], Ty::Object, span),
+                    _ => call(
+                        &table_fn("as_box_tagged", stored),
+                        vec![v.node, int_lit(table_tag(stored), span)],
+                        Ty::Object,
+                        span,
+                    ),
+                };
+                let checked = Val {
+                    node: checked,
+                    ty: Ty::Object,
+                };
+                if self.guards {
+                    self.guard(checked, span).node
+                } else {
+                    checked.node
+                }
+            }
+            Ty::List(_) | Ty::Dict(_) | Ty::Set(_) => {
+                let typed = Val {
+                    node: self.coerce(v, stored),
+                    ty: stored,
+                };
+                self.coerce(typed, Ty::Object)
+            }
+            _ => self.coerce(v, stored),
+        }
+    }
+
+    /// A value read out of a slot of a table stored as `stored`, as `ty`;
+    /// a call that can raise is checked before its value is read.
+    pub(crate) fn table_out(&mut self, v: Node, stored: Ty, ty: Ty, span: Span) -> Node {
+        let v = match stored {
+            Ty::List(_) | Ty::Dict(_) | Ty::Set(_) => {
+                let boxed = self.checked(Val {
+                    node: v,
+                    ty: Ty::Object,
+                });
+                Val {
+                    node: self.trusted(boxed, stored),
+                    ty: stored,
+                }
+            }
+            _ => Val {
+                node: v,
+                ty: stored,
+            },
+        };
+        if v.ty == ty {
+            return v.node;
+        }
+        self.read_as(v, ty, span)
     }
 
     /// How `key` probes a typed table of type `table` (not the library's
@@ -270,7 +336,7 @@ impl Lowerer<'_> {
         let stored = key_stored(table);
         let never_number = |t: Ty| matches!(t, Ty::Str | Ty::None | Ty::Class(_) | Ty::Bytes);
         match (stored, key.ty) {
-            (s, k) if s == k => Probe::Typed(key.node),
+            (s, k) if s == k => Probe::Typed(self.table_in(key, stored)),
             (Ty::Int, Ty::Bool) => Probe::Typed(cast(key.node, Ty::Int, span)),
             (Ty::Float, Ty::Bool) => {
                 Probe::Typed(cast(cast(key.node, Ty::Int, span), Ty::Float, span))
@@ -302,16 +368,17 @@ impl Lowerer<'_> {
                 ty,
             };
         }
+        let slot = slot_ty(sv);
         let got = match self.probe(d.ty, key, span) {
-            Probe::Typed(k) => call(&dict_fn("get", d.ty), vec![d.node, k], sv, span),
+            Probe::Typed(k) => call(&dict_fn("get", d.ty), vec![d.node, k], slot, span),
             Probe::Absent(k) => {
                 let k = self.coerce(k, Ty::Object);
-                call(&dict_fn("get_any", d.ty), vec![d.node, k], sv, span)
+                call(&dict_fn("get_any", d.ty), vec![d.node, k], slot, span)
             }
-            Probe::Any(k) => call(&dict_fn("get_any", d.ty), vec![d.node, k], sv, span),
+            Probe::Any(k) => call(&dict_fn("get_any", d.ty), vec![d.node, k], slot, span),
         };
         Val {
-            node: self.read_as(Val { node: got, ty: sv }, ty, span),
+            node: self.table_out(got, sv, ty, span),
             ty,
         }
     }
@@ -431,7 +498,7 @@ impl Lowerer<'_> {
                 ty,
             };
         }
-        let typed_default = default.ty == sv && sv != Ty::Object;
+        let typed_default = default.ty == sv && slot_ty(sv) == sv && sv != Ty::Object;
         let got = match self.probe(d.ty, key, span) {
             Probe::Typed(k) if typed_default => Val {
                 node: call(
@@ -462,46 +529,14 @@ impl Lowerer<'_> {
                 }
             }
             Probe::Any(k) => {
-                // Found through the rule the runtime applies, else the
-                // default: two lookups on a path no typed key takes.
-                let mut pre = Vec::new();
-                let held_d = self.hold(d, &mut pre, span);
-                let held_k = self.hold(
-                    Val {
-                        node: k,
-                        ty: Ty::Object,
-                    },
-                    &mut pre,
-                    span,
-                );
                 let default = self.coerce(default, Ty::Object);
-                let found = call(
-                    &dict_fn("contains_any", held_d.ty),
-                    vec![held_d.node.clone(), held_k.node.clone()],
-                    Ty::Bool,
-                    span,
-                );
-                let value = Val {
+                Val {
                     node: call(
-                        &dict_fn("get_any", held_d.ty),
-                        vec![held_d.node, held_k.node],
-                        sv,
+                        &dict_fn("get_default_any", d.ty),
+                        vec![d.node, k, default],
+                        Ty::Object,
                         span,
                     ),
-                    ty: sv,
-                };
-                let value = self.coerce(value, Ty::Object);
-                let picked = node(
-                    TypedExpression::If(zyntax_typed_ast::typed_ast::TypedIfExpr {
-                        condition: Box::new(found),
-                        then_branch: Box::new(value),
-                        else_branch: Box::new(default),
-                    }),
-                    Ty::Object,
-                    span,
-                );
-                Val {
-                    node: Self::block_value(pre, picked, Ty::Object, span),
                     ty: Ty::Object,
                 }
             }
@@ -557,19 +592,24 @@ impl Lowerer<'_> {
             Probe::Any(k) => Err(k),
         };
         let got = match (key, default) {
-            (Ok(k), None) => Val {
-                node: call(&dict_fn("pop", d.ty), vec![d.node, k], sv, span),
-                ty: sv,
-            },
-            (Ok(k), Some(default)) if default.ty == sv && sv != Ty::Object => Val {
-                node: call(
-                    &dict_fn("pop_default", d.ty),
-                    vec![d.node, k, default.node],
-                    sv,
-                    span,
-                ),
-                ty: sv,
-            },
+            (Ok(k), None) => {
+                let got = call(&dict_fn("pop", d.ty), vec![d.node, k], slot_ty(sv), span);
+                return Val {
+                    node: self.table_out(got, sv, ty, span),
+                    ty,
+                };
+            }
+            (Ok(k), Some(default)) if default.ty == sv && slot_ty(sv) == sv && sv != Ty::Object => {
+                Val {
+                    node: call(
+                        &dict_fn("pop_default", d.ty),
+                        vec![d.node, k, default.node],
+                        sv,
+                        span,
+                    ),
+                    ty: sv,
+                }
+            }
             (Ok(k), Some(default)) => {
                 let default = self.coerce(default, Ty::Object);
                 Val {
@@ -582,75 +622,21 @@ impl Lowerer<'_> {
                     ty: Ty::Object,
                 }
             }
-            (Err(k), default) => {
-                let mut pre = Vec::new();
-                let held_d = self.hold(d, &mut pre, span);
-                let held_k = self.hold(
-                    Val {
-                        node: k,
-                        ty: Ty::Object,
-                    },
-                    &mut pre,
-                    span,
-                );
-                let read = |this: &mut Self| {
-                    let value = Val {
-                        node: call(
-                            &dict_fn("get_any", held_d.ty),
-                            vec![held_d.node.clone(), held_k.node.clone()],
-                            sv,
-                            span,
-                        ),
-                        ty: sv,
-                    };
-                    let value = this.coerce(value, Ty::Object);
-                    let name = this.temp();
-                    let mut body = vec![TypedNode::new(
-                        TypedStatement::Let(TypedLet {
-                            name,
-                            ty: Type::Any,
-                            mutability: Mutability::Immutable,
-                            initializer: Some(Box::new(value)),
-                            span,
-                        }),
-                        Type::Unknown,
-                        span,
-                    )];
-                    body.push(effect(
-                        call(
-                            &dict_fn("del_any", held_d.ty),
-                            vec![held_d.node.clone(), held_k.node.clone()],
-                            Ty::None,
-                            span,
-                        ),
-                        span,
-                    ));
-                    Self::block_value(body, var(name, Ty::Object, span), Ty::Object, span)
-                };
-                let value = match default {
-                    None => read(self),
-                    Some(default) => {
-                        let default = self.coerce(default, Ty::Object);
-                        let found = call(
-                            &dict_fn("contains_any", held_d.ty),
-                            vec![held_d.node.clone(), held_k.node.clone()],
-                            Ty::Bool,
-                            span,
-                        );
-                        let value = read(self);
-                        node(
-                            TypedExpression::If(zyntax_typed_ast::typed_ast::TypedIfExpr {
-                                condition: Box::new(found),
-                                then_branch: Box::new(value),
-                                else_branch: Box::new(default),
-                            }),
-                            Ty::Object,
-                            span,
-                        )
-                    }
-                };
+            // A key of another kind is found by the rule the runtime
+            // applies.
+            (Err(k), None) => Val {
+                node: call(&dict_fn("pop_any", d.ty), vec![d.node, k], Ty::Object, span),
+                ty: Ty::Object,
+            },
+            (Err(k), Some(default)) => {
+                let default = self.coerce(default, Ty::Object);
                 Val {
-                    node: Self::block_value(pre, value, Ty::Object, span),
+                    node: call(
+                        &dict_fn("pop_default_any", d.ty),
+                        vec![d.node, k, default],
+                        Ty::Object,
+                        span,
+                    ),
                     ty: Ty::Object,
                 }
             }
@@ -673,9 +659,14 @@ impl Lowerer<'_> {
         let (sk, sv) = dict_stored(d.ty);
         let k = self.table_in(key, sk);
         let v = self.table_in(value, sv);
-        let got = call(&dict_fn("setdefault", d.ty), vec![d.node, k, v], sv, span);
+        let got = call(
+            &dict_fn("setdefault", d.ty),
+            vec![d.node, k, v],
+            slot_ty(sv),
+            span,
+        );
         Val {
-            node: self.read_as(Val { node: got, ty: sv }, ty, span),
+            node: self.table_out(got, sv, ty, span),
             ty,
         }
     }

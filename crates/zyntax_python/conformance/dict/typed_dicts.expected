@@ -1,0 +1,36 @@
+{'a': 1, 'b': 2, 'c': 3} 3 1 None 2 True False False
+{1: 'x', 2: 'y'} y none True True x z {1: 'x', 2: 'y'}
+{2: 'y'} [2] ['y'] [(2, 'y')]
+True True a
+{'the': 3, 'cat': 1, 'dog': 1, 'end': 1} [('cat', 1), ('dog', 1), ('end', 1), ('the', 3)]
+[0, 1, 2, 3, 4, 5, 6] True True False
+True False True
+[frozenset({1, 2}), frozenset({3})] frozenset({1, 2, 3}) 1
+True True 1
+{0: 0, 1: 1, 2: 4, 3: 9} 9
+{'a': 1, 'b': 2, 'z': 26} True
+{'x': [1, 2, 3], 'y': [4]} 3 1
+{'p': {'q': 1, 'r': 2, 's': 3}}
+3 True ['a', 'b', 'z'] 1
+3 False ['a', 'b', 'z'] None
+{'a': 1, 'c': 'q'}
+{"k": 1, "j": 2} {"n": [1, 2]}
+[1] [1, 2, 3, 4] [2, 3] [1, 4] False False False
+[4] [1, 2, 3, 4] [2, 3] [1, 4] False False False
+[] [2, 3, 4, 5.0] [2, 3, 4] [5.0] True True True
+[frozenset({2, 3, 4})] {'t': frozenset({2, 3, 4})} (frozenset({2, 3, 4}), 1)
+4 -1 49 1 {0: 0, 1: 1, 3: 9, 4: 16, 7: 49}
+6 7 (10, 100) {0: 0, 1: 1, 3: 9, 4: 16, 7: 49}
+{} 0 False True
+['d', 'e', 'h', 'l', 'o', 'r', 'w'] True False
+['a', 'b', 'z'] ['a', 'b', 'z'] z 1 29
+61
+3 True 4 False
+o True o False
+{'x': True, 'y': False, 'z': True} True 2
+{'k': None, 'j': 1}
+True True True True True
+{'a': 1, 'c': 'q'} 1
+{'a': 1, 'b': 'x'}
+{5: 6} {1: 2}
+[1, 2, 'three']

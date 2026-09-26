@@ -2777,6 +2777,44 @@ fn probe_any_ops(t: &Table) -> Vec<Decl> {
                 ret(t.value_of(t.entry(d.e(), e.e()))),
             ]
         }));
+        // The value as a dynamic value, or `default` when absent; and the
+        // same with the entry removed.
+        let default = kept("default", any());
+        let x = local("x", any());
+        out_decls.push(define(
+            &t.name("get_default_any"),
+            &[&d, &k, &default],
+            any(),
+            vec![
+                e.decl(found()),
+                when(lt(e.e(), int(0)), vec![ret(default.e())]),
+                ret(vf.boxed(t.value_of(t.entry(d.e(), e.e())))),
+            ],
+        ));
+        out_decls.push(define(
+            &t.name("pop_default_any"),
+            &[&d, &k, &default],
+            any(),
+            vec![
+                e.decl(found()),
+                when(lt(e.e(), int(0)), vec![ret(default.e())]),
+                x.decl(vf.boxed(t.value_of(t.entry(d.e(), e.e())))),
+                t.go("delete_at", vec![d.e(), e.e()]),
+                ret(x.e()),
+            ],
+        ));
+        out_decls.push(define(&t.name("pop_any"), &[&d, &k], any(), {
+            vec![
+                e.decl(found()),
+                when(
+                    lt(e.e(), int(0)),
+                    vec![fatal("KeyError", call("zb_any_str", vec![k.e()], string()))],
+                ),
+                x.decl(vf.boxed(t.value_of(t.entry(d.e(), e.e())))),
+                t.go("delete_at", vec![d.e(), e.e()]),
+                ret(x.e()),
+            ]
+        }));
         out_decls.push(define(&t.name("del_any"), &[&d, &k], unit(), {
             vec![
                 e.decl(found()),

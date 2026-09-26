@@ -429,6 +429,13 @@ pub(crate) fn raise_facts(
 /// Marked generated, so their bodies are not type checked.
 pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
     let span = Span::new(0, 0);
+    // The frozenset of dynamic values an operation on a frozenset
+    // yields, a store before the hooks and method arms read the stores.
+    if !crate::types::set_stores().is_empty()
+        && let Ty::Set(k) = crate::types::dynamic_set(true)
+    {
+        crate::types::set_store(k);
+    }
     let mut out = Vec::new();
     for (k, class) in module.classes.iter().enumerate() {
         out.push(constructor(module, k, span));
@@ -1357,6 +1364,14 @@ fn builtin_arms(
             Some(format!("zb_unbox_list_raw_{}", e.suffix())),
         ));
     }
+    // A dict or set of each store the program has, and a frozenset.
+    for store in keyed_stores() {
+        receivers.push((
+            kind(store.kind),
+            store.ty,
+            Some(crate::lower::tables::table_fn("raw", store.ty)),
+        ));
+    }
     let mut arms = Vec::new();
     for (test, ty, raw) in receivers {
         let mut vars: Vec<(&str, Ty)> = vec![("s", ty)];
@@ -1763,15 +1778,570 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         box_hook(module, span),
         unbox_hook(module, span),
     ];
-    out.extend(shaped_hooks(span));
+    out.extend(shaped_hooks(module, span));
+    out.extend(keyed_hooks(module, span));
     out
+}
+
+/// A dict or set store the program used, as the hooks see it: the tag
+/// (kind) its boxes carry, a shape of the store to lower against, and
+/// whether its sets are frozen.
+struct Keyed {
+    kind: i64,
+    ty: Ty,
+}
+
+/// Every dict and set store the lowering used, each set store once as a
+/// set (when its elements are typed) and once as a frozenset.
+fn keyed_stores() -> Vec<Keyed> {
+    use crate::lower::tables;
+    let mut out = Vec::new();
+    for (key, value) in crate::types::dict_stores() {
+        let ty = crate::types::dict_of(key, value);
+        out.push(Keyed {
+            kind: tables::table_tag(ty) >> 8,
+            ty,
+        });
+    }
+    for stored in crate::types::set_stores() {
+        for frozen in [false, true] {
+            if !frozen && stored == Ty::Object {
+                continue;
+            }
+            let ty = crate::types::set_of(stored, frozen);
+            out.push(Keyed {
+                kind: tables::table_tag(ty) >> 8,
+                ty,
+            });
+        }
+    }
+    out
+}
+
+/// What the library asks of a boxed dict or set of a store the program
+/// has: each hook dispatches on the box's kind to the store's functions;
+/// a kind no store here has is a type error. A set's arithmetic and
+/// inclusion with another set go through the library's own set.
+fn keyed_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
+    use crate::lower::tables::{self, table_fn};
+    let stores = keyed_stores();
+    let x = var(intern("x"), Ty::Object, span);
+    let k = var(intern("k"), Ty::Object, span);
+    let v = var(intern("v"), Ty::Object, span);
+    let a = var(intern("a"), Ty::Object, span);
+    let b = var(intern("b"), Ty::Object, span);
+    let is = |x: &Node, kind: i64| {
+        binary(
+            BinaryOp::Eq,
+            call("zb_any_kind", vec![x.clone()], Ty::Int, span),
+            int_lit(kind, span),
+            Ty::Bool,
+            span,
+        )
+    };
+    let raw = |lowerer: &mut Lowerer<'_>, x: &Node, ty: Ty| lowerer.raw_table(x.clone(), ty, span);
+    let unknown = |ret_ty: Ty| {
+        let mut out = vec![stmt(
+            call(
+                "zb_fatal",
+                vec![
+                    str_lit("TypeError", span),
+                    str_lit("a dict or set of an unknown kind", span),
+                ],
+                Ty::None,
+                span,
+            ),
+            span,
+        )];
+        out.push(match ret_ty {
+            Ty::None => ret_void(span),
+            Ty::Object => ret(
+                node(
+                    TypedExpression::Literal(TypedLiteral::Null),
+                    Ty::Object,
+                    span,
+                ),
+                span,
+            ),
+            Ty::Bool => ret(
+                node(
+                    TypedExpression::Literal(TypedLiteral::Bool(false)),
+                    Ty::Bool,
+                    span,
+                ),
+                span,
+            ),
+            _ => ret(int_lit(0, span), span),
+        });
+        out
+    };
+    let mut lowerer = scratch(module);
+    let (mut getitem, mut setitem, mut delitem, mut contains) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut len, mut eq, mut hash, mut json) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for store in &stores {
+        let ty = store.ty;
+        let d = raw(&mut lowerer, &x, ty);
+        let key = |lowerer: &mut Lowerer<'_>, k: &Node| {
+            lowerer.table_in(
+                Val {
+                    node: k.clone(),
+                    ty: Ty::Object,
+                },
+                tables::key_stored(ty),
+            )
+        };
+        if tables::key_stored(ty) == Ty::Object {
+            contains.push(when(
+                is(&x, store.kind),
+                vec![ret(
+                    call(
+                        &table_fn("contains", ty),
+                        vec![d.clone(), k.clone()],
+                        Ty::Bool,
+                        span,
+                    ),
+                    span,
+                )],
+                span,
+            ));
+        } else {
+            contains.push(when(
+                is(&x, store.kind),
+                vec![ret(
+                    call(
+                        &table_fn("contains_any", ty),
+                        vec![d.clone(), k.clone()],
+                        Ty::Bool,
+                        span,
+                    ),
+                    span,
+                )],
+                span,
+            ));
+        }
+        len.push(when(
+            is(&x, store.kind),
+            vec![ret(
+                call(&table_fn("len", ty), vec![d.clone()], Ty::Int, span),
+                span,
+            )],
+            span,
+        ));
+        // Equal to another dict or set of any store: through the store's
+        // own comparison with a dynamic value, the library's own set
+        // through a copy of the other as one.
+        for (this, other) in [(&a, &b), (&b, &a)] {
+            let own = raw(&mut lowerer, this, ty);
+            let test = if key_is_dynamic(ty) {
+                let setlike = binary(
+                    BinaryOp::Or,
+                    binary(
+                        BinaryOp::Eq,
+                        call("zb_any_kind", vec![other.clone()], Ty::Int, span),
+                        int_lit(zyntax_builtins::SET_TAG >> 8, span),
+                        Ty::Bool,
+                        span,
+                    ),
+                    call("zb_any_is_keyed_set", vec![other.clone()], Ty::Bool, span),
+                    Ty::Bool,
+                    span,
+                );
+                let custom = binary(
+                    BinaryOp::Eq,
+                    call("zb_any_category", vec![other.clone()], Ty::Int, span),
+                    int_lit(255, span),
+                    Ty::Bool,
+                    span,
+                );
+                vec![
+                    when(
+                        binary(BinaryOp::And, custom, setlike, Ty::Bool, span),
+                        vec![ret(
+                            call(
+                                "zb_set_eq",
+                                vec![
+                                    own.clone(),
+                                    call(
+                                        "zb_set_from_dyn",
+                                        vec![other.clone()],
+                                        crate::types::dynamic_set(false),
+                                        span,
+                                    ),
+                                ],
+                                Ty::Bool,
+                                span,
+                            ),
+                            span,
+                        )],
+                        span,
+                    ),
+                    ret(
+                        node(
+                            TypedExpression::Literal(TypedLiteral::Bool(false)),
+                            Ty::Bool,
+                            span,
+                        ),
+                        span,
+                    ),
+                ]
+            } else {
+                vec![ret(
+                    call(
+                        &table_fn("eq_any", ty),
+                        vec![own, other.clone()],
+                        Ty::Bool,
+                        span,
+                    ),
+                    span,
+                )]
+            };
+            eq.push(when(is(this, store.kind), test, span));
+        }
+        match ty {
+            Ty::Dict(_) => {
+                let (_, sv) = tables::dict_stored(ty);
+                let slot = tables::slot_ty(sv);
+                let got = call(
+                    &table_fn("get_any", ty),
+                    vec![d.clone(), k.clone()],
+                    slot,
+                    span,
+                );
+                let boxed = lowerer.coerce(
+                    Val {
+                        node: got,
+                        ty: slot,
+                    },
+                    Ty::Object,
+                );
+                getitem.push(when(is(&x, store.kind), vec![ret(boxed, span)], span));
+                let kk = key(&mut lowerer, &k);
+                let vv = lowerer.table_in(
+                    Val {
+                        node: v.clone(),
+                        ty: Ty::Object,
+                    },
+                    sv,
+                );
+                setitem.push(when(
+                    is(&x, store.kind),
+                    vec![
+                        stmt(
+                            call(
+                                &table_fn("set", ty),
+                                vec![d.clone(), kk, vv],
+                                Ty::None,
+                                span,
+                            ),
+                            span,
+                        ),
+                        ret_void(span),
+                    ],
+                    span,
+                ));
+                delitem.push(when(
+                    is(&x, store.kind),
+                    vec![
+                        stmt(
+                            call(
+                                &table_fn("del_any", ty),
+                                vec![d.clone(), k.clone()],
+                                Ty::None,
+                                span,
+                            ),
+                            span,
+                        ),
+                        ret_void(span),
+                    ],
+                    span,
+                ));
+                hash.push(when(
+                    is(&x, store.kind),
+                    vec![ret(
+                        call(&table_fn("hash", ty), vec![d.clone()], Ty::Int, span),
+                        span,
+                    )],
+                    span,
+                ));
+                // As the library's own dict, a copy converted value by
+                // value.
+                let library = crate::types::dynamic_dict();
+                let copy = call("zb_dict_from_dyn", vec![x.clone()], library, span);
+                json.push(when(
+                    is(&x, store.kind),
+                    vec![
+                        stmt(
+                            call(
+                                "zb_json_into",
+                                vec![
+                                    var(intern("pieces"), Ty::List(Elem::Str), span),
+                                    call("zb_dict_box", vec![copy], Ty::Object, span),
+                                ],
+                                Ty::None,
+                                span,
+                            ),
+                            span,
+                        ),
+                        ret_void(span),
+                    ],
+                    span,
+                ));
+            }
+            _ => {
+                // A frozenset hashes by its values; a set is unhashable.
+                let hashed = if tables::frozen(ty) {
+                    vec![ret(
+                        call(&table_fn("hash", ty), vec![d.clone()], Ty::Int, span),
+                        span,
+                    )]
+                } else {
+                    vec![
+                        stmt(
+                            call(
+                                "zb_fatal",
+                                vec![
+                                    str_lit("TypeError", span),
+                                    str_lit("unhashable type: 'set'", span),
+                                ],
+                                Ty::None,
+                                span,
+                            ),
+                            span,
+                        ),
+                        ret(int_lit(0, span), span),
+                    ]
+                };
+                hash.push(when(is(&x, store.kind), hashed, span));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let with_unknown = |mut arms: Vec<TypedNode<TypedStatement>>, ret_ty: Ty| {
+        arms.extend(unknown(ret_ty));
+        arms
+    };
+    out.push(function(
+        "zb_hook_shaped_getitem",
+        vec![param("x", Ty::Object, span), param("k", Ty::Object, span)],
+        Ty::Object,
+        with_unknown(getitem, Ty::Object),
+        span,
+    ));
+    out.push(function(
+        "zb_hook_shaped_setitem",
+        vec![
+            param("x", Ty::Object, span),
+            param("k", Ty::Object, span),
+            param("v", Ty::Object, span),
+        ],
+        Ty::None,
+        with_unknown(setitem, Ty::None),
+        span,
+    ));
+    out.push(function(
+        "zb_hook_shaped_delitem",
+        vec![param("x", Ty::Object, span), param("k", Ty::Object, span)],
+        Ty::None,
+        with_unknown(delitem, Ty::None),
+        span,
+    ));
+    out.push(function(
+        "zb_hook_shaped_contains",
+        vec![param("x", Ty::Object, span), param("k", Ty::Object, span)],
+        Ty::Bool,
+        with_unknown(contains, Ty::Bool),
+        span,
+    ));
+    out.push(function(
+        "zb_hook_shaped_len",
+        vec![param("x", Ty::Object, span)],
+        Ty::Int,
+        with_unknown(len, Ty::Int),
+        span,
+    ));
+    out.push(function(
+        "zb_hook_shaped_eq",
+        vec![param("a", Ty::Object, span), param("b", Ty::Object, span)],
+        Ty::Bool,
+        with_unknown(eq, Ty::Bool),
+        span,
+    ));
+    out.push(function(
+        "zb_hook_shaped_hash",
+        vec![param("x", Ty::Object, span)],
+        Ty::Int,
+        with_unknown(hash, Ty::Int),
+        span,
+    ));
+    out.push(function(
+        "zb_hook_shaped_json",
+        vec![
+            param("pieces", Ty::List(Elem::Str), span),
+            param("x", Ty::Object, span),
+        ],
+        Ty::None,
+        with_unknown(json, Ty::None),
+        span,
+    ));
+    out.extend(set_operation_hooks(module, span));
+    out
+}
+
+/// Whether a set type's store holds dynamic values: the library's own
+/// set, whose functions take no dynamic probe of their own.
+fn key_is_dynamic(ty: Ty) -> bool {
+    matches!(ty, Ty::Set(_)) && crate::lower::tables::set_stored(ty) == Ty::Object
+}
+
+/// A set's arithmetic (by the operator's code: 1 `-`, 7 `&`, 8 `|`, 9
+/// `^`) and inclusion with another set, where one of them is of a store
+/// the program has: both as copies in the library's own set, the result
+/// a frozenset when the left one is.
+fn set_operation_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
+    let _ = module;
+    let a = var(intern("a"), Ty::Object, span);
+    let b = var(intern("b"), Ty::Object, span);
+    let code = var(intern("code"), Ty::Int, span);
+    let library = crate::types::dynamic_set(false);
+    let copy = |x: &Node| call("zb_set_from_dyn", vec![x.clone()], library, span);
+    let mut arith = vec![
+        let_("la", library, copy(&a), span),
+        let_("lb", library, copy(&b), span),
+    ];
+    let la = var(intern("la"), library, span);
+    let lb = var(intern("lb"), library, span);
+    let frozen_tag = crate::lower::tables::table_tag(crate::types::dynamic_set(true));
+    let left_frozen = call(
+        "zb_any_is_keyed_frozen_set",
+        vec![a.clone()],
+        Ty::Bool,
+        span,
+    );
+    for (c, op) in [(1, "sub"), (7, "and"), (8, "or"), (9, "xor")] {
+        let result = call(
+            &format!("zb_set_{op}"),
+            vec![la.clone(), lb.clone()],
+            library,
+            span,
+        );
+        arith.push(when(
+            binary(BinaryOp::Eq, code.clone(), int_lit(c, span), Ty::Bool, span),
+            vec![
+                let_("r", library, result, span),
+                when(
+                    left_frozen.clone(),
+                    vec![ret(
+                        call(
+                            "zb_set_box_raw",
+                            vec![
+                                var(intern("r"), library, span),
+                                crate::lower::int32_lit(frozen_tag as i32, span),
+                            ],
+                            Ty::Object,
+                            span,
+                        ),
+                        span,
+                    )],
+                    span,
+                ),
+                ret(
+                    call(
+                        "zb_set_box",
+                        vec![var(intern("r"), library, span)],
+                        Ty::Object,
+                        span,
+                    ),
+                    span,
+                ),
+            ],
+            span,
+        ));
+    }
+    arith.push(stmt(
+        call(
+            "zb_fatal",
+            vec![
+                str_lit("TypeError", span),
+                str_lit("unsupported operand type(s) for a set", span),
+            ],
+            Ty::None,
+            span,
+        ),
+        span,
+    ));
+    arith.push(ret(
+        node(
+            TypedExpression::Literal(TypedLiteral::Null),
+            Ty::Object,
+            span,
+        ),
+        span,
+    ));
+    let strict = var(intern("strict"), Ty::Bool, span);
+    let len = |x: &Node| call("zb_set_len", vec![x.clone()], Ty::Int, span);
+    let le = vec![
+        let_("la", library, copy(&a), span),
+        let_("lb", library, copy(&b), span),
+        when(
+            binary(
+                BinaryOp::And,
+                strict,
+                binary(BinaryOp::Ge, len(&la), len(&lb), Ty::Bool, span),
+                Ty::Bool,
+                span,
+            ),
+            vec![ret(
+                node(
+                    TypedExpression::Literal(TypedLiteral::Bool(false)),
+                    Ty::Bool,
+                    span,
+                ),
+                span,
+            )],
+            span,
+        ),
+        ret(
+            call(
+                "zb_set_issubset",
+                vec![la.clone(), lb.clone()],
+                Ty::Bool,
+                span,
+            ),
+            span,
+        ),
+    ];
+    vec![
+        function(
+            "zb_hook_shaped_set_arith",
+            vec![
+                param("code", Ty::Int, span),
+                param("a", Ty::Object, span),
+                param("b", Ty::Object, span),
+            ],
+            Ty::Object,
+            arith,
+            span,
+        ),
+        function(
+            "zb_hook_shaped_set_le",
+            vec![
+                param("a", Ty::Object, span),
+                param("b", Ty::Object, span),
+                param("strict", Ty::Bool, span),
+            ],
+            Ty::Bool,
+            le,
+            span,
+        ),
+    ]
 }
 
 /// What the library asks of a boxed list whose elements are a tuple
 /// shape: its elements as dynamic values, one element, a store and an
 /// append. Each dispatches on the box's kind to the list functions
 /// generated for the shape; a kind no list here has is a type error.
-fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
+fn shaped_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
     use crate::types::Elem;
     let x = var(intern("x"), Ty::Object, span);
     let i = var(intern("i"), Ty::Int, span);
@@ -2181,6 +2751,27 @@ fn shaped_hooks(span: Span) -> Vec<TypedFunction> {
             ],
             span,
         ));
+    }
+    // A dict or set of a store the program has prints as the store
+    // prints it, and iterates as its keys or values.
+    let mut lowerer = scratch(module);
+    for store in keyed_stores() {
+        let is_store = binary(
+            BinaryOp::Eq,
+            kind.clone(),
+            int_lit(store.kind, span),
+            Ty::Bool,
+            span,
+        );
+        let d = Val {
+            node: lowerer.raw_table(x.clone(), store.ty, span),
+            ty: store.ty,
+        };
+        let text = lowerer.table_repr(d.clone(), span);
+        repr.push(when(is_store.clone(), vec![ret(text, span)], span));
+        let listed = lowerer.table_items(d, span);
+        let listed = lowerer.coerce(listed, Ty::List(Elem::Object));
+        items.push(when(is_store, vec![ret(listed, span)], span));
     }
     items.push(unknown());
     items.push(ret(

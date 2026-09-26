@@ -485,10 +485,12 @@ pub(crate) fn dynamic_set(frozen: bool) -> Ty {
 }
 
 /// Whether dicts and sets store their keys, values and elements as the
-/// types inference gave them: not yet, every one stores dynamic values
-/// as the library's own dict and set do.
+/// types inference gave them. `ZYNTAX_DYNAMIC_TABLES=1` stores every one
+/// as dynamic values, as the library's own dict and set do; safe to run
+/// with.
 pub(crate) fn typed_tables() -> bool {
-    false
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZYNTAX_DYNAMIC_TABLES").is_none())
 }
 
 /// How a table stores a key (`key`) or a value of type `ty`: as itself
@@ -499,17 +501,38 @@ pub(crate) fn table_stored(ty: Ty, key: bool) -> Ty {
     if !typed_tables() {
         return Ty::Object;
     }
+    // A bool, alone or in a tuple, is boxed: the interpreter misplaces
+    // the entries of a table whose struct has a one-byte field.
+    fn holds_bool(t: Ty) -> bool {
+        match t {
+            Ty::Bool => true,
+            Ty::Tuple(k) => tuple_shape(k).into_iter().any(|f| holds_bool(f.settled())),
+            _ => false,
+        }
+    }
     match ty.settled() {
+        t if holds_bool(t) => Ty::Object,
         t @ (Ty::Int | Ty::Float | Ty::Str | Ty::Tuple(_)) => t,
-        Ty::Bool if !key => Ty::Bool,
         Ty::Class(k) if !key => Ty::Class(k),
         Ty::List(e) if !key => Ty::List(e),
+        // A table held in a table: its store comes first, so the store
+        // holding it is declared after it.
         Ty::Dict(k) if !key => {
             let (kk, kv) = dict_shape(k);
-            dict_of(table_stored(kk, true), table_stored(kv, false))
+            let inner = dict_of(table_stored(kk, true), table_stored(kv, false));
+            if let Ty::Dict(i) = inner {
+                dict_store(i);
+            }
+            inner
         }
         Ty::Set(k) => match set_shape(k) {
-            (e, frozen) if frozen || !key => set_of(table_stored(e, true), frozen),
+            (e, frozen) if frozen || !key => {
+                let inner = set_of(table_stored(e, true), frozen);
+                if let Ty::Set(i) = inner {
+                    set_store(i);
+                }
+                inner
+            }
             _ => Ty::Object,
         },
         _ => Ty::Object,
@@ -555,6 +578,11 @@ pub(crate) fn set_store(k: u16) -> (u16, Ty) {
         i
     });
     (i, stored)
+}
+
+/// The set stores the lowering used, by index.
+pub(crate) fn set_stores() -> Vec<Ty> {
+    SET_STORES.with(|t| t.borrow().clone())
 }
 
 /// Record that a list of elements of kind `e`, a tuple or list shape,
@@ -5150,6 +5178,92 @@ impl Walker<'_> {
         }
     }
 
+    /// `target = source` where both hold a dict or set: one storage under
+    /// two names, so the source takes whatever the target is widened to.
+    fn widen_alias(&mut self, target: &py::Expr, source: &py::Expr) {
+        if !matches!(source, py::Expr::Name(_) | py::Expr::Attribute(_)) {
+            return;
+        }
+        let (held, taken) = (self.expr(source), self.expr(target));
+        if matches!(
+            (held, taken),
+            (Ty::Dict(_), Ty::Dict(_)) | (Ty::Set(_), Ty::Set(_))
+        ) {
+            let widened = held.join(taken);
+            if widened != held && matches!(widened, Ty::Dict(_) | Ty::Set(_)) {
+                self.widen_holder(source, widened);
+            }
+        }
+    }
+
+    /// A dict or set passed to a function of the module whose parameter
+    /// takes a wider one (the callee writes other kinds into it) is
+    /// widened where it is held, so both see one storage.
+    fn widen_passed(&mut self, e: &py::Expr) {
+        use ruff_python_ast::visitor::{Visitor, walk_expr};
+        #[derive(Default)]
+        struct Calls<'a> {
+            found: Vec<&'a py::ExprCall>,
+        }
+        impl<'a> Visitor<'a> for Calls<'a> {
+            fn visit_expr(&mut self, expr: &'a py::Expr) {
+                match expr {
+                    py::Expr::Lambda(_) => {}
+                    py::Expr::Call(c) => {
+                        self.found.push(c);
+                        walk_expr(self, expr);
+                    }
+                    _ => walk_expr(self, expr),
+                }
+            }
+        }
+        let mut calls = Calls::default();
+        calls.visit_expr(e);
+        for c in calls.found {
+            let (sig, skip) = match &*c.func {
+                py::Expr::Name(n) if !self.typer().is_variable(n.id.as_str()) => {
+                    let name = n.id.as_str();
+                    if let Some(sig) = self.module.funcs.get(name) {
+                        (sig.clone(), 0)
+                    } else if let Some(&k) = self.module.class_index.get(name) {
+                        match self.module.method_sig(k, "__init__") {
+                            Some((sig, _)) => (sig.clone(), 1),
+                            None => continue,
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                py::Expr::Attribute(a) => match self.expr(&a.value) {
+                    Ty::Class(k) => match self.module.method_sig(k as usize, a.attr.as_str()) {
+                        Some((sig, _)) => (sig.clone(), 1),
+                        None => continue,
+                    },
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            for (i, arg) in c.arguments.args.iter().enumerate() {
+                if matches!(arg, py::Expr::Starred(_)) {
+                    break;
+                }
+                let Some((_, param)) = sig.params.get(i + skip) else {
+                    break;
+                };
+                let passed = self.expr(arg);
+                if matches!(
+                    (passed, *param),
+                    (Ty::Dict(_), Ty::Dict(_)) | (Ty::Set(_), Ty::Set(_))
+                ) {
+                    let widened = passed.join(*param);
+                    if widened != passed && matches!(widened, Ty::Dict(_) | Ty::Set(_)) {
+                        self.widen_holder(arg, widened);
+                    }
+                }
+            }
+        }
+    }
+
     /// `s.add(x)`, `s.update(xs)`, `d.setdefault(k, v)` and `d.update(e)`
     /// widen the set or dict they are called on as a store into it does.
     fn container_write(&mut self, e: &py::Expr) {
@@ -5241,6 +5355,20 @@ impl Walker<'_> {
 
     fn stmt(&mut self, s: &py::Stmt) {
         match s {
+            py::Stmt::Expr(e) => self.widen_passed(&e.value),
+            py::Stmt::Assign(a) => self.widen_passed(&a.value),
+            py::Stmt::AugAssign(a) => self.widen_passed(&a.value),
+            py::Stmt::Return(r) => {
+                if let Some(v) = &r.value {
+                    self.widen_passed(v);
+                }
+            }
+            py::Stmt::If(i) => self.widen_passed(&i.test),
+            py::Stmt::While(w) => self.widen_passed(&w.test),
+            py::Stmt::For(f) => self.widen_passed(&f.iter),
+            _ => {}
+        }
+        match s {
             py::Stmt::Assign(a) => {
                 // A local takes a run-time number as itself; any other
                 // target reads it as its box.
@@ -5287,6 +5415,7 @@ impl Walker<'_> {
                         }
                     }
                     self.target(t, ty);
+                    self.widen_alias(t, &a.value);
                 }
             }
             py::Stmt::AnnAssign(a) => {
