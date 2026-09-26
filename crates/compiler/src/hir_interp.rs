@@ -110,6 +110,14 @@ pub fn trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("ZYNTAX_TRACE_INTERP").is_some())
 }
 
+/// `ZYNTAX_CHECK_ERROR_FLAG=1` aborts when an interpreted function is
+/// entered with the module's error-flag global non-null; safe to run
+/// with, slow.
+fn check_error_flag_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZYNTAX_CHECK_ERROR_FLAG").is_some_and(|v| v != "0"))
+}
+
 /// The address of `name` in the running process, if the dynamic linker
 /// knows it.
 #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -2795,6 +2803,9 @@ pub struct HirInterpreter {
     symbol_call_dispatcher: Option<
         Box<dyn FnMut(&str, Vec<ZyntaxValue>) -> Result<Option<ZyntaxValue>, InterpError> + Send>,
     >,
+    /// The module last asked for its error-flag global, and that
+    /// global, for `ZYNTAX_CHECK_ERROR_FLAG`.
+    error_flag_of: Option<(usize, Option<HirId>)>,
 }
 
 /// When a `tick_callback` returns one of these, the interpreter
@@ -2866,6 +2877,7 @@ impl HirInterpreter {
             wasm_jit_threshold: 1,
             indirect_call_dispatcher: None,
             symbol_call_dispatcher: None,
+            error_flag_of: None,
         }
     }
 
@@ -3606,6 +3618,9 @@ impl HirInterpreter {
         func_id: HirId,
         dest: *mut u8,
     ) -> Result<ZyntaxValue, InterpError> {
+        if check_error_flag_enabled() {
+            self.check_error_flag(module, func_id);
+        }
         let mut scratch = Scratch::new();
         let marks = self.waiting_marks.len();
         // The frame starts on cleared stack, so a slot it never writes
@@ -3636,6 +3651,41 @@ impl HirInterpreter {
             self.memory.release_scratch(block);
         }
         result
+    }
+
+    /// Every function is entered with the error flag null: abort
+    /// naming the function when it is not.
+    fn check_error_flag(&mut self, module: &HirModule, func_id: HirId) {
+        let key = module as *const HirModule as usize;
+        let flag = match self.error_flag_of {
+            Some((k, flag)) if k == key => flag,
+            _ => {
+                let flag = module
+                    .globals
+                    .iter()
+                    .find(|(_, g)| g.error_flag)
+                    .map(|(id, _)| *id);
+                self.error_flag_of = Some((key, flag));
+                flag
+            }
+        };
+        let Some(ptr) = flag.and_then(|id| self.memory.globals.get(&id).copied()) else {
+            return;
+        };
+        // SAFETY: a global slot is at least a word, and the flag is a
+        // pointer.
+        let value = unsafe { (ptr as *const usize).read_unaligned() };
+        if value != 0 {
+            let name = module
+                .functions
+                .get(&func_id)
+                .and_then(|f| f.name.resolve_global())
+                .unwrap_or_default();
+            eprintln!(
+                "ZYNTAX_CHECK_ERROR_FLAG: `{name}` entered with the error flag set ({value:#x})"
+            );
+            std::process::abort();
+        }
     }
 
     /// Storage for this frame: zeroed, released with the frame.
