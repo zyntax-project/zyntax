@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1790424195,"nonce":"qRU40/OidB83GugBqtu94mZMd7Q=","added":["bug","area:python"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":2,"timestamp":1790424200,"nonce":"1NoYQBW/D5uU0rgJaKXDygkGWoI=","title":"Python: a NaN dict key, set or list element never finds itself; CPython finds it by identity","was":"Python: a NaN key or element is found only by identity in CPython, never in zypy"}]}
