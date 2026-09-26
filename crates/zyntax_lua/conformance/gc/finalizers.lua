@@ -1,8 +1,8 @@
 -- __gc runs for unreachable objects, the last marked first; the
 -- object is resurrected for its finalizer, and a __gc added to the
--- metatable after setmetatable does not mark the object. Only the
--- program's own collections run, so the objects made together are
--- finalized together whenever the collector would have run by itself.
+-- metatable after setmetatable does not mark the object. The order
+-- depends on when a collection runs (reference Lua collecting after the
+-- second object prints 2 1 3), so only the program's own collections run.
 collectgarbage("stop")
 local order = {}
 local saved
