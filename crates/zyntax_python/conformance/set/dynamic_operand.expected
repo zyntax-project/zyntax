@@ -1,0 +1,6 @@
+([0, 1, 4, 5, 6, 7, 8, 9], [2, 3], True, True, True, True, False, 0, 2, 8)
+([0, 1, 3, 4, 6, 7, 8, 9], [2, 5], True, True, True, True, False, 0, 2, 8)
+([0, 2, 3, 4, 5, 6, 7, 8], [1, 9], True, True, True, True, False, 0, 2, 8)
+TypeError unsupported operand type(s) for -: 'frozenset' and 'int'
+[2, 3] True False True
+TypeError unsupported operand type(s) for &: 'set' and 'list'

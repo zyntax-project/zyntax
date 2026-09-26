@@ -5900,6 +5900,13 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
             let ((ea, frozen), (eb, _)) = (set_shape(a), set_shape(b));
             set_of(ea.join(eb), frozen)
         }
+        // A set less, or cut to, another value holds values of its own:
+        // the other is a set only the runtime knows, or the TypeError.
+        py::Operator::BitAnd | py::Operator::Sub
+            if matches!(l, Ty::Set(_)) && matches!(r, Ty::Object) =>
+        {
+            l
+        }
         py::Operator::Add if matches!(l, Ty::List(_)) && l == r => l,
         // Two shapes concatenate into one.
         py::Operator::Add if let (Ty::Tuple(a), Ty::Tuple(b)) = (l, r) => {

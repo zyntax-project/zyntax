@@ -1049,6 +1049,149 @@ impl Lowerer<'_> {
         Some(Self::block_value(pre, value, Ty::Bool, span))
     }
 
+    /// `s op x` for a set `s` and a dynamic value `x` (`op` a set
+    /// function taking one, `sub_any` or `and_any`), as set type `ty`.
+    pub(crate) fn set_with_dynamic(
+        &mut self,
+        op: &str,
+        s: Val,
+        x: Val,
+        ty: Ty,
+        span: Span,
+    ) -> Node {
+        let s = if same_store(s.ty, ty) {
+            s.node
+        } else {
+            self.convert_items(s, ty, span)
+        };
+        let x = self.coerce(x, Ty::Object);
+        let result = Val {
+            node: call(
+                &set_fn(op, ty),
+                vec![
+                    s,
+                    x,
+                    int_lit(frozen_tag_of(ty), span),
+                    bool_lit(frozen(ty), span),
+                ],
+                ty,
+                span,
+            ),
+            ty,
+        };
+        if self.guards {
+            self.guard(result, span).node
+        } else {
+            result.node
+        }
+    }
+
+    /// `len(a & b)` or `len(a - b)` (`op` "and" or "sub") for a set `a`
+    /// and a set or dynamic value `b`, counted without making the set.
+    pub(crate) fn set_arith_len(&mut self, op: &str, a: Val, b: Val, span: Span) -> Node {
+        let ty = a.ty;
+        if b.ty == Ty::Object {
+            let b = self.coerce(b, Ty::Object);
+            let counted = Val {
+                node: call(
+                    &set_fn(&format!("{op}_len_any"), ty),
+                    vec![
+                        a.node,
+                        b,
+                        int_lit(frozen_tag_of(ty), span),
+                        bool_lit(frozen(ty), span),
+                    ],
+                    Ty::Int,
+                    span,
+                ),
+                ty: Ty::Int,
+            };
+            return if self.guards {
+                self.guard(counted, span).node
+            } else {
+                counted.node
+            };
+        }
+        call(
+            &set_fn(&format!("{op}_len"), ty),
+            vec![a.node, b.node],
+            Ty::Int,
+            span,
+        )
+    }
+
+    /// A set ordered against a dynamic value, either side.
+    pub(crate) fn set_order_dynamic(&mut self, op: py::CmpOp, a: Val, b: Val, span: Span) -> Node {
+        let set_left = matches!(a.ty, Ty::Set(_));
+        let (s, x) = if set_left { (a, b) } else { (b, a) };
+        // With the set on the left, `<=` asks whether it is a subset of
+        // the other; with it on the right, a superset.
+        let subset = matches!(
+            (op, set_left),
+            (py::CmpOp::LtE | py::CmpOp::Lt, true) | (py::CmpOp::GtE | py::CmpOp::Gt, false)
+        );
+        let strict = matches!(op, py::CmpOp::Lt | py::CmpOp::Gt);
+        let ty = s.ty;
+        if !set_fn_typed(ty) {
+            let l = self.coerce(if set_left { s.clone() } else { x.clone() }, Ty::Object);
+            let r = self.coerce(if set_left { x } else { s }, Ty::Object);
+            let name = match op {
+                py::CmpOp::LtE => "zb_any_le",
+                py::CmpOp::Lt => "zb_any_lt",
+                py::CmpOp::GtE => return call("zb_any_le", vec![r, l], Ty::Bool, span),
+                _ => return call("zb_any_lt", vec![r, l], Ty::Bool, span),
+            };
+            return call(name, vec![l, r], Ty::Bool, span);
+        }
+        // Held ahead, with what the operands hoisted, so the checked
+        // test that reads them twice follows them.
+        let x = Val {
+            node: self.coerce(x, Ty::Object),
+            ty: Ty::Object,
+        };
+        let mut pre = Vec::new();
+        let s = self.hold(s, &mut pre, span);
+        let x = self.hold(x, &mut pre, span);
+        self.hoisted.append(&mut pre);
+        let test = if subset {
+            "issubset_any"
+        } else {
+            "issuperset_any"
+        };
+        let included = Val {
+            node: call(
+                &set_fn(test, ty),
+                vec![
+                    s.node.clone(),
+                    x.node.clone(),
+                    int_lit(frozen_tag_of(ty), span),
+                    bool_lit(frozen(ty), span),
+                ],
+                Ty::Bool,
+                span,
+            ),
+            ty: Ty::Bool,
+        };
+        let included = if self.guards {
+            self.guard(included, span).node
+        } else {
+            included.node
+        };
+        if !strict {
+            return included;
+        }
+        // Proper: included and of another size.
+        let other_len = call("zb_any_len", vec![x.node], Ty::Int, span);
+        let own_len = self.table_len(s, span);
+        binary(
+            BinaryOp::And,
+            included,
+            binary(BinaryOp::Ne, own_len, other_len, Ty::Bool, span),
+            Ty::Bool,
+            span,
+        )
+    }
+
     /// Two dicts compared for equality.
     pub(crate) fn dict_equal(&mut self, a: Val, b: Val, span: Span) -> Node {
         if same_store(a.ty, b.ty) {
@@ -1072,6 +1215,20 @@ impl Lowerer<'_> {
         }
         self.set_from(v, ty, span)
     }
+}
+
+/// The tag of the frozensets of `ty`'s store.
+fn frozen_tag_of(ty: Ty) -> i64 {
+    let Ty::Set(k) = ty else {
+        unreachable!("a set type")
+    };
+    table_tag(types::set_of(types::set_shape(k).0, true))
+}
+
+/// Whether set type `ty` has functions of its own, generated for its
+/// store, rather than the library's.
+fn set_fn_typed(ty: Ty) -> bool {
+    set_stored(ty) != Ty::Object
 }
 
 /// Whether every key of a dict literal is a string literal, no two

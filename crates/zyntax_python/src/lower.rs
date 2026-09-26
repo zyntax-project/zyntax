@@ -7179,6 +7179,22 @@ impl<'m> Lowerer<'m> {
                 _ => {}
             }
         }
+        // A set less, or cut to, a dynamic value: through the set's own
+        // functions when the value is a set of its store.
+        if let (Ty::Set(_), Ty::Object, py::Operator::Sub | py::Operator::BitAnd) =
+            (left.ty, right.ty, op)
+        {
+            let name = if op == py::Operator::Sub {
+                "sub_any"
+            } else {
+                "and_any"
+            };
+            let ty = left.ty.settled();
+            return Ok(Val {
+                node: self.set_with_dynamic(name, left, right, ty, span),
+                ty,
+            });
+        }
         // Set algebra, in the store of the set inference made of the
         // result: the left one's kind, of either's elements.
         if let (Ty::Set(a), Ty::Set(b)) = (left.ty, right.ty) {
@@ -7614,6 +7630,15 @@ impl<'m> Lowerer<'m> {
                 return Ok(if op == py::CmpOp::IsNot { negate(n) } else { n });
             }
             _ => {}
+        }
+        // A set ordered against a dynamic value: through the set's own
+        // functions when the value is a set of its store.
+        if let (
+            (Ty::Set(_), Ty::Object) | (Ty::Object, Ty::Set(_)),
+            py::CmpOp::LtE | py::CmpOp::Lt | py::CmpOp::GtE | py::CmpOp::Gt,
+        ) = ((left.ty, right.ty), op)
+        {
+            return Ok(self.set_order_dynamic(op, left, right, span));
         }
         // Sets order by inclusion.
         if matches!((left.ty, right.ty), (Ty::Set(_), Ty::Set(_))) {
@@ -9476,6 +9501,30 @@ impl<'m> Lowerer<'m> {
                     return Ok(self.next_of(g.node, default, span));
                 }
                 "len" => {
+                    // The size of a set's intersection with or difference
+                    // from another, without making it.
+                    if let py::Expr::BinOp(b) = &args[0]
+                        && matches!(b.op, py::Operator::BitAnd | py::Operator::Sub)
+                        && let Ty::Set(_) = self.ty_of(&b.left)
+                        && let (l, r) = (
+                            self.ty_of(&b.left).settled(),
+                            self.ty_of(&b.right).settled(),
+                        )
+                        && (matches!(r, Ty::Set(_)) && tables::same_store(l, r)
+                            || r == Ty::Object && tables::set_stored(l) != Ty::Object)
+                    {
+                        let left = self.expr(&b.left)?;
+                        let right = self.expr(&b.right)?;
+                        let op = if b.op == py::Operator::BitAnd {
+                            "and"
+                        } else {
+                            "sub"
+                        };
+                        return Ok(Val {
+                            node: self.set_arith_len(op, left, right, span),
+                            ty: Ty::Int,
+                        });
+                    }
                     let v = self.expr(&args[0])?;
                     let node = match v.ty {
                         Ty::Str => call("zb_str_chars_len", vec![v.node], Ty::Int, span),
@@ -9610,6 +9659,24 @@ impl<'m> Lowerer<'m> {
                     });
                 }
                 "min" | "max" => {
+                    // The least of a set of small ints is the lowest bit
+                    // of its mask.
+                    if name == "min"
+                        && args.len() == 1
+                        && let Ty::Set(_) = self.ty_of(&args[0])
+                        && tables::set_stored(self.ty_of(&args[0]).settled()) == Ty::Int
+                    {
+                        let v = self.expr(&args[0])?;
+                        let least = Val {
+                            node: call(&tables::set_fn("min", v.ty), vec![v.node], Ty::Int, span),
+                            ty: Ty::Int,
+                        };
+                        let least = self.checked(least);
+                        return Ok(Val {
+                            node: self.coerce(least, ty),
+                            ty,
+                        });
+                    }
                     // Several arguments are the one-argument form over a
                     // list of them.
                     let list = if args.len() == 1 {

@@ -2064,20 +2064,13 @@ fn keyed_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
                     )],
                     span,
                 ));
-                // As the library's own dict, a copy converted value by
-                // value.
-                let library = crate::types::dynamic_dict();
-                let copy = call("zb_dict_from_dyn", vec![x.clone()], library, span);
                 json.push(when(
                     is(&x, store.kind),
                     vec![
                         stmt(
                             call(
-                                "zb_json_into",
-                                vec![
-                                    var(intern("pieces"), Ty::List(Elem::Str), span),
-                                    call("zb_dict_box", vec![copy], Ty::Object, span),
-                                ],
+                                &table_fn("json_into", ty),
+                                vec![var(intern("pieces"), Ty::List(Elem::Str), span), d.clone()],
                                 Ty::None,
                                 span,
                             ),
@@ -2265,16 +2258,127 @@ fn key_is_dynamic(ty: Ty) -> bool {
 /// the program has: both as copies in the library's own set, the result
 /// a frozenset when the left one is.
 fn set_operation_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
-    let _ = module;
+    use crate::lower::tables::{self, set_fn};
     let a = var(intern("a"), Ty::Object, span);
     let b = var(intern("b"), Ty::Object, span);
     let code = var(intern("code"), Ty::Int, span);
+    let strict = var(intern("strict"), Ty::Bool, span);
     let library = crate::types::dynamic_set(false);
     let copy = |x: &Node| call("zb_set_from_dyn", vec![x.clone()], library, span);
-    let mut arith = vec![
+    let kind_of = |x: &Node| call("zb_any_kind", vec![x.clone()], Ty::Int, span);
+    let either = |x: &Node, kinds: (i64, i64)| {
+        binary(
+            BinaryOp::Or,
+            binary(
+                BinaryOp::Eq,
+                kind_of(x),
+                int_lit(kinds.0, span),
+                Ty::Bool,
+                span,
+            ),
+            binary(
+                BinaryOp::Eq,
+                kind_of(x),
+                int_lit(kinds.1, span),
+                Ty::Bool,
+                span,
+            ),
+            Ty::Bool,
+            span,
+        )
+    };
+    // Two sets of one store, frozen or not, through the store's own
+    // functions: the result a frozenset when the left one is.
+    let mut lowerer = scratch(module);
+    let mut same_arith = Vec::new();
+    let mut same_le = Vec::new();
+    for stored in crate::types::set_stores() {
+        let (set, frozen) = (
+            crate::types::set_of(stored, false),
+            crate::types::set_of(stored, true),
+        );
+        let kinds = (tables::table_tag(set) >> 8, tables::table_tag(frozen) >> 8);
+        let both = binary(
+            BinaryOp::And,
+            either(&a, kinds),
+            either(&b, kinds),
+            Ty::Bool,
+            span,
+        );
+        let ra = lowerer.raw_table(a.clone(), set, span);
+        let rb = lowerer.raw_table(b.clone(), set, span);
+        let len = |x: &Node| call(&set_fn("len", set), vec![x.clone()], Ty::Int, span);
+        same_le.push(when(
+            both.clone(),
+            vec![
+                when(
+                    binary(
+                        BinaryOp::And,
+                        strict.clone(),
+                        binary(BinaryOp::Ge, len(&ra), len(&rb), Ty::Bool, span),
+                        Ty::Bool,
+                        span,
+                    ),
+                    vec![ret(
+                        node(
+                            TypedExpression::Literal(TypedLiteral::Bool(false)),
+                            Ty::Bool,
+                            span,
+                        ),
+                        span,
+                    )],
+                    span,
+                ),
+                ret(
+                    call(
+                        &set_fn("issubset", set),
+                        vec![ra.clone(), rb.clone()],
+                        Ty::Bool,
+                        span,
+                    ),
+                    span,
+                ),
+            ],
+            span,
+        ));
+        let mut arms = Vec::new();
+        for (c, op) in [(1, "sub"), (7, "and"), (8, "or"), (9, "xor")] {
+            let result = Val {
+                node: call(&set_fn(op, set), vec![ra.clone(), rb.clone()], set, span),
+                ty: set,
+            };
+            let as_frozen = Val {
+                node: result.node.clone(),
+                ty: frozen,
+            };
+            let boxed = lowerer.box_table(result, span);
+            let boxed_frozen = lowerer.box_table(as_frozen, span);
+            arms.push(when(
+                binary(BinaryOp::Eq, code.clone(), int_lit(c, span), Ty::Bool, span),
+                vec![
+                    when(
+                        binary(
+                            BinaryOp::Eq,
+                            kind_of(&a),
+                            int_lit(kinds.1, span),
+                            Ty::Bool,
+                            span,
+                        ),
+                        vec![ret(boxed_frozen, span)],
+                        span,
+                    ),
+                    ret(boxed, span),
+                ],
+                span,
+            ));
+        }
+        same_arith.push(when(both, arms, span));
+    }
+    let mut arith = same_arith;
+    arith.extend([
         let_("la", library, copy(&a), span),
         let_("lb", library, copy(&b), span),
-    ];
+    ]);
     let la = var(intern("la"), library, span);
     let lb = var(intern("lb"), library, span);
     let frozen_tag = crate::lower::tables::table_tag(crate::types::dynamic_set(true));
@@ -2344,9 +2448,9 @@ fn set_operation_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         ),
         span,
     ));
-    let strict = var(intern("strict"), Ty::Bool, span);
     let len = |x: &Node| call("zb_set_len", vec![x.clone()], Ty::Int, span);
-    let le = vec![
+    let mut le = same_le;
+    le.extend(vec![
         let_("la", library, copy(&a), span),
         let_("lb", library, copy(&b), span),
         when(
@@ -2376,7 +2480,7 @@ fn set_operation_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
             ),
             span,
         ),
-    ];
+    ]);
     vec![
         function(
             "zb_hook_shaped_set_arith",
@@ -2835,8 +2939,23 @@ fn shaped_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         };
         let text = lowerer.table_repr(d.clone(), span);
         repr.push(when(is_store.clone(), vec![ret(text, span)], span));
-        let listed = lowerer.table_items(d, span);
-        let listed = lowerer.coerce(listed, Ty::List(Elem::Object));
+        // The keys or values boxed in one pass; the library's own set
+        // lists its boxes.
+        let listed = if crate::lower::tables::key_stored(store.ty) == Ty::Object {
+            let listed = lowerer.table_items(d, span);
+            lowerer.coerce(listed, Ty::List(Elem::Object))
+        } else {
+            let op = match store.ty {
+                Ty::Dict(_) => "keys_any",
+                _ => "items_any",
+            };
+            call(
+                &crate::lower::tables::table_fn(op, store.ty),
+                vec![d.node],
+                Ty::List(Elem::Object),
+                span,
+            )
+        };
         items.push(when(is_store, vec![ret(listed, span)], span));
     }
     items.push(unknown());

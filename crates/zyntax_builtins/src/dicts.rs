@@ -1412,6 +1412,65 @@ fn dict_ops(t: &Table) -> Vec<Decl> {
         )));
         st
     }));
+    // The JSON text of a dict of a frontend's shape, into `pieces`: its
+    // live pairs in order, as the library's own dict writes them, a
+    // number or string value written as it is stored.
+    if !t.sfx.is_empty() {
+        let jp = borrowed("pieces", strs.clone());
+        let jpiece = |p: Expr| expr(mcall(jp.e(), "push", vec![p], unit()));
+        let jfirst = local("first", boolean());
+        let key_text = match t.key {
+            Field::Str => Some(call("zb_json_escape", vec![t.key_of(en.e())], string())),
+            Field::Any => None,
+            _ => Some(text("")),
+        };
+        let mut body = vec![
+            when(not(jfirst.e()), vec![jpiece(text(", "))]),
+            jfirst.set(bool(false)),
+        ];
+        match (t.key, key_text) {
+            (Field::Str, Some(k)) => body.push(jpiece(k)),
+            (Field::Any, _) => {
+                body.push(when(
+                    ne(
+                        call("zb_any_category", vec![t.key_of(en.e())], i64()),
+                        int(crate::dynamic::STR),
+                    ),
+                    vec![fatal(
+                        "TypeError",
+                        text("keys must be str, int, float, bool or None"),
+                    )],
+                ));
+                body.push(expr(call(
+                    "zb_json_into",
+                    vec![jp.e(), t.key_of(en.e())],
+                    unit(),
+                )));
+            }
+            _ => body.push(fatal(
+                "TypeError",
+                text("keys must be str, int, float, bool or None"),
+            )),
+        }
+        body.push(jpiece(text(": ")));
+        let value = t.value_of(en.e());
+        body.push(match vf {
+            Field::Int => jpiece(call("zb_str_of_int", vec![value], string())),
+            Field::Float => jpiece(call("zb_json_float", vec![value], string())),
+            Field::Str => jpiece(call("zb_json_escape", vec![value], string())),
+            Field::Bool => jpiece(if_expr(value, text("true"), text("false"))),
+            other => expr(call(
+                "zb_json_into",
+                vec![jp.e(), other.boxed(value)],
+                unit(),
+            )),
+        });
+        let mut st = vec![jpiece(text("{")), jfirst.decl(bool(true))];
+        st.extend(live_walk(&d, body));
+        st.push(jpiece(text("}")));
+        st.push(ret_void());
+        d_out.push(define(&t.name("json_into"), &[&jp, &d], unit(), st));
+    }
     // A dict is not a key.
     d_out.push(define(
         &t.name("hash"),
@@ -2826,6 +2885,33 @@ fn probe_any_ops(t: &Table) -> Vec<Decl> {
                 ret_void(),
             ]
         }));
+        // The keys as dynamic values, for the dynamic layer's walk.
+        out_decls.push(define(&t.name("keys_any"), &[&d], anys.clone(), {
+            let mut st = vec![
+                keys.decl(list(Vec::new(), anys.clone())),
+                n.decl(len(d.e())),
+                expr(mcall(keys.e(), "reserve", vec![n.e()], unit())),
+            ];
+            st.extend(for_range(
+                &i,
+                t.first(t.ctrl(d.e())),
+                n.e(),
+                vec![
+                    en.decl(t.entry(d.e(), i.e())),
+                    when(
+                        ne(t.hash_of(en.e()), int(TOMB)),
+                        vec![expr(mcall(
+                            keys.e(),
+                            "push",
+                            vec![boxed_key(en.e())],
+                            unit(),
+                        ))],
+                    ),
+                ],
+            ));
+            st.push(ret(keys.e()));
+            st
+        }));
         // Equal to any dict of the same keys, each keyed to an equal
         // value, whatever either's shape.
         out_decls.push(define(&t.name("eq_any"), &[&d, &other], boolean(), {
@@ -2909,6 +2995,210 @@ fn probe_any_ops(t: &Table) -> Vec<Decl> {
             st
         }));
     } else {
+        // A dynamic value as a set of this shape: its own storage when
+        // its tag is this shape's or `tag` (a frozen set's), else a copy.
+        let tag2 = local("tag", i64());
+        let left_frozen = local("frozen", boolean());
+        let xb = borrowed("x", any());
+        let box_tag = || cast(call("zb_box_tag", vec![xb.e()], i32()), i64());
+        out_decls.push(define(&t.name("adopt"), &[&xb, &tag2], lt_.clone(), {
+            vec![
+                when(
+                    or(eq(box_tag(), int(t.tag)), eq(box_tag(), tag2.e())),
+                    vec![ret(call(&t.name("raw"), vec![xb.e()], lt_.clone()))],
+                ),
+                ret(t.call("from_dyn", vec![xb.e()], lt_.clone())),
+            ]
+        }));
+        // `s - x`, `s & x` and the inclusions of `s` and a dynamic `x`:
+        // through this shape's own functions when `x` is a set of it
+        // (its tag this shape's or `tag`, a frozen set's), else value by
+        // value through the dynamic membership test. A result holds
+        // values of `s`; `frozen` names the type of `s` in an error.
+        let own = |x: Expr| {
+            or(
+                eq(
+                    cast(call("zb_box_tag", vec![x.clone()], i32()), i64()),
+                    int(t.tag),
+                ),
+                eq(cast(call("zb_box_tag", vec![x], i32()), i64()), tag2.e()),
+            )
+        };
+        let raw_x = || call(&t.name("raw"), vec![xb.e()], lt_.clone());
+        let not_a_set = |op: &str| {
+            when(
+                not(is_like(xb.e())),
+                vec![fatal(
+                    "TypeError",
+                    add(
+                        add(
+                            text(&format!("unsupported operand type(s) for {op}: '")),
+                            if_expr(left_frozen.e(), text("frozenset"), text("set")),
+                        ),
+                        add(
+                            text("' and '"),
+                            add(call("zb_any_type", vec![xb.e()], string()), text("'")),
+                        ),
+                    ),
+                )],
+            )
+        };
+        let has = |x: Expr, v: Expr| call("zb_any_contains", vec![x, v], boolean());
+        for (op, name, keep) in [("-", "sub", false), ("&", "and", true)] {
+            out_decls.push(define(
+                &t.name(&format!("{name}_any")),
+                &[&d, &xb, &tag2, &left_frozen],
+                lt_.clone(),
+                {
+                    let mut st = vec![
+                        when(
+                            own(xb.e()),
+                            vec![ret(t.call(name, vec![d.e(), raw_x()], lt_.clone()))],
+                        ),
+                        not_a_set(op),
+                        out.decl(t.call("new", vec![], lt_.clone())),
+                        n.decl(len(d.e())),
+                    ];
+                    let hit = has(xb.e(), boxed_key(en.e()));
+                    st.extend(for_range(
+                        &i,
+                        t.first(t.ctrl(d.e())),
+                        n.e(),
+                        vec![
+                            en.decl(t.entry(d.e(), i.e())),
+                            when(
+                                and(
+                                    ne(t.hash_of(en.e()), int(TOMB)),
+                                    if keep { hit } else { not(hit) },
+                                ),
+                                vec![t.go("add", vec![out.e(), t.key_of(en.e())])],
+                            ),
+                        ],
+                    ));
+                    st.push(ret(out.e()));
+                    st
+                },
+            ));
+        }
+        // The size of `s & x` or `s - x`, the set not made when `x` is of
+        // this shape.
+        for name in ["and", "sub"] {
+            out_decls.push(define(
+                &t.name(&format!("{name}_len_any")),
+                &[&d, &xb, &tag2, &left_frozen],
+                i64(),
+                vec![
+                    when(
+                        own(xb.e()),
+                        vec![ret(t.call(
+                            &format!("{name}_len"),
+                            vec![d.e(), raw_x()],
+                            i64(),
+                        ))],
+                    ),
+                    ret(t.call(
+                        "len",
+                        vec![t.call(
+                            &format!("{name}_any"),
+                            vec![d.e(), xb.e(), tag2.e(), left_frozen.e()],
+                            lt_.clone(),
+                        )],
+                        i64(),
+                    )),
+                ],
+            ));
+        }
+        // Whether every value of `s` is in `x`, or of `x` in `s`.
+        out_decls.push(define(
+            &t.name("issubset_any"),
+            &[&d, &xb, &tag2, &left_frozen],
+            boolean(),
+            {
+                let mut st = vec![
+                    when(
+                        own(xb.e()),
+                        vec![ret(t.call("issubset", vec![d.e(), raw_x()], boolean()))],
+                    ),
+                    not_a_set("<="),
+                    n.decl(len(d.e())),
+                ];
+                st.extend(for_range(
+                    &i,
+                    t.first(t.ctrl(d.e())),
+                    n.e(),
+                    vec![
+                        en.decl(t.entry(d.e(), i.e())),
+                        when(
+                            and(
+                                ne(t.hash_of(en.e()), int(TOMB)),
+                                not(has(xb.e(), boxed_key(en.e()))),
+                            ),
+                            vec![ret(bool(false))],
+                        ),
+                    ],
+                ));
+                st.push(ret(bool(true)));
+                st
+            },
+        ));
+        out_decls.push(define(
+            &t.name("issuperset_any"),
+            &[&d, &xb, &tag2, &left_frozen],
+            boolean(),
+            {
+                let mut st = vec![
+                    when(
+                        own(xb.e()),
+                        vec![ret(t.call("issubset", vec![raw_x(), d.e()], boolean()))],
+                    ),
+                    not_a_set(">="),
+                    keys.decl(call("zb_any_iter", vec![xb.e()], anys.clone())),
+                    n.decl(len(keys.e())),
+                ];
+                st.extend(for_range(
+                    &i,
+                    int(0),
+                    n.e(),
+                    vec![when(
+                        not(t.call(
+                            "contains_any",
+                            vec![d.e(), idx(keys.e(), i.e(), any())],
+                            boolean(),
+                        )),
+                        vec![ret(bool(false))],
+                    )],
+                ));
+                st.push(ret(bool(true)));
+                st
+            },
+        ));
+        // The values as dynamic values, for the dynamic layer's walk.
+        out_decls.push(define(&t.name("items_any"), &[&d], anys.clone(), {
+            let mut st = vec![
+                keys.decl(list(Vec::new(), anys.clone())),
+                n.decl(len(d.e())),
+                expr(mcall(keys.e(), "reserve", vec![n.e()], unit())),
+            ];
+            st.extend(for_range(
+                &i,
+                t.first(t.ctrl(d.e())),
+                n.e(),
+                vec![
+                    en.decl(t.entry(d.e(), i.e())),
+                    when(
+                        ne(t.hash_of(en.e()), int(TOMB)),
+                        vec![expr(mcall(
+                            keys.e(),
+                            "push",
+                            vec![boxed_key(en.e())],
+                            unit(),
+                        ))],
+                    ),
+                ],
+            ));
+            st.push(ret(keys.e()));
+            st
+        }));
         // A value found by the rule, removed; absent, nothing, or the
         // KeyError of `remove`.
         for (op, raises) in [("discard_any", false), ("remove_any", true)] {
