@@ -268,6 +268,9 @@ pub struct CraneliftBackend {
     declined_functions: std::collections::HashSet<HirId>,
     /// JIT module for code generation
     module: JITModule,
+    /// Address space each JIT module this backend makes reserves for its
+    /// code and data (see [`crate::jit_memory`]).
+    jit_reservation: usize,
     /// The target the module compiles for, held so a translated function
     /// can be compiled without the module in hand.
     isa: Arc<dyn cranelift_codegen::isa::TargetIsa>,
@@ -557,6 +560,34 @@ fn configured_isa(
         .unwrap()
 }
 
+/// A builder for a JIT module compiling for `isa`: it places its code
+/// and data in `reservation` bytes of address space of its own, and
+/// resolves the runtime symbols every module's code may call.
+fn jit_builder(isa: Arc<dyn cranelift_codegen::isa::TargetIsa>, reservation: usize) -> JITBuilder {
+    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    if let Some(memory) = crate::jit_memory::provider(reservation) {
+        builder.memory_provider(memory);
+    }
+    // OSR runtime symbols are always available: tier-0 codegen emits
+    // probe call sites unconditionally for any loop header. In paths
+    // that don't use beadie (Classic runtime), the probe returns null
+    // harmlessly because no beads are registered.
+    for (name, ptr) in crate::osr::osr_runtime_symbols() {
+        builder.symbol(name, ptr);
+    }
+    // The allocation intrinsics call into the runtime's size-class
+    // pools rather than libc, so the JIT has to resolve them.
+    for (name, ptr) in crate::pool_alloc::alloc_runtime_symbols() {
+        builder.symbol(name, ptr);
+    }
+    // String-op runtime intrinsics, referenced unconditionally by
+    // `BinaryOp::Eq` / `Ne` on `Ptr(I8)` operands.
+    for (name, ptr) in crate::string_intrinsics::string_runtime_symbols() {
+        builder.symbol(name, ptr);
+    }
+    builder
+}
+
 impl CraneliftBackend {
     /// Create a new Cranelift backend with custom runtime symbols
     ///
@@ -583,29 +614,20 @@ impl CraneliftBackend {
         isa: Arc<dyn cranelift_codegen::isa::TargetIsa>,
         additional_symbols: Option<&[(&str, *const u8)]>,
     ) -> CompilerResult<Self> {
+        Self::with_jit_reservation(isa, additional_symbols, crate::jit_memory::RESERVATION)
+    }
+
+    /// [`Self::new_internal`] with `jit_reservation` bytes of address
+    /// space for each JIT module to place its code and data in.
+    fn with_jit_reservation(
+        isa: Arc<dyn cranelift_codegen::isa::TargetIsa>,
+        additional_symbols: Option<&[(&str, *const u8)]>,
+        jit_reservation: usize,
+    ) -> CompilerResult<Self> {
         let isa_shared = Arc::clone(&isa);
 
         // Create JIT module and register runtime functions
-        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-
-        // OSR runtime symbols are always available — tier-0 codegen emits
-        // probe call sites unconditionally for any loop header. In paths
-        // that don't use beadie (Classic runtime), the probe returns null
-        // harmlessly because no beads are registered.
-        for (name, ptr) in crate::osr::osr_runtime_symbols() {
-            builder.symbol(name, ptr);
-        }
-        // The allocation intrinsics call into the runtime's size-class
-        // pools rather than libc, so the JIT has to resolve them.
-        for (name, ptr) in crate::pool_alloc::alloc_runtime_symbols() {
-            builder.symbol(name, ptr);
-        }
-
-        // String-op runtime intrinsics — referenced unconditionally
-        // by `BinaryOp::Eq` / `Ne` on `Ptr(I8)` operands.
-        for (name, ptr) in crate::string_intrinsics::string_runtime_symbols() {
-            builder.symbol(name, ptr);
-        }
+        let mut builder = jit_builder(isa, jit_reservation);
 
         // Register all runtime symbols (both stdlib and frontend-specific)
         // All symbols are now provided via the plugin system
@@ -625,6 +647,7 @@ impl CraneliftBackend {
         Ok(Self {
             declined_functions: std::collections::HashSet::new(),
             module,
+            jit_reservation,
             isa: isa_shared,
             builder_context: FunctionBuilderContext::new(),
             codegen_context: codegen::Context::new(),
@@ -10524,23 +10547,7 @@ impl CraneliftBackend {
         let isa = Arc::clone(&self.isa);
 
         // Create new JIT module with all symbols
-        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        // OSR runtime symbols must be re-registered on every module rebuild —
-        // tier-0 codegen emits probe call sites unconditionally for any loop.
-        for (name, ptr) in crate::osr::osr_runtime_symbols() {
-            builder.symbol(name, ptr);
-        }
-        // The allocation intrinsics call into the runtime's size-class
-        // pools rather than libc, so the JIT has to resolve them.
-        for (name, ptr) in crate::pool_alloc::alloc_runtime_symbols() {
-            builder.symbol(name, ptr);
-        }
-
-        // String-op runtime intrinsics — referenced unconditionally
-        // by `BinaryOp::Eq` / `Ne` on `Ptr(I8)` operands.
-        for (name, ptr) in crate::string_intrinsics::string_runtime_symbols() {
-            builder.symbol(name, ptr);
-        }
+        let mut builder = jit_builder(isa, self.jit_reservation);
         for (name, ptr) in &all_symbols {
             builder.symbol(*name, *ptr);
         }
@@ -11203,6 +11210,71 @@ mod tests {
     fn test_cranelift_backend_creation() {
         let backend = CraneliftBackend::new();
         assert!(backend.is_ok());
+    }
+
+    /// A module whose range is full refuses the next compile with an
+    /// error, and the code it placed before keeps running.
+    #[test]
+    #[cfg(unix)]
+    fn a_full_jit_range_refuses_a_compile_and_keeps_its_code() {
+        use crate::hir::{HirFunctionSignature, HirValueKind};
+        let returning = |k: i64| {
+            let sig = HirFunctionSignature {
+                params: vec![],
+                returns: vec![HirType::I64],
+                type_params: vec![],
+                const_params: vec![],
+                lifetime_params: vec![],
+                is_variadic: false,
+                is_async: false,
+                is_fiber: false,
+                effects: vec![],
+                is_pure: false,
+            };
+            let name = zyntax_typed_ast::InternedString::new_global(&format!("returns_{k}"));
+            let mut f = HirFunction::new(name, sig);
+            let v = f.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(k)));
+            let entry = f.entry_block;
+            f.blocks.get_mut(&entry).unwrap().terminator =
+                HirTerminator::Return { values: vec![v] };
+            f
+        };
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        // Each finalization starts code on a fresh page, so a few
+        // compiles fill four pages.
+        let mut backend =
+            CraneliftBackend::with_jit_reservation(host_isa(), None, 4 * page).expect("backend");
+        let first = returning(0);
+        backend
+            .compile_function(first.id, &first)
+            .expect("the first compile fits");
+        backend.finalize_definitions().expect("finalized");
+        let first_code = backend.get_function_ptr(first.id).expect("compiled");
+
+        let refused = (1..64).find_map(|k| {
+            let f = returning(k);
+            backend
+                .compile_function(f.id, &f)
+                .and_then(|()| backend.finalize_definitions())
+                .err()
+        });
+        let refused = refused.expect("a compile past the range's end is refused");
+        assert!(
+            refused.to_string().contains("JIT module's range"),
+            "the error says the range is full: {refused}"
+        );
+
+        // A recompile of a function that has code is refused the same
+        // way, and the function keeps the code it had.
+        assert!(backend.compile_function(first.id, &first).is_err());
+        backend
+            .finalize_definitions()
+            .expect("nothing left to finalize");
+        assert_eq!(backend.get_function_ptr(first.id), Some(first_code));
+        // SAFETY: compiled above as `fn() -> i64`, and finalized.
+        let run: extern "C" fn() -> i64 = unsafe { std::mem::transmute(first_code) };
+        assert_eq!(run(), 0);
     }
 
     /// 5b end-to-end: build a small counted-loop function in HIR, compile
