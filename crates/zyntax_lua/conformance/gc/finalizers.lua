@@ -1,6 +1,9 @@
 -- __gc runs for unreachable objects, the last marked first; the
 -- object is resurrected for its finalizer, and a __gc added to the
--- metatable after setmetatable does not mark the object.
+-- metatable after setmetatable does not mark the object. Only the
+-- program's own collections run, so the objects made together are
+-- finalized together whenever the collector would have run by itself.
+collectgarbage("stop")
 local order = {}
 local saved
 local function make()
