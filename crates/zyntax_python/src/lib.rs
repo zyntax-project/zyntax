@@ -281,8 +281,12 @@ pub fn parse_program_with(
     // A record shape the lowering demotes is typed again as a dict, so
     // the program is read again without it; shapes only ever leave.
     let mut demoted: HashSet<Vec<String>> = HashSet::default();
+    // The library a reading left untouched serves the next one, so a
+    // program read again is built from the same library a single reading
+    // would use.
+    let mut kept: Option<Library> = None;
     loop {
-        let result = parse_program_once(source, file, modules, &demoted);
+        let result = parse_program_once(source, file, modules, &demoted, &mut kept);
         records::watch(false);
         let mut found = records::demoted();
         // A lowering that failed with records in the program is read
@@ -302,6 +306,7 @@ fn parse_program_once(
     file: &str,
     modules: &modules::Resolver<'_>,
     demoted: &HashSet<Vec<String>>,
+    kept: &mut Option<Library>,
 ) -> Result<TypedProgram> {
     // `ZYNTAX_TRACE_LOWER_PHASES=1` times the frontend's steps on stderr,
     // the same switch the embedder's phase trace reads.
@@ -441,7 +446,10 @@ fn parse_program_once(
         &items,
     )?);
     lap("classes");
-    let mut library = library()?;
+    let mut library = match kept.take() {
+        Some(library) => library,
+        None => library()?,
+    };
     lower::set_list_type(library.list_type);
     lap("library");
     let owned: Vec<py::Stmt> = top_level.iter().map(|(s, _)| (*s).clone()).collect();
@@ -689,6 +697,7 @@ fn parse_program_once(
     // anything is lowered.
     records::demote_globals(&inferred);
     if records::any_demoted() {
+        *kept = Some(library);
         return Err(Error::unsupported_span(
             "a dict literal used as a record",
             Span::new(0, 0),
