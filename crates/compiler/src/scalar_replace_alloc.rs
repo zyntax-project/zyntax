@@ -833,6 +833,7 @@ mod tests {
             effects: IndexMap::new(),
             handlers: IndexMap::new(),
             automatic_release: false,
+            exact_struct_types: Default::default(),
         };
         module.functions.insert(func_id, f);
         (module, func_id)

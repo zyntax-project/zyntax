@@ -315,6 +315,7 @@ mod tests {
             initializer: None,
             is_const: true,
             is_thread_local: false,
+            error_flag: false,
             linkage: crate::hir::Linkage::Internal,
             visibility: crate::hir::Visibility::Default,
         };

@@ -45,6 +45,9 @@ pub(crate) struct Inputs<'a> {
     /// Whether the pattern rewrites run on a program that declares no
     /// effects; see `TieredRuntime::set_pattern_rewrites`.
     pub pattern_rewrites: bool,
+    /// The language's pending-error global; see
+    /// `TieredRuntime::set_error_flag_global`.
+    pub error_flag_global: Option<InternedString>,
 }
 
 /// A lowered program.
@@ -159,6 +162,7 @@ pub(crate) fn lower_typed_program(
     crate::import_chain::resolve_unresolved_types(&mut program, &type_registry);
     program.type_registry = type_registry;
     lap("externs+resolve", &mut at);
+    let exact_struct_types = exact_struct_types(&program.type_registry);
 
     zyntax_compiler::register_impl_blocks(&mut program)
         .map_err(|e| RuntimeError::Execution(format!("Failed to register impl blocks: {:?}", e)))?;
@@ -193,6 +197,8 @@ pub(crate) fn lower_typed_program(
         closed: inputs.closed,
         prelowered,
         linked: inputs.linked,
+        error_flag_global: inputs.error_flag_global,
+        exact_struct_types,
         ..LoweringConfig::default()
     };
 
@@ -224,6 +230,22 @@ pub(crate) fn lower_typed_program(
         module,
         entered: lowering_ctx.entered_functions(),
     })
+}
+
+/// The metadata key a frontend sets on a struct type it guarantees
+/// exact: every pointer typed as one points at an object of that type.
+pub const EXACT_STRUCT_KEY: &str = "exact";
+
+/// The struct types `registry` marks exact under [`EXACT_STRUCT_KEY`].
+fn exact_struct_types(
+    registry: &zyntax_typed_ast::TypeRegistry,
+) -> std::collections::HashSet<zyntax_typed_ast::TypeId> {
+    let key = InternedString::new_global(EXACT_STRUCT_KEY);
+    registry
+        .get_all_types()
+        .filter(|def| def.metadata.custom.contains_key(&key))
+        .map(|def| def.id)
+        .collect()
 }
 
 /// The structural cleanup and the effect rewrites, in the order their

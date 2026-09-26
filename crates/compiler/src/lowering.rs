@@ -449,6 +449,12 @@ pub struct LoweringConfig {
     /// installed where this module is going: calls and reads reach them
     /// there, and they are not brought into this module again.
     pub linked: Arc<std::collections::HashSet<crate::hir::HirId>>,
+    /// The global that holds the language's pending error, if it keeps
+    /// one; lowered with `HirGlobal::error_flag` set.
+    pub error_flag_global: Option<InternedString>,
+    /// Struct types the frontend guarantees exact; becomes
+    /// `HirModule::exact_struct_types`.
+    pub exact_struct_types: std::collections::HashSet<zyntax_typed_ast::TypeId>,
 }
 
 impl std::fmt::Debug for LoweringConfig {
@@ -482,6 +488,8 @@ impl Default for LoweringConfig {
             prelowered: Vec::new(),
             linked: Arc::default(),
             use_krio_async: false,
+            error_flag_global: None,
+            exact_struct_types: std::collections::HashSet::new(),
         }
     }
 }
@@ -565,7 +573,10 @@ impl LoweringContext {
 
         Self {
             declared_in: indexmap::IndexMap::new(),
-            module: HirModule::new(module_name),
+            module: HirModule {
+                exact_struct_types: config.exact_struct_types.clone(),
+                ..HirModule::new(module_name)
+            },
             wanted: None,
             lowered_fns: std::collections::HashSet::new(),
             skipped_at: std::collections::HashMap::new(),
@@ -4144,6 +4155,16 @@ impl LoweringContext {
             hir_func.attributes.inline = crate::hir::InlineHint::Never;
         }
         hir_func.attributes.strict_fp = annotated("strict_fp");
+        // Facts about the error-flag global the frontend proved: see
+        // `FunctionAttributes::sets_error_flag` and `nothrow`.
+        hir_func.attributes.sets_error_flag = annotated("sets_error_flag");
+        hir_func.attributes.nothrow = annotated("nothrow");
+        // `@inline_always`: the inliner copies it into every caller its
+        // size and recursion rules allow.
+        if annotated("inline_always") {
+            hir_func.attributes.inline = crate::hir::InlineHint::Always;
+            hir_func.attributes.always_inline = true;
+        }
         // `@cooperative` (short alias `@coop`) marks an async function whose
         // fiber steps may interleave at the executor's yield points. Recorded
         // here so both spellings are recognized; the interleaving lowering
@@ -4864,6 +4885,7 @@ impl LoweringContext {
             initializer,
             is_const: var.mutability == Mutability::Immutable,
             is_thread_local: false,
+            error_flag: self.config.error_flag_global == Some(var.name),
             linkage: self.convert_linkage(var.visibility),
             visibility: self.convert_visibility(var.visibility),
         };

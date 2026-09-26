@@ -9254,6 +9254,7 @@ impl SsaBuilder {
             initializer: Some(HirConstant::String(string_name)),
             is_const: true,
             is_thread_local: false,
+            error_flag: false,
             linkage: Linkage::Private,
             visibility: Visibility::Default,
         };

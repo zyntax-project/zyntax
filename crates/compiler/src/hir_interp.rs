@@ -6005,6 +6005,7 @@ mod tests {
                 initializer: Some(HirConstant::I64(0)),
                 is_const: false,
                 is_thread_local: false,
+                error_flag: false,
                 linkage: crate::hir::Linkage::Internal,
                 visibility: crate::hir::Visibility::Default,
             },

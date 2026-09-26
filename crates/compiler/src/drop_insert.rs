@@ -3730,6 +3730,7 @@ mod tests {
             returns_owned: false,
             returns_param: Vec::new(),
             automatic_release: false,
+            exact_struct_types: Default::default(),
         });
         let mut m = HirModule::new(InternedString::new_global("m"));
         m.functions.insert(ctor_key, ctor);

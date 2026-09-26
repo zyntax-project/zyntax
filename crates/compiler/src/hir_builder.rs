@@ -125,6 +125,7 @@ impl<'arena> HirBuilder<'arena> {
                 effects: IndexMap::new(),
                 handlers: IndexMap::new(),
                 automatic_release: false,
+                exact_struct_types: Default::default(),
             },
             arena,
             current_function: None,
@@ -479,6 +480,7 @@ impl<'arena> HirBuilder<'arena> {
             initializer: Some(HirConstant::String(self.intern(string_data))),
             is_const: true,
             is_thread_local: false,
+            error_flag: false,
             linkage: Linkage::Private,
             visibility: Visibility::Default,
         };

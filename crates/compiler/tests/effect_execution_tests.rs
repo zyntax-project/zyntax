@@ -77,6 +77,7 @@ fn empty_module() -> HirModule {
         effects: IndexMap::new(),
         handlers: IndexMap::new(),
         automatic_release: false,
+        exact_struct_types: Default::default(),
     }
 }
 

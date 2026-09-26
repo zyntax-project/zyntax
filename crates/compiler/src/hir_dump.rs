@@ -1275,6 +1275,20 @@ pub fn dump_function(func: &HirFunction, module: &HirModule) -> String {
     if let Some(ref link) = func.link_name {
         let _ = writeln!(out, "    ; link_name: \"{}\"", link);
     }
+    let attrs: Vec<&str> = [
+        (func.attributes.sets_error_flag, "sets_error_flag"),
+        (func.attributes.nothrow, "nothrow"),
+        (
+            func.attributes.inline == crate::hir::InlineHint::Always,
+            "inline_always",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if !attrs.is_empty() {
+        let _ = writeln!(out, "    ; attrs: {}", attrs.join(" "));
+    }
 
     // Value declarations: constants, undefs, globals (not parameters or instructions)
     // This makes it visible what implicit values exist in the function
@@ -1373,7 +1387,20 @@ pub fn dump_module(module: &HirModule) -> String {
             Some(c) => format!(" = {}", fmt_constant(c)),
             None => String::new(),
         };
-        let _ = writeln!(out, "{} @{}: {}{}", kind, gname, fmt_type(&global.ty), init);
+        let flag = if global.error_flag {
+            " ; error_flag"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "{} @{}: {}{}{}",
+            kind,
+            gname,
+            fmt_type(&global.ty),
+            init,
+            flag
+        );
     }
     if !module.globals.is_empty() {
         let _ = writeln!(out);

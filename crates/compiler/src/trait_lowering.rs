@@ -784,6 +784,7 @@ pub fn create_vtable_global(
         initializer: Some(HirConstant::VTable(vtable)),
         is_const: true,
         is_thread_local: false,
+        error_flag: false,
         linkage: Linkage::Internal,
         visibility: Visibility::Hidden, // Use Hidden instead of Private
     }

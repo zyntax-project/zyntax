@@ -307,6 +307,12 @@ pub struct HirModule {
     /// or its own release frees what was already freed.
     #[serde(default)]
     pub automatic_release: bool,
+    /// Struct types whose every `*S` points at an object laid out as
+    /// `S`, never at one of another type viewed through it: pointers to
+    /// two different such types never name the same bytes. Filled from
+    /// `LoweringConfig::exact_struct_types`.
+    #[serde(default)]
+    pub exact_struct_types: HashSet<TypeId>,
 }
 
 /// HIR function with CFG and SSA form
@@ -2276,6 +2282,15 @@ pub struct FunctionAttributes {
     /// that rewrites the body clears it.
     #[serde(default)]
     pub release_facts: Option<ReleaseFacts>,
+    /// Every return leaves the module's error-flag global (see
+    /// `HirGlobal::error_flag`) non-null.
+    #[serde(default)]
+    pub sets_error_flag: bool,
+    /// A call leaves the error-flag global as it found it: the body
+    /// leaves no error pending that it did not catch, and calls nothing
+    /// that does.
+    #[serde(default)]
+    pub nothrow: bool,
 }
 
 /// The release pass's per-function facts; see
@@ -2311,6 +2326,11 @@ pub struct HirGlobal {
     pub is_thread_local: bool,
     pub linkage: Linkage,
     pub visibility: Visibility,
+    /// The language's pending-error indicator: null while no error is
+    /// pending, and only stores, `sets_error_flag` functions and calls
+    /// not marked `nothrow` change it.
+    #[serde(default)]
+    pub error_flag: bool,
 }
 
 /// Virtual method table (vtable) for trait objects
@@ -2628,6 +2648,7 @@ impl HirModule {
             effects: IndexMap::new(),
             handlers: IndexMap::new(),
             automatic_release: false,
+            exact_struct_types: Default::default(),
         }
     }
 
@@ -2946,5 +2967,46 @@ mod capacity_tests {
             postcard::to_allocvec(&f).unwrap(),
             postcard::to_allocvec(&g).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod error_flag_tests {
+    use super::*;
+
+    /// The error-flag facts and exact struct types ride in the bytes a
+    /// snapshot stores.
+    #[test]
+    fn error_flag_facts_survive_encoding() {
+        let name = InternedString::new_global("m");
+        let mut module = HirModule::new(name);
+        let ty = zyntax_typed_ast::TypeId::next();
+        module.exact_struct_types.insert(ty);
+        let global = HirGlobal {
+            id: HirId::new(),
+            name: InternedString::new_global("flag"),
+            ty: HirType::Ptr(Box::new(HirType::I8)),
+            initializer: None,
+            is_const: false,
+            is_thread_local: false,
+            error_flag: true,
+            linkage: Linkage::External,
+            visibility: Visibility::Default,
+        };
+        let attrs = FunctionAttributes {
+            sets_error_flag: true,
+            nothrow: true,
+            ..FunctionAttributes::default()
+        };
+        let global: HirGlobal =
+            postcard::from_bytes(&postcard::to_allocvec(&global).unwrap()).unwrap();
+        let attrs: FunctionAttributes =
+            postcard::from_bytes(&postcard::to_allocvec(&attrs).unwrap()).unwrap();
+        let exact: HashSet<zyntax_typed_ast::TypeId> =
+            postcard::from_bytes(&postcard::to_allocvec(&module.exact_struct_types).unwrap())
+                .unwrap();
+        assert!(global.error_flag);
+        assert!(attrs.sets_error_flag && attrs.nothrow);
+        assert!(exact.contains(&ty));
     }
 }

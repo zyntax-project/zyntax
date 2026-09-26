@@ -1329,6 +1329,7 @@ mod tests {
                 initializer: Some(HirConstant::I64(0)),
                 is_const: false,
                 is_thread_local: false,
+                error_flag: false,
                 linkage: Linkage::Internal,
                 visibility: Visibility::Default,
             },

@@ -54,6 +54,7 @@ mod llvm_tests {
             effects: indexmap::IndexMap::new(),
             handlers: indexmap::IndexMap::new(),
             automatic_release: false,
+            exact_struct_types: Default::default(),
         }
     }
 

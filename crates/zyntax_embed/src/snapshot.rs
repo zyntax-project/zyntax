@@ -22,7 +22,7 @@ use std::sync::Arc;
 use zyntax_compiler::hir::HirModule;
 
 const MAGIC: &[u8; 5] = b"ZSNAP";
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 /// magic, schema, and the length of the directory that follows.
 const HEADER_LEN: usize = MAGIC.len() + 2 * std::mem::size_of::<u32>();
 
@@ -543,6 +543,7 @@ pub fn lower_for_snapshot_releasing(
             linked: Arc::default(),
             selective: false,
             pattern_rewrites: true,
+            error_flag_global: None,
         },
     )
     .map_err(|e| SnapshotError::Lowering {

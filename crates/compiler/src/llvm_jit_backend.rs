@@ -1207,6 +1207,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             effects,
             handlers,
             automatic_release: false,
+            exact_struct_types: Default::default(),
         };
         self.compile_module(&temp_module)?;
         Ok(())

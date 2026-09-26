@@ -1577,6 +1577,8 @@ pub fn compile_to_hir(
         closed: false,
         prelowered: Vec::new(),
         linked: Arc::default(),
+        error_flag_global: None,
+        exact_struct_types: Default::default(),
     };
 
     // Create arena for string interning (needed for async transformation)

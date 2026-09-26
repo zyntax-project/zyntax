@@ -92,6 +92,7 @@ pub mod iterator;
 /// directly after `compile_to_hir`).
 pub mod krio_lowering;
 mod lower;
+pub use lower::EXACT_STRUCT_KEY;
 mod snapshot;
 // `runtime` carries the full ZyntaxRuntime (Cranelift JIT, plugin
 // loader, async executor). Native-only — the wasm-target entry point

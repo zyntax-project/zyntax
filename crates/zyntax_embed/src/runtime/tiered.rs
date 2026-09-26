@@ -84,6 +84,8 @@ pub struct TieredRuntime {
     /// released across blocks and through returned storage. See
     /// [`Self::set_automatic_release`].
     automatic_release: bool,
+    /// See [`Self::set_error_flag_global`].
+    error_flag_global: Option<zyntax_typed_ast::InternedString>,
     /// Whether programs go through the pattern rewrites before
     /// lowering. See [`Self::set_pattern_rewrites`].
     pattern_rewrites: bool,
@@ -428,6 +430,7 @@ impl TieredRuntime {
             loaded_plugins: Vec::new(),
             run_interp_opts: true,
             automatic_release: false,
+            error_flag_global: None,
             pattern_rewrites: true,
             collecting: false,
             import_resolvers: Vec::new(),
@@ -1230,6 +1233,14 @@ impl TieredRuntime {
         self.automatic_release = on;
     }
 
+    /// Name the global a language keeps its pending error in: null while
+    /// none is pending. Lowered with `HirGlobal::error_flag` set, which
+    /// promises that only stores, `sets_error_flag` functions and calls
+    /// not marked `nothrow` change it.
+    pub fn set_error_flag_global(&mut self, name: &str) {
+        self.error_flag_global = Some(zyntax_typed_ast::InternedString::new_global(name));
+    }
+
     /// Whether programs go through the pattern rewrites before lowering:
     /// the structural cleanup and the rewrites that lower effect and
     /// handler declarations. On by default. A language whose frontend
@@ -1599,6 +1610,7 @@ impl TieredRuntime {
                 linked: Arc::clone(&self.installed),
                 selective: true,
                 pattern_rewrites: self.pattern_rewrites,
+                error_flag_global: self.error_flag_global,
             },
         )?;
         let mut hir_module = lowered.module;
@@ -2792,6 +2804,7 @@ impl TieredRuntime {
                 linked: Arc::default(),
                 selective: false,
                 pattern_rewrites: self.pattern_rewrites,
+                error_flag_global: self.error_flag_global,
             },
         )?;
         Ok((lowered.module, lowered.entered))
