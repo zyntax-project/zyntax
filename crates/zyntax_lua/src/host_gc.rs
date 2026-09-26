@@ -203,9 +203,11 @@ unsafe fn elements(list: &mut ListHeader) -> &'static mut [*mut BoxHeader] {
     unsafe { std::slice::from_raw_parts_mut(list.data, list.len as usize) }
 }
 
-/// A hash part's entries after its control entry, each the key's hash
-/// word, the key and the value; the control entry's hash word, the
-/// index's address or 0. See the library's dicts.
+/// A hash part's entries, each the key's hash word, the key and the
+/// value, and the address of its index, 0 when it has none. An indexed
+/// dict's first entry is its control entry, whose hash word is that
+/// address; a small one's hash words are all zero. See the library's
+/// dicts.
 ///
 /// # Safety
 /// The list is a live dict and nothing else touches it meanwhile.
@@ -215,8 +217,11 @@ unsafe fn dict_entries(list: &mut ListHeader) -> (usize, &'static mut [[*mut Box
     }
     let words = unsafe { std::slice::from_raw_parts_mut(list.data, list.len as usize * 3) };
     let (entries, _) = words.as_chunks_mut::<3>();
-    let (control, rest) = entries.split_first_mut().expect("a control entry");
-    (control[0] as usize, rest)
+    let index = entries[0][0] as usize;
+    if index == 0 {
+        return (0, entries);
+    }
+    (index, &mut entries[1..])
 }
 
 // ─── the collector's hooks ──────────────────────────────────────────

@@ -13,12 +13,12 @@ use crate::{
 use zyntax_typed_ast::TypeId;
 
 pub(crate) const NONE: i64 = 0;
-const BOOL: i64 = 1;
-const INT: i64 = 2;
-const UINT: i64 = 3;
-const FLOAT: i64 = 4;
+pub(crate) const BOOL: i64 = 1;
+pub(crate) const INT: i64 = 2;
+pub(crate) const UINT: i64 = 3;
+pub(crate) const FLOAT: i64 = 4;
 pub(crate) const STR: i64 = 5;
-const CUSTOM: i64 = 255;
+pub(crate) const CUSTOM: i64 = 255;
 /// The whole tag of a box of the width its category's readers assume:
 /// the width in the byte above the category.
 pub(crate) const I64_TAG: i64 = (4 << 8) | INT;
@@ -107,6 +107,27 @@ fn is_shaped(x: Expr) -> Expr {
     and(
         eq(category(x.clone()), int(CUSTOM)),
         ge(kind(x), int(crate::lists::SHAPE_KIND_BASE)),
+    )
+}
+
+/// A boxed dict or set of a shape the frontend registered, whose
+/// operations are the frontend's hooks; of its dicts, or its sets.
+fn is_keyed(x: Expr) -> Expr {
+    let (first, last) = crate::dicts::keyed_kind_range();
+    in_kinds(x, first, last)
+}
+fn is_keyed_dict(x: Expr) -> Expr {
+    let (first, _) = crate::dicts::keyed_kind_range();
+    in_kinds(x, first, crate::dicts::set_kinds_from())
+}
+fn is_keyed_set(x: Expr) -> Expr {
+    let (_, last) = crate::dicts::keyed_kind_range();
+    in_kinds(x, crate::dicts::set_kinds_from(), last)
+}
+fn in_kinds(x: Expr, first: i64, last: i64) -> Expr {
+    and(
+        eq(category(x.clone()), int(CUSTOM)),
+        and(ge(kind(x.clone()), int(first)), lt(kind(x), int(last))),
     )
 }
 
@@ -568,6 +589,20 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         i64(),
         vec![ret(bitand(tag(x.e()), int(255)))],
     ));
+    // Whether the box holds a dict, or a set, of a shape the frontend
+    // registered.
+    d.push(define(
+        "zb_any_is_keyed_dict",
+        &[&x],
+        boolean(),
+        vec![ret(is_keyed_dict(x.e()))],
+    ));
+    d.push(define(
+        "zb_any_is_keyed_set",
+        &[&x],
+        boolean(),
+        vec![ret(is_keyed_set(x.e()))],
+    ));
     // Whether the box holds an instance of a frontend class.
     d.push(define(
         "zb_any_is_instance",
@@ -684,6 +719,8 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                         vec![ret(text(names.set))],
                     ),
                     when(eq(kind(x.e()), int(FILE_TAG >> 8)), vec![ret(text("file"))]),
+                    when(is_keyed_dict(x.e()), vec![ret(text(names.dict))]),
+                    when(is_keyed_set(x.e()), vec![ret(text(names.set))]),
                     ret(text(names.list)),
                 ],
             ),
@@ -874,6 +911,17 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 and(is(&ca, CUSTOM), is(&cb, CUSTOM)),
                 vec![
+                    // A dict or set of a shape compares through its hooks,
+                    // with a dict or set of any shape, before the kinds are
+                    // told apart.
+                    when(
+                        or(is_keyed(a.e()), is_keyed(b.e())),
+                        vec![ret(call(
+                            "zb_hook_shaped_eq",
+                            vec![a.e(), b.e()],
+                            boolean(),
+                        ))],
+                    ),
                     // A function is equal to itself only.
                     when(
                         or(
@@ -1099,6 +1147,12 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is_set(x.e()),
                 vec![ret(call("zb_set_hash", vec![raw_set(x.e())], i64()))],
             ),
+            // A frozen set of a shape hashes through its hooks; a dict of
+            // one raises there.
+            when(
+                is_keyed(x.e()),
+                vec![ret(call("zb_hook_shaped_hash", vec![x.e()], i64()))],
+            ),
             type_error(add(text("unhashable type: "), quoted(type_name(x.e())))),
             ret(int(0)),
         ],
@@ -1289,6 +1343,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is_instance(container.e()),
                 vec![ret(call(
                     "zb_hook_instance_contains",
+                    vec![container.e(), item.e()],
+                    boolean(),
+                ))],
+            ),
+            when(
+                is_keyed(container.e()),
+                vec![ret(call(
+                    "zb_hook_shaped_contains",
                     vec![container.e(), item.e()],
                     boolean(),
                 ))],
@@ -1539,6 +1601,64 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     // Operator codes: 0 +, 1 -, 2 *, 3 /, 4 //, 5 %, 6 **, 7 &, 8 |,
     // 9 ^, 10 <<, 11 >>.
     let code = local("code", i64());
+    // `a op b` for two boxed sets and a set operator.
+    let mut set_arms = vec![
+        when(
+            eq(code.e(), int(1)),
+            vec![ret(call(
+                "zb_set_box",
+                vec![call(
+                    "zb_set_sub",
+                    vec![raw_set(a.e()), raw_set(b.e())],
+                    set_ty.clone(),
+                )],
+                any(),
+            ))],
+        ),
+        when(
+            eq(code.e(), int(7)),
+            vec![ret(call(
+                "zb_set_box",
+                vec![call(
+                    "zb_set_and",
+                    vec![raw_set(a.e()), raw_set(b.e())],
+                    set_ty.clone(),
+                )],
+                any(),
+            ))],
+        ),
+        when(
+            eq(code.e(), int(8)),
+            vec![ret(call(
+                "zb_set_box",
+                vec![call(
+                    "zb_set_or",
+                    vec![raw_set(a.e()), raw_set(b.e())],
+                    set_ty.clone(),
+                )],
+                any(),
+            ))],
+        ),
+        when(
+            eq(code.e(), int(9)),
+            vec![ret(call(
+                "zb_set_box",
+                vec![call(
+                    "zb_set_xor",
+                    vec![raw_set(a.e()), raw_set(b.e())],
+                    set_ty.clone(),
+                )],
+                any(),
+            ))],
+        ),
+    ];
+    set_arms.push(ret(null(any())));
+    d.push(define_cold(
+        "zb_any_set_arith",
+        &[&code, &a, &b],
+        any(),
+        set_arms,
+    ));
     d.push(define(
         "zb_any_arith",
         &[&code, &a, &b],
@@ -1646,58 +1766,21 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     string(),
                 )))],
             ),
+            // Set arithmetic, out of line: a caller doing numbers does not
+            // compile the set library ahead of a first use.
             when(
-                and(is_set(a.e()), is_set(b.e())),
-                vec![
-                    when(
-                        eq(code.e(), int(1)),
-                        vec![ret(call(
-                            "zb_set_box",
-                            vec![call(
-                                "zb_set_sub",
-                                vec![raw_set(a.e()), raw_set(b.e())],
-                                set_ty.clone(),
-                            )],
-                            any(),
-                        ))],
+                and(
+                    and(is_set(a.e()), is_set(b.e())),
+                    or(
+                        or(eq(code.e(), int(1)), eq(code.e(), int(7))),
+                        or(eq(code.e(), int(8)), eq(code.e(), int(9))),
                     ),
-                    when(
-                        eq(code.e(), int(7)),
-                        vec![ret(call(
-                            "zb_set_box",
-                            vec![call(
-                                "zb_set_and",
-                                vec![raw_set(a.e()), raw_set(b.e())],
-                                set_ty.clone(),
-                            )],
-                            any(),
-                        ))],
-                    ),
-                    when(
-                        eq(code.e(), int(8)),
-                        vec![ret(call(
-                            "zb_set_box",
-                            vec![call(
-                                "zb_set_or",
-                                vec![raw_set(a.e()), raw_set(b.e())],
-                                set_ty.clone(),
-                            )],
-                            any(),
-                        ))],
-                    ),
-                    when(
-                        eq(code.e(), int(9)),
-                        vec![ret(call(
-                            "zb_set_box",
-                            vec![call(
-                                "zb_set_xor",
-                                vec![raw_set(a.e()), raw_set(b.e())],
-                                set_ty.clone(),
-                            )],
-                            any(),
-                        ))],
-                    ),
-                ],
+                ),
+                vec![ret(call(
+                    "zb_any_set_arith",
+                    vec![code.e(), a.e(), b.e()],
+                    any(),
+                ))],
             ),
             // An instance on either side takes part through its class.
             when(
@@ -2155,6 +2238,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         i64(),
         vec![
             when(
+                is_keyed(x.e()),
+                vec![ret(call("zb_hook_shaped_len", vec![x.e()], i64()))],
+            ),
+            when(
                 kind_is(Kind::Int, x.e()),
                 vec![ret(len_of(Kind::Int, x.e()))],
             ),
@@ -2223,6 +2310,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is_instance(x.e()),
                 vec![ret(call(
                     "zb_hook_instance_getitem",
+                    vec![x.e(), i.e()],
+                    any(),
+                ))],
+            ),
+            when(
+                is_keyed(x.e()),
+                vec![ret(call(
+                    "zb_hook_shaped_getitem",
                     vec![x.e(), i.e()],
                     any(),
                 ))],
@@ -2326,6 +2421,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 ))],
             ),
             when(
+                is_keyed(x.e()),
+                vec![ret(call(
+                    "zb_hook_shaped_getitem",
+                    vec![x.e(), box_i64(position.e())],
+                    any(),
+                ))],
+            ),
+            when(
                 is_dict(x.e()),
                 vec![ret(call(
                     "zb_dict_get",
@@ -2419,6 +2522,17 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         &[&x, &key, &v],
         unit(),
         vec![
+            when(
+                is_keyed(x.e()),
+                vec![
+                    expr(call(
+                        "zb_hook_shaped_setitem",
+                        vec![x.e(), i.e(), v.e()],
+                        unit(),
+                    )),
+                    ret_void(),
+                ],
+            ),
             when(
                 boxed_dict(x.e()),
                 vec![
@@ -2535,6 +2649,17 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         unit(),
         vec![
             when(
+                is_keyed(x.e()),
+                vec![
+                    expr(call(
+                        "zb_hook_shaped_setitem",
+                        vec![x.e(), box_i64(position.e()), v.e()],
+                        unit(),
+                    )),
+                    ret_void(),
+                ],
+            ),
+            when(
                 boxed_dict(x.e()),
                 vec![
                     expr(call(
@@ -2642,6 +2767,13 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         &[&x, &i],
         unit(),
         vec![
+            when(
+                is_keyed(x.e()),
+                vec![
+                    expr(call("zb_hook_shaped_delitem", vec![x.e(), i.e()], unit())),
+                    ret_void(),
+                ],
+            ),
             when(
                 boxed_dict(x.e()),
                 vec![

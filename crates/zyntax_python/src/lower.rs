@@ -211,6 +211,17 @@ pub(crate) fn shape_declarations(
         });
     }
     let mut out = Vec::new();
+    // What the dynamic layer asks of a dict or set of a shape: no
+    // program has one yet, so each reports the kind unknown. They are
+    // the program's own, as the other hooks are, so the library's calls
+    // into them link whatever the program reaches.
+    for mut decl in zyntax_builtins::lists::keyed_hook_stubs(list_type) {
+        if let zyntax_typed_ast::typed_ast::TypedDeclaration::Function(f) = &mut decl.node {
+            f.module = None;
+            f.mark_generated();
+        }
+        out.push(decl);
+    }
     // The storage kinds the library does not carry, before anything
     // that calls their functions.
     for kind in types::array_kinds() {
@@ -6779,20 +6790,13 @@ impl<'m> Lowerer<'m> {
                 };
                 // Keys that are distinct literals need no search for an
                 // earlier equal key: the literal lays out the dict's
-                // entries itself, the control entry first, each hash
-                // left for the index to fill if the dict takes one.
+                // entries itself, each hash left zero for the index to
+                // fill if the dict takes one.
                 if distinct_literal_keys(d) {
                     let entry_ty = zyntax_builtins::dicts::dict_entry_type(
                         &zyntax_builtins::lists::Field::Any,
                         &zyntax_builtins::lists::Field::Any,
                     );
-                    let null = || {
-                        node(
-                            TypedExpression::Literal(TypedLiteral::Null),
-                            Ty::Object,
-                            span,
-                        )
-                    };
                     let entry = |k: Node, v: Node| {
                         TypedNode::new(
                             TypedExpression::Tuple(vec![int_lit(0, span), k, v]),
@@ -6800,8 +6804,7 @@ impl<'m> Lowerer<'m> {
                             span,
                         )
                     };
-                    let mut entries = Vec::with_capacity(d.items.len() + 1);
-                    entries.push(entry(null(), null()));
+                    let mut entries = Vec::with_capacity(d.items.len());
                     for item in &d.items {
                         let Some(key) = &item.key else {
                             return unsupported("`**` in a dict literal", d);

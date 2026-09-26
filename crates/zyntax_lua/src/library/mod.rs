@@ -1393,6 +1393,9 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     };
     lib.declarations.push(table_class(table_type));
     lib.declarations.extend(shape_hook_decls(&t));
+    // No Lua value is a dict or set of a shape.
+    lib.declarations
+        .extend(zyntax_builtins::lists::keyed_hook_stubs(t.list_type));
     lib.declarations.extend(instance_hooks(&t));
     lib.declarations.extend(raising(&t));
     lib.declarations.extend(tables::declarations(&t));

@@ -3,7 +3,7 @@
 //! the host; numbers print as Python prints them.
 
 use crate::build::*;
-use crate::{DICT_TAG, TUPLE_TAG, list_of};
+use crate::{DICT_TAG, SET_TAG, TUPLE_TAG, list_of};
 use zyntax_typed_ast::TypeId;
 
 pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
@@ -114,6 +114,25 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                         ),
                         text(" is not JSON serializable"),
                     ),
+                )],
+            ),
+            // A dict or set of a shape through its hooks; a set is not
+            // JSON.
+            when(
+                call("zb_any_is_keyed_dict", vec![x.e()], boolean()),
+                vec![
+                    expr(call("zb_hook_shaped_json", vec![pieces.e(), x.e()], unit())),
+                    ret_void(),
+                ],
+            ),
+            when(
+                or(
+                    eq(kind(x.e()), int(SET_TAG >> 8)),
+                    call("zb_any_is_keyed_set", vec![x.e()], boolean()),
+                ),
+                vec![fatal(
+                    "TypeError",
+                    text("Object of type set is not JSON serializable"),
                 )],
             ),
             // A dict: its live pairs, in order, through the accessors.

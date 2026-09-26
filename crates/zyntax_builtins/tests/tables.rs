@@ -112,10 +112,21 @@ fn the_tables_run() {
         small_distinct_literal_lookups_hit(list_type),
         int_dict_deletes_and_compacts(list_type),
         int_set_keeps_its_mask(list_type),
+        dynamic_keys_meet_typed_ones(list_type),
     ];
     let mut declarations = lib.declarations;
     for case in &cases {
-        declarations.extend(case.decls.iter().cloned());
+        for decl in &case.decls {
+            let mut decl = decl.clone();
+            // The entry is the program's own, which the library's
+            // functions are built as the program reaches them from.
+            if let zyntax_typed_ast::typed_ast::TypedDeclaration::Function(f) = &mut decl.node
+                && f.name.resolve_global().as_deref() == Some(case.entry)
+            {
+                f.module = None;
+            }
+            declarations.push(decl);
+        }
     }
     let program = TypedProgram {
         declarations,
@@ -124,13 +135,7 @@ fn the_tables_run() {
         source_files: Vec::new(),
         type_registry: lib.type_registry,
     };
-    // A frame stays in the tier it started in: these cases test the
-    // library, and moving a running frame between tiers is tested where
-    // the tiers are.
-    let config = TieredConfig {
-        enable_osr: false,
-        ..TieredConfig::default()
-    };
+    let config = TieredConfig::default();
     let mut rt = TieredRuntime::new(config).expect("runtime");
     rt.set_automatic_release(true);
     rt.set_pattern_rewrites(false);
@@ -140,6 +145,7 @@ fn the_tables_run() {
         zrtl_string::static_plugin(),
         zrtl_math::static_plugin(),
         host(),
+        zyntax_embed::foreign::static_plugin(),
     ])
     .expect("plugins");
     rt.compile_typed_program(program).expect("compiles");
@@ -178,14 +184,14 @@ fn small_distinct_literal_lookups_hit(list_type: TypeId) -> Case {
         let big = local("big", dt.clone());
         let r = local("r", i64());
         let get = |d: &Local, k: Expr| as_int(call("zb_dict_get", vec![d.e(), k], any()));
-        // Laid out as a literal lays them out: the control entry, then
-        // each pair with its hash word zero.
+        // Laid out as a literal lays them out: each pair with its hash
+        // word zero.
         let entry = |k: Expr, v: Expr| tuple(vec![int(0), k, v], entry_ty.clone());
-        let mut pairs = vec![entry(null(any()), null(any()))];
+        let mut pairs = Vec::new();
         for (k, v) in [(boxed(1), 10), (boxed(2), 20), (boxed_str("a"), 30)] {
             pairs.push(entry(k, boxed(v)));
         }
-        let mut big_pairs = vec![entry(null(any()), null(any()))];
+        let mut big_pairs = Vec::new();
         for i in 0..20 {
             big_pairs.push(entry(boxed(i * 7), boxed(i)));
         }
@@ -384,5 +390,104 @@ fn int_set_keeps_its_mask(list_type: TypeId) -> Case {
         decls,
         entry: "t_int_set",
         expected: 7 + 13 * 100 + 2 * 10_000 + 10_000_000 + 100_000_000 + 6 * 1_000_000_000 + 5,
+    }
+}
+
+/// A dynamic key probes a typed shape by the rule keys of different
+/// kinds meet by: a bool or an integral float finds an int key, a float
+/// that is not integral or a string finds none, and an int finds a
+/// float key only when the conversion is exact. A typed dict equals a
+/// dynamic one of equal keys and values across kinds.
+fn dynamic_keys_meet_typed_ones(list_type: TypeId) -> Case {
+    let int_key = Field::Int;
+    let float_key = Field::Float;
+    let mut decls = dict_declarations(list_type, "ij", dict_shape_tag(1), &int_key, &int_key);
+    decls.extend(dict_declarations(
+        list_type,
+        "fk",
+        dict_shape_tag(2),
+        &float_key,
+        &int_key,
+    ));
+    let ij = list_of(list_type, dict_entry_type(&int_key, &int_key));
+    let fk = list_of(list_type, dict_entry_type(&float_key, &int_key));
+    let dt = dict_type(list_type);
+    let a = local("a", ij.clone());
+    let f = local("f", fk.clone());
+    let dy = local("dy", dt.clone());
+    let r = local("r", i64());
+    let boxed_f = |v: f64| call("zb_box_f64", vec![float(v)], any());
+    let boxed_b = |v: bool| call("zb_box_bool", vec![bool(v)], any());
+    let found = |d: &Local, shape: &str, k: Expr| {
+        ge(
+            call(&format!("zb_dict_find_any_{shape}"), vec![d.e(), k], i64()),
+            int(0),
+        )
+    };
+    let bit = |cond: Expr, weight: i64| when(cond, vec![r.set(add(r.e(), int(weight)))]);
+    let body = vec![
+        a.decl(call("zb_dict_new_ij", vec![], ij.clone())),
+        expr(call("zb_dict_set_ij", vec![a.e(), int(1), int(10)], unit())),
+        expr(call("zb_dict_set_ij", vec![a.e(), int(2), int(20)], unit())),
+        f.decl(call("zb_dict_new_fk", vec![], fk.clone())),
+        expr(call(
+            "zb_dict_set_fk",
+            vec![f.e(), float(1.0), int(5)],
+            unit(),
+        )),
+        expr(call(
+            "zb_dict_set_fk",
+            vec![f.e(), float(4_611_686_018_427_387_904.0), int(6)],
+            unit(),
+        )),
+        r.decl(int(0)),
+        bit(found(&a, "ij", boxed_f(1.0)), 1),
+        bit(found(&a, "ij", boxed_b(true)), 2),
+        bit(found(&a, "ij", boxed(2)), 4),
+        bit(found(&a, "ij", boxed_f(1.5)), 8),
+        bit(found(&a, "ij", boxed_str("1")), 16),
+        bit(found(&f, "fk", boxed(1)), 32),
+        bit(found(&f, "fk", boxed(4_611_686_018_427_387_904)), 64),
+        bit(found(&f, "fk", boxed(4_611_686_018_427_387_905)), 128),
+        // {1.0: 10.0, 2: 20} equals a; {1: 10, 2: 21} does not.
+        dy.decl(call("zb_dict_new", vec![], dt.clone())),
+        expr(call(
+            "zb_dict_set",
+            vec![dy.e(), boxed_f(1.0), boxed_f(10.0)],
+            unit(),
+        )),
+        expr(call(
+            "zb_dict_set",
+            vec![dy.e(), boxed(2), boxed(20)],
+            unit(),
+        )),
+        bit(
+            call(
+                "zb_dict_eq_any_ij",
+                vec![a.e(), call("zb_dict_box", vec![dy.e()], any())],
+                boolean(),
+            ),
+            256,
+        ),
+        expr(call(
+            "zb_dict_set",
+            vec![dy.e(), boxed(2), boxed(21)],
+            unit(),
+        )),
+        bit(
+            call(
+                "zb_dict_eq_any_ij",
+                vec![a.e(), call("zb_dict_box", vec![dy.e()], any())],
+                boolean(),
+            ),
+            512,
+        ),
+        ret(r.e()),
+    ];
+    decls.push(define("t_dynamic_keys", &[], i64(), body));
+    Case {
+        decls,
+        entry: "t_dynamic_keys",
+        expected: 1 + 2 + 4 + 32 + 64 + 256,
     }
 }

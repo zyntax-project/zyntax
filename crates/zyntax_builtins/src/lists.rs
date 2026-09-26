@@ -2352,6 +2352,11 @@ pub(crate) fn shape_hook_declarations(policy: &Policy, list_type: TypeId) -> Vec
     let v = kept("v", any());
     let mut d = Vec::new();
     if policy.instance_hooks {
+        d.extend(keyed_hook_externs(list_type));
+    } else {
+        d.extend(keyed_hook_stubs(list_type));
+    }
+    if policy.instance_hooks {
         d.push(extern_fn(
             "zb_hook_shaped_items",
             &[("x", any())],
@@ -2458,6 +2463,79 @@ pub(crate) fn shape_hook_declarations(policy: &Policy, list_type: TypeId) -> Vec
         vec![unknown(), ret(null(any()))],
     ));
     d
+}
+
+/// The hooks the dynamic layer asks of a boxed dict or set of a shape a
+/// frontend registered (a kind in `dicts::keyed_kind_range`): an item
+/// read, store and deletion by a dynamic key, membership, the length,
+/// equality with any value, the hash of a frozen set, and its JSON text.
+/// Its repr and its items as a list are asked of the list hooks.
+const KEYED_HOOKS: [(&str, &[&'static str], &str); 8] = [
+    ("zb_hook_shaped_getitem", &["x", "k"], "any"),
+    ("zb_hook_shaped_setitem", &["x", "k", "v"], "unit"),
+    ("zb_hook_shaped_delitem", &["x", "k"], "unit"),
+    ("zb_hook_shaped_contains", &["x", "k"], "bool"),
+    ("zb_hook_shaped_len", &["x"], "i64"),
+    ("zb_hook_shaped_eq", &["a", "b"], "bool"),
+    ("zb_hook_shaped_hash", &["x"], "i64"),
+    ("zb_hook_shaped_json", &["pieces", "x"], "unit"),
+];
+
+fn keyed_hook_signature(
+    list_type: TypeId,
+    params: &[&'static str],
+    ret_name: &str,
+) -> (Vec<(&'static str, Type)>, Type) {
+    let params = params
+        .iter()
+        .map(|p| {
+            let ty = if *p == "pieces" {
+                list_of(list_type, string())
+            } else {
+                any()
+            };
+            (*p, ty)
+        })
+        .collect();
+    let ret_ty = match ret_name {
+        "any" => any(),
+        "bool" => boolean(),
+        "i64" => i64(),
+        _ => unit(),
+    };
+    (params, ret_ty)
+}
+
+fn keyed_hook_externs(list_type: TypeId) -> Vec<Decl> {
+    KEYED_HOOKS
+        .iter()
+        .map(|(name, params, ret_name)| {
+            let (params, ret_ty) = keyed_hook_signature(list_type, params, ret_name);
+            extern_fn(name, &params, ret_ty, None)
+        })
+        .collect()
+}
+
+/// The keyed hooks of a frontend with no dict or set shapes: every one
+/// reports the kind unknown, since no such value exists.
+pub fn keyed_hook_stubs(list_type: TypeId) -> Vec<Decl> {
+    KEYED_HOOKS
+        .iter()
+        .map(|(name, params, ret_name)| {
+            let (params, ret_ty) = keyed_hook_signature(list_type, params, ret_name);
+            let locals: Vec<Local> = params
+                .into_iter()
+                .map(|(n, t)| if n == "v" { kept(n, t) } else { borrowed(n, t) })
+                .collect();
+            let refs: Vec<&Local> = locals.iter().collect();
+            let mut body = vec![fatal("TypeError", text("a dict or set of an unknown kind"))];
+            body.push(match ret_ty {
+                Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit) => ret_void(),
+                ref other => ret(zero_of(other)),
+            });
+            define(name, &refs, ret_ty, body)
+        })
+        .collect()
 }
 
 fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
