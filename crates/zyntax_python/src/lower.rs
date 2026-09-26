@@ -102,13 +102,13 @@ pub(crate) fn class_type(k: usize) -> Type {
 }
 
 /// A field holds its own scalar, the pointer to an instance, or the
-/// address of a dict's or set's entry list (a word, as a list of lists
-/// holds its inner lists); anything else on the heap is stored boxed, so
-/// a list field is one shared header.
+/// address of a list's header or of a dict's or set's entry list (a
+/// word, as a list of lists holds its inner lists), so a list field is
+/// one shared header; anything else on the heap is stored boxed.
 pub(crate) fn field_storage(ty: Ty) -> Ty {
     match ty {
         Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Class(_) => ty,
-        Ty::Dict(_) | Ty::Set(_) => Ty::Int,
+        Ty::Dict(_) | Ty::Set(_) | Ty::List(_) => Ty::Int,
         _ => Ty::Object,
     }
 }
@@ -2568,11 +2568,11 @@ impl<'m> Lowerer<'m> {
         }
     }
 
-    /// A field's stored value read as its type `ty`: a dict or set from
-    /// its address.
+    /// A field's stored value read as its type `ty`: a list, dict or set
+    /// from its address.
     pub(crate) fn field_out(&mut self, stored: Node, ty: Ty, span: Span) -> Node {
         match ty {
-            Ty::Dict(_) | Ty::Set(_) => cast(stored, ty, span),
+            Ty::Dict(_) | Ty::Set(_) | Ty::List(_) => cast(stored, ty, span),
             _ => self.trusted(
                 Val {
                     node: stored,
@@ -2588,7 +2588,7 @@ impl<'m> Lowerer<'m> {
         let span = v.node.span;
         let typed = self.coerce(v, ty);
         match ty {
-            Ty::Dict(_) | Ty::Set(_) => cast(typed, Ty::Int, span),
+            Ty::Dict(_) | Ty::Set(_) | Ty::List(_) => cast(typed, Ty::Int, span),
             _ => self.coerce(Val { node: typed, ty }, field_storage(ty)),
         }
     }
