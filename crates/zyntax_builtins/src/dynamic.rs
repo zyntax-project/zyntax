@@ -112,23 +112,16 @@ fn is_shaped(x: Expr) -> Expr {
 
 /// A boxed dict or set of a shape the frontend registered, whose
 /// operations are the frontend's hooks; of its dicts, or its sets.
+/// A box's kind names none of these unless its category is custom: the
+/// byte above another category is a width.
 fn is_keyed(x: Expr) -> Expr {
-    let (first, last) = crate::dicts::keyed_kind_range();
-    in_kinds(x, first, last)
+    call("zb_any_is_keyed", vec![x], boolean())
 }
 fn is_keyed_dict(x: Expr) -> Expr {
-    let (first, _) = crate::dicts::keyed_kind_range();
-    in_kinds(x, first, crate::dicts::set_kinds_from())
+    call("zb_any_is_keyed_dict", vec![x], boolean())
 }
 fn is_keyed_set(x: Expr) -> Expr {
-    let (_, last) = crate::dicts::keyed_kind_range();
-    in_kinds(x, crate::dicts::set_kinds_from(), last)
-}
-fn in_kinds(x: Expr, first: i64, last: i64) -> Expr {
-    and(
-        eq(category(x.clone()), int(CUSTOM)),
-        and(ge(kind(x.clone()), int(first)), lt(kind(x), int(last))),
-    )
+    call("zb_any_is_keyed_set", vec![x], boolean())
 }
 
 fn shaped_items(x: Expr, anys: zyntax_typed_ast::Type) -> Expr {
@@ -589,20 +582,34 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         i64(),
         vec![ret(bitand(tag(x.e()), int(255)))],
     ));
+    // The length of a dict or set of a shape, out of line: the length
+    // of everything else is read without a call, and stays inlinable.
+    d.push(define_cold(
+        "zb_keyed_len",
+        &[&x],
+        i64(),
+        vec![ret(call("zb_hook_shaped_len", vec![x.e()], i64()))],
+    ));
     // Whether the box holds a dict, or a set, of a shape the frontend
     // registered.
-    d.push(define(
-        "zb_any_is_keyed_dict",
-        &[&x],
-        boolean(),
-        vec![ret(is_keyed_dict(x.e()))],
-    ));
-    d.push(define(
-        "zb_any_is_keyed_set",
-        &[&x],
-        boolean(),
-        vec![ret(is_keyed_set(x.e()))],
-    ));
+    let kind_of = local("kind", i64());
+    let (first, last) = crate::dicts::keyed_kind_range();
+    let sets_from = crate::dicts::set_kinds_from();
+    for (name, lo, hi) in [
+        ("zb_any_is_keyed", first, last),
+        ("zb_any_is_keyed_dict", first, sets_from),
+        ("zb_any_is_keyed_set", sets_from, last),
+    ] {
+        d.push(define(
+            name,
+            &[&x],
+            boolean(),
+            vec![
+                kind_of.decl(kind(x.e())),
+                ret(and(ge(kind_of.e(), int(lo)), lt(kind_of.e(), int(hi)))),
+            ],
+        ));
+    }
     // Whether the box holds an instance of a frontend class.
     d.push(define(
         "zb_any_is_instance",
@@ -1601,64 +1608,6 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     // Operator codes: 0 +, 1 -, 2 *, 3 /, 4 //, 5 %, 6 **, 7 &, 8 |,
     // 9 ^, 10 <<, 11 >>.
     let code = local("code", i64());
-    // `a op b` for two boxed sets and a set operator.
-    let mut set_arms = vec![
-        when(
-            eq(code.e(), int(1)),
-            vec![ret(call(
-                "zb_set_box",
-                vec![call(
-                    "zb_set_sub",
-                    vec![raw_set(a.e()), raw_set(b.e())],
-                    set_ty.clone(),
-                )],
-                any(),
-            ))],
-        ),
-        when(
-            eq(code.e(), int(7)),
-            vec![ret(call(
-                "zb_set_box",
-                vec![call(
-                    "zb_set_and",
-                    vec![raw_set(a.e()), raw_set(b.e())],
-                    set_ty.clone(),
-                )],
-                any(),
-            ))],
-        ),
-        when(
-            eq(code.e(), int(8)),
-            vec![ret(call(
-                "zb_set_box",
-                vec![call(
-                    "zb_set_or",
-                    vec![raw_set(a.e()), raw_set(b.e())],
-                    set_ty.clone(),
-                )],
-                any(),
-            ))],
-        ),
-        when(
-            eq(code.e(), int(9)),
-            vec![ret(call(
-                "zb_set_box",
-                vec![call(
-                    "zb_set_xor",
-                    vec![raw_set(a.e()), raw_set(b.e())],
-                    set_ty.clone(),
-                )],
-                any(),
-            ))],
-        ),
-    ];
-    set_arms.push(ret(null(any())));
-    d.push(define_cold(
-        "zb_any_set_arith",
-        &[&code, &a, &b],
-        any(),
-        set_arms,
-    ));
     d.push(define(
         "zb_any_arith",
         &[&code, &a, &b],
@@ -1766,21 +1715,58 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     string(),
                 )))],
             ),
-            // Set arithmetic, out of line: a caller doing numbers does not
-            // compile the set library ahead of a first use.
             when(
-                and(
-                    and(is_set(a.e()), is_set(b.e())),
-                    or(
-                        or(eq(code.e(), int(1)), eq(code.e(), int(7))),
-                        or(eq(code.e(), int(8)), eq(code.e(), int(9))),
+                and(is_set(a.e()), is_set(b.e())),
+                vec![
+                    when(
+                        eq(code.e(), int(1)),
+                        vec![ret(call(
+                            "zb_set_box",
+                            vec![call(
+                                "zb_set_sub",
+                                vec![raw_set(a.e()), raw_set(b.e())],
+                                set_ty.clone(),
+                            )],
+                            any(),
+                        ))],
                     ),
-                ),
-                vec![ret(call(
-                    "zb_any_set_arith",
-                    vec![code.e(), a.e(), b.e()],
-                    any(),
-                ))],
+                    when(
+                        eq(code.e(), int(7)),
+                        vec![ret(call(
+                            "zb_set_box",
+                            vec![call(
+                                "zb_set_and",
+                                vec![raw_set(a.e()), raw_set(b.e())],
+                                set_ty.clone(),
+                            )],
+                            any(),
+                        ))],
+                    ),
+                    when(
+                        eq(code.e(), int(8)),
+                        vec![ret(call(
+                            "zb_set_box",
+                            vec![call(
+                                "zb_set_or",
+                                vec![raw_set(a.e()), raw_set(b.e())],
+                                set_ty.clone(),
+                            )],
+                            any(),
+                        ))],
+                    ),
+                    when(
+                        eq(code.e(), int(9)),
+                        vec![ret(call(
+                            "zb_set_box",
+                            vec![call(
+                                "zb_set_xor",
+                                vec![raw_set(a.e()), raw_set(b.e())],
+                                set_ty.clone(),
+                            )],
+                            any(),
+                        ))],
+                    ),
+                ],
             ),
             // An instance on either side takes part through its class.
             when(
@@ -1950,6 +1936,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         &[&x],
         anys.clone(),
         vec![
+            when(
+                eq(tag(x.e()), int(Kind::Any.list_tag())),
+                vec![ret(call(
+                    "zb_unbox_list_raw_any",
+                    vec![x.e()],
+                    anys.clone(),
+                ))],
+            ),
             when(
                 eq(tag(x.e()), int(TUPLE_TAG)),
                 vec![ret(call("zb_unbox_tuple_raw", vec![x.e()], anys.clone()))],
@@ -2232,42 +2226,45 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         ],
     ));
     let len_of = |k: Kind, x: Expr| mcall(unbox(k, x), "len", vec![], i64());
-    d.push(define(
-        "zb_seq_len_any",
-        &[&x],
-        i64(),
-        vec![
-            when(
-                is_keyed(x.e()),
-                vec![ret(call("zb_hook_shaped_len", vec![x.e()], i64()))],
+    // The kind read once; a list of dynamic values, the common case,
+    // first, and every list read raw once its tag is known.
+    let k_of = local("kind", i64());
+    let raw_len = |k: Kind, x: Expr| {
+        mcall(
+            call(
+                &format!("zb_unbox_list_raw_{}", k.suffix()),
+                vec![x],
+                list_of(list_type, k.ty()),
             ),
-            when(
-                kind_is(Kind::Int, x.e()),
-                vec![ret(len_of(Kind::Int, x.e()))],
-            ),
-            when(
-                kind_is(Kind::Float, x.e()),
-                vec![ret(len_of(Kind::Float, x.e()))],
-            ),
-            when(
-                kind_is(Kind::Str, x.e()),
-                vec![ret(len_of(Kind::Str, x.e()))],
-            ),
-            when(
-                kind_is(Kind::Ptr, x.e()),
-                vec![ret(len_of(Kind::Ptr, x.e()))],
-            ),
-            when(
-                is_dict(x.e()),
-                vec![ret(call("zb_dict_len", vec![raw_dict(x.e())], i64()))],
-            ),
-            when(
-                is_set(x.e()),
-                vec![ret(call("zb_set_len", vec![raw_set(x.e())], i64()))],
-            ),
-            ret(len_of(Kind::Any, x.e())),
-        ],
-    ));
+            "len",
+            vec![],
+            i64(),
+        )
+    };
+    let is_kind = |k: i64| eq(k_of.e(), int(k));
+    let mut len_arms = vec![k_of.decl(kind(x.e()))];
+    for k in [Kind::Any, Kind::Int, Kind::Float, Kind::Str, Kind::Ptr] {
+        len_arms.push(when(
+            is_kind(k.list_tag() >> 8),
+            vec![ret(raw_len(k, x.e()))],
+        ));
+    }
+    len_arms.extend([
+        when(
+            is_kind(DICT_TAG >> 8),
+            vec![ret(call("zb_dict_len", vec![raw_dict(x.e())], i64()))],
+        ),
+        when(
+            is_kind(SET_TAG >> 8),
+            vec![ret(call("zb_set_len", vec![raw_set(x.e())], i64()))],
+        ),
+        when(
+            is_keyed(x.e()),
+            vec![ret(call("zb_keyed_len", vec![x.e()], i64()))],
+        ),
+        ret(len_of(Kind::Any, x.e())),
+    ]);
+    d.push(define("zb_seq_len_any", &[&x], i64(), len_arms));
     let i = local("i", any());
     let index = |i: Expr| call("zb_any_int", vec![i], i64());
     let list_get = |k: Kind, x: Expr, i: Expr| {
