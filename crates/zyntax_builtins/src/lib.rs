@@ -73,6 +73,7 @@ pub struct TypeNames {
     pub tuple: &'static str,
     pub dict: &'static str,
     pub set: &'static str,
+    pub frozenset: &'static str,
     pub function: &'static str,
     pub object: &'static str,
 }
@@ -375,6 +376,7 @@ mod tests {
                 tuple: "tuple",
                 dict: "dict",
                 set: "set",
+                frozenset: "frozenset",
                 function: "function",
                 object: "object",
             },
@@ -421,6 +423,7 @@ mod tests {
                     tuple: "tuple",
                     dict: "dict",
                     set: "set",
+                    frozenset: "frozenset",
                     function: "function",
                     object: "object",
                 },

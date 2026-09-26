@@ -50,6 +50,8 @@ const MASK_UNKNOWN: i64 = -2;
 /// [`crate::lists::SHAPE_KIND_BASE`], dicts first, then sets.
 const DICT_SHAPES: i64 = 1 << 16;
 const SET_SHAPES: i64 = 2 << 16;
+/// A frozen set's kind is its shape's set kind this far up.
+const FROZEN_SETS: i64 = 1 << 15;
 
 /// The type of a dict entry of key `key` and value `value`.
 pub fn dict_entry_type(key: &Field, value: &Field) -> Type {
@@ -69,6 +71,23 @@ pub fn dict_shape_tag(index: u16) -> i64 {
 /// The box tag of the set shape a frontend registered as `index`.
 pub fn set_shape_tag(index: u16) -> i64 {
     ((crate::lists::SHAPE_KIND_BASE + SET_SHAPES + index as i64) << 8) | 255
+}
+
+/// The box tag of the frozen sets of the set shape a frontend registered
+/// as `index`: the kinds past [`FROZEN_SETS`] above its set shapes'.
+pub fn frozen_set_shape_tag(index: u16) -> i64 {
+    assert!(
+        i64::from(index) < FROZEN_SETS,
+        "a set shape index below the frozen ones"
+    );
+    set_shape_tag(index) + (FROZEN_SETS << 8)
+}
+
+/// The box kinds of a frontend's frozen sets: from the first, up to but
+/// not including the second.
+pub(crate) fn frozen_kind_range() -> (i64, i64) {
+    let from = crate::lists::SHAPE_KIND_BASE + SET_SHAPES + FROZEN_SETS;
+    (from, from + FROZEN_SETS)
 }
 
 /// The box kinds of a frontend's dict and set shapes: from the first,
@@ -135,6 +154,30 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     d.extend(dict_probe_by(list_type, &Field::Str, "str"));
     d.extend(set_declarations(list_type, "", SET_TAG, &Field::Any));
     d.extend(dynamic_set(list_type));
+    // A copy of any dict or set as the library's, for a frontend whose
+    // typed tables meet dynamic ones.
+    for (value, tag) in [(Some(&Field::Any), DICT_TAG), (None, SET_TAG)] {
+        let t = Table {
+            list_type,
+            prefix: if value.is_some() { "zb_dict" } else { "zb_set" },
+            sfx: String::new(),
+            key: &Field::Any,
+            value,
+            tag,
+            mask: Mask::None,
+        };
+        let from = t.name("from_dyn");
+        d.extend(
+            probe_any_ops(&t)
+                .into_iter()
+                .filter(|decl| match &decl.node {
+                    zyntax_typed_ast::typed_ast::TypedDeclaration::Function(f) => {
+                        f.name.resolve_global().as_deref() == Some(from.as_str())
+                    }
+                    _ => false,
+                }),
+        );
+    }
     d
 }
 
@@ -929,6 +972,39 @@ fn table_core(t: &Table) -> Vec<Decl> {
             ret(call(&t.name("raw"), vec![x.e()], lt_.clone())),
         ],
     ));
+    // The same for a box of another tag the frontend gave this shape's
+    // storage (a frozen set's), and the box itself once checked.
+    let want = local("tag", i64());
+    let checked = |x: &Local| {
+        when(
+            ne(
+                cast(call("zb_box_tag", vec![x.e()], i32()), i64()),
+                want.e(),
+            ),
+            vec![fatal(
+                "TypeError",
+                add(
+                    text(&format!("expected {what}, got ")),
+                    call("zb_any_type", vec![x.e()], string()),
+                ),
+            )],
+        )
+    };
+    out_decls.push(define(
+        &t.name("unbox_tagged"),
+        &[&x, &want],
+        lt_.clone(),
+        vec![
+            checked(&x),
+            ret(call(&t.name("raw"), vec![x.e()], lt_.clone())),
+        ],
+    ));
+    out_decls.push(define(
+        &t.name("as_box_tagged"),
+        &[&x, &want],
+        any(),
+        vec![checked(&x), ret(x.e())],
+    ));
     out_decls
 }
 
@@ -1040,6 +1116,60 @@ fn dict_ops(t: &Table) -> Vec<Decl> {
             ret(value_at(d.e(), e.e())),
         ],
     ));
+    // The value as a dynamic value, or `default` when `k` is absent:
+    // a read whose default the value field cannot hold.
+    let default_box = kept("default", any());
+    d_out.push(define(
+        &t.name("get_boxed"),
+        &[&d, &key, &default_box],
+        any(),
+        vec![
+            e.decl(find(d.e(), key.e())),
+            when(lt(e.e(), int(0)), vec![ret(default_box.e())]),
+            ret(vf.boxed(value_at(d.e(), e.e()))),
+        ],
+    ));
+    let boxed_out = local("x", any());
+    d_out.push(define(
+        &t.name("pop_boxed"),
+        &[&d, &key, &default_box],
+        any(),
+        vec![
+            e.decl(find(d.e(), key.e())),
+            when(lt(e.e(), int(0)), vec![ret(default_box.e())]),
+            boxed_out.decl(vf.boxed(value_at(d.e(), e.e()))),
+            t.go("delete_at", vec![d.e(), e.e()]),
+            ret(boxed_out.e()),
+        ],
+    ));
+    // A dict whose entries a literal laid out itself, its keys known to
+    // be distinct and its hash words zero: the storage is the dict, and
+    // only a large one takes an index.
+    if !t.sfx.is_empty() {
+        let entries = kept("d", lt_.clone());
+        d_out.push(define(
+            &t.name("from_distinct"),
+            &[&entries],
+            lt_.clone(),
+            {
+                vec![
+                    n.decl(len(entries.e())),
+                    when(
+                        gt(n.e(), int(SMALL)),
+                        vec![t.go(
+                            "rebuild",
+                            vec![
+                                entries.e(),
+                                call("zb_table_cap_for", vec![n.e()], i64()),
+                                bool(false),
+                            ],
+                        )],
+                    ),
+                    ret(entries.e()),
+                ]
+            },
+        ));
+    }
     // Store `v` under `k`; the key is hashed once on the indexed path.
     d_out.push(define(&t.name("set"), &[&d, &k, &v], unit(), {
         let mut small = vec![e.decl(find(d.e(), k.e()))];
@@ -2741,6 +2871,24 @@ fn probe_any_ops(t: &Table) -> Vec<Decl> {
             st
         }));
     } else {
+        // A value found by the rule, removed; absent, nothing, or the
+        // KeyError of `remove`.
+        for (op, raises) in [("discard_any", false), ("remove_any", true)] {
+            out_decls.push(define(&t.name(op), &[&d, &k], unit(), {
+                let mut st = vec![e.decl(found())];
+                if raises {
+                    st.push(when(
+                        lt(e.e(), int(0)),
+                        vec![fatal("KeyError", call("zb_any_str", vec![k.e()], string()))],
+                    ));
+                } else {
+                    st.push(when(lt(e.e(), int(0)), vec![ret_void()]));
+                }
+                st.push(t.go("delete_at", vec![d.e(), e.e()]));
+                st.push(ret_void());
+                st
+            }));
+        }
         // Equal to any set of equal values, whatever either's shape.
         out_decls.push(define(&t.name("eq_any"), &[&d, &other], boolean(), {
             let mut st = vec![

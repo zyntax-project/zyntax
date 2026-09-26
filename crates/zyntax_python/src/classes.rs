@@ -1283,7 +1283,11 @@ fn builtin_arms(
             crate::types::dynamic_dict(),
             None,
         ),
-        (kind(zyntax_builtins::SET_TAG >> 8), Ty::Set, None),
+        (
+            kind(zyntax_builtins::SET_TAG >> 8),
+            crate::types::dynamic_set(false),
+            None,
+        ),
     ];
     // A boxed file reads text or bytes by the mode it was opened in.
     let is_file = kind(zyntax_builtins::FILE_TAG >> 8);

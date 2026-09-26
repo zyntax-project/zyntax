@@ -33,6 +33,7 @@ fn policy() -> Policy {
             tuple: "tuple",
             dict: "dict",
             set: "set",
+            frozenset: "frozenset",
             function: "function",
             object: "object",
         },

@@ -31,6 +31,8 @@ use zyntax_typed_ast::{
 
 #[path = "num.rs"]
 pub(crate) mod num;
+#[path = "tables.rs"]
+pub(crate) mod tables;
 
 pub(crate) type Node = TypedNode<TypedExpression>;
 pub(crate) type Stmt = TypedNode<TypedStatement>;
@@ -139,8 +141,22 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         Ty::Float => Field::Float,
         Ty::Bool => Field::Bool,
         Ty::Str => Field::Str,
-        Ty::Dict(_) => Field::Dict { ty: ir(ty) },
-        Ty::Set => Field::Set { ty: ir(ty) },
+        Ty::Dict(_) | Ty::Set(_) => {
+            let (suffix, tag) = (tables::table_suffix(ty), tables::table_tag(ty));
+            match ty {
+                Ty::Dict(_) => Field::Dict {
+                    ty: ir(ty),
+                    suffix,
+                    tag,
+                },
+                _ => Field::Set {
+                    ty: ir(ty),
+                    suffix,
+                    tag,
+                    frozen: tables::frozen(ty),
+                },
+            }
+        }
         Ty::Class(k) => Field::Instance {
             ty: class_type(k as usize),
             tag: zyntax_builtins::instance_tag(k as usize) as i32,
@@ -278,8 +294,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
                 .map(|t| ir(tuple_field_storage(t)))
                 .collect(),
         ),
-        Ty::Dict(_) => zyntax_builtins::dicts::dict_type(list_type_id()),
-        Ty::Set => zyntax_builtins::dicts::set_type(list_type_id()),
+        Ty::Dict(_) | Ty::Set(_) => tables::table_ir(ty),
         // A file is the record the library keeps: a list of its parts.
         Ty::File(_) => list_type(Type::Any),
         Ty::Class(k) => class_type(k as usize),
@@ -491,8 +506,9 @@ enum Hold<'a> {
 #[derive(Clone, Copy)]
 enum Produce<'a> {
     List(Elem, &'a py::Expr),
-    Set(&'a py::Expr),
-    Dict(&'a py::Expr, &'a py::Expr),
+    /// A set or dict of the type given.
+    Set(Ty, &'a py::Expr),
+    Dict(Ty, &'a py::Expr, &'a py::Expr),
     /// A generator body: each element yielded.
     Yield(&'a py::Expr),
 }
@@ -2250,10 +2266,12 @@ impl<'m> Lowerer<'m> {
                     Self::block_value(pre, value, target, span)
                 }
             }
-            (Ty::Dict(_), Ty::Object) => call("zb_dict_box", vec![v.node], Ty::Object, span),
-            // Every dict shape is stored the same way.
-            (Ty::Dict(_), Ty::Dict(_)) => v.node,
-            (Ty::Set, Ty::Object) => call("zb_set_box", vec![v.node], Ty::Object, span),
+            // A dict or set is boxed by reference under its store's tag,
+            // and is the same storage as any shape of its store.
+            (Ty::Dict(_) | Ty::Set(_), Ty::Object) => self.box_table(v, span),
+            (Ty::Dict(_), Ty::Dict(_)) | (Ty::Set(_), Ty::Set(_)) => {
+                self.convert_table(v, target, span)
+            }
             // Bytes box under their own category, so a box of text is
             // never read as them; a file is boxed as the list it is.
             (Ty::Bytes, Ty::Object) => call("zb_box_bytes", vec![v.node], Ty::Object, span),
@@ -2321,8 +2339,7 @@ impl<'m> Lowerer<'m> {
                     checked.node
                 }
             }
-            (Ty::Object, Ty::Dict(_)) => call("zb_dict_unbox", vec![v.node], target, span),
-            (Ty::Object, Ty::Set) => call("zb_set_unbox", vec![v.node], Ty::Set, span),
+            (Ty::Object, Ty::Dict(_) | Ty::Set(_)) => self.unbox_table(v, target, span),
             // Evaluate a None-producing expression before representing its result.
             (Ty::None, Ty::Class(_) | Ty::Object) => {
                 let result = if target == Ty::Object {
@@ -2386,24 +2403,18 @@ impl<'m> Lowerer<'m> {
             {
                 cast(v.node, target, span)
             }
-            // A dict iterates as its keys; a set is its list of elements;
-            // a generator is run to exhaustion.
-            (Ty::Dict(_), Ty::List(Elem::Object)) => {
-                call("zb_dict_keys", vec![v.node], target, span)
-            }
-            // A dict's keys as a list of the kind they are.
-            (Ty::Dict(_), Ty::List(e)) => {
-                let keys = call("zb_dict_keys", vec![v.node], Ty::List(Elem::Object), span);
-                self.coerce(
-                    Val {
-                        node: keys,
-                        ty: Ty::List(Elem::Object),
-                    },
-                    Ty::List(e),
-                )
+            // A dict iterates as its keys and a set as its elements, as
+            // a list of the kind wanted; a generator is run to
+            // exhaustion.
+            (Ty::Dict(_) | Ty::Set(_), Ty::List(e)) => {
+                let items = self.table_items(v, span);
+                if items.ty == target {
+                    items.node
+                } else {
+                    self.coerce(items, Ty::List(e))
+                }
             }
             (Ty::Gen, Ty::List(Elem::Object)) => self.generator_to_list(v.node, span),
-            (Ty::Set, Ty::List(Elem::Object)) => call("zb_set_items", vec![v.node], target, span),
             // Lists of one kind into lists of dynamic values.
             (Ty::List(e), Ty::List(Elem::Object)) => {
                 call(&list_fn("to_any", e), vec![v.node], target, span)
@@ -2551,11 +2562,8 @@ impl<'m> Lowerer<'m> {
                     span,
                 );
             }
-            (Ty::Object, Ty::Dict(_)) => {
-                return call("zb_dict_raw", vec![v.node], target, span);
-            }
-            (Ty::Object, Ty::Set) => {
-                return call("zb_set_raw", vec![v.node], target, span);
+            (Ty::Object, Ty::Dict(_) | Ty::Set(_)) => {
+                return self.raw_table(v.node, target, span);
             }
             (Ty::Object, Ty::File(_)) => {
                 return call("zb_unbox_list_raw_any", vec![v.node], target, span);
@@ -2632,17 +2640,20 @@ impl<'m> Lowerer<'m> {
                 // A box going into a slot that stores boxes keeps its
                 // identity: checked, not unboxed and boxed again.
                 if item.ty == Ty::Object && tuple_field_storage(elem) == Ty::Object {
-                    let check = match elem {
-                        Ty::List(e) => Some(list_fn("as_box", e)),
-                        Ty::Dict(_) => Some("zb_dict_as_box".to_string()),
-                        Ty::Set => Some("zb_set_as_box".to_string()),
-                        _ => None,
-                    };
-                    let Some(check) = check else {
-                        return item.node;
+                    let checked = match elem {
+                        Ty::List(e) => {
+                            call(&list_fn("as_box", e), vec![item.node], Ty::Object, span)
+                        }
+                        Ty::Dict(_) | Ty::Set(_) => call(
+                            &tables::table_fn("as_box_tagged", elem),
+                            vec![item.node, int_lit(tables::table_tag(elem), span)],
+                            Ty::Object,
+                            span,
+                        ),
+                        _ => return item.node,
                     };
                     let checked = Val {
-                        node: call(&check, vec![item.node], Ty::Object, span),
+                        node: checked,
                         ty: Ty::Object,
                     };
                     return if self.guards {
@@ -2970,9 +2981,9 @@ impl<'m> Lowerer<'m> {
                 ),
                 Ty::Bool,
             ),
-            Ty::Dict(_) => binary(
+            Ty::Dict(_) | Ty::Set(_) => binary(
                 BinaryOp::Ne,
-                call("zb_dict_len", vec![v.node], Ty::Int, span),
+                self.table_len(v, span),
                 int_lit(0, span),
                 Ty::Bool,
                 span,
@@ -3031,13 +3042,6 @@ impl<'m> Lowerer<'m> {
                     span,
                 ),
                 Ty::Bool,
-            ),
-            Ty::Set => binary(
-                BinaryOp::Ne,
-                call("zb_set_len", vec![v.node], Ty::Int, span),
-                int_lit(0, span),
-                Ty::Bool,
-                span,
             ),
             Ty::None => Self::after_none(
                 v.node,
@@ -3130,8 +3134,7 @@ impl<'m> Lowerer<'m> {
                 let items = self.coerce(v, Ty::List(Elem::Object));
                 call("zb_tuple_repr", vec![items], Ty::Str, span)
             }
-            Ty::Dict(_) => call("zb_dict_repr", vec![v.node], Ty::Str, span),
-            Ty::Set => call("zb_set_repr", vec![v.node], Ty::Str, span),
+            Ty::Dict(_) | Ty::Set(_) => self.table_repr(v, span),
             Ty::Gen => str_lit("<generator object>", span),
             Ty::Closure(_) => str_lit("<function>", span),
             Ty::Bound(_) => str_lit("<bound method>", span),
@@ -3840,8 +3843,8 @@ impl<'m> Lowerer<'m> {
                             elem_call("pop", e, vec![seq.node, i], span)
                         }
                         Ty::Dict(_) => {
-                            let k = self.expr_as(&sub.slice, Ty::Object)?;
-                            call("zb_dict_del", vec![seq.node, k], Ty::None, span)
+                            let k = self.expr(&sub.slice)?;
+                            self.dict_del(seq, k, span)
                         }
                         _ => {
                             let key = self.expr_as(&sub.slice, Ty::Object)?;
@@ -4542,7 +4545,7 @@ impl<'m> Lowerer<'m> {
                 // the list of its characters, a dict as whatever
                 // iterating it yields.
                 let value = match value.ty {
-                    Ty::Set | Ty::Tuple(_) => Val {
+                    Ty::Set(_) | Ty::Tuple(_) => Val {
                         node: self.coerce(value, Ty::List(Elem::Object)),
                         ty: Ty::List(Elem::Object),
                     },
@@ -4848,8 +4851,14 @@ impl<'m> Lowerer<'m> {
             }
             Ty::Str => call("zb_str_get", vec![seq.node, index], Ty::Str, span),
             Ty::Bytes => call("zb_bytes_index", vec![seq.node, index], Ty::Int, span),
-            // A set by position, as `zb_set_iter_len` left it.
-            Ty::Set => call("zb_set_iter_at", vec![seq.node, index], Ty::Object, span),
+            // A set by position, as `iter_len` left it.
+            Ty::Set(_) => {
+                let at = self.set_iter_at(seq, index, span);
+                return Val {
+                    node: self.coerce(at, elem_ty),
+                    ty: elem_ty,
+                };
+            }
             _ => call(
                 "zb_any_getitem_i64",
                 vec![seq.node, index],
@@ -4904,13 +4913,8 @@ impl<'m> Lowerer<'m> {
         let seq = match seq.ty {
             // A dynamic iterable is snapshotted into a list of objects,
             // and a dict iterates over a snapshot of its keys.
-            Ty::Object | Ty::Dict(_) => {
-                let items = match seq.ty {
-                    Ty::Dict(_) => {
-                        call("zb_dict_keys", vec![seq.node], Ty::List(Elem::Object), span)
-                    }
-                    _ => call("zb_any_iter", vec![seq.node], Ty::List(Elem::Object), span),
-                };
+            Ty::Object => {
+                let items = call("zb_any_iter", vec![seq.node], Ty::List(Elem::Object), span);
                 self.hold(
                     Val {
                         node: items,
@@ -4919,6 +4923,10 @@ impl<'m> Lowerer<'m> {
                     &mut prologue,
                     span,
                 )
+            }
+            Ty::Dict(_) => {
+                let keys = self.table_items(seq, span);
+                self.hold(keys, &mut prologue, span)
             }
             _ => self.hold(seq, &mut prologue, span),
         };
@@ -4937,7 +4945,12 @@ impl<'m> Lowerer<'m> {
         let len = match seq.ty {
             Ty::Str => call("zb_str_chars_len", vec![seq.node.clone()], Ty::Int, span),
             Ty::Bytes => call("zb_str_len", vec![seq.node.clone()], Ty::Int, span),
-            Ty::Set => call("zb_set_iter_len", vec![seq.node.clone()], Ty::Int, span),
+            Ty::Set(_) => call(
+                &tables::set_fn("iter_len", seq.ty),
+                vec![seq.node.clone()],
+                Ty::Int,
+                span,
+            ),
             _ => method_call(seq.node.clone(), "len", vec![], Ty::Int, span),
         };
         let item = self.index_value(
@@ -5461,7 +5474,7 @@ impl<'m> Lowerer<'m> {
             }
             Ty::List(_) | Ty::Tuple(_) => self.coerce(source, target),
             // A set or a generator: its items first.
-            Ty::Set | Ty::Gen => {
+            Ty::Set(_) | Ty::Gen => {
                 let items = Val {
                     node: self.iterable(source, span),
                     ty: Ty::List(Elem::Object),
@@ -5827,15 +5840,6 @@ impl<'m> Lowerer<'m> {
         }
     }
 
-    /// A dict key and the suffix of the dict functions that take it as
-    /// it is: a string or a tuple of known shape goes unboxed, for the
-    /// lookups that hash and compare it without boxing; anything else
-    /// is a dynamic value.
-    fn dict_key(&mut self, e: &py::Expr) -> Result<(Node, String)> {
-        let key = self.index_val(types::dynamic_dict(), e)?;
-        Ok(self.dict_key_of(key))
-    }
-
     /// The key `index_val` evaluated for a dict, as the lookup takes it.
     fn dict_key_of(&mut self, key: Val) -> (Node, String) {
         match key.ty {
@@ -5854,6 +5858,9 @@ impl<'m> Lowerer<'m> {
                 node: self.expr_as(slice, Ty::Int)?,
                 ty: Ty::Int,
             }),
+            // A typed dict's key as it is, for the probe rule to take;
+            // the library dict's as a string, a shape, or a box.
+            Ty::Dict(_) if tables::key_stored(container) != Ty::Object => self.expr(slice),
             Ty::Dict(_) => match self.ty_of(slice) {
                 Ty::Str => Ok(Val {
                     node: self.expr_as(slice, Ty::Str)?,
@@ -5875,23 +5882,7 @@ impl<'m> Lowerer<'m> {
             Ty::List(_) | Ty::Tuple(_) | Ty::Str | Ty::Bytes => {
                 Ok(self.index_value(seq, index.node, ty, span))
             }
-            // The stored value is dynamic; it is read as the shape says.
-            Ty::Dict(_) => {
-                let (key, by) = self.dict_key_of(index);
-                let value = Val {
-                    node: call(
-                        &format!("zb_dict_get{by}"),
-                        vec![seq.node, key],
-                        Ty::Object,
-                        span,
-                    ),
-                    ty: Ty::Object,
-                };
-                Ok(Val {
-                    node: self.read_as(value, ty, span),
-                    ty,
-                })
-            }
+            Ty::Dict(_) => Ok(self.dict_get(seq, index, ty, span)),
             // An instance answers through its class's `__getitem__`.
             Ty::Class(k) => {
                 match self.dunder(k as usize, "__getitem__", seq.node, vec![index], span) {
@@ -5946,16 +5937,7 @@ impl<'m> Lowerer<'m> {
                     span,
                 )
             }
-            Ty::Dict(_) => {
-                let (k, by) = self.dict_key_of(index);
-                let v = self.coerce(value, Ty::Object);
-                call(
-                    &format!("zb_dict_set{by}"),
-                    vec![seq.node, k, v],
-                    Ty::None,
-                    span,
-                )
-            }
+            Ty::Dict(_) => self.dict_set(seq, index, value, span),
             // An instance stores through its class's `__setitem__`.
             Ty::Class(k) => {
                 match self.dunder(
@@ -6775,80 +6757,35 @@ impl<'m> Lowerer<'m> {
                 self.comprehension(&c.generators, Produce::List(elem, &c.elt), span)?
             }
             py::Expr::SetComp(c) => {
-                self.comprehension(&c.generators, Produce::Set(&c.elt), span)?
+                let set_ty = match ty {
+                    Ty::Set(_) => ty.settled(),
+                    _ => types::dynamic_set(false),
+                };
+                self.comprehension(&c.generators, Produce::Set(set_ty, &c.elt), span)?
             }
             py::Expr::DictComp(c) => {
                 let Some(key) = &c.key else {
                     return unsupported("`**` in a dict comprehension", c);
                 };
-                self.comprehension(&c.generators, Produce::Dict(key, &c.value), span)?
+                let dict_ty = match ty {
+                    Ty::Dict(_) => ty.settled(),
+                    _ => types::dynamic_dict(),
+                };
+                self.comprehension(&c.generators, Produce::Dict(dict_ty, key, &c.value), span)?
             }
             py::Expr::Dict(d) => {
                 let dict_ty = match ty {
-                    Ty::Dict(_) => ty,
+                    Ty::Dict(_) => ty.settled(),
                     _ => types::dynamic_dict(),
                 };
-                // Keys that are distinct literals need no search for an
-                // earlier equal key: the literal lays out the dict's
-                // entries itself, each hash left zero for the index to
-                // fill if the dict takes one.
-                if distinct_literal_keys(d) {
-                    let entry_ty = zyntax_builtins::dicts::dict_entry_type(
-                        &zyntax_builtins::lists::Field::Any,
-                        &zyntax_builtins::lists::Field::Any,
-                    );
-                    let entry = |k: Node, v: Node| {
-                        TypedNode::new(
-                            TypedExpression::Tuple(vec![int_lit(0, span), k, v]),
-                            entry_ty.clone(),
-                            span,
-                        )
-                    };
-                    let mut entries = Vec::with_capacity(d.items.len());
-                    for item in &d.items {
-                        let Some(key) = &item.key else {
-                            return unsupported("`**` in a dict literal", d);
-                        };
-                        let k = self.expr(key)?;
-                        let k = self.coerce(k, Ty::Object);
-                        let v = self.expr(&item.value)?;
-                        let v = self.coerce(v, Ty::Object);
-                        entries.push(entry(k, v));
-                    }
-                    let storage = TypedNode::new(
-                        TypedExpression::Array(entries),
-                        zyntax_builtins::dicts::dict_type(list_type_id()),
-                        span,
-                    );
-                    return Ok(Val {
-                        node: call("zb_dict_from_distinct", vec![storage], dict_ty, span),
-                        ty: dict_ty,
-                    });
-                }
-                let mut items = Vec::with_capacity(d.items.len() * 2);
-                for item in &d.items {
-                    let Some(key) = &item.key else {
-                        return unsupported("`**` in a dict literal", d);
-                    };
-                    items.push(self.expr(key)?);
-                    items.push(self.expr(&item.value)?);
-                }
-                let pairs = self.list_of(items, Elem::Object, span);
-                Val {
-                    node: call("zb_dict_from_pairs", vec![pairs], dict_ty, span),
-                    ty: dict_ty,
-                }
+                self.dict_display(d, dict_ty, span)?
             }
             py::Expr::Set(st) => {
-                let mut items = Vec::with_capacity(st.elts.len());
-                for e in &st.elts {
-                    items.push(self.expr(e)?);
-                }
-                let elements = self.list_of(items, Elem::Object, span);
-                Val {
-                    node: call("zb_set_from", vec![elements], Ty::Set, span),
-                    ty: Ty::Set,
-                }
+                let set_ty = match ty {
+                    Ty::Set(_) => ty.settled(),
+                    _ => types::dynamic_set(false),
+                };
+                self.set_display(st, set_ty, span)?
             }
             py::Expr::FString(f) => self.fstring(f, span)?,
             other => return unsupported(types::expr_kind(other), other),
@@ -7159,19 +7096,22 @@ impl<'m> Lowerer<'m> {
                 _ => {}
             }
         }
-        // Set algebra.
-        if left.ty == Ty::Set && right.ty == Ty::Set {
+        // Set algebra, in the store of the set inference made of the
+        // result: the left one's kind, of either's elements.
+        if let (Ty::Set(a), Ty::Set(b)) = (left.ty, right.ty) {
             let name = match op {
-                py::Operator::BitAnd => Some("zb_set_and"),
-                py::Operator::BitOr => Some("zb_set_or"),
-                py::Operator::Sub => Some("zb_set_sub"),
-                py::Operator::BitXor => Some("zb_set_xor"),
+                py::Operator::BitAnd => Some("and"),
+                py::Operator::BitOr => Some("or"),
+                py::Operator::Sub => Some("sub"),
+                py::Operator::BitXor => Some("xor"),
                 _ => None,
             };
             if let Some(name) = name {
+                let ((ea, frozen), (eb, _)) = (types::set_shape(a), types::set_shape(b));
+                let ty = types::set_of(ea.join(eb), frozen).settled();
                 return Ok(Val {
-                    node: call(name, vec![left.node, right.node], Ty::Set, span),
-                    ty: Ty::Set,
+                    node: self.set_arith(name, left, right, ty, span),
+                    ty,
                 });
             }
         }
@@ -7478,19 +7418,8 @@ impl<'m> Lowerer<'m> {
                         Ty::Bool,
                         span,
                     )
-                } else if right.ty == Ty::Set {
-                    // A tuple of known shape probes by its fields, no box.
-                    if let Ty::Tuple(k) = left.ty {
-                        call(
-                            &format!("zb_set_contains_{}", types::tuple_suffix(k)),
-                            vec![right.node, left.node],
-                            Ty::Bool,
-                            span,
-                        )
-                    } else {
-                        let item = self.coerce(left, Ty::Object);
-                        call("zb_set_contains", vec![right.node, item], Ty::Bool, span)
-                    }
+                } else if matches!(right.ty, Ty::Set(_) | Ty::Dict(_)) {
+                    self.table_contains(right, left, span)
                 } else if matches!(right.ty, Ty::Tuple(_)) {
                     // Through the list of the elements, of the one kind
                     // they all are when they are.
@@ -7499,18 +7428,6 @@ impl<'m> Lowerer<'m> {
                     let items = self.coerce(right, Ty::List(e));
                     let item = self.elem_arg(left, e);
                     call(&list_fn("contains", e), vec![items, item], Ty::Bool, span)
-                } else if matches!(right.ty, Ty::Dict(_)) {
-                    let (item, by) = match left.ty {
-                        Ty::Str => (left.node, "_str".to_string()),
-                        Ty::Tuple(k) => (left.node, format!("_{}", types::tuple_suffix(k))),
-                        _ => (self.coerce(left, Ty::Object), String::new()),
-                    };
-                    call(
-                        &format!("zb_dict_contains{by}"),
-                        vec![right.node, item],
-                        Ty::Bool,
-                        span,
-                    )
                 } else if let Ty::Class(k) = right.ty
                     && self.module.method_sig(k as usize, "__contains__").is_some()
                 {
@@ -7599,8 +7516,8 @@ impl<'m> Lowerer<'m> {
                         span,
                     ),
                     // Containers are identical when they are the same heap object.
-                    (Ty::List(_) | Ty::Tuple(_) | Ty::Dict(_) | Ty::Set, _)
-                    | (_, Ty::List(_) | Ty::Tuple(_) | Ty::Dict(_) | Ty::Set) => {
+                    (Ty::List(_) | Ty::Tuple(_) | Ty::Dict(_) | Ty::Set(_), _)
+                    | (_, Ty::List(_) | Ty::Tuple(_) | Ty::Dict(_) | Ty::Set(_)) => {
                         let l = self.coerce(left, Ty::Object);
                         let r = self.coerce(right, Ty::Object);
                         call("zb_any_same", vec![l, r], Ty::Bool, span)
@@ -7616,36 +7533,25 @@ impl<'m> Lowerer<'m> {
             _ => {}
         }
         // Sets order by inclusion.
-        if left.ty == Ty::Set && right.ty == Ty::Set {
-            let subset = |this: &mut Self, a: Node, b: Node| {
-                let _ = this;
-                call("zb_set_issubset", vec![a, b], Ty::Bool, span)
-            };
-            let proper = |this: &mut Self, a: Node, b: Node| {
-                let sub = subset(this, a.clone(), b.clone());
-                let same_size = binary(
-                    BinaryOp::Eq,
-                    call("zb_set_len", vec![a], Ty::Int, span),
-                    call("zb_set_len", vec![b], Ty::Int, span),
-                    Ty::Bool,
+        if matches!((left.ty, right.ty), (Ty::Set(_), Ty::Set(_))) {
+            return match self.set_compare(op, left, right, span) {
+                Some(n) => Ok(n),
+                None => Err(Error::unsupported_span(
+                    "this comparison of sets".to_string(),
                     span,
-                );
-                binary(BinaryOp::And, sub, negate(same_size), Ty::Bool, span)
+                )),
             };
-            let (l, r) = (left.node, right.node);
-            return Ok(match op {
-                py::CmpOp::LtE => subset(self, l, r),
-                py::CmpOp::GtE => subset(self, r, l),
-                py::CmpOp::Lt => proper(self, l, r),
-                py::CmpOp::Gt => proper(self, r, l),
-                py::CmpOp::Eq => call("zb_set_eq", vec![l, r], Ty::Bool, span),
-                py::CmpOp::NotEq => negate(call("zb_set_eq", vec![l, r], Ty::Bool, span)),
-                _ => {
-                    return Err(Error::unsupported_span(
-                        "this comparison of sets".to_string(),
-                        span,
-                    ));
-                }
+        }
+        // Two dicts of one store compare by their functions; of two, one
+        // as the other's dynamic value.
+        if let (Ty::Dict(_), Ty::Dict(_), py::CmpOp::Eq | py::CmpOp::NotEq) =
+            (left.ty, right.ty, op)
+        {
+            let equal = self.dict_equal(left, right, span);
+            return Ok(if op == py::CmpOp::NotEq {
+                negate(equal)
+            } else {
+                equal
             });
         }
         // A tuple and a list are never equal and have no order.
@@ -8216,8 +8122,7 @@ impl<'m> Lowerer<'m> {
     ) -> Result<Val> {
         let ty = match produce {
             Produce::List(elem, _) => Ty::List(elem),
-            Produce::Set(_) => Ty::Set,
-            Produce::Dict(..) => types::dynamic_dict(),
+            Produce::Set(ty, _) | Produce::Dict(ty, ..) => ty,
             Produce::Yield(_) => Ty::None,
         };
         let out = self.temp();
@@ -8252,8 +8157,7 @@ impl<'m> Lowerer<'m> {
         };
         let initializer = match produce {
             Produce::List(elem, _) => Some(self.list_of(Vec::new(), elem, span)),
-            Produce::Set(_) => Some(call("zb_set_new", vec![], Ty::Set, span)),
-            Produce::Dict(..) => Some(call("zb_dict_new", vec![], ty, span)),
+            Produce::Set(..) | Produce::Dict(..) => Some(self.new_table(ty, span)),
             _ => None,
         };
         if let Some(initializer) = initializer {
@@ -8285,20 +8189,25 @@ impl<'m> Lowerer<'m> {
                 let value = self.expr_as_elem(elt, elem)?;
                 method_call(var(out, ty, span), "push", vec![value], Ty::None, span)
             }
-            Produce::Set(elt) => {
-                let value = self.expr_as(elt, Ty::Object)?;
-                call(
-                    "zb_set_add",
-                    vec![var(out, ty, span), value],
-                    Ty::None,
+            Produce::Set(_, elt) => {
+                let value = self.expr(elt)?;
+                self.set_add(
+                    Val {
+                        node: var(out, ty, span),
+                        ty,
+                    },
+                    value,
                     span,
                 )
             }
-            Produce::Dict(key, value) => {
-                let k = self.expr_as(key, Ty::Object)?;
-                let v = self.expr_as(value, Ty::Object)?;
+            Produce::Dict(_, key, value) => {
+                let k = self.expr(key)?;
+                let v = self.expr(value)?;
+                let (sk, sv) = tables::dict_stored(ty);
+                let k = self.table_in(k, sk);
+                let v = self.table_in(v, sv);
                 call(
-                    "zb_dict_set",
+                    &tables::dict_fn("set", ty),
                     vec![var(out, ty, span), k, v],
                     Ty::None,
                     span,
@@ -8589,82 +8498,93 @@ impl<'m> Lowerer<'m> {
                 };
                 Ok(Val { node, ty })
             }
-            // The stored keys and values are dynamic; what comes out is
-            // read as the shape says.
+            // What comes out is read as the shape says.
             Ty::Dict(_) => {
-                let d = receiver.node;
                 let dict_ty = receiver.ty;
-                let mut produced = Ty::Object;
-                let node = match (name, args.len()) {
-                    ("get", 1) => {
-                        let (k, by) = self.dict_key(&args[0])?;
-                        let none = self.coerce(
-                            Val {
-                                node: node(
-                                    TypedExpression::Literal(TypedLiteral::Null),
-                                    Ty::None,
-                                    span,
-                                ),
-                                ty: Ty::None,
-                            },
-                            Ty::Object,
-                        );
-                        call(
-                            &format!("zb_dict_get_default{by}"),
-                            vec![d, k, none],
+                let none = || Val {
+                    node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+                    ty: Ty::None,
+                };
+                match (name, args.len()) {
+                    ("get", 1 | 2) => {
+                        let k = self.expr(&args[0])?;
+                        let default = match args.get(1) {
+                            Some(a) => self.expr(a)?,
+                            None => none(),
+                        };
+                        return Ok(self.dict_get_default(receiver, k, default, ty, span));
+                    }
+                    ("setdefault", 1 | 2) => {
+                        let k = self.expr(&args[0])?;
+                        let v = match args.get(1) {
+                            Some(a) => self.expr(a)?,
+                            None => none(),
+                        };
+                        return Ok(self.dict_setdefault(receiver, k, v, ty, span));
+                    }
+                    ("pop", 1 | 2) => {
+                        let k = self.expr(&args[0])?;
+                        let default = match args.get(1) {
+                            Some(a) => Some(self.expr(a)?),
+                            None => None,
+                        };
+                        return Ok(self.dict_pop(receiver, k, default, ty, span));
+                    }
+                    _ => {}
+                }
+                let d = receiver.node;
+                let value = match (name, args.len()) {
+                    ("keys", 0) => self.table_items(
+                        Val {
+                            node: d,
+                            ty: dict_ty,
+                        },
+                        span,
+                    ),
+                    ("values", 0) => self.dict_values(
+                        Val {
+                            node: d,
+                            ty: dict_ty,
+                        },
+                        span,
+                    ),
+                    ("items", 0) => Val {
+                        node: call(
+                            &tables::dict_fn("items", dict_ty),
+                            vec![d],
+                            Ty::List(Elem::Object),
+                            span,
+                        ),
+                        ty: Ty::List(Elem::Object),
+                    },
+                    ("copy", 0) => Val {
+                        node: call(&tables::dict_fn("copy", dict_ty), vec![d], dict_ty, span),
+                        ty: dict_ty,
+                    },
+                    ("clear", 0) => Val {
+                        node: call(&tables::dict_fn("clear", dict_ty), vec![d], Ty::None, span),
+                        ty: Ty::None,
+                    },
+                    ("popitem", 0) => Val {
+                        node: call(
+                            &tables::dict_fn("popitem", dict_ty),
+                            vec![d],
                             Ty::Object,
                             span,
-                        )
-                    }
-                    ("get", 2) => {
-                        let (k, by) = self.dict_key(&args[0])?;
-                        let default = self.expr_as(&args[1], Ty::Object)?;
-                        call(
-                            &format!("zb_dict_get_default{by}"),
-                            vec![d, k, default],
-                            Ty::Object,
-                            span,
-                        )
-                    }
-                    ("setdefault", 2) => {
-                        let k = self.expr_as(&args[0], Ty::Object)?;
-                        let v = self.expr_as(&args[1], Ty::Object)?;
-                        call("zb_dict_setdefault", vec![d, k, v], Ty::Object, span)
-                    }
-                    ("pop", 1) => {
-                        let k = self.expr_as(&args[0], Ty::Object)?;
-                        call("zb_dict_pop", vec![d, k], Ty::Object, span)
-                    }
-                    ("pop", 2) => {
-                        let k = self.expr_as(&args[0], Ty::Object)?;
-                        let default = self.expr_as(&args[1], Ty::Object)?;
-                        call("zb_dict_pop_default", vec![d, k, default], Ty::Object, span)
-                    }
-                    ("keys", 0) => {
-                        produced = Ty::List(Elem::Object);
-                        call("zb_dict_keys", vec![d], produced, span)
-                    }
-                    ("values", 0) => {
-                        produced = Ty::List(Elem::Object);
-                        call("zb_dict_values", vec![d], produced, span)
-                    }
-                    ("items", 0) => {
-                        produced = Ty::List(Elem::Object);
-                        call("zb_dict_items", vec![d], produced, span)
-                    }
-                    ("copy", 0) => {
-                        produced = dict_ty;
-                        call("zb_dict_copy", vec![d], dict_ty, span)
-                    }
-                    ("clear", 0) => {
-                        produced = Ty::None;
-                        call("zb_dict_clear", vec![d], Ty::None, span)
-                    }
-                    ("popitem", 0) => call("zb_dict_popitem", vec![d], Ty::Object, span),
+                        ),
+                        ty: Ty::Object,
+                    },
                     ("update", 1) => {
-                        produced = Ty::None;
-                        let other = self.expr_as(&args[0], types::dynamic_dict())?;
-                        call("zb_dict_update", vec![d, other], Ty::None, span)
+                        let other = self.expr_as(&args[0], dict_ty)?;
+                        Val {
+                            node: call(
+                                &tables::dict_fn("update", dict_ty),
+                                vec![d, other],
+                                Ty::None,
+                                span,
+                            ),
+                            ty: Ty::None,
+                        }
                     }
                     _ => {
                         return Err(Error::unsupported_span(
@@ -8673,53 +8593,131 @@ impl<'m> Lowerer<'m> {
                         ));
                     }
                 };
-                let value = Val { node, ty: produced };
                 Ok(Val {
                     node: self.read_as(value, ty, span),
                     ty,
                 })
             }
-            Ty::Set => {
-                let st = receiver.node;
+            Ty::Set(_) => {
+                let set_ty = receiver.ty;
+                let mutators = [
+                    "add",
+                    "remove",
+                    "discard",
+                    "clear",
+                    "pop",
+                    "update",
+                    "intersection_update",
+                    "difference_update",
+                    "symmetric_difference_update",
+                ];
+                // A frozenset has none of the methods that change a set.
+                if tables::frozen(set_ty) && mutators.contains(&name) {
+                    let mut operands = vec![receiver.node];
+                    for a in args {
+                        operands.push(self.expr(a)?.node);
+                    }
+                    let message = format!("'frozenset' object has no attribute '{name}'");
+                    return Ok(Val {
+                        node: self.raised_value(operands, "AttributeError", &message, ty, span),
+                        ty,
+                    });
+                }
+                let st = receiver;
+                let elem_arg = |this: &mut Self, a: &py::Expr| -> Result<Val> { this.expr(a) };
                 let node = match (name, args.len()) {
                     ("add", 1) => {
-                        let v = self.expr_as(&args[0], Ty::Object)?;
-                        call("zb_set_add", vec![st, v], Ty::None, span)
+                        let v = elem_arg(self, &args[0])?;
+                        self.set_add(st, v, span)
                     }
-                    ("remove", 1) => {
-                        let v = self.expr_as(&args[0], Ty::Object)?;
-                        call("zb_set_remove", vec![st, v], Ty::None, span)
+                    ("remove" | "discard", 1) => {
+                        let v = elem_arg(self, &args[0])?;
+                        self.set_discard(st, v, name == "remove", span)
                     }
-                    ("discard", 1) => {
-                        let v = self.expr_as(&args[0], Ty::Object)?;
-                        call("zb_set_discard", vec![st, v], Ty::None, span)
+                    ("clear", 0) => call(
+                        &tables::set_fn("clear", set_ty),
+                        vec![st.node],
+                        Ty::None,
+                        span,
+                    ),
+                    ("copy", 0) => {
+                        call(&tables::set_fn("copy", set_ty), vec![st.node], set_ty, span)
                     }
-                    ("clear", 0) => call("zb_set_clear", vec![st], Ty::None, span),
-                    ("copy", 0) => call("zb_set_copy", vec![st], Ty::Set, span),
-                    (
-                        "union"
-                        | "intersection"
-                        | "difference"
-                        | "symmetric_difference"
-                        | "issubset"
-                        | "issuperset",
-                        1,
-                    ) => {
-                        let other = self.expr_as(&args[0], Ty::Set)?;
-                        let (f, result) = match name {
-                            "union" => ("zb_set_or", Ty::Set),
-                            "intersection" => ("zb_set_and", Ty::Set),
-                            "difference" => ("zb_set_sub", Ty::Set),
-                            "symmetric_difference" => ("zb_set_xor", Ty::Set),
-                            "issubset" => ("zb_set_issubset", Ty::Bool),
-                            _ => ("zb_set_issubset", Ty::Bool),
+                    ("pop", 0) => {
+                        let stored = tables::set_stored(set_ty);
+                        let popped =
+                            call(&tables::set_fn("pop", set_ty), vec![st.node], stored, span);
+                        self.read_as(
+                            Val {
+                                node: popped,
+                                ty: stored,
+                            },
+                            ty,
+                            span,
+                        )
+                    }
+                    ("update", _) => {
+                        let mut pre = Vec::new();
+                        let held = self.hold(st, &mut pre, span);
+                        for a in args {
+                            let other = self.expr(a)?;
+                            pre.append(&mut self.hoisted);
+                            let other = self.as_set_of(other, set_ty, span);
+                            pre.append(&mut self.hoisted);
+                            pre.push(TypedNode::new(
+                                TypedStatement::Expression(Box::new(call(
+                                    &tables::set_fn("update", set_ty),
+                                    vec![held.node.clone(), other],
+                                    Ty::None,
+                                    span,
+                                ))),
+                                Type::Unknown,
+                                span,
+                            ));
+                        }
+                        let none =
+                            node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span);
+                        Self::block_value(pre, none, Ty::None, span)
+                    }
+                    ("union" | "intersection" | "difference" | "symmetric_difference", 1) => {
+                        let result = match ty {
+                            Ty::Set(_) => ty.settled(),
+                            _ => set_ty,
                         };
-                        let args = if name == "issuperset" {
-                            vec![other, st]
+                        let other = self.expr(&args[0])?;
+                        let other = Val {
+                            node: self.as_set_of(other, result, span),
+                            ty: result,
+                        };
+                        let op = match name {
+                            "union" => "or",
+                            "intersection" => "and",
+                            "difference" => "sub",
+                            _ => "xor",
+                        };
+                        let node = self.set_arith(op, st, other, result, span);
+                        return Ok(Val {
+                            node: self.coerce(Val { node, ty: result }, ty),
+                            ty,
+                        });
+                    }
+                    ("issubset" | "issuperset" | "isdisjoint", 1) => {
+                        let other = self.expr(&args[0])?;
+                        let other = Val {
+                            node: self.as_set_of(other, set_ty, span),
+                            ty: set_ty,
+                        };
+                        let (a, b) = if name == "issuperset" {
+                            (other.node, st.node)
                         } else {
-                            vec![st, other]
+                            (st.node, other.node)
                         };
-                        call(f, args, result, span)
+                        let f = if name == "isdisjoint" {
+                            "isdisjoint"
+                        } else {
+                            "issubset"
+                        };
+                        call(&tables::set_fn(f, set_ty), vec![a, b], Ty::Bool, span)
                     }
                     _ => {
                         return Err(Error::unsupported_span(
@@ -8989,22 +8987,29 @@ impl<'m> Lowerer<'m> {
             && !args.is_empty()
         {
             // One copy of the first set, the rest added into it.
-            let first = self.expr_as(&args[0], Ty::Set)?;
-            let result = call("zb_set_copy", vec![first], Ty::Set, span);
-            let mut pre = Vec::new();
+            let set_ty = match ty {
+                Ty::Set(_) => ty.settled(),
+                _ => types::dynamic_set(true),
+            };
+            let first = self.expr(&args[0])?;
+            let result = self.set_from(first, set_ty, span);
+            let mut pre = std::mem::take(&mut self.hoisted);
             let held = self.hold(
                 Val {
                     node: result,
-                    ty: Ty::Set,
+                    ty: set_ty,
                 },
                 &mut pre,
                 span,
             );
             for arg in &args[1..] {
-                let other = self.expr_as(arg, Ty::Set)?;
+                let other = self.expr(arg)?;
+                pre.append(&mut self.hoisted);
+                let other = self.as_set_of(other, set_ty, span);
+                pre.append(&mut self.hoisted);
                 pre.push(TypedNode::new(
                     TypedStatement::Expression(Box::new(call(
-                        "zb_set_update",
+                        &tables::set_fn("update", set_ty),
                         vec![held.node.clone(), other],
                         Ty::None,
                         span,
@@ -9013,10 +9018,16 @@ impl<'m> Lowerer<'m> {
                     span,
                 ));
             }
-            let result = Self::block_value(pre, held.node, Ty::Set, span);
+            let result = Self::block_value(pre, held.node, set_ty, span);
             return Ok(Val {
-                node: result,
-                ty: Ty::Set,
+                node: self.coerce(
+                    Val {
+                        node: result,
+                        ty: set_ty,
+                    },
+                    ty,
+                ),
+                ty,
             });
         }
         // `"...{}".format(args)` with a literal template is built here.
@@ -9392,8 +9403,7 @@ impl<'m> Lowerer<'m> {
                             int_lit(types::tuple_shape(k).len() as i64, span),
                             Ty::Int,
                         ),
-                        Ty::Set => call("zb_set_len", vec![v.node], Ty::Int, span),
-                        Ty::Dict(_) => call("zb_dict_len", vec![v.node], Ty::Int, span),
+                        Ty::Set(_) | Ty::Dict(_) => self.table_len(v, span),
                         Ty::Class(k) => {
                             match self.dunder(k as usize, "__len__", v.node, vec![], span) {
                                 Some(r) => self.coerce(r, Ty::Int),
@@ -9553,24 +9563,53 @@ impl<'m> Lowerer<'m> {
                 "dict" => {
                     // The shape is what inference gave the call.
                     let dict_ty = match ty {
-                        Ty::Dict(_) => ty,
+                        Ty::Dict(_) => ty.settled(),
                         _ => types::dynamic_dict(),
                     };
-                    let node = match args.first() {
-                        None => call(
-                            "zb_dict_from_pairs",
-                            vec![self.list_of(Vec::new(), Elem::Object, span)],
-                            dict_ty,
+                    // Pairs a comprehension yields are the comprehension
+                    // of the dict itself.
+                    if let Some((generators, py::Expr::Tuple(pair))) =
+                        args.first().and_then(|a| match a {
+                            py::Expr::Generator(g) => Some((&g.generators, &*g.elt)),
+                            py::Expr::ListComp(l) => Some((&l.generators, &*l.elt)),
+                            _ => None,
+                        })
+                        && pair.elts.len() == 2
+                        && !pair.elts.iter().any(|e| matches!(e, py::Expr::Starred(_)))
+                    {
+                        let value = self.comprehension(
+                            generators,
+                            Produce::Dict(dict_ty, &pair.elts[0], &pair.elts[1]),
                             span,
-                        ),
+                        )?;
+                        return Ok(value);
+                    }
+                    let node = match args.first() {
+                        None => self.new_table(dict_ty, span),
                         Some(a) => {
                             let v = self.consumed(a, span)?;
                             match v.ty {
-                                Ty::Dict(_) => call("zb_dict_copy", vec![v.node], dict_ty, span),
+                                Ty::Dict(_) if tables::same_store(v.ty, dict_ty) => call(
+                                    &tables::dict_fn("copy", dict_ty),
+                                    vec![v.node],
+                                    dict_ty,
+                                    span,
+                                ),
+                                Ty::Dict(_) => self.convert_table(v, dict_ty, span),
                                 // Anything else is a sequence of pairs.
                                 _ => {
                                     let items = self.iterable(v, span);
-                                    call("zb_dict_from_tuples", vec![items], dict_ty, span)
+                                    let library = types::dynamic_dict();
+                                    let pairs = Val {
+                                        node: call(
+                                            "zb_dict_from_tuples",
+                                            vec![items],
+                                            library,
+                                            span,
+                                        ),
+                                        ty: library,
+                                    };
+                                    self.convert_table(pairs, dict_ty, span)
                                 }
                             }
                         }
@@ -9578,25 +9617,18 @@ impl<'m> Lowerer<'m> {
                     return Ok(Val { node, ty: dict_ty });
                 }
                 "set" | "frozenset" => {
-                    let items = match args.first() {
-                        None => self.list_of(Vec::new(), Elem::Object, span),
+                    let set_ty = match ty {
+                        Ty::Set(_) => ty.settled(),
+                        _ => types::dynamic_set(name == "frozenset"),
+                    };
+                    let node = match args.first() {
+                        None => self.new_table(set_ty, span),
                         Some(a) => {
                             let v = self.consumed(a, span)?;
-                            match v.ty {
-                                Ty::List(_) | Ty::Tuple(_) | Ty::Set | Ty::Dict(_) => {
-                                    self.coerce(v, Ty::List(Elem::Object))
-                                }
-                                _ => {
-                                    let o = self.coerce(v, Ty::Object);
-                                    call("zb_any_iter", vec![o], Ty::List(Elem::Object), span)
-                                }
-                            }
+                            self.set_from(v, set_ty, span)
                         }
                     };
-                    return Ok(Val {
-                        node: call("zb_set_from", vec![items], Ty::Set, span),
-                        ty: Ty::Set,
-                    });
+                    return Ok(Val { node, ty: set_ty });
                 }
                 "tuple" if matches!(ty, Ty::Tuple(_)) => {
                     let v = self.expr(&args[0])?;
@@ -9672,7 +9704,8 @@ impl<'m> Lowerer<'m> {
                                         ty: Ty::List(target_elem),
                                     }
                                 }
-                                Ty::Set | Ty::Dict(_) | Ty::Gen => {
+                                Ty::Set(_) | Ty::Dict(_) => self.table_items(v, span),
+                                Ty::Gen => {
                                     let node = self.coerce(v, Ty::List(Elem::Object));
                                     Val {
                                         node,
@@ -9890,7 +9923,8 @@ impl<'m> Lowerer<'m> {
                         Ty::List(_) => str_lit("list", span),
                         Ty::Tuple(_) => str_lit("tuple", span),
                         Ty::Dict(_) => str_lit("dict", span),
-                        Ty::Set => str_lit("set", span),
+                        Ty::Set(_) if tables::frozen(v.ty) => str_lit("frozenset", span),
+                        Ty::Set(_) => str_lit("set", span),
                         Ty::Class(k) => str_lit(&self.module.classes[k as usize].name, span),
                         _ => call("zb_any_type", vec![v.node], Ty::Str, span),
                     };
@@ -13015,21 +13049,4 @@ impl<'m> Lowerer<'m> {
 /// value anything.
 fn never_none(ty: Ty) -> bool {
     !matches!(ty, Ty::None | Ty::Object | Ty::Unknown | Ty::Class(_))
-}
-
-/// Whether every key of a dict literal is a string literal and no two
-/// are equal, so the pairs are the dict's pairs as written.
-fn distinct_literal_keys(d: &py::ExprDict) -> bool {
-    let mut seen: Vec<String> = Vec::with_capacity(d.items.len());
-    for item in &d.items {
-        let Some(py::Expr::StringLiteral(s)) = &item.key else {
-            return false;
-        };
-        let text = s.value.to_str().to_string();
-        if seen.contains(&text) {
-            return false;
-        }
-        seen.push(text);
-    }
-    true
 }

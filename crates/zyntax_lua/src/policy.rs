@@ -28,6 +28,7 @@ pub const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
         tuple: "table",
         dict: "table",
         set: "table",
+        frozenset: "table",
         function: "function",
         object: "userdata",
     },

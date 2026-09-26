@@ -222,12 +222,19 @@ pub enum Field {
     Any,
     /// A dict or a set, stored as the box its tag identifies (a header
     /// has an identity a copy inside the tuple would lose) and read raw
-    /// as `ty`: a dict's entry list, a set's list of values.
+    /// as `ty`: a dict's entry list, a set's list of values. `suffix`
+    /// names the shape's functions, empty for the library's own; a
+    /// frozen set prints as one.
     Dict {
         ty: Type,
+        suffix: String,
+        tag: i64,
     },
     Set {
         ty: Type,
+        suffix: String,
+        tag: i64,
+        frozen: bool,
     },
     /// An instance of the frontend's class carrying `tag`, held by
     /// address as `ty`.
@@ -254,6 +261,16 @@ pub enum Field {
         suffix: String,
         ty: Type,
     },
+}
+
+/// The function `op` of the dict or set (`family`) shape whose functions
+/// carry `suffix`, empty for the library's own.
+pub fn keyed_fn(family: &str, op: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        format!("zb_{family}_{op}")
+    } else {
+        format!("zb_{family}_{op}_{suffix}")
+    }
 }
 
 impl Field {
@@ -289,8 +306,12 @@ impl Field {
     /// checked when the field was stored.
     pub(crate) fn raw(&self, x: Expr) -> Expr {
         match self {
-            Field::Dict { ty } => call("zb_dict_raw", vec![x], ty.clone()),
-            Field::Set { ty } => call("zb_set_raw", vec![x], ty.clone()),
+            Field::Dict { ty, suffix, .. } => {
+                call(&keyed_fn("dict", "raw", suffix), vec![x], ty.clone())
+            }
+            Field::Set { ty, suffix, .. } => {
+                call(&keyed_fn("set", "raw", suffix), vec![x], ty.clone())
+            }
             Field::List { suffix, ty } | Field::Array { suffix, ty, .. } => {
                 call(&format!("zb_unbox_list_raw_{suffix}"), vec![x], ty.clone())
             }
@@ -306,8 +327,16 @@ impl Field {
                 eq(a.clone(), b.clone()),
                 call("zb_any_eq", vec![a, b], boolean()),
             ),
-            Field::Dict { .. } => call("zb_dict_eq", vec![self.raw(a), self.raw(b)], boolean()),
-            Field::Set { .. } => call("zb_set_eq", vec![self.raw(a), self.raw(b)], boolean()),
+            Field::Dict { suffix, .. } => call(
+                &keyed_fn("dict", "eq", suffix),
+                vec![self.raw(a), self.raw(b)],
+                boolean(),
+            ),
+            Field::Set { suffix, .. } => call(
+                &keyed_fn("set", "eq", suffix),
+                vec![self.raw(a), self.raw(b)],
+                boolean(),
+            ),
             Field::Instance { .. } => eq(cast(a, usize()), cast(b, usize())),
             Field::List { suffix, .. } | Field::Array { suffix, .. } => call(
                 &format!("zb_list_eq_{suffix}"),
@@ -351,8 +380,31 @@ impl Field {
             Field::Bool => call("zb_bool_repr", vec![x], string()),
             Field::Str => call("zb_str_repr", vec![x], string()),
             Field::Any => call("zb_any_repr", vec![x], string()),
-            Field::Dict { .. } => call("zb_dict_repr", vec![self.raw(x)], string()),
-            Field::Set { .. } => call("zb_set_repr", vec![self.raw(x)], string()),
+            Field::Dict { suffix, .. } => call(
+                &keyed_fn("dict", "repr", suffix),
+                vec![self.raw(x)],
+                string(),
+            ),
+            Field::Set { suffix, frozen, .. } => {
+                let text_of = call(
+                    &keyed_fn("set", "repr", suffix),
+                    vec![self.raw(x.clone())],
+                    string(),
+                );
+                if *frozen {
+                    // `frozenset({1, 2})`, and `frozenset()` when empty.
+                    if_expr(
+                        eq(
+                            call(&keyed_fn("set", "len", suffix), vec![self.raw(x)], i64()),
+                            int(0),
+                        ),
+                        text("frozenset()"),
+                        add(add(text("frozenset("), text_of), text(")")),
+                    )
+                } else {
+                    text_of
+                }
+            }
             Field::Instance { .. } => call("zb_any_repr", vec![self.boxed(x)], string()),
             Field::List { suffix, .. } => call(
                 &format!("zb_list_repr_{suffix}"),
@@ -477,8 +529,18 @@ impl Field {
             Field::Bool => call("zb_any_as_bool", vec![x], boolean()),
             Field::Str => call("zb_any_as_str", vec![x], string()),
             Field::Any => x,
-            Field::Dict { .. } => call("zb_dict_as_box", vec![x], any()),
-            Field::Set { .. } => call("zb_set_as_box", vec![x], any()),
+            Field::Dict { suffix, tag, .. } | Field::Set { suffix, tag, .. } => {
+                let family = if matches!(self, Field::Dict { .. }) {
+                    "dict"
+                } else {
+                    "set"
+                };
+                call(
+                    &keyed_fn(family, "as_box_tagged", suffix),
+                    vec![x, int(*tag)],
+                    any(),
+                )
+            }
             Field::Instance { ty, tag } => cast(
                 call("zb_hook_unbox_instance", vec![x, int32(*tag)], usize()),
                 ty.clone(),
@@ -2468,9 +2530,11 @@ pub(crate) fn shape_hook_declarations(policy: &Policy, list_type: TypeId) -> Vec
 /// The hooks the dynamic layer asks of a boxed dict or set of a shape a
 /// frontend registered (a kind in `dicts::keyed_kind_range`): an item
 /// read, store and deletion by a dynamic key, membership, the length,
-/// equality with any value, the hash of a frozen set, and its JSON text.
-/// Its repr and its items as a list are asked of the list hooks.
-const KEYED_HOOKS: [(&str, &[&'static str], &str); 8] = [
+/// equality with any value, the hash of a frozen set, its JSON text, and
+/// a set's arithmetic (the operator's code) and inclusion (`strict` for
+/// `<`) with another set. Its repr and its items as a list are asked of
+/// the list hooks.
+const KEYED_HOOKS: [(&str, &[&'static str], &str); 10] = [
     ("zb_hook_shaped_getitem", &["x", "k"], "any"),
     ("zb_hook_shaped_setitem", &["x", "k", "v"], "unit"),
     ("zb_hook_shaped_delitem", &["x", "k"], "unit"),
@@ -2479,6 +2543,8 @@ const KEYED_HOOKS: [(&str, &[&'static str], &str); 8] = [
     ("zb_hook_shaped_eq", &["a", "b"], "bool"),
     ("zb_hook_shaped_hash", &["x"], "i64"),
     ("zb_hook_shaped_json", &["pieces", "x"], "unit"),
+    ("zb_hook_shaped_set_arith", &["code", "a", "b"], "any"),
+    ("zb_hook_shaped_set_le", &["a", "b", "strict"], "bool"),
 ];
 
 fn keyed_hook_signature(
@@ -2489,10 +2555,11 @@ fn keyed_hook_signature(
     let params = params
         .iter()
         .map(|p| {
-            let ty = if *p == "pieces" {
-                list_of(list_type, string())
-            } else {
-                any()
+            let ty = match *p {
+                "pieces" => list_of(list_type, string()),
+                "code" => i64(),
+                "strict" => boolean(),
+                _ => any(),
             };
             (*p, ty)
         })

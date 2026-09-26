@@ -22,6 +22,7 @@ pub const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
         tuple: "tuple",
         dict: "dict",
         set: "set",
+        frozenset: "frozenset",
         function: "function",
         object: "object",
     },

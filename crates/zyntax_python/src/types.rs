@@ -49,8 +49,9 @@ pub(crate) enum Ty {
     /// its keys and values are typed as. Storage is dynamic whatever
     /// the shape; the shape types what is read out.
     Dict(u16),
-    /// A set of dynamic values.
-    Set,
+    /// A set of the shape at this index of the set shape table: what
+    /// its elements are typed as, and whether it is a frozenset.
+    Set(u16),
     /// An instance of the module's class at this index, or None: the
     /// value is a pointer, and None is the null one. Reading through
     /// None raises AttributeError, where the lowering does not know the
@@ -374,6 +375,20 @@ thread_local! {
     /// The dict shapes of the program being compiled: key and value
     /// types, by index, interned like tuple shapes.
     static DICT_SHAPES: std::cell::RefCell<Vec<(Ty, Ty)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The set shapes of the program being compiled: the element type
+    /// and whether the set is frozen, by index, interned like tuple
+    /// shapes.
+    static SET_SHAPES: std::cell::RefCell<Vec<(Ty, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// How the dicts the lowering used store their keys and values
+    /// (see [`table_stored`]), by index: each gets its functions
+    /// generated with the program and numbers its box tag. The library's
+    /// own dict, of dynamic keys and values, is not among them.
+    static DICT_STORES: std::cell::RefCell<Vec<(Ty, Ty)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// How the sets the lowering used store their elements, by index:
+    /// each numbers the box tags of its sets and frozensets, and gets its
+    /// functions generated unless its elements are dynamic, which the
+    /// library's own set holds.
+    static SET_STORES: std::cell::RefCell<Vec<Ty>> = const { std::cell::RefCell::new(Vec::new()) };
     /// The storage kinds of the arrays the lowering used, as positions
     /// in `Kind::ALL`. A kind the library does not carry gets its list
     /// functions generated with the program; every kind gets its arms
@@ -388,6 +403,9 @@ pub(crate) fn reset_tuple_shapes() {
     ELEM_LISTS.with(|t| t.borrow_mut().clear());
     LIST_SHAPES.with(|t| t.borrow_mut().clear());
     DICT_SHAPES.with(|t| t.borrow_mut().clear());
+    SET_SHAPES.with(|t| t.borrow_mut().clear());
+    DICT_STORES.with(|t| t.borrow_mut().clear());
+    SET_STORES.with(|t| t.borrow_mut().clear());
     ARRAY_KINDS.with(|t| t.borrow_mut().clear());
 }
 
@@ -440,6 +458,103 @@ pub(crate) fn dict_shape(k: u16) -> (Ty, Ty) {
 /// A dict of dynamic keys and values.
 pub(crate) fn dynamic_dict() -> Ty {
     dict_of(Ty::Object, Ty::Object)
+}
+
+/// The set type with this element type, frozen or not.
+pub(crate) fn set_of(elem: Ty, frozen: bool) -> Ty {
+    let elem = elem.boxed_view();
+    SET_SHAPES.with(|t| {
+        let mut table = t.borrow_mut();
+        if let Some(k) = table.iter().position(|shape| *shape == (elem, frozen)) {
+            return Ty::Set(k as u16);
+        }
+        let k = u16::try_from(table.len()).expect("fewer than 65536 set shapes in a program");
+        table.push((elem, frozen));
+        Ty::Set(k)
+    })
+}
+
+/// The element type of set shape `k`, and whether it is frozen.
+pub(crate) fn set_shape(k: u16) -> (Ty, bool) {
+    SET_SHAPES.with(|t| t.borrow()[k as usize])
+}
+
+/// A set of dynamic values.
+pub(crate) fn dynamic_set(frozen: bool) -> Ty {
+    set_of(Ty::Object, frozen)
+}
+
+/// Whether dicts and sets store their keys, values and elements as the
+/// types inference gave them: not yet, every one stores dynamic values
+/// as the library's own dict and set do.
+pub(crate) fn typed_tables() -> bool {
+    false
+}
+
+/// How a table stores a key (`key`) or a value of type `ty`: as itself
+/// when the table has a field of that kind, else as a box. A key is a
+/// number, a string, a tuple or a frozenset; a value may also be a
+/// bool, an instance or a container, which is held by reference.
+pub(crate) fn table_stored(ty: Ty, key: bool) -> Ty {
+    if !typed_tables() {
+        return Ty::Object;
+    }
+    match ty.settled() {
+        t @ (Ty::Int | Ty::Float | Ty::Str | Ty::Tuple(_)) => t,
+        Ty::Bool if !key => Ty::Bool,
+        Ty::Class(k) if !key => Ty::Class(k),
+        Ty::List(e) if !key => Ty::List(e),
+        Ty::Dict(k) if !key => {
+            let (kk, kv) = dict_shape(k);
+            dict_of(table_stored(kk, true), table_stored(kv, false))
+        }
+        Ty::Set(k) => match set_shape(k) {
+            (e, frozen) if frozen || !key => set_of(table_stored(e, true), frozen),
+            _ => Ty::Object,
+        },
+        _ => Ty::Object,
+    }
+}
+
+/// The store of dict shape `k`: its index among [`dict_stores`], or
+/// None for the library's dict of dynamic keys and values.
+pub(crate) fn dict_store(k: u16) -> Option<u16> {
+    let (key, value) = dict_shape(k);
+    let stored = (table_stored(key, true), table_stored(value, false));
+    if stored == (Ty::Object, Ty::Object) {
+        return None;
+    }
+    Some(DICT_STORES.with(|t| {
+        let mut table = t.borrow_mut();
+        if let Some(i) = table.iter().position(|s| *s == stored) {
+            return i as u16;
+        }
+        let i = u16::try_from(table.len()).expect("fewer than 65536 dict stores in a program");
+        table.push(stored);
+        i
+    }))
+}
+
+/// The dict stores the lowering used, by index.
+pub(crate) fn dict_stores() -> Vec<(Ty, Ty)> {
+    DICT_STORES.with(|t| t.borrow().clone())
+}
+
+/// The store of set shape `k`: its index among [`set_stores`], and how
+/// it stores its elements.
+pub(crate) fn set_store(k: u16) -> (u16, Ty) {
+    let stored = table_stored(set_shape(k).0, true);
+    let i = SET_STORES.with(|t| {
+        let mut table = t.borrow_mut();
+        if let Some(i) = table.iter().position(|s| *s == stored) {
+            return i as u16;
+        }
+        let i = u16::try_from(table.len()).expect("fewer than 32768 set stores in a program");
+        assert!(i < 0x8000, "fewer than 32768 set stores in a program");
+        table.push(stored);
+        i
+    });
+    (i, stored)
 }
 
 /// Record that a list of elements of kind `e`, a tuple or list shape,
@@ -602,6 +717,15 @@ impl Ty {
                 let ((ka, va), (kb, vb)) = (dict_shape(a), dict_shape(b));
                 dict_of(ka.join(kb), va.join(vb))
             }
+            // Two sets join element with element; a set and a frozenset
+            // are two types.
+            (Ty::Set(a), Ty::Set(b)) => {
+                let ((ea, fa), (eb, fb)) = (set_shape(a), set_shape(b));
+                if fa != fb {
+                    return Ty::Object;
+                }
+                set_of(ea.join(eb), fa)
+            }
             // Two lists of shapes are one list seen before and after
             // its elements were typed; of two shapes decided apart
             // they are lists of two kinds.
@@ -624,6 +748,10 @@ impl Ty {
             (Ty::Dict(a), Ty::Dict(b)) => {
                 let ((ka, va), (kb, vb)) = (dict_shape(a), dict_shape(b));
                 ka.refined_by(kb) && va.refined_by(vb)
+            }
+            (Ty::Set(a), Ty::Set(b)) => {
+                let ((ea, fa), (eb, fb)) = (set_shape(a), set_shape(b));
+                fa == fb && ea.refined_by(eb)
             }
             (Ty::List(Elem::Tuple(a)), Ty::List(Elem::Tuple(b))) => {
                 Ty::Tuple(a).refined_by(Ty::Tuple(b))
@@ -650,6 +778,10 @@ impl Ty {
                 let (key, value) = dict_shape(k);
                 format!("Dict({})", list(vec![key, value]))
             }
+            Ty::Set(k) => match set_shape(k) {
+                (elem, true) => format!("Set({},frozen)", elem.describe()),
+                (elem, false) => format!("Set({})", elem.describe()),
+            },
             Ty::List(Elem::Tuple(k)) => format!("List({})", Ty::Tuple(k).describe()),
             Ty::List(Elem::List(k)) => format!("List({})", Ty::List(list_shape(k)).describe()),
             Ty::List(Elem::Array(c)) => format!("Array({})", c.letter()),
@@ -688,6 +820,10 @@ impl Ty {
                 let (key, value) = dict_shape(k);
                 dict_of(key.settled(), value.settled())
             }
+            Ty::Set(k) => {
+                let (elem, frozen) = set_shape(k);
+                set_of(elem.settled(), frozen)
+            }
             Ty::List(Elem::Tuple(k)) => Ty::List(Elem::of(Ty::Tuple(k).settled())),
             Ty::List(Elem::List(k)) => Ty::List(Elem::of(Ty::List(list_shape(k)).settled())),
             other => other,
@@ -717,7 +853,9 @@ impl Ty {
                 Ty::Unknown => Ty::Unknown,
                 key => Elem::of(key).ty(),
             }),
-            Ty::Set | Ty::Gen => Some(Ty::Object),
+            // A set iterates as its elements.
+            Ty::Set(k) => Some(set_shape(k).0),
+            Ty::Gen => Some(Ty::Object),
             Ty::Str => Some(Ty::Str),
             // Bytes iterate as their byte values; a file as its lines.
             Ty::Bytes => Some(Ty::Int),
@@ -2009,7 +2147,8 @@ pub(crate) fn annotation_in(classes: &HashMap<String, usize>, e: &py::Expr) -> T
             "None" => Ty::None,
             "list" | "List" | "Sequence" | "Iterable" => Ty::List(Elem::Object),
             "dict" | "Dict" | "Mapping" => dynamic_dict(),
-            "set" | "Set" => Ty::Set,
+            "set" | "Set" => dynamic_set(false),
+            "frozenset" | "FrozenSet" => dynamic_set(true),
             "tuple" | "Tuple" => Ty::Object,
             other => classes
                 .get(other)
@@ -4894,7 +5033,10 @@ impl Walker<'_> {
             // what was recorded above, and is read here as declared.
             if !matches!(*declared, Ty::Object | Ty::Unknown)
                 && ty != Ty::Unknown
-                && !matches!((*declared, ty), (Ty::Dict(_), Ty::Dict(_)))
+                && !matches!(
+                    (*declared, ty),
+                    (Ty::Dict(_), Ty::Dict(_)) | (Ty::Set(_), Ty::Set(_))
+                )
                 && self.module.join_classes(*declared, ty) != *declared
             {
                 self.locals.vars.insert(name.to_string(), Ty::Object);
@@ -4963,17 +5105,16 @@ impl Walker<'_> {
                 }
             }
             py::Expr::Attribute(a) => self.field_write(a, ty),
-            // `d[k] = v` on a dict held by a name widens the dict's keys
-            // by the key's type and its values by the value's.
+            // `d[k] = v` on a dict held by a name or a field of `self`
+            // widens the dict's keys by the key's type and its values by
+            // the value's.
             py::Expr::Subscript(sub) => {
-                if let py::Expr::Name(n) = &*sub.value
-                    && let Ty::Dict(k) = self.expr(&sub.value)
-                {
+                if let Ty::Dict(k) = self.expr(&sub.value) {
                     let (key, value) = dict_shape(k);
                     let written = self.expr(&sub.slice);
                     let widened = dict_of(key.join(written), value.join(ty));
                     if widened != Ty::Dict(k) {
-                        self.assign(n.id.as_str(), widened);
+                        self.widen_holder(&sub.value, widened);
                     }
                 }
             }
@@ -4991,6 +5132,76 @@ impl Walker<'_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A container held by a name or a field of `self`, widened to `ty`
+    /// by what the body puts in it.
+    fn widen_holder(&mut self, holder: &py::Expr, ty: Ty) {
+        match holder {
+            py::Expr::Name(n) => self.assign(n.id.as_str(), ty),
+            py::Expr::Attribute(a)
+                if matches!(&*a.value, py::Expr::Name(n)
+                    if self.params.first().is_some_and(|(p, _)| p == n.id.as_str())) =>
+            {
+                self.target(holder, ty)
+            }
+            _ => {}
+        }
+    }
+
+    /// `s.add(x)`, `s.update(xs)`, `d.setdefault(k, v)` and `d.update(e)`
+    /// widen the set or dict they are called on as a store into it does.
+    fn container_write(&mut self, e: &py::Expr) {
+        let py::Expr::Call(c) = e else {
+            return;
+        };
+        let py::Expr::Attribute(m) = &*c.func else {
+            return;
+        };
+        if !c.arguments.keywords.is_empty() {
+            return;
+        }
+        let args = &c.arguments.args;
+        let receiver = self.expr(&m.value);
+        let widened = match (receiver, m.attr.as_str(), args.len()) {
+            (Ty::Set(k), "add", 1) => {
+                let (elem, frozen) = set_shape(k);
+                set_of(elem.join(self.expr(&args[0])), frozen)
+            }
+            (Ty::Set(k), "update", _) => {
+                let (elem, frozen) = set_shape(k);
+                let typer = self.typer();
+                set_of(
+                    args.iter().fold(elem, |e, a| e.join(typer.iter_elem(a))),
+                    frozen,
+                )
+            }
+            (Ty::Dict(k), "setdefault", 2) => {
+                let (key, value) = dict_shape(k);
+                dict_of(
+                    key.join(self.expr(&args[0])),
+                    value.join(self.expr(&args[1])),
+                )
+            }
+            (Ty::Dict(k), "update", 1) => {
+                let (key, value) = dict_shape(k);
+                let [ok, ov] = match self.expr(&args[0]) {
+                    Ty::Dict(o) => {
+                        let (ok, ov) = dict_shape(o);
+                        [ok, ov]
+                    }
+                    _ => self
+                        .typer()
+                        .pair_elem(&args[0])
+                        .unwrap_or([Ty::Object, Ty::Object]),
+                };
+                dict_of(key.join(ok), value.join(ov))
+            }
+            _ => return,
+        };
+        if widened != receiver {
+            self.widen_holder(&m.value, widened);
         }
     }
 
@@ -5103,6 +5314,7 @@ impl Walker<'_> {
                 let ty = binop(a.op, lhs, rhs, &a.value);
                 self.target(&a.target, ty);
             }
+            py::Stmt::Expr(e) => self.container_write(&e.value),
             py::Stmt::Return(r) => {
                 let ty = match &r.value {
                     Some(v) => self.expr(v),
@@ -5372,7 +5584,8 @@ pub(crate) fn isinstance_of_builtin(name: &str, ty: Ty) -> Option<bool> {
         ("list", Ty::List(_)) => true,
         ("tuple", Ty::Tuple(_)) => true,
         ("dict", Ty::Dict(_)) => true,
-        ("set", Ty::Set) => true,
+        ("set", Ty::Set(k)) => !set_shape(k).1,
+        ("frozenset", Ty::Set(k)) => set_shape(k).1,
         (_, Ty::Object | Ty::Unknown) => return None,
         _ => false,
     })
@@ -5550,10 +5763,13 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
             }
         }
         py::Operator::Add if l == Ty::Str && r == Ty::Str => Ty::Str,
+        // Two sets make a set of the left one's kind, of either's
+        // elements.
         py::Operator::BitAnd | py::Operator::BitOr | py::Operator::Sub | py::Operator::BitXor
-            if l == Ty::Set && r == Ty::Set =>
+            if let (Ty::Set(a), Ty::Set(b)) = (l, r) =>
         {
-            Ty::Set
+            let ((ea, frozen), (eb, _)) = (set_shape(a), set_shape(b));
+            set_of(ea.join(eb), frozen)
         }
         py::Operator::Add if matches!(l, Ty::List(_)) && l == r => l,
         // Two shapes concatenate into one.
@@ -5750,7 +5966,7 @@ impl Typer<'_> {
 
     /// The key and value types of the pairs `e` yields, for a dict
     /// built from them: a comprehension or list of two-element tuples.
-    fn pair_elem(&self, e: &py::Expr) -> Option<[Ty; 2]> {
+    pub(crate) fn pair_elem(&self, e: &py::Expr) -> Option<[Ty; 2]> {
         let elem = match e {
             py::Expr::ListComp(py::ExprListComp {
                 generators, elt, ..
@@ -5787,6 +6003,23 @@ impl Typer<'_> {
             bind_target(&mut vars, &g.target, item);
         }
         vars
+    }
+
+    /// What iterating `e` yields, a comprehension's elements included:
+    /// what a container built from `e` holds.
+    pub(crate) fn iter_elem(&self, e: &py::Expr) -> Ty {
+        match e {
+            py::Expr::Generator(py::ExprGenerator {
+                generators, elt, ..
+            })
+            | py::Expr::ListComp(py::ExprListComp {
+                generators, elt, ..
+            })
+            | py::Expr::SetComp(py::ExprSetComp {
+                generators, elt, ..
+            }) => self.comprehension_elem(generators, elt),
+            other => self.item_ty(other),
+        }
     }
 
     /// What one round of iterating `iter` binds: an int from `range`,
@@ -6028,7 +6261,19 @@ impl Typer<'_> {
                 let (k, v) = self.comprehension_pair(&c.generators, key, &c.value);
                 dict_of(k, v)
             }
-            py::Expr::Set(_) | py::Expr::SetComp(_) => Ty::Set,
+            // A literal's elements are the join of its elements'; a
+            // spread brings elements of every kind.
+            py::Expr::Set(st) => {
+                let mut elem = Ty::Unknown;
+                for e in &st.elts {
+                    elem = elem.join(match e {
+                        py::Expr::Starred(s) => self.iter_elem(&s.value),
+                        e => self.expr(e),
+                    });
+                }
+                set_of(elem, false)
+            }
+            py::Expr::SetComp(c) => set_of(self.comprehension_elem(&c.generators, &c.elt), false),
             py::Expr::Generator(_) => Ty::Gen,
             py::Expr::Yield(_) | py::Expr::YieldFrom(_) => Ty::None,
             // A lambda is the closure it defines, where inference knows
@@ -6146,7 +6391,12 @@ impl Typer<'_> {
             && is_name(&a.value, "frozenset")
             && a.attr.as_str() == "union"
         {
-            return Ty::Set;
+            let elem = c
+                .arguments
+                .args
+                .iter()
+                .fold(Ty::Unknown, |e, a| e.join(self.iter_elem(a)));
+            return set_of(elem, true);
         }
         if let py::Expr::Attribute(a) = &*c.func
             && let Some(m) = self.module_member_of(&a.value, a.attr.as_str())
@@ -6273,6 +6523,22 @@ impl Typer<'_> {
         {
             return self.item_call_ret(&name, sig, 1, arguments);
         }
+        // Of this set's kind, of the elements of every argument.
+        if let Ty::Set(k) = receiver
+            && matches!(
+                attr,
+                "union" | "intersection" | "difference" | "symmetric_difference"
+            )
+        {
+            let (elem, frozen) = set_shape(k);
+            return set_of(
+                arguments
+                    .args
+                    .iter()
+                    .fold(elem, |e, a| e.join(self.iter_elem(a))),
+                frozen,
+            );
+        }
         self.method_ret(receiver, attr)
     }
 
@@ -6314,7 +6580,11 @@ impl Typer<'_> {
                 Ty::Tuple(_) => Ty::List(Elem::of(arg(0).element().unwrap_or(Ty::Object))),
                 // A list of a dict is its keys.
                 Ty::Dict(k) => Ty::List(Elem::of(dict_shape(k).0)),
-                Ty::Set | Ty::Gen => Ty::List(Elem::Object),
+                Ty::Set(k) => match set_shape(k).0 {
+                    Ty::Unknown => Ty::Unknown,
+                    e => Ty::List(Elem::of(e)),
+                },
+                Ty::Gen => Ty::List(Elem::Object),
                 Ty::Unknown if !args.is_empty() => Ty::Unknown,
                 _ => match args.first() {
                     Some(py::Expr::Call(c)) if is_name(&c.func, "range") => Ty::List(Elem::Int),
@@ -6338,7 +6608,14 @@ impl Typer<'_> {
                     _ => dynamic_dict(),
                 },
             },
-            "set" | "frozenset" => Ty::Set,
+            // Of the elements of what it is made from.
+            "set" | "frozenset" => {
+                let elem = match args.first() {
+                    Some(a) => self.iter_elem(a),
+                    None => Ty::Unknown,
+                };
+                set_of(elem, name == "frozenset")
+            }
             // Pairs and mapped values are dynamic; the lists are eager.
             "enumerate" | "zip" | "map" | "filter" => Ty::List(Elem::Object),
             "any" | "all" => Ty::Bool,
@@ -6456,14 +6733,21 @@ impl Typer<'_> {
                     _ => Ty::Object,
                 }
             }
-            Ty::Set => match attr {
-                "add" | "remove" | "discard" | "clear" | "update" => Ty::None,
-                "union" | "intersection" | "difference" | "symmetric_difference" | "copy" => {
-                    Ty::Set
+            Ty::Set(k) => {
+                let (elem, frozen) = set_shape(k);
+                match attr {
+                    "add" | "remove" | "discard" | "clear" | "update" => Ty::None,
+                    "copy" => receiver,
+                    "pop" => elem,
+                    // Of this set's kind, of the elements of every
+                    // argument.
+                    "union" | "intersection" | "difference" | "symmetric_difference" => {
+                        set_of(elem, frozen)
+                    }
+                    "issubset" | "issuperset" | "isdisjoint" => Ty::Bool,
+                    _ => Ty::Object,
                 }
-                "issubset" | "issuperset" | "isdisjoint" => Ty::Bool,
-                _ => Ty::Object,
-            },
+            }
             Ty::Str => match attr {
                 "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace" | "join"
                 | "capitalize" | "title" | "swapcase" | "format" | "zfill" | "center" | "ljust"
