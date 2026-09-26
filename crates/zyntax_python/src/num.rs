@@ -146,7 +146,7 @@ impl Lowerer<'_> {
     }
 
     /// A plain value of int, float, bool or None as the Num `target`.
-    pub(crate) fn to_num(&mut self, v: Val, target: Ty) -> Node {
+    pub(crate) fn coerce_to_num(&mut self, v: Val, target: Ty) -> Node {
         let span = v.node.span;
         match v.ty {
             Ty::Int => value(
@@ -257,7 +257,7 @@ impl Lowerer<'_> {
 
     /// A Num as `target`: its box, a float or an int where every kind it
     /// admits converts without a raise, and otherwise through its box.
-    pub(crate) fn from_num(&mut self, v: Val, target: Ty) -> Node {
+    pub(crate) fn coerce_from_num(&mut self, v: Val, target: Ty) -> Node {
         let span = v.node.span;
         let mask = v.ty.mask().unwrap_or(0);
         let mut pre = Vec::new();
@@ -270,9 +270,9 @@ impl Lowerer<'_> {
             Ty::Int if mask & !(Ty::NUM_BOOL | Ty::NUM_INT) == 0 => {
                 self.num_held(v, &mut pre, span).int
             }
-            Ty::Num(_) => return self.to_num(v, target),
+            Ty::Num(_) => return self.coerce_to_num(v, target),
             _ => {
-                let boxed = self.from_num(v, Ty::Object);
+                let boxed = self.coerce_from_num(v, Ty::Object);
                 return self.coerce(
                     Val {
                         node: boxed,
@@ -290,7 +290,7 @@ impl Lowerer<'_> {
         if !matches!(v.ty, Ty::Num(_)) {
             return v;
         }
-        let node = self.from_num(v, Ty::Object);
+        let node = self.coerce_from_num(v, Ty::Object);
         Val {
             node,
             ty: Ty::Object,

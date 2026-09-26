@@ -2062,8 +2062,8 @@ impl<'m> Lowerer<'m> {
         match (v.ty, target) {
             (a, b) if a == b => v.node,
             (_, Ty::Unknown) => v.node,
-            (Ty::Num(_), _) => self.from_num(v, target),
-            (_, Ty::Num(_)) => self.to_num(v, target),
+            (Ty::Num(_), _) => self.coerce_from_num(v, target),
+            (_, Ty::Num(_)) => self.coerce_to_num(v, target),
             // A known function value is a dynamic value already.
             (Ty::Closure(_), Ty::Object | Ty::Closure(_)) | (Ty::Object, Ty::Closure(_)) => v.node,
             (Ty::Bound(_), Ty::Object | Ty::Bound(_)) | (Ty::Object, Ty::Bound(_)) => v.node,
