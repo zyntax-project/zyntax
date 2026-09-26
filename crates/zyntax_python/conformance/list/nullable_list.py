@@ -38,6 +38,19 @@ def reads(d):
         print("store TypeError", e)
 
 
+def iterate(d):
+    try:
+        for c in d.cells:
+            print("row", c, len(c))
+        print(sum(len(c) for c in d.cells), [c[0] for c in d.cells], len(d.cells))
+    except TypeError as e:
+        print("TypeError", e)
+    try:
+        print(len(d.cells))
+    except TypeError as e:
+        print("TypeError", e)
+
+
 def locals_of_both(n):
     xs = None
     if n > 1:
@@ -68,6 +81,8 @@ def main():
     print(c, c is None, c == None, bool(c), [c])
     print(f(), f(0), f(3), g(), g(0), g(7))
     reads(d)
+    iterate(d)
+    iterate(Done(2))
     try:
         d.set_done(0, 3)
     except TypeError as e:

@@ -6748,7 +6748,12 @@ impl Typer<'_> {
                 _ => {}
             }
         }
-        self.expr(iter).element().unwrap_or(Ty::Object)
+        // A list or None iterates as the list: None raises there.
+        let seq = match self.expr_num(iter) {
+            Ty::MaybeList(e) => Ty::List(e),
+            t => t.boxed_view(),
+        };
+        seq.element().unwrap_or(Ty::Object)
     }
 
     /// Whether `name` is a variable of this scope, an enclosing one or

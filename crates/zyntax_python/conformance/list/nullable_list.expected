@@ -2,6 +2,12 @@ None True True False [None]
 empty empty 4 5 5 7
 subscript TypeError 'NoneType' object is not subscriptable
 store TypeError 'NoneType' object does not support item assignment
+TypeError 'NoneType' object is not iterable
+TypeError object of type 'NoneType' has no len()
+row [0, 1] 2
+row [0, 1] 2
+4 [0, 0] 2
+2
 TypeError 'NoneType' object does not support item assignment
 [[0, 1], [4], [0, 1]] [[0, 1, 5], [4], [0, 1]] True False
 [[0, 1], [4], [0, 1]] None True

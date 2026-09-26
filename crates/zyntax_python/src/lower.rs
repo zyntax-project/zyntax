@@ -5082,7 +5082,7 @@ impl<'m> Lowerer<'m> {
         extra: Vec<Stmt>,
         span: Span,
     ) -> Result<TypedStatement> {
-        let seq = self.expr(&f.iter)?;
+        let seq = self.expr_list_read(&f.iter, "'NoneType' object is not iterable")?;
         if seq.ty == Ty::Gen {
             return self.for_generator(f, seq, extra, span);
         }
@@ -9778,7 +9778,8 @@ impl<'m> Lowerer<'m> {
                             ty: Ty::Int,
                         });
                     }
-                    let v = self.expr(&args[0])?;
+                    let v =
+                        self.expr_list_read(&args[0], "object of type 'NoneType' has no len()")?;
                     let node = match v.ty {
                         Ty::Str => call("zb_str_chars_len", vec![v.node], Ty::Int, span),
                         Ty::Bytes => call("zb_str_len", vec![v.node], Ty::Int, span),
