@@ -203,6 +203,22 @@ unsafe fn elements(list: &mut ListHeader) -> &'static mut [*mut BoxHeader] {
     unsafe { std::slice::from_raw_parts_mut(list.data, list.len as usize) }
 }
 
+/// A hash part's entries after its control entry, each the key's hash
+/// word, the key and the value; the control entry's hash word, the
+/// index's address or 0. See the library's dicts.
+///
+/// # Safety
+/// The list is a live dict and nothing else touches it meanwhile.
+unsafe fn dict_entries(list: &mut ListHeader) -> (usize, &'static mut [[*mut BoxHeader; 3]]) {
+    if list.data.is_null() || list.len <= 0 {
+        return (0, &mut []);
+    }
+    let words = unsafe { std::slice::from_raw_parts_mut(list.data, list.len as usize * 3) };
+    let (entries, _) = words.as_chunks_mut::<3>();
+    let (control, rest) = entries.split_first_mut().expect("a control entry");
+    (control[0] as usize, rest)
+}
+
 // ─── the collector's hooks ──────────────────────────────────────────
 
 fn hold(f: &mut dyn FnMut(usize)) {
@@ -245,22 +261,17 @@ fn trace(m: &mut dyn Marking) {
             }
         };
         if let Some(list) = unsafe { list_of(t.hash) } {
-            let items = unsafe { elements(list) };
-            if let Some((&index, pairs)) = items.split_first() {
-                m.mark(index as usize);
-                let (whole, rest) = pairs.as_chunks::<2>();
-                for &[k, v] in whole {
-                    if v.is_null() || !alive(m, k, w.mode & WEAK_KEYS != 0) {
-                        continue;
-                    }
-                    m.mark(k as usize);
-                    if alive(m, v, w.mode & WEAK_VALUES != 0) {
-                        m.mark(v as usize);
-                    }
+            let (index, entries) = unsafe { dict_entries(list) };
+            if index != 0 {
+                m.mark(index);
+            }
+            for &[_, k, v] in entries.iter() {
+                if v.is_null() || !alive(m, k, w.mode & WEAK_KEYS != 0) {
+                    continue;
                 }
-                // A key pushed without its value yet.
-                for &k in rest {
-                    m.mark(k as usize);
+                m.mark(k as usize);
+                if alive(m, v, w.mode & WEAK_VALUES != 0) {
+                    m.mark(v as usize);
                 }
             }
         }
@@ -344,12 +355,7 @@ fn report_survivors(s: &State, m: &dyn Marking) {
         let Some(list) = (unsafe { list_of(t.hash) }) else {
             continue;
         };
-        for &[k, v] in unsafe { elements(list) }
-            .get(1..)
-            .unwrap_or_default()
-            .as_chunks::<2>()
-            .0
-        {
+        for &[_, k, v] in unsafe { dict_entries(list) }.1.iter() {
             // SAFETY: a key of a reached table is a live box.
             if let (true, Some(r)) = (v.is_null(), unsafe { referent(k) }) {
                 report("key of a nil value", r);
@@ -387,15 +393,9 @@ fn clear_dead_values(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking, trim: bo
         // SAFETY: reached, so live; the world is stopped.
         let t = unsafe { &mut *(t as *mut TableHeader) };
         if let Some(list) = unsafe { list_of(t.hash) } {
-            let items = unsafe { elements(list) };
-            for pair in items
-                .get_mut(1..)
-                .unwrap_or_default()
-                .as_chunks_mut::<2>()
-                .0
-            {
-                if dead(pair[1]) {
-                    pair[1] = std::ptr::null_mut();
+            for entry in unsafe { dict_entries(list) }.1.iter_mut() {
+                if dead(entry[2]) {
+                    entry[2] = std::ptr::null_mut();
                     w.dirty = true;
                 }
             }
@@ -440,14 +440,8 @@ fn tombstone_dead_keys(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking) -> Vec
         let Some(list) = (unsafe { list_of(t.hash) }) else {
             continue;
         };
-        let items = unsafe { elements(list) };
-        for pair in items
-            .get_mut(1..)
-            .unwrap_or_default()
-            .as_chunks_mut::<2>()
-            .0
-        {
-            let k = pair[0];
+        for entry in unsafe { dict_entries(list) }.1.iter_mut() {
+            let k = entry[1];
             // SAFETY: a key of a reached table is a live box.
             match unsafe { referent(k) } {
                 Some(r) if !m.is_marked(r) => {
@@ -459,7 +453,7 @@ fn tombstone_dead_keys(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking) -> Vec
                         (*k).tag = dead_key_tag();
                         (*k).data = !r;
                     }
-                    pair[1] = std::ptr::null_mut();
+                    entry[2] = std::ptr::null_mut();
                     boxes.push(k as usize);
                     w.dirty = true;
                 }

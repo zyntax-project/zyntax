@@ -267,7 +267,8 @@ pub(crate) fn ir(ty: Ty) -> Type {
                 .map(|t| ir(tuple_field_storage(t)))
                 .collect(),
         ),
-        Ty::Dict(_) | Ty::Set => list_type(Type::Any),
+        Ty::Dict(_) => zyntax_builtins::dicts::dict_type(list_type_id()),
+        Ty::Set => list_type(Type::Any),
         // A file is the record the library keeps: a list of its parts.
         Ty::File(_) => list_type(Type::Any),
         Ty::Class(k) => class_type(k as usize),
@@ -2539,7 +2540,13 @@ impl<'m> Lowerer<'m> {
                     span,
                 );
             }
-            (Ty::Object, Ty::Dict(_) | Ty::Set | Ty::File(_)) => {
+            (Ty::Object, Ty::Dict(_)) => {
+                return call("zb_dict_raw", vec![v.node], target, span);
+            }
+            (Ty::Object, Ty::Set) => {
+                return call("zb_set_raw", vec![v.node], target, span);
+            }
+            (Ty::Object, Ty::File(_)) => {
                 return call("zb_unbox_list_raw_any", vec![v.node], target, span);
             }
             _ => return self.coerce(v, target),
@@ -8619,8 +8626,9 @@ impl<'m> Lowerer<'m> {
                     }
                     ("clear", 0) => {
                         produced = Ty::None;
-                        method_call(d, "clear", vec![], Ty::None, span)
+                        call("zb_dict_clear", vec![d], Ty::None, span)
                     }
+                    ("popitem", 0) => call("zb_dict_popitem", vec![d], Ty::Object, span),
                     ("update", 1) => {
                         produced = Ty::None;
                         let other = self.expr_as(&args[0], types::dynamic_dict())?;

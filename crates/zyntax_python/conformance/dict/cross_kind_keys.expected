@@ -1,0 +1,9 @@
+x True False False x none
+True a
+True True False False
+v3 True False False v1 none
+True -7 7 False
+True True False False
+{1: 'c'} 1
+KeyError
+KeyError '1'

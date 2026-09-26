@@ -124,6 +124,11 @@ impl Types {
     pub fn table(&self) -> Type {
         table_ty(self.table_type)
     }
+    /// The hash part: the shared library's dict of dynamic keys and
+    /// values.
+    pub fn dict(&self) -> Type {
+        zyntax_builtins::dicts::dict_type(self.list_type)
+    }
 }
 
 /// The table struct's type, a pointer to a heap object.
@@ -437,7 +442,7 @@ pub fn hash_field(tb: Expr) -> Expr {
     fld(tb, "hash", any())
 }
 pub fn hash_of(tb: Expr, t: &Types) -> Expr {
-    call("zb_unbox_list_raw_any", vec![hash_field(tb)], t.anys())
+    call("zb_dict_raw", vec![hash_field(tb)], t.dict())
 }
 pub fn meta_of(tb: Expr, t: &Types) -> Expr {
     fld(tb, "meta", t.table())

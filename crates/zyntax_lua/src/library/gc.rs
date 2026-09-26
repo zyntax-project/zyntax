@@ -47,8 +47,8 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let p = local("p", i64());
     let op = local("op", i64());
     let r = local("r", i64());
-    let h = borrowed("h", anys.clone());
-    let nd = local("nd", anys.clone());
+    let h = borrowed("h", t.dict());
+    let nd = local("nd", t.dict());
     let saved = local("saved", any());
     let line = local("line", i64());
     let varinfo = local("varinfo", i64());
@@ -256,14 +256,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
         vec![
             when(is_nil(hash_field(tb.e())), vec![ret_void()]),
             h.decl(hash_of(tb.e(), t)),
-            nd.decl(call("zb_dict_new", vec![], anys.clone())),
-            n.decl(call("zb_dict_len", vec![h.e()], i64())),
+            nd.decl(call("zb_dict_new", vec![], t.dict())),
+            n.decl(call("zb_dict_pair_count", vec![h.e()], i64())),
             i.decl(int(0)),
             while_(
                 lt(i.e(), n.e()),
                 vec![
-                    y.decl(at(h.e(), add(mul(i.e(), int(2)), int(1)))),
-                    e.decl(at(h.e(), add(mul(i.e(), int(2)), int(2)))),
+                    y.decl(call("zb_dict_key_at", vec![h.e(), i.e()], any())),
+                    e.decl(call("zb_dict_value_at", vec![h.e(), i.e()], any())),
                     when(
                         and(ne(tag_of(y.e()), dead.clone()), not(is_nil(e.e()))),
                         vec![expr(call(
@@ -275,7 +275,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     i.add_assign(int(1)),
                 ],
             ),
-            set_field(tb.e(), "hash", call("zb_list_box_any", vec![nd.e()], any())),
+            set_field(tb.e(), "hash", call("zb_dict_box", vec![nd.e()], any())),
             ret_void(),
         ],
     ));

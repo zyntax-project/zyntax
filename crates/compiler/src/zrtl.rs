@@ -1851,6 +1851,21 @@ pub unsafe extern "C" fn zyntax_box_free(boxed: *mut DynamicBoxRepr) {
     crate::pool_alloc::zyntax_free(boxed as *mut u8);
 }
 
+/// Release a growable list's element storage and its header, both from
+/// the allocation intrinsic, when the caller knows nothing else names
+/// either.
+///
+/// # Safety
+/// `list` must be null or the header of a live list no one reads again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zyntax_list_free(list: *mut [usize; 3]) {
+    if list.is_null() {
+        return;
+    }
+    crate::pool_alloc::zyntax_free((*list)[0] as *mut u8);
+    crate::pool_alloc::zyntax_free(list as *mut u8);
+}
+
 /// Get the value from a DynamicBox as i64
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_box_get_i64(boxed: *const DynamicBoxRepr) -> i64 {
@@ -2083,6 +2098,7 @@ pub fn box_runtime_symbols() -> Vec<(&'static str, *const u8, u8)> {
             1,
         ),
         ("zyntax_box_free", zyntax_box_free as *const u8, 1),
+        ("zyntax_list_free", zyntax_list_free as *const u8, 1),
         ("zyntax_box_get_i32", zyntax_box_get_i32 as *const u8, 1),
         ("zyntax_box_get_i64", zyntax_box_get_i64 as *const u8, 1),
         ("zyntax_box_get_f32", zyntax_box_get_f32 as *const u8, 1),

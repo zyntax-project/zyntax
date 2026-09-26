@@ -222,7 +222,7 @@ pub enum Field {
     Any,
     /// A dict or a set, stored as the box its tag identifies (a header
     /// has an identity a copy inside the tuple would lose) and read raw
-    /// as `ty`, the list of dynamic values.
+    /// as `ty`: a dict's entry list, a set's list of values.
     Dict {
         ty: Type,
     },
@@ -257,7 +257,7 @@ pub enum Field {
 }
 
 impl Field {
-    fn ty(&self) -> Type {
+    pub(crate) fn ty(&self) -> Type {
         match self {
             Field::Int => i64(),
             Field::Float => f64(),
@@ -272,13 +272,25 @@ impl Field {
         }
     }
 
+    /// The value a slot of this field holds when it holds nothing: what
+    /// a deleted entry of a table keeps, so it names no heap object.
+    pub(crate) fn zero(&self) -> Expr {
+        zero_of(&self.ty())
+    }
+
+    /// Whether equal values of this field are equal by a comparison
+    /// that runs none of the program's code, so a probe of a table keyed
+    /// by it cannot see the table change under it.
+    pub(crate) fn is_scalar(&self) -> bool {
+        matches!(self, Field::Int | Field::Float | Field::Bool | Field::Str)
+    }
+
     /// The header a stored dict, set or list box holds; the tag was
     /// checked when the field was stored.
-    fn raw(&self, x: Expr) -> Expr {
+    pub(crate) fn raw(&self, x: Expr) -> Expr {
         match self {
-            Field::Dict { ty } | Field::Set { ty } => {
-                call("zb_unbox_list_raw_any", vec![x], ty.clone())
-            }
+            Field::Dict { ty } => call("zb_dict_raw", vec![x], ty.clone()),
+            Field::Set { ty } => call("zb_set_raw", vec![x], ty.clone()),
             Field::List { suffix, ty } | Field::Array { suffix, ty, .. } => {
                 call(&format!("zb_unbox_list_raw_{suffix}"), vec![x], ty.clone())
             }
@@ -286,7 +298,7 @@ impl Field {
         }
     }
 
-    fn eq(&self, a: Expr, b: Expr) -> Expr {
+    pub(crate) fn eq(&self, a: Expr, b: Expr) -> Expr {
         match self {
             Field::Int | Field::Float | Field::Bool => eq(a, b),
             Field::Str => call("zb_str_eq", vec![a, b], boolean()),
@@ -308,7 +320,7 @@ impl Field {
         }
     }
 
-    fn lt(&self, a: Expr, b: Expr) -> Expr {
+    pub(crate) fn lt(&self, a: Expr, b: Expr) -> Expr {
         match self {
             Field::Int | Field::Float => lt(a, b),
             Field::Bool => lt(cast(a, i64()), cast(b, i64())),
@@ -332,7 +344,7 @@ impl Field {
         }
     }
 
-    fn repr(&self, x: Expr) -> Expr {
+    pub(crate) fn repr(&self, x: Expr) -> Expr {
         match self {
             Field::Int => call("zb_str_of_int", vec![x], string()),
             Field::Float => call("zb_float_repr", vec![x], string()),
@@ -367,7 +379,7 @@ impl Field {
         }
     }
 
-    fn boxed(&self, x: Expr) -> Expr {
+    pub(crate) fn boxed(&self, x: Expr) -> Expr {
         match self {
             Field::Int => call("zb_box_i64", vec![x], any()),
             Field::Float => call("zb_box_f64", vec![x], any()),
@@ -389,7 +401,7 @@ impl Field {
 
     /// The hash of a field value, as `zb_any_hash` hashes its boxed
     /// form, so a shaped tuple lands where its boxed twin does.
-    fn hash(&self, x: Expr) -> Expr {
+    pub(crate) fn hash(&self, x: Expr) -> Expr {
         match self {
             Field::Int => x,
             Field::Bool => cast(x, i64()),
@@ -409,7 +421,7 @@ impl Field {
     /// `zb_any_eq` would find its boxed form equal: a box of the
     /// field's own kind is read directly, anything else goes through
     /// the dynamic comparison.
-    fn eq_boxed(&self, stored: Expr, v: Expr) -> Expr {
+    pub(crate) fn eq_boxed(&self, stored: Expr, v: Expr) -> Expr {
         let tag = |x: Expr| cast(call("zb_box_tag", vec![x], i32()), i64());
         let any_eq = |a: Expr, b: Expr| call("zb_any_eq", vec![a, b], boolean());
         match self {
@@ -458,7 +470,7 @@ impl Field {
     /// The stored form of a dynamic value: a dict, set or list stays the
     /// box it came in once checked, or a list of another kind is
     /// converted and boxed anew.
-    fn read(&self, x: Expr) -> Expr {
+    pub(crate) fn read(&self, x: Expr) -> Expr {
         match self {
             Field::Int => call("zb_any_as_i64", vec![x], i64()),
             Field::Float => call("zb_any_as_f64", vec![x], f64()),
@@ -503,6 +515,21 @@ impl Field {
                 call(&format!("zb_tuple_read_{suffix}"), vec![x], ty.clone())
             }
         }
+    }
+}
+
+/// The zero of a value of `ty`: 0, 0.0, false, the empty string, a
+/// tuple of zeros, or null.
+pub(crate) fn zero_of(ty: &Type) -> Expr {
+    use zyntax_typed_ast::PrimitiveType as P;
+    match ty {
+        Type::Primitive(P::I64) => int(0),
+        Type::Primitive(P::F64) => float(0.0),
+        Type::Primitive(P::Bool) => bool(false),
+        Type::Primitive(P::String) => text(""),
+        Type::Primitive(_) => cast(int(0), ty.clone()),
+        Type::Tuple(fields) => tuple(fields.iter().map(zero_of).collect(), ty.clone()),
+        other => null(other.clone()),
     }
 }
 
@@ -663,8 +690,6 @@ pub fn tuple_declarations(
     // `value in set` and the dict lookups by the value, no box made.
     let hash_name = format!("zb_tuple_hash_{suffix}");
     let eq_name = format!("zb_tuple_eq_boxed_{suffix}");
-    let box_name = format!("zb_tuple_box_{suffix}");
-    let repr_name = format!("zb_tuple_repr_{suffix}");
     d.push(crate::dicts::set_contains_by(
         &format!("zb_set_contains_{suffix}"),
         list_type,
@@ -672,14 +697,13 @@ pub fn tuple_declarations(
         &|key| call(&hash_name, vec![key], i64()),
         &|stored, key| call(&eq_name, vec![stored, key], boolean()),
     ));
-    d.extend(crate::dicts::dict_ops_by(
+    d.extend(crate::dicts::dict_probe_by(
         list_type,
+        &Field::Tuple {
+            suffix: suffix.to_string(),
+            ty: tuple_ty.clone(),
+        },
         suffix,
-        tuple_ty.clone(),
-        &|key| call(&hash_name, vec![key], i64()),
-        &|stored, key| call(&eq_name, vec![stored, key], boolean()),
-        &|key| call(&box_name, vec![key], any()),
-        &|key| call(&repr_name, vec![key], string()),
     ));
     generated(d)
 }
@@ -813,7 +837,7 @@ pub fn nested_list_declarations(
 
 /// Mark what a frontend generates into a program as generated, so its
 /// bodies are not type checked with every program that declares them.
-fn generated(mut decls: Vec<Decl>) -> Vec<Decl> {
+pub(crate) fn generated(mut decls: Vec<Decl>) -> Vec<Decl> {
     for decl in &mut decls {
         if let TypedDeclaration::Function(f) = &mut decl.node {
             f.mark_generated();

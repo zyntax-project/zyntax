@@ -365,9 +365,11 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     // A dict from a list of pairs, later pairs winning.
     let items = local("items", anys.clone());
     let kv = local("kv", anys.clone());
-    d.push(define("zb_dict_from_tuples", &[&items], anys.clone(), {
+    let dict_ty = crate::dicts::dict_type(list_type);
+    let made = local("out", dict_ty.clone());
+    d.push(define("zb_dict_from_tuples", &[&items], dict_ty.clone(), {
         let mut s = vec![
-            out.decl(call("zb_dict_new", vec![], anys.clone())),
+            made.decl(call("zb_dict_new", vec![], dict_ty.clone())),
             n.decl(len(&items)),
         ];
         s.extend(for_range(
@@ -389,12 +391,12 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 ),
                 expr(call(
                     "zb_dict_set",
-                    vec![out.e(), at(&kv, int(0)), at(&kv, int(1))],
+                    vec![made.e(), at(&kv, int(0)), at(&kv, int(1))],
                     unit(),
                 )),
             ],
         ));
-        s.push(ret(out.e()));
+        s.push(ret(made.e()));
         s
     }));
 

@@ -25,7 +25,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     let i = local("i", i64());
     let n = local("n", i64());
     let arr = borrowed("arr", anys.clone());
-    let h = borrowed("h", anys.clone());
+    let h = borrowed("h", t.dict());
     let x = kept("x", any());
     let f = local("f", f64());
     let cat = local("cat", i64());
@@ -174,7 +174,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
     d.push(define(
         "zl_hash_ensure",
         &[&tb],
-        anys.clone(),
+        t.dict(),
         vec![
             when(
                 is_nil(hash_field(tb.e())),
@@ -182,8 +182,8 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                     tb.e(),
                     "hash",
                     call(
-                        "zb_list_box_any",
-                        vec![call("zb_dict_new", vec![], anys.clone())],
+                        "zb_dict_box",
+                        vec![call("zb_dict_new", vec![], t.dict())],
                         any(),
                     ),
                 )],
@@ -285,11 +285,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             expr(call(
                 "zb_dict_set",
-                vec![
-                    call("zl_hash_ensure", vec![tb.e()], anys.clone()),
-                    k.e(),
-                    v.e(),
-                ],
+                vec![call("zl_hash_ensure", vec![tb.e()], t.dict()), k.e(), v.e()],
                 unit(),
             )),
             ret_void(),
@@ -433,7 +429,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             expr(call(
                 "zb_dict_set",
                 vec![
-                    call("zl_hash_ensure", vec![tb.e()], anys.clone()),
+                    call("zl_hash_ensure", vec![tb.e()], t.dict()),
                     box_i64(i.e()),
                     v.e(),
                 ],
@@ -471,11 +467,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             expr(call(
                 "zb_dict_set_str",
-                vec![
-                    call("zl_hash_ensure", vec![tb.e()], anys.clone()),
-                    s.e(),
-                    v.e(),
-                ],
+                vec![call("zl_hash_ensure", vec![tb.e()], t.dict()), s.e(), v.e()],
                 unit(),
             )),
             ret_void(),
@@ -545,11 +537,7 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             expr(call(
                 "zb_dict_set",
-                vec![
-                    call("zl_hash_ensure", vec![tb.e()], anys.clone()),
-                    k.e(),
-                    v.e(),
-                ],
+                vec![call("zl_hash_ensure", vec![tb.e()], t.dict()), k.e(), v.e()],
                 unit(),
             )),
             ret_void(),
@@ -1571,14 +1559,15 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             when(is_nil(hash_field(tb.e())), vec![ret(int(-1))]),
             h.decl(hash_of(tb.e())),
-            count.decl(call("zb_dict_len", vec![h.e()], i64())),
+            count.decl(call("zb_dict_pair_count", vec![h.e()], i64())),
             while_(
                 lt(sub(sub(i.e(), n.e()), slots.e()), count.e()),
                 vec![
                     when(
-                        not(is_nil(at(
-                            h.e(),
-                            add(mul(sub(sub(i.e(), n.e()), slots.e()), int(2)), int(2)),
+                        not(is_nil(call(
+                            "zb_dict_value_at",
+                            vec![h.e(), sub(sub(i.e(), n.e()), slots.e())],
+                            any(),
                         ))),
                         vec![ret(i.e())],
                     ),
@@ -1600,9 +1589,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 lt(sub(pos.e(), n.e()), slots.e()),
                 vec![ret(box_str(slot_key(tb.e(), sub(pos.e(), n.e()))))],
             ),
-            ret(at(
-                hash_of(tb.e()),
-                add(mul(sub(sub(pos.e(), n.e()), slots.e()), int(2)), int(1)),
+            ret(call(
+                "zb_dict_key_at",
+                vec![hash_of(tb.e()), sub(sub(pos.e(), n.e()), slots.e())],
+                any(),
             )),
         ],
     ));
@@ -1619,9 +1609,10 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 lt(sub(pos.e(), n.e()), slots.e()),
                 vec![ret(slot_load(tb.e(), sub(pos.e(), n.e())))],
             ),
-            ret(at(
-                hash_of(tb.e()),
-                add(mul(sub(sub(pos.e(), n.e()), slots.e()), int(2)), int(2)),
+            ret(call(
+                "zb_dict_value_at",
+                vec![hash_of(tb.e()), sub(sub(pos.e(), n.e()), slots.e())],
+                any(),
             )),
         ],
     ));
@@ -1659,14 +1650,14 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
                 vec![
                     h.decl(hash_of(tb.e())),
                     i.decl(int(0)),
-                    count.decl(call("zb_dict_len", vec![h.e()], i64())),
+                    count.decl(call("zb_dict_pair_count", vec![h.e()], i64())),
                     while_(
                         lt(i.e(), count.e()),
                         vec![
                             when(
                                 call(
                                     "zb_any_eq",
-                                    vec![at(h.e(), add(mul(i.e(), int(2)), int(1))), k.e()],
+                                    vec![call("zb_dict_key_at", vec![h.e(), i.e()], any()), k.e()],
                                     boolean(),
                                 ),
                                 vec![ret(add(add(add(n.e(), slots.e()), i.e()), int(1)))],

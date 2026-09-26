@@ -7,5 +7,14 @@ description = "The built-in library frontends share: lists, strings, dynamic val
 [dependencies]
 zyntax_typed_ast = { path = "../typed_ast" }
 
+[dev-dependencies]
+# The tests compile the library and run it, with the plugins its
+# primitives come from.
+zyntax_embed = { path = "../zyntax_embed" }
+zrtl = { path = "../../sdk/zrtl" }
+zrtl_io = { path = "../../plugins/zrtl_io", features = ["linked-into-host"] }
+zrtl_string = { path = "../../plugins/zrtl_string", features = ["linked-into-host"] }
+zrtl_math = { path = "../../plugins/zrtl_math", features = ["linked-into-host"] }
+
 [lints]
 workspace = true

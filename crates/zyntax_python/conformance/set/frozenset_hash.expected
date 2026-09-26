@@ -1,0 +1,7 @@
+2 True True
+False False
+a True
+1
+{1} {1.5} {'a'} {(1, 2)} {None} {True} set()
+[2, 3]
+40 True False

@@ -12,7 +12,7 @@
 
 pub mod build;
 mod bytes;
-mod dicts;
+pub mod dicts;
 mod dynamic;
 pub mod foreign;
 mod format;

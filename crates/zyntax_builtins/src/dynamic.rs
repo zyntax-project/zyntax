@@ -786,6 +786,8 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     let is_dict = |x: Expr| eq(kind(x), int(DICT_TAG >> 8));
     let is_set = |x: Expr| eq(kind(x), int(SET_TAG >> 8));
     let raw_any = |x: Expr| call("zb_unbox_list_raw_any", vec![x], anys.clone());
+    let dict_ty = crate::dicts::dict_type(list_type);
+    let raw_dict = |x: Expr| call("zb_dict_raw", vec![x], dict_ty.clone());
     d.push(define(
         "zb_any_eq",
         &[&a, &b],
@@ -905,7 +907,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                         is_dict(a.e()),
                         vec![ret(call(
                             "zb_dict_eq",
-                            vec![raw_any(a.e()), raw_any(b.e())],
+                            vec![raw_dict(a.e()), raw_dict(b.e())],
                             boolean(),
                         ))],
                     ),
@@ -1269,6 +1271,14 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![ret(call(
                     "zb_set_contains",
                     vec![raw_any(container.e()), item.e()],
+                    boolean(),
+                ))],
+            ),
+            when(
+                is_dict(container.e()),
+                vec![ret(call(
+                    "zb_dict_contains",
+                    vec![raw_dict(container.e()), item.e()],
                     boolean(),
                 ))],
             ),
@@ -1896,7 +1906,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is_dict(x.e()),
                 vec![ret(call(
                     "zb_dict_keys",
-                    vec![raw_any(x.e())],
+                    vec![raw_dict(x.e())],
                     anys.clone(),
                 ))],
             ),
@@ -2127,7 +2137,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ),
             when(
                 is_dict(x.e()),
-                vec![ret(call("zb_dict_repr", vec![raw_any(x.e())], string()))],
+                vec![ret(call("zb_dict_repr", vec![raw_dict(x.e())], string()))],
             ),
             when(
                 is_set(x.e()),
@@ -2160,7 +2170,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ),
             when(
                 is_dict(x.e()),
-                vec![ret(call("zb_dict_len", vec![raw_any(x.e())], i64()))],
+                vec![ret(call("zb_dict_len", vec![raw_dict(x.e())], i64()))],
             ),
             when(
                 is_set(x.e()),
@@ -2217,7 +2227,11 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ),
             when(
                 is_dict(x.e()),
-                vec![ret(call("zb_dict_get", vec![raw_any(x.e()), i.e()], any()))],
+                vec![ret(call(
+                    "zb_dict_get",
+                    vec![raw_dict(x.e()), i.e()],
+                    any(),
+                ))],
             ),
             // A list of one kind is read in place, the element boxed.
             when(
@@ -2313,7 +2327,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 is_dict(x.e()),
                 vec![ret(call(
                     "zb_dict_get",
-                    vec![raw_any(x.e()), box_i64(position.e())],
+                    vec![raw_dict(x.e()), box_i64(position.e())],
                     any(),
                 ))],
             ),
@@ -2408,7 +2422,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![
                     expr(call(
                         "zb_dict_set",
-                        vec![raw_any(x.e()), i.e(), v.e()],
+                        vec![raw_dict(x.e()), i.e(), v.e()],
                         unit(),
                     )),
                     ret_void(),
@@ -2523,7 +2537,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 vec![
                     expr(call(
                         "zb_dict_set",
-                        vec![raw_any(x.e()), box_i64(position.e()), v.e()],
+                        vec![raw_dict(x.e()), box_i64(position.e()), v.e()],
                         unit(),
                     )),
                     ret_void(),
@@ -2629,7 +2643,7 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 boxed_dict(x.e()),
                 vec![
-                    expr(call("zb_dict_del", vec![raw_any(x.e()), i.e()], unit())),
+                    expr(call("zb_dict_del", vec![raw_dict(x.e()), i.e()], unit())),
                     ret_void(),
                 ],
             ),

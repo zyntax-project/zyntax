@@ -23,11 +23,14 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let n = local("n", i64());
     let i = local("i", i64());
     let cat = local("cat", i64());
+    let dict_ty = crate::dicts::dict_type(list_type);
+    let dict = local("dict", dict_ty.clone());
+    let first = local("first", boolean());
+    let key = local("key", any());
     let piece = |p: Expr| expr(mcall(pieces.e(), "push", vec![p], unit()));
     let category = |x: Expr| call("zb_any_category", vec![x], i64());
     let kind = |x: Expr| call("zb_any_kind", vec![x], i64());
     let into = |v: Expr| expr(call("zb_json_into", vec![pieces.e(), v], unit()));
-    let raw = |x: Expr| call("zb_unbox_list_raw_any", vec![x], anys.clone());
     // The elements of a list or tuple, then each value of a dict after
     // its key, between the brackets and separators JSON spells.
     let sequence = |items_of: Expr| {
@@ -113,29 +116,37 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                     ),
                 )],
             ),
-            // A dict: its key, value pairs after the index slot.
+            // A dict: its live pairs, in order, through the accessors.
             when(
                 eq(kind(x.e()), int(DICT_TAG >> 8)),
                 vec![
-                    items.decl(raw(x.e())),
+                    dict.decl(call("zb_dict_raw", vec![x.e()], dict_ty.clone())),
                     piece(text("{")),
-                    n.decl(mcall(items.e(), "len", vec![], i64())),
-                    i.decl(int(1)),
+                    n.decl(call("zb_dict_pair_count", vec![dict.e()], i64())),
+                    first.decl(bool(true)),
+                    i.decl(int(0)),
                     while_(
                         lt(i.e(), n.e()),
                         vec![
-                            when(gt(i.e(), int(1)), vec![piece(text(", "))]),
                             when(
-                                ne(category(idx(items.e(), i.e(), any())), int(5)),
-                                vec![fatal(
-                                    "TypeError",
-                                    text("keys must be str, int, float, bool or None"),
-                                )],
+                                call("zb_dict_live_at", vec![dict.e(), i.e()], boolean()),
+                                vec![
+                                    when(not(first.e()), vec![piece(text(", "))]),
+                                    first.set(bool(false)),
+                                    key.decl(call("zb_dict_key_at", vec![dict.e(), i.e()], any())),
+                                    when(
+                                        ne(category(key.e()), int(5)),
+                                        vec![fatal(
+                                            "TypeError",
+                                            text("keys must be str, int, float, bool or None"),
+                                        )],
+                                    ),
+                                    into(key.e()),
+                                    piece(text(": ")),
+                                    into(call("zb_dict_value_at", vec![dict.e(), i.e()], any())),
+                                ],
                             ),
-                            into(idx(items.e(), i.e(), any())),
-                            piece(text(": ")),
-                            into(idx(items.e(), add(i.e(), int(1)), any())),
-                            i.add_assign(int(2)),
+                            i.add_assign(int(1)),
                         ],
                     ),
                     piece(text("}")),
