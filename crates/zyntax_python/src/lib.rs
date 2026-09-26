@@ -480,6 +480,17 @@ fn parse_program_once(
     // A class attribute not fixed as a constant is a module variable.
     global_names.extend(inferred.class_attrs.globals().map(str::to_string));
     inferred.closed = types::closed_items(&module.body, &items);
+    inferred.items_by_index = items
+        .iter()
+        .filter(|item| item.class.is_none() && item.def.decorator_list.is_empty())
+        .map(|item| item.name.clone())
+        .collect();
+    inferred.func_values = inferred
+        .items_by_index
+        .iter()
+        .enumerate()
+        .map(|(k, name)| (name.clone(), k as u16))
+        .collect();
     inferred.methods = items
         .iter()
         .filter(|item| item.class.is_some())

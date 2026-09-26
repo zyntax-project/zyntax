@@ -64,6 +64,11 @@ pub(crate) enum Ty {
     /// value is, so it is a dynamic value wherever one is needed; where
     /// it is called, the call is direct and typed.
     Closure(u16),
+    /// A module function named as a value, the one at this index of
+    /// [`Module::items_by_index`]: the record every function value is,
+    /// wherever a dynamic value is needed; where it is called, the call
+    /// is the function's own, direct and typed.
+    Func(u16),
     /// A method of a list or an instance bound to a local, at this
     /// index of the module's table: the record every bound method is,
     /// so it is a dynamic value wherever one is needed; where it is
@@ -1209,6 +1214,12 @@ pub(crate) const MAX_SPECS: usize = 4;
 #[derive(Default, Debug)]
 pub(crate) struct Module {
     pub(crate) funcs: HashMap<String, Sig>,
+    /// The module functions a value can name, in definition order: no
+    /// method, no decorated `def`, none bound again (see
+    /// [`crate::rebind::rebound_defs`]). [`Ty::Func`] indexes it.
+    pub(crate) items_by_index: Vec<String>,
+    /// The index of each of [`Self::items_by_index`] by name.
+    pub(crate) func_values: HashMap<String, u16>,
     /// The functions that are methods, by the name they lower to.
     pub(crate) methods: HashSet<String>,
     /// For each item, which parameters keep their declared type in
@@ -2346,6 +2357,23 @@ impl Module {
             .map(|&i| &self.specs[i])
     }
 
+    /// What a call through a value of a module function with `sig`
+    /// passes to each parameter: `None` where the arguments do not fill
+    /// the parameters, a call that raises TypeError through the value.
+    pub(crate) fn func_value_call(
+        &self,
+        sig: &Sig,
+        arguments: &py::Arguments,
+        arg_ty: impl Fn(&py::Expr) -> Ty,
+    ) -> Option<Vec<Ty>> {
+        let (args, keywords) = (&arguments.args, &arguments.keywords);
+        let filled = call_types(self, sig, 0, args, keywords, |_| Ty::Object)?;
+        if filled.contains(&Ty::Unknown) {
+            return None;
+        }
+        call_types(self, sig, 0, args, keywords, arg_ty)
+    }
+
     /// What a call of item `name` passing `tys` returns: its instance's
     /// result where one was made for these types, the item's otherwise.
     pub(crate) fn instance_ret(&self, name: &str, sig: &Sig, tys: &[Ty]) -> Ty {
@@ -2807,6 +2835,8 @@ pub(crate) fn infer_module(
         closure_index: known.closure_index.clone(),
         bounds: known.bounds.clone(),
         bound_index: known.bound_index.clone(),
+        items_by_index: known.items_by_index.clone(),
+        func_values: known.func_values.clone(),
         list_params: known.list_params.clone(),
         dynamic_methods: known.dynamic_methods.clone(),
         list_fields: known.list_fields.clone(),
@@ -3388,7 +3418,13 @@ fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) ->
 /// not a generator, whose fiber is started by name; and not a method a
 /// subclass overrides, whose calls go through the dispatcher.
 fn specialisable(module: &Module, item: &Item<'_>) -> bool {
-    if !module.closed.contains(&item.name) || item.def.name.as_str() == "__init__" {
+    // A function named as a value keeps dynamic parameters for the
+    // calls out of view; a call through its value, or by its name, with
+    // typed arguments goes to an instance.
+    let valued = module.func_values.contains_key(&item.name)
+        && item.def.parameters.vararg.is_none()
+        && item.def.parameters.kwarg.is_none();
+    if !(module.closed.contains(&item.name) || valued) || item.def.name.as_str() == "__init__" {
         return false;
     }
     if module.funcs[&item.name].ret == Ty::Gen {
@@ -3663,6 +3699,17 @@ impl Calls<'_> {
                     return Some((Target::Item(name.to_string()), 0));
                 }
                 self.closure_of(func).map(|k| (Target::Closure(k), 0))
+            }
+            // A call through a known function value reaches the
+            // function, where the arguments fit its parameters.
+            py::Expr::Name(_) if matches!(self.typer().callee_ty(func), Ty::Func(_)) => {
+                let Ty::Func(k) = self.typer().callee_ty(func) else {
+                    unreachable!()
+                };
+                Some((
+                    Target::Item(self.module.items_by_index[k as usize].clone()),
+                    0,
+                ))
             }
             // A call through a bound method of an instance reaches the
             // class's method, with the receiver as its first argument.
@@ -6807,6 +6854,9 @@ impl Typer<'_> {
                         member_ty(m)
                     };
                 }
+                if let Some(&k) = self.module.func_values.get(name) {
+                    return Ty::Func(k);
+                }
                 if !self.module.funcs.contains_key(name)
                     && !self.module.class_index.contains_key(name)
                     && let Some(k) = builtin_index(name)
@@ -7164,6 +7214,17 @@ impl Typer<'_> {
         // that function returns.
         match self.callee_ty(&c.func) {
             Ty::Closure(k) => return self.module.closure_ret(k),
+            Ty::Func(k) => {
+                let name = &self.module.items_by_index[k as usize];
+                let sig = &self.module.funcs[name];
+                return match self
+                    .module
+                    .func_value_call(sig, &c.arguments, |e| self.expr(e))
+                {
+                    Some(tys) => self.module.instance_ret(name, sig, &tys),
+                    None => Ty::Object,
+                };
+            }
             Ty::Bound(k) => {
                 let info = &self.module.bounds[k as usize];
                 let receiver = self.expr(&py::Expr::Name(info.receiver.clone()));

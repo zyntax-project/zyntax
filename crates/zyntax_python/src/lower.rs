@@ -190,6 +190,7 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         | Ty::File(_)
         | Ty::Gen
         | Ty::Closure(_)
+        | Ty::Func(_)
         | Ty::Bound(_)
         | Ty::Builtin(_)
         | Ty::Num(_)
@@ -339,7 +340,9 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Gen => Type::Fiber(Box::new(Type::Any)),
         // A known function value is still the record every function
         // value is.
-        Ty::Closure(_) | Ty::Bound(_) | Ty::Builtin(_) | Ty::Object | Ty::Unknown => Type::Any,
+        Ty::Closure(_) | Ty::Func(_) | Ty::Bound(_) | Ty::Builtin(_) | Ty::Object | Ty::Unknown => {
+            Type::Any
+        }
         // The tag, the int and the float: see `num`.
         Ty::Num(_) => Type::Tuple(vec![
             prim(PrimitiveType::I64),
@@ -852,7 +855,7 @@ fn parameter(name: &str, ty: Ty, span: Span) -> TypedParameter {
 pub(crate) fn dynamic_attribute(ty: Ty, span: Span) -> Vec<ParameterAttribute> {
     if matches!(
         ty,
-        Ty::Object | Ty::Closure(_) | Ty::Bound(_) | Ty::Builtin(_)
+        Ty::Object | Ty::Closure(_) | Ty::Func(_) | Ty::Bound(_) | Ty::Builtin(_)
     ) {
         vec![ParameterAttribute {
             name: intern("dynamic"),
@@ -1569,7 +1572,12 @@ impl<'m> Lowerer<'m> {
                 span,
             ),
             Ty::Str => str_lit("", span),
-            Ty::Object | Ty::Unknown | Ty::Closure(_) | Ty::Bound(_) | Ty::Builtin(_) => {
+            Ty::Object
+            | Ty::Unknown
+            | Ty::Closure(_)
+            | Ty::Func(_)
+            | Ty::Bound(_)
+            | Ty::Builtin(_) => {
                 let none = Val {
                     node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
                     ty: Ty::None,
@@ -2258,6 +2266,7 @@ impl<'m> Lowerer<'m> {
             (Ty::MaybeList(_), _) | (_, Ty::MaybeList(_)) => self.coerce_nullable_list(v, target),
             // A known function value is a dynamic value already.
             (Ty::Closure(_), Ty::Object | Ty::Closure(_)) | (Ty::Object, Ty::Closure(_)) => v.node,
+            (Ty::Func(_), Ty::Object | Ty::Func(_)) | (Ty::Object, Ty::Func(_)) => v.node,
             (Ty::Bound(_), Ty::Object | Ty::Bound(_)) | (Ty::Object, Ty::Bound(_)) => v.node,
             (Ty::Builtin(_), Ty::Object | Ty::Builtin(_)) | (Ty::Object, Ty::Builtin(_)) => v.node,
             (Ty::Int | Ty::Bool, Ty::Float) => cast(v.node, Ty::Float, span),
@@ -3161,7 +3170,7 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
                 span,
             ),
-            Ty::Gen | Ty::Closure(_) | Ty::Bound(_) | Ty::Builtin(_) => node(
+            Ty::Gen | Ty::Closure(_) | Ty::Func(_) | Ty::Bound(_) | Ty::Builtin(_) => node(
                 TypedExpression::Literal(TypedLiteral::Bool(true)),
                 Ty::Bool,
                 span,
@@ -3343,7 +3352,9 @@ impl<'m> Lowerer<'m> {
                     }
                 })
             }
-            Ty::Object | Ty::Unknown => call("zb_any_str", vec![v.node], Ty::Str, span),
+            Ty::Object | Ty::Func(_) | Ty::Unknown => {
+                call("zb_any_str", vec![v.node], Ty::Str, span)
+            }
         }
     }
 
@@ -6625,7 +6636,7 @@ impl<'m> Lowerer<'m> {
         // A function value whose function is known is the record every
         // function value is; only a call reads the type, off the callee
         // expression itself.
-        if let Ty::Closure(_) | Ty::Bound(_) | Ty::Builtin(_) = v.ty {
+        if let Ty::Closure(_) | Ty::Func(_) | Ty::Bound(_) | Ty::Builtin(_) = v.ty {
             v.ty = Ty::Object;
         }
         // A library call that can raise is checked before its value is
@@ -9435,6 +9446,20 @@ impl<'m> Lowerer<'m> {
                         let callee = self.expr(&c.func)?;
                         return self.call_closure(k, callee, args, keywords, c, span);
                     }
+                    // The function the value names, called by its name
+                    // where the arguments fit; the value itself is not
+                    // read.
+                    Ty::Func(k) => {
+                        let item = self.module.items_by_index[k as usize].clone();
+                        let sig = self.module.funcs[&item].clone();
+                        let fits = self
+                            .module
+                            .func_value_call(&sig, &c.arguments, |e| self.ty_of(e))
+                            .is_some();
+                        if fits {
+                            return self.call_item(&item, sig, args, keywords, c, span);
+                        }
+                    }
                     // The method on the receiver as it is: the record
                     // the name holds is not read.
                     // The builtin's own call, under its own name, where
@@ -9504,19 +9529,7 @@ impl<'m> Lowerer<'m> {
                 return self.construct(k, args, keywords, c, span);
             }
             if let Some(sig) = self.module.funcs.get(name).cloned() {
-                let (fn_name, sig) = self
-                    .pick_instance(name, &sig, 0, args, keywords)
-                    .unwrap_or((name.to_string(), sig));
-                let lowered = self.arguments(name, &sig, args, keywords, c)?;
-                if sig.ret == Ty::Gen {
-                    return Ok(self.start_generator(name, &sig, lowered, Vec::new(), span));
-                }
-                let target = self.call_target(&fn_name, &sig.params, &lowered);
-                let v = Val {
-                    node: call(&target, lowered, sig.ret, span),
-                    ty: sig.ret,
-                };
-                return Ok(self.guard_named(v, &target, span));
+                return self.call_item(name, sig, args, keywords, c, span);
             }
             if name == "print" {
                 return self.print(args, keywords, span);
@@ -11501,6 +11514,32 @@ impl<'m> Lowerer<'m> {
     /// The instance of item `name` a call passing `args` and `keywords`
     /// to the parameters from `first` on goes to, with its signature,
     /// when one was made for the types passed.
+    /// A direct call of the module function `name`: the instance made
+    /// for the arguments' types where there is one.
+    fn call_item(
+        &mut self,
+        name: &str,
+        sig: Sig,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+        span: Span,
+    ) -> Result<Val> {
+        let (fn_name, sig) = self
+            .pick_instance(name, &sig, 0, args, keywords)
+            .unwrap_or((name.to_string(), sig));
+        let lowered = self.arguments(name, &sig, args, keywords, c)?;
+        if sig.ret == Ty::Gen {
+            return Ok(self.start_generator(name, &sig, lowered, Vec::new(), span));
+        }
+        let target = self.call_target(&fn_name, &sig.params, &lowered);
+        let v = Val {
+            node: call(&target, lowered, sig.ret, span),
+            ty: sig.ret,
+        };
+        Ok(self.guard_named(v, &target, span))
+    }
+
     fn pick_instance(
         &self,
         name: &str,
