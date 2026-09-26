@@ -110,9 +110,9 @@ pub fn trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("ZYNTAX_TRACE_INTERP").is_some())
 }
 
-/// `ZYNTAX_CHECK_ERROR_FLAG=1` aborts when an interpreted function is
-/// entered with the module's error-flag global non-null; safe to run
-/// with, slow.
+/// `ZYNTAX_CHECK_ERROR_FLAG=1` aborts when an interpreted function that
+/// reads the module's error-flag global is entered with it non-null;
+/// safe to run with, slow.
 fn check_error_flag_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("ZYNTAX_CHECK_ERROR_FLAG").is_some_and(|v| v != "0"))
@@ -2806,6 +2806,8 @@ pub struct HirInterpreter {
     /// The module last asked for its error-flag global, and that
     /// global, for `ZYNTAX_CHECK_ERROR_FLAG`.
     error_flag_of: Option<(usize, Option<HirId>)>,
+    /// Whether each function loads the error flag.
+    reads_error_flag: IdMap<bool>,
 }
 
 /// When a `tick_callback` returns one of these, the interpreter
@@ -2878,6 +2880,7 @@ impl HirInterpreter {
             indirect_call_dispatcher: None,
             symbol_call_dispatcher: None,
             error_flag_of: None,
+            reads_error_flag: IdMap::default(),
         }
     }
 
@@ -3619,7 +3622,7 @@ impl HirInterpreter {
         dest: *mut u8,
     ) -> Result<ZyntaxValue, InterpError> {
         if check_error_flag_enabled() {
-            self.check_error_flag(module, func_id);
+            self.check_error_flag(module, cf, func_id);
         }
         let mut scratch = Scratch::new();
         let marks = self.waiting_marks.len();
@@ -3653,9 +3656,10 @@ impl HirInterpreter {
         result
     }
 
-    /// Every function is entered with the error flag null: abort
-    /// naming the function when it is not.
-    fn check_error_flag(&mut self, module: &HirModule, func_id: HirId) {
+    /// Every function that reads the error flag is entered with it
+    /// null: abort naming the function when it is not. A function that
+    /// never reads the flag assumes nothing about it.
+    fn check_error_flag(&mut self, module: &HirModule, cf: &CompiledFunction, func_id: HirId) {
         let key = module as *const HirModule as usize;
         let flag = match self.error_flag_of {
             Some((k, flag)) if k == key => flag,
@@ -3669,7 +3673,23 @@ impl HirInterpreter {
                 flag
             }
         };
-        let Some(ptr) = flag.and_then(|id| self.memory.globals.get(&id).copied()) else {
+        let Some(flag) = flag else { return };
+        if !cf.global_consts.iter().any(|&(g, _)| g == flag) {
+            return;
+        }
+        let reads = *self.reads_error_flag.entry(func_id).or_insert_with(|| {
+            module.functions.get(&func_id).is_some_and(|f| {
+                f.blocks.values().flat_map(|b| &b.instructions).any(|i| {
+                    matches!(i, HirInstruction::Load { ptr, .. }
+                        if matches!(f.values.get(ptr).map(|v| &v.kind),
+                            Some(HirValueKind::Global(g)) if *g == flag))
+                })
+            })
+        });
+        if !reads {
+            return;
+        }
+        let Some(ptr) = self.memory.globals.get(&flag).copied() else {
             return;
         };
         // SAFETY: a global slot is at least a word, and the flag is a
