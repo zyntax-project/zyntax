@@ -6486,13 +6486,12 @@ impl SsaBuilder {
                 // whatever it is assigned to, so a `List<i64>` binding
                 // would otherwise lay the data out four bytes apart and
                 // read it back eight at a time.
-                let inferred_elem_ty = match &expr.ty {
-                    Type::Array { element_type, .. }
-                        if !matches!(**element_type, Type::Any | Type::Unknown) =>
-                    {
-                        (**element_type).clone()
-                    }
-                    _ => {
+                // A literal typed as `List<T>` or an array of `T` holds `T`,
+                // whatever position it is in; one typed no further says by
+                // its first element.
+                let inferred_elem_ty = match self.declared_element_type(&expr.ty) {
+                    Some(elem) => elem,
+                    None => {
                         if let Some(first) = elements.first() {
                             self.resolve_expr_type(first)
                         } else {
