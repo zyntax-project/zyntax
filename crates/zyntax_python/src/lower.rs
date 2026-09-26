@@ -108,7 +108,7 @@ pub(crate) fn class_type(k: usize) -> Type {
 pub(crate) fn field_storage(ty: Ty) -> Ty {
     match ty {
         Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Class(_) => ty,
-        Ty::Dict(_) | Ty::Set(_) | Ty::List(_) => Ty::Int,
+        Ty::Dict(_) | Ty::Set(_) | Ty::List(_) | Ty::MaybeList(_) => Ty::Int,
         _ => Ty::Object,
     }
 }
@@ -193,6 +193,7 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         | Ty::Bound(_)
         | Ty::Builtin(_)
         | Ty::Num(_)
+        | Ty::MaybeList(_)
         | Ty::Object
         | Ty::Unknown => Field::Any,
     }
@@ -322,7 +323,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Bool => prim(PrimitiveType::Bool),
         Ty::Str | Ty::Bytes => prim(PrimitiveType::String),
         Ty::None => prim(PrimitiveType::Unit),
-        Ty::List(e) => list_type(elem_ir(e)),
+        Ty::List(e) | Ty::MaybeList(e) => list_type(elem_ir(e)),
         // A shape is a value struct with one field per element, each
         // stored as `tuple_field_storage` says.
         Ty::Tuple(k) => Type::Tuple(
@@ -2254,6 +2255,7 @@ impl<'m> Lowerer<'m> {
             (_, Ty::Unknown) => v.node,
             (Ty::Num(_), _) => self.coerce_from_num(v, target),
             (_, Ty::Num(_)) => self.coerce_to_num(v, target),
+            (Ty::MaybeList(_), _) | (_, Ty::MaybeList(_)) => self.coerce_nullable_list(v, target),
             // A known function value is a dynamic value already.
             (Ty::Closure(_), Ty::Object | Ty::Closure(_)) | (Ty::Object, Ty::Closure(_)) => v.node,
             (Ty::Bound(_), Ty::Object | Ty::Bound(_)) | (Ty::Object, Ty::Bound(_)) => v.node,
@@ -2572,7 +2574,7 @@ impl<'m> Lowerer<'m> {
     /// from its address.
     pub(crate) fn field_out(&mut self, stored: Node, ty: Ty, span: Span) -> Node {
         match ty {
-            Ty::Dict(_) | Ty::Set(_) | Ty::List(_) => cast(stored, ty, span),
+            Ty::Dict(_) | Ty::Set(_) | Ty::List(_) | Ty::MaybeList(_) => cast(stored, ty, span),
             _ => self.trusted(
                 Val {
                     node: stored,
@@ -2588,8 +2590,98 @@ impl<'m> Lowerer<'m> {
         let span = v.node.span;
         let typed = self.coerce(v, ty);
         match ty {
-            Ty::Dict(_) | Ty::Set(_) | Ty::List(_) => cast(typed, Ty::Int, span),
+            Ty::Dict(_) | Ty::Set(_) | Ty::List(_) | Ty::MaybeList(_) => cast(typed, Ty::Int, span),
             _ => self.coerce(Val { node: typed, ty }, field_storage(ty)),
+        }
+    }
+
+    /// `e` about to be read or written as a list: a list or None
+    /// ([`Ty::MaybeList`]) checked, None raising TypeError with `message`,
+    /// and read as the list; anything else as [`Self::expr`] gives it.
+    fn expr_list_read(&mut self, e: &py::Expr, message: &str) -> Result<Val> {
+        let v = self.expr_num(e)?;
+        match v.ty {
+            Ty::MaybeList(elem) => {
+                let span = v.node.span;
+                let held = self.checked_instance_as(v, "TypeError", message, span);
+                Ok(Val {
+                    node: held.node,
+                    ty: Ty::List(elem),
+                })
+            }
+            _ => Ok(self.boxed_num(v)),
+        }
+    }
+
+    /// A conversion from or to a list or None ([`Ty::MaybeList`]): a list
+    /// of the kind is the same header and None the null one; a box is
+    /// None or checked as the list; anything else goes through the box.
+    fn coerce_nullable_list(&mut self, v: Val, target: Ty) -> Node {
+        let span = v.node.span;
+        match (v.ty, target) {
+            (Ty::MaybeList(e), Ty::Object) => {
+                let none = node(
+                    TypedExpression::Literal(TypedLiteral::Null),
+                    Ty::Object,
+                    span,
+                );
+                self.unless_null(v, none, Ty::Object, |_, held| box_list(e, held.node, span))
+            }
+            // The same header either way.
+            (Ty::List(e), Ty::MaybeList(f)) => {
+                if e == f {
+                    v.node
+                } else {
+                    self.coerce(v, Ty::List(f))
+                }
+            }
+            (Ty::None, Ty::MaybeList(_)) => Self::block_value(
+                vec![TypedNode::new(
+                    TypedStatement::Expression(Box::new(v.node)),
+                    Type::Unknown,
+                    span,
+                )],
+                cast(int_lit(0, span), target, span),
+                target,
+                span,
+            ),
+            (Ty::Object, Ty::MaybeList(e)) => {
+                let mut pre = Vec::new();
+                let held = self.hold(v, &mut pre, span);
+                self.hoisted.extend(pre);
+                let is_none = binary(
+                    BinaryOp::Eq,
+                    call("zb_any_category", vec![held.node.clone()], Ty::Int, span),
+                    int_lit(zyntax_builtins::NONE_CATEGORY, span),
+                    Ty::Bool,
+                    span,
+                );
+                // What the checked read hoists runs only when it is read.
+                let outer = std::mem::take(&mut self.hoisted);
+                let list = self.coerce(held, Ty::List(e));
+                let inner = std::mem::replace(&mut self.hoisted, outer);
+                let mut out = Vec::new();
+                let picked = self.conditional_value(
+                    is_none,
+                    (Vec::new(), cast(int_lit(0, span), target, span)),
+                    (inner, list),
+                    target,
+                    span,
+                    &mut out,
+                );
+                self.hoisted.extend(out);
+                picked
+            }
+            _ => {
+                let boxed = self.coerce(v, Ty::Object);
+                self.coerce(
+                    Val {
+                        node: boxed,
+                        ty: Ty::Object,
+                    },
+                    target,
+                )
+            }
         }
     }
 
@@ -3132,6 +3224,20 @@ impl<'m> Lowerer<'m> {
             ),
             Ty::Object | Ty::Unknown => call("zb_any_truthy", vec![v.node], Ty::Bool, span),
             Ty::Num(_) => self.num_truthy(v),
+            // None is false; a list is true when it has elements.
+            Ty::MaybeList(e) => {
+                let no = node(
+                    TypedExpression::Literal(TypedLiteral::Bool(false)),
+                    Ty::Bool,
+                    span,
+                );
+                self.unless_null(v, no, Ty::Bool, |this, held| {
+                    this.truthy(Val {
+                        node: held.node,
+                        ty: Ty::List(e),
+                    })
+                })
+            }
         }
     }
 
@@ -3163,7 +3269,7 @@ impl<'m> Lowerer<'m> {
         let span = v.node.span;
         crate::records::demote_reached(self.module, v.ty);
         match v.ty {
-            Ty::Num(_) => {
+            Ty::Num(_) | Ty::MaybeList(_) => {
                 let boxed = self.boxed_num(v);
                 self.str_of(boxed)
             }
@@ -3259,7 +3365,7 @@ impl<'m> Lowerer<'m> {
                 })
             }
             Ty::Object | Ty::Unknown => call("zb_any_repr", vec![v.node], Ty::Str, span),
-            Ty::Num(_) => {
+            Ty::Num(_) | Ty::MaybeList(_) => {
                 let boxed = self.boxed_num(v);
                 self.repr_of(boxed)
             }
@@ -3751,6 +3857,18 @@ impl<'m> Lowerer<'m> {
                 // as itself, as inference typed it.
                 let value = if a.targets.iter().all(|t| matches!(t, py::Expr::Name(_))) {
                     self.expr_num(&a.value)?
+                } else if a
+                    .targets
+                    .iter()
+                    .all(|t| matches!(t, py::Expr::Attribute(_)))
+                {
+                    // A field holds a list or None as itself.
+                    let v = self.expr_num(&a.value)?;
+                    if let Ty::Num(_) = v.ty {
+                        self.boxed_num(v)
+                    } else {
+                        v
+                    }
                 } else {
                     self.expr(&a.value)?
                 };
@@ -4172,7 +4290,8 @@ impl<'m> Lowerer<'m> {
         let ty = self.ty_of(&a.target);
         let (held, place) = match &*a.target {
             py::Expr::Subscript(sub) if !matches!(&*sub.slice, py::Expr::Slice(_)) => {
-                let seq = self.expr(&sub.value)?;
+                let seq =
+                    self.expr_list_read(&sub.value, "'NoneType' object is not subscriptable")?;
                 if !Self::stores_items(seq.ty) {
                     return unsupported(
                         format!("item assignment on {}", types::expr_kind(&sub.value)),
@@ -4509,7 +4628,10 @@ impl<'m> Lowerer<'m> {
             py::Expr::Subscript(sub) => {
                 if let py::Expr::Slice(sl) = &*sub.slice {
                     let rhs_pre = std::mem::take(&mut self.hoisted);
-                    let seq = self.expr(&sub.value)?;
+                    let seq = self.expr_list_read(
+                        &sub.value,
+                        "'NoneType' object does not support item assignment",
+                    )?;
                     let target_pre = std::mem::take(&mut self.hoisted);
                     self.hoisted = rhs_pre;
                     let seq_node = if target_pre.is_empty() {
@@ -4578,7 +4700,10 @@ impl<'m> Lowerer<'m> {
                     out.push(self.pending_check(span));
                     return Ok(());
                 }
-                let seq = self.expr(&sub.value)?;
+                let seq = self.expr_list_read(
+                    &sub.value,
+                    "'NoneType' object does not support item assignment",
+                )?;
                 if !Self::stores_items(seq.ty) {
                     return unsupported(
                         format!("item assignment on {}", types::expr_kind(&sub.value)),
@@ -6470,7 +6595,7 @@ impl<'m> Lowerer<'m> {
 
     pub(crate) fn expr(&mut self, e: &py::Expr) -> Result<Val> {
         let v = self.expr_num(e)?;
-        if let Ty::Num(_) = v.ty {
+        if let Ty::Num(_) | Ty::MaybeList(_) = v.ty {
             let node = self.coerce(v, Ty::Object);
             return Ok(Val {
                 node,
@@ -7657,7 +7782,8 @@ impl<'m> Lowerer<'m> {
             }
             py::CmpOp::Is | py::CmpOp::IsNot => {
                 let (left, right) = match (left.ty, right.ty) {
-                    (Ty::Num(_), Ty::None) | (Ty::None, Ty::Num(_)) => (left, right),
+                    (Ty::Num(_) | Ty::MaybeList(_), Ty::None)
+                    | (Ty::None, Ty::Num(_) | Ty::MaybeList(_)) => (left, right),
                     _ => (self.boxed_num(left), self.boxed_num(right)),
                 };
                 let n = match (left.ty, right.ty) {
@@ -7692,6 +7818,27 @@ impl<'m> Lowerer<'m> {
                         Ty::Bool,
                         span,
                     ),
+                    // A list or None is None when its address is null.
+                    (Ty::MaybeList(_), Ty::None) => {
+                        let test = binary(
+                            BinaryOp::Eq,
+                            as_addr(left.node, span),
+                            int_lit(0, span),
+                            Ty::Bool,
+                            span,
+                        );
+                        Self::after_none(right.node, test, Ty::Bool)
+                    }
+                    (Ty::None, Ty::MaybeList(_)) => {
+                        let test = binary(
+                            BinaryOp::Eq,
+                            as_addr(right.node, span),
+                            int_lit(0, span),
+                            Ty::Bool,
+                            span,
+                        );
+                        Self::after_none(left.node, test, Ty::Bool)
+                    }
                     // An instance is None when its pointer is null.
                     (Ty::None, Ty::Class(_)) => binary(
                         BinaryOp::Eq,
@@ -8219,7 +8366,7 @@ impl<'m> Lowerer<'m> {
         {
             return self.globals_lookup(&sub.slice, span);
         }
-        let seq = self.expr(&sub.value)?;
+        let seq = self.expr_list_read(&sub.value, "'NoneType' object is not subscriptable")?;
         if let py::Expr::Slice(sl) = &*sub.slice {
             let mut mask = 0;
             let mut bound =

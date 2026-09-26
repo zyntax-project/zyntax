@@ -285,12 +285,12 @@ impl Lowerer<'_> {
         Self::with_pre(pre, result, target, span)
     }
 
-    /// `v`, read as its box when it is a Num.
+    /// `v`, read as its box when it is a Num or a list or None.
     pub(crate) fn boxed_num(&mut self, v: Val) -> Val {
-        if !matches!(v.ty, Ty::Num(_)) {
+        if !matches!(v.ty, Ty::Num(_) | Ty::MaybeList(_)) {
             return v;
         }
-        let node = self.coerce_from_num(v, Ty::Object);
+        let node = self.coerce(v, Ty::Object);
         Val {
             node,
             ty: Ty::Object,

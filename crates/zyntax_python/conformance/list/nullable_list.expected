@@ -1,0 +1,22 @@
+None True True False [None]
+empty empty 4 5 5 7
+subscript TypeError 'NoneType' object is not subscriptable
+store TypeError 'NoneType' object does not support item assignment
+TypeError 'NoneType' object does not support item assignment
+[[0, 1], [4], [0, 1]] [[0, 1, 5], [4], [0, 1]] True False
+[[0, 1], [4], [0, 1]] None True
+is None
+None None [None, None] None None None|None
+error 'NoneType' object is not subscriptable
+error 'NoneType' object does not support item assignment
+truthy 2 2
+not None [9, 3]
+[9, 3] None [[9, 3], None] [9, 3] None [9, 3]|None
+error 'NoneType' object is not subscriptable
+error 'NoneType' object does not support item assignment
+truthy 7 2
+not None [9, 8]
+[9, 8] [] [[9, 8], []] [9, 8] [] [9, 8]|[]
+error list index out of range
+error list assignment index out of range
+None [9, 3] [9, 8]

@@ -77,6 +77,10 @@ pub(crate) enum Ty {
     /// kinds its mask names (see [`Ty::num`]). A value struct of a tag,
     /// the int and the float, as [`crate::num`] lays it out.
     Num(u8),
+    /// A list of this kind or None: the header's address, null for None.
+    /// A local of one body or a field holds it as itself; every other
+    /// reader sees its box (see [`Ty::boxed_view`]).
+    MaybeList(Elem),
     /// A dynamic value: a boxed `Any`.
     Object,
     #[default]
@@ -359,6 +363,14 @@ pub(crate) const BUILTIN_VALUES: &[&str] = &[
     "divmod",
     "id",
 ];
+
+/// Whether a local or a field may be a [`Ty::MaybeList`].
+/// `ZYNTAX_DISABLE_NULLABLE_LISTS=1` makes a list or None dynamic, as it
+/// was before; safe to run with.
+pub(crate) fn nullable_lists() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZYNTAX_DISABLE_NULLABLE_LISTS").is_none())
+}
 
 pub(crate) fn builtin_index(name: &str) -> Option<u8> {
     BUILTIN_VALUES
@@ -823,7 +835,7 @@ pub(crate) fn tuple_of(elems: Vec<Ty>) -> Ty {
     let elems: Vec<Ty> = elems
         .into_iter()
         .map(|t| match t {
-            Ty::None | Ty::Gen | Ty::Num(_) => Ty::Object,
+            Ty::None | Ty::Gen | Ty::Num(_) | Ty::MaybeList(_) => Ty::Object,
             other => other,
         })
         .collect();
@@ -880,8 +892,46 @@ impl Ty {
     /// wherever the reader has no arm of its own for it.
     pub(crate) fn boxed_view(self) -> Ty {
         match self {
+            Ty::Num(_) | Ty::MaybeList(_) => Ty::Object,
+            t => t,
+        }
+    }
+
+    /// The type as a field or a local stores it: a run-time number as
+    /// its box, a list or None as itself.
+    pub(crate) fn stored_view(self) -> Ty {
+        match self {
             Ty::Num(_) => Ty::Object,
             t => t,
+        }
+    }
+
+    /// The join of two values of a local or a field when one may be None
+    /// and the rest are lists of one kind: a [`Ty::MaybeList`]. `None`
+    /// for any other pair, which [`Ty::join`] decides.
+    pub(crate) fn join_nullable(self, other: Ty) -> Option<Ty> {
+        if !nullable_lists() {
+            return None;
+        }
+        let part = |t: Ty| match t {
+            Ty::None => Some((true, None)),
+            Ty::List(e) => Some((false, Some(Ty::List(e)))),
+            Ty::MaybeList(e) => Some((true, Some(Ty::List(e)))),
+            _ => None,
+        };
+        let (none_a, list_a) = part(self)?;
+        let (none_b, list_b) = part(other)?;
+        if !(none_a || none_b) {
+            return None;
+        }
+        let list = match (list_a, list_b) {
+            (Some(a), Some(b)) => a.join(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return None,
+        };
+        match list {
+            Ty::List(e) => Some(Ty::MaybeList(e)),
+            _ => None,
         }
     }
 
@@ -1003,6 +1053,7 @@ impl Ty {
             Ty::List(Elem::Dict(k)) => format!("List({})", Ty::Dict(k).describe()),
             Ty::List(Elem::Set(k)) => format!("List({})", Ty::Set(k).describe()),
             Ty::List(Elem::Array(c)) => format!("Array({})", c.letter()),
+            Ty::MaybeList(e) => format!("{}|None", Ty::List(e).describe()),
             Ty::Num(m) => {
                 let names: Vec<&str> = [
                     (Ty::NUM_INT, "int"),
@@ -1070,6 +1121,10 @@ impl Ty {
             Ty::List(Elem::List(k)) => Ty::List(Elem::of(Ty::List(list_shape(k)).settled())),
             Ty::List(Elem::Dict(k)) => Ty::List(Elem::of(Ty::Dict(k).settled())),
             Ty::List(Elem::Set(k)) => Ty::List(Elem::of(Ty::Set(k).settled())),
+            Ty::MaybeList(e) => match Ty::List(e).settled() {
+                Ty::List(e) => Ty::MaybeList(e),
+                other => other,
+            },
             other => other,
         }
     }
@@ -2155,8 +2210,12 @@ impl Module {
             || self.dynamic_fields.contains(&lists_only_key(field));
         match ty {
             Ty::List(Elem::List(_)) if lists => Ty::List(Elem::Object),
+            Ty::MaybeList(Elem::List(_)) if lists => Ty::MaybeList(Elem::Object),
             Ty::List(Elem::Dict(_) | Elem::Set(_)) if self.dynamic_fields.contains(field) => {
                 Ty::List(Elem::Object)
+            }
+            Ty::MaybeList(Elem::Dict(_) | Elem::Set(_)) if self.dynamic_fields.contains(field) => {
+                Ty::MaybeList(Elem::Object)
             }
             Ty::Dict(_) if self.dynamic_fields.contains(field) => dynamic_dict(),
             Ty::Set(k) if self.dynamic_fields.contains(field) => dynamic_set(set_shape(k).1),
@@ -2179,7 +2238,11 @@ impl Module {
         }
         let denested = |ty: Ty| match ty {
             Ty::List(Elem::List(_)) => Ty::List(Elem::Object),
+            Ty::MaybeList(Elem::List(_)) => Ty::MaybeList(Elem::Object),
             Ty::List(Elem::Dict(_) | Elem::Set(_)) if !lists_only => Ty::List(Elem::Object),
+            Ty::MaybeList(Elem::Dict(_) | Elem::Set(_)) if !lists_only => {
+                Ty::MaybeList(Elem::Object)
+            }
             Ty::Dict(_) if !lists_only => dynamic_dict(),
             Ty::Set(k) if !lists_only => dynamic_set(set_shape(k).1),
             other => other,
@@ -4228,7 +4291,7 @@ fn widen_field(classes: &mut [ClassInfo], k: usize, name: &str, ty: Ty) -> bool 
                 at = bases[c];
             }
         }
-        a.join(b)
+        a.join_nullable(b).unwrap_or_else(|| a.join(b))
     };
     for c in targets {
         match classes[c].fields.iter().position(|(f, _)| f == name) {
@@ -4450,6 +4513,9 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
         /// The receiver parameter of each method being read, innermost
         /// last.
         receivers: Vec<String>,
+        /// Whether the class whose methods are being read is alone in
+        /// its hierarchy, innermost last.
+        alone: Vec<bool>,
     }
     impl Stores<'_, '_> {
         /// `o.f` for `o` of no known class.
@@ -4462,6 +4528,12 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
                 };
                 let own = matches!(&*a.value, py::Expr::Name(n)
                     if self.receivers.last().is_some_and(|r| r == n.id.as_str()));
+                // A method's own receiver in a class with no base and no
+                // subclass is an instance of that class, whose field the
+                // method's own inference types.
+                if own && self.alone.last() == Some(&true) {
+                    return;
+                }
                 self.out.push(FieldStore {
                     field: a.attr.to_string(),
                     untyped,
@@ -4484,6 +4556,22 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
             match stmt {
                 // A class's methods, each with its receiver named.
                 py::Stmt::ClassDef(c) => {
+                    let named = |name: &str| {
+                        name == c.name.as_str()
+                            || name
+                                .rsplit_once('$')
+                                .is_some_and(|(_, last)| last == c.name.as_str())
+                    };
+                    let mut found = self
+                        .typer
+                        .module
+                        .classes
+                        .iter()
+                        .filter(|class| named(&class.name))
+                        .peekable();
+                    let alone = found.peek().is_some()
+                        && found.all(|class| class.base.is_none() && class.descendants == 1);
+                    self.alone.push(alone);
                     for s in &c.body {
                         if let py::Stmt::FunctionDef(f) = s {
                             let receiver = f
@@ -4503,6 +4591,7 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
                             self.visit_stmt(s);
                         }
                     }
+                    self.alone.pop();
                     return;
                 }
                 // A nested function has a receiver of its own, or none.
@@ -4537,6 +4626,7 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
         typer,
         out: Vec::new(),
         receivers: Vec::new(),
+        alone: Vec::new(),
     };
     for s in body {
         stores.visit_stmt(s);
@@ -5500,10 +5590,17 @@ impl Walker<'_> {
         }
         let current = self.locals.vars.get(name).copied().unwrap_or(Ty::Unknown);
         let numeric = |t: Ty| t.mask().is_some() || t == Ty::Unknown;
-        let joined = if numeric(current) && value.mask().is_some() && !self.shared.contains(name) {
+        let shared = self.shared.contains(name);
+        let joined = if numeric(current) && value.mask().is_some() && !shared {
             current.join_local(value)
-        } else {
+        } else if shared {
             self.module.join_classes(current, ty)
+        } else {
+            // A local of this body holds a list or None as itself.
+            let stored = value.stored_view();
+            current
+                .join_nullable(stored)
+                .unwrap_or_else(|| self.module.join_classes(current, stored))
         };
         self.locals.vars.insert(name.to_string(), joined);
     }
@@ -5548,7 +5645,9 @@ impl Walker<'_> {
                     .get(a.attr.as_str())
                     .copied()
                     .unwrap_or(Ty::Unknown);
-                let joined = self.module.join_classes(current, ty);
+                let joined = current
+                    .join_nullable(ty)
+                    .unwrap_or_else(|| self.module.join_classes(current, ty));
                 self.locals.field_writes.insert(a.attr.to_string(), joined);
                 self.field_write(a, ty);
             }
@@ -5810,10 +5909,16 @@ impl Walker<'_> {
         }
         match s {
             py::Stmt::Assign(a) => {
-                // A local takes a run-time number as itself; any other
-                // target reads it as its box.
+                // A local takes a run-time number as itself, a field a
+                // list or None; any other target reads it as its box.
                 let ty = if a.targets.iter().all(|t| matches!(t, py::Expr::Name(_))) {
                     self.expr_num(&a.value)
+                } else if a
+                    .targets
+                    .iter()
+                    .all(|t| matches!(t, py::Expr::Attribute(_)))
+                {
+                    self.expr_num(&a.value).stored_view()
                 } else {
                     self.expr(&a.value)
                 };
@@ -6716,7 +6821,12 @@ impl Typer<'_> {
                 }
                 acc
             }
-            py::Expr::If(i) => self.expr(&i.body).join(self.expr(&i.orelse)),
+            py::Expr::If(i) => {
+                let a = self.expr_num(&i.body).stored_view();
+                let b = self.expr_num(&i.orelse).stored_view();
+                a.join_nullable(b)
+                    .unwrap_or_else(|| a.boxed_view().join(b.boxed_view()))
+            }
             py::Expr::Call(c) => self.call(c),
             py::Expr::Attribute(a) => {
                 if let Some(m) = self.module_member_of(&a.value, a.attr.as_str()) {
@@ -6766,7 +6876,11 @@ impl Typer<'_> {
                 }
             }
             py::Expr::Subscript(s) => {
-                let seq = self.expr(&s.value);
+                // A list or None is read as the list: None raises there.
+                let seq = match self.expr_num(&s.value) {
+                    Ty::MaybeList(e) => Ty::List(e),
+                    t => t.boxed_view(),
+                };
                 if seq == Ty::Unknown {
                     return Ty::Unknown;
                 }
