@@ -50,6 +50,12 @@ pub struct TypedCfgBuilder {
     labels: HashMap<InternedString, HirId>,
     /// `with` scopes discovered during construction, in source order.
     pub with_scopes: Vec<WithScopeInfo>,
+    /// Distinguishes this builder's hidden locals from those of every
+    /// other builder run over the same function.
+    name_scope: String,
+    /// The innermost loop around each block made, as (continue target,
+    /// exit). A block outside every loop has no entry.
+    pub loop_of: HashMap<HirId, (HirId, HirId)>,
 }
 
 /// Control flow graph with TypedAST statements (not yet converted to HIR)
@@ -64,6 +70,8 @@ pub struct TypedControlFlowGraph {
     pub block_map: HashMap<HirId, NodeIndex>,
     /// Map from graph node to HirId
     pub node_map: HashMap<NodeIndex, HirId>,
+    /// The innermost loop around each block, as (continue target, exit).
+    pub loop_of: HashMap<HirId, (HirId, HirId)>,
 }
 
 /// A basic block containing TypedAST statements
@@ -118,6 +126,22 @@ impl TypedCfgBuilder {
             loop_stack: Vec::new(),
             labels: HashMap::new(),
             with_scopes: Vec::new(),
+            name_scope: String::new(),
+            loop_of: HashMap::new(),
+        }
+    }
+
+    /// A builder for statements nested in an expression of a function
+    /// another builder already split. `scope` must differ between the
+    /// builders run over one function, so their hidden locals do not
+    /// share names. `outer` is the loop around the expression, as
+    /// (continue target, exit): a `break` or `continue` among the
+    /// statements that no loop of their own encloses acts on it.
+    pub fn nested(scope: &str, outer: Option<(HirId, HirId)>) -> Self {
+        Self {
+            name_scope: format!("{scope}_"),
+            loop_stack: outer.into_iter().collect(),
+            ..Self::new()
         }
     }
 
@@ -144,8 +168,9 @@ impl TypedCfgBuilder {
         let n = self.next_block_id;
         self.next_block_id += 1;
         InternedString::new_global(&format!(
-            "__{role}_{}_{n}",
-            loop_var.resolve_global().unwrap_or_default()
+            "__{role}_{}_{}{n}",
+            loop_var.resolve_global().unwrap_or_default(),
+            self.name_scope
         ))
     }
 
@@ -205,6 +230,27 @@ impl TypedCfgBuilder {
             .flatten()
             .collect();
 
+        // A `break` or `continue` in a block value leaves from inside the
+        // block that holds the expression. Its edge is made when the
+        // expression is lowered, but phi placement and sealing need it
+        // now.
+        let mut edges_to_add = edges_to_add;
+        for node in graph.node_indices() {
+            let block = &graph[node];
+            let Some(&(continue_target, exit)) = self.loop_of.get(&block.id) else {
+                continue;
+            };
+            let (breaks, continues) = escaping_jumps(block);
+            for (jumps, target) in [(breaks, exit), (continues, continue_target)] {
+                if jumps
+                    && let Some(&target_node) = block_map.get(&target)
+                    && !edges_to_add.contains(&(node, target_node))
+                {
+                    edges_to_add.push((node, target_node));
+                }
+            }
+        }
+
         // Add collected edges
         for (source, target) in edges_to_add {
             graph.add_edge(source, target, ());
@@ -219,6 +265,7 @@ impl TypedCfgBuilder {
             exit: exit_node,
             block_map,
             node_map,
+            loop_of: self.loop_of.clone(),
         })
     }
 
@@ -269,17 +316,43 @@ impl TypedCfgBuilder {
         entry_id: HirId,
         is_function_body: bool,
     ) -> CompilerResult<(Vec<TypedBasicBlock>, HirId, HirId)> {
+        self.split_statements(&block.statements, entry_id, is_function_body)
+    }
+
+    /// [`Self::split_at_control_flow`] over a statement list.
+    pub(crate) fn split_statements(
+        &mut self,
+        statements: &[TypedNode<TypedStatement>],
+        entry_id: HirId,
+        is_function_body: bool,
+    ) -> CompilerResult<(Vec<TypedBasicBlock>, HirId, HirId)> {
+        let split = self.split_statements_in_loop(statements, entry_id, is_function_body)?;
+        // The loop bodies split inside recorded their own blocks first.
+        if let Some(&innermost) = self.loop_stack.last() {
+            for block in &split.0 {
+                self.loop_of.entry(block.id).or_insert(innermost);
+            }
+        }
+        Ok(split)
+    }
+
+    fn split_statements_in_loop(
+        &mut self,
+        statements: &[TypedNode<TypedStatement>],
+        entry_id: HirId,
+        is_function_body: bool,
+    ) -> CompilerResult<(Vec<TypedBasicBlock>, HirId, HirId)> {
         log::debug!(
             "[CFG] split_at_control_flow: entry_id={:?}, statements={}",
             entry_id,
-            block.statements.len()
+            statements.len()
         );
         let mut all_blocks = Vec::new();
         let mut current_statements = Vec::new();
         let mut current_block_id = entry_id;
         let mut exit_id = entry_id;
 
-        for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+        for (stmt_idx, stmt) in statements.iter().enumerate() {
             log::debug!(
                 "[CFG]   stmt[{}]: {:?}, current_block={:?}",
                 stmt_idx,
@@ -1928,6 +2001,252 @@ fn counted_loop_bounds(iter: &TypedNode<TypedExpression>) -> Option<CountedLoop>
         }
         _ => None,
     }
+}
+
+/// What [`visit_nested_statements`] and [`visit_nested_expression`] meet.
+pub(crate) enum Nested<'a> {
+    Expr(&'a TypedNode<TypedExpression>),
+    Stmt(&'a TypedNode<TypedStatement>),
+    /// A loop body begins; what follows up to the matching end is in it.
+    LoopBodyStart,
+    LoopBodyEnd,
+}
+
+/// Visit `stmts` and everything nested in them, statements and
+/// expressions both, in source order. Closure bodies are functions of
+/// their own and are not entered. A loop's condition, iterator and
+/// update are visited outside its body, as they are split.
+pub(crate) fn visit_nested_statements<'a>(
+    stmts: &'a [TypedNode<TypedStatement>],
+    f: &mut dyn FnMut(Nested<'a>),
+) {
+    use zyntax_typed_ast::typed_ast::TypedLoop;
+    let body = |b: &'a TypedBlock, f: &mut dyn FnMut(Nested<'a>)| {
+        f(Nested::LoopBodyStart);
+        visit_nested_statements(&b.statements, f);
+        f(Nested::LoopBodyEnd);
+    };
+    for stmt in stmts {
+        f(Nested::Stmt(stmt));
+        match &stmt.node {
+            TypedStatement::Let(l) => {
+                if let Some(init) = &l.initializer {
+                    visit_nested_expression(init, f);
+                }
+            }
+            TypedStatement::LetPattern(l) => visit_nested_expression(&l.initializer, f),
+            TypedStatement::Expression(e) | TypedStatement::Yield(e) | TypedStatement::Throw(e) => {
+                visit_nested_expression(e, f)
+            }
+            TypedStatement::Return(Some(e)) | TypedStatement::Break(Some(e)) => {
+                visit_nested_expression(e, f)
+            }
+            TypedStatement::If(i) => {
+                visit_nested_expression(&i.condition, f);
+                visit_nested_statements(&i.then_block.statements, f);
+                if let Some(e) = &i.else_block {
+                    visit_nested_statements(&e.statements, f);
+                }
+            }
+            TypedStatement::While(w) => {
+                visit_nested_expression(&w.condition, f);
+                body(&w.body, f);
+            }
+            TypedStatement::For(l) => {
+                visit_nested_expression(&l.iterator, f);
+                body(&l.body, f);
+            }
+            TypedStatement::ForCStyle(l) => {
+                if let Some(init) = &l.init {
+                    visit_nested_statements(std::slice::from_ref(&**init), f);
+                }
+                for e in [&l.condition, &l.update].into_iter().flatten() {
+                    visit_nested_expression(e, f);
+                }
+                body(&l.body, f);
+            }
+            TypedStatement::Loop(l) => match l {
+                TypedLoop::ForEach {
+                    iterator, body: b, ..
+                } => {
+                    visit_nested_expression(iterator, f);
+                    body(b, f);
+                }
+                TypedLoop::ForCStyle {
+                    init,
+                    condition,
+                    update,
+                    body: b,
+                } => {
+                    if let Some(init) = init {
+                        visit_nested_statements(std::slice::from_ref(&**init), f);
+                    }
+                    for e in [condition, update].into_iter().flatten() {
+                        visit_nested_expression(e, f);
+                    }
+                    body(b, f);
+                }
+                TypedLoop::While { condition, body: b }
+                | TypedLoop::DoWhile { body: b, condition } => {
+                    visit_nested_expression(condition, f);
+                    body(b, f);
+                }
+                TypedLoop::Infinite { body: b } => body(b, f),
+            },
+            TypedStatement::Match(m) => {
+                visit_nested_expression(&m.scrutinee, f);
+                for arm in &m.arms {
+                    if let Some(g) = &arm.guard {
+                        visit_nested_expression(g, f);
+                    }
+                    visit_nested_expression(&arm.body, f);
+                }
+            }
+            TypedStatement::Block(b) => visit_nested_statements(&b.statements, f),
+            TypedStatement::With(w) => visit_nested_statements(&w.body.statements, f),
+            TypedStatement::Return(None)
+            | TypedStatement::Break(None)
+            | TypedStatement::Continue
+            | TypedStatement::Label(_)
+            | TypedStatement::Goto(_)
+            | TypedStatement::Try(_)
+            | TypedStatement::Coroutine(_)
+            | TypedStatement::Defer(_)
+            | TypedStatement::Select(_) => {}
+        }
+    }
+}
+
+/// [`visit_nested_statements`] from an expression.
+pub(crate) fn visit_nested_expression<'a>(
+    expr: &'a TypedNode<TypedExpression>,
+    f: &mut dyn FnMut(Nested<'a>),
+) {
+    f(Nested::Expr(expr));
+    let mut each = |e: &'a TypedNode<TypedExpression>| visit_nested_expression(e, f);
+    match &expr.node {
+        TypedExpression::Binary(b) => {
+            each(&b.left);
+            each(&b.right);
+        }
+        TypedExpression::Unary(u) => each(&u.operand),
+        TypedExpression::Call(c) => {
+            each(&c.callee);
+            for a in &c.positional_args {
+                each(a);
+            }
+            for a in &c.named_args {
+                each(&a.value);
+            }
+        }
+        TypedExpression::MethodCall(m) => {
+            each(&m.receiver);
+            for a in &m.positional_args {
+                each(a);
+            }
+            for a in &m.named_args {
+                each(&a.value);
+            }
+        }
+        TypedExpression::Field(field) => each(&field.object),
+        TypedExpression::Index(i) => {
+            each(&i.object);
+            each(&i.index);
+        }
+        TypedExpression::Array(items) | TypedExpression::Tuple(items) => {
+            for e in items {
+                each(e);
+            }
+        }
+        TypedExpression::Struct(s) => {
+            for field in &s.fields {
+                each(&field.value);
+            }
+        }
+        TypedExpression::Match(m) => {
+            each(&m.scrutinee);
+            for arm in &m.arms {
+                if let Some(g) = &arm.guard {
+                    each(g);
+                }
+                each(&arm.body);
+            }
+        }
+        TypedExpression::If(i) => {
+            each(&i.condition);
+            each(&i.then_branch);
+            each(&i.else_branch);
+        }
+        TypedExpression::Cast(c) => each(&c.expr),
+        TypedExpression::Await(e) | TypedExpression::Try(e) | TypedExpression::Dereference(e) => {
+            each(e)
+        }
+        TypedExpression::Reference(r) => each(&r.expr),
+        TypedExpression::Range(r) => {
+            for e in [&r.start, &r.end].into_iter().flatten() {
+                each(e);
+            }
+        }
+        TypedExpression::Slice(s) => {
+            each(&s.object);
+            for e in [&s.start, &s.end, &s.step].into_iter().flatten() {
+                each(e);
+            }
+        }
+        TypedExpression::Block(b) => visit_nested_statements(&b.statements, f),
+        TypedExpression::Compute(c) => {
+            for a in &c.args {
+                each(a);
+            }
+            visit_nested_statements(&c.body.statements, f);
+        }
+        TypedExpression::Lambda(_)
+        | TypedExpression::Literal(_)
+        | TypedExpression::Variable(_)
+        | TypedExpression::ListComprehension(_)
+        | TypedExpression::ImportModifier(_)
+        | TypedExpression::Path(_) => {}
+    }
+}
+
+/// Whether a `break`, and whether a `continue`, nested in the
+/// expressions of `block` acts on the loop around the block: one no
+/// loop inside the expression encloses. A `match` statement's arms are
+/// blocks of their own, so only its scrutinee is looked in.
+pub(crate) fn escaping_jumps(block: &TypedBasicBlock) -> (bool, bool) {
+    let (mut breaks, mut continues, mut depth) = (false, false, 0usize);
+    let mut f = |n: Nested<'_>| match n {
+        Nested::LoopBodyStart => depth += 1,
+        Nested::LoopBodyEnd => depth -= 1,
+        Nested::Stmt(s) if depth == 0 => match s.node {
+            TypedStatement::Break(_) => breaks = true,
+            TypedStatement::Continue => continues = true,
+            _ => {}
+        },
+        _ => {}
+    };
+    // Only what is nested in an expression counts: the block's own
+    // statements hold no loop control, which splitting made jumps.
+    for stmt in &block.statements {
+        match &stmt.node {
+            TypedStatement::Match(m) => visit_nested_expression(&m.scrutinee, &mut f),
+            TypedStatement::Let(l) => {
+                if let Some(init) = &l.initializer {
+                    visit_nested_expression(init, &mut f);
+                }
+            }
+            TypedStatement::Expression(e) | TypedStatement::Yield(e) => {
+                visit_nested_expression(e, &mut f)
+            }
+            _ => {}
+        }
+    }
+    match &block.terminator {
+        TypedTerminator::CondBranch { condition, .. } => visit_nested_expression(condition, &mut f),
+        TypedTerminator::Return(Some(value)) => visit_nested_expression(value, &mut f),
+        _ => {}
+    }
+    (breaks, continues)
 }
 
 impl Default for TypedCfgBuilder {

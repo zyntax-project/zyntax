@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use zyntax_typed_ast::{
     ConstValue, InternedString, Type,
-    typed_ast::{TypedExpression, TypedNode},
+    typed_ast::{TypedExpression, TypedNode, TypedStatement},
 };
 
 /// Kernel types recognised in `compute()` body statements (M2).
@@ -430,6 +430,16 @@ pub struct SsaBuilder {
     /// which hands back an unexpanded pointer to the name instead of
     /// descending a second time.
     converting: std::cell::RefCell<HashSet<InternedString>>,
+    /// Statement lists nested in expressions split so far; names each
+    /// split's hidden locals apart from the others'.
+    nested_splits: u32,
+    /// `with` scopes found in nested statement lists, by the function
+    /// whose blocks they name.
+    nested_with_scopes: Vec<(HirId, crate::typed_cfg::WithScopeInfo)>,
+    /// The innermost loop around the block being lowered, as (continue
+    /// target, exit): what a `break` or `continue` in a nested statement
+    /// list with no loop of its own acts on.
+    enclosing_loop: Option<(HirId, HirId)>,
 }
 
 /// Context for pattern matching
@@ -462,6 +472,9 @@ pub struct SsaForm {
     pub closure_functions: Vec<HirFunction>,
     /// String globals generated during translation
     pub string_globals: Vec<crate::hir::HirGlobal>,
+    /// `with` scopes in statement lists nested in expressions, by the
+    /// function (this one or a closure) whose blocks they name.
+    pub with_scopes: Vec<(HirId, crate::typed_cfg::WithScopeInfo)>,
 }
 
 /// Phi node during construction
@@ -773,6 +786,9 @@ impl SsaBuilder {
             fiber_fn_names: Arc::default(),
             body_fn_names: Arc::default(),
             converting: Default::default(),
+            nested_splits: 0,
+            nested_with_scopes: Vec::new(),
+            enclosing_loop: None,
         }
     }
 
@@ -831,6 +847,9 @@ impl SsaBuilder {
             fiber_fn_names: Arc::default(),
             body_fn_names: Arc::default(),
             converting: Default::default(),
+            nested_splits: 0,
+            nested_with_scopes: Vec::new(),
+            enclosing_loop: None,
             function,
         };
         // Pre-register all existing blocks in the definitions map
@@ -1015,6 +1034,7 @@ impl SsaBuilder {
             use_def_chains,
             closure_functions: self.closure_functions,
             string_globals: self.string_globals,
+            with_scopes: self.nested_with_scopes,
         })
     }
 
@@ -1159,16 +1179,7 @@ impl SsaBuilder {
             let typed_block = &cfg.graph[node_idx];
             if typed_block.id == entry_block {
                 found_entry = true;
-                // Track current block - try expressions may create continuation blocks
-                let mut current_block = entry_block;
-                for stmt in &typed_block.statements {
-                    current_block = self.process_statement(current_block, stmt)?;
-                }
-                self.process_typed_terminator(
-                    current_block,
-                    &typed_block.terminator,
-                    &typed_block.pattern_check,
-                )?;
+                self.lower_typed_block(typed_block, true, &cfg.loop_of)?;
                 break;
             }
         }
@@ -1227,37 +1238,7 @@ impl SsaBuilder {
                     self.seal_block(block_id);
                 }
 
-                // Extract pattern bindings if this is a match arm body.
-                // variant_index is Some for enum patterns, None for struct patterns.
-                if let Some(pattern_info) = &typed_block.pattern_check {
-                    let variant_idx = pattern_info.variant_index.unwrap_or(0);
-                    if let Err(e) =
-                        self.extract_pattern_bindings(block_id, &pattern_info.pattern, variant_idx)
-                    {
-                        *first_error.borrow_mut() = Some(e);
-                        return false;
-                    }
-                }
-
-                // Process each TypedStatement in this block
-                // Track current block - try expressions may create continuation blocks
-                let mut current_block = block_id;
-                for stmt in &typed_block.statements {
-                    match self.process_statement(current_block, stmt) {
-                        Ok(next_block) => current_block = next_block,
-                        Err(e) => {
-                            *first_error.borrow_mut() = Some(e);
-                            return false;
-                        }
-                    }
-                }
-
-                // Process the terminator
-                if let Err(e) = self.process_typed_terminator(
-                    current_block,
-                    &typed_block.terminator,
-                    &typed_block.pattern_check,
-                ) {
+                if let Err(e) = self.lower_typed_block(typed_block, true, &cfg.loop_of) {
                     *first_error.borrow_mut() = Some(e);
                     return false;
                 }
@@ -1290,26 +1271,7 @@ impl SsaBuilder {
                         continue;
                     }
 
-                    // Extract pattern bindings if this is a match arm body
-                    if let Some(pattern_info) = &typed_block.pattern_check {
-                        let variant_idx = pattern_info.variant_index.unwrap_or(0);
-                        self.extract_pattern_bindings(
-                            block_id,
-                            &pattern_info.pattern,
-                            variant_idx,
-                        )?;
-                    }
-
-                    // Track current block - try expressions may create continuation blocks
-                    let mut current_block = block_id;
-                    for stmt in &typed_block.statements {
-                        current_block = self.process_statement(current_block, stmt)?;
-                    }
-                    self.process_typed_terminator(
-                        current_block,
-                        &typed_block.terminator,
-                        &typed_block.pattern_check,
-                    )?;
+                    self.lower_typed_block(typed_block, true, &cfg.loop_of)?;
                     self.filled_blocks.insert(block_id);
                     if !self.sealed_blocks.contains(&block_id) {
                         self.seal_block(block_id);
@@ -1344,7 +1306,257 @@ impl SsaBuilder {
             use_def_chains,
             closure_functions: self.closure_functions,
             string_globals: self.string_globals,
+            with_scopes: self.nested_with_scopes,
         })
+    }
+
+    /// Lower one block of a typed CFG: its match-arm bindings, its
+    /// statements, and, when `terminate`, its terminator. Returns the
+    /// block evaluation ended in, which a control-flow expression among
+    /// the statements may have moved past `tb.id`. `loops` gives the
+    /// loop around each block of the CFG.
+    fn lower_typed_block(
+        &mut self,
+        tb: &crate::typed_cfg::TypedBasicBlock,
+        terminate: bool,
+        loops: &HashMap<HirId, (HirId, HirId)>,
+    ) -> CompilerResult<HirId> {
+        let outer = std::mem::replace(&mut self.enclosing_loop, loops.get(&tb.id).copied());
+        let lowered = self.lower_typed_block_in_loop(tb, terminate);
+        self.enclosing_loop = outer;
+        lowered
+    }
+
+    fn lower_typed_block_in_loop(
+        &mut self,
+        tb: &crate::typed_cfg::TypedBasicBlock,
+        terminate: bool,
+    ) -> CompilerResult<HirId> {
+        // variant_index is Some for enum patterns, None for struct patterns.
+        if let Some(pattern_info) = &tb.pattern_check {
+            let variant_idx = pattern_info.variant_index.unwrap_or(0);
+            self.extract_pattern_bindings(tb.id, &pattern_info.pattern, variant_idx)?;
+        }
+        let mut current = tb.id;
+        for stmt in &tb.statements {
+            current = self.process_statement(current, stmt)?;
+        }
+        if terminate {
+            self.process_typed_terminator(current, &tb.terminator, &tb.pattern_check)?;
+        }
+        Ok(current)
+    }
+
+    /// Whether lowering `stmt` in a nested statement list takes the
+    /// CFG split: it branches, loops, or jumps.
+    fn splits_control_flow(stmt: &TypedNode<TypedStatement>) -> bool {
+        matches!(
+            stmt.node,
+            TypedStatement::If(_)
+                | TypedStatement::While(_)
+                | TypedStatement::For(_)
+                | TypedStatement::ForCStyle(_)
+                | TypedStatement::Loop(_)
+                | TypedStatement::With(_)
+                | TypedStatement::Label(_)
+                | TypedStatement::Goto(_)
+                | TypedStatement::Block(_)
+                | TypedStatement::Match(_)
+                | TypedStatement::Break(_)
+                | TypedStatement::Continue
+        )
+    }
+
+    /// Lower statements nested in an expression (a block used as a
+    /// value, a closure body), starting in `block_id`, and return the
+    /// block control continues in.
+    ///
+    /// Control flow among them is split into blocks by the same
+    /// `TypedCfgBuilder` pass a function body goes through, and each
+    /// block is lowered as a function-level one is. No dominance
+    /// frontier phis were placed for these blocks, so a block is sealed
+    /// only once every predecessor is lowered: until then a read in it
+    /// leaves an incomplete phi, filled from the predecessors' final
+    /// definitions. A `break` or `continue` no loop of the list encloses
+    /// acts on the loop around the block the list is lowered in.
+    ///
+    /// When control cannot fall out of the list, the returned block has
+    /// no predecessors, so what follows is unreachable.
+    fn lower_nested_statements(
+        &mut self,
+        block_id: HirId,
+        stmts: &[TypedNode<TypedStatement>],
+    ) -> CompilerResult<HirId> {
+        use crate::typed_cfg::TypedTerminator;
+
+        if !stmts.iter().any(Self::splits_control_flow) {
+            let mut current = block_id;
+            for stmt in stmts {
+                current = self.process_statement(current, stmt)?;
+            }
+            return Ok(current);
+        }
+
+        self.nested_splits += 1;
+        let outer_loop = self.enclosing_loop;
+        let mut builder = crate::typed_cfg::TypedCfgBuilder::nested(
+            &format!("n{}", self.nested_splits),
+            outer_loop,
+        );
+        let (blocks, _, exit) = builder.split_statements(stmts, block_id, false)?;
+        let fn_id = self.function.id;
+        self.nested_with_scopes
+            .extend(builder.with_scopes.into_iter().map(|scope| (fn_id, scope)));
+        let loops = builder.loop_of;
+        // A jump to the loop around the list leaves it. The block holding
+        // the list counted that edge before lowering it.
+        let leaves = |t: HirId| outer_loop.is_some_and(|(c, x)| t == c || t == x);
+
+        let targets = |tb: &crate::typed_cfg::TypedBasicBlock| -> Vec<HirId> {
+            let mut out = match &tb.terminator {
+                TypedTerminator::Jump(t) => vec![*t],
+                TypedTerminator::CondBranch {
+                    true_target,
+                    false_target,
+                    ..
+                } => vec![*true_target, *false_target],
+                TypedTerminator::Return(_) | TypedTerminator::Unreachable => vec![],
+            };
+            // An enum pattern check branches to the next arm on a miss.
+            if let TypedTerminator::Jump(_) = tb.terminator
+                && let Some(p) = &tb.pattern_check
+                && let (Some(_), Some(false_target)) = (p.variant_index, p.false_target)
+            {
+                out.push(false_target);
+            }
+            out
+        };
+
+        // Only blocks reachable from the entry are lowered: the builder
+        // leaves a block behind for whatever follows a jump.
+        let index: HashMap<HirId, usize> =
+            blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+        if !index.contains_key(&block_id) {
+            return Err(crate::CompilerError::Analysis(
+                "splitting a nested statement list gave no entry block".into(),
+            ));
+        }
+        let mut reachable: HashSet<HirId> = HashSet::new();
+        let mut stack = vec![block_id];
+        let mut preds: HashMap<HirId, Vec<HirId>> = HashMap::new();
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            let Some(&i) = index.get(&id) else {
+                return Err(crate::CompilerError::Lowering(format!(
+                    "a jump in a nested statement list leaves it: a label its `goto` \
+                     names must lie in the same list (at {:?})",
+                    stmts.first().map(|s| s.span)
+                )));
+            };
+            let mut out = targets(&blocks[i]);
+            // A `break` or `continue` in a block value of this block
+            // leaves from inside it; see `escaping_jumps`.
+            if let Some(&(continue_target, loop_exit)) = loops.get(&id) {
+                let (breaks, continues) = crate::typed_cfg::escaping_jumps(&blocks[i]);
+                for (jumps, t) in [(breaks, loop_exit), (continues, continue_target)] {
+                    if jumps && !out.contains(&t) {
+                        out.push(t);
+                    }
+                }
+            }
+            for t in out {
+                if leaves(t) {
+                    continue;
+                }
+                if t == block_id {
+                    return Err(crate::CompilerError::Lowering(
+                        "a nested statement list jumps back to its own first block".into(),
+                    ));
+                }
+                let list = preds.entry(t).or_default();
+                if !list.contains(&id) {
+                    list.push(id);
+                }
+                stack.push(t);
+            }
+        }
+
+        let order: Vec<usize> = (0..blocks.len())
+            .filter(|&i| reachable.contains(&blocks[i].id))
+            .collect();
+        for &i in &order {
+            let id = blocks[i].id;
+            if id == block_id {
+                continue;
+            }
+            let mut hir_block = HirBlock::new(id);
+            hir_block.predecessors = preds.get(&id).cloned().unwrap_or_default();
+            self.function.blocks.insert(id, hir_block);
+            self.definitions.insert(id, IndexMap::new());
+        }
+
+        let entry = &blocks[index[&block_id]];
+        let mut end = self.lower_typed_block(entry, entry.id != exit, &loops)?;
+        let mut done: HashSet<HirId> = HashSet::from([block_id]);
+        let mut pending: Vec<usize> = order
+            .into_iter()
+            .filter(|&i| blocks[i].id != block_id)
+            .collect();
+        let all_done = |done: &HashSet<HirId>, id: HirId| {
+            preds
+                .get(&id)
+                .is_none_or(|ps| ps.iter().all(|p| done.contains(p)))
+        };
+        while !pending.is_empty() {
+            let Some(pos) = pending.iter().position(|&i| {
+                preds
+                    .get(&blocks[i].id)
+                    .is_some_and(|ps| ps.iter().any(|p| done.contains(p)))
+            }) else {
+                return Err(crate::CompilerError::Analysis(
+                    "a nested statement list has a block no lowered block reaches".into(),
+                ));
+            };
+            let tb = &blocks[pending.remove(pos)];
+            if all_done(&done, tb.id) {
+                self.seal_block(tb.id);
+            }
+            let current = self.lower_typed_block(tb, tb.id != exit, &loops)?;
+            if tb.id == exit {
+                end = current;
+            }
+            done.insert(tb.id);
+            // A block lowered before its last predecessor (a loop header,
+            // a join reached first from one side) is sealed now.
+            let successors: Vec<HirId> = preds
+                .iter()
+                .filter(|(_, ps)| ps.contains(&tb.id))
+                .map(|(t, _)| *t)
+                .collect();
+            for t in successors {
+                if t != block_id
+                    && done.contains(&t)
+                    && !self.sealed_blocks.contains(&t)
+                    && all_done(&done, t)
+                {
+                    self.seal_block(t);
+                }
+            }
+        }
+
+        let falls_through = reachable.contains(&exit)
+            && matches!(
+                blocks[index[&exit]].terminator,
+                TypedTerminator::Unreachable
+            );
+        if falls_through {
+            return Ok(end);
+        }
+        let dead = self.new_block();
+        self.sealed_blocks.insert(dead);
+        Ok(dead)
     }
 
     /// Process a typed terminator
@@ -2497,19 +2709,7 @@ impl SsaBuilder {
                 return self.emit_return(block_id, expr.as_deref());
             }
             TypedStatement::Block(block) => {
-                // Recurse into the inner statements. Closure / lambda
-                // bodies don't go through `TypedCfgBuilder`, so the
-                // statement-form control flow split (multi-block CFG)
-                // never runs for them. Any nested `TypedStatement::Block`
-                // — emitted by frontend grammars that group statements,
-                // e.g. a frontend's `match`-arm lowering — must still execute
-                // its children. Without this arm the block falls into
-                // the `_ =>` no-op below and its contents silently drop.
-                let mut current = block_id;
-                for inner in &block.statements {
-                    current = self.process_statement(current, inner)?;
-                }
-                return Ok(current);
+                return self.lower_nested_statements(block_id, &block.statements);
             }
             TypedStatement::Yield(expr) => {
                 let yielded = self.translate_expression(block_id, expr)?;
@@ -2623,211 +2823,24 @@ impl SsaBuilder {
                 // The CFG creates separate blocks for each pattern check and arm body
             }
 
-            // Statement-form `if` inside a closure / lambda body — these
-            // bodies bypass `TypedCfgBuilder`, so the CFG-driven If
-            // handler in `process_terminator` (which reads pre-built
-            // `block.successors`) never fires for them. Create the
-            // then/else/continuation blocks on demand here, mirroring the
-            // expression-form `TypedExpression::If` translator. The
-            // current block ends with a CondBranch into the new blocks;
-            // the returned HirId is the continuation so subsequent
-            // statements in the surrounding body land there.
-            TypedStatement::If(if_stmt) => {
-                let cond_val = self.translate_expression(block_id, &if_stmt.condition)?;
-
-                let then_id = HirId::new();
-                let else_id = HirId::new();
-                let cont_id = HirId::new();
-                self.function
-                    .blocks
-                    .insert(then_id, crate::hir::HirBlock::new(then_id));
-                self.function
-                    .blocks
-                    .insert(else_id, crate::hir::HirBlock::new(else_id));
-                self.function
-                    .blocks
-                    .insert(cont_id, crate::hir::HirBlock::new(cont_id));
-                self.definitions.insert(then_id, IndexMap::new());
-                self.definitions.insert(else_id, IndexMap::new());
-                self.definitions.insert(cont_id, IndexMap::new());
-                self.sealed_blocks.insert(then_id);
-                self.sealed_blocks.insert(else_id);
-                self.sealed_blocks.insert(cont_id);
-
-                // Inherit the current block's variable definitions so the
-                // branch bodies can read locals defined above the `if`.
-                let inherited = self.definitions.get(&block_id).cloned().unwrap_or_default();
-                self.definitions.insert(then_id, inherited.clone());
-                self.definitions.insert(else_id, inherited.clone());
-                self.definitions.insert(cont_id, inherited);
-
-                {
-                    let blk = self.function.blocks.get_mut(&block_id).unwrap();
-                    blk.terminator = HirTerminator::CondBranch {
-                        condition: cond_val,
-                        true_target: then_id,
-                        false_target: else_id,
-                    };
-                    blk.successors = vec![then_id, else_id];
-                }
-                self.function
-                    .blocks
-                    .get_mut(&then_id)
-                    .unwrap()
-                    .predecessors
-                    .push(block_id);
-                self.function
-                    .blocks
-                    .get_mut(&else_id)
-                    .unwrap()
-                    .predecessors
-                    .push(block_id);
-
-                // Translate the then-branch's statements into then_id.
-                let mut then_tail = then_id;
-                for inner in &if_stmt.then_block.statements {
-                    then_tail = self.process_statement(then_tail, inner)?;
-                }
-                // A branch that already ended (a `return`) does not reach
-                // the continuation.
-                {
-                    let blk = self.function.blocks.get_mut(&then_tail).unwrap();
-                    if matches!(blk.terminator, HirTerminator::Unreachable) {
-                        blk.terminator = HirTerminator::Branch { target: cont_id };
-                        blk.successors = vec![cont_id];
-                        self.function
-                            .blocks
-                            .get_mut(&cont_id)
-                            .unwrap()
-                            .predecessors
-                            .push(then_tail);
-                    }
-                }
-
-                // Translate the else-branch (or fall straight to cont
-                // when there's no else).
-                let mut else_tail = else_id;
-                if let Some(else_block) = &if_stmt.else_block {
-                    for inner in &else_block.statements {
-                        else_tail = self.process_statement(else_tail, inner)?;
-                    }
-                }
-                {
-                    let blk = self.function.blocks.get_mut(&else_tail).unwrap();
-                    if matches!(blk.terminator, HirTerminator::Unreachable) {
-                        blk.terminator = HirTerminator::Branch { target: cont_id };
-                        blk.successors = vec![cont_id];
-                        self.function
-                            .blocks
-                            .get_mut(&cont_id)
-                            .unwrap()
-                            .predecessors
-                            .push(else_tail);
-                    }
-                }
-
-                return Ok(cont_id);
+            // Control flow the CFG builder never saw: statements nested
+            // in an expression (a block used as a value, a closure body).
+            // At function level these were split into blocks already.
+            TypedStatement::If(_)
+            | TypedStatement::While(_)
+            | TypedStatement::For(_)
+            | TypedStatement::ForCStyle(_)
+            | TypedStatement::Loop(_)
+            | TypedStatement::With(_)
+            | TypedStatement::Label(_)
+            | TypedStatement::Goto(_) => {
+                return self.lower_nested_statements(block_id, std::slice::from_ref(stmt));
             }
 
-            // `while` in expression position, built on demand.
-            //
-            // `TypedCfgBuilder::split_at_control_flow` performs the
-            // multi-block split for statements it walks, but it only walks
-            // function bodies — statements nested inside a value-position
-            // `TypedExpression::Block` (closure bodies, block expressions)
-            // never reach it. This arm builds the same three-block shape
-            // directly, mirroring the `If` arm above:
-            //
-            //     block_id ──► header ──cond──► body ──┐
-            //                    │  ▲                  │
-            //                    │  └──── back-edge ───┘
-            //                    └──!cond──► exit  (returned as the new current)
-            //
-            // The condition is translated into `header`, not `block_id`, so
-            // it is re-evaluated on every iteration.
-            //
-            // Loop-carried state must live behind memory the body reaches by
-            // call (signals, cells). Block-local SSA variables mutated across
-            // iterations would need phi nodes at the header, which this path
-            // does not insert — it seals all three blocks up front.
-            TypedStatement::While(while_stmt) => {
-                let header_id = HirId::new();
-                let body_id = HirId::new();
-                let exit_id = HirId::new();
-                for id in [header_id, body_id, exit_id] {
-                    self.function
-                        .blocks
-                        .insert(id, crate::hir::HirBlock::new(id));
-                    self.sealed_blocks.insert(id);
-                }
-                let inherited = self.definitions.get(&block_id).cloned().unwrap_or_default();
-                self.definitions.insert(header_id, inherited.clone());
-                self.definitions.insert(body_id, inherited.clone());
-                self.definitions.insert(exit_id, inherited);
-
-                // Fall through from the current block into the header.
-                {
-                    let blk = self.function.blocks.get_mut(&block_id).unwrap();
-                    blk.terminator = HirTerminator::Branch { target: header_id };
-                    blk.successors = vec![header_id];
-                }
-                self.function
-                    .blocks
-                    .get_mut(&header_id)
-                    .unwrap()
-                    .predecessors
-                    .push(block_id);
-
-                // Condition lives in the header so it re-runs per iteration.
-                let cond_val = self.translate_expression(header_id, &while_stmt.condition)?;
-                {
-                    let blk = self.function.blocks.get_mut(&header_id).unwrap();
-                    blk.terminator = HirTerminator::CondBranch {
-                        condition: cond_val,
-                        true_target: body_id,
-                        false_target: exit_id,
-                    };
-                    blk.successors = vec![body_id, exit_id];
-                }
-                self.function
-                    .blocks
-                    .get_mut(&body_id)
-                    .unwrap()
-                    .predecessors
-                    .push(header_id);
-                self.function
-                    .blocks
-                    .get_mut(&exit_id)
-                    .unwrap()
-                    .predecessors
-                    .push(header_id);
-
-                // Body statements, then the back-edge (unless the body
-                // already terminated, e.g. via `return`).
-                let mut body_tail = body_id;
-                for inner in &while_stmt.body.statements {
-                    body_tail = self.process_statement(body_tail, inner)?;
-                }
-                {
-                    let blk = self.function.blocks.get_mut(&body_tail).unwrap();
-                    if matches!(blk.terminator, HirTerminator::Unreachable) {
-                        blk.terminator = HirTerminator::Branch { target: header_id };
-                        blk.successors = vec![header_id];
-                    }
-                }
-                self.function
-                    .blocks
-                    .get_mut(&header_id)
-                    .unwrap()
-                    .predecessors
-                    .push(body_tail);
-
-                return Ok(exit_id);
-            }
-
-            // Note: Control flow statements (While, etc.) are now handled at the
-            // TypedCFG level by TypedCfgBuilder.split_at_control_flow()
-            // This is the solution to Gap 2 - multi-block CFG construction
+            // Splitting turns these into jumps to the loop around them.
+            // One that reaches here lies in no loop and does nothing, as
+            // a statement of no effect.
+            TypedStatement::Break(_) | TypedStatement::Continue => {}
 
             // Note: TypedStatement doesn't have Assign variant - assignments are expressions
             _ => {
@@ -5471,7 +5484,8 @@ impl SsaBuilder {
                     if Self::is_kernel_directive_stmt(stmt) {
                         continue;
                     }
-                    current_block = self.process_statement(current_block, stmt)?;
+                    current_block =
+                        self.lower_nested_statements(current_block, std::slice::from_ref(stmt))?;
                 }
 
                 let yields = self.compute_yield_stack.pop().unwrap_or_default();
@@ -7429,11 +7443,11 @@ impl SsaBuilder {
                             }
                         }
                         _ => {
-                            // Route through process_statement so If / nested Block /
-                            // While / etc. get their on-demand block-creation
-                            // handlers. The returned HirId is the new "current" block
-                            // — subsequent statements in this body land there.
-                            current = self.process_statement(current, stmt)?;
+                            // Control flow is split into blocks here; the
+                            // returned block is where the next statement
+                            // lands.
+                            current =
+                                self.lower_nested_statements(current, std::slice::from_ref(stmt))?;
                             last_val = self.create_undef(HirType::Void);
                         }
                     }
@@ -7969,8 +7983,9 @@ impl SsaBuilder {
     fn fill_incomplete_phi(&mut self, block: HirId, var: InternedString) {
         let phi_key = (block, var);
         if let Some(phi_val) = self.incomplete_phis.remove(&phi_key) {
-            // Get predecessors
-            let preds = self.function.blocks[&block].predecessors.clone();
+            // What the terminators say too: a block a nested statement
+            // list wires is not in every stored list.
+            let preds = self.current_preds_of(block);
             let mut incoming = Vec::new();
 
             log::debug!(
@@ -8632,6 +8647,7 @@ impl SsaBuilder {
         use zyntax_typed_ast::typed_ast::{BinaryOp, TypedExpression, TypedStatement};
 
         let mut writes: IndexMap<HirId, indexmap::IndexSet<InternedString>> = IndexMap::new();
+        let mut nested: Vec<(HirId, &TypedNode<TypedExpression>)> = Vec::new();
 
         for node_idx in cfg.graph.node_indices() {
             let typed_block = &cfg.graph[node_idx];
@@ -8649,13 +8665,28 @@ impl SsaBuilder {
                         if let_stmt.initializer.is_some() {
                             block_writes.insert(let_stmt.name);
                         }
+                        if let Some(init) = &let_stmt.initializer {
+                            nested.push((block_id, init));
+                        }
                     }
                     // Expression statements might contain assignments
                     TypedStatement::Expression(expr) => {
                         self.collect_assigned_vars(expr, &mut block_writes);
+                        nested.push((block_id, expr));
                     }
+                    TypedStatement::Match(m) => nested.push((block_id, &m.scrutinee)),
+                    TypedStatement::Yield(expr) => nested.push((block_id, expr)),
                     _ => {}
                 }
+            }
+            match &typed_block.terminator {
+                crate::typed_cfg::TypedTerminator::CondBranch { condition, .. } => {
+                    nested.push((block_id, condition));
+                }
+                crate::typed_cfg::TypedTerminator::Return(Some(value)) => {
+                    nested.push((block_id, value));
+                }
+                _ => {}
             }
 
             if !block_writes.is_empty() {
@@ -8663,7 +8694,69 @@ impl SsaBuilder {
             }
         }
 
+        // Statements nested in expressions are lowered into blocks of
+        // their own, and whatever they write is written, as far as the
+        // blocks of this CFG can tell, by the block holding the
+        // expression. A name a nested list binds and nothing outside
+        // one does is local to that list and needs no phi out here,
+        // whether or not the list also assigns it.
+        let outer: HashSet<InternedString> = writes
+            .values()
+            .flatten()
+            .copied()
+            .chain(self.function.signature.params.iter().map(|p| p.name))
+            .collect();
+        for (block_id, expr) in nested {
+            let mut assigned = indexmap::IndexSet::new();
+            let mut bound = indexmap::IndexSet::new();
+            Self::collect_nested_writes(expr, &mut assigned, &mut bound);
+            let local = |name: &InternedString| bound.contains(name) && !outer.contains(name);
+            let found: Vec<InternedString> = assigned
+                .iter()
+                .chain(bound.iter())
+                .filter(|name| !local(name))
+                .copied()
+                .collect();
+            if !found.is_empty() {
+                writes.entry(block_id).or_default().extend(found);
+            }
+        }
+
         writes
+    }
+
+    /// The variables written inside `expr`: `assigned` gets the root of
+    /// every assignment target, `bound` every name a nested statement
+    /// list binds. Closure bodies are functions of their own and are
+    /// not entered.
+    fn collect_nested_writes(
+        expr: &TypedNode<TypedExpression>,
+        assigned: &mut indexmap::IndexSet<InternedString>,
+        bound: &mut indexmap::IndexSet<InternedString>,
+    ) {
+        use crate::typed_cfg::Nested;
+        use zyntax_typed_ast::typed_ast::{BinaryOp, TypedPattern};
+        crate::typed_cfg::visit_nested_expression(expr, &mut |n| match n {
+            Nested::Expr(e) => {
+                if let TypedExpression::Binary(b) = &e.node
+                    && matches!(b.op, BinaryOp::Assign)
+                {
+                    Self::collect_lvalue_root(&b.left, assigned);
+                }
+            }
+            Nested::Stmt(st) => match &st.node {
+                TypedStatement::Let(l) if l.initializer.is_some() => {
+                    bound.insert(l.name);
+                }
+                TypedStatement::For(f) => {
+                    if let TypedPattern::Identifier { name, .. } = &f.pattern.node {
+                        bound.insert(*name);
+                    }
+                }
+                _ => {}
+            },
+            Nested::LoopBodyStart | Nested::LoopBodyEnd => {}
+        });
     }
 
     /// Scan CFG to find which variables have their address taken
@@ -16032,6 +16125,8 @@ impl SsaBuilder {
             let saved_idf_placement_done = std::mem::replace(&mut self.idf_placement_done, false);
             let saved_match_context = std::mem::take(&mut self.match_context);
             let saved_continuation_block = std::mem::take(&mut self.continuation_block);
+            // A loop around the closure is not one its body can leave.
+            let saved_enclosing_loop = self.enclosing_loop.take();
             let saved_original_return_type =
                 std::mem::replace(&mut self.original_return_type, Some(typed_ast_return_type));
             let saved_address_taken_vars = std::mem::take(&mut self.address_taken_vars);
@@ -16109,49 +16204,29 @@ impl SsaBuilder {
                     self.translate_expression(entry_block_id, expr)
                 }
                 TypedLambdaBody::Block(block) => {
-                    use zyntax_typed_ast::typed_ast::TypedStatement;
-                    let mut current_block = entry_block_id;
+                    // A trailing expression statement is the lambda's
+                    // value. An error is held, not returned, so the
+                    // context restoration below runs before it
+                    // propagates.
+                    let (body, tail) = match block.statements.split_last() {
+                        Some((last, rest)) => match &last.node {
+                            TypedStatement::Expression(expr) => (rest, Some(expr)),
+                            _ => (&block.statements[..], None),
+                        },
+                        None => (&block.statements[..], None),
+                    };
                     let mut last_expr_val: Option<HirId> = None;
                     let mut errored: Option<crate::CompilerError> = None;
-                    let n = block.statements.len();
-                    for (i, stmt) in block.statements.iter().enumerate() {
-                        // If the last statement is an Expression, hold
-                        // it so we can use its value as the return.
-                        if i + 1 == n {
-                            if let TypedStatement::Expression(expr) = &stmt.node {
+                    match self.lower_nested_statements(entry_block_id, body) {
+                        Ok(current_block) => {
+                            if let Some(expr) = tail {
                                 match self.translate_expression(current_block, expr) {
-                                    Ok(v) => {
-                                        last_expr_val = Some(v);
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        // Capture the error and break — the
-                                        // context-restoration tail must run
-                                        // before we can propagate. Direct
-                                        // `return Err(e)` would skip the
-                                        // restoration and leave the outer
-                                        // function's state corrupted with
-                                        // the lambda's swapped-in fields.
-                                        // The previous `let _ = e; break`
-                                        // silently swallowed the error,
-                                        // letting an undefined-callee
-                                        // Lowering error vanish and the
-                                        // lambda compile to an empty body
-                                        // returning zero (a caller
-                                        // `Indirect(Undef)` SIGSEGV).
-                                        errored = Some(e);
-                                        break;
-                                    }
+                                    Ok(v) => last_expr_val = Some(v),
+                                    Err(e) => errored = Some(e),
                                 }
                             }
                         }
-                        match self.process_statement(current_block, stmt) {
-                            Ok(next) => current_block = next,
-                            Err(e) => {
-                                errored = Some(e);
-                                break;
-                            }
-                        }
+                        Err(e) => errored = Some(e),
                     }
                     if let Some(e) = errored {
                         Err(e)
@@ -16195,6 +16270,7 @@ impl SsaBuilder {
             self.idf_placement_done = saved_idf_placement_done;
             self.match_context = saved_match_context;
             self.continuation_block = saved_continuation_block;
+            self.enclosing_loop = saved_enclosing_loop;
             self.original_return_type = saved_original_return_type;
             self.address_taken_vars = saved_address_taken_vars;
             self.stack_slots = saved_stack_slots;

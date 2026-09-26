@@ -840,15 +840,15 @@ impl<'a> FunctionEmitter<'a> {
         // another phi's result in the SAME block, we'd need parallel-
         // copy resolution (with temporaries) to avoid stomping on the
         // value before reading it. Bail rather than emit incorrect
-        // code — production HIR from `SsaBuilder` doesn't produce
-        // these shapes for the loops we care about; if it ever does,
-        // a follow-up can implement the parallel-copy split.
+        // code; a follow-up can implement the parallel-copy split. A
+        // phi that passes its own value along a back edge copies it
+        // onto itself, which no order of the copies disturbs.
         for block in self.func.blocks.values() {
             let phi_results: std::collections::HashSet<HirId> =
                 block.phis.iter().map(|p| p.result).collect();
             for phi in &block.phis {
                 for (val, _pred) in &phi.incoming {
-                    if phi_results.contains(val) {
+                    if *val != phi.result && phi_results.contains(val) {
                         return Err(WasmEmitError::Unsupported(format!(
                             "phi cycle in block {:?}: phi result {:?} \
                              references another phi in the same block",
@@ -2182,6 +2182,29 @@ fn case_constant_to_i64(c: &HirConstant) -> Result<i64> {
 
 fn emit_binary_op(out: &mut Vec<WasmInst<'static>>, op: BinaryOp, ty: &HirType) -> Result<()> {
     let is_float = matches!(ty, HirType::F32 | HirType::F64);
+    let unsigned = matches!(ty, HirType::U8 | HirType::U16 | HirType::U32 | HirType::U64);
+    // Integer comparisons on the i64 funnel give an i32 bool, extended
+    // back to the funnel as the float ones below are.
+    let int_compare = match (op, unsigned) {
+        (BinaryOp::Eq, _) => Some(WasmInst::I64Eq),
+        (BinaryOp::Ne, _) => Some(WasmInst::I64Ne),
+        (BinaryOp::Lt, false) => Some(WasmInst::I64LtS),
+        (BinaryOp::Lt, true) => Some(WasmInst::I64LtU),
+        (BinaryOp::Le, false) => Some(WasmInst::I64LeS),
+        (BinaryOp::Le, true) => Some(WasmInst::I64LeU),
+        (BinaryOp::Gt, false) => Some(WasmInst::I64GtS),
+        (BinaryOp::Gt, true) => Some(WasmInst::I64GtU),
+        (BinaryOp::Ge, false) => Some(WasmInst::I64GeS),
+        (BinaryOp::Ge, true) => Some(WasmInst::I64GeU),
+        _ => None,
+    };
+    if let Some(compare) = int_compare
+        && !is_float
+    {
+        out.push(compare);
+        out.push(WasmInst::I64ExtendI32U);
+        return Ok(());
+    }
     let inst = match (op, is_float) {
         (BinaryOp::Add, false) => WasmInst::I64Add,
         (BinaryOp::Sub, false) => WasmInst::I64Sub,
@@ -2194,6 +2217,12 @@ fn emit_binary_op(out: &mut Vec<WasmInst<'static>>, op: BinaryOp, ty: &HirType) 
             WasmInst::I64DivS
         }
         (BinaryOp::Rem, false) => WasmInst::I64RemS,
+        (BinaryOp::And, false) => WasmInst::I64And,
+        (BinaryOp::Or, false) => WasmInst::I64Or,
+        (BinaryOp::Xor, false) => WasmInst::I64Xor,
+        (BinaryOp::Shl, false) => WasmInst::I64Shl,
+        (BinaryOp::Shr, false) if unsigned => WasmInst::I64ShrU,
+        (BinaryOp::Shr, false) => WasmInst::I64ShrS,
         (BinaryOp::Add, true) => WasmInst::F64Add,
         (BinaryOp::Sub, true) => WasmInst::F64Sub,
         (BinaryOp::Mul, true) => WasmInst::F64Mul,

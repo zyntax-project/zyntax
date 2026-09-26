@@ -3405,6 +3405,7 @@ impl LoweringContext {
             total_phis_after
         );
 
+        let nested_with_scopes = std::mem::take(&mut ssa.with_scopes);
         hir_func = ssa.function;
 
         // Fiber drop-site insertion: free fibers created (and not
@@ -3421,6 +3422,14 @@ impl LoweringContext {
             self.pending_with_scopes
                 .push((hir_func.id, typed_cfg_builder.with_scopes.clone()));
         }
+        let mut nested_by_fn: indexmap::IndexMap<
+            crate::hir::HirId,
+            Vec<crate::typed_cfg::WithScopeInfo>,
+        > = indexmap::IndexMap::new();
+        for (fn_id, scope) in nested_with_scopes {
+            nested_by_fn.entry(fn_id).or_default().push(scope);
+        }
+        self.pending_with_scopes.extend(nested_by_fn);
 
         // Add string globals generated during SSA construction
         for global in ssa.string_globals {
