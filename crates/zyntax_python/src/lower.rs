@@ -813,6 +813,33 @@ fn free_generator(r#gen: Node, span: Span) -> Stmt {
 }
 
 /// `zb_release_caught(caught)`: the exception's instance and box freed.
+/// Whether the library function `name` calls back into the program: a
+/// function value it is handed, or an ordering hook of the elements it
+/// sorts. What the program raises there is pending when it returns.
+fn calls_back(name: &str) -> bool {
+    if matches!(
+        name,
+        "zb_list_map1"
+            | "zb_list_map2"
+            | "zb_list_filter"
+            | "zb_list_reduce"
+            | "zb_list_reduce_first"
+    ) || name.starts_with("zb_list_sort_by_")
+    {
+        return true;
+    }
+    name.strip_prefix("zb_list_sort_")
+        .is_some_and(|suffix| !matches!(suffix, "i64" | "f64" | "str") && !is_array_storage(suffix))
+}
+
+/// Whether `suffix` names an array storage kind, whose elements are numbers.
+fn is_array_storage(suffix: &str) -> bool {
+    zyntax_builtins::Kind::ALL.iter().any(|k| {
+        k.suffix() == suffix
+            && !matches!(k, zyntax_builtins::Kind::Ptr | zyntax_builtins::Kind::Any)
+    })
+}
+
 fn release_caught(caught: InternedString, span: Span) -> Stmt {
     TypedNode::new(
         TypedStatement::Expression(Box::new(call(
@@ -3587,6 +3614,33 @@ impl<'m> Lowerer<'m> {
     }
 
     /// A block expression: statements, then the value.
+    /// [`Self::block_value`], unless a statement calls back into the
+    /// program: then the statements are hoisted and checked before the
+    /// value is used, so nothing after the call runs with an exception
+    /// pending.
+    fn value_after_calls(
+        &mut self,
+        statements: Vec<Stmt>,
+        value: Node,
+        ty: Ty,
+        span: Span,
+    ) -> Node {
+        let reenters = statements.iter().any(|s| match &s.node {
+            TypedStatement::Expression(e) => match &e.node {
+                TypedExpression::Call(c) => self.is_fallible_callee(&c.callee),
+                _ => false,
+            },
+            _ => false,
+        });
+        if !reenters {
+            return Self::block_value(statements, value, ty, span);
+        }
+        self.hoisted.extend(statements);
+        let check = self.pending_check(span);
+        self.hoisted.push(check);
+        value
+    }
+
     pub(crate) fn block_value(statements: Vec<Stmt>, value: Node, ty: Ty, span: Span) -> Node {
         let mut statements = statements;
         statements.push(TypedNode::new(
@@ -6554,7 +6608,7 @@ impl<'m> Lowerer<'m> {
                 );
                 self.sort_in_place(held.node.clone(), e, key, reverse, &mut statements, span)?;
                 return Ok(Some(Val {
-                    node: Self::block_value(statements, held.node, Ty::List(e), span),
+                    node: self.value_after_calls(statements, held.node, Ty::List(e), span),
                     ty: Ty::List(e),
                 }));
             }
@@ -6686,6 +6740,9 @@ impl<'m> Lowerer<'m> {
     /// counterparts do; reading a tuple back and ordering tuples can.
     fn is_fallible_name(&self, name: &str) -> bool {
         if self.module.fallible.contains(name) {
+            return true;
+        }
+        if calls_back(name) {
             return true;
         }
         if let Some(rest) = name.strip_prefix("zb_tuple_") {
@@ -9603,7 +9660,7 @@ impl<'m> Lowerer<'m> {
                 self.sort_in_place(held.node, e, key, reverse, &mut statements, span)?;
                 let none = node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span);
                 return Ok(Val {
-                    node: Self::block_value(statements, none, Ty::None, span),
+                    node: self.value_after_calls(statements, none, Ty::None, span),
                     ty: Ty::None,
                 });
             }
@@ -10219,7 +10276,7 @@ impl<'m> Lowerer<'m> {
                         (held.node, Ty::List(e))
                     };
                     return Ok(Val {
-                        node: Self::block_value(statements, value, result_ty, span),
+                        node: self.value_after_calls(statements, value, result_ty, span),
                         ty: result_ty,
                     });
                 }
