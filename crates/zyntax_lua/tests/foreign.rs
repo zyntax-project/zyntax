@@ -22,6 +22,8 @@ enum Obj {
     Method(String),
     /// A buffer of bytes, which the program reads in place.
     Blob(Vec<u8>),
+    /// Two values given at once.
+    Pair(f64, f64),
 }
 
 struct State {
@@ -73,6 +75,7 @@ fn text(any: Any) -> String {
         Value::Float(f) => format!("{f:?}"),
         Value::Str(s) => s.to_string(),
         Value::Foreign(w) => Stand.text(w),
+        Value::Tuple(items) => format!("<{} values>", items.len()),
         Value::Other(tag) => format!("<tag {tag:#x}>"),
     }
 }
@@ -84,6 +87,7 @@ fn type_of(obj: &Obj) -> &'static str {
         Obj::Point { .. } => "Point",
         Obj::Method(_) => "method",
         Obj::Blob(_) => "blob",
+        Obj::Pair(..) => "pair",
     }
 }
 
@@ -95,6 +99,7 @@ impl Foreign for Stand {
             (Obj::Shapes, "Point") => Ok(make(Obj::Function("Point"))),
             (Obj::Shapes, "same") => Ok(make(Obj::Function("same"))),
             (Obj::Shapes, "blob") => Ok(make(Obj::Function("blob"))),
+            (Obj::Shapes, "pair") => Ok(make(Obj::Function("pair"))),
             (Obj::Shapes, "version") => Ok(foreign::int(3)),
             (Obj::Log, "record") => Ok(make(Obj::Function("record"))),
             (Obj::Point { x, .. }, "x") => Ok(foreign::float(x)),
@@ -133,6 +138,7 @@ impl Foreign for Stand {
             Obj::Function("blob") => Ok(make(Obj::Blob(
                 [1i32.to_le_bytes(), 1.5f32.to_le_bytes()].concat(),
             ))),
+            Obj::Function("pair") => Ok(make(Obj::Pair(1.0, 2.0))),
             Obj::Function("same") => match unsafe { foreign::read(args[0]) } {
                 Value::Foreign(w) => Ok(again(w)),
                 _ => Err(ForeignError::new("TypeError", "same() takes a point")),
@@ -218,6 +224,17 @@ impl Foreign for Stand {
             _ => None,
         }
     }
+
+    fn values(&self, word: usize) -> Option<usize> {
+        matches!(object(word), Obj::Pair(..)).then_some(2)
+    }
+
+    fn value(&self, word: usize, index: usize) -> Any {
+        match object(word) {
+            Obj::Pair(a, b) => foreign::float(if index == 0 { a } else { b }),
+            _ => foreign::none(),
+        }
+    }
 }
 
 const PROGRAM: &str = r#"
@@ -245,6 +262,8 @@ log.record(string.unpack("<i4f", b))
 log.record(string.sub(b, 1, 4) == string.pack("<i4", 1))
 log.record(pcall(string.len, shapes))
 log.record(string.len("abc"), ("xyz"):byte(2))
+log.record(shapes.pair())
+log.record((shapes.pair()))
 "#;
 
 #[test]
@@ -254,6 +273,7 @@ fn a_program_uses_the_embedders_objects() {
         foreign::FOREIGN_TAG,
         "the library and the embedding agree on the tag"
     );
+    assert_eq!(zyntax_builtins::TUPLE_TAG as u32, foreign::TUPLE_TAG);
     assert!(foreign::install(Box::new(Stand)));
     let program = zyntax_lua::parse_program(PROGRAM, "foreign.lua").expect("parses");
     let mut rt = TieredRuntime::new(TieredConfig::default()).expect("runtime");
@@ -295,6 +315,9 @@ fn a_program_uses_the_embedders_objects() {
         records[13]
     );
     assert_eq!(records[14], "3\t121");
+    // Several values given at once are that many results, and one where
+    // a single value is kept.
+    assert_eq!(records[15..17], ["1.0\t2.0", "1.0"]);
     assert!(
         s.held.iter().all(|&n| n >= 0),
         "an object was released more often than boxed: {:?}",

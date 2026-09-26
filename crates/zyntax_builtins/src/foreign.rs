@@ -21,12 +21,15 @@ pub fn is_foreign(x: Expr) -> Expr {
 
 pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let anys = list_of(list_type, any());
+    let items = local("items", anys.clone());
+    let n = local("n", i64());
+    let i = local("i", i64());
     let x = local("x", any());
     let a = local("a", any());
     let b = local("b", any());
     let v = local("v", any());
     let name = local("name", string());
-    let args = borrowed("args", anys);
+    let args = borrowed("args", anys.clone());
     let r = local("r", any());
     let kind = local("kind", string());
     // The error the embedder reported, raised as the library's own.
@@ -100,6 +103,20 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             string(),
             Some("$Foreign$type"),
         ),
+        // How many values `x` is when it is several given at once, -1
+        // when it is not; then value `i` of them.
+        extern_fn(
+            "zb_foreign_values_len",
+            &[("x", any())],
+            i64(),
+            Some("$Foreign$values_len"),
+        ),
+        extern_fn(
+            "zb_foreign_value",
+            &[("x", any()), ("i", i64())],
+            any(),
+            Some("$Foreign$value"),
+        ),
         // The length of the bytes `x` is a buffer of, -1 when none.
         extern_fn(
             "zb_foreign_bytes_len",
@@ -159,6 +176,33 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 ret_void(),
             ],
         ),
+        // What the embedder gave: several values given at once as the
+        // program's tuple of them, anything else as it is.
+        define(
+            "zb_foreign_values",
+            &[&x],
+            any(),
+            vec![
+                when(not(is_foreign(x.e())), vec![ret(x.e())]),
+                n.decl(call("zb_foreign_values_len", vec![x.e()], i64())),
+                when(lt(n.e(), int(0)), vec![ret(x.e())]),
+                items.decl(list(vec![], anys.clone())),
+                i.decl(int(0)),
+                while_(
+                    lt(i.e(), n.e()),
+                    vec![
+                        expr(mcall(
+                            items.e(),
+                            "push",
+                            vec![call("zb_foreign_value", vec![x.e(), i.e()], any())],
+                            unit(),
+                        )),
+                        i.add_assign(int(1)),
+                    ],
+                ),
+                ret(call("zb_box_tuple", vec![items.e()], any())),
+            ],
+        ),
         define(
             "zb_foreign_call",
             &[&x, &args],
@@ -170,7 +214,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                     any(),
                 )),
                 raise_reported(),
-                ret(r.e()),
+                ret(call("zb_foreign_values", vec![r.e()], any())),
             ],
         ),
         // The method `name` of `x`, called with `args`.
@@ -185,7 +229,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                     any(),
                 )),
                 raise_reported(),
-                ret(r.e()),
+                ret(call("zb_foreign_values", vec![r.e()], any())),
             ],
         ),
         // The embedder's module `name`, or None when it has none.

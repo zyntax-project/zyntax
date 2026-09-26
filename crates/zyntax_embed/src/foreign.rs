@@ -25,6 +25,18 @@ use zrtl::{DynamicBox, StringConstPtr, StringPtr, TypeCategory, TypeTag};
 /// `zyntax_builtins::FOREIGN_TAG` gives it.
 pub const FOREIGN_TAG: u32 = (20 << 8) | 0xFF;
 
+/// The box tag of a tuple, as `zyntax_builtins::TUPLE_TAG` gives it:
+/// several values as one, a list of them.
+pub const TUPLE_TAG: u32 = (14 << 8) | 0xFF;
+
+/// The header a list points at, as the library lays one out.
+#[repr(C)]
+struct ListHeader {
+    data: *mut Any,
+    len: i64,
+    capacity: i64,
+}
+
 /// A dynamic value as the library holds it.
 pub type Any = *mut DynamicBox;
 
@@ -86,6 +98,19 @@ pub trait Foreign: Send + Sync {
     /// `object`. `None` for an object that is not one.
     fn bytes(&self, _object: usize) -> Option<(*const u8, usize)> {
         None
+    }
+
+    /// How many values `object` is, when it is several values a call
+    /// gave at once: a call or method that returns it gives the program
+    /// that many, as its tuple of them. `None` for any other object.
+    fn values(&self, _object: usize) -> Option<usize> {
+        None
+    }
+
+    /// Value `index` of an `object` that [`Foreign::values`] counts, as
+    /// a box the program owns.
+    fn value(&self, _object: usize, _index: usize) -> Any {
+        none()
     }
 }
 
@@ -152,6 +177,8 @@ pub enum Value<'a> {
     Float(f64),
     Str(&'a str),
     Foreign(usize),
+    /// Several values as one, a tuple: its items.
+    Tuple(&'a [Any]),
     /// A value of the program's own that has no reading here, with its tag.
     Other(u32),
 }
@@ -167,6 +194,15 @@ pub unsafe fn read<'a>(any: Any) -> Value<'a> {
     let b = &*any;
     if b.tag.0 == FOREIGN_TAG {
         return Value::Foreign(b.data as usize);
+    }
+    if b.tag.0 == TUPLE_TAG {
+        let list = b.data as *const ListHeader;
+        return Value::Tuple(match list.as_ref() {
+            Some(h) if h.len > 0 && !h.data.is_null() => {
+                std::slice::from_raw_parts(h.data, h.len as usize)
+            }
+            _ => &[],
+        });
     }
     // A number of any width, read at the size its box records.
     let p = b.data as *const u8;
@@ -352,6 +388,23 @@ unsafe extern "C" fn foreign_bytes_len(x: Any) -> i64 {
     }
 }
 
+/// How many values `x` is when it is several values given at once, or -1
+/// when it is not.
+unsafe extern "C" fn foreign_values_len(x: Any) -> i64 {
+    match unsafe { word(x) } {
+        Some(object) => with(-1, |f| Ok(f.values(object).map_or(-1, |n| n as i64))),
+        None => -1,
+    }
+}
+
+/// Value `index` of such an `x`.
+unsafe extern "C" fn foreign_value(x: Any, index: i64) -> Any {
+    let Some(object) = (unsafe { word(x) }) else {
+        return none();
+    };
+    with(none(), |f| Ok(f.value(object, index.max(0) as usize)))
+}
+
 /// The kind of the error the last operation reported, or null when it
 /// reported none.
 extern "C" fn foreign_error_kind() -> StringPtr {
@@ -368,7 +421,7 @@ extern "C" fn foreign_error_message() -> StringPtr {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"foreign".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 12] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 14] = [
     zrtl::ZrtlSymbol::new(c"$Foreign$get".as_ptr(), foreign_get as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$set".as_ptr(), foreign_set as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$call".as_ptr(), foreign_call as *const u8),
@@ -382,6 +435,11 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 12] = [
         c"$Foreign$bytes_len".as_ptr(),
         foreign_bytes_len as *const u8,
     ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$values_len".as_ptr(),
+        foreign_values_len as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(c"$Foreign$value".as_ptr(), foreign_value as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Foreign$error_kind".as_ptr(),
         foreign_error_kind as *const u8,

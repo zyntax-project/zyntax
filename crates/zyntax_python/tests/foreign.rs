@@ -21,6 +21,8 @@ enum Obj {
     },
     /// A method as a value: its receiver comes first.
     Method(String),
+    /// Two values given at once.
+    Pair(f64, f64),
 }
 
 struct State {
@@ -72,6 +74,7 @@ fn text(any: Any) -> String {
         Value::Float(f) => format!("{f:?}"),
         Value::Str(s) => s.to_string(),
         Value::Foreign(w) => Stand.text(w),
+        Value::Tuple(items) => format!("<{} values>", items.len()),
         Value::Other(tag) => format!("<tag {tag:#x}>"),
     }
 }
@@ -82,6 +85,7 @@ fn type_of(obj: &Obj) -> &'static str {
         Obj::Function(_) => "function",
         Obj::Point { .. } => "Point",
         Obj::Method(_) => "method",
+        Obj::Pair(..) => "pair",
     }
 }
 
@@ -92,6 +96,7 @@ impl Foreign for Stand {
         match (object(word), name) {
             (Obj::Shapes, "Point") => Ok(make(Obj::Function("Point"))),
             (Obj::Shapes, "same") => Ok(make(Obj::Function("same"))),
+            (Obj::Shapes, "pair") => Ok(make(Obj::Function("pair"))),
             (Obj::Shapes, "version") => Ok(foreign::int(3)),
             (Obj::Log, "record") => Ok(make(Obj::Function("record"))),
             (Obj::Point { x, .. }, "x") => Ok(foreign::float(x)),
@@ -126,6 +131,7 @@ impl Foreign for Stand {
                 x: number(args[0])?,
                 y: number(args[1])?,
             })),
+            Obj::Function("pair") => Ok(make(Obj::Pair(1.0, 2.0))),
             Obj::Function("same") => match unsafe { foreign::read(args[0]) } {
                 Value::Foreign(w) => Ok(again(w)),
                 _ => Err(ForeignError::new("TypeError", "same() takes a point")),
@@ -204,6 +210,17 @@ impl Foreign for Stand {
     fn release(&self, word: usize) {
         STATE.lock().unwrap().held[word - 1] -= 1;
     }
+
+    fn values(&self, word: usize) -> Option<usize> {
+        matches!(object(word), Obj::Pair(..)).then_some(2)
+    }
+
+    fn value(&self, word: usize, index: usize) -> Any {
+        match object(word) {
+            Obj::Pair(a, b) => foreign::float(if index == 0 { a } else { b }),
+            _ => foreign::none(),
+        }
+    }
 }
 
 const PROGRAM: &str = r#"
@@ -230,6 +247,8 @@ except ModuleNotFoundError as e:
 seen = {}
 seen[p] = "seen"
 record(seen[s.same(p)])
+a, b = s.pair()
+record(a, b, len(s.pair()))
 "#;
 
 #[test]
@@ -239,6 +258,7 @@ fn a_program_uses_the_embedders_objects() {
         foreign::FOREIGN_TAG,
         "the library and the embedding agree on the tag"
     );
+    assert_eq!(zyntax_builtins::TUPLE_TAG as u32, foreign::TUPLE_TAG);
     assert!(foreign::install(Box::new(Stand)));
     let program =
         zyntax_python::parse_program_with(PROGRAM, "foreign.py", &|_| None).expect("parses");
@@ -260,6 +280,8 @@ fn a_program_uses_the_embedders_objects() {
             "AttributeError\tPoint has no member 'missing'",
             "ModuleNotFoundError\tNo module named 'nowhere'",
             "seen",
+            // Several values given at once are a tuple of them.
+            "1.0\t2.0\t2",
         ]
     );
     assert!(
