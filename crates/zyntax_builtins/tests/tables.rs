@@ -3,7 +3,7 @@
 //! library and called.
 
 use zyntax_builtins::build::*;
-use zyntax_builtins::dicts::{dict_declarations, dict_shape_tag, dict_type};
+use zyntax_builtins::dicts::{dict_declarations, dict_entry_type, dict_shape_tag, dict_type};
 use zyntax_builtins::lists::Field;
 use zyntax_builtins::{Policy, TypeNames, library, list_of};
 use zyntax_embed::{TieredConfig, TieredRuntime, ZyntaxValue};
@@ -168,21 +168,22 @@ fn as_int(x: Expr) -> Expr {
 /// an index.
 fn small_distinct_literal_lookups_hit(list_type: TypeId) -> Case {
     let decls = {
-        let anys = list_of(list_type, any());
         let dt = dict_type(list_type);
+        let entry_ty = dict_entry_type(&Field::Any, &Field::Any);
         let d = local("d", dt.clone());
         let big = local("big", dt.clone());
         let r = local("r", i64());
         let get = |d: &Local, k: Expr| as_int(call("zb_dict_get", vec![d.e(), k], any()));
-        let mut pairs = vec![null(any())];
+        // Laid out as a literal lays them out: the control entry, then
+        // each pair with its hash word zero.
+        let entry = |k: Expr, v: Expr| tuple(vec![int(0), k, v], entry_ty.clone());
+        let mut pairs = vec![entry(null(any()), null(any()))];
         for (k, v) in [(boxed(1), 10), (boxed(2), 20), (boxed_str("a"), 30)] {
-            pairs.push(k);
-            pairs.push(boxed(v));
+            pairs.push(entry(k, boxed(v)));
         }
-        let mut big_pairs = vec![null(any())];
+        let mut big_pairs = vec![entry(null(any()), null(any()))];
         for i in 0..20 {
-            big_pairs.push(boxed(i * 7));
-            big_pairs.push(boxed(i));
+            big_pairs.push(entry(boxed(i * 7), boxed(i)));
         }
         vec![define(
             "t_small_literal",
@@ -191,12 +192,12 @@ fn small_distinct_literal_lookups_hit(list_type: TypeId) -> Case {
             vec![
                 d.decl(call(
                     "zb_dict_from_distinct",
-                    vec![list(pairs, anys.clone())],
+                    vec![list(pairs, dt.clone())],
                     dt.clone(),
                 )),
                 big.decl(call(
                     "zb_dict_from_distinct",
-                    vec![list(big_pairs, anys.clone())],
+                    vec![list(big_pairs, dt.clone())],
                     dt.clone(),
                 )),
                 r.decl(add(get(&d, boxed(1)), get(&d, boxed(2)))),

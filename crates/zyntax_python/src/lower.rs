@@ -6770,21 +6770,56 @@ impl<'m> Lowerer<'m> {
                 self.comprehension(&c.generators, Produce::Dict(key, &c.value), span)?
             }
             py::Expr::Dict(d) => {
-                // Keys that are distinct literals need no search for
-                // an earlier equal key: the literal lays the dict's
-                // storage out itself, the index slot first.
-                let distinct = distinct_literal_keys(d);
-                let mut items = Vec::with_capacity(d.items.len() * 2 + 1);
-                if distinct {
-                    items.push(Val {
-                        node: node(
+                let dict_ty = match ty {
+                    Ty::Dict(_) => ty,
+                    _ => types::dynamic_dict(),
+                };
+                // Keys that are distinct literals need no search for an
+                // earlier equal key: the literal lays out the dict's
+                // entries itself, the control entry first, each hash
+                // left for the index to fill if the dict takes one.
+                if distinct_literal_keys(d) {
+                    let entry_ty = zyntax_builtins::dicts::dict_entry_type(
+                        &zyntax_builtins::lists::Field::Any,
+                        &zyntax_builtins::lists::Field::Any,
+                    );
+                    let null = || {
+                        node(
                             TypedExpression::Literal(TypedLiteral::Null),
                             Ty::Object,
                             span,
-                        ),
-                        ty: Ty::Object,
+                        )
+                    };
+                    let entry = |k: Node, v: Node| {
+                        TypedNode::new(
+                            TypedExpression::Tuple(vec![int_lit(0, span), k, v]),
+                            entry_ty.clone(),
+                            span,
+                        )
+                    };
+                    let mut entries = Vec::with_capacity(d.items.len() + 1);
+                    entries.push(entry(null(), null()));
+                    for item in &d.items {
+                        let Some(key) = &item.key else {
+                            return unsupported("`**` in a dict literal", d);
+                        };
+                        let k = self.expr(key)?;
+                        let k = self.coerce(k, Ty::Object);
+                        let v = self.expr(&item.value)?;
+                        let v = self.coerce(v, Ty::Object);
+                        entries.push(entry(k, v));
+                    }
+                    let storage = TypedNode::new(
+                        TypedExpression::Array(entries),
+                        zyntax_builtins::dicts::dict_type(list_type_id()),
+                        span,
+                    );
+                    return Ok(Val {
+                        node: call("zb_dict_from_distinct", vec![storage], dict_ty, span),
+                        ty: dict_ty,
                     });
                 }
+                let mut items = Vec::with_capacity(d.items.len() * 2);
                 for item in &d.items {
                     let Some(key) = &item.key else {
                         return unsupported("`**` in a dict literal", d);
@@ -6793,17 +6828,8 @@ impl<'m> Lowerer<'m> {
                     items.push(self.expr(&item.value)?);
                 }
                 let pairs = self.list_of(items, Elem::Object, span);
-                let maker = if distinct {
-                    "zb_dict_from_distinct"
-                } else {
-                    "zb_dict_from_pairs"
-                };
-                let dict_ty = match ty {
-                    Ty::Dict(_) => ty,
-                    _ => types::dynamic_dict(),
-                };
                 Val {
-                    node: call(maker, vec![pairs], dict_ty, span),
+                    node: call("zb_dict_from_pairs", vec![pairs], dict_ty, span),
                     ty: dict_ty,
                 }
             }

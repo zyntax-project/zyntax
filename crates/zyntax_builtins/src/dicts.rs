@@ -1215,15 +1215,6 @@ fn dict_ops(t: &Table) -> Vec<Decl> {
 fn dynamic_dict(list_type: TypeId) -> Vec<Decl> {
     let dt = dict_type(list_type);
     let anys = list_of(list_type, any());
-    let t = Table {
-        list_type,
-        prefix: "zb_dict",
-        sfx: String::new(),
-        key: &Field::Any,
-        value: Some(&Field::Any),
-        tag: DICT_TAG,
-        mask: Mask::None,
-    };
     let pairs = borrowed("pairs", anys.clone());
     let out = local("out", dt.clone());
     let n = local("n", i64());
@@ -1255,49 +1246,26 @@ fn dynamic_dict(list_type: TypeId) -> Vec<Decl> {
             ret(out.e()),
         ]
     }));
-    // A dict from a literal whose keys are known to be distinct, laid
-    // out as a slot then key, value, key, value: the pairs become the
-    // entries as they are, unhashed until the dict takes an index.
-    d.push(define("zb_dict_from_distinct", &[&pairs], dt.clone(), {
+    // A dict whose entries a literal laid out itself, its keys known to
+    // be distinct and its hash words zero: the storage is the dict, and
+    // only a large one takes an index.
+    let entries = kept("d", dt.clone());
+    d.push(define("zb_dict_from_distinct", &[&entries], dt.clone(), {
         vec![
-            n.decl(len(pairs.e())),
-            out.decl(list(Vec::new(), dt.clone())),
-            expr(mcall(
-                out.e(),
-                "reserve",
-                vec![add(div(n.e(), int(2)), int(1))],
-                unit(),
-            )),
-            push(out.e(), t.fresh()),
-            i.decl(int(1)),
-            while_(
-                lt(i.e(), n.e()),
-                vec![
-                    push(
-                        out.e(),
-                        t.make(
-                            int(0),
-                            at(pairs.e(), i.e()),
-                            Some(at(pairs.e(), add(i.e(), int(1)))),
-                        ),
-                    ),
-                    i.add_assign(int(2)),
-                ],
-            ),
-            live.decl(sub(len(out.e()), int(1))),
+            live.decl(sub(len(entries.e()), int(1))),
             when(
                 gt(live.e(), int(SMALL)),
                 vec![expr(call(
                     "zb_dict_rebuild",
                     vec![
-                        out.e(),
+                        entries.e(),
                         call("zb_table_cap_for", vec![live.e()], i64()),
                         bool(false),
                     ],
                     unit(),
                 ))],
             ),
-            ret(out.e()),
+            ret(entries.e()),
         ]
     }));
     // The box itself, once it is known to hold a dict: what a slot that
