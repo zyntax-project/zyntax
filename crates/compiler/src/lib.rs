@@ -2142,7 +2142,6 @@ fn run_interp_safe_opts_with(
             || agsc.webs > 0
             || sra.mallocs_eliminated > 0
             || il.inlined > 0
-            || ef.folded > 0
             || ef.threaded > 0
             || lc.hoisted > 0
             || cs_cfg.merged > 0

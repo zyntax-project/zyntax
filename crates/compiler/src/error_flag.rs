@@ -808,6 +808,37 @@ fn fold(func: &mut HirFunction, flag: HirId, effects: &HashMap<HirId, Effect>) -
     crate::cse::apply_substitutions_public(func, &subs);
     crate::cse::remove_redundant_instructions_public(func, &subs);
 
+    // A branch on a decided compare is a jump, made here so that the
+    // round's cfg_simplify finishes the job without another round.
+    let mut jumps: Vec<(HirId, HirId, HirId)> = Vec::new();
+    for (&id, block) in &func.blocks {
+        if let HirTerminator::CondBranch {
+            condition,
+            true_target,
+            false_target,
+        } = block.terminator
+            && let Some(value) = constants.iter().position(|c| *c == Some(condition))
+        {
+            let (taken, dropped) = if value == 1 {
+                (true_target, false_target)
+            } else {
+                (false_target, true_target)
+            };
+            jumps.push((id, taken, dropped));
+        }
+    }
+    for (id, taken, dropped) in jumps {
+        func.blocks[&id].terminator = HirTerminator::Branch { target: taken };
+        if dropped != taken
+            && let Some(other) = func.blocks.get_mut(&dropped)
+        {
+            for phi in &mut other.phis {
+                phi.incoming.retain(|(_, from)| *from != id);
+            }
+        }
+    }
+    func.rebuild_cfg_edges();
+
     // Loads whose every compare folded.
     let mut used: HashSet<HirId> = HashSet::new();
     for block in func.blocks.values() {
@@ -1040,14 +1071,11 @@ mod tests {
         &m.module.functions[&id]
     }
 
-    /// The constant a compare was folded to, where `cond` is the branch
-    /// condition of `block`.
-    fn branch_constant(f: &HirFunction, block: HirId) -> Option<bool> {
-        let HirTerminator::CondBranch { condition, .. } = f.blocks[&block].terminator else {
-            return None;
-        };
-        match f.values[&condition].kind {
-            HirValueKind::Constant(HirConstant::Bool(b)) => Some(b),
+    /// Whether the check ending `block` was decided: `Some(true)` when
+    /// it now jumps to `raise`, `Some(false)` when it jumps elsewhere.
+    fn branch_constant(f: &HirFunction, block: HirId, raise: HirId) -> Option<bool> {
+        match f.blocks[&block].terminator {
+            HirTerminator::Branch { target } => Some(target == raise),
             _ => None,
         }
     }
@@ -1061,7 +1089,7 @@ mod tests {
     }
 
     /// entry: call callee; check -> raise, ok.
-    fn after_call(attributes: FunctionAttributes) -> (Module, HirId, HirId) {
+    fn after_call(attributes: FunctionAttributes) -> (Module, HirId, HirId, HirId) {
         let mut m = Module::new(true);
         let callee = m.callee("callee", attributes);
         let mut b = Body::new(&m);
@@ -1074,32 +1102,32 @@ mod tests {
         b.ret(ok, 0);
         let f = b.finish(&mut m);
         run_module(&mut m.module);
-        (m, f, entry)
+        (m, f, entry, raise)
     }
 
     #[test]
     fn the_check_after_a_nothrow_call_folds_to_no_error() {
-        let (m, f, entry) = after_call(FunctionAttributes {
+        let (m, f, entry, raise) = after_call(FunctionAttributes {
             nothrow: true,
             ..Default::default()
         });
-        assert_eq!(branch_constant(body(&m, f), entry), Some(false));
+        assert_eq!(branch_constant(body(&m, f), entry, raise), Some(false));
         assert_eq!(flag_loads(body(&m, f), entry), 0);
     }
 
     #[test]
     fn the_check_after_a_raiser_takes_the_raising_arm() {
-        let (m, f, entry) = after_call(FunctionAttributes {
+        let (m, f, entry, raise) = after_call(FunctionAttributes {
             sets_error_flag: true,
             ..Default::default()
         });
-        assert_eq!(branch_constant(body(&m, f), entry), Some(true));
+        assert_eq!(branch_constant(body(&m, f), entry, raise), Some(true));
     }
 
     #[test]
     fn the_check_after_a_call_that_may_raise_is_kept() {
-        let (m, f, entry) = after_call(FunctionAttributes::default());
-        assert_eq!(branch_constant(body(&m, f), entry), None);
+        let (m, f, entry, raise) = after_call(FunctionAttributes::default());
+        assert_eq!(branch_constant(body(&m, f), entry, raise), None);
         assert_eq!(flag_loads(body(&m, f), entry), 1);
     }
 
@@ -1142,7 +1170,7 @@ mod tests {
         b.ret(ok, 0);
         let f = b.finish(&mut m);
         run_module(&mut m.module);
-        assert_eq!(branch_constant(body(&m, f), entry), None);
+        assert_eq!(branch_constant(body(&m, f), entry, raise), None);
     }
 
     /// A store through another pointer between two checks leaves the
@@ -1180,8 +1208,8 @@ mod tests {
         b.ret(ok, 0);
         let f = b.finish(&mut m);
         run_module(&mut m.module);
-        assert_eq!(branch_constant(body(&m, f), entry), Some(false));
-        assert_eq!(branch_constant(body(&m, f), mid), Some(false));
+        assert_eq!(branch_constant(body(&m, f), entry, raise), Some(false));
+        assert_eq!(branch_constant(body(&m, f), mid, raise), Some(false));
     }
 
     /// entry: brcond p, a, b; a: call raiser; b: nothing; both reach a
@@ -1248,7 +1276,7 @@ mod tests {
         assert!(func.blocks[&raise].phis[0].incoming.contains(&(one, a)));
         assert_eq!(func.blocks[&check].predecessors, vec![other]);
         assert_eq!(func.blocks[&check].phis[0].incoming, vec![(two, other)]);
-        assert_eq!(branch_constant(func, check), Some(false));
+        assert_eq!(branch_constant(func, check, raise), Some(false));
         assert!(dominance_holds(func));
     }
 
