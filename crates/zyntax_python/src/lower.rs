@@ -1327,6 +1327,9 @@ pub(crate) const PENDING: &str = "py$exc";
 /// The function record's fixed prefix: code address and arity.
 const RECORD_CELLS_AT: usize = 2;
 
+/// What unpacking None raises, ahead of iterating it.
+const UNPACK_NONE: &str = "cannot unpack non-iterable NoneType object";
+
 impl<'m> Lowerer<'m> {
     pub(crate) fn new(
         module: &'m Module,
@@ -3725,6 +3728,7 @@ impl<'m> Lowerer<'m> {
 
         // The general arm: what any other dynamic value goes through.
         let mut general = Vec::new();
+        self.raise_if_none(&source.node, "TypeError", UNPACK_NONE, &mut general);
         let items = Val {
             node: call(
                 "zb_any_iter",
@@ -5051,6 +5055,7 @@ impl<'m> Lowerer<'m> {
                 }
                 let (value, source) = if dynamic {
                     let source = self.hold(value, out, span);
+                    self.raise_if_none(&source.node, "TypeError", UNPACK_NONE, out);
                     let items = Val {
                         node: call(
                             "zb_any_iter",
@@ -5415,14 +5420,17 @@ impl<'m> Lowerer<'m> {
             // and a dict iterates over a snapshot of its keys.
             Ty::Object => {
                 let items = call("zb_any_iter", vec![seq.node], Ty::List(Elem::Object), span);
-                self.hold(
+                let held = self.hold(
                     Val {
                         node: items,
                         ty: Ty::List(Elem::Object),
                     },
                     &mut prologue,
                     span,
-                )
+                );
+                // A value that is not iterable raised: the loop does not run.
+                prologue.push(self.pending_check(span));
+                held
             }
             Ty::Dict(_) => {
                 let keys = self.table_items(seq, span);
@@ -8359,6 +8367,18 @@ impl<'m> Lowerer<'m> {
                     ));
                 }
             });
+        }
+        // A tuple against a dynamic value compares as its tuple box: as
+        // a list it would equal no tuple.
+        if let ((true, false), _, Ty::Object) | ((false, true), Ty::Object, _) =
+            (tuple_sides, left.ty, right.ty)
+        {
+            let object = |this: &mut Self, v: Val| Val {
+                node: this.coerce(v, Ty::Object),
+                ty: Ty::Object,
+            };
+            let (left, right) = (object(self, left), object(self, right));
+            return self.compare_one(op, left, right, span);
         }
         // Two sequences compare element by element; tuples as the lists
         // of their elements.
@@ -12139,6 +12159,34 @@ impl<'m> Lowerer<'m> {
             span,
         ));
         held
+    }
+
+    /// Raise `exception` with `message` into `out` when the held dynamic
+    /// value `v` is None.
+    fn raise_if_none(&mut self, v: &Node, exception: &str, message: &str, out: &mut Vec<Stmt>) {
+        let span = v.span;
+        let is_null = binary(
+            BinaryOp::Eq,
+            as_addr(v.clone(), span),
+            int_lit(0, span),
+            Ty::Bool,
+            span,
+        );
+        let mut raise = Vec::new();
+        self.raise_named(exception, str_lit(message, span), span, &mut raise);
+        out.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(is_null),
+                then_block: TypedBlock {
+                    statements: raise,
+                    span,
+                },
+                else_block: None,
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
     }
 
     /// `then(v)` when `v` is an instance, `when_null` when it is None.

@@ -1,0 +1,13 @@
+(2, 3.0)
+2 3.0
+None True True False True
+True True False False False
+False True True False
+TypeError 'NoneType' object is not subscriptable
+TypeError cannot unpack non-iterable NoneType object
+TypeError object of type 'NoneType' has no len()
+TypeError 'NoneType' object is not iterable
+AttributeError 'NoneType' object has no attribute 'count'
+7
+TypeError cannot unpack non-iterable NoneType object
+20
