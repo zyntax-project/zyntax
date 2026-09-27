@@ -2820,7 +2820,7 @@ impl TieredBackend {
                             queue.request_compile(ctx.bead_id, Some(count))
                         }
                         _ => {
-                            let code = osr::lazy_compile(ctx.bead_id);
+                            let code = osr::try_lazy_compile(ctx.bead_id);
                             if !code.is_null() {
                                 return Some(code);
                             }
@@ -4781,7 +4781,7 @@ fn ensure_baseline(
         return true;
     }
     if lazy {
-        return !osr::lazy_compile(bead_id).is_null() || bound.bead().compiled().is_some();
+        return !osr::try_lazy_compile(bead_id).is_null() || bound.bead().compiled().is_some();
     }
     let existing = cranelift.with_lock(|be| be.get_function_ptr(func_id));
     let entry = match existing {

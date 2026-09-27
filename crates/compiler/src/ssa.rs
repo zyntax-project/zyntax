@@ -1795,6 +1795,14 @@ impl SsaBuilder {
                         .clone()
                         .into_iter()
                         .map(|ret_ty| {
+                            // An aggregate is held by address: a scalar
+                            // zero in its place is no address at all.
+                            if matches!(
+                                ret_ty,
+                                HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_)
+                            ) {
+                                return self.create_value(ret_ty, HirValueKind::Undef);
+                            }
                             let konst = default_const_for(&ret_ty);
                             self.create_value(ret_ty, HirValueKind::Constant(konst))
                         })
