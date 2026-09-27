@@ -480,6 +480,7 @@ impl Scratch {
                 effects: module.effects.clone(),
                 handlers: module.handlers.clone(),
                 automatic_release: module.automatic_release,
+                exact_struct_types: module.exact_struct_types.clone(),
             };
             if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
                 eprintln!(
