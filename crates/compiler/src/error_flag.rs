@@ -777,3 +777,446 @@ fn fold(func: &mut HirFunction, flag: HirId, effects: &HashMap<HirId, Effect>) -
     }
     decided.len()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::{
+        FunctionAttributes, HirBlock, HirFunctionSignature, HirGlobal, HirPhi, HirValue, Linkage,
+        Visibility,
+    };
+    use zyntax_typed_ast::InternedString;
+
+    fn flag_ty() -> HirType {
+        HirType::Ptr(Box::new(HirType::I8))
+    }
+
+    fn sig(params: Vec<HirType>) -> HirFunctionSignature {
+        HirFunctionSignature {
+            params: params
+                .into_iter()
+                .enumerate()
+                .map(|(i, ty)| crate::hir::HirParam {
+                    id: HirId::new(),
+                    name: InternedString::new_global(&format!("p{i}")),
+                    ty,
+                    attributes: Default::default(),
+                    ownership: Default::default(),
+                })
+                .collect(),
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        }
+    }
+
+    struct Module {
+        module: HirModule,
+        flag: HirId,
+    }
+
+    impl Module {
+        fn new(with_flag: bool) -> Self {
+            let mut module = HirModule::new(InternedString::new_global("m"));
+            let flag = HirId::new();
+            module.globals.insert(
+                flag,
+                HirGlobal {
+                    id: flag,
+                    name: InternedString::new_global("flag"),
+                    ty: flag_ty(),
+                    initializer: None,
+                    is_const: false,
+                    is_thread_local: false,
+                    linkage: Linkage::Internal,
+                    visibility: Visibility::Default,
+                    error_flag: with_flag,
+                },
+            );
+            Module { module, flag }
+        }
+
+        /// A bodiless callee with `attributes`.
+        fn callee(&mut self, name: &str, attributes: FunctionAttributes) -> HirId {
+            let mut f = HirFunction::new(InternedString::new_global(name), sig(vec![]));
+            f.is_external = true;
+            f.attributes = attributes;
+            let id = f.id;
+            self.module.functions.insert(id, f);
+            id
+        }
+    }
+
+    /// A function under construction.
+    struct Body {
+        f: HirFunction,
+        flag_ptr: HirId,
+        null: HirId,
+    }
+
+    impl Body {
+        fn new(m: &Module) -> Self {
+            let mut f = HirFunction::new(
+                InternedString::new_global("caller"),
+                sig(vec![HirType::Bool, HirType::Ptr(Box::new(HirType::I64))]),
+            );
+            f.blocks.clear();
+            let flag_ptr = f.create_value(
+                HirType::Ptr(Box::new(flag_ty())),
+                HirValueKind::Global(m.flag),
+            );
+            let null = f.create_value(flag_ty(), HirValueKind::Constant(HirConstant::I64(0)));
+            Body { f, flag_ptr, null }
+        }
+
+        fn param(&mut self, i: u32, ty: HirType) -> HirId {
+            let id = HirId::new();
+            self.f.values.insert(
+                id,
+                HirValue {
+                    id,
+                    ty,
+                    kind: HirValueKind::Parameter(i),
+                    uses: Default::default(),
+                    span: None,
+                },
+            );
+            id
+        }
+
+        fn int(&mut self, v: i64) -> HirId {
+            self.f
+                .create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(v)))
+        }
+
+        fn block(&mut self) -> HirId {
+            let id = HirId::new();
+            let mut b = HirBlock::new(id);
+            b.terminator = HirTerminator::Unreachable;
+            self.f.blocks.insert(id, b);
+            if self.f.blocks.len() == 1 {
+                self.f.entry_block = id;
+            }
+            id
+        }
+
+        fn push(&mut self, b: HirId, inst: HirInstruction) {
+            self.f.blocks[&b].instructions.push(inst);
+        }
+
+        fn term(&mut self, b: HirId, t: HirTerminator) {
+            self.f.blocks[&b].terminator = t;
+        }
+
+        fn call(&mut self, b: HirId, callee: HirId) {
+            self.push(
+                b,
+                HirInstruction::Call {
+                    result: None,
+                    callee: HirCallable::Function(callee),
+                    args: vec![],
+                    type_args: vec![],
+                    const_args: vec![],
+                    is_tail: false,
+                },
+            );
+        }
+
+        /// `load flag; ne null; brcond -> raise, ok`, returning the compare.
+        fn check(&mut self, b: HirId, raise: HirId, ok: HirId) -> HirId {
+            let load = self.f.create_value(flag_ty(), HirValueKind::Instruction);
+            let cmp = self
+                .f
+                .create_value(HirType::Bool, HirValueKind::Instruction);
+            let ptr = self.flag_ptr;
+            let null = self.null;
+            self.push(
+                b,
+                HirInstruction::Load {
+                    result: load,
+                    ty: flag_ty(),
+                    ptr,
+                    align: 8,
+                    volatile: false,
+                },
+            );
+            self.push(
+                b,
+                HirInstruction::Binary {
+                    op: BinaryOp::Ne,
+                    result: cmp,
+                    ty: HirType::Bool,
+                    left: load,
+                    right: null,
+                },
+            );
+            self.term(
+                b,
+                HirTerminator::CondBranch {
+                    condition: cmp,
+                    true_target: raise,
+                    false_target: ok,
+                },
+            );
+            cmp
+        }
+
+        fn ret(&mut self, b: HirId, v: i64) {
+            let v = self.int(v);
+            self.term(b, HirTerminator::Return { values: vec![v] });
+        }
+
+        fn finish(mut self, m: &mut Module) -> HirId {
+            self.f.rebuild_cfg_edges();
+            let id = self.f.id;
+            m.module.functions.insert(id, self.f);
+            id
+        }
+    }
+
+    fn body(m: &Module, id: HirId) -> &HirFunction {
+        &m.module.functions[&id]
+    }
+
+    /// The constant a compare was folded to, where `cond` is the branch
+    /// condition of `block`.
+    fn branch_constant(f: &HirFunction, block: HirId) -> Option<bool> {
+        let HirTerminator::CondBranch { condition, .. } = f.blocks[&block].terminator else {
+            return None;
+        };
+        match f.values[&condition].kind {
+            HirValueKind::Constant(HirConstant::Bool(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    fn flag_loads(f: &HirFunction, block: HirId) -> usize {
+        f.blocks[&block]
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, HirInstruction::Load { ty, .. } if *ty == flag_ty()))
+            .count()
+    }
+
+    /// entry: call callee; check -> raise, ok.
+    fn after_call(attributes: FunctionAttributes) -> (Module, HirId, HirId) {
+        let mut m = Module::new(true);
+        let callee = m.callee("callee", attributes);
+        let mut b = Body::new(&m);
+        let entry = b.block();
+        let raise = b.block();
+        let ok = b.block();
+        b.call(entry, callee);
+        b.check(entry, raise, ok);
+        b.ret(raise, -1);
+        b.ret(ok, 0);
+        let f = b.finish(&mut m);
+        run_module(&mut m.module);
+        (m, f, entry)
+    }
+
+    #[test]
+    fn the_check_after_a_nothrow_call_folds_to_no_error() {
+        let (m, f, entry) = after_call(FunctionAttributes {
+            nothrow: true,
+            ..Default::default()
+        });
+        assert_eq!(branch_constant(body(&m, f), entry), Some(false));
+        assert_eq!(flag_loads(body(&m, f), entry), 0);
+    }
+
+    #[test]
+    fn the_check_after_a_raiser_takes_the_raising_arm() {
+        let (m, f, entry) = after_call(FunctionAttributes {
+            sets_error_flag: true,
+            ..Default::default()
+        });
+        assert_eq!(branch_constant(body(&m, f), entry), Some(true));
+    }
+
+    #[test]
+    fn the_check_after_a_call_that_may_raise_is_kept() {
+        let (m, f, entry) = after_call(FunctionAttributes::default());
+        assert_eq!(branch_constant(body(&m, f), entry), None);
+        assert_eq!(flag_loads(body(&m, f), entry), 1);
+    }
+
+    /// A body that raises and catches its own error is neither a raiser
+    /// nor free of the flag: the check after it stays.
+    #[test]
+    fn a_callee_that_stores_the_flag_keeps_the_callers_check() {
+        let mut m = Module::new(true);
+        let mut inner = Body::new(&m);
+        let e = inner.block();
+        let one = inner.int(1);
+        let (ptr, null) = (inner.flag_ptr, inner.null);
+        inner.push(
+            e,
+            HirInstruction::Store {
+                value: one,
+                ptr,
+                align: 8,
+                volatile: false,
+            },
+        );
+        inner.push(
+            e,
+            HirInstruction::Store {
+                value: null,
+                ptr,
+                align: 8,
+                volatile: false,
+            },
+        );
+        inner.ret(e, 0);
+        let catches = inner.finish(&mut m);
+        let mut b = Body::new(&m);
+        let entry = b.block();
+        let raise = b.block();
+        let ok = b.block();
+        b.call(entry, catches);
+        b.check(entry, raise, ok);
+        b.ret(raise, -1);
+        b.ret(ok, 0);
+        let f = b.finish(&mut m);
+        run_module(&mut m.module);
+        assert_eq!(branch_constant(body(&m, f), entry), None);
+    }
+
+    /// A store through another pointer between two checks leaves the
+    /// flag as it was: the second check folds too.
+    #[test]
+    fn an_element_store_between_checks_keeps_the_state() {
+        let mut m = Module::new(true);
+        let nothrow = m.callee(
+            "leaf",
+            FunctionAttributes {
+                nothrow: true,
+                ..Default::default()
+            },
+        );
+        let mut b = Body::new(&m);
+        let p = b.param(1, HirType::Ptr(Box::new(HirType::I64)));
+        let entry = b.block();
+        let mid = b.block();
+        let raise = b.block();
+        let ok = b.block();
+        b.call(entry, nothrow);
+        b.check(entry, raise, mid);
+        let v = b.int(7);
+        b.push(
+            mid,
+            HirInstruction::Store {
+                value: v,
+                ptr: p,
+                align: 8,
+                volatile: false,
+            },
+        );
+        b.check(mid, raise, ok);
+        b.ret(raise, -1);
+        b.ret(ok, 0);
+        let f = b.finish(&mut m);
+        run_module(&mut m.module);
+        assert_eq!(branch_constant(body(&m, f), entry), Some(false));
+        assert_eq!(branch_constant(body(&m, f), mid), Some(false));
+    }
+
+    /// entry: brcond p, a, b; a: call raiser; b: nothing; both reach a
+    /// check whose raising arm returns a phi of the check block's phi.
+    /// The raiser's edge goes straight to the arm with its own value, and
+    /// the check, now reached only with the flag clear, folds.
+    #[test]
+    fn a_set_predecessor_threads_to_the_raising_arm() {
+        let mut m = Module::new(true);
+        let raiser = m.callee(
+            "raiser",
+            FunctionAttributes {
+                sets_error_flag: true,
+                ..Default::default()
+            },
+        );
+        let mut b = Body::new(&m);
+        let cond = b.param(0, HirType::Bool);
+        let entry = b.block();
+        let a = b.block();
+        let other = b.block();
+        let check = b.block();
+        let raise = b.block();
+        let ok = b.block();
+        b.term(
+            entry,
+            HirTerminator::CondBranch {
+                condition: cond,
+                true_target: a,
+                false_target: other,
+            },
+        );
+        b.call(a, raiser);
+        b.term(a, HirTerminator::Branch { target: check });
+        b.term(other, HirTerminator::Branch { target: check });
+        let (one, two) = (b.int(1), b.int(2));
+        let merged = b.f.create_value(HirType::I64, HirValueKind::Instruction);
+        b.f.blocks[&check].phis.push(HirPhi {
+            result: merged,
+            ty: HirType::I64,
+            incoming: vec![(one, a), (two, other)],
+        });
+        b.check(check, raise, ok);
+        let out = b.f.create_value(HirType::I64, HirValueKind::Instruction);
+        b.f.blocks[&raise].phis.push(HirPhi {
+            result: out,
+            ty: HirType::I64,
+            incoming: vec![(merged, check)],
+        });
+        b.term(raise, HirTerminator::Return { values: vec![out] });
+        b.term(
+            ok,
+            HirTerminator::Return {
+                values: vec![merged],
+            },
+        );
+        let f = b.finish(&mut m);
+        let stats = run_module(&mut m.module);
+        assert_eq!(stats.threaded, 1);
+        let func = body(&m, f);
+        assert!(
+            matches!(func.blocks[&a].terminator, HirTerminator::Branch { target } if target == raise)
+        );
+        assert!(func.blocks[&raise].phis[0].incoming.contains(&(one, a)));
+        assert_eq!(func.blocks[&check].predecessors, vec![other]);
+        assert_eq!(func.blocks[&check].phis[0].incoming, vec![(two, other)]);
+        assert_eq!(branch_constant(func, check), Some(false));
+        assert!(dominance_holds(func));
+    }
+
+    /// A module that names no error flag is left alone.
+    #[test]
+    fn a_module_without_an_error_flag_is_untouched() {
+        let mut m = Module::new(false);
+        let callee = m.callee(
+            "leaf",
+            FunctionAttributes {
+                nothrow: true,
+                ..Default::default()
+            },
+        );
+        let mut b = Body::new(&m);
+        let entry = b.block();
+        let raise = b.block();
+        let ok = b.block();
+        b.call(entry, callee);
+        b.check(entry, raise, ok);
+        b.ret(raise, -1);
+        b.ret(ok, 0);
+        let f = b.finish(&mut m);
+        assert_eq!(run_module(&mut m.module), ErrorFlagStats::default());
+        assert_eq!(flag_loads(body(&m, f), entry), 1);
+    }
+}
