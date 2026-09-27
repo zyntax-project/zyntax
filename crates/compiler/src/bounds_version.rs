@@ -413,19 +413,6 @@ fn recognise(func: &HirFunction, dt: &DominatorTree, lp: &NaturalLoop) -> Result
                     continue;
                 }
                 match defs.get(&v) {
-                    // A select whose condition the copy decides is the
-                    // value it picks there.
-                    Some(HirInstruction::Select {
-                        condition,
-                        true_val,
-                        false_val,
-                        ..
-                    }) => {
-                        v = match folds.get(condition)? {
-                            true => *true_val,
-                            false => *false_val,
-                        };
-                    }
                     Some(HirInstruction::Binary {
                         op: BinaryOp::Add,
                         left,

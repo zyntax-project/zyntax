@@ -80,13 +80,103 @@ pub fn fold_function(func: &mut HirFunction) -> FoldStats {
     let mut stats = FoldStats::default();
     for _ in 0..16 {
         stats.iterations += 1;
-        let this_pass = fold_one_pass(func);
+        let this_pass = fold_one_pass(func) + forward_decided(func);
         if this_pass == 0 {
             return stats;
         }
         stats.folded += this_pass;
     }
     stats
+}
+
+/// A select on a known condition is the value it picks, and a boolean
+/// `and` or `or` with one known operand is that operand or the other:
+/// every use reads that value instead, and the instruction goes.
+fn forward_decided(func: &mut HirFunction) -> usize {
+    let known = |id: HirId| match func.values.get(&id).map(|v| &v.kind) {
+        Some(HirValueKind::Constant(HirConstant::Bool(b))) => Some(*b),
+        _ => None,
+    };
+    let is_bool = |id: HirId| func.values.get(&id).is_some_and(|v| v.ty == HirType::Bool);
+    let mut subs: indexmap::IndexMap<HirId, HirId> = indexmap::IndexMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            let pick = match inst {
+                HirInstruction::Select {
+                    result,
+                    condition,
+                    true_val,
+                    false_val,
+                    ..
+                } => known(*condition).map(|b| (*result, if b { *true_val } else { *false_val })),
+                HirInstruction::Binary {
+                    op: op @ (BinaryOp::And | BinaryOp::Or),
+                    result,
+                    left,
+                    right,
+                    ..
+                } if is_bool(*left) && is_bool(*right) => {
+                    // The operand that decides: `false and x`, `true or x`.
+                    let absorbing = *op == BinaryOp::Or;
+                    match (known(*left), known(*right)) {
+                        (Some(_), Some(_)) => None,
+                        (Some(l), None) => {
+                            Some((*result, if l == absorbing { *left } else { *right }))
+                        }
+                        (None, Some(r)) => {
+                            Some((*result, if r == absorbing { *right } else { *left }))
+                        }
+                        (None, None) => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some((result, value)) = pick
+                && result != value
+            {
+                subs.insert(result, value);
+            }
+        }
+    }
+    if subs.is_empty() {
+        return 0;
+    }
+    // Each substituted id to the end of its chain.
+    let ends: Vec<(HirId, HirId)> = subs
+        .keys()
+        .map(|&id| {
+            let mut end = subs[&id];
+            for _ in 0..subs.len() {
+                match subs.get(&end) {
+                    Some(&next) if next != id => end = next,
+                    _ => break,
+                }
+            }
+            (id, end)
+        })
+        .collect();
+    // A cycle, possible only in unreachable code, is left alone.
+    let map: indexmap::IndexMap<HirId, HirId> = ends
+        .into_iter()
+        .filter(|(id, end)| id != end && !subs.contains_key(end))
+        .collect();
+    for block in func.blocks.values_mut() {
+        block
+            .instructions
+            .retain(|inst| inst.result_id().is_none_or(|r| !map.contains_key(&r)));
+        for inst in &mut block.instructions {
+            inst.replace_uses(&map);
+        }
+        block.terminator.replace_uses(&map);
+        for phi in &mut block.phis {
+            for (value, _) in &mut phi.incoming {
+                if let Some(new) = map.get(value) {
+                    *value = *new;
+                }
+            }
+        }
+    }
+    map.len()
 }
 
 fn combine(a: FoldStats, b: FoldStats) -> FoldStats {
@@ -787,6 +877,73 @@ mod tests {
         match &f.values[&result].kind {
             HirValueKind::Constant(HirConstant::I64(42)) => {}
             other => panic!("expected I64(42), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forwards_select_and_bool_ops_with_a_known_operand() {
+        let mut f = mk_func(HirType::I64);
+        let no = add_const(&mut f, HirType::Bool, HirConstant::Bool(false));
+        let a = add_inst_result(&mut f, HirType::I64);
+        let b = add_inst_result(&mut f, HirType::I64);
+        let x = add_inst_result(&mut f, HirType::Bool);
+        let picked = add_inst_result(&mut f, HirType::I64);
+        let both = add_inst_result(&mut f, HirType::Bool);
+        let either = add_inst_result(&mut f, HirType::Bool);
+        push(
+            &mut f,
+            HirInstruction::Select {
+                result: picked,
+                ty: HirType::I64,
+                condition: no,
+                true_val: a,
+                false_val: b,
+            },
+        );
+        // `x and false` is false; `false or x` is x.
+        push(
+            &mut f,
+            HirInstruction::Binary {
+                op: BinaryOp::And,
+                result: both,
+                ty: HirType::Bool,
+                left: x,
+                right: no,
+            },
+        );
+        push(
+            &mut f,
+            HirInstruction::Binary {
+                op: BinaryOp::Or,
+                result: either,
+                ty: HirType::Bool,
+                left: no,
+                right: x,
+            },
+        );
+        let entry = f.entry_block;
+        f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::CondBranch {
+            condition: either,
+            true_target: entry,
+            false_target: entry,
+        };
+        f.blocks
+            .get_mut(&entry)
+            .unwrap()
+            .phis
+            .push(crate::hir::HirPhi {
+                result: HirId::new(),
+                ty: HirType::I64,
+                incoming: vec![(picked, entry), (both, entry)],
+            });
+        fold_function(&mut f);
+        let block = &f.blocks[&entry];
+        assert!(block.instructions.is_empty());
+        assert_eq!(block.phis[0].incoming[0].0, b);
+        assert_eq!(block.phis[0].incoming[1].0, no);
+        match &block.terminator {
+            HirTerminator::CondBranch { condition, .. } => assert_eq!(*condition, x),
+            other => panic!("expected a branch on x, got {other:?}"),
         }
     }
 
