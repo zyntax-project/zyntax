@@ -13040,13 +13040,8 @@ impl<'m> Lowerer<'m> {
         })
     }
 
-    /// `obj.attr = value` as a statement expression.
-    fn set_attribute(&mut self, object: Val, attr: &str, value: Val, span: Span) -> Result<Node> {
-        self.set_attribute_via(object, attr, value, None, span)
-    }
-
-    /// [`Self::set_attribute`] through a receiver that may be any class
-    /// of `set`, as [`Self::attribute_via`] reads.
+    /// `obj.attr = value` as a statement expression, through a receiver
+    /// that may be any class of `set`, as [`Self::attribute_via`] reads.
     fn set_attribute_via(
         &mut self,
         object: Val,
