@@ -3267,7 +3267,8 @@ fn arithmetic() -> Vec<Decl> {
     let box_i64 = |v: Expr| call("zb_box_i64", vec![v], any());
     let box_f64 = |v: Expr| call("zb_box_f64", vec![v], any());
     let is_code = |c: i64| eq(code.e(), int(c));
-    // ZeroDivisionError with CPython's text for `code` on a zero divisor.
+    // ZeroDivisionError with CPython's text for `code` on a zero divisor,
+    // checked after the arms that cannot raise it.
     let zero_division = |c: i64, divisor_zero: Expr, message: &str| {
         when(
             and(is_code(c), divisor_zero),
@@ -3287,13 +3288,13 @@ fn arithmetic() -> Vec<Decl> {
         )
     };
     let mut int_ops: Vec<Stmt> = vec![
+        when(is_code(0), vec![ret(box_i64(add(a.e(), b.e())))]),
+        when(is_code(1), vec![ret(box_i64(sub(a.e(), b.e())))]),
+        when(is_code(2), vec![ret(box_i64(mul(a.e(), b.e())))]),
         zero_division(3, eq(b.e(), int(0)), "division by zero"),
         zero_division(4, eq(b.e(), int(0)), "integer division or modulo by zero"),
         zero_division(5, eq(b.e(), int(0)), "integer modulo by zero"),
         negative_power(eq(a.e(), int(0)), lt(b.e(), int(0))),
-        when(is_code(0), vec![ret(box_i64(add(a.e(), b.e())))]),
-        when(is_code(1), vec![ret(box_i64(sub(a.e(), b.e())))]),
-        when(is_code(2), vec![ret(box_i64(mul(a.e(), b.e())))]),
         when(
             is_code(3),
             vec![ret(box_f64(div(cast(a.e(), f64()), cast(b.e(), f64()))))],
@@ -3357,13 +3358,13 @@ fn arithmetic() -> Vec<Decl> {
         &[&code, &fa, &fb],
         any(),
         vec![
+            when(is_code(0), vec![ret(box_f64(add(fa.e(), fb.e())))]),
+            when(is_code(1), vec![ret(box_f64(sub(fa.e(), fb.e())))]),
+            when(is_code(2), vec![ret(box_f64(mul(fa.e(), fb.e())))]),
             zero_division(3, eq(fb.e(), float(0.0)), "float division by zero"),
             zero_division(4, eq(fb.e(), float(0.0)), "float floor division by zero"),
             zero_division(5, eq(fb.e(), float(0.0)), "float modulo"),
             negative_power(eq(fa.e(), float(0.0)), lt(fb.e(), float(0.0))),
-            when(is_code(0), vec![ret(box_f64(add(fa.e(), fb.e())))]),
-            when(is_code(1), vec![ret(box_f64(sub(fa.e(), fb.e())))]),
-            when(is_code(2), vec![ret(box_f64(mul(fa.e(), fb.e())))]),
             when(is_code(3), vec![ret(box_f64(div(fa.e(), fb.e())))]),
             when(
                 is_code(4),
