@@ -107,6 +107,12 @@ pub struct LLVMJitBackend<'ctx> {
     /// [`Self::set_cross_tier_links`].
     cross_tier_key: Option<u64>,
     global_resolver: Option<std::sync::Arc<dyn Fn(HirId) -> Option<usize> + Send + Sync>>,
+    /// The body each tier compiles of a module function, when it is not
+    /// the module context's own; a callee compiled alongside a promoted
+    /// function takes it. See [`Self::set_body_source`].
+    #[allow(clippy::type_complexity)]
+    body_source:
+        Option<std::sync::Arc<dyn Fn(HirId) -> Option<std::sync::Arc<HirFunction>> + Send + Sync>>,
     /// What the module being compiled reaches across tiers, handed to
     /// the lowering.
     pending_cross_tier: HashMap<HirId, crate::llvm_backend::CrossTierCallee>,
@@ -207,6 +213,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             address_taken: std::collections::HashSet::new(),
             cross_tier_key: None,
             global_resolver: None,
+            body_source: None,
             pending_cross_tier: HashMap::new(),
             pending_shared_globals: HashMap::new(),
             pending_entry_abi: None,
@@ -1084,6 +1091,17 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         self.global_resolver = Some(globals);
     }
 
+    /// Where a callee compiled alongside a promoted function takes its
+    /// body from: `bodies` answers with the body every tier compiles of
+    /// a function, or `None` for one whose module-context body is that.
+    #[allow(clippy::type_complexity)]
+    pub fn set_body_source(
+        &mut self,
+        bodies: std::sync::Arc<dyn Fn(HirId) -> Option<std::sync::Arc<HirFunction>> + Send + Sync>,
+    ) {
+        self.body_source = Some(bodies);
+    }
+
     /// Compile a single function, together with everything it calls.
     ///
     /// The callees come from the module context, so they are recompiled at
@@ -1169,7 +1187,11 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                     if callee == id {
                         continue;
                     }
-                    if let Some(f) = ctx.functions.get(&callee) {
+                    let tier_body = self.body_source.as_ref().and_then(|body| body(callee));
+                    if let Some(f) = tier_body {
+                        crate::opt_audit::note_llvm_body(callee, &f);
+                        functions.insert(callee, (*f).clone());
+                    } else if let Some(f) = ctx.functions.get(&callee) {
                         functions.insert(callee, f.clone());
                     }
                 }
