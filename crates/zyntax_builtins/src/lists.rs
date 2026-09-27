@@ -105,6 +105,15 @@ struct KindOps {
     read: Unary,
 }
 
+impl KindOps {
+    /// Whether comparing two elements can call back into the program:
+    /// dynamic values, instances and shapes can, numbers and strings
+    /// cannot.
+    fn calls_back(&self) -> bool {
+        !matches!(self.kind, Some(k) if k != Kind::Any && k != Kind::Ptr)
+    }
+}
+
 fn ops(kind: Kind, list_type: TypeId) -> KindOps {
     let elem = kind.ty();
     let (eq, lt, repr): (Binary, Binary, Unary) = match kind {
@@ -1012,11 +1021,15 @@ fn len(xs: Expr) -> Expr {
 /// with their elements. Runs are merged into a scratch copy and
 /// written back after each pass; an element moves past another only
 /// when `less` says so, never when the two compare equal. `copy` is the
-/// element list's copy function.
+/// element list's copy function. When `less` calls back into the
+/// program (`calls_back`), the sort stops at the first comparison that
+/// raised, leaving the list as the last whole pass wrote it: every
+/// element still in it once.
 fn merge_sort(
     xs: &Local,
     keys: Option<(&Local, &str)>,
     copy: &str,
+    calls_back: bool,
     less: &dyn Fn(Expr, Expr) -> Expr,
 ) -> Vec<Stmt> {
     let elem_of = |ty: &Type| match ty {
@@ -1044,6 +1057,7 @@ fn merge_sort(
     let b = local("b", i64());
     let o = local("o", i64());
     let i = local("i", i64());
+    let c = local("c", boolean());
 
     // Move `src[from]` to `dst[o]`, keys alongside.
     let place = |from: &Local| {
@@ -1070,15 +1084,18 @@ fn merge_sort(
                 if_(
                     ge(a.e(), mid.e()),
                     place(&b),
-                    vec![if_(
-                        ge(b.e(), hi.e()),
-                        place(&a),
-                        vec![if_(
-                            less(key_of(b.e()), key_of(a.e())),
-                            place(&b),
-                            place(&a),
-                        )],
-                    )],
+                    vec![if_(ge(b.e(), hi.e()), place(&a), {
+                        let before = less(key_of(b.e()), key_of(a.e()));
+                        if calls_back {
+                            vec![
+                                c.decl(before),
+                                leave_if_pending(&unit()),
+                                if_(c.e(), place(&b), place(&a)),
+                            ]
+                        } else {
+                            vec![if_(before, place(&b), place(&a))]
+                        }
+                    })],
                 ),
                 o.add_assign(int(1)),
             ],
@@ -1338,7 +1355,9 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         &name("sort"),
         &[&xs],
         unit(),
-        merge_sort(&xs, None, &name("copy"), &|a, b| (k.lt)(a, b)),
+        merge_sort(&xs, None, &name("copy"), k.calls_back(), &|a, b| {
+            (k.lt)(a, b)
+        }),
     ));
     // One copy of the bytes: an element is the word or struct it is
     // stored as, whichever kind.
@@ -1802,6 +1821,7 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         ))],
     ));
     let best = local("best", k.elem.clone());
+    let c = local("c", boolean());
     for (op, message, better) in [
         ("min", "min() arg is an empty sequence", true),
         ("max", "max() arg is an empty sequence", false),
@@ -1819,12 +1839,17 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
             best.decl(el(&xs, int(0))),
             n.decl(len(xs.e())),
         ];
-        s.extend(for_range(
-            &i,
-            int(1),
-            n.e(),
-            vec![e.decl(el(&xs, i.e())), when(pick, vec![best.set(e.e())])],
-        ));
+        let step = if k.calls_back() {
+            vec![
+                e.decl(el(&xs, i.e())),
+                c.decl(pick),
+                leave_if_pending(&k.elem),
+                when(c.e(), vec![best.set(e.e())]),
+            ]
+        } else {
+            vec![e.decl(el(&xs, i.e())), when(pick, vec![best.set(e.e())])]
+        };
+        s.extend(for_range(&i, int(1), n.e(), step));
         s.push(ret(best.e()));
         d.push(define(&name(op), &[&xs], k.elem.clone(), s));
     }
@@ -1842,11 +1867,19 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     // ints, all floats or all strings are read out once and compared
     // as such, since the dynamic comparison would settle the same
     // question at every step.
+    // Only dynamic keys can call back into the program to compare.
     let sort_with = |ks: &Local, key_copy: &str, less: &dyn Fn(Expr, Expr) -> Expr| {
+        let calls_back = key_copy == "zb_list_copy_any";
         vec![if_(
             descending.e(),
-            merge_sort(&xs, Some((ks, key_copy)), &name("copy"), &|a, b| less(b, a)),
-            merge_sort(&xs, Some((ks, key_copy)), &name("copy"), less),
+            merge_sort(
+                &xs,
+                Some((ks, key_copy)),
+                &name("copy"),
+                calls_back,
+                &|a, b| less(b, a),
+            ),
+            merge_sort(&xs, Some((ks, key_copy)), &name("copy"), calls_back, less),
         )]
     };
     let ikeys = local("ikeys", list_of(list_type_of(&k.list), i64()));
@@ -1947,7 +1980,9 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         &name("sort_desc"),
         &[&xs],
         unit(),
-        merge_sort(&xs, None, &name("copy"), &|a, b| (k.lt)(b, a)),
+        merge_sort(&xs, None, &name("copy"), k.calls_back(), &|a, b| {
+            (k.lt)(b, a)
+        }),
     ));
     // The element whose key is least (or greatest); the first of equals.
     let best_key = local("best_key", any());
@@ -1975,7 +2010,9 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
             n.e(),
             vec![
                 key.decl(idx(keys.e(), i.e(), any())),
-                when(pick, vec![best.set(el(&xs, i.e())), best_key.set(key.e())]),
+                c.decl(pick),
+                leave_if_pending(&k.elem),
+                when(c.e(), vec![best.set(el(&xs, i.e())), best_key.set(key.e())]),
             ],
         ));
         s.push(ret(best.e()));

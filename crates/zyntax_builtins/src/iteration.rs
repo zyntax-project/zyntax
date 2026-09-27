@@ -238,13 +238,20 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         s
     }));
 
+    // Each call back into the program may raise; the loop stops at the
+    // first that does.
+    let y = local("y", any());
     d.push(define("zb_list_map1", &[&f, &xs], anys.clone(), {
         let mut s = vec![out.decl(empty()), n.decl(len(&xs))];
         s.extend(for_range(
             &i,
             int(0),
             n.e(),
-            vec![push(&out, call1(&f, at(&xs, i.e())))],
+            vec![
+                y.decl(call1(&f, at(&xs, i.e()))),
+                leave_if_pending(&anys),
+                push(&out, y.e()),
+            ],
         ));
         s.push(ret(out.e()));
         s
@@ -255,14 +262,15 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             &i,
             int(0),
             n.e(),
-            vec![push(
-                &out,
-                call(
+            vec![
+                y.decl(call(
                     "zb_call_2",
                     vec![f.e(), at(&xs, i.e()), at(&ys, i.e())],
                     any(),
-                ),
-            )],
+                )),
+                leave_if_pending(&anys),
+                push(&out, y.e()),
+            ],
         ));
         s.push(ret(out.e()));
         s
@@ -278,11 +286,14 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             &i,
             int(0),
             n.e(),
-            vec![acc.set(call(
-                "zb_call_2",
-                vec![f.e(), acc.e(), at(&xs, i.e())],
-                any(),
-            ))],
+            vec![
+                acc.set(call(
+                    "zb_call_2",
+                    vec![f.e(), acc.e(), at(&xs, i.e())],
+                    any(),
+                )),
+                leave_if_pending(&any()),
+            ],
         ));
         s.push(ret(acc.e()));
         s
@@ -303,11 +314,14 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             &i,
             int(1),
             n.e(),
-            vec![acc.set(call(
-                "zb_call_2",
-                vec![f.e(), acc.e(), at(&xs, i.e())],
-                any(),
-            ))],
+            vec![
+                acc.set(call(
+                    "zb_call_2",
+                    vec![f.e(), acc.e(), at(&xs, i.e())],
+                    any(),
+                )),
+                leave_if_pending(&any()),
+            ],
         ));
         s.push(ret(acc.e()));
         s
@@ -322,7 +336,9 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             n.e(),
             vec![
                 x.decl(at(&xs, i.e())),
-                when(truthy(call1(&f, x.e())), vec![push(&out, x.e())]),
+                y.decl(call1(&f, x.e())),
+                leave_if_pending(&anys),
+                when(truthy(y.e()), vec![push(&out, x.e())]),
             ],
         ));
         s.push(ret(out.e()));

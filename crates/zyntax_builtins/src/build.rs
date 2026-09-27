@@ -474,6 +474,19 @@ pub fn fatal(kind: &str, message: Expr) -> Stmt {
     expr(call("zb_fatal", vec![text(kind), message], unit()))
 }
 
+/// Leave with a placeholder result when an error is pending. Follows a
+/// call back into the program, which may have raised: the library runs
+/// no more of the program's code while the error stands.
+pub fn leave_if_pending(ret_ty: &Type) -> Stmt {
+    when(
+        call("zb_hook_pending", vec![], boolean()),
+        vec![match placeholder(ret_ty) {
+            Some(value) => ret(value),
+            None => ret_void(),
+        }],
+    )
+}
+
 fn is_fatal(stmt: &Stmt) -> bool {
     match &stmt.node {
         TypedStatement::Expression(e) => match &e.node {

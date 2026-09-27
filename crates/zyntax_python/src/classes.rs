@@ -3446,6 +3446,40 @@ pub(crate) fn raise_hook(module: &Module) -> TypedFunction {
     hook
 }
 
+/// `zb_hook_pending()`: whether an exception is pending, which the
+/// library asks after each call back into the program. Entered with one
+/// pending by design, and leaves it as it found it.
+pub(crate) fn pending_hook() -> TypedFunction {
+    let span = Span::new(0, 0);
+    let pending = binary(
+        BinaryOp::Ne,
+        var(intern(lower::PENDING), Ty::Object, span),
+        node(
+            TypedExpression::Literal(TypedLiteral::Null),
+            Ty::Object,
+            span,
+        ),
+        Ty::Bool,
+        span,
+    );
+    let mut hook = function(
+        "zb_hook_pending",
+        Vec::new(),
+        Ty::Bool,
+        vec![ret(pending, span)],
+        span,
+    );
+    for mark in ["queries_error_flag", "nothrow", "inline_always"] {
+        hook.annotations.push(TypedAnnotation {
+            name: intern(mark),
+            args: Vec::new(),
+            span,
+        });
+    }
+    hook.mark_generated();
+    hook
+}
+
 fn raise_hook_body(module: &Module, span: Span) -> TypedFunction {
     let mut lowerer = scratch(module);
     let kind = var(intern("kind"), Ty::Str, span);

@@ -1016,6 +1016,11 @@ fn parse_program_once(
         Type::Unknown,
         Span::new(0, 0),
     ));
+    declarations.push(TypedNode::new(
+        TypedDeclaration::Function(classes::pending_hook()),
+        Type::Unknown,
+        Span::new(0, 0),
+    ));
     for func in classes::generated(&inferred) {
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(func),

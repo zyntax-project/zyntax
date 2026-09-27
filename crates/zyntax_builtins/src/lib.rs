@@ -52,7 +52,10 @@ pub struct Policy {
     /// turns a library error into an exception it can catch. When it
     /// does, every library function that can fail returns a placeholder
     /// after the hook, and the frontend checks for the pending exception
-    /// after calling one; see [`Library::fallible`].
+    /// after calling one; see [`Library::fallible`]. The frontend then
+    /// also defines `zb_hook_pending()`, whether an exception is pending,
+    /// which a library loop calling back into the program asks after
+    /// each call, returning a placeholder once one raised.
     pub exceptions: bool,
     /// Whether a boolean equals the number it stands for, as in Python
     /// (`True == 1`, one dict key), or is its own kind of value that
@@ -295,6 +298,22 @@ pub fn library(policy: &Policy) -> Library {
             &[("kind", build::string()), ("message", build::string())],
             build::unit(),
             None,
+        ));
+        // Whether an error is pending: asked after each call back into
+        // the program, so a loop runs no more of the program's code once
+        // one raised.
+        declarations.push(build::extern_fn(
+            "zb_hook_pending",
+            &[],
+            build::boolean(),
+            None,
+        ));
+    } else {
+        declarations.push(build::define(
+            "zb_hook_pending",
+            &[],
+            build::boolean(),
+            vec![build::ret(build::bool(false))],
         ));
     }
     // Every call is typed as its callee returns; checked where the

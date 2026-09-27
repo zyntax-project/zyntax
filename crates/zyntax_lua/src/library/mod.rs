@@ -1142,6 +1142,14 @@ fn raising(t: &Types) -> Vec<Decl> {
             ret_void(),
         ],
     ));
+    // The shared library asks whether an error is pending after each
+    // call back into the program.
+    d.push(define(
+        "zb_hook_pending",
+        &[],
+        boolean(),
+        vec![ret(not(is_nil(pending())))],
+    ));
     // A type error, positioned, with the operand it is about noted for
     // the site to describe.
     let operand = local("operand", i64());

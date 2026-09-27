@@ -6594,8 +6594,17 @@ impl<'m> Lowerer<'m> {
             },
             Ty::List(Elem::Object),
         );
+        // A key function that raised leaves no keys to sort by.
         let keys = match key {
-            Some(f) => call("zb_list_map1", vec![f, boxed], Ty::List(Elem::Object), span),
+            Some(f) => {
+                let keys = Val {
+                    node: call("zb_list_map1", vec![f, boxed], Ty::List(Elem::Object), span),
+                    ty: Ty::List(Elem::Object),
+                };
+                let held = self.hold(keys, out, span);
+                out.push(self.pending_check(span));
+                held.node
+            }
             None => boxed,
         };
         let descending = reverse.unwrap_or_else(|| {
@@ -6749,7 +6758,11 @@ impl<'m> Lowerer<'m> {
                     },
                     Ty::List(Elem::Object),
                 );
-                let keys = call("zb_list_map1", vec![f, boxed], anys, span);
+                let keys = Val {
+                    node: call("zb_list_map1", vec![f, boxed], anys, span),
+                    ty: anys,
+                };
+                let keys = self.guard(keys, span).node;
                 let best = Val {
                     node: elem_call(&format!("{name}_by"), e, vec![held.node, keys], span),
                     ty: e.ty(),

@@ -5,3 +5,16 @@ KeyError: 'no key for 2'
 KeyError: 'no key for 2'
 ValueError: filter at 2
 fine [1, 2, 3]
+ValueError: cannot compare 3
+ValueError: cannot compare 3
+kept [1, 2, 3, 4, 5, 6]
+ValueError: cannot compare 3
+ValueError: cannot compare 3
+sorted KeyError: 'no key for 2' [1, 2]
+sort KeyError: 'no key for 2' [1, 2]
+max KeyError: 'no key for 2' [1, 2]
+map KeyError: 'no key for 2' [1, 2]
+filter KeyError: 'no key for 2' [1, 2]
+map2 KeyError: 'no sum with 2' [1, 2]
+reduce KeyError: 'no sum with 2' [2]
+reduce start KeyError: 'no sum with 2' [1, 2]
