@@ -5624,6 +5624,11 @@ impl<'m> Lowerer<'m> {
             )
         });
         let counter = self.temp();
+        if let Ty::List(e) = seq.ty {
+            return self.for_list_items(
+                f, seq, e, elem_ty, counter, index_from, extra, prologue, span,
+            );
+        }
         let len = match seq.ty {
             Ty::Str => call("zb_str_chars_len", vec![seq.node.clone()], Ty::Int, span),
             Ty::Bytes => call("zb_str_len", vec![seq.node.clone()], Ty::Int, span),
@@ -5698,6 +5703,121 @@ impl<'m> Lowerer<'m> {
             },
         });
         prologue.push(TypedNode::new(loop_stmt, Type::Unknown, span));
+        Ok(TypedStatement::Block(TypedBlock {
+            statements: prologue,
+            span,
+        }))
+    }
+
+    /// [`Self::for_items`] over a list `seq` of kind `e`, held: `i = 0;
+    /// while i < len(seq) { x = seq[i]; i += 1; body }`. The length is
+    /// read on every step, as a list iterator does, so items appended in
+    /// the body are visited; the header's `0 <= i < len` is all the read
+    /// needs, since nothing runs between the test and the read.
+    #[allow(clippy::too_many_arguments)]
+    fn for_list_items(
+        &mut self,
+        f: &py::StmtFor,
+        seq: Val,
+        e: Elem,
+        elem_ty: Ty,
+        counter: InternedString,
+        index_from: Option<Val>,
+        extra: Vec<Stmt>,
+        mut prologue: Vec<Stmt>,
+        span: Span,
+    ) -> Result<TypedStatement> {
+        let int_let = |name, mutability, ty: Type, value: Node| {
+            TypedNode::new(
+                TypedStatement::Let(TypedLet {
+                    name,
+                    ty,
+                    mutability,
+                    initializer: Some(Box::new(value)),
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            )
+        };
+        let i = || var(counter, Ty::Int, span);
+        prologue.push(int_let(
+            counter,
+            Mutability::Mutable,
+            ir(Ty::Int),
+            int_lit(0, span),
+        ));
+        let test = binary(
+            BinaryOp::Lt,
+            i(),
+            method_call(seq.node.clone(), "len", vec![], Ty::Int, span),
+            Ty::Bool,
+            span,
+        );
+        let read = Val {
+            node: list_slot(seq.node.clone(), i(), e, span),
+            ty: e.ty(),
+        };
+        let read = if e.ty() == elem_ty {
+            read
+        } else {
+            Val {
+                node: self.coerce(read, elem_ty),
+                ty: elem_ty,
+            }
+        };
+        let mut body = std::mem::take(&mut self.hoisted);
+        let item = self.hold(read, &mut body, span);
+        let index = index_from.map(|start| {
+            self.hold(
+                Val {
+                    node: binary(BinaryOp::Add, start.node, i(), Ty::Int, span),
+                    ty: Ty::Int,
+                },
+                &mut body,
+                span,
+            )
+        });
+        body.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(binary(
+                BinaryOp::Assign,
+                i(),
+                binary(BinaryOp::Add, i(), int_lit(1, span), Ty::Int, span),
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        ));
+        match index {
+            Some(index) => {
+                let py::Expr::Tuple(t) = &*f.target else {
+                    unreachable!("an enumerate loop binds a pair");
+                };
+                self.bind_after(&t.elts[0], index, span, &mut body)?;
+                self.bind_after(&t.elts[1], item, span, &mut body)?;
+            }
+            None => self.bind_after(&f.target, item, span, &mut body)?,
+        }
+        self.in_loop(|this| -> Result<()> {
+            for s in &f.body {
+                this.stmt(s, &mut body)?;
+            }
+            Ok(())
+        })?;
+        body.extend(extra);
+        prologue.push(TypedNode::new(
+            TypedStatement::While(TypedWhile {
+                condition: Box::new(test),
+                body: TypedBlock {
+                    statements: body,
+                    span,
+                },
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
         Ok(TypedStatement::Block(TypedBlock {
             statements: prologue,
             span,
