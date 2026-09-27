@@ -3658,7 +3658,8 @@ impl HirInterpreter {
 
     /// Every function that reads the error flag is entered with it
     /// null: abort naming the function when it is not. A function that
-    /// never reads the flag assumes nothing about it.
+    /// never reads the flag, or reads it to report a pending error,
+    /// assumes nothing about it.
     fn check_error_flag(&mut self, module: &HirModule, cf: &CompiledFunction, func_id: HirId) {
         let key = module as *const HirModule as usize;
         let flag = match self.error_flag_of {
@@ -3679,11 +3680,12 @@ impl HirInterpreter {
         }
         let reads = *self.reads_error_flag.entry(func_id).or_insert_with(|| {
             module.functions.get(&func_id).is_some_and(|f| {
-                f.blocks.values().flat_map(|b| &b.instructions).any(|i| {
-                    matches!(i, HirInstruction::Load { ptr, .. }
+                !f.attributes.queries_error_flag
+                    && f.blocks.values().flat_map(|b| &b.instructions).any(|i| {
+                        matches!(i, HirInstruction::Load { ptr, .. }
                         if matches!(f.values.get(ptr).map(|v| &v.kind),
                             Some(HirValueKind::Global(g)) if *g == flag))
-                })
+                    })
             })
         });
         if !reads {

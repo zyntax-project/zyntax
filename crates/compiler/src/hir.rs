@@ -2291,6 +2291,11 @@ pub struct FunctionAttributes {
     /// that does.
     #[serde(default)]
     pub nothrow: bool,
+    /// The body reports whether an error is pending, so it may be
+    /// entered with the error-flag global set: nothing about the flag
+    /// holds at its entry.
+    #[serde(default)]
+    pub queries_error_flag: bool,
 }
 
 /// The release pass's per-function facts; see

@@ -1278,6 +1278,7 @@ pub fn dump_function(func: &HirFunction, module: &HirModule) -> String {
     let attrs: Vec<&str> = [
         (func.attributes.sets_error_flag, "sets_error_flag"),
         (func.attributes.nothrow, "nothrow"),
+        (func.attributes.queries_error_flag, "queries_error_flag"),
         (
             func.attributes.inline == crate::hir::InlineHint::Always,
             "inline_always",

@@ -4156,9 +4156,11 @@ impl LoweringContext {
         }
         hir_func.attributes.strict_fp = annotated("strict_fp");
         // Facts about the error-flag global the frontend proved: see
-        // `FunctionAttributes::sets_error_flag` and `nothrow`.
+        // `FunctionAttributes::sets_error_flag`, `nothrow` and
+        // `queries_error_flag`.
         hir_func.attributes.sets_error_flag = annotated("sets_error_flag");
         hir_func.attributes.nothrow = annotated("nothrow");
+        hir_func.attributes.queries_error_flag = annotated("queries_error_flag");
         // `@inline_always`: the inliner copies it into every caller its
         // size and recursion rules allow.
         if annotated("inline_always") {
