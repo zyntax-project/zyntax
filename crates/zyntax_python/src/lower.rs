@@ -4628,10 +4628,13 @@ impl<'m> Lowerer<'m> {
                 let index = self.hold_unless_plain(index, &sub.slice, span);
                 let read = self.read_item(seq.clone(), index.clone(), ty, span)?;
                 let read = self.checked(read);
-                (
-                    self.hold_ahead(read, span),
-                    Place::Item(Box::new((seq, index))),
-                )
+                // A list's item comes back held already.
+                let held = if matches!(read.node.node, TypedExpression::Variable(_)) {
+                    read
+                } else {
+                    self.hold_ahead(read, span)
+                };
+                (held, Place::Item(Box::new((seq, index))))
             }
             py::Expr::Attribute(attr)
                 if self
@@ -5389,6 +5392,9 @@ impl<'m> Lowerer<'m> {
     /// order: the list, the index, then its length. A negative index
     /// counts from the end; one out of range raises IndexError(`message`)
     /// and leaves, so the position is in bounds wherever it is used.
+    /// Every name bound here is a value a loop around it carries and an
+    /// entry mid-loop has to restore, so a plain variable or literal is
+    /// used as it is and the position is bound once.
     fn list_position(
         &mut self,
         seq: Val,
@@ -5397,63 +5403,69 @@ impl<'m> Lowerer<'m> {
         span: Span,
         out: &mut Vec<Stmt>,
     ) -> (Node, Node) {
-        let xs = self.hold(seq, out, span).node;
-        let j = self.temp();
-        let n = self.temp();
-        let let_ = |name, mutability, value: Node| {
-            TypedNode::new(
-                TypedStatement::Let(TypedLet {
-                    name,
-                    ty: ir(Ty::Int),
-                    mutability,
-                    initializer: Some(Box::new(value)),
-                    span,
-                }),
-                Type::Unknown,
-                span,
+        let plain = |n: &Node| {
+            matches!(
+                n.node,
+                TypedExpression::Variable(_) | TypedExpression::Literal(_)
             )
         };
-        out.push(let_(j, Mutability::Mutable, index));
-        out.push(let_(
-            n,
-            Mutability::Immutable,
-            method_call(xs.clone(), "len", vec![], Ty::Int, span),
-        ));
-        let jv = || var(j, Ty::Int, span);
-        let nv = || var(n, Ty::Int, span);
-        let negative = || binary(BinaryOp::Lt, jv(), int_lit(0, span), Ty::Bool, span);
-        out.push(TypedNode::new(
-            TypedStatement::If(TypedIf {
-                condition: Box::new(negative()),
-                then_block: TypedBlock {
-                    statements: vec![TypedNode::new(
-                        TypedStatement::Expression(Box::new(binary(
-                            BinaryOp::Assign,
-                            jv(),
-                            binary(BinaryOp::Add, jv(), nv(), Ty::Int, span),
-                            Ty::None,
-                            span,
-                        ))),
-                        Type::Unknown,
-                        span,
-                    )],
-                    span,
+        let xs = if plain(&seq.node) {
+            seq.node
+        } else {
+            self.hold(seq, out, span).node
+        };
+        let len = || method_call(xs.clone(), "len", vec![], Ty::Int, span);
+        let lt = |a, b| binary(BinaryOp::Lt, a, b, Ty::Bool, span);
+        let ge = |a, b| binary(BinaryOp::Ge, a, b, Ty::Bool, span);
+        // A literal index at or past zero is its own position.
+        if let Some(k) = int_literal_node(&index)
+            && k >= 0
+        {
+            self.raise_if(ge(index.clone(), len()), "IndexError", message, span, out);
+            return (xs, index);
+        }
+        let i = if plain(&index) {
+            index
+        } else {
+            self.hold(
+                Val {
+                    node: index,
+                    ty: Ty::Int,
                 },
-                else_block: None,
+                out,
                 span,
+            )
+            .node
+        };
+        let zero = || int_lit(0, span);
+        let position = node(
+            TypedExpression::If(TypedIfExpr {
+                condition: Box::new(lt(i.clone(), zero())),
+                then_branch: Box::new(binary(BinaryOp::Add, i.clone(), len(), Ty::Int, span)),
+                else_branch: Box::new(i),
             }),
-            Type::Unknown,
+            Ty::Int,
             span,
-        ));
+        );
+        let j = self
+            .hold(
+                Val {
+                    node: position,
+                    ty: Ty::Int,
+                },
+                out,
+                span,
+            )
+            .node;
         let outside = binary(
             BinaryOp::Or,
-            negative(),
-            binary(BinaryOp::Ge, jv(), nv(), Ty::Bool, span),
+            lt(j.clone(), zero()),
+            ge(j.clone(), len()),
             Ty::Bool,
             span,
         );
         self.raise_if(outside, "IndexError", message, span, out);
-        (xs, jv())
+        (xs, j)
     }
 
     /// `seq[i]` for a sequence value and an int index already lowered.
@@ -5488,11 +5500,17 @@ impl<'m> Lowerer<'m> {
                 span,
                 &mut pre,
             );
+            // Read where it is checked: a call later in the expression
+            // runs before the expression does, and may shrink the list.
+            let read = self.hold(
+                Val {
+                    node: list_slot(xs, j, e, span),
+                    ty: e.ty(),
+                },
+                &mut pre,
+                span,
+            );
             self.hoisted.extend(pre);
-            let read = Val {
-                node: list_slot(xs, j, e, span),
-                ty: e.ty(),
-            };
             if e.ty() == elem_ty {
                 return read;
             }
@@ -6832,23 +6850,13 @@ impl<'m> Lowerer<'m> {
                     }
                     _ => None,
                 };
-                let (v, held_ty) = match narrow {
-                    Some(c) => (self.coerce(value, c.item()), ir(c.item())),
-                    None => (self.elem_arg(value, e), elem_ir(e)),
+                // Anything in the value that calls out was hoisted ahead
+                // of the statement; what is left reads nothing the check
+                // can change.
+                let v = match narrow {
+                    Some(c) => self.coerce(value, c.item()),
+                    None => self.elem_arg(value, e),
                 };
-                let held = self.temp();
-                out.push(TypedNode::new(
-                    TypedStatement::Let(TypedLet {
-                        name: held,
-                        ty: held_ty.clone(),
-                        mutability: Mutability::Immutable,
-                        initializer: Some(Box::new(v)),
-                        span,
-                    }),
-                    Type::Unknown,
-                    span,
-                ));
-                let v = TypedNode::new(TypedExpression::Variable(held), held_ty, span);
                 let what = if matches!(e, Elem::Array(_)) {
                     "array"
                 } else {
