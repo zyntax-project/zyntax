@@ -2,7 +2,7 @@ IndexError: list index out of range 16
 16 32 0 0
 IndexError: list index out of range
 [1.0, 5.0, 9.0, 13.0, 17.0, 21.0, 25.0, 29.0]
-81 0
+81 0 -45
 IndexError: list index out of range
 popping IndexError: list index out of range [0, 1, 2, 3, 4]
 deleting IndexError: list index out of range [5, 6, 7, 8, 9]
@@ -11,7 +11,7 @@ IndexError: list index out of range 16
 16 32 0 0
 IndexError: list index out of range
 [1.0, 5.0, 9.0, 13.0, 17.0, 21.0, 25.0, 29.0]
-81 0
+81 0 -45
 IndexError: list index out of range
 popping IndexError: list index out of range [0, 1, 2, 3, 4]
 deleting IndexError: list index out of range [5, 6, 7, 8, 9]

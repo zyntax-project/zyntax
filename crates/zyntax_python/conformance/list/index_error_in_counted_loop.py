@@ -74,7 +74,7 @@ def main() -> None:
             print(yf)
         sq = [i * i for i in range(10)]
         if show:
-            print(ahead(sq, 0, 9), ahead(sq, 3, 3))
+            print(ahead(sq, 0, 9), ahead(sq, 3, 3), ahead(sq, -3, 2))
         try:
             ahead(sq, 2, 10)
         except IndexError as e:

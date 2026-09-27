@@ -346,129 +346,166 @@ fn recognise(func: &HirFunction, dt: &DominatorTree, lp: &NaturalLoop) -> Result
     }
     let start = start.ok_or("no counter phi")?;
 
-    let reached = |block: &HirBlock, from: HirId| {
-        block.predecessors.contains(&from) && dt.rpo_position(from).is_some()
-    };
-    // `v` as `i + offset` in the iteration that computes it.
-    let single_phis: HashMap<HirId, HirId> = body
-        .iter()
-        .filter(|b| **b != lp.header)
-        .flat_map(|b| {
-            let block = &func.blocks[b];
-            block.phis.iter().map(move |p| (block, p))
-        })
-        .filter_map(|(block, p)| {
-            // Incomings from blocks that no longer branch here are not
-            // values the phi can take.
-            let mut live = p
-                .incoming
-                .iter()
-                .filter(|(_, from)| reached(block, *from))
-                .map(|(v, _)| *v);
-            let first = live.next()?;
-            live.all(|v| v == first).then_some((p.result, first))
-        })
-        .collect();
-    let affine = |mut v: HirId| -> Option<i64> {
-        let mut offset = 0i64;
-        for _ in 0..16 {
-            if v == iv {
-                return (offset.abs() <= 1 << 31).then_some(offset);
-            }
-            if let Some(&from) = single_phis.get(&v) {
-                v = from;
-                continue;
-            }
-            match defs.get(&v) {
-                Some(HirInstruction::Binary {
-                    op: BinaryOp::Add,
-                    left,
-                    right,
-                    ..
-                }) => {
-                    if let Some(c) = const_i64(*right) {
-                        offset = offset.checked_add(c)?;
-                        v = *left;
-                    } else if let Some(c) = const_i64(*left) {
-                        offset = offset.checked_add(c)?;
-                        v = *right;
-                    } else {
-                        return None;
-                    }
-                }
-                Some(HirInstruction::Binary {
-                    op: BinaryOp::Sub,
-                    left,
-                    right,
-                    ..
-                }) => {
-                    offset = offset.checked_sub(const_i64(*right)?)?;
-                    v = *left;
-                }
-                _ => return None,
-            }
-        }
-        None
-    };
-
-    // Compares the copy decides. The header's own run once more with
-    // `i == N` and are left.
+    // Compares the copy decides, to a fixed point: a decided branch
+    // leaves the copy fewer edges, a phi left with one value there is
+    // that value, and that can make another compare one on an index.
+    // The header's own compares run once more with `i == N` and are left.
     let mut folds: HashMap<HirId, bool> = HashMap::new();
     let mut facts: Vec<Fact> = Vec::new();
-    for b in body {
-        if *b == lp.header {
-            continue;
+    let order: Vec<HirId> = func
+        .blocks
+        .keys()
+        .copied()
+        .filter(|b| body.contains(b))
+        .collect();
+    loop {
+        let taken = |from: HirId, to: HirId| match &func.blocks[&from].terminator {
+            HirTerminator::CondBranch {
+                condition,
+                true_target,
+                false_target,
+            } => match folds.get(condition) {
+                Some(true) => *true_target == to,
+                Some(false) => *false_target == to,
+                None => true,
+            },
+            _ => true,
+        };
+        let mut live: HashSet<HirId> = HashSet::from([lp.header]);
+        let mut stack = vec![lp.header];
+        while let Some(b) = stack.pop() {
+            for t in func.blocks[&b].terminator.targets() {
+                if body.contains(&t) && taken(b, t) && live.insert(t) {
+                    stack.push(t);
+                }
+            }
         }
-        for inst in &func.blocks[b].instructions {
-            let HirInstruction::Binary {
-                op,
-                result,
-                left,
-                right,
-                ..
-            } = inst
-            else {
-                continue;
-            };
-            if !matches!(
-                op,
-                BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
-            ) || !is_i64(*left)
-                || !is_i64(*right)
-            {
+        // `v` as `i + offset` in the iteration that computes it.
+        let single_phis: HashMap<HirId, HirId> = order
+            .iter()
+            .filter(|b| **b != lp.header && live.contains(b))
+            .flat_map(|b| {
+                let block = &func.blocks[b];
+                block.phis.iter().map(move |p| (*b, block, p))
+            })
+            .filter_map(|(bid, block, p)| {
+                let mut values = p
+                    .incoming
+                    .iter()
+                    .filter(|(_, from)| {
+                        block.predecessors.contains(from)
+                            && live.contains(from)
+                            && taken(*from, bid)
+                    })
+                    .map(|(v, _)| *v);
+                let first = values.next()?;
+                values.all(|v| v == first).then_some((p.result, first))
+            })
+            .collect();
+        let affine = |mut v: HirId| -> Option<i64> {
+            let mut offset = 0i64;
+            for _ in 0..16 {
+                if v == iv {
+                    return (offset.abs() <= 1 << 31).then_some(offset);
+                }
+                if let Some(&from) = single_phis.get(&v) {
+                    v = from;
+                    continue;
+                }
+                match defs.get(&v) {
+                    Some(HirInstruction::Binary {
+                        op: BinaryOp::Add,
+                        left,
+                        right,
+                        ..
+                    }) => {
+                        if let Some(c) = const_i64(*right) {
+                            offset = offset.checked_add(c)?;
+                            v = *left;
+                        } else if let Some(c) = const_i64(*left) {
+                            offset = offset.checked_add(c)?;
+                            v = *right;
+                        } else {
+                            return None;
+                        }
+                    }
+                    Some(HirInstruction::Binary {
+                        op: BinaryOp::Sub,
+                        left,
+                        right,
+                        ..
+                    }) => {
+                        offset = offset.checked_sub(const_i64(*right)?)?;
+                        v = *left;
+                    }
+                    _ => return None,
+                }
+            }
+            None
+        };
+        let mut decided: Vec<(HirId, bool, Fact)> = Vec::new();
+        for b in &order {
+            if *b == lp.header || !live.contains(b) {
                 continue;
             }
-            // As `idx op bound`.
-            let (op, offset, bound) = if let Some(off) = affine(*left) {
-                (*op, off, *right)
-            } else if let Some(off) = affine(*right) {
-                let swapped = match op {
-                    BinaryOp::Lt => BinaryOp::Gt,
-                    BinaryOp::Le => BinaryOp::Ge,
-                    BinaryOp::Gt => BinaryOp::Lt,
-                    _ => BinaryOp::Le,
+            for inst in &func.blocks[b].instructions {
+                let HirInstruction::Binary {
+                    op,
+                    result,
+                    left,
+                    right,
+                    ..
+                } = inst
+                else {
+                    continue;
                 };
-                (swapped, off, *left)
-            } else {
-                continue;
-            };
-            let (truth, len) = match const_i64(bound) {
-                // `0 <= idx`.
-                Some(0) => match op {
-                    BinaryOp::Lt => (false, None),
-                    BinaryOp::Ge => (true, None),
-                    _ => continue,
-                },
-                Some(_) => continue,
-                // `idx < len`.
-                None if invariant(bound) => match op {
-                    BinaryOp::Lt | BinaryOp::Le => (true, Some(bound)),
-                    _ => (false, Some(bound)),
-                },
-                None => continue,
-            };
-            folds.insert(*result, truth);
-            let fact = Fact { offset, len };
+                if folds.contains_key(result)
+                    || !matches!(
+                        op,
+                        BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+                    )
+                    || !is_i64(*left)
+                    || !is_i64(*right)
+                {
+                    continue;
+                }
+                // As `idx op bound`.
+                let (op, offset, bound) = if let Some(off) = affine(*left) {
+                    (*op, off, *right)
+                } else if let Some(off) = affine(*right) {
+                    let swapped = match op {
+                        BinaryOp::Lt => BinaryOp::Gt,
+                        BinaryOp::Le => BinaryOp::Ge,
+                        BinaryOp::Gt => BinaryOp::Lt,
+                        _ => BinaryOp::Le,
+                    };
+                    (swapped, off, *left)
+                } else {
+                    continue;
+                };
+                let (truth, len) = match const_i64(bound) {
+                    // `0 <= idx`.
+                    Some(0) => match op {
+                        BinaryOp::Lt => (false, None),
+                        BinaryOp::Ge => (true, None),
+                        _ => continue,
+                    },
+                    Some(_) => continue,
+                    // `idx < len`.
+                    None if invariant(bound) => match op {
+                        BinaryOp::Lt | BinaryOp::Le => (true, Some(bound)),
+                        _ => (false, Some(bound)),
+                    },
+                    None => continue,
+                };
+                decided.push((*result, truth, Fact { offset, len }));
+            }
+        }
+        if decided.is_empty() {
+            break;
+        }
+        for (result, truth, fact) in decided {
+            folds.insert(result, truth);
             if !facts.contains(&fact) {
                 facts.push(fact);
             }
