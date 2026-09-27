@@ -91,10 +91,12 @@
 
 use crate::analysis::{DominatorTree, LoopForest, NaturalLoop};
 use crate::hir::{
-    BinaryOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirTerminator, HirType,
+    BinaryOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
+    HirTerminator, HirType,
 };
 use fnv::{FnvHashMap, FnvHashSet};
 use std::collections::{HashMap, HashSet};
+use zyntax_typed_ast::InternedString;
 
 /// Stats surfaced for callers / tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -109,11 +111,16 @@ pub struct LicmStats {
 
 /// Run LICM over `func`.
 pub fn run(func: &mut HirFunction) -> LicmStats {
-    run_with(func, &HashSet::new())
+    run_with(func, &HashSet::new(), &FnvHashSet::default())
 }
 
-/// [`run`], knowing which functions are pure.
-fn run_with(func: &mut HirFunction, pure: &HashSet<HirId>) -> LicmStats {
+/// [`run`], knowing which functions are pure and which struct types
+/// are exact (see [`exact_struct_names`]).
+fn run_with(
+    func: &mut HirFunction,
+    pure: &HashSet<HirId>,
+    exact: &FnvHashSet<InternedString>,
+) -> LicmStats {
     // SSA construction doesn't reliably populate `block.successors` /
     // `block.predecessors` — different lowering paths write the
     // fields at different times, the optimisation passes that splice
@@ -157,7 +164,7 @@ fn run_with(func: &mut HirFunction, pure: &HashSet<HirId>) -> LicmStats {
             value_block.insert(phi.result, *block_id);
         }
     }
-    let addr_index = build_addr_index(func);
+    let addr_index = build_addr_index(func, exact);
     let from_integer = func
         .blocks
         .values()
@@ -176,6 +183,7 @@ fn run_with(func: &mut HirFunction, pure: &HashSet<HirId>) -> LicmStats {
         value_block,
         addr_index,
         from_integer,
+        exact,
     };
 
     // Innermost-first ordering — `LoopForest::loops()` already
@@ -199,7 +207,7 @@ fn run_with(func: &mut HirFunction, pure: &HashSet<HirId>) -> LicmStats {
 }
 
 /// Module-level entry — runs LICM on every function in `module`.
-pub fn run_module(module: &mut crate::hir::HirModule) -> LicmStats {
+pub fn run_module(module: &mut HirModule) -> LicmStats {
     let mut total = LicmStats::default();
     // Functions inferred pure write nothing, so a call to one inside a
     // loop leaves every load in the loop invariant.
@@ -209,8 +217,9 @@ pub fn run_module(module: &mut crate::hir::HirModule) -> LicmStats {
         .filter(|(_, f)| f.signature.is_pure)
         .map(|(id, _)| *id)
         .collect();
+    let exact = exact_struct_names(module);
     for func in module.functions_to_optimize() {
-        let s = run_with(func, &pure);
+        let s = run_with(func, &pure, &exact);
         total.hoisted += s.hoisted;
         total.loops_visited += s.loops_visited;
         total.loops_skipped_no_preheader += s.loops_skipped_no_preheader;
@@ -277,9 +286,34 @@ fn unique_outside_predecessor(func: &HirFunction, lp: &NaturalLoop) -> Option<Hi
     }
 }
 
+/// The names of `module`'s exact struct types
+/// (`HirModule::exact_struct_types`, spelled in `module.types`): two
+/// pointers whose pointee types are two different ones never name the
+/// same bytes.
+pub(crate) fn exact_struct_names(module: &HirModule) -> FnvHashSet<InternedString> {
+    // ZYNTAX_DISABLE_TYPED_ALIAS=1 ignores exact struct types in alias
+    // checks; safe to run with.
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("ZYNTAX_DISABLE_TYPED_ALIAS").is_some()) {
+        return FnvHashSet::default();
+    }
+    module
+        .exact_struct_types
+        .iter()
+        .filter_map(|id| match module.types.get(id)? {
+            HirType::Struct(s) => s.name,
+            HirType::Ptr(inner) => match &**inner {
+                HirType::Struct(s) => s.name,
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 /// What `hoist_loop` reads of the whole function, the same for each of
 /// its loops.
-struct Shared {
+struct Shared<'a> {
     /// Values that live in no block: parameters, constants, globals.
     outside: FnvHashSet<HirId>,
     /// The block each instruction or phi result is defined in.
@@ -288,6 +322,8 @@ struct Shared {
     /// Pointers made from integers (`IntToPtr`): an address a program
     /// may keep as zero when there is nothing to point at.
     from_integer: FnvHashSet<HirId>,
+    /// Names of the exact struct types.
+    exact: &'a FnvHashSet<InternedString>,
 }
 
 /// Whether `ptr` is made, through address arithmetic and casts, from
@@ -412,6 +448,7 @@ fn hoist_loop(
                 value_byte_size(func, *value),
                 &identity_subst,
                 addr_index,
+                shared.exact,
             )),
             // A vectorized store writes memory exactly as the scalar one
             // it replaced. Counting only the scalar spelling makes a
@@ -424,6 +461,7 @@ fn hoist_loop(
                 value_byte_size(func, *value),
                 &identity_subst,
                 addr_index,
+                shared.exact,
             )),
             _ => None,
         })
@@ -509,6 +547,7 @@ fn hoist_loop(
                         hir_ty_byte_size(ty),
                         &identity_subst,
                         addr_index,
+                        shared.exact,
                     );
                     // A Load with an entirely opaque root (no GEP+Cast
                     // chain we can trace) can't be disambiguated from
@@ -623,7 +662,7 @@ fn operands_all_invariant(inst: &HirInstruction, invariant: &FnvHashSet<HirId>) 
 /// chain has a non-constant index along the way). `size` is the
 /// byte width of the value being loaded/stored.
 #[derive(Debug, Clone, Copy)]
-struct MemLoc {
+pub(crate) struct MemLoc {
     root: Option<HirId>,
     offset: Option<u64>,
     size: u32,
@@ -634,6 +673,9 @@ struct MemLoc {
     /// The root is a module global: storage the compiler owns, which
     /// no object pointer handed to a region points into.
     global_root: bool,
+    /// The root's pointee type when it is an exact struct type: the
+    /// root points at an object of that type.
+    exact_type: Option<InternedString>,
 }
 
 impl MemLoc {
@@ -647,7 +689,10 @@ impl MemLoc {
     /// or unknown size, because the roots already establish disjoint
     /// allocations. Only when roots match (or one is unknown) do we
     /// fall back to byte-range comparison.
-    fn may_alias(&self, other: &MemLoc) -> bool {
+    pub(crate) fn may_alias(&self, other: &MemLoc) -> bool {
+        if self.distinct_exact_objects(other) {
+            return false;
+        }
         match (self.root, other.root) {
             (Some(r1), Some(r2)) if r1 != r2 && (self.shared_root || other.shared_root) => {
                 !(self.global_root || other.global_root)
@@ -684,10 +729,29 @@ impl MemLoc {
     }
 }
 
+impl MemLoc {
+    /// Whether the two roots point at objects of two different exact
+    /// struct types, which are two different objects.
+    fn distinct_exact_objects(&self, other: &MemLoc) -> bool {
+        matches!(
+            (self.root, other.root, self.exact_type, other.exact_type),
+            (Some(r1), Some(r2), Some(t1), Some(t2)) if r1 != r2 && t1 != t2
+        )
+    }
+
+    /// Whether the two locations provably never overlap, without the
+    /// assumption [`Self::may_alias`] makes that distinct roots name
+    /// distinct objects: they lie in objects of two different exact
+    /// struct types.
+    pub(crate) fn provably_disjoint(&self, other: &MemLoc) -> bool {
+        self.distinct_exact_objects(other)
+    }
+}
+
 /// Compact representation of the GEP/Cast chain we need to chase.
 /// Owning copies of operands/indices keep us from holding a borrow on
 /// `func.blocks` while the alias check runs.
-enum AddrLink {
+pub(crate) enum AddrLink {
     /// Bitcast — chase to the operand verbatim.
     Cast(HirId),
     /// GEP — chase to `base`, optionally with constant byte-offset
@@ -707,7 +771,10 @@ enum AddrLink {
 /// Without this index every chase step walked `func.blocks ×
 /// instructions` looking for the defining instruction — for a
 /// function with N instructions and K Loads we paid O(N²·K).
-fn build_addr_index(func: &HirFunction) -> HashMap<HirId, AddrLink> {
+pub(crate) fn build_addr_index(
+    func: &HirFunction,
+    exact: &FnvHashSet<InternedString>,
+) -> HashMap<HirId, AddrLink> {
     let mut idx: HashMap<HirId, AddrLink> = HashMap::new();
     for block in func.blocks.values() {
         for inst in &block.instructions {
@@ -784,7 +851,7 @@ fn build_addr_index(func: &HirFunction) -> HashMap<HirId, AddrLink> {
             else {
                 continue;
             };
-            let at = extract_mem_loc(func, *ptr, 8, &no_subst, &idx);
+            let at = extract_mem_loc(func, *ptr, 8, &no_subst, &idx, exact);
             let (Some(root), Some(offset)) = (at.root, at.offset) else {
                 continue;
             };
@@ -805,12 +872,13 @@ fn build_addr_index(func: &HirFunction) -> HashMap<HirId, AddrLink> {
 /// `MemLoc { root, offset, size }`. `size` comes from the caller
 /// (byte width of the Load/Store's value type). The chain step
 /// lookup is O(1) via the pre-built `addr_index`.
-fn extract_mem_loc(
+pub(crate) fn extract_mem_loc(
     func: &HirFunction,
     ptr: HirId,
     size: u32,
     identity_subst: &indexmap::IndexMap<HirId, HirId>,
     addr_index: &HashMap<HirId, AddrLink>,
+    exact: &FnvHashSet<InternedString>,
 ) -> MemLoc {
     let mut current = identity_subst.get(&ptr).copied().unwrap_or(ptr);
     let mut total_offset: u64 = 0;
@@ -843,10 +911,18 @@ fn extract_mem_loc(
             None => break,
         }
     }
-    let root_kind = func.values.get(&current).map(|v| &v.kind);
+    let root_value = func.values.get(&current);
+    let root_kind = root_value.map(|v| &v.kind);
     let shared_root = func.attributes.osr_region
         && matches!(root_kind, Some(crate::hir::HirValueKind::Parameter(_)));
     let global_root = matches!(root_kind, Some(crate::hir::HirValueKind::Global(_)));
+    let exact_type = match root_value.map(|v| &v.ty) {
+        Some(HirType::Ptr(inner)) => match &**inner {
+            HirType::Struct(s) => s.name.filter(|n| exact.contains(n)),
+            _ => None,
+        },
+        _ => None,
+    };
     MemLoc {
         root: Some(current),
         offset: if offset_known {
@@ -857,6 +933,7 @@ fn extract_mem_loc(
         size,
         shared_root,
         global_root,
+        exact_type,
     }
 }
 
@@ -884,7 +961,7 @@ fn constant_i64_value(func: &HirFunction, id: HirId) -> Option<i64> {
 /// Byte size of an `HirType` for the purpose of alias-range checks.
 /// Conservative — returns 0 for shapes we don't model, which makes
 /// the alias check default to "may overlap".
-fn hir_ty_byte_size(ty: &HirType) -> u32 {
+pub(crate) fn hir_ty_byte_size(ty: &HirType) -> u32 {
     match ty {
         HirType::I8 | HirType::U8 | HirType::Bool => 1,
         HirType::I16 | HirType::U16 => 2,
@@ -897,7 +974,7 @@ fn hir_ty_byte_size(ty: &HirType) -> u32 {
 }
 
 /// Byte size of the value at `id`, derived from its HIR type.
-fn value_byte_size(func: &HirFunction, id: HirId) -> u32 {
+pub(crate) fn value_byte_size(func: &HirFunction, id: HirId) -> u32 {
     func.values
         .get(&id)
         .map(|v| hir_ty_byte_size(&v.ty))
@@ -1532,5 +1609,106 @@ mod tests {
                 .any(|inst| matches!(inst, HirInstruction::Load { result, .. } if *result == r)),
             "the global read leaves the loop"
         );
+    }
+
+    fn struct_ptr(name: &str) -> HirType {
+        HirType::Ptr(Box::new(HirType::Struct(crate::hir::HirStructType {
+            name: Some(InternedString::new_global(name)),
+            fields: vec![HirType::I64, HirType::I64],
+            packed: false,
+        })))
+    }
+
+    /// A region storing through `*store_ty` and loading through
+    /// `*load_ty`, both parameters, in a module where `exact` names the
+    /// exact struct types; a call to an extern in the loop when `call`.
+    /// Whether the load left the loop.
+    fn typed_region_hoists(store_ty: &str, load_ty: &str, exact: &[&str], call: bool) -> bool {
+        let (mut f, _entry, _header, body, _exit) = mk_func();
+        f.attributes.osr_region = true;
+        let stored = add_param(&mut f, struct_ptr(store_ty), 0);
+        let loaded = add_param(&mut f, struct_ptr(load_ty), 1);
+        let off = add_param(&mut f, HirType::I64, 2);
+        let v = add_param(&mut f, HirType::I64, 3);
+        let field_ty = HirType::Ptr(Box::new(HirType::I64));
+        let store_at = add_inst(&mut f, field_ty.clone());
+        let load_at = add_inst(&mut f, field_ty.clone());
+        let r = add_inst(&mut f, HirType::I64);
+        let b = f.blocks.get_mut(&body).unwrap();
+        b.instructions.push(HirInstruction::GetElementPtr {
+            result: store_at,
+            ty: field_ty.clone(),
+            ptr: stored,
+            indices: vec![off],
+        });
+        b.instructions.push(HirInstruction::Store {
+            value: v,
+            ptr: store_at,
+            align: 8,
+            volatile: false,
+        });
+        if call {
+            b.instructions.push(HirInstruction::Call {
+                result: None,
+                callee: HirCallable::Symbol("ext".to_string()),
+                args: vec![],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            });
+        }
+        b.instructions.push(HirInstruction::GetElementPtr {
+            result: load_at,
+            ty: field_ty,
+            ptr: loaded,
+            indices: vec![off],
+        });
+        b.instructions.push(HirInstruction::Load {
+            result: r,
+            ty: HirType::I64,
+            ptr: load_at,
+            align: 8,
+            volatile: false,
+        });
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        for name in [store_ty, load_ty] {
+            let id = zyntax_typed_ast::TypeId::next();
+            module.types.insert(id, struct_ptr(name));
+            if exact.contains(&name) {
+                module.exact_struct_types.insert(id);
+            }
+        }
+        let fid = f.id;
+        module.functions.insert(fid, f);
+        run_module(&mut module);
+        !module.functions[&fid].blocks[&body]
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, HirInstruction::Load { result, .. } if *result == r))
+    }
+
+    /// Objects of two different exact struct types are two objects: a
+    /// store through one leaves a read of the other free to leave the
+    /// loop, even where parameters may alias.
+    #[test]
+    fn a_store_to_another_exact_type_leaves_the_load_free() {
+        assert!(typed_region_hoists("B", "A", &["A", "B"], false));
+        assert!(
+            !typed_region_hoists("A", "A", &["A"], false),
+            "one exact type: the two pointers may name one object"
+        );
+    }
+
+    /// A base class is not exact: a pointer to it may point at a
+    /// subclass object, so a store through it pins the subclass read.
+    #[test]
+    fn a_store_through_a_base_pointer_pins_a_subclass_read() {
+        assert!(!typed_region_hoists("Base", "Sub", &["Sub"], false));
+    }
+
+    /// A call may write any object, exact or not.
+    #[test]
+    fn a_call_pins_a_read_of_another_exact_type() {
+        assert!(!typed_region_hoists("B", "A", &["A", "B"], true));
     }
 }

@@ -10,9 +10,11 @@
 //!   * Track `Load { ptr, result }` entries in a per-block "available
 //!     loads" map keyed by the pointer's canonical HirId (chasing
 //!     substitutions through any prior CSE).
-//!   * On a *memory-killing* instruction (`Store`, `Call`,
-//!     `IndirectCall`, `Atomic`, `Fence`), clear the map — we
-//!     conservatively assume anything in memory could have changed.
+//!   * On a *memory-killing* instruction (`Call`, `IndirectCall`,
+//!     `Atomic`, `Fence`), clear the map — we conservatively assume
+//!     anything in memory could have changed. A `Store` kills every
+//!     load but those of an object of another exact struct type
+//!     (`licm::MemLoc::provably_disjoint`).
 //!   * On a redundant `Load` (its pointer is already in the map),
 //!     record a substitution from the new load result to the
 //!     previously-seen load result.
@@ -30,7 +32,10 @@
 
 use crate::cse;
 use crate::hir::{HirFunction, HirId, HirInstruction, HirModule};
+use crate::licm::{MemLoc, extract_mem_loc, hir_ty_byte_size, value_byte_size};
+use fnv::FnvHashSet;
 use std::collections::HashMap;
+use zyntax_typed_ast::InternedString;
 
 /// Public stats — same shape as `CseStats` so callers can compose.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -41,22 +46,40 @@ pub struct LoadCseStats {
 
 /// Run intra-block Load CSE on `func`.
 pub fn run(func: &mut HirFunction) -> LoadCseStats {
+    run_with(func, &FnvHashSet::default())
+}
+
+/// [`run`], knowing the exact struct types
+/// (`licm::exact_struct_names`).
+fn run_with(func: &mut HirFunction, exact: &FnvHashSet<InternedString>) -> LoadCseStats {
     let mut substitutions: HashMap<HirId, HirId> = HashMap::new();
+    let addr_index = crate::licm::build_addr_index(func, exact);
+    let no_subst = indexmap::IndexMap::new();
+    let loc = |ptr: HirId, size: u32| -> MemLoc {
+        extract_mem_loc(func, ptr, size, &no_subst, &addr_index, exact)
+    };
 
     for block in func.blocks.values() {
-        let mut available: HashMap<HirId, HirId> = HashMap::new();
+        let mut available: HashMap<HirId, (HirId, MemLoc)> = HashMap::new();
         for inst in &block.instructions {
             match inst {
-                HirInstruction::Load { result, ptr, .. } => {
+                HirInstruction::Load {
+                    result, ptr, ty, ..
+                } => {
                     let canonical_ptr = chase(*ptr, &substitutions);
                     match available.get(&canonical_ptr) {
-                        Some(&prev_result) => {
+                        Some(&(prev_result, _)) => {
                             substitutions.insert(*result, prev_result);
                         }
                         None => {
-                            available.insert(canonical_ptr, *result);
+                            let at = loc(*ptr, hir_ty_byte_size(ty));
+                            available.insert(canonical_ptr, (*result, at));
                         }
                     }
+                }
+                HirInstruction::Store { ptr, value, .. } => {
+                    let at = loc(*ptr, value_byte_size(func, *value));
+                    available.retain(|_, (_, loaded)| at.provably_disjoint(loaded));
                 }
                 // Memory-killing ops invalidate everything we
                 // believe about memory contents. Conservative
@@ -74,7 +97,7 @@ pub fn run(func: &mut HirFunction) -> LoadCseStats {
                 // `CreateClosure` may capture by reference to a
                 // mutable environment; conservatively treat as a
                 // barrier.
-                HirInstruction::Store { .. }
+                HirInstruction::VectorStore { .. }
                 | HirInstruction::Call { .. }
                 | HirInstruction::IndirectCall { .. }
                 | HirInstruction::Atomic { .. }
@@ -100,8 +123,9 @@ pub fn run(func: &mut HirFunction) -> LoadCseStats {
 /// Module-level entry.
 pub fn run_module(module: &mut HirModule) -> LoadCseStats {
     let mut total = LoadCseStats::default();
+    let exact = crate::licm::exact_struct_names(module);
     for func in module.functions_to_optimize() {
-        let s = run(func);
+        let s = run_with(func, &exact);
         total.eliminated += s.eliminated;
     }
     total
@@ -385,5 +409,76 @@ mod tests {
         );
         let stats = run(&mut f);
         assert_eq!(stats.eliminated, 0, "different ptrs are different loads");
+    }
+
+    /// Two loads through `*load_ty` around a store through `*store_ty`,
+    /// in a module where `exact` names the exact struct types. How many
+    /// loads the pass removed.
+    fn typed_store_between_loads(store_ty: &str, load_ty: &str, exact: &[&str]) -> usize {
+        let named = |name: &str| {
+            HirType::Ptr(Box::new(HirType::Struct(crate::hir::HirStructType {
+                name: Some(InternedString::new_global(name)),
+                fields: vec![HirType::I64],
+                packed: false,
+            })))
+        };
+        let (mut f, entry) = mk_func();
+        let stored = add_param(&mut f, named(store_ty), 0);
+        let loaded = add_param(&mut f, named(load_ty), 1);
+        let v = add_param(&mut f, HirType::I64, 2);
+        let l1 = add_inst(&mut f, HirType::I64);
+        let l2 = add_inst(&mut f, HirType::I64);
+        let sum = add_inst(&mut f, HirType::I64);
+        let load = |result| HirInstruction::Load {
+            result,
+            ty: HirType::I64,
+            ptr: loaded,
+            align: 8,
+            volatile: false,
+        };
+        push(&mut f, entry, load(l1));
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Store {
+                value: v,
+                ptr: stored,
+                align: 8,
+                volatile: false,
+            },
+        );
+        push(&mut f, entry, load(l2));
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Binary {
+                op: BinaryOp::Add,
+                result: sum,
+                ty: HirType::I64,
+                left: l1,
+                right: l2,
+            },
+        );
+        f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Return { values: vec![sum] };
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        for name in [store_ty, load_ty] {
+            let id = zyntax_typed_ast::TypeId::next();
+            module.types.insert(id, named(name));
+            if exact.contains(&name) {
+                module.exact_struct_types.insert(id);
+            }
+        }
+        module.functions.insert(f.id, f);
+        run_module(&mut module).eliminated
+    }
+
+    /// A store to an object of one exact struct type leaves a load of
+    /// another exact type standing; a store that may reach the loaded
+    /// object does not.
+    #[test]
+    fn a_store_to_another_exact_type_keeps_the_load() {
+        assert_eq!(typed_store_between_loads("B", "A", &["A", "B"]), 1);
+        assert_eq!(typed_store_between_loads("Base", "Sub", &["Sub"]), 0);
+        assert_eq!(typed_store_between_loads("A", "A", &["A"]), 0);
     }
 }

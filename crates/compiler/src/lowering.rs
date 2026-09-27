@@ -724,6 +724,37 @@ impl LoweringContext {
             .unwrap_or_else(crate::hir::HirId::new)
     }
 
+    /// Put each exact struct type's HIR spelling in `module.types`, where
+    /// the optimiser finds the name its pointers carry. A type whose name
+    /// another registered type shares is left out: a pointer spelled with
+    /// that name need not point at the exact one.
+    fn record_exact_struct_types(&mut self) {
+        let exact = self.module.exact_struct_types.clone();
+        if exact.is_empty() {
+            return;
+        }
+        let mut names: HashMap<InternedString, usize> = HashMap::new();
+        for def in self.type_registry.get_all_types() {
+            *names.entry(def.name).or_default() += 1;
+        }
+        for id in exact {
+            let Some(def) = self.type_registry.get_type_by_id(id) else {
+                continue;
+            };
+            if names.get(&def.name).copied() != Some(1) {
+                continue;
+            }
+            let ty = self.convert_type(&Type::Named {
+                id,
+                type_args: vec![],
+                const_args: vec![],
+                variance: vec![],
+                nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
+            });
+            self.module.types.entry(id).or_insert(ty);
+        }
+    }
+
     /// Whether a prelowered module already holds this function's body.
     fn is_prelowered(&self, name: InternedString) -> bool {
         self.prelowered.bodies.contains(&name)
@@ -1086,6 +1117,7 @@ impl AstLowering for LoweringContext {
         // Checked here because only now is every call in the module
         // present, and because every backend is downstream of it.
         self.report_calls_with_wrong_arity()?;
+        self.record_exact_struct_types();
 
         // The module leaves the context rather than being copied out;
         // what is still asked of the context afterwards is kept.
