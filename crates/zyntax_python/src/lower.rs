@@ -3564,8 +3564,8 @@ impl<'m> Lowerer<'m> {
         general.push(self.pending_check(span));
         general.push(TypedNode::new(
             TypedStatement::Expression(Box::new(call(
-                "zb_list_expect_len_any",
-                vec![seq.node.clone(), int_lit(n, span)],
+                "zb_any_expect_len_of",
+                vec![source.node.clone(), seq.node.clone(), int_lit(n, span)],
                 Ty::None,
                 span,
             ))),
@@ -4840,7 +4840,9 @@ impl<'m> Lowerer<'m> {
                 }
                 // A set unpacks as the list of its values, a string as
                 // the list of its characters, a dict as whatever
-                // iterating it yields.
+                // iterating it yields. Too many from a set or a string
+                // raises without the count.
+                let bare = matches!(value.ty, Ty::Set(_) | Ty::Str);
                 let value = match value.ty {
                     Ty::Set(_) | Ty::Tuple(_) => Val {
                         node: self.coerce(value, Ty::List(Elem::Object)),
@@ -4861,18 +4863,20 @@ impl<'m> Lowerer<'m> {
                 if dynamic && let Some(kind) = self.unpacks_primitive_names(&t.elts) {
                     return self.bind_unpacked_primitives(t, value, kind, span, out);
                 }
-                let value = if dynamic {
-                    Val {
+                let (value, source) = if dynamic {
+                    let source = self.hold(value, out, span);
+                    let items = Val {
                         node: call(
                             "zb_any_iter",
-                            vec![value.node],
+                            vec![source.node.clone()],
                             Ty::List(Elem::Object),
                             span,
                         ),
                         ty: Ty::List(Elem::Object),
-                    }
+                    };
+                    (items, Some(source.node))
                 } else {
-                    value
+                    (value, None)
                 };
                 let elem_ty = value.ty.element().unwrap_or(Ty::Object);
                 let seq = self.hold(value, out, span);
@@ -4880,9 +4884,22 @@ impl<'m> Lowerer<'m> {
                     out.push(self.pending_check(span));
                 }
                 let n = t.elts.len() as i64;
-                let check = match seq.ty {
-                    Ty::List(e) => Some(call(
-                        &list_fn("expect_len", e),
+                let check = match (seq.ty, source) {
+                    (Ty::List(_), Some(source)) => Some(call(
+                        "zb_any_expect_len_of",
+                        vec![source, seq.node.clone(), int_lit(n, span)],
+                        Ty::None,
+                        span,
+                    )),
+                    (Ty::List(e), None) => Some(call(
+                        &list_fn(
+                            if bare {
+                                "expect_len_bare"
+                            } else {
+                                "expect_len"
+                            },
+                            e,
+                        ),
                         vec![seq.node.clone(), int_lit(n, span)],
                         Ty::None,
                         span,

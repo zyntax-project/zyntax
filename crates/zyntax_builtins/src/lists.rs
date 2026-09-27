@@ -2032,49 +2032,50 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         s.push(ret(out_typed.e()));
         s
     }));
-    // Unpacking: exactly `n` elements.
+    // Unpacking: exactly `n` elements. Too many from a list, tuple or
+    // dict says how many there were; `_bare` is for any other source,
+    // whose count Python does not give.
     let have = local("have", i64());
-    d.push(define(
-        &name("expect_len"),
-        &[&xs, &n],
-        unit(),
-        vec![
-            have.decl(len(xs.e())),
-            when(
-                lt(have.e(), n.e()),
-                vec![fatal(
-                    "ValueError",
-                    add(
+    for (suffix, counted) in [("expect_len", true), ("expect_len_bare", false)] {
+        let many = add(
+            text("too many values to unpack (expected "),
+            call("zb_str_of_int", vec![n.e()], string()),
+        );
+        let many = if counted {
+            add(
+                add(many, text(", got ")),
+                add(call("zb_str_of_int", vec![have.e()], string()), text(")")),
+            )
+        } else {
+            add(many, text(")"))
+        };
+        d.push(define(
+            &name(suffix),
+            &[&xs, &n],
+            unit(),
+            vec![
+                have.decl(len(xs.e())),
+                when(
+                    lt(have.e(), n.e()),
+                    vec![fatal(
+                        "ValueError",
                         add(
                             add(
-                                text("not enough values to unpack (expected "),
-                                call("zb_str_of_int", vec![n.e()], string()),
+                                add(
+                                    text("not enough values to unpack (expected "),
+                                    call("zb_str_of_int", vec![n.e()], string()),
+                                ),
+                                text(", got "),
                             ),
-                            text(", got "),
+                            add(call("zb_str_of_int", vec![have.e()], string()), text(")")),
                         ),
-                        add(call("zb_str_of_int", vec![have.e()], string()), text(")")),
-                    ),
-                )],
-            ),
-            when(
-                gt(have.e(), n.e()),
-                vec![fatal(
-                    "ValueError",
-                    add(
-                        add(
-                            add(
-                                text("too many values to unpack (expected "),
-                                call("zb_str_of_int", vec![n.e()], string()),
-                            ),
-                            text(", got "),
-                        ),
-                        add(call("zb_str_of_int", vec![have.e()], string()), text(")")),
-                    ),
-                )],
-            ),
-            ret_void(),
-        ],
-    ));
+                    )],
+                ),
+                when(gt(have.e(), n.e()), vec![fatal("ValueError", many)]),
+                ret_void(),
+            ],
+        ));
+    }
     // A list flows into a dynamic slot by reference, under the tag of
     // its kind, and comes back out by checking that tag.
     d.push(extern_fn(

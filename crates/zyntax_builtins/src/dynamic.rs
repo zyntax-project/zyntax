@@ -2124,6 +2124,46 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         },
     ));
 
+    // The length check of unpacking `x` through `items`, the list of
+    // what it yields: a string or a set gives no count when there are
+    // too many.
+    let source = local("source", any());
+    let yielded = local("yielded", anys.clone());
+    let want = local("want", i64());
+    d.push(define(
+        "zb_any_expect_len_of",
+        &[&source, &yielded, &want],
+        unit(),
+        vec![
+            when(
+                or(
+                    eq(category(source.e()), int(STR)),
+                    and(
+                        eq(category(source.e()), int(CUSTOM)),
+                        or(
+                            eq(kind(source.e()), int(SET_TAG >> 8)),
+                            is_keyed_set(source.e()),
+                        ),
+                    ),
+                ),
+                vec![
+                    expr(call(
+                        "zb_list_expect_len_bare_any",
+                        vec![yielded.e(), want.e()],
+                        unit(),
+                    )),
+                    ret_void(),
+                ],
+            ),
+            expr(call(
+                "zb_list_expect_len_any",
+                vec![yielded.e(), want.e()],
+                unit(),
+            )),
+            ret_void(),
+        ],
+    ));
+
     // `a += b` and `a *= n` on a boxed list of the library's own kinds:
     // the list itself grows or empties, so every reference to it sees
     // the change, and is the result. A list of one kind grows in place
