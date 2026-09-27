@@ -686,95 +686,114 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
     // What the rounds below ask of each value does not change between
     // them: indexed once.
     let mut index = PhiIndex::of(func, &phi_blocks);
-    loop {
-        let before = candidates.len();
-        copies.clear();
-        for (block_id, block) in &func.blocks {
-            let body = bodies.get(block_id);
-            for phi in &block.phis {
-                if !candidates.contains(&phi.result) {
-                    continue;
-                }
-                match phi_incomings_owned(func, facts, &sites, &candidates, body, phi, &mut index) {
-                    Some(seed_copies) => copies.extend(seed_copies),
-                    None => {
-                        candidates.remove(&phi.result);
-                    }
-                }
-            }
-        }
-        // The phi's own value: read only by borrowers, and handed on only
-        // to phis that own what they are handed.
-        let mut dropped: Vec<HirId> = Vec::new();
-        for p in candidates.iter().copied() {
-            let kept = !index.borrowed_only(func, facts, p);
-            let handed_on = index
-                .phis_using_derived(func, facts, p)
-                .iter()
-                .any(|other| !candidates.contains(other));
-            if kept || handed_on {
-                if trace_enabled() {
-                    eprintln!(
-                        "[drop] {}: phi {:?} cannot own its value (kept by a use {kept}, handed to a phi that does not own {handed_on})",
-                        func.name.resolve_global().unwrap_or_default(),
-                        p
-                    );
-                }
-                dropped.push(p);
-            }
-        }
-        for p in dropped {
-            candidates.remove(&p);
-        }
-        if candidates.len() == before {
-            break;
-        }
-    }
-    if candidates.is_empty() {
-        return 0;
-    }
-
-    // What releases each owning phi's value: what releases what reaches
-    // it, agreed on by every incoming or the phi is not owned.
-    let mut releases: std::collections::HashMap<HirId, Release> = std::collections::HashMap::new();
-    for _ in 0..candidates.len() {
-        for (_, block) in &func.blocks {
-            for phi in &block.phis {
-                if !candidates.contains(&phi.result) || releases.contains_key(&phi.result) {
-                    continue;
-                }
-                let mut agreed: Option<Release> = None;
-                let mut known = true;
-                for (val, _) in &phi.incoming {
-                    let r = if *val == phi.result || is_null_value(func, *val) {
+    // Ownership, then the release each owner uses. A phi whose incomings
+    // agree on no release does not own, and a phi handing its value on
+    // to it no longer may either, so both are decided again until every
+    // owner has a release.
+    let releases = loop {
+        loop {
+            let before = candidates.len();
+            copies.clear();
+            for (block_id, block) in &func.blocks {
+                let body = bodies.get(block_id);
+                for phi in &block.phis {
+                    if !candidates.contains(&phi.result) {
                         continue;
-                    } else if let Some(r) = sites.get(val) {
-                        *r
-                    } else if let Some(r) = releases.get(val) {
-                        *r
-                    } else if copies
-                        .iter()
-                        .any(|(_, p, _, v)| *p == phi.result && *v == *val)
-                    {
-                        Release::Symbol(STRING_FREE)
-                    } else {
-                        known = false;
-                        break;
-                    };
-                    if agreed.is_none_or(|have| have == r) {
-                        agreed = Some(r);
-                    } else {
-                        known = false;
-                        break;
+                    }
+                    match phi_incomings_owned(
+                        func,
+                        facts,
+                        &sites,
+                        &candidates,
+                        body,
+                        phi,
+                        &mut index,
+                    ) {
+                        Some(seed_copies) => copies.extend(seed_copies),
+                        None => {
+                            candidates.remove(&phi.result);
+                        }
                     }
                 }
-                if let (true, Some(r)) = (known, agreed) {
-                    releases.insert(phi.result, r);
+            }
+            // The phi's own value: read only by borrowers, and handed on only
+            // to phis that own what they are handed.
+            let mut dropped: Vec<HirId> = Vec::new();
+            for p in candidates.iter().copied() {
+                let kept = !index.borrowed_only(func, facts, p);
+                let handed_on = index
+                    .phis_using_derived(func, facts, p)
+                    .iter()
+                    .any(|other| !candidates.contains(other));
+                if kept || handed_on {
+                    if trace_enabled() {
+                        eprintln!(
+                            "[drop] {}: phi {:?} cannot own its value (kept by a use {kept}, handed to a phi that does not own {handed_on})",
+                            func.name.resolve_global().unwrap_or_default(),
+                            p
+                        );
+                    }
+                    dropped.push(p);
+                }
+            }
+            for p in dropped {
+                candidates.remove(&p);
+            }
+            if candidates.len() == before {
+                break;
+            }
+        }
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // What releases each owning phi's value: what releases what reaches
+        // it, agreed on by every incoming or the phi is not owned.
+        let mut releases: std::collections::HashMap<HirId, Release> =
+            std::collections::HashMap::new();
+        for _ in 0..candidates.len() {
+            for (_, block) in &func.blocks {
+                for phi in &block.phis {
+                    if !candidates.contains(&phi.result) || releases.contains_key(&phi.result) {
+                        continue;
+                    }
+                    let mut agreed: Option<Release> = None;
+                    let mut known = true;
+                    for (val, _) in &phi.incoming {
+                        let r = if *val == phi.result || is_null_value(func, *val) {
+                            continue;
+                        } else if let Some(r) = sites.get(val) {
+                            *r
+                        } else if let Some(r) = releases.get(val) {
+                            *r
+                        } else if copies
+                            .iter()
+                            .any(|(_, p, _, v)| *p == phi.result && *v == *val)
+                        {
+                            Release::Symbol(STRING_FREE)
+                        } else {
+                            known = false;
+                            break;
+                        };
+                        if agreed.is_none_or(|have| have == r) {
+                            agreed = Some(r);
+                        } else {
+                            known = false;
+                            break;
+                        }
+                    }
+                    if let (true, Some(r)) = (known, agreed) {
+                        releases.insert(phi.result, r);
+                    }
                 }
             }
         }
-    }
-    candidates.retain(|p| releases.contains_key(p));
+        let before = candidates.len();
+        candidates.retain(|p| releases.contains_key(p));
+        if candidates.len() == before {
+            break releases;
+        }
+    };
     copies.retain(|(_, p, _, _)| candidates.contains(p));
 
     for (pred, phi_result, index, val) in copies {
