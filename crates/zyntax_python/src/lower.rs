@@ -5393,10 +5393,10 @@ impl<'m> Lowerer<'m> {
     /// counts from the end; one out of range raises IndexError(`message`)
     /// and leaves, so the position is in bounds wherever it is used.
     ///
-    /// The position is a select and the test one branch of plain
-    /// compares, so an access adds only the raise arm's blocks, and the
-    /// test compares the index itself against zero and the length, as
-    /// bounds versioning decides them. A loop carries every name bound
+    /// The position is a select and the test one branch of two plain
+    /// compares on it, so an access adds only the raise arm's blocks;
+    /// bounds versioning decides the select's condition, then the
+    /// compares on the value it picks. A loop carries every name bound
     /// here, so a plain list or index is used as it is.
     fn list_position(
         &mut self,
@@ -5471,17 +5471,11 @@ impl<'m> Lowerer<'m> {
                 span,
             )
             .node;
-        // `i >= n or (i < 0 and i + n < 0)`, evaluated whole.
+        // Both compares on the position, evaluated whole.
         let outside = binary(
             BinaryOp::BitOr,
-            ge(i.clone(), n.clone()),
-            binary(
-                BinaryOp::BitAnd,
-                lt(i.clone(), zero()),
-                lt(from_end(), zero()),
-                Ty::Bool,
-                span,
-            ),
+            lt(j.clone(), zero()),
+            ge(j.clone(), n),
             Ty::Bool,
             span,
         );
