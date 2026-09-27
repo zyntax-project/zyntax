@@ -666,44 +666,52 @@ pub(crate) struct MemLoc {
     root: Option<HirId>,
     offset: Option<u64>,
     size: u32,
-    /// The root is a parameter of an outlined loop region: a pointer
-    /// the region's function had live at the header, which may name
-    /// the same object as any other root.
-    shared_root: bool,
-    /// The root is a module global: storage the compiler owns, which
-    /// no object pointer handed to a region points into.
-    global_root: bool,
+    /// Where the root comes from, which decides what it may alias.
+    root_kind: RootKind,
     /// The root's pointee type when it is an exact struct type: the
     /// root points at an object of that type.
     exact_type: Option<InternedString>,
+}
+
+/// Where a location's root pointer comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootKind {
+    /// An allocation this function made: no other root names it until
+    /// it is stored and read back, and a read back is `Unknown`.
+    Fresh,
+    /// A parameter: an object that existed before the function began,
+    /// so never one it allocates.
+    Param,
+    /// A module global: storage the compiler owns, which no object
+    /// pointer points into.
+    Global,
+    /// A phi, a loaded pointer, a call's result or anything else: it
+    /// may name the same object as any root but a global.
+    Unknown,
 }
 
 impl MemLoc {
     /// May the regions described by `self` and `other` overlap?
     ///
     /// Returns `true` conservatively when we can't prove they don't.
-    /// The fast win: when both sides have a *known root* and the
-    /// roots differ, we rely on the SSA no-aliasing assumption
-    /// (distinct pointer SSA values refer to distinct memory) — that
-    /// case returns `false` even if one side has an unknown offset
-    /// or unknown size, because the roots already establish disjoint
-    /// allocations. Only when roots match (or one is unknown) do we
-    /// fall back to byte-range comparison.
+    /// Two different roots are disjoint when they point at objects of
+    /// two different exact struct types, or when their [`RootKind`]s
+    /// prove two objects; then the offsets do not matter. One root is
+    /// compared by byte range.
     pub(crate) fn may_alias(&self, other: &MemLoc) -> bool {
         if self.distinct_exact_objects(other) {
             return false;
         }
         match (self.root, other.root) {
-            (Some(r1), Some(r2)) if r1 != r2 && (self.shared_root || other.shared_root) => {
-                !(self.global_root || other.global_root)
-            }
             (Some(r1), Some(r2)) if r1 != r2 => {
-                // Different SSA roots: rely on the SSA-level
-                // no-aliasing assumption. Holds for the patterns ZynML
-                // emits — each malloc / alloca produces a fresh root,
-                // table reads through different indices produce
-                // different SSA values, etc.
-                false
+                use RootKind::*;
+                // Two different roots are two objects only when their
+                // provenance says so; two parameters, or a phi and a
+                // parameter, may be one object passed twice.
+                !matches!(
+                    (self.root_kind, other.root_kind),
+                    (Global, _) | (_, Global) | (Fresh, Fresh) | (Fresh, Param) | (Param, Fresh)
+                )
             }
             (None, _) | (_, None) => {
                 // At least one side's root is opaque; can't reason.
@@ -763,6 +771,8 @@ pub(crate) enum AddrLink {
     },
     /// A pointer read out of a struct field — chase to the aggregate.
     Field { aggregate: HirId, index: u32 },
+    /// An allocation this function makes: a root, and a fresh object.
+    Fresh,
 }
 
 /// Build a `HirId → AddrLink` lookup over every `Cast` / `GEP`
@@ -779,6 +789,14 @@ pub(crate) fn build_addr_index(
     for block in func.blocks.values() {
         for inst in &block.instructions {
             match inst {
+                HirInstruction::Alloca { result, .. }
+                | HirInstruction::Call {
+                    result: Some(result),
+                    callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc),
+                    ..
+                } => {
+                    idx.insert(*result, AddrLink::Fresh);
+                }
                 HirInstruction::Cast {
                     result, operand, ..
                 } => {
@@ -908,14 +926,16 @@ pub(crate) fn extract_mem_loc(
                 }
                 current = identity_subst.get(base).copied().unwrap_or(*base);
             }
-            None => break,
+            Some(AddrLink::Fresh) | None => break,
         }
     }
     let root_value = func.values.get(&current);
-    let root_kind = root_value.map(|v| &v.kind);
-    let shared_root = func.attributes.osr_region
-        && matches!(root_kind, Some(crate::hir::HirValueKind::Parameter(_)));
-    let global_root = matches!(root_kind, Some(crate::hir::HirValueKind::Global(_)));
+    let root_kind = match root_value.map(|v| &v.kind) {
+        Some(crate::hir::HirValueKind::Parameter(_)) => RootKind::Param,
+        Some(crate::hir::HirValueKind::Global(_)) => RootKind::Global,
+        _ if matches!(addr_index.get(&current), Some(AddrLink::Fresh)) => RootKind::Fresh,
+        _ => RootKind::Unknown,
+    };
     let exact_type = match root_value.map(|v| &v.ty) {
         Some(HirType::Ptr(inner)) => match &**inner {
             HirType::Struct(s) => s.name.filter(|n| exact.contains(n)),
@@ -931,8 +951,7 @@ pub(crate) fn extract_mem_loc(
             None
         },
         size,
-        shared_root,
-        global_root,
+        root_kind,
         exact_type,
     }
 }
@@ -1555,6 +1574,94 @@ mod tests {
                 .any(|inst| matches!(inst, HirInstruction::Load { result, .. } if *result == r)),
             "a region's parameters may alias: the read stays in the loop"
         );
+    }
+
+    /// A loop storing through `stored` and loading through `loaded`,
+    /// both `*i64`. Whether the load left the loop.
+    fn hoists_past_store(
+        make: impl FnOnce(&mut HirFunction, HirId, HirType) -> (HirId, HirId),
+    ) -> bool {
+        let (mut f, entry, _header, body, _exit) = mk_func();
+        let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let (stored, loaded) = make(&mut f, entry, ptr_ty);
+        let v = add_param(&mut f, HirType::I64, 9);
+        let r = add_inst(&mut f, HirType::I64);
+        let b = f.blocks.get_mut(&body).unwrap();
+        b.instructions.push(HirInstruction::Store {
+            value: v,
+            ptr: stored,
+            align: 8,
+            volatile: false,
+        });
+        b.instructions.push(HirInstruction::Load {
+            result: r,
+            ty: HirType::I64,
+            ptr: loaded,
+            align: 8,
+            volatile: false,
+        });
+        run(&mut f);
+        !f.blocks[&body]
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, HirInstruction::Load { result, .. } if *result == r))
+    }
+
+    /// Two pointer parameters of any function may name one object, as
+    /// a call passing it twice does: a read through one is not free of
+    /// a store through the other.
+    #[test]
+    fn parameters_may_alias() {
+        assert!(!hoists_past_store(|f, _, ty| {
+            (add_param(f, ty.clone(), 0), add_param(f, ty, 1))
+        }));
+    }
+
+    /// A pointer read from memory may name what a parameter names.
+    #[test]
+    fn a_loaded_pointer_may_alias_a_parameter() {
+        assert!(!hoists_past_store(|f, entry, ty| {
+            let param = add_param(f, ty.clone(), 0);
+            let slot = add_param(f, HirType::Ptr(Box::new(ty.clone())), 1);
+            let loaded = add_inst(f, ty);
+            f.blocks
+                .get_mut(&entry)
+                .unwrap()
+                .instructions
+                .push(HirInstruction::Load {
+                    result: loaded,
+                    ty: HirType::Ptr(Box::new(HirType::I64)),
+                    ptr: slot,
+                    align: 8,
+                    volatile: false,
+                });
+            (param, loaded)
+        }));
+    }
+
+    /// An allocation the function makes is not an object its caller
+    /// passed in: a read through a parameter leaves the loop past a
+    /// store to it.
+    #[test]
+    fn a_parameter_is_not_an_allocation_the_function_makes() {
+        assert!(hoists_past_store(|f, entry, ty| {
+            let param = add_param(f, ty.clone(), 0);
+            let size = add_param(f, HirType::I64, 1);
+            let fresh = add_inst(f, ty);
+            f.blocks
+                .get_mut(&entry)
+                .unwrap()
+                .instructions
+                .push(HirInstruction::Call {
+                    result: Some(fresh),
+                    callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc),
+                    args: vec![size],
+                    type_args: vec![],
+                    const_args: vec![],
+                    is_tail: false,
+                });
+            (fresh, param)
+        }));
     }
 
     /// A global's storage is the compiler's own: a store through a

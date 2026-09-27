@@ -80,3 +80,11 @@ fn scimark_lu_factor_on_boxed_rows() {
     run("lu_scimark_dynamic", false);
     run("lu_scimark_dynamic", true);
 }
+
+/// A loop writing a field through one parameter and reading it through
+/// another, called with one object for both.
+#[test]
+fn one_object_passed_as_two_parameters() {
+    run("one_object_passed_twice", false);
+    run("one_object_passed_twice", true);
+}
