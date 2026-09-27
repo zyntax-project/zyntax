@@ -53,8 +53,8 @@ official_suite/complete_all     49075da
 official_suite/main_lua         49075da
 
 errors/library_names.lua      0903215
-errors/c_stack.lua            4379825   failing-on windows
-gc/finalize_after_return.lua  18b4bab   failing-on windows
+errors/c_stack.lua            4379825   unix
+gc/finalize_after_return.lua  18b4bab   linux
 
 # C modules load where the executable exports the C API: not on Windows yet.
 official/attrib.lua           c17ca09   unix
