@@ -1875,6 +1875,8 @@ pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
 pub struct OptCache {
     facts: std::sync::Arc<drop_insert::ModuleFacts>,
     cycles: inline::Cycles,
+    /// Read at the first optimisation that needs them.
+    error_flag: std::sync::OnceLock<error_flag::Summaries>,
 }
 
 impl OptCache {
@@ -1888,6 +1890,7 @@ impl OptCache {
         Self {
             facts,
             cycles: inline::cycles_of(module),
+            error_flag: std::sync::OnceLock::new(),
         }
     }
 }
@@ -2019,6 +2022,18 @@ fn run_interp_safe_opts_with(
     timed("purity", &mut at);
     check_hir_uses(module, "purity");
 
+    // What each call does to the error flag, read from the bodies once
+    // per module rather than per round.
+    let local_summaries;
+    let ef_summaries = match cache {
+        Some(c) => c.error_flag.get_or_init(|| error_flag::summaries(module)),
+        None => {
+            local_summaries = error_flag::summaries(module);
+            &local_summaries
+        }
+    };
+    timed("error_flag summaries", &mut at);
+
     // Outer fixed-point: keeps iterating the whole sweep until none
     // of the passes report new work. Compounding example: inline
     // exposes new constant operands → const_fold creates a Constant
@@ -2107,7 +2122,7 @@ fn run_interp_safe_opts_with(
         // Its checks come from inlining: a round that inlined nothing
         // has none new for it.
         let ef = if round == 0 || il.inlined > 0 {
-            error_flag::run_module(module)
+            error_flag::run_module(module, ef_summaries)
         } else {
             error_flag::ErrorFlagStats::default()
         };

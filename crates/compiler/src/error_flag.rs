@@ -4,8 +4,11 @@
 //! `HirGlobal::error_flag`) tests it after every fallible call. The flag
 //! is null at every function entry, only stores and calls change it, and
 //! a callee's attributes say what a call does to it: `sets_error_flag`
-//! leaves it set, `nothrow` leaves a null flag null, and a foreign
-//! `nothrow` function, which reaches no hook, leaves it as found.
+//! leaves it set, `nothrow` leaves a null flag null, and a body that
+//! stores nothing to it and calls only such bodies leaves it as found.
+//! Those body summaries are read once per module ([`summaries`]) and
+//! reused across rounds and compiles: they describe what a call does,
+//! which no semantics-preserving pass changes.
 //!
 //! A forward dataflow over {Clear, Set, Unknown} gives each block its
 //! entry state, a branch on the flag refining its two edges. Two
@@ -89,19 +92,122 @@ impl Effect {
     }
 }
 
-pub fn run_module(module: &mut HirModule) -> ErrorFlagStats {
-    let mut total = ErrorFlagStats::default();
+/// What calling each function of a module does to the error flag.
+#[derive(Debug, Default)]
+pub struct Summaries(HashMap<HirId, Effect>);
+
+/// The module's error flag, unless it names none or the pass is off.
+fn flag_of(module: &HirModule) -> Option<HirId> {
     // `ZYNTAX_DISABLE_ERROR_FLAG=1` keeps every error-flag check as
     // lowered; safe to run with.
     if std::env::var_os("ZYNTAX_DISABLE_ERROR_FLAG").is_some() {
-        return total;
+        return None;
     }
-    let Some(flag) = module
+    module
         .globals
         .iter()
         .find(|(_, g)| g.error_flag)
         .map(|(id, _)| *id)
-    else {
+}
+
+/// Every function's effect on the flag, each body read once. A body
+/// that keeps the flag by itself stops keeping it when a callee does
+/// not, which a worklist carries back along the call edges.
+pub fn summaries(module: &HirModule) -> Summaries {
+    let Some(flag) = flag_of(module) else {
+        return Summaries::default();
+    };
+    let demoted = |f: &HirFunction| {
+        if f.attributes.nothrow {
+            Effect::KeepsClear
+        } else {
+            Effect::Unknown
+        }
+    };
+    let mut effects: HashMap<HirId, Effect> = HashMap::with_capacity(module.functions.len());
+    let mut callers: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut work: Vec<HirId> = Vec::new();
+    for (&id, f) in &module.functions {
+        let e = if f.attributes.sets_error_flag {
+            Effect::Sets
+        } else if f.is_external {
+            // A foreign `nothrow` body reaches no hook, so it has no way
+            // to the flag.
+            if f.attributes.nothrow {
+                Effect::Keeps
+            } else {
+                Effect::Unknown
+            }
+        } else if body_keeps_locally(f, flag, |callee| {
+            callers.entry(callee).or_default().push(id)
+        }) {
+            Effect::Keeps
+        } else {
+            demoted(f)
+        };
+        if e != Effect::Keeps {
+            work.push(id);
+        }
+        effects.insert(id, e);
+    }
+    // A callee the module does not define keeps nothing.
+    for (callee, list) in &callers {
+        if !effects.contains_key(callee) {
+            for c in list {
+                if effects.get(c) == Some(&Effect::Keeps) {
+                    effects.insert(*c, demoted(&module.functions[c]));
+                    work.push(*c);
+                }
+            }
+        }
+    }
+    while let Some(id) = work.pop() {
+        let Some(list) = callers.get(&id) else {
+            continue;
+        };
+        for c in list {
+            if effects.get(c) == Some(&Effect::Keeps) {
+                effects.insert(*c, demoted(&module.functions[c]));
+                work.push(*c);
+            }
+        }
+    }
+    Summaries(effects)
+}
+
+/// Whether `f` keeps the flag provided every function it calls does,
+/// naming each such callee to `callee`.
+fn body_keeps_locally(f: &HirFunction, flag: HirId, mut callee: impl FnMut(HirId)) -> bool {
+    let ptrs = flag_pointers(f, flag);
+    if !ptrs.is_empty() && address_escapes(f, &ptrs) {
+        return false;
+    }
+    let none = HashMap::new();
+    let mut keeps = true;
+    for b in f.blocks.values() {
+        if matches!(b.terminator, HirTerminator::Invoke { .. }) {
+            return false;
+        }
+        for inst in &b.instructions {
+            match inst {
+                HirInstruction::Store { ptr, .. } if ptrs.contains(ptr) => return false,
+                HirInstruction::Call {
+                    callee: HirCallable::Function(id),
+                    ..
+                } => callee(*id),
+                _ => keeps &= effect_of(inst, &none) == Effect::Keeps,
+            }
+        }
+    }
+    keeps
+}
+
+/// Fold and thread the flag checks of the functions still to optimise,
+/// calls read through `summaries` (built by [`summaries`] on this module
+/// or one it was copied from).
+pub fn run_module(module: &mut HirModule, summaries: &Summaries) -> ErrorFlagStats {
+    let mut total = ErrorFlagStats::default();
+    let Some(flag) = flag_of(module) else {
         return total;
     };
     // Only bodies that name the flag have a check to decide.
@@ -120,7 +226,7 @@ pub fn run_module(module: &mut HirModule) -> ErrorFlagStats {
     if candidates.is_empty() {
         return total;
     }
-    let effects = call_effects(module, &candidates);
+    let effects = call_effects(module, &candidates, summaries);
     for func in module.functions_to_optimize() {
         if !candidates.contains(&func.id) {
             continue;
@@ -132,10 +238,14 @@ pub fn run_module(module: &mut HirModule) -> ErrorFlagStats {
     total
 }
 
-/// What calling each function `bodies` call does to the flag, from the
-/// callee's attributes alone: reading callee bodies would cost every
-/// compile a walk of the linked library.
-fn call_effects(module: &HirModule, bodies: &HashSet<HirId>) -> HashMap<HirId, Effect> {
+/// What calling each function `bodies` call does to the flag: its
+/// summary, or for a function added since the summaries were read, what
+/// its attributes say.
+fn call_effects(
+    module: &HirModule,
+    bodies: &HashSet<HirId>,
+    summaries: &Summaries,
+) -> HashMap<HirId, Effect> {
     let mut effects = HashMap::new();
     for id in bodies {
         for b in module.functions[id].blocks.values() {
@@ -146,6 +256,9 @@ fn call_effects(module: &HirModule, bodies: &HashSet<HirId>) -> HashMap<HirId, E
                 } = inst
                 {
                     effects.entry(*c).or_insert_with(|| {
+                        if let Some(e) = summaries.0.get(c) {
+                            return *e;
+                        }
                         module.functions.get(c).map_or(Effect::Unknown, |f| {
                             if f.attributes.sets_error_flag {
                                 Effect::Sets
@@ -1018,6 +1131,11 @@ mod tests {
         }
     }
 
+    fn run_all(module: &mut HirModule) -> ErrorFlagStats {
+        let s = summaries(module);
+        run_module(module, &s)
+    }
+
     fn body(m: &Module, id: HirId) -> &HirFunction {
         &m.module.functions[&id]
     }
@@ -1052,7 +1170,7 @@ mod tests {
         b.ret(raise, -1);
         b.ret(ok, 0);
         let f = b.finish(&mut m);
-        run_module(&mut m.module);
+        run_all(&mut m.module);
         (m, f, entry, raise)
     }
 
@@ -1120,7 +1238,7 @@ mod tests {
         b.ret(raise, -1);
         b.ret(ok, 0);
         let f = b.finish(&mut m);
-        run_module(&mut m.module);
+        run_all(&mut m.module);
         assert_eq!(branch_constant(body(&m, f), entry, raise), None);
     }
 
@@ -1158,7 +1276,7 @@ mod tests {
         b.ret(raise, -1);
         b.ret(ok, 0);
         let f = b.finish(&mut m);
-        run_module(&mut m.module);
+        run_all(&mut m.module);
         assert_eq!(branch_constant(body(&m, f), entry, raise), Some(false));
         assert_eq!(branch_constant(body(&m, f), mid, raise), Some(false));
     }
@@ -1218,7 +1336,7 @@ mod tests {
             },
         );
         let f = b.finish(&mut m);
-        let stats = run_module(&mut m.module);
+        let stats = run_all(&mut m.module);
         assert_eq!(stats.threaded, 1);
         let func = body(&m, f);
         assert!(
@@ -1251,7 +1369,29 @@ mod tests {
         b.ret(raise, -1);
         b.ret(ok, 0);
         let f = b.finish(&mut m);
-        assert_eq!(run_module(&mut m.module), ErrorFlagStats::default());
+        assert_eq!(run_all(&mut m.module), ErrorFlagStats::default());
         assert_eq!(flag_loads(body(&m, f), entry), 1);
+    }
+
+    /// A callee with no attributes whose body never touches the flag
+    /// keeps it: the check after it folds.
+    #[test]
+    fn a_callee_whose_body_keeps_the_flag_folds_the_check() {
+        let mut m = Module::new(true);
+        let mut leaf = Body::new(&m);
+        let e = leaf.block();
+        leaf.ret(e, 0);
+        let leaf = leaf.finish(&mut m);
+        let mut b = Body::new(&m);
+        let entry = b.block();
+        let raise = b.block();
+        let ok = b.block();
+        b.call(entry, leaf);
+        b.check(entry, raise, ok);
+        b.ret(raise, -1);
+        b.ret(ok, 0);
+        let f = b.finish(&mut m);
+        run_all(&mut m.module);
+        assert_eq!(branch_constant(body(&m, f), entry, raise), Some(false));
     }
 }
