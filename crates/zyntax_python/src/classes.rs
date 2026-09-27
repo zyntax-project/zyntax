@@ -1039,7 +1039,7 @@ fn getattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
         x.clone(),
         |c| module.field(c, attr).is_some(),
         |lowerer, c, obj| {
-            let (_, ty) = module.field(c, attr).expect("picked");
+            let (_, ty) = module.field_exact(c, attr).expect("picked");
             let value = lowerer.field_out(field(obj, attr, ty, span), ty, span);
             let boxed = lowerer.coerce(Val { node: value, ty }, Ty::Object);
             vec![ret(boxed, span)]
@@ -1077,7 +1077,7 @@ fn setattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
         x.clone(),
         |c| module.field(c, attr).is_some(),
         |lowerer, c, obj| {
-            let (_, ty) = module.field(c, attr).expect("picked");
+            let (_, ty) = module.field_exact(c, attr).expect("picked");
             // A field only ever given None holds nothing else; a value
             // arriving through a dynamic receiver is refused rather than
             // stored as None.

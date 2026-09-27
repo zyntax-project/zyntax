@@ -2342,6 +2342,10 @@ impl<'m> Lowerer<'m> {
         f: &py::StmtFunctionDef,
         name: &str,
     ) -> Result<TypedFunction> {
+        types::in_body(&f.body, || self.function_named_in(f, name))
+    }
+
+    fn function_named_in(&mut self, f: &py::StmtFunctionDef, name: &str) -> Result<TypedFunction> {
         if !f.decorator_list.is_empty() {
             return unsupported("decorators", f);
         }
@@ -4644,7 +4648,8 @@ impl<'m> Lowerer<'m> {
             {
                 let object = self.expr(&attr.value)?;
                 let object = self.hold_unless_plain(object, &attr.value, span);
-                let read = self.attribute(object.clone(), attr.attr.as_str(), span)?;
+                let set = self.receiver_set_of(&attr.value, object.ty);
+                let read = self.attribute_via(object.clone(), attr.attr.as_str(), set, span)?;
                 let read = self.checked(read);
                 (self.hold_ahead(read, span), Place::Attr(Box::new(object)))
             }
@@ -4673,7 +4678,9 @@ impl<'m> Lowerer<'m> {
                 let py::Expr::Attribute(attr) = &*a.target else {
                     unreachable!()
                 };
-                let stmt = self.set_attribute(*object, attr.attr.as_str(), combined, span)?;
+                let set = self.receiver_set_of(&attr.value, object.ty);
+                let stmt =
+                    self.set_attribute_via(*object, attr.attr.as_str(), combined, set, span)?;
                 out.push(TypedNode::new(
                     TypedStatement::Expression(Box::new(stmt)),
                     Type::Unknown,
@@ -4944,7 +4951,8 @@ impl<'m> Lowerer<'m> {
             // `obj.attr = v`
             py::Expr::Attribute(a) => {
                 let object = self.expr(&a.value)?;
-                let stmt = self.set_attribute(object, a.attr.as_str(), value, span)?;
+                let set = self.receiver_set_of(&a.value, object.ty);
+                let stmt = self.set_attribute_via(object, a.attr.as_str(), value, set, span)?;
                 out.push(TypedNode::new(
                     TypedStatement::Expression(Box::new(stmt)),
                     Type::Unknown,
@@ -7743,7 +7751,8 @@ impl<'m> Lowerer<'m> {
                     return Ok(self.class_attr_read(&attr, span));
                 }
                 let object = self.expr(&a.value)?;
-                self.attribute(object, a.attr.as_str(), span)?
+                let set = self.receiver_set_of(&a.value, object.ty);
+                self.attribute_via(object, a.attr.as_str(), set, span)?
             }
             // `"..." % values` with a literal format.
             py::Expr::BinOp(b)
@@ -12702,8 +12711,31 @@ impl<'m> Lowerer<'m> {
         result
     }
 
+    /// The classes the receiver `e`, a value of type `ty`, may be, where
+    /// it is an instance.
+    fn receiver_set_of(&self, e: &py::Expr, ty: Ty) -> Option<Vec<usize>> {
+        match ty {
+            Ty::Class(k) => Some(self.module.receiver_set(e, k as usize)),
+            _ => None,
+        }
+    }
+
     /// `obj.attr` read.
     fn attribute(&mut self, object: Val, attr: &str, span: Span) -> Result<Val> {
+        self.attribute_via(object, attr, None, span)
+    }
+
+    /// `obj.attr` read through a receiver that may be any class of `set`
+    /// (every class deriving from its own when `None`). Where those
+    /// classes hold kinds of the field that disagree, the read goes by
+    /// the instance's class, as a dynamic receiver's does.
+    fn attribute_via(
+        &mut self,
+        object: Val,
+        attr: &str,
+        set: Option<Vec<usize>>,
+        span: Span,
+    ) -> Result<Val> {
         // A value known to be None reads as any dynamic value would:
         // the AttributeError is raised at run time.
         let object = if object.ty == Ty::None {
@@ -12724,7 +12756,16 @@ impl<'m> Lowerer<'m> {
         }
         match object.ty {
             Ty::Class(k) => {
-                let Some((_, ty)) = self.module.field(k as usize, attr) else {
+                let set = set.unwrap_or_else(|| self.module.class_range(k as usize).collect());
+                if self.module.field_mixed(set.iter().copied(), attr) {
+                    let object = self.checked_instance(object, attr, span);
+                    let boxed = Val {
+                        node: self.coerce(object, Ty::Object),
+                        ty: Ty::Object,
+                    };
+                    return self.attribute_via(boxed, attr, None, span);
+                }
+                let Some((_, ty)) = self.module.field_via(set.iter().copied(), attr) else {
                     // The class's attribute, once the instance is known
                     // not to be None.
                     let class_attr = self.class_attr_of(k as usize, attr, span)?;
@@ -13001,6 +13042,19 @@ impl<'m> Lowerer<'m> {
 
     /// `obj.attr = value` as a statement expression.
     fn set_attribute(&mut self, object: Val, attr: &str, value: Val, span: Span) -> Result<Node> {
+        self.set_attribute_via(object, attr, value, None, span)
+    }
+
+    /// [`Self::set_attribute`] through a receiver that may be any class
+    /// of `set`, as [`Self::attribute_via`] reads.
+    fn set_attribute_via(
+        &mut self,
+        object: Val,
+        attr: &str,
+        value: Val,
+        set: Option<Vec<usize>>,
+        span: Span,
+    ) -> Result<Node> {
         // The field may now hold anything, on this object or another
         // that aliases it.
         self.nonnull_fields.retain(|(_, field)| field != attr);
@@ -13017,8 +13071,17 @@ impl<'m> Lowerer<'m> {
                 if crate::records::is_record(k as usize) {
                     crate::records::demote_reached(self.module, object.ty);
                 }
+                let set = set.unwrap_or_else(|| self.module.class_range(k as usize).collect());
+                if self.module.field_mixed(set.iter().copied(), attr) {
+                    let object = self.checked_instance(object, attr, span);
+                    let boxed = Val {
+                        node: self.coerce(object, Ty::Object),
+                        ty: Ty::Object,
+                    };
+                    return self.set_attribute_via(boxed, attr, value, None, span);
+                }
                 let object = self.checked_instance(object, attr, span);
-                let Some((_, ty)) = self.module.field(k as usize, attr) else {
+                let Some((_, ty)) = self.module.field_via(set.iter().copied(), attr) else {
                     return Err(Error::unsupported_span(
                         format!(
                             "attribute `{attr}` of {}, which has no such field",

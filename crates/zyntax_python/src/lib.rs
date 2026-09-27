@@ -627,6 +627,7 @@ fn parse_program_once(
         inferred.list_fields = out.list_fields;
         inferred.field_lists = out.field_lists;
         inferred.dynamic_fields = out.dynamic_fields;
+        inferred.field_by_class = out.field_by_class;
         if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
             let mut dynamic: Vec<&String> = inferred.dynamic_methods.iter().collect();
             dynamic.sort();
@@ -741,11 +742,16 @@ fn parse_program_once(
                 eprintln!("[types]   instance {}{}", spec.name, describe(&spec.sig));
             }
         }
-        for class in &inferred.classes {
+        for (k, class) in inferred.classes.iter().enumerate() {
             let fields: Vec<String> = class
                 .fields
                 .iter()
-                .map(|(n, t)| format!("{n}: {}", t.describe()))
+                .map(|(n, _)| {
+                    let t = inferred
+                        .field_exact(k, n)
+                        .map_or(types::Ty::Object, |(_, t)| t);
+                    format!("{n}: {}", t.describe())
+                })
                 .collect();
             eprintln!("[types] class {} {{ {} }}", class.name, fields.join(", "));
         }

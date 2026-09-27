@@ -384,7 +384,30 @@ pub(crate) fn builtin_index(name: &str) -> Option<u8> {
         .map(|i| i as u8)
 }
 
+/// Whether a field of this type holds an address (a list's header, a
+/// dict's or set's), the one storage kinds of such fields share.
+fn by_address(ty: Ty) -> bool {
+    matches!(
+        ty,
+        Ty::List(_) | Ty::MaybeList(_) | Ty::Dict(_) | Ty::Set(_)
+    )
+}
+
 thread_local! {
+    /// Each method body of the program, by the address of its first
+    /// statement: its receiver's name, its class and its name. Set by
+    /// [`note_methods`] for each inference of the module.
+    static METHOD_BODIES: std::cell::RefCell<HashMap<usize, (String, usize, String)>> =
+        std::cell::RefCell::new(HashMap::default());
+    /// The method whose body is being read, as [`METHOD_BODIES`] names
+    /// it; see [`in_body`].
+    static EXACT_SELF: std::cell::RefCell<Option<(String, usize, String)>> =
+        const { std::cell::RefCell::new(None) };
+    /// Methods some code calls by their class or through `super()`,
+    /// which reach the definition with an instance of any class
+    /// deriving from its owner.
+    static EXPLICIT_METHODS: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::default());
     /// The tuple shapes of the program being compiled, by index. A
     /// shape is interned once and its index never changes, so a
     /// `Ty::Tuple` decided in one inference round names the same shape
@@ -1314,6 +1337,12 @@ pub(crate) struct Module {
     /// Field names some body changes the list of through a receiver of
     /// no known class; see [`dynamic_field_stores`]. Only grows.
     pub(crate) dynamic_fields: std::collections::BTreeSet<String>,
+    /// The type each concrete class's instances hold in a field, by
+    /// class and name: the join of the stores whose receiver may be an
+    /// instance of exactly that class. Where the classes sharing a slot
+    /// disagree and every kind is held by address, a read takes the
+    /// type of the classes its receiver may be; see [`Module::field`].
+    pub(crate) field_by_class: HashMap<(usize, String), Ty>,
     /// What lowering each function found about its raising, by the
     /// name it lowers to; see [`RaiseFact`].
     pub(crate) raise_facts: std::cell::RefCell<std::collections::BTreeMap<String, RaiseFact>>,
@@ -2106,13 +2135,149 @@ pub(crate) fn method_fn(class: &str, method: &str) -> String {
 }
 
 impl Module {
-    /// The index of a field on class `k`, inherited or own, and its type.
+    /// The index of a field on class `k`, inherited or own, and its type
+    /// as read through a receiver that may be any class deriving from
+    /// `k`: `Object` where those classes hold kinds that disagree (see
+    /// [`Self::field_mixed`]).
     pub(crate) fn field(&self, k: usize, name: &str) -> Option<(usize, Ty)> {
-        self.classes[k]
-            .fields
+        self.field_via(self.class_range(k), name)
+    }
+
+    /// The field as held by instances of exactly class `k`.
+    pub(crate) fn field_exact(&self, k: usize, name: &str) -> Option<(usize, Ty)> {
+        self.field_via(k..k + 1, name)
+    }
+
+    /// The classes an instance typed `Class(k)` may be.
+    pub(crate) fn class_range(&self, k: usize) -> std::ops::Range<usize> {
+        k..k + self.classes[k].descendants.max(1)
+    }
+
+    /// The field `name` read through a receiver that may be any class of
+    /// `set`, the first of which lays the slot out.
+    pub(crate) fn field_via(
+        &self,
+        set: impl IntoIterator<Item = usize> + Clone,
+        name: &str,
+    ) -> Option<(usize, Ty)> {
+        let k = set.clone().into_iter().next()?;
+        let i = self.classes[k].fields.iter().position(|(f, _)| f == name)?;
+        let slot = self.classes[k].fields[i].1;
+        Some((
+            i,
+            match self.per_class(set, name, slot) {
+                Some(Some(ty)) => ty,
+                Some(None) => Ty::Object,
+                None => slot,
+            },
+        ))
+    }
+
+    /// Whether classes of `set` hold kinds of field `name` that
+    /// disagree, so a read or write through such a receiver goes by the
+    /// instance's class at run time.
+    pub(crate) fn field_mixed(
+        &self,
+        set: impl IntoIterator<Item = usize> + Clone,
+        name: &str,
+    ) -> bool {
+        let Some(k) = set.clone().into_iter().next() else {
+            return false;
+        };
+        let Some((_, slot)) = self.classes[k].fields.iter().find(|(f, _)| f == name) else {
+            return false;
+        };
+        matches!(self.per_class(set, name, *slot), Some(None))
+    }
+
+    /// The per-class type of field `name` over `set`: None where the
+    /// slot's own type applies (a slot not held by address, or a class
+    /// whose kind is not), `Some(None)` where the classes disagree.
+    fn per_class(
+        &self,
+        set: impl IntoIterator<Item = usize>,
+        name: &str,
+        slot: Ty,
+    ) -> Option<Option<Ty>> {
+        if self.field_by_class.is_empty() {
+            return None;
+        }
+        let set: Vec<usize> = set.into_iter().collect();
+        let first = *set.first()?;
+        // A class whose store is still undecided leaves the read so.
+        if set
             .iter()
-            .position(|(f, _)| f == name)
-            .map(|i| (i, self.classes[k].fields[i].1))
+            .any(|&c| self.field_by_class.get(&(c, name.to_string())) == Some(&Ty::Unknown))
+        {
+            return Some(Some(Ty::Unknown));
+        }
+        if !by_address(slot) || !self.split(first, name) {
+            return None;
+        }
+        let mut found: Option<Ty> = None;
+        let mut missing = false;
+        let mut mixed = false;
+        for c in set {
+            let Some(&ty) = self.field_by_class.get(&(c, name.to_string())) else {
+                missing = true;
+                continue;
+            };
+            match found {
+                None => found = Some(ty),
+                Some(t) if t == ty => {}
+                Some(_) => mixed = true,
+            }
+        }
+        match found {
+            None => None,
+            // A class with no store of its own holds the slot's type.
+            Some(ty) if missing => (ty == slot).then_some(Some(ty)).or(Some(None)),
+            Some(_) if mixed => Some(None),
+            Some(ty) => Some(Some(ty)),
+        }
+    }
+
+    /// Whether field `name` of class `k` is typed per class: every class
+    /// sharing its slot holds an address in it.
+    fn split(&self, k: usize, name: &str) -> bool {
+        let mut root = k;
+        while let Some(base) = self.classes[root].base {
+            if self.classes[base].fields.iter().any(|(f, _)| f == name) {
+                root = base;
+            } else {
+                break;
+            }
+        }
+        self.class_range(root).all(|c| {
+            self.field_by_class
+                .get(&(c, name.to_string()))
+                .is_none_or(|&ty| by_address(ty))
+        })
+    }
+
+    /// The concrete classes a method's own receiver may be: those in
+    /// the owner's hierarchy that reach this definition of `method`,
+    /// or all of them where the definition is also called by name
+    /// (`super().m(...)`, `Owner.m(obj, ...)`).
+    pub(crate) fn self_set(&self, owner: usize, method: &str) -> Vec<usize> {
+        let explicit = EXPLICIT_METHODS.with(|e| e.borrow().contains(method));
+        self.class_range(owner)
+            .filter(|&c| explicit || self.method_owner(c, method) == Some(owner))
+            .collect()
+    }
+
+    /// The classes a receiver typed `Class(k)` may be: a method's own
+    /// receiver, where the body being read is that method's, its
+    /// [`Self::self_set`]; anything else every class deriving from `k`.
+    pub(crate) fn receiver_set(&self, receiver: &py::Expr, k: usize) -> Vec<usize> {
+        if let py::Expr::Name(n) = receiver
+            && let Some((param, owner, method)) = EXACT_SELF.with(|e| e.borrow().clone())
+            && owner == k
+            && param == n.id.as_str()
+        {
+            return self.self_set(owner, &method);
+        }
+        self.class_range(k).collect()
     }
 
     /// The class attribute `name` as class `k` sees it, when `k` has no
@@ -2279,6 +2444,11 @@ impl Module {
             }
         }
         for ((_, name), ty) in &mut self.field_lists {
+            if name == field {
+                *ty = denested(*ty);
+            }
+        }
+        for ((_, name), ty) in &mut self.field_by_class {
             if name == field {
                 *ty = denested(*ty);
             }
@@ -2713,6 +2883,7 @@ pub(crate) struct Inferred {
     pub(crate) list_fields: HashSet<(usize, String)>,
     pub(crate) field_lists: HashMap<(usize, String), Ty>,
     pub(crate) dynamic_fields: std::collections::BTreeSet<String>,
+    pub(crate) field_by_class: HashMap<(usize, String), Ty>,
 }
 
 /// The items every call of which is in view: module functions never
@@ -2860,6 +3031,7 @@ pub(crate) fn infer_module(
         from_names: known.from_names.clone(),
         ..Default::default()
     };
+    note_methods(&module, items, entry);
     // The fields a constructor binds to an unkinded literal.
     for item in items {
         let Some(k) = item.class else {
@@ -2890,6 +3062,8 @@ pub(crate) fn infer_module(
     // its name on an unknown receiver was seen last time round, or the
     // library reaches it with boxes.
     let mut inferring: HashMap<String, Vec<bool>> = HashMap::default();
+    // Methods whose last round left a field write undecided.
+    let mut late: HashSet<String> = HashSet::default();
     for item in items {
         let mut sig = declared_sig_in(&module.class_index, item.def, item.class);
         // An inferred parameter starts undecided; a default counts as
@@ -3009,6 +3183,13 @@ pub(crate) fn infer_module(
                         }
                         let ty = module.denest(field, *ty);
                         changed |= widen_field(&mut module.classes, k, field, ty);
+                        let set = module.self_set(k, item.def.name.as_str());
+                        changed |= widen_by_class(&mut module, &set, field, ty);
+                    }
+                    if locals.field_writes.values().any(|t| *t == Ty::Unknown) {
+                        late.insert(item.name.clone());
+                    } else {
+                        late.remove(&item.name);
                     }
                 }
                 for (k, field, ty) in &locals.other_field_writes {
@@ -3020,6 +3201,8 @@ pub(crate) fn infer_module(
                     }
                     let ty = module.denest(field, *ty);
                     changed |= widen_field(&mut module.classes, *k, field, ty);
+                    let set: Vec<usize> = module.class_range(*k).collect();
+                    changed |= widen_by_class(&mut module, &set, field, ty);
                 }
                 if let Some(flags) = inferring.get(&item.name) {
                     for (i, (name, _)) in sig.params.iter().enumerate() {
@@ -3059,6 +3242,8 @@ pub(crate) fn infer_module(
                 for (k, field, ty) in &entry_locals.other_field_writes {
                     let ty = module.denest(field, *ty);
                     changed |= widen_field(&mut module.classes, *k, field, ty);
+                    let set: Vec<usize> = module.class_range(*k).collect();
+                    changed |= widen_by_class(&mut module, &set, field, ty);
                 }
                 if !field_keys.is_empty() {
                     field_sites_into(
@@ -3091,6 +3276,8 @@ pub(crate) fn infer_module(
             }
             for (k, field, ty) in crate::records::take_writes() {
                 changed |= widen_field(&mut module.classes, k, &field, ty);
+                let set: Vec<usize> = module.class_range(k).collect();
+                changed |= widen_by_class(&mut module, &set, &field, ty);
             }
             for (callee, index, ty) in passed {
                 let slot = match &callee {
@@ -3272,10 +3459,35 @@ pub(crate) fn infer_module(
             }
         }
     }
+    // A method whose writes were undecided through every round (one
+    // reached only through a class value) stores what its settled
+    // parameters give. Where that leaves a field the classes sharing its
+    // slot do not all hold by address, the slot is the old join, which
+    // does not know that write: its lists of lists are dynamic, as a
+    // store the rounds cannot see makes them.
+    for item in items.iter().filter(|i| late.contains(&i.name)) {
+        let Some(k) = item.class else {
+            continue;
+        };
+        let sig = module.funcs[&item.name].clone();
+        let file = module.file_of(item.module.as_deref());
+        let locals = in_file(file, || infer_locals(&module, &sig, &item.def.body));
+        let set = module.self_set(k, item.def.name.as_str());
+        for (field, ty) in &locals.field_writes {
+            let ty = module.denest(field, *ty);
+            widen_by_class(&mut module, &set, field, ty.settled());
+            if !module.split(k, field) {
+                module.note_dynamic_field(field, true);
+            }
+        }
+    }
     for class in &mut module.classes {
         for (_, ty) in &mut class.fields {
             *ty = ty.settled();
         }
+    }
+    for ty in module.field_by_class.values_mut() {
+        *ty = ty.settled();
     }
     let mut closures = module.closures.take();
     for c in &mut closures {
@@ -3300,6 +3512,7 @@ pub(crate) fn infer_module(
         list_fields: module.list_fields,
         field_lists: module.field_lists,
         dynamic_fields: module.dynamic_fields,
+        field_by_class: module.field_by_class,
     }
 }
 
@@ -4339,6 +4552,94 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
     }
 }
 
+/// Name each method body of `items` for [`in_body`], and find the
+/// methods called by their class or through `super()` in `items` and
+/// `entry`.
+fn note_methods(module: &Module, items: &[Item<'_>], entry: &[py::Stmt]) {
+    use ruff_python_ast::visitor::{Visitor, walk_expr};
+    struct Explicit<'m> {
+        module: &'m Module,
+        found: HashSet<String>,
+    }
+    impl<'a> Visitor<'a> for Explicit<'_> {
+        fn visit_expr(&mut self, expr: &'a py::Expr) {
+            if let py::Expr::Attribute(a) = expr {
+                let by_super = matches!(&*a.value, py::Expr::Call(c)
+                    if matches!(&*c.func, py::Expr::Name(n) if n.id.as_str() == "super"));
+                if by_super || self.module.class_of_expr(&a.value).is_some() {
+                    self.found.insert(a.attr.to_string());
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut bodies = HashMap::default();
+    let mut explicit = Explicit {
+        module,
+        found: HashSet::default(),
+    };
+    for item in items {
+        for s in &item.def.body {
+            explicit.visit_stmt(s);
+        }
+        let (Some(k), Some(first)) = (
+            item.class,
+            item.def.parameters.iter_non_variadic_params().next(),
+        ) else {
+            continue;
+        };
+        if item.def.body.is_empty() {
+            continue;
+        }
+        bodies.insert(
+            item.def.body.as_ptr() as usize,
+            (
+                first.parameter.name.to_string(),
+                k,
+                item.def.name.to_string(),
+            ),
+        );
+    }
+    for s in entry {
+        explicit.visit_stmt(s);
+    }
+    METHOD_BODIES.with(|m| *m.borrow_mut() = bodies);
+    EXPLICIT_METHODS.with(|e| *e.borrow_mut() = explicit.found);
+}
+
+/// Run `f` reading `body`: where it is a method's, that method's
+/// receiver is typed by the classes that reach it (see
+/// [`Module::receiver_set`]).
+pub(crate) fn in_body<R>(body: &[py::Stmt], f: impl FnOnce() -> R) -> R {
+    let this = METHOD_BODIES.with(|m| m.borrow().get(&(body.as_ptr() as usize)).cloned());
+    let before = EXACT_SELF.with(|e| e.replace(this));
+    let out = f();
+    EXACT_SELF.with(|e| *e.borrow_mut() = before);
+    out
+}
+
+/// Join `ty` into the per-class type of field `name` for each class of
+/// `set`. Whether anything changed.
+fn widen_by_class(module: &mut Module, set: &[usize], name: &str, ty: Ty) -> bool {
+    let mut changed = false;
+    for &c in set {
+        let key = (c, name.to_string());
+        let Some(&current) = module.field_by_class.get(&key) else {
+            module.field_by_class.insert(key, ty);
+            changed = true;
+            continue;
+        };
+        let joined = current
+            .join_nullable(ty)
+            .unwrap_or_else(|| module.join_classes(current, ty));
+        if joined != current {
+            module.field_by_class.insert(key, joined);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Lay each class out as its base's fields followed by its own, so an
 /// instance reads correctly through a base-typed reference. Bases come
 /// before their subclasses in the list.
@@ -4402,7 +4703,13 @@ fn widen_field(classes: &mut [ClassInfo], k: usize, name: &str, ty: Ty) -> bool 
                 at = bases[c];
             }
         }
-        a.join_nullable(b).unwrap_or_else(|| a.join(b))
+        let joined = a.join_nullable(b).unwrap_or_else(|| a.join(b));
+        // Kinds held by address share the slot's storage; the classes
+        // storing each read it typed through their own receivers.
+        if by_address(a) && by_address(b) && !by_address(joined) {
+            return Ty::List(Elem::Object);
+        }
+        joined
     };
     for c in targets {
         match classes[c].fields.iter().position(|(f, _)| f == name) {
@@ -4476,6 +4783,20 @@ pub(crate) fn infer_locals_seeded(
 /// spans several, so a lambda or nested def is looked up in the right
 /// one; empty for a body from one file.
 fn infer_locals_with(
+    module: &Module,
+    sig: &Sig,
+    body: &[py::Stmt],
+    seeds: &HashMap<String, Ty>,
+    files: &[u32],
+    settled: bool,
+    entry: bool,
+) -> Locals {
+    in_body(body, || {
+        infer_locals_in(module, sig, body, seeds, files, settled, entry)
+    })
+}
+
+fn infer_locals_in(
     module: &Module,
     sig: &Sig,
     body: &[py::Stmt],
@@ -4645,6 +4966,9 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
         /// Whether the class whose methods are being read is alone in
         /// its hierarchy, innermost last.
         alone: Vec<bool>,
+        /// The classes of that name, and the method being read.
+        classes: Vec<Vec<usize>>,
+        methods: Vec<String>,
     }
     impl Stores<'_, '_> {
         /// `o.f` for `o` of no known class.
@@ -4661,6 +4985,17 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
                 // subclass is an instance of that class, whose field the
                 // method's own inference types.
                 if own && self.alone.last() == Some(&true) {
+                    return;
+                }
+                // Likewise where only one class reaches the method: its
+                // receiver reads that class's own field.
+                if own
+                    && let (Some(ks), Some(m)) = (self.classes.last(), self.methods.last())
+                    && !ks.is_empty()
+                    && ks
+                        .iter()
+                        .all(|&k| self.typer.module.self_set(k, m).len() == 1)
+                {
                     return;
                 }
                 self.out.push(FieldStore {
@@ -4698,9 +5033,19 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
                         .iter()
                         .filter(|class| named(&class.name))
                         .peekable();
+                    let ks: Vec<usize> = self
+                        .typer
+                        .module
+                        .classes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, class)| named(&class.name))
+                        .map(|(k, _)| k)
+                        .collect();
                     let alone = found.peek().is_some()
                         && found.all(|class| class.base.is_none() && class.descendants == 1);
                     self.alone.push(alone);
+                    self.classes.push(ks);
                     for s in &c.body {
                         if let py::Stmt::FunctionDef(f) = s {
                             let receiver = f
@@ -4712,15 +5057,18 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
                                 .map(|p| p.parameter.name.to_string())
                                 .unwrap_or_default();
                             self.receivers.push(receiver);
+                            self.methods.push(f.name.to_string());
                             for s in &f.body {
                                 self.visit_stmt(s);
                             }
+                            self.methods.pop();
                             self.receivers.pop();
                         } else {
                             self.visit_stmt(s);
                         }
                     }
                     self.alone.pop();
+                    self.classes.pop();
                     return;
                 }
                 // A nested function has a receiver of its own, or none.
@@ -4756,6 +5104,8 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
         out: Vec::new(),
         receivers: Vec::new(),
         alone: Vec::new(),
+        classes: Vec::new(),
+        methods: Vec::new(),
     };
     for s in body {
         stores.visit_stmt(s);
@@ -5820,7 +6170,14 @@ impl Walker<'_> {
                     .join_nullable(ty)
                     .unwrap_or_else(|| self.module.join_classes(current, ty));
                 self.locals.field_writes.insert(a.attr.to_string(), joined);
-                self.field_write(a, ty);
+                // A method's own receiver is typed by the classes that
+                // reach the method, from its field writes above.
+                let own = matches!(self.expr(&a.value), Ty::Class(k)
+                    if self.module.receiver_set(&a.value, k as usize).len()
+                        < self.module.class_range(k as usize).len());
+                if !own {
+                    self.field_write(a, ty);
+                }
             }
             // `C.X = v`: the class attribute's module variable.
             py::Expr::Attribute(a) if let Some(k) = self.module.class_of_expr(&a.value) => {
@@ -7261,7 +7618,10 @@ impl Typer<'_> {
                 match self.expr(&a.value) {
                     Ty::Class(k) => self
                         .module
-                        .field(k as usize, a.attr.as_str())
+                        .field_via(
+                            self.module.receiver_set(&a.value, k as usize),
+                            a.attr.as_str(),
+                        )
                         .map(|(_, ty)| ty)
                         .or_else(|| {
                             self.module
