@@ -3401,7 +3401,23 @@ fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) ->
         uses.visit_body(&item.def.body);
         uses.counts
     });
+    let facts = module.list_params.get(&item.name);
     for i in narrowed {
+        // A list the body may keep, or write another kind into, stays
+        // dynamic: storage of one kind cannot take the write.
+        if let Ty::List(e) = key[i]
+            && e != Elem::Object
+        {
+            let fits = match facts.and_then(|f| f.get(i)) {
+                Some(ListFact::Reads) => true,
+                Some(ListFact::Writes(t)) => *t == Ty::Unknown || Elem::of(*t) == e,
+                _ => false,
+            };
+            if !fits {
+                key[i] = sig.params[i].1;
+                continue;
+            }
+        }
         if let Some(&(read, boxed)) = counts.get(&sig.params[i].0)
             && read == 0
             && boxed > 1

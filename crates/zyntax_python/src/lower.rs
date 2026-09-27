@@ -2782,6 +2782,19 @@ impl<'m> Lowerer<'m> {
         call(read, vec![v.node], target, span)
     }
 
+    /// A list just made, bound where a dynamic value is wanted: built
+    /// as a list of dynamic values, which takes a write of any kind in
+    /// place. Nothing else holds it yet, so the copy is not seen.
+    fn dynamic_list(&mut self, v: Val) -> Val {
+        match v.ty {
+            Ty::List(e) if e != Elem::Object && e.code().is_none() => Val {
+                node: self.coerce(v, Ty::List(Elem::Object)),
+                ty: Ty::List(Elem::Object),
+            },
+            _ => v,
+        }
+    }
+
     pub(crate) fn expr_as(&mut self, e: &py::Expr, target: Ty) -> Result<Node> {
         let v = self.expr(e)?;
         Ok(self.coerce(v, target))
@@ -3788,19 +3801,8 @@ impl<'m> Lowerer<'m> {
             py::Stmt::Return(r) => {
                 let value = match &r.value {
                     Some(v) if self.sig.ret == Ty::Object && types::fresh_list(v) => {
-                        // A list made here leaves as a list of dynamic
-                        // values, which the caller may write any kind
-                        // into; nothing else holds it, so the copy is
-                        // not seen.
-                        let mut val = self.expr(v)?;
-                        if matches!(val.ty, Ty::List(e) if e != Elem::Object && e.code().is_none())
-                        {
-                            let node = self.coerce(val, Ty::List(Elem::Object));
-                            val = Val {
-                                node,
-                                ty: Ty::List(Elem::Object),
-                            };
-                        }
+                        let val = self.expr(v)?;
+                        let val = self.dynamic_list(val);
                         Some(Box::new(self.coerce(val, Ty::Object)))
                     }
                     Some(v) => {
@@ -3939,7 +3941,13 @@ impl<'m> Lowerer<'m> {
                 // `a = b = v` evaluates `v` once and binds each target
                 // to it, left to right. A local takes a run-time number
                 // as itself, as inference typed it.
-                let value = if a.targets.iter().all(|t| matches!(t, py::Expr::Name(_))) {
+                let value = if let [py::Expr::Name(n)] = a.targets.as_slice()
+                    && types::fresh_list(&a.value)
+                    && self.var_ty(n.id.as_str()) == Ty::Object
+                {
+                    let v = self.expr(&a.value)?;
+                    self.dynamic_list(v)
+                } else if a.targets.iter().all(|t| matches!(t, py::Expr::Name(_))) {
                     self.expr_num(&a.value)?
                 } else if a
                     .targets
@@ -13654,6 +13662,12 @@ impl<'m> Lowerer<'m> {
                     );
                 }
             };
+            if *pty == Ty::Object && slot.is_some() && types::fresh_list(e) {
+                let v = self.expr(e)?;
+                let v = self.dynamic_list(v);
+                lowered.push(self.coerce(v, Ty::Object));
+                continue;
+            }
             lowered.push(self.expr_as(e, *pty)?);
         }
         Ok(lowered)

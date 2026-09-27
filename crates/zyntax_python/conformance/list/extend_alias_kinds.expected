@@ -1,0 +1,11 @@
+[1, 2, 1.5] True
+[1, 2, 's'] True
+[1, 2, 's', 2.5] True
+['x', 's'] True
+['x', 's', 2.5] True
+[1.0, 's'] True
+[1.0, 's', 2.5] True
+[1, 2, 3, 'a'] True
+[1, None]
+[1.5, None]
+[1, 2, 'x', None] True
