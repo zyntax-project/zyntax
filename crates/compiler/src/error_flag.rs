@@ -4,8 +4,8 @@
 //! `HirGlobal::error_flag`) tests it after every fallible call. The flag
 //! is null at every function entry, only stores and calls change it, and
 //! a callee's attributes say what a call does to it: `sets_error_flag`
-//! leaves it set, `nothrow` leaves a null flag null, and a body that
-//! stores nothing to it and calls only such bodies leaves it as found.
+//! leaves it set, `nothrow` leaves a null flag null, and a foreign
+//! `nothrow` function, which reaches no hook, leaves it as found.
 //!
 //! A forward dataflow over {Clear, Set, Unknown} gives each block its
 //! entry state, a branch on the flag refining its two edges. Two
@@ -104,8 +104,7 @@ pub fn run_module(module: &mut HirModule) -> ErrorFlagStats {
     else {
         return total;
     };
-    // Only bodies that name the flag have a check to decide, and only
-    // the functions they reach need a summary.
+    // Only bodies that name the flag have a check to decide.
     let candidates: HashSet<HirId> = module
         .functions
         .iter()
@@ -121,7 +120,7 @@ pub fn run_module(module: &mut HirModule) -> ErrorFlagStats {
     if candidates.is_empty() {
         return total;
     }
-    let effects = call_effects(module, flag, &callees_of(module, &candidates));
+    let effects = call_effects(module, &candidates);
     for func in module.functions_to_optimize() {
         if !candidates.contains(&func.id) {
             continue;
@@ -133,100 +132,37 @@ pub fn run_module(module: &mut HirModule) -> ErrorFlagStats {
     total
 }
 
-/// The functions `roots` call, directly or through bodies in between.
-fn callees_of(module: &HirModule, roots: &HashSet<HirId>) -> HashSet<HirId> {
-    let mut reach = HashSet::new();
-    let mut stack: Vec<HirId> = roots.iter().copied().collect();
-    let mut expanded = HashSet::new();
-    while let Some(id) = stack.pop() {
-        if !expanded.insert(id) {
-            continue;
-        }
-        let Some(f) = module.functions.get(&id) else {
-            continue;
-        };
-        for b in f.blocks.values() {
+/// What calling each function `bodies` call does to the flag, from the
+/// callee's attributes alone: reading callee bodies would cost every
+/// compile a walk of the linked library.
+fn call_effects(module: &HirModule, bodies: &HashSet<HirId>) -> HashMap<HirId, Effect> {
+    let mut effects = HashMap::new();
+    for id in bodies {
+        for b in module.functions[id].blocks.values() {
             for inst in &b.instructions {
                 if let HirInstruction::Call {
                     callee: HirCallable::Function(c),
                     ..
                 } = inst
-                    && reach.insert(*c)
                 {
-                    stack.push(*c);
+                    effects.entry(*c).or_insert_with(|| {
+                        module.functions.get(c).map_or(Effect::Unknown, |f| {
+                            if f.attributes.sets_error_flag {
+                                Effect::Sets
+                            } else if f.attributes.nothrow && f.is_external {
+                                Effect::Keeps
+                            } else if f.attributes.nothrow {
+                                Effect::KeepsClear
+                            } else {
+                                Effect::Unknown
+                            }
+                        })
+                    });
                 }
             }
         }
     }
-    reach
-}
-
-/// The effect on the flag of calling each of `functions`, every
-/// function they call being among them.
-fn call_effects(
-    module: &HirModule,
-    flag: HirId,
-    functions: &HashSet<HirId>,
-) -> HashMap<HirId, Effect> {
-    let mut effects: HashMap<HirId, Effect> = functions
-        .iter()
-        .filter_map(|id| module.functions.get(id).map(|f| (id, f)))
-        .map(|(id, f)| {
-            let e = if f.attributes.sets_error_flag {
-                Effect::Sets
-            } else if f.is_external {
-                // A foreign `nothrow` body reaches no hook, so it has no
-                // way to the flag.
-                if f.attributes.nothrow {
-                    Effect::Keeps
-                } else {
-                    Effect::Unknown
-                }
-            } else {
-                Effect::Keeps
-            };
-            (*id, e)
-        })
-        .collect();
-    // Greatest fixed point: a body keeps the flag while it stores nothing
-    // to it and every call it makes keeps it.
-    loop {
-        let mut changed = false;
-        for id in functions {
-            let Some(f) = module.functions.get(id) else {
-                continue;
-            };
-            if f.is_external || effects[id] != Effect::Keeps {
-                continue;
-            }
-            if !body_keeps(f, flag, &effects) {
-                let e = if f.attributes.nothrow {
-                    Effect::KeepsClear
-                } else {
-                    Effect::Unknown
-                };
-                effects.insert(*id, e);
-                changed = true;
-            }
-        }
-        if !changed {
-            return effects;
-        }
-    }
-}
-
-fn body_keeps(f: &HirFunction, flag: HirId, effects: &HashMap<HirId, Effect>) -> bool {
-    let ptrs = flag_pointers(f, flag);
-    if !ptrs.is_empty() && address_escapes(f, &ptrs) {
-        return false;
-    }
-    f.blocks.values().all(|b| {
-        !matches!(b.terminator, HirTerminator::Invoke { .. })
-            && b.instructions.iter().all(|inst| match inst {
-                HirInstruction::Store { ptr, .. } => !ptrs.contains(ptr),
-                _ => effect_of(inst, effects) == Effect::Keeps,
-            })
-    })
+    effects
 }
 
 /// The effect of an instruction other than a store to the flag.
@@ -431,10 +367,10 @@ impl Flow<'_> {
         (state, last_load)
     }
 
-    fn solve(&self, f: &HirFunction, dt: &DominatorTree) -> Solution {
+    fn solve(&self, f: &HirFunction) -> Solution {
         let mut entry: HashMap<HirId, State> = HashMap::new();
         let mut edges: HashMap<(HirId, HirId), State> = HashMap::new();
-        let rpo = dt.rpo();
+        let rpo = &reverse_postorder(f);
         let mut changed = true;
         while changed {
             changed = false;
@@ -513,25 +449,46 @@ fn run(func: &mut HirFunction, flag: HirId, effects: &HashMap<HirId, Effect>) ->
     if ptrs.is_empty() || address_escapes(func, &ptrs) {
         return stats;
     }
+    let flow = Flow::new(func, flag, effects);
+    if flow.compares.is_empty() {
+        return stats;
+    }
     func.rebuild_cfg_edges();
-    stats.threaded = thread(func, flag, effects);
+    let mut sol = flow.solve(func);
+    stats.threaded = thread(func, &flow, &sol);
     if stats.threaded > 0 {
         func.rebuild_cfg_edges();
+        sol = flow.solve(func);
     }
-    stats.folded = fold(func, flag, effects);
+    stats.folded = fold(func, &flow, &sol);
     stats
+}
+
+/// Blocks reachable from the entry, each before its successors except
+/// along back edges.
+fn reverse_postorder(f: &HirFunction) -> Vec<HirId> {
+    let mut seen: HashSet<HirId> = HashSet::new();
+    let mut post: Vec<HirId> = Vec::new();
+    let mut stack: Vec<(HirId, usize)> = vec![(f.entry_block, 0)];
+    seen.insert(f.entry_block);
+    while let Some((b, i)) = stack.pop() {
+        let succs = f.blocks.get(&b).map_or(&[][..], |bb| &bb.successors[..]);
+        if let Some(&next) = succs.get(i) {
+            stack.push((b, i + 1));
+            if f.blocks.contains_key(&next) && seen.insert(next) {
+                stack.push((next, 0));
+            }
+        } else {
+            post.push(b);
+        }
+    }
+    post.reverse();
+    post
 }
 
 /// Send each predecessor that reaches a check block with the flag Set
 /// straight to the check's raising arm.
-fn thread(func: &mut HirFunction, flag: HirId, effects: &HashMap<HirId, Effect>) -> usize {
-    let flow = Flow::new(func, flag, effects);
-    if flow.compares.is_empty() {
-        return 0;
-    }
-    let dt = DominatorTree::new(func);
-    let sol = flow.solve(func, &dt);
-
+fn thread(func: &mut HirFunction, flow: &Flow, sol: &Solution) -> usize {
     // (pred, check block, raising arm)
     let mut plan: Vec<(HirId, HirId, HirId)> = Vec::new();
     for (&c, block) in &func.blocks {
@@ -775,13 +732,7 @@ fn dominance_holds(func: &HirFunction) -> bool {
 
 /// Make each compare of the flag against null whose state is known a
 /// constant, and drop the loads that leaves unused.
-fn fold(func: &mut HirFunction, flag: HirId, effects: &HashMap<HirId, Effect>) -> usize {
-    let flow = Flow::new(func, flag, effects);
-    if flow.compares.is_empty() {
-        return 0;
-    }
-    let dt = DominatorTree::new(func);
-    let sol = flow.solve(func, &dt);
+fn fold(func: &mut HirFunction, flow: &Flow, sol: &Solution) -> usize {
     let mut decided: Vec<(HirId, bool)> = Vec::new();
     for (&cmp, &(load, is_eq)) in &flow.compares {
         let value = match sol.at_load.get(&load) {

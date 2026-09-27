@@ -2104,7 +2104,13 @@ fn run_interp_safe_opts_with(
         // After inline, which puts a callee's raising arm and the
         // caller's check in one body; before licm, so a loop left with no
         // flag load has nothing of it to hoist.
-        let ef = error_flag::run_module(module);
+        // Its checks come from inlining: a round that inlined nothing
+        // has none new for it.
+        let ef = if round == 0 || il.inlined > 0 {
+            error_flag::run_module(module)
+        } else {
+            error_flag::ErrorFlagStats::default()
+        };
         stats.error_flag.folded += ef.folded;
         stats.error_flag.threaded += ef.threaded;
         timed("error_flag", &mut at);
