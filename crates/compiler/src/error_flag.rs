@@ -104,8 +104,28 @@ pub fn run_module(module: &mut HirModule) -> ErrorFlagStats {
     else {
         return total;
     };
-    let effects = call_effects(module, flag);
+    // Only bodies that name the flag have a check to decide, and only
+    // the functions they reach need a summary.
+    let candidates: HashSet<HirId> = module
+        .functions
+        .iter()
+        .filter(|(_, f)| {
+            !f.attributes.optimized
+                && !f.is_external
+                && f.values
+                    .values()
+                    .any(|v| matches!(v.kind, HirValueKind::Global(g) if g == flag))
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    if candidates.is_empty() {
+        return total;
+    }
+    let effects = call_effects(module, flag, &callees_of(module, &candidates));
     for func in module.functions_to_optimize() {
+        if !candidates.contains(&func.id) {
+            continue;
+        }
         let s = run(func, flag, &effects);
         total.folded += s.folded;
         total.threaded += s.threaded;
@@ -113,11 +133,44 @@ pub fn run_module(module: &mut HirModule) -> ErrorFlagStats {
     total
 }
 
-/// Each function's effect on the flag when called.
-fn call_effects(module: &HirModule, flag: HirId) -> HashMap<HirId, Effect> {
-    let mut effects: HashMap<HirId, Effect> = module
-        .functions
+/// The functions `roots` call, directly or through bodies in between.
+fn callees_of(module: &HirModule, roots: &HashSet<HirId>) -> HashSet<HirId> {
+    let mut reach = HashSet::new();
+    let mut stack: Vec<HirId> = roots.iter().copied().collect();
+    let mut expanded = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !expanded.insert(id) {
+            continue;
+        }
+        let Some(f) = module.functions.get(&id) else {
+            continue;
+        };
+        for b in f.blocks.values() {
+            for inst in &b.instructions {
+                if let HirInstruction::Call {
+                    callee: HirCallable::Function(c),
+                    ..
+                } = inst
+                    && reach.insert(*c)
+                {
+                    stack.push(*c);
+                }
+            }
+        }
+    }
+    reach
+}
+
+/// The effect on the flag of calling each of `functions`, every
+/// function they call being among them.
+fn call_effects(
+    module: &HirModule,
+    flag: HirId,
+    functions: &HashSet<HirId>,
+) -> HashMap<HirId, Effect> {
+    let mut effects: HashMap<HirId, Effect> = functions
         .iter()
+        .filter_map(|id| module.functions.get(id).map(|f| (id, f)))
         .map(|(id, f)| {
             let e = if f.attributes.sets_error_flag {
                 Effect::Sets
@@ -139,7 +192,10 @@ fn call_effects(module: &HirModule, flag: HirId) -> HashMap<HirId, Effect> {
     // to it and every call it makes keeps it.
     loop {
         let mut changed = false;
-        for (id, f) in &module.functions {
+        for id in functions {
+            let Some(f) = module.functions.get(id) else {
+                continue;
+            };
             if f.is_external || effects[id] != Effect::Keeps {
                 continue;
             }
