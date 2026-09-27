@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1790459116,"nonce":"raOAXKNhjj65nm+5bjfG3ohFlA8=","added":["perf","area:python"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790499317,"nonce":"XX7jmnZzoASOcYE3bjyai1OPYuc=","message":"After 0a52dfb9 (per-class field types) LU_factor reads typed rows: scimark_lu 4175 -\u003e 344 ms on the NUC, so the slowdown described here no longer shows up in this kernel.","files":null}]}
