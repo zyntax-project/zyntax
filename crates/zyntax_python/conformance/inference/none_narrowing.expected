@@ -16,3 +16,4 @@ None 3
 False True 1
 True False 2
 None False True
+[1.5, 1.5, None]

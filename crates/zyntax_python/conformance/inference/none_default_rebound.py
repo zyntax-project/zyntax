@@ -49,3 +49,46 @@ g()
 print(h(), h(2))
 p = P()
 print(sum(p.tp(i) for i in range(5)))
+
+
+def only_default(n, step=None):
+    if step is None:
+        step = (1, 2)
+    total = 0
+    for i in range(n):
+        total += step[0] * i + step[1]
+    return total
+
+
+def read_later(k=None):
+    if k is None:
+        k = 3
+
+    def inner():
+        return k * 2
+
+    return inner()
+
+
+def reset_in_loop(v=None):
+    if v is None:
+        v = 1.5
+    out = []
+    for i in range(3):
+        out.append(v)
+        if i == 1:
+            v = None
+    return out
+
+
+def equal_none(xs=None):
+    if xs == None:
+        xs = []
+    xs.append(1)
+    return xs
+
+
+print(only_default(4), only_default(2))
+print(read_later(), read_later(5))
+print(reset_in_loop())
+print(equal_none(), equal_none([0]))

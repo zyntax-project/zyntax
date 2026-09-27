@@ -102,3 +102,16 @@ print(comp(0), comp(1))
 print(early(0), early(3), early(1))
 print(trying(0), trying(1))
 print(bools(0), bools(2), bools(3))
+
+
+def list_of_later_none():
+    v = 1.5
+    out = []
+    for i in range(3):
+        out.append(v)
+        if i == 1:
+            v = None
+    return out
+
+
+print(list_of_later_none())

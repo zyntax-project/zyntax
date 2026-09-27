@@ -375,6 +375,7 @@ fn none(span: Span) -> Val {
 }
 fn scratch(module: &Module) -> Lowerer<'_> {
     let sig = Sig {
+        none_params: Vec::new(),
         params: Vec::new(),
         ret: Ty::None,
         defaults: Vec::new(),
@@ -717,6 +718,7 @@ fn dispatcher(
     let base = &module.funcs[fn_name];
     // The dispatcher returns what any of the methods it reaches may.
     let sig = Sig {
+        none_params: base.none_params.clone(),
         params: base.params.clone(),
         ret: module.dispatched_ret(owner, method).unwrap_or(base.ret),
         defaults: base.defaults.clone(),
@@ -1432,6 +1434,7 @@ fn builtin_arms(
 
 fn scratch_with<'m>(module: &'m Module, vars: &[(&str, Ty)]) -> Lowerer<'m> {
     let sig = Sig {
+        none_params: Vec::new(),
         params: Vec::new(),
         ret: Ty::Object,
         defaults: Vec::new(),

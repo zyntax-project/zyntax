@@ -457,6 +457,7 @@ fn parse_program_once(
     lap("library");
     let owned: Vec<py::Stmt> = top_level.iter().map(|(s, _)| (*s).clone()).collect();
     let entry_sig = types::Sig {
+        none_params: Vec::new(),
         params: Vec::new(),
         ret: types::Ty::None,
         defaults: Vec::new(),

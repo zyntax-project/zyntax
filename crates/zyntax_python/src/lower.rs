@@ -714,6 +714,11 @@ pub(crate) fn callm_name(method: &str, arity: usize) -> String {
 /// A method's signature as its callers see it: without `self`.
 pub(crate) fn without_self(sig: &Sig) -> Sig {
     Sig {
+        none_params: sig
+            .none_params
+            .get(1..)
+            .map(|d| d.to_vec())
+            .unwrap_or_default(),
         params: sig.params[1..].to_vec(),
         ret: sig.ret,
         defaults: sig
@@ -945,6 +950,7 @@ pub(crate) fn class_adapter(module: &Module, k: usize) -> TypedFunction {
     let sig = match module.method_sig(k, "__init__") {
         Some((sig, _)) => without_self(sig),
         None => Sig {
+            none_params: Vec::new(),
             params: Vec::new(),
             ret: Ty::None,
             defaults: Vec::new(),
@@ -1214,6 +1220,8 @@ pub(crate) struct Lowerer<'m> {
     /// not what they hold from then on, so neither `self` nor a trusted
     /// instance parameter is one once the body assigns it.
     reassigned_params: HashSet<InternedString>,
+    /// See [`Typer::none_params`].
+    none_params: HashSet<String>,
     /// Variables that hold an instance for the whole function: assigned
     /// a constructor's result before anything reads them, and assigned
     /// nothing else anywhere; see [`Self::always_instances`].
@@ -1362,9 +1370,11 @@ impl<'m> Lowerer<'m> {
             .filter(|(n, _)| scope.bound.contains(n) || cells.contains(n))
             .map(|(n, _)| intern(n))
             .collect();
+        let none_params = types::none_params(&sig, scope);
         Self {
             module,
             name: name.to_string(),
+            none_params,
             sig,
             locals,
             bound,
@@ -2021,9 +2031,19 @@ impl<'m> Lowerer<'m> {
             module: self.module,
             vars: &self.locals.vars,
             outer: &self.captured_types,
-            // A comprehension's own names are typed without the facts.
-            nonnone: self.comp_symbols.is_empty().then_some(&self.nonnull),
+            nonnone: None,
             inferring: false,
+            none_params: Some(&self.none_params),
+        }
+    }
+
+    /// [`Self::typer`] with what tests settled where the lowering
+    /// stands: for the expression being lowered here and nothing read
+    /// elsewhere. A comprehension's own names are typed without them.
+    fn typer_here(&self) -> Typer<'_> {
+        Typer {
+            nonnone: self.comp_symbols.is_empty().then_some(&self.nonnull),
+            ..self.typer()
         }
     }
 
@@ -7153,7 +7173,7 @@ impl<'m> Lowerer<'m> {
 
     fn expr_unchecked(&mut self, e: &py::Expr) -> Result<Val> {
         let span = span_of(e);
-        let ty = self.typer().expr_num(e);
+        let ty = self.typer_here().expr_num(e);
         let lit = |x: TypedExpression, ty: Ty| Val {
             node: node(x, ty, span),
             ty,
@@ -7385,13 +7405,35 @@ impl<'m> Lowerer<'m> {
             py::Expr::Compare(c) => self.compare(c, span)?,
             py::Expr::BoolOp(b) => self.bool_op(b, ty, span)?,
             py::Expr::If(i) => {
+                // A parameter only ever passed None takes one branch.
+                if let Some(holds) = self.typer().none_fold(&i.test) {
+                    let taken = if holds { &i.body } else { &i.orelse };
+                    return Ok(Val {
+                        node: self.expr_as(taken, ty)?,
+                        ty,
+                    });
+                }
                 let cond = self.expr_num(&i.test)?;
                 let condition = self.truthy(cond);
-                // What a branch hoists runs only when that branch does.
+                // What a branch hoists runs only when that branch does,
+                // and knows what the test settled.
                 let outer = std::mem::take(&mut self.hoisted);
-                let then_value = self.expr_as(&i.body, ty)?;
+                let (vars, fields) = (self.nonnull.clone(), self.nonnull_fields.clone());
+                for place in self.settled_places(&i.test, true) {
+                    self.assume_place(&place);
+                }
+                let then_value = self.expr_as(&i.body, ty);
+                self.nonnull = vars.clone();
+                self.nonnull_fields = fields.clone();
+                let then_value = then_value?;
                 let then_pre = std::mem::take(&mut self.hoisted);
-                let else_value = self.expr_as(&i.orelse, ty)?;
+                for place in self.settled_places(&i.test, false) {
+                    self.assume_place(&place);
+                }
+                let else_value = self.expr_as(&i.orelse, ty);
+                self.nonnull = vars;
+                self.nonnull_fields = fields;
+                let else_value = else_value?;
                 let else_pre = std::mem::replace(&mut self.hoisted, outer);
                 if then_pre.is_empty() && else_pre.is_empty() {
                     Val {
@@ -11559,6 +11601,7 @@ impl<'m> Lowerer<'m> {
         let (captured, seeds) = self.captures_for(&scope);
         let lifted = self.lifted_name("genexpr");
         let sig = Sig {
+            none_params: Vec::new(),
             params: Vec::new(),
             ret: Ty::Gen,
             defaults: Vec::new(),
@@ -11601,6 +11644,7 @@ impl<'m> Lowerer<'m> {
         };
         self.module.lifted.borrow_mut().push(function);
         let sig = Sig {
+            none_params: Vec::new(),
             params: Vec::new(),
             ret: Ty::Gen,
             defaults: Vec::new(),
@@ -12386,6 +12430,7 @@ impl<'m> Lowerer<'m> {
             .map(|i| (format!("a{i}"), Ty::Object))
             .collect();
         let sig = Sig {
+            none_params: Vec::new(),
             params: params.clone(),
             ret: Ty::Object,
             defaults: vec![None; params.len()],
@@ -13204,6 +13249,7 @@ impl<'m> Lowerer<'m> {
         let sig = match self.module.method_sig(k, "__init__") {
             Some((sig, _)) => without_self(sig),
             None => Sig {
+                none_params: Vec::new(),
                 params: Vec::new(),
                 ret: Ty::None,
                 defaults: Vec::new(),
@@ -13607,6 +13653,7 @@ impl<'m> Lowerer<'m> {
         let sig = match &known {
             Some(info) => info.sig.clone(),
             None => Sig {
+                none_params: Vec::new(),
                 params: params.clone(),
                 ret: Ty::Object,
                 defaults: l

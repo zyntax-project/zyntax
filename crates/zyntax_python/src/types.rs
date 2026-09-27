@@ -1189,6 +1189,10 @@ pub(crate) struct Sig {
     /// Each parameter's default, evaluated at the call site that leaves
     /// the parameter out.
     pub(crate) defaults: Vec<Option<py::Expr>>,
+    /// Per parameter, whether every call passes None: inferred
+    /// parameters of a closed item only. Such a parameter is carried as
+    /// a dynamic value, the IR having no None to pass.
+    pub(crate) none_params: Vec<bool>,
 }
 
 /// One instance of an item for the argument types of a call site: the
@@ -1809,6 +1813,7 @@ pub(crate) fn collect_closures(
                 if !variadic && !with_default {
                     let n = params.len();
                     let sig = Sig {
+                        none_params: Vec::new(),
                         params,
                         ret: Ty::Unknown,
                         defaults: vec![None; n],
@@ -1955,6 +1960,7 @@ fn infer_closure(module: &Module, k: u16, def: &ClosureDef, vars: &HashMap<Strin
                 outer: &seeds,
                 nonnone: None,
                 inferring: false,
+                none_params: None,
             }
             .expr(&l.body);
             let mut inner = seeds;
@@ -2210,6 +2216,7 @@ impl Module {
             *this = Ty::Class(k as u16);
         }
         Some(Sig {
+            none_params: Vec::new(),
             params,
             ret,
             defaults: vec![None; first.params.len()],
@@ -2441,6 +2448,7 @@ pub(crate) fn call_types(
         outer: &HashMap::default(),
         nonnone: None,
         inferring: false,
+        none_params: None,
     };
     Some(
         given
@@ -2647,6 +2655,7 @@ pub(crate) fn declared_sig_in(
             .unwrap_or(Ty::Unknown)
     };
     Sig {
+        none_params: Vec::new(),
         params,
         ret,
         defaults,
@@ -2903,6 +2912,7 @@ pub(crate) fn infer_module(
         module.funcs.insert(item.name.clone(), sig);
     }
     let entry_sig = Sig {
+        none_params: Vec::new(),
         params: Vec::new(),
         ret: Ty::None,
         defaults: Vec::new(),
@@ -3248,10 +3258,14 @@ pub(crate) fn infer_module(
     for (name, sig) in module.funcs.iter_mut() {
         sig.ret = sig.ret.settled();
         if let Some(flags) = inferring.get(name) {
-            for (flag, (_, ty)) in flags.iter().zip(sig.params.iter_mut()) {
+            sig.none_params = vec![false; sig.params.len()];
+            for (i, (flag, (_, ty))) in flags.iter().zip(sig.params.iter_mut()).enumerate() {
                 if *flag {
                     *ty = match *ty {
-                        Ty::None => Ty::Object,
+                        Ty::None => {
+                            sig.none_params[i] = true;
+                            Ty::Object
+                        }
                         t => t.settled(),
                     };
                 }
@@ -3379,6 +3393,7 @@ fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) ->
         return key;
     }
     let trial = Sig {
+        none_params: sig.none_params.clone(),
         params: sig
             .params
             .iter()
@@ -3402,6 +3417,7 @@ fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) ->
                 outer: &HashMap::default(),
                 nonnone: None,
                 inferring: false,
+                none_params: None,
             },
             counts: narrowed
                 .iter()
@@ -3489,6 +3505,7 @@ pub(crate) fn specialise(
     }
     let trace = std::env::var_os("ZYNTAX_TRACE_TYPES_ROUNDS").is_some();
     let entry_sig = Sig {
+        none_params: Vec::new(),
         params: Vec::new(),
         ret: Ty::None,
         defaults: Vec::new(),
@@ -3600,6 +3617,7 @@ pub(crate) fn specialise(
                 item: name.clone(),
                 name: spec_name(&name, n),
                 sig: Sig {
+                    none_params: sig.none_params.clone(),
                     params,
                     ret: if annotated { sig.ret } else { Ty::Unknown },
                     defaults: sig.defaults.clone(),
@@ -3915,6 +3933,7 @@ impl Calls<'_> {
             outer: &self.no_outer,
             nonnone: None,
             inferring: false,
+            none_params: None,
         }
     }
 
@@ -4505,6 +4524,7 @@ fn infer_locals_with(
         true,
     );
     locals.narrowed = asserted_classes(body, &module.class_index);
+    let none_params = none_params(sig, &scope);
     let shared: HashSet<String> = scope
         .children
         .iter()
@@ -4526,6 +4546,7 @@ fn infer_locals_with(
             shared: &shared,
             fills: &fills,
             nonnone: HashSet::default(),
+            none_params: &none_params,
         };
         for (i, s) in body.iter().enumerate() {
             match files.get(i) {
@@ -4573,6 +4594,7 @@ fn infer_locals_with(
             outer: seeds,
             nonnone: None,
             inferring: false,
+            none_params: None,
         },
         body,
     );
@@ -5187,6 +5209,7 @@ pub(crate) fn list_sites<'ast>(
             outer: &no_outer,
             nonnone: None,
             inferring: false,
+            none_params: None,
         },
         sites: names
             .into_iter()
@@ -5503,6 +5526,7 @@ fn field_sites_into(
         outer: &no_outer,
         nonnone: None,
         inferring: false,
+        none_params: None,
     };
     for (key, site) in sites {
         let round = rounds.entry(key).or_default();
@@ -5553,6 +5577,7 @@ fn list_param_facts(
         outer: &no_outer,
         nonnone: None,
         inferring: false,
+        none_params: None,
     };
     params
         .iter()
@@ -5664,6 +5689,8 @@ struct Walker<'a> {
     /// a compound statement keeps those it does not assign (none past a
     /// `try`, a `match` or a nested body), a store keeps a number.
     nonnone: HashSet<crate::InternedString>,
+    /// See [`Typer::none_params`].
+    none_params: &'a HashSet<String>,
 }
 
 impl Walker<'_> {
@@ -5674,6 +5701,16 @@ impl Walker<'_> {
             outer: self.seeds,
             nonnone: Some(&self.nonnone),
             inferring: true,
+            none_params: Some(self.none_params),
+        }
+    }
+
+    /// [`Self::typer`] without what tests settled where the walk stands:
+    /// for expressions read elsewhere in the body.
+    fn typer_anywhere(&self) -> Typer<'_> {
+        Typer {
+            nonnone: None,
+            ..self.typer()
         }
     }
 
@@ -6124,7 +6161,7 @@ impl Walker<'_> {
                     // it, decided afresh from the types known now.
                     if let py::Expr::Name(n) = t {
                         if let Some(sites) = self.fills.get(n.id.as_str()) {
-                            let decided = decide_list(self.module, sites, &self.typer());
+                            let decided = decide_list(self.module, sites, &self.typer_anywhere());
                             self.locals.vars.remove(n.id.as_str());
                             self.assign(n.id.as_str(), decided);
                             continue;
@@ -6315,6 +6352,37 @@ impl Walker<'_> {
     }
 }
 
+/// The parameters of `sig` every call passes None that the body of
+/// `scope` never assigns.
+pub(crate) fn none_params(sig: &Sig, scope: &crate::scope::Scope) -> HashSet<String> {
+    sig.params
+        .iter()
+        .zip(&sig.none_params)
+        .filter(|((p, _), none)| **none && !scope.bound.contains(p))
+        .map(|((p, _), _)| p.clone())
+        .collect()
+}
+
+/// The name `test` compares with None by `is`, `is not`, `==` or
+/// `!=`, and whether the test holding means the name is None.
+fn none_tested(test: &py::Expr) -> Option<(&str, bool)> {
+    let py::Expr::Compare(c) = test else {
+        return None;
+    };
+    let holds_means_none = match c.ops.as_ref() {
+        [py::CmpOp::Is | py::CmpOp::Eq] => true,
+        [py::CmpOp::IsNot | py::CmpOp::NotEq] => false,
+        _ => return None,
+    };
+    match (&*c.left, c.comparators.as_ref()) {
+        (py::Expr::Name(n), [py::Expr::NoneLiteral(_)])
+        | (py::Expr::NoneLiteral(_), [py::Expr::Name(n)]) => {
+            Some((n.id.as_str(), holds_means_none))
+        }
+        _ => None,
+    }
+}
+
 /// The names an assignment target binds.
 fn collect_names<'e>(target: &'e py::Expr, out: &mut Vec<&'e str>) {
     match target {
@@ -6382,6 +6450,9 @@ pub(crate) struct Typer<'a> {
     /// Whether this types a round of a body's local inference, where a
     /// later store may still widen what a local holds.
     pub(crate) inferring: bool,
+    /// Parameters every call passes None and the body never assigns:
+    /// None wherever they are read.
+    pub(crate) none_params: Option<&'a HashSet<String>>,
 }
 
 /// Give the names in an assignment target a type, in a scratch
@@ -6902,6 +6973,7 @@ impl Typer<'_> {
             outer: self.outer,
             nonnone: None,
             inferring: false,
+            none_params: None,
         };
         inner.expr(elt)
     }
@@ -6920,6 +6992,7 @@ impl Typer<'_> {
             outer: self.outer,
             nonnone: None,
             inferring: false,
+            none_params: None,
         };
         (inner.expr(key), inner.expr(value))
     }
@@ -6960,6 +7033,7 @@ impl Typer<'_> {
                 outer: self.outer,
                 nonnone: None,
                 inferring: false,
+                none_params: None,
             }
             .item_ty(&g.iter);
             bind_target(&mut vars, &g.target, item);
@@ -7011,6 +7085,23 @@ impl Typer<'_> {
             t => t.boxed_view(),
         };
         seq.element().unwrap_or(Ty::Object)
+    }
+
+    /// Whether `test`, a None test of a parameter only ever passed
+    /// None, holds: it always does or never does.
+    pub(crate) fn none_fold(&self, test: &py::Expr) -> Option<bool> {
+        let (name, holds_means_none) = none_tested(test)?;
+        self.none_params?.contains(name).then_some(holds_means_none)
+    }
+
+    /// A value of type `t` a test has shown is not None.
+    pub(crate) fn not_none(&self, t: Ty) -> Ty {
+        match t {
+            Ty::Num(m) => Ty::num(m & !Ty::NUM_NONE),
+            Ty::MaybeList(e) => Ty::List(e),
+            Ty::None if self.inferring => Ty::Unknown,
+            t => t,
+        }
     }
 
     /// Whether `name` is a variable of this scope, an enclosing one or
@@ -7125,8 +7216,21 @@ impl Typer<'_> {
                 acc
             }
             py::Expr::If(i) => {
-                let a = self.expr_num(&i.body).stored_view();
-                let b = self.expr_num(&i.orelse).stored_view();
+                if let Some(holds) = self.none_fold(&i.test) {
+                    let taken = if holds { &i.body } else { &i.orelse };
+                    return self.expr_num(taken).stored_view();
+                }
+                // `e if x is None else x`: the second `x` is not None.
+                let arm = |branch: &py::Expr, when: bool| match (none_tested(&i.test), branch) {
+                    (Some((tested, holds)), py::Expr::Name(n))
+                        if holds == when && n.id.as_str() == tested =>
+                    {
+                        self.not_none(self.expr_num(branch))
+                    }
+                    _ => self.expr_num(branch),
+                };
+                let a = arm(&i.body, false).stored_view();
+                let b = arm(&i.orelse, true).stored_view();
                 a.join_nullable(b)
                     .unwrap_or_else(|| a.boxed_view().join(b.boxed_view()))
             }

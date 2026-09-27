@@ -18,7 +18,7 @@
 use ruff_python_ast as py;
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr, walk_stmt};
 use ruff_python_ast::visitor::{Visitor, walk_expr as walk_expr_ref, walk_stmt as walk_stmt_ref};
-use ruff_text_size::TextSize;
+use ruff_text_size::{Ranged, TextSize};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 /// Rewrite every function body in the module, nested ones included.
@@ -96,11 +96,64 @@ fn function(f: &mut py::StmtFunctionDef) {
     for s in &f.body {
         facts.visit_stmt(s);
     }
+    // `if x is None: x = e` at the top of the body is `x = e if x is None
+    // else x`: a straight-line rebinding, so versioned like any other.
+    for s in f.body.iter_mut() {
+        if let Some(assign) = none_default(s, &facts) {
+            *s = assign;
+        }
+    }
     let mut versions = Versions {
         facts,
         next: HashMap::default(),
     };
     block(&mut f.body, &mut versions, &|_| false);
+}
+
+/// `if x is None: x = e` (or `== None`), with no other branch, as the
+/// assignment `x = e if x is None else x`, for a name this pass may
+/// version.
+fn none_default(s: &py::Stmt, facts: &Facts) -> Option<py::Stmt> {
+    let py::Stmt::If(i) = s else { return None };
+    if !i.elif_else_clauses.is_empty() {
+        return None;
+    }
+    let [py::Stmt::Assign(a)] = i.body.as_slice() else {
+        return None;
+    };
+    let [py::Expr::Name(target)] = a.targets.as_slice() else {
+        return None;
+    };
+    let py::Expr::Compare(c) = &*i.test else {
+        return None;
+    };
+    let tested = match (c.ops.as_ref(), &*c.left, c.comparators.as_ref()) {
+        ([py::CmpOp::Is | py::CmpOp::Eq], py::Expr::Name(n), [py::Expr::NoneLiteral(_)]) => n,
+        _ => return None,
+    };
+    let name = target.id.as_str();
+    if tested.id.as_str() != name || facts.fixed.contains(name) || !facts.locals.contains(name) {
+        return None;
+    }
+    let kept = py::Expr::Name(py::ExprName {
+        node_index: Default::default(),
+        range: tested.range,
+        id: tested.id.clone(),
+        ctx: py::ExprContext::Load,
+    });
+    let value = py::Expr::If(py::ExprIf {
+        node_index: Default::default(),
+        range: a.value.range(),
+        test: i.test.clone(),
+        body: a.value.clone(),
+        orelse: Box::new(kept),
+    });
+    Some(py::Stmt::Assign(py::StmtAssign {
+        node_index: Default::default(),
+        range: i.range,
+        targets: a.targets.clone(),
+        value: Box::new(value),
+    }))
 }
 
 /// One block's statements, in order. A rebinding at `i` renames the
@@ -515,6 +568,17 @@ mod tests {
     fn a_straight_line_rebinding_is_a_fresh_version() {
         let names = names_in("def f(data):\n    data = g(data)\n    return h(data)\n");
         assert_eq!(names, ["g", "data", "data$1", "h", "data$1"]);
+    }
+
+    #[test]
+    fn a_none_default_replaced_at_the_top_is_a_fresh_version() {
+        let names = names_in("def f(x=None):\n    if x is None:\n        x = g()\n    return x\n");
+        assert_eq!(names, ["x", "g", "x", "x$1", "x$1"]);
+        // Nested in a loop, it is left as written.
+        let names = names_in(
+            "def f(x=None):\n    for i in r:\n        if x is None:\n            x = 1\n    return x\n",
+        );
+        assert!(names.iter().all(|n| !n.contains('$')), "{names:?}");
     }
 
     #[test]
