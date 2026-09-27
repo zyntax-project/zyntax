@@ -8015,6 +8015,9 @@ impl<'m> Lowerer<'m> {
 
     /// One comparison between two typed values.
     fn compare_one(&mut self, op: py::CmpOp, left: Val, right: Val, span: Span) -> Result<Node> {
+        if let Some(n) = self.num_compare(op, left.clone(), right.clone(), span) {
+            return Ok(n);
+        }
         let (left, right) = if matches!(op, py::CmpOp::Is | py::CmpOp::IsNot) {
             (left, right)
         } else {
@@ -8552,15 +8555,19 @@ impl<'m> Lowerer<'m> {
     /// hidden local first, and the whole comparison becomes a block
     /// whose value is the chain.
     fn compare(&mut self, c: &py::ExprCompare, span: Span) -> Result<Val> {
-        // `x is None` reads a run-time number's tag.
-        let identity = matches!(c.ops.as_ref(), [py::CmpOp::Is | py::CmpOp::IsNot]);
-        let mut operands = vec![if identity {
+        // `x is None` reads a run-time number's tag, and an ordering or
+        // equality its parts.
+        let parts = c
+            .ops
+            .iter()
+            .all(|op| !matches!(op, py::CmpOp::In | py::CmpOp::NotIn));
+        let mut operands = vec![if parts {
             self.expr_num(&c.left)?
         } else {
             self.expr(&c.left)?
         }];
         for x in c.comparators.iter() {
-            operands.push(if identity {
+            operands.push(if parts {
                 self.expr_num(x)?
             } else {
                 self.expr(x)?

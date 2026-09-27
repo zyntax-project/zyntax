@@ -552,6 +552,173 @@ impl Lowerer<'_> {
     }
 }
 
+impl Lowerer<'_> {
+    /// `left op right` for an ordering or equality where a Num takes part
+    /// and neither side may be None, on the parts: two ints compare as
+    /// ints, anything else as floats, and an int beyond 2^53 against a
+    /// float exactly. None when the comparison is not one of these.
+    pub(crate) fn num_compare(
+        &mut self,
+        op: ruff_python_ast::CmpOp,
+        left: Val,
+        right: Val,
+        span: Span,
+    ) -> Option<Node> {
+        use ruff_python_ast::CmpOp as C;
+        if !matches!(left.ty, Ty::Num(_)) && !matches!(right.ty, Ty::Num(_)) {
+            return None;
+        }
+        let bin = match op {
+            C::Eq => BinaryOp::Eq,
+            C::NotEq => BinaryOp::Ne,
+            C::Lt => BinaryOp::Lt,
+            C::LtE => BinaryOp::Le,
+            C::Gt => BinaryOp::Gt,
+            C::GtE => BinaryOp::Ge,
+            _ => return None,
+        };
+        let (ml, mr) = (left.ty.mask()?, right.ty.mask()?);
+        if (ml | mr) & !NUMBERS != 0 {
+            return None;
+        }
+        let ints = |m: u8| m & !(Ty::NUM_BOOL | Ty::NUM_INT) == 0;
+        let mut pre = Vec::new();
+        // One kind a side: the typed comparison of those kinds.
+        if (ints(ml) || ml == Ty::NUM_FLOAT) && (ints(mr) || mr == Ty::NUM_FLOAT) {
+            let lk = if ints(ml) { Ty::Int } else { Ty::Float };
+            let rk = if ints(mr) { Ty::Int } else { Ty::Float };
+            let l = self.coerce(left, lk);
+            let r = self.coerce(right, rk);
+            return self
+                .compare_one(op, Val { node: l, ty: lk }, Val { node: r, ty: rk }, span)
+                .ok();
+        }
+        let wide = |t: Ty| Ty::Num(t.mask().unwrap_or(0) | Ty::NUM_INT | Ty::NUM_FLOAT);
+        let (lty, rty) = (wide(left.ty), wide(right.ty));
+        let l = Val {
+            node: self.coerce(left, lty),
+            ty: lty,
+        };
+        let r = Val {
+            node: self.coerce(right, rty),
+            ty: rty,
+        };
+        let l = self.num_held(l, &mut pre, span);
+        let r = self.num_held(r, &mut pre, span);
+        let is_int = |p: &NumParts| {
+            binary(
+                BinaryOp::Le,
+                p.tag.clone(),
+                int_lit(TAG_INT, span),
+                Ty::Bool,
+                span,
+            )
+        };
+        let both_int = binary(BinaryOp::And, is_int(&l), is_int(&r), Ty::Bool, span);
+        let plain = select(
+            both_int.clone(),
+            binary(bin, l.int.clone(), r.int.clone(), Ty::Bool, span),
+            binary(bin, l.as_f64(span), r.as_f64(span), Ty::Bool, span),
+            Ty::Bool,
+            span,
+        );
+        // An int converts to float exactly within 2^53, and two ints
+        // never convert; otherwise one side is a wide int, the other a
+        // float.
+        let wide_int = |p: &NumParts| {
+            let limit = 1i64 << 53;
+            binary(
+                BinaryOp::And,
+                is_int(p),
+                binary(
+                    BinaryOp::Or,
+                    binary(
+                        BinaryOp::Gt,
+                        p.int.clone(),
+                        int_lit(limit, span),
+                        Ty::Bool,
+                        span,
+                    ),
+                    binary(
+                        BinaryOp::Lt,
+                        p.int.clone(),
+                        int_lit(-limit, span),
+                        Ty::Bool,
+                        span,
+                    ),
+                    Ty::Bool,
+                    span,
+                ),
+                Ty::Bool,
+                span,
+            )
+        };
+        let inexact = binary(
+            BinaryOp::And,
+            binary(BinaryOp::Or, wide_int(&l), wide_int(&r), Ty::Bool, span),
+            not(both_int, span),
+            Ty::Bool,
+            span,
+        );
+        let saved = std::mem::take(&mut self.hoisted);
+        let int_left = self.exact_int_float_compare(
+            op,
+            Val {
+                node: l.int.clone(),
+                ty: Ty::Int,
+            },
+            Val {
+                node: r.float.clone(),
+                ty: Ty::Float,
+            },
+            span,
+        )?;
+        let int_left_pre = std::mem::take(&mut self.hoisted);
+        let int_right = self.exact_int_float_compare(
+            op,
+            Val {
+                node: l.float.clone(),
+                ty: Ty::Float,
+            },
+            Val {
+                node: r.int.clone(),
+                ty: Ty::Int,
+            },
+            span,
+        )?;
+        let int_right_pre = std::mem::replace(&mut self.hoisted, saved);
+        let mut exact_pre = Vec::new();
+        let exact = self.conditional_value(
+            is_int(&l),
+            (int_left_pre, int_left),
+            (int_right_pre, int_right),
+            Ty::Bool,
+            span,
+            &mut exact_pre,
+        );
+        let n = self.conditional_value(
+            inexact,
+            (exact_pre, exact),
+            (Vec::new(), plain),
+            Ty::Bool,
+            span,
+            &mut pre,
+        );
+        Some(Self::with_pre(pre, n, Ty::Bool, span))
+    }
+}
+
+fn not(n: Node, span: Span) -> Node {
+    node(
+        TypedExpression::Unary(zyntax_typed_ast::typed_ast::TypedUnary {
+            op: zyntax_typed_ast::UnaryOp::Not,
+            operand: Box::new(n),
+        }),
+        Ty::Bool,
+        span,
+    )
+}
+
 fn if_stmt(cond: Node, then: Vec<Stmt>, otherwise: Option<Vec<Stmt>>, span: Span) -> Stmt {
     use zyntax_typed_ast::typed_ast::{TypedBlock, TypedIf, TypedStatement};
     TypedNode::new(
