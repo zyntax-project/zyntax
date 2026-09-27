@@ -1,8 +1,8 @@
 # Zyntax Bytecode Format Specification
 
-**Version**: 3.0
+**Version**: 4.0
 **Status**: Stable
-**Last Updated**: 2026-09-25
+**Last Updated**: 2026-09-27
 
 ---
 
@@ -27,7 +27,7 @@ on values.
 | CLI loader | `crates/zyntax_cli/src/formats/hir_bytecode.rs` |
 
 The payload layout is defined by the codec applied to the declarations in
-those files. Section 5 transcribes them for format 3.0; where the two
+those files. Section 5 transcribes them for format 4.0; where the two
 disagree, the source is authoritative.
 
 ### Where the format is used
@@ -60,7 +60,7 @@ All multi-byte fields are little-endian.
 | Offset | Size | Field | Written as | Checked on read |
 |--------|------|-------|------------|-----------------|
 | 0x00 | 4 | `magic` | u32 `0x5A424300`, bytes `00 43 42 5A` | must match |
-| 0x04 | 2 | `major_version` | u16 `3` | must equal 3 |
+| 0x04 | 2 | `major_version` | u16 `4` | must equal 4 |
 | 0x06 | 2 | `minor_version` | u16 `0` | not checked |
 | 0x08 | 1 | `format` | u8 payload encoding, section 3 | must be 0 to 3 |
 | 0x09 | 3 | padding | zero | not checked |
@@ -92,7 +92,7 @@ over bytes 44 to the end of the file. The header is not covered.
 
 1. The file is at least 44 bytes, else `InvalidFormat`.
 2. `magic` matches, else `InvalidFormat`.
-3. `major_version` is 3, else `VersionMismatch`. The minor version is not
+3. `major_version` is 4, else `VersionMismatch`. The minor version is not
    compared.
 4. The CRC-32 of bytes 44 to the end matches `checksum`, else
    `ChecksumMismatch`.
@@ -188,27 +188,27 @@ as in Postcard.
 
 ### 4.1 A complete file
 
-An empty module with id 1 named `m`, in the Postcard encoding (57 bytes):
+An empty module with id 1 named `m`, in the Postcard encoding (58 bytes):
 
 ```
-0000  00 43 42 5a 03 00 00 00 00 00 00 00 00 00 00 00
+0000  00 43 42 5a 04 00 00 00 00 00 00 00 00 00 00 00
 0010  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-0020  0d 00 00 00 00 00 00 00 57 08 07 d2 01 01 6d 00
-0030  00 00 00 00 00 00 00 00 00
+0020  0e 00 00 00 00 00 00 00 d2 2c df 27 01 01 6d 00
+0030  00 00 00 00 00 00 00 00 00 00
 ```
 
 | Bytes | Meaning |
 |-------|---------|
 | `00 43 42 5a` | magic |
-| `03 00` `00 00` | version 3.0 |
+| `04 00` `00 00` | version 4.0 |
 | `00` `00 00 00` | format 0 (Postcard), padding |
 | `00 00 00 00` | flags |
 | `01 00 00 00` + 12 zero bytes | module_id: module id 1 |
-| `0d 00 00 00 00 00 00 00` | payload_size 13 |
-| `57 08 07 d2` | checksum `0xD2070857` |
+| `0e 00 00 00 00 00 00 00` | payload_size 14 |
+| `d2 2c df 27` | checksum `0x27DF2CD2` |
 | `01` | `HirModule.id` = 1 |
 | `01 6d` | `name` = `"m"` |
-| `00` x 10 | `functions`, `globals`, `types`, `imports`, `exports` empty; `version` 0; `dependencies`, `effects`, `handlers` empty; `automatic_release` false |
+| `00` x 11 | `functions`, `globals`, `types`, `imports`, `exports` empty; `version` 0; `dependencies`, `effects`, `handlers` empty; `automatic_release` false; `exact_struct_types` empty |
 
 ### 4.2 Instructions and terminators
 
@@ -229,7 +229,7 @@ An empty module with id 1 named `m`, in the Postcard encoding (57 bytes):
 
 ## 5. Payload Data Model
 
-This is the format 3.0 schema. Types are written in Rust notation; every
+This is the format 4.0 schema. Types are written in Rust notation; every
 struct field is present, in the order shown. A `Box<T>` in the source is
 shown as `T`, which encodes identically.
 
@@ -278,6 +278,7 @@ HirModule {
     effects: IndexMap<HirId, HirEffect>,
     handlers: IndexMap<HirId, HirEffectHandler>,
     automatic_release: bool,
+    exact_struct_types: HashSet<TypeId>,  // struct types no pointer of another type aliases
 }
 ```
 
@@ -324,6 +325,9 @@ FunctionAttributes {
     strict_fp: bool, cooperative: bool, optimized: bool, deferred: bool,
     osr_region: bool,
     release_facts: Option<ReleaseFacts>,
+    sets_error_flag: bool,                // may store to the error-flag global
+    nothrow: bool,                        // never sets the error flag
+    queries_error_flag: bool,             // reports whether an error is pending
 }
 ReleaseFacts { returns_owned: bool, returns_param: Vec<bool>, automatic_release: bool }
 
@@ -376,7 +380,8 @@ Globals, imports and exports:
 ```rust
 HirGlobal { id: HirId, name: InternedString, ty: HirType,
             initializer: Option<HirConstant>, is_const: bool,
-            is_thread_local: bool, linkage: Linkage, visibility: Visibility }
+            is_thread_local: bool, linkage: Linkage, visibility: Visibility,
+            error_flag: bool }            // the global a pending error is recorded in
 HirImport { name: InternedString, kind: ImportKind, attributes: ImportAttributes }
 ImportAttributes { dll_import: Option<String>, weak: bool }
 HirExport { name: InternedString, internal_name: InternedString, kind: ExportKind }
@@ -655,7 +660,7 @@ it has no body), keyed by the entry's id.
 2. Encode it with the chosen codec (section 3). For Split, lay out the blob
    and directory as in section 6.1.
 3. Compute the CRC-32 of the encoded payload.
-4. Write the 44-byte header (section 2) with version 3.0, the format byte,
+4. Write the 44-byte header (section 2) with version 4.0, the format byte,
    flags 0, the module id, the payload length and the checksum; then the
    payload; then nothing else.
 
@@ -670,20 +675,19 @@ The Rust entry points are `serialize_module(&module, Format)`,
 ## 8. Versioning
 
 A reader accepts a file only when its major version equals the reader's own,
-3. The minor version is written as 0 and not compared. A file of any other
+4. The minor version is written as 0 and not compared. A file of any other
 major version is refused with `VersionMismatch`; there is no reading of older
 or newer majors. The HIR caches in this repository treat any read error,
 `VersionMismatch` included, as a miss and recompile.
 
-The major version moves when the bytecode's own layout changes: the header,
-the Split structures, or the encoding of identifiers. It does not track the
-HIR schema of section 5. Adding, removing or reordering a field or a variant
-of any type there also changes the payload layout, since Postcard and Bincode
-are positional and tags are declaration positions, so a payload must match
-the declarations of the build that reads it. Language snapshots pair each
-Split image with the compiler's build id and target pointer width for this
-reason, and do not read an image recorded by a different build or for a
-different width.
+The major version moves with any change to the payload layout: the header,
+the Split structures, the encoding of identifiers, and the HIR schema of
+section 5. Adding, removing or reordering a field or a variant of any type
+there changes the payload layout, since Postcard and Bincode are positional
+and tags are declaration positions, so a payload must match the declarations
+of the build that reads it. Language snapshots also pair each Split image with
+the compiler's build id and target pointer width, and do not read an image
+recorded by a different build or for a different width.
 
 ### Version history
 
@@ -694,3 +698,4 @@ different width.
 | 2.0 | 2026-06-05 | `HirId` and `LifetimeId` become u32; the header's `module_id` carries the u32 id zero-extended to 16 bytes. |
 | 2.0 | 2026-09-14 | Format 3 (Split) added: a stripped module with each function body encoded separately; version unchanged. |
 | 3.0 | 2026-09-24 | Split payload becomes a function directory with per-function name, shell and body extents into one blob, plus `by_id`, `by_name` and `blob_len`. |
+| 4.0 | 2026-09-27 | HIR error-flag facts and exact struct types: `HirGlobal.error_flag`, `FunctionAttributes.sets_error_flag`, `nothrow` and `queries_error_flag`, `HirModule.exact_struct_types`. |
