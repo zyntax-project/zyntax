@@ -3787,6 +3787,22 @@ impl<'m> Lowerer<'m> {
             }
             py::Stmt::Return(r) => {
                 let value = match &r.value {
+                    Some(v) if self.sig.ret == Ty::Object && types::fresh_list(v) => {
+                        // A list made here leaves as a list of dynamic
+                        // values, which the caller may write any kind
+                        // into; nothing else holds it, so the copy is
+                        // not seen.
+                        let mut val = self.expr(v)?;
+                        if matches!(val.ty, Ty::List(e) if e != Elem::Object && e.code().is_none())
+                        {
+                            let node = self.coerce(val, Ty::List(Elem::Object));
+                            val = Val {
+                                node,
+                                ty: Ty::List(Elem::Object),
+                            };
+                        }
+                        Some(Box::new(self.coerce(val, Ty::Object)))
+                    }
                     Some(v) => {
                         let ret = self.sig.ret;
                         Some(Box::new(self.expr_as(v, ret)?))

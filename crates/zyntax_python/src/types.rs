@@ -3600,7 +3600,15 @@ pub(crate) fn specialise(
             let locals = in_file(file, || {
                 infer_locals_open(module, &spec.sig, &item.def.body, &[], false)
             });
-            let ret = if locals.returns { locals.ret } else { Ty::None };
+            let mut ret = if locals.returns { locals.ret } else { Ty::None };
+            // Where the item returns a dynamic value, an instance does
+            // not narrow it to a list of one kind: a caller may write any
+            // kind into what it gets back.
+            if module.funcs[&spec.item].ret == Ty::Object
+                && matches!(ret, Ty::List(e) if e != Elem::Object && e.code().is_none())
+            {
+                ret = Ty::Object;
+            }
             if ret != spec.sig.ret {
                 if trace {
                     eprintln!(
@@ -4703,6 +4711,18 @@ pub(crate) fn dynamic_field_stores(typer: &Typer<'_>, body: &[py::Stmt]) -> Vec<
     stores.out.sort();
     stores.out.dedup();
     stores.out
+}
+
+/// An expression that makes a new list no name holds yet: a literal, a
+/// comprehension, a slice, a concatenation, or `list(...)`/`sorted(...)`.
+pub(crate) fn fresh_list(e: &py::Expr) -> bool {
+    match e {
+        py::Expr::List(_) | py::Expr::ListComp(_) => true,
+        py::Expr::Subscript(s) => matches!(&*s.slice, py::Expr::Slice(_)),
+        py::Expr::BinOp(b) => matches!(b.op, py::Operator::Add | py::Operator::Mult),
+        py::Expr::Call(c) => is_name(&c.func, "list") || is_name(&c.func, "sorted"),
+        _ => false,
+    }
 }
 
 pub(crate) fn is_empty_list(e: &py::Expr) -> bool {
