@@ -52,6 +52,7 @@ pub mod drop_insert; // Speculative drop-site analysis: insert free() for non-es
 pub mod effect_analysis; // Effect inference and checking for algebraic effects
 pub mod effect_codegen; // Code generation support for algebraic effects
 pub mod effect_handler_resolution; // Handler resolution for effect dispatch
+pub mod error_flag; // Pending-error checks the error flag's state decides
 pub mod exclusive_args; // An exclusive argument may not be a second name for another
 pub mod fiber_backend; // `FiberCfg` trait + global install slot for fiber primitives
 pub mod fiber_lowering; // First-class fiber HIR ops → Call::Symbol("krio_fiber_*") rewrite
@@ -1790,6 +1791,7 @@ pub struct InterpOptStats {
     pub dead_store: dead_store::DeadStoreStats,
     pub sign_fold: sign_fold::SignFoldStats,
     pub branch_fold: branch_fold::BranchFoldStats,
+    pub error_flag: error_flag::ErrorFlagStats,
     pub licm: licm::LicmStats,
     pub affine_loop: affine_loop::AffineLoopStats,
     pub inline: inline::InlineStats,
@@ -2097,6 +2099,14 @@ fn run_interp_safe_opts_with(
         let il = inline::run_module_with(module, cache.map(|c| &c.cycles));
         timed("inline", &mut at);
         check_hir_uses(module, "inline");
+        // After inline, which puts a callee's raising arm and the
+        // caller's check in one body; before licm, so a loop left with no
+        // flag load has nothing of it to hoist.
+        let ef = error_flag::run_module(module);
+        stats.error_flag.folded += ef.folded;
+        stats.error_flag.threaded += ef.threaded;
+        timed("error_flag", &mut at);
+        check_hir_uses(module, "error_flag");
         let lc = licm::run_module(module);
         timed("licm", &mut at);
         check_hir_uses(module, "licm");
@@ -2132,6 +2142,8 @@ fn run_interp_safe_opts_with(
             || agsc.webs > 0
             || sra.mallocs_eliminated > 0
             || il.inlined > 0
+            || ef.folded > 0
+            || ef.threaded > 0
             || lc.hoisted > 0
             || cs_cfg.merged > 0
             || cs_cfg.threaded > 0;
