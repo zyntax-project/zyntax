@@ -1953,6 +1953,8 @@ fn infer_closure(module: &Module, k: u16, def: &ClosureDef, vars: &HashMap<Strin
                 module,
                 vars: &params,
                 outer: &seeds,
+                nonnone: None,
+                inferring: false,
             }
             .expr(&l.body);
             let mut inner = seeds;
@@ -2437,6 +2439,8 @@ pub(crate) fn call_types(
         module,
         vars: &HashMap::default(),
         outer: &HashMap::default(),
+        nonnone: None,
+        inferring: false,
     };
     Some(
         given
@@ -3396,6 +3400,8 @@ fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) ->
                 module,
                 vars: &locals.vars,
                 outer: &HashMap::default(),
+                nonnone: None,
+                inferring: false,
             },
             counts: narrowed
                 .iter()
@@ -3907,6 +3913,8 @@ impl Calls<'_> {
             module: self.module,
             vars: self.comp_vars.as_ref().unwrap_or(self.vars),
             outer: &self.no_outer,
+            nonnone: None,
+            inferring: false,
         }
     }
 
@@ -4517,6 +4525,7 @@ fn infer_locals_with(
             seeds,
             shared: &shared,
             fills: &fills,
+            nonnone: HashSet::default(),
         };
         for (i, s) in body.iter().enumerate() {
             match files.get(i) {
@@ -4562,6 +4571,8 @@ fn infer_locals_with(
             module,
             vars: &locals.vars,
             outer: seeds,
+            nonnone: None,
+            inferring: false,
         },
         body,
     );
@@ -5174,6 +5185,8 @@ pub(crate) fn list_sites<'ast>(
             module,
             vars,
             outer: &no_outer,
+            nonnone: None,
+            inferring: false,
         },
         sites: names
             .into_iter()
@@ -5488,6 +5501,8 @@ fn field_sites_into(
         module,
         vars,
         outer: &no_outer,
+        nonnone: None,
+        inferring: false,
     };
     for (key, site) in sites {
         let round = rounds.entry(key).or_default();
@@ -5536,6 +5551,8 @@ fn list_param_facts(
         module,
         vars,
         outer: &no_outer,
+        nonnone: None,
+        inferring: false,
     };
     params
         .iter()
@@ -5642,6 +5659,11 @@ struct Walker<'a> {
     /// The uses of each local bound only to unkinded list literals,
     /// whose kind is decided from them at each such binding.
     fills: &'a HashMap<String, ListSites<'a>>,
+    /// Locals a test has shown are not None where the walk stands, kept
+    /// by the lowering's rules for its own facts and never beyond them:
+    /// a compound statement keeps those it does not assign (none past a
+    /// `try`, a `match` or a nested body), a store keeps a number.
+    nonnone: HashSet<crate::InternedString>,
 }
 
 impl Walker<'_> {
@@ -5650,6 +5672,8 @@ impl Walker<'_> {
             module: self.module,
             vars: &self.locals.vars,
             outer: self.seeds,
+            nonnone: Some(&self.nonnone),
+            inferring: true,
         }
     }
 
@@ -6003,6 +6027,66 @@ impl Walker<'_> {
     }
 
     fn stmt(&mut self, s: &py::Stmt) {
+        let compound = matches!(
+            s,
+            py::Stmt::If(_)
+                | py::Stmt::While(_)
+                | py::Stmt::For(_)
+                | py::Stmt::Try(_)
+                | py::Stmt::With(_)
+                | py::Stmt::Match(_)
+                | py::Stmt::FunctionDef(_)
+                | py::Stmt::ClassDef(_)
+        );
+        if !compound {
+            self.stmt_types(s);
+            let stored: Vec<&py::Expr> = match s {
+                py::Stmt::Assign(a) => a.targets.iter().collect(),
+                py::Stmt::AugAssign(a) => vec![&*a.target],
+                py::Stmt::AnnAssign(a) => vec![&*a.target],
+                _ => Vec::new(),
+            };
+            for t in stored {
+                let mut names = Vec::new();
+                collect_names(t, &mut names);
+                for name in names {
+                    self.nonnone.remove(&crate::intern(name));
+                }
+            }
+            // A number stored in a number local is not None.
+            if let py::Stmt::Assign(a) = s
+                && let [py::Expr::Name(n)] = a.targets.as_slice()
+                && matches!(self.locals.vars.get(n.id.as_str()), Some(Ty::Num(_)))
+                && self
+                    .expr_num(&a.value)
+                    .mask()
+                    .is_some_and(|m| m & Ty::NUM_NONE == 0)
+            {
+                self.nonnone.insert(crate::intern(n.id.as_str()));
+            }
+            return;
+        }
+        let scope = crate::scope::Scope::of_body(Vec::new(), std::slice::from_ref(s));
+        if matches!(s, py::Stmt::Try(_) | py::Stmt::Match(_)) || !scope.children.is_empty() {
+            self.nonnone.clear();
+        } else {
+            self.nonnone
+                .retain(|v| !v.resolve_global().is_some_and(|n| scope.bound.contains(&n)));
+        }
+        let kept = self.nonnone.clone();
+        self.stmt_types(s);
+        self.nonnone = kept;
+        // `if x is None: return` settles `x` for what follows.
+        if let py::Stmt::If(i) = s
+            && i.elif_else_clauses.is_empty()
+            && terminates(&i.body)
+            && let Some((name, false)) = none_test(&i.test)
+        {
+            self.nonnone.insert(crate::intern(name));
+        }
+    }
+
+    fn stmt_types(&mut self, s: &py::Stmt) {
         match s {
             py::Stmt::Expr(e) => self.widen_passed(&e.value),
             py::Stmt::Assign(a) => self.widen_passed(&a.value),
@@ -6132,9 +6216,19 @@ impl Walker<'_> {
                         .iter()
                         .map(|clause| (clause.test.as_ref(), &clause.body)),
                 );
+                // A clause's body is reached with every earlier test
+                // failed and its own held.
+                let base = self.nonnone.clone();
+                let mut failed = Vec::new();
                 for (test, body) in tests {
                     let known =
                         test.and_then(|t| static_isinstance(self.module, t, |e| self.expr(e)));
+                    self.nonnone = base.clone();
+                    self.nonnone.extend(failed.iter().copied());
+                    if let Some(t) = test {
+                        self.nonnone.extend(settled_names(t, true));
+                        failed.extend(settled_names(t, false));
+                    }
                     match known {
                         Some(false) => continue,
                         Some(true) => {
@@ -6144,6 +6238,7 @@ impl Walker<'_> {
                         None => self.stmts(body),
                     }
                 }
+                self.nonnone = base;
             }
             py::Stmt::Try(t) => {
                 self.stmts(&t.body);
@@ -6220,6 +6315,59 @@ impl Walker<'_> {
     }
 }
 
+/// The names an assignment target binds.
+fn collect_names<'e>(target: &'e py::Expr, out: &mut Vec<&'e str>) {
+    match target {
+        py::Expr::Name(n) => out.push(n.id.as_str()),
+        py::Expr::Tuple(t) => t.elts.iter().for_each(|e| collect_names(e, out)),
+        py::Expr::List(l) => l.elts.iter().for_each(|e| collect_names(e, out)),
+        py::Expr::Starred(s) => collect_names(&s.value, out),
+        _ => {}
+    }
+}
+
+/// The name `test` compares with None by `is` or `is not`, perhaps
+/// under `not`, and whether the test holding means it is not None.
+fn none_test(test: &py::Expr) -> Option<(&str, bool)> {
+    match test {
+        py::Expr::Compare(c) if c.ops.len() == 1 && c.comparators.len() == 1 => {
+            let holds_means_not_none = match c.ops[0] {
+                py::CmpOp::Is => false,
+                py::CmpOp::IsNot => true,
+                _ => return None,
+            };
+            let named = match (&*c.left, &c.comparators[0]) {
+                (py::Expr::Name(n), py::Expr::NoneLiteral(_))
+                | (py::Expr::NoneLiteral(_), py::Expr::Name(n)) => n,
+                _ => return None,
+            };
+            Some((named.id.as_str(), holds_means_not_none))
+        }
+        py::Expr::UnaryOp(u) if matches!(u.op, py::UnaryOp::Not) => {
+            let (name, holds) = none_test(&u.operand)?;
+            Some((name, !holds))
+        }
+        _ => None,
+    }
+}
+
+/// The names `test` being `truth` shows are not None: the test's own,
+/// each operand of an `and` that holds, each operand of an `or` that
+/// fails. The lowering settles the same, and more.
+fn settled_names(test: &py::Expr, truth: bool) -> Vec<crate::InternedString> {
+    match test {
+        py::Expr::BoolOp(b) if (b.op == py::BoolOp::And) == truth => b
+            .values
+            .iter()
+            .flat_map(|v| settled_names(v, truth))
+            .collect(),
+        _ => match none_test(test) {
+            Some((name, holds)) if holds == truth => vec![crate::intern(name)],
+            _ => Vec::new(),
+        },
+    }
+}
+
 /// Expression typing against a fixed environment. The lowering uses
 /// the same rules, so what it emits agrees with what inference
 /// assumed.
@@ -6228,6 +6376,12 @@ pub(crate) struct Typer<'a> {
     pub(crate) vars: &'a HashMap<String, Ty>,
     /// Variables of the enclosing function this body captured.
     pub(crate) outer: &'a HashMap<String, Ty>,
+    /// Locals a test has shown are not None where the expression
+    /// stands: a run-time number among them reads without its NONE.
+    pub(crate) nonnone: Option<&'a HashSet<crate::InternedString>>,
+    /// Whether this types a round of a body's local inference, where a
+    /// later store may still widen what a local holds.
+    pub(crate) inferring: bool,
 }
 
 /// Give the names in an assignment target a type, in a scratch
@@ -6746,6 +6900,8 @@ impl Typer<'_> {
             module: self.module,
             vars: &vars,
             outer: self.outer,
+            nonnone: None,
+            inferring: false,
         };
         inner.expr(elt)
     }
@@ -6762,6 +6918,8 @@ impl Typer<'_> {
             module: self.module,
             vars: &vars,
             outer: self.outer,
+            nonnone: None,
+            inferring: false,
         };
         (inner.expr(key), inner.expr(value))
     }
@@ -6800,6 +6958,8 @@ impl Typer<'_> {
                 module: self.module,
                 vars: &vars,
                 outer: self.outer,
+                nonnone: None,
+                inferring: false,
             }
             .item_ty(&g.iter);
             bind_target(&mut vars, &g.target, item);
@@ -6882,6 +7042,19 @@ impl Typer<'_> {
             py::Expr::BytesLiteral(_) => Ty::Bytes,
             py::Expr::Name(n) => {
                 let name = n.id.as_str();
+                if let Some(held @ (Ty::Num(_) | Ty::None)) = self.vars.get(name)
+                    && self
+                        .nonnone
+                        .is_some_and(|set| set.contains(&crate::intern(name)))
+                {
+                    match *held {
+                        Ty::Num(m) => return Ty::num(m & !Ty::NUM_NONE),
+                        // While a body's locals are inferred, one only None
+                        // so far is nothing yet where it is not None.
+                        _ if self.inferring => return Ty::Unknown,
+                        _ => {}
+                    }
+                }
                 if let Some(ty) = self
                     .vars
                     .get(name)

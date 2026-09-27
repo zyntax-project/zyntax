@@ -318,6 +318,30 @@ impl Lowerer<'_> {
         Self::with_pre(pre, result, target, span)
     }
 
+    /// A Num a test has shown is not None, as the kinds left: a float,
+    /// an int or a bool read off its part, else the same struct under
+    /// the narrower mask. No check: the test excluded the NONE tag.
+    pub(crate) fn num_not_none(&mut self, v: Val) -> Val {
+        let span = v.node.span;
+        let mask = v.ty.mask().unwrap_or(0) & !Ty::NUM_NONE;
+        let parts = NumParts::of(&v.node, span);
+        let node = match Ty::num(mask) {
+            Ty::Float => parts.float,
+            Ty::Int => parts.int,
+            Ty::Bool => binary(BinaryOp::Ne, parts.int, int_lit(0, span), Ty::Bool, span),
+            Ty::Num(_) => {
+                let mut n = v.node;
+                n.ty = super::ir(Ty::Num(mask));
+                n
+            }
+            _ => return v,
+        };
+        Val {
+            node,
+            ty: Ty::num(mask),
+        }
+    }
+
     /// `v`, read as its box when it is a Num or a list or None.
     pub(crate) fn boxed_num(&mut self, v: Val) -> Val {
         if !matches!(v.ty, Ty::Num(_) | Ty::MaybeList(_)) {

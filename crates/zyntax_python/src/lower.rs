@@ -2021,6 +2021,9 @@ impl<'m> Lowerer<'m> {
             module: self.module,
             vars: &self.locals.vars,
             outer: &self.captured_types,
+            // A comprehension's own names are typed without the facts.
+            nonnone: self.comp_symbols.is_empty().then_some(&self.nonnull),
+            inferring: false,
         }
     }
 
@@ -5152,12 +5155,23 @@ impl<'m> Lowerer<'m> {
             );
         // An instance assigned from its constructor is known to be one
         // until the block ends or the variable is assigned again.
-        if let Ty::Class(_) = ty {
-            if value.ty != Ty::None && self.known_instance(&value.node) {
-                self.nonnull.insert(name);
-            } else {
-                self.nonnull.remove(&name);
+        match ty {
+            Ty::Class(_) => {
+                if value.ty != Ty::None && self.known_instance(&value.node) {
+                    self.nonnull.insert(name);
+                } else {
+                    self.nonnull.remove(&name);
+                }
             }
+            // A number stored is not None; anything else may be.
+            Ty::Num(_) => {
+                if value.ty.mask().is_some_and(|m| m & Ty::NUM_NONE == 0) {
+                    self.nonnull.insert(name);
+                } else {
+                    self.nonnull.remove(&name);
+                }
+            }
+            _ => {}
         }
         if !self.comp_symbols.contains_key(n.id.as_str())
             && let Some(cell) = self.cells.get(n.id.as_str()).copied()
@@ -5281,17 +5295,16 @@ impl<'m> Lowerer<'m> {
         let condition = Box::new(self.truthy(cond));
         out.append(&mut self.hoisted);
         // What the test settles holds in the branch it selects.
-        let settled = self.instance_test(test);
         let vars = self.nonnull.clone();
         let fields = self.nonnull_fields.clone();
-        if let Some((place, true)) = &settled {
-            self.assume_place(place);
+        for place in self.settled_places(test, true) {
+            self.assume_place(&place);
         }
         let then_block = self.block(body, span)?;
         self.nonnull = vars.clone();
         self.nonnull_fields = fields.clone();
-        if let Some((place, false)) = &settled {
-            self.assume_place(place);
+        for place in self.settled_places(test, false) {
+            self.assume_place(&place);
         }
         let else_block = match rest.split_first() {
             None => None,
@@ -7310,10 +7323,25 @@ impl<'m> Lowerer<'m> {
             {
                 self.class_value(k, span)?
             }
-            py::Expr::Name(n) => Val {
-                node: var(self.local_symbol(n.id.as_str()), ty, span),
-                ty,
-            },
+            py::Expr::Name(n) => {
+                let name = self.local_symbol(n.id.as_str());
+                // A number a test has shown is not None is held as the
+                // number or None it is stored as.
+                match self.locals.vars.get(n.id.as_str()).copied() {
+                    Some(stored @ Ty::Num(m))
+                        if m & Ty::NUM_NONE != 0 && self.nonnull.contains(&name) =>
+                    {
+                        self.num_not_none(Val {
+                            node: var(name, stored, span),
+                            ty: stored,
+                        })
+                    }
+                    _ => Val {
+                        node: var(name, ty, span),
+                        ty,
+                    },
+                }
+            }
             py::Expr::Lambda(l) => self.lambda(l, span)?,
             py::Expr::Generator(g) => self.generator_expr(g, span)?,
             py::Expr::Attribute(a) => {
@@ -8690,9 +8718,22 @@ impl<'m> Lowerer<'m> {
         // Each operand with what it hoists; a later operand's statements
         // run only if it is reached. The first operand's run regardless.
         let mut vals: Vec<(Vec<Stmt>, Val)> = Vec::with_capacity(b.values.len());
+        // An operand runs only after the ones before it chose to go on:
+        // what their tests settle holds in it.
+        let (vars, fields) = (self.nonnull.clone(), self.nonnull_fields.clone());
         for (i, v) in b.values.iter().enumerate() {
+            if i > 0 {
+                for place in self.settled_places(&b.values[i - 1], is_and) {
+                    self.assume_place(&place);
+                }
+            }
             let outer = std::mem::take(&mut self.hoisted);
-            let val = self.expr(v)?;
+            let val = self.expr(v);
+            if val.is_err() {
+                self.nonnull = vars.clone();
+                self.nonnull_fields = fields.clone();
+            }
+            let val = val?;
             let mine = std::mem::replace(&mut self.hoisted, outer);
             if i == 0 {
                 self.hoisted.extend(mine);
@@ -8701,6 +8742,8 @@ impl<'m> Lowerer<'m> {
                 vals.push((mine, val));
             }
         }
+        self.nonnull = vars;
+        self.nonnull_fields = fields;
         let needs_statements = vals.iter().any(|(pre, _)| !pre.is_empty());
         if needs_statements {
             // Right to left: each step chooses between its operand and
@@ -11862,6 +11905,23 @@ impl<'m> Lowerer<'m> {
                 }
                 Some((place, true))
             }
+        }
+    }
+
+    /// The places `test` being `truth` shows not to be None: the test's
+    /// own, each operand of an `and` that holds, each operand of an `or`
+    /// that fails.
+    fn settled_places(&self, test: &py::Expr, truth: bool) -> Vec<Place> {
+        match test {
+            py::Expr::BoolOp(b) if (b.op == py::BoolOp::And) == truth => b
+                .values
+                .iter()
+                .flat_map(|v| self.settled_places(v, truth))
+                .collect(),
+            _ => match self.instance_test(test) {
+                Some((place, holds)) if holds == truth => vec![place],
+                _ => Vec::new(),
+            },
         }
     }
 
