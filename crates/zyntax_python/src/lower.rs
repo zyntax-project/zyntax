@@ -7464,11 +7464,33 @@ impl<'m> Lowerer<'m> {
 
     fn unary(&mut self, u: &py::ExprUnaryOp, span: Span) -> Result<Val> {
         // `not` reads a run-time number's parts; the others its box.
-        let operand = if u.op == py::UnaryOp::Not {
+        let operand = if matches!(
+            u.op,
+            py::UnaryOp::Not | py::UnaryOp::USub | py::UnaryOp::UAdd
+        ) {
             self.expr_num(&u.operand)?
         } else {
             self.expr(&u.operand)?
         };
+        if u.op != py::UnaryOp::Not
+            && let Ty::Num(_) = operand.ty
+        {
+            let Some(ty) = num::num_unary(operand.ty) else {
+                // A Num that may be None reads as its box.
+                let operand = self.boxed_num(operand);
+                let name = if u.op == py::UnaryOp::USub {
+                    "zb_any_neg"
+                } else {
+                    "zb_any_pos"
+                };
+                return Ok(Val {
+                    node: call(name, vec![operand.node], Ty::Object, span),
+                    ty: Ty::Object,
+                });
+            };
+            let node = self.num_negate(operand, u.op == py::UnaryOp::USub, ty, span);
+            return Ok(Val { node, ty });
+        }
         Ok(match u.op {
             py::UnaryOp::Not => {
                 let cond = self.truthy(operand);

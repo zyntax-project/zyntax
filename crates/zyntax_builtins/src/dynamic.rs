@@ -1600,9 +1600,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         any(),
         vec![
             cat.decl(category(x.e())),
+            // Times -1, so that zero changes sign.
             when(
                 is(&cat, FLOAT),
-                vec![ret(box_f64(sub(float(0.0), get_f64(x.e()))))],
+                vec![ret(box_f64(mul(float(-1.0), get_f64(x.e()))))],
             ),
             when(
                 and(is(&cat, CUSTOM), is_instance(x.e())),
@@ -1611,6 +1612,16 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     vec![int(0), x.e()],
                     any(),
                 ))],
+            ),
+            when(
+                not(is_number(cat.e())),
+                vec![
+                    type_error(add(
+                        text("bad operand type for unary -: "),
+                        quoted(type_name(x.e())),
+                    )),
+                    ret(null(any())),
+                ],
             ),
             ret(box_i64(sub(int(0), number_i64(x.e(), cat.e())))),
         ],

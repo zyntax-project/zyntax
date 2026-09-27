@@ -74,6 +74,21 @@ pub(crate) fn num_binop(
     })
 }
 
+/// What `-x` and `+x` are for a [`Ty::Num`] `x` that cannot be None: a
+/// bool becomes an int, an int or a float stays itself.
+pub(crate) fn num_unary(t: Ty) -> Option<Ty> {
+    let m = t.mask()?;
+    if m & !NUMBERS != 0 {
+        return None;
+    }
+    let bool_as_int = if m & Ty::NUM_BOOL != 0 {
+        Ty::NUM_INT
+    } else {
+        0
+    };
+    Some(Ty::num((m & !Ty::NUM_BOOL) | bool_as_int))
+}
+
 /// Whether `e` is the int literal 2.
 fn is_two(e: &ruff_python_ast::Expr) -> bool {
     matches!(e, ruff_python_ast::Expr::NumberLiteral(n)
@@ -553,6 +568,45 @@ impl Lowerer<'_> {
 }
 
 impl Lowerer<'_> {
+    /// `-x` or `+x` of a Num as [`num_unary`] types it, on the parts: the
+    /// tag is FLOAT or INT, and both words follow.
+    pub(crate) fn num_negate(&mut self, v: Val, negate: bool, ty: Ty, span: Span) -> Node {
+        if ty == Ty::Int {
+            let n = self.coerce(v, Ty::Int);
+            return if negate {
+                binary(BinaryOp::Sub, int_lit(0, span), n, Ty::Int, span)
+            } else {
+                n
+            };
+        }
+        let mut pre = Vec::new();
+        let p = self.num_held(v, &mut pre, span);
+        let tag = select(
+            p.has_tag(TAG_FLOAT, span),
+            int_lit(TAG_FLOAT, span),
+            int_lit(TAG_INT, span),
+            Ty::Int,
+            span,
+        );
+        let (int, float) = if negate {
+            (
+                binary(BinaryOp::Sub, int_lit(0, span), p.int, Ty::Int, span),
+                node(
+                    TypedExpression::Unary(zyntax_typed_ast::typed_ast::TypedUnary {
+                        op: zyntax_typed_ast::UnaryOp::Minus,
+                        operand: Box::new(p.float),
+                    }),
+                    Ty::Float,
+                    span,
+                ),
+            )
+        } else {
+            (p.int, p.float)
+        };
+        let built = value(tag, int, float, ty, span);
+        Self::with_pre(pre, built, ty, span)
+    }
+
     /// `left op right` for an ordering or equality where a Num takes part
     /// and neither side may be None, on the parts: two ints compare as
     /// ints, anything else as floats, and an int beyond 2^53 against a

@@ -6937,9 +6937,10 @@ impl Typer<'_> {
                     Ty::Unknown => Ty::Unknown,
                     _ => Ty::Object,
                 },
-                py::UnaryOp::UAdd | py::UnaryOp::USub => match self.expr(&u.operand) {
+                py::UnaryOp::UAdd | py::UnaryOp::USub => match self.expr_num(&u.operand) {
                     Ty::Bool => Ty::Int,
-                    t => t,
+                    t @ Ty::Num(_) => crate::lower::num::num_unary(t).unwrap_or(t.boxed_view()),
+                    t => t.boxed_view(),
                 },
             },
             py::Expr::Compare(_) => Ty::Bool,
