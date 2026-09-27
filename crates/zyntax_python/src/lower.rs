@@ -5392,9 +5392,12 @@ impl<'m> Lowerer<'m> {
     /// order: the list, the index, then its length. A negative index
     /// counts from the end; one out of range raises IndexError(`message`)
     /// and leaves, so the position is in bounds wherever it is used.
-    /// Every name bound here is a value a loop around it carries and an
-    /// entry mid-loop has to restore, so a plain variable or literal is
-    /// used as it is and the position is bound once.
+    ///
+    /// The position is a select and the test one branch of plain
+    /// compares, so an access adds only the raise arm's blocks, and the
+    /// test compares the index itself against zero and the length, as
+    /// bounds versioning decides them. A loop carries every name bound
+    /// here, so a plain list or index is used as it is.
     fn list_position(
         &mut self,
         seq: Val,
@@ -5414,14 +5417,15 @@ impl<'m> Lowerer<'m> {
         } else {
             self.hold(seq, out, span).node
         };
-        let len = || method_call(xs.clone(), "len", vec![], Ty::Int, span);
         let lt = |a, b| binary(BinaryOp::Lt, a, b, Ty::Bool, span);
         let ge = |a, b| binary(BinaryOp::Ge, a, b, Ty::Bool, span);
+        let zero = || int_lit(0, span);
         // A literal index at or past zero is its own position.
         if let Some(k) = int_literal_node(&index)
             && k >= 0
         {
-            self.raise_if(ge(index.clone(), len()), "IndexError", message, span, out);
+            let len = method_call(xs.clone(), "len", vec![], Ty::Int, span);
+            self.raise_if(ge(index.clone(), len), "IndexError", message, span, out);
             return (xs, index);
         }
         let i = if plain(&index) {
@@ -5437,12 +5441,22 @@ impl<'m> Lowerer<'m> {
             )
             .node
         };
-        let zero = || int_lit(0, span);
+        let n = self
+            .hold(
+                Val {
+                    node: method_call(xs.clone(), "len", vec![], Ty::Int, span),
+                    ty: Ty::Int,
+                },
+                out,
+                span,
+            )
+            .node;
+        let from_end = || binary(BinaryOp::Add, i.clone(), n.clone(), Ty::Int, span);
         let position = node(
             TypedExpression::If(TypedIfExpr {
                 condition: Box::new(lt(i.clone(), zero())),
-                then_branch: Box::new(binary(BinaryOp::Add, i.clone(), len(), Ty::Int, span)),
-                else_branch: Box::new(i),
+                then_branch: Box::new(from_end()),
+                else_branch: Box::new(i.clone()),
             }),
             Ty::Int,
             span,
@@ -5457,10 +5471,17 @@ impl<'m> Lowerer<'m> {
                 span,
             )
             .node;
+        // `i >= n or (i < 0 and i + n < 0)`, evaluated whole.
         let outside = binary(
-            BinaryOp::Or,
-            lt(j.clone(), zero()),
-            ge(j.clone(), len()),
+            BinaryOp::BitOr,
+            ge(i.clone(), n.clone()),
+            binary(
+                BinaryOp::BitAnd,
+                lt(i.clone(), zero()),
+                lt(from_end(), zero()),
+                Ty::Bool,
+                span,
+            ),
             Ty::Bool,
             span,
         );
