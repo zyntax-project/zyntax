@@ -1,0 +1,20 @@
+1 3 1 IndexError: list index out of range IndexError: list index out of range
+[1, 2, 9] IndexError: list assignment index out of range IndexError: list assignment index out of range
+[1, 4, 9] [1, 4, 9] IndexError: list index out of range
+2.5 IndexError: list index out of range [0.5, 2.5] IndexError: list assignment index out of range
+b IndexError: list index out of range IndexError: list assignment index out of range
+2.0 IndexError: array index out of range
+[3.0, 2.0] IndexError: array assignment index out of range
+2 IndexError: array index out of range IndexError: array assignment index out of range
+2 IndexError: tuple index out of range
+loop list index out of range 6
+6 6
+store loop list index out of range
+[2, 3, 4] [2, 3, 4]
+3 4
+[[1, 7], [3, 4]]
+nested list index out of range
+OverflowError signed char is greater than maximum
+IndexError array assignment index out of range
+[1, 2] [1, 2]
+[1, 5]

@@ -539,6 +539,27 @@ fn slot(list: Node, i: usize, ty: Ty, span: Span) -> Node {
     )
 }
 
+/// Element `j` of a list of kind `e`, read from its slot with no check:
+/// an address comes back as the instance or container it points to, an
+/// array's element widened to the number it reads as.
+fn list_slot(xs: Node, j: Node, e: Elem, span: Span) -> Node {
+    note_list_kind(e);
+    let read = TypedNode::new(
+        TypedExpression::Index(TypedIndex {
+            object: Box::new(xs),
+            index: Box::new(j),
+        }),
+        elem_ir(e),
+        span,
+    );
+    match e {
+        Elem::Class(k) => cast(read, Ty::Class(k), span),
+        Elem::List(_) | Elem::Dict(_) | Elem::Set(_) => cast(read, e.ty(), span),
+        Elem::Array(c) if c.narrows() => cast(read, c.item(), span),
+        _ => read,
+    }
+}
+
 /// A tuple value of shape `ty` from its elements, each already of the
 /// shape's element type and stored as `tuple_field_storage` says.
 fn tuple_value(items: Vec<Node>, ty: Ty, span: Span) -> Node {
@@ -5358,8 +5379,128 @@ impl<'m> Lowerer<'m> {
         Ok(())
     }
 
+    /// Whether list subscripts check their index here and raise
+    /// IndexError themselves, reading and storing the slot directly.
+    fn checks_list_index(&self) -> bool {
+        self.module.class_index.contains_key("IndexError")
+    }
+
+    /// Held `seq` and the position `index` names in it, in Python's
+    /// order: the list, the index, then its length. A negative index
+    /// counts from the end; one out of range raises IndexError(`message`)
+    /// and leaves, so the position is in bounds wherever it is used.
+    fn list_position(
+        &mut self,
+        seq: Val,
+        index: Node,
+        message: &str,
+        span: Span,
+        out: &mut Vec<Stmt>,
+    ) -> (Node, Node) {
+        let xs = self.hold(seq, out, span).node;
+        let j = self.temp();
+        let n = self.temp();
+        let let_ = |name, mutability, value: Node| {
+            TypedNode::new(
+                TypedStatement::Let(TypedLet {
+                    name,
+                    ty: ir(Ty::Int),
+                    mutability,
+                    initializer: Some(Box::new(value)),
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            )
+        };
+        out.push(let_(j, Mutability::Mutable, index));
+        out.push(let_(
+            n,
+            Mutability::Immutable,
+            method_call(xs.clone(), "len", vec![], Ty::Int, span),
+        ));
+        let jv = || var(j, Ty::Int, span);
+        let nv = || var(n, Ty::Int, span);
+        let negative = || binary(BinaryOp::Lt, jv(), int_lit(0, span), Ty::Bool, span);
+        out.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(negative()),
+                then_block: TypedBlock {
+                    statements: vec![TypedNode::new(
+                        TypedStatement::Expression(Box::new(binary(
+                            BinaryOp::Assign,
+                            jv(),
+                            binary(BinaryOp::Add, jv(), nv(), Ty::Int, span),
+                            Ty::None,
+                            span,
+                        ))),
+                        Type::Unknown,
+                        span,
+                    )],
+                    span,
+                },
+                else_block: None,
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        let outside = binary(
+            BinaryOp::Or,
+            negative(),
+            binary(BinaryOp::Ge, jv(), nv(), Ty::Bool, span),
+            Ty::Bool,
+            span,
+        );
+        self.raise_if(outside, "IndexError", message, span, out);
+        (xs, jv())
+    }
+
     /// `seq[i]` for a sequence value and an int index already lowered.
     fn index_value(&mut self, seq: Val, index: Node, elem_ty: Ty, span: Span) -> Val {
+        self.index_value_as(seq, index, elem_ty, "list", span)
+    }
+
+    /// [`Self::index_value`], an out-of-range index of a list naming
+    /// `what` the list stands for: `list`, or `tuple` for a tuple read
+    /// as the list of its elements.
+    fn index_value_as(
+        &mut self,
+        seq: Val,
+        index: Node,
+        elem_ty: Ty,
+        what: &str,
+        span: Span,
+    ) -> Val {
+        if let Ty::List(e) = seq.ty
+            && self.checks_list_index()
+        {
+            let what = if matches!(e, Elem::Array(_)) {
+                "array"
+            } else {
+                what
+            };
+            let mut pre = Vec::new();
+            let (xs, j) = self.list_position(
+                seq,
+                index,
+                &format!("{what} index out of range"),
+                span,
+                &mut pre,
+            );
+            self.hoisted.extend(pre);
+            let read = Val {
+                node: list_slot(xs, j, e, span),
+                ty: e.ty(),
+            };
+            if e.ty() == elem_ty {
+                return read;
+            }
+            return Val {
+                node: self.coerce(read, elem_ty),
+                ty: elem_ty,
+            };
+        }
         // A list's element comes out as the list's kind, then as the
         // type wanted when that differs (a dict's keys, read as they are
         // typed).
@@ -5385,7 +5526,7 @@ impl<'m> Lowerer<'m> {
                     node: self.coerce(seq, Ty::List(e)),
                     ty: Ty::List(e),
                 };
-                return self.index_value(items, index, elem_ty, span);
+                return self.index_value_as(items, index, elem_ty, "tuple", span);
             }
             Ty::Str => call("zb_str_get", vec![seq.node, index], Ty::Str, span),
             Ty::Bytes => call("zb_bytes_index", vec![seq.node, index], Ty::Int, span),
@@ -6560,6 +6701,78 @@ impl<'m> Lowerer<'m> {
         out: &mut Vec<Stmt>,
     ) -> Result<()> {
         let stmt = match seq.ty {
+            // The value, the list, the index, then the check, and the
+            // slot stored directly.
+            Ty::List(e) if self.checks_list_index() => {
+                // An integer array narrows the value to its width after
+                // the index is checked, as CPython's array does.
+                let narrow = match e {
+                    Elem::Array(c) if c.narrows() && c.storage() != zyntax_builtins::Kind::F32 => {
+                        Some(c)
+                    }
+                    _ => None,
+                };
+                let (v, held_ty) = match narrow {
+                    Some(c) => (self.coerce(value, c.item()), ir(c.item())),
+                    None => (self.elem_arg(value, e), elem_ir(e)),
+                };
+                let held = self.temp();
+                out.push(TypedNode::new(
+                    TypedStatement::Let(TypedLet {
+                        name: held,
+                        ty: held_ty.clone(),
+                        mutability: Mutability::Immutable,
+                        initializer: Some(Box::new(v)),
+                        span,
+                    }),
+                    Type::Unknown,
+                    span,
+                ));
+                let v = TypedNode::new(TypedExpression::Variable(held), held_ty, span);
+                let what = if matches!(e, Elem::Array(_)) {
+                    "array"
+                } else {
+                    "list"
+                };
+                let (xs, j) = self.list_position(
+                    seq,
+                    index.node,
+                    &format!("{what} assignment index out of range"),
+                    span,
+                    out,
+                );
+                let v = match narrow {
+                    Some(c) => {
+                        let outer = std::mem::take(&mut self.hoisted);
+                        let narrowed = self.narrowed(v, c, span);
+                        out.extend(std::mem::replace(&mut self.hoisted, outer));
+                        narrowed
+                    }
+                    None => v,
+                };
+                let slot = TypedNode::new(
+                    TypedExpression::Index(TypedIndex {
+                        object: Box::new(xs),
+                        index: Box::new(j),
+                    }),
+                    elem_ir(e),
+                    span,
+                );
+                out.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(TypedNode::new(
+                        TypedExpression::Binary(TypedBinary {
+                            op: BinaryOp::Assign,
+                            left: Box::new(slot),
+                            right: Box::new(v),
+                        }),
+                        elem_ir(e),
+                        span,
+                    ))),
+                    Type::Unknown,
+                    span,
+                ));
+                return Ok(());
+            }
             Ty::List(e) => {
                 let v = self.elem_arg(value, e);
                 call(
