@@ -1932,6 +1932,79 @@ impl<'m> Lowerer<'m> {
         (b, e)
     }
 
+    /// An int against a float, compared exactly, or None when converting
+    /// the int to float cannot change the answer: a bool, an int literal
+    /// within 2^53, or a float literal below 2^53 or not finite.
+    fn exact_int_float_compare(
+        &mut self,
+        op: py::CmpOp,
+        left: Val,
+        right: Val,
+        span: Span,
+    ) -> Option<Node> {
+        let int_left = match (left.ty, right.ty) {
+            (Ty::Int, Ty::Float) => true,
+            (Ty::Float, Ty::Int) => false,
+            _ => return None,
+        };
+        let (i, f) = if int_left {
+            (&left, &right)
+        } else {
+            (&right, &left)
+        };
+        const EXACT: f64 = 9007199254740992.0;
+        if int_literal_node(&i.node).is_some_and(|v| (v as f64).abs() <= EXACT) {
+            return None;
+        }
+        let float_literal = match &f.node.node {
+            TypedExpression::Literal(TypedLiteral::Float(v)) => Some(*v),
+            TypedExpression::Unary(TypedUnary {
+                op: UnaryOp::Minus,
+                operand,
+            }) => match &operand.node {
+                TypedExpression::Literal(TypedLiteral::Float(v)) => Some(-*v),
+                _ => None,
+            },
+            _ => None,
+        };
+        if float_literal.is_some_and(|v| !v.is_finite() || v.abs() < EXACT) {
+            return None;
+        }
+        let mut pre = Vec::new();
+        let l = self.hold(left, &mut pre, span).node;
+        let r = self.hold(right, &mut pre, span).node;
+        let (i, f) = if int_left { (l, r) } else { (r, l) };
+        let name = |n: &str| n.to_string();
+        // `a op b` as one of the exact helpers, with its operands in the
+        // helper's order.
+        let (helper, args, negated) = match (op, int_left) {
+            (py::CmpOp::Eq, _) => (name("zb_eq_if"), vec![i, f], false),
+            (py::CmpOp::NotEq, _) => (name("zb_eq_if"), vec![i, f], true),
+            (py::CmpOp::Lt, true) | (py::CmpOp::Gt, false) => (name("zb_lt_if"), vec![i, f], false),
+            (py::CmpOp::LtE, true) | (py::CmpOp::GtE, false) => {
+                (name("zb_le_if"), vec![i, f], false)
+            }
+            (py::CmpOp::Lt, false) | (py::CmpOp::Gt, true) => (name("zb_lt_fi"), vec![f, i], false),
+            (py::CmpOp::LtE, false) | (py::CmpOp::GtE, true) => {
+                (name("zb_le_fi"), vec![f, i], false)
+            }
+            _ => return None,
+        };
+        let mut n = call(&helper, args, Ty::Bool, span);
+        if negated {
+            n = node(
+                TypedExpression::Unary(TypedUnary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(n),
+                }),
+                Ty::Bool,
+                span,
+            );
+        }
+        self.hoisted.extend(pre);
+        Some(n)
+    }
+
     fn typer(&self) -> Typer<'_> {
         Typer {
             module: self.module,
@@ -8434,6 +8507,11 @@ impl<'m> Lowerer<'m> {
             } else {
                 Ty::Int
             };
+            if operand_ty == Ty::Float
+                && let Some(n) = self.exact_int_float_compare(op, left.clone(), right.clone(), span)
+            {
+                return Ok(n);
+            }
             let l = self.coerce(left, operand_ty);
             let r = self.coerce(right, operand_ty);
             let bin = match op {

@@ -3151,6 +3151,76 @@ fn arithmetic() -> Vec<Decl> {
             ret(fr.e()),
         ],
     ));
+    // An int against a float, exactly: the float is brought to an int
+    // when it has one in range, otherwise its side of the range decides.
+    // An int within 2^53 compares as a float.
+    let fl = local("f", f64());
+    let (a, fa) = (local("i", i64()), local("x", f64()));
+    let fits_float = |i: Expr| and(ge(i.clone(), int(-(1i64 << 53))), le(i, int(1i64 << 53)));
+    let in_range = |x: Expr| {
+        and(
+            ge(x.clone(), float(-9223372036854775808.0)),
+            lt(x, float(9223372036854775808.0)),
+        )
+    };
+    let floor = |x: Expr| call("floor", vec![x], f64());
+    let ceil = |x: Expr| sub(float(0.0), call("floor", vec![sub(float(0.0), x)], f64()));
+    d.push(define(
+        "zb_eq_if",
+        &[&a, &fa],
+        boolean(),
+        vec![
+            when(fits_float(a.e()), vec![ret(eq(cast(a.e(), f64()), fa.e()))]),
+            when(ne(fa.e(), fa.e()), vec![ret(bool(false))]),
+            when(ne(floor(fa.e()), fa.e()), vec![ret(bool(false))]),
+            when(not(in_range(fa.e())), vec![ret(bool(false))]),
+            ret(eq(a.e(), cast(fa.e(), i64()))),
+        ],
+    ));
+    // `i < f` with the float's ceiling, `i <= f` with its floor, and the
+    // mirrors with the other.
+    let ordered = |name: &str, int_left: bool, strict: bool| {
+        let (lf, rf) = if int_left {
+            (cast(a.e(), f64()), fa.e())
+        } else {
+            (fa.e(), cast(a.e(), f64()))
+        };
+        let rounded = if int_left == strict {
+            ceil(fa.e())
+        } else {
+            floor(fa.e())
+        };
+        let (li, ri) = if int_left {
+            (a.e(), cast(fl.e(), i64()))
+        } else {
+            (cast(fl.e(), i64()), a.e())
+        };
+        let cmp = |x: Expr, y: Expr| if strict { lt(x, y) } else { le(x, y) };
+        // Out of range, a float above every int is greater than it.
+        let beyond = if int_left {
+            gt(fa.e(), float(0.0))
+        } else {
+            lt(fa.e(), float(0.0))
+        };
+        let params: [&Local; 2] = if int_left { [&a, &fa] } else { [&fa, &a] };
+        define(
+            name,
+            &params,
+            boolean(),
+            vec![
+                when(ne(fa.e(), fa.e()), vec![ret(bool(false))]),
+                when(fits_float(a.e()), vec![ret(cmp(lf, rf))]),
+                fl.decl(rounded),
+                when(in_range(fl.e()), vec![ret(cmp(li, ri))]),
+                ret(beyond),
+            ],
+        )
+    };
+    d.push(ordered("zb_lt_if", true, true));
+    d.push(ordered("zb_le_if", true, false));
+    d.push(ordered("zb_lt_fi", false, true));
+    d.push(ordered("zb_le_fi", false, false));
+
     let result = local("result", i64());
     let base = local("base", i64());
     let exp = local("exp", i64());
