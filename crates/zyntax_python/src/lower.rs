@@ -1218,6 +1218,9 @@ pub(crate) struct Lowerer<'m> {
     /// Whether the statement being lowered emitted a pending check, so a
     /// loop containing it re-checks once the loop is left.
     raised: bool,
+    /// The value being unpacked is a `range()`, which gives no count
+    /// when it has too many values.
+    unpacking_range: bool,
     /// Whether this function raises anywhere itself: a `raise`, or a
     /// check after anything but a call to a function of the program.
     /// Those calls are listed in `raise_callees` instead, and the
@@ -1357,6 +1360,7 @@ impl<'m> Lowerer<'m> {
             class: None,
             escapes: vec![Escape::Return],
             raised: false,
+            unpacking_range: false,
             may_raise_own: false,
             raise_callees: BTreeSet::new(),
             caught: None,
@@ -3938,6 +3942,17 @@ impl<'m> Lowerer<'m> {
                         return self.bind(target, value, span, out);
                     }
                 }
+                if let ([py::Expr::Tuple(_) | py::Expr::List(_)], py::Expr::Call(c)) =
+                    (a.targets.as_slice(), &*a.value)
+                    && types::is_name(&c.func, "range")
+                    && !self.is_variable("range")
+                {
+                    let value = self.expr(&a.value)?;
+                    self.unpacking_range = true;
+                    let bound = self.bind(&a.targets[0], value, span, out);
+                    self.unpacking_range = false;
+                    return bound;
+                }
                 // `a = b = v` evaluates `v` once and binds each target
                 // to it, left to right. A local takes a run-time number
                 // as itself, as inference typed it.
@@ -4842,7 +4857,8 @@ impl<'m> Lowerer<'m> {
                 // the list of its characters, a dict as whatever
                 // iterating it yields. Too many from a set or a string
                 // raises without the count.
-                let bare = matches!(value.ty, Ty::Set(_) | Ty::Str);
+                let bare = matches!(value.ty, Ty::Set(_) | Ty::Str)
+                    || std::mem::take(&mut self.unpacking_range);
                 let value = match value.ty {
                     Ty::Set(_) | Ty::Tuple(_) => Val {
                         node: self.coerce(value, Ty::List(Elem::Object)),

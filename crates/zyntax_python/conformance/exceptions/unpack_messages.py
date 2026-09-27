@@ -43,6 +43,16 @@ def typed():
     except ValueError as e:
         print(e)
     try:
+        a, b = range(3)
+    except ValueError as e:
+        print(e)
+    try:
+        [a, b] = range(1, 5, 2)
+        print(a, b)
+        a, b = range(1)
+    except ValueError as e:
+        print(e)
+    try:
         x, y = "q"
     except ValueError as e:
         print(e)
