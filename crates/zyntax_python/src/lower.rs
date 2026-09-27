@@ -5393,10 +5393,10 @@ impl<'m> Lowerer<'m> {
     /// counts from the end; one out of range raises IndexError(`message`)
     /// and leaves, so the position is in bounds wherever it is used.
     ///
-    /// The position is a select and the test one branch of plain
-    /// compares, so an access adds only the raise arm's blocks, and the
-    /// test compares the index itself against zero and the length, as
-    /// bounds versioning decides them. A loop carries every name bound
+    /// The position is a select and the test one unsigned compare of it
+    /// against the length, so an access adds only the raise arm's
+    /// blocks; bounds versioning decides the select's condition and the
+    /// compare. A loop carries every name bound
     /// here, so a plain list or index is used as it is.
     fn list_position(
         &mut self,
@@ -5471,18 +5471,25 @@ impl<'m> Lowerer<'m> {
                 span,
             )
             .node;
-        // `i >= n or (i < 0 and i + n < 0)`, evaluated whole.
-        let outside = binary(
-            BinaryOp::BitOr,
-            ge(i.clone(), n.clone()),
-            binary(
-                BinaryOp::BitAnd,
-                lt(i.clone(), zero()),
-                lt(from_end(), zero()),
-                Ty::Bool,
+        // One unsigned compare: a position still negative reads as
+        // past any length.
+        let unsigned = |v: Node| {
+            TypedNode::new(
+                TypedExpression::Cast(TypedCast {
+                    expr: Box::new(v),
+                    target_type: prim(PrimitiveType::U64),
+                }),
+                prim(PrimitiveType::U64),
                 span,
-            ),
-            Ty::Bool,
+            )
+        };
+        let outside = TypedNode::new(
+            TypedExpression::Binary(TypedBinary {
+                op: BinaryOp::Ge,
+                left: Box::new(unsigned(j.clone())),
+                right: Box::new(unsigned(n)),
+            }),
+            ir(Ty::Bool),
             span,
         );
         self.raise_if(outside, "IndexError", message, span, out);

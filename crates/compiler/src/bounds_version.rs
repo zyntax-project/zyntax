@@ -36,7 +36,7 @@
 
 use crate::analysis::{DominatorTree, LoopForest, NaturalLoop};
 use crate::hir::{
-    BinaryOp, HirBlock, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirPhi,
+    BinaryOp, CastOp, HirBlock, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirPhi,
     HirTerminator, HirType, HirValue, HirValueKind,
 };
 use indexmap::IndexMap;
@@ -259,6 +259,17 @@ fn recognise(func: &HirFunction, dt: &DominatorTree, lp: &NaturalLoop) -> Result
         }
     }
     let invariant = |v: HirId| !defined_in.contains_key(&v);
+    // Casts ahead of the loop, where LICM leaves an invariant one.
+    let outside_casts: HashMap<HirId, &HirInstruction> = func
+        .blocks
+        .iter()
+        .filter(|(b, _)| !body.contains(b))
+        .flat_map(|(_, block)| block.instructions.iter())
+        .filter_map(|inst| match inst {
+            HirInstruction::Cast { result, .. } => Some((*result, inst)),
+            _ => None,
+        })
+        .collect();
     let phi_tys: HashMap<HirId, &HirType> = func
         .blocks
         .values()
@@ -413,6 +424,19 @@ fn recognise(func: &HirFunction, dt: &DominatorTree, lp: &NaturalLoop) -> Result
                     continue;
                 }
                 match defs.get(&v) {
+                    // A select whose condition the copy decides is the
+                    // value it picks there.
+                    Some(HirInstruction::Select {
+                        condition,
+                        true_val,
+                        false_val,
+                        ..
+                    }) => {
+                        v = match folds.get(condition)? {
+                            true => *true_val,
+                            false => *false_val,
+                        };
+                    }
                     Some(HirInstruction::Binary {
                         op: BinaryOp::Add,
                         left,
@@ -444,6 +468,17 @@ fn recognise(func: &HirFunction, dt: &DominatorTree, lp: &NaturalLoop) -> Result
             None
         };
         let mut decided: Vec<(HirId, bool, Fact)> = Vec::new();
+        // An i64 value reinterpreted as u64, wherever it is cast.
+        let unsigned_of = |v: HirId| match defs.get(&v).copied().or(outside_casts.get(&v).copied())
+        {
+            Some(HirInstruction::Cast {
+                op: CastOp::Bitcast,
+                operand,
+                ty: HirType::U64,
+                ..
+            }) if is_i64(*operand) => Some(*operand),
+            _ => None,
+        };
         for b in &order {
             if *b == lp.header || !live.contains(b) {
                 continue;
@@ -454,11 +489,33 @@ fn recognise(func: &HirFunction, dt: &DominatorTree, lp: &NaturalLoop) -> Result
                     result,
                     left,
                     right,
-                    ..
+                    ty,
                 } = inst
                 else {
                     continue;
                 };
+                // `idx as u64 < len as u64` holds exactly when
+                // `0 <= idx < len`: decided on both facts.
+                if *ty == HirType::U64
+                    && !folds.contains_key(result)
+                    && matches!(op, BinaryOp::Lt | BinaryOp::Ge)
+                    && let (Some(idx), Some(bound)) = (unsigned_of(*left), unsigned_of(*right))
+                    && let Some(offset) = affine(idx)
+                    && const_i64(bound).is_none()
+                    && invariant(bound)
+                {
+                    let truth = *op == BinaryOp::Lt;
+                    decided.push((*result, truth, Fact { offset, len: None }));
+                    decided.push((
+                        *result,
+                        truth,
+                        Fact {
+                            offset,
+                            len: Some(bound),
+                        },
+                    ));
+                    continue;
+                }
                 if folds.contains_key(result)
                     || !matches!(
                         op,

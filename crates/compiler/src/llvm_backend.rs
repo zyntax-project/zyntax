@@ -2216,8 +2216,33 @@ impl<'ctx> LLVMBackend<'ctx> {
                 // Element-wise vector arithmetic: LLVM's build_int_*/build_float_*
                 // accept vector operands directly (VectorValue is Int/FloatMathValue),
                 // but the scalar path's `.into_int_value()` would panic on them.
+                let unsigned_order = match op {
+                    BinaryOp::Lt => Some(IntPredicate::ULT),
+                    BinaryOp::Le => Some(IntPredicate::ULE),
+                    BinaryOp::Gt => Some(IntPredicate::UGT),
+                    BinaryOp::Ge => Some(IntPredicate::UGE),
+                    _ => None,
+                }
+                .filter(|_| {
+                    matches!(
+                        ty,
+                        HirType::U8 | HirType::U16 | HirType::U32 | HirType::U64 | HirType::U128
+                    ) && left_val.is_int_value()
+                        && right_val.is_int_value()
+                        && left_val.get_type() == right_val.get_type()
+                });
                 let result_val = if let HirType::Vector(elem, _) = ty {
                     self.compile_vector_binary(*op, left_val, right_val, elem)?
+                } else if let Some(predicate) = unsigned_order {
+                    // An order on unsigned operands compares them unsigned.
+                    self.builder
+                        .build_int_compare(
+                            predicate,
+                            left_val.into_int_value(),
+                            right_val.into_int_value(),
+                            "ucmp",
+                        )?
+                        .into()
                 } else {
                     self.compile_binary_op(*op, left_val, right_val)?
                 };

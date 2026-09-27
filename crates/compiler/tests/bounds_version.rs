@@ -14,8 +14,8 @@
 use std::collections::HashSet;
 use zyntax_compiler::bounds_version;
 use zyntax_compiler::hir::{
-    BinaryOp, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction, HirModule,
-    HirParam, HirPhi, HirTerminator, HirType, HirValue, HirValueKind, ParamAttributes,
+    BinaryOp, CastOp, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction,
+    HirModule, HirParam, HirPhi, HirTerminator, HirType, HirValue, HirValueKind, ParamAttributes,
 };
 use zyntax_typed_ast::InternedString;
 
@@ -71,6 +71,10 @@ fn int(func: &mut HirFunction) -> HirId {
     add_value(func, HirType::I64, HirValueKind::Instruction)
 }
 
+fn unsigned(func: &mut HirFunction) -> HirId {
+    add_value(func, HirType::U64, HirValueKind::Instruction)
+}
+
 fn flag(func: &mut HirFunction) -> HirId {
     add_value(func, HirType::Bool, HirValueKind::Instruction)
 }
@@ -90,6 +94,10 @@ fn bin(op: BinaryOp, result: HirId, left: HirId, right: HirId) -> HirInstruction
 enum Bound {
     /// `len` itself, read before the loop.
     Before,
+    /// `len` read before the loop, the index checked with one unsigned
+    /// compare, `idx as u64 >= len as u64`, which fails as `OOB` for a
+    /// negative index too.
+    Unsigned,
     /// A length kept in memory, read every iteration, which the body
     /// shrinks by one each time round.
     Shrinking,
@@ -111,7 +119,8 @@ fn reference(offset: i64, bound: Bound, len: i64, n: i64) -> i64 {
     while i < n {
         let idx = i + offset;
         if idx < 0 {
-            return failed(NEG, i, acc);
+            let code = if bound == Bound::Unsigned { OOB } else { NEG };
+            return failed(code, i, acc);
         }
         if idx >= len {
             return failed(OOB, i, acc);
@@ -204,17 +213,45 @@ fn build(offset: i64, bound: Bound) -> (HirModule, HirId) {
     {
         let blk = f.blocks.get_mut(&body).unwrap();
         blk.instructions.push(bin(BinaryOp::Add, idx, i, off));
-        blk.instructions.push(bin(BinaryOp::Lt, neg, idx, zero));
-        blk.terminator = HirTerminator::CondBranch {
-            condition: neg,
-            true_target: fail_neg,
-            false_target: check,
-        };
+        if bound == Bound::Unsigned {
+            blk.terminator = HirTerminator::Branch { target: check };
+        } else {
+            blk.instructions.push(bin(BinaryOp::Lt, neg, idx, zero));
+            blk.terminator = HirTerminator::CondBranch {
+                condition: neg,
+                true_target: fail_neg,
+                false_target: check,
+            };
+        }
     }
+    let (uidx, ulen) = (unsigned(&mut f), unsigned(&mut f));
     {
         let blk = f.blocks.get_mut(&check).unwrap();
         let limit = match bound {
             Bound::Before => len,
+            Bound::Unsigned => {
+                for (result, operand) in [(uidx, idx), (ulen, len)] {
+                    blk.instructions.push(HirInstruction::Cast {
+                        op: CastOp::Bitcast,
+                        result,
+                        ty: HirType::U64,
+                        operand,
+                    });
+                }
+                blk.instructions.push(HirInstruction::Binary {
+                    op: BinaryOp::Ge,
+                    result: oob,
+                    ty: HirType::U64,
+                    left: uidx,
+                    right: ulen,
+                });
+                blk.terminator = HirTerminator::CondBranch {
+                    condition: oob,
+                    true_target: fail_oob,
+                    false_target: ok,
+                };
+                len
+            }
             Bound::Shrinking => {
                 blk.instructions.push(HirInstruction::Load {
                     result: cur,
@@ -226,12 +263,14 @@ fn build(offset: i64, bound: Bound) -> (HirModule, HirId) {
                 cur
             }
         };
-        blk.instructions.push(bin(BinaryOp::Ge, oob, idx, limit));
-        blk.terminator = HirTerminator::CondBranch {
-            condition: oob,
-            true_target: fail_oob,
-            false_target: ok,
-        };
+        if bound != Bound::Unsigned {
+            blk.instructions.push(bin(BinaryOp::Ge, oob, idx, limit));
+            blk.terminator = HirTerminator::CondBranch {
+                condition: oob,
+                true_target: fail_oob,
+                false_target: ok,
+            };
+        }
     }
     {
         let blk = f.blocks.get_mut(&ok).unwrap();
@@ -271,7 +310,7 @@ fn optimised(offset: i64, bound: Bound) -> (HirModule, HirId) {
     let stats = zyntax_compiler::run_interp_safe_opts(&mut module);
     // A bound the body changes leaves nothing the copy could decide
     // once the sign check is folded on its own.
-    let expected = usize::from(bound == Bound::Before);
+    let expected = usize::from(bound != Bound::Shrinking);
     assert_eq!(
         stats.bounds_version.versioned, expected,
         "the pipeline versions a loop over a bound read before it, only"
@@ -395,4 +434,16 @@ fn a_bound_the_body_changes_is_checked_every_iteration() {
         "a bound read in the loop decides nothing"
     );
     run_all(0, Bound::Shrinking);
+}
+
+#[test]
+fn an_unsigned_check_decides_both_bounds() {
+    let (mut module, id) = build(0, Bound::Unsigned);
+    let f = module.functions.get_mut(&id).unwrap();
+    let stats = bounds_version::run_function(f);
+    assert_eq!(stats.versioned, 1);
+    assert_eq!(stats.folded, 1, "one compare for the sign and the length");
+    run_all(0, Bound::Unsigned);
+    run_all(-1, Bound::Unsigned);
+    run_all(1, Bound::Unsigned);
 }
