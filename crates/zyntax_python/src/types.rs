@@ -3385,8 +3385,12 @@ fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) ->
         defaults: sig.defaults.clone(),
     };
     let file = module.file_of(item.module.as_deref());
-    let counts = in_file(file, || {
+    let (counts, facts) = in_file(file, || {
         let locals = infer_locals_open(module, &trial, &item.def.body, &[], false);
+        // What the body writes into a list parameter, typed against the
+        // instance's own parameters: a write of the list's own slices is
+        // of its kind.
+        let facts = list_param_facts(module, &item.def.body, &locals.vars, &trial.params);
         let mut uses = Uses {
             typer: Typer {
                 module,
@@ -3399,16 +3403,15 @@ fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) ->
                 .collect(),
         };
         uses.visit_body(&item.def.body);
-        uses.counts
+        (uses.counts, facts)
     });
-    let facts = module.list_params.get(&item.name);
     for i in narrowed {
         // A list the body may keep, or write another kind into, stays
         // dynamic: storage of one kind cannot take the write.
         if let Ty::List(e) = key[i]
             && e != Elem::Object
         {
-            let fits = match facts.and_then(|f| f.get(i)) {
+            let fits = match facts.get(i) {
                 Some(ListFact::Reads) => true,
                 Some(ListFact::Writes(t)) => *t == Ty::Unknown || Elem::of(*t) == e,
                 _ => false,
