@@ -33,6 +33,7 @@ pub mod associated_type_resolver; // Associated type resolution for trait dispat
 pub mod async_support;
 pub mod auto_vectorize;
 pub mod borrow_check; // HIR-level borrow checking pass
+pub mod bounds_version; // Counted loops versioned on the bounds of their indices
 pub mod boxes; // Dynamic boxes made, read and released in HIR
 pub mod branch_fold; // Conditional branches a dominating branch has decided
 pub mod builtin_class; // Wrapper-class dispatch for compiler-known built-in types (Fiber, future SimdVector, etc.)
@@ -1790,6 +1791,7 @@ pub struct InterpOptStats {
     pub scalar_replace_alloc: scalar_replace_alloc::ScalarReplaceAllocStats,
     pub dead_store: dead_store::DeadStoreStats,
     pub sign_fold: sign_fold::SignFoldStats,
+    pub bounds_version: bounds_version::BoundsVersionStats,
     pub branch_fold: branch_fold::BranchFoldStats,
     pub error_flag: error_flag::ErrorFlagStats,
     pub licm: licm::LicmStats,
@@ -2226,6 +2228,35 @@ fn run_interp_safe_opts_with(
         }
     }
 
+    // Once the sweep has hoisted what leaves the loops: a bound read
+    // before the loop is what the copy's checks are decided against.
+    // Then one cleaning round, which folds the copies' decided branches
+    // away and merges what is left into one block.
+    at = web_time::Instant::now();
+    let bv = bounds_version::run_module(module);
+    stats.bounds_version.versioned += bv.versioned;
+    stats.bounds_version.folded += bv.folded;
+    timed("bounds_version", &mut at);
+    check_hir_uses(module, "bounds_version");
+    if bv.versioned > 0 {
+        for _ in 0..2 {
+            let cf = const_fold::fold_module(module);
+            stats.const_fold.folded += cf.folded;
+            let bf = branch_fold::run_module(module);
+            stats.branch_fold.folded += bf.folded;
+            let cs = cse::eliminate_module(module);
+            stats.cse.eliminated += cs.eliminated;
+            stats.cse.rewrites += cs.rewrites;
+            let ppf = phi_prune::run_module(module);
+            stats.phi_prune.removed += ppf.removed;
+            let cs_cfg = cfg_simplify::run_module(module);
+            stats.cfg_simplify.merged += cs_cfg.merged;
+            stats.cfg_simplify.threaded += cs_cfg.threaded;
+        }
+        timed("bounds_version cleanup", &mut at);
+        check_hir_uses(module, "bounds_version cleanup");
+    }
+
     // Affine reduction-loop closed-forming runs ONCE after the
     // fixed-point sweep, before the vectorizers. Ordering rationale:
     //   * After the sweep: it needs const_fold to have propagated
@@ -2244,7 +2275,6 @@ fn run_interp_safe_opts_with(
     // constant and (for floats) the closed form is provably bit-exact,
     // so it introduces no rounding the serial loop wouldn't also
     // produce. See `affine_loop` module docs for the soundness proof.
-    at = web_time::Instant::now();
     let al = affine_loop::run_module(module);
     timed("affine_loop", &mut at);
     check_hir_uses(module, "affine_loop");
