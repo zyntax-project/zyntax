@@ -2855,7 +2855,7 @@ impl LoweringContext {
     /// the first of those appears. Kept are the entry points and what
     /// is entered some other way or does work at lowering: externs and
     /// bodiless declarations, fiber and async bodies, generics,
-    /// functions with effects or handlers, and a name declared twice,
+    /// functions with effects or handlers, and a name given two bodies,
     /// whose meaning depends on the order its declarations are built.
     ///
     /// `ZYNTAX_DISABLE_REACH_LOWERING=1` builds every own function up
@@ -2868,10 +2868,14 @@ impl LoweringContext {
         if !self.config.closed || std::env::var_os("ZYNTAX_DISABLE_REACH_LOWERING").is_some() {
             return deferred;
         }
+        // Only bodies count: a body beside a bodiless declaration of its
+        // name, as a hook the program defines for a library's extern, has
+        // one meaning, and the extern stands for it until it is built.
         let mut seen = std::collections::HashSet::new();
         let mut twice = std::collections::HashSet::new();
         for decl in &program.declarations {
             if let TypedDeclaration::Function(f) = &decl.node
+                && f.body.is_some()
                 && !seen.insert(f.name)
             {
                 twice.insert(f.name);

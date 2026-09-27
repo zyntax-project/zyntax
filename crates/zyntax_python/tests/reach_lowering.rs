@@ -90,3 +90,37 @@ fn a_closed_program_builds_only_what_its_body_reaches() {
     let open = compiled(UNREACHED, false);
     assert!(open.iter().any(|n| n == "unused"), "{open:?}");
 }
+
+const TYPED_OPERATOR: &str = r#"
+class Vec3:
+    def __init__(self, x: float, y: float, z: float):
+        self.x = x
+        self.y = y
+        self.z = z
+
+    def __add__(self, other):
+        return Vec3(self.x + other.x, self.y + other.y, self.z + other.z)
+
+def main() -> int:
+    a = Vec3(1.0, 2.0, 3.0)
+    acc = Vec3(0.0, 0.0, 0.0)
+    for i in range(10):
+        acc = acc + a
+    return int(acc.x + acc.y + acc.z)
+
+print(main())
+"#;
+
+/// A class's operator is reached only through its typed instances, so
+/// the hook that dispatches a dynamic `a + b` to it is never called and
+/// neither it nor the dynamic arithmetic it serves is built.
+#[test]
+fn an_operator_used_on_typed_instances_builds_no_dynamic_arithmetic() {
+    let built = compiled(TYPED_OPERATOR, true);
+    for name in ["zb_hook_instance_arith", "zb_any_arith"] {
+        assert!(
+            !built.iter().any(|n| n == name),
+            "{name} is built for a program that never boxes an instance"
+        );
+    }
+}
