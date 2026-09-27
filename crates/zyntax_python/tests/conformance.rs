@@ -89,20 +89,26 @@ fn on_family(family: &str) -> bool {
 struct Outcome {
     stdout: String,
     status: i32,
+    /// The last lines the program wrote to stderr, shown when a case
+    /// fails; never compared.
+    stderr_tail: String,
 }
+
+/// How many lines of a failing case's stderr are shown.
+const STDERR_LINES: usize = 20;
 
 /// Run a command with a deadline. A conformance case that hangs is a
 /// failure that must be reported, not a suite that never finishes.
 fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
-    // Only stdout is compared. A piped stderr nobody reads would stall
-    // the child once it filled the pipe.
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    // Only stdout is compared; stderr is kept for the report.
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return Outcome {
                 stdout: format!("<could not start: {e}>"),
                 status: -1,
+                stderr_tail: String::new(),
             };
         }
     };
@@ -115,6 +121,15 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
             out
         })
     });
+    let err_reader = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = s.read_to_end(&mut out);
+            let text = String::from_utf8_lossy(&out);
+            let lines: Vec<&str> = text.lines().collect();
+            lines[lines.len().saturating_sub(STDERR_LINES)..].join("\n")
+        })
+    });
     let collect = |reader: Option<std::thread::JoinHandle<String>>| {
         reader.and_then(|r| r.join().ok()).unwrap_or_default()
     };
@@ -125,6 +140,7 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
                 return Outcome {
                     stdout: collect(reader),
                     status: status.code().unwrap_or(-2),
+                    stderr_tail: collect(err_reader),
                 };
             }
             Ok(None) if start.elapsed() > limit => {
@@ -134,6 +150,7 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
                 return Outcome {
                     stdout: format!("<timed out after {:?}>", limit),
                     status: -3,
+                    stderr_tail: collect(err_reader),
                 };
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
@@ -141,6 +158,7 @@ fn run_bounded(mut cmd: Command, limit: Duration) -> Outcome {
                 return Outcome {
                     stdout: format!("<wait failed: {e}>"),
                     status: -1,
+                    stderr_tail: String::new(),
                 };
             }
         }
@@ -163,6 +181,7 @@ fn expected_for(case: &Path) -> Option<Outcome> {
         return Some(Outcome {
             stdout: text,
             status,
+            stderr_tail: String::new(),
         });
     }
     let mut cmd = Command::new("python3");
@@ -266,13 +285,20 @@ fn category(name: &str, warm_up: WarmUp) {
             (true, Some(issue)) => fixed.push((key, issue.clone())),
             (false, Some(issue)) => known_failed.push((key, issue.clone())),
             (false, None) => {
-                regressions.push(format!(
+                let mut report = format!(
                     "{key}\n    expected (CPython, exit {}):\n{}\n    got (zypy, exit {}):\n{}",
                     expected.status,
                     indent(&expected.stdout),
                     got.status,
                     indent(&got.stdout)
-                ));
+                );
+                if !got.stderr_tail.is_empty() {
+                    report.push_str(&format!(
+                        "\n    zypy's stderr (last {STDERR_LINES} lines):\n{}",
+                        indent(&got.stderr_tail)
+                    ));
+                }
+                regressions.push(report);
             }
         }
     }
