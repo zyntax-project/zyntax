@@ -125,6 +125,12 @@ fn store(value: HirId, ptr: HirId) -> HirInstruction {
 /// exit:   return *t
 /// ```
 fn build_module() -> (HirModule, HirId) {
+    let (module, id, _) = build_module_with_values();
+    (module, id)
+}
+
+/// The module, the function and the values `a`, `t` and `tn`.
+fn build_module_with_values() -> (HirModule, HirId, [HirId; 3]) {
     let mut f = HirFunction::new(InternedString::new_global("keep_largest"), sig());
     let entry = f.entry_block;
     let header = f.create_block();
@@ -267,7 +273,38 @@ fn build_module() -> (HirModule, HirId) {
     module.automatic_release = true;
     module.functions.insert(id, f);
     zyntax_compiler::drop_insert::run_module(&mut module);
-    (module, id)
+    (module, id, [a, t, tn])
+}
+
+/// The values the function frees.
+fn freed(module: &HirModule, id: HirId) -> HashSet<HirId> {
+    module.functions[&id]
+        .blocks
+        .values()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|inst| match inst {
+            HirInstruction::Call {
+                callee: HirCallable::Intrinsic(Intrinsic::Free),
+                args,
+                ..
+            } => args.first().copied(),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_running_value_and_the_candidate_are_released() {
+    let (module, id, [a, t, tn]) = build_module_with_values();
+    let freed = freed(&module, id);
+    assert!(
+        freed.contains(&a),
+        "the candidate is never freed: {freed:?}"
+    );
+    assert!(
+        freed.contains(&t) || freed.contains(&tn),
+        "the running value is never freed: {freed:?}"
+    );
 }
 
 #[test]

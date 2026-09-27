@@ -748,7 +748,32 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
         }
 
         // What releases each owning phi's value: what releases what reaches
-        // it, agreed on by every incoming or the phi is not owned.
+        // it, agreed on by every incoming or the phi is not owned. A
+        // loop-carried pair of phis names each other, so an incoming that
+        // is a candidate still undecided does not hold a phi back; every
+        // decision is then checked against all incomings and withdrawn
+        // until the decisions agree.
+        let incoming_release = |phi: &crate::hir::HirPhi,
+                                val: HirId,
+                                releases: &std::collections::HashMap<HirId, Release>|
+         -> IncomingRelease {
+            if val == phi.result || is_null_value(func, val) {
+                IncomingRelease::Nothing
+            } else if let Some(r) = sites.get(&val) {
+                IncomingRelease::Known(*r)
+            } else if let Some(r) = releases.get(&val) {
+                IncomingRelease::Known(*r)
+            } else if copies
+                .iter()
+                .any(|(_, p, _, v)| *p == phi.result && *v == val)
+            {
+                IncomingRelease::Known(Release::Symbol(STRING_FREE))
+            } else if candidates.contains(&val) {
+                IncomingRelease::Undecided
+            } else {
+                IncomingRelease::Unknown
+            }
+        };
         let mut releases: std::collections::HashMap<HirId, Release> =
             std::collections::HashMap::new();
         for _ in 0..candidates.len() {
@@ -760,20 +785,13 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
                     let mut agreed: Option<Release> = None;
                     let mut known = true;
                     for (val, _) in &phi.incoming {
-                        let r = if *val == phi.result || is_null_value(func, *val) {
-                            continue;
-                        } else if let Some(r) = sites.get(val) {
-                            *r
-                        } else if let Some(r) = releases.get(val) {
-                            *r
-                        } else if copies
-                            .iter()
-                            .any(|(_, p, _, v)| *p == phi.result && *v == *val)
-                        {
-                            Release::Symbol(STRING_FREE)
-                        } else {
-                            known = false;
-                            break;
+                        let r = match incoming_release(phi, *val, &releases) {
+                            IncomingRelease::Nothing | IncomingRelease::Undecided => continue,
+                            IncomingRelease::Known(r) => r,
+                            IncomingRelease::Unknown => {
+                                known = false;
+                                break;
+                            }
                         };
                         if agreed.is_none_or(|have| have == r) {
                             agreed = Some(r);
@@ -786,6 +804,32 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
                         releases.insert(phi.result, r);
                     }
                 }
+            }
+        }
+        loop {
+            let mut withdrawn: Vec<HirId> = Vec::new();
+            for (_, block) in &func.blocks {
+                for phi in &block.phis {
+                    let Some(own) = releases.get(&phi.result) else {
+                        continue;
+                    };
+                    let agrees = phi.incoming.iter().all(|(val, _)| {
+                        match incoming_release(phi, *val, &releases) {
+                            IncomingRelease::Nothing => true,
+                            IncomingRelease::Known(r) => r == *own,
+                            IncomingRelease::Undecided | IncomingRelease::Unknown => false,
+                        }
+                    });
+                    if !agrees {
+                        withdrawn.push(phi.result);
+                    }
+                }
+            }
+            if withdrawn.is_empty() {
+                break;
+            }
+            for p in withdrawn {
+                releases.remove(&p);
             }
         }
         let before = candidates.len();
@@ -869,6 +913,18 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
         }
     }
     inserted
+}
+
+/// What releases one incoming of a phi, while the phis' releases are
+/// being decided.
+enum IncomingRelease {
+    /// The phi itself or a null: nothing arrives to release.
+    Nothing,
+    Known(Release),
+    /// Another candidate phi whose release is not decided yet.
+    Undecided,
+    /// Storage no release is known for.
+    Unknown,
 }
 
 /// Whether every incoming of `phi` is storage the phi may own, given the
