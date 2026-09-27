@@ -1,0 +1,84 @@
+9.5 float
+5.5 float
+15.0 float
+3.75 float
+3.0 float
+1.5 float
+56.25 float
+2.0 float
+1.5 float
+1.875 float
+-4 int
+1 int
+3.0 float
+0.0 float
+ZeroDivisionError: float floor division by zero
+ZeroDivisionError: float modulo
+ZeroDivisionError: float division by zero
+9.0 float
+5.0 float
+14.0 float
+3.5 float
+3.0 float
+1.0 float
+49 int
+2 int
+1 int
+1.75 float
+-4.0 float
+1.0 float
+3.0 float
+2.0 float
+ZeroDivisionError: float floor division by zero
+ZeroDivisionError: float modulo
+ZeroDivisionError: float division by zero
+-4.5 float
+-12.5 float
+-34.0 float
+-2.125 float
+-3.0 float
+3.5 float
+72.25 float
+-3.0 float
+0.5 float
+-2.125 float
+-2 int
+1 int
+-5.0 float
+1.5 float
+ZeroDivisionError: float floor division by zero
+ZeroDivisionError: float modulo
+ZeroDivisionError: float division by zero
+-5.0 float
+-13.0 float
+-36.0 float
+-2.25 float
+-3.0 float
+3.0 float
+81 int
+-3 int
+0 int
+-2.25 float
+-2.0 float
+1.0 float
+-5.0 float
+1.0 float
+ZeroDivisionError: float floor division by zero
+ZeroDivisionError: float modulo
+ZeroDivisionError: float division by zero
+8 int
+3 int
+1 int
+3.5 float
+49 int
+ZeroDivisionError: integer division or modulo by zero
+2 int
+0 int
+1 int
+0.5 float
+1 int
+ZeroDivisionError: integer division or modulo by zero
+nan float
+0 int
+nan float
+0.0 float

@@ -6521,7 +6521,7 @@ pub(crate) fn reflected_dunder_name(op: py::Operator) -> &'static str {
 /// What `left op right` produces. `/` is always a float on numbers,
 /// `**` with a negative literal exponent too.
 pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
-    if let Some(ty) = crate::lower::num::num_binop(op, l, r) {
+    if let Some(ty) = crate::lower::num::num_binop(op, l, r, right) {
         return ty;
     }
     let (l, r) = (l.boxed_view(), r.boxed_view());

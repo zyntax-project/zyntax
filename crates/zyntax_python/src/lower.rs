@@ -1651,6 +1651,14 @@ impl<'m> Lowerer<'m> {
                     .collect();
                 tuple_value(fields, ty, span)
             }
+            // A run-time number's nothing is None's parts.
+            Ty::Num(_) => {
+                let none = Val {
+                    node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+                    ty: Ty::None,
+                };
+                self.coerce_to_num(none, ty)
+            }
             other => cast(int_lit(0, span), other, span),
         }
     }
@@ -7629,9 +7637,8 @@ impl<'m> Lowerer<'m> {
         right_expr: &py::Expr,
         span: Span,
     ) -> Result<Val> {
-        if let Some(ty) = num::num_binop(op, left.ty, right.ty) {
-            let node = self.num_arith(op, left, right, ty, span);
-            return Ok(Val { node, ty });
+        if let Some(ty) = num::num_binop(op, left.ty, right.ty, right_expr) {
+            return self.num_arith(op, left, right, right_expr, ty, span);
         }
         // Any other operation reads a run-time number as its box.
         let (left, right) = (self.boxed_num(left), self.boxed_num(right));

@@ -37,29 +37,47 @@ pub(crate) fn enabled() -> bool {
 const NUMBERS: u8 = Ty::NUM_BOOL | Ty::NUM_INT | Ty::NUM_FLOAT;
 
 /// What `left op right` is when a [`Ty::Num`] takes part and the
-/// lowering computes it on the parts: `+ - *` on operands that cannot
-/// be None. An int and a bool give an int, a float on either side a
-/// float, otherwise the run-time number. Any other operation reads the
-/// Num as its box.
-pub(crate) fn num_binop(op: ruff_python_ast::Operator, l: Ty, r: Ty) -> Option<Ty> {
+/// lowering computes it on the parts: `+ - * // %` and `** 2` on
+/// operands that cannot be None give an int when neither may be a float,
+/// a float when one side is one, and otherwise the run-time number; `/`
+/// gives a float. Any other operation reads the Num as its box.
+pub(crate) fn num_binop(
+    op: ruff_python_ast::Operator,
+    l: Ty,
+    r: Ty,
+    right: &ruff_python_ast::Expr,
+) -> Option<Ty> {
     use ruff_python_ast::Operator as O;
     if !matches!(l, Ty::Num(_)) && !matches!(r, Ty::Num(_)) {
         return None;
     }
-    if !matches!(op, O::Add | O::Sub | O::Mult) {
+    let squared = op == O::Pow && is_two(right);
+    if !matches!(
+        op,
+        O::Add | O::Sub | O::Mult | O::Div | O::FloorDiv | O::Mod
+    ) && !squared
+    {
         return None;
     }
     let (ml, mr) = (l.mask()?, r.mask()?);
     if (ml | mr) & !NUMBERS != 0 {
         return None;
     }
-    Some(if (ml | mr) & Ty::NUM_FLOAT == 0 {
+    Some(if op == O::Div {
+        Ty::Float
+    } else if (ml | mr) & Ty::NUM_FLOAT == 0 {
         Ty::Int
     } else if ml == Ty::NUM_FLOAT || mr == Ty::NUM_FLOAT {
         Ty::Float
     } else {
         Ty::Num(Ty::NUM_INT | Ty::NUM_FLOAT)
     })
+}
+
+/// Whether `e` is the int literal 2.
+fn is_two(e: &ruff_python_ast::Expr) -> bool {
+    matches!(e, ruff_python_ast::Expr::NumberLiteral(n)
+        if matches!(&n.value, ruff_python_ast::Number::Int(i) if i.as_u8() == Some(2)))
 }
 
 fn float_lit(v: f64, span: Span) -> Node {
@@ -350,29 +368,46 @@ impl Lowerer<'_> {
         Self::with_pre(pre, test, Ty::Bool, span)
     }
 
-    /// `left op right` as [`num_binop`] types it, on the parts.
+    /// `left op right` as [`num_binop`] types it, on the parts. An
+    /// operation whose operands have one kind each is the typed one on
+    /// those kinds.
     pub(crate) fn num_arith(
         &mut self,
         op: ruff_python_ast::Operator,
         left: Val,
         right: Val,
+        right_expr: &ruff_python_ast::Expr,
         ty: Ty,
         span: Span,
-    ) -> Node {
+    ) -> crate::Result<Val> {
         use ruff_python_ast::Operator as O;
-        let bin = match op {
-            O::Add => BinaryOp::Add,
-            O::Sub => BinaryOp::Sub,
-            _ => BinaryOp::Mul,
+        let ints = |t: Ty| t.mask().unwrap_or(0) & !(Ty::NUM_BOOL | Ty::NUM_INT) == 0;
+        let floats = |t: Ty| t.mask() == Some(Ty::NUM_FLOAT);
+        let kinds = if ints(left.ty) && ints(right.ty) {
+            Some(Ty::Int)
+        } else if floats(left.ty) || floats(right.ty) {
+            Some(Ty::Float)
+        } else {
+            None
         };
-        if matches!(ty, Ty::Float | Ty::Int) {
-            let l = self.coerce(left, ty);
-            let r = self.coerce(right, ty);
-            return binary(bin, l, r, ty, span);
+        if let Some(kind) = kinds {
+            let l = self.coerce(left, kind);
+            let r = self.coerce(right, kind);
+            return self.arithmetic(
+                op,
+                Val { node: l, ty: kind },
+                Val { node: r, ty: kind },
+                right_expr,
+                span,
+            );
         }
-        // Both paths are free of traps, so both are computed and the
-        // tags pick one.
         let mut pre = Vec::new();
+        if op == O::Pow {
+            // `x ** 2` is `x * x` on each path.
+            let x = self.hold(left, &mut pre, span);
+            self.hoisted.append(&mut pre);
+            return self.num_arith(O::Mult, x.clone(), x, right_expr, ty, span);
+        }
         let wide = |t: Ty| Ty::Num(t.mask().unwrap_or(0) | Ty::NUM_INT | Ty::NUM_FLOAT);
         let (lty, rty) = (wide(left.ty), wide(right.ty));
         let l = Val {
@@ -385,35 +420,151 @@ impl Lowerer<'_> {
         };
         let l = self.num_held(l, &mut pre, span);
         let r = self.num_held(r, &mut pre, span);
-        let both_int = binary(
-            BinaryOp::And,
+        let is_int = |p: &NumParts| {
             binary(
                 BinaryOp::Le,
-                l.tag.clone(),
+                p.tag.clone(),
                 int_lit(TAG_INT, span),
                 Ty::Bool,
                 span,
-            ),
-            binary(
-                BinaryOp::Le,
-                r.tag.clone(),
-                int_lit(TAG_INT, span),
-                Ty::Bool,
-                span,
-            ),
-            Ty::Bool,
-            span,
-        );
-        let tag = select(
-            both_int,
-            int_lit(TAG_INT, span),
-            int_lit(TAG_FLOAT, span),
-            Ty::Int,
-            span,
-        );
-        let int = binary(bin, l.int.clone(), r.int.clone(), Ty::Int, span);
-        let float = binary(bin, l.as_f64(span), r.as_f64(span), Ty::Float, span);
-        let built = value(tag, int, float, ty, span);
-        Self::with_pre(pre, built, ty, span)
+            )
+        };
+        let both_int = binary(BinaryOp::And, is_int(&l), is_int(&r), Ty::Bool, span);
+        let node = match op {
+            // Both paths are free of traps, so both are computed and the
+            // tags pick one.
+            O::Add | O::Sub | O::Mult => {
+                let bin = match op {
+                    O::Add => BinaryOp::Add,
+                    O::Sub => BinaryOp::Sub,
+                    _ => BinaryOp::Mul,
+                };
+                let tag = select(
+                    both_int,
+                    int_lit(TAG_INT, span),
+                    int_lit(TAG_FLOAT, span),
+                    Ty::Int,
+                    span,
+                );
+                let int = binary(bin, l.int.clone(), r.int.clone(), Ty::Int, span);
+                let float = binary(bin, l.as_f64(span), r.as_f64(span), Ty::Float, span);
+                value(tag, int, float, ty, span)
+            }
+            // A float quotient, whose zero text depends on the kinds.
+            O::Div => {
+                let divisor = self.hold(
+                    Val {
+                        node: r.as_f64(span),
+                        ty: Ty::Float,
+                    },
+                    &mut pre,
+                    span,
+                );
+                let mut raise_int = Vec::new();
+                self.raise_named(
+                    "ZeroDivisionError",
+                    super::str_lit("division by zero", span),
+                    span,
+                    &mut raise_int,
+                );
+                let mut raise_float = Vec::new();
+                self.raise_named(
+                    "ZeroDivisionError",
+                    super::str_lit("float division by zero", span),
+                    span,
+                    &mut raise_float,
+                );
+                let raise = vec![if_stmt(both_int, raise_int, Some(raise_float), span)];
+                pre.push(if_stmt(
+                    binary(
+                        BinaryOp::Eq,
+                        divisor.node.clone(),
+                        float_lit(0.0, span),
+                        Ty::Bool,
+                        span,
+                    ),
+                    raise,
+                    None,
+                    span,
+                ));
+                binary(BinaryOp::Div, l.as_f64(span), divisor.node, Ty::Float, span)
+            }
+            // `//` and `%` branch on the kinds: the int path traps on
+            // operands a float's words would give it.
+            _ => {
+                let saved = std::mem::take(&mut self.hoisted);
+                let int = self.arithmetic(
+                    op,
+                    Val {
+                        node: l.int.clone(),
+                        ty: Ty::Int,
+                    },
+                    Val {
+                        node: r.int.clone(),
+                        ty: Ty::Int,
+                    },
+                    right_expr,
+                    span,
+                )?;
+                let int_pre = std::mem::take(&mut self.hoisted);
+                let float = self.arithmetic(
+                    op,
+                    Val {
+                        node: l.as_f64(span),
+                        ty: Ty::Float,
+                    },
+                    Val {
+                        node: r.as_f64(span),
+                        ty: Ty::Float,
+                    },
+                    right_expr,
+                    span,
+                )?;
+                let float_pre = std::mem::replace(&mut self.hoisted, saved);
+                let int = value(
+                    int_lit(TAG_INT, span),
+                    int.node,
+                    float_lit(0.0, span),
+                    ty,
+                    span,
+                );
+                let float = value(
+                    int_lit(TAG_FLOAT, span),
+                    int_lit(0, span),
+                    float.node,
+                    ty,
+                    span,
+                );
+                self.conditional_value(
+                    both_int,
+                    (int_pre, int),
+                    (float_pre, float),
+                    ty,
+                    span,
+                    &mut pre,
+                )
+            }
+        };
+        Ok(Val {
+            node: Self::with_pre(pre, node, ty, span),
+            ty,
+        })
     }
+}
+
+fn if_stmt(cond: Node, then: Vec<Stmt>, otherwise: Option<Vec<Stmt>>, span: Span) -> Stmt {
+    use zyntax_typed_ast::typed_ast::{TypedBlock, TypedIf, TypedStatement};
+    TypedNode::new(
+        TypedStatement::If(TypedIf {
+            condition: Box::new(cond),
+            then_block: TypedBlock {
+                statements: then,
+                span,
+            },
+            else_block: otherwise.map(|statements| TypedBlock { statements, span }),
+            span,
+        }),
+        Type::Unknown,
+        span,
+    )
 }
