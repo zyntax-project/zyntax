@@ -7,7 +7,10 @@
 //! run twice, at a small count and at one many times larger; the
 //! difference in peak resident memory between the two is what the run
 //! failed to release. A bounded program grows by a slab or two; a leak
-//! grows by the count.
+//! grows by the count. A program that grows past the allowance runs a
+//! third time, longer again: the growth a warm-up leaves stops by the
+//! second run, and only a program that grows past the allowance again
+//! leaks.
 //!
 //! `pressure/KNOWN_LEAKS` lists the programs known to grow, each with
 //! the git-bug issue that tracks why. A known leak that stops growing
@@ -38,6 +41,8 @@ const LARGE: u64 = 400_000;
 /// makes has landed in both.
 const SMALL_LLVM: u64 = 100_000;
 const LARGE_LLVM: u64 = 1_000_000;
+/// How many times the long run's steps the confirming run takes.
+const CONFIRM_FACTOR: u64 = 4;
 /// Growth a bounded program is allowed between the two: the slabs its
 /// allocator takes, the code the long run compiles that the short one
 /// interprets, and the bodies kept for later tiers, all of which stop
@@ -150,9 +155,29 @@ fn peak_memory_does_not_grow_with_the_step_count() {
             ));
             continue;
         }
-        let growth = large.saturating_sub(small);
-        let leaks = growth > ALLOWED_GROWTH;
-        let per_step = growth / (large_steps - small_steps);
+        let mut growth = large.saturating_sub(small);
+        let mut per_step = growth / (large_steps - small_steps);
+        let mut leaks = growth > ALLOWED_GROWTH;
+        if leaks {
+            let confirm_steps = large_steps * CONFIRM_FACTOR;
+            let (confirm_status, confirm) = run(program, confirm_steps);
+            if confirm_status != 0 {
+                failures.push(format!(
+                    "{name}: exited {confirm_status} at {confirm_steps} steps"
+                ));
+                continue;
+            }
+            let further = confirm.saturating_sub(large);
+            eprintln!(
+                "  {name}: {} MB to {} MB, then {} MB at {confirm_steps} steps",
+                small >> 20,
+                large >> 20,
+                confirm >> 20
+            );
+            leaks = further > ALLOWED_GROWTH;
+            growth = further;
+            per_step = further / (confirm_steps - large_steps);
+        }
         match (leaks, known.get(&name)) {
             (true, Some(issue)) => {
                 known_count += 1;
