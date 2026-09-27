@@ -614,6 +614,34 @@ fn int_literal_node(n: &Node) -> Option<i128> {
     }
 }
 
+/// Whether `n` is an int or float literal other than zero.
+fn nonzero_literal(n: &Node) -> bool {
+    fn float_of(n: &Node) -> Option<f64> {
+        match &n.node {
+            TypedExpression::Literal(TypedLiteral::Float(f)) => Some(*f),
+            TypedExpression::Unary(TypedUnary {
+                op: UnaryOp::Minus | UnaryOp::Plus,
+                operand,
+            }) => float_of(operand),
+            TypedExpression::Cast(c) => {
+                float_of(&c.expr).or_else(|| int_literal_node(&c.expr).map(|v| v as f64))
+            }
+            _ => None,
+        }
+    }
+    int_literal_node(n).is_some_and(|v| v != 0) || float_of(n).is_some_and(|f| f != 0.0)
+}
+
+/// Whether `n` is a float literal, or an int literal cast to float,
+/// that is not negative.
+fn nonnegative_float_literal(n: &Node) -> bool {
+    match &n.node {
+        TypedExpression::Literal(TypedLiteral::Float(f)) => *f >= 0.0,
+        TypedExpression::Cast(c) => int_literal_node(&c.expr).is_some_and(|v| v >= 0),
+        _ => false,
+    }
+}
+
 pub(crate) fn str_lit(s: &str, span: Span) -> Node {
     node(
         TypedExpression::Literal(TypedLiteral::String(intern(s))),
@@ -1800,37 +1828,49 @@ impl<'m> Lowerer<'m> {
         self.zero_of(ty, span)
     }
 
-    /// Integer division and remainder trap on zero, so a divisor that is
-    /// not a non-zero literal is checked first and a zero raises.
-    fn nonzero(&mut self, divisor: Node, span: Span) -> Node {
-        if int_literal_node(&divisor).is_some_and(|v| v != 0) {
+    /// A divisor checked against zero ahead of its division: a zero
+    /// raises ZeroDivisionError(`message`). A non-zero literal needs no
+    /// check. `ty` is the divisor's type, Int or Float.
+    fn nonzero(&mut self, divisor: Node, ty: Ty, message: &str, span: Span) -> Node {
+        if nonzero_literal(&divisor) {
             return divisor;
         }
         let mut pre = Vec::new();
-        let held = self.hold(
-            Val {
-                node: divisor,
-                ty: Ty::Int,
-            },
-            &mut pre,
-            span,
-        );
-        let mut raise = Vec::new();
-        self.raise_named(
+        let held = self.hold(Val { node: divisor, ty }, &mut pre, span);
+        let zero = if ty == Ty::Float {
+            node(
+                TypedExpression::Literal(TypedLiteral::Float(0.0)),
+                Ty::Float,
+                span,
+            )
+        } else {
+            int_lit(0, span)
+        };
+        self.raise_if(
+            binary(BinaryOp::Eq, held.node.clone(), zero, Ty::Bool, span),
             "ZeroDivisionError",
-            str_lit("integer division or modulo by zero", span),
+            message,
             span,
-            &mut raise,
+            &mut pre,
         );
-        pre.push(TypedNode::new(
+        self.hoisted.extend(pre);
+        held.node
+    }
+
+    /// `if cond: raise Class(message)`, appended to `out`.
+    fn raise_if(
+        &mut self,
+        cond: Node,
+        class: &str,
+        message: &str,
+        span: Span,
+        out: &mut Vec<Stmt>,
+    ) {
+        let mut raise = Vec::new();
+        self.raise_named(class, str_lit(message, span), span, &mut raise);
+        out.push(TypedNode::new(
             TypedStatement::If(TypedIf {
-                condition: Box::new(binary(
-                    BinaryOp::Eq,
-                    held.node.clone(),
-                    int_lit(0, span),
-                    Ty::Bool,
-                    span,
-                )),
+                condition: Box::new(cond),
                 then_block: TypedBlock {
                     statements: raise,
                     span,
@@ -1841,8 +1881,55 @@ impl<'m> Lowerer<'m> {
             Type::Unknown,
             span,
         ));
+    }
+
+    /// Float `base ** exponent` operands, checked: a zero base raised
+    /// to a negative power raises ZeroDivisionError.
+    fn zero_to_negative_power(&mut self, base: Node, exponent: Node, span: Span) -> (Node, Node) {
+        let mut pre = Vec::new();
+        let b = self
+            .hold(
+                Val {
+                    node: base,
+                    ty: Ty::Float,
+                },
+                &mut pre,
+                span,
+            )
+            .node;
+        let e = self
+            .hold(
+                Val {
+                    node: exponent,
+                    ty: Ty::Float,
+                },
+                &mut pre,
+                span,
+            )
+            .node;
+        let zero = || {
+            node(
+                TypedExpression::Literal(TypedLiteral::Float(0.0)),
+                Ty::Float,
+                span,
+            )
+        };
+        let cond = binary(
+            BinaryOp::And,
+            binary(BinaryOp::Eq, b.clone(), zero(), Ty::Bool, span),
+            binary(BinaryOp::Lt, e.clone(), zero(), Ty::Bool, span),
+            Ty::Bool,
+            span,
+        );
+        self.raise_if(
+            cond,
+            "ZeroDivisionError",
+            "0.0 cannot be raised to a negative power",
+            span,
+            &mut pre,
+        );
         self.hoisted.extend(pre);
-        held.node
+        (b, e)
     }
 
     fn typer(&self) -> Typer<'_> {
@@ -2300,7 +2387,9 @@ impl<'m> Lowerer<'m> {
             (Ty::Func(_), Ty::Object | Ty::Func(_)) | (Ty::Object, Ty::Func(_)) => v.node,
             (Ty::Bound(_), Ty::Object | Ty::Bound(_)) | (Ty::Object, Ty::Bound(_)) => v.node,
             (Ty::Builtin(_), Ty::Object | Ty::Builtin(_)) | (Ty::Object, Ty::Builtin(_)) => v.node,
-            (Ty::Int | Ty::Bool, Ty::Float) => cast(v.node, Ty::Float, span),
+            (Ty::Int, Ty::Float) => cast(v.node, Ty::Float, span),
+            // A bool widens to its 0 or 1 before converting.
+            (Ty::Bool, Ty::Float) => cast(cast(v.node, Ty::Int, span), Ty::Float, span),
             (Ty::Bool, Ty::Int) => cast(v.node, Ty::Int, span),
             (Ty::Int, Ty::Bool) => binary(BinaryOp::Ne, v.node, int_lit(0, span), Ty::Bool, span),
             // An array is boxed by reference under a tag of its typecode,
@@ -7420,6 +7509,15 @@ impl<'m> Lowerer<'m> {
         let both_float = binary(BinaryOp::And, is_float(&l), is_float(&r), Ty::Bool, span);
         let lf = call("zb_box_get_f64", vec![l.node.clone()], Ty::Float, span);
         let rf = call("zb_box_get_f64", vec![r.node.clone()], Ty::Float, span);
+        let mut fast_pre = Vec::new();
+        let rf = if op == py::Operator::Div {
+            let saved = std::mem::take(&mut self.hoisted);
+            let checked = self.nonzero(rf, Ty::Float, "float division by zero", span);
+            fast_pre = std::mem::replace(&mut self.hoisted, saved);
+            checked
+        } else {
+            rf
+        };
         let fast = call(
             "zb_box_f64",
             vec![binary(bin, lf, rf, Ty::Float, span)],
@@ -7439,7 +7537,7 @@ impl<'m> Lowerer<'m> {
         slow_pre.push(self.pending_check(span));
         let chosen = self.conditional_value(
             both_float,
-            (Vec::new(), fast),
+            (fast_pre, fast),
             (slow_pre, slow.node),
             Ty::Object,
             span,
@@ -7761,13 +7859,29 @@ impl<'m> Lowerer<'m> {
             _ if ty == Ty::Float => Ty::Float,
             _ => Ty::Int,
         };
+        let ints = |t: Ty| matches!(t, Ty::Int | Ty::Bool);
+        let both_int = ints(left.ty) && ints(right.ty);
         let l = self.coerce(left, operand_ty);
         let r = self.coerce(right, operand_ty);
-        let r = if operand_ty == Ty::Int && matches!(op, py::Operator::FloorDiv | py::Operator::Mod)
-        {
-            self.nonzero(r, span)
-        } else {
-            r
+        let zero_text = match (op, operand_ty) {
+            (py::Operator::Div, _) if both_int => Some("division by zero"),
+            (py::Operator::Div, _) => Some("float division by zero"),
+            (py::Operator::FloorDiv, Ty::Int) => Some("integer division or modulo by zero"),
+            (py::Operator::Mod, Ty::Int) => Some("integer modulo by zero"),
+            (py::Operator::FloorDiv, _) => Some("float floor division by zero"),
+            (py::Operator::Mod, _) => Some("float modulo"),
+            _ => None,
+        };
+        let (l, r) = match zero_text {
+            Some(text) => (l, self.nonzero(r, operand_ty, text, span)),
+            None if op == py::Operator::Pow
+                && operand_ty == Ty::Float
+                && !int_literal_node(&r).is_some_and(|v| v >= 0)
+                && !nonnegative_float_literal(&r) =>
+            {
+                self.zero_to_negative_power(l, r, span)
+            }
+            None => (l, r),
         };
         let bin = match op {
             py::Operator::Add => BinaryOp::Add,
@@ -7810,6 +7924,9 @@ impl<'m> Lowerer<'m> {
         // integer operands; the lowering computes it as one.
         let result = if ty == Ty::Float && operand_ty == Ty::Int {
             cast(result, Ty::Float, span)
+        } else if ty == Ty::Bool {
+            // `& | ^` of two bools: the int result's truth.
+            binary(BinaryOp::Ne, result, int_lit(0, span), Ty::Bool, span)
         } else {
             result
         };
@@ -10407,6 +10524,16 @@ impl<'m> Lowerer<'m> {
                     let a = self.hold(a, &mut statements, span);
                     let b = self.hold(b, &mut statements, span);
                     self.hoisted.extend(statements);
+                    // A float pair has divmod's own zero text; an int
+                    // pair's is the one `//` raises.
+                    if matches!(
+                        (a.ty, b.ty),
+                        (Ty::Float, Ty::Int | Ty::Bool | Ty::Float)
+                            | (Ty::Int | Ty::Bool, Ty::Float)
+                    ) {
+                        let divisor = self.coerce(b.clone(), Ty::Float);
+                        self.nonzero(divisor, Ty::Float, "float divmod()", span);
+                    }
                     let q = self.arithmetic(
                         py::Operator::FloorDiv,
                         Val {

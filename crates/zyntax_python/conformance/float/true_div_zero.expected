@@ -1,0 +1,139 @@
+int / int ZeroDivisionError: division by zero
+float / int ZeroDivisionError: float division by zero
+int / float ZeroDivisionError: float division by zero
+float / float ZeroDivisionError: float division by zero
+int // int ZeroDivisionError: integer division or modulo by zero
+int % int ZeroDivisionError: integer modulo by zero
+float // float ZeroDivisionError: float floor division by zero
+float % float ZeroDivisionError: float modulo
+int // float ZeroDivisionError: float floor division by zero
+float % int ZeroDivisionError: float modulo
+divmod int ZeroDivisionError: integer division or modulo by zero
+divmod float ZeroDivisionError: float divmod()
+0.0 ** -1 ZeroDivisionError: 0.0 cannot be raised to a negative power
+0.0 ** -0.5 ZeroDivisionError: 0.0 cannot be raised to a negative power
+direct int / division by zero
+direct float / float division by zero
+direct int % integer modulo by zero
+direct float // float floor division by zero
+direct float % float modulo
+direct divmod float divmod()
+direct pow 0.0 cannot be raised to a negative power
+3.5 3.75 3.0 1.5 (3.0, 1.5) 0.5
+direct int / division by zero
+direct float / float division by zero
+direct int % integer modulo by zero
+direct float // float floor division by zero
+direct float % float modulo
+direct divmod float divmod()
+direct pow 0.0 cannot be raised to a negative power
+3.5 -3.75 -4.0 0.5 (-4.0, 0.5) 0.5
+3.5 3.0 0.5 (3.0, 1.5)
+1 / 1 1.0
+1 // 1 1
+1 % 1 0
+1 / 0 ZeroDivisionError: division by zero
+1 // 0 ZeroDivisionError: integer division or modulo by zero
+1 % 0 ZeroDivisionError: integer modulo by zero
+1 / 2.5 0.4
+1 // 2.5 0.0
+1 % 2.5 1.0
+1 / 0.0 ZeroDivisionError: float division by zero
+1 // 0.0 ZeroDivisionError: float floor division by zero
+1 % 0.0 ZeroDivisionError: float modulo
+1 / True 1.0
+1 // True 1
+1 % True 0
+1 / False ZeroDivisionError: division by zero
+1 // False ZeroDivisionError: integer division or modulo by zero
+1 % False ZeroDivisionError: integer modulo by zero
+0 / 1 0.0
+0 // 1 0
+0 % 1 0
+0 / 0 ZeroDivisionError: division by zero
+0 // 0 ZeroDivisionError: integer division or modulo by zero
+0 % 0 ZeroDivisionError: integer modulo by zero
+0 / 2.5 0.0
+0 // 2.5 0.0
+0 % 2.5 0.0
+0 / 0.0 ZeroDivisionError: float division by zero
+0 // 0.0 ZeroDivisionError: float floor division by zero
+0 % 0.0 ZeroDivisionError: float modulo
+0 / True 0.0
+0 // True 0
+0 % True 0
+0 / False ZeroDivisionError: division by zero
+0 // False ZeroDivisionError: integer division or modulo by zero
+0 % False ZeroDivisionError: integer modulo by zero
+2.5 / 1 2.5
+2.5 // 1 2.0
+2.5 % 1 0.5
+2.5 / 0 ZeroDivisionError: float division by zero
+2.5 // 0 ZeroDivisionError: float floor division by zero
+2.5 % 0 ZeroDivisionError: float modulo
+2.5 / 2.5 1.0
+2.5 // 2.5 1.0
+2.5 % 2.5 0.0
+2.5 / 0.0 ZeroDivisionError: float division by zero
+2.5 // 0.0 ZeroDivisionError: float floor division by zero
+2.5 % 0.0 ZeroDivisionError: float modulo
+2.5 / True 2.5
+2.5 // True 2.0
+2.5 % True 0.5
+2.5 / False ZeroDivisionError: float division by zero
+2.5 // False ZeroDivisionError: float floor division by zero
+2.5 % False ZeroDivisionError: float modulo
+0.0 / 1 0.0
+0.0 // 1 0.0
+0.0 % 1 0.0
+0.0 / 0 ZeroDivisionError: float division by zero
+0.0 // 0 ZeroDivisionError: float floor division by zero
+0.0 % 0 ZeroDivisionError: float modulo
+0.0 / 2.5 0.0
+0.0 // 2.5 0.0
+0.0 % 2.5 0.0
+0.0 / 0.0 ZeroDivisionError: float division by zero
+0.0 // 0.0 ZeroDivisionError: float floor division by zero
+0.0 % 0.0 ZeroDivisionError: float modulo
+0.0 / True 0.0
+0.0 // True 0.0
+0.0 % True 0.0
+0.0 / False ZeroDivisionError: float division by zero
+0.0 // False ZeroDivisionError: float floor division by zero
+0.0 % False ZeroDivisionError: float modulo
+True / 1 1.0
+True // 1 1
+True % 1 0
+True / 0 ZeroDivisionError: division by zero
+True // 0 ZeroDivisionError: integer division or modulo by zero
+True % 0 ZeroDivisionError: integer modulo by zero
+True / 2.5 0.4
+True // 2.5 0.0
+True % 2.5 1.0
+True / 0.0 ZeroDivisionError: float division by zero
+True // 0.0 ZeroDivisionError: float floor division by zero
+True % 0.0 ZeroDivisionError: float modulo
+True / True 1.0
+True // True 1
+True % True 0
+True / False ZeroDivisionError: division by zero
+True // False ZeroDivisionError: integer division or modulo by zero
+True % False ZeroDivisionError: integer modulo by zero
+False / 1 0.0
+False // 1 0
+False % 1 0
+False / 0 ZeroDivisionError: division by zero
+False // 0 ZeroDivisionError: integer division or modulo by zero
+False % 0 ZeroDivisionError: integer modulo by zero
+False / 2.5 0.0
+False // 2.5 0.0
+False % 2.5 0.0
+False / 0.0 ZeroDivisionError: float division by zero
+False // 0.0 ZeroDivisionError: float floor division by zero
+False % 0.0 ZeroDivisionError: float modulo
+False / True 0.0
+False // True 0
+False % True 0
+False / False ZeroDivisionError: division by zero
+False // False ZeroDivisionError: integer division or modulo by zero
+False % False ZeroDivisionError: integer modulo by zero

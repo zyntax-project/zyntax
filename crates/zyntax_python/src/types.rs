@@ -6552,6 +6552,12 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
             }
         }
         py::Operator::Add if l == Ty::Str && r == Ty::Str => Ty::Str,
+        // `& | ^` of two bools is a bool.
+        py::Operator::BitAnd | py::Operator::BitOr | py::Operator::BitXor
+            if l == Ty::Bool && r == Ty::Bool =>
+        {
+            Ty::Bool
+        }
         // Two sets make a set of the left one's kind, of either's
         // elements.
         py::Operator::BitAnd | py::Operator::BitOr | py::Operator::Sub | py::Operator::BitXor
