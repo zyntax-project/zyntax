@@ -26,11 +26,13 @@
 //! it hoisted the load, and a loop that may resize its list keeps the
 //! load inside and is not versioned here.
 //!
-//! Only innermost loops whose preheader ends in a plain branch to the
-//! header are versioned; the copy's preheader ends in the version
-//! test, so a second run finds nothing to do. Values the loop defines
-//! and code after it reads meet in a phi at the exit block that
-//! dominates the read; a loop whose exits cannot carry them is left.
+//! Only innermost loops with one way in are versioned, and only when the
+//! copy decides at least one index against a bound: a sign check alone
+//! does not pay for a second copy of the loop. The version test ends
+//! the preheader in a branch between two loop headers, which a second
+//! run takes as a loop it does not version. Values the loop defines and
+//! code after it reads meet in a phi at the exit block that dominates
+//! the read; a loop whose exits cannot carry them is left.
 
 use crate::analysis::{DominatorTree, LoopForest, NaturalLoop};
 use crate::hir::{
@@ -84,9 +86,13 @@ pub fn run_module(module: &mut HirModule) -> BoundsVersionStats {
 pub fn run_function(func: &mut HirFunction) -> BoundsVersionStats {
     let mut stats = BoundsVersionStats::default();
     let mut tried: HashSet<HirId> = HashSet::new();
-    // A block nothing reaches may still read a loop's values, which no
-    // exit of the loop dominates.
-    crate::cfg_simplify::prune_unreachable(func);
+    // A function with no loop to version leaves exactly as it came,
+    // edge lists included.
+    let edges: Vec<(HirId, Vec<HirId>, Vec<HirId>)> = func
+        .blocks
+        .iter()
+        .map(|(id, b)| (*id, b.predecessors.clone(), b.successors.clone()))
+        .collect();
     loop {
         rebuild_cfg_edges(func);
         let dt = DominatorTree::new(func);
@@ -123,7 +129,16 @@ pub fn run_function(func: &mut HirFunction) -> BoundsVersionStats {
         let lp = lp.clone();
         apply(func, &lp, plan, &mut tried);
     }
-    rebuild_cfg_edges(func);
+    if stats.versioned == 0 {
+        for (id, preds, succs) in edges {
+            if let Some(b) = func.blocks.get_mut(&id) {
+                b.predecessors = preds;
+                b.successors = succs;
+            }
+        }
+    } else {
+        rebuild_cfg_edges(func);
+    }
     stats
 }
 
@@ -462,6 +477,11 @@ fn recognise(func: &HirFunction, dt: &DominatorTree, lp: &NaturalLoop) -> Result
     if folds.is_empty() {
         return Err("no compare decided".to_string());
     }
+    // A sign check alone is one compare the copy would save, against a
+    // second copy of the loop.
+    if facts.iter().all(|f| f.len.is_none()) {
+        return Err("no bound decided, only signs".to_string());
+    }
 
     // Reads of loop values after the loop, each through the exit that
     // dominates it and that only the loop enters.
@@ -479,12 +499,16 @@ fn recognise(func: &HirFunction, dt: &DominatorTree, lp: &NaturalLoop) -> Result
         Ok(())
     };
     for (bid, block) in &func.blocks {
-        if body.contains(bid) {
+        // A block nothing reaches may read what it likes; it runs never.
+        if body.contains(bid) || dt.rpo_position(*bid).is_none() {
             continue;
         }
         for p in &block.phis {
             for (v, from) in &p.incoming {
-                if defined_in.contains_key(v) && !body.contains(from) {
+                if defined_in.contains_key(v)
+                    && !body.contains(from)
+                    && dt.rpo_position(*from).is_some()
+                {
                     need(*from, *v)?;
                 }
             }

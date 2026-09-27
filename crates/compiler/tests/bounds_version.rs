@@ -390,6 +390,9 @@ fn a_bound_the_body_changes_is_checked_every_iteration() {
     let (mut module, id) = build(0, Bound::Shrinking);
     let f = module.functions.get_mut(&id).unwrap();
     let stats = bounds_version::run_function(f);
-    assert_eq!(stats.folded, 1, "only the sign check is decided");
+    assert_eq!(
+        stats.versioned, 0,
+        "a bound read in the loop decides nothing"
+    );
     run_all(0, Bound::Shrinking);
 }
