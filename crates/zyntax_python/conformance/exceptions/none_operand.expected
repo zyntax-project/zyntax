@@ -1,0 +1,22 @@
++ 4
+- -2
+* 6
+/ 1.5
+// 1
+% 1
+** 9
+& 1
+4
+False
+False False True
++ TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'
+- TypeError: unsupported operand type(s) for -: 'int' and 'NoneType'
+* TypeError: unsupported operand type(s) for *: 'NoneType' and 'int'
+/ TypeError: unsupported operand type(s) for /: 'NoneType' and 'int'
+// TypeError: unsupported operand type(s) for //: 'NoneType' and 'int'
+% TypeError: unsupported operand type(s) for %: 'NoneType' and 'int'
+** TypeError: unsupported operand type(s) for ** or pow(): 'NoneType' and 'int'
+& TypeError: unsupported operand type(s) for &: 'NoneType' and 'int'
+TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'
+TypeError: '<' not supported between instances of 'NoneType' and 'int'
+True True False

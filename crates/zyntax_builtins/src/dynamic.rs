@@ -1927,7 +1927,13 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             type_error(add(
                 add(
                     add(
-                        text("unsupported operand type(s): "),
+                        add(
+                            add(
+                                text("unsupported operand type(s) for "),
+                                call("zb_arith_op_text", vec![code.e()], string()),
+                            ),
+                            text(": "),
+                        ),
                         quoted(type_name(a.e())),
                     ),
                     text(" and "),
@@ -3325,6 +3331,26 @@ fn arithmetic() -> Vec<Decl> {
     ];
     int_ops.push(ret(box_i64(shr(a.e(), b.e()))));
     d.push(define("zb_arith_i64", &[&code, &a, &b], any(), int_ops));
+    // The operator a `zb_any_arith` code names, as Python writes it.
+    let mut symbols: Vec<Stmt> = [
+        "+",
+        "-",
+        "*",
+        "/",
+        "//",
+        "%",
+        "** or pow()",
+        "&",
+        "|",
+        "^",
+        "<<",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(c, sym)| when(is_code(c as i64), vec![ret(text(sym))]))
+    .collect();
+    symbols.push(ret(text(">>")));
+    d.push(define_cold("zb_arith_op_text", &[&code], string(), symbols));
 
     d.push(define(
         "zb_arith_f64",
