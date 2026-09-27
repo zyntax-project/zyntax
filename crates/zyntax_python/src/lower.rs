@@ -5454,6 +5454,54 @@ impl<'m> Lowerer<'m> {
         };
         // The bounds are evaluated once, before the loop.
         let mut pre = std::mem::take(&mut self.hoisted);
+        // A step that is not a non-zero literal is checked once, at
+        // entry: range() raises on a zero step before the first
+        // iteration. The bounds are held first so they keep their order.
+        let (start, end, step) = match step {
+            Some(s) if !int_literal_node(&s).is_some_and(|v| v != 0) => {
+                let mut held = [start, end, s].map(|n| {
+                    self.hold(
+                        Val {
+                            node: n,
+                            ty: Ty::Int,
+                        },
+                        &mut pre,
+                        span,
+                    )
+                    .node
+                });
+                let mut raise = Vec::new();
+                self.raise_named(
+                    "ValueError",
+                    str_lit("range() arg 3 must not be zero", span),
+                    span,
+                    &mut raise,
+                );
+                pre.push(TypedNode::new(
+                    TypedStatement::If(TypedIf {
+                        condition: Box::new(binary(
+                            BinaryOp::Eq,
+                            held[2].clone(),
+                            int_lit(0, span),
+                            Ty::Bool,
+                            span,
+                        )),
+                        then_block: TypedBlock {
+                            statements: raise,
+                            span,
+                        },
+                        else_block: None,
+                        span,
+                    }),
+                    Type::Unknown,
+                    span,
+                ));
+                let step = std::mem::replace(&mut held[2], int_lit(0, span));
+                let [start, end, _] = held;
+                (start, end, Some(step))
+            }
+            other => (start, end, other),
+        };
         // The loop counts in the target itself when the target is a
         // plain int local the body never assigns and the step's sign is
         // known; a shared, global or object-typed target, or one the
