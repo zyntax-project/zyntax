@@ -6467,6 +6467,10 @@ impl SsaBuilder {
             }
 
             TypedExpression::Array(elements) => {
+                // An element may end in another block, a power's loop or a
+                // conditional; what follows it is built where it ended.
+                let started = block_id;
+                let mut block_id = block_id;
                 // Lower array literal as List<T> struct: { data: i64 (ptr), len: i64, capacity: i64 }
                 // This matches the List<T> struct definition in prelude.zynml and allows
                 // field access (shape.data, shape.len) via extractvalue to work correctly.
@@ -6644,7 +6648,7 @@ impl SsaBuilder {
                         self.add_use(offset_const, slot_ptr);
                         self.array_pool_placement = Some(slot_ptr);
                     }
-                    let elem_val = self.translate_expression(block_id, elem_expr)?;
+                    let elem_val = self.translate_operand(&mut block_id, elem_expr)?;
                     // Clear immediately so it doesn't leak into nested
                     // struct literals inside subsequent elements.
                     self.array_pool_placement = None;
@@ -6801,6 +6805,7 @@ impl SsaBuilder {
                     },
                 );
 
+                self.settle(started, block_id);
                 // Return pointer to the List struct
                 Ok(list_alloc)
             }

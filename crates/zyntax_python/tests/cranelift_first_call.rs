@@ -80,3 +80,11 @@ fn scimark_lu_factor_on_boxed_rows() {
     run("lu_scimark_dynamic", false);
     run("lu_scimark_dynamic", true);
 }
+
+/// A list literal whose elements are integer powers, each built in a
+/// loop of its own.
+#[test]
+fn a_list_literal_of_powers() {
+    run("list_literal_power", false);
+    run("list_literal_power", true);
+}
