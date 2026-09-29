@@ -53,6 +53,8 @@ pub fn run_module(module: &mut HirModule) -> PhiPruneStats {
 /// Run the pass over a single function.
 pub fn run_function(func: &mut HirFunction) -> PhiPruneStats {
     let mut stats = PhiPruneStats::default();
+    rebuild_cfg_edges(func);
+    prune_stale_incomings(func);
     // Removing a phi can make a trivial phi collapsible and vice versa,
     // so iterate. The bound is generous; convergence is typically one or
     // two rounds.
@@ -76,6 +78,67 @@ pub fn run_function(func: &mut HirFunction) -> PhiPruneStats {
     stats
 }
 
+/// CFG simplification may delete or merge a predecessor without removing
+/// its old phi arm. Rebuild edges from terminators and discard those stale
+/// arms before deciding whether a phi is live or trivial.
+fn rebuild_cfg_edges(func: &mut HirFunction) {
+    let mut successors: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    for (&id, block) in &func.blocks {
+        let targets = match &block.terminator {
+            HirTerminator::Branch { target } => vec![*target],
+            HirTerminator::CondBranch {
+                true_target,
+                false_target,
+                ..
+            } => vec![*true_target, *false_target],
+            HirTerminator::Switch { default, cases, .. } => {
+                let mut targets = vec![*default];
+                targets.extend(cases.iter().map(|(_, target)| *target));
+                targets
+            }
+            HirTerminator::Invoke { normal, unwind, .. } => vec![*normal, *unwind],
+            HirTerminator::PatternMatch { .. }
+            | HirTerminator::Return { .. }
+            | HirTerminator::Unreachable => Vec::new(),
+        };
+        successors.insert(id, targets);
+    }
+    let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    for (&source, targets) in &successors {
+        for target in targets {
+            predecessors.entry(*target).or_default().push(source);
+        }
+    }
+    for (id, block) in &mut func.blocks {
+        block.successors = successors.remove(id).unwrap_or_default();
+        block.predecessors = predecessors.remove(id).unwrap_or_default();
+    }
+}
+
+fn prune_stale_incomings(func: &mut HirFunction) {
+    let mut reachable = HashSet::new();
+    let mut work = vec![func.entry_block];
+    while let Some(block_id) = work.pop() {
+        if !reachable.insert(block_id) {
+            continue;
+        }
+        if let Some(block) = func.blocks.get(&block_id) {
+            work.extend(block.successors.iter().copied());
+        }
+    }
+    for block in func.blocks.values_mut() {
+        if block.predecessors.is_empty() {
+            continue;
+        }
+        let predecessors: HashSet<HirId> = block.predecessors.iter().copied().collect();
+        for phi in &mut block.phis {
+            phi.incoming.retain(|(_, predecessor)| {
+                predecessors.contains(predecessor) && reachable.contains(predecessor)
+            });
+        }
+    }
+}
+
 /// Replace a phi that can only ever be one value with that value.
 ///
 /// A variable that is live across a loop but never reassigned in it still
@@ -89,14 +152,6 @@ fn collapse_trivial_phis(func: &mut HirFunction) -> usize {
     let mut replacements: HashMap<HirId, HirId> = HashMap::new();
     for block in func.blocks.values() {
         for phi in &block.phis {
-            // A phi with one incoming is left alone. The shape this is
-            // for is the loop-carried one, which has an edge from
-            // outside the loop and one from within, and a single-entry
-            // phi is a different construct that the removal above
-            // already decides on.
-            if phi.incoming.len() < 2 {
-                continue;
-            }
             let mut distinct = phi
                 .incoming
                 .iter()
@@ -371,9 +426,9 @@ mod tests {
         assert!(f.blocks[&entry].phis.is_empty());
     }
 
-    /// A phi whose result is read stays.
+    /// A single-incoming phi is replaced by its incoming value.
     #[test]
-    fn used_phi_is_kept() {
+    fn used_single_incoming_phi_is_collapsed() {
         let (mut f, entry) = mk();
         let incoming = val(&mut f);
         let live = val(&mut f);
@@ -385,8 +440,12 @@ mod tests {
         f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Return { values: vec![live] };
 
         let stats = run_function(&mut f);
-        assert_eq!(stats.removed, 0);
-        assert_eq!(f.blocks[&entry].phis.len(), 1);
+        assert_eq!(stats.removed, 1);
+        assert!(f.blocks[&entry].phis.is_empty());
+        assert!(matches!(
+            &f.blocks[&entry].terminator,
+            HirTerminator::Return { values } if values == &vec![incoming]
+        ));
     }
 
     /// A phi read only by another dead phi goes too, and the whole
@@ -417,9 +476,9 @@ mod tests {
         assert!(f.blocks[&entry].phis.is_empty());
     }
 
-    /// A phi feeding a real instruction is never dropped.
+    /// A single-incoming phi feeding an instruction is substituted.
     #[test]
-    fn phi_used_by_instruction_is_kept() {
+    fn single_incoming_phi_used_by_instruction_is_collapsed() {
         let (mut f, entry) = mk();
         let incoming = val(&mut f);
         let live = val(&mut f);
@@ -439,6 +498,42 @@ mod tests {
         });
         blk.terminator = HirTerminator::Return { values: vec![sum] };
 
-        assert_eq!(run_function(&mut f).removed, 0);
+        assert_eq!(run_function(&mut f).removed, 1);
+        assert!(f.blocks[&entry].phis.is_empty());
+        assert!(matches!(
+            &f.blocks[&entry].instructions[0],
+            HirInstruction::Binary { left, .. } if *left == incoming
+        ));
+    }
+
+    #[test]
+    fn drops_phi_arm_from_deleted_predecessor() {
+        let (mut f, entry) = mk();
+        let join = HirId::new();
+        let stale = HirId::new();
+        f.blocks.insert(join, HirBlock::new(join));
+        f.blocks.insert(stale, HirBlock::new(stale));
+        f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Branch { target: join };
+        f.blocks.get_mut(&stale).unwrap().terminator = HirTerminator::Branch { target: join };
+        let live_value = val(&mut f);
+        let stale_value = val(&mut f);
+        let phi_result = val(&mut f);
+        let join_block = f.blocks.get_mut(&join).unwrap();
+        join_block.phis.push(HirPhi {
+            result: phi_result,
+            ty: HirType::I64,
+            incoming: vec![(live_value, entry), (stale_value, stale)],
+        });
+        join_block.terminator = HirTerminator::Return {
+            values: vec![phi_result],
+        };
+
+        let stats = run_function(&mut f);
+        assert_eq!(stats.removed, 1);
+        assert!(f.blocks[&join].phis.is_empty());
+        assert!(matches!(
+            &f.blocks[&join].terminator,
+            HirTerminator::Return { values } if values == &vec![live_value]
+        ));
     }
 }

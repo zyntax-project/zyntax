@@ -38,10 +38,14 @@
 //!                          common ref-class hot loop where
 //!                          `body.vx` is both read and written each
 //!                          iteration silently deoptimises.
+//!   * `Store`            — one non-volatile store to a global may move
+//!                          when a counted loop runs at least once, the
+//!                          store dominates every latch, and no other
+//!                          observable instruction occurs in the loop
 //!
 //! ## What we don't touch
 //!
-//!   * `Store` / atomics / fences
+//!   * General `Store` / atomics / fences
 //!   * `Call` / `IndirectCall` — arbitrary side effects, even
 //!                                marked-pure callees can observe
 //!                                globals we don't model
@@ -94,6 +98,7 @@ use crate::hir::{
     BinaryOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
     HirTerminator, HirType,
 };
+use crate::loop_facts::{const_int, counted_loop};
 use fnv::{FnvHashMap, FnvHashSet};
 use std::collections::{HashMap, HashSet};
 use zyntax_typed_ast::InternedString;
@@ -598,7 +603,108 @@ fn hoist_loop(
         total_hoisted += to_hoist.len();
     }
 
+    total_hoisted +=
+        hoist_invariant_global_store(func, lp, preheader, &invariant, &identity_subst, dt);
+
     total_hoisted
+}
+
+/// Move one idempotent global store out of a statically non-empty loop.
+/// This handles execution metadata such as a current source line. With
+/// no other observable instruction in the loop, repeating the same
+/// store has the same final state as executing it once.
+fn hoist_invariant_global_store(
+    func: &mut HirFunction,
+    lp: &NaturalLoop,
+    preheader: HirId,
+    invariant: &FnvHashSet<HirId>,
+    identity_subst: &indexmap::IndexMap<HirId, HirId>,
+    dt: &DominatorTree,
+) -> usize {
+    let resolve = |id: HirId| *identity_subst.get(&id).unwrap_or(&id);
+    let Ok(counted) = counted_loop(func, lp, &|id| const_int(func, resolve(id))) else {
+        return 0;
+    };
+    if counted.trips <= 0 || lp.latches.is_empty() {
+        return 0;
+    }
+
+    // The counted-loop header must be the only way out. Together with
+    // a store block that dominates every latch, a positive trip count
+    // proves the store executes before the loop exits.
+    for (&block_id, block) in &func.blocks {
+        if !lp.body.contains(&block_id) {
+            continue;
+        }
+        if block
+            .successors
+            .iter()
+            .any(|target| !lp.body.contains(target))
+            && block_id != lp.header
+        {
+            return 0;
+        }
+    }
+
+    let mut candidate: Option<(HirId, usize, HirInstruction)> = None;
+    for &block_id in &lp.body {
+        let Some(block) = func.blocks.get(&block_id) else {
+            return 0;
+        };
+        for (index, inst) in block.instructions.iter().enumerate() {
+            match inst {
+                HirInstruction::Store {
+                    value,
+                    ptr,
+                    volatile: false,
+                    ..
+                } if invariant.contains(value)
+                    && invariant.contains(ptr)
+                    && matches!(
+                        func.values.get(&resolve(*ptr)).map(|v| &v.kind),
+                        Some(crate::hir::HirValueKind::Global(_))
+                    ) =>
+                {
+                    if candidate.is_some() {
+                        return 0;
+                    }
+                    candidate = Some((block_id, index, inst.clone()));
+                }
+                HirInstruction::Binary { .. }
+                | HirInstruction::Unary { .. }
+                | HirInstruction::Cast { .. }
+                | HirInstruction::GetElementPtr { .. }
+                | HirInstruction::ExtractValue { .. }
+                | HirInstruction::InsertValue { .. }
+                | HirInstruction::Select { .. } => {}
+                _ => return 0,
+            }
+        }
+    }
+
+    let Some((block_id, index, mut store)) = candidate else {
+        return 0;
+    };
+    if !lp
+        .latches
+        .iter()
+        .all(|latch| dt.dominates(block_id, *latch))
+    {
+        return 0;
+    }
+
+    apply_subst(&mut store, identity_subst);
+    func.blocks
+        .get_mut(&block_id)
+        .unwrap()
+        .instructions
+        .remove(index);
+    func.blocks
+        .get_mut(&preheader)
+        .unwrap()
+        .instructions
+        .push(store);
+    1
 }
 
 /// Is `inst` shape we consider safe to relocate? Excludes ops with
@@ -1165,6 +1271,116 @@ mod tests {
             },
         );
         id
+    }
+
+    fn add_i64_const(f: &mut HirFunction, value: i64) -> HirId {
+        let id = HirId::new();
+        f.values.insert(
+            id,
+            HirValue {
+                id,
+                ty: HirType::I64,
+                kind: HirValueKind::Constant(crate::hir::HirConstant::I64(value)),
+                uses: Default::default(),
+                span: None,
+            },
+        );
+        id
+    }
+
+    fn counted_global_store_loop(bound_value: i64) -> (HirFunction, HirId, HirId) {
+        let (mut f, entry, header, body, _exit) = mk_func();
+        let init = add_i64_const(&mut f, 0);
+        let bound = add_i64_const(&mut f, bound_value);
+        let step = add_i64_const(&mut f, 1);
+        let line = add_i64_const(&mut f, 11);
+        let global = HirId::new();
+        f.values.insert(
+            global,
+            HirValue {
+                id: global,
+                ty: HirType::Ptr(Box::new(HirType::I64)),
+                kind: HirValueKind::Global(HirId::new()),
+                uses: Default::default(),
+                span: None,
+            },
+        );
+        let induction = add_inst(&mut f, HirType::I64);
+        let condition = add_inst(&mut f, HirType::Bool);
+        let next = add_inst(&mut f, HirType::I64);
+        f.blocks
+            .get_mut(&header)
+            .unwrap()
+            .phis
+            .push(crate::hir::HirPhi {
+                result: induction,
+                ty: HirType::I64,
+                incoming: vec![(init, entry), (next, body)],
+            });
+        f.blocks
+            .get_mut(&header)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Binary {
+                op: BinaryOp::Lt,
+                result: condition,
+                ty: HirType::Bool,
+                left: induction,
+                right: bound,
+            });
+        f.blocks.get_mut(&header).unwrap().terminator = HirTerminator::CondBranch {
+            condition,
+            true_target: body,
+            false_target: _exit,
+        };
+        let body_block = f.blocks.get_mut(&body).unwrap();
+        body_block.instructions.push(HirInstruction::Store {
+            value: line,
+            ptr: global,
+            align: 8,
+            volatile: false,
+        });
+        body_block.instructions.push(HirInstruction::Binary {
+            op: BinaryOp::Add,
+            result: next,
+            ty: HirType::I64,
+            left: induction,
+            right: step,
+        });
+        (f, entry, body)
+    }
+
+    #[test]
+    fn hoists_invariant_global_store_from_nonempty_counted_loop() {
+        let (mut f, entry, body) = counted_global_store_loop(100);
+        let stats = run(&mut f);
+        assert_eq!(stats.hoisted, 1);
+        assert!(
+            f.blocks[&entry]
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, HirInstruction::Store { .. }))
+        );
+        assert!(
+            !f.blocks[&body]
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, HirInstruction::Store { .. }))
+        );
+    }
+
+    #[test]
+    fn keeps_invariant_global_store_in_empty_counted_loop() {
+        let (mut f, entry, body) = counted_global_store_loop(0);
+        let stats = run(&mut f);
+        assert_eq!(stats.hoisted, 0);
+        assert!(f.blocks[&entry].instructions.is_empty());
+        assert!(
+            f.blocks[&body]
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, HirInstruction::Store { .. }))
+        );
     }
 
     #[test]

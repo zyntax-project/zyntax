@@ -2300,6 +2300,9 @@ fn run_interp_safe_opts_with(
     // so it introduces no rounding the serial loop wouldn't also
     // produce. See `affine_loop` module docs for the soundness proof.
     let al = affine_loop::run_module(module);
+    if trace {
+        eprintln!("[OPT] affine_loop stats {al:?}");
+    }
     timed("affine_loop", &mut at);
     check_hir_uses(module, "affine_loop");
     stats.affine_loop.folded += al.folded;

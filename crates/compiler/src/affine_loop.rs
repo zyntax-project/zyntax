@@ -32,16 +32,16 @@
 //! For a **float** accumulator, reassociating `T` roundings into one
 //! multiply changes IEEE-754 results in general, so we fire ONLY when
 //! the closed form is provably *bit-exact*. That holds when every
-//! partial sum is an exactly-representable integer, which we guarantee
-//! by requiring:
+//! partial sum is exactly representable. We express the initial value
+//! and increment as integers with a shared power-of-two scale, then
+//! require:
 //!
-//!   * `acc_init` is an integer-valued float constant (`v == trunc(v)`),
-//!   * `b` is an integer-valued float constant,
-//!   * `|acc_init| + T*|b|` ≤ 2^p, where `p` is the mantissa width
+//!   * both are finite float constants,
+//!   * `|scaled(acc_init)| + T*|scaled(b)|` ≤ 2^p, where `p` is the mantissa width
 //!     (53 for f64, 24 for f32).
 //!
 //! Under those bounds every intermediate sum `acc_init + k*b`
-//! (0 ≤ k ≤ T) is an integer with magnitude ≤ 2^p, hence exactly
+//! (0 ≤ k ≤ T) is a scaled integer with magnitude ≤ 2^p, hence exactly
 //! representable, so serial addition and the closed form agree to the
 //! bit. Anything outside these bounds bails. This is deliberately
 //! narrower than a general fast-math reassociation — we introduce no
@@ -184,6 +184,16 @@ fn bump_skip(stats: &mut AffineLoopStats, reason: Skip) {
     }
 }
 
+fn unrecognized(func: &HirFunction, reason: &'static str) -> Skip {
+    if std::env::var_os("ZYNTAX_TRACE_AFFINE").is_some() {
+        eprintln!(
+            "[affine] {}: {reason}",
+            func.name.resolve_global().unwrap_or_default()
+        );
+    }
+    Skip::UnrecognizedBody
+}
+
 /// Everything the transform needs, computed during recognition.
 struct FoldPlan {
     preheader: HirId,
@@ -215,7 +225,7 @@ fn try_recognize(func: &HirFunction, lp: &NaturalLoop) -> Result<FoldPlan, Skip>
         || !lp.body.contains(&latch)
         || header == latch
     {
-        return Err(Skip::UnrecognizedBody);
+        return Err(unrecognized(func, "loop body is not header plus latch"));
     }
 
     let preheader = unique_outside_predecessor(func, lp).ok_or(Skip::NoPreheader)?;
@@ -238,11 +248,6 @@ fn try_recognize(func: &HirFunction, lp: &NaturalLoop) -> Result<FoldPlan, Skip>
     let header_block = &func.blocks[&header];
     let latch_block = &func.blocks[&latch];
 
-    // Latch carries no phis (all loop-carried state lives in the header).
-    if !latch_block.phis.is_empty() {
-        return Err(Skip::UnrecognizedBody);
-    }
-
     // --- Header terminator: cond-branch on `i < bound` --------------
     let (cond, t_target, f_target) = match &header_block.terminator {
         HirTerminator::CondBranch {
@@ -259,7 +264,10 @@ fn try_recognize(func: &HirFunction, lp: &NaturalLoop) -> Result<FoldPlan, Skip>
 
     // Header contains exactly the compare defining `cond` — nothing else.
     if header_block.instructions.len() != 1 {
-        return Err(Skip::UnrecognizedBody);
+        return Err(unrecognized(
+            func,
+            "header contains work besides its compare",
+        ));
     }
     let cmp_left = match &header_block.instructions[0] {
         HirInstruction::Binary {
@@ -277,7 +285,31 @@ fn try_recognize(func: &HirFunction, lp: &NaturalLoop) -> Result<FoldPlan, Skip>
     // so operand checks resolve through them, and exclude them from the
     // induction/accumulator count.
     let invariant = loop_invariant_values(func, lp);
-    let ident_map = identity_phi_map(header_block, &invariant);
+    let mut ident_map = identity_phi_map(header_block, &invariant);
+    // CFG merging can leave a one-predecessor phi in the latch. It is
+    // another spelling of its incoming value. Duplicate predecessor
+    // edges may leave more than one identical incoming, so accept the
+    // phi only when every arm resolves to one loop invariant.
+    for phi in &latch_block.phis {
+        let mut consensus = None;
+        for (incoming, _) in &phi.incoming {
+            if *incoming == phi.result {
+                continue;
+            }
+            let incoming = resolve(*incoming, &ident_map);
+            if !invariant.contains(&incoming) || consensus.is_some_and(|prior| prior != incoming) {
+                if std::env::var_os("ZYNTAX_TRACE_AFFINE").is_some() {
+                    eprintln!("[affine] latch phi {phi:?}; resolved incoming {incoming:?}");
+                }
+                return Err(unrecognized(func, "latch phi is not invariant"));
+            }
+            consensus = Some(incoming);
+        }
+        let Some(incoming) = consensus else {
+            return Err(unrecognized(func, "latch phi has no incoming"));
+        };
+        ident_map.insert(phi.result, incoming);
+    }
 
     // The real loop-carried phis: induction + accumulator, exactly two.
     let carried: Vec<&crate::hir::HirPhi> = header_block
@@ -286,7 +318,7 @@ fn try_recognize(func: &HirFunction, lp: &NaturalLoop) -> Result<FoldPlan, Skip>
         .filter(|p| !ident_map.contains_key(&p.result))
         .collect();
     if carried.len() != 2 {
-        return Err(Skip::UnrecognizedBody);
+        return Err(unrecognized(func, "loop does not have two carried phis"));
     }
 
     // Induction phi is the compare's LHS; the bound, the start and the
@@ -341,7 +373,7 @@ fn try_recognize(func: &HirFunction, lp: &NaturalLoop) -> Result<FoldPlan, Skip>
             // Any instruction whose result isn't part of the recurrence
             // — or that has no result at all (Store / Fence / void Call
             // / effect ops) — means unmodelled work in the loop body.
-            _ => return Err(Skip::UnrecognizedBody),
+            _ => return Err(unrecognized(func, "latch contains unrecognized work")),
         }
     }
     match &latch_block.terminator {
@@ -359,16 +391,9 @@ fn try_recognize(func: &HirFunction, lp: &NaturalLoop) -> Result<FoldPlan, Skip>
         let acc_init_f =
             resolve_const_float(func, acc_init_id, &ident_map).ok_or(Skip::FloatInexact)?;
         let b_f = resolve_const_float(func, b_id, &ident_map).ok_or(Skip::FloatInexact)?;
-        // Bit-exactness gate.
-        if !is_integer_valued_float(acc_init_f) || !is_integer_valued_float(b_f) {
-            return Err(Skip::FloatInexact);
-        }
-        let mantissa_max: f64 = match acc_ty {
-            HirType::F32 => (1u64 << 24) as f64,
-            _ => (1u64 << 53) as f64,
-        };
-        let max_partial = acc_init_f.abs() + (trip as f64) * b_f.abs();
-        if !(max_partial <= mantissa_max) {
+        // Decimal-looking values such as 1.5 are dyadic in IEEE-754
+        // and can be proved exact after scaling.
+        if !float_affine_is_exact(acc_init_f, b_f, trip, &acc_ty) {
             return Err(Skip::FloatInexact);
         }
         let final_f = acc_init_f + (trip as f64) * b_f;
@@ -595,8 +620,113 @@ fn const_float(func: &HirFunction, id: HirId) -> Option<f64> {
     }
 }
 
-fn is_integer_valued_float(v: f64) -> bool {
-    v.is_finite() && v == v.trunc()
+fn float_affine_is_exact(acc: f64, addend: f64, trip: i128, ty: &HirType) -> bool {
+    let Ok(trip) = u128::try_from(trip) else {
+        return false;
+    };
+    let (a_sig, a_exp, b_sig, b_exp, precision) = match ty {
+        HirType::F32 => {
+            let Some((a_sig, a_exp)) = f32_dyadic(acc as f32) else {
+                return false;
+            };
+            let Some((b_sig, b_exp)) = f32_dyadic(addend as f32) else {
+                return false;
+            };
+            (a_sig, a_exp, b_sig, b_exp, 24)
+        }
+        HirType::F64 => {
+            let Some((a_sig, a_exp)) = f64_dyadic(acc) else {
+                return false;
+            };
+            let Some((b_sig, b_exp)) = f64_dyadic(addend) else {
+                return false;
+            };
+            (a_sig, a_exp, b_sig, b_exp, 53)
+        }
+        _ => return false,
+    };
+
+    let common_exp = match (a_sig == 0, b_sig == 0) {
+        (true, true) => 0,
+        (true, false) => b_exp,
+        (false, true) => a_exp,
+        (false, false) => a_exp.min(b_exp),
+    };
+    let Some(a_scaled) = scale_significand(a_sig, a_exp - common_exp) else {
+        return false;
+    };
+    let Some(b_scaled) = scale_significand(b_sig, b_exp - common_exp) else {
+        return false;
+    };
+    let Some(delta) = trip.checked_mul(b_scaled.unsigned_abs()) else {
+        return false;
+    };
+    let Some(max_partial) = a_scaled.unsigned_abs().checked_add(delta) else {
+        return false;
+    };
+    max_partial <= (1u128 << precision)
+}
+
+fn scale_significand(value: i128, shift: i32) -> Option<i128> {
+    if value == 0 {
+        return Some(0);
+    }
+    let factor = 1i128.checked_shl(u32::try_from(shift).ok()?)?;
+    value.checked_mul(factor)
+}
+
+/// Exact `value = significand * 2^exponent` decomposition, with powers
+/// of two removed from the significand.
+fn f64_dyadic(value: f64) -> Option<(i128, i32)> {
+    let bits = value.to_bits();
+    let encoded_exp = ((bits >> 52) & 0x7ff) as i32;
+    if encoded_exp == 0x7ff {
+        return None;
+    }
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (mut significand, mut exponent) = if encoded_exp == 0 {
+        (fraction, -1074)
+    } else {
+        ((1u64 << 52) | fraction, encoded_exp - 1023 - 52)
+    };
+    if significand == 0 {
+        return Some((0, 0));
+    }
+    let trailing = significand.trailing_zeros();
+    significand >>= trailing;
+    exponent += trailing as i32;
+    let signed = if bits >> 63 != 0 {
+        -(significand as i128)
+    } else {
+        significand as i128
+    };
+    Some((signed, exponent))
+}
+
+fn f32_dyadic(value: f32) -> Option<(i128, i32)> {
+    let bits = value.to_bits();
+    let encoded_exp = ((bits >> 23) & 0xff) as i32;
+    if encoded_exp == 0xff {
+        return None;
+    }
+    let fraction = bits & ((1u32 << 23) - 1);
+    let (mut significand, mut exponent) = if encoded_exp == 0 {
+        (fraction, -149)
+    } else {
+        ((1u32 << 23) | fraction, encoded_exp - 127 - 23)
+    };
+    if significand == 0 {
+        return Some((0, 0));
+    }
+    let trailing = significand.trailing_zeros();
+    significand >>= trailing;
+    exponent += trailing as i32;
+    let signed = if bits >> 31 != 0 {
+        -(significand as i128)
+    } else {
+        significand as i128
+    };
+    Some((signed, exponent))
 }
 
 /// The integer type to emit a closed-form integer constant of `ty`
@@ -1098,6 +1228,12 @@ mod tests {
             s.f.values.insert(id, v);
         }
         wire_induction(&mut s, step, ind_ty.clone());
+        let b_phi = add_inst_val(&mut s.f, acc_ty.clone());
+        s.f.blocks.get_mut(&s.latch).unwrap().phis.push(HirPhi {
+            result: b_phi,
+            ty: acc_ty.clone(),
+            incoming: vec![(b, s.header), (b_phi, s.latch)],
+        });
         let acc_next = add_inst_val(&mut s.f, acc_ty.clone());
         s.f.blocks
             .get_mut(&s.latch)
@@ -1108,7 +1244,7 @@ mod tests {
                 result: acc_next,
                 ty: acc_ty.clone(),
                 left: s.acc_phi,
-                right: b,
+                right: b_phi,
             });
         wire_acc_phi(&mut s, acc_init, acc_next);
 
@@ -1346,10 +1482,10 @@ mod tests {
         assert_eq!(stats.skipped_trip_count, 1);
     }
 
-    // ── negative: non-integer float b (not bit-exact) ───────────────
+    // ── positive: exactly representable fractional float step ──────
 
     #[test]
-    fn bails_on_non_integer_float_step() {
+    fn folds_exact_fractional_float_step() {
         let ind_ty = HirType::I64;
         let acc_ty = HirType::F64;
         let mut f0 = HirFunction::new(InternedString::new_global("seed"), sig(HirType::I64));
@@ -1357,7 +1493,7 @@ mod tests {
         let bound = add_const(&mut f0, ind_ty.clone(), HirConstant::I64(100));
         let step = add_const(&mut f0, ind_ty.clone(), HirConstant::I64(1));
         let acc_init = add_const(&mut f0, acc_ty.clone(), HirConstant::F64(0.0));
-        let b = add_const(&mut f0, acc_ty.clone(), HirConstant::F64(0.5)); // not integer-valued
+        let b = add_const(&mut f0, acc_ty.clone(), HirConstant::F64(0.5));
 
         let mut s = skeleton(acc_ty.clone(), i_init, bound, ind_ty.clone());
         for id in [i_init, bound, step, acc_init, b] {
@@ -1380,8 +1516,14 @@ mod tests {
         wire_acc_phi(&mut s, acc_init, acc_next);
 
         let stats = run_function(&mut s.f);
-        assert_eq!(stats.folded, 0);
-        assert_eq!(stats.skipped_float_inexact, 1);
+        assert_eq!(stats.folded, 1);
+        let op = exit_cast_operand(&s.f, s.exit);
+        assert_eq!(const_float(&s.f, op), Some(50.0));
+    }
+
+    #[test]
+    fn rejects_fractional_step_whose_partial_sums_round() {
+        assert!(!float_affine_is_exact(0.0, 0.1, 100, &HirType::F64));
     }
 
     // ── negative: oversized trip count breaks float exactness ───────
