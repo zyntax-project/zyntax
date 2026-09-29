@@ -70,17 +70,25 @@ pub(crate) struct Linked {
     pub(crate) statements: Vec<(py::Stmt, Option<String>)>,
     /// The modules loaded, by name with their source, in load order.
     pub(crate) modules: Vec<(String, String)>,
+    /// Typed interfaces of modules owned by the embedding host.
+    pub(crate) hosts: Vec<crate::HostModule>,
 }
 
 /// Link `main`'s body with every module it imports, transitively.
 /// Imported modules come first, each once, in the order first reached.
-pub(crate) fn link(main: Vec<py::Stmt>, resolve: &Resolver<'_>) -> Result<Linked> {
+pub(crate) fn link(
+    main: Vec<py::Stmt>,
+    resolve: &Resolver<'_>,
+    host: &crate::HostResolver<'_>,
+) -> Result<Linked> {
     let mut linker = Linker {
         resolve,
         done: HashSet::default(),
         in_progress: Vec::new(),
         out: Vec::new(),
         sources: Vec::new(),
+        hosts: Vec::new(),
+        host,
         reads: names_read(&main),
     };
     let mut main = main;
@@ -93,6 +101,7 @@ pub(crate) fn link(main: Vec<py::Stmt>, resolve: &Resolver<'_>) -> Result<Linked
     Ok(Linked {
         statements,
         modules: linker.sources,
+        hosts: linker.hosts,
     })
 }
 
@@ -102,6 +111,8 @@ struct Linker<'r> {
     in_progress: Vec<String>,
     out: Vec<(py::Stmt, Option<String>)>,
     sources: Vec<(String, String)>,
+    hosts: Vec<crate::HostModule>,
+    host: &'r crate::HostResolver<'r>,
     /// Every name the body being linked reads anywhere, so an import
     /// nothing reads is known to be one.
     reads: HashSet<String>,
@@ -130,6 +141,7 @@ impl Linker<'_> {
                             .map(|a| a.id.as_str())
                             .unwrap_or(module);
                         if source_of(self.resolve, module).is_none() {
+                            self.note_host(module);
                             // Not the program's: the embedding program's,
                             // bound by the name it is read through.
                             if self
@@ -210,6 +222,7 @@ impl Linker<'_> {
                             self.load(&module, at)?;
                             imports.names.insert(local, qualified(&module, name));
                         } else if self.reads.contains(&local) {
+                            self.note_host(&module);
                             // A member of the embedding program's module.
                             imports
                                 .foreign
@@ -273,6 +286,16 @@ impl Linker<'_> {
             }
         }
         Ok(imports)
+    }
+
+    fn note_host(&mut self, module: &str) {
+        if self.hosts.iter().any(|m| m.name == module) {
+            return;
+        }
+        if let Some(mut found) = (self.host)(module) {
+            found.name = module.to_owned();
+            self.hosts.push(found);
+        }
     }
 
     /// Load a module once: parse it, link its own imports, qualify its

@@ -44,6 +44,59 @@ mod stdlib;
 mod sugar;
 mod types;
 
+/// A type exposed by an embedding host to Python. Values keep using the
+/// frontend's foreign-object protocol; this description only supplies the
+/// static signature used while lowering calls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostType {
+    Void,
+    Bool,
+    Int,
+    Float,
+    Str,
+    Bytes,
+    Object(String),
+    Dynamic,
+}
+
+/// A callable member exposed by an embedding host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostMethod {
+    pub name: String,
+    pub params: Vec<HostType>,
+    pub ret: HostType,
+    pub is_static: bool,
+}
+
+/// A field exposed by an embedding host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostField {
+    pub name: String,
+    pub ty: HostType,
+    pub is_static: bool,
+}
+
+/// A class exposed by an embedding host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostClass {
+    pub name: String,
+    pub type_name: String,
+    pub fields: Vec<HostField>,
+    pub methods: Vec<HostMethod>,
+    pub constructor: Option<HostMethod>,
+}
+
+/// A module exposed by an embedding host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostModule {
+    pub name: String,
+    pub classes: Vec<HostClass>,
+    pub functions: Vec<HostMethod>,
+}
+
+/// Finds the typed interface of a module owned by the embedding host.
+pub type HostResolver<'a> = dyn Fn(&str) -> Option<HostModule> + 'a;
+
 /// Why a program could not be turned into a `TypedProgram`.
 ///
 /// Each carries where in the source it happened, as byte offsets into
@@ -280,6 +333,18 @@ pub fn parse_program_with(
     file: &str,
     modules: &modules::Resolver<'_>,
 ) -> Result<TypedProgram> {
+    parse_program_with_host(source, file, modules, &|_| None)
+}
+
+/// [`parse_program_with`] with typed interfaces for modules owned by the
+/// embedding host. Host values still dispatch through the foreign-object
+/// protocol; the interface supplies argument and result types.
+pub fn parse_program_with_host(
+    source: &str,
+    file: &str,
+    modules: &modules::Resolver<'_>,
+    hosts: &HostResolver<'_>,
+) -> Result<TypedProgram> {
     // A record shape the lowering demotes is typed again as a dict, so
     // the program is read again without it; shapes only ever leave.
     let mut demoted: HashSet<Vec<String>> = HashSet::default();
@@ -288,7 +353,7 @@ pub fn parse_program_with(
     // would use.
     let mut kept: Option<Library> = None;
     loop {
-        let result = parse_program_once(source, file, modules, &demoted, &mut kept);
+        let result = parse_program_once(source, file, modules, hosts, &demoted, &mut kept);
         records::watch(false);
         let mut found = records::demoted();
         // A lowering that failed with records in the program is read
@@ -307,6 +372,7 @@ fn parse_program_once(
     source: &str,
     file: &str,
     modules: &modules::Resolver<'_>,
+    hosts: &HostResolver<'_>,
     demoted: &HashSet<Vec<String>>,
     kept: &mut Option<Library>,
 ) -> Result<TypedProgram> {
@@ -332,7 +398,7 @@ fn parse_program_once(
     scope::reset_cache();
     let mut module = parsed.into_syntax();
     let main: Vec<py::Stmt> = std::mem::take(&mut module.body).into_iter().collect();
-    let linked = modules::link(main, modules)?;
+    let linked = modules::link(main, modules, hosts)?;
     // The program's source files: the main file first, then each module
     // in the order it was loaded; a span names its file by that index.
     let mut source_files = vec![zyntax_typed_ast::source::SourceFile::new(
@@ -474,6 +540,7 @@ fn parse_program_once(
         from_names,
         files,
         file_names: source_files.iter().map(|f| f.name.clone()).collect(),
+        hosts: linked.hosts,
         ..Default::default()
     };
     let def_stmts: Vec<&py::StmtFunctionDef> = defs.iter().map(|(f, _)| *f).collect();

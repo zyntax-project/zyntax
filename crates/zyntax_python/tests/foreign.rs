@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use zyntax_embed::foreign::{self, Any, Foreign, ForeignError, Value};
 use zyntax_embed::{TieredConfig, TieredRuntime};
+use zyntax_python::{HostClass, HostField, HostMethod, HostModule, HostType};
 
 #[derive(Clone, Debug)]
 enum Obj {
@@ -260,8 +261,68 @@ fn a_program_uses_the_embedders_objects() {
     );
     assert_eq!(zyntax_builtins::TUPLE_TAG as u32, foreign::TUPLE_TAG);
     assert!(foreign::install(Box::new(Stand)));
-    let program =
-        zyntax_python::parse_program_with(PROGRAM, "foreign.py", &|_| None).expect("parses");
+    let hosts = |name: &str| {
+        (name == "shapes").then(|| HostModule {
+            name: name.to_owned(),
+            classes: vec![HostClass {
+                name: "Point".into(),
+                type_name: "Point".into(),
+                fields: vec![
+                    HostField {
+                        name: "x".into(),
+                        ty: HostType::Float,
+                        is_static: false,
+                    },
+                    HostField {
+                        name: "y".into(),
+                        ty: HostType::Float,
+                        is_static: false,
+                    },
+                ],
+                methods: vec![
+                    HostMethod {
+                        name: "length".into(),
+                        params: vec![],
+                        ret: HostType::Float,
+                        is_static: false,
+                    },
+                    HostMethod {
+                        name: "scaled".into(),
+                        params: vec![HostType::Float],
+                        ret: HostType::Object("Point".into()),
+                        is_static: false,
+                    },
+                ],
+                constructor: Some(HostMethod {
+                    name: "Point".into(),
+                    params: vec![HostType::Float, HostType::Float],
+                    ret: HostType::Object("Point".into()),
+                    is_static: true,
+                }),
+            }],
+            functions: vec![HostMethod {
+                name: "same".into(),
+                params: vec![HostType::Object("Point".into())],
+                ret: HostType::Object("Point".into()),
+                is_static: true,
+            }],
+        })
+    };
+    let program = zyntax_python::parse_program_with_host(PROGRAM, "foreign.py", &|_| None, &hosts)
+        .expect("parses");
+    let wrong_arity = zyntax_python::parse_program_with_host(
+        "from shapes import Point\nPoint(1)\n",
+        "bad_foreign.py",
+        &|_| None,
+        &hosts,
+    )
+    .expect_err("the host constructor signature is checked");
+    assert!(
+        wrong_arity
+            .to_string()
+            .contains("Point() takes 2 argument(s), got 1"),
+        "{wrong_arity}"
+    );
     let mut rt = TieredRuntime::new(TieredConfig::default()).expect("runtime");
     zyntax_python::register_runtime(&mut rt).expect("registered");
     rt.enter_only_through_entry_points();

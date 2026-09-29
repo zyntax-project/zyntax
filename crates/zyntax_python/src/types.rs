@@ -57,6 +57,13 @@ pub(crate) enum Ty {
     /// None raises AttributeError, where the lowering does not know the
     /// value is an instance.
     Class(u16),
+    /// A module, class, instance or function owned by the embedding host.
+    /// Each is carried as the same boxed foreign value as `Object`; the
+    /// indices retain its declared interface while it stays statically known.
+    HostModule(u16),
+    HostClass(u16, u16),
+    HostObject(u16, u16),
+    HostFunction(u16, u16),
     /// A generator: a fiber yielding dynamic values.
     Gen,
     /// A function value whose function is known: the closure at this
@@ -1276,6 +1283,7 @@ pub(crate) struct Module {
     /// The module's classes, bases before subclasses.
     pub(crate) classes: Vec<ClassInfo>,
     pub(crate) class_index: HashMap<String, usize>,
+    pub(crate) hosts: Vec<crate::HostModule>,
     /// The attributes the classes declare (`class C: X = 1`, `C.X = v`).
     pub(crate) class_attrs: std::sync::Arc<crate::class_attrs::ClassAttrs>,
     /// Attribute names read and written on dynamic receivers, and
@@ -2035,6 +2043,65 @@ pub(crate) enum ClosureDef {
 }
 
 impl Module {
+    pub(crate) fn host_module(&self, name: &str) -> Option<u16> {
+        self.hosts
+            .iter()
+            .position(|m| m.name == name)
+            .map(|i| i as u16)
+    }
+
+    pub(crate) fn host_member(&self, module: u16, name: &str) -> Ty {
+        let host = &self.hosts[module as usize];
+        if let Some(class) = host.classes.iter().position(|c| c.name == name) {
+            return Ty::HostClass(module, class as u16);
+        }
+        if let Some(function) = host.functions.iter().position(|f| f.name == name) {
+            return Ty::HostFunction(module, function as u16);
+        }
+        Ty::Object
+    }
+
+    pub(crate) fn host_type(&self, ty: &crate::HostType) -> Ty {
+        match ty {
+            crate::HostType::Void => Ty::None,
+            crate::HostType::Bool => Ty::Bool,
+            crate::HostType::Int => Ty::Int,
+            crate::HostType::Float => Ty::Float,
+            crate::HostType::Str => Ty::Str,
+            crate::HostType::Bytes => Ty::Bytes,
+            crate::HostType::Object(name) => self
+                .hosts
+                .iter()
+                .enumerate()
+                .find_map(|(m, module)| {
+                    module
+                        .classes
+                        .iter()
+                        .position(|class| class.type_name == *name)
+                        .map(|class| Ty::HostObject(m as u16, class as u16))
+                })
+                .unwrap_or(Ty::Object),
+            crate::HostType::Dynamic => Ty::Object,
+        }
+    }
+
+    pub(crate) fn host_class(&self, module: u16, class: u16) -> &crate::HostClass {
+        &self.hosts[module as usize].classes[class as usize]
+    }
+
+    pub(crate) fn host_method(
+        &self,
+        module: u16,
+        class: u16,
+        name: &str,
+        is_static: bool,
+    ) -> Option<&crate::HostMethod> {
+        self.host_class(module, class)
+            .methods
+            .iter()
+            .find(|method| method.name == name && method.is_static == is_static)
+    }
+
     /// The closure a lambda or nested def is, from the function holding
     /// it and the start of its range.
     pub(crate) fn closure_at(&self, file: u32, start: u32) -> Option<u16> {
@@ -7616,6 +7683,23 @@ impl Typer<'_> {
                     };
                 }
                 match self.expr(&a.value) {
+                    Ty::HostModule(module) => self.module.host_member(module, a.attr.as_str()),
+                    Ty::HostClass(module, class) => self
+                        .module
+                        .host_class(module, class)
+                        .fields
+                        .iter()
+                        .find(|field| field.is_static && field.name == a.attr.as_str())
+                        .map(|field| self.module.host_type(&field.ty))
+                        .unwrap_or(Ty::Object),
+                    Ty::HostObject(module, class) => self
+                        .module
+                        .host_class(module, class)
+                        .fields
+                        .iter()
+                        .find(|field| !field.is_static && field.name == a.attr.as_str())
+                        .map(|field| self.module.host_type(&field.ty))
+                        .unwrap_or(Ty::Object),
                     Ty::Class(k) => self
                         .module
                         .field_via(
@@ -7897,6 +7981,12 @@ impl Typer<'_> {
         // A call through a value whose function is known returns what
         // that function returns.
         match self.callee_ty(&c.func) {
+            Ty::HostClass(module, class) => return Ty::HostObject(module, class),
+            Ty::HostFunction(module, function) => {
+                return self.module.host_type(
+                    &self.module.hosts[module as usize].functions[function as usize].ret,
+                );
+            }
             Ty::Closure(k) => return self.module.closure_ret(k),
             Ty::Func(k) => {
                 let name = &self.module.items_by_index[k as usize];
@@ -8057,7 +8147,14 @@ impl Typer<'_> {
         match name {
             "print" => Ty::None,
             // A module of the embedding program's.
-            "__import__" => Ty::Object,
+            "__import__" => args
+                .first()
+                .and_then(|arg| match arg {
+                    py::Expr::StringLiteral(s) => self.module.host_module(s.value.to_str()),
+                    _ => None,
+                })
+                .map(Ty::HostModule)
+                .unwrap_or(Ty::Object),
             // A range is iterated as ints.
             "range" => Ty::List(Elem::Int),
             "len" | "int" | "ord" | "hash" | "id" => Ty::Int,
@@ -8213,6 +8310,16 @@ impl Typer<'_> {
             Ty::Class(k) => self
                 .module
                 .dispatched_ret(k as usize, attr)
+                .unwrap_or(Ty::Object),
+            Ty::HostObject(module, class) => self
+                .module
+                .host_method(module, class, attr, false)
+                .map(|method| self.module.host_type(&method.ret))
+                .unwrap_or(Ty::Object),
+            Ty::HostClass(module, class) => self
+                .module
+                .host_method(module, class, attr, true)
+                .map(|method| self.module.host_type(&method.ret))
                 .unwrap_or(Ty::Object),
             Ty::Dict(k) => {
                 let (key, value) = dict_shape(k);

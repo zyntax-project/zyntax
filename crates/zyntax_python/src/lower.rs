@@ -193,6 +193,10 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         | Ty::Func(_)
         | Ty::Bound(_)
         | Ty::Builtin(_)
+        | Ty::HostModule(_)
+        | Ty::HostClass(_, _)
+        | Ty::HostObject(_, _)
+        | Ty::HostFunction(_, _)
         | Ty::Num(_)
         | Ty::MaybeList(_)
         | Ty::Object
@@ -340,9 +344,16 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Gen => Type::Fiber(Box::new(Type::Any)),
         // A known function value is still the record every function
         // value is.
-        Ty::Closure(_) | Ty::Func(_) | Ty::Bound(_) | Ty::Builtin(_) | Ty::Object | Ty::Unknown => {
-            Type::Any
-        }
+        Ty::Closure(_)
+        | Ty::Func(_)
+        | Ty::Bound(_)
+        | Ty::Builtin(_)
+        | Ty::HostModule(_)
+        | Ty::HostClass(_, _)
+        | Ty::HostObject(_, _)
+        | Ty::HostFunction(_, _)
+        | Ty::Object
+        | Ty::Unknown => Type::Any,
         // The tag, the int and the float: see `num`.
         Ty::Num(_) => Type::Tuple(vec![
             prim(PrimitiveType::I64),
@@ -2519,6 +2530,20 @@ impl<'m> Lowerer<'m> {
             (Ty::Func(_), Ty::Object | Ty::Func(_)) | (Ty::Object, Ty::Func(_)) => v.node,
             (Ty::Bound(_), Ty::Object | Ty::Bound(_)) | (Ty::Object, Ty::Bound(_)) => v.node,
             (Ty::Builtin(_), Ty::Object | Ty::Builtin(_)) | (Ty::Object, Ty::Builtin(_)) => v.node,
+            (
+                Ty::HostModule(_)
+                | Ty::HostClass(_, _)
+                | Ty::HostObject(_, _)
+                | Ty::HostFunction(_, _),
+                Ty::Object,
+            )
+            | (
+                Ty::Object,
+                Ty::HostModule(_)
+                | Ty::HostClass(_, _)
+                | Ty::HostObject(_, _)
+                | Ty::HostFunction(_, _),
+            ) => v.node,
             (Ty::Int, Ty::Float) => cast(v.node, Ty::Float, span),
             // A bool widens to its 0 or 1 before converting.
             (Ty::Bool, Ty::Float) => cast(cast(v.node, Ty::Int, span), Ty::Float, span),
@@ -3499,7 +3524,12 @@ impl<'m> Lowerer<'m> {
                 ),
                 Ty::Bool,
             ),
-            Ty::Object | Ty::Unknown => call("zb_any_truthy", vec![v.node], Ty::Bool, span),
+            Ty::HostModule(_)
+            | Ty::HostClass(_, _)
+            | Ty::HostObject(_, _)
+            | Ty::HostFunction(_, _)
+            | Ty::Object
+            | Ty::Unknown => call("zb_any_truthy", vec![v.node], Ty::Bool, span),
             Ty::Num(_) => self.num_truthy(v),
             // None is false; a list is true when it has elements.
             Ty::MaybeList(e) => {
@@ -3617,9 +3647,13 @@ impl<'m> Lowerer<'m> {
                     }
                 })
             }
-            Ty::Object | Ty::Func(_) | Ty::Unknown => {
-                call("zb_any_str", vec![v.node], Ty::Str, span)
-            }
+            Ty::HostModule(_)
+            | Ty::HostClass(_, _)
+            | Ty::HostObject(_, _)
+            | Ty::HostFunction(_, _)
+            | Ty::Object
+            | Ty::Func(_)
+            | Ty::Unknown => call("zb_any_str", vec![v.node], Ty::Str, span),
         }
     }
 
@@ -10372,6 +10406,20 @@ impl<'m> Lowerer<'m> {
                         return self
                             .method_on(k as usize, receiver, "__call__", args, keywords, c, span);
                     }
+                    Ty::HostClass(module, class) => {
+                        let signature = self.module.host_class(module, class).constructor.clone();
+                        let Some(signature) = signature else {
+                            return unsupported("a host class without a constructor", c);
+                        };
+                        let callee = self.expr(&c.func)?;
+                        return self.host_call(callee, &signature, args, keywords, c, ty, span);
+                    }
+                    Ty::HostFunction(module, function) => {
+                        let signature =
+                            self.module.hosts[module as usize].functions[function as usize].clone();
+                        let callee = self.expr(&c.func)?;
+                        return self.host_call(callee, &signature, args, keywords, c, ty, span);
+                    }
                     Ty::Bound(k) => {
                         let info = self.module.bounds[k as usize].clone();
                         let receiver = self.expr(&py::Expr::Name(info.receiver))?;
@@ -10472,6 +10520,45 @@ impl<'m> Lowerer<'m> {
                     span,
                 );
             }
+            if let Ty::HostObject(module, class) = receiver.ty {
+                let signature = self
+                    .module
+                    .host_method(module, class, a.attr.as_str(), false)
+                    .cloned();
+                if let Some(signature) = signature {
+                    return self.host_method(receiver, &signature, args, keywords, c, ty, span);
+                }
+            }
+            if let Ty::HostClass(module, class) = receiver.ty {
+                let signature = self
+                    .module
+                    .host_method(module, class, a.attr.as_str(), true)
+                    .cloned();
+                if let Some(signature) = signature {
+                    return self.host_method(receiver, &signature, args, keywords, c, ty, span);
+                }
+            }
+            if let Ty::HostModule(module) = receiver.ty
+                && let Ty::HostFunction(_, function) =
+                    self.module.host_member(module, a.attr.as_str())
+            {
+                let signature =
+                    self.module.hosts[module as usize].functions[function as usize].clone();
+                return self.host_method(receiver, &signature, args, keywords, c, ty, span);
+            }
+            if matches!(
+                receiver.ty,
+                Ty::HostModule(_) | Ty::HostClass(_, _) | Ty::HostObject(_, _)
+            ) {
+                if !keywords.is_empty() {
+                    return unsupported("keyword arguments in a host call", c);
+                }
+                let receiver = Val {
+                    node: self.coerce(receiver, Ty::Object),
+                    ty: Ty::Object,
+                };
+                return self.dynamic_method(receiver, a.attr.as_str(), args, span);
+            }
             if receiver.ty == Ty::Object && !keywords.is_empty() {
                 return unsupported("keyword arguments in a call through a value", c);
             }
@@ -10539,7 +10626,11 @@ impl<'m> Lowerer<'m> {
                         node: call("zb_foreign_module", vec![module], Ty::Object, span),
                         ty: Ty::Object,
                     };
-                    return Ok(self.guard(v, span));
+                    let guarded = self.guard(v, span);
+                    return Ok(Val {
+                        node: guarded.node,
+                        ty,
+                    });
                 }
                 "repr" => {
                     let v = self.expr(&args[0])?;
@@ -12802,6 +12893,32 @@ impl<'m> Lowerer<'m> {
                 };
                 Ok(self.guard(v, span))
             }
+            Ty::HostModule(module) => {
+                let ty = self.module.host_member(module, attr);
+                self.host_attribute(object, attr, ty, span)
+            }
+            Ty::HostClass(module, class) => {
+                let ty = self
+                    .module
+                    .host_class(module, class)
+                    .fields
+                    .iter()
+                    .find(|field| field.is_static && field.name == attr)
+                    .map(|field| self.module.host_type(&field.ty))
+                    .unwrap_or(Ty::Object);
+                self.host_attribute(object, attr, ty, span)
+            }
+            Ty::HostObject(module, class) => {
+                let ty = self
+                    .module
+                    .host_class(module, class)
+                    .fields
+                    .iter()
+                    .find(|field| !field.is_static && field.name == attr)
+                    .map(|field| self.module.host_type(&field.ty))
+                    .unwrap_or(Ty::Object);
+                self.host_attribute(object, attr, ty, span)
+            }
             // An array's typecode and element size are its type's.
             Ty::List(Elem::Array(c)) if matches!(attr, "typecode" | "itemsize") => {
                 let (value, ty) = if attr == "typecode" {
@@ -12824,6 +12941,24 @@ impl<'m> Lowerer<'m> {
                 span,
             )),
         }
+    }
+
+    fn host_attribute(&mut self, object: Val, attr: &str, ty: Ty, span: Span) -> Result<Val> {
+        self.module.attr_reads.borrow_mut().insert(attr.to_string());
+        let dynamic = Val {
+            node: call(
+                &getattr_name(attr),
+                vec![self.coerce(object, Ty::Object)],
+                Ty::Object,
+                span,
+            ),
+            ty: Ty::Object,
+        };
+        let guarded = self.guard(dynamic, span);
+        Ok(Val {
+            node: self.coerce(guarded, ty),
+            ty,
+        })
     }
 
     /// A function record with the receiver held in its first cell.
@@ -13106,6 +13241,29 @@ impl<'m> Lowerer<'m> {
                 Ok(call(
                     &setattr_name(attr),
                     vec![object.node, v],
+                    Ty::None,
+                    span,
+                ))
+            }
+            Ty::HostObject(module, class) | Ty::HostClass(module, class) => {
+                let static_field = matches!(object.ty, Ty::HostClass(_, _));
+                let ty = self
+                    .module
+                    .host_class(module, class)
+                    .fields
+                    .iter()
+                    .find(|field| field.is_static == static_field && field.name == attr)
+                    .map(|field| self.module.host_type(&field.ty))
+                    .unwrap_or(Ty::Object);
+                self.module
+                    .attr_writes
+                    .borrow_mut()
+                    .insert(attr.to_string());
+                let value = self.coerce(value, ty);
+                let value = self.coerce(Val { node: value, ty }, Ty::Object);
+                Ok(call(
+                    &setattr_name(attr),
+                    vec![self.coerce(object, Ty::Object), value],
                     Ty::None,
                     span,
                 ))
@@ -13558,6 +13716,97 @@ impl<'m> Lowerer<'m> {
             ty: Ty::Object,
         };
         Ok(self.guard(v, span))
+    }
+
+    fn host_arguments(
+        &mut self,
+        signature: &crate::HostMethod,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        at: &impl Ranged,
+    ) -> Result<Vec<Node>> {
+        if !keywords.is_empty() {
+            return unsupported("keyword arguments in a host call", at);
+        }
+        if args.len() != signature.params.len() {
+            return unsupported(
+                format!(
+                    "{}() takes {} argument(s), got {}",
+                    signature.name,
+                    signature.params.len(),
+                    args.len()
+                ),
+                at,
+            );
+        }
+        args.iter()
+            .zip(&signature.params)
+            .map(|(arg, ty)| {
+                let ty = self.module.host_type(ty);
+                let node = self.expr_as(arg, ty)?;
+                Ok(self.coerce(Val { node, ty }, Ty::Object))
+            })
+            .collect()
+    }
+
+    fn host_call(
+        &mut self,
+        callee: Val,
+        signature: &crate::HostMethod,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        at: &impl Ranged,
+        ty: Ty,
+        span: Span,
+    ) -> Result<Val> {
+        let mut lowered = vec![self.coerce(callee, Ty::Object)];
+        lowered.extend(self.host_arguments(signature, args, keywords, at)?);
+        let dynamic = Val {
+            node: call(
+                &format!("zb_call_{}", args.len()),
+                lowered,
+                Ty::Object,
+                span,
+            ),
+            ty: Ty::Object,
+        };
+        let guarded = self.guard(dynamic, span);
+        Ok(Val {
+            node: self.coerce(guarded, ty),
+            ty,
+        })
+    }
+
+    fn host_method(
+        &mut self,
+        receiver: Val,
+        signature: &crate::HostMethod,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        at: &impl Ranged,
+        ty: Ty,
+        span: Span,
+    ) -> Result<Val> {
+        let mut lowered = vec![self.coerce(receiver, Ty::Object)];
+        lowered.extend(self.host_arguments(signature, args, keywords, at)?);
+        self.module
+            .dyn_methods
+            .borrow_mut()
+            .insert((signature.name.clone(), args.len()));
+        let dynamic = Val {
+            node: call(
+                &callm_name(&signature.name, args.len()),
+                lowered,
+                Ty::Object,
+                span,
+            ),
+            ty: Ty::Object,
+        };
+        let guarded = self.guard(dynamic, span);
+        Ok(Val {
+            node: self.coerce(guarded, ty),
+            ty,
+        })
     }
 
     /// A call through a value whose function inference knows: the
