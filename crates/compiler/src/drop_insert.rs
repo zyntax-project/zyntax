@@ -973,23 +973,29 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
         // Replacing a loop-carried value ends the previous iteration's
         // claim even when the body never reads it. Treat each replacing
         // back edge as an implicit last use; otherwise `x = make()` in a
-        // loop retains every value except the final one.
-        let implicit_uses: IdSet = bodies
-            .get(&block_id)
-            .into_iter()
-            .flat_map(|body| {
-                func.blocks[&block_id]
-                    .phis
-                    .iter()
-                    .find(|p| p.result == phi_result)
-                    .into_iter()
-                    .flat_map(move |phi| {
-                        phi.incoming.iter().filter_map(move |(value, pred)| {
-                            (body.contains(pred) && *value != phi_result).then_some(*pred)
+        // loop retains every value except the final one. A transfer edge
+        // already gives liveness the path-specific end of the old claim;
+        // merging in the back edge would also release the transferred alias.
+        let implicit_uses: IdSet = if transfer_out.is_empty() {
+            bodies
+                .get(&block_id)
+                .into_iter()
+                .flat_map(|body| {
+                    func.blocks[&block_id]
+                        .phis
+                        .iter()
+                        .find(|p| p.result == phi_result)
+                        .into_iter()
+                        .flat_map(move |phi| {
+                            phi.incoming.iter().filter_map(move |(value, pred)| {
+                                (body.contains(pred) && *value != phi_result).then_some(*pred)
+                            })
                         })
-                    })
-            })
-            .collect();
+                })
+                .collect()
+        } else {
+            IdSet::default()
+        };
         if let Some(points) = drop_points_transferring_with_uses(
             func,
             &site,
@@ -4153,6 +4159,132 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// A value conditionally handed to another owning phi is released on
+    /// the arm that replaces it, not again after the arms merge.
+    #[test]
+    fn a_conditional_phi_transfer_is_not_released_twice() {
+        let mut f = HirFunction::new(
+            InternedString::new_global("conditional_accumulate"),
+            empty_sig(HirType::I64),
+        );
+        let entry = f.entry_block;
+        let header = HirId::new();
+        let body = HirId::new();
+        let reuse = HirId::new();
+        let replace = HirId::new();
+        let merge = HirId::new();
+        let exit = HirId::new();
+        for id in [header, body, reuse, replace, merge, exit] {
+            f.blocks.insert(id, HirBlock::new(id));
+        }
+
+        let ptr_ty = HirType::Ptr(Box::new(HirType::I8));
+        let cond = add_const(&mut f, HirType::Bool, HirConstant::Bool(true));
+        let literal = add_const(&mut f, ptr_ty.clone(), HirConstant::Null(ptr_ty.clone()));
+        let seed = add_inst_val(&mut f, ptr_ty.clone());
+        let separated = add_inst_val(&mut f, ptr_ty.clone());
+        let next = add_inst_val(&mut f, ptr_ty.clone());
+        let acc = add_inst_val(&mut f, ptr_ty.clone());
+        let selected = add_inst_val(&mut f, ptr_ty.clone());
+        let read_exit = add_inst_val(&mut f, HirType::I8);
+        let call = |result, name: &str, args| HirInstruction::Call {
+            result: Some(result),
+            callee: HirCallable::Symbol(name.to_string()),
+            args,
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            is_tail: false,
+        };
+
+        let block = f.blocks.get_mut(&entry).unwrap();
+        block
+            .instructions
+            .push(call(seed, STRING_COPY, vec![literal]));
+        block.terminator = HirTerminator::Branch { target: header };
+        block.successors = vec![header];
+
+        let block = f.blocks.get_mut(&header).unwrap();
+        block.phis.push(crate::hir::HirPhi {
+            result: acc,
+            ty: ptr_ty.clone(),
+            incoming: vec![(seed, entry), (next, merge)],
+        });
+        block.terminator = HirTerminator::CondBranch {
+            condition: cond,
+            true_target: body,
+            false_target: exit,
+        };
+        block.predecessors = vec![entry, merge];
+        block.successors = vec![body, exit];
+
+        let block = f.blocks.get_mut(&body).unwrap();
+        block.terminator = HirTerminator::CondBranch {
+            condition: cond,
+            true_target: reuse,
+            false_target: replace,
+        };
+        block.predecessors = vec![header];
+        block.successors = vec![reuse, replace];
+
+        let block = f.blocks.get_mut(&reuse).unwrap();
+        block.terminator = HirTerminator::Branch { target: merge };
+        block.predecessors = vec![body];
+        block.successors = vec![merge];
+
+        let block = f.blocks.get_mut(&replace).unwrap();
+        block
+            .instructions
+            .push(call(separated, "$IO$string_concat", vec![acc, literal]));
+        block.terminator = HirTerminator::Branch { target: merge };
+        block.predecessors = vec![body];
+        block.successors = vec![merge];
+
+        let block = f.blocks.get_mut(&merge).unwrap();
+        block.phis.push(crate::hir::HirPhi {
+            result: selected,
+            ty: ptr_ty.clone(),
+            incoming: vec![(acc, reuse), (separated, replace)],
+        });
+        block
+            .instructions
+            .push(call(next, "$IO$string_concat", vec![selected, literal]));
+        block.terminator = HirTerminator::Branch { target: header };
+        block.predecessors = vec![reuse, replace];
+        block.successors = vec![header];
+
+        let block = f.blocks.get_mut(&exit).unwrap();
+        block.instructions.push(HirInstruction::Load {
+            result: read_exit,
+            ty: HirType::I8,
+            ptr: acc,
+            align: 1,
+            volatile: false,
+        });
+        block.terminator = HirTerminator::Return {
+            values: vec![read_exit],
+        };
+        block.predecessors = vec![header];
+
+        let facts = ModuleFacts {
+            automatic_release: true,
+            ..ModuleFacts::default()
+        };
+        release_owned_phis(&mut f, &facts);
+
+        let frees = |block: HirId, value: HirId| {
+            f.blocks[&block]
+                .instructions
+                .iter()
+                .filter(|inst| {
+                    matches!(inst, HirInstruction::Call { callee: HirCallable::Symbol(name), args, .. } if name == STRING_FREE && args == &vec![value])
+                })
+                .count()
+        };
+        assert_eq!(frees(replace, acc), 1);
+        assert_eq!(frees(merge, acc), 0);
+        assert_eq!(frees(merge, selected), 1);
     }
 
     /// If anything might keep the accumulator, it is not ours to
