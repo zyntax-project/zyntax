@@ -195,11 +195,12 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 when(
                     crate::foreign::is_foreign(f.e()),
                     vec![ret(call(
-                        "zb_foreign_call",
-                        vec![
-                            f.e(),
-                            list(args[..n].iter().map(|a| a.e()).collect(), anys.clone()),
-                        ],
+                        &format!("zb_foreign_call_{n}"),
+                        {
+                            let mut passed = vec![f.e()];
+                            passed.extend(args[..n].iter().map(|a| a.e()));
+                            passed
+                        },
                         any(),
                     ))],
                 ),

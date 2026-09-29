@@ -74,6 +74,34 @@ pub trait Foreign: Send + Sync {
     /// Call the method `name` of `object` with `args`.
     fn invoke(&self, object: usize, name: &str, args: &[Any]) -> Result<Any, ForeignError>;
 
+    /// Read a field whose schema declares a floating-point result without
+    /// allocating a dynamic box for that result.
+    fn get_float(&self, _object: usize, _name: &str) -> Result<f64, ForeignError> {
+        number_of(self.get(_object, _name)?)
+    }
+
+    /// Write a schema-declared floating-point field without boxing it.
+    fn set_float(&self, _object: usize, _name: &str, _value: f64) -> Result<(), ForeignError> {
+        self.set(_object, _name, float(_value))
+    }
+
+    /// Call a schema-declared function of float arguments and result.
+    fn call_float(&self, _object: usize, _args: &[f64]) -> Result<f64, ForeignError> {
+        let args: Vec<Any> = _args.iter().map(|&value| float(value)).collect();
+        number_of(self.call(_object, &args)?)
+    }
+
+    /// Invoke a schema-declared method of float arguments and result.
+    fn invoke_float(
+        &self,
+        _object: usize,
+        _name: &str,
+        _args: &[f64],
+    ) -> Result<f64, ForeignError> {
+        let args: Vec<Any> = _args.iter().map(|&value| float(value)).collect();
+        number_of(self.invoke(_object, _name, &args)?)
+    }
+
     /// `object` as text.
     fn text(&self, object: usize) -> String;
 
@@ -111,6 +139,17 @@ pub trait Foreign: Send + Sync {
     /// a box the program owns.
     fn value(&self, _object: usize, _index: usize) -> Any {
         none()
+    }
+}
+
+fn number_of(any: Any) -> Result<f64, ForeignError> {
+    match unsafe { read(any) } {
+        Value::Float(value) => Ok(value),
+        Value::Int(value) => Ok(value as f64),
+        _ => Err(ForeignError::new(
+            "TypeError",
+            "a numeric host result was expected",
+        )),
     }
 }
 
@@ -335,6 +374,145 @@ unsafe extern "C" fn foreign_invoke(x: Any, name: StringConstPtr, data: i64, len
     })
 }
 
+// Fixed-arity entries let typed frontends hand arguments to the embedder
+// directly. The variadic entries above remain for calls whose arity is only
+// known at runtime.
+macro_rules! fixed_foreign_calls {
+    ($call:ident, $invoke:ident $(, $arg:ident)*) => {
+        unsafe extern "C" fn $call(x: Any, $($arg: Any),*) -> Any {
+            let Some(object) = (unsafe { word(x) }) else {
+                fail(no_embedder());
+                return none();
+            };
+            let args: &[Any] = &[$($arg),*];
+            with(none(), |f| f.call(object, args))
+        }
+
+        unsafe extern "C" fn $invoke(
+            x: Any,
+            name: StringConstPtr,
+            $($arg: Any),*
+        ) -> Any {
+            let Some(object) = (unsafe { word(x) }) else {
+                fail(no_embedder());
+                return none();
+            };
+            let args: &[Any] = &[$($arg),*];
+            with(none(), |f| f.invoke(object, unsafe { text_of(name) }, args))
+        }
+    };
+}
+
+fixed_foreign_calls!(foreign_call_0, foreign_invoke_0);
+fixed_foreign_calls!(foreign_call_1, foreign_invoke_1, a0);
+fixed_foreign_calls!(foreign_call_2, foreign_invoke_2, a0, a1);
+fixed_foreign_calls!(foreign_call_3, foreign_invoke_3, a0, a1, a2);
+fixed_foreign_calls!(foreign_call_4, foreign_invoke_4, a0, a1, a2, a3);
+fixed_foreign_calls!(foreign_call_5, foreign_invoke_5, a0, a1, a2, a3, a4);
+fixed_foreign_calls!(foreign_call_6, foreign_invoke_6, a0, a1, a2, a3, a4, a5);
+fixed_foreign_calls!(foreign_call_7, foreign_invoke_7, a0, a1, a2, a3, a4, a5, a6);
+fixed_foreign_calls!(
+    foreign_call_8,
+    foreign_invoke_8,
+    a0,
+    a1,
+    a2,
+    a3,
+    a4,
+    a5,
+    a6,
+    a7
+);
+
+unsafe extern "C" fn foreign_get_float(x: Any, name: StringConstPtr) -> f64 {
+    let Some(object) = (unsafe { word(x) }) else {
+        fail(no_embedder());
+        return 0.0;
+    };
+    with(0.0, |f| f.get_float(object, unsafe { text_of(name) }))
+}
+
+unsafe extern "C" fn foreign_set_float(x: Any, name: StringConstPtr, value: f64) {
+    let Some(object) = (unsafe { word(x) }) else {
+        return fail(no_embedder());
+    };
+    with((), |f| f.set_float(object, unsafe { text_of(name) }, value))
+}
+
+macro_rules! fixed_float_calls {
+    ($call:ident, $invoke:ident $(, $arg:ident)*) => {
+        unsafe extern "C" fn $call(x: Any, $($arg: f64),*) -> f64 {
+            let Some(object) = (unsafe { word(x) }) else {
+                fail(no_embedder());
+                return 0.0;
+            };
+            let args: &[f64] = &[$($arg),*];
+            with(0.0, |f| f.call_float(object, args))
+        }
+
+        unsafe extern "C" fn $invoke(
+            x: Any,
+            name: StringConstPtr,
+            $($arg: f64),*
+        ) -> f64 {
+            let Some(object) = (unsafe { word(x) }) else {
+                fail(no_embedder());
+                return 0.0;
+            };
+            let args: &[f64] = &[$($arg),*];
+            with(0.0, |f| f.invoke_float(object, unsafe { text_of(name) }, args))
+        }
+    };
+}
+
+fixed_float_calls!(foreign_call_float_0, foreign_invoke_float_0);
+fixed_float_calls!(foreign_call_float_1, foreign_invoke_float_1, a0);
+fixed_float_calls!(foreign_call_float_2, foreign_invoke_float_2, a0, a1);
+fixed_float_calls!(foreign_call_float_3, foreign_invoke_float_3, a0, a1, a2);
+fixed_float_calls!(foreign_call_float_4, foreign_invoke_float_4, a0, a1, a2, a3);
+fixed_float_calls!(
+    foreign_call_float_5,
+    foreign_invoke_float_5,
+    a0,
+    a1,
+    a2,
+    a3,
+    a4
+);
+fixed_float_calls!(
+    foreign_call_float_6,
+    foreign_invoke_float_6,
+    a0,
+    a1,
+    a2,
+    a3,
+    a4,
+    a5
+);
+fixed_float_calls!(
+    foreign_call_float_7,
+    foreign_invoke_float_7,
+    a0,
+    a1,
+    a2,
+    a3,
+    a4,
+    a5,
+    a6
+);
+fixed_float_calls!(
+    foreign_call_float_8,
+    foreign_invoke_float_8,
+    a0,
+    a1,
+    a2,
+    a3,
+    a4,
+    a5,
+    a6,
+    a7
+);
+
 unsafe extern "C" fn foreign_str(x: Any) -> StringPtr {
     let text = match (word(x), installed()) {
         (Some(object), Some(f)) => f.text(object),
@@ -421,11 +599,109 @@ extern "C" fn foreign_error_message() -> StringPtr {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"foreign".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 14] = [
+static SYMBOLS: &[zrtl::ZrtlSymbol] = &[
     zrtl::ZrtlSymbol::new(c"$Foreign$get".as_ptr(), foreign_get as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$set".as_ptr(), foreign_set as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$call".as_ptr(), foreign_call as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$invoke".as_ptr(), foreign_invoke as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$call0".as_ptr(), foreign_call_0 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$call1".as_ptr(), foreign_call_1 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$call2".as_ptr(), foreign_call_2 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$call3".as_ptr(), foreign_call_3 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$call4".as_ptr(), foreign_call_4 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$call5".as_ptr(), foreign_call_5 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$call6".as_ptr(), foreign_call_6 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$call7".as_ptr(), foreign_call_7 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$call8".as_ptr(), foreign_call_8 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$invoke0".as_ptr(), foreign_invoke_0 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$invoke1".as_ptr(), foreign_invoke_1 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$invoke2".as_ptr(), foreign_invoke_2 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$invoke3".as_ptr(), foreign_invoke_3 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$invoke4".as_ptr(), foreign_invoke_4 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$invoke5".as_ptr(), foreign_invoke_5 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$invoke6".as_ptr(), foreign_invoke_6 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$invoke7".as_ptr(), foreign_invoke_7 as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Foreign$invoke8".as_ptr(), foreign_invoke_8 as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$get_float".as_ptr(),
+        foreign_get_float as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$set_float".as_ptr(),
+        foreign_set_float as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$call_float0".as_ptr(),
+        foreign_call_float_0 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$call_float1".as_ptr(),
+        foreign_call_float_1 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$call_float2".as_ptr(),
+        foreign_call_float_2 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$call_float3".as_ptr(),
+        foreign_call_float_3 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$call_float4".as_ptr(),
+        foreign_call_float_4 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$call_float5".as_ptr(),
+        foreign_call_float_5 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$call_float6".as_ptr(),
+        foreign_call_float_6 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$call_float7".as_ptr(),
+        foreign_call_float_7 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$call_float8".as_ptr(),
+        foreign_call_float_8 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float0".as_ptr(),
+        foreign_invoke_float_0 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float1".as_ptr(),
+        foreign_invoke_float_1 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float2".as_ptr(),
+        foreign_invoke_float_2 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float3".as_ptr(),
+        foreign_invoke_float_3 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float4".as_ptr(),
+        foreign_invoke_float_4 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float5".as_ptr(),
+        foreign_invoke_float_5 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float6".as_ptr(),
+        foreign_invoke_float_6 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float7".as_ptr(),
+        foreign_invoke_float_7 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float8".as_ptr(),
+        foreign_invoke_float_8 as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(c"$Foreign$str".as_ptr(), foreign_str as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$type".as_ptr(), foreign_type as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$eq".as_ptr(), foreign_eq as *const u8),
@@ -455,6 +731,6 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 14] = [
 pub fn static_plugin() -> zrtl::StaticPlugin {
     zrtl::StaticPlugin {
         info: &INFO,
-        symbols: &SYMBOLS,
+        symbols: SYMBOLS,
     }
 }

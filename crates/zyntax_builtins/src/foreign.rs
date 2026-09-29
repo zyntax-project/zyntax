@@ -31,6 +31,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let name = local("name", string());
     let args = borrowed("args", anys.clone());
     let r = local("r", any());
+    let rf = local("rf", f64());
     let kind = local("kind", string());
     // The error the embedder reported, raised as the library's own.
     let raise_reported = || {
@@ -48,7 +49,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     };
     let data = || fld(args.e(), "data", i64());
     let len = || fld(args.e(), "len", i64());
-    vec![
+    let mut declarations = vec![
         extern_fn(
             "zb_foreign_get_raw",
             &[("x", any()), ("name", string())],
@@ -60,6 +61,18 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             &[("x", any()), ("name", string()), ("v", any())],
             unit(),
             Some("$Foreign$set"),
+        ),
+        extern_fn(
+            "zb_foreign_get_float_raw",
+            &[("x", any()), ("name", string())],
+            f64(),
+            Some("$Foreign$get_float"),
+        ),
+        extern_fn(
+            "zb_foreign_set_float_raw",
+            &[("x", any()), ("name", string()), ("v", f64())],
+            unit(),
+            Some("$Foreign$set_float"),
         ),
         extern_fn(
             "zb_foreign_call_raw",
@@ -176,6 +189,34 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 ret_void(),
             ],
         ),
+        define(
+            "zb_foreign_get_float",
+            &[&x, &name],
+            f64(),
+            vec![
+                rf.decl(call(
+                    "zb_foreign_get_float_raw",
+                    vec![x.e(), name.e()],
+                    f64(),
+                )),
+                raise_reported(),
+                ret(rf.e()),
+            ],
+        ),
+        define(
+            "zb_foreign_set_float",
+            &[&x, &name, &rf],
+            unit(),
+            vec![
+                expr(call(
+                    "zb_foreign_set_float_raw",
+                    vec![x.e(), name.e(), rf.e()],
+                    unit(),
+                )),
+                raise_reported(),
+                ret_void(),
+            ],
+        ),
         // What the embedder gave: several values given at once as the
         // program's tuple of them, anything else as it is.
         define(
@@ -270,5 +311,124 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 int32(0),
             ))],
         ),
-    ]
+    ];
+
+    // Calls whose arity is known use fixed parameters all the way into the
+    // embedder. Dynamic and variadic callers keep the list-based entries.
+    for arity in 0..=crate::functions::MAX_CALL_ARITY {
+        let call_raw = format!("zb_foreign_call_fixed_raw_{arity}");
+        let invoke_raw = format!("zb_foreign_invoke_fixed_raw_{arity}");
+        let call_name = format!("zb_foreign_call_{arity}");
+        let invoke_name = format!("zb_foreign_invoke_{arity}");
+        let call_symbol = format!("$Foreign$call{arity}");
+        let invoke_symbol = format!("$Foreign$invoke{arity}");
+        let fixed_names: Vec<&'static str> = (0..arity)
+            .map(|i| Box::leak(format!("a{i}").into_boxed_str()) as &'static str)
+            .collect();
+        let fixed: Vec<Local> = fixed_names.iter().map(|name| local(name, any())).collect();
+
+        let mut call_extern_params = vec![("x", any())];
+        call_extern_params.extend(fixed_names.iter().map(|name| (*name, any())));
+        declarations.push(extern_fn(
+            &call_raw,
+            &call_extern_params,
+            any(),
+            Some(&call_symbol),
+        ));
+        let mut invoke_extern_params = vec![("x", any()), ("name", string())];
+        invoke_extern_params.extend(fixed_names.iter().map(|name| (*name, any())));
+        declarations.push(extern_fn(
+            &invoke_raw,
+            &invoke_extern_params,
+            any(),
+            Some(&invoke_symbol),
+        ));
+
+        let mut call_params: Vec<&Local> = vec![&x];
+        call_params.extend(&fixed);
+        let mut call_args = vec![x.e()];
+        call_args.extend(fixed.iter().map(Local::e));
+        declarations.push(define(
+            &call_name,
+            &call_params,
+            any(),
+            vec![
+                r.decl(call(&call_raw, call_args, any())),
+                raise_reported(),
+                ret(call("zb_foreign_values", vec![r.e()], any())),
+            ],
+        ));
+
+        let mut invoke_params: Vec<&Local> = vec![&x, &name];
+        invoke_params.extend(&fixed);
+        let mut invoke_args = vec![x.e(), name.e()];
+        invoke_args.extend(fixed.iter().map(Local::e));
+        declarations.push(define(
+            &invoke_name,
+            &invoke_params,
+            any(),
+            vec![
+                r.decl(call(&invoke_raw, invoke_args, any())),
+                raise_reported(),
+                ret(call("zb_foreign_values", vec![r.e()], any())),
+            ],
+        ));
+
+        let call_float_raw = format!("zb_foreign_call_float_raw_{arity}");
+        let invoke_float_raw = format!("zb_foreign_invoke_float_raw_{arity}");
+        let call_float_name = format!("zb_foreign_call_float_{arity}");
+        let invoke_float_name = format!("zb_foreign_invoke_float_{arity}");
+        let call_float_symbol = format!("$Foreign$call_float{arity}");
+        let invoke_float_symbol = format!("$Foreign$invoke_float{arity}");
+        let floats: Vec<Local> = fixed_names.iter().map(|name| local(name, f64())).collect();
+
+        let mut call_float_extern_params = vec![("x", any())];
+        call_float_extern_params.extend(fixed_names.iter().map(|name| (*name, f64())));
+        declarations.push(extern_fn(
+            &call_float_raw,
+            &call_float_extern_params,
+            f64(),
+            Some(&call_float_symbol),
+        ));
+        let mut invoke_float_extern_params = vec![("x", any()), ("name", string())];
+        invoke_float_extern_params.extend(fixed_names.iter().map(|name| (*name, f64())));
+        declarations.push(extern_fn(
+            &invoke_float_raw,
+            &invoke_float_extern_params,
+            f64(),
+            Some(&invoke_float_symbol),
+        ));
+
+        let mut call_float_params: Vec<&Local> = vec![&x];
+        call_float_params.extend(&floats);
+        let mut call_float_args = vec![x.e()];
+        call_float_args.extend(floats.iter().map(Local::e));
+        declarations.push(define(
+            &call_float_name,
+            &call_float_params,
+            f64(),
+            vec![
+                rf.decl(call(&call_float_raw, call_float_args, f64())),
+                raise_reported(),
+                ret(rf.e()),
+            ],
+        ));
+
+        let mut invoke_float_params: Vec<&Local> = vec![&x, &name];
+        invoke_float_params.extend(&floats);
+        let mut invoke_float_args = vec![x.e(), name.e()];
+        invoke_float_args.extend(floats.iter().map(Local::e));
+        declarations.push(define(
+            &invoke_float_name,
+            &invoke_float_params,
+            f64(),
+            vec![
+                rf.decl(call(&invoke_float_raw, invoke_float_args, f64())),
+                raise_reported(),
+                ret(rf.e()),
+            ],
+        ));
+    }
+
+    declarations
 }

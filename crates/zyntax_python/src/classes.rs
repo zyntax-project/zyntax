@@ -1220,19 +1220,19 @@ fn dynamic_call(module: &Module, method: &str, arity: usize, span: Span) -> Type
         span,
     );
     statements.extend(builtin_arms(module, method, arity, x.clone(), span));
-    let args = (0..arity)
+    let args: Vec<Node> = (0..arity)
         .map(|i| var(intern(&format!("a{i}")), Ty::Object, span))
         .collect();
     statements.push(when(
         is_foreign(x.clone(), span),
         vec![ret(
             call(
-                "zb_foreign_invoke",
-                vec![
-                    x.clone(),
-                    str_lit(method, span),
-                    node(TypedExpression::Array(args), Ty::List(Elem::Object), span),
-                ],
+                &format!("zb_foreign_invoke_{arity}"),
+                {
+                    let mut passed = vec![x.clone(), str_lit(method, span)];
+                    passed.extend(args);
+                    passed
+                },
                 Ty::Object,
                 span,
             ),

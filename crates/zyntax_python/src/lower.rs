@@ -12945,6 +12945,17 @@ impl<'m> Lowerer<'m> {
 
     fn host_attribute(&mut self, object: Val, attr: &str, ty: Ty, span: Span) -> Result<Val> {
         self.module.attr_reads.borrow_mut().insert(attr.to_string());
+        if ty == Ty::Float {
+            return Ok(Val {
+                node: call(
+                    "zb_foreign_get_float",
+                    vec![self.coerce(object, Ty::Object), str_lit(attr, span)],
+                    Ty::Float,
+                    span,
+                ),
+                ty,
+            });
+        }
         let dynamic = Val {
             node: call(
                 &getattr_name(attr),
@@ -13260,6 +13271,14 @@ impl<'m> Lowerer<'m> {
                     .borrow_mut()
                     .insert(attr.to_string());
                 let value = self.coerce(value, ty);
+                if ty == Ty::Float {
+                    return Ok(call(
+                        "zb_foreign_set_float",
+                        vec![self.coerce(object, Ty::Object), str_lit(attr, span), value],
+                        Ty::None,
+                        span,
+                    ));
+                }
                 let value = self.coerce(Val { node: value, ty }, Ty::Object);
                 Ok(call(
                     &setattr_name(attr),
@@ -13759,6 +13778,41 @@ impl<'m> Lowerer<'m> {
         ty: Ty,
         span: Span,
     ) -> Result<Val> {
+        if ty == Ty::Float
+            && signature.ret == crate::HostType::Float
+            && signature
+                .params
+                .iter()
+                .all(|ty| *ty == crate::HostType::Float)
+        {
+            if !keywords.is_empty() {
+                return unsupported("keyword arguments in a host call", at);
+            }
+            if args.len() != signature.params.len() {
+                return unsupported(
+                    format!(
+                        "{}() takes {} argument(s), got {}",
+                        signature.name,
+                        signature.params.len(),
+                        args.len()
+                    ),
+                    at,
+                );
+            }
+            let mut lowered = vec![self.coerce(callee, Ty::Object)];
+            for arg in args {
+                lowered.push(self.expr_as(arg, Ty::Float)?);
+            }
+            return Ok(Val {
+                node: call(
+                    &format!("zb_foreign_call_float_{}", args.len()),
+                    lowered,
+                    Ty::Float,
+                    span,
+                ),
+                ty,
+            });
+        }
         let mut lowered = vec![self.coerce(callee, Ty::Object)];
         lowered.extend(self.host_arguments(signature, args, keywords, at)?);
         let dynamic = Val {
@@ -13787,6 +13841,44 @@ impl<'m> Lowerer<'m> {
         ty: Ty,
         span: Span,
     ) -> Result<Val> {
+        if ty == Ty::Float
+            && signature.ret == crate::HostType::Float
+            && signature
+                .params
+                .iter()
+                .all(|ty| *ty == crate::HostType::Float)
+        {
+            if !keywords.is_empty() {
+                return unsupported("keyword arguments in a host call", at);
+            }
+            if args.len() != signature.params.len() {
+                return unsupported(
+                    format!(
+                        "{}() takes {} argument(s), got {}",
+                        signature.name,
+                        signature.params.len(),
+                        args.len()
+                    ),
+                    at,
+                );
+            }
+            let mut lowered = vec![
+                self.coerce(receiver, Ty::Object),
+                str_lit(&signature.name, span),
+            ];
+            for arg in args {
+                lowered.push(self.expr_as(arg, Ty::Float)?);
+            }
+            return Ok(Val {
+                node: call(
+                    &format!("zb_foreign_invoke_float_{}", args.len()),
+                    lowered,
+                    Ty::Float,
+                    span,
+                ),
+                ty,
+            });
+        }
         let mut lowered = vec![self.coerce(receiver, Ty::Object)];
         lowered.extend(self.host_arguments(signature, args, keywords, at)?);
         self.module
