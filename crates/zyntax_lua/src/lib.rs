@@ -222,7 +222,7 @@ fn read_library() -> std::result::Result<Library, String> {
         other => other.to_string(),
     })?;
     let module = snapshot
-        .module(LIBRARY_MODULE)
+        .module_interface(LIBRARY_MODULE)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("the snapshot has no `{LIBRARY_MODULE}`"))?;
     let program = module.program();

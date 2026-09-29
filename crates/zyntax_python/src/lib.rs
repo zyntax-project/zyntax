@@ -270,7 +270,7 @@ fn library() -> Result<Library> {
     let snapshot = snapshot()?;
     let t1 = std::time::Instant::now();
     let module = snapshot
-        .module(LIBRARY_MODULE)
+        .module_interface(LIBRARY_MODULE)
         .map_err(|e| Error::Library(e.to_string()))?
         .ok_or_else(|| Error::Library(format!("the snapshot has no `{LIBRARY_MODULE}`")))?;
     let t2 = std::time::Instant::now();

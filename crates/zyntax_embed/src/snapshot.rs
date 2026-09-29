@@ -22,7 +22,7 @@ use std::sync::Arc;
 use zyntax_compiler::hir::HirModule;
 
 const MAGIC: &[u8; 5] = b"ZSNAP";
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 /// magic, schema, and the length of the directory that follows.
 const HEADER_LEN: usize = MAGIC.len() + 2 * std::mem::size_of::<u32>();
 
@@ -113,6 +113,9 @@ struct DirectoryEntry {
     max_type_id: u32,
     /// The encoded [`CompiledImport`].
     artifact: Extent,
+    /// The module without top-level function declarations, when each
+    /// function declaration is available separately in `signatures`.
+    interface: Option<Extent>,
     /// The module's source, when the language chose to carry it.
     source: Option<Extent>,
     /// The module lowered, when the build did that.
@@ -129,35 +132,48 @@ struct DirectoryEntry {
 /// reader decodes the index and the declarations it asks for.
 #[derive(Serialize, Deserialize, Default)]
 struct SignatureIndex {
-    /// Name and declaration extents, ordered by name.
-    entries: Vec<(Extent, Extent)>,
+    /// Name, declaration extent, and its position in the original
+    /// program, ordered by name and then position.
+    entries: Vec<(Extent, Extent, u32)>,
+    /// Original positions of the declarations retained in the compact
+    /// interface, in their encoded order.
+    non_functions: Vec<u32>,
 }
 
 /// Encode the function declarations of a program whose bodies were
-/// stripped, the first under each name.
+/// stripped, preserving declarations that share a name.
 fn signature_table(program: &zyntax_typed_ast::TypedProgram) -> Result<Vec<u8>, SnapshotError> {
     use zyntax_typed_ast::TypedDeclaration;
-    let mut named: Vec<(String, &zyntax_typed_ast::TypedFunction)> = Vec::new();
-    for decl in &program.declarations {
+    let mut named: Vec<(
+        String,
+        u32,
+        &zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>,
+    )> = Vec::new();
+    let mut non_functions = Vec::new();
+    for (position, decl) in program.declarations.iter().enumerate() {
         if let TypedDeclaration::Function(function) = &decl.node
             && let Some(name) = function.name.resolve_global()
         {
-            named.push((name, function));
+            named.push((name, position as u32, decl));
+        } else {
+            non_functions.push(position as u32);
         }
     }
-    named.sort_by(|a, b| a.0.cmp(&b.0));
-    named.dedup_by(|later, earlier| later.0 == earlier.0);
+    named.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
     let mut data = Vec::new();
-    let mut index = SignatureIndex::default();
-    for (name, function) in named {
+    let mut index = SignatureIndex {
+        entries: Vec::new(),
+        non_functions,
+    };
+    for (name, position, declaration) in named {
         let name_extent = Extent::of(name.as_bytes(), data.len());
         data.extend_from_slice(name.as_bytes());
         let encoded =
-            postcard::to_allocvec(function).map_err(|e| SnapshotError::Encode(e.to_string()))?;
+            postcard::to_allocvec(declaration).map_err(|e| SnapshotError::Encode(e.to_string()))?;
         let decl_extent = Extent::of(&encoded, data.len());
         data.extend_from_slice(&encoded);
-        index.entries.push((name_extent, decl_extent));
+        index.entries.push((name_extent, decl_extent, position));
     }
     let mut bytes =
         postcard::to_allocvec(&index).map_err(|e| SnapshotError::Encode(e.to_string()))?;
@@ -202,6 +218,16 @@ pub struct Snapshot {
     /// Each module, decoded when something first asks for it. A module
     /// nobody imports is never decoded.
     decoded: Vec<std::sync::OnceLock<Result<CompiledImport, String>>>,
+    /// Each lowered module's interface, decoded when a named import or
+    /// frontend asks for it.
+    interfaces: Vec<std::sync::OnceLock<Result<CompiledImport, String>>>,
+    /// Each lowered module's HIR directory, decoded independently of
+    /// its typed declarations.
+    decoded_hir: Vec<
+        std::sync::OnceLock<
+            Result<Option<std::sync::Arc<zyntax_compiler::bytecode::LazyModule>>, String>,
+        >,
+    >,
     /// Each module's signature index, and where the bytes it addresses
     /// start in its table, decoded when first asked for.
     signature_indexes: Vec<std::sync::OnceLock<Result<(SignatureIndex, usize), String>>>,
@@ -260,6 +286,16 @@ impl Snapshot {
             .iter()
             .map(|_| std::sync::OnceLock::new())
             .collect();
+        let interfaces = directory
+            .modules
+            .iter()
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
+        let decoded_hir = directory
+            .modules
+            .iter()
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
         let signature_indexes = directory
             .modules
             .iter()
@@ -272,6 +308,8 @@ impl Snapshot {
             grammar: directory.grammar,
             modules: directory.modules,
             decoded,
+            interfaces,
+            decoded_hir,
             signature_indexes,
         })
     }
@@ -332,6 +370,76 @@ impl Snapshot {
         self.module_selecting(name, None)
     }
 
+    /// A lowered module's types and non-function declarations. Function
+    /// declarations are available individually through [`Self::function_signature`].
+    /// Falls back to the whole module for snapshots without an interface.
+    pub fn module_interface(&self, name: &str) -> Result<Option<CompiledImport>, SnapshotError> {
+        let Some(index) = self.modules.iter().position(|m| m.name == name) else {
+            return Ok(None);
+        };
+        if self.modules[index].interface.is_none() {
+            return self.module(name);
+        }
+        self.interface_at(index).map(Some)
+    }
+
+    fn interface_at(&self, index: usize) -> Result<CompiledImport, SnapshotError> {
+        self.interfaces[index]
+            .get_or_init(|| {
+                let entry = &self.modules[index];
+                let extent = entry.interface.ok_or_else(|| {
+                    format!("module '{}' carries no compact interface", entry.name)
+                })?;
+                let bytes = extent
+                    .slice(self.blobs(), &entry.name)
+                    .map_err(|e| e.to_string())?;
+                let t0 = web_time::Instant::now();
+                let interface = CompiledImport::decode(bytes).map_err(|e| e.to_string())?;
+                if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
+                    eprintln!(
+                        "[SNAPSHOT] {}: interface {:.2} ms ({} bytes)",
+                        entry.name,
+                        t0.elapsed().as_secs_f64() * 1000.0,
+                        bytes.len(),
+                    );
+                }
+                Ok(interface)
+            })
+            .as_ref()
+            .cloned()
+            .map_err(|e| SnapshotError::Decode(e.clone()))
+    }
+
+    fn hir_at(
+        &self,
+        index: usize,
+    ) -> Result<Option<Arc<zyntax_compiler::bytecode::LazyModule>>, SnapshotError> {
+        self.decoded_hir[index]
+            .get_or_init(|| {
+                let entry = &self.modules[index];
+                let Some(lowered) = entry.lowered.as_ref().filter(|l| l.usable_here()) else {
+                    return Ok(None);
+                };
+                let t0 = web_time::Instant::now();
+                self.lazy_hir(lowered.hir, &entry.name)
+                    .map(|(hir, bytes)| {
+                        if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
+                            eprintln!(
+                                "[SNAPSHOT] {}: hir {:.2} ms ({} bytes)",
+                                entry.name,
+                                t0.elapsed().as_secs_f64() * 1000.0,
+                                bytes,
+                            );
+                        }
+                        Some(Arc::new(hir))
+                    })
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .cloned()
+            .map_err(|e| SnapshotError::Decode(e.clone()))
+    }
+
     /// [`Self::module`], keeping of its functions only those `named`
     /// names when that is given and the module arrives lowered.
     pub(crate) fn module_selecting(
@@ -342,6 +450,38 @@ impl Snapshot {
         let Some(index) = self.modules.iter().position(|m| m.name == name) else {
             return Ok(None);
         };
+        if let Some(named) = named
+            && self.modules[index].interface.is_some()
+            && let Some(hir) = self.hir_at(index)?
+        {
+            let mut program = self.interface_at(index)?.into_program();
+            let positions = self.non_function_positions_at(index)?;
+            if positions.len() != program.declarations.len() {
+                return Err(SnapshotError::Decode(format!(
+                    "module '{}' has {} compact declarations but {} declaration positions",
+                    name,
+                    program.declarations.len(),
+                    positions.len(),
+                )));
+            }
+            let mut declarations: Vec<_> = positions
+                .into_iter()
+                .zip(std::mem::take(&mut program.declarations))
+                .collect();
+            let mut names: Vec<String> = named.iter().filter_map(|n| n.resolve_global()).collect();
+            names.sort();
+            for name in names {
+                declarations.extend(self.declaration_signatures_at(index, &name)?);
+            }
+            declarations.sort_by_key(|(position, _)| *position);
+            program.declarations = declarations
+                .into_iter()
+                .map(|(_, declaration)| declaration)
+                .collect();
+            return Ok(Some(
+                CompiledImport::new(self.language.clone(), name.to_string(), program).with_hir(hir),
+            ));
+        }
         self.decoded[index]
             .get_or_init(|| {
                 let entry = &self.modules[index];
@@ -352,24 +492,20 @@ impl Snapshot {
                 let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
                 let t0 = web_time::Instant::now();
                 let import = CompiledImport::decode(bytes).map_err(|e| e.to_string())?;
-                let t1 = web_time::Instant::now();
-                let Some(lowered) = entry.lowered.as_ref().filter(|l| l.usable_here()) else {
-                    return Ok(import);
-                };
-                let (hir, hir_len) = self
-                    .lazy_hir(lowered.hir, &entry.name)
-                    .map_err(|e| e.to_string())?;
+                let elapsed = t0.elapsed();
+                let hir = self.hir_at(index).map_err(|e| e.to_string())?;
                 if trace {
                     eprintln!(
-                        "[SNAPSHOT] {}: program {:.2} ms ({} bytes), hir {:.2} ms ({} bytes)",
+                        "[SNAPSHOT] {}: program {:.2} ms ({} bytes)",
                         entry.name,
-                        (t1 - t0).as_secs_f64() * 1000.0,
+                        elapsed.as_secs_f64() * 1000.0,
                         bytes.len(),
-                        t1.elapsed().as_secs_f64() * 1000.0,
-                        hir_len
                     );
                 }
-                Ok(import.with_hir(Arc::new(hir)))
+                Ok(match hir {
+                    Some(hir) => import.with_hir(hir),
+                    None => import,
+                })
             })
             .as_ref()
             .map(|module| {
@@ -395,6 +531,21 @@ impl Snapshot {
         let Some(at) = self.modules.iter().position(|m| m.name == module) else {
             return Ok(None);
         };
+        self.declaration_signatures_at(at, name)
+            .map(|declarations| {
+                declarations
+                    .into_iter()
+                    .find_map(|(_, declaration)| match declaration.node {
+                        zyntax_typed_ast::TypedDeclaration::Function(function) => Some(function),
+                        _ => None,
+                    })
+            })
+    }
+
+    fn signature_index_at(
+        &self,
+        at: usize,
+    ) -> Result<Option<(&SignatureIndex, usize, &[u8])>, SnapshotError> {
         let entry = &self.modules[at];
         let Some(extent) = entry.signatures else {
             return Ok(None);
@@ -408,21 +559,48 @@ impl Snapshot {
             })
             .as_ref()
             .map_err(|e| SnapshotError::Decode(e.clone()))?;
-        let data = &table[*data_at..];
+        Ok(Some((index, *data_at, table)))
+    }
+
+    fn non_function_positions_at(&self, at: usize) -> Result<Vec<u32>, SnapshotError> {
+        Ok(self
+            .signature_index_at(at)?
+            .map(|(index, _, _)| index.non_functions.clone())
+            .unwrap_or_default())
+    }
+
+    fn declaration_signatures_at(
+        &self,
+        at: usize,
+        name: &str,
+    ) -> Result<
+        Vec<(
+            u32,
+            zyntax_typed_ast::TypedNode<zyntax_typed_ast::TypedDeclaration>,
+        )>,
+        SnapshotError,
+    > {
+        let entry = &self.modules[at];
+        let Some((index, data_at, table)) = self.signature_index_at(at)? else {
+            return Ok(Vec::new());
+        };
+        let data = &table[data_at..];
         let name_of = |extent: &Extent| extent.slice(data, &entry.name).unwrap_or_default();
         let first = index
             .entries
-            .partition_point(|(entry_name, _)| name_of(entry_name) < name.as_bytes());
-        let Some((entry_name, declaration)) = index.entries.get(first) else {
-            return Ok(None);
-        };
-        if name_of(entry_name) != name.as_bytes() {
-            return Ok(None);
+            .partition_point(|(entry_name, _, _)| name_of(entry_name) < name.as_bytes());
+        let mut declarations = Vec::new();
+        for (entry_name, declaration, position) in &index.entries[first..] {
+            if name_of(entry_name) != name.as_bytes() {
+                break;
+            }
+            let bytes = declaration.slice(data, &entry.name)?;
+            declarations.push((
+                *position,
+                postcard::from_bytes(bytes).map_err(|e| SnapshotError::Decode(e.to_string()))?,
+            ));
         }
-        let bytes = declaration.slice(data, &entry.name)?;
-        postcard::from_bytes(bytes)
-            .map(Some)
-            .map_err(|e| SnapshotError::Decode(e.to_string()))
+        Ok(declarations)
     }
 
     /// Whether a module's lowered form is carried and readable here.
@@ -487,6 +665,8 @@ struct PendingModule {
     name: String,
     max_type_id: u32,
     artifact: Vec<u8>,
+    /// The encoded module without top-level function declarations.
+    interface: Option<Vec<u8>>,
     source: Option<String>,
     /// The module's HIR, encoded, with what may read it.
     lowered: Option<(Vec<u8>, String, u8)>,
@@ -676,11 +856,21 @@ impl SnapshotBuilder {
     ) -> Result<Self, SnapshotError> {
         let name = name.into();
         let max_type_id = program.type_registry.max_type_id();
+        let interface = if lowered.is_some() {
+            let mut interface = program.clone();
+            interface.declarations.retain(|decl| {
+                !matches!(decl.node, zyntax_typed_ast::TypedDeclaration::Function(_))
+            });
+            Some(CompiledImport::new(self.language.clone(), name.clone(), interface).encode()?)
+        } else {
+            None
+        };
         let artifact = CompiledImport::new(self.language.clone(), name.clone(), program);
         self.modules.push(PendingModule {
             name,
             max_type_id,
             artifact: artifact.encode()?,
+            interface,
             source,
             lowered,
             signatures: None,
@@ -705,6 +895,10 @@ impl SnapshotBuilder {
         let mut entries = Vec::with_capacity(self.modules.len());
         for module in &self.modules {
             let artifact = put(&module.artifact, &mut blobs);
+            let interface = module
+                .interface
+                .as_ref()
+                .map(|bytes| put(bytes, &mut blobs));
             let source = module
                 .source
                 .as_ref()
@@ -725,6 +919,7 @@ impl SnapshotBuilder {
                 name: module.name.clone(),
                 max_type_id: module.max_type_id,
                 artifact,
+                interface,
                 source,
                 lowered,
                 signatures,
@@ -893,6 +1088,14 @@ mod tests {
             .expect("decodes")
             .expect("declared");
         assert!(!len.is_pure, "the first declaration under a name answers");
+        assert_eq!(
+            snapshot
+                .declaration_signatures_at(0, "len")
+                .expect("decodes all overloads")
+                .len(),
+            2,
+            "declarations that share a name are all retained"
+        );
         assert!(
             snapshot
                 .function_signature("lib", "missing")
@@ -904,6 +1107,80 @@ mod tests {
                 .function_signature("other", "abs")
                 .expect("decodes")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_named_lowered_import_does_not_decode_the_whole_program() {
+        use std::collections::HashSet;
+        use zyntax_typed_ast::{Span, Type, TypedDeclaration, TypedFunction, TypedNode};
+
+        let mut program = empty_program();
+        for name in ["keep", "drop"] {
+            program.declarations.push(TypedNode::new(
+                TypedDeclaration::Function(TypedFunction {
+                    name: zyntax_typed_ast::InternedString::new_global(name),
+                    return_type: Type::Unknown,
+                    body: Some(zyntax_typed_ast::TypedBlock {
+                        statements: Vec::new(),
+                        span: Span::default(),
+                    }),
+                    ..Default::default()
+                }),
+                Type::Unknown,
+                Span::default(),
+            ));
+            if name == "keep" {
+                program.declarations.push(TypedNode::new(
+                    TypedDeclaration::Variable(zyntax_typed_ast::TypedVariable {
+                        name: zyntax_typed_ast::InternedString::new_global("between"),
+                        ty: Type::Primitive(zyntax_typed_ast::PrimitiveType::I64),
+                        mutability: zyntax_typed_ast::Mutability::Immutable,
+                        initializer: None,
+                        visibility: zyntax_typed_ast::Visibility::Private,
+                    }),
+                    Type::Primitive(zyntax_typed_ast::PrimitiveType::I64),
+                    Span::default(),
+                ));
+            }
+        }
+        let mut expected_program = program.clone();
+        strip_bodies(&mut expected_program);
+        let mut arena = zyntax_typed_ast::AstArena::new();
+        let hir = HirModule::new(arena.intern_string("lib"));
+        let bytes = SnapshotBuilder::new("demo")
+            .module_lowered("lib", program, &hir)
+            .expect("module")
+            .encode()
+            .expect("encode");
+        let snapshot = Snapshot::load_owned(bytes).expect("load");
+
+        let named = HashSet::from([zyntax_typed_ast::InternedString::new_global("keep")]);
+        let selected = snapshot
+            .module_selecting("lib", Some(&named))
+            .expect("decodes")
+            .expect("present");
+        let expected = CompiledImport::new("demo", "lib", expected_program).selecting(&named);
+        assert_eq!(
+            selected.program().declarations,
+            expected.program().declarations,
+            "compact selection preserves complete nodes and declaration order"
+        );
+        let names: Vec<String> = selected
+            .program()
+            .declarations
+            .iter()
+            .filter_map(|decl| match &decl.node {
+                TypedDeclaration::Function(function) => function.name.resolve_global(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["keep"]);
+        assert!(selected.hir().is_some());
+        assert!(snapshot.interfaces[0].get().is_some());
+        assert!(
+            snapshot.decoded[0].get().is_none(),
+            "the complete typed program stays encoded"
         );
     }
 
