@@ -654,6 +654,12 @@ pub(crate) extern "C" fn host_io_write(h: i64, s: zrtl::StringConstPtr) -> i64 {
     }
 }
 
+/// Write to the standard output stream without constructing Lua's file
+/// wrapper. `print` always targets stdout, independently of `io.output`.
+pub(crate) extern "C" fn host_stdout_write(s: zrtl::StringConstPtr) -> i64 {
+    host_io_write(host_io_std(1), s)
+}
+
 /// The position after seeking, or -1 with the error noted. `whence`
 /// is 0 for the start, 1 for the current position, 2 for the end.
 pub(crate) extern "C" fn host_io_seek(h: i64, whence: i64, offset: i64) -> i64 {

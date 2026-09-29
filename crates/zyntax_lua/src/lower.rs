@@ -8094,6 +8094,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         {
             return Ok(m);
         }
+        if tail.is_none()
+            && let Some(m) = self.simple_string_format(b, &mut vals, &mut pre, span)
+        {
+            return Ok(m);
+        }
+        if tail.is_none()
+            && let Some(m) = self.typed_print(b, is_method, &mut vals, &mut pre, span)
+        {
+            return Ok(m);
+        }
         // `tostring` of a string or a number is its text, made as `..`
         // makes it.
         if b.lib.is_empty()
@@ -8558,6 +8568,111 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         };
         let node = block_value(std::mem::take(pre), v.node, span);
         Some(Multi::Fixed(vec![Val { node, ty }]))
+    }
+
+    /// A literal format with one unadorned conversion can use the
+    /// argument type directly instead of entering the variadic formatter.
+    fn simple_string_format(
+        &mut self,
+        b: &Builtin,
+        vals: &mut Vec<Val>,
+        pre: &mut Vec<St>,
+        span: Span,
+    ) -> Option<Multi> {
+        if b.lib != "string" || b.name != "format" || vals.len() != 2 {
+            return None;
+        }
+        let format = self.literal_key(&vals[0])?;
+        let conversion = format.find('%')?;
+        let specifier = format.as_bytes().get(conversion + 1).copied()?;
+        if format[conversion + 2..].contains('%') {
+            return None;
+        }
+        let arg = vals.pop().expect("the format argument");
+        let accepted = match specifier {
+            b'd' => arg.ty == Ty::Int,
+            b's' => matches!(arg.ty, Ty::Str | Ty::Int | Ty::Float | Ty::Number),
+            _ => false,
+        };
+        if !accepted {
+            vals.push(arg);
+            return None;
+        }
+        vals.clear();
+        let string_t = prim(PrimitiveType::String);
+        let prefix = str_lit(&format[..conversion], span);
+        let suffix = str_lit(&format[conversion + 2..], span);
+        let value = binary(
+            BinaryOp::Add,
+            binary(
+                BinaryOp::Add,
+                prefix,
+                self.text_of(arg),
+                string_t.clone(),
+                span,
+            ),
+            suffix,
+            string_t,
+            span,
+        );
+        Some(Multi::Fixed(vec![Val {
+            node: block_value(std::mem::take(pre), value, span),
+            ty: Ty::Str,
+        }]))
+    }
+
+    /// `print` can render statically known strings and numbers without
+    /// packaging a variadic list or consulting dynamic `tostring` rules.
+    fn typed_print(
+        &mut self,
+        b: &Builtin,
+        is_method: bool,
+        vals: &mut Vec<Val>,
+        pre: &mut Vec<St>,
+        span: Span,
+    ) -> Option<Multi> {
+        if !b.lib.is_empty()
+            || b.name != "print"
+            || vals
+                .iter()
+                .any(|v| !matches!(v.ty, Ty::Str | Ty::Int | Ty::Float | Ty::Number))
+        {
+            return None;
+        }
+        let string_t = prim(PrimitiveType::String);
+        let mut text = str_lit("", span);
+        for (i, value) in std::mem::take(vals).into_iter().enumerate() {
+            if i != 0 {
+                text = binary(
+                    BinaryOp::Add,
+                    text,
+                    str_lit("\t", span),
+                    string_t.clone(),
+                    span,
+                );
+            }
+            text = binary(
+                BinaryOp::Add,
+                text,
+                self.text_of(value),
+                string_t.clone(),
+                span,
+            );
+        }
+        text = binary(BinaryOp::Add, text, str_lit("\n", span), string_t, span);
+        let after = self.around_builtin(b, is_method, span, pre);
+        pre.push(expr_stmt(call(
+            "zl_stdout_write",
+            vec![text],
+            prim(PrimitiveType::I64),
+            span,
+        )));
+        pre.extend(after);
+        Some(Multi::None(block_value(
+            std::mem::take(pre),
+            nil(span),
+            span,
+        )))
     }
 
     /// An integral float as a number: the integer when it fits, else

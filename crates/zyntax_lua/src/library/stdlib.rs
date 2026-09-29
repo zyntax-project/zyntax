@@ -1151,6 +1151,13 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
     let what = kept("what", string());
     let mut d = Vec::new();
 
+    d.push(extern_fn(
+        "zl_stdout_write",
+        &[("s", string())],
+        i64(),
+        Some("$Lua$stdout_write"),
+    ));
+
     // ─── argument checks ────────────────────────────────────────
     // The message's start for the `i`th of a function's values, counted
     // from zero.
@@ -1368,11 +1375,8 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
             // Written as bytes through the standard stream, as `io.write`
             // writes: a string is whatever bytes it holds.
             expr(call(
-                "zl_io_write",
-                vec![
-                    call("zl_io_std", vec![int(1)], i64()),
-                    add(acc.e(), text("\n")),
-                ],
+                "zl_stdout_write",
+                vec![add(acc.e(), text("\n"))],
                 i64(),
             )),
             ret_void(),

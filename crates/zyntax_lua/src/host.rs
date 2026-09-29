@@ -2028,7 +2028,7 @@ fn table_error_text(err: *const DynamicBox) -> Result<Option<Vec<u8>>, String> {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 104] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 105] = [
     zrtl::ZrtlSymbol::new(c"$Lua$cpath".as_ptr(), host_cpath as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
@@ -2182,6 +2182,10 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 104] = [
         host_io::host_io_failed as *const u8,
     ),
     zrtl::ZrtlSymbol::new(c"$Lua$io_std".as_ptr(), host_io::host_io_std as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$stdout_write".as_ptr(),
+        host_io::host_stdout_write as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(c"$Lua$io_open".as_ptr(), host_io::host_io_open as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Lua$io_popen".as_ptr(),
