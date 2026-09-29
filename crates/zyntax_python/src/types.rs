@@ -3588,12 +3588,103 @@ fn spec_name(name: &str, n: usize) -> String {
     format!("{name}$s{n}")
 }
 
+/// Whether narrowing one list parameter to `element` preserves every
+/// write the body and the known functions it calls can make through it.
+/// Calls are followed against the same narrowed parameter type instead
+/// of their joined signature, which is exactly the body a per-signature
+/// instance will lower.
+fn list_parameter_accepts(
+    module: &Module,
+    items: &HashMap<&str, &Item<'_>>,
+    item: &Item<'_>,
+    sig: &Sig,
+    index: usize,
+    element: Elem,
+    visiting: &mut HashSet<(String, usize, Elem)>,
+) -> bool {
+    let key = (item.name.clone(), index, element);
+    if !visiting.insert(key.clone()) {
+        return true;
+    }
+    let file = module.file_of(item.module.as_deref());
+    let accepted = in_file(file, || {
+        let locals = infer_locals_open(module, sig, &item.def.body, &[], false);
+        let name = &sig.params[index].0;
+        let sites = list_sites(
+            module,
+            &item.def.body,
+            &locals.vars,
+            vec![name.clone()],
+            false,
+        );
+        let Some(site) = sites.get(name) else {
+            return false;
+        };
+        if site.kept || site.undecided || site.none {
+            return false;
+        }
+        let no_outer = HashMap::default();
+        let typer = Typer {
+            module,
+            vars: &locals.vars,
+            outer: &no_outer,
+            nonnone: None,
+            inferring: false,
+            none_params: None,
+        };
+        let fits = |ty: Ty| {
+            ty == Ty::Unknown
+                || match element {
+                    Elem::Array(code) => ty == code.item(),
+                    _ => Elem::of(ty) == element,
+                }
+        };
+        if !site.elements.iter().all(|value| fits(typer.expr(value)))
+            || !site
+                .sequences
+                .iter()
+                .all(|value| fits(typer.expr(value).element().unwrap_or(Ty::Object)))
+        {
+            return false;
+        }
+        site.passed_to.iter().all(|(callee, parameter)| {
+            let Some(callee_item) = items.get(callee.as_str()).copied() else {
+                return false;
+            };
+            let Some(mut callee_sig) = module.funcs.get(callee).cloned() else {
+                return false;
+            };
+            let Some((_, ty)) = callee_sig.params.get_mut(*parameter) else {
+                return false;
+            };
+            *ty = Ty::List(element);
+            list_parameter_accepts(
+                module,
+                items,
+                callee_item,
+                &callee_sig,
+                *parameter,
+                element,
+                visiting,
+            )
+        })
+    });
+    visiting.remove(&key);
+    accepted
+}
+
 /// `key` with each parameter it narrows from a dynamic one put back
 /// where the item's body would only box it: a parameter used beside
 /// dynamic operands more than once and never where its type is read
 /// costs a box at every such use in an instance, against one at the
 /// call to the item's own function.
-fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) -> Vec<Ty> {
+fn unboxed_key(
+    module: &Module,
+    items: &HashMap<&str, &Item<'_>>,
+    item: &Item<'_>,
+    sig: &Sig,
+    mut key: Vec<Ty>,
+) -> Vec<Ty> {
     use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
     struct Uses<'a> {
         typer: Typer<'a>,
@@ -3684,12 +3775,8 @@ fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) ->
         defaults: sig.defaults.clone(),
     };
     let file = module.file_of(item.module.as_deref());
-    let (counts, facts) = in_file(file, || {
+    let counts = in_file(file, || {
         let locals = infer_locals_open(module, &trial, &item.def.body, &[], false);
-        // What the body writes into a list parameter, typed against the
-        // instance's own parameters: a write of the list's own slices is
-        // of its kind.
-        let facts = list_param_facts(module, &item.def.body, &locals.vars, &trial.params);
         let mut uses = Uses {
             typer: Typer {
                 module,
@@ -3705,7 +3792,7 @@ fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) ->
                 .collect(),
         };
         uses.visit_body(&item.def.body);
-        (uses.counts, facts)
+        uses.counts
     });
     for i in narrowed {
         // A list the body may keep, or write another kind into, stays
@@ -3713,11 +3800,8 @@ fn unboxed_key(module: &Module, item: &Item<'_>, sig: &Sig, mut key: Vec<Ty>) ->
         if let Ty::List(e) = key[i]
             && e != Elem::Object
         {
-            let fits = match facts.get(i) {
-                Some(ListFact::Reads) => true,
-                Some(ListFact::Writes(t)) => *t == Ty::Unknown || Elem::of(*t) == e,
-                _ => false,
-            };
+            let fits =
+                list_parameter_accepts(module, items, item, &trial, i, e, &mut HashSet::default());
             if !fits {
                 key[i] = sig.params[i].1;
                 continue;
@@ -3866,7 +3950,7 @@ pub(crate) fn specialise(
             {
                 continue;
             }
-            let key = unboxed_key(module, by_name[name.as_str()], &sig, raw);
+            let key = unboxed_key(module, &by_name, by_name[name.as_str()], &sig, raw);
             if own(&key) {
                 declined.insert(raw_index);
                 continue;
@@ -5551,6 +5635,41 @@ pub(crate) fn list_sites<'ast>(
                                     }
                                     None => self.visit_expr(arg),
                                 }
+                            }
+                        }
+                        // A method on a receiver whose class is known
+                        // does with the list what that method's parameter
+                        // facts say. An overridden method is left opaque:
+                        // the runtime receiver may select any override.
+                        py::Expr::Attribute(a)
+                            if c.arguments.keywords.is_empty()
+                                && matches!(self.typer.expr(&a.value), Ty::Class(_)) =>
+                        {
+                            let Ty::Class(k) = self.typer.expr(&a.value) else {
+                                unreachable!()
+                            };
+                            let method = a.attr.as_str();
+                            let callee = self
+                                .module
+                                .overriders(k as usize, method)
+                                .is_empty()
+                                .then(|| self.module.method_sig(k as usize, method))
+                                .flatten()
+                                .map(|(_, name)| name);
+                            if let Some(callee) = callee {
+                                self.visit_expr(&a.value);
+                                for (i, arg) in args.iter().enumerate() {
+                                    match self.is_candidate(arg) {
+                                        Some(name) => {
+                                            self.site(&name)
+                                                .passed_to
+                                                .push((callee.clone(), i + 1));
+                                        }
+                                        None => self.visit_expr(arg),
+                                    }
+                                }
+                            } else {
+                                walk_expr(self, expr);
                             }
                         }
                         _ => walk_expr(self, expr),
