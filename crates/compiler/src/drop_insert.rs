@@ -973,13 +973,17 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
         // Replacing a loop-carried value ends the previous iteration's
         // claim even when the body never reads it. Treat each replacing
         // back edge as an implicit last use; otherwise `x = make()` in a
-        // loop retains every value except the final one. A transfer edge
-        // already gives liveness the path-specific end of the old claim;
-        // merging in the back edge would also release the transferred alias.
-        let implicit_uses: IdSet = if transfer_out.is_empty() {
-            bodies
-                .get(&block_id)
-                .into_iter()
+        // loop retains every value except the final one. A transfer inside
+        // this loop already gives liveness the path-specific end of the old
+        // claim; merging in the back edge would also release the transferred
+        // alias. Transfers after the loop do not replace that back-edge use.
+        let body = bodies.get(&block_id);
+        let transfers_inside_loop =
+            body.is_some_and(|body| transfer_out.iter().any(|transfer| body.contains(transfer)));
+        let implicit_uses: IdSet = if transfers_inside_loop {
+            IdSet::default()
+        } else {
+            body.into_iter()
                 .flat_map(|body| {
                     func.blocks[&block_id]
                         .phis
@@ -993,8 +997,6 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
                         })
                 })
                 .collect()
-        } else {
-            IdSet::default()
         };
         if let Some(points) = drop_points_transferring_with_uses(
             func,
