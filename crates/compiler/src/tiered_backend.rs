@@ -3948,7 +3948,7 @@ impl TieredBackend {
                     .map(|(bead, (id, _, _, module, _))| (*bead, (*id, Arc::clone(module))))
                     .collect();
                 let bodies = Arc::clone(&self.optimized_bodies);
-                Box::new(move |bead_id: u64, body: &Arc<HirFunction>| {
+                Arc::new(move |bead_id: u64, body: &Arc<HirFunction>| {
                     let Some((func_id, module_arc)) = modules.get(&bead_id) else {
                         return;
                     };
@@ -4685,7 +4685,7 @@ impl LateResumePoints {
 /// Run after the optimizing tier compiled a bead's body, from every path
 /// that installs one: the bead id and the body compiled.
 #[cfg(feature = "llvm-backend")]
-type OptimizingInstallHook = Box<dyn Fn(u64, &Arc<HirFunction>) + Send + Sync>;
+type OptimizingInstallHook = Arc<dyn Fn(u64, &Arc<HirFunction>) + Send + Sync>;
 
 #[cfg(feature = "llvm-backend")]
 fn optimizing_install_hook() -> &'static RwLock<Option<OptimizingInstallHook>> {
@@ -5251,7 +5251,8 @@ pub fn compile_at_tier(
                             }
                         }
                     }
-                    if let Some(hook) = optimizing_install_hook().read().unwrap().as_ref() {
+                    let hook = optimizing_install_hook().read().unwrap().clone();
+                    if let Some(hook) = hook {
                         hook(bead_id, func_arc);
                     }
                     p

@@ -2377,7 +2377,7 @@ pub const LAZY_COMPILE_SYMBOL: &str = "__zyntax_lazy_compile";
 
 /// Installed by the runtime: compile the function behind a bead now and
 /// hand back its entry, publishing it wherever the stub was.
-type LazyCompiler = Box<dyn Fn(u64) -> *const u8 + Send + Sync>;
+type LazyCompiler = Arc<dyn Fn(u64) -> *const u8 + Send + Sync>;
 
 fn lazy_compiler() -> &'static RwLock<Option<LazyCompiler>> {
     static R: OnceLock<RwLock<Option<LazyCompiler>>> = OnceLock::new();
@@ -2386,12 +2386,12 @@ fn lazy_compiler() -> &'static RwLock<Option<LazyCompiler>> {
 
 /// Register how a function left uncompiled is compiled on its first call.
 pub fn set_lazy_compiler(f: impl Fn(u64) -> *const u8 + Send + Sync + 'static) {
-    *lazy_compiler().write().unwrap() = Some(Box::new(f));
+    *lazy_compiler().write().unwrap() = Some(Arc::new(f));
 }
 
 /// Installed by the runtime: the body of the function behind a bead as
 /// every tier runs it, optimised now if it was not yet.
-type LazyOptimizer = Box<dyn Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync>;
+type LazyOptimizer = Arc<dyn Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync>;
 
 fn lazy_optimizer() -> &'static RwLock<Option<LazyOptimizer>> {
     static R: OnceLock<RwLock<Option<LazyOptimizer>>> = OnceLock::new();
@@ -2400,15 +2400,15 @@ fn lazy_optimizer() -> &'static RwLock<Option<LazyOptimizer>> {
 
 /// Register how a lazy function's body is optimised ahead of its run.
 pub fn set_lazy_optimizer(f: impl Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync + 'static) {
-    *lazy_optimizer().write().unwrap() = Some(Box::new(f));
+    *lazy_optimizer().write().unwrap() = Some(Arc::new(f));
 }
 
 /// The body every tier of the function behind `bead_id` runs, or
 /// `None` when the function is not one left for its call: the
 /// interpreter then runs the module's.
 pub fn lazy_optimized_body(bead_id: u64) -> Option<Arc<HirFunction>> {
-    let guard = lazy_optimizer().read().unwrap();
-    guard.as_ref().and_then(|f| f(bead_id))
+    let optimizer = lazy_optimizer().read().unwrap().clone();
+    optimizer.and_then(|f| f(bead_id))
 }
 
 /// The entry each bead's stub calls once its function is compiled,
@@ -2471,8 +2471,8 @@ pub fn try_lazy_compile(bead_id: u64) -> *const u8 {
     if entry != 0 {
         return entry as *const u8;
     }
-    let guard = lazy_compiler().read().unwrap();
-    match guard.as_ref() {
+    let compiler = lazy_compiler().read().unwrap().clone();
+    match compiler {
         Some(f) => f(bead_id),
         None => std::ptr::null(),
     }
@@ -2520,7 +2520,7 @@ impl Requester {
 
 /// Installed by the runtime to answer a request: resume points for an
 /// interpreted frame, a top-tier compile for either.
-type PromotionRequester = Box<dyn Fn(u64, Requester) -> bool + Send + Sync>;
+type PromotionRequester = Arc<dyn Fn(u64, Requester) -> bool + Send + Sync>;
 
 fn promotion_requester() -> &'static RwLock<Option<PromotionRequester>> {
     static R: OnceLock<RwLock<Option<PromotionRequester>>> = OnceLock::new();
@@ -2530,7 +2530,7 @@ fn promotion_requester() -> &'static RwLock<Option<PromotionRequester>> {
 /// Register how a promotion request is fulfilled. The runtime owns the
 /// policy: what to compile, and where the frame can go meanwhile.
 pub fn set_promotion_requester(f: impl Fn(u64, Requester) -> bool + Send + Sync + 'static) {
-    *promotion_requester().write().unwrap() = Some(Box::new(f));
+    *promotion_requester().write().unwrap() = Some(Arc::new(f));
 }
 
 /// Requests already made, so a function called repeatedly does not queue
@@ -2854,8 +2854,8 @@ pub fn frame_waiting(bead_id: u64) -> bool {
 /// a worker does with a request another thread queued. Returns whether
 /// it was fulfilled.
 pub fn run_promotion(bead_id: u64, from: Requester) -> bool {
-    let guard = promotion_requester().read().unwrap();
-    guard.as_ref().is_some_and(|f| f(bead_id, from))
+    let requester = promotion_requester().read().unwrap().clone();
+    requester.is_some_and(|f| f(bead_id, from))
 }
 
 fn request(bead_id: u64, from: Requester) {
@@ -2887,9 +2887,8 @@ fn request(bead_id: u64, from: Requester) {
     if osr_trace_enabled() {
         eprintln!("[osr] promotion requested for bead={bead_id} ({from:?})");
     }
-    let guard = promotion_requester().read().unwrap();
-    let submitted = guard.as_ref().is_some_and(|f| f(bead_id, from));
-    drop(guard);
+    let requester = promotion_requester().read().unwrap().clone();
+    let submitted = requester.is_some_and(|f| f(bead_id, from));
     if !submitted && first {
         requested().write().unwrap().remove(&key);
     }
