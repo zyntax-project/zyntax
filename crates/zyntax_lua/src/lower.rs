@@ -5835,29 +5835,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 &mut pre,
             )
             .node;
+        let arr = match arr {
+            Some(arr) => call("zl_arr_box", vec![arr], Type::Any, span),
+            // The shared empty one, made at state entry.
+            None => var(intern(library::ARR_EMPTY), Type::Any, span),
+        };
         let arr = self
             .hold(
                 Val {
-                    node: match arr {
-                        Some(arr) => call("zl_arr_box", vec![arr], Type::Any, span),
-                        // The shared empty one, made on the first table.
-                        None => {
-                            let shared = var(intern(library::ARR_EMPTY), Type::Any, span);
-                            if_value(
-                                binary(
-                                    BinaryOp::Ne,
-                                    shared.clone(),
-                                    nil(span),
-                                    prim(PrimitiveType::Bool),
-                                    span,
-                                ),
-                                shared,
-                                call("zl_arr_shared", vec![], Type::Any, span),
-                                Type::Any,
-                                span,
-                            )
-                        }
-                    },
+                    node: arr,
                     ty: Ty::Any,
                 },
                 &mut pre,
@@ -12762,6 +12748,7 @@ pub(crate) fn program(
         },
     ]);
     entry_body.extend(preloads);
+    entry_body.push(expr_stmt(call("zl_arr_shared", vec![], Type::Any, span)));
     if entry_kind == Entry::Program {
         entry_body.extend([
             expr_stmt(call(CHUNK_FN, vec![], prim(PrimitiveType::Unit), span)),

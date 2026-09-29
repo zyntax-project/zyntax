@@ -2657,7 +2657,7 @@ impl SsaBuilder {
                     } else {
                         self.convert_type(&effective_ty)
                     };
-                    self.var_types.insert(let_stmt.name, hir_type.clone());
+                    self.record_variable_type(let_stmt.name, hir_type.clone());
 
                     // For TypedAST type, use initializer's type if variable type is Any/Unknown
                     // This works around the issue where type inference doesn't update the AST
@@ -7939,6 +7939,45 @@ impl SsaBuilder {
                         incoming,
                     });
                 phi_val
+            }
+        }
+    }
+
+    /// Record a variable's concrete HIR type once its initializer has
+    /// been lowered. IDF placement runs before lowering and may already
+    /// have created loop phis with the I64 fallback for an unresolved
+    /// binding. Repair those phis now, before an expression consuming
+    /// one chooses representation-sensitive operations such as boxing.
+    fn record_variable_type(&mut self, var: InternedString, ty: HirType) {
+        self.var_types.insert(var, ty.clone());
+        if matches!(ty, HirType::I64) {
+            return;
+        }
+
+        let phis: Vec<(HirId, HirId)> = self
+            .incomplete_phis
+            .iter()
+            .filter_map(|(&(block, name), &result)| (name == var).then_some((block, result)))
+            .collect();
+        for (block, result) in phis {
+            let fallback = self
+                .function
+                .values
+                .get(&result)
+                .is_some_and(|value| matches!(value.ty, HirType::I64));
+            if !fallback {
+                continue;
+            }
+            if let Some(value) = self.function.values.get_mut(&result) {
+                value.ty = ty.clone();
+            }
+            if let Some(phi) = self
+                .function
+                .blocks
+                .get_mut(&block)
+                .and_then(|block| block.phis.iter_mut().find(|phi| phi.result == result))
+            {
+                phi.ty = ty.clone();
             }
         }
     }
