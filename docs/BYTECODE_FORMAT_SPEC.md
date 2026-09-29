@@ -1,8 +1,8 @@
 # Zyntax Bytecode Format Specification
 
-**Version**: 4.0
+**Version**: 5.0
 **Status**: Stable
-**Last Updated**: 2026-09-27
+**Last Updated**: 2026-09-30
 
 ---
 
@@ -27,7 +27,7 @@ on values.
 | CLI loader | `crates/zyntax_cli/src/formats/hir_bytecode.rs` |
 
 The payload layout is defined by the codec applied to the declarations in
-those files. Section 5 transcribes them for format 4.0; where the two
+those files. Section 5 transcribes them for format 5.0; where the two
 disagree, the source is authoritative.
 
 ### Where the format is used
@@ -60,7 +60,7 @@ All multi-byte fields are little-endian.
 | Offset | Size | Field | Written as | Checked on read |
 |--------|------|-------|------------|-----------------|
 | 0x00 | 4 | `magic` | u32 `0x5A424300`, bytes `00 43 42 5A` | must match |
-| 0x04 | 2 | `major_version` | u16 `4` | must equal 4 |
+| 0x04 | 2 | `major_version` | u16 `5` | must equal 5 |
 | 0x06 | 2 | `minor_version` | u16 `0` | not checked |
 | 0x08 | 1 | `format` | u8 payload encoding, section 3 | must be 0 to 3 |
 | 0x09 | 3 | padding | zero | not checked |
@@ -92,7 +92,7 @@ over bytes 44 to the end of the file. The header is not covered.
 
 1. The file is at least 44 bytes, else `InvalidFormat`.
 2. `magic` matches, else `InvalidFormat`.
-3. `major_version` is 4, else `VersionMismatch`. The minor version is not
+3. `major_version` is 5, else `VersionMismatch`. The minor version is not
    compared.
 4. The CRC-32 of bytes 44 to the end matches `checksum`, else
    `ChecksumMismatch`.
@@ -191,7 +191,7 @@ as in Postcard.
 An empty module with id 1 named `m`, in the Postcard encoding (58 bytes):
 
 ```
-0000  00 43 42 5a 04 00 00 00 00 00 00 00 00 00 00 00
+0000  00 43 42 5a 05 00 00 00 00 00 00 00 00 00 00 00
 0010  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 0020  0e 00 00 00 00 00 00 00 d2 2c df 27 01 01 6d 00
 0030  00 00 00 00 00 00 00 00 00 00
@@ -200,7 +200,7 @@ An empty module with id 1 named `m`, in the Postcard encoding (58 bytes):
 | Bytes | Meaning |
 |-------|---------|
 | `00 43 42 5a` | magic |
-| `04 00` `00 00` | version 4.0 |
+| `05 00` `00 00` | version 5.0 |
 | `00` `00 00 00` | format 0 (Postcard), padding |
 | `00 00 00 00` | flags |
 | `01 00 00 00` + 12 zero bytes | module_id: module id 1 |
@@ -229,7 +229,7 @@ An empty module with id 1 named `m`, in the Postcard encoding (58 bytes):
 
 ## 5. Payload Data Model
 
-This is the format 4.0 schema. Types are written in Rust notation; every
+This is the format 5.0 schema. Types are written in Rust notation; every
 struct field is present, in the order shown. A `Box<T>` in the source is
 shown as `T`, which encodes identically.
 
@@ -660,7 +660,7 @@ it has no body), keyed by the entry's id.
 2. Encode it with the chosen codec (section 3). For Split, lay out the blob
    and directory as in section 6.1.
 3. Compute the CRC-32 of the encoded payload.
-4. Write the 44-byte header (section 2) with version 4.0, the format byte,
+4. Write the 44-byte header (section 2) with version 5.0, the format byte,
    flags 0, the module id, the payload length and the checksum; then the
    payload; then nothing else.
 
@@ -699,3 +699,4 @@ recorded by a different build or for a different width.
 | 2.0 | 2026-09-14 | Format 3 (Split) added: a stripped module with each function body encoded separately; version unchanged. |
 | 3.0 | 2026-09-24 | Split payload becomes a function directory with per-function name, shell and body extents into one blob, plus `by_id`, `by_name` and `blob_len`. |
 | 4.0 | 2026-09-27 | HIR error-flag facts and exact struct types: `HirGlobal.error_flag`, `FunctionAttributes.sets_error_flag`, `nothrow` and `queries_error_flag`, `HirModule.exact_struct_types`. |
+| 5.0 | 2026-09-29 | Split function-directory entries record direct callees so reachability can be followed without decoding function bodies. |
