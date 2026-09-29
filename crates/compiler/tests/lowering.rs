@@ -130,6 +130,7 @@ fn lower(closed: bool, entry: &str) -> HirModule {
         Arc::new(TypeRegistry::new()),
         Arc::new(Mutex::new(arena)),
         LoweringConfig {
+            defer_prelowered_bodies: false,
             entry_names: vec![entry.to_string()],
             closed,
             ..LoweringConfig::default()

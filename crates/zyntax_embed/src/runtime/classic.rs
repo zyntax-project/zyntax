@@ -729,6 +729,7 @@ impl ZyntaxRuntime {
 
         // Create LoweringConfig with builtins for extern call resolution
         let lowering_config = LoweringConfig {
+            defer_prelowered_bodies: false,
             builtins,
             use_krio_async: cfg!(feature = "krio-async-backend"),
             // Where a program can begin, so lowering can skip the

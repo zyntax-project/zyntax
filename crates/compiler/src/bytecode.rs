@@ -194,7 +194,7 @@ struct Extent {
 }
 
 /// One function of a [`Format::Split`] image.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 struct FnEntry {
     id: crate::hir::HirId,
     /// The function's name, UTF-8.
@@ -204,6 +204,9 @@ struct FnEntry {
     shell: Extent,
     /// The whole function; absent for an external one.
     body: Option<Extent>,
+    /// Functions this body names directly. Kept in the directory so a
+    /// linker can follow reachability without decoding the body.
+    callees: Vec<crate::hir::HirId>,
 }
 
 /// The wire shape of [`Format::Split`]: this, then `blob_len` bytes
@@ -388,6 +391,15 @@ impl LazyModule {
         self.function_at(self.position(id)?)
     }
 
+    /// Functions `id` names directly, without decoding its body when
+    /// this module came from a split image.
+    pub fn direct_callees(&self, id: crate::hir::HirId) -> Option<Vec<crate::hir::HirId>> {
+        if self.in_memory {
+            return self.shell().functions.get(&id).map(function_callees);
+        }
+        Some(self.directory.get(self.position(id)?)?.callees.clone())
+    }
+
     /// Every function, decoded, in the module's order.
     pub fn functions(&self) -> Box<dyn Iterator<Item = (crate::hir::HirId, HirFunction)> + '_> {
         if self.in_memory {
@@ -420,6 +432,34 @@ impl LazyModule {
         }
         module
     }
+}
+
+fn function_callees(function: &HirFunction) -> Vec<crate::hir::HirId> {
+    use crate::hir::{HirCallable, HirInstruction, HirTerminator};
+
+    let mut callees = Vec::new();
+    for block in function.blocks.values() {
+        for instruction in &block.instructions {
+            match instruction {
+                HirInstruction::Call {
+                    callee: HirCallable::Function(id) | HirCallable::FuncRef(id),
+                    ..
+                } => callees.push(*id),
+                HirInstruction::CreateClosure { function, .. } => callees.push(*function),
+                _ => {}
+            }
+        }
+        if let HirTerminator::Invoke {
+            callee: HirCallable::Function(id) | HirCallable::FuncRef(id),
+            ..
+        } = &block.terminator
+        {
+            callees.push(*id);
+        }
+    }
+    callees.sort_unstable_by_key(|id| id.as_u32());
+    callees.dedup();
+    callees
 }
 
 /// Serialize a module as [`Format::Split`].
@@ -465,6 +505,7 @@ pub fn serialize_module_split(module: &HirModule) -> Result<Vec<u8>> {
             name: name_extent,
             shell,
             body,
+            callees: function_callees(function),
         });
     }
     let positions = 0..directory.len() as u32;
@@ -568,7 +609,7 @@ impl BytecodeHeader {
     // Moves with any change to a payload's layout, so a payload in an
     // older layout is refused with VersionMismatch and a cache loader
     // recompiles rather than misreading it.
-    const CURRENT_MAJOR: u16 = 4;
+    const CURRENT_MAJOR: u16 = 5;
     const CURRENT_MINOR: u16 = 0;
 
     /// Create a new header for the given module and format
@@ -1102,6 +1143,32 @@ mod tests {
             );
             module.functions.insert(func.id, func);
         }
+        let zeta = module
+            .functions
+            .iter()
+            .find(|(_, function)| name_of(function) == "zeta")
+            .map(|(id, _)| *id)
+            .unwrap();
+        let alpha = module
+            .functions
+            .iter()
+            .find(|(_, function)| name_of(function) == "alpha")
+            .map(|(id, _)| *id)
+            .unwrap();
+        let entry = module.functions[&zeta].entry_block;
+        module.functions[&zeta]
+            .blocks
+            .get_mut(&entry)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Call {
+                result: None,
+                callee: HirCallable::Function(alpha),
+                args: Vec::new(),
+                type_args: Vec::new(),
+                const_args: Vec::new(),
+                is_tail: false,
+            });
         let mut external = HirFunction::new(arena.intern_string("puts"), empty_signature());
         external.is_external = true;
         external.blocks.clear();
@@ -1139,6 +1206,9 @@ mod tests {
             "a shell has no body"
         );
         assert!(lazy.by_name("beta").is_none());
+
+        let zeta = lazy.by_name("zeta").expect("the caller");
+        assert_eq!(lazy.direct_callees(zeta.id), Some(vec![alpha.id]));
 
         let id = alpha.id;
         assert!(lazy.has_function(id));

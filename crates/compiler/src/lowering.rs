@@ -265,6 +265,10 @@ pub struct LoweringContext {
     /// Functions adopted so far, and the time spent decoding them, for
     /// the phase trace; the clock is read only when the trace is on.
     adopted: (usize, f64),
+    /// Bodies kept in their split images while only their shells are in
+    /// the lowered module.
+    deferred_prelowered:
+        std::collections::HashMap<crate::hir::HirId, Arc<crate::bytecode::LazyModule>>,
     trace_phases: bool,
     /// Functions dropped because their body failed analysis, keyed by
     /// the id a call site still carries, with the name and what the
@@ -445,6 +449,9 @@ pub struct LoweringConfig {
     /// is linked to it instead of being lowered, and the modules' contents
     /// join the program's module.
     pub prelowered: Vec<Arc<crate::bytecode::LazyModule>>,
+    /// Keep reached prelowered functions as shells and return their split
+    /// images as body sources for a lazy runtime.
+    pub defer_prelowered_bodies: bool,
     /// Functions and globals of the prelowered modules that are already
     /// installed where this module is going: calls and reads reach them
     /// there, and they are not brought into this module again.
@@ -486,6 +493,7 @@ impl Default for LoweringConfig {
             entry_names: Vec::new(),
             closed: false,
             prelowered: Vec::new(),
+            defer_prelowered_bodies: false,
             linked: Arc::default(),
             use_krio_async: false,
             error_flag_global: None,
@@ -599,6 +607,7 @@ impl LoweringContext {
             },
             adopt_followed: std::collections::HashSet::new(),
             adopted: (0, 0.0),
+            deferred_prelowered: std::collections::HashMap::new(),
             trace_phases: std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some(),
             dropped_for: std::collections::HashMap::new(),
             type_registry,
@@ -784,6 +793,26 @@ impl LoweringContext {
     /// a host may call any of them.
     fn adopt_all_prelowered(&mut self) {
         for prelowered in &self.config.prelowered {
+            if self.config.defer_prelowered_bodies {
+                let mut functions = Vec::new();
+                prelowered.for_each_function(|_, id, has_body| {
+                    functions.push((id, has_body));
+                });
+                for (id, has_body) in functions {
+                    if self.config.linked.contains(&id) {
+                        continue;
+                    }
+                    let Some(mut function) = prelowered.signature(id).cloned() else {
+                        continue;
+                    };
+                    function.attributes.deferred |= has_body;
+                    self.module.functions.insert(id, function);
+                    if has_body {
+                        self.deferred_prelowered.insert(id, Arc::clone(prelowered));
+                    }
+                }
+                continue;
+            }
             for (id, function) in prelowered.functions() {
                 if !self.config.linked.contains(&id) {
                     self.module.functions.insert(id, function);
@@ -853,14 +882,29 @@ impl LoweringContext {
                 continue;
             };
             let decoding = self.trace_phases.then(web_time::Instant::now);
-            let Some(function) = self.config.prelowered[m].function(target) else {
-                continue;
+            let source = Arc::clone(&self.config.prelowered[m]);
+            let (function, targets) = if self.config.defer_prelowered_bodies {
+                let Some(mut function) = source.signature(target).cloned() else {
+                    continue;
+                };
+                if !function.is_external {
+                    function.attributes.deferred = true;
+                    self.deferred_prelowered.insert(target, Arc::clone(&source));
+                }
+                let targets = source.direct_callees(target).unwrap_or_default();
+                (function, targets)
+            } else {
+                let Some(function) = source.function(target) else {
+                    continue;
+                };
+                let targets = targets_of(&function);
+                (function, targets)
             };
             self.adopted.0 += 1;
             if let Some(decoding) = decoding {
                 self.adopted.1 += decoding.elapsed().as_secs_f64() * 1000.0;
             }
-            pending.extend(targets_of(&function));
+            pending.extend(targets);
             self.adopt_followed.insert(target);
             self.module.functions.insert(target, function);
             adopted = true;
@@ -889,6 +933,14 @@ impl LoweringContext {
                 .filter_map(|f| f.name.resolve_global())
                 .collect(),
         )
+    }
+
+    /// Split images that still hold the bodies represented by shells in
+    /// the lowered module.
+    pub fn deferred_prelowered(
+        &self,
+    ) -> std::collections::HashMap<crate::hir::HirId, Arc<crate::bytecode::LazyModule>> {
+        self.deferred_prelowered.clone()
     }
 
     /// Display all collected lowering diagnostics using the proper formatter.
@@ -1121,6 +1173,9 @@ impl AstLowering for LoweringContext {
 
         // The module leaves the context rather than being copied out;
         // what is still asked of the context afterwards is kept.
+        if self.config.closed {
+            self.entered_names = Some(self.config.entry_names.clone());
+        }
         self.entered_names = self.entered_functions();
         let name = self.module.name;
         Ok(std::mem::replace(&mut self.module, HirModule::new(name)))
@@ -3010,7 +3065,9 @@ impl LoweringContext {
             // settle it. Build the rest and stop assuming.
             self.wanted = None;
             self.deferred_own.clear();
-            self.adopt_all_prelowered();
+            if !self.config.defer_prelowered_bodies {
+                self.adopt_all_prelowered();
+            }
             let mut rest: Vec<usize> = self.skipped_at.values().copied().collect();
             rest.sort_unstable();
             rest.dedup();
@@ -3029,6 +3086,14 @@ impl LoweringContext {
             for index in rest {
                 self.current_decl = index;
                 self.lower_declaration(&program.declarations[index])?;
+            }
+            // Split snapshots keep enough directory metadata to follow
+            // every direct call, closure and dispatch-table entry without
+            // decoding unrelated functions. The conservative fallback
+            // still builds every remaining program declaration, then adopts
+            // only the snapshot closure those bodies actually expose.
+            if self.config.defer_prelowered_bodies {
+                while self.adopt_prelowered_reached() {}
             }
             // Everything that could be built has been. A call still
             // landing nowhere reaches a function with no body, which

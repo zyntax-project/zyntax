@@ -36,6 +36,9 @@ pub(crate) struct Inputs<'a> {
     pub closed: bool,
     /// Modules already lowered, beyond what the program's imports bring.
     pub prelowered: Vec<Arc<zyntax_compiler::bytecode::LazyModule>>,
+    /// Keep reached snapshot bodies encoded for TieredRuntime's lazy
+    /// interpreter and compiler path.
+    pub defer_prelowered_bodies: bool,
     /// Functions and globals of lowered imports already installed where
     /// the program is going, which it links rather than brings.
     pub linked: Arc<std::collections::HashSet<zyntax_compiler::hir::HirId>>,
@@ -56,6 +59,10 @@ pub(crate) struct Lowered {
     /// The functions the program can be entered through, when it named
     /// an entry point; `None` when a host may call anything.
     pub entered: Option<Vec<String>>,
+    pub deferred_prelowered: std::collections::HashMap<
+        zyntax_compiler::hir::HirId,
+        Arc<zyntax_compiler::bytecode::LazyModule>,
+    >,
 }
 
 /// Lower a typed program: resolve its imports, register what it
@@ -196,6 +203,7 @@ pub(crate) fn lower_typed_program(
         entry_names: inputs.entry_names,
         closed: inputs.closed,
         prelowered,
+        defer_prelowered_bodies: inputs.defer_prelowered_bodies,
         linked: inputs.linked,
         error_flag_global: inputs.error_flag_global,
         exact_struct_types,
@@ -229,6 +237,7 @@ pub(crate) fn lower_typed_program(
     Ok(Lowered {
         module,
         entered: lowering_ctx.entered_functions(),
+        deferred_prelowered: lowering_ctx.deferred_prelowered(),
     })
 }
 

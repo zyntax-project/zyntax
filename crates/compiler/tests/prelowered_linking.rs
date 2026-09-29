@@ -3,7 +3,9 @@
 //! for them, and a call reaches the body the module brought.
 
 use std::sync::{Arc, Mutex};
-use zyntax_compiler::bytecode::{Format, deserialize_module, serialize_module};
+use zyntax_compiler::bytecode::{
+    Format, deserialize_module, deserialize_module_lazy, serialize_module,
+};
 use zyntax_compiler::hir::{HirCallable, HirInstruction, HirModule};
 use zyntax_compiler::lowering::{AstLowering, LoweringConfig, LoweringContext};
 use zyntax_typed_ast::{
@@ -154,6 +156,7 @@ fn a_declaration_links_to_the_prelowered_body() {
 
     let mut program = client();
     let config = LoweringConfig {
+        defer_prelowered_bodies: false,
         prelowered: vec![Arc::clone(&lib)],
         ..LoweringConfig::default()
     };
@@ -192,6 +195,44 @@ fn a_declaration_links_to_the_prelowered_body() {
     assert_eq!(target, twice_id, "the call lands on the library's id");
 }
 
+#[test]
+fn a_split_prelowered_body_can_stay_encoded_after_lowering() {
+    let bytes = serialize_module(&library(), Format::Split).expect("serializes split");
+    let lib = Arc::new(deserialize_module_lazy(bytes).expect("reads split directory"));
+    let twice_id = lib.by_name("twice").expect("twice shell").id;
+    let mut program = client();
+    let mut arena = AstArena::new();
+    let module_name = arena.intern_string("app");
+    let mut ctx = LoweringContext::new(
+        module_name,
+        Arc::new(TypeRegistry::new()),
+        Arc::new(Mutex::new(arena)),
+        LoweringConfig {
+            prelowered: vec![Arc::clone(&lib)],
+            defer_prelowered_bodies: true,
+            entry_names: vec!["main".into()],
+            closed: true,
+            ..LoweringConfig::default()
+        },
+    );
+
+    let module = ctx.lower_program(&mut program).expect("lowers");
+    assert_eq!(ctx.entered_functions(), Some(vec!["main".into()]));
+    let twice = module
+        .functions
+        .get(&twice_id)
+        .expect("twice shell is linked");
+    assert!(twice.blocks.is_empty(), "the body remains encoded");
+    let sources = ctx.deferred_prelowered();
+    let source = sources.get(&twice_id).expect("body source is retained");
+    assert!(
+        source
+            .function(twice_id)
+            .is_some_and(|body| !body.blocks.is_empty()),
+        "the retained source decodes the body on demand"
+    );
+}
+
 #[cfg(feature = "cranelift-backend")]
 #[test]
 fn the_linked_program_runs() {
@@ -203,6 +244,7 @@ fn the_linked_program_runs() {
         "app",
         &mut program,
         LoweringConfig {
+            defer_prelowered_bodies: false,
             prelowered: vec![lib],
             ..LoweringConfig::default()
         },

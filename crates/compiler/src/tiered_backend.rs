@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex, RwLock, atomic::AtomicUsize};
 use beadie::{Bead, HotnessPolicy, JitBackend, ThresholdPolicy, TieredAdapter, TieredBound};
 
 use crate::beadie_adapter::{ZyntaxCraneliftBackend, ZyntaxFunctionDef};
+use crate::bytecode::LazyModule;
 use crate::cranelift_backend::CraneliftBackend;
 use crate::hir::{HirFunction, HirId, HirModule};
 use crate::osr;
@@ -236,6 +237,9 @@ struct FunctionEntry {
     /// per-function promotion cannot resolve effects, handlers, globals, or
     /// callees from the function body alone.
     module: Arc<HirModule>,
+    /// Encoded snapshot body retained until the interpreter or a JIT tier
+    /// first asks for it. The module contains only its signature shell.
+    body_source: Option<Arc<LazyModule>>,
     /// OSR registry id for this function. Embedded as a constant in
     /// tier-0 probe call sites so JIT'd code can find the bead.
     bead_id: u64,
@@ -304,6 +308,7 @@ fn tier_body(
     bodies: &OptimizedBodies,
     lazy: bool,
     module: &HirModule,
+    source: Option<&Arc<LazyModule>>,
 ) -> Option<Arc<HirFunction>> {
     if let Some(f) = swapped {
         return Some(Arc::clone(f));
@@ -314,7 +319,10 @@ fn tier_body(
     if lazy && let Some(f) = osr::lazy_optimized_body(bead_id) {
         return Some(f);
     }
-    module.functions.get(&func_id).map(|f| Arc::new(f.clone()))
+    source
+        .and_then(|source| source.function(func_id))
+        .or_else(|| module.functions.get(&func_id).cloned())
+        .map(Arc::new)
 }
 
 impl OptimizedBodies {
@@ -507,6 +515,7 @@ impl Scratch {
         &mut self,
         roots: impl IntoIterator<Item = HirId>,
         module: &HirModule,
+        sources: &HashMap<HirId, Arc<LazyModule>>,
         bodies: &OptimizedBodies,
         program: &HashSet<HirId>,
     ) {
@@ -515,7 +524,11 @@ impl Scratch {
             if self.module.functions.contains_key(&id) {
                 continue;
             }
-            let Some(lowered) = module.functions.get(&id) else {
+            let lowered = sources
+                .get(&id)
+                .and_then(|source| source.function(id))
+                .or_else(|| module.functions.get(&id).cloned());
+            let Some(lowered) = lowered else {
                 continue;
             };
             let optimized = program.contains(&id).then(|| bodies.get(id)).flatten();
@@ -524,7 +537,7 @@ impl Scratch {
                     self.done.insert(id);
                     (*body).clone()
                 }
-                None => lowered.clone(),
+                None => lowered,
             };
             f.attributes.optimized = true;
             f.attributes.deferred = true;
@@ -950,11 +963,11 @@ impl FunctionEntry {
         match &self.function {
             Some(f) => Arc::clone(f),
             None => Arc::new(
-                self.module
-                    .functions
-                    .get(&id)
-                    .cloned()
-                    .expect("a registered function is in its module"),
+                self.body_source
+                    .as_ref()
+                    .and_then(|source| source.function(id))
+                    .or_else(|| self.module.functions.get(&id).cloned())
+                    .expect("a registered function has a body or snapshot source"),
             ),
         }
     }
@@ -1254,6 +1267,27 @@ impl TieredBackend {
         finished: HashSet<HirId>,
         joining: bool,
     ) -> CompilerResult<()> {
+        self.compile_module_lazily_with_sources(
+            module,
+            reachable,
+            lazy,
+            finished,
+            HashMap::new(),
+            joining,
+        )
+    }
+
+    /// Lazy compilation with snapshot sources for functions whose module
+    /// entries contain signature shells rather than decoded bodies.
+    pub fn compile_module_lazily_with_sources(
+        &mut self,
+        module: HirModule,
+        reachable: Option<HashSet<HirId>>,
+        mut lazy: HashSet<HirId>,
+        finished: HashSet<HirId>,
+        mut body_sources: HashMap<HirId, Arc<LazyModule>>,
+        joining: bool,
+    ) -> CompilerResult<()> {
         if self.config.verbosity >= 1 {
             eprintln!(
                 "[TieredBackend] Compiling {} functions at Tier 0 (Baseline)",
@@ -1314,10 +1348,14 @@ impl TieredBackend {
             .with_lock(|be| be.set_bead_ids(bead_ids.clone()));
 
         // Only what codegen would compile at all can wait for its call.
+        // A source-backed body cannot be compiled eagerly: the point of
+        // retaining its snapshot bytes is to avoid decoding it at load.
+        lazy.extend(body_sources.keys().copied());
         let lazy: HashSet<HirId> = match &reachable {
             Some(reachable) => lazy.intersection(reachable).copied().collect(),
             None => lazy,
         };
+        body_sources.retain(|id, _| lazy.contains(id));
         if std::env::var_os("ZYNTAX_TRACE_OPT_PHASES").is_some() {
             let mut eager: Vec<String> = module
                 .functions
@@ -1430,6 +1468,7 @@ impl TieredBackend {
                     bound,
                     function: None,
                     module: Arc::clone(&module_context),
+                    body_source: body_sources.get(func_id).cloned(),
                     bead_id,
                 },
             );
@@ -1451,6 +1490,7 @@ impl TieredBackend {
         #[cfg(feature = "llvm-backend")]
         if let Some(llvm) = &self.llvm {
             let bodies = Arc::clone(&self.optimized_bodies);
+            let sources = body_sources.clone();
             let beads: HashMap<HirId, u64> = self
                 .functions
                 .iter()
@@ -1462,6 +1502,12 @@ impl TieredBackend {
                     bodies
                         .get(id)
                         .or_else(|| beads.get(&id).and_then(|b| osr::lazy_optimized_body(*b)))
+                        .or_else(|| {
+                            sources
+                                .get(&id)
+                                .and_then(|source| source.function(id))
+                                .map(Arc::new)
+                        })
                 }))
             });
         }
@@ -2083,6 +2129,7 @@ impl TieredBackend {
                     bound,
                     function: Some(Arc::new(body.clone())),
                     module: Arc::new(merged.clone()),
+                    body_source: None,
                     bead_id,
                 },
             );
@@ -2769,6 +2816,7 @@ impl TieredBackend {
             /// read when a compile needs it rather than copied out per
             /// function at load.
             swapped: Option<Arc<HirFunction>>,
+            source: Option<Arc<LazyModule>>,
             module: Arc<HirModule>,
             cranelift: Arc<ZyntaxCraneliftBackend>,
             #[cfg(feature = "llvm-backend")]
@@ -2780,6 +2828,7 @@ impl TieredBackend {
         }
         let ctx = Arc::new(Compile {
             swapped: entry.function.clone(),
+            source: entry.body_source.clone(),
             module: Arc::clone(&entry.module),
             cranelift: Arc::clone(&self.cranelift),
             #[cfg(feature = "llvm-backend")]
@@ -2867,6 +2916,7 @@ impl TieredBackend {
                     &optimized_bodies,
                     lazy,
                     &c.module,
+                    c.source.as_ref(),
                 ) else {
                     return ptr::null_mut();
                 };
@@ -3058,6 +3108,7 @@ impl TieredBackend {
         let bodies = Arc::clone(&self.optimized_bodies);
         let lazy = self.lazy.contains(&func_id);
         let module_arc = Arc::clone(&entry.module);
+        let body_source = entry.body_source.clone();
         let bead_id = entry.bead_id;
         let cranelift = Arc::clone(&self.cranelift);
         #[cfg(feature = "llvm-backend")]
@@ -3073,6 +3124,7 @@ impl TieredBackend {
                 &bodies,
                 lazy,
                 &module_arc,
+                body_source.as_ref(),
             ) else {
                 return ptr::null_mut();
             };
@@ -3124,6 +3176,17 @@ impl TieredBackend {
             .iter()
             .filter(|(id, _)| lazy.contains(id))
             .map(|(id, e)| (e.bead_id, (*id, e.bound.clone(), Arc::clone(&e.module))))
+            .collect();
+        let body_sources: HashMap<HirId, Arc<LazyModule>> = self
+            .functions
+            .iter()
+            .filter(|(id, _)| lazy.contains(id))
+            .filter_map(|(id, entry)| {
+                entry
+                    .body_source
+                    .as_ref()
+                    .map(|source| (*id, Arc::clone(source)))
+            })
             .collect();
         let reload_key = self.cranelift.with_lock(|be| be.reload_key());
         let lazy: HashSet<HirId> = lazy.difference(finished).copied().collect();
@@ -3204,6 +3267,7 @@ impl TieredBackend {
             let lazy = lazy.clone();
             let finish = Arc::clone(&finish);
             let quiet = Arc::clone(&quiet);
+            let body_sources = body_sources.clone();
             move |bead_id: u64| -> Option<Arc<HirFunction>> {
                 let (func_id, module_arc) = by_bead.get(&bead_id)?;
                 let cell = optimized_bodies.cell(*func_id)?;
@@ -3211,14 +3275,19 @@ impl TieredBackend {
                     return Some(Arc::clone(body));
                 }
                 let finished = finished.contains(func_id);
-                if !module_arc.functions.contains_key(func_id)
+                if !(module_arc.functions.contains_key(func_id)
+                    || body_sources.contains_key(func_id))
                     || (!finished && !lazy.contains(func_id))
                 {
                     return None;
                 }
                 let body = cell.get_or_init(|| {
                     if finished {
-                        let mut f = module_arc.functions[func_id].clone();
+                        let mut f = body_sources
+                            .get(func_id)
+                            .and_then(|source| source.function(*func_id))
+                            .or_else(|| module_arc.functions.get(func_id).cloned())
+                            .expect("a finished lazy function has a body");
                         f.attributes.deferred = false;
                         finish(&mut f);
                         return Arc::new(f);
@@ -3228,7 +3297,13 @@ impl TieredBackend {
                     let _using = optimized.enter(&*quiet);
                     let mut slots = optimized.slots.lock().unwrap();
                     let scratch = Scratch::of(&mut slots, module_arc);
-                    scratch.reach([*func_id], module_arc, &optimized_bodies, &lazy);
+                    scratch.reach(
+                        [*func_id],
+                        module_arc,
+                        &body_sources,
+                        &optimized_bodies,
+                        &lazy,
+                    );
                     if !scratch.done.contains(func_id) {
                         let f = scratch
                             .module
@@ -3300,6 +3375,7 @@ impl TieredBackend {
             let finish = Arc::clone(&finish);
             let lazy = lazy.clone();
             let quiet = Arc::clone(&quiet);
+            let body_sources = body_sources.clone();
             move |bead_id: u64, mut f: HirFunction, already_optimized: bool| -> HirFunction {
                 if already_optimized {
                     finish(&mut f);
@@ -3316,7 +3392,7 @@ impl TieredBackend {
                 let mut slots = optimized.slots.lock().unwrap();
                 let scratch = Scratch::of(&mut slots, module_arc);
                 let callees: Vec<HirId> = direct_callees(&f).collect();
-                scratch.reach(callees, module_arc, &optimized_bodies, &lazy);
+                scratch.reach(callees, module_arc, &body_sources, &optimized_bodies, &lazy);
                 let id = f.id;
                 scratch.module.functions.insert(id, f);
                 crate::run_interp_safe_opts_cached(&mut scratch.module, &facts.cache(module_arc));
@@ -3342,9 +3418,13 @@ impl TieredBackend {
                 .map(|(bead, (id, _, module))| (*bead, (*id, Arc::clone(module))))
                 .collect();
             let facts = Arc::clone(&facts);
+            let body_sources = body_sources.clone();
             move |bead_id: u64| -> Option<Arc<HirFunction>> {
                 let (func_id, module_arc) = by_bead.get(&bead_id)?;
-                let mut f = module_arc.functions.get(func_id)?.clone();
+                let mut f = body_sources
+                    .get(func_id)
+                    .and_then(|source| source.function(*func_id))
+                    .or_else(|| module_arc.functions.get(func_id).cloned())?;
                 f.attributes.optimized = false;
                 f.attributes.deferred = false;
                 crate::drop_insert::run_function_with(&mut f, &facts.of(module_arc));
@@ -3445,10 +3525,13 @@ impl TieredBackend {
             let queue = queue_for_callees.lock().unwrap().clone();
             if let Some(queue) = &queue
                 && replacing.is_none()
-                && let Some(f) = module_arc.functions.get(func_id)
+                && let Some(f) = body_sources
+                    .get(func_id)
+                    .and_then(|source| source.function(*func_id))
+                    .or_else(|| module_arc.functions.get(func_id).cloned())
             {
                 let closures = !finished.contains(func_id);
-                for callee in direct_lazy_callees(f, closures, &bead_of) {
+                for callee in direct_lazy_callees(&f, closures, &bead_of) {
                     let Some((callee_id, bound, module)) = by_bead.get(&callee) else {
                         continue;
                     };
@@ -3828,6 +3911,16 @@ impl TieredBackend {
                 )
             })
             .collect();
+        let body_sources: HashMap<HirId, Arc<LazyModule>> = self
+            .functions
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry
+                    .body_source
+                    .as_ref()
+                    .map(|source| (*id, Arc::clone(source)))
+            })
+            .collect();
         // Of those, the functions that arrived optimised.
         let finished_beads: HashSet<u64> = self
             .functions
@@ -3994,6 +4087,7 @@ impl TieredBackend {
                     &optimized_bodies,
                     *lazy,
                     &module_arc,
+                    body_sources.get(&func_id),
                 )
             };
             // An interpreted frame can enter no code mid-loop without a
@@ -4273,6 +4367,7 @@ impl TieredBackend {
             &self.optimized_bodies,
             lazy,
             &entry.module,
+            entry.body_source.as_ref(),
         )
         .ok_or_else(|| CompilerError::Backend(format!("Function {:?} has no body", func_id)))?;
         let module_arc = Arc::clone(&entry.module);

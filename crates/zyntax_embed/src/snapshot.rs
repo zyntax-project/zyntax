@@ -720,6 +720,7 @@ pub fn lower_for_snapshot_releasing(
             entry_names: Vec::new(),
             closed: false,
             prelowered,
+            defer_prelowered_bodies: false,
             linked: Arc::default(),
             selective: false,
             pattern_rewrites: true,

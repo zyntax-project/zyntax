@@ -1563,6 +1563,7 @@ pub fn compile_to_hir(
 ) -> CompilerResult<HirModule> {
     // Step 1: Lower TypedAST → HIR
     let lowering_config = lowering::LoweringConfig {
+        defer_prelowered_bodies: false,
         debug_info: config.debug_info,
         opt_level: config.opt_level,
         target_triple: config.target_triple.clone(),

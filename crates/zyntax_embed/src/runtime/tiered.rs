@@ -15,7 +15,7 @@ use crate::convert::FromZyntax;
 use crate::error::ZyntaxError;
 use crate::grammar::{GrammarError, LanguageGrammar};
 use crate::value::ZyntaxValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use zyntax_compiler::{
@@ -26,6 +26,45 @@ use zyntax_compiler::{
     tiered_backend::{OptimizationTier, TieredBackend, TieredConfig, TieredStatistics},
     zrtl::DynamicValue,
 };
+
+/// Reach functions whose bodies may still live in split snapshots. The
+/// ordinary DCE walk sees each such function's signature shell; its direct
+/// callees come from the split directory, and any non-snapshot callees are
+/// handed back to the ordinary walk.
+fn reachable_with_body_sources(
+    module: &HirModule,
+    entry_names: &[&str],
+    sources: &HashMap<HirId, Arc<zyntax_compiler::bytecode::LazyModule>>,
+) -> HashSet<HirId> {
+    let mut reachable = zyntax_compiler::reachable_function_ids(module, entry_names);
+    let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
+    let initial = reachable.len();
+    let mut scanned = HashSet::new();
+    loop {
+        let roots: Vec<HirId> = reachable
+            .iter()
+            .filter(|id| sources.contains_key(id) && scanned.insert(**id))
+            .flat_map(|id| {
+                sources[id]
+                    .direct_callees(*id)
+                    .unwrap_or_default()
+                    .into_iter()
+            })
+            .collect();
+        if roots.is_empty() {
+            break;
+        }
+        reachable.extend(roots.iter().copied());
+        reachable.extend(zyntax_compiler::dce::reachable_from_roots(module, roots));
+    }
+    if trace && reachable.len() != initial {
+        eprintln!(
+            "[COMPILE] shell reach expanded {initial} to {} functions",
+            reachable.len()
+        );
+    }
+    reachable
+}
 
 /// A multi-tier runtime: interpreted first, compiled as it runs.
 ///
@@ -523,7 +562,7 @@ impl TieredRuntime {
 
     /// Compile a HIR module into the tiered runtime
     pub fn compile_module(&mut self, module: HirModule) -> RuntimeResult<()> {
-        self.compile_module_entered(module, None, false)
+        self.compile_module_entered(module, None, Default::default(), false)
     }
 
     /// Compile a module whose entry points are known, generating code
@@ -536,6 +575,10 @@ impl TieredRuntime {
         &mut self,
         mut module: HirModule,
         mut entered: Option<Vec<String>>,
+        mut deferred_prelowered: std::collections::HashMap<
+            HirId,
+            Arc<zyntax_compiler::bytecode::LazyModule>,
+        >,
         joining: bool,
     ) -> RuntimeResult<()> {
         // What the entry points cannot reach is dropped before the
@@ -567,8 +610,9 @@ impl TieredRuntime {
         if let Some(names) = &mut entered {
             names.extend(box_inits.iter().cloned());
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
-            let keep = zyntax_compiler::reachable_function_ids(&module, &names);
+            let keep = reachable_with_body_sources(&module, &names, &deferred_prelowered);
             module.functions.retain(|id, _| keep.contains(id));
+            deferred_prelowered.retain(|id, _| keep.contains(id));
             if lazily {
                 for (id, f) in module.functions.iter_mut() {
                     if f.is_external {
@@ -670,7 +714,7 @@ impl TieredRuntime {
         // sees.
         let reachable = entered.as_ref().map(|names| {
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
-            zyntax_compiler::reachable_function_ids(&module, &names)
+            reachable_with_body_sources(&module, &names, &deferred_prelowered)
         });
         if trace_phases {
             eprintln!(
@@ -694,9 +738,14 @@ impl TieredRuntime {
 
         // Compile the module (consumes it).
         let started = web_time::Instant::now();
-        let compiled = self
-            .backend
-            .compile_module_lazily(module, reachable, lazy, finished, joining);
+        let compiled = self.backend.compile_module_lazily_with_sources(
+            module,
+            reachable,
+            lazy,
+            finished,
+            deferred_prelowered,
+            joining,
+        );
         // What the running module compiles later asks as it always has.
         self.backend.set_emit_osr_probes(self.config.enable_osr);
         compiled?;
@@ -1541,7 +1590,7 @@ impl TieredRuntime {
         let fiber_decls = collect_fiber_decls(&program);
         let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
         let started = web_time::Instant::now();
-        let (mut hir_module, entered) =
+        let (mut hir_module, entered, deferred_prelowered) =
             self.lower_typed_program(program, self.builtin_aliases.clone())?;
         if trace {
             eprintln!(
@@ -1568,7 +1617,7 @@ impl TieredRuntime {
             );
         }
 
-        self.compile_module_entered(hir_module, entered, false)?;
+        self.compile_module_entered(hir_module, entered, deferred_prelowered, false)?;
         let _ = self.apply_fiber_decls(fiber_decls);
         Ok(function_names)
     }
@@ -1608,6 +1657,7 @@ impl TieredRuntime {
                 // it declares is built now.
                 closed: false,
                 prelowered: Vec::new(),
+                defer_prelowered_bodies: false,
                 linked: Arc::clone(&self.installed),
                 selective: true,
                 pattern_rewrites: self.pattern_rewrites,
@@ -1625,7 +1675,12 @@ impl TieredRuntime {
             .filter(|f| !f.is_external)
             .filter_map(|f| f.name.resolve_global())
             .collect();
-        self.compile_module_entered(hir_module, lowered.entered, true)?;
+        self.compile_module_entered(
+            hir_module,
+            lowered.entered,
+            lowered.deferred_prelowered,
+            true,
+        )?;
         Ok(function_names)
     }
 
@@ -1637,7 +1692,7 @@ impl TieredRuntime {
         &self,
         program: zyntax_typed_ast::TypedProgram,
     ) -> RuntimeResult<HirModule> {
-        let (mut hir_module, _) =
+        let (mut hir_module, _, _) =
             self.lower_typed_program(program, self.builtin_aliases.clone())?;
         hir_module.automatic_release = self.automatic_release;
         apply_krio_async_lowering(&mut hir_module)?;
@@ -1658,7 +1713,7 @@ impl TieredRuntime {
             self.event_sink.as_ref(),
         );
         let fiber_decls = collect_fiber_decls(&program);
-        let (mut hir_module, _) =
+        let (mut hir_module, _, _) =
             self.lower_typed_program(program, self.builtin_aliases.clone())?;
         hir_module.automatic_release = self.automatic_release;
         apply_krio_async_lowering(&mut hir_module)?;
@@ -2670,7 +2725,7 @@ impl TieredRuntime {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let fiber_decls = collect_fiber_decls(&typed_program);
-        let (mut hir_module, _) = self.lower_typed_program(typed_program, builtins)?;
+        let (mut hir_module, _, _) = self.lower_typed_program(typed_program, builtins)?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
         apply_krio_fiber_lowering(&mut hir_module);
@@ -2743,7 +2798,8 @@ impl TieredRuntime {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let fiber_decls = collect_fiber_decls(&typed_program);
-        let (mut hir_module, entered) = self.lower_typed_program(typed_program, builtins)?;
+        let (mut hir_module, entered, deferred_prelowered) =
+            self.lower_typed_program(typed_program, builtins)?;
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
         apply_krio_fiber_lowering(&mut hir_module);
@@ -2760,7 +2816,7 @@ impl TieredRuntime {
             .collect();
 
         // Compile the module
-        self.compile_module_entered(hir_module, entered, false)?;
+        self.compile_module_entered(hir_module, entered, deferred_prelowered, false)?;
         let _ = self.apply_fiber_decls(fiber_decls);
 
         Ok(function_names)
@@ -2800,7 +2856,12 @@ impl TieredRuntime {
         &self,
         program: zyntax_typed_ast::TypedProgram,
         builtins: indexmap::IndexMap<String, String>,
-    ) -> RuntimeResult<(HirModule, Option<Vec<String>>)> {
+    ) -> RuntimeResult<(
+        HirModule,
+        Option<Vec<String>>,
+        std::collections::HashMap<HirId, Arc<zyntax_compiler::bytecode::LazyModule>>,
+    )> {
+        let closed = self.closed && !self.entry_points.is_empty();
         let lowered = crate::lower::lower_typed_program(
             program,
             crate::lower::Inputs {
@@ -2812,15 +2873,16 @@ impl TieredRuntime {
                 builtins,
                 builtin_registry: self.snapshot_builtin_registry(),
                 entry_names: self.entry_names(),
-                closed: self.closed && !self.entry_points.is_empty(),
+                closed,
                 prelowered: Vec::new(),
+                defer_prelowered_bodies: closed,
                 linked: Arc::default(),
                 selective: true,
                 pattern_rewrites: self.pattern_rewrites,
                 error_flag_global: self.error_flag_global,
             },
         )?;
-        Ok((lowered.module, lowered.entered))
+        Ok((lowered.module, lowered.entered, lowered.deferred_prelowered))
     }
 
     /// List all loaded function names
