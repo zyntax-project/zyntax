@@ -73,6 +73,17 @@ const STRING_FREE: &str = "$IO$string_free";
 const STRING_COPY: &str = "$IO$string_copy";
 /// Releases a dynamic box and whatever it owns.
 const BOX_FREE: &str = "zyntax_box_free";
+/// Releases one ownership claim on an opaque foreign-object word.
+const FOREIGN_WORD_FREE: &str = "$Foreign$release_word";
+
+fn known_release_symbol(name: &str) -> Option<&'static str> {
+    match name {
+        STRING_FREE => Some(STRING_FREE),
+        BOX_FREE => Some(BOX_FREE),
+        FOREIGN_WORD_FREE => Some(FOREIGN_WORD_FREE),
+        _ => None,
+    }
+}
 /// Boxes a copy of a string; the box owns the copy.
 const STRING_TO_BOX: &str = "$IO$string_to_dynamic";
 /// Boxes a string as it is; the box owns it from then on.
@@ -663,9 +674,16 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
             .get(position as usize)
             .is_some_and(|p| p.ownership == crate::hir::ParamOwnership::Owned)
         {
+            let declared = func
+                .signature
+                .params
+                .get(position as usize)
+                .and_then(|p| p.attributes.release_symbol.as_deref())
+                .and_then(known_release_symbol)
+                .map(Release::Symbol);
             sites
                 .entry(value.id)
-                .or_insert_with(|| release_for(func, value.id, facts));
+                .or_insert_with(|| declared.unwrap_or_else(|| release_for(func, value.id, facts)));
         }
     }
     if sites.is_empty() {
@@ -687,6 +705,27 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
     // Copies to make on entry edges: the predecessor block, the phi, the
     // position of its incoming, and the value to copy.
     let mut copies: Vec<(HirId, HirId, usize, HirId)> = Vec::new();
+    // A runtime may carry owned storage in a scalar word. Follow known
+    // owned sites through phis so those words participate without making
+    // ordinary integer phis look like storage.
+    let mut owned_flow: IdSet = sites.keys().copied().collect();
+    loop {
+        let before = owned_flow.len();
+        for block in func.blocks.values() {
+            for phi in &block.phis {
+                if phi
+                    .incoming
+                    .iter()
+                    .any(|(value, _)| owned_flow.contains(value))
+                {
+                    owned_flow.insert(phi.result);
+                }
+            }
+        }
+        if owned_flow.len() == before {
+            break;
+        }
+    }
     // Every phi that may carry storage to begin with; a join's phi only
     // under automatic release, since a program releasing by hand may
     // release what arrives at one.
@@ -695,7 +734,8 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
         .iter()
         .flat_map(|(b, block)| block.phis.iter().map(move |p| (p, *b)))
         .filter(|(p, block)| {
-            may_be_storage(&p.ty) && (facts.automatic_release || bodies.contains_key(block))
+            (may_be_storage(&p.ty) || owned_flow.contains(&p.result))
+                && (facts.automatic_release || bodies.contains_key(block))
         })
         .map(|(p, _)| p.result)
         .collect();
@@ -2027,10 +2067,19 @@ pub(crate) fn symbol_role(name: &str) -> Option<SymbolRole> {
         STRING_TO_BOX => Some(SymbolRole::COPIES_INTO_BOX),
         // A box that took the string itself.
         STRING_INTO_BOX => Some(SymbolRole::KEEPS_INTO_BOX),
-        // A host constructor hands the program a fresh dynamic box. Host
-        // calls and member reads may return borrowed values, so only the
-        // constructor ABI carries this ownership promise.
+        // A typed host constructor hands back an owned opaque word.
+        _ if name.starts_with("$Foreign$construct") && name.contains("_word") => Some(SymbolRole {
+            allocates: Some(FOREIGN_WORD_FREE),
+            borrows_args: true,
+        }),
+        // A dynamic host constructor hands the program a fresh box.
         _ if name.starts_with("$Foreign$construct") => Some(SymbolRole::COPIES_INTO_BOX),
+        "$Foreign$box_retained_word" => Some(SymbolRole::COPIES_INTO_BOX),
+        "$Foreign$retain_box_word" => Some(SymbolRole {
+            allocates: Some(FOREIGN_WORD_FREE),
+            borrows_args: true,
+        }),
+        "$Foreign$release_word" => Some(SymbolRole::BORROWS),
         // The IO, string and math plugins read their arguments and hand
         // back fresh storage; none keeps a pointer it was given.
         _ if name.starts_with("$IO$")

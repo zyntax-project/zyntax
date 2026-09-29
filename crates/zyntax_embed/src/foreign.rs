@@ -77,6 +77,21 @@ pub trait Foreign: Send + Sync {
         self.call(object, args)
     }
 
+    /// Construct and return the owned opaque word without a dynamic box.
+    fn construct_word(&self, object: usize, args: &[Any]) -> Result<usize, ForeignError> {
+        let boxed = self.construct(object, args)?;
+        unsafe { take_word(boxed) }
+            .ok_or_else(|| ForeignError::new("TypeError", "a host constructor returned no object"))
+    }
+
+    /// Add one ownership claim to an opaque host-object word.
+    fn retain(&self, _object: usize) -> Result<usize, ForeignError> {
+        Err(ForeignError::new(
+            "TypeError",
+            "host object cannot be retained",
+        ))
+    }
+
     /// Call the method `name` of `object` with `args`.
     fn invoke(&self, object: usize, name: &str, args: &[Any]) -> Result<Any, ForeignError>;
 
@@ -102,6 +117,13 @@ pub trait Foreign: Send + Sync {
     fn construct_float(&self, _object: usize, _args: &[f64]) -> Result<Any, ForeignError> {
         let args: Vec<Any> = _args.iter().map(|&value| float(value)).collect();
         self.construct(_object, &args)
+    }
+
+    /// Construct from unboxed floats and return the owned opaque word.
+    fn construct_float_word(&self, object: usize, args: &[f64]) -> Result<usize, ForeignError> {
+        let boxed = self.construct_float(object, args)?;
+        unsafe { take_word(boxed) }
+            .ok_or_else(|| ForeignError::new("TypeError", "a host constructor returned no object"))
     }
 
     /// Invoke a schema-declared method of float arguments and result.
@@ -233,6 +255,20 @@ extern "C" fn drop_foreign(word: *mut u8) {
 /// `any` must be null or a live box.
 pub unsafe fn word(any: Any) -> Option<usize> {
     (!any.is_null() && (*any).tag.0 == FOREIGN_TAG).then(|| (*any).data as usize)
+}
+
+/// Take a foreign box's opaque word and release only its header.
+///
+/// # Safety
+/// `any` must be null or a live box owned by the caller.
+unsafe fn take_word(any: Any) -> Option<usize> {
+    let word = unsafe { word(any) }?;
+    unsafe {
+        (*any).data = std::ptr::null_mut();
+        (*any).dropper = None;
+        DynamicBox::free_raw(any);
+    }
+    Some(word)
 }
 
 /// The bytes the foreign object `any` is a buffer of, read in place;
@@ -416,6 +452,31 @@ unsafe extern "C" fn foreign_invoke(x: Any, name: StringConstPtr, data: i64, len
     })
 }
 
+extern "C" fn foreign_box_retained_word(word: i64) -> Any {
+    let retained = with(0, |f| f.retain(word as usize));
+    if retained == 0 {
+        none()
+    } else {
+        boxed(retained)
+    }
+}
+
+unsafe extern "C" fn foreign_retain_box_word(value: Any) -> i64 {
+    let Some(word) = (unsafe { word(value) }) else {
+        fail(no_embedder());
+        return 0;
+    };
+    with(0, |f| f.retain(word).map(|word| word as i64))
+}
+
+extern "C" fn foreign_release_word(word: i64) {
+    if word != 0
+        && let Some(foreign) = installed()
+    {
+        foreign.release(word as usize);
+    }
+}
+
 // Fixed-arity entries let typed frontends hand arguments to the embedder
 // directly. The variadic entries above remain for calls whose arity is only
 // known at runtime.
@@ -526,6 +587,29 @@ fixed_foreign_calls!(
     a6,
     a7
 );
+
+macro_rules! fixed_word_constructs {
+    ($construct:ident $(, $arg:ident)*) => {
+        unsafe extern "C" fn $construct(x: Any, $($arg: Any),*) -> i64 {
+            let Some(object) = (unsafe { word(x) }) else {
+                fail(no_embedder());
+                return 0;
+            };
+            let args: &[Any] = &[$($arg),*];
+            with(0, |f| f.construct_word(object, args).map(|word| word as i64))
+        }
+    };
+}
+
+fixed_word_constructs!(foreign_construct_word_0);
+fixed_word_constructs!(foreign_construct_word_1, a0);
+fixed_word_constructs!(foreign_construct_word_2, a0, a1);
+fixed_word_constructs!(foreign_construct_word_3, a0, a1, a2);
+fixed_word_constructs!(foreign_construct_word_4, a0, a1, a2, a3);
+fixed_word_constructs!(foreign_construct_word_5, a0, a1, a2, a3, a4);
+fixed_word_constructs!(foreign_construct_word_6, a0, a1, a2, a3, a4, a5);
+fixed_word_constructs!(foreign_construct_word_7, a0, a1, a2, a3, a4, a5, a6);
+fixed_word_constructs!(foreign_construct_word_8, a0, a1, a2, a3, a4, a5, a6, a7);
 
 unsafe extern "C" fn foreign_get_float(x: Any, name: StringConstPtr) -> f64 {
     let Some(object) = (unsafe { word(x) }) else {
@@ -704,6 +788,42 @@ fixed_float_calls!(
     a7
 );
 
+macro_rules! fixed_float_word_constructs {
+    ($construct:ident $(, $arg:ident)*) => {
+        unsafe extern "C" fn $construct(x: Any, $($arg: f64),*) -> i64 {
+            let Some(object) = (unsafe { word(x) }) else {
+                fail(no_embedder());
+                return 0;
+            };
+            let args: &[f64] = &[$($arg),*];
+            with(0, |f| {
+                f.construct_float_word(object, args)
+                    .map(|word| word as i64)
+            })
+        }
+    };
+}
+
+fixed_float_word_constructs!(foreign_construct_float_word_0);
+fixed_float_word_constructs!(foreign_construct_float_word_1, a0);
+fixed_float_word_constructs!(foreign_construct_float_word_2, a0, a1);
+fixed_float_word_constructs!(foreign_construct_float_word_3, a0, a1, a2);
+fixed_float_word_constructs!(foreign_construct_float_word_4, a0, a1, a2, a3);
+fixed_float_word_constructs!(foreign_construct_float_word_5, a0, a1, a2, a3, a4);
+fixed_float_word_constructs!(foreign_construct_float_word_6, a0, a1, a2, a3, a4, a5);
+fixed_float_word_constructs!(foreign_construct_float_word_7, a0, a1, a2, a3, a4, a5, a6);
+fixed_float_word_constructs!(
+    foreign_construct_float_word_8,
+    a0,
+    a1,
+    a2,
+    a3,
+    a4,
+    a5,
+    a6,
+    a7
+);
+
 unsafe extern "C" fn foreign_str(x: Any) -> StringPtr {
     let text = match (word(x), installed()) {
         (Some(object), Some(f)) => f.text(object),
@@ -791,6 +911,90 @@ extern "C" fn foreign_error_message() -> StringPtr {
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"foreign".as_ptr());
 static SYMBOLS: &[zrtl::ZrtlSymbol] = &[
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$box_retained_word".as_ptr(),
+        foreign_box_retained_word as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$retain_box_word".as_ptr(),
+        foreign_retain_box_word as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$release_word".as_ptr(),
+        foreign_release_word as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_word0".as_ptr(),
+        foreign_construct_word_0 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_word1".as_ptr(),
+        foreign_construct_word_1 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_word2".as_ptr(),
+        foreign_construct_word_2 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_word3".as_ptr(),
+        foreign_construct_word_3 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_word4".as_ptr(),
+        foreign_construct_word_4 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_word5".as_ptr(),
+        foreign_construct_word_5 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_word6".as_ptr(),
+        foreign_construct_word_6 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_word7".as_ptr(),
+        foreign_construct_word_7 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_word8".as_ptr(),
+        foreign_construct_word_8 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float_word0".as_ptr(),
+        foreign_construct_float_word_0 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float_word1".as_ptr(),
+        foreign_construct_float_word_1 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float_word2".as_ptr(),
+        foreign_construct_float_word_2 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float_word3".as_ptr(),
+        foreign_construct_float_word_3 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float_word4".as_ptr(),
+        foreign_construct_float_word_4 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float_word5".as_ptr(),
+        foreign_construct_float_word_5 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float_word6".as_ptr(),
+        foreign_construct_float_word_6 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float_word7".as_ptr(),
+        foreign_construct_float_word_7 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float_word8".as_ptr(),
+        foreign_construct_float_word_8 as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(c"$Foreign$get".as_ptr(), foreign_get as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$set".as_ptr(), foreign_set as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$call".as_ptr(), foreign_call as *const u8),

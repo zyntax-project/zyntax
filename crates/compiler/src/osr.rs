@@ -980,6 +980,30 @@ pub struct Outlined {
 /// their declared mode. A loop value that this body explicitly releases
 /// is handed to the outlined region as owned: the old frame stops at the
 /// transfer, so the region becomes the sole holder of that claim.
+fn live_in_release_symbol(function: &HirFunction, value: HirId) -> Option<String> {
+    function.blocks.values().find_map(|block| {
+        block.instructions.iter().find_map(|inst| {
+            let crate::hir::HirInstruction::Call { callee, args, .. } = inst else {
+                return None;
+            };
+            if args.first() != Some(&value) {
+                return None;
+            }
+            match callee {
+                crate::hir::HirCallable::Symbol(name)
+                    if matches!(
+                        name.as_str(),
+                        "zyntax_box_free" | "$IO$string_free" | "$Foreign$release_word"
+                    ) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            }
+        })
+    })
+}
+
 fn live_in_ownership(function: &HirFunction, value: HirId) -> crate::hir::ParamOwnership {
     if let Some(crate::hir::HirValue {
         kind: crate::hir::HirValueKind::Parameter(position),
@@ -1002,9 +1026,10 @@ fn live_in_ownership(function: &HirFunction, value: HirId) -> crate::hir::ParamO
                 crate::hir::HirCallable::Intrinsic(
                     crate::hir::Intrinsic::Free | crate::hir::Intrinsic::Drop,
                 ) => true,
-                crate::hir::HirCallable::Symbol(name) => {
-                    matches!(name.as_str(), "zyntax_box_free" | "$IO$string_free")
-                }
+                crate::hir::HirCallable::Symbol(name) => matches!(
+                    name.as_str(),
+                    "zyntax_box_free" | "$IO$string_free" | "$Foreign$release_word"
+                ),
                 _ => false,
             }
         })
@@ -1071,11 +1096,13 @@ pub fn outline(
                 span: None,
             },
         );
+        let mut attributes = crate::hir::ParamAttributes::default();
+        attributes.release_symbol = live_in_release_symbol(function, *id);
         params.push(HirParam {
             id: param_id,
             name: zyntax_typed_ast::InternedString::new_global(&format!("live_in{i}")),
             ty: ty.clone(),
-            attributes: Default::default(),
+            attributes,
             ownership: live_in_ownership(function, *id),
         });
     }

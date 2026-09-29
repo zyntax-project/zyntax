@@ -53,6 +53,24 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let len = || fld(args.e(), "len", i64());
     let mut declarations = vec![
         extern_fn(
+            "zb_foreign_box_retained_word_raw",
+            &[("word", i64())],
+            any(),
+            Some("$Foreign$box_retained_word"),
+        ),
+        extern_fn(
+            "zb_foreign_retain_box_word_raw",
+            &[("x", any())],
+            i64(),
+            Some("$Foreign$retain_box_word"),
+        ),
+        extern_fn(
+            "zb_foreign_release_word_raw",
+            &[("word", i64())],
+            unit(),
+            Some("$Foreign$release_word"),
+        ),
+        extern_fn(
             "zb_foreign_get_raw",
             &[("x", any()), ("name", string())],
             any(),
@@ -170,6 +188,12 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             &[],
             string(),
             Some("$Foreign$error_message"),
+        ),
+        define(
+            "zb_foreign_raise_reported",
+            &[],
+            unit(),
+            vec![raise_reported()],
         ),
         define(
             "zb_is_foreign",
@@ -360,12 +384,14 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     for arity in 0..=crate::functions::MAX_CALL_ARITY {
         let call_raw = format!("zb_foreign_call_fixed_raw_{arity}");
         let construct_raw = format!("zb_foreign_construct_fixed_raw_{arity}");
+        let construct_word_raw = format!("zb_foreign_construct_word_raw_{arity}");
         let invoke_raw = format!("zb_foreign_invoke_fixed_raw_{arity}");
         let call_name = format!("zb_foreign_call_{arity}");
         let construct_name = format!("zb_foreign_construct_{arity}");
         let invoke_name = format!("zb_foreign_invoke_{arity}");
         let call_symbol = format!("$Foreign$call{arity}");
         let construct_symbol = format!("$Foreign$construct{arity}");
+        let construct_word_symbol = format!("$Foreign$construct_word{arity}");
         let invoke_symbol = format!("$Foreign$invoke{arity}");
         let fixed_names: Vec<&'static str> = (0..arity)
             .map(|i| Box::leak(format!("a{i}").into_boxed_str()) as &'static str)
@@ -385,6 +411,12 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             &call_extern_params,
             any(),
             Some(&construct_symbol),
+        ));
+        declarations.push(extern_fn(
+            &construct_word_raw,
+            &call_extern_params,
+            i64(),
+            Some(&construct_word_symbol),
         ));
         let mut invoke_extern_params = vec![("x", any()), ("name", string())];
         invoke_extern_params.extend(fixed_names.iter().map(|name| (*name, any())));
@@ -443,12 +475,14 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
 
         let call_float_raw = format!("zb_foreign_call_float_raw_{arity}");
         let construct_float_raw = format!("zb_foreign_construct_float_raw_{arity}");
+        let construct_float_word_raw = format!("zb_foreign_construct_float_word_raw_{arity}");
         let invoke_float_raw = format!("zb_foreign_invoke_float_raw_{arity}");
         let call_float_name = format!("zb_foreign_call_float_{arity}");
         let construct_float_name = format!("zb_foreign_construct_float_{arity}");
         let invoke_float_name = format!("zb_foreign_invoke_float_{arity}");
         let call_float_symbol = format!("$Foreign$call_float{arity}");
         let construct_float_symbol = format!("$Foreign$construct_float{arity}");
+        let construct_float_word_symbol = format!("$Foreign$construct_float_word{arity}");
         let invoke_float_symbol = format!("$Foreign$invoke_float{arity}");
         let invoke_float_key_raw = format!("zb_foreign_invoke_float_key_raw_{arity}");
         let invoke_float_key_name = format!("zb_foreign_invoke_float_key_{arity}");
@@ -468,6 +502,12 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             &call_float_extern_params,
             any(),
             Some(&construct_float_symbol),
+        ));
+        declarations.push(extern_fn(
+            &construct_float_word_raw,
+            &call_float_extern_params,
+            i64(),
+            Some(&construct_float_word_symbol),
         ));
         let mut invoke_float_extern_params = vec![("x", any()), ("name", string())];
         invoke_float_extern_params.extend(fixed_names.iter().map(|name| (*name, f64())));

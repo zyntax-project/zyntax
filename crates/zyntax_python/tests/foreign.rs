@@ -94,6 +94,11 @@ fn type_of(obj: &Obj) -> &'static str {
 struct Stand;
 
 impl Foreign for Stand {
+    fn retain(&self, word: usize) -> Result<usize, ForeignError> {
+        STATE.lock().unwrap().held[word - 1] += 1;
+        Ok(word)
+    }
+
     fn get(&self, word: usize, name: &str) -> Result<Any, ForeignError> {
         match (object(word), name) {
             (Obj::Shapes, "Point") => Ok(make(Obj::Function("Point"))),

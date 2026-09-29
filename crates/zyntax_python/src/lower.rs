@@ -342,6 +342,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
         // A file is the record the library keeps: a list of its parts.
         Ty::File(_) => list_type(Type::Any),
         Ty::Class(k) => class_type(k as usize),
+        Ty::HostObject(_, _) => prim(PrimitiveType::I64),
         Ty::Gen => Type::Fiber(Box::new(Type::Any)),
         // A known function value is still the record every function
         // value is.
@@ -351,7 +352,6 @@ pub(crate) fn ir(ty: Ty) -> Type {
         | Ty::Builtin(_)
         | Ty::HostModule(_)
         | Ty::HostClass(_, _)
-        | Ty::HostObject(_, _)
         | Ty::HostFunction(_, _)
         | Ty::HostFloatCallable(_)
         | Ty::Object
@@ -1794,6 +1794,46 @@ impl<'m> Lowerer<'m> {
         )
     }
 
+    /// An owned host-object word, returning from this function on failure.
+    fn guard_host_word(&mut self, value: Val, span: Span) -> Val {
+        let mut pre = Vec::new();
+        let held = self.hold(value, &mut pre, span);
+        self.raised = true;
+        self.may_raise_own = true;
+        let mut fail = vec![TypedNode::new(
+            TypedStatement::Expression(Box::new(call(
+                "zb_foreign_raise_reported",
+                Vec::new(),
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        )];
+        self.escape_into(span, &mut fail);
+        pre.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(binary(
+                    BinaryOp::Eq,
+                    held.node.clone(),
+                    int_lit(0, span),
+                    Ty::Bool,
+                    span,
+                )),
+                then_block: TypedBlock {
+                    statements: fail,
+                    span,
+                },
+                else_block: None,
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        self.hoisted.extend(pre);
+        held
+    }
+
     /// [`Self::guard`] for a call to function `name` of the program: no
     /// check when the function is known not to raise, and otherwise a
     /// check attributed to the callee rather than to this function.
@@ -2532,10 +2572,25 @@ impl<'m> Lowerer<'m> {
             (Ty::Func(_), Ty::Object | Ty::Func(_)) | (Ty::Object, Ty::Func(_)) => v.node,
             (Ty::Bound(_), Ty::Object | Ty::Bound(_)) | (Ty::Object, Ty::Bound(_)) => v.node,
             (Ty::Builtin(_), Ty::Object | Ty::Builtin(_)) | (Ty::Object, Ty::Builtin(_)) => v.node,
+            (Ty::HostObject(_, _), Ty::Object) => call(
+                "zb_foreign_box_retained_word_raw",
+                vec![v.node],
+                Ty::Object,
+                span,
+            ),
+            (Ty::Object, Ty::HostObject(_, _)) => {
+                self.guard_host_word(
+                    Val {
+                        node: call("zb_foreign_retain_box_word_raw", vec![v.node], target, span),
+                        ty: target,
+                    },
+                    span,
+                )
+                .node
+            }
             (
                 Ty::HostModule(_)
                 | Ty::HostClass(_, _)
-                | Ty::HostObject(_, _)
                 | Ty::HostFunction(_, _)
                 | Ty::HostFloatCallable(_),
                 Ty::Object,
@@ -2544,7 +2599,6 @@ impl<'m> Lowerer<'m> {
                 Ty::Object,
                 Ty::HostModule(_)
                 | Ty::HostClass(_, _)
-                | Ty::HostObject(_, _)
                 | Ty::HostFunction(_, _)
                 | Ty::HostFloatCallable(_),
             ) => v.node,
@@ -3528,9 +3582,9 @@ impl<'m> Lowerer<'m> {
                 ),
                 Ty::Bool,
             ),
+            Ty::HostObject(_, _) => binary(BinaryOp::Ne, v.node, int_lit(0, span), Ty::Bool, span),
             Ty::HostModule(_)
             | Ty::HostClass(_, _)
-            | Ty::HostObject(_, _)
             | Ty::HostFunction(_, _)
             | Ty::HostFloatCallable(_)
             | Ty::Object
@@ -3652,9 +3706,12 @@ impl<'m> Lowerer<'m> {
                     }
                 })
             }
+            Ty::HostObject(_, _) => {
+                let dynamic = self.coerce(v, Ty::Object);
+                call("zb_any_str", vec![dynamic], Ty::Str, span)
+            }
             Ty::HostModule(_)
             | Ty::HostClass(_, _)
-            | Ty::HostObject(_, _)
             | Ty::HostFunction(_, _)
             | Ty::HostFloatCallable(_)
             | Ty::Object
@@ -13909,6 +13966,22 @@ impl<'m> Lowerer<'m> {
             }
         } else {
             lowered.extend(self.host_arguments(signature, args, keywords, at)?);
+        }
+        if matches!(ty, Ty::HostObject(_, _)) {
+            let word = Val {
+                node: call(
+                    &format!(
+                        "zb_foreign_construct_{}word_raw_{}",
+                        if all_float { "float_" } else { "" },
+                        args.len()
+                    ),
+                    lowered,
+                    ty,
+                    span,
+                ),
+                ty,
+            };
+            return Ok(self.guard_host_word(word, span));
         }
         let dynamic = Val {
             node: call(
