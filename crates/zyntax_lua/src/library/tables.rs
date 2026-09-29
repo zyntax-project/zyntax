@@ -769,14 +769,15 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             ),
             when(
                 is_file(o.e()),
-                vec![ret(call(
-                    "zl_rawget_str",
-                    vec![
-                        unbox_table(call("zl_file_metatable", vec![], any()), t),
-                        event.e(),
-                    ],
-                    any(),
-                ))],
+                vec![
+                    mt.decl(read_global("zl_file_meta", any())),
+                    when(is_nil(mt.e()), vec![ret(nil())]),
+                    ret(call(
+                        "zl_rawget_str",
+                        vec![unbox_table(mt.e(), t), event.e()],
+                        any(),
+                    )),
+                ],
             ),
             // Any other value that is not a table, its type's; a full
             // userdata, its own.
