@@ -3096,6 +3096,7 @@ pub(crate) fn infer_module(
         files: known.files.clone(),
         imports: known.imports.clone(),
         from_names: known.from_names.clone(),
+        hosts: known.hosts.clone(),
         ..Default::default()
     };
     note_methods(&module, items, entry);

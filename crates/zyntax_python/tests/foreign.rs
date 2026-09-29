@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use zyntax_embed::foreign::{self, Any, Foreign, ForeignError, Value};
 use zyntax_embed::{TieredConfig, TieredRuntime};
 use zyntax_python::{HostClass, HostField, HostMethod, HostModule, HostType};
+use zyntax_typed_ast::{PrimitiveType, Type, TypedDeclaration};
 
 #[derive(Clone, Debug)]
 enum Obj {
@@ -229,6 +230,9 @@ from shapes import Point
 import shapes as s
 from log import record
 
+def inferred_length():
+    return Point(3, 4).length()
+
 p = Point(3, 4)
 record(p.x + p.y)
 record(p.length())
@@ -310,6 +314,21 @@ fn a_program_uses_the_embedders_objects() {
     };
     let program = zyntax_python::parse_program_with_host(PROGRAM, "foreign.py", &|_| None, &hosts)
         .expect("parses");
+    let inferred = program
+        .declarations
+        .iter()
+        .find_map(|declaration| match &declaration.node {
+            TypedDeclaration::Function(function)
+                if function
+                    .name
+                    .resolve_global()
+                    .is_some_and(|name| name == "inferred_length") =>
+            {
+                Some(&function.return_type)
+            }
+            _ => None,
+        });
+    assert_eq!(inferred, Some(&Type::Primitive(PrimitiveType::F64)));
     let wrong_arity = zyntax_python::parse_program_with_host(
         "from shapes import Point\nPoint(1)\n",
         "bad_foreign.py",
