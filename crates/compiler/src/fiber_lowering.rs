@@ -53,6 +53,13 @@ use crate::hir::{HirCallable, HirId, HirInstruction, HirModule, HirType, HirValu
 /// frontend-side fiber-shape transforms have run.
 pub fn apply_krio_fiber_lowering(module: &mut HirModule) {
     for func in module.functions.values_mut() {
+        if !func
+            .blocks
+            .values()
+            .any(|block| block.instructions.iter().any(is_fiber_instruction))
+        {
+            continue;
+        }
         let mut minted: Vec<HirId> = Vec::new();
         for block in func.blocks.values_mut() {
             let mut out = Vec::with_capacity(block.instructions.len());
@@ -108,6 +115,19 @@ pub fn apply_krio_fiber_lowering(module: &mut HirModule) {
             );
         }
     }
+}
+
+fn is_fiber_instruction(inst: &HirInstruction) -> bool {
+    matches!(
+        inst,
+        HirInstruction::FiberNew { .. }
+            | HirInstruction::FiberResume { .. }
+            | HirInstruction::FiberResumeWith { .. }
+            | HirInstruction::FiberYield { .. }
+            | HirInstruction::FiberTransfer { .. }
+            | HirInstruction::FiberCancel { .. }
+            | HirInstruction::FiberDrop { .. }
+    )
 }
 
 /// Build a `Call::Symbol` instruction (the runtime-extern call shape used
@@ -334,5 +354,6 @@ mod tests {
             is_tail: false,
         };
         assert!(rewrite(&inst).is_none());
+        assert!(!is_fiber_instruction(&inst));
     }
 }
