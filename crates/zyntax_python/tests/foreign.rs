@@ -99,6 +99,7 @@ impl Foreign for Stand {
             (Obj::Shapes, "Point") => Ok(make(Obj::Function("Point"))),
             (Obj::Shapes, "same") => Ok(make(Obj::Function("same"))),
             (Obj::Shapes, "pair") => Ok(make(Obj::Function("pair"))),
+            (Obj::Shapes, "adder") => Ok(make(Obj::Function("adder"))),
             (Obj::Shapes, "version") => Ok(foreign::int(3)),
             (Obj::Log, "record") => Ok(make(Obj::Function("record"))),
             (Obj::Point { x, .. }, "x") => Ok(foreign::float(x)),
@@ -134,6 +135,8 @@ impl Foreign for Stand {
                 y: number(args[1])?,
             })),
             Obj::Function("pair") => Ok(make(Obj::Pair(1.0, 2.0))),
+            Obj::Function("adder") => Ok(make(Obj::Function("increment"))),
+            Obj::Function("increment") => Ok(foreign::float(number(args[0])? + 1.0)),
             Obj::Function("same") => match unsafe { foreign::read(args[0]) } {
                 Value::Foreign(w) => Ok(again(w)),
                 _ => Err(ForeignError::new("TypeError", "same() takes a point")),
@@ -254,6 +257,8 @@ seen[p] = "seen"
 record(seen[s.same(p)])
 a, b = s.pair()
 record(a, b, len(s.pair()))
+add = s.adder()
+record(add(4.0))
 "#;
 
 #[test]
@@ -274,11 +279,13 @@ fn a_program_uses_the_embedders_objects() {
                 fields: vec![
                     HostField {
                         name: "x".into(),
+                        key: 0,
                         ty: HostType::Float,
                         is_static: false,
                     },
                     HostField {
                         name: "y".into(),
+                        key: 0,
                         ty: HostType::Float,
                         is_static: false,
                     },
@@ -286,12 +293,14 @@ fn a_program_uses_the_embedders_objects() {
                 methods: vec![
                     HostMethod {
                         name: "length".into(),
+                        key: 0,
                         params: vec![],
                         ret: HostType::Float,
                         is_static: false,
                     },
                     HostMethod {
                         name: "scaled".into(),
+                        key: 0,
                         params: vec![HostType::Float],
                         ret: HostType::Object("Point".into()),
                         is_static: false,
@@ -299,17 +308,31 @@ fn a_program_uses_the_embedders_objects() {
                 ],
                 constructor: Some(HostMethod {
                     name: "Point".into(),
+                    key: 0,
                     params: vec![HostType::Float, HostType::Float],
                     ret: HostType::Object("Point".into()),
                     is_static: true,
                 }),
             }],
-            functions: vec![HostMethod {
-                name: "same".into(),
-                params: vec![HostType::Object("Point".into())],
-                ret: HostType::Object("Point".into()),
-                is_static: true,
-            }],
+            functions: vec![
+                HostMethod {
+                    name: "same".into(),
+                    key: 0,
+                    params: vec![HostType::Object("Point".into())],
+                    ret: HostType::Object("Point".into()),
+                    is_static: true,
+                },
+                HostMethod {
+                    name: "adder".into(),
+                    key: 0,
+                    params: vec![],
+                    ret: HostType::Function {
+                        params: vec![HostType::Float],
+                        ret: Box::new(HostType::Float),
+                    },
+                    is_static: true,
+                },
+            ],
         })
     };
     let program = zyntax_python::parse_program_with_host(PROGRAM, "foreign.py", &|_| None, &hosts)
@@ -362,6 +385,7 @@ fn a_program_uses_the_embedders_objects() {
             "seen",
             // Several values given at once are a tuple of them.
             "1.0\t2.0\t2",
+            "5.0",
         ]
     );
     assert!(

@@ -197,6 +197,7 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         | Ty::HostClass(_, _)
         | Ty::HostObject(_, _)
         | Ty::HostFunction(_, _)
+        | Ty::HostFloatCallable(_)
         | Ty::Num(_)
         | Ty::MaybeList(_)
         | Ty::Object
@@ -352,6 +353,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
         | Ty::HostClass(_, _)
         | Ty::HostObject(_, _)
         | Ty::HostFunction(_, _)
+        | Ty::HostFloatCallable(_)
         | Ty::Object
         | Ty::Unknown => Type::Any,
         // The tag, the int and the float: see `num`.
@@ -2534,7 +2536,8 @@ impl<'m> Lowerer<'m> {
                 Ty::HostModule(_)
                 | Ty::HostClass(_, _)
                 | Ty::HostObject(_, _)
-                | Ty::HostFunction(_, _),
+                | Ty::HostFunction(_, _)
+                | Ty::HostFloatCallable(_),
                 Ty::Object,
             )
             | (
@@ -2542,7 +2545,8 @@ impl<'m> Lowerer<'m> {
                 Ty::HostModule(_)
                 | Ty::HostClass(_, _)
                 | Ty::HostObject(_, _)
-                | Ty::HostFunction(_, _),
+                | Ty::HostFunction(_, _)
+                | Ty::HostFloatCallable(_),
             ) => v.node,
             (Ty::Int, Ty::Float) => cast(v.node, Ty::Float, span),
             // A bool widens to its 0 or 1 before converting.
@@ -3528,6 +3532,7 @@ impl<'m> Lowerer<'m> {
             | Ty::HostClass(_, _)
             | Ty::HostObject(_, _)
             | Ty::HostFunction(_, _)
+            | Ty::HostFloatCallable(_)
             | Ty::Object
             | Ty::Unknown => call("zb_any_truthy", vec![v.node], Ty::Bool, span),
             Ty::Num(_) => self.num_truthy(v),
@@ -3651,6 +3656,7 @@ impl<'m> Lowerer<'m> {
             | Ty::HostClass(_, _)
             | Ty::HostObject(_, _)
             | Ty::HostFunction(_, _)
+            | Ty::HostFloatCallable(_)
             | Ty::Object
             | Ty::Func(_)
             | Ty::Unknown => call("zb_any_str", vec![v.node], Ty::Str, span),
@@ -10369,6 +10375,10 @@ impl<'m> Lowerer<'m> {
                         let callee = self.expr(&c.func)?;
                         return self.call_closure(k, callee, args, keywords, c, span);
                     }
+                    Ty::HostFloatCallable(arity) => {
+                        let callee = self.expr(&c.func)?;
+                        return self.host_float_callable(callee, arity, args, keywords, c, span);
+                    }
                     // The function the value names, called by its name
                     // where the arguments fit; the value itself is not
                     // read.
@@ -10602,6 +10612,9 @@ impl<'m> Lowerer<'m> {
             let callee = self.expr(&c.func)?;
             if let Ty::Closure(k) = self.ty_of(&c.func) {
                 return self.call_closure(k, callee, args, keywords, c, span);
+            }
+            if let Ty::HostFloatCallable(arity) = self.ty_of(&c.func) {
+                return self.host_float_callable(callee, arity, args, keywords, c, span);
             }
             if let Ty::Class(k) = callee.ty {
                 return self.method_on(k as usize, callee, "__call__", args, keywords, c, span);
@@ -12895,29 +12908,29 @@ impl<'m> Lowerer<'m> {
             }
             Ty::HostModule(module) => {
                 let ty = self.module.host_member(module, attr);
-                self.host_attribute(object, attr, ty, span)
+                self.host_attribute(object, attr, ty, 0, span)
             }
             Ty::HostClass(module, class) => {
-                let ty = self
+                let (ty, key) = self
                     .module
                     .host_class(module, class)
                     .fields
                     .iter()
                     .find(|field| field.is_static && field.name == attr)
-                    .map(|field| self.module.host_type(&field.ty))
-                    .unwrap_or(Ty::Object);
-                self.host_attribute(object, attr, ty, span)
+                    .map(|field| (self.module.host_type(&field.ty), field.key))
+                    .unwrap_or((Ty::Object, 0));
+                self.host_attribute(object, attr, ty, key, span)
             }
             Ty::HostObject(module, class) => {
-                let ty = self
+                let (ty, key) = self
                     .module
                     .host_class(module, class)
                     .fields
                     .iter()
                     .find(|field| !field.is_static && field.name == attr)
-                    .map(|field| self.module.host_type(&field.ty))
-                    .unwrap_or(Ty::Object);
-                self.host_attribute(object, attr, ty, span)
+                    .map(|field| (self.module.host_type(&field.ty), field.key))
+                    .unwrap_or((Ty::Object, 0));
+                self.host_attribute(object, attr, ty, key, span)
             }
             // An array's typecode and element size are its type's.
             Ty::List(Elem::Array(c)) if matches!(attr, "typecode" | "itemsize") => {
@@ -12943,16 +12956,32 @@ impl<'m> Lowerer<'m> {
         }
     }
 
-    fn host_attribute(&mut self, object: Val, attr: &str, ty: Ty, span: Span) -> Result<Val> {
+    fn host_attribute(
+        &mut self,
+        object: Val,
+        attr: &str,
+        ty: Ty,
+        key: u64,
+        span: Span,
+    ) -> Result<Val> {
         self.module.attr_reads.borrow_mut().insert(attr.to_string());
         if ty == Ty::Float {
             return Ok(Val {
-                node: call(
-                    "zb_foreign_get_float",
-                    vec![self.coerce(object, Ty::Object), str_lit(attr, span)],
-                    Ty::Float,
-                    span,
-                ),
+                node: if key == 0 {
+                    call(
+                        "zb_foreign_get_float",
+                        vec![self.coerce(object, Ty::Object), str_lit(attr, span)],
+                        Ty::Float,
+                        span,
+                    )
+                } else {
+                    call(
+                        "zb_foreign_get_float_key",
+                        vec![self.coerce(object, Ty::Object), int_lit(key as i64, span)],
+                        Ty::Float,
+                        span,
+                    )
+                },
                 ty,
             });
         }
@@ -13258,26 +13287,39 @@ impl<'m> Lowerer<'m> {
             }
             Ty::HostObject(module, class) | Ty::HostClass(module, class) => {
                 let static_field = matches!(object.ty, Ty::HostClass(_, _));
-                let ty = self
+                let (ty, key) = self
                     .module
                     .host_class(module, class)
                     .fields
                     .iter()
                     .find(|field| field.is_static == static_field && field.name == attr)
-                    .map(|field| self.module.host_type(&field.ty))
-                    .unwrap_or(Ty::Object);
+                    .map(|field| (self.module.host_type(&field.ty), field.key))
+                    .unwrap_or((Ty::Object, 0));
                 self.module
                     .attr_writes
                     .borrow_mut()
                     .insert(attr.to_string());
                 let value = self.coerce(value, ty);
                 if ty == Ty::Float {
-                    return Ok(call(
-                        "zb_foreign_set_float",
-                        vec![self.coerce(object, Ty::Object), str_lit(attr, span), value],
-                        Ty::None,
-                        span,
-                    ));
+                    return Ok(if key == 0 {
+                        call(
+                            "zb_foreign_set_float",
+                            vec![self.coerce(object, Ty::Object), str_lit(attr, span), value],
+                            Ty::None,
+                            span,
+                        )
+                    } else {
+                        call(
+                            "zb_foreign_set_float_key",
+                            vec![
+                                self.coerce(object, Ty::Object),
+                                int_lit(key as i64, span),
+                                value,
+                            ],
+                            Ty::None,
+                            span,
+                        )
+                    });
                 }
                 let value = self.coerce(Val { node: value, ty }, Ty::Object);
                 Ok(call(
@@ -13831,6 +13873,43 @@ impl<'m> Lowerer<'m> {
         })
     }
 
+    fn host_float_callable(
+        &mut self,
+        callee: Val,
+        arity: u8,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        at: &impl Ranged,
+        span: Span,
+    ) -> Result<Val> {
+        if !keywords.is_empty() {
+            return unsupported("keyword arguments in a host closure call", at);
+        }
+        if args.len() != arity as usize {
+            return unsupported(
+                format!(
+                    "host closure takes {} argument(s), got {}",
+                    arity,
+                    args.len()
+                ),
+                at,
+            );
+        }
+        let mut lowered = vec![self.coerce(callee, Ty::Object)];
+        for arg in args {
+            lowered.push(self.expr_as(arg, Ty::Float)?);
+        }
+        Ok(Val {
+            node: call(
+                &format!("zb_foreign_call_float_{}", arity),
+                lowered,
+                Ty::Float,
+                span,
+            ),
+            ty: Ty::Float,
+        })
+    }
+
     fn host_method(
         &mut self,
         receiver: Val,
@@ -13862,16 +13941,22 @@ impl<'m> Lowerer<'m> {
                     at,
                 );
             }
-            let mut lowered = vec![
-                self.coerce(receiver, Ty::Object),
-                str_lit(&signature.name, span),
-            ];
+            let mut lowered = vec![self.coerce(receiver, Ty::Object)];
+            if signature.key == 0 {
+                lowered.push(str_lit(&signature.name, span));
+            } else {
+                lowered.push(int_lit(signature.key as i64, span));
+            }
             for arg in args {
                 lowered.push(self.expr_as(arg, Ty::Float)?);
             }
             return Ok(Val {
                 node: call(
-                    &format!("zb_foreign_invoke_float_{}", args.len()),
+                    &format!(
+                        "zb_foreign_invoke_float_{}{}",
+                        if signature.key == 0 { "" } else { "key_" },
+                        args.len()
+                    ),
                     lowered,
                     Ty::Float,
                     span,

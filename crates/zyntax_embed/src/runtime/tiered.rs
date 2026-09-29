@@ -2623,6 +2623,18 @@ impl TieredRuntime {
         self.backend.get_function_pointer(*id)
     }
 
+    /// The stable atomic cell containing `name`'s current entry. Foreign
+    /// callers load this for every call so promotion and reload take effect
+    /// without returning through the interpreter or retaining an old tier.
+    pub fn function_cell(&self, name: &str) -> Option<*const std::sync::atomic::AtomicUsize> {
+        let id = self.function_ids.get(name)?;
+        // A lazy export has no entry until its stub is requested. Creating
+        // the stub also publishes it into the cell; its first call replaces
+        // it with compiled code and later promotion replaces that in turn.
+        self.backend.get_function_pointer(*id)?;
+        self.backend.function_cell(*id)
+    }
+
     /// Reload edited source against the running module.
     ///
     /// Parses and lowers exactly as [`Self::load_module`] does, then

@@ -37,7 +37,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ptr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, atomic::AtomicUsize};
 
 use beadie::{Bead, HotnessPolicy, JitBackend, ThresholdPolicy, TieredAdapter, TieredBound};
 
@@ -2702,6 +2702,17 @@ impl TieredBackend {
             // exports) still need an address before a bead is hot: a
             // lazy function's stub, made now if it has none.
             self.cranelift.with_lock(|be| be.entry_or_stub(func_id))
+        })
+    }
+
+    /// The reload cell holding `func_id`'s current entry. The cell is stable
+    /// for the process and changes atomically as the function promotes or
+    /// reloads, so foreign callers do not retain an interpreter stub or an
+    /// older compiled tier.
+    pub fn function_cell(&self, func_id: HirId) -> Option<*const AtomicUsize> {
+        self.functions.contains_key(&func_id).then(|| {
+            let key = self.cranelift.with_lock(|backend| backend.reload_key());
+            crate::reload::call_cell_addr(key, func_id) as *const AtomicUsize
         })
     }
 

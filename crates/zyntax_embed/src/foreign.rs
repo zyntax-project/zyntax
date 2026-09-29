@@ -102,6 +102,35 @@ pub trait Foreign: Send + Sync {
         number_of(self.invoke(_object, _name, &args)?)
     }
 
+    /// Read a float field by an embedder-defined schema key.
+    fn get_float_key(&self, _object: usize, _key: u64) -> Result<f64, ForeignError> {
+        Err(ForeignError::new(
+            "TypeError",
+            "the embedder does not recognize keyed float fields",
+        ))
+    }
+
+    /// Write a float field by an embedder-defined schema key.
+    fn set_float_key(&self, _object: usize, _key: u64, _value: f64) -> Result<(), ForeignError> {
+        Err(ForeignError::new(
+            "TypeError",
+            "the embedder does not recognize keyed float fields",
+        ))
+    }
+
+    /// Invoke a float method by an embedder-defined schema key.
+    fn invoke_float_key(
+        &self,
+        _object: usize,
+        _key: u64,
+        _args: &[f64],
+    ) -> Result<f64, ForeignError> {
+        Err(ForeignError::new(
+            "TypeError",
+            "the embedder does not recognize keyed float methods",
+        ))
+    }
+
     /// `object` as text.
     fn text(&self, object: usize) -> String;
 
@@ -427,16 +456,38 @@ fixed_foreign_calls!(
 unsafe extern "C" fn foreign_get_float(x: Any, name: StringConstPtr) -> f64 {
     let Some(object) = (unsafe { word(x) }) else {
         fail(no_embedder());
-        return 0.0;
+        return f64::MAX;
     };
-    with(0.0, |f| f.get_float(object, unsafe { text_of(name) }))
+    with(f64::MAX, |f| f.get_float(object, unsafe { text_of(name) }))
 }
 
-unsafe extern "C" fn foreign_set_float(x: Any, name: StringConstPtr, value: f64) {
+unsafe extern "C" fn foreign_set_float(x: Any, name: StringConstPtr, value: f64) -> i32 {
     let Some(object) = (unsafe { word(x) }) else {
-        return fail(no_embedder());
+        fail(no_embedder());
+        return 0;
     };
-    with((), |f| f.set_float(object, unsafe { text_of(name) }, value))
+    with(0, |f| {
+        f.set_float(object, unsafe { text_of(name) }, value)
+            .map(|()| 1)
+    })
+}
+
+unsafe extern "C" fn foreign_get_float_key(x: Any, key: i64) -> f64 {
+    let Some(object) = (unsafe { word(x) }) else {
+        fail(no_embedder());
+        return f64::MAX;
+    };
+    with(f64::MAX, |f| f.get_float_key(object, key as u64))
+}
+
+unsafe extern "C" fn foreign_set_float_key(x: Any, key: i64, value: f64) -> i32 {
+    let Some(object) = (unsafe { word(x) }) else {
+        fail(no_embedder());
+        return 0;
+    };
+    with(0, |f| {
+        f.set_float_key(object, key as u64, value).map(|()| 1)
+    })
 }
 
 macro_rules! fixed_float_calls {
@@ -444,10 +495,10 @@ macro_rules! fixed_float_calls {
         unsafe extern "C" fn $call(x: Any, $($arg: f64),*) -> f64 {
             let Some(object) = (unsafe { word(x) }) else {
                 fail(no_embedder());
-                return 0.0;
+                return f64::MAX;
             };
             let args: &[f64] = &[$($arg),*];
-            with(0.0, |f| f.call_float(object, args))
+            with(f64::MAX, |f| f.call_float(object, args))
         }
 
         unsafe extern "C" fn $invoke(
@@ -457,10 +508,10 @@ macro_rules! fixed_float_calls {
         ) -> f64 {
             let Some(object) = (unsafe { word(x) }) else {
                 fail(no_embedder());
-                return 0.0;
+                return f64::MAX;
             };
             let args: &[f64] = &[$($arg),*];
-            with(0.0, |f| f.invoke_float(object, unsafe { text_of(name) }, args))
+            with(f64::MAX, |f| f.invoke_float(object, unsafe { text_of(name) }, args))
         }
     };
 }
@@ -479,6 +530,29 @@ fixed_float_calls!(
     a3,
     a4
 );
+
+macro_rules! fixed_float_key_invokes {
+    ($invoke:ident $(, $arg:ident)*) => {
+        unsafe extern "C" fn $invoke(x: Any, key: i64, $($arg: f64),*) -> f64 {
+            let Some(object) = (unsafe { word(x) }) else {
+                fail(no_embedder());
+                return f64::MAX;
+            };
+            let args: &[f64] = &[$($arg),*];
+            with(f64::MAX, |f| f.invoke_float_key(object, key as u64, args))
+        }
+    };
+}
+
+fixed_float_key_invokes!(foreign_invoke_float_key_0);
+fixed_float_key_invokes!(foreign_invoke_float_key_1, a0);
+fixed_float_key_invokes!(foreign_invoke_float_key_2, a0, a1);
+fixed_float_key_invokes!(foreign_invoke_float_key_3, a0, a1, a2);
+fixed_float_key_invokes!(foreign_invoke_float_key_4, a0, a1, a2, a3);
+fixed_float_key_invokes!(foreign_invoke_float_key_5, a0, a1, a2, a3, a4);
+fixed_float_key_invokes!(foreign_invoke_float_key_6, a0, a1, a2, a3, a4, a5);
+fixed_float_key_invokes!(foreign_invoke_float_key_7, a0, a1, a2, a3, a4, a5, a6);
+fixed_float_key_invokes!(foreign_invoke_float_key_8, a0, a1, a2, a3, a4, a5, a6, a7);
 fixed_float_calls!(
     foreign_call_float_6,
     foreign_invoke_float_6,
@@ -631,6 +705,14 @@ static SYMBOLS: &[zrtl::ZrtlSymbol] = &[
         foreign_set_float as *const u8,
     ),
     zrtl::ZrtlSymbol::new(
+        c"$Foreign$get_float_key".as_ptr(),
+        foreign_get_float_key as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$set_float_key".as_ptr(),
+        foreign_set_float_key as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
         c"$Foreign$call_float0".as_ptr(),
         foreign_call_float_0 as *const u8,
     ),
@@ -701,6 +783,42 @@ static SYMBOLS: &[zrtl::ZrtlSymbol] = &[
     zrtl::ZrtlSymbol::new(
         c"$Foreign$invoke_float8".as_ptr(),
         foreign_invoke_float_8 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float_key0".as_ptr(),
+        foreign_invoke_float_key_0 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float_key1".as_ptr(),
+        foreign_invoke_float_key_1 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float_key2".as_ptr(),
+        foreign_invoke_float_key_2 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float_key3".as_ptr(),
+        foreign_invoke_float_key_3 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float_key4".as_ptr(),
+        foreign_invoke_float_key_4 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float_key5".as_ptr(),
+        foreign_invoke_float_key_5 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float_key6".as_ptr(),
+        foreign_invoke_float_key_6 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float_key7".as_ptr(),
+        foreign_invoke_float_key_7 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$invoke_float_key8".as_ptr(),
+        foreign_invoke_float_key_8 as *const u8,
     ),
     zrtl::ZrtlSymbol::new(c"$Foreign$str".as_ptr(), foreign_str as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$type".as_ptr(), foreign_type as *const u8),

@@ -56,6 +56,10 @@ pub enum HostType {
     Str,
     Bytes,
     Object(String),
+    Function {
+        params: Vec<HostType>,
+        ret: Box<HostType>,
+    },
     Dynamic,
 }
 
@@ -63,6 +67,8 @@ pub enum HostType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostMethod {
     pub name: String,
+    /// An embedder-defined member key. Zero keeps name-based dispatch.
+    pub key: u64,
     pub params: Vec<HostType>,
     pub ret: HostType,
     pub is_static: bool,
@@ -72,6 +78,8 @@ pub struct HostMethod {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostField {
     pub name: String,
+    /// An embedder-defined member key. Zero keeps name-based dispatch.
+    pub key: u64,
     pub ty: HostType,
     pub is_static: bool,
 }

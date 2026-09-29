@@ -64,6 +64,9 @@ pub(crate) enum Ty {
     HostClass(u16, u16),
     HostObject(u16, u16),
     HostFunction(u16, u16),
+    /// A callable supplied by the host whose arguments and result are
+    /// all unboxed floats. The arity is enough to select its fixed ABI.
+    HostFloatCallable(u8),
     /// A generator: a fiber yielding dynamic values.
     Gen,
     /// A function value whose function is known: the closure at this
@@ -2081,6 +2084,14 @@ impl Module {
                         .map(|class| Ty::HostObject(m as u16, class as u16))
                 })
                 .unwrap_or(Ty::Object),
+            crate::HostType::Function { params, ret }
+                if params.iter().all(|ty| *ty == crate::HostType::Float)
+                    && **ret == crate::HostType::Float
+                    && params.len() <= 8 =>
+            {
+                Ty::HostFloatCallable(params.len() as u8)
+            }
+            crate::HostType::Function { .. } => Ty::Object,
             crate::HostType::Dynamic => Ty::Object,
         }
     }
@@ -8107,6 +8118,7 @@ impl Typer<'_> {
                     &self.module.hosts[module as usize].functions[function as usize].ret,
                 );
             }
+            Ty::HostFloatCallable(_) => return Ty::Float,
             Ty::Closure(k) => return self.module.closure_ret(k),
             Ty::Func(k) => {
                 let name = &self.module.items_by_index[k as usize];

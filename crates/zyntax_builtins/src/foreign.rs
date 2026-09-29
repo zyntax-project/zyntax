@@ -32,6 +32,8 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     let args = borrowed("args", anys.clone());
     let r = local("r", any());
     let rf = local("rf", f64());
+    let ok = local("ok", i32());
+    let key = local("key", i64());
     let kind = local("kind", string());
     // The error the embedder reported, raised as the library's own.
     let raise_reported = || {
@@ -71,8 +73,20 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         extern_fn(
             "zb_foreign_set_float_raw",
             &[("x", any()), ("name", string()), ("v", f64())],
-            unit(),
+            i32(),
             Some("$Foreign$set_float"),
+        ),
+        extern_fn(
+            "zb_foreign_get_float_key_raw",
+            &[("x", any()), ("key", i64())],
+            f64(),
+            Some("$Foreign$get_float_key"),
+        ),
+        extern_fn(
+            "zb_foreign_set_float_key_raw",
+            &[("x", any()), ("key", i64()), ("v", f64())],
+            i32(),
+            Some("$Foreign$set_float_key"),
         ),
         extern_fn(
             "zb_foreign_call_raw",
@@ -199,7 +213,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                     vec![x.e(), name.e()],
                     f64(),
                 )),
-                raise_reported(),
+                when(eq(rf.e(), float(f64::MAX)), vec![raise_reported()]),
                 ret(rf.e()),
             ],
         ),
@@ -208,12 +222,40 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             &[&x, &name, &rf],
             unit(),
             vec![
-                expr(call(
+                ok.decl(call(
                     "zb_foreign_set_float_raw",
                     vec![x.e(), name.e(), rf.e()],
-                    unit(),
+                    i32(),
                 )),
-                raise_reported(),
+                when(eq(ok.e(), int32(0)), vec![raise_reported()]),
+                ret_void(),
+            ],
+        ),
+        define(
+            "zb_foreign_get_float_key",
+            &[&x, &key],
+            f64(),
+            vec![
+                rf.decl(call(
+                    "zb_foreign_get_float_key_raw",
+                    vec![x.e(), key.e()],
+                    f64(),
+                )),
+                when(eq(rf.e(), float(f64::MAX)), vec![raise_reported()]),
+                ret(rf.e()),
+            ],
+        ),
+        define(
+            "zb_foreign_set_float_key",
+            &[&x, &key, &rf],
+            unit(),
+            vec![
+                ok.decl(call(
+                    "zb_foreign_set_float_key_raw",
+                    vec![x.e(), key.e(), rf.e()],
+                    i32(),
+                )),
+                when(eq(ok.e(), int32(0)), vec![raise_reported()]),
                 ret_void(),
             ],
         ),
@@ -380,6 +422,9 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         let invoke_float_name = format!("zb_foreign_invoke_float_{arity}");
         let call_float_symbol = format!("$Foreign$call_float{arity}");
         let invoke_float_symbol = format!("$Foreign$invoke_float{arity}");
+        let invoke_float_key_raw = format!("zb_foreign_invoke_float_key_raw_{arity}");
+        let invoke_float_key_name = format!("zb_foreign_invoke_float_key_{arity}");
+        let invoke_float_key_symbol = format!("$Foreign$invoke_float_key{arity}");
         let floats: Vec<Local> = fixed_names.iter().map(|name| local(name, f64())).collect();
 
         let mut call_float_extern_params = vec![("x", any())];
@@ -398,6 +443,14 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             f64(),
             Some(&invoke_float_symbol),
         ));
+        let mut invoke_float_key_extern_params = vec![("x", any()), ("key", i64())];
+        invoke_float_key_extern_params.extend(fixed_names.iter().map(|name| (*name, f64())));
+        declarations.push(extern_fn(
+            &invoke_float_key_raw,
+            &invoke_float_key_extern_params,
+            f64(),
+            Some(&invoke_float_key_symbol),
+        ));
 
         let mut call_float_params: Vec<&Local> = vec![&x];
         call_float_params.extend(&floats);
@@ -409,7 +462,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             f64(),
             vec![
                 rf.decl(call(&call_float_raw, call_float_args, f64())),
-                raise_reported(),
+                when(eq(rf.e(), float(f64::MAX)), vec![raise_reported()]),
                 ret(rf.e()),
             ],
         ));
@@ -424,7 +477,22 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             f64(),
             vec![
                 rf.decl(call(&invoke_float_raw, invoke_float_args, f64())),
-                raise_reported(),
+                when(eq(rf.e(), float(f64::MAX)), vec![raise_reported()]),
+                ret(rf.e()),
+            ],
+        ));
+
+        let mut invoke_float_key_params: Vec<&Local> = vec![&x, &key];
+        invoke_float_key_params.extend(&floats);
+        let mut invoke_float_key_args = vec![x.e(), key.e()];
+        invoke_float_key_args.extend(floats.iter().map(Local::e));
+        declarations.push(define(
+            &invoke_float_key_name,
+            &invoke_float_key_params,
+            f64(),
+            vec![
+                rf.decl(call(&invoke_float_key_raw, invoke_float_key_args, f64())),
+                when(eq(rf.e(), float(f64::MAX)), vec![raise_reported()]),
                 ret(rf.e()),
             ],
         ));
