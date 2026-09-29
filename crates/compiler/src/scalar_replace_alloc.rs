@@ -28,7 +28,8 @@
 //!
 //! Conditions for safety:
 //! * The `Call(Intrinsic::Malloc)` and all its tracked-pointer
-//!   derivations (GEPs / pointer-typed Casts) live in a single block.
+//!   derivations (GEPs / pointer casts / lossless PtrToInt → IntToPtr
+//!   round trips) live in a single block.
 //! * Every tracked pointer is only used as: the `ptr` of a `Load`,
 //!   the `ptr` of a `Store` (where the stored value is itself NOT a
 //!   tracked pointer — otherwise the allocation escapes through
@@ -56,17 +57,17 @@
 //!    Store, and every matched Free.
 //!
 //! Risks (see project_sroa_target_was_wrong.md):
-//! * Type-erasing casts on the malloc result (e.g. `Ptr<U8>` → `I64`)
-//!   are the canonical escape — `Cast` to a non-pointer type aborts
-//!   the candidate.
+//! * A PtrToInt result is accepted only when every use restores it with
+//!   IntToPtr in the same block. Arithmetic, storage, calls, phis, or
+//!   cross-block uses of the encoded pointer abort the candidate.
 //! * Non-constant GEP indices abort the candidate (counted as
 //!   `escapes_skipped`).
 //! * Cross-block reachability via phi or unreachable blocks
 //!   short-circuits to abort; v1 is intentionally single-block.
 
 use crate::hir::{
-    HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirType, HirValueKind,
-    Intrinsic,
+    CastOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirType,
+    HirValueKind, Intrinsic,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -267,6 +268,9 @@ struct Candidate {
     malloc_result: HirId,
     /// All pointer-typed HirIds derived (transitively) from malloc_result.
     tracked: HashSet<HirId>,
+    /// Integer encodings of tracked pointers. These are accepted only
+    /// as the middle of a PtrToInt → IntToPtr representation round trip.
+    encoded: HashSet<HirId>,
     /// `gep_id → constant byte-offset` for every tracked GEP.
     /// We canonicalise the offset to a single u64 key. For multi-index
     /// GEPs we sum the index values (treating them as raw byte offsets,
@@ -322,6 +326,7 @@ fn build_candidate(
 
     let mut tracked: HashSet<HirId> = HashSet::new();
     tracked.insert(malloc_result);
+    let mut encoded: HashSet<HirId> = HashSet::new();
     let mut gep_field: HashMap<HirId, u64> = HashMap::new();
     let mut gep_iidxs: Vec<usize> = Vec::new();
     let mut cast_iidxs: Vec<usize> = Vec::new();
@@ -398,23 +403,44 @@ fn build_candidate(
                 HirInstruction::Cast {
                     result,
                     ty,
+                    op,
                     operand,
-                    ..
-                } if tracked.contains(operand) => {
-                    if tracked.contains(result) {
-                        continue;
+                } if tracked.contains(operand) => match op {
+                    CastOp::PtrToInt => {
+                        if encoded.insert(*result) {
+                            if let Some(off) = gep_field.get(operand).copied() {
+                                gep_field.insert(*result, off);
+                            }
+                        }
+                        if !cast_iidxs.contains(&idx) {
+                            cast_iidxs.push(idx);
+                        }
                     }
-                    // Cast to non-pointer type → the value escapes
-                    // through an integer encoding (or similar). Bail.
+                    CastOp::Bitcast if matches!(ty, HirType::Ptr(_)) => {
+                        if tracked.insert(*result) {
+                            if let Some(off) = gep_field.get(operand).copied() {
+                                gep_field.insert(*result, off);
+                            }
+                        }
+                        if !cast_iidxs.contains(&idx) {
+                            cast_iidxs.push(idx);
+                        }
+                    }
+                    _ => return None,
+                },
+                HirInstruction::Cast {
+                    result,
+                    ty,
+                    op: CastOp::IntToPtr,
+                    operand,
+                } if encoded.contains(operand) => {
                     if !matches!(ty, HirType::Ptr(_)) {
                         return None;
                     }
-                    // Pointer-to-pointer cast inherits the source's
-                    // field offset, if any.
-                    let inherit_offset = gep_field.get(operand).copied();
-                    tracked.insert(*result);
-                    if let Some(off) = inherit_offset {
-                        gep_field.insert(*result, off);
+                    if tracked.insert(*result) {
+                        if let Some(off) = gep_field.get(operand).copied() {
+                            gep_field.insert(*result, off);
+                        }
                     }
                     if !cast_iidxs.contains(&idx) {
                         cast_iidxs.push(idx);
@@ -442,6 +468,26 @@ fn build_candidate(
                 // Already classified by fixpoint above. Sanity: the
                 // result must be in tracked (or we'd have aborted on
                 // non-const indices).
+                if !tracked.contains(result) {
+                    return None;
+                }
+            }
+            HirInstruction::Cast {
+                result,
+                op: CastOp::PtrToInt,
+                operand,
+                ..
+            } if tracked.contains(operand) => {
+                if !encoded.contains(result) {
+                    return None;
+                }
+            }
+            HirInstruction::Cast {
+                result,
+                op: CastOp::IntToPtr,
+                operand,
+                ..
+            } if encoded.contains(operand) => {
                 if !tracked.contains(result) {
                     return None;
                 }
@@ -502,15 +548,19 @@ fn build_candidate(
                     store_iidxs.push(idx);
                 }
             }
-            HirInstruction::Store { value, .. } if tracked.contains(value) => {
+            HirInstruction::Store { value, .. }
+                if tracked.contains(value) || encoded.contains(value) =>
+            {
                 // Storing a tracked ptr into some other slot escapes.
                 return None;
             }
             HirInstruction::Call { callee, args, .. } => {
-                let any_tracked = args.iter().any(|a| tracked.contains(a));
+                let any_tracked = args
+                    .iter()
+                    .any(|a| tracked.contains(a) || encoded.contains(a));
                 if !any_tracked {
                     if let HirCallable::Indirect(v) = callee {
-                        if tracked.contains(v) {
+                        if tracked.contains(v) || encoded.contains(v) {
                             return None;
                         }
                     }
@@ -534,7 +584,10 @@ fn build_candidate(
                 // Any other instruction touching a tracked id is an
                 // escape (Return / IndirectCall / Atomic / CreateClosure
                 // / Async* / Throw / ExtractValue / InsertValue …).
-                let uses_tracked = other.operands().iter().any(|o| tracked.contains(o));
+                let uses_tracked = other
+                    .operands()
+                    .iter()
+                    .any(|o| tracked.contains(o) || encoded.contains(o));
                 if uses_tracked {
                     return None;
                 }
@@ -543,7 +596,7 @@ fn build_candidate(
     }
 
     // Terminator can't reference any tracked id.
-    if term_uses_any(&block.terminator, &tracked) {
+    if term_uses_any(&block.terminator, &tracked) || term_uses_any(&block.terminator, &encoded) {
         return None;
     }
 
@@ -551,7 +604,7 @@ fn build_candidate(
     // is post-def) but check defensively.
     for phi in &block.phis {
         for (val, _) in &phi.incoming {
-            if tracked.contains(val) {
+            if tracked.contains(val) || encoded.contains(val) {
                 return None;
             }
         }
@@ -562,7 +615,7 @@ fn build_candidate(
         uses.get(v)
             .is_some_and(|blocks| blocks.iter().any(|b| *b != bid))
     };
-    if tracked.iter().any(used_elsewhere) {
+    if tracked.iter().any(used_elsewhere) || encoded.iter().any(used_elsewhere) {
         return None;
     }
 
@@ -578,6 +631,7 @@ fn build_candidate(
         malloc_iidx,
         malloc_result,
         tracked,
+        encoded,
         gep_field,
         field_ty,
         free_iidxs,
@@ -691,6 +745,9 @@ fn apply_candidate(func: &mut HirFunction, bid: HirId, c: &Candidate) -> (usize,
         if *id == c.malloc_result {
             continue;
         }
+        func.values.shift_remove(id);
+    }
+    for id in &c.encoded {
         func.values.shift_remove(id);
     }
     // Load results aren't in tracked (they're scalar values, not
@@ -1044,6 +1101,97 @@ mod tests {
         assert_eq!(stats.frees_eliminated, 1);
         assert_eq!(count_malloc(&module, func_id, entry), 0);
         assert_eq!(count_free(&module, func_id, entry), 0);
+    }
+
+    #[test]
+    fn eliminates_through_pointer_integer_round_trip() {
+        let _arena = AstArena::new();
+        let (mut f, entry) = mk_func();
+        let size = add_const_u64(&mut f, 8);
+        let malloc_ptr = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let address = add_inst(&mut f, HirType::I64);
+        let restored = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let off = add_const_i64(&mut f, 0);
+        let gep = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let stored = add_const_i64(&mut f, 42);
+        let loaded = add_inst(&mut f, HirType::I64);
+
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Call {
+                result: Some(malloc_ptr),
+                callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+                args: vec![size],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Cast {
+                result: address,
+                ty: HirType::I64,
+                op: CastOp::PtrToInt,
+                operand: malloc_ptr,
+            },
+        );
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Cast {
+                result: restored,
+                ty: HirType::Ptr(Box::new(HirType::U8)),
+                op: CastOp::IntToPtr,
+                operand: address,
+            },
+        );
+        push(
+            &mut f,
+            entry,
+            HirInstruction::GetElementPtr {
+                result: gep,
+                ty: HirType::U8,
+                ptr: restored,
+                indices: vec![off],
+            },
+        );
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Store {
+                value: stored,
+                ptr: gep,
+                align: 8,
+                volatile: false,
+            },
+        );
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Load {
+                result: loaded,
+                ty: HirType::I64,
+                ptr: gep,
+                align: 8,
+                volatile: false,
+            },
+        );
+        f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Return {
+            values: vec![loaded],
+        };
+
+        let (mut module, func_id) = empty_module(f);
+        let stats = run_module(&mut module);
+
+        assert_eq!(stats.mallocs_eliminated, 1);
+        assert_eq!(count_malloc(&module, func_id, entry), 0);
+        assert!(matches!(
+            &module.functions[&func_id].blocks[&entry].terminator,
+            HirTerminator::Return { values } if values == &vec![stored]
+        ));
     }
 
     /// A malloc whose pointer is returned (escapes) — must be left
