@@ -2815,7 +2815,7 @@ impl TieredRuntime {
                 closed: self.closed && !self.entry_points.is_empty(),
                 prelowered: Vec::new(),
                 linked: Arc::default(),
-                selective: false,
+                selective: true,
                 pattern_rewrites: self.pattern_rewrites,
                 error_flag_global: self.error_flag_global,
             },

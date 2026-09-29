@@ -850,6 +850,39 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Collect the library symbols lowering refers to, restoring an outer
+/// collection when lowering returns early with an error.
+struct NamedReferences {
+    previous: Option<HashSet<InternedString>>,
+    active: bool,
+}
+
+impl NamedReferences {
+    fn start() -> Self {
+        let previous = NAMED.with(|named| named.replace(Some(HashSet::new())));
+        Self {
+            previous,
+            active: true,
+        }
+    }
+
+    fn finish(mut self) -> HashSet<InternedString> {
+        let found = NAMED.with(|named| named.replace(self.previous.take()));
+        self.active = false;
+        found.unwrap_or_default()
+    }
+}
+
+impl Drop for NamedReferences {
+    fn drop(&mut self) {
+        if self.active {
+            NAMED.with(|named| {
+                named.replace(self.previous.take());
+            });
+        }
+    }
+}
+
 fn var(name: InternedString, ty: Type, span: Span) -> Node {
     NAMED.with(|named| {
         if let Some(named) = named.borrow_mut().as_mut() {
@@ -12304,13 +12337,11 @@ pub(crate) fn loaded_program(
     library: &Library,
 ) -> Result<TypedProgram> {
     let (scopes, inferred) = loaded_types(ast);
-    NAMED.with(|named| *named.borrow_mut() = Some(Default::default()));
+    let references = NamedReferences::start();
     let lowered = loaded_declarations(
         &scopes, &inferred, ast, source, chunk_name, index, stripped, library,
     );
-    let named = NAMED
-        .with(|named| named.borrow_mut().take())
-        .unwrap_or_default();
+    let named = references.finish();
     let (mut declarations, registry) = lowered?;
     // The library's functions the chunk names, and no others: the rest
     // are already where the chunk will run.
@@ -12674,6 +12705,7 @@ pub(crate) fn program(
         );
         Ok(statements)
     };
+    let references = NamedReferences::start();
     lower_chunk(&module)?;
     let bounded = bounded_functions(&module.facts.borrow(), |f| {
         module.inferred.escaping.contains(&f) || module.scopes.func(f).escapes
@@ -12916,11 +12948,25 @@ pub(crate) fn program(
             m.source.clone(),
         ));
     }
-    Ok(TypedProgram {
+    let mut program = TypedProgram {
         declarations,
         language: Some(intern("lua")),
         span,
         source_files,
         type_registry: registry,
-    })
+    };
+    let named = references.finish();
+    let TypedDeclaration::Import(import) = &mut program
+        .declarations
+        .last_mut()
+        .expect("the library import")
+        .node
+    else {
+        unreachable!("the last declaration is the library import");
+    };
+    import.items = named
+        .into_iter()
+        .map(|name| zyntax_typed_ast::typed_ast::TypedImportItem::Named { name, alias: None })
+        .collect();
+    Ok(program)
 }
