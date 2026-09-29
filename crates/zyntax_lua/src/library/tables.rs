@@ -753,14 +753,19 @@ pub(super) fn declarations(t: &Types) -> Vec<Decl> {
             // Strings and files have metatables of their own.
             when(
                 eq(category(o.e()), int(STR)),
-                vec![ret(call(
-                    "zl_rawget_str",
-                    vec![
-                        unbox_table(call("zl_string_metatable", vec![], any()), t),
-                        event.e(),
-                    ],
-                    any(),
-                ))],
+                vec![
+                    mt.decl(read_global("zl_string_meta", any())),
+                    // The default string metatable only has `__index`,
+                    // which string indexing handles directly. Avoid
+                    // constructing the full string library for unrelated
+                    // metamethod probes such as numeric `tostring`.
+                    when(is_nil(mt.e()), vec![ret(nil())]),
+                    ret(call(
+                        "zl_rawget_str",
+                        vec![unbox_table(mt.e(), t), event.e()],
+                        any(),
+                    )),
+                ],
             ),
             when(
                 is_file(o.e()),
