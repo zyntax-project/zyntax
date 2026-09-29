@@ -1,4 +1,4 @@
-//! Compares against zero decided by the sign of what is compared.
+//! Compares against zero decided by the sign or provenance of what is compared.
 //!
 //! A floor division or remainder by a positive constant is a truncating
 //! `div`/`rem` and a correction taken when the remainder is negative.
@@ -8,8 +8,10 @@
 //! decides nothing: `x % 7` on an `x` that is itself `y % M` needs no
 //! correction at all.
 //!
-//! The pass finds the values a function can show are non-negative, then
+//! The pass finds the values a function can show are non-negative or
+//! non-zero, then
 //! folds each `lt v, 0` on one to false and each `ge v, 0` to true, and
+//! each equality comparison between a non-zero value and zero, and
 //! each `select` on a constant condition to the arm it takes. What is
 //! known is decided together, since a loop's phi is non-negative only
 //! if what comes round the back edge is.
@@ -43,13 +45,14 @@ pub fn run_module(module: &mut HirModule) -> SignFoldStats {
 fn run_function(func: &mut HirFunction) -> SignFoldStats {
     let mut stats = SignFoldStats::default();
     let nonneg = non_negative(func);
-    if nonneg.is_empty() {
+    let nonzero = non_zero(func);
+    if nonneg.is_empty() && nonzero.is_empty() {
         return stats;
     }
     let zero_of = |id: HirId| -> bool {
         matches!(
             func.values.get(&id).map(|v| &v.kind),
-            Some(HirValueKind::Constant(c)) if const_i128(c) == Some(0)
+            Some(HirValueKind::Constant(c)) if is_zero(c)
         )
     };
     // Compares decided by the sign become constants; their results are
@@ -58,15 +61,24 @@ fn run_function(func: &mut HirFunction) -> SignFoldStats {
     for block in func.blocks.values() {
         for inst in &block.instructions {
             if let HirInstruction::Binary {
-                op: op @ (BinaryOp::Lt | BinaryOp::Ge),
+                op,
                 result,
                 left,
                 right,
                 ..
             } = inst
             {
-                if nonneg.contains(left) && zero_of(*right) {
-                    decided.push((*result, matches!(op, BinaryOp::Ge)));
+                match op {
+                    BinaryOp::Lt | BinaryOp::Ge if nonneg.contains(left) && zero_of(*right) => {
+                        decided.push((*result, matches!(op, BinaryOp::Ge)));
+                    }
+                    BinaryOp::Eq | BinaryOp::Ne
+                        if (nonzero.contains(left) && zero_of(*right))
+                            || (nonzero.contains(right) && zero_of(*left)) =>
+                    {
+                        decided.push((*result, matches!(op, BinaryOp::Ne)));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -112,6 +124,90 @@ fn run_function(func: &mut HirFunction) -> SignFoldStats {
         crate::cse::apply_substitutions_public(func, &picks);
     }
     stats
+}
+
+/// Values proven unequal to zero. Allocation results stay non-zero in
+/// every successful execution; pointer/integer representation casts
+/// preserve that fact. A select or phi is non-zero only when every arm
+/// is, which carries the fact around loops without guessing about a
+/// parameter or load.
+fn non_zero(func: &HirFunction) -> HashSet<HirId> {
+    use crate::hir::{CastOp, Intrinsic};
+
+    let mut set: HashSet<HirId> = HashSet::new();
+    let mut defs: HashMap<HirId, &HirInstruction> = HashMap::new();
+    for (id, value) in &func.values {
+        match &value.kind {
+            HirValueKind::Constant(c) if const_i128(c).is_some_and(|n| n != 0) => {
+                set.insert(*id);
+            }
+            HirValueKind::Instruction => {
+                set.insert(*id);
+            }
+            _ => {}
+        }
+    }
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            if let Some(result) = inst.result_id() {
+                defs.insert(result, inst);
+            }
+        }
+    }
+    let phis: HashMap<HirId, Vec<HirId>> = func
+        .blocks
+        .values()
+        .flat_map(|block| block.phis.iter())
+        .map(|phi| {
+            (
+                phi.result,
+                phi.incoming.iter().map(|(value, _)| *value).collect(),
+            )
+        })
+        .collect();
+
+    loop {
+        let before = set.len();
+        let dropped: Vec<HirId> = set
+            .iter()
+            .copied()
+            .filter(|id| {
+                let holds = if let Some(incoming) = phis.get(id) {
+                    !incoming.is_empty() && incoming.iter().all(|value| set.contains(value))
+                } else if let Some(inst) = defs.get(id) {
+                    match inst {
+                        HirInstruction::Call {
+                            callee: crate::hir::HirCallable::Intrinsic(Intrinsic::Malloc),
+                            ..
+                        } => true,
+                        HirInstruction::Cast {
+                            op: CastOp::PtrToInt | CastOp::IntToPtr | CastOp::Bitcast,
+                            operand,
+                            ..
+                        } => set.contains(operand),
+                        HirInstruction::Select {
+                            true_val,
+                            false_val,
+                            ..
+                        } => set.contains(true_val) && set.contains(false_val),
+                        _ => false,
+                    }
+                } else {
+                    matches!(
+                        func.values.get(id).map(|value| &value.kind),
+                        Some(HirValueKind::Constant(c)) if const_i128(c).is_some_and(|n| n != 0)
+                    )
+                };
+                !holds
+            })
+            .collect();
+        for id in dropped {
+            set.remove(&id);
+        }
+        if set.len() == before {
+            return set;
+        }
+    }
 }
 
 /// The integer values of `func` that are never negative: non-negative
@@ -278,10 +374,17 @@ fn const_i128(c: &HirConstant) -> Option<i128> {
     })
 }
 
+fn is_zero(c: &HirConstant) -> bool {
+    matches!(c, HirConstant::Null(_)) || const_i128(c) == Some(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::{HirBlock, HirFunctionSignature, HirTerminator, HirType, HirValue};
+    use crate::hir::{
+        CastOp, HirBlock, HirCallable, HirFunctionSignature, HirTerminator, HirType, HirValue,
+        Intrinsic,
+    };
     use indexmap::IndexMap;
     use zyntax_typed_ast::InternedString;
 
@@ -428,5 +531,94 @@ mod tests {
             i,
             HirInstruction::Binary { op: BinaryOp::Lt, left, .. } if *left == k_rem
         )));
+    }
+
+    #[test]
+    fn allocation_is_nonzero_through_pointer_integer_round_trip() {
+        let mut values = IndexMap::new();
+        let size = value(
+            &mut values,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(32)),
+        );
+        let null = value(
+            &mut values,
+            HirType::Ptr(Box::new(HirType::U8)),
+            HirValueKind::Constant(HirConstant::Null(HirType::Ptr(Box::new(HirType::U8)))),
+        );
+        let allocation = value(
+            &mut values,
+            HirType::Ptr(Box::new(HirType::U8)),
+            HirValueKind::Instruction,
+        );
+        let address = value(&mut values, HirType::I64, HirValueKind::Instruction);
+        let pointer = value(
+            &mut values,
+            HirType::Ptr(Box::new(HirType::U8)),
+            HirValueKind::Instruction,
+        );
+        let nonnull = value(&mut values, HirType::Bool, HirValueKind::Instruction);
+
+        let entry = HirId::new();
+        let mut block = HirBlock::new(entry);
+        block.instructions = vec![
+            HirInstruction::Call {
+                result: Some(allocation),
+                callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+                args: vec![size],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+            HirInstruction::Cast {
+                result: address,
+                ty: HirType::I64,
+                op: CastOp::PtrToInt,
+                operand: allocation,
+            },
+            HirInstruction::Cast {
+                result: pointer,
+                ty: HirType::Ptr(Box::new(HirType::U8)),
+                op: CastOp::IntToPtr,
+                operand: address,
+            },
+            bin(BinaryOp::Ne, nonnull, HirType::Bool, pointer, null),
+        ];
+        block.terminator = HirTerminator::Return {
+            values: vec![nonnull],
+        };
+
+        let mut func = HirFunction::new(
+            InternedString::new_global("f"),
+            HirFunctionSignature {
+                params: vec![],
+                returns: vec![HirType::Bool],
+                type_params: vec![],
+                const_params: vec![],
+                lifetime_params: vec![],
+                is_variadic: false,
+                is_async: false,
+                is_fiber: false,
+                effects: vec![],
+                is_pure: false,
+            },
+        );
+        func.values = values;
+        func.blocks.clear();
+        func.blocks.insert(entry, block);
+        func.entry_block = entry;
+
+        let stats = run_function(&mut func);
+        assert_eq!(stats.compares, 1);
+        assert!(matches!(
+            func.values[&nonnull].kind,
+            HirValueKind::Constant(HirConstant::Bool(true))
+        ));
+        assert!(
+            !func.blocks[&entry]
+                .instructions
+                .iter()
+                .any(|instruction| instruction.result_id() == Some(nonnull))
+        );
     }
 }
