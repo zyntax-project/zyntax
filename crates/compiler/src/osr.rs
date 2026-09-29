@@ -1043,8 +1043,8 @@ fn live_in_ownership(function: &HirFunction, value: HirId) -> crate::hir::ParamO
 
 /// Outline the resume point of `function` at `layout.header` (see
 /// [`Outlined`]). `region_id` names the outlined function; the adapter
-/// takes a fresh id. `None` for a function that returns through a
-/// destination, whose frame carries the destination too.
+/// takes a fresh id. A destination-return function keeps that destination
+/// in the adapter's frame layout, just as an ordinary resume helper does.
 pub fn outline(
     function: &HirFunction,
     layout: &OsrLayout,
@@ -1054,9 +1054,6 @@ pub fn outline(
     use crate::hir::{
         HirBlock, HirFunctionSignature, HirInstruction, HirParam, HirPhi, HirValue, HirValueKind,
     };
-    if layout.destination.is_some() {
-        return None;
-    }
     let resumed = resumable(function, layout);
     let reachable = reachable_from(&resumed, layout.header);
     let in_region: IdSet = reachable.iter().copied().collect();
@@ -1316,7 +1313,7 @@ pub fn outline(
         phi_count: 0,
         return_type: layout.return_type.clone(),
         frame: layout.frame.clone(),
-        destination: None,
+        destination: layout.destination,
         repairs: Vec::new(),
     };
     Some(Outlined {

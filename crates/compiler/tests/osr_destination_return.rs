@@ -211,6 +211,51 @@ fn the_layout_carries_the_destination_and_returns_the_pointer() {
 }
 
 #[test]
+fn the_destination_returning_loop_can_be_outlined() {
+    let (function, header) = build_sums();
+    let layout = osr::osr_layout(&function, header).expect("a layout");
+    let outlined = osr::outline(
+        &function,
+        &layout,
+        HirId::new(),
+        InternedString::new_global("sums$resume"),
+    )
+    .expect("a destination-returning loop can stand alone");
+
+    assert_eq!(outlined.adapter_layout.destination, layout.destination);
+    assert_eq!(
+        outlined.function.signature.returns,
+        function.signature.returns
+    );
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn the_llvm_helper_recovers_the_destination_from_the_frame() {
+    use inkwell::context::Context;
+    use zyntax_compiler::llvm_backend::LLVMBackend;
+
+    let (function, header) = build_sums();
+    let layout = osr::osr_layout(&function, header).expect("a layout");
+    let context = Context::create();
+    let mut backend = LLVMBackend::new(&context, "osr_destination");
+    backend.set_entry_abi(
+        function.id,
+        zyntax_compiler::abi::function_abi(&function, false),
+    );
+    let helper = backend
+        .compile_osr_helper(&function, &layout)
+        .expect("LLVM emits a destination-return helper");
+
+    assert!(backend.module().get_function(&helper).is_some());
+    assert!(
+        backend.module().verify().is_ok(),
+        "destination-return helper should verify:\n{}",
+        backend.module().print_to_string()
+    );
+}
+
+#[test]
 fn a_tier0_probe_hands_the_destination_to_the_helper() {
     const BEAD: u64 = 0xDE57;
     let (function, header) = build_sums();

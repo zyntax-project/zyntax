@@ -1181,13 +1181,6 @@ impl<'ctx> LLVMBackend<'ctx> {
         func: &HirFunction,
         layout: &crate::osr::OsrLayout,
     ) -> CompilerResult<String> {
-        // A function returning through a destination keeps the Cranelift
-        // convention this tier does not enter.
-        if layout.destination.is_some() {
-            return Err(CompilerError::CodeGen(
-                "OSR helper for a destination return".into(),
-            ));
-        }
         // The helper enters only at this header. Predecessors outside its
         // reachable graph are omitted when wiring the copied blocks' phis.
         // The region is compiled in reverse postorder from the header, so
@@ -1280,6 +1273,34 @@ impl<'ctx> LLVMBackend<'ctx> {
             .ok_or_else(|| CompilerError::CodeGen("OSR helper missing its frame pointer".into()))?
             .into_pointer_value();
         let i8_ty = self.context.i8_type();
+        self.entry_destination = if let Some(offset) = layout.destination {
+            let slot = unsafe {
+                self.builder
+                    .build_in_bounds_gep(
+                        i8_ty,
+                        frame_ptr,
+                        &[self.context.i32_type().const_int(offset as u64, false)],
+                        "osr_destination_slot",
+                    )
+                    .map_err(|e| {
+                        CompilerError::CodeGen(format!("OSR destination frame gep: {e}"))
+                    })?
+            };
+            Some(
+                self.builder
+                    .build_load(
+                        self.context.ptr_type(inkwell::AddressSpace::default()),
+                        slot,
+                        "osr_destination",
+                    )
+                    .map_err(|e| {
+                        CompilerError::CodeGen(format!("OSR destination frame load: {e}"))
+                    })?
+                    .into_pointer_value(),
+            )
+        } else {
+            None
+        };
         let mut phi_seeds: Vec<(HirId, BasicValueEnum<'ctx>)> = Vec::new();
         let mut phi_seed_slots: Vec<(HirId, inkwell::values::PointerValue<'ctx>, HirType)> =
             Vec::new();
@@ -1427,6 +1448,7 @@ impl<'ctx> LLVMBackend<'ctx> {
         }
 
         self.current_function = None;
+        self.entry_destination = None;
 
         // The precondition above should have caught anything malformed, so
         // a failure here means the emitted body is wrong rather than the
