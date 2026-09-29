@@ -55,10 +55,10 @@ fn disassemble(src: &str, name: &str) -> Option<String> {
 /// Whether the running x86_64 host has `feature`; the backend selects
 /// instructions by what the host has.
 #[allow(unreachable_code)]
-fn host_has(feature: &str) -> bool {
+fn host_has(_feature: &str) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        return match feature {
+        return match _feature {
             "avx" => std::arch::is_x86_feature_detected!("avx"),
             "fma" => std::arch::is_x86_feature_detected!("fma"),
             _ => false,

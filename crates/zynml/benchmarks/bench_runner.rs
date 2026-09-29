@@ -748,7 +748,6 @@ fn main() {
     for kernel_spec in KERNELS {
         let pretty = kernel_spec.name();
         let kernel = kernel_spec.source;
-        let expected = &kernel_spec.expected;
         // Each row states the pipeline it wants, so a row that opts out
         // of a pass cannot leak that choice into the next one.
         zyntax_compiler::pure_call_pre::set_enabled(Some(kernel_spec.pure_call_pre));

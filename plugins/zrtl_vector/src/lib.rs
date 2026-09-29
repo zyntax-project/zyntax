@@ -570,7 +570,7 @@ pub extern "C" fn vector_topk_euclidean(
 // ============================================================================
 
 /// Flat index for exact nearest neighbor search
-struct FlatIndex {
+pub struct FlatIndex {
     dim: usize,
     vectors: Vec<f32>,
     ids: Vec<u64>,
@@ -595,14 +595,6 @@ impl FlatIndex {
 
     fn len(&self) -> usize {
         self.ids.len()
-    }
-
-    fn get_vector(&self, idx: usize) -> Option<&[f32]> {
-        if idx >= self.len() {
-            return None;
-        }
-        let start = idx * self.dim;
-        Some(&self.vectors[start..start + self.dim])
     }
 }
 
@@ -724,7 +716,7 @@ impl HNSWLayer {
 }
 
 /// HNSW index for approximate nearest neighbor search
-struct HNSWIndex {
+pub struct HNSWIndex {
     dim: usize,
     m: usize,     // Number of connections per layer
     m_max: usize, // Max connections at layer 0
@@ -949,9 +941,6 @@ impl HNSWIndex {
         if query.len() != self.dim || self.entry_point.is_none() {
             return Vec::new();
         }
-
-        // Create a temporary ID for the query
-        let query_id = u64::MAX; // Use max as sentinel
 
         // We need to compute distances differently since query isn't stored
         let entry = self.entry_point.unwrap();

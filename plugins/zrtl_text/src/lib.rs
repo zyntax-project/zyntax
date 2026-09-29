@@ -68,10 +68,6 @@ impl BPETokenizer {
         self.vocab.get(token).copied()
     }
 
-    fn id_to_token(&self, id: u32) -> Option<&str> {
-        self.id_to_token.get(&id).map(|s| s.as_str())
-    }
-
     /// Encode text to token IDs using BPE
     fn encode(&self, text: &str) -> Vec<u32> {
         if text.is_empty() {

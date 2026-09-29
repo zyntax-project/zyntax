@@ -87,8 +87,6 @@ struct TensorStorage {
     refcount: AtomicUsize,
     /// Data pointer (owned)
     data: *mut u8,
-    /// Total size in bytes
-    size_bytes: usize,
     /// Memory layout for deallocation
     alloc_layout: AllocLayout,
 }
@@ -110,7 +108,6 @@ impl TensorStorage {
         let storage = Box::new(TensorStorage {
             refcount: AtomicUsize::new(1),
             data,
-            size_bytes,
             alloc_layout,
         });
 
@@ -2690,13 +2687,11 @@ mod tests {
         let tensor = tensor_new(shape.as_ptr(), 2, DType::F32 as u8);
         assert!(!tensor.is_null());
 
-        unsafe {
-            assert_eq!(tensor_ndim(tensor), 2);
-            assert_eq!(tensor_shape(tensor, 0), 2);
-            assert_eq!(tensor_shape(tensor, 1), 3);
-            assert_eq!(tensor_numel(tensor), 6);
-            assert!(tensor_is_contiguous(tensor));
-        }
+        assert_eq!(tensor_ndim(tensor), 2);
+        assert_eq!(tensor_shape(tensor, 0), 2);
+        assert_eq!(tensor_shape(tensor, 1), 3);
+        assert_eq!(tensor_numel(tensor), 6);
+        assert!(tensor_is_contiguous(tensor));
 
         tensor_free(tensor);
     }
@@ -2736,10 +2731,8 @@ mod tests {
         let reshaped = tensor_reshape(tensor, new_shape.as_ptr(), 1);
         assert!(!reshaped.is_null());
 
-        unsafe {
-            assert_eq!(tensor_ndim(reshaped), 1);
-            assert_eq!(tensor_shape(reshaped, 0), 6);
-        }
+        assert_eq!(tensor_ndim(reshaped), 1);
+        assert_eq!(tensor_shape(reshaped, 0), 6);
 
         tensor_free(reshaped);
         tensor_free(tensor);
@@ -2752,10 +2745,8 @@ mod tests {
         let reshaped = tensor_reshape(tensor, shape.as_ptr(), 2);
         let transposed = tensor_transpose(reshaped, 0, 1);
 
-        unsafe {
-            assert_eq!(tensor_shape(transposed, 0), 3);
-            assert_eq!(tensor_shape(transposed, 1), 2);
-        }
+        assert_eq!(tensor_shape(transposed, 0), 3);
+        assert_eq!(tensor_shape(transposed, 1), 2);
 
         tensor_free(transposed);
         tensor_free(reshaped);

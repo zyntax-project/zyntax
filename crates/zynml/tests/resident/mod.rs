@@ -16,11 +16,13 @@ pub fn bytes() -> u64 {
 }
 
 /// Resident size in KiB.
+#[allow(dead_code)]
 pub fn kb() -> i64 {
     (bytes() / 1024) as i64
 }
 
 /// Resident size in MiB.
+#[allow(dead_code)]
 pub fn mb() -> u64 {
     bytes() / (1024 * 1024)
 }

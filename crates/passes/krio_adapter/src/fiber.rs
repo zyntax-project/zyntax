@@ -232,7 +232,8 @@ impl FiberCfg for KrioFiberBackend {
         env: *mut u8,
         stack_size: i64,
     ) -> *mut FiberRepr {
-        let ptr = self.fiber_new(closure, stack_size);
+        // SAFETY: this method forwards the caller's valid closure contract.
+        let ptr = unsafe { self.fiber_new(closure, stack_size) };
         ENV_MAP.with(|m| {
             m.borrow_mut().insert(ptr as usize, env as usize);
         });
@@ -251,7 +252,8 @@ impl FiberCfg for KrioFiberBackend {
 
     unsafe fn fiber_resume(&self, fiber: *mut FiberRepr) -> i64 {
         let handle = fiber as usize;
-        let fiber = &mut *(fiber as *mut Fiber);
+        // SAFETY: callers pass a live handle returned by `fiber_new`.
+        let fiber = unsafe { &mut *(fiber as *mut Fiber) };
         // Honour cooperative cancel at the resume boundary: an
         // auto-generated `fiber def` body has no chance to call
         // `is_cancelled()` itself between yields, so the cancel flag
@@ -281,7 +283,8 @@ impl FiberCfg for KrioFiberBackend {
 
     unsafe fn fiber_resume_with(&self, fiber: *mut FiberRepr, value: i64) -> i64 {
         let handle = fiber as usize;
-        let fiber = &mut *(fiber as *mut Fiber);
+        // SAFETY: callers pass a live handle returned by `fiber_new`.
+        let fiber = unsafe { &mut *(fiber as *mut Fiber) };
         if fiber.is_cancelled() {
             return fiber_backend::pack_fiber_step(FIBER_STEP_DONE, 0);
         }
@@ -326,7 +329,8 @@ impl FiberCfg for KrioFiberBackend {
     }
 
     unsafe fn fiber_cancel(&self, fiber: *mut FiberRepr) {
-        let fiber = &*(fiber as *const Fiber);
+        // SAFETY: callers pass a live handle returned by `fiber_new`.
+        let fiber = unsafe { &*(fiber as *const Fiber) };
         fiber.cancel();
     }
 
@@ -408,7 +412,9 @@ impl FiberCfg for KrioFiberBackend {
         });
         // Reclaim ownership handed out by `fiber_new`'s `Box::into_raw`.
         // Dropping the box unmaps the fiber's stack + guard page.
-        drop(Box::from_raw(fiber as *mut Fiber));
+        // SAFETY: `fiber_new` created this allocation with `Box::into_raw`,
+        // and the task maps above ensure this handle is reclaimed once.
+        drop(unsafe { Box::from_raw(fiber as *mut Fiber) });
     }
 
     fn fiber_abort_with(&self, variant: i64, payload: i64) {

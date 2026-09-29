@@ -80,16 +80,21 @@ pub unsafe extern "C" fn print_str(ptr: *const u8, len: i32) {
     if ptr.is_null() || len < 0 {
         return;
     }
-    for i in 0..len {
-        libc::putchar(*ptr.offset(i as isize) as i32);
+    // SAFETY: the caller promises that `ptr` addresses at least `len`
+    // readable bytes, and the null and negative-length cases were rejected.
+    unsafe {
+        for i in 0..len {
+            libc::putchar(*ptr.add(i as usize) as i32);
+        }
+        libc::fflush(core::ptr::null_mut());
     }
-    libc::fflush(core::ptr::null_mut());
 }
 
 /// Print a string with newline
 #[runtime_export("println_str")]
 pub unsafe extern "C" fn println_str(ptr: *const u8, len: i32) {
-    print_str(ptr, len);
+    // SAFETY: this function carries the same pointer contract as `print_str`.
+    unsafe { print_str(ptr, len) };
     print_newline();
 }
 

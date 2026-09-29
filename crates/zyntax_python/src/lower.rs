@@ -10479,14 +10479,20 @@ impl<'m> Lowerer<'m> {
                             return unsupported("a host class without a constructor", c);
                         };
                         let callee = self.expr(&c.func)?;
-                        return self
-                            .host_construct(callee, &signature, args, keywords, c, ty, span);
+                        return self.host_construct(
+                            callee,
+                            &signature,
+                            args,
+                            keywords,
+                            c,
+                            (ty, span),
+                        );
                     }
                     Ty::HostFunction(module, function) => {
                         let signature =
                             self.module.hosts[module as usize].functions[function as usize].clone();
                         let callee = self.expr(&c.func)?;
-                        return self.host_call(callee, &signature, args, keywords, c, ty, span);
+                        return self.host_call(callee, &signature, args, keywords, c, (ty, span));
                     }
                     Ty::Bound(k) => {
                         let info = self.module.bounds[k as usize].clone();
@@ -10594,7 +10600,7 @@ impl<'m> Lowerer<'m> {
                     .host_method(module, class, a.attr.as_str(), false)
                     .cloned();
                 if let Some(signature) = signature {
-                    return self.host_method(receiver, &signature, args, keywords, c, ty, span);
+                    return self.host_method(receiver, &signature, args, keywords, c, (ty, span));
                 }
             }
             if let Ty::HostClass(module, class) = receiver.ty {
@@ -10603,7 +10609,7 @@ impl<'m> Lowerer<'m> {
                     .host_method(module, class, a.attr.as_str(), true)
                     .cloned();
                 if let Some(signature) = signature {
-                    return self.host_method(receiver, &signature, args, keywords, c, ty, span);
+                    return self.host_method(receiver, &signature, args, keywords, c, (ty, span));
                 }
             }
             if let Ty::HostModule(module) = receiver.ty
@@ -10612,7 +10618,7 @@ impl<'m> Lowerer<'m> {
             {
                 let signature =
                     self.module.hosts[module as usize].functions[function as usize].clone();
-                return self.host_method(receiver, &signature, args, keywords, c, ty, span);
+                return self.host_method(receiver, &signature, args, keywords, c, (ty, span));
             }
             if matches!(
                 receiver.ty,
@@ -13875,9 +13881,9 @@ impl<'m> Lowerer<'m> {
         args: &[py::Expr],
         keywords: &[py::Keyword],
         at: &impl Ranged,
-        ty: Ty,
-        span: Span,
+        expected: (Ty, Span),
     ) -> Result<Val> {
+        let (ty, span) = expected;
         if ty == Ty::Float
             && signature.ret == crate::HostType::Float
             && signature
@@ -13938,9 +13944,9 @@ impl<'m> Lowerer<'m> {
         args: &[py::Expr],
         keywords: &[py::Keyword],
         at: &impl Ranged,
-        ty: Ty,
-        span: Span,
+        expected: (Ty, Span),
     ) -> Result<Val> {
+        let (ty, span) = expected;
         let all_float = signature
             .params
             .iter()
@@ -14047,9 +14053,9 @@ impl<'m> Lowerer<'m> {
         args: &[py::Expr],
         keywords: &[py::Keyword],
         at: &impl Ranged,
-        ty: Ty,
-        span: Span,
+        expected: (Ty, Span),
     ) -> Result<Val> {
+        let (ty, span) = expected;
         if ty == Ty::Float
             && signature.ret == crate::HostType::Float
             && signature
