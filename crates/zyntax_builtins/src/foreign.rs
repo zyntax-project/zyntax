@@ -418,7 +418,10 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             any(),
             vec![
                 r.decl(call(&construct_raw, construct_args, any())),
-                raise_reported(),
+                // A successful constructor always returns its owned object.
+                // Null is therefore the error sentinel, so the common path
+                // does not query thread-local error state.
+                when(eq(r.e(), null(any())), vec![raise_reported()]),
                 ret(r.e()),
             ],
         ));
@@ -506,7 +509,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             any(),
             vec![
                 r.decl(call(&construct_float_raw, construct_float_args, any())),
-                raise_reported(),
+                when(eq(r.e(), null(any())), vec![raise_reported()]),
                 ret(r.e()),
             ],
         ));

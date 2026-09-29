@@ -71,8 +71,8 @@ pub trait Foreign: Send + Sync {
     /// Call `object` with `args`.
     fn call(&self, object: usize, args: &[Any]) -> Result<Any, ForeignError>;
 
-    /// Construct through a host class. The returned box is owned by the
-    /// program and is released when its value dies.
+    /// Construct through a host class. A successful result is a non-null box
+    /// owned by the program and released when its value dies.
     fn construct(&self, object: usize, args: &[Any]) -> Result<Any, ForeignError> {
         self.call(object, args)
     }
@@ -97,8 +97,8 @@ pub trait Foreign: Send + Sync {
         number_of(self.call(_object, &args)?)
     }
 
-    /// Construct with unboxed float arguments. The returned box is owned by
-    /// the program and is released when its value dies.
+    /// Construct with unboxed float arguments. A successful result is a
+    /// non-null box owned by the program and released when its value dies.
     fn construct_float(&self, _object: usize, _args: &[f64]) -> Result<Any, ForeignError> {
         let args: Vec<Any> = _args.iter().map(|&value| float(value)).collect();
         self.construct(_object, &args)
