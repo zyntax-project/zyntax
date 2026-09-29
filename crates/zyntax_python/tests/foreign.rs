@@ -236,6 +236,12 @@ from log import record
 def inferred_length():
     return Point(3, 4).length()
 
+def replace_points(n):
+    point = Point(0.0, 0.0)
+    for i in range(n):
+        point = Point(float(i), 0.0)
+    return point.x
+
 p = Point(3, 4)
 record(p.x + p.y)
 record(p.length())
@@ -259,6 +265,7 @@ a, b = s.pair()
 record(a, b, len(s.pair()))
 add = s.adder()
 record(add(4.0))
+record(replace_points(1000))
 "#;
 
 #[test]
@@ -386,7 +393,18 @@ fn a_program_uses_the_embedders_objects() {
             // Several values given at once are a tuple of them.
             "1.0\t2.0\t2",
             "5.0",
+            "999.0",
         ]
+    );
+    let live_points = s
+        .objects
+        .iter()
+        .zip(&s.held)
+        .filter(|(object, held)| matches!(object, Obj::Point { .. }) && **held > 0)
+        .count();
+    assert!(
+        live_points <= 2,
+        "replaced constructor results remain held: {live_points}"
     );
     assert!(
         s.held.iter().all(|&n| n >= 0),

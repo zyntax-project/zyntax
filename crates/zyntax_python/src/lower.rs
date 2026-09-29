@@ -10422,7 +10422,8 @@ impl<'m> Lowerer<'m> {
                             return unsupported("a host class without a constructor", c);
                         };
                         let callee = self.expr(&c.func)?;
-                        return self.host_call(callee, &signature, args, keywords, c, ty, span);
+                        return self
+                            .host_construct(callee, &signature, args, keywords, c, ty, span);
                     }
                     Ty::HostFunction(module, function) => {
                         let signature =
@@ -13860,6 +13861,62 @@ impl<'m> Lowerer<'m> {
         let dynamic = Val {
             node: call(
                 &format!("zb_call_{}", args.len()),
+                lowered,
+                Ty::Object,
+                span,
+            ),
+            ty: Ty::Object,
+        };
+        let guarded = self.guard(dynamic, span);
+        Ok(Val {
+            node: self.coerce(guarded, ty),
+            ty,
+        })
+    }
+
+    fn host_construct(
+        &mut self,
+        callee: Val,
+        signature: &crate::HostMethod,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        at: &impl Ranged,
+        ty: Ty,
+        span: Span,
+    ) -> Result<Val> {
+        let all_float = signature
+            .params
+            .iter()
+            .all(|ty| *ty == crate::HostType::Float);
+        let mut lowered = vec![self.coerce(callee, Ty::Object)];
+        if all_float {
+            if !keywords.is_empty() {
+                return unsupported("keyword arguments in a host constructor", at);
+            }
+            if args.len() != signature.params.len() {
+                return unsupported(
+                    format!(
+                        "{}() takes {} argument(s), got {}",
+                        signature.name,
+                        signature.params.len(),
+                        args.len()
+                    ),
+                    at,
+                );
+            }
+            for arg in args {
+                lowered.push(self.expr_as(arg, Ty::Float)?);
+            }
+        } else {
+            lowered.extend(self.host_arguments(signature, args, keywords, at)?);
+        }
+        let dynamic = Val {
+            node: call(
+                &format!(
+                    "zb_foreign_construct_{}{}",
+                    if all_float { "float_" } else { "" },
+                    args.len()
+                ),
                 lowered,
                 Ty::Object,
                 span,

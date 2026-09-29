@@ -976,6 +976,46 @@ pub struct Outlined {
     pub adapter_layout: OsrLayout,
 }
 
+/// Ownership a live-in carries across an OSR transfer. Parameters keep
+/// their declared mode. A loop value that this body explicitly releases
+/// is handed to the outlined region as owned: the old frame stops at the
+/// transfer, so the region becomes the sole holder of that claim.
+fn live_in_ownership(function: &HirFunction, value: HirId) -> crate::hir::ParamOwnership {
+    if let Some(crate::hir::HirValue {
+        kind: crate::hir::HirValueKind::Parameter(position),
+        ..
+    }) = function.values.get(&value)
+        && let Some(param) = function.signature.params.get(*position as usize)
+    {
+        return param.ownership;
+    }
+
+    let released = function.blocks.values().any(|block| {
+        block.instructions.iter().any(|inst| {
+            let crate::hir::HirInstruction::Call { callee, args, .. } = inst else {
+                return false;
+            };
+            if args.first() != Some(&value) {
+                return false;
+            }
+            match callee {
+                crate::hir::HirCallable::Intrinsic(
+                    crate::hir::Intrinsic::Free | crate::hir::Intrinsic::Drop,
+                ) => true,
+                crate::hir::HirCallable::Symbol(name) => {
+                    matches!(name.as_str(), "zyntax_box_free" | "$IO$string_free")
+                }
+                _ => false,
+            }
+        })
+    });
+    if released {
+        crate::hir::ParamOwnership::Owned
+    } else {
+        crate::hir::ParamOwnership::default()
+    }
+}
+
 /// Outline the resume point of `function` at `layout.header` (see
 /// [`Outlined`]). `region_id` names the outlined function; the adapter
 /// takes a fresh id. `None` for a function that returns through a
@@ -1036,7 +1076,7 @@ pub fn outline(
             name: zyntax_typed_ast::InternedString::new_global(&format!("live_in{i}")),
             ty: ty.clone(),
             attributes: Default::default(),
-            ownership: Default::default(),
+            ownership: live_in_ownership(function, *id),
         });
     }
     // Every other value the region names: constants, globals and its

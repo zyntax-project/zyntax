@@ -645,10 +645,29 @@ impl ModuleFacts {
 fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
     use crate::analysis::{DominatorTree, LoopForest};
 
-    let sites: std::collections::HashMap<HirId, Release> = collect_owned_sites(func, facts)
+    let mut sites: std::collections::HashMap<HirId, Release> = collect_owned_sites(func, facts)
         .iter()
         .map(|s| (s.result, s.release))
         .collect();
+    // An owned parameter is an allocation site whose call happened in
+    // the caller. This matters in particular for an outlined OSR region:
+    // its first loop value arrives through a parameter and the phi takes
+    // over that claim exactly as it takes over values made in the body.
+    for value in func.values.values() {
+        let crate::hir::HirValueKind::Parameter(position) = value.kind else {
+            continue;
+        };
+        if func
+            .signature
+            .params
+            .get(position as usize)
+            .is_some_and(|p| p.ownership == crate::hir::ParamOwnership::Owned)
+        {
+            sites
+                .entry(value.id)
+                .or_insert_with(|| release_for(func, value.id, facts));
+        }
+    }
     if sites.is_empty() {
         return 0;
     }
@@ -686,6 +705,10 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
     // What the rounds below ask of each value does not change between
     // them: indexed once.
     let mut index = PhiIndex::of(func, &phi_blocks);
+    // Lowering can leave shadow phis whose results feed only other dead
+    // phis. They carry no runtime claim and must not compete with the
+    // live program variable for ownership of the same incoming value.
+    candidates.retain(|p| index.live_phis.contains(p));
     // Ownership, then the release each owner uses. A phi whose incomings
     // agree on no release does not own, and a phi handing its value on
     // to it no longer may either, so both are decided again until every
@@ -907,8 +930,34 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
             inst_idx: usize::MAX,
             release,
         };
-        if let Some(points) = drop_points_transferring(func, &site, &derived, facts, &transfer_out)
-        {
+        // Replacing a loop-carried value ends the previous iteration's
+        // claim even when the body never reads it. Treat each replacing
+        // back edge as an implicit last use; otherwise `x = make()` in a
+        // loop retains every value except the final one.
+        let implicit_uses: IdSet = bodies
+            .get(&block_id)
+            .into_iter()
+            .flat_map(|body| {
+                func.blocks[&block_id]
+                    .phis
+                    .iter()
+                    .find(|p| p.result == phi_result)
+                    .into_iter()
+                    .flat_map(move |phi| {
+                        phi.incoming.iter().filter_map(move |(value, pred)| {
+                            (body.contains(pred) && *value != phi_result).then_some(*pred)
+                        })
+                    })
+            })
+            .collect();
+        if let Some(points) = drop_points_transferring_with_uses(
+            func,
+            &site,
+            &derived,
+            facts,
+            &transfer_out,
+            &implicit_uses,
+        ) {
             inserted += apply_points(func, points, phi_result, release);
         }
     }
@@ -944,6 +993,8 @@ struct PhiIndex {
     derived: std::collections::HashMap<HirId, IdSet>,
     borrowed: std::collections::HashMap<HirId, bool>,
     past_merge: std::collections::HashMap<(HirId, HirId), bool>,
+    /// Phi results that eventually reach an instruction or terminator.
+    live_phis: IdSet,
 }
 
 impl PhiIndex {
@@ -968,14 +1019,39 @@ impl PhiIndex {
                 terminator_users.entry(v).or_default().push(*b);
             }
         }
+        let users = Users::of(func);
+        let phi_results: IdSet = phi_blocks.keys().copied().collect();
+        let mut live_phis: IdSet = phi_results
+            .iter()
+            .copied()
+            .filter(|id| {
+                users.by_value.get(id).is_some_and(|uses| !uses.is_empty())
+                    || terminator_users
+                        .get(id)
+                        .is_some_and(|uses| !uses.is_empty())
+            })
+            .collect();
+        loop {
+            let before = live_phis.len();
+            for (value, destinations) in &phi_users {
+                if phi_results.contains(value) && destinations.iter().any(|p| live_phis.contains(p))
+                {
+                    live_phis.insert(*value);
+                }
+            }
+            if live_phis.len() == before {
+                break;
+            }
+        }
         PhiIndex {
-            users: Users::of(func),
+            users,
             phi_users,
             terminator_users,
             def_blocks,
             derived: std::collections::HashMap::new(),
             borrowed: std::collections::HashMap::new(),
             past_merge: std::collections::HashMap::new(),
+            live_phis,
         }
     }
 
@@ -1042,7 +1118,7 @@ impl PhiIndex {
         let mut out = Vec::new();
         for d in &derived {
             if let Some(users) = self.phi_users.get(d) {
-                out.extend(users.iter().copied());
+                out.extend(users.iter().copied().filter(|p| self.live_phis.contains(p)));
             }
         }
         out
@@ -1093,7 +1169,7 @@ fn phi_incomings_owned(
         let kept_elsewhere = index.phi_users.get(val).is_some_and(|users| {
             users
                 .iter()
-                .any(|p| *p != phi.result && !candidates.contains(p))
+                .any(|p| index.live_phis.contains(p) && *p != phi.result && !candidates.contains(p))
         });
         let borrowed_only = index.borrowed_only(func, facts, *val);
         let fine = if round_back_edge {
@@ -1951,6 +2027,10 @@ pub(crate) fn symbol_role(name: &str) -> Option<SymbolRole> {
         STRING_TO_BOX => Some(SymbolRole::COPIES_INTO_BOX),
         // A box that took the string itself.
         STRING_INTO_BOX => Some(SymbolRole::KEEPS_INTO_BOX),
+        // A host constructor hands the program a fresh dynamic box. Host
+        // calls and member reads may return borrowed values, so only the
+        // constructor ABI carries this ownership promise.
+        _ if name.starts_with("$Foreign$construct") => Some(SymbolRole::COPIES_INTO_BOX),
         // The IO, string and math plugins read their arguments and hand
         // back fresh storage; none keeps a pointer it was given.
         _ if name.starts_with("$IO$")
@@ -2303,6 +2383,17 @@ fn drop_points_transferring(
     facts: &ModuleFacts,
     transfer_out: &IdSet,
 ) -> Option<Vec<Point>> {
+    drop_points_transferring_with_uses(func, site, derived, facts, transfer_out, &IdSet::default())
+}
+
+fn drop_points_transferring_with_uses(
+    func: &HirFunction,
+    site: &MallocSite,
+    derived: &IdSet,
+    facts: &ModuleFacts,
+    transfer_out: &IdSet,
+    implicit_uses: &IdSet,
+) -> Option<Vec<Point>> {
     // Only blocks the entry can get to. An unreachable one has no
     // bearing on where the value dies and its successors would drag
     // liveness around the graph for nothing.
@@ -2320,7 +2411,7 @@ fn drop_points_transferring(
     // What each block does with the value: the last instruction that
     // uses it, and whether the terminator does.
     let mut last_use: std::collections::HashMap<HirId, usize> = std::collections::HashMap::new();
-    let mut uses_block: IdSet = IdSet::default();
+    let mut uses_block: IdSet = implicit_uses.clone();
     for (block_id, block) in &func.blocks {
         if !reachable.contains(block_id) {
             continue;
@@ -3972,6 +4063,47 @@ mod tests {
                 "releasing before the read would be a use after free"
             );
         }
+    }
+
+    /// Assignment can replace a loop-carried object without reading the
+    /// old one. The back edge is still the end of that object's lifetime.
+    #[test]
+    fn an_unread_accumulator_releases_what_it_replaces() {
+        let (mut f, acc) = build_accumulator_loop(false);
+        let body_id = f
+            .blocks
+            .iter()
+            .find(|(_, block)| {
+                matches!(block.terminator, HirTerminator::Branch { .. })
+                    && block.instructions.iter().any(|inst| {
+                        matches!(
+                            inst,
+                            HirInstruction::Call {
+                                callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+                                ..
+                            }
+                        )
+                    })
+            })
+            .map(|(id, _)| *id)
+            .expect("loop body");
+        f.blocks
+            .get_mut(&body_id)
+            .unwrap()
+            .instructions
+            .retain(|inst| !matches!(inst, HirInstruction::Load { .. }));
+
+        assert_eq!(release_owned_phis(&mut f, &ModuleFacts::default()), 2);
+        assert_eq!(
+            f.blocks
+                .values()
+                .flat_map(|block| &block.instructions)
+                .filter(|inst| {
+                    matches!(inst, HirInstruction::Call { callee: HirCallable::Intrinsic(Intrinsic::Free), args, .. } if args == &vec![acc])
+                })
+                .count(),
+            2
+        );
     }
 
     /// If anything might keep the accumulator, it is not ours to

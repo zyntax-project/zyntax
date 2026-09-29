@@ -359,10 +359,13 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     // embedder. Dynamic and variadic callers keep the list-based entries.
     for arity in 0..=crate::functions::MAX_CALL_ARITY {
         let call_raw = format!("zb_foreign_call_fixed_raw_{arity}");
+        let construct_raw = format!("zb_foreign_construct_fixed_raw_{arity}");
         let invoke_raw = format!("zb_foreign_invoke_fixed_raw_{arity}");
         let call_name = format!("zb_foreign_call_{arity}");
+        let construct_name = format!("zb_foreign_construct_{arity}");
         let invoke_name = format!("zb_foreign_invoke_{arity}");
         let call_symbol = format!("$Foreign$call{arity}");
+        let construct_symbol = format!("$Foreign$construct{arity}");
         let invoke_symbol = format!("$Foreign$invoke{arity}");
         let fixed_names: Vec<&'static str> = (0..arity)
             .map(|i| Box::leak(format!("a{i}").into_boxed_str()) as &'static str)
@@ -376,6 +379,12 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             &call_extern_params,
             any(),
             Some(&call_symbol),
+        ));
+        declarations.push(extern_fn(
+            &construct_raw,
+            &call_extern_params,
+            any(),
+            Some(&construct_symbol),
         ));
         let mut invoke_extern_params = vec![("x", any()), ("name", string())];
         invoke_extern_params.extend(fixed_names.iter().map(|name| (*name, any())));
@@ -401,6 +410,19 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             ],
         ));
 
+        let mut construct_args = vec![x.e()];
+        construct_args.extend(fixed.iter().map(Local::e));
+        declarations.push(define(
+            &construct_name,
+            &call_params,
+            any(),
+            vec![
+                r.decl(call(&construct_raw, construct_args, any())),
+                raise_reported(),
+                ret(r.e()),
+            ],
+        ));
+
         let mut invoke_params: Vec<&Local> = vec![&x, &name];
         invoke_params.extend(&fixed);
         let mut invoke_args = vec![x.e(), name.e()];
@@ -417,10 +439,13 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         ));
 
         let call_float_raw = format!("zb_foreign_call_float_raw_{arity}");
+        let construct_float_raw = format!("zb_foreign_construct_float_raw_{arity}");
         let invoke_float_raw = format!("zb_foreign_invoke_float_raw_{arity}");
         let call_float_name = format!("zb_foreign_call_float_{arity}");
+        let construct_float_name = format!("zb_foreign_construct_float_{arity}");
         let invoke_float_name = format!("zb_foreign_invoke_float_{arity}");
         let call_float_symbol = format!("$Foreign$call_float{arity}");
+        let construct_float_symbol = format!("$Foreign$construct_float{arity}");
         let invoke_float_symbol = format!("$Foreign$invoke_float{arity}");
         let invoke_float_key_raw = format!("zb_foreign_invoke_float_key_raw_{arity}");
         let invoke_float_key_name = format!("zb_foreign_invoke_float_key_{arity}");
@@ -434,6 +459,12 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             &call_float_extern_params,
             f64(),
             Some(&call_float_symbol),
+        ));
+        declarations.push(extern_fn(
+            &construct_float_raw,
+            &call_float_extern_params,
+            any(),
+            Some(&construct_float_symbol),
         ));
         let mut invoke_float_extern_params = vec![("x", any()), ("name", string())];
         invoke_float_extern_params.extend(fixed_names.iter().map(|name| (*name, f64())));
@@ -464,6 +495,19 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 rf.decl(call(&call_float_raw, call_float_args, f64())),
                 when(eq(rf.e(), float(f64::MAX)), vec![raise_reported()]),
                 ret(rf.e()),
+            ],
+        ));
+
+        let mut construct_float_args = vec![x.e()];
+        construct_float_args.extend(floats.iter().map(Local::e));
+        declarations.push(define(
+            &construct_float_name,
+            &call_float_params,
+            any(),
+            vec![
+                r.decl(call(&construct_float_raw, construct_float_args, any())),
+                raise_reported(),
+                ret(r.e()),
             ],
         ));
 

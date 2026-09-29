@@ -71,6 +71,12 @@ pub trait Foreign: Send + Sync {
     /// Call `object` with `args`.
     fn call(&self, object: usize, args: &[Any]) -> Result<Any, ForeignError>;
 
+    /// Construct through a host class. The returned box is owned by the
+    /// program and is released when its value dies.
+    fn construct(&self, object: usize, args: &[Any]) -> Result<Any, ForeignError> {
+        self.call(object, args)
+    }
+
     /// Call the method `name` of `object` with `args`.
     fn invoke(&self, object: usize, name: &str, args: &[Any]) -> Result<Any, ForeignError>;
 
@@ -89,6 +95,13 @@ pub trait Foreign: Send + Sync {
     fn call_float(&self, _object: usize, _args: &[f64]) -> Result<f64, ForeignError> {
         let args: Vec<Any> = _args.iter().map(|&value| float(value)).collect();
         number_of(self.call(_object, &args)?)
+    }
+
+    /// Construct with unboxed float arguments. The returned box is owned by
+    /// the program and is released when its value dies.
+    fn construct_float(&self, _object: usize, _args: &[f64]) -> Result<Any, ForeignError> {
+        let args: Vec<Any> = _args.iter().map(|&value| float(value)).collect();
+        self.construct(_object, &args)
     }
 
     /// Invoke a schema-declared method of float arguments and result.
@@ -407,7 +420,7 @@ unsafe extern "C" fn foreign_invoke(x: Any, name: StringConstPtr, data: i64, len
 // directly. The variadic entries above remain for calls whose arity is only
 // known at runtime.
 macro_rules! fixed_foreign_calls {
-    ($call:ident, $invoke:ident $(, $arg:ident)*) => {
+    ($call:ident, $construct:ident, $invoke:ident $(, $arg:ident)*) => {
         unsafe extern "C" fn $call(x: Any, $($arg: Any),*) -> Any {
             let Some(object) = (unsafe { word(x) }) else {
                 fail(no_embedder());
@@ -415,6 +428,15 @@ macro_rules! fixed_foreign_calls {
             };
             let args: &[Any] = &[$($arg),*];
             with(none(), |f| f.call(object, args))
+        }
+
+        unsafe extern "C" fn $construct(x: Any, $($arg: Any),*) -> Any {
+            let Some(object) = (unsafe { word(x) }) else {
+                fail(no_embedder());
+                return none();
+            };
+            let args: &[Any] = &[$($arg),*];
+            with(none(), |f| f.construct(object, args))
         }
 
         unsafe extern "C" fn $invoke(
@@ -432,16 +454,68 @@ macro_rules! fixed_foreign_calls {
     };
 }
 
-fixed_foreign_calls!(foreign_call_0, foreign_invoke_0);
-fixed_foreign_calls!(foreign_call_1, foreign_invoke_1, a0);
-fixed_foreign_calls!(foreign_call_2, foreign_invoke_2, a0, a1);
-fixed_foreign_calls!(foreign_call_3, foreign_invoke_3, a0, a1, a2);
-fixed_foreign_calls!(foreign_call_4, foreign_invoke_4, a0, a1, a2, a3);
-fixed_foreign_calls!(foreign_call_5, foreign_invoke_5, a0, a1, a2, a3, a4);
-fixed_foreign_calls!(foreign_call_6, foreign_invoke_6, a0, a1, a2, a3, a4, a5);
-fixed_foreign_calls!(foreign_call_7, foreign_invoke_7, a0, a1, a2, a3, a4, a5, a6);
+fixed_foreign_calls!(foreign_call_0, foreign_construct_0, foreign_invoke_0);
+fixed_foreign_calls!(foreign_call_1, foreign_construct_1, foreign_invoke_1, a0);
+fixed_foreign_calls!(
+    foreign_call_2,
+    foreign_construct_2,
+    foreign_invoke_2,
+    a0,
+    a1
+);
+fixed_foreign_calls!(
+    foreign_call_3,
+    foreign_construct_3,
+    foreign_invoke_3,
+    a0,
+    a1,
+    a2
+);
+fixed_foreign_calls!(
+    foreign_call_4,
+    foreign_construct_4,
+    foreign_invoke_4,
+    a0,
+    a1,
+    a2,
+    a3
+);
+fixed_foreign_calls!(
+    foreign_call_5,
+    foreign_construct_5,
+    foreign_invoke_5,
+    a0,
+    a1,
+    a2,
+    a3,
+    a4
+);
+fixed_foreign_calls!(
+    foreign_call_6,
+    foreign_construct_6,
+    foreign_invoke_6,
+    a0,
+    a1,
+    a2,
+    a3,
+    a4,
+    a5
+);
+fixed_foreign_calls!(
+    foreign_call_7,
+    foreign_construct_7,
+    foreign_invoke_7,
+    a0,
+    a1,
+    a2,
+    a3,
+    a4,
+    a5,
+    a6
+);
 fixed_foreign_calls!(
     foreign_call_8,
+    foreign_construct_8,
     foreign_invoke_8,
     a0,
     a1,
@@ -491,7 +565,7 @@ unsafe extern "C" fn foreign_set_float_key(x: Any, key: i64, value: f64) -> i32 
 }
 
 macro_rules! fixed_float_calls {
-    ($call:ident, $invoke:ident $(, $arg:ident)*) => {
+    ($call:ident, $construct:ident, $invoke:ident $(, $arg:ident)*) => {
         unsafe extern "C" fn $call(x: Any, $($arg: f64),*) -> f64 {
             let Some(object) = (unsafe { word(x) }) else {
                 fail(no_embedder());
@@ -499,6 +573,15 @@ macro_rules! fixed_float_calls {
             };
             let args: &[f64] = &[$($arg),*];
             with(f64::MAX, |f| f.call_float(object, args))
+        }
+
+        unsafe extern "C" fn $construct(x: Any, $($arg: f64),*) -> Any {
+            let Some(object) = (unsafe { word(x) }) else {
+                fail(no_embedder());
+                return none();
+            };
+            let args: &[f64] = &[$($arg),*];
+            with(none(), |f| f.construct_float(object, args))
         }
 
         unsafe extern "C" fn $invoke(
@@ -516,13 +599,44 @@ macro_rules! fixed_float_calls {
     };
 }
 
-fixed_float_calls!(foreign_call_float_0, foreign_invoke_float_0);
-fixed_float_calls!(foreign_call_float_1, foreign_invoke_float_1, a0);
-fixed_float_calls!(foreign_call_float_2, foreign_invoke_float_2, a0, a1);
-fixed_float_calls!(foreign_call_float_3, foreign_invoke_float_3, a0, a1, a2);
-fixed_float_calls!(foreign_call_float_4, foreign_invoke_float_4, a0, a1, a2, a3);
+fixed_float_calls!(
+    foreign_call_float_0,
+    foreign_construct_float_0,
+    foreign_invoke_float_0
+);
+fixed_float_calls!(
+    foreign_call_float_1,
+    foreign_construct_float_1,
+    foreign_invoke_float_1,
+    a0
+);
+fixed_float_calls!(
+    foreign_call_float_2,
+    foreign_construct_float_2,
+    foreign_invoke_float_2,
+    a0,
+    a1
+);
+fixed_float_calls!(
+    foreign_call_float_3,
+    foreign_construct_float_3,
+    foreign_invoke_float_3,
+    a0,
+    a1,
+    a2
+);
+fixed_float_calls!(
+    foreign_call_float_4,
+    foreign_construct_float_4,
+    foreign_invoke_float_4,
+    a0,
+    a1,
+    a2,
+    a3
+);
 fixed_float_calls!(
     foreign_call_float_5,
+    foreign_construct_float_5,
     foreign_invoke_float_5,
     a0,
     a1,
@@ -555,6 +669,7 @@ fixed_float_key_invokes!(foreign_invoke_float_key_7, a0, a1, a2, a3, a4, a5, a6)
 fixed_float_key_invokes!(foreign_invoke_float_key_8, a0, a1, a2, a3, a4, a5, a6, a7);
 fixed_float_calls!(
     foreign_call_float_6,
+    foreign_construct_float_6,
     foreign_invoke_float_6,
     a0,
     a1,
@@ -565,6 +680,7 @@ fixed_float_calls!(
 );
 fixed_float_calls!(
     foreign_call_float_7,
+    foreign_construct_float_7,
     foreign_invoke_float_7,
     a0,
     a1,
@@ -576,6 +692,7 @@ fixed_float_calls!(
 );
 fixed_float_calls!(
     foreign_call_float_8,
+    foreign_construct_float_8,
     foreign_invoke_float_8,
     a0,
     a1,
@@ -687,6 +804,42 @@ static SYMBOLS: &[zrtl::ZrtlSymbol] = &[
     zrtl::ZrtlSymbol::new(c"$Foreign$call6".as_ptr(), foreign_call_6 as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$call7".as_ptr(), foreign_call_7 as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$call8".as_ptr(), foreign_call_8 as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct0".as_ptr(),
+        foreign_construct_0 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct1".as_ptr(),
+        foreign_construct_1 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct2".as_ptr(),
+        foreign_construct_2 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct3".as_ptr(),
+        foreign_construct_3 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct4".as_ptr(),
+        foreign_construct_4 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct5".as_ptr(),
+        foreign_construct_5 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct6".as_ptr(),
+        foreign_construct_6 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct7".as_ptr(),
+        foreign_construct_7 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct8".as_ptr(),
+        foreign_construct_8 as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(c"$Foreign$invoke0".as_ptr(), foreign_invoke_0 as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$invoke1".as_ptr(), foreign_invoke_1 as *const u8),
     zrtl::ZrtlSymbol::new(c"$Foreign$invoke2".as_ptr(), foreign_invoke_2 as *const u8),
@@ -747,6 +900,42 @@ static SYMBOLS: &[zrtl::ZrtlSymbol] = &[
     zrtl::ZrtlSymbol::new(
         c"$Foreign$call_float8".as_ptr(),
         foreign_call_float_8 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float0".as_ptr(),
+        foreign_construct_float_0 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float1".as_ptr(),
+        foreign_construct_float_1 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float2".as_ptr(),
+        foreign_construct_float_2 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float3".as_ptr(),
+        foreign_construct_float_3 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float4".as_ptr(),
+        foreign_construct_float_4 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float5".as_ptr(),
+        foreign_construct_float_5 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float6".as_ptr(),
+        foreign_construct_float_6 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float7".as_ptr(),
+        foreign_construct_float_7 as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Foreign$construct_float8".as_ptr(),
+        foreign_construct_float_8 as *const u8,
     ),
     zrtl::ZrtlSymbol::new(
         c"$Foreign$invoke_float0".as_ptr(),
