@@ -3055,7 +3055,20 @@ impl LoweringContext {
                 sites.dedup();
                 for index in sites {
                     self.current_decl = index;
+                    let at = self.trace_phases.then(web_time::Instant::now);
                     self.lower_declaration(&program.declarations[index])?;
+                    if let Some(at) = at {
+                        let ms = at.elapsed().as_secs_f64() * 1000.0;
+                        if ms > 0.5 {
+                            let what = match &program.declarations[index].node {
+                                TypedDeclaration::Function(f) => {
+                                    f.name.resolve_global().unwrap_or_default()
+                                }
+                                _ => "other".to_string(),
+                            };
+                            eprintln!("[LOWER-PROGRAM] {ms:10.2} ms reached {what}");
+                        }
+                    }
                 }
                 // A body built under an id an adoption round already
                 // followed, as a stub for a hook the program defines,
@@ -3395,8 +3408,20 @@ impl LoweringContext {
 
         // Build TypedCFG from function body (new approach - Gap #4 solution!)
         // This creates CFG structure from TypedAST without converting to HIR first
+        let stage = self.trace_phases.then(web_time::Instant::now);
         let mut typed_cfg_builder = crate::typed_cfg::TypedCfgBuilder::new();
         let typed_cfg = typed_cfg_builder.build_from_block(body, hir_func.entry_block)?;
+        if let Some(stage) = stage {
+            let ms = stage.elapsed().as_secs_f64() * 1000.0;
+            if ms > 10.0 {
+                eprintln!(
+                    "[LOWER-FUNCTION] {ms:10.2} ms CFG {} nodes {} edges for {}",
+                    typed_cfg.graph.node_count(),
+                    typed_cfg.graph.edge_count(),
+                    func.name.resolve_global().unwrap_or_default(),
+                );
+            }
+        }
 
         // Debug: check TypedCFG
         log::trace!(
@@ -3488,7 +3513,26 @@ impl LoweringContext {
         .with_fiber_fn_names(Arc::clone(&self.symbols.fiber_fn_names))
         .with_body_fn_names(Arc::clone(&self.symbols.body_fn_names))
         .with_module_globals(self.module_globals());
+        let stage = self.trace_phases.then(web_time::Instant::now);
         let ssa = ssa_builder.build_from_typed_cfg(&typed_cfg)?;
+        if let Some(stage) = stage {
+            let ms = stage.elapsed().as_secs_f64() * 1000.0;
+            if ms > 10.0 {
+                let instructions: usize = ssa
+                    .function
+                    .blocks
+                    .values()
+                    .map(|block| block.instructions.len())
+                    .sum();
+                eprintln!(
+                    "[LOWER-FUNCTION] {ms:10.2} ms SSA {} blocks {} values {} instructions for {}",
+                    ssa.function.blocks.len(),
+                    ssa.function.values.len(),
+                    instructions,
+                    func.name.resolve_global().unwrap_or_default(),
+                );
+            }
+        }
 
         // Debug: check SSA result
         if func.is_async {

@@ -1124,47 +1124,20 @@ impl SsaBuilder {
         // These variables need stack allocation instead of SSA registers
         self.scan_cfg_for_address_taken_vars(cfg);
 
-        // IDF-BASED SSA: Place phis using Iterated Dominance Frontier
-        // CRITICAL: This must run BEFORE blocks are processed
-        // It scans the CFG to find variable writes without translating to HIR
-        self.place_phis_using_idf(cfg);
-
-        // Mark IDF placement as done - no new phis should be created after this
-        self.idf_placement_done = true;
-
-        // Make each parameter visible in every block, but only one that
-        // is never written. A parameter that is assigned somewhere has
-        // its phis placed above, and a block below one of those must
-        // reach the parameter through the phi, by the ordinary
-        // predecessor walk, not through a copy of the entry value: the
-        // copy is found first and read as the current value, so a
-        // parameter decremented in a loop body reads as the original in
-        // the next iteration and the loop never ends.
-        let written: std::collections::HashSet<InternedString> = self
-            .scan_cfg_for_variable_writes(cfg)
-            .into_values()
-            .flatten()
-            .collect();
-        let param_defs: Vec<_> = self
-            .definitions
-            .get(&entry_block)
-            .map(|defs| {
-                defs.iter()
-                    .filter(|(var, _)| !written.contains(*var))
-                    .map(|(&var, &val)| (var, val))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        for (block_id, _) in &self.function.blocks {
-            if *block_id != entry_block {
-                for (var, val) in &param_defs {
-                    if let Some(defs) = self.definitions.get_mut(block_id) {
-                        defs.entry(*var).or_insert(*val);
-                    }
-                }
-            }
+        // Demand-driven SSA places phis only for variables that are read.
+        // Keep eager iterated-dominance-frontier placement as a diagnostic.
+        // `ZYNTAX_SSA_EAGER_IDF=1` restores eager phi placement for diagnosis.
+        let eager_idf = std::env::var_os("ZYNTAX_SSA_EAGER_IDF").is_some();
+        if eager_idf {
+            self.place_phis_using_idf(cfg);
         }
+
+        self.idf_placement_done = eager_idf;
+
+        // Parameters live in the entry definition map. Reads in other
+        // blocks find them by walking predecessors, just like any other
+        // dominating definition; copying every parameter into every block
+        // turns large functions into a dense block-by-variable matrix.
 
         // Process blocks in dominance-friendly order
         // For now, we use a simple worklist algorithm that processes blocks when their
@@ -1246,11 +1219,6 @@ impl SsaBuilder {
                 // Mark block as filled
                 self.filled_blocks.insert(block_id);
 
-                // Seal if not sealed yet
-                if !self.sealed_blocks.contains(&block_id) {
-                    self.seal_block(block_id);
-                }
-
                 processed_blocks.insert(block_id);
                 made_progress = true;
                 false // Remove from worklist
@@ -1273,9 +1241,6 @@ impl SsaBuilder {
 
                     self.lower_typed_block(typed_block, true, &cfg.loop_of)?;
                     self.filled_blocks.insert(block_id);
-                    if !self.sealed_blocks.contains(&block_id) {
-                        self.seal_block(block_id);
-                    }
                     processed_blocks.insert(block_id);
                 }
                 break;
@@ -1285,6 +1250,16 @@ impl SsaBuilder {
         // Fill remaining incomplete phis (from IDF placement)
         self.recompute_cfg_edges();
         self.remove_unreachable_blocks();
+        let unsealed: Vec<HirId> = self
+            .function
+            .blocks
+            .keys()
+            .copied()
+            .filter(|block| !self.sealed_blocks.contains(block))
+            .collect();
+        for block in unsealed {
+            self.seal_block(block);
+        }
         self.fill_incomplete_phis();
         self.collapse_trivial_phis();
         // Only now is every value named that will be: a phi filled above
@@ -6109,20 +6084,12 @@ impl SsaBuilder {
                     .blocks
                     .insert(merge_block_id, HirBlock::new(merge_block_id));
 
-                // Initialize definitions for new blocks. Inherit the
-                // current block's variable bindings so the branch bodies
-                // can read locals (function params, let-bindings, outer
-                // captures) defined above the if-expression. Without
-                // inheritance, `read_variable` synthesises an incomplete
-                // phi for every outer-scope variable referenced inside the
-                // branches — which Cranelift lowers to a block parameter,
-                // and the matching `brif` ends up missing its arg list →
-                // "got 0, expected 1" verifier error. The merge block
-                // intentionally stays empty (its phis are created
-                // explicitly for the if's value below).
-                let inherited = self.definitions.get(&block_id).cloned().unwrap_or_default();
-                self.definitions.insert(then_block_id, inherited.clone());
-                self.definitions.insert(else_block_id, inherited);
+                // The branch blocks read bindings through their single
+                // predecessor. Copying the predecessor's whole definition
+                // map into both arms makes sparse SSA dense in functions
+                // with many conditional expressions.
+                self.definitions.insert(then_block_id, IndexMap::new());
+                self.definitions.insert(else_block_id, IndexMap::new());
                 self.definitions.insert(merge_block_id, IndexMap::new());
                 self.sealed_blocks.insert(then_block_id);
                 self.sealed_blocks.insert(else_block_id);
@@ -7657,41 +7624,25 @@ impl SsaBuilder {
     /// Read a variable not defined in `block`, inserting phis as needed
     /// (before IDF); after IDF placement only existing phis are used.
     ///
-    /// A chain of sealed single-predecessor blocks is walked, not
-    /// recursed: a straight-line body is one such chain, as long as its
-    /// statements, and each step's predecessor scan costs the whole
-    /// function. The blocks walked cache the value for the next read.
+    /// Walk a chain of sealed single-predecessor blocks instead of recursing.
+    /// Inherited reads are not cached because that makes the definition maps
+    /// dense in large functions.
     fn read_variable_recursive(&mut self, var: InternedString, block: HirId) -> HirId {
-        let mut walked = Vec::new();
         let mut at = block;
         loop {
             if at != block
                 && let Some(&v) = self.definitions.get(&at).and_then(|d| d.get(&var))
             {
-                return self.cache_read(var, &walked, v);
+                return v;
             }
             let preds = self.current_preds_of(at);
             if self.sealed_blocks.contains(&at) && preds.len() == 1 && preds[0] != at {
-                walked.push(at);
                 at = preds[0];
                 continue;
             }
             break;
         }
-        let value = self.read_variable_at(var, at);
-        self.cache_read(var, &walked, value)
-    }
-
-    /// The value a read through `blocks` found, recorded in each so the
-    /// next read stops there. Not a write: loop phi placement does not
-    /// see it.
-    fn cache_read(&mut self, var: InternedString, blocks: &[HirId], value: HirId) -> HirId {
-        for b in blocks {
-            if let Some(defs) = self.definitions.get_mut(b) {
-                defs.insert(var, value);
-            }
-        }
-        value
+        self.read_variable_at(var, at)
     }
 
     fn read_variable_at(&mut self, var: InternedString, block: HirId) -> HirId {
@@ -8357,6 +8308,11 @@ impl SsaBuilder {
                 self.fill_incomplete_phi(block, var);
             }
         }
+        // No variable lookup follows phi filling. Release the construction
+        // maps before substitution walks the finished function; retaining
+        // and rewriting them keeps a dense block-by-variable matrix alive.
+        self.definitions.clear();
+        self.variable_writes.clear();
         self.apply_substitutions();
         // Conservative phi-type fix-up: when a phi result is typed
         // I64 (the `var_types[var].unwrap_or(I64)` fallback hit
@@ -15195,7 +15151,6 @@ impl SsaBuilder {
     fn set_pattern_branch(&mut self, block_id: HirId, target: HirId) {
         self.function.blocks.get_mut(&block_id).unwrap().terminator =
             HirTerminator::Branch { target };
-        self.propagate_pattern_definitions(block_id, target);
     }
 
     fn set_pattern_cond_branch(
@@ -15210,18 +15165,6 @@ impl SsaBuilder {
             true_target,
             false_target,
         };
-        self.propagate_pattern_definitions(block_id, true_target);
-    }
-
-    fn propagate_pattern_definitions(&mut self, source: HirId, target: HirId) {
-        if self.ssa_trace {
-            eprintln!("[ssa] propagate defs {source:?} -> {target:?}");
-        }
-        let definitions = self.definitions.get(&source).cloned().unwrap_or_default();
-        self.definitions
-            .get_mut(&target)
-            .expect("pattern target definitions were initialized")
-            .extend(definitions);
     }
 
     fn translate_pattern_test(
