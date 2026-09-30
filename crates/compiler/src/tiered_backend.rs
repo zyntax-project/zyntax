@@ -473,49 +473,45 @@ struct Scratch {
 }
 
 impl Scratch {
-    /// The scratch of `module` in `slots`, made if none is.
-    fn of<'a>(slots: &'a mut HashMap<usize, Scratch>, module: &Arc<HirModule>) -> &'a mut Scratch {
-        let key = Arc::as_ptr(module) as usize;
-        slots.entry(key).or_insert_with(|| {
-            let started = web_time::Instant::now();
-            let externs = module
-                .functions
-                .iter()
-                .filter(|(_, f)| f.is_external)
-                .map(|(id, f)| {
-                    let mut f = f.clone();
-                    f.attributes.optimized = true;
-                    f.attributes.deferred = true;
-                    (*id, f)
-                })
-                .collect();
-            let scratch = HirModule {
-                id: module.id,
-                name: module.name,
-                functions: externs,
-                globals: module.globals.clone(),
-                types: module.types.clone(),
-                imports: module.imports.clone(),
-                exports: module.exports.clone(),
-                version: module.version,
-                dependencies: module.dependencies.clone(),
-                effects: module.effects.clone(),
-                handlers: module.handlers.clone(),
-                automatic_release: module.automatic_release,
-                exact_struct_types: module.exact_struct_types.clone(),
-            };
-            if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
-                eprintln!(
-                    "[lazy] scratch module made in {:.2} ms on {}",
-                    started.elapsed().as_secs_f64() * 1e3,
-                    std::thread::current().name().unwrap_or("?")
-                );
-            }
-            Scratch {
-                module: scratch,
-                done: HashSet::new(),
-            }
-        })
+    fn new(module: &HirModule) -> Self {
+        let started = web_time::Instant::now();
+        let externs = module
+            .functions
+            .iter()
+            .filter(|(_, f)| f.is_external)
+            .map(|(id, f)| {
+                let mut f = f.clone();
+                f.attributes.optimized = true;
+                f.attributes.deferred = true;
+                (*id, f)
+            })
+            .collect();
+        let scratch = HirModule {
+            id: module.id,
+            name: module.name,
+            functions: externs,
+            globals: module.globals.clone(),
+            types: module.types.clone(),
+            imports: module.imports.clone(),
+            exports: module.exports.clone(),
+            version: module.version,
+            dependencies: module.dependencies.clone(),
+            effects: module.effects.clone(),
+            handlers: module.handlers.clone(),
+            automatic_release: module.automatic_release,
+            exact_struct_types: module.exact_struct_types.clone(),
+        };
+        if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+            eprintln!(
+                "[lazy] scratch module made in {:.2} ms on {}",
+                started.elapsed().as_secs_f64() * 1e3,
+                std::thread::current().name().unwrap_or("?")
+            );
+        }
+        Self {
+            module: scratch,
+            done: HashSet::new(),
+        }
     }
 
     /// Copy in `roots` and every function they reach through direct
@@ -566,7 +562,7 @@ impl Scratch {
 /// is waiting, and made again as asked.
 #[derive(Default)]
 struct Scratches {
-    slots: Mutex<HashMap<usize, Scratch>>,
+    slots: Mutex<HashMap<usize, Vec<Scratch>>>,
     pending: std::sync::atomic::AtomicUsize,
 }
 
@@ -580,6 +576,30 @@ impl Scratches {
             scratches: self,
             quiet,
         }
+    }
+
+    /// Take a reusable scratch without retaining the pool lock while it is
+    /// populated and optimized.
+    fn take(&self, module: &Arc<HirModule>) -> (usize, Scratch) {
+        let key = Arc::as_ptr(module) as usize;
+        let scratch = self
+            .slots
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .pop()
+            .unwrap_or_else(|| Scratch::new(module));
+        (key, scratch)
+    }
+
+    fn put(&self, key: usize, scratch: Scratch) {
+        self.slots
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .push(scratch);
     }
 
     /// Let every scratch go, once the optimisation in one, if any, is
@@ -3304,8 +3324,7 @@ impl TieredBackend {
                     // The scratch is held until the body is in the cell's
                     // hands, so no other caller sees it half made.
                     let _using = optimized.enter(&*quiet);
-                    let mut slots = optimized.slots.lock().unwrap();
-                    let scratch = Scratch::of(&mut slots, module_arc);
+                    let (scratch_key, mut scratch) = optimized.take(module_arc);
                     scratch.reach(
                         [*func_id],
                         module_arc,
@@ -3354,6 +3373,7 @@ impl TieredBackend {
                         &scratch.module,
                         &format!("{name}-body"),
                     );
+                    optimized.put(scratch_key, scratch);
                     Arc::new(body)
                 });
                 Some(Arc::clone(body))
@@ -3398,8 +3418,7 @@ impl TieredBackend {
                     return f;
                 };
                 let _using = optimized.enter(&*quiet);
-                let mut slots = optimized.slots.lock().unwrap();
-                let scratch = Scratch::of(&mut slots, module_arc);
+                let (scratch_key, mut scratch) = optimized.take(module_arc);
                 let callees: Vec<HirId> = direct_callees(&f).collect();
                 scratch.reach(callees, module_arc, &body_sources, &optimized_bodies, &lazy);
                 let id = f.id;
@@ -3413,6 +3432,7 @@ impl TieredBackend {
                     .expect("the function optimised is still in the scratch module");
                 f.attributes.optimized = false;
                 f.attributes.deferred = false;
+                optimized.put(scratch_key, scratch);
                 f
             }
         }));
