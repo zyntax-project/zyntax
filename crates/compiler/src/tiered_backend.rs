@@ -37,7 +37,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ptr;
-use std::sync::{Arc, Mutex, RwLock, atomic::AtomicUsize};
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+};
 
 use beadie::{Bead, HotnessPolicy, JitBackend, ThresholdPolicy, TieredAdapter, TieredBound};
 
@@ -229,6 +232,10 @@ impl TieredConfig {
 /// Per-function state held alongside its beadie bound bead.
 struct FunctionEntry {
     bound: TieredBound,
+    /// Statistics counter registered once with [`ProfileData`].
+    profile_counter: Arc<AtomicU64>,
+    /// Calls seen by the sampler, including those it skips.
+    profile_calls: AtomicU64,
     /// The body a reload swapped in, when one has; otherwise the body is
     /// the module's, read through [`Self::body`] when a promotion needs
     /// it, so registering a module copies no function.
@@ -243,6 +250,13 @@ struct FunctionEntry {
     /// OSR registry id for this function. Embedded as a constant in
     /// tier-0 probe call sites so JIT'd code can find the bead.
     bead_id: u64,
+}
+
+fn record_profile_sample(counter: &AtomicU64, calls: &AtomicU64, sample_rate: u64) {
+    let call = calls.fetch_add(1, Ordering::Relaxed);
+    if sample_rate != 0 && call.is_multiple_of(sample_rate) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// A function's optimised body; see [`OptimizedBodies`].
@@ -1466,6 +1480,8 @@ impl TieredBackend {
                 *func_id,
                 FunctionEntry {
                     bound,
+                    profile_counter: self.profile_data.get_or_create_function_counter(*func_id),
+                    profile_calls: AtomicU64::new(0),
                     function: None,
                     module: Arc::clone(&module_context),
                     body_source: body_sources.get(func_id).cloned(),
@@ -2127,6 +2143,8 @@ impl TieredBackend {
                 new_id,
                 FunctionEntry {
                     bound,
+                    profile_counter: self.profile_data.get_or_create_function_counter(new_id),
+                    profile_calls: AtomicU64::new(0),
                     function: Some(Arc::new(body.clone())),
                     module: Arc::new(merged.clone()),
                     body_source: None,
@@ -3080,27 +3098,18 @@ impl TieredBackend {
 
     /// Record an invocation. Drives tier promotion via beadie.
     pub fn record_call(&self, func_id: HirId) {
-        // Sample at the configured rate for cheap profile stats. Beadie
-        // counts independently.
-        let count = self.profile_data.get_function_count(func_id);
-        if self
-            .config
-            .profile_config
-            .sample_rate
-            .checked_mul(1)
-            .map(|r| count % r != 0)
-            .unwrap_or(false)
-        {
-            // sample_rate = 0 would div-by-zero; treat that as "never sample
-            // beyond the first" by skipping. We still drive beadie below.
-        } else {
-            self.profile_data.record_function_call(func_id);
-        }
-
         let entry = match self.functions.get(&func_id) {
             Some(e) => e,
             None => return,
         };
+
+        // The map entry is stable for this function's generation, so host
+        // dispatch only touches atomics. Beadie counts independently.
+        record_profile_sample(
+            &entry.profile_counter,
+            &entry.profile_calls,
+            self.config.profile_config.sample_rate,
+        );
 
         // Build a closure beadie can call from any tier broker thread. The
         // body is looked up when a compile needs it, not per call.
@@ -5461,11 +5470,12 @@ fn remap_body(
 
 #[cfg(test)]
 mod tests {
-    use super::llvm_list_entry_has_headroom;
+    use super::{llvm_list_entry_has_headroom, record_profile_sample};
     use crate::hir::{
         HirCallable, HirFunction, HirFunctionSignature, HirInstruction, HirModule, HirParam,
         HirStructType, HirType, ParamOwnership,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
     use zyntax_typed_ast::InternedString;
 
     fn calling_100_times(param: HirType) -> (HirFunction, HirModule) {
@@ -5526,5 +5536,25 @@ mod tests {
         });
         let (f, module) = calling_100_times(list);
         assert!(!llvm_list_entry_has_headroom(&f, &module));
+    }
+
+    #[test]
+    fn sampled_profile_count_keeps_advancing() {
+        let counter = AtomicU64::new(0);
+        let calls = AtomicU64::new(0);
+        for _ in 0..25 {
+            record_profile_sample(&counter, &calls, 10);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+        assert_eq!(calls.load(Ordering::Relaxed), 25);
+    }
+
+    #[test]
+    fn a_zero_sample_rate_disables_samples() {
+        let counter = AtomicU64::new(0);
+        let calls = AtomicU64::new(0);
+        record_profile_sample(&counter, &calls, 0);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }

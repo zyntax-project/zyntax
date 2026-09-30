@@ -174,11 +174,15 @@ impl ProfileData {
 
     /// Reset all profiling counters
     pub fn reset(&self) {
-        let mut func_counts = self.function_counts.write().unwrap();
-        let mut block_counts = self.block_counts.write().unwrap();
+        let func_counts = self.function_counts.read().unwrap();
+        let block_counts = self.block_counts.read().unwrap();
 
-        func_counts.clear();
-        block_counts.clear();
+        for counter in func_counts.values() {
+            counter.store(0, Ordering::Relaxed);
+        }
+        for counter in block_counts.values() {
+            counter.store(0, Ordering::Relaxed);
+        }
     }
 
     /// Get a function's counter reference for direct instrumentation
