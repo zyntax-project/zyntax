@@ -231,6 +231,24 @@ fn a_split_prelowered_body_can_stay_encoded_after_lowering() {
     let lib = Arc::new(deserialize_module_lazy(bytes).expect("reads split directory"));
     let twice_id = lib.by_name("twice").expect("twice shell").id;
     let mut program = client();
+    let unused = InternedString::new_global("unused");
+    let unused_body = TypedBlock {
+        statements: vec![typed_node(
+            TypedStatement::Return(Some(Box::new(typed_node(
+                TypedExpression::Literal(TypedLiteral::Integer(0)),
+                i64_ty(),
+                SPAN,
+            )))),
+            Type::Primitive(PrimitiveType::Unit),
+            SPAN,
+        )],
+        span: SPAN,
+    };
+    program.declarations.push(typed_node(
+        function(unused, vec![], Some(unused_body), None),
+        Type::Primitive(PrimitiveType::Unit),
+        SPAN,
+    ));
     let mut arena = AstArena::new();
     let module_name = arena.intern_string("app");
     let mut ctx = LoweringContext::new(
@@ -253,6 +271,13 @@ fn a_split_prelowered_body_can_stay_encoded_after_lowering() {
         .get(&twice_id)
         .expect("twice shell is linked");
     assert!(twice.blocks.is_empty(), "the body remains encoded");
+    assert!(
+        module
+            .functions
+            .values()
+            .all(|function| function.name != unused),
+        "an unrelated program body remains unlowered"
+    );
     let sources = ctx.deferred_prelowered();
     let source = sources.get(&twice_id).expect("body source is retained");
     assert!(

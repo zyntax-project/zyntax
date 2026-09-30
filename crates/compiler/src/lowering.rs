@@ -3225,7 +3225,10 @@ impl LoweringContext {
             };
             let awaits_own_body =
                 target_fn.is_external && self.deferred_own.contains(&target_fn.name);
-            !((target_fn.is_external && !awaits_own_body) || !target_fn.blocks.is_empty())
+            let has_deferred_body = self.deferred_prelowered.contains_key(target);
+            !((target_fn.is_external && !awaits_own_body)
+                || !target_fn.blocks.is_empty()
+                || has_deferred_body)
         });
         if targets.is_empty() {
             return Vec::new();
