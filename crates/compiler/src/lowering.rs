@@ -850,6 +850,13 @@ impl LoweringContext {
         };
         let mut pending: Vec<crate::hir::HirId> = Vec::new();
         for (id, function) in &self.module.functions {
+            // An extern declaration can be replaced later by a body under
+            // the same id (a frontend hook declared by the linked library,
+            // for example). Do not call the empty shell followed: its body
+            // still has to be scanned when it arrives.
+            if function.blocks.is_empty() {
+                continue;
+            }
             if self.adopt_followed.insert(*id) {
                 pending.extend(targets_of(function));
             }
@@ -905,7 +912,9 @@ impl LoweringContext {
                 self.adopted.1 += decoding.elapsed().as_secs_f64() * 1000.0;
             }
             pending.extend(targets);
-            self.adopt_followed.insert(target);
+            if !function.blocks.is_empty() {
+                self.adopt_followed.insert(target);
+            }
             self.module.functions.insert(target, function);
             adopted = true;
         }

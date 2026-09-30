@@ -47,6 +47,36 @@ fn function(
     })
 }
 
+fn external_function(name: InternedString, module: Option<InternedString>) -> TypedDeclaration {
+    let mut declaration = function(name, vec![], None, module);
+    let TypedDeclaration::Function(function) = &mut declaration else {
+        unreachable!();
+    };
+    function.is_external = true;
+    declaration
+}
+
+fn returning_call(name: InternedString) -> TypedBlock {
+    let call = typed_node(
+        TypedExpression::Call(TypedCall {
+            callee: Box::new(typed_node(TypedExpression::Variable(name), i64_ty(), SPAN)),
+            positional_args: vec![],
+            named_args: vec![],
+            type_args: vec![],
+        }),
+        i64_ty(),
+        SPAN,
+    );
+    TypedBlock {
+        statements: vec![typed_node(
+            TypedStatement::Return(Some(Box::new(call))),
+            Type::Primitive(PrimitiveType::Unit),
+            SPAN,
+        )],
+        span: SPAN,
+    }
+}
+
 fn program(declarations: Vec<TypedDeclaration>) -> TypedProgram {
     TypedProgram {
         language: None,
@@ -230,6 +260,65 @@ fn a_split_prelowered_body_can_stay_encoded_after_lowering() {
             .function(twice_id)
             .is_some_and(|body| !body.blocks.is_empty()),
         "the retained source decodes the body on demand"
+    );
+}
+
+#[test]
+fn a_body_replacing_a_linked_extern_has_its_dependencies_adopted() {
+    let hook = InternedString::new_global("hook");
+    let dependency = InternedString::new_global("dependency");
+    let library_entry = InternedString::new_global("library_entry");
+    let main = InternedString::new_global("main");
+    let library_name = InternedString::new_global("lib");
+
+    let dependency_body = TypedBlock {
+        statements: vec![typed_node(
+            TypedStatement::Return(Some(Box::new(typed_node(
+                TypedExpression::Literal(TypedLiteral::Integer(42)),
+                i64_ty(),
+                SPAN,
+            )))),
+            Type::Primitive(PrimitiveType::Unit),
+            SPAN,
+        )],
+        span: SPAN,
+    };
+    let mut library_program = program(vec![
+        external_function(hook, None),
+        function(dependency, vec![], Some(dependency_body), None),
+        function(library_entry, vec![], Some(returning_call(hook)), None),
+    ]);
+    let library = lower("lib", &mut library_program, LoweringConfig::default());
+    let bytes = serialize_module(&library, Format::Split).expect("serializes split");
+    let library = Arc::new(deserialize_module_lazy(bytes).expect("reads split directory"));
+    let dependency_id = library.by_name("dependency").expect("dependency shell").id;
+
+    // `main` first reaches the linked library entry. That entry reaches the
+    // library's external hook shell; lowering then supplies the program's
+    // hook body, whose call to `dependency` must trigger another link scan.
+    let mut client = program(vec![
+        function(library_entry, vec![], None, Some(library_name)),
+        function(dependency, vec![], None, Some(library_name)),
+        function(hook, vec![], Some(returning_call(dependency)), None),
+        function(main, vec![], Some(returning_call(library_entry)), None),
+    ]);
+    let module = lower(
+        "app",
+        &mut client,
+        LoweringConfig {
+            prelowered: vec![library],
+            entry_names: vec!["main".into()],
+            closed: true,
+            ..LoweringConfig::default()
+        },
+    );
+
+    assert!(
+        module
+            .functions
+            .get(&dependency_id)
+            .is_some_and(|function| !function.blocks.is_empty()),
+        "the body supplied for an external hook is scanned for linked dependencies"
     );
 }
 
