@@ -566,6 +566,23 @@ struct Scratches {
     pending: std::sync::atomic::AtomicUsize,
 }
 
+/// Return wholly unused glibc heap pages after a batch of background
+/// optimisations releases its scratch modules.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn release_unused_scratch_pages() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // SAFETY: `malloc_trim` takes no pointers and preserves every live
+    // allocation; it only releases wholly unused pages from glibc arenas.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn release_unused_scratch_pages() {}
+
 impl Scratches {
     /// Note an optimisation about to use a scratch, until the returned
     /// guard drops; `quiet` answers whether no compile is waiting.
@@ -607,6 +624,7 @@ impl Scratches {
     fn clear(&self) {
         let gone = std::mem::take(&mut *self.slots.lock().unwrap());
         drop(gone);
+        release_unused_scratch_pages();
     }
 
     /// Let every scratch go if no optimisation is under way.
@@ -618,6 +636,7 @@ impl Scratches {
         let gone = std::mem::take(&mut *slots);
         drop(slots);
         drop(gone);
+        release_unused_scratch_pages();
     }
 }
 

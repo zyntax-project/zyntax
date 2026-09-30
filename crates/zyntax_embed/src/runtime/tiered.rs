@@ -27,6 +27,24 @@ use zyntax_compiler::{
     zrtl::DynamicValue,
 };
 
+/// Return pages held by glibc after lowering and code generation. Large
+/// programs leave most of their temporary SSA and optimiser allocations free,
+/// but glibc otherwise keeps those arenas mapped for the rest of the process.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn release_unused_compile_pages() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // SAFETY: `malloc_trim` takes no pointers and only asks glibc to release
+    // wholly unused heap pages. Live allocations keep their backing pages.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn release_unused_compile_pages() {}
+
 /// Reach functions whose bodies may still live in split snapshots. The
 /// ordinary DCE walk sees each such function's signature shell; its direct
 /// callees come from the split directory, and any non-snapshot callees are
@@ -814,6 +832,7 @@ impl TieredRuntime {
                 started.elapsed().as_secs_f64() * 1000.0
             );
         }
+        release_unused_compile_pages();
 
         Ok(())
     }
