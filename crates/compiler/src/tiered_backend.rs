@@ -4301,6 +4301,15 @@ impl TieredBackend {
                 );
                 return true;
             }
+            #[cfg(feature = "llvm-backend")]
+            let promote_whole_body = llvm_whole_body_has_headroom(&func_arc);
+            #[cfg(feature = "llvm-backend")]
+            if !promote_whole_body && osr::osr_trace_enabled() {
+                eprintln!(
+                    "[osr] LLVM whole-body promotion skipped for {}: oversized body",
+                    func_arc.name.resolve_global().unwrap_or_default()
+                );
+            }
             let cranelift = Arc::clone(&cranelift);
             #[cfg(feature = "llvm-backend")]
             let llvm = llvm.clone();
@@ -4342,6 +4351,12 @@ impl TieredBackend {
                 }
                 #[cfg(not(feature = "llvm-backend"))]
                 drop(regions);
+                // An oversized entry stays on its baseline. Regions already
+                // outlined above can still move independently.
+                #[cfg(feature = "llvm-backend")]
+                if !promote_whole_body {
+                    return bead.compiled().unwrap_or(ptr::null_mut());
+                }
                 let entry = compile_at_tier(
                     tier_idx,
                     bead,
@@ -4902,6 +4917,14 @@ fn llvm_list_entry_has_headroom(f: &HirFunction, module: &HirModule) -> bool {
         .take(65)
         .count()
         <= 64
+}
+
+/// Whole bodies above this size stay on the baseline; OSR still promotes
+/// their outlined hot regions independently.
+#[cfg(feature = "llvm-backend")]
+fn llvm_whole_body_has_headroom(f: &HirFunction) -> bool {
+    const MAX_BLOCKS: usize = 2_048;
+    f.blocks.len() <= MAX_BLOCKS
 }
 
 /// Dispatch the correct JIT backend for a tier index.
@@ -5509,6 +5532,8 @@ fn remap_body(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "llvm-backend")]
+    use super::llvm_whole_body_has_headroom;
     use super::{llvm_list_entry_has_headroom, record_profile_sample};
     use crate::hir::{
         HirCallable, HirFunction, HirFunctionSignature, HirInstruction, HirModule, HirParam,
@@ -5575,6 +5600,18 @@ mod tests {
         });
         let (f, module) = calling_100_times(list);
         assert!(!llvm_list_entry_has_headroom(&f, &module));
+    }
+
+    #[cfg(feature = "llvm-backend")]
+    #[test]
+    fn oversized_body_is_left_to_region_promotion() {
+        let (mut f, _) = calling_100_times(HirType::I64);
+        assert!(llvm_whole_body_has_headroom(&f));
+        while f.blocks.len() <= 2_048 {
+            let id = crate::hir::HirId::new();
+            f.blocks.insert(id, crate::hir::HirBlock::new(id));
+        }
+        assert!(!llvm_whole_body_has_headroom(&f));
     }
 
     #[test]
