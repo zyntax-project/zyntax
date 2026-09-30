@@ -25,11 +25,17 @@ pub fn official_dir() -> PathBuf {
 /// line, where a global write of `debug` changes how the file compiles.
 pub const OFFICIAL_PRELUDE: &str = "_U=true _soft=true _port=true _nomsg=true";
 
-/// Official files that are never run, and why.
-pub const NOT_RUN: &[(&str, &str)] = &[(
-    "heavy.lua",
-    "a memory stress test with no pass criterion; all.lua never runs it",
-)];
+/// Official files that are not useful as independent per-file cases, and why.
+pub const NOT_RUN: &[(&str, &str)] = &[
+    (
+        "all.lua",
+        "the whole-suite driver is covered by tests/official_suite.rs",
+    ),
+    (
+        "heavy.lua",
+        "a memory stress test with no pass criterion; all.lua never runs it",
+    ),
+];
 
 /// The deadline of one file's run: a debug build compiles and runs
 /// several times slower.

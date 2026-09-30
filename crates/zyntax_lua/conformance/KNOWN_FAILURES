@@ -13,7 +13,6 @@
 # family only; everywhere else the case runs and must pass.
 
 # The official files, each run in the configuration all.lua derives from _U.
-official/all.lua              558e28e
 official/closure.lua          558e28e
 official/coroutine.lua        c33bf81
 official/cstack.lua           4379825   failing-on windows
@@ -29,7 +28,6 @@ official/strings.lua          3e444f9
 
 # The official files in lua.org's complete configuration (release, unix,
 # the C test libraries built; skipped otherwise).
-official_complete/all.lua        49075da
 official_complete/big.lua        298dff8
 official_complete/closure.lua    558e28e
 official_complete/constructs.lua 6709b37
