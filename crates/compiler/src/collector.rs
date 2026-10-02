@@ -147,8 +147,9 @@ struct Registry {
     /// Large blocks by payload address, with their total length.
     large: BTreeMap<usize, usize>,
     /// Memory outside the heap that may hold pointers into it, by
-    /// start address and length.
-    roots: BTreeMap<usize, usize>,
+    /// start address: its length, and for memory whose layout its
+    /// owner knows, the reader of the spans that can hold a pointer.
+    roots: BTreeMap<usize, (usize, Option<RootSpans>)>,
     /// Bytes reached by the last collection.
     live: usize,
     collections: usize,
@@ -442,7 +443,22 @@ pub fn add_root_range(ptr: *const u8, len: usize) {
     if len == 0 {
         return;
     }
-    registry().roots.insert(ptr as usize, len);
+    registry().roots.insert(ptr as usize, (len, None));
+}
+
+/// Hands `visit` each span `[lo, hi)` that can hold a pointer, for the
+/// root registered at `start`, `len` bytes long. The spans may lie
+/// outside that range: the range can describe where they are.
+pub type RootSpans = fn(start: *const u8, len: usize, visit: &mut dyn FnMut(usize, usize));
+
+/// [`add_root_range`] for a root its owner knows the layout of: the
+/// collector reads the spans `spans` names and nothing else, where
+/// bytes a shorter value left behind would read as pointers.
+pub fn add_root_range_with(ptr: *const u8, len: usize, spans: RootSpans) {
+    if len == 0 {
+        return;
+    }
+    registry().roots.insert(ptr as usize, (len, Some(spans)));
 }
 
 /// Forget a range [`add_root_range`] registered, once what it held is
@@ -1721,10 +1737,14 @@ fn collect_from(sp: usize) {
                 }
             }
         }
-        let roots: Vec<(usize, usize)> = marker.reg.roots.iter().map(|(a, l)| (*a, *l)).collect();
-        for (a, l) in roots {
+        let roots: Vec<(usize, (usize, Option<RootSpans>))> =
+            marker.reg.roots.iter().map(|(a, r)| (*a, *r)).collect();
+        for (a, (l, spans)) in roots {
             let before = marker.marked_bytes;
-            marker.scan_outside("global", a, a + l);
+            match spans {
+                Some(spans) => spans(a as *const u8, l, &mut |lo, hi| marker.scan(lo, hi)),
+                None => marker.scan_outside("global", a, a + l),
+            }
             // Under the detailed trace each range is followed to the
             // end before the next, so what it alone keeps alive shows.
             if trace_detail() {

@@ -37,6 +37,7 @@
 //! runs as any other and must pass; on any other it is not run and is
 //! reported as skipped. An entry that ends with `failing-on <family>`
 //! is known to fail on that family only, and must pass on the others.
+//! `debug` and `release` name a build in place of a family.
 //!
 //! ## C modules
 //!
@@ -384,10 +385,11 @@ fn families_parse() {
          official/c.lua 3333333 linux\n\
          stdlib/d.lua 4444444 unix\n\
          stdlib/e.lua 5555555 windows\n\
-         official/f.lua 6666666 failing-on linux\n",
+         official/f.lua 6666666 failing-on linux\n\
+         official/g.lua 7777777 failing-on debug\n",
     );
     let family = |case: &str| known[case].only_on.as_deref();
-    assert_eq!(known.len(), 6);
+    assert_eq!(known.len(), 7);
     assert_eq!(known["official/a.lua"].issue, "1111111");
     assert_eq!(family("official/a.lua"), None);
     assert_eq!(family("official/b.lua"), Some("macos"));
@@ -396,6 +398,9 @@ fn families_parse() {
     assert_eq!(family("stdlib/e.lua"), Some("windows"));
     assert_eq!(family("official/f.lua"), None);
     assert_eq!(known["official/f.lua"].fails_on.as_deref(), Some("linux"));
+    assert_eq!(known["official/g.lua"].fails_on.as_deref(), Some("debug"));
+    assert_eq!(on_family("debug"), cfg!(debug_assertions));
+    assert_eq!(on_family("release"), !cfg!(debug_assertions));
     assert_eq!(on_family("macos"), cfg!(target_os = "macos"));
     assert_eq!(on_family("linux"), cfg!(target_os = "linux"));
     assert_eq!(on_family("unix"), cfg!(unix));

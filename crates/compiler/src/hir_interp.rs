@@ -860,6 +860,12 @@ pub struct CompiledFunction {
     pub switch_pool: Vec<Vec<(i64, Pc)>>,
     /// Each entry is the index path for `ExtractValue` / `InsertValue`.
     pub indices_pool: Vec<Vec<u32>>,
+    /// Per call site, the registers the collector reads while the call
+    /// runs, one bit each: those live across it, and the constants.
+    pub read_sets: Vec<Vec<u64>>,
+    /// Per op, the entry of `read_sets` in force while it runs, or
+    /// `u32::MAX` where every register is read.
+    pub read_set_at: Vec<u32>,
     /// Symbol-name pool for FFI calls; we hold names (not raw fn ptrs)
     /// at compile time because symbols are registered at the
     /// interpreter level, not the compiler level.
@@ -910,10 +916,19 @@ fn clear_stack_below() {
 }
 
 /// A frame's register file registered with the collector as a root
-/// range for as long as the frame runs interpreted. Once the frame
-/// transfers to compiled code its live-ins are the compiled frame's,
-/// and what the registers still name is no longer held by this frame.
-struct FrameRoots(*const u8);
+/// for as long as the frame runs interpreted. Once the frame transfers
+/// to compiled code its live-ins are the compiled frame's, and what the
+/// registers still name is no longer held by this frame.
+struct FrameRoots(Option<Box<FrameView>>);
+
+/// What the collector reads a frame's registers through: where they
+/// are, and the op the frame is running, which says which are live.
+struct FrameView {
+    regs: *const ZyntaxValue,
+    len: usize,
+    pc: std::cell::Cell<usize>,
+    cf: *const CompiledFunction,
+}
 
 /// Storage a frame took for itself: the blocks it owns until it
 /// finishes, as a stack frame owns its slots. A block may be named by
@@ -954,21 +969,103 @@ impl Drop for Scratch {
     }
 }
 
-impl FrameRoots {
-    fn new(regs: &[ZyntaxValue]) -> Self {
-        let ptr = regs.as_ptr() as *const u8;
-        if crate::collector::is_enabled() {
-            crate::collector::add_root_range(ptr, std::mem::size_of_val(regs));
+/// Hand `visit` the span of each word in `value` that can hold an
+/// address, aggregates included.
+fn value_spans(value: &ZyntaxValue, visit: &mut dyn FnMut(usize, usize)) {
+    fn span<T>(field: &T, visit: &mut dyn FnMut(usize, usize)) {
+        let at = field as *const T as usize;
+        visit(at, at + std::mem::size_of::<T>());
+    }
+    match value {
+        ZyntaxValue::Int(v) => span(v, visit),
+        ZyntaxValue::UInt(v) => span(v, visit),
+        ZyntaxValue::Pointer(v) => span(v, visit),
+        ZyntaxValue::Function { ptr, .. } => span(ptr, visit),
+        ZyntaxValue::Opaque { ptr, .. } => span(ptr, visit),
+        ZyntaxValue::Array(items) | ZyntaxValue::Tuple(items) => {
+            for item in items {
+                value_spans(item, visit);
+            }
         }
-        Self(ptr)
+        ZyntaxValue::Map(items) | ZyntaxValue::Struct { fields: items, .. } => {
+            for item in items.values() {
+                value_spans(item, visit);
+            }
+        }
+        ZyntaxValue::Enum {
+            data: Some(item), ..
+        } => value_spans(item, visit),
+        ZyntaxValue::Optional(item) => {
+            if let Some(item) = item.as_ref() {
+                value_spans(item, visit);
+            }
+        }
+        ZyntaxValue::Result(item) => match item.as_ref() {
+            Ok(item) | Err(item) => value_spans(item, visit),
+        },
+        _ => {}
+    }
+}
+
+/// The spans of a frame's registers the collector reads: within a
+/// call, the registers live across it; elsewhere, all of them. Each by
+/// its payload: a register is wider than most of its variants, and the
+/// bytes past a payload keep whatever was there before.
+fn frame_spans(start: *const u8, _len: usize, visit: &mut dyn FnMut(usize, usize)) {
+    // SAFETY: `start` is a `FrameView` that `FrameRoots` registered,
+    // naming a register file and code that outlive the registration.
+    let (view, cf, regs) = unsafe {
+        let view = &*(start as *const FrameView);
+        (
+            view,
+            &*view.cf,
+            std::slice::from_raw_parts(view.regs, view.len),
+        )
+    };
+    let read = cf
+        .read_set_at
+        .get(view.pc.get())
+        .and_then(|set| cf.read_sets.get(*set as usize));
+    for (r, reg) in regs.iter().enumerate() {
+        if read.is_some_and(|bits| bits.get(r / 64).is_none_or(|w| w & (1 << (r % 64)) == 0)) {
+            continue;
+        }
+        value_spans(reg, visit);
+    }
+}
+
+impl FrameRoots {
+    fn new(regs: &[ZyntaxValue], cf: &CompiledFunction) -> Self {
+        if !crate::collector::is_enabled() {
+            return Self(None);
+        }
+        let view = Box::new(FrameView {
+            regs: regs.as_ptr(),
+            len: regs.len(),
+            pc: std::cell::Cell::new(0),
+            cf,
+        });
+        crate::collector::add_root_range_with(
+            &*view as *const FrameView as *const u8,
+            std::mem::size_of::<FrameView>(),
+            frame_spans,
+        );
+        Self(Some(view))
+    }
+
+    /// Note the op the frame is about to run.
+    #[inline(always)]
+    fn at(&self, pc: usize) {
+        if let Some(view) = &self.0 {
+            view.pc.set(pc);
+        }
     }
 
     /// Stop rooting the registers: the frame has handed its live
     /// values elsewhere.
     fn release(&mut self) {
-        if !self.0.is_null() {
-            crate::collector::remove_root_range(self.0);
-            self.0 = std::ptr::null();
+        if let Some(view) = self.0.take() {
+            crate::collector::remove_root_range(&*view as *const FrameView as *const u8);
         }
     }
 }
@@ -1277,6 +1374,19 @@ pub fn compile_function_with(
         }
     }
 
+    // Registers read whatever op runs: constants and entry storage,
+    // written once at entry.
+    let mut always = vec![0u64; (cf.n_regs as usize).div_ceil(64)];
+    for id in const_idx_for.keys() {
+        set_bit(&mut always, reg_of[id] as usize);
+    }
+    for (r, _) in &cf.entry_storage {
+        set_bit(&mut always, *r as usize);
+    }
+    let mut read_sets = live_across_calls(func, &reg_of, &always);
+    // Each call's ops, with the read set in force while they run.
+    let mut call_ops: Vec<(usize, usize, u32)> = Vec::new();
+
     // ── Code emission ──
     // First pass: emit ops; record block-id → start PC; track every
     // jump-target site so we can backpatch after pass 1.
@@ -1316,8 +1426,13 @@ pub fn compile_function_with(
         }
 
         // Lower each instruction.
-        for inst in &block.instructions {
+        for (i, inst) in block.instructions.iter().enumerate() {
+            let first = cf.code.len();
             lower_inst(inst, &mut cf, &reg_of, &const_ints)?;
+            if let Some(read) = read_sets.remove(&(*bid, i)) {
+                call_ops.push((first, cf.code.len(), cf.read_sets.len() as u32));
+                cf.read_sets.push(read);
+            }
         }
 
         // Lower terminator (phi-copy preamble for branch targets is
@@ -1363,7 +1478,15 @@ pub fn compile_function_with(
     // function's const_pool by examining `const_idx_for` via a
     // side-channel. To keep things simple, we instead emit one
     // `LoadConst` per constant at the top of the entry block.
+    let before = cf.code.len();
     inject_const_loads_at_entry(func, &mut cf, &reg_of, &const_idx_for, &block_pcs)?;
+    let shift = cf.code.len() - before;
+    if !call_ops.is_empty() {
+        cf.read_set_at = vec![u32::MAX; cf.code.len()];
+        for (first, end, set) in call_ops {
+            cf.read_set_at[first + shift..end + shift].fill(set);
+        }
+    }
 
     Ok(cf)
 }
@@ -1417,6 +1540,153 @@ fn inject_const_loads_at_entry(
     new_code.extend(cf.code.drain(..));
     cf.code = new_code;
     Ok(())
+}
+
+/// Bound on blocks × register words the liveness analysis works over;
+/// a function past it has every register read throughout.
+const LIVENESS_WORDS: usize = 1 << 17;
+
+/// Whether an instruction calls out, and so can run the collector.
+fn calls_out(inst: &HirInstruction) -> bool {
+    matches!(
+        inst,
+        HirInstruction::Call { .. }
+            | HirInstruction::IndirectCall { .. }
+            | HirInstruction::TraitMethodCall { .. }
+            | HirInstruction::CallClosure { .. }
+    )
+}
+
+fn set_bit(bits: &mut [u64], i: usize) {
+    bits[i / 64] |= 1 << (i % 64);
+}
+
+fn has_bit(bits: &[u64], i: usize) -> bool {
+    bits[i / 64] & (1 << (i % 64)) != 0
+}
+
+/// The registers the collector reads during each call, keyed by block
+/// and instruction index: those live across the call or read by it,
+/// and `always`.
+///
+/// A register still holding a value nothing reads again would keep its
+/// object alive for as long as the frame runs. Liveness is per register,
+/// so names sharing one (a parameter's two) keep it live while either
+/// is.
+fn live_across_calls(
+    func: &HirFunction,
+    reg_of: &HashMap<HirId, Reg>,
+    always: &[u64],
+) -> HashMap<(HirId, usize), Vec<u64>> {
+    let mut sets = HashMap::new();
+    let words = always.len();
+    let ids: Vec<HirId> = func.blocks.keys().copied().collect();
+    let n = ids.len();
+    if words == 0 || n.saturating_mul(words) > LIVENESS_WORDS {
+        if trace_enabled() && words != 0 {
+            eprintln!(
+                "[interp] {}: {n} blocks x {words} register words, every register read",
+                func.name.resolve_global().unwrap_or_default()
+            );
+        }
+        return sets;
+    }
+    let index: HashMap<HirId, usize> = ids.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+    let slot = |id: HirId| reg_of.get(&id).map(|r| *r as usize);
+    let row = |b: usize| b * words..(b + 1) * words;
+    let succs: Vec<Vec<usize>> = ids
+        .iter()
+        .map(|id| {
+            func.blocks[id]
+                .terminator
+                .targets()
+                .iter()
+                .filter_map(|t| index.get(t).copied())
+                .collect()
+        })
+        .collect();
+
+    // Per block: registers read before any write (`up`), written
+    // (`def`, phis included), and read on the way out as a successor's
+    // phi operands (`exit`).
+    let mut up = vec![0u64; n * words];
+    let mut def = vec![0u64; n * words];
+    let mut exit = vec![0u64; n * words];
+    for (b, id) in ids.iter().enumerate() {
+        let block = &func.blocks[id];
+        for p in &block.phis {
+            if let Some(d) = slot(p.result) {
+                set_bit(&mut def[row(b)], d);
+            }
+            for (v, pred) in &p.incoming {
+                if let (Some(d), Some(&pb)) = (slot(*v), index.get(pred)) {
+                    set_bit(&mut exit[row(pb)], d);
+                }
+            }
+        }
+        let (u, w) = (&mut up[row(b)], &mut def[row(b)]);
+        let read = |v: HirId, u: &mut [u64], w: &[u64]| {
+            if let Some(d) = slot(v) {
+                if !has_bit(w, d) {
+                    set_bit(u, d);
+                }
+            }
+        };
+        for inst in &block.instructions {
+            inst.for_each_operand(|v| read(v, u, w));
+            if let Some(d) = inst.result_id().and_then(slot) {
+                set_bit(w, d);
+            }
+        }
+        block.terminator.for_each_operand(|v| read(v, u, w));
+    }
+
+    let mut live_in = vec![0u64; n * words];
+    let mut live_out = vec![0u64; n * words];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            for w in 0..words {
+                let mut out = exit[b * words + w];
+                for &s in &succs[b] {
+                    out |= live_in[s * words + w];
+                }
+                live_out[b * words + w] = out;
+                let inn = up[b * words + w] | (out & !def[b * words + w]);
+                if inn != live_in[b * words + w] {
+                    live_in[b * words + w] = inn;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // Walk each block backward from its live-out set to its calls.
+    for (b, id) in ids.iter().enumerate() {
+        let block = &func.blocks[id];
+        let mut live = live_out[row(b)].to_vec();
+        block.terminator.for_each_operand(|v| {
+            if let Some(d) = slot(v) {
+                set_bit(&mut live, d);
+            }
+        });
+        for (i, inst) in block.instructions.iter().enumerate().rev() {
+            if let Some(d) = inst.result_id().and_then(slot) {
+                live[d / 64] &= !(1 << (d % 64));
+            }
+            inst.for_each_operand(|v| {
+                if let Some(d) = slot(v) {
+                    set_bit(&mut live, d);
+                }
+            });
+            if calls_out(inst) {
+                let read = live.iter().zip(always).map(|(l, a)| l | a).collect();
+                sets.insert((*id, i), read);
+            }
+        }
+    }
+    sets
 }
 
 fn inst_result(inst: &HirInstruction) -> Option<HirId> {
@@ -3811,7 +4081,7 @@ impl HirInterpreter {
         let mut regs: Vec<ZyntaxValue> = vec![ZyntaxValue::Undef; cf.n_regs as usize];
         // The registers hold pointers the collector cannot see on any
         // stack; they are a root for as long as the frame runs here.
-        let mut roots = FrameRoots::new(&regs);
+        let mut roots = FrameRoots::new(&regs, cf);
 
         // Bind params into regs[0..n_params].
         for (i, a) in args.into_iter().enumerate() {
@@ -3862,6 +4132,7 @@ impl HirInterpreter {
             if let Some(p) = self.profile.get_mut(&func_id) {
                 p.instructions_executed += 1;
             }
+            roots.at(pc);
             match &code[pc] {
                 Op::LoadConst { dst, c } => {
                     regs[*dst as usize] = cf.const_pool[*c as usize].clone();
@@ -6229,6 +6500,83 @@ mod tests {
             )
             .expect("call should succeed");
         assert!(matches!(result, ZyntaxValue::Int(42)));
+    }
+
+    /// `a = id(7); b = id(a); id(7); return b`: during the last call
+    /// the collector reads `b`'s register and the constant's, and not
+    /// `a`'s, which nothing reads again.
+    #[test]
+    fn bc_reads_registers_live_across_calls() {
+        let mut id_fn = mk_fn("id", vec![HirType::I64], vec![HirType::I64]);
+        let x = id_fn.signature.params[0].id;
+        let id_entry = id_fn.entry_block;
+        id_fn.blocks.get_mut(&id_entry).unwrap().terminator =
+            HirTerminator::Return { values: vec![x] };
+        let id_id = id_fn.id;
+
+        let mut func = mk_fn("f", vec![], vec![HirType::I64]);
+        let seven = add_value(
+            &mut func,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(7)),
+        );
+        let a = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let b = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
+        let call = |result: Option<HirId>, arg: HirId| HirInstruction::Call {
+            result,
+            callee: HirCallable::Function(id_id),
+            args: vec![arg],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        };
+        let entry_id = func.entry_block;
+        let entry = func.blocks.get_mut(&entry_id).unwrap();
+        entry.instructions.push(call(Some(a), seven));
+        entry.instructions.push(call(Some(b), a));
+        entry.instructions.push(call(None, seven));
+        entry.terminator = HirTerminator::Return { values: vec![b] };
+
+        let mut module = HirModule::new(InternedString::new_global("test"));
+        module.functions.insert(id_id, id_fn);
+        let mut memory = Memory::new();
+        let cf = compile_function(&module, &mut memory, &func).unwrap();
+        let calls: Vec<(usize, Reg)> = cf
+            .code
+            .iter()
+            .enumerate()
+            .filter_map(|(pc, op)| match op {
+                Op::CallFn { dst, has_dst, .. } => {
+                    Some((pc, if *has_dst { *dst } else { Reg::MAX }))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 3);
+        let (reg_a, reg_b) = (calls[0].1, calls[1].1);
+        let reg_seven = cf
+            .code
+            .iter()
+            .find_map(|op| match op {
+                Op::LoadConst { dst, .. } => Some(*dst),
+                _ => None,
+            })
+            .unwrap();
+        let reads = |pc: usize| &cf.read_sets[cf.read_set_at[pc] as usize];
+        // `b = id(a)` reads its operand; its result is not written yet.
+        assert!(has_bit(reads(calls[1].0), reg_a as usize));
+        assert!(!has_bit(reads(calls[1].0), reg_b as usize));
+        let last = reads(calls[2].0);
+        assert!(!has_bit(last, reg_a as usize));
+        assert!(has_bit(last, reg_b as usize));
+        assert!(has_bit(last, reg_seven as usize));
+
+        module.functions.insert(func.id, func);
+        let mut interp = HirInterpreter::new();
+        assert_eq!(
+            interp.call(&module, "f", vec![]).unwrap(),
+            ZyntaxValue::Int(7)
+        );
     }
 
     /// SIMD scalarization: splat → element-wise add → insert → extract →

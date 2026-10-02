@@ -60,8 +60,8 @@ pub struct Listed {
     pub fails_on: Option<String>,
 }
 
-/// The platform families an entry may name.
-pub const FAMILIES: &[&str] = &["unix", "windows", "macos", "linux"];
+/// The platform families an entry may name, and the two builds.
+pub const FAMILIES: &[&str] = &["unix", "windows", "macos", "linux", "debug", "release"];
 
 /// `category/file.lua` -> its entry, from KNOWN_FAILURES.
 pub fn known_failures() -> HashMap<String, Listed> {
@@ -112,6 +112,8 @@ pub fn on_family(family: &str) -> bool {
         "windows" => cfg!(windows),
         "macos" => cfg!(target_os = "macos"),
         "linux" => cfg!(target_os = "linux"),
+        "debug" => cfg!(debug_assertions),
+        "release" => !cfg!(debug_assertions),
         _ => false,
     }
 }
