@@ -257,6 +257,168 @@ pub unsafe fn word(any: Any) -> Option<usize> {
     (!any.is_null() && (*any).tag.0 == FOREIGN_TAG).then(|| (*any).data as usize)
 }
 
+/// The box tag of a function value, as `zyntax_builtins::FUNC_TAG` gives
+/// it: a record of dynamic values, the code's address first, its arity
+/// word second and what it captured after.
+pub const FUNC_TAG: u32 = (17 << 8) | 0xFF;
+
+/// The most arguments a call through a function value passes, as
+/// `zyntax_builtins::MAX_CALL_ARITY` says.
+pub const MAX_CALL_ARITY: usize = 8;
+
+/// The arity word of a function whose code takes its arguments packed in
+/// one list.
+const VARIADIC_ARITY: i64 = -1;
+
+/// Whether `any` is a function value.
+///
+/// # Safety
+/// `any` must be null or a live box.
+pub unsafe fn is_function(any: Any) -> bool {
+    !any.is_null() && (*any).tag.0 == FUNC_TAG
+}
+
+/// A function value's record: its items, the code first.
+///
+/// # Safety
+/// `f` must be a live function value.
+unsafe fn record<'a>(f: Any) -> (*const ListHeader, &'a [Any]) {
+    let list = (*f).data as *const ListHeader;
+    let items = match list.as_ref() {
+        Some(h) if h.len > 0 && !h.data.is_null() => {
+            std::slice::from_raw_parts(h.data, h.len as usize)
+        }
+        _ => &[],
+    };
+    (list, items)
+}
+
+/// How many arguments the function value `f` takes, `(least, most)`, as
+/// its arity word says; `None` for any other value and for a function
+/// whose code takes its arguments packed in a list.
+///
+/// # Safety
+/// `f` must be null or a live box.
+pub unsafe fn function_arity(f: Any) -> Option<(usize, usize)> {
+    if !is_function(f) {
+        return None;
+    }
+    let (_, items) = record(f);
+    let Value::Int(word) = read(*items.get(1)?) else {
+        return None;
+    };
+    if word == VARIADIC_ARITY {
+        return None;
+    }
+    let most = (word & 0xFFFF) as usize;
+    let least = match word >> 16 {
+        0 => most,
+        n => n as usize - 1,
+    };
+    Some((least, most))
+}
+
+/// Call the function value `f` with `args`, as the library's own call
+/// through a value does: the record and each argument as dynamic values,
+/// to a dynamic result. An error the call raises is left pending in the
+/// runtime's error flag, as any call's is.
+///
+/// A call passes every argument the code takes: leaving out one with a
+/// default needs the frontend's marker for it, and a code taking its
+/// arguments packed in a list needs the library to build the list.
+///
+/// # Safety
+/// `f` must be null or a live box, each of `args` a live box or null, and
+/// the program that made `f` must still be loaded.
+pub unsafe fn call_function(f: Any, args: &[Any]) -> Result<Any, ForeignError> {
+    if !is_function(f) {
+        return Err(ForeignError::new(
+            "TypeError",
+            "the value is not a function",
+        ));
+    }
+    let Some((least, most)) = function_arity(f) else {
+        return Err(ForeignError::new(
+            "TypeError",
+            "a function taking its arguments packed is not called from the host",
+        ));
+    };
+    if args.len() != most {
+        let takes = if least == most {
+            format!("{most}")
+        } else {
+            format!("{most} (the host passes every one; {least} without defaults)")
+        };
+        return Err(ForeignError::new(
+            "TypeError",
+            format!(
+                "function takes {takes} arguments but {} were given",
+                args.len()
+            ),
+        ));
+    }
+    let (list, items) = record(f);
+    let code = match items.first() {
+        Some(&b) if !b.is_null() && !(*b).data.is_null() => (*b).data as *const u8,
+        _ => {
+            return Err(ForeignError::new(
+                "TypeError",
+                "the function value has no code",
+            ));
+        }
+    };
+    type R = *const ListHeader;
+    let a = |i: usize| args[i];
+    Ok(match most {
+        0 => std::mem::transmute::<_, extern "C" fn(R) -> Any>(code)(list),
+        1 => std::mem::transmute::<_, extern "C" fn(R, Any) -> Any>(code)(list, a(0)),
+        2 => std::mem::transmute::<_, extern "C" fn(R, Any, Any) -> Any>(code)(list, a(0), a(1)),
+        3 => std::mem::transmute::<_, extern "C" fn(R, Any, Any, Any) -> Any>(code)(
+            list,
+            a(0),
+            a(1),
+            a(2),
+        ),
+        4 => std::mem::transmute::<_, extern "C" fn(R, Any, Any, Any, Any) -> Any>(code)(
+            list,
+            a(0),
+            a(1),
+            a(2),
+            a(3),
+        ),
+        5 => std::mem::transmute::<_, extern "C" fn(R, Any, Any, Any, Any, Any) -> Any>(code)(
+            list,
+            a(0),
+            a(1),
+            a(2),
+            a(3),
+            a(4),
+        ),
+        6 => std::mem::transmute::<_, extern "C" fn(R, Any, Any, Any, Any, Any, Any) -> Any>(code)(
+            list,
+            a(0),
+            a(1),
+            a(2),
+            a(3),
+            a(4),
+            a(5),
+        ),
+        7 => std::mem::transmute::<_, extern "C" fn(R, Any, Any, Any, Any, Any, Any, Any) -> Any>(
+            code,
+        )(list, a(0), a(1), a(2), a(3), a(4), a(5), a(6)),
+        8 => std::mem::transmute::<
+            _,
+            extern "C" fn(R, Any, Any, Any, Any, Any, Any, Any, Any) -> Any,
+        >(code)(list, a(0), a(1), a(2), a(3), a(4), a(5), a(6), a(7)),
+        _ => {
+            return Err(ForeignError::new(
+                "TypeError",
+                format!("a call through a value passes at most {MAX_CALL_ARITY} arguments"),
+            ));
+        }
+    })
+}
+
 /// Take a foreign box's opaque word and release only its header.
 ///
 /// # Safety
