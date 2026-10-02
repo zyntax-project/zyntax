@@ -2894,7 +2894,7 @@ impl TieredRuntime {
                 entry_names: self.entry_names(),
                 closed,
                 prelowered: Vec::new(),
-                defer_prelowered_bodies: closed,
+                defer_prelowered_bodies: false,
                 linked: Arc::default(),
                 selective: true,
                 pattern_rewrites: self.pattern_rewrites,
