@@ -1124,20 +1124,35 @@ impl SsaBuilder {
         // These variables need stack allocation instead of SSA registers
         self.scan_cfg_for_address_taken_vars(cfg);
 
-        // Demand-driven SSA places phis only for variables that are read.
-        // Keep eager iterated-dominance-frontier placement as a diagnostic.
-        // `ZYNTAX_SSA_EAGER_IDF=1` restores eager phi placement for diagnosis.
-        let eager_idf = std::env::var_os("ZYNTAX_SSA_EAGER_IDF").is_some();
-        if eager_idf {
-            self.place_phis_using_idf(cfg);
+        self.place_phis_using_idf(cfg);
+        self.idf_placement_done = true;
+
+        // Make each read-only parameter visible in every typed-CFG block.
+        // Generated expression blocks inherit their definitions separately.
+        let written: std::collections::HashSet<InternedString> = self
+            .scan_cfg_for_variable_writes(cfg)
+            .into_values()
+            .flatten()
+            .collect();
+        let param_defs: Vec<_> = self
+            .definitions
+            .get(&entry_block)
+            .map(|defs| {
+                defs.iter()
+                    .filter(|(var, _)| !written.contains(*var))
+                    .map(|(&var, &val)| (var, val))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for block_id in self.function.blocks.keys() {
+            if *block_id != entry_block {
+                for (var, val) in &param_defs {
+                    if let Some(defs) = self.definitions.get_mut(block_id) {
+                        defs.entry(*var).or_insert(*val);
+                    }
+                }
+            }
         }
-
-        self.idf_placement_done = eager_idf;
-
-        // Parameters live in the entry definition map. Reads in other
-        // blocks find them by walking predecessors, just like any other
-        // dominating definition; copying every parameter into every block
-        // turns large functions into a dense block-by-variable matrix.
 
         // Process blocks in dominance-friendly order
         // For now, we use a simple worklist algorithm that processes blocks when their
@@ -1219,6 +1234,10 @@ impl SsaBuilder {
                 // Mark block as filled
                 self.filled_blocks.insert(block_id);
 
+                if !self.sealed_blocks.contains(&block_id) {
+                    self.seal_block(block_id);
+                }
+
                 processed_blocks.insert(block_id);
                 made_progress = true;
                 false // Remove from worklist
@@ -1241,6 +1260,9 @@ impl SsaBuilder {
 
                     self.lower_typed_block(typed_block, true, &cfg.loop_of)?;
                     self.filled_blocks.insert(block_id);
+                    if !self.sealed_blocks.contains(&block_id) {
+                        self.seal_block(block_id);
+                    }
                     processed_blocks.insert(block_id);
                 }
                 break;
@@ -1250,16 +1272,6 @@ impl SsaBuilder {
         // Fill remaining incomplete phis (from IDF placement)
         self.recompute_cfg_edges();
         self.remove_unreachable_blocks();
-        let unsealed: Vec<HirId> = self
-            .function
-            .blocks
-            .keys()
-            .copied()
-            .filter(|block| !self.sealed_blocks.contains(block))
-            .collect();
-        for block in unsealed {
-            self.seal_block(block);
-        }
         self.fill_incomplete_phis();
         self.collapse_trivial_phis();
         // Only now is every value named that will be: a phi filled above
@@ -6085,9 +6097,7 @@ impl SsaBuilder {
                     .insert(merge_block_id, HirBlock::new(merge_block_id));
 
                 // The branch blocks read bindings through their single
-                // predecessor. Copying the predecessor's whole definition
-                // map into both arms makes sparse SSA dense in functions
-                // with many conditional expressions.
+                // predecessor without copying the entire definition map.
                 self.definitions.insert(then_block_id, IndexMap::new());
                 self.definitions.insert(else_block_id, IndexMap::new());
                 self.definitions.insert(merge_block_id, IndexMap::new());
