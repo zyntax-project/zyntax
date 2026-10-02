@@ -316,7 +316,9 @@ pub fn register_runtime(
     runtime.set_pattern_rewrites(false);
     let snapshot = snapshot().map_err(|e| zyntax_embed::RuntimeError::Execution(e.to_string()))?;
     runtime.install_snapshot(snapshot)?;
-    runtime.declare_entry_points([ENTRY]);
+    // A module an embedder imports is also entered to describe what it
+    // raised; a program has no such function.
+    runtime.declare_entry_points([ENTRY, DESCRIBE]);
     runtime.register_static_plugins([
         zrtl_io::static_plugin(),
         zrtl_string::static_plugin(),
@@ -368,6 +370,40 @@ pub fn parse_module_with_host(
     hosts: &HostResolver<'_>,
 ) -> Result<TypedProgram> {
     parse_with_host(source, file, modules, hosts, Uncaught::Pending)
+}
+
+/// In a module [`parse_module_with_host`] lowered, a value's text as an
+/// uncaught exception reports it: its type's name, then `: ` and its own
+/// text when it has any. A host describes what
+/// `TieredRuntime::take_pending_error` took with it. Each module has its
+/// own, since the class hooks it reaches are the module's, so a host
+/// takes its address once the module is compiled.
+pub const DESCRIBE: &str = "py$describe";
+
+/// [`DESCRIBE`]'s declaration.
+fn describe() -> zyntax_builtins::Decl {
+    use zyntax_builtins::build::*;
+    let x = local("x", any());
+    let shown = local("shown", string());
+    let type_name = call("zb_any_type", vec![x.e()], string());
+    let mut decl = define_cold(
+        DESCRIBE,
+        &[&x],
+        string(),
+        vec![
+            shown.decl(call("zb_any_str", vec![x.e()], string())),
+            if_(
+                call("zb_str_truthy", vec![shown.e()], boolean()),
+                vec![ret(add(add(type_name.clone(), text(": ")), shown.e()))],
+                vec![ret(type_name)],
+            ),
+        ],
+    );
+    // The module's own, not the library's: built with the module.
+    if let TypedDeclaration::Function(f) = &mut decl.node {
+        f.module = None;
+    }
+    decl
 }
 
 /// What [`ENTRY`] does with an exception nothing in the body caught.
@@ -1089,6 +1125,9 @@ fn parse_program_once(
             Type::Unknown,
             span,
         ));
+    }
+    if let Uncaught::Pending = uncaught {
+        declarations.push(describe());
     }
 
     for name in inferred.adapters.borrow().iter() {
