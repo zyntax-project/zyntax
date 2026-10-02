@@ -911,6 +911,17 @@ impl LoweringContext {
             if let Some(decoding) = decoding {
                 self.adopted.1 += decoding.elapsed().as_secs_f64() * 1000.0;
             }
+            // A deferred shell has no instructions for
+            // `calls_with_nowhere_to_land` to scan. Its split-module
+            // directory still tells us every direct callee, so carry those
+            // targets into the ordinary owed-body pass. This is especially
+            // important for a linked library calling a hook supplied by the
+            // program: the hook already has an extern shell in the module,
+            // and `pending` alone would skip it as present without asking
+            // lowering to build its body.
+            if self.config.defer_prelowered_bodies {
+                self.owed_targets.extend(targets.iter().copied());
+            }
             pending.extend(targets);
             if !function.blocks.is_empty() {
                 self.adopt_followed.insert(target);

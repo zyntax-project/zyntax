@@ -316,35 +316,49 @@ fn a_body_replacing_a_linked_extern_has_its_dependencies_adopted() {
     let library = lower("lib", &mut library_program, LoweringConfig::default());
     let bytes = serialize_module(&library, Format::Split).expect("serializes split");
     let library = Arc::new(deserialize_module_lazy(bytes).expect("reads split directory"));
+    let hook_id = library.by_name("hook").expect("hook shell").id;
     let dependency_id = library.by_name("dependency").expect("dependency shell").id;
 
-    // `main` first reaches the linked library entry. That entry reaches the
-    // library's external hook shell; lowering then supplies the program's
-    // hook body, whose call to `dependency` must trigger another link scan.
-    let mut client = program(vec![
-        function(library_entry, vec![], None, Some(library_name)),
-        function(dependency, vec![], None, Some(library_name)),
-        function(hook, vec![], Some(returning_call(dependency)), None),
-        function(main, vec![], Some(returning_call(library_entry)), None),
-    ]);
-    let module = lower(
-        "app",
-        &mut client,
-        LoweringConfig {
-            prelowered: vec![library],
-            entry_names: vec!["main".into()],
-            closed: true,
-            ..LoweringConfig::default()
-        },
-    );
+    for defer_prelowered_bodies in [false, true] {
+        // `main` first reaches the linked library entry. That entry reaches
+        // the library's external hook shell; lowering then supplies the
+        // program's hook body, whose call to `dependency` must trigger
+        // another link scan. A deferred library body exposes that call only
+        // through its split-module directory.
+        let mut client = program(vec![
+            function(library_entry, vec![], None, Some(library_name)),
+            function(dependency, vec![], None, Some(library_name)),
+            function(hook, vec![], Some(returning_call(dependency)), None),
+            function(main, vec![], Some(returning_call(library_entry)), None),
+        ]);
+        let module = lower(
+            "app",
+            &mut client,
+            LoweringConfig {
+                prelowered: vec![Arc::clone(&library)],
+                defer_prelowered_bodies,
+                entry_names: vec!["main".into()],
+                closed: true,
+                ..LoweringConfig::default()
+            },
+        );
 
-    assert!(
-        module
+        assert!(
+            module
+                .functions
+                .get(&hook_id)
+                .is_some_and(|function| !function.blocks.is_empty()),
+            "the program's hook body is built when a deferred library body calls it"
+        );
+        let dependency = module
             .functions
             .get(&dependency_id)
-            .is_some_and(|function| !function.blocks.is_empty()),
-        "the body supplied for an external hook is scanned for linked dependencies"
-    );
+            .expect("the hook's linked dependency is adopted");
+        assert!(
+            defer_prelowered_bodies || !dependency.blocks.is_empty(),
+            "an eager dependency carries its body"
+        );
+    }
 }
 
 #[cfg(feature = "cranelift-backend")]
