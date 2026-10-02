@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1790510953,"nonce":"oYWvoVem3cXEOcjeW+o59VC29C4=","added":["bug","area:compiler"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1790954582,"nonce":"N/u7VanRZ2TppX8exEE5kP4+cQo=","message":"Fixed by 1f9c89f5 (drop insertion resolves the release of a loop-carried pair of phis), landed on main through PR #4 (4d4b9c2d).","files":null}]}
