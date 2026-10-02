@@ -281,6 +281,11 @@ fn a_program_uses_the_embedders_objects() {
         "the library and the embedding agree on the tag"
     );
     assert_eq!(zyntax_builtins::TUPLE_TAG as u32, foreign::TUPLE_TAG);
+    assert_eq!(zyntax_builtins::FUNC_TAG as u32, foreign::FUNC_TAG);
+    assert_eq!(
+        zyntax_builtins::functions::MAX_CALL_ARITY,
+        foreign::MAX_CALL_ARITY
+    );
     assert!(foreign::install(Box::new(Stand)));
     let hosts = |name: &str| {
         (name == "shapes").then(|| HostModule {
