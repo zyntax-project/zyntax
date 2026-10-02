@@ -143,6 +143,10 @@ pub struct TieredRuntime {
     automatic_release: bool,
     /// See [`Self::set_error_flag_global`].
     error_flag_global: Option<zyntax_typed_ast::InternedString>,
+    /// The native slot and size of every loaded module's error-flag
+    /// global, as addresses; refreshed whenever compiling or rebuilding
+    /// can move them. See [`Self::take_pending_error`].
+    error_flags: std::sync::RwLock<Vec<(usize, usize)>>,
     /// Whether programs go through the pattern rewrites before
     /// lowering. See [`Self::set_pattern_rewrites`].
     pattern_rewrites: bool,
@@ -488,6 +492,7 @@ impl TieredRuntime {
             run_interp_opts: true,
             automatic_release: false,
             error_flag_global: None,
+            error_flags: std::sync::RwLock::new(Vec::new()),
             pattern_rewrites: true,
             collecting: false,
             import_resolvers: Vec::new(),
@@ -767,6 +772,7 @@ impl TieredRuntime {
         // What the running module compiles later asks as it always has.
         self.backend.set_emit_osr_probes(self.config.enable_osr);
         compiled?;
+        self.refresh_error_flags();
         // The backend owns the optimized HIR and native global slots. Bind
         // both into the interpreter before the initializer can run.
         //
@@ -1310,6 +1316,52 @@ impl TieredRuntime {
         self.error_flag_global = Some(zyntax_typed_ast::InternedString::new_global(name));
     }
 
+    /// The error a call into this runtime's code left pending, taken: the
+    /// value of the global [`Self::set_error_flag_global`] names, with
+    /// that global null again. `None` when nothing is pending.
+    ///
+    /// A host calls this after calling compiled code, by name or by
+    /// pointer, to see whether the call ended in an error. Each loaded
+    /// module keeps its own copy of the global; the first that holds a
+    /// value is taken. The value is the global's word as stored, and
+    /// whatever it refers to is the host's from here on.
+    pub fn take_pending_error(&self) -> Option<u64> {
+        let slots = self.error_flags.read().unwrap_or_else(|e| e.into_inner());
+        for &(slot, size) in slots.iter() {
+            // SAFETY: the backend keeps a loaded module's global slots
+            // alive and refreshes this list whenever they move.
+            unsafe {
+                let word = match size {
+                    4 => u64::from((slot as *const u32).read()),
+                    _ => (slot as *const u64).read(),
+                };
+                if word != 0 {
+                    match size {
+                        4 => (slot as *mut u32).write(0),
+                        _ => (slot as *mut u64).write(0),
+                    }
+                    return Some(word);
+                }
+            }
+        }
+        None
+    }
+
+    /// Read the error-flag slots afresh from the backend: after a compile
+    /// adds a module, or a rebuild or reload moves module globals.
+    fn refresh_error_flags(&self) {
+        let slots = if self.error_flag_global.is_some() {
+            self.backend
+                .error_flag_slots()
+                .into_iter()
+                .map(|(ptr, size)| (ptr as usize, size))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        *self.error_flags.write().unwrap_or_else(|e| e.into_inner()) = slots;
+    }
+
     /// Whether programs go through the pattern rewrites before lowering:
     /// the structural cleanup and the rewrites that lower effect and
     /// handler declarations. On by default. A language whose frontend
@@ -1590,7 +1642,9 @@ impl TieredRuntime {
         // the last without being told.
         self.backend
             .rebuild_and_restore()
-            .map_err(|error| RuntimeError::Execution(error.to_string()))
+            .map_err(|error| RuntimeError::Execution(error.to_string()))?;
+        self.refresh_error_flags();
+        Ok(())
     }
 
     /// Compile a pre-parsed typed program, mirroring
@@ -1751,6 +1805,7 @@ impl TieredRuntime {
         // An aborted reload changed nothing, so the handles' view of
         // shapes and machines must not move either.
         if !report.aborted {
+            self.refresh_error_flags();
             self.rebind_interpreter_ticks();
             self.apply_reload_fiber_meta(fiber_decls, &report);
             if !report.state_migrations.is_empty() {
@@ -2766,6 +2821,7 @@ impl TieredRuntime {
         // An aborted reload changed nothing, so the handles' view of
         // shapes and machines must not move either.
         if !report.aborted {
+            self.refresh_error_flags();
             self.rebind_interpreter_ticks();
             self.apply_reload_fiber_meta(fiber_decls, &report);
             if !report.state_migrations.is_empty() {

@@ -2855,6 +2855,26 @@ impl TieredBackend {
         (symbols, globals)
     }
 
+    /// The native slot and size of each loaded module's error-flag global
+    /// (`HirGlobal::error_flag`). A module that declares none has none; one
+    /// that does keeps its own.
+    pub fn error_flag_slots(&self) -> Vec<(*mut u8, usize)> {
+        self.loaded_modules()
+            .into_iter()
+            .flat_map(|m| {
+                m.globals
+                    .iter()
+                    .filter(|(_, global)| global.error_flag)
+                    .map(|(id, _)| *id)
+            })
+            .filter_map(|id| {
+                self.cranelift
+                    .with_lock(|be| be.global_data_addr(id))
+                    .map(|(ptr, size)| (ptr as *mut u8, size))
+            })
+            .collect()
+    }
+
     /// Entry callback for the bytecode interpreter: ticks the function's
     /// bead as a native call would and hands back the native entry once
     /// there is one. The baseline of a function compiled at load is the
