@@ -11881,8 +11881,14 @@ impl<'m> Lowerer<'m> {
     }
 
     /// The entry function's statements: the module body in a loop of one
-    /// pass, then a report of whatever exception nothing caught.
-    pub(crate) fn entry_body(&mut self, stmts: &[(&py::Stmt, Option<&str>)]) -> Result<Vec<Stmt>> {
+    /// pass, then, for a program, a report of whatever exception nothing
+    /// caught. For a module an embedder imports the exception stays
+    /// pending.
+    pub(crate) fn entry_body(
+        &mut self,
+        stmts: &[(&py::Stmt, Option<&str>)],
+        uncaught: crate::Uncaught,
+    ) -> Result<Vec<Stmt>> {
         let span = stmts
             .first()
             .map(|(s, _)| span_of(*s))
@@ -11908,6 +11914,9 @@ impl<'m> Lowerer<'m> {
             Type::Unknown,
             span,
         ));
+        if let crate::Uncaught::Pending = uncaught {
+            return Ok(vec![one_pass(body, span)]);
+        }
         // An exception left pending ends the program; the report and
         // the exit are the library's, kept out of this function's code.
         let report = vec![TypedNode::new(

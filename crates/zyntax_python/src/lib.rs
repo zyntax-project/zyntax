@@ -353,6 +353,39 @@ pub fn parse_program_with_host(
     modules: &modules::Resolver<'_>,
     hosts: &HostResolver<'_>,
 ) -> Result<TypedProgram> {
+    parse_with_host(source, file, modules, hosts, Uncaught::Report)
+}
+
+/// [`parse_program_with_host`] for a module an embedder imports rather
+/// than a program it runs: an exception nothing in the module's body
+/// catches stays pending when [`ENTRY`] returns, for the host to take
+/// with `TieredRuntime::take_pending_error`, instead of being reported
+/// and ending the process.
+pub fn parse_module_with_host(
+    source: &str,
+    file: &str,
+    modules: &modules::Resolver<'_>,
+    hosts: &HostResolver<'_>,
+) -> Result<TypedProgram> {
+    parse_with_host(source, file, modules, hosts, Uncaught::Pending)
+}
+
+/// What [`ENTRY`] does with an exception nothing in the body caught.
+#[derive(Clone, Copy)]
+pub(crate) enum Uncaught {
+    /// Report it on stderr and end the process, as a program does.
+    Report,
+    /// Leave it pending for the host.
+    Pending,
+}
+
+fn parse_with_host(
+    source: &str,
+    file: &str,
+    modules: &modules::Resolver<'_>,
+    hosts: &HostResolver<'_>,
+    uncaught: Uncaught,
+) -> Result<TypedProgram> {
     // A record shape the lowering demotes is typed again as a dict, so
     // the program is read again without it; shapes only ever leave.
     let mut demoted: HashSet<Vec<String>> = HashSet::default();
@@ -361,7 +394,8 @@ pub fn parse_program_with_host(
     // would use.
     let mut kept: Option<Library> = None;
     loop {
-        let result = parse_program_once(source, file, modules, hosts, &demoted, &mut kept);
+        let result =
+            parse_program_once(source, file, modules, hosts, &demoted, &mut kept, uncaught);
         records::watch(false);
         let mut found = records::demoted();
         // A lowering that failed with records in the program is read
@@ -383,6 +417,7 @@ fn parse_program_once(
     hosts: &HostResolver<'_>,
     demoted: &HashSet<Vec<String>>,
     kept: &mut Option<Library>,
+    uncaught: Uncaught,
 ) -> Result<TypedProgram> {
     // `ZYNTAX_TRACE_LOWER_PHASES=1` times the frontend's steps on stderr,
     // the same switch the embedder's phase trace reads.
@@ -1024,7 +1059,7 @@ fn parse_program_once(
             Vec::new(),
             HashMap::default(),
         )
-        .entry_body(&top_level)?;
+        .entry_body(&top_level, uncaught)?;
         let span = match (top_level.first(), top_level.last()) {
             (Some(first), Some(last)) => Span::new(
                 first.0.range().start().to_usize(),
