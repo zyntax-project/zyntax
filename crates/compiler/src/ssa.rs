@@ -13608,6 +13608,19 @@ impl SsaBuilder {
                 }
                 node.ty.clone()
             }
+            // A method call has the type its method returns, which the
+            // parser cannot know for a method declared outside the
+            // source, such as one a host module brings.
+            TypedExpression::MethodCall(call) => {
+                let receiver = self.resolve_expr_type(&call.receiver);
+                if !matches!(receiver, Type::Any | Type::Unknown)
+                    && let Ok(function) = self.resolve_method_to_function(&receiver, call.method)
+                    && let Some(ret_ty) = self.function_return_types.get(&function)
+                {
+                    return ret_ty.clone();
+                }
+                node.ty.clone()
+            }
             // Array literal `[a, b, c]` — the parser fills `element_type`
             // from the first element's `expr.ty`, but if the first
             // element is a Variable expression the parser leaves its
