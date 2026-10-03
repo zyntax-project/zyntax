@@ -25,6 +25,8 @@ pub(crate) struct Inputs<'a> {
     pub plugin_signatures: &'a HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
     pub import_resolvers: &'a [ImportResolverCallback],
     pub compiled_import_resolvers: &'a [CompiledImportResolverCallback],
+    /// Host modules an import may name; see `TieredRuntime::add_host_modules`.
+    pub host_modules: &'a [crate::host_import::HostModuleResolver],
     pub snapshot_modules: &'a SnapshotModules,
     /// Extern aliases, name to runtime symbol.
     pub builtins: indexmap::IndexMap<String, String>,
@@ -151,6 +153,7 @@ pub(crate) fn lower_typed_program(
     // anything resolves against it. Modules that arrive already lowered
     // are collected for the lowering to link against.
     let mut prelowered = inputs.prelowered;
+    crate::host_import::expand_host_imports(&mut program, inputs.host_modules)?;
     crate::import_chain::process_imports_for_traits(
         inputs.grammars,
         inputs.plugin_signatures,

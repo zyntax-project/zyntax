@@ -77,6 +77,7 @@ pub mod host;
 /// targets get the same surface so the per-bridge stdlib code
 /// stays target-uniform.
 pub mod host_futures;
+mod host_import;
 mod import_chain;
 /// BC-interpreter-backed execution engine. On native it's internal
 /// scaffolding for [`runtime::ZyntaxRuntime`]; on wasm32 (where the

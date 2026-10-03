@@ -159,6 +159,9 @@ pub struct TieredRuntime {
     import_resolvers: Vec<ImportResolverCallback>,
     /// Build-time parsed imports, consulted before source resolvers.
     compiled_import_resolvers: Vec<CompiledImportResolverCallback>,
+    /// Modules the host owns, which an import may name; see
+    /// [`Self::add_host_modules`].
+    host_modules: Vec<crate::host_import::HostModuleResolver>,
     /// Modules a snapshot installed, keyed by the language that
     /// brought them, so a name means what it means inside the language
     /// asking rather than whichever language registered first.
@@ -503,6 +506,7 @@ impl TieredRuntime {
             collecting: false,
             import_resolvers: Vec::new(),
             compiled_import_resolvers: Vec::new(),
+            host_modules: Vec::new(),
             snapshot_modules: Default::default(),
             entry_points: Vec::new(),
             installed: Arc::default(),
@@ -545,6 +549,29 @@ impl TieredRuntime {
     /// Register a resolver for build-time parsed import artifacts.
     pub fn add_compiled_import_resolver(&mut self, resolver: CompiledImportResolverCallback) {
         self.compiled_import_resolvers.push(resolver);
+    }
+
+    /// Let a program import modules the host owns, typed by the host's
+    /// description of them.
+    ///
+    /// `resolver` answers a module path with its [`crate::host::HostModule`],
+    /// or `None` for a module it does not own. An import that names one
+    /// brings its classes as types and its functions as functions: a
+    /// class `C` takes `C::new(..)` for its constructor, `C::m(..)` for a
+    /// static, `c.m(..)` for a method, and `c.x()` / `c.set_x(v)` for a
+    /// field. Every call is checked against the declared types and runs
+    /// through the [`crate::foreign::Foreign`] the host installed. A call
+    /// the host fails returns its type's zero and leaves the error for
+    /// [`crate::foreign::take_error`].
+    pub fn add_host_modules(
+        &mut self,
+        resolver: impl Fn(&str) -> Option<crate::host::HostModule> + 'static,
+    ) -> RuntimeResult<()> {
+        if self.host_modules.is_empty() {
+            self.register_static_plugin(crate::foreign::static_plugin())?;
+        }
+        self.host_modules.push(Box::new(resolver));
+        Ok(())
     }
 
     /// Extern aliases for typed-program compiles, the counterpart of
@@ -1728,6 +1755,7 @@ impl TieredRuntime {
                 plugin_signatures: &self.plugin_signatures,
                 import_resolvers: &self.import_resolvers,
                 compiled_import_resolvers: &self.compiled_import_resolvers,
+                host_modules: &self.host_modules,
                 snapshot_modules: &self.snapshot_modules,
                 builtins: self.builtin_aliases.clone(),
                 builtin_registry: self.snapshot_builtin_registry(),
@@ -2984,6 +3012,7 @@ impl TieredRuntime {
                 plugin_signatures: &self.plugin_signatures,
                 import_resolvers: &self.import_resolvers,
                 compiled_import_resolvers: &self.compiled_import_resolvers,
+                host_modules: &self.host_modules,
                 snapshot_modules: &self.snapshot_modules,
                 builtins,
                 builtin_registry: self.snapshot_builtin_registry(),

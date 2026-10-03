@@ -268,6 +268,25 @@ Parse and compile imported module
 - Callback-based (custom logic)
 - Filesystem-based (directory + extension)
 
+### Host modules
+
+A host exposes its own classes and functions to a program through `TieredRuntime::add_host_modules`. The resolver answers a module path with a `zyntax_embed::host::HostModule`: its classes (constructor, methods, fields, statics) and functions, typed with `HostType`. Calls run through the `zyntax_embed::foreign::Foreign` the host installed with `foreign::install`, the same protocol the Python and Lua frontends use.
+
+An import names its module by its whole path, longest first. `import game.Prompt` is module `game.Prompt`, or else member `Prompt` of module `game`; `from game import Prompt` is module `game.Prompt`, or else member `Prompt` of `game`. An import no host module answers goes to the other resolvers.
+
+Each class `C` becomes a type, its value the foreign object's box:
+
+| Host member | Call |
+|---|---|
+| constructor | `C::new(args)` |
+| static method | `C::m(args)` |
+| method | `c.m(args)` |
+| field `x` | `c.x()`, `c.set_x(v)` |
+| static field `x` | `C::x()`, `C::set_x(v)` |
+| module function `f` | `f(args)` |
+
+`Bool`, `Int`, `Float` and `Str` cross as the language's own values; a class of the same module crosses as its type and any other host object, or `Dynamic`, as `Any`. `Bytes` and function types are refused. Each call is checked against the declared signature when the program compiles. A call the host fails returns its type's zero and leaves the error for `foreign::take_error`.
+
 ## ZRTL Plugin System
 
 Native runtime libraries follow the ZRTL format:

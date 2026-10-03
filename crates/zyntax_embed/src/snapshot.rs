@@ -712,6 +712,7 @@ pub fn lower_for_snapshot_releasing(
             plugin_signatures: &none_signatures,
             import_resolvers: &[],
             compiled_import_resolvers: &[],
+            host_modules: &[],
             snapshot_modules: &none_modules,
             builtins,
             builtin_registry: Arc::new(

@@ -547,6 +547,13 @@ thread_local! {
     static ERROR: RefCell<Option<ForeignError>> = const { RefCell::new(None) };
 }
 
+/// The error the last failed operation on this thread reported, taken
+/// so the next failure starts afresh. A program the host's own errors
+/// cannot unwind reads as having failed through this.
+pub fn take_error() -> Option<ForeignError> {
+    ERROR.with(|e| e.borrow_mut().take())
+}
+
 fn fail(error: ForeignError) {
     ERROR.with(|e| *e.borrow_mut() = Some(error));
 }
