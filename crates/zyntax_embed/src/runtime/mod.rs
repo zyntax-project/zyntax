@@ -56,6 +56,8 @@ pub use promise::{
     AsyncPollResult, PromiseAll, PromiseAllSettled, PromiseAllState, PromiseRace, PromiseRaceState,
     PromiseState, SettledResult, ZyntaxPromise, drive_tasks,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use promise::{HostTask, HostTaskStep};
 pub use tiered::{
     EffectHandlerToken, FiberToken, HandlerContext, HandlerContextScope, HandlerFrame,
     HandlerInstance, HostFiberInfo, HostFiberStep, TieredRuntime,

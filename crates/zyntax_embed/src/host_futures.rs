@@ -414,6 +414,44 @@ pub fn drive_own_timer(task_id: i64) -> Option<ResolveOutcome> {
     Some(resolve_future(handle, 0))
 }
 
+/// The handle of `task_id`'s earliest timer that is due at `now`, taken
+/// off the queue; `None` when none of its timers is due. Never sleeps.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn take_due_timer(task_id: i64, now: web_time::Instant) -> Option<i64> {
+    TIMER_QUEUE.with(|q| {
+        let mut q = q.borrow_mut();
+        let mut best: Option<usize> = None;
+        for i in 0..q.len() {
+            let (deadline, handle) = q[i];
+            let owned =
+                FUTURE_TABLE.with(|t| t.borrow().get(&handle).map(|p| p.task_id) == Some(task_id));
+            if owned && deadline <= now && best.is_none_or(|b| deadline < q[b].0) {
+                best = Some(i);
+            }
+        }
+        best.map(|i| q.swap_remove(i).1)
+    })
+}
+
+/// When `task_id`'s earliest timer is due, if it has one.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn task_next_deadline(task_id: i64) -> Option<web_time::Instant> {
+    TIMER_QUEUE.with(|q| {
+        q.borrow()
+            .iter()
+            .filter(|(_, handle)| {
+                FUTURE_TABLE.with(|t| t.borrow().get(handle).map(|p| p.task_id) == Some(task_id))
+            })
+            .map(|(deadline, _)| *deadline)
+            .min()
+    })
+}
+
+/// Whether a future `task_id` parked still waits to be resolved.
+pub(crate) fn task_has_parked(task_id: i64) -> bool {
+    FUTURE_TABLE.with(|t| t.borrow().values().any(|p| p.task_id == task_id))
+}
+
 /// Drop every parked future and pending timer belonging to `task_id`.
 /// Used when a task is cancelled so the executor stops driving its (now
 /// dead) state machine and its timers don't fire into freed memory. The

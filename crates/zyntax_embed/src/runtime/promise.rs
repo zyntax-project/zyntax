@@ -129,6 +129,25 @@ pub enum PromiseState {
     Cancelled,
 }
 
+/// The state machine and poll function of the promise an async entry
+/// returned, `{state_machine @0, poll_fn @8}`, and the 16 bytes released:
+/// the entry mallocs them only to hand the pair back. The state machine is
+/// a separate allocation and stays.
+///
+/// # Safety
+/// `promise` is null or a promise an async entry returned, read once.
+unsafe fn take_promise(promise: *mut u8) -> (*mut u8, *const u8) {
+    if promise.is_null() {
+        return (std::ptr::null_mut(), std::ptr::null());
+    }
+    unsafe {
+        let state_machine = *(promise as *const *mut u8);
+        let poll_fn = *(promise.add(8) as *const *const u8);
+        crate::effect_runtime::free_handler_state(promise);
+        (state_machine, poll_fn)
+    }
+}
+
 /// Global task ID counter for promise wakers
 static NEXT_TASK_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -172,24 +191,36 @@ impl ZyntaxPromise {
         // Promise layout at pointer: offset 0 = state_machine (8 bytes), offset 8 = poll_fn (8 bytes)
         let (state_machine, poll_fn) = unsafe {
             let promise_ptr: *const u8 = call_with_signature(func_ptr, &args, signature);
-
-            if promise_ptr.is_null() {
-                (std::ptr::null_mut(), std::ptr::null())
-            } else {
-                // Read the Promise struct from the pointer
-                // Promise layout: {state_machine: *mut u8, poll_fn: fn(*mut u8) -> i64}
-                let state_machine = *(promise_ptr as *const *mut u8);
-                let poll_fn = *((promise_ptr as *const u8).offset(8) as *const *const u8);
-                // The entry function mallocs this 16-byte struct purely to
-                // hand back the pair. Both fields are copied out above and
-                // the pointer goes no further, so it is released here
-                // rather than lost. The state machine it named is a
-                // separate allocation and is NOT released.
-                crate::effect_runtime::free_handler_state(promise_ptr as *mut u8);
-                (state_machine, poll_fn)
-            }
+            take_promise(promise_ptr as *mut u8)
         };
+        Self::of_machine(func_ptr, args, task_id, state_machine, poll_fn)
+    }
 
+    /// The promise an async function's entry returned, which the caller
+    /// made the call for itself; the 16 bytes go, as they do for
+    /// [`Self::from_async_call`].
+    ///
+    /// # Safety
+    /// `promise` is null or what an async entry returned, not yet adopted.
+    pub unsafe fn adopt(promise: *mut u8) -> Self {
+        let task_id = NEXT_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (state_machine, poll_fn) = unsafe { take_promise(promise) };
+        Self::of_machine(
+            std::ptr::null(),
+            Vec::new(),
+            task_id,
+            state_machine,
+            poll_fn,
+        )
+    }
+
+    fn of_machine(
+        func_ptr: *const u8,
+        args: Vec<DynamicValue>,
+        task_id: usize,
+        state_machine: *mut u8,
+        poll_fn: *const u8,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(PromiseInner {
                 init_fn: func_ptr, // Keep for reference
@@ -829,6 +860,150 @@ pub fn drive_tasks(promises: &[ZyntaxPromise]) -> Vec<RuntimeResult<ZyntaxValue>
             }
         })
         .collect()
+}
+
+/// What one [`HostTask::step`] left the task as.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostTaskStep {
+    /// Finished, with the poll function's result word: the result as the
+    /// function's type casts it to `i64` (a float by its bits, a pointer by
+    /// its address), or 1 for a function that returns nothing.
+    Ready(i64),
+    /// Waits on a timer of its own, due at this instant.
+    Timer(web_time::Instant),
+    /// Waits on a future it parked, which the host bridge that took it
+    /// resolves.
+    Parked,
+    /// Waits on nothing it parked: step it again.
+    Yield,
+}
+
+/// The first id a [`HostTask`] takes: above any slice index `drive_until`
+/// stamps, and positive where handler drives are negative.
+#[cfg(not(target_arch = "wasm32"))]
+static NEXT_HOST_TASK_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1 << 32);
+
+/// A top-level async task a host's own scheduler steps: each step advances
+/// it as far as it goes without waiting, and says what it waits on next, so
+/// the host decides when to step it again. It never sleeps the thread.
+///
+/// A step is stamped with the task's id and bracketed by its handler-stack
+/// segment, as `drive_until` brackets each poll. The task's futures,
+/// timers and segment are this thread's; step and drop it on the thread
+/// that made it. Dropping it before it finishes tears its parking down,
+/// as a cancel does.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct HostTask {
+    id: i64,
+    promise: ZyntaxPromise,
+    started: bool,
+    result: Option<i64>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl HostTask {
+    /// The task of the promise an async function's call returned.
+    pub fn new(promise: ZyntaxPromise) -> HostTask {
+        HostTask {
+            id: NEXT_HOST_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            promise,
+            started: false,
+            result: None,
+        }
+    }
+
+    /// The id the task's futures and timers are stamped with.
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    /// Advance the task as far as it goes without waiting.
+    pub fn step(&mut self) -> HostTaskStep {
+        use crate::host_futures::{current_task_id, set_current_task_id};
+        if let Some(value) = self.result {
+            return HostTaskStep::Ready(value);
+        }
+        let previous = current_task_id();
+        set_current_task_id(self.id);
+        let baseline = crate::effect_runtime::task_handler_enter(self.id);
+        let step = self.advance();
+        crate::effect_runtime::task_handler_leave(self.id, baseline);
+        set_current_task_id(previous);
+        if let HostTaskStep::Ready(value) = step {
+            self.result = Some(value);
+            self.promise.state.lock().unwrap().state = PromiseState::Ready(ZyntaxValue::Int(value));
+        }
+        step
+    }
+
+    fn advance(&mut self) -> HostTaskStep {
+        use crate::host_futures::{
+            resolve_future, take_due_timer, take_sm_completion, task_has_parked, task_next_deadline,
+        };
+        let (state_machine, poll_fn) = {
+            let inner = self.promise.state.lock().unwrap();
+            (inner.state_machine, inner.poll_fn)
+        };
+        // A promise with no machine is a synchronous function's, finished.
+        let (Some(sm), Some(poll_fn)) = (state_machine, poll_fn) else {
+            return HostTaskStep::Ready(1);
+        };
+        // SAFETY: the poll function the entry stored, of the C signature
+        // section 6.3 of docs/ASYNC_EFFECTS_FIBERS.md fixes.
+        let poll: extern "C" fn(*mut u8) -> i64 = unsafe { std::mem::transmute(poll_fn) };
+        let resumed = self.started;
+        if resumed {
+            // Its due timers resume the machines that parked them. A
+            // machine parked on a bridge already saved its next state, so
+            // it is only ever resumed through its future, never polled.
+            let now = web_time::Instant::now();
+            while let Some(handle) = take_due_timer(self.id, now) {
+                resolve_future(handle, 0);
+            }
+        } else {
+            self.started = true;
+            let rc = poll(sm);
+            if rc != 0 {
+                return HostTaskStep::Ready(rc);
+            }
+        }
+        // Finished by a resolve or a nested resume, so not polled again.
+        if let Some(value) = take_sm_completion(sm) {
+            return HostTaskStep::Ready(value);
+        }
+        // With nothing of its own parked, the machine is polled: what it
+        // awaited finished under a resolve, or it advances by polling.
+        if resumed && !task_has_parked(self.id) {
+            let rc = poll(sm);
+            if rc != 0 {
+                return HostTaskStep::Ready(rc);
+            }
+            if let Some(value) = take_sm_completion(sm) {
+                return HostTaskStep::Ready(value);
+            }
+        }
+        match task_next_deadline(self.id) {
+            Some(deadline) => HostTaskStep::Timer(deadline),
+            None if task_has_parked(self.id) => HostTaskStep::Parked,
+            None => HostTaskStep::Yield,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for HostTask {
+    fn drop(&mut self) {
+        if self.result.is_some() {
+            return;
+        }
+        let mut inner = self.promise.state.lock().unwrap();
+        if std::thread::current().id() != inner.owner_thread {
+            return;
+        }
+        crate::host_futures::deregister_task(self.id);
+        inner.state = PromiseState::Cancelled;
+    }
 }
 
 // ============================================================================

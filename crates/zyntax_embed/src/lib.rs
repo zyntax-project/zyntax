@@ -199,6 +199,9 @@ pub use runtime::{
     ZyntaxPromise,
     ZyntaxRuntime,
 };
+/// A task a host's own scheduler steps (native only, as `drive_tasks`).
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub use runtime::{HostTask, HostTaskStep};
 pub use string::ZyntaxString;
 pub use value::ZyntaxValue;
 pub use zyntax_compiler::hir_interp::{HirInterpreter, InterpError, JitDispatch, ProfileSample};
