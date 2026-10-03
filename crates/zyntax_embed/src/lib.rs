@@ -69,6 +69,7 @@ mod fiber;
 pub mod foreign;
 mod grammar;
 mod grammar2;
+pub mod host;
 /// Cooperative-async future table. Browser-runtime parking layer
 /// that breaks the spin-poll in `__zyntax_effect_resume` for SMs
 /// that wait on host async ops (setTimeout / fetch / WebSocket).
