@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1791049649,"nonce":"yYw9Rdhr5KIKBNbzr+ho9BtfrwY=","message":"Landed on main in 4a90f7b3 (local; push pending). Tests: crates/zynml/tests/handler_segments.rs.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1791049650,"nonce":"frUjmIQ+SIdCy0ocZhF1rHv/GmI=","status":2}]}
