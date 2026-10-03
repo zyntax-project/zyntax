@@ -271,7 +271,8 @@ fn disabled_by_env() -> bool {
 /// Turn the collector on, on this thread. Roots registered before are
 /// forgotten: they belonged to whatever enabled it last.
 pub fn enable() {
-    if disabled_by_env() {
+    // With a host's heap the host's collector reclaims, and this one stays off.
+    if disabled_by_env() || crate::host_heap::is_installed() {
         return;
     }
     let mut owner = OWNER.lock().unwrap_or_else(|e| e.into_inner());
@@ -290,6 +291,7 @@ pub fn enable() {
         l.budget = heap_floor();
     });
     ENABLED.store(true, Ordering::SeqCst);
+    crate::host_heap::root_holds_again();
 }
 
 /// Turn the collector off and forget its roots; what is allocated
@@ -301,6 +303,13 @@ pub fn disable() {
 
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// Whether anything collects, so a root registered now is read: this
+/// collector, or a host heap's.
+#[inline]
+pub fn roots_wanted() -> bool {
+    is_enabled() || crate::host_heap::is_installed()
 }
 
 /// Whether the calling thread is the one the collector belongs to.
@@ -443,6 +452,9 @@ pub fn add_root_range(ptr: *const u8, len: usize) {
     if len == 0 {
         return;
     }
+    if let Some(host) = crate::host_heap::installed() {
+        return crate::host_heap::add_root_range(host, ptr, len);
+    }
     registry().roots.insert(ptr as usize, (len, None));
 }
 
@@ -458,12 +470,18 @@ pub fn add_root_range_with(ptr: *const u8, len: usize, spans: RootSpans) {
     if len == 0 {
         return;
     }
+    if let Some(host) = crate::host_heap::installed() {
+        return crate::host_heap::add_root_spans(host, ptr, len, spans);
+    }
     registry().roots.insert(ptr as usize, (len, Some(spans)));
 }
 
 /// Forget a range [`add_root_range`] registered, once what it held is
 /// gone: an interpreter frame's registers, for one.
 pub fn remove_root_range(ptr: *const u8) {
+    if let Some(host) = crate::host_heap::installed() {
+        return crate::host_heap::remove_root(host, ptr);
+    }
     if !is_enabled() {
         return;
     }

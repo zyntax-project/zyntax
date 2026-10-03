@@ -1489,8 +1489,9 @@ pub unsafe extern "C" fn zyntax_closure_to_zrtl(
 ) -> *mut ZrtlClosureRepr {
     // Allocate and copy environment if present
     let env_copy = if env_size > 0 && !env_ptr.is_null() {
-        let layout = std::alloc::Layout::from_size_align(env_size, 8).unwrap();
-        let ptr = std::alloc::alloc(layout);
+        // Held: the captures name program objects, and a collector must
+        // read them while the closure lives.
+        let ptr = crate::host_heap::alloc_held(env_size);
         std::ptr::copy_nonoverlapping(env_ptr, ptr, env_size);
         ptr
     } else {
@@ -1527,10 +1528,7 @@ struct RawClosureWrapper {
 impl Drop for RawClosureWrapper {
     fn drop(&mut self) {
         if !self.env.is_null() && self.env_size > 0 {
-            unsafe {
-                let layout = std::alloc::Layout::from_size_align(self.env_size, 8).unwrap();
-                std::alloc::dealloc(self.env, layout);
-            }
+            unsafe { crate::pool_alloc::zyntax_free(self.env) }
         }
     }
 }
@@ -1565,8 +1563,7 @@ extern "C" fn raw_closure_clone(ptr: *const ()) -> *const () {
 
         // Copy environment
         let env_copy = if wrapper.env_size > 0 && !wrapper.env.is_null() {
-            let layout = std::alloc::Layout::from_size_align(wrapper.env_size, 8).unwrap();
-            let new_ptr = std::alloc::alloc(layout);
+            let new_ptr = crate::host_heap::alloc_held(wrapper.env_size);
             std::ptr::copy_nonoverlapping(wrapper.env, new_ptr, wrapper.env_size);
             new_ptr
         } else {
@@ -2536,6 +2533,7 @@ impl BandPool {
             queues.push(send);
             let done = Arc::clone(&done);
             std::thread::spawn(move || {
+                let _heap = crate::host_heap::ThreadGuard::enter();
                 while let Ok(job) = recv.recv() {
                     run_bands(&job);
                     // The last thread out wakes whoever is waiting.

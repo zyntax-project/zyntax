@@ -68,6 +68,9 @@ struct PromiseInner {
     state: PromiseState,
     /// State machine pointer (for Zyntax async functions)
     state_machine: Option<*mut u8>,
+    /// Keeps the state machine for a collector, which cannot read this
+    /// struct.
+    held: Option<zyntax_compiler::host_heap::Hold>,
     /// Ready queue for waker integration
     ready_queue: Arc<Mutex<std::collections::VecDeque<usize>>>,
     /// Task ID for waker
@@ -162,6 +165,7 @@ impl ZyntaxPromise {
                 args,
                 state: PromiseState::Pending,
                 state_machine: None,
+                held: None,
                 ready_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 task_id,
                 poll_count: 0,
@@ -236,6 +240,8 @@ impl ZyntaxPromise {
                 } else {
                     Some(state_machine)
                 },
+                held: (!state_machine.is_null())
+                    .then(|| zyntax_compiler::host_heap::Hold::new(state_machine)),
                 ready_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 task_id,
                 poll_count: 0,
@@ -261,6 +267,7 @@ impl ZyntaxPromise {
                 args,
                 state: PromiseState::Pending,
                 state_machine: None,
+                held: None,
                 ready_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 task_id,
                 poll_count: 0,
@@ -396,6 +403,7 @@ impl ZyntaxPromise {
                 }
 
                 inner.state_machine = Some(state_machine);
+                inner.held = Some(zyntax_compiler::host_heap::Hold::new(state_machine));
 
                 // The async ABI in Zyntax generates two functions:
                 // 1. Constructor: `{fn}_new(params...) -> StateMachine` (init_fn)
@@ -600,6 +608,7 @@ impl ZyntaxPromise {
                 args: vec![],
                 state: PromiseState::Pending,
                 state_machine: None,
+                held: None,
                 ready_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 task_id,
                 poll_count: 0,
@@ -612,6 +621,7 @@ impl ZyntaxPromise {
 
         // Spawn a thread to wait for completion and run the callback
         std::thread::spawn(move || {
+            let _heap = zyntax_compiler::host_heap::ThreadGuard::enter();
             loop {
                 let source_state = source.lock().unwrap().state.clone();
                 match source_state {
@@ -653,6 +663,7 @@ impl ZyntaxPromise {
                 args: vec![],
                 state: PromiseState::Pending,
                 state_machine: None,
+                held: None,
                 ready_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 task_id,
                 poll_count: 0,
@@ -664,6 +675,7 @@ impl ZyntaxPromise {
         let target = new_promise.state.clone();
 
         std::thread::spawn(move || {
+            let _heap = zyntax_compiler::host_heap::ThreadGuard::enter();
             loop {
                 let source_state = source.lock().unwrap().state.clone();
                 match source_state {
@@ -1524,6 +1536,7 @@ mod tests {
                 args: vec![],
                 state: PromiseState::Ready(ZyntaxValue::Int(42)),
                 state_machine: None,
+                held: None,
                 ready_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 task_id: 0,
                 poll_count: 0,
@@ -1550,6 +1563,7 @@ mod tests {
                 args: vec![],
                 state: PromiseState::Ready(ZyntaxValue::Int(10)),
                 state_machine: None,
+                held: None,
                 ready_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 task_id: 0,
                 poll_count: 0,

@@ -25,6 +25,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use zyntax_compiler::host_heap::Hold;
 
 use krio_fiber::{Fiber, FiberStep};
 use zyntax_compiler::fiber_backend::{
@@ -66,6 +67,10 @@ thread_local! {
 
     /// Each fiber's environment address, by handle; see `fiber_env`.
     static ENV_MAP: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
+
+    /// What a fiber's environment and error payload name, kept for a
+    /// collector on any thread, by handle, until the fiber is freed.
+    static HELD: RefCell<HashMap<usize, Vec<Hold>>> = RefCell::new(HashMap::new());
 
     /// The fibers being resumed right now, innermost last, so a body
     /// can find its own handle.
@@ -160,6 +165,7 @@ fn encode_step(step: FiberStep, fiber: &Fiber) -> i64 {
         // we used to suspend the body — not the payload of record).
         let _ = fiber.take_yield_u64();
         ERROR_MAP.with(|m| m.borrow_mut().insert(key, info));
+        hold_for(key, info.1 as usize as *const u8);
         // The packed step's i64 payload carries the variant tag in
         // its low bits so callers that don't bother with
         // `take_error` still see *something* indicative; the
@@ -205,6 +211,33 @@ fn make_body(closure: *mut u8) -> impl FnOnce() {
     }
 }
 
+fn hold_for(fiber: usize, address: *const u8) {
+    if address.is_null() {
+        return;
+    }
+    HELD.with(|m| {
+        m.borrow_mut()
+            .entry(fiber)
+            .or_default()
+            .push(Hold::new(address))
+    });
+}
+
+/// The stack a live fiber may hold pointers on, read from any thread: the
+/// whole of it, since whether it is running is known only on its own.
+fn fiber_spans(start: *const u8, _len: usize, visit: &mut dyn FnMut(usize, usize)) {
+    // SAFETY: registered by `fiber_new` for a live Box<Fiber> and removed
+    // by `fiber_free` before the box goes.
+    let fiber = unsafe { &*(start as *const Fiber) };
+    if matches!(
+        fiber.state(),
+        krio_fiber::FiberState::New | krio_fiber::FiberState::Suspended
+    ) {
+        let (low, len) = fiber.stack_range();
+        visit(low as usize, low as usize + len);
+    }
+}
+
 impl FiberCfg for KrioFiberBackend {
     unsafe fn fiber_new(&self, closure: *mut u8, stack_size: i64) -> *mut FiberRepr {
         let body = make_body(closure);
@@ -223,6 +256,11 @@ impl FiberCfg for KrioFiberBackend {
         TASK_FIBERS.with(|m| {
             m.borrow_mut().entry(task).or_default().insert(ptr as usize);
         });
+        // A host's collector reads the stack from whatever thread it
+        // runs on; this one's own windows are read in `stack_windows`.
+        if zyntax_compiler::host_heap::is_installed() {
+            zyntax_compiler::collector::add_root_range_with(ptr as *const u8, 1, fiber_spans);
+        }
         ptr
     }
 
@@ -237,6 +275,7 @@ impl FiberCfg for KrioFiberBackend {
         ENV_MAP.with(|m| {
             m.borrow_mut().insert(ptr as usize, env as usize);
         });
+        hold_for(ptr as usize, env);
         ptr
     }
 
@@ -403,6 +442,10 @@ impl FiberCfg for KrioFiberBackend {
         ENV_MAP.with(|m| {
             m.borrow_mut().remove(&key);
         });
+        HELD.with(|m| m.borrow_mut().remove(&key));
+        if zyntax_compiler::host_heap::is_installed() {
+            zyntax_compiler::collector::remove_root_range(fiber as *const u8);
+        }
         // Drop the fiber from its owning task's set so a later
         // `free_task_fibers` can't double-free it.
         TASK_FIBERS.with(|m| {

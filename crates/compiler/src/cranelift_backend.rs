@@ -7377,7 +7377,7 @@ impl CraneliftBackend {
     /// since the last time, once the module is finalized and the
     /// storage has its address.
     fn register_root_globals(&mut self) {
-        if !crate::collector::is_enabled() {
+        if !crate::collector::roots_wanted() {
             return;
         }
         for id in std::mem::take(&mut self.roots_to_register) {

@@ -299,6 +299,8 @@ struct HandlerInstanceEntry {
     /// Set at creation for a region the runtime allocated implicitly on
     /// a caller's behalf, which nothing else can ever name.
     dropped_by_owner: bool,
+    /// Keeps the region for a collector, which cannot read this map.
+    held: zyntax_compiler::host_heap::Hold,
 }
 
 /// One step of a host-driven machine.
@@ -469,6 +471,7 @@ fn collect_fiber_decls(
 impl TieredRuntime {
     /// Create a tiered runtime with the given configuration
     pub fn new(config: TieredConfig) -> RuntimeResult<Self> {
+        zyntax_compiler::host_heap::install_from_env();
         super::install_sdk_allocator();
         let mut backend = TieredBackend::new(config.clone())?;
 
@@ -2366,6 +2369,7 @@ impl TieredRuntime {
                 async_mask,
                 installs: 0,
                 dropped_by_owner: false,
+                held: zyntax_compiler::host_heap::Hold::new(state as *const u8),
             },
         );
         Ok(HandlerInstance(id))
@@ -2696,6 +2700,7 @@ impl TieredRuntime {
                 async_mask,
                 installs: 1,
                 dropped_by_owner: true,
+                held: zyntax_compiler::host_heap::Hold::new(state as *const u8),
             },
         );
         if let Some(hf) = self.host_fibers.get_mut(&token.0) {

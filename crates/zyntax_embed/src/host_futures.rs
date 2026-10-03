@@ -55,6 +55,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+use zyntax_compiler::host_heap::Hold;
+
 /// Layout of a parked SM's resume info. Mirrors the field set of
 /// the `Resume<T>` struct in `effect_runtime.rs:226–232`, plus the
 /// `task_id` linkage to the top-level Promise resolver.
@@ -136,7 +138,7 @@ thread_local! {
     /// from `register_future`; cleared on `resolve_future` (one
     /// way or another — the entry is removed before the poll runs so
     /// a re-park inside the poll fn doesn't collide with itself).
-    static FUTURE_TABLE: RefCell<HashMap<i64, ParkedFuture>> =
+    static FUTURE_TABLE: RefCell<HashMap<i64, (ParkedFuture, Hold)>> =
         RefCell::new(HashMap::new());
 
     /// Wasm32-only poll fn dispatcher. See [`WasmPollDispatcher`] and
@@ -186,7 +188,7 @@ thread_local! {
     /// before polling a promise: if its SM completed nested, mark it Ready
     /// WITHOUT re-polling (re-polling would re-enter an already-finished SM
     /// — the use-after-free the removed sync-completion latch once guarded).
-    static SM_COMPLETIONS: RefCell<std::collections::HashMap<usize, i64>> =
+    static SM_COMPLETIONS: RefCell<std::collections::HashMap<usize, (i64, [Hold; 2])>> =
         RefCell::new(std::collections::HashMap::new());
 }
 
@@ -195,14 +197,26 @@ thread_local! {
 /// completion.
 pub fn record_sm_completion(sm_ptr: *mut u8, value: i64) {
     SM_COMPLETIONS.with(|c| {
-        c.borrow_mut().insert(sm_ptr as usize, value);
+        c.borrow_mut().insert(
+            sm_ptr as usize,
+            (value, completion_holds(sm_ptr as usize, value)),
+        );
     });
 }
 
 /// Take a nested-completion value for `sm_ptr`, if one was recorded. Clears
 /// it. The executor calls this before polling a promise.
 pub fn take_sm_completion(sm_ptr: *mut u8) -> Option<i64> {
-    SM_COMPLETIONS.with(|c| c.borrow_mut().remove(&(sm_ptr as usize)))
+    SM_COMPLETIONS.with(|c| c.borrow_mut().remove(&(sm_ptr as usize)).map(|(v, _)| v))
+}
+
+/// A recorded completion keeps its machine and, should its value be an
+/// address, what it names.
+fn completion_holds(sm: usize, value: i64) -> [Hold; 2] {
+    [
+        Hold::new(sm as *const u8),
+        Hold::new(value as usize as *const u8),
+    ]
 }
 
 thread_local! {
@@ -213,7 +227,7 @@ thread_local! {
     /// not the last resume — is what the performer completes with). When the
     /// handler reaches Ready, its result is routed to the performer via
     /// `record_sm_completion`.
-    static HANDLER_TO_PERFORMER: RefCell<std::collections::HashMap<usize, usize>> =
+    static HANDLER_TO_PERFORMER: RefCell<std::collections::HashMap<usize, (usize, [Hold; 2])>> =
         RefCell::new(std::collections::HashMap::new());
 }
 
@@ -221,8 +235,16 @@ thread_local! {
 /// `performer_sm`. Called when the handler is launched.
 pub fn register_handler_performer(handler_sm: *mut u8, performer_sm: *mut u8) {
     HANDLER_TO_PERFORMER.with(|m| {
-        m.borrow_mut()
-            .insert(handler_sm as usize, performer_sm as usize);
+        m.borrow_mut().insert(
+            handler_sm as usize,
+            (
+                performer_sm as usize,
+                [
+                    Hold::new(handler_sm as *const u8),
+                    Hold::new(performer_sm as *const u8),
+                ],
+            ),
+        );
     });
 }
 
@@ -232,9 +254,10 @@ pub fn register_handler_performer(handler_sm: *mut u8, performer_sm: *mut u8) {
 /// executor-driven) finishes its parked performer with the HANDLER's return.
 pub fn route_handler_completion(handler_sm: *mut u8, value: i64) -> bool {
     let performer = HANDLER_TO_PERFORMER.with(|m| m.borrow_mut().remove(&(handler_sm as usize)));
-    if let Some(performer) = performer {
+    if let Some((performer, _)) = performer {
         SM_COMPLETIONS.with(|c| {
-            c.borrow_mut().insert(performer, value);
+            c.borrow_mut()
+                .insert(performer, (value, completion_holds(performer, value)));
         });
         true
     } else {
@@ -344,7 +367,8 @@ pub fn drive_next_timer_with_task() -> Option<(i64, ResolveOutcome)> {
         Some(q.swap_remove(min_i))
     })?;
     let (deadline, handle) = entry;
-    let task_id = FUTURE_TABLE.with(|t| t.borrow().get(&handle).map(|p| p.task_id).unwrap_or(0));
+    let task_id =
+        FUTURE_TABLE.with(|t| t.borrow().get(&handle).map(|(p, _)| p.task_id).unwrap_or(0));
     set_current_task_id(task_id);
     let now = web_time::Instant::now();
     if deadline > now {
@@ -398,8 +422,8 @@ pub fn drive_own_timer(task_id: i64) -> Option<ResolveOutcome> {
         let mut best: Option<usize> = None;
         for i in 0..q.len() {
             let handle = q[i].1;
-            let owned =
-                FUTURE_TABLE.with(|t| t.borrow().get(&handle).map(|p| p.task_id) == Some(task_id));
+            let owned = FUTURE_TABLE
+                .with(|t| t.borrow().get(&handle).map(|(p, _)| p.task_id) == Some(task_id));
             if owned && best.map_or(true, |b| q[i].0 < q[b].0) {
                 best = Some(i);
             }
@@ -423,8 +447,8 @@ pub(crate) fn take_due_timer(task_id: i64, now: web_time::Instant) -> Option<i64
         let mut best: Option<usize> = None;
         for i in 0..q.len() {
             let (deadline, handle) = q[i];
-            let owned =
-                FUTURE_TABLE.with(|t| t.borrow().get(&handle).map(|p| p.task_id) == Some(task_id));
+            let owned = FUTURE_TABLE
+                .with(|t| t.borrow().get(&handle).map(|(p, _)| p.task_id) == Some(task_id));
             if owned && deadline <= now && best.is_none_or(|b| deadline < q[b].0) {
                 best = Some(i);
             }
@@ -440,7 +464,8 @@ pub(crate) fn task_next_deadline(task_id: i64) -> Option<web_time::Instant> {
         q.borrow()
             .iter()
             .filter(|(_, handle)| {
-                FUTURE_TABLE.with(|t| t.borrow().get(handle).map(|p| p.task_id) == Some(task_id))
+                FUTURE_TABLE
+                    .with(|t| t.borrow().get(handle).map(|(p, _)| p.task_id) == Some(task_id))
             })
             .map(|(deadline, _)| *deadline)
             .min()
@@ -449,7 +474,7 @@ pub(crate) fn task_next_deadline(task_id: i64) -> Option<web_time::Instant> {
 
 /// Whether a future `task_id` parked still waits to be resolved.
 pub(crate) fn task_has_parked(task_id: i64) -> bool {
-    FUTURE_TABLE.with(|t| t.borrow().values().any(|p| p.task_id == task_id))
+    FUTURE_TABLE.with(|t| t.borrow().values().any(|(p, _)| p.task_id == task_id))
 }
 
 /// Drop every parked future and pending timer belonging to `task_id`.
@@ -463,12 +488,12 @@ pub fn deregister_task(task_id: i64) {
     let handles: Vec<i64> = FUTURE_TABLE.with(|t| {
         t.borrow()
             .iter()
-            .filter(|(_, p)| p.task_id == task_id)
+            .filter(|(_, (p, _))| p.task_id == task_id)
             .map(|(h, _)| *h)
             .collect()
     });
     TIMER_QUEUE.with(|q| q.borrow_mut().retain(|(_, h)| !handles.contains(h)));
-    FUTURE_TABLE.with(|t| t.borrow_mut().retain(|_, p| p.task_id != task_id));
+    FUTURE_TABLE.with(|t| t.borrow_mut().retain(|_, (p, _)| p.task_id != task_id));
     // Free any fibers the cancelled task created but never dropped (it
     // won't reach its normal scope-exit `FiberDrop`s).
     krio_adapter::fiber::free_task_fibers(task_id);
@@ -543,7 +568,8 @@ pub fn register_future(f: ParkedFuture) -> i64 {
         h
     });
     FUTURE_TABLE.with(|t| {
-        t.borrow_mut().insert(handle, f);
+        t.borrow_mut()
+            .insert(handle, (f, Hold::new(f.state_machine_ptr)));
     });
     handle
 }
@@ -566,8 +592,10 @@ pub fn register_future(f: ParkedFuture) -> i64 {
 /// concurrent unwinding caller. The top-level scheduler enforces
 /// this via the RuntimeHolder lifetime.
 pub fn resolve_future(handle: i64, value: i64) -> ResolveOutcome {
+    // The hold goes with the guard at the end of the resolve: the machine
+    // stays named while it is polled.
     let parked = FUTURE_TABLE.with(|t| t.borrow_mut().remove(&handle));
-    let Some(parked) = parked else {
+    let Some((parked, _hold)) = parked else {
         return ResolveOutcome::UnknownHandle;
     };
     // Write `value` into the SM's result slot, set the dispatcher
@@ -691,11 +719,11 @@ pub fn sm_is_referenced(sm: *mut u8) -> bool {
     FUTURE_TABLE.with(|t| {
         t.borrow()
             .values()
-            .any(|p| p.state_machine_ptr as usize == k)
+            .any(|(p, _)| p.state_machine_ptr as usize == k)
     }) || SM_COMPLETIONS.with(|c| c.borrow().contains_key(&k))
         || HANDLER_TO_PERFORMER.with(|m| {
             let m = m.borrow();
-            m.contains_key(&k) || m.values().any(|v| *v == k)
+            m.contains_key(&k) || m.values().any(|(v, _)| *v == k)
         })
 }
 

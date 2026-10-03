@@ -949,7 +949,7 @@ impl Scratch {
 
     fn push(&mut self, block: *mut u8) {
         self.blocks.push(block);
-        if !crate::collector::is_enabled() {
+        if !crate::collector::roots_wanted() {
             return;
         }
         let now = self.blocks.as_ptr() as *const u8;
@@ -1036,7 +1036,7 @@ fn frame_spans(start: *const u8, _len: usize, visit: &mut dyn FnMut(usize, usize
 
 impl FrameRoots {
     fn new(regs: &[ZyntaxValue], cf: &CompiledFunction) -> Self {
-        if !crate::collector::is_enabled() {
+        if !crate::collector::roots_wanted() {
             return Self(None);
         }
         let view = Box::new(FrameView {
@@ -3552,7 +3552,7 @@ impl HirInterpreter {
                 cached.1 = thunk;
             }
         }
-        if crate::collector::is_enabled() {
+        if crate::collector::roots_wanted() {
             clear_stack_below();
         }
         self.call_native_through(entry, &sig, thunk, args, dest)

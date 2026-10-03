@@ -917,6 +917,7 @@ impl InterpRuntime {
                 // default, which it overruns on a module of any size.
                 .stack_size(64 * 1024 * 1024)
                 .spawn(move || {
+                    let _heap = zyntax_compiler::host_heap::ThreadGuard::enter();
                     let r = llvm_for_bg.with_lock(|be| {
                         // Tier 1 additionally emits a resume point per loop
                         // header, so a frame already running tier-0 code can

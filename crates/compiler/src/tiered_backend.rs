@@ -3815,6 +3815,7 @@ impl TieredBackend {
                 .name("zyntax-warm-up".into())
                 .stack_size(16 << 20)
                 .spawn(move || {
+                    let _heap = crate::host_heap::ThreadGuard::enter();
                     ON_WARM_UP.with(|on| on.set(true));
                     loop {
                         if stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -3868,7 +3869,10 @@ impl TieredBackend {
                 std::thread::Builder::new()
                     .name("zyntax-first-call-compile".into())
                     .stack_size(16 << 20)
-                    .spawn_scoped(scope, || compile_lazy_function(bead_id, quick) as usize)
+                    .spawn_scoped(scope, || {
+                        let _heap = crate::host_heap::ThreadGuard::enter();
+                        compile_lazy_function(bead_id, quick) as usize
+                    })
                     .map(|handle| handle.join().unwrap_or(0))
                     .unwrap_or(0) as *const u8
             })
@@ -4118,6 +4122,7 @@ impl TieredBackend {
                     .name("zyntax-promotion".into())
                     .stack_size(16 << 20)
                     .spawn(move || {
+                        let _heap = crate::host_heap::ThreadGuard::enter();
                         ON_WARM_UP.with(|on| on.set(true));
                         on_thread.run_promotions(bead_id, site);
                     });
@@ -4836,6 +4841,7 @@ fn spawn_late_resume_points(
         .name("zyntax-resume-points".into())
         .stack_size(64 << 20)
         .spawn(move || {
+            let _heap = crate::host_heap::ThreadGuard::enter();
             for site in made {
                 publish_late_resume_point(&llvm, &bodies, &module_arc, bead_id, site);
             }
@@ -4990,6 +4996,7 @@ fn ensure_baseline(
                     .name("zyntax-baseline-compile".into())
                     .stack_size(16 << 20)
                     .spawn_scoped(scope, || {
+                        let _heap = crate::host_heap::ThreadGuard::enter();
                         compile_at_tier(
                             0,
                             &bead,
@@ -5066,6 +5073,7 @@ fn publish_outlined_resume_point(
             .name("zyntax-resume-points".into())
             .stack_size(16 << 20)
             .spawn_scoped(scope, || {
+                let _heap = crate::host_heap::ThreadGuard::enter();
                 cranelift
                     .outlined_resume_point_at(&def, header, optimize)
                     .map(|out| {
@@ -5209,6 +5217,7 @@ fn publish_baseline_resume_points(
             .name("zyntax-resume-points".into())
             .stack_size(16 << 20)
             .spawn_scoped(scope, || {
+                let _heap = crate::host_heap::ThreadGuard::enter();
                 cranelift
                     .resume_point_at(&def, header)
                     .into_iter()

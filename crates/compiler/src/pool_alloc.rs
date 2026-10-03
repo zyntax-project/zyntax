@@ -388,6 +388,13 @@ fn slot_bytes(class: usize) -> usize {
 /// with [`zyntax_free`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zyntax_alloc(size: usize) -> *mut u8 {
+    if let Some(host) = crate::host_heap::installed() {
+        return (host.alloc)(
+            host.context,
+            size.max(1),
+            crate::host_heap::HeapKind::Collected,
+        );
+    }
     let Some(class) = class_of(size) else {
         return large_alloc(size);
     };
@@ -658,6 +665,13 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
+    // A host's block goes back to the host; one from before the host's
+    // heap, or from another allocator, takes the path it always did.
+    if let Some(host) = crate::host_heap::installed()
+        && (host.owns)(host.context, ptr)
+    {
+        return (host.free)(host.context, ptr);
+    }
     // An address no allocator returns is not passed on to one either:
     // libc would fault on it for its own reasons and the report would
     // name libc rather than whatever produced it. Loud where a
@@ -785,6 +799,11 @@ unsafe fn usable_size(ptr: *mut u8) -> Option<usize> {
 pub unsafe extern "C" fn zyntax_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
     if ptr.is_null() {
         return zyntax_alloc(new_size);
+    }
+    if let Some(host) = crate::host_heap::installed()
+        && (host.owns)(host.context, ptr)
+    {
+        return (host.realloc)(host.context, ptr, new_size.max(1));
     }
     let Some(have) = usable_size(ptr) else {
         // Not this pool's: let the allocator that owns it resize it.
