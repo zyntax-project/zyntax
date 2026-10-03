@@ -258,6 +258,12 @@ pub struct HandlerContext {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct HandlerContextScope(usize);
 
+/// An open [`TieredRuntime::enter_handler_segment`] scope, closed by
+/// [`TieredRuntime::leave_handler_segment`]. Not `Copy`: a scope is
+/// closed exactly once.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct HandlerSegmentScope(usize);
+
 /// Opaque handle to ONE allocated instance of a stateful handler's
 /// state.
 ///
@@ -2244,6 +2250,40 @@ impl TieredRuntime {
     /// strand it on the caller's stack.
     pub fn leave_handler_context(&self, scope: HandlerContextScope) {
         crate::effect_runtime::leave_handler_frames(scope.0);
+    }
+
+    /// A fresh handler-segment id, from the space [`crate::HostTask`]
+    /// ids come from, so it names no task's segment.
+    pub fn new_handler_segment(&self) -> i64 {
+        crate::runtime::promise::next_host_task_id()
+    }
+
+    /// Run a stack's Zyntax code in its own segment of this thread's
+    /// handler stack: re-push the `with` frames it had open when it
+    /// last left, on top of what is installed now.
+    ///
+    /// For a host that switches between stacks on one thread: bracket
+    /// each stretch a stack runs with this and
+    /// [`Self::leave_handler_segment`], so a `with` scope open on one
+    /// stack is not in scope on another. `id` is
+    /// [`Self::new_handler_segment`]'s, or [`crate::HostTask::id`] for
+    /// the stack a task runs on; a [`crate::HostTask`] already brackets
+    /// its own steps.
+    pub fn enter_handler_segment(&self, id: i64) -> HandlerSegmentScope {
+        HandlerSegmentScope(crate::effect_runtime::task_handler_enter(id))
+    }
+
+    /// Close a scope [`Self::enter_handler_segment`] opened: lift the
+    /// frames the stack left open into its segment and restore the stack
+    /// the caller had.
+    pub fn leave_handler_segment(&self, id: i64, scope: HandlerSegmentScope) {
+        crate::effect_runtime::task_handler_leave(id, scope.0);
+    }
+
+    /// Drop a segment's saved frames, for a stack that ends with `with`
+    /// scopes still open.
+    pub fn forget_handler_segment(&self, id: i64) {
+        crate::effect_runtime::task_handler_forget(id);
     }
 
     /// Give up the installs a context claimed. The handler state it

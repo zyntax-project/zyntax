@@ -881,8 +881,13 @@ pub enum HostTaskStep {
 
 /// The first id a [`HostTask`] takes: above any slice index `drive_until`
 /// stamps, and positive where handler drives are negative.
-#[cfg(not(target_arch = "wasm32"))]
 static NEXT_HOST_TASK_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1 << 32);
+
+/// A fresh id from the space [`HostTask`] ids and host handler segments
+/// share.
+pub(crate) fn next_host_task_id() -> i64 {
+    NEXT_HOST_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// A top-level async task a host's own scheduler steps: each step advances
 /// it as far as it goes without waiting, and says what it waits on next, so
@@ -906,7 +911,7 @@ impl HostTask {
     /// The task of the promise an async function's call returned.
     pub fn new(promise: ZyntaxPromise) -> HostTask {
         HostTask {
-            id: NEXT_HOST_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: next_host_task_id(),
             promise,
             started: false,
             result: None,

@@ -170,6 +170,7 @@ pub use runtime::{
     HandlerContextScope,
     HandlerFrame,
     HandlerInstance,
+    HandlerSegmentScope,
     HostFiberInfo,
     HostFiberStep,
     ImportContext,

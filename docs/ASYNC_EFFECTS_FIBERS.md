@@ -541,6 +541,8 @@ An instance counts its installs: `HandlerInstanceEntry { installs, dropped_by_ow
 
 **Callbacks.** `capture_handler_context()` snapshots the frames in force (claiming an install on each instance a frame names); `enter_handler_context` and `leave_handler_context` reinstate them around a callback that runs later; `release_handler_context` gives the claims back.
 
+**Stack switching.** A host that runs Zyntax code on several stacks of one thread gives each stack its own segment (section 5.9): `enter_handler_segment(id)` re-pushes the `with` frames the stack left open, `leave_handler_segment(id, scope)` lifts them off again, and `forget_handler_segment(id)` drops them for a stack that ends with scopes open. `new_handler_segment()` hands out ids from the space `HostTask` ids come from; a `HostTask` brackets its own steps with its id.
+
 **Guards and reload.** `call_raw` refuses a call that reaches a stateful effect with no frame in scope (section 5.6). A reload migrates live handler state into an edited layout through `effect_runtime::migrate_handler_states`, which visits the shared stack and every fiber and task segment and migrates each distinct region once.
 
 ```rust

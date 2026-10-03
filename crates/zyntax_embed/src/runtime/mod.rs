@@ -60,7 +60,7 @@ pub use promise::{
 pub use promise::{HostTask, HostTaskStep};
 pub use tiered::{
     EffectHandlerToken, FiberToken, HandlerContext, HandlerContextScope, HandlerFrame,
-    HandlerInstance, HostFiberInfo, HostFiberStep, TieredRuntime,
+    HandlerInstance, HandlerSegmentScope, HostFiberInfo, HostFiberStep, TieredRuntime,
 };
 pub use types::{
     BuiltinResolver, ChainedResolver, CompiledImportResolverCallback, ExportedSymbol,
