@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1791122611,"nonce":"I0G9GVjOKJLi07iJrhSH70URjMI=","added":["bug","area:compiler"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1791128676,"nonce":"/NN0HoVJ9oGkGNNddho0VfxkrsQ=","message":"Fixed in 9d6d49e85ec79d1089efa2712feca062c035cfbf: pool slots are sized by object_header::field_layout, the rule the literal uses.","files":null}]}
