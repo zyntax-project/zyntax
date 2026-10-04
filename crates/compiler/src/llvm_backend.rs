@@ -755,6 +755,23 @@ impl<'ctx> LLVMBackend<'ctx> {
         } else {
             self.module.add_function(&fn_name, fn_type, None)
         };
+        if func.is_external {
+            // A native function reads an argument narrower than 32 bits
+            // as its caller extended it.
+            use inkwell::attributes::{Attribute, AttributeLoc};
+            for (i, param) in func.signature.params.iter().enumerate() {
+                let extend = match param.ty {
+                    HirType::I8 | HirType::I16 => "signext",
+                    HirType::U8 | HirType::U16 | HirType::Bool => "zeroext",
+                    _ => continue,
+                };
+                let kind = Attribute::get_named_enum_kind_id(extend);
+                if kind != 0 {
+                    let attr = self.context.create_enum_attribute(kind, 0);
+                    fn_value.add_attribute(AttributeLoc::Param(i as u32), attr);
+                }
+            }
+        }
         self.finish_declaration(id, func, fn_value, 0);
         Ok(fn_value)
     }

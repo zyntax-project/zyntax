@@ -585,6 +585,9 @@ fn jit_builder(isa: Arc<dyn cranelift_codegen::isa::TargetIsa>, reservation: usi
     for (name, ptr) in crate::string_intrinsics::string_runtime_symbols() {
         builder.symbol(name, ptr);
     }
+    // Ahead of the process's own symbols: what an embedder supplied
+    // after this module was set up.
+    builder.symbol_lookup_fn(Box::new(crate::late_symbols::lookup));
     builder
 }
 
@@ -7436,10 +7439,17 @@ impl CraneliftBackend {
                 .push(AbiParam::new(self.module.target_config().pointer_type()));
         }
 
-        // Add parameters
+        // Add parameters. A native function reads an argument narrower
+        // than 32 bits as its caller extended it, as the C ABIs of the
+        // targets this runs on assume.
         for param in &function.signature.params {
             let ty = self.translate_type(&param.ty)?;
-            cranelift_sig.params.push(AbiParam::new(ty));
+            let abi = AbiParam::new(ty);
+            cranelift_sig.params.push(match &param.ty {
+                HirType::I8 | HirType::I16 if function.is_external => abi.sext(),
+                HirType::U8 | HirType::U16 | HirType::Bool if function.is_external => abi.uext(),
+                _ => abi,
+            });
         }
 
         // Add return types

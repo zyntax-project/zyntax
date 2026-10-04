@@ -475,7 +475,10 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                     let c_name = std::ffi::CString::new(name.clone()).map_err(|_| {
                         CompilerError::Backend(format!("symbol name {name:?} contains NUL"))
                     })?;
-                    let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) as usize };
+                    let addr = crate::late_symbols::lookup(&name).map_or_else(
+                        || unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) as usize },
+                        |a| a as usize,
+                    );
                     if addr == 0 {
                         return Err(CompilerError::Backend(format!(
                             "unresolved symbol {name} in MCJIT install"

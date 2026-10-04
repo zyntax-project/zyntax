@@ -3741,7 +3741,8 @@ impl HirInterpreter {
                     None => {
                         // A symbol nothing registered is the process's own,
                         // as the native tiers resolve one: libc's `exit`.
-                        let ptr = process_symbol(&name)
+                        let ptr = crate::late_symbols::lookup(&name)
+                            .or_else(|| process_symbol(&name))
                             .ok_or_else(|| InterpError::UnknownFunction(name.clone()))?;
                         let e = SymbolEntry {
                             ptr,
@@ -5050,9 +5051,11 @@ impl HirInterpreter {
                                 match self.symbols.get(name).copied() {
                                     Some(e) => e,
                                     None => {
-                                        let ptr = process_symbol(name).ok_or_else(|| {
-                                            InterpError::UnknownFunction(name.clone())
-                                        })?;
+                                        let ptr = crate::late_symbols::lookup(name)
+                                            .or_else(|| process_symbol(name))
+                                            .ok_or_else(|| {
+                                                InterpError::UnknownFunction(name.clone())
+                                            })?;
                                         let e = SymbolEntry {
                                             ptr,
                                             param_count: arg_vals.len().min(255) as u8,
