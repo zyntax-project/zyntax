@@ -12995,12 +12995,26 @@ impl<'m> Lowerer<'m> {
                 self.host_attribute(object, attr, ty, key, span)
             }
             Ty::HostObject(module, class) => {
-                let (ty, key) = self
+                let field = self
                     .module
                     .host_class(module, class)
                     .fields
                     .iter()
                     .find(|field| !field.is_static && field.name == attr)
+                    .cloned();
+                // A field at a fixed place in the object is read there.
+                if let Some(field) = &field
+                    && let Some(native) = &field.native
+                    && let Some((place, _)) =
+                        self.native_field_place(object.node.clone(), native, span)
+                {
+                    let ty = self.module.host_type(&field.ty);
+                    return Ok(Val {
+                        node: self.native_result(place, &native.ty, ty, span),
+                        ty,
+                    });
+                }
+                let (ty, key) = field
                     .map(|field| (self.module.host_type(&field.ty), field.key))
                     .unwrap_or((Ty::Object, 0));
                 self.host_attribute(object, attr, ty, key, span)
@@ -13360,6 +13374,36 @@ impl<'m> Lowerer<'m> {
             }
             Ty::HostObject(module, class) | Ty::HostClass(module, class) => {
                 let static_field = matches!(object.ty, Ty::HostClass(_, _));
+                // A field at a fixed place in the object is stored there.
+                if let Ty::HostObject(_, _) = object.ty
+                    && let Some(field) = self
+                        .module
+                        .host_class(module, class)
+                        .fields
+                        .iter()
+                        .find(|field| !field.is_static && field.name == attr)
+                        .cloned()
+                    && field.writable
+                    && let Some(native) = &field.native
+                    && !matches!(
+                        native.ty,
+                        crate::NativeType::Str | crate::NativeType::Object { .. }
+                    )
+                    && let Some((place, p)) =
+                        self.native_field_place(object.node.clone(), native, span)
+                {
+                    let ty = self.module.host_type(&field.ty);
+                    let value = self.coerce(value, ty);
+                    return Ok(TypedNode::new(
+                        TypedExpression::Binary(TypedBinary {
+                            op: BinaryOp::Assign,
+                            left: Box::new(place),
+                            right: Box::new(raw_cast(value, prim(p), span)),
+                        }),
+                        prim(p),
+                        span,
+                    ));
+                }
                 let (ty, key) = self
                     .module
                     .host_class(module, class)
@@ -13852,6 +13896,285 @@ impl<'m> Lowerer<'m> {
         Ok(self.guard(v, span))
     }
 
+    /// The `p` stored at the address `addr`, an `i64`, as a place to read
+    /// or assign: a field of a header-free view struct.
+    fn native_at(&self, addr: Node, p: PrimitiveType, span: Span) -> Node {
+        let view = Type::Named {
+            id: self.module.views[&format!("{p:?}")],
+            type_args: Vec::new(),
+            const_args: Vec::new(),
+            variance: Vec::new(),
+            nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
+        };
+        TypedNode::new(
+            TypedExpression::Field(TypedFieldAccess {
+                object: Box::new(raw_cast(addr, view, span)),
+                field: intern("v"),
+            }),
+            prim(p),
+            span,
+        )
+    }
+
+    /// What a native function takes for an object whose word is `word`.
+    fn native_pass(&self, word: Node, pass: crate::NativePass, span: Span) -> Node {
+        match pass {
+            crate::NativePass::Word => word,
+            crate::NativePass::Indirect(k) => {
+                self.native_at(raw_add(word, k as i64, span), PrimitiveType::I64, span)
+            }
+        }
+    }
+
+    /// `name` declared as the native function `symbol` takes and gives.
+    fn declare_native(&self, name: &str, symbol: &str, params: Vec<Type>, ret: Type) {
+        self.module
+            .native_externs
+            .borrow_mut()
+            .insert(name.to_string(), (symbol.to_string(), params, ret));
+    }
+
+    /// Hoist `value`, of IR type `ty`, into a temporary, returning it.
+    fn hold_raw(&mut self, value: Node, ty: Type, span: Span) -> Node {
+        let name = self.temp();
+        self.hoisted.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name,
+                ty: ty.clone(),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(value)),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        TypedNode::new(TypedExpression::Variable(name), ty, span)
+    }
+
+    /// After a native call that may raise: one load of the host's
+    /// pending flag, and when it is set the host's error raised as the
+    /// library raises a foreign one.
+    fn native_check(&mut self, span: Span) {
+        let i64t = prim(PrimitiveType::I64);
+        let unit = prim(PrimitiveType::Unit);
+        self.declare_native(
+            "host$pending_flag",
+            "$Host$pending_flag",
+            Vec::new(),
+            i64t.clone(),
+        );
+        self.declare_native(
+            "host$raise_pending",
+            "$Host$raise_pending",
+            Vec::new(),
+            unit.clone(),
+        );
+        let flag = self.hold_raw(
+            typed_call("host$pending_flag", Vec::new(), i64t, span),
+            prim(PrimitiveType::I64),
+            span,
+        );
+        let set = TypedNode::new(
+            TypedExpression::Binary(TypedBinary {
+                op: BinaryOp::Ne,
+                left: Box::new(self.native_at(flag, PrimitiveType::U8, span)),
+                right: Box::new(raw_cast(int_lit(0, span), prim(PrimitiveType::U8), span)),
+            }),
+            prim(PrimitiveType::Bool),
+            span,
+        );
+        let kind = self.temp();
+        let raise = vec![
+            expression_stmt(
+                typed_call("host$raise_pending", Vec::new(), unit, span),
+                span,
+            ),
+            TypedNode::new(
+                TypedStatement::Let(TypedLet {
+                    name: kind,
+                    ty: ir(Ty::Str),
+                    mutability: Mutability::Immutable,
+                    initializer: Some(Box::new(call(
+                        "zb_foreign_error_kind",
+                        Vec::new(),
+                        Ty::Str,
+                        span,
+                    ))),
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ),
+            expression_stmt(
+                call(
+                    "zb_fatal",
+                    vec![
+                        var(kind, Ty::Str, span),
+                        call("zb_foreign_error_message", Vec::new(), Ty::Str, span),
+                    ],
+                    Ty::None,
+                    span,
+                ),
+                span,
+            ),
+            self.pending_check(span),
+        ];
+        self.hoisted.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(set),
+                then_block: TypedBlock {
+                    statements: raise,
+                    span,
+                },
+                else_block: None,
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+    }
+
+    /// A native result `r` of `ty` as the Python value of type `want`.
+    fn native_result(&self, r: Node, ty: &crate::NativeType, want: Ty, span: Span) -> Node {
+        match ty {
+            crate::NativeType::Str => {
+                self.declare_native(
+                    "host$text_to_string",
+                    "$Host$text_to_string",
+                    vec![prim(PrimitiveType::I64)],
+                    ir(Ty::Str),
+                );
+                call("host$text_to_string", vec![r], Ty::Str, span)
+            }
+            _ => raw_cast(r, ir(want), span),
+        }
+    }
+
+    /// A call to a host member bound to a native function: one direct
+    /// call. `None` when an object operand is not statically of the class
+    /// the binding takes, or the call is not one the binding fits; the
+    /// protocol serves those.
+    fn native_call(
+        &mut self,
+        receiver: Option<&Val>,
+        signature: &crate::HostMethod,
+        binding: &crate::NativeBinding,
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        span: Span,
+    ) -> Result<Option<Val>> {
+        if !keywords.is_empty()
+            || args.len() != signature.params.len()
+            || binding.params.len() != args.len()
+        {
+            return Ok(None);
+        }
+        let receiver = match binding.receiver {
+            None => None,
+            Some(pass) => match receiver {
+                Some(v) if matches!(v.ty, Ty::HostObject(_, _)) => Some((v.node.clone(), pass)),
+                _ => return Ok(None),
+            },
+        };
+        for ((arg, native), ty) in args.iter().zip(&binding.params).zip(&signature.params) {
+            match native {
+                crate::NativeType::Void => return Ok(None),
+                crate::NativeType::Object { .. } => {
+                    let want = self.module.host_type(ty);
+                    if !matches!(want, Ty::HostObject(_, _)) || self.ty_of(arg) != want {
+                        return Ok(None);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if binding.address != 0 {
+            zyntax_compiler::late_symbols::register(&binding.symbol, binding.address as *const u8);
+        }
+        let i64t = prim(PrimitiveType::I64);
+        let mut types = Vec::new();
+        let mut operands = Vec::new();
+        if let Some((word, pass)) = receiver {
+            let word = self.hold_raw(word, i64t.clone(), span);
+            operands.push(self.native_pass(word, pass, span));
+            types.push(i64t.clone());
+        }
+        // Every operand is held in order, so the call's own reads of them
+        // happen after all of them were evaluated, left to right.
+        for ((arg, native), ty) in args.iter().zip(&binding.params).zip(&signature.params) {
+            let want = self.module.host_type(ty);
+            let value = self.expr_as(arg, want)?;
+            let value = self.hold_raw(value, ir(want), span);
+            match native {
+                crate::NativeType::Str => {
+                    let word = raw_cast(value, i64t.clone(), span);
+                    operands.push(raw_add(word.clone(), 16, span));
+                    let len = self.native_at(word, PrimitiveType::U32, span);
+                    operands.push(raw_cast(len, i64t.clone(), span));
+                    types.push(i64t.clone());
+                    types.push(i64t.clone());
+                }
+                crate::NativeType::Object { pass, .. } => {
+                    operands.push(self.native_pass(value, *pass, span));
+                    types.push(i64t.clone());
+                }
+                other => {
+                    let p = native_prim(other).expect("a value operand");
+                    operands.push(raw_cast(value, prim(p), span));
+                    types.push(prim(p));
+                }
+            }
+        }
+        let ret = native_prim(&binding.ret)
+            .map(prim)
+            .unwrap_or(prim(PrimitiveType::Unit));
+        let callee = format!("native${}", binding.symbol);
+        self.declare_native(&callee, &binding.symbol, types, ret.clone());
+        let called = typed_call(&callee, operands, ret.clone(), span);
+        if binding.ret == crate::NativeType::Void {
+            self.hoisted.push(expression_stmt(called, span));
+            if binding.may_raise {
+                self.native_check(span);
+            }
+            return Ok(Some(Val {
+                node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+                ty: Ty::None,
+            }));
+        }
+        let result = if binding.may_raise {
+            let held = self.hold_raw(called, ret, span);
+            self.native_check(span);
+            held
+        } else {
+            called
+        };
+        let want = self.module.host_type(&signature.ret);
+        Ok(Some(Val {
+            node: self.native_result(result, &binding.ret, want, span),
+            ty: want,
+        }))
+    }
+
+    /// The place a natively bound field of the object `word` lies at, and
+    /// its primitive type.
+    fn native_field_place(
+        &self,
+        word: Node,
+        field: &crate::NativeField,
+        span: Span,
+    ) -> Option<(Node, PrimitiveType)> {
+        let p = native_prim(&field.ty)?;
+        let payload = self.native_pass(
+            raw_cast(word, prim(PrimitiveType::I64), span),
+            field.pass,
+            span,
+        );
+        Some((
+            self.native_at(raw_add(payload, field.offset as i64, span), p, span),
+            p,
+        ))
+    }
+
     fn host_arguments(
         &mut self,
         signature: &crate::HostMethod,
@@ -13893,6 +14216,14 @@ impl<'m> Lowerer<'m> {
         expected: (Ty, Span),
     ) -> Result<Val> {
         let (ty, span) = expected;
+        if let Some(binding) = &signature.native
+            && let Some(v) = self.native_call(None, signature, binding, args, keywords, span)?
+        {
+            return Ok(Val {
+                node: self.coerce(v, ty),
+                ty,
+            });
+        }
         if ty == Ty::Float
             && signature.ret == crate::HostType::Float
             && signature
@@ -13956,6 +14287,14 @@ impl<'m> Lowerer<'m> {
         expected: (Ty, Span),
     ) -> Result<Val> {
         let (ty, span) = expected;
+        if let Some(binding) = &signature.native
+            && let Some(v) = self.native_call(None, signature, binding, args, keywords, span)?
+        {
+            return Ok(Val {
+                node: self.coerce(v, ty),
+                ty,
+            });
+        }
         let all_float = signature
             .params
             .iter()
@@ -14065,6 +14404,15 @@ impl<'m> Lowerer<'m> {
         expected: (Ty, Span),
     ) -> Result<Val> {
         let (ty, span) = expected;
+        if let Some(binding) = &signature.native
+            && let Some(v) =
+                self.native_call(Some(&receiver), signature, binding, args, keywords, span)?
+        {
+            return Ok(Val {
+                node: self.coerce(v, ty),
+                ty,
+            });
+        }
         if ty == Ty::Float
             && signature.ret == crate::HostType::Float
             && signature
@@ -15195,4 +15543,59 @@ impl<'m> Lowerer<'m> {
 /// value anything.
 fn never_none(ty: Ty) -> bool {
     !matches!(ty, Ty::None | Ty::Object | Ty::Unknown | Ty::Class(_))
+}
+
+/// `value` as IR type `ty`; itself when it already is.
+fn raw_cast(value: Node, ty: Type, span: Span) -> Node {
+    if value.ty == ty {
+        return value;
+    }
+    TypedNode::new(
+        TypedExpression::Cast(TypedCast {
+            expr: Box::new(value),
+            target_type: ty.clone(),
+        }),
+        ty,
+        span,
+    )
+}
+
+/// The `i64` `value` plus `k`.
+fn raw_add(value: Node, k: i64, span: Span) -> Node {
+    let ty = value.ty.clone();
+    TypedNode::new(
+        TypedExpression::Binary(TypedBinary {
+            op: BinaryOp::Add,
+            left: Box::new(value),
+            right: Box::new(int_lit(k, span)),
+        }),
+        ty,
+        span,
+    )
+}
+
+fn expression_stmt(value: Node, span: Span) -> Stmt {
+    TypedNode::new(
+        TypedStatement::Expression(Box::new(value)),
+        Type::Unknown,
+        span,
+    )
+}
+
+/// The primitive a native operand of `ty` is passed as.
+fn native_prim(ty: &crate::NativeType) -> Option<PrimitiveType> {
+    use crate::NativeType as N;
+    Some(match ty {
+        N::Bool | N::I8 => PrimitiveType::I8,
+        N::I16 => PrimitiveType::I16,
+        N::I32 => PrimitiveType::I32,
+        N::I64 | N::Word | N::Str | N::Object { .. } => PrimitiveType::I64,
+        N::U8 => PrimitiveType::U8,
+        N::U16 => PrimitiveType::U16,
+        N::U32 => PrimitiveType::U32,
+        N::U64 => PrimitiveType::U64,
+        N::F32 => PrimitiveType::F32,
+        N::F64 => PrimitiveType::F64,
+        N::Void => return None,
+    })
 }

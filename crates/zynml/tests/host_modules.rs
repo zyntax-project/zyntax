@@ -157,6 +157,7 @@ fn method(name: &str, params: Vec<HostType>, ret: HostType, is_static: bool) -> 
         params,
         ret,
         is_static,
+        native: None,
     }
 }
 
@@ -173,12 +174,16 @@ fn game() -> HostModule {
                     key: 0,
                     ty: HostType::Int,
                     is_static: false,
+                    writable: true,
+                    native: None,
                 },
                 HostField {
                     name: "total".into(),
                     key: 0,
                     ty: HostType::Int,
                     is_static: true,
+                    writable: true,
+                    native: None,
                 },
             ],
             methods: vec![
@@ -192,6 +197,7 @@ fn game() -> HostModule {
                 method("fail", vec![], HostType::Int, false),
             ],
             constructor: Some(method("new", vec![HostType::Int], prompt, true)),
+            word: false,
         }],
         functions: vec![method("greet", vec![HostType::Str], HostType::Str, false)],
     }

@@ -45,7 +45,8 @@ mod sugar;
 mod types;
 
 pub use zyntax_embed::host::{
-    HostClass, HostField, HostMethod, HostModule, HostResolver, HostType,
+    HostClass, HostField, HostMethod, HostModule, HostResolver, HostType, NativeBinding,
+    NativeField, NativePass, NativeType,
 };
 
 /// Why a program could not be turned into a `TypedProgram`.

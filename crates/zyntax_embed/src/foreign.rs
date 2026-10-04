@@ -554,6 +554,12 @@ pub fn take_error() -> Option<ForeignError> {
     ERROR.with(|e| e.borrow_mut().take())
 }
 
+/// Leave `error` pending, as a failed operation does: for a host whose
+/// native functions report errors of their own.
+pub fn report(error: ForeignError) {
+    fail(error);
+}
+
 fn fail(error: ForeignError) {
     ERROR.with(|e| *e.borrow_mut() = Some(error));
 }

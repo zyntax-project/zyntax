@@ -299,12 +299,16 @@ fn a_program_uses_the_embedders_objects() {
                         key: 0,
                         ty: HostType::Float,
                         is_static: false,
+                        writable: true,
+                        native: None,
                     },
                     HostField {
                         name: "y".into(),
                         key: 0,
                         ty: HostType::Float,
                         is_static: false,
+                        writable: true,
+                        native: None,
                     },
                 ],
                 methods: vec![
@@ -314,6 +318,7 @@ fn a_program_uses_the_embedders_objects() {
                         params: vec![],
                         ret: HostType::Float,
                         is_static: false,
+                        native: None,
                     },
                     HostMethod {
                         name: "scaled".into(),
@@ -321,6 +326,7 @@ fn a_program_uses_the_embedders_objects() {
                         params: vec![HostType::Float],
                         ret: HostType::Object("Point".into()),
                         is_static: false,
+                        native: None,
                     },
                 ],
                 constructor: Some(HostMethod {
@@ -329,7 +335,9 @@ fn a_program_uses_the_embedders_objects() {
                     params: vec![HostType::Float, HostType::Float],
                     ret: HostType::Object("Point".into()),
                     is_static: true,
+                    native: None,
                 }),
+                word: false,
             }],
             functions: vec![
                 HostMethod {
@@ -338,6 +346,7 @@ fn a_program_uses_the_embedders_objects() {
                     params: vec![HostType::Object("Point".into())],
                     ret: HostType::Object("Point".into()),
                     is_static: true,
+                    native: None,
                 },
                 HostMethod {
                     name: "adder".into(),
@@ -348,6 +357,7 @@ fn a_program_uses_the_embedders_objects() {
                         ret: Box::new(HostType::Float),
                     },
                     is_static: true,
+                    native: None,
                 },
             ],
         })

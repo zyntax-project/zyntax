@@ -169,7 +169,7 @@ pub(crate) fn lower_typed_program(
     // anything resolves against it. Modules that arrive already lowered
     // are collected for the lowering to link against.
     let mut prelowered = inputs.prelowered;
-    crate::host_import::expand_host_imports(&mut program, inputs.host_modules)?;
+    crate::host_import::expand_host_imports(&mut program, &mut type_registry, inputs.host_modules)?;
     crate::import_chain::process_imports_for_traits(
         inputs.grammars,
         inputs.plugin_signatures,

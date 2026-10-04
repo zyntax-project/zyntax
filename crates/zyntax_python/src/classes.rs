@@ -187,6 +187,7 @@ pub(crate) fn register(
 ) -> Vec<TypedNode<TypedDeclaration>> {
     let span = Span::new(0, 0);
     let mut decls = Vec::new();
+    register_views(module, registry);
     // Every class has its id before any is laid out, so a field holding
     // an instance of a class declared later, or of its own, has a type.
     let ids: Vec<TypeId> = module.classes.iter().map(|_| TypeId::next()).collect();
@@ -455,6 +456,62 @@ pub(crate) fn exact_classes(module: &Module) -> Vec<usize> {
 
 /// The functions every class needs: construction, unboxing, dispatch.
 /// Marked generated, so their bodies are not type checked.
+/// The structs a native host binding reads a value in place through: one
+/// field `v` of each primitive, at offset 0, with no header word.
+fn register_views(module: &mut Module, registry: &mut TypeRegistry) {
+    use zyntax_typed_ast::type_registry::{Mutability, PrimitiveType as P, Visibility};
+    for prim in [
+        P::I8,
+        P::I16,
+        P::I32,
+        P::I64,
+        P::U8,
+        P::U16,
+        P::U32,
+        P::U64,
+        P::F32,
+        P::F64,
+    ] {
+        let id = TypeId::next();
+        let field = FieldDef {
+            name: intern("v"),
+            ty: zyntax_typed_ast::Type::Primitive(prim),
+            visibility: Visibility::Public,
+            mutability: Mutability::Mutable,
+            is_static: false,
+            span: Span::new(0, 0),
+            getter: None,
+            setter: None,
+            is_synthetic: false,
+        };
+        let mut metadata = TypeMetadata {
+            is_reference: true,
+            ..Default::default()
+        };
+        metadata.custom.insert(
+            intern(zyntax_compiler::object_header::HEADER_FREE_KEY),
+            String::new(),
+        );
+        registry.register_type(TypeDefinition {
+            id,
+            module: None,
+            name: intern(&format!("py$at${prim:?}")),
+            kind: TypeKind::Struct {
+                fields: vec![field.clone()],
+                is_tuple: false,
+            },
+            type_params: vec![],
+            constraints: vec![],
+            fields: vec![field],
+            methods: vec![],
+            constructors: vec![],
+            metadata,
+            span: Span::new(0, 0),
+        });
+        module.views.insert(format!("{prim:?}"), id);
+    }
+}
+
 pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
     let span = Span::new(0, 0);
     // The frozenset of dynamic values an operation on a frozenset
@@ -485,6 +542,26 @@ pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
     }
     for (method, arity) in module.dyn_methods.borrow().iter() {
         out.push(dynamic_call(module, method, *arity, span));
+    }
+    for (name, (symbol, params, ret)) in module.native_externs.borrow().iter() {
+        out.push(TypedFunction {
+            name: intern(name),
+            params: params
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| zyntax_typed_ast::typed_ast::TypedParameter {
+                    name: intern(&format!("a{i}")),
+                    ty: ty.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            return_type: ret.clone(),
+            body: None,
+            visibility: zyntax_typed_ast::type_registry::Visibility::Public,
+            is_external: true,
+            link_name: Some(intern(symbol)),
+            ..Default::default()
+        });
     }
     for (k, method) in module.abstract_calls.borrow().iter() {
         out.push(abstract_dispatcher(module, *k, method, span));

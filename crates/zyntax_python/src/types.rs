@@ -1245,6 +1245,10 @@ pub(crate) struct SpecInfo {
 /// item's own function.
 pub(crate) const MAX_SPECS: usize = 4;
 
+/// A native function a host member is bound to: the symbol it links
+/// against, its operand types and its result type.
+pub(crate) type NativeExtern = (String, Vec<zyntax_typed_ast::Type>, zyntax_typed_ast::Type);
+
 /// What the module declares: every `def` by name, and the library's
 /// `List<T>` so list types can be spelled the way the library spells
 /// them.
@@ -1295,6 +1299,13 @@ pub(crate) struct Module {
     pub(crate) attr_reads: std::cell::RefCell<std::collections::BTreeSet<String>>,
     pub(crate) attr_writes: std::cell::RefCell<std::collections::BTreeSet<String>>,
     pub(crate) dyn_methods: std::cell::RefCell<std::collections::BTreeSet<(String, usize)>>,
+    /// The native functions host members are bound to, by the name the
+    /// program calls them: the symbol they link against, their operand
+    /// types and their result type.
+    pub(crate) native_externs: std::cell::RefCell<std::collections::BTreeMap<String, NativeExtern>>,
+    /// The header-free structs a native lowering reads one value in
+    /// memory through, by the value's primitive type.
+    pub(crate) views: std::collections::HashMap<String, zyntax_typed_ast::TypeId>,
     /// Library functions that can raise.
     pub(crate) fallible: std::collections::BTreeSet<String>,
     pub(crate) list_type: Option<zyntax_typed_ast::TypeId>,
