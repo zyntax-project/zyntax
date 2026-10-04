@@ -216,6 +216,14 @@ pub fn declare_reference_struct(
         constructors: Vec::new(),
         metadata: TypeMetadata {
             is_reference: true,
+            // A table stays a foreign object to a host heap, and its
+            // header fields are read in place (`host_gc::TableHeader`).
+            custom: [(
+                intern(zyntax_compiler::object_header::HEADER_FREE_KEY),
+                String::new(),
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         },
         span: SPAN,

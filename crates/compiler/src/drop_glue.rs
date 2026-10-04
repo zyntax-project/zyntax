@@ -89,19 +89,7 @@ pub fn glue_target(func: &HirFunction) -> Option<InternedString> {
 /// Returns each field's byte offset. Kept next to the release that
 /// reads through it so the two cannot drift apart.
 fn field_offsets(fields: &[HirType]) -> Vec<u64> {
-    let mut offsets = Vec::with_capacity(fields.len());
-    let mut running: u64 = 0;
-    for fty in fields {
-        let sz = crate::ssa::hir_ty_size(fty) as u64;
-        let align = sz.max(1);
-        if align > 1 {
-            let m = align - 1;
-            running = (running + m) & !m;
-        }
-        offsets.push(running);
-        running += sz.max(1);
-    }
-    offsets
+    crate::object_header::field_layout(fields).0
 }
 
 /// Whether a field's type is one this owns rather than merely points at.

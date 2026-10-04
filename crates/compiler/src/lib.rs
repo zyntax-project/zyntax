@@ -75,6 +75,7 @@ pub mod memory_optimization; // Memory-aware optimizations
 pub mod memory_pass;
 pub mod monomorphize;
 pub mod move_insert; // Owning parameters become `Move` the borrow check can see
+pub mod object_header; // The word a reference object carries ahead of its fields
 #[doc(hidden)]
 pub mod opt_audit; // Per-function counts of optimiser runs, for tests
 pub mod optimization;

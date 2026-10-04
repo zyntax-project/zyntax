@@ -22,7 +22,7 @@ use std::sync::Arc;
 use zyntax_compiler::hir::HirModule;
 
 const MAGIC: &[u8; 5] = b"ZSNAP";
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 /// magic, schema, and the length of the directory that follows.
 const HEADER_LEN: usize = MAGIC.len() + 2 * std::mem::size_of::<u32>();
 

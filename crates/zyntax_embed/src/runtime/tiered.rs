@@ -147,6 +147,9 @@ pub struct TieredRuntime {
     /// global, as addresses; refreshed whenever compiling or rebuilding
     /// can move them. See [`Self::take_pending_error`].
     error_flags: std::sync::RwLock<Vec<(usize, usize)>>,
+    /// Every lowered reference type with a header word, by its descriptor
+    /// global, and the word a host heap gave each layout.
+    type_descriptors: std::sync::Mutex<TypeDescriptors>,
     /// Whether programs go through the pattern rewrites before
     /// lowering. See [`Self::set_pattern_rewrites`].
     pattern_rewrites: bool,
@@ -285,6 +288,15 @@ pub struct HandlerInstance(u64);
 /// back a bind and any number of pushes, so no single install may
 /// release it. Each install holds a count, the owner asks for the drop,
 /// and the last one out frees.
+/// What the runtime tells a host heap about its header-bearing types.
+#[derive(Default)]
+struct TypeDescriptors {
+    /// The latest layout of each type, by its descriptor global.
+    types: std::collections::HashMap<String, zyntax_compiler::object_header::TypeDescriptor>,
+    /// The word the host gave each layout it was asked about.
+    words: std::collections::HashMap<zyntax_compiler::object_header::TypeDescriptor, u64>,
+}
+
 struct HandlerInstanceEntry {
     handler: String,
     effect_id: u64,
@@ -505,6 +517,7 @@ impl TieredRuntime {
             automatic_release: false,
             error_flag_global: None,
             error_flags: std::sync::RwLock::new(Vec::new()),
+            type_descriptors: std::sync::Mutex::new(TypeDescriptors::default()),
             pattern_rewrites: true,
             collecting: false,
             import_resolvers: Vec::new(),
@@ -1386,6 +1399,7 @@ impl TieredRuntime {
     /// Read the error-flag slots afresh from the backend: after a compile
     /// adds a module, or a rebuild or reload moves module globals.
     fn refresh_error_flags(&self) {
+        self.refresh_type_descriptors();
         let slots = if self.error_flag_global.is_some() {
             self.backend
                 .error_flag_slots()
@@ -3031,7 +3045,48 @@ impl TieredRuntime {
                 error_flag_global: self.error_flag_global,
             },
         )?;
+        if zyntax_compiler::host_heap::is_installed() {
+            let mut known = self
+                .type_descriptors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for d in lowered.type_descriptors {
+                known.types.insert(d.global.clone(), d);
+            }
+        }
         Ok((lowered.module, lowered.entered, lowered.deferred_prelowered))
+    }
+
+    /// Write each loaded module's descriptor globals with the word the
+    /// host heap gives its type, asking once per type and layout: after a
+    /// compile adds a module, or a rebuild or reload moves or relays them.
+    fn refresh_type_descriptors(&self) {
+        if !zyntax_compiler::host_heap::is_installed() {
+            return;
+        }
+        let mut known = self
+            .type_descriptors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let slots = self
+            .backend
+            .global_slots_named(zyntax_compiler::object_header::DESCRIPTOR_PREFIX);
+        for (name, slot) in slots {
+            let Some(descriptor) = known.types.get(&name).cloned() else {
+                continue;
+            };
+            let word = match known.words.get(&descriptor) {
+                Some(word) => *word,
+                None => {
+                    let word = zyntax_compiler::host_heap::type_header(&descriptor);
+                    known.words.insert(descriptor, word);
+                    word
+                }
+            };
+            // SAFETY: the backend keeps a loaded module's global slots
+            // alive, and a descriptor global is a word.
+            unsafe { (slot as *mut u64).write(word) };
+        }
     }
 
     /// List all loaded function names

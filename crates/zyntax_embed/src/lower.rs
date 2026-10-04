@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
         zyntax_compiler::hir::HirId,
         Arc<zyntax_compiler::bytecode::LazyModule>,
     >,
+    /// The reference types whose objects carry a header word, and the
+    /// global each one's descriptor goes in.
+    pub type_descriptors: Vec<zyntax_compiler::object_header::TypeDescriptor>,
 }
 
 /// Lower a typed program: resolve its imports, register what it
@@ -125,6 +128,19 @@ pub(crate) fn lower_typed_program(
             });
             let mut metadata: TypeMetadata = Default::default();
             metadata.is_reference = is_reference;
+            // A frontend that registered the type itself and marked its
+            // objects header-free keeps that: their layout is read in
+            // place by the frontend's own runtime.
+            let header_free =
+                InternedString::new_global(zyntax_compiler::object_header::HEADER_FREE_KEY);
+            if let Some(mark) = program
+                .type_registry
+                .get_type_by_id(type_id)
+                .or_else(|| program.type_registry.get_type_by_name(class.name))
+                .and_then(|existing| existing.metadata.custom.get(&header_free))
+            {
+                metadata.custom.insert(header_free, mark.clone());
+            }
 
             let type_def = TypeDefinition {
                 id: type_id,
@@ -241,6 +257,7 @@ pub(crate) fn lower_typed_program(
         module,
         entered: lowering_ctx.entered_functions(),
         deferred_prelowered: lowering_ctx.deferred_prelowered(),
+        type_descriptors: lowering_ctx.type_descriptors().to_vec(),
     })
 }
 

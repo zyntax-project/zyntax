@@ -10,7 +10,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use zynml::{Grammar2, ZYNML_GRAMMAR};
-use zyntax_compiler::host_heap::{self, HeapKind, HostHeap, SpanReader, SpanVisit};
+use zyntax_compiler::host_heap::{
+    self, HeapKind, HostFieldKind, HostHeap, HostTypeInfo, SpanReader, SpanVisit,
+};
 use zyntax_embed::{TieredConfig, TieredRuntime};
 
 /// The fake host's blocks, by address, with their sizes.
@@ -98,6 +100,37 @@ unsafe extern "C" fn thread_leave(_cx: *mut c_void) {
     THREADS_LEFT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// What the fake host was told about each type, by name: its size and
+/// its fields as (name, offset, size, kind).
+type Described = (u32, Vec<(String, u32, u32, HostFieldKind)>);
+static TYPES: Mutex<BTreeMap<String, Described>> = Mutex::new(BTreeMap::new());
+
+/// The descriptor the fake host gives every type.
+static DESCRIPTOR: u8 = 0;
+
+unsafe extern "C" fn type_header(_cx: *mut c_void, info: *const HostTypeInfo) -> *const c_void {
+    let info = unsafe { &*info };
+    let text = |p: *const std::ffi::c_char| unsafe {
+        std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+    };
+    let fields = (0..info.field_count as usize)
+        .map(|i| {
+            let f = unsafe { &*info.fields.add(i) };
+            (text(f.name), f.offset, f.size, f.kind)
+        })
+        .collect();
+    TYPES
+        .lock()
+        .unwrap()
+        .insert(text(info.name), (info.size, fields));
+    &DESCRIPTOR as *const u8 as *const c_void
+}
+
+/// Word 0 of an object the program hands over.
+extern "C" fn peek_header(object: *const u64) -> i64 {
+    unsafe { *object as i64 }
+}
+
 fn table() -> HostHeap {
     HostHeap {
         version: host_heap::HOST_HEAP_VERSION,
@@ -112,6 +145,7 @@ fn table() -> HostHeap {
         remove_root_range,
         thread_enter,
         thread_leave,
+        type_header: Some(type_header),
     }
 }
 
@@ -287,4 +321,75 @@ fn a_hold_is_read_through_its_root() {
         !unsafe { owns(std::ptr::null_mut(), block) },
         "freed to the host"
     );
+}
+
+const POINTS: &str = r#"
+@reference
+struct Point {
+    x: i64,
+    y: f64,
+    tag: i32
+}
+
+extern def peek_header(p: Point): i64
+
+def header(): i64 {
+    let p = Point { x: 3, y: 4.5, tag: 7 }
+    return peek_header(p)
+}
+
+def fields(): i64 {
+    let p = Point { x: 3, y: 4.5, tag: 7 }
+    p.x = p.x + 1
+    return p.x * 100 + p.tag
+}
+"#;
+
+/// A reference object starts with the word its type's host descriptor
+/// is, and its fields sit past it where the host was told they are.
+#[test]
+fn a_reference_object_starts_with_its_host_descriptor() {
+    install();
+    let mut rt = TieredRuntime::new(TieredConfig::development()).expect("runtime should start");
+    let mut params = [zyntax_compiler::zrtl::TypeTag::VOID; 16];
+    params[0] = zyntax_compiler::zrtl::TypeTag::new(
+        zyntax_compiler::zrtl::TypeCategory::Pointer,
+        0,
+        zyntax_compiler::zrtl::TypeFlags::NONE,
+    );
+    rt.register_function_typed(
+        "peek_header",
+        peek_header as *const u8,
+        zyntax_compiler::zrtl::ZrtlSymbolSig {
+            param_count: 1,
+            flags: zyntax_compiler::zrtl::ZrtlSigFlags::NONE,
+            return_type: zyntax_compiler::zrtl::TypeTag::I64,
+            params,
+        },
+    );
+    rt.finalize_runtime_symbols().expect("symbols");
+    let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("grammar");
+    let program = grammar
+        .parse_with_filename(POINTS, "<host_heap_points>")
+        .expect("parse");
+    rt.compile_typed_program(program).expect("compile");
+    let call = |f: &str| rt.call::<i64>(f, &[]).map_err(|e| e.to_string());
+    assert_eq!(call("header"), Ok(&DESCRIPTOR as *const u8 as i64));
+    assert_eq!(call("fields"), Ok(407));
+
+    let types = TYPES.lock().unwrap();
+    let (name, (size, fields)) = types
+        .iter()
+        .find(|(name, _)| name.ends_with("Point"))
+        .expect("the host was asked about Point");
+    assert_eq!(*size, 32, "{name}: header, x, y and tag, padded to 8");
+    assert_eq!(
+        fields,
+        &vec![
+            ("x".to_string(), 8, 8, HostFieldKind::Int),
+            ("y".to_string(), 16, 8, HostFieldKind::Float),
+            ("tag".to_string(), 24, 4, HostFieldKind::Int),
+        ]
+    );
+    std::mem::forget(rt);
 }

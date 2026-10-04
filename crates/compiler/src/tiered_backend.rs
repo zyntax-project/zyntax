@@ -2390,7 +2390,16 @@ impl TieredBackend {
                 be.struct_field_extents(new_ty),
             )
         });
-        let (old_ext, new_ext) = (old_ext?, new_ext?);
+        // A state struct may start with the header word its type owns,
+        // which is no declared field and is the new region's own.
+        let fields_of =
+            |ext: Vec<(usize, usize)>, declared: usize| match ext.len() - declared.min(ext.len()) {
+                0 => Some(ext),
+                1 => Some(ext[1..].to_vec()),
+                _ => None,
+            };
+        let old_ext = fields_of(old_ext?, old_h.state_fields.len())?;
+        let new_ext = fields_of(new_ext?, new_h.state_fields.len())?;
         if old_ext.len() != old_h.state_fields.len() || new_ext.len() != new_h.state_fields.len() {
             return None;
         }
@@ -2858,6 +2867,28 @@ impl TieredBackend {
     /// The native slot and size of each loaded module's error-flag global
     /// (`HirGlobal::error_flag`). A module that declares none has none; one
     /// that does keeps its own.
+    /// The storage of every loaded module's global whose name starts with
+    /// `prefix`, by name: one name may be in several modules.
+    pub fn global_slots_named(&self, prefix: &str) -> Vec<(String, *mut u8)> {
+        self.loaded_modules()
+            .into_iter()
+            .flat_map(|m| {
+                m.globals
+                    .iter()
+                    .filter_map(|(id, global)| {
+                        let name = global.name.resolve_global()?;
+                        name.starts_with(prefix).then_some((name, *id))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter_map(|(name, id)| {
+                self.cranelift
+                    .with_lock(|be| be.global_data_addr(id))
+                    .map(|(ptr, _)| (name, ptr as *mut u8))
+            })
+            .collect()
+    }
+
     pub fn error_flag_slots(&self) -> Vec<(*mut u8, usize)> {
         self.loaded_modules()
             .into_iter()

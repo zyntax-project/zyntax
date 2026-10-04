@@ -277,6 +277,9 @@ pub struct LoweringContext {
     /// caller is owed. Keyed by id because the name is what the drop
     /// removes.
     dropped_for: std::collections::HashMap<crate::hir::HirId, (InternedString, String)>,
+    /// The reference types whose objects carry a header word, with the
+    /// global each one's descriptor goes in; see [`crate::object_header`].
+    type_descriptors: Vec<crate::object_header::TypeDescriptor>,
     /// Type registry for type conversions
     pub type_registry: Arc<zyntax_typed_ast::TypeRegistry>,
     /// String arena for creating mangled names
@@ -610,6 +613,7 @@ impl LoweringContext {
             deferred_prelowered: std::collections::HashMap::new(),
             trace_phases: std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some(),
             dropped_for: std::collections::HashMap::new(),
+            type_descriptors: Vec::new(),
             type_registry,
             arena,
             symbols,
@@ -938,6 +942,103 @@ impl LoweringContext {
     /// in, which only matters if one of the former reaches it. `None`
     /// when the program named no entry point, so a host may call
     /// anything and nothing may be left out.
+    /// The reference types this module allocates with a header word, and
+    /// the global each one's descriptor goes in.
+    pub fn type_descriptors(&self) -> &[crate::object_header::TypeDescriptor] {
+        &self.type_descriptors
+    }
+
+    /// Give every header-bearing reference type a descriptor global, 0
+    /// until the runtime fills it, and record what a host is told about
+    /// the type. A global a linked module already declares is used as it
+    /// is.
+    fn declare_type_descriptors(&mut self) {
+        use crate::object_header::{
+            DescribedField, TypeDescriptor, descriptor_name, field_layout, has_header,
+            header_field, qualified_name,
+        };
+        let defs: Vec<_> = self
+            .type_registry
+            .get_all_types()
+            .filter(|def| {
+                has_header(def) && matches!(def.kind, zyntax_typed_ast::TypeKind::Struct { .. })
+            })
+            .cloned()
+            .collect();
+        for def in defs {
+            let global = descriptor_name(&def);
+            let name = InternedString::new_global(&global);
+            if !self.symbols.globals.contains_key(&name) {
+                let global_def = crate::hir::HirGlobal {
+                    id: crate::hir::HirId::new(),
+                    name,
+                    ty: HirType::I64,
+                    initializer: Some(crate::hir::HirConstant::I64(0)),
+                    is_const: false,
+                    is_thread_local: false,
+                    error_flag: false,
+                    linkage: crate::hir::Linkage::Internal,
+                    visibility: crate::hir::Visibility::Default,
+                };
+                self.symbols.globals.insert(name, global_def.id);
+                self.module.add_global(global_def);
+            }
+            let types: Vec<HirType> = std::iter::once(header_field())
+                .chain(def.fields.iter().map(|f| self.convert_type(&f.ty)))
+                .collect();
+            let (offsets, size) = field_layout(&types);
+            let fields = def
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| DescribedField {
+                    name: f.name.resolve_global().unwrap_or_default(),
+                    offset: offsets[i + 1],
+                    size: crate::ssa::hir_ty_size(&types[i + 1]) as u64,
+                    kind: self.field_kind(&f.ty, &types[i + 1]),
+                })
+                .collect();
+            self.type_descriptors.push(TypeDescriptor {
+                global,
+                name: qualified_name(&def),
+                size,
+                fields,
+            });
+        }
+    }
+
+    /// How a host reads a field of `ty`, lowered to `hir`.
+    fn field_kind(&self, ty: &Type, hir: &HirType) -> crate::object_header::FieldKind {
+        use crate::object_header::FieldKind;
+        use zyntax_typed_ast::PrimitiveType as P;
+        match ty {
+            Type::Primitive(P::Bool) => FieldKind::Bool,
+            Type::Primitive(P::String) => FieldKind::Str,
+            Type::Primitive(P::F32 | P::F64) => FieldKind::Float,
+            Type::Primitive(P::U8 | P::U16 | P::U32 | P::U64 | P::U128 | P::USize) => {
+                FieldKind::UInt
+            }
+            Type::Primitive(_) => FieldKind::Int,
+            Type::Any | Type::Dynamic => FieldKind::Any,
+            Type::Named { id, .. } => match self.type_registry.get_type_by_id(*id) {
+                Some(def) if def.metadata.is_reference => {
+                    FieldKind::Object(crate::object_header::qualified_name(def))
+                }
+                _ if matches!(hir, HirType::Ptr(_)) => FieldKind::Pointer,
+                _ => FieldKind::Raw,
+            },
+            Type::Unresolved(name) => match self.type_registry.get_type_by_name(*name) {
+                Some(def) if def.metadata.is_reference => {
+                    FieldKind::Object(crate::object_header::qualified_name(def))
+                }
+                _ if matches!(hir, HirType::Ptr(_)) => FieldKind::Pointer,
+                _ => FieldKind::Raw,
+            },
+            _ if matches!(hir, HirType::Ptr(_)) => FieldKind::Pointer,
+            _ => FieldKind::Raw,
+        }
+    }
+
     pub fn entered_functions(&self) -> Option<Vec<String>> {
         if !self.entered {
             return None;
@@ -1046,6 +1147,7 @@ impl AstLowering for LoweringContext {
         // First pass: collect all declarations
         self.collect_declarations(program)?;
         self.adopt_prelowered();
+        self.declare_type_descriptors();
         let collect_ms = phase.lap();
 
         // Wrap typed-AST `Call(...)` expressions for fiber defs so
@@ -4852,10 +4954,16 @@ impl LoweringContext {
                             // instances are pointers to the struct rather
                             // than value-typed aggregates.
                             if type_def.metadata.is_reference {
+                                // Ahead of the fields, the word the type owns.
+                                let fields = crate::object_header::has_header(type_def)
+                                    .then(crate::object_header::header_field)
+                                    .into_iter()
+                                    .chain(field_types)
+                                    .collect();
                                 return HirType::Ptr(Box::new(HirType::Struct(
                                     crate::hir::HirStructType {
                                         name: Some(type_def.name),
-                                        fields: field_types,
+                                        fields,
                                         packed: false,
                                     },
                                 )));

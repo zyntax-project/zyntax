@@ -13,8 +13,58 @@ use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 /// The table layout this runtime reads. A host fills [`HostHeap::version`]
-/// with it.
-pub const HOST_HEAP_VERSION: u32 = 1;
+/// with it, or with an earlier version, whose table ends before the
+/// slots later versions append.
+pub const HOST_HEAP_VERSION: u32 = 2;
+
+/// How a field of a [`HostTypeInfo`] is read.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostFieldKind {
+    /// A signed integer of the field's size.
+    Int = 0,
+    /// An unsigned integer of the field's size.
+    UInt = 1,
+    /// A float of the field's size.
+    Float = 2,
+    Bool = 3,
+    /// A runtime string: a pointer to its header.
+    Str = 4,
+    /// A pointer to an object of the type [`HostFieldInfo::type_name`]
+    /// names.
+    Object = 5,
+    /// A dynamic value's box.
+    Any = 6,
+    /// Any other pointer.
+    Pointer = 7,
+    /// Bytes with no reading.
+    Raw = 8,
+}
+
+/// One field of a [`HostTypeInfo`].
+#[repr(C)]
+pub struct HostFieldInfo {
+    pub name: *const std::ffi::c_char,
+    /// Byte offset from the object's start; the header word is at 0.
+    pub offset: u32,
+    pub size: u32,
+    pub kind: HostFieldKind,
+    /// For [`HostFieldKind::Object`], the field's type, qualified as
+    /// [`HostTypeInfo::name`] is; null otherwise.
+    pub type_name: *const std::ffi::c_char,
+}
+
+/// A type whose objects carry the header word, as the runtime describes
+/// it to [`HostHeap::type_header`]. Valid for the duration of the call.
+#[repr(C)]
+pub struct HostTypeInfo {
+    /// `module.Name`.
+    pub name: *const std::ffi::c_char,
+    /// The object's size in bytes, header included.
+    pub size: u32,
+    pub field_count: u32,
+    pub fields: *const HostFieldInfo,
+}
 
 /// What an allocation is for.
 #[repr(u32)]
@@ -74,7 +124,14 @@ pub struct HostHeap {
     /// `thread_leave`; its stack ends at `stack_top`.
     pub thread_enter: unsafe extern "C" fn(cx: *mut c_void, stack_top: *const u8),
     pub thread_leave: unsafe extern "C" fn(cx: *mut c_void),
+    /// Version 2. The word every new object of the described type starts
+    /// with, asked once per type and layout; null leaves it 0.
+    pub type_header:
+        Option<unsafe extern "C" fn(cx: *mut c_void, info: *const HostTypeInfo) -> *const c_void>,
 }
+
+/// The size of a version-1 table, which ends before `type_header`.
+const V1_SIZE: u32 = std::mem::offset_of!(HostHeap, type_header) as u32;
 
 struct Installed(HostHeap);
 
@@ -120,21 +177,37 @@ impl std::error::Error for InstallError {}
 /// # Safety
 /// Every slot must behave as [`HostHeap`] describes for the rest of the
 /// process, and `table.context` must stay valid that long.
-pub unsafe fn install(table: &HostHeap) -> Result<(), InstallError> {
-    if table.version != HOST_HEAP_VERSION {
-        return Err(InstallError::Version {
-            found: table.version,
-            expected: HOST_HEAP_VERSION,
-        });
-    }
-    let expected = std::mem::size_of::<HostHeap>() as u32;
-    if table.size < expected {
+pub unsafe fn install(table: *const HostHeap) -> Result<(), InstallError> {
+    // The version and size lead every layout.
+    let (version, size) = unsafe { ((*table).version, (*table).size) };
+    let expected = match version {
+        1 => V1_SIZE,
+        HOST_HEAP_VERSION => std::mem::size_of::<HostHeap>() as u32,
+        found => {
+            return Err(InstallError::Version {
+                found,
+                expected: HOST_HEAP_VERSION,
+            });
+        }
+    };
+    if size < expected {
         return Err(InstallError::TooShort {
-            found: table.size,
+            found: size,
             expected,
         });
     }
-    if HOST.set(Installed(*table)).is_err() {
+    // Only the bytes the host's version has are read; the slots it
+    // predates stay empty.
+    let mut copy = std::mem::MaybeUninit::<HostHeap>::zeroed();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            table as *const u8,
+            copy.as_mut_ptr() as *mut u8,
+            expected as usize,
+        )
+    };
+    let copy = unsafe { copy.assume_init() };
+    if HOST.set(Installed(copy)).is_err() {
         return Err(InstallError::AlreadyInstalled);
     }
     // This crate's collector stays off from here, and what it rooted is
@@ -454,8 +527,62 @@ pub mod reference {
             remove_root_range,
             thread_enter,
             thread_leave,
+            type_header: None,
         }
     }
+}
+
+/// The word objects of the type `descriptor` describes start with: the
+/// host heap's answer, or 0 without one or without its `type_header`.
+pub fn type_header(descriptor: &crate::object_header::TypeDescriptor) -> u64 {
+    use crate::object_header::FieldKind;
+    use std::ffi::CString;
+    let Some(h) = installed() else {
+        return 0;
+    };
+    let Some(slot) = h.type_header else {
+        return 0;
+    };
+    let text = |s: &str| CString::new(s.replace('\0', "")).unwrap_or_default();
+    let name = text(&descriptor.name);
+    let names: Vec<CString> = descriptor.fields.iter().map(|f| text(&f.name)).collect();
+    let types: Vec<Option<CString>> = descriptor
+        .fields
+        .iter()
+        .map(|f| match &f.kind {
+            FieldKind::Object(t) => Some(text(t)),
+            _ => None,
+        })
+        .collect();
+    let fields: Vec<HostFieldInfo> = descriptor
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| HostFieldInfo {
+            name: names[i].as_ptr(),
+            offset: f.offset as u32,
+            size: f.size as u32,
+            kind: match f.kind {
+                FieldKind::Int => HostFieldKind::Int,
+                FieldKind::UInt => HostFieldKind::UInt,
+                FieldKind::Float => HostFieldKind::Float,
+                FieldKind::Bool => HostFieldKind::Bool,
+                FieldKind::Str => HostFieldKind::Str,
+                FieldKind::Object(_) => HostFieldKind::Object,
+                FieldKind::Any => HostFieldKind::Any,
+                FieldKind::Pointer => HostFieldKind::Pointer,
+                FieldKind::Raw => HostFieldKind::Raw,
+            },
+            type_name: types[i].as_ref().map_or(std::ptr::null(), |t| t.as_ptr()),
+        })
+        .collect();
+    let info = HostTypeInfo {
+        name: name.as_ptr(),
+        size: descriptor.size as u32,
+        field_count: fields.len() as u32,
+        fields: fields.as_ptr(),
+    };
+    unsafe { slot(h.context, &info) as u64 }
 }
 
 /// `ZYNTAX_HOST_HEAP=reference` runs the program on [`reference`]'s

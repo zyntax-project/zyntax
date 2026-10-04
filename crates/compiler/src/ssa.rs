@@ -5596,21 +5596,8 @@ impl SsaBuilder {
                         let hir_struct = &self.struct_body(hir_struct);
                         if let Some(field_ty) = hir_struct.fields.get(field_index as usize).cloned()
                         {
-                            // Per-field natural-alignment offset, mirroring
-                            // the Struct-literal lowering above.
-                            let mut offset: u64 = 0;
-                            for (i, fty) in hir_struct.fields.iter().enumerate() {
-                                let sz = hir_ty_size(fty) as u64;
-                                let align = sz.max(1);
-                                if align > 1 {
-                                    let m = align - 1;
-                                    offset = (offset + m) & !m;
-                                }
-                                if i as u32 == field_index {
-                                    break;
-                                }
-                                offset += sz.max(1);
-                            }
+                            let offset = crate::object_header::field_layout(&hir_struct.fields).0
+                                [field_index as usize];
 
                             let offset_id = self.create_value(
                                 HirType::I64,
@@ -5776,9 +5763,8 @@ impl SsaBuilder {
                 // The expr.ty may be Type::Unknown if the parser didn't propagate types.
                 let result_type = if matches!(&expr.ty, Type::Unknown | Type::Any) {
                     if let Type::Named { id, .. } = &object_type {
-                        self.type_registry
-                            .get_type_by_id(*id)
-                            .and_then(|td| td.fields.get(field_index as usize))
+                        self.typed_field_index(&object_type, field_index as usize)
+                            .and_then(|i| self.type_registry.get_type_by_id(*id)?.fields.get(i))
                             .map(|f| self.convert_type(&f.ty))
                             .unwrap_or_else(|| self.convert_type(&expr.ty))
                     } else {
@@ -6237,29 +6223,12 @@ impl SsaBuilder {
                         // padded to the largest field). This mirrors the
                         // ABI Cranelift uses for value-typed structs and
                         // keeps Loads/Stores aligned.
-                        let mut offsets: Vec<u64> = Vec::with_capacity(hir_struct.fields.len());
-                        let mut running: u64 = 0;
-                        let mut max_align: u64 = 1;
-                        for fty in &hir_struct.fields {
-                            let sz = hir_ty_size(fty) as u64;
-                            let align = sz.max(1);
-                            if align > max_align {
-                                max_align = align;
-                            }
-                            // Align the running offset up to the field's alignment.
-                            if align > 1 {
-                                let m = align - 1;
-                                running = (running + m) & !m;
-                            }
-                            offsets.push(running);
-                            running += sz.max(1);
-                        }
-                        // Round total size up to max alignment.
-                        if max_align > 1 {
-                            let m = max_align - 1;
-                            running = (running + m) & !m;
-                        }
-                        let total_size = running.max(1);
+                        let (offsets, total_size) =
+                            crate::object_header::field_layout(&hir_struct.fields);
+                        // The descriptor the object's type has, ahead of the
+                        // literal's own fields.
+                        let header = self.header_descriptor(&expr.ty);
+                        let first_field = header.is_some() as usize;
 
                         // Allocation site. Two modes:
                         //   * Normal: emit `Call(Intrinsic::Malloc, [size])`
@@ -6301,6 +6270,11 @@ impl SsaBuilder {
                             r
                         };
 
+                        if let Some(descriptor) = header {
+                            let word = self.read_descriptor(block_id, descriptor);
+                            self.store_at_offset(block_id, malloc_result, 0, word, HirType::I64);
+                        }
+
                         // For each field: emit GEP (byte offset) + Store.
                         // GEPs use HirType::U8 + a single i64 byte-offset
                         // index, exactly the shape
@@ -6308,7 +6282,7 @@ impl SsaBuilder {
                         // expect.
                         let field_typed_types = self.get_field_typed_types(&expr.ty);
                         for (i, field) in struct_lit.fields.iter().enumerate() {
-                            let field_ty = hir_struct.fields[i].clone();
+                            let field_ty = hir_struct.fields[i + first_field].clone();
                             let mut field_val =
                                 self.translate_expecting(block_id, &field.value, &field_ty)?;
                             if let Some(types) = field_typed_types.as_ref() {
@@ -6316,7 +6290,7 @@ impl SsaBuilder {
                                     field_val = self.maybe_box_for_any_field(block_id, field_val);
                                 }
                             }
-                            let offset = offsets[i] as i64;
+                            let offset = offsets[i + first_field] as i64;
 
                             // Coerce the initializer to the field's declared
                             // width before storing. An integer literal types as
@@ -6565,13 +6539,23 @@ impl SsaBuilder {
                 // the pointer-array (`data_ptr` slots) still holds
                 // distinct per-body pointers so identity semantics are
                 // preserved.
+                // A host heap takes each object as an allocation of its own,
+                // which a pool of several is not.
                 let pool_eligible = matches!(elem_ty, HirType::Ptr(ref inner) if matches!(**inner, HirType::Struct(_)))
+                    && !crate::host_heap::is_installed()
                     && elements
                         .iter()
                         .all(|e| matches!(e.node, TypedExpression::Struct(_)));
                 let (pool_buf_ptr, pool_slot_size) = if pool_eligible {
                     if let HirType::Ptr(ref inner) = elem_ty {
-                        let slot_size = hir_ty_size(inner);
+                        // A slot is an object as the literal lays it out.
+                        let slot_size = match &**inner {
+                            HirType::Struct(st) => {
+                                crate::object_header::field_layout(&self.struct_body(st).fields).1
+                                    as usize
+                            }
+                            other => hir_ty_size(other),
+                        };
                         let pool_total = elements.len() * slot_size;
                         let size_const = self.create_value(
                             HirType::I64,
@@ -9895,6 +9879,103 @@ impl SsaBuilder {
     /// from, so a read through such a pointer expands the name once
     /// more here. The expansion terminates for the same reason the
     /// first one did: it stops when it reaches the type it started at.
+    /// The declared field a lowered field index names: past the header
+    /// word, for a type whose objects carry one.
+    fn typed_field_index(&self, ty: &Type, hir_index: usize) -> Option<usize> {
+        hir_index.checked_sub(self.header_descriptor(ty).is_some() as usize)
+    }
+
+    /// The descriptor global of `ty`'s objects, by name, when its objects
+    /// carry the header word; see [`crate::object_header`].
+    fn header_descriptor(&self, ty: &Type) -> Option<InternedString> {
+        let def = match ty {
+            Type::Named { id, .. } => self.type_registry.get_type_by_id(*id),
+            Type::Unresolved(name) => self.type_registry.get_type_by_name(*name),
+            _ => None,
+        }?;
+        crate::object_header::has_header(def)
+            .then(|| InternedString::new_global(&crate::object_header::descriptor_name(def)))
+    }
+
+    /// The descriptor word to store in a new object: the global the
+    /// module was given for its type, or 0 where it has none.
+    fn read_descriptor(&mut self, block_id: HirId, descriptor: InternedString) -> HirId {
+        let Some((ptr, ty)) = self.global_slot(descriptor) else {
+            return self.create_value(
+                HirType::I64,
+                HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
+            );
+        };
+        let word = self.create_value(ty.clone(), HirValueKind::Instruction);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Load {
+                result: word,
+                ty,
+                ptr,
+                align: 8,
+                volatile: false,
+            },
+        );
+        self.add_use(ptr, word);
+        word
+    }
+
+    /// Store `value`, of type `ty`, at byte `offset` of the object `base`,
+    /// in the GEP-u8 / cast / store shape the reference lowering uses.
+    fn store_at_offset(
+        &mut self,
+        block_id: HirId,
+        base: HirId,
+        offset: i64,
+        value: HirId,
+        ty: HirType,
+    ) {
+        let offset_id = self.create_value(
+            HirType::I64,
+            HirValueKind::Constant(crate::hir::HirConstant::I64(offset)),
+        );
+        let gep = self.create_value(
+            HirType::Ptr(Box::new(HirType::U8)),
+            HirValueKind::Instruction,
+        );
+        self.add_instruction(
+            block_id,
+            HirInstruction::GetElementPtr {
+                result: gep,
+                ty: HirType::U8,
+                ptr: base,
+                indices: vec![offset_id],
+            },
+        );
+        self.add_use(base, gep);
+        self.add_use(offset_id, gep);
+        let typed = self.create_value(
+            HirType::Ptr(Box::new(ty.clone())),
+            HirValueKind::Instruction,
+        );
+        self.add_instruction(
+            block_id,
+            HirInstruction::Cast {
+                result: typed,
+                ty: HirType::Ptr(Box::new(ty)),
+                op: crate::hir::CastOp::Bitcast,
+                operand: gep,
+            },
+        );
+        self.add_use(gep, typed);
+        self.add_instruction(
+            block_id,
+            HirInstruction::Store {
+                value,
+                ptr: typed,
+                align: 8,
+                volatile: false,
+            },
+        );
+        self.add_use(typed, value);
+    }
+
     fn struct_body(&self, s: &crate::hir::HirStructType) -> crate::hir::HirStructType {
         if !s.fields.is_empty() {
             return s.clone();
@@ -10172,12 +10253,19 @@ impl SsaBuilder {
         if field_types.is_empty() {
             return None;
         }
-        let mut total = 0usize;
-        for field_ty in field_types {
-            let hir = self.convert_type(&field_ty);
-            total = total.checked_add(hir_ty_size(&hir))?;
+        // The bytes of a reference object, header word included.
+        let header = match ty {
+            Type::Named { id, .. } => self.type_registry.get_type_by_id(*id),
+            Type::Unresolved(name) => self.type_registry.get_type_by_name(*name),
+            _ => None,
         }
-        Some(total)
+        .is_some_and(crate::object_header::has_header);
+        let mut fields: Vec<HirType> = Vec::new();
+        if header {
+            fields.push(crate::object_header::header_field());
+        }
+        fields.extend(field_types.iter().map(|t| self.convert_type(t)));
+        Some(crate::object_header::field_layout(&fields).1 as usize)
     }
 
     /// Box the bytes behind `ptr` through `zyntax_box_opaque`, tagging
@@ -10285,8 +10373,8 @@ impl SsaBuilder {
         use_site_ty: &Type,
     ) -> HirId {
         let field_is_any = self
-            .get_field_typed_types(object_ty)
-            .and_then(|fs| fs.get(field_index).cloned())
+            .typed_field_index(object_ty, field_index)
+            .and_then(|i| self.get_field_typed_types(object_ty)?.get(i).cloned())
             .map(|t| matches!(t, Type::Any))
             .unwrap_or(false);
         if !field_is_any {
@@ -12619,10 +12707,16 @@ impl SsaBuilder {
         if !self.converting.borrow_mut().insert(type_def.name) {
             return Vec::new();
         }
-        let fields = type_def
-            .fields
-            .iter()
-            .map(|field| self.convert_type(&field.ty))
+        let header =
+            crate::object_header::has_header(type_def).then(crate::object_header::header_field);
+        let fields = header
+            .into_iter()
+            .chain(
+                type_def
+                    .fields
+                    .iter()
+                    .map(|field| self.convert_type(&field.ty)),
+            )
             .collect();
         self.converting.borrow_mut().remove(&type_def.name);
         fields
@@ -13931,10 +14025,12 @@ impl SsaBuilder {
             ))
         })?;
 
-        // Find the field index in the type definition
+        // The field's index among the lowered fields, past the header
+        // word a reference object starts with.
+        let header = crate::object_header::has_header(type_def) as u32;
         for (idx, field) in type_def.fields.iter().enumerate() {
             if &field.name == field_name {
-                return Ok(idx as u32);
+                return Ok(idx as u32 + header);
             }
         }
 
@@ -13944,7 +14040,7 @@ impl SsaBuilder {
                 (field.name.resolve_global(), field_name.resolve_global())
             {
                 if field_name_str == lookup_name_str {
-                    return Ok(idx as u32);
+                    return Ok(idx as u32 + header);
                 }
             }
         }
@@ -14132,21 +14228,8 @@ impl SsaBuilder {
                         let hir_struct = &self.struct_body(hir_struct);
                         if let Some(field_ty) = hir_struct.fields.get(field_index as usize).cloned()
                         {
-                            // Compute byte offset (natural alignment, same
-                            // as the Struct-literal / Field-read branch).
-                            let mut offset: u64 = 0;
-                            for (i, fty) in hir_struct.fields.iter().enumerate() {
-                                let sz = hir_ty_size(fty) as u64;
-                                let align = sz.max(1);
-                                if align > 1 {
-                                    let m = align - 1;
-                                    offset = (offset + m) & !m;
-                                }
-                                if i as u32 == field_index {
-                                    break;
-                                }
-                                offset += sz.max(1);
-                            }
+                            let offset = crate::object_header::field_layout(&hir_struct.fields).0
+                                [field_index as usize];
 
                             let offset_id = self.create_value(
                                 HirType::I64,
