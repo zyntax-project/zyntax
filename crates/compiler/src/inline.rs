@@ -1153,6 +1153,8 @@ fn inline_in_function(
             // as its hot path: one whose arms carry calls is held to
             // the call-bearing size over its whole body.
             if !hot_blocks.contains(&block_id)
+                && !(returns_local_allocation(callee)
+                    && result.is_some_and(|r| feeds_object_phi(caller, r)))
                 && (shape.hot.calls
                     || (shape.calls_anywhere && count_insts(callee) > MAX_INLINE_INSTS_WITH_CALLS))
             {
@@ -1379,6 +1381,43 @@ fn is_plain_call_intrinsic(i: crate::hir::Intrinsic) -> bool {
             | Panic
             | Abort
     )
+}
+
+/// A constructor whose initialization can be exposed to scalar replacement.
+fn returns_local_allocation(callee: &HirFunction) -> bool {
+    if callee.blocks.len() != 1 {
+        return false;
+    }
+    let block = &callee.blocks[&callee.entry_block];
+    let HirTerminator::Return { values } = &block.terminator else {
+        return false;
+    };
+    if values.len() != 1 {
+        return false;
+    }
+    block.instructions.iter().any(|i| matches!(i,
+        HirInstruction::Call {
+            result: Some(r),
+            callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc),
+            ..
+        } if *r == values[0]
+    ))
+}
+
+/// A changing object, not an invariant carried through a trivial phi.
+/// Constructors outside loops are expanded when their result joins one;
+/// other call-bearing constructors keep the normal cold-site policy.
+fn feeds_object_phi(caller: &HirFunction, result: HirId) -> bool {
+    let allocations: HashSet<_> = caller.blocks.values().flat_map(|b| &b.instructions)
+        .filter_map(|inst| match inst {
+            HirInstruction::Call { result, callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc), .. } => *result,
+            _ => None,
+        }).collect();
+    caller.blocks.values().flat_map(|b| &b.phis).any(|phi| {
+        matches!(phi.ty, HirType::Ptr(_))
+            && phi.incoming.iter().any(|(v, _)| *v == result)
+            && phi.incoming.iter().any(|(v, _)| allocations.contains(v))
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

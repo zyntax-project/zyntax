@@ -91,6 +91,7 @@ pub mod reduction_vectorize;
 pub(crate) mod return_infer; // Return types for declarations that don't state one
 pub mod runtime;
 pub mod scalar_replace_alloc; // Eliminate non-escaping Call(Intrinsic::Malloc) allocations (heap SROA)
+pub mod heap_scalarize; // Immutable heap objects carried by phis become scalar fields
 pub mod sign_fold; // Compares against zero decided by the sign of what is compared
 pub mod ssa;
 pub mod stdlib; // Standard library implementation using HIR Builder
@@ -2114,6 +2115,9 @@ fn run_interp_safe_opts_with(
         let sra = scalar_replace_alloc::run_module(module);
         timed("scalar_replace_alloc", &mut at);
         check_hir_uses(module, "scalar_replace_alloc");
+        let heap = heap_scalarize::run_module(module);
+        timed("heap_scalarize", &mut at);
+        check_hir_uses(module, "heap_scalarize");
         // A field a constructor defaulted and its caller then set: the
         // default's store is dead once both are in one block.
         let ds = dead_store::run_module(module);
@@ -2171,6 +2175,7 @@ fn run_interp_safe_opts_with(
             || ags.field_reads_only > 0
             || agsc.webs > 0
             || sra.mallocs_eliminated > 0
+            || heap > 0
             || il.inlined > 0
             || ef.threaded > 0
             || lc.hoisted > 0
@@ -2208,6 +2213,7 @@ fn run_interp_safe_opts_with(
         stats.aggregate_split.field_reads_only += ags.field_reads_only;
         stats.scalar_replace_alloc.candidates_examined += sra.candidates_examined;
         stats.scalar_replace_alloc.mallocs_eliminated += sra.mallocs_eliminated;
+        stats.scalar_replace_alloc.mallocs_eliminated += heap;
         stats.scalar_replace_alloc.frees_eliminated += sra.frees_eliminated;
         stats.scalar_replace_alloc.escapes_skipped += sra.escapes_skipped;
         stats.inline.inlined += il.inlined;
