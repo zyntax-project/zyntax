@@ -1664,7 +1664,7 @@ impl<'m> Lowerer<'m> {
 
     /// A value of `ty` that stands for nothing: what a variable holds
     /// before the branch that assigns it runs.
-    fn zero_of(&mut self, ty: Ty, span: Span) -> Node {
+    pub(crate) fn zero_of(&mut self, ty: Ty, span: Span) -> Node {
         match ty {
             Ty::Int => int_lit(0, span),
             Ty::Float => node(
@@ -2517,6 +2517,9 @@ impl<'m> Lowerer<'m> {
         let span = span_of(f);
         let mut statements = prologue;
         statements.extend(self.cell_prologue(span));
+        if name == self.name || name == types::trusted_name(&self.name) {
+            self.guarded_class_entries(span, &mut statements);
+        }
         self.always_instance = self.always_instances(&f.body);
         for s in &f.body {
             self.stmt(s, &mut statements)?;
@@ -2554,6 +2557,130 @@ impl<'m> Lowerer<'m> {
     }
 
     // ─── Conversions ────────────────────────────────────────────────
+
+    /// Enter a class instance only when every narrowed parameter's
+    /// box belongs to that class's hierarchy; all other values run the
+    /// original body, including None and unrelated duck types.
+    fn guarded_class_entries(&mut self, span: Span, out: &mut Vec<Stmt>) {
+        let specs: Vec<_> = self
+            .module
+            .specs
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                s.item == self.name
+                    && self.module.guarded_specs.contains(i)
+                    && !self.module.failed_specs.borrow().contains(&s.name)
+            })
+            .map(|(_, s)| s.clone())
+            .collect();
+        for spec in specs {
+            let mut condition: Option<Node> = None;
+            let mut args = Vec::new();
+            let mut pre = Vec::new();
+            for ((name, own), (_, target)) in self.sig.params.clone().iter().zip(&spec.sig.params) {
+                let value = var(intern(name), *own, span);
+                if own == target {
+                    args.push(value);
+                    continue;
+                }
+                let Ty::Class(k) = *target else {
+                    return;
+                };
+                if *own != Ty::Object {
+                    return;
+                }
+                let kind = self
+                    .hold(
+                        Val {
+                            node: call("zb_any_kind", vec![value.clone()], Ty::Int, span),
+                            ty: Ty::Int,
+                        },
+                        &mut pre,
+                        span,
+                    )
+                    .node;
+                let range = self.module.class_range(k as usize);
+                let test = binary(
+                    BinaryOp::And,
+                    binary(
+                        BinaryOp::Ge,
+                        kind.clone(),
+                        int_lit(
+                            zyntax_builtins::INSTANCE_KIND_BASE + range.start as i64,
+                            span,
+                        ),
+                        Ty::Bool,
+                        span,
+                    ),
+                    binary(
+                        BinaryOp::Lt,
+                        kind,
+                        int_lit(zyntax_builtins::INSTANCE_KIND_BASE + range.end as i64, span),
+                        Ty::Bool,
+                        span,
+                    ),
+                    Ty::Bool,
+                    span,
+                );
+                condition = Some(match condition {
+                    None => test,
+                    Some(previous) => binary(BinaryOp::And, previous, test, Ty::Bool, span),
+                });
+                args.push(cast(
+                    addr_call("zb_unbox_instance_raw", vec![value], span),
+                    *target,
+                    span,
+                ));
+            }
+            let Some(condition) = condition else {
+                continue;
+            };
+            let result = self.guard_named(
+                Val {
+                    node: call(&spec.name, args, spec.sig.ret, span),
+                    ty: spec.sig.ret,
+                },
+                &spec.name,
+                span,
+            );
+            let mut branch = std::mem::take(&mut self.hoisted);
+            if self.sig.ret == Ty::None {
+                branch.push(TypedNode::new(
+                    TypedStatement::Expression(Box::new(result.node)),
+                    Type::Unknown,
+                    span,
+                ));
+                branch.push(TypedNode::new(
+                    TypedStatement::Return(None),
+                    Type::Unknown,
+                    span,
+                ));
+            } else {
+                let result = self.coerce(result, self.sig.ret);
+                branch.append(&mut self.hoisted);
+                branch.push(TypedNode::new(
+                    TypedStatement::Return(Some(Box::new(result))),
+                    Type::Unknown,
+                    span,
+                ));
+            }
+            out.extend(pre);
+            out.push(TypedNode::new(
+                TypedStatement::If(TypedIf {
+                    condition: Box::new(condition),
+                    then_block: TypedBlock {
+                        statements: branch,
+                        span,
+                    },
+                    else_block: None,
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ));
+        }
+    }
 
     /// `v` as a value of type `target`, converting where the two differ.
     pub(crate) fn coerce(&mut self, v: Val, target: Ty) -> Node {
@@ -13488,7 +13615,7 @@ impl<'m> Lowerer<'m> {
     /// [`Self::invoke`], also naming the function called, which a
     /// check after the call is attributed to. `instance` is the
     /// method's instance for the arguments' types, when one was made:
-    /// a call nothing dispatches goes there.
+    /// its dispatcher preserves those argument types across overrides.
     fn invoke_targeted(
         &mut self,
         k: usize,
@@ -13507,12 +13634,21 @@ impl<'m> Lowerer<'m> {
         let mut ret = if direct {
             sig.ret
         } else {
-            self.module.dispatched_ret(k, method).unwrap_or(sig.ret)
+            self.module.dispatched_ret(owner, method).unwrap_or(sig.ret)
         };
-        if direct && let Some((spec_name, spec_sig)) = instance {
+        if let Some((spec_name, spec_sig)) = instance {
             params = without_self(&spec_sig).params;
-            ret = spec_sig.ret;
-            target = spec_name;
+            if direct {
+                ret = spec_sig.ret;
+                target = spec_name;
+            } else {
+                let tys: Vec<_> = spec_sig.params.iter().map(|(_, t)| *t).collect();
+                ret = self
+                    .module
+                    .dispatched_instance_ret(owner, method, &tys)
+                    .unwrap_or(spec_sig.ret);
+                target = dispatch_name(&spec_name);
+            }
         }
         // A method nothing overrides may go to its trusted variant.
         let target = if direct {

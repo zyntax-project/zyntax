@@ -1597,6 +1597,7 @@ fn lower_specs(
         match lower_item_as(inferred, item, &spec.name, spec.sig.clone(), unpack_shapes) {
             Ok(d) => declarations.extend(d),
             Err(e) => {
+                inferred.failed_specs.borrow_mut().insert(spec.name.clone());
                 if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
                     eprintln!(
                         "[types] instance {} forwards to {}: {e:?}",

@@ -1271,6 +1271,10 @@ pub(crate) struct Module {
     /// and parameter types.
     pub(crate) specs: Vec<SpecInfo>,
     pub(crate) spec_index: HashMap<(String, Vec<Ty>), usize>,
+    /// Class instances reached through a guarded dynamic function entry.
+    pub(crate) guarded_specs: HashSet<usize>,
+    /// A forwarding instance cannot be re-entered from its item's guard.
+    pub(crate) failed_specs: std::cell::RefCell<HashSet<String>>,
     /// Module-level variables a function reads or declares `global`,
     /// with the join of everything assigned to them anywhere.
     pub(crate) globals: HashMap<String, Ty>,
@@ -2439,6 +2443,24 @@ impl Module {
             // A method only subclasses define: what they return.
             None => self.abstract_sig(k, method).map(|sig| sig.ret),
         }
+    }
+
+    /// The result of a typed dispatcher, joining the instances each
+    /// override selects for the same argument types.
+    pub(crate) fn dispatched_instance_ret(&self, k: usize, method: &str, tys: &[Ty]) -> Option<Ty> {
+        let (sig, name) = self.method_sig(k, method)?;
+        if self.instance(&name, sig, tys).is_none() {
+            return self.dispatched_ret(k, method);
+        }
+        let mut ret = self.instance_ret(&name, sig, tys);
+        for sub in self.overriders(k, method) {
+            if let Some((sig, name)) = self.method_sig(sub, method)
+                && sig.params.len() == tys.len()
+            {
+                ret = self.join_classes(ret, self.instance_ret(&name, sig, tys));
+            }
+        }
+        Some(ret)
     }
 
     /// The signature of a call of `method` on an instance of `k`, where
@@ -3843,8 +3865,8 @@ fn unboxed_key(
 /// Whether item `name` gets per-signature instances: a closed item, so
 /// its own function is the join of every call and an instance narrows
 /// it; not a constructor, which its class's constructor function calls;
-/// not a generator, whose fiber is started by name; and not a method a
-/// subclass overrides, whose calls go through the dispatcher.
+/// not a generator, whose fiber is started by name. Overridden methods
+/// use a dispatcher for each argument signature.
 fn specialisable(module: &Module, item: &Item<'_>) -> bool {
     // A function or method named as a value keeps dynamic parameters
     // for the calls out of view; a call in view with typed arguments
@@ -3859,10 +3881,7 @@ fn specialisable(module: &Module, item: &Item<'_>) -> bool {
     if module.funcs[&item.name].ret == Ty::Gen {
         return false;
     }
-    match item.class {
-        Some(k) => module.overriders(k, item.def.name.as_str()).is_empty(),
-        None => true,
-    }
+    true
 }
 
 /// Make the per-signature instances of the items: for each call of a
@@ -3890,6 +3909,7 @@ pub(crate) fn specialise(
     if candidates.is_empty() {
         return;
     }
+    let guarded_sites = class_loop_sites(module, items);
     let trace = std::env::var_os("ZYNTAX_TRACE_TYPES_ROUNDS").is_some();
     let entry_sig = Sig {
         none_params: Vec::new(),
@@ -3927,7 +3947,7 @@ pub(crate) fn specialise(
     let mut rounds = 0;
     loop {
         rounds += 1;
-        let mut sites: Vec<(String, Vec<Ty>)> = Vec::new();
+        let mut sites: Vec<(String, Vec<Ty>)> = guarded_sites.clone();
         for item in items {
             let sig = module.funcs[&item.name].clone();
             sites_of(module, &sig, item, &mut sites);
@@ -4057,6 +4077,85 @@ pub(crate) fn specialise(
     for spec in &mut module.specs {
         spec.sig.ret = spec.sig.ret.settled();
     }
+    module.guarded_specs = guarded_sites
+        .iter()
+        .filter_map(|(name, tys)| {
+            let sig = &module.funcs[name];
+            module
+                .spec_index
+                .get(&(name.clone(), module.spec_key(name, sig, tys)))
+                .copied()
+        })
+        .collect();
+}
+
+/// A loop reading several attributes of a dynamic parameter can enter
+/// a class instance after checking its box. Matching parents cover
+/// their descendants through ordinary method dispatch.
+fn class_loop_sites(module: &Module, items: &[Item<'_>]) -> Vec<(String, Vec<Ty>)> {
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+    #[derive(Default)]
+    struct Reads {
+        loops: bool,
+        attrs: HashMap<String, HashSet<String>>,
+    }
+    impl<'a> Visitor<'a> for Reads {
+        fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
+            if matches!(stmt, py::Stmt::FunctionDef(_) | py::Stmt::ClassDef(_)) {
+                return;
+            }
+            self.loops |= matches!(stmt, py::Stmt::For(_) | py::Stmt::While(_));
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'a py::Expr) {
+            if matches!(expr, py::Expr::Lambda(_)) {
+                return;
+            }
+            if let py::Expr::Attribute(a) = expr
+                && let py::Expr::Name(n) = &*a.value
+            {
+                self.attrs
+                    .entry(n.id.to_string())
+                    .or_default()
+                    .insert(a.attr.to_string());
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut sites = Vec::new();
+    for item in items
+        .iter()
+        .filter(|i| i.class.is_none() && specialisable(module, i))
+    {
+        let mut reads = Reads::default();
+        reads.visit_body(&item.def.body);
+        if !reads.loops {
+            continue;
+        }
+        let sig = &module.funcs[&item.name];
+        for (i, (name, ty)) in sig.params.iter().enumerate() {
+            let Some(attrs) = reads.attrs.get(name).filter(|a| a.len() >= 2) else {
+                continue;
+            };
+            if *ty != Ty::Object || module.fixed_params.get(&item.name).is_some_and(|f| f[i]) {
+                continue;
+            }
+            let fits = |k: usize| {
+                attrs
+                    .iter()
+                    .all(|a| module.field(k, a).is_some() || module.method_sig(k, a).is_some())
+            };
+            for k in 0..module.classes.len() {
+                if !fits(k) || module.classes[k].base.is_some_and(fits) {
+                    continue;
+                }
+                let mut tys: Vec<_> = sig.params.iter().map(|(_, t)| *t).collect();
+                tys[i] = Ty::Class(k as u16);
+                sites.push((item.name.clone(), tys));
+            }
+        }
+    }
+    sites
 }
 
 /// The calls a body makes to the module's own functions and
@@ -8239,15 +8338,26 @@ impl Typer<'_> {
     }
 
     /// [`Self::method_ret`] with the arguments passed: a method of a
-    /// known class nothing overrides goes to the instance made for
-    /// them, where there is one.
+    /// known class joins the instances its overrides may reach.
     fn method_call_ret(&self, receiver: Ty, attr: &str, arguments: &py::Arguments) -> Ty {
         if let Ty::Class(k) = receiver
             && !self.module.specs.is_empty()
-            && let Some((sig, name)) = self.module.method_sig(k as usize, attr)
-            && self.module.dispatched_ret(k as usize, attr) == Some(sig.ret)
+            && let Some((sig, _)) = self.module.method_sig(k as usize, attr)
         {
-            return self.item_call_ret(&name, sig, 1, arguments);
+            if let Some(tys) = call_types(
+                self.module,
+                sig,
+                1,
+                &arguments.args,
+                &arguments.keywords,
+                |e| self.expr(e),
+            ) {
+                let owner = self.module.method_owner(k as usize, attr).unwrap();
+                return self
+                    .module
+                    .dispatched_instance_ret(owner, attr, &tys)
+                    .unwrap_or(sig.ret);
+            }
         }
         // Of this set's kind, of the elements of every argument.
         if let Ty::Set(k) = receiver
@@ -8272,11 +8382,14 @@ impl Typer<'_> {
     /// `__getitem__` instance made for the key's type, where there is one.
     fn item_read_ret(&self, k: u16, key: Ty) -> Ty {
         if !self.module.specs.is_empty()
-            && let Some((sig, name)) = self.module.method_sig(k as usize, "__getitem__")
+            && let Some((sig, _)) = self.module.method_sig(k as usize, "__getitem__")
             && sig.params.len() == 2
-            && self.module.dispatched_ret(k as usize, "__getitem__") == Some(sig.ret)
         {
-            return self.module.instance_ret(&name, sig, &[Ty::Unknown, key]);
+            let owner = self.module.method_owner(k as usize, "__getitem__").unwrap();
+            return self
+                .module
+                .dispatched_instance_ret(owner, "__getitem__", &[Ty::Unknown, key])
+                .unwrap_or(sig.ret);
         }
         self.module
             .dispatched_ret(k as usize, "__getitem__")

@@ -418,11 +418,40 @@ pub(crate) fn raise_facts(
             let mut dispatcher = crate::types::RaiseFact::default();
             dispatcher.callees.insert(fn_name.clone());
             for sub in overriders {
+                if let Some((sig, _)) = module.method_sig(sub, method) {
+                    dispatcher.own |= sig.params.len() != module.funcs[&fn_name].params.len()
+                        || sig
+                            .params
+                            .iter()
+                            .skip(1)
+                            .zip(module.funcs[&fn_name].params.iter().skip(1))
+                            .any(|((_, target), (_, source))| {
+                                target != source && *target != Ty::Object
+                            });
+                }
                 dispatcher
                     .callees
                     .insert(method_fn(&module.classes[sub].name, method));
             }
             facts.insert(lower::dispatch_name(&fn_name), dispatcher);
+            for spec in module.specs.iter().filter(|s| s.item == fn_name) {
+                let tys: Vec<_> = spec.sig.params.iter().map(|(_, t)| *t).collect();
+                let mut fact = crate::types::RaiseFact::default();
+                fact.callees.insert(spec.name.clone());
+                for sub in module.overriders(k, method) {
+                    if let Some((sig, name)) = module.method_sig(sub, method) {
+                        let instance = module.instance(&name, sig, &tys);
+                        let target = instance.map_or(name.as_str(), |s| s.name.as_str());
+                        let sig = instance.map_or(sig, |s| &s.sig);
+                        fact.own |= sig.params.len() != tys.len()
+                            || sig.params.iter().skip(1).zip(tys.iter().skip(1)).any(
+                                |((_, target), source)| target != source && *target != Ty::Object,
+                            );
+                        fact.callees.insert(target.to_string());
+                    }
+                }
+                facts.insert(lower::dispatch_name(&spec.name), fact);
+            }
         }
     }
 }
@@ -530,7 +559,10 @@ pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
         for method in &class.methods {
             let fn_name = method_fn(&class.name, method);
             if method != "__init__" && !module.overriders(k, method).is_empty() {
-                out.push(dispatcher(module, k, method, &fn_name, span));
+                out.push(dispatcher(module, k, method, &fn_name, None, span));
+                for spec in module.specs.iter().filter(|s| s.item == fn_name) {
+                    out.push(dispatcher(module, k, method, &fn_name, Some(spec), span));
+                }
             }
         }
     }
@@ -790,14 +822,23 @@ fn dispatcher(
     owner: usize,
     method: &str,
     fn_name: &str,
+    instance: Option<&crate::types::SpecInfo>,
     span: Span,
 ) -> TypedFunction {
-    let base = &module.funcs[fn_name];
+    let base = instance.map_or(&module.funcs[fn_name], |s| &s.sig);
+    let target = instance.map_or(fn_name, |s| s.name.as_str());
+    let tys: Vec<_> = base.params.iter().map(|(_, t)| *t).collect();
     // The dispatcher returns what any of the methods it reaches may.
     let sig = Sig {
         none_params: base.none_params.clone(),
         params: base.params.clone(),
-        ret: module.dispatched_ret(owner, method).unwrap_or(base.ret),
+        ret: if instance.is_some() {
+            module
+                .dispatched_instance_ret(owner, method, &tys)
+                .unwrap_or(base.ret)
+        } else {
+            module.dispatched_ret(owner, method).unwrap_or(base.ret)
+        },
         defaults: base.defaults.clone(),
     };
     let sig = &sig;
@@ -809,9 +850,15 @@ fn dispatcher(
     }
     let tag = field(var(intern("self"), self_ty, span), "$class", Ty::Int, span);
     let mut statements = vec![let_("tag", Ty::Int, tag, span)];
-    for sub in module.overriders(owner, method) {
-        let sub_fn = method_fn(&module.classes[sub].name, method);
-        let sub_sig = &module.funcs[&sub_fn];
+    for sub in module.class_range(owner).skip(1) {
+        let sub_owner = module.method_owner(sub, method).expect("inherited method");
+        if sub_owner == owner {
+            continue;
+        }
+        let (sub_sig, sub_fn) = module.method_sig(sub, method).expect("inherited method");
+        let sub_instance = instance.and_then(|_| module.instance(&sub_fn, sub_sig, &tys));
+        let sub_target = sub_instance.map_or(sub_fn.as_str(), |s| s.name.as_str());
+        let sub_sig = sub_instance.map_or(sub_sig, |s| &s.sig);
         // An override taking another number of arguments cannot be
         // called with these; the call fails as it would in Python.
         if sub_sig.params.len() != sig.params.len() {
@@ -833,13 +880,11 @@ fn dispatcher(
                 ),
                 span,
             );
-            let none = lowerer.coerce(
-                Val {
-                    node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
-                    ty: Ty::None,
-                },
-                sig.ret,
-            );
+            let returned = if sig.ret == Ty::None {
+                TypedNode::new(TypedStatement::Return(None), Type::Unknown, span)
+            } else {
+                ret(lowerer.zero_of(sig.ret, span), span)
+            };
             statements.push(when(
                 binary(
                     BinaryOp::Eq,
@@ -848,7 +893,7 @@ fn dispatcher(
                     Ty::Bool,
                     span,
                 ),
-                vec![fail, ret(none, span)],
+                vec![fail, returned],
                 span,
             ));
             continue;
@@ -857,7 +902,7 @@ fn dispatcher(
         // from it, so `self` is an instance of `sub`.
         let mut args = vec![cast(
             var(intern("self"), self_ty, span),
-            Ty::Class(sub as u16),
+            Ty::Class(sub_owner as u16),
             span,
         )];
         for ((name, ty), (_, sub_ty)) in
@@ -873,7 +918,7 @@ fn dispatcher(
         }
         let result = lowerer.coerce(
             Val {
-                node: call(&sub_fn, args, sub_sig.ret, span),
+                node: call(sub_target, args, sub_sig.ret, span),
                 ty: sub_sig.ret,
             },
             sig.ret,
@@ -896,13 +941,13 @@ fn dispatcher(
     }
     let own = lowerer.coerce(
         Val {
-            node: call(fn_name, args, base.ret, span),
+            node: call(target, args, base.ret, span),
             ty: base.ret,
         },
         sig.ret,
     );
     statements.push(ret(own, span));
-    function(&dispatch_name(fn_name), params, sig.ret, statements, span)
+    function(&dispatch_name(target), params, sig.ret, statements, span)
 }
 
 /// `C$m$abstract(self, args)`: `m` on an instance of `C`, which only
