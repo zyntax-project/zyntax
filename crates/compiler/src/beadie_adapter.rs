@@ -418,8 +418,8 @@ mod llvm_impl {
 
         /// This tier's resume points for `def`'s function at `sites`
         /// alone, as `(site, code)`, published under the bead. The
-        /// function is compiled again for them; its entry is left to
-        /// whatever code is installed.
+        /// entry keeps its installed code; ordinary functions emit only
+        /// their requested continuation bodies.
         pub fn resume_points(
             &self,
             def: &ZyntaxFunctionDef,
@@ -433,7 +433,10 @@ mod llvm_impl {
                 backend.set_compile_tier(def.tier);
                 backend.set_module_context(std::sync::Arc::clone(&def.module));
                 backend.set_osr_helper_sites(Some(sites));
-                if backend.compile_function(def.id, &def.function).is_err() {
+                if backend
+                    .compile_resume_points(def.id, &def.function)
+                    .is_err()
+                {
                     return Vec::new();
                 }
                 Self::publish_helpers(backend, def)

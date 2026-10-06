@@ -187,6 +187,8 @@ pub struct LLVMJitBackend<'ctx> {
     /// The resume points the next install makes, as site keys; `None`
     /// makes one at every header. See [`Self::set_osr_helper_sites`].
     osr_helper_sites: Option<std::collections::HashSet<u64>>,
+    /// Emit only the requested resume points; leave normal entry cells alone.
+    osr_helpers_only: bool,
 }
 
 impl<'ctx> LLVMJitBackend<'ctx> {
@@ -232,6 +234,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             compile_tier: 0,
             pending_osr_helpers: Vec::new(),
             osr_helper_sites: None,
+            osr_helpers_only: false,
         };
 
         // The allocation intrinsics call into the runtime's pools. Both
@@ -498,17 +501,6 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 self.function_pointers.insert(hir_id, addr as usize);
             }
         }
-        if crate::osr::osr_trace_enabled() {
-            let total_ms = started.elapsed().as_secs_f64() * 1e3;
-            let (lowered_ms, opt_ms) = self.last_ir_ms.get();
-            eprintln!(
-                "[osr] llvm install {total_ms:.2} ms: ir {lowered_ms:.2}, opt {opt_ms:.2}, \
-                 verify {:.2}, engine {engine_ms:.2}, codegen {:.2}",
-                ir_ms - lowered_ms - opt_ms,
-                total_ms - ir_ms - engine_ms
-            );
-        }
-
         for (func_id, site, name) in helper_names {
             let resolved = engine.get_function_address(&name);
             if crate::osr::osr_trace_enabled() {
@@ -521,6 +513,17 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 self.pending_osr_helpers
                     .push((func_id, site, addr as usize));
             }
+        }
+
+        if crate::osr::osr_trace_enabled() {
+            let total_ms = started.elapsed().as_secs_f64() * 1e3;
+            let (lowered_ms, opt_ms) = self.last_ir_ms.get();
+            eprintln!(
+                "[osr] llvm install {total_ms:.2} ms: ir {lowered_ms:.2}, opt {opt_ms:.2}, \
+                 verify {:.2}, engine {engine_ms:.2}, codegen {:.2}",
+                ir_ms - lowered_ms - opt_ms,
+                total_ms - ir_ms - engine_ms
+            );
         }
 
         self.engines.push(engine);
@@ -726,6 +729,18 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 || std::arch::is_x86_feature_detected!("avx512vnni"),
         );
         let lowering = web_time::Instant::now();
+        if self.osr_helpers_only {
+            // Internal calls, including recursion into the original function,
+            // use the installed tier's cells. Only externs need declarations.
+            backend.set_only_compile_reachable(Some(
+                hir_module
+                    .functions
+                    .iter()
+                    .filter(|(_, f)| f.is_external)
+                    .map(|(id, _)| *id)
+                    .collect(),
+            ));
+        }
         backend.lower_module(hir_module)?;
 
         // Patch internal function names to a linker-safe mangling.
@@ -908,6 +923,9 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     /// can feed them straight to dlsym.
     pub fn get_function_symbols(&self, hir_module: &HirModule) -> BTreeMap<HirId, String> {
         let mut map = BTreeMap::new();
+        if self.osr_helpers_only {
+            return map;
+        }
         for (id, function) in &hir_module.functions {
             if function.is_external {
                 continue;
@@ -1105,6 +1123,35 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         self.body_source = Some(bodies);
     }
 
+    /// Separate helpers need stable cross-tier call cells. An outlined region
+    /// already shares its entry body with its reentry helper.
+    pub(crate) fn can_compile_helpers_only(&self, function: &HirFunction) -> bool {
+        self.use_mcjit
+            && self.cross_tier_key.is_some()
+            && !function.attributes.osr_region
+            && !self.address_taken.contains(&function.id)
+    }
+
+    /// Compile selected resume points without replacing or duplicating the entry.
+    pub(crate) fn compile_resume_points(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+    ) -> CompilerResult<()> {
+        self.osr_helpers_only = self.can_compile_helpers_only(function);
+        let entries = self
+            .osr_helpers_only
+            .then(|| std::mem::take(&mut self.function_pointers));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.compile_function(id, function)
+        }));
+        self.osr_helpers_only = false;
+        if let Some(entries) = entries {
+            self.function_pointers = entries;
+        }
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
     /// Compile a single function, together with everything it calls.
     ///
     /// The callees come from the module context, so they are recompiled at
@@ -1140,10 +1187,14 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 self.pending_entry_abi = Some((id, abi));
                 let key = self.cross_tier_key.unwrap_or_default();
                 for callee in direct_callees(function) {
-                    if callee == id {
+                    if callee == id && !self.osr_helpers_only {
                         continue;
                     }
-                    let Some(f) = ctx.functions.get(&callee) else {
+                    let Some(f) = (if callee == id {
+                        Some(function)
+                    } else {
+                        ctx.functions.get(&callee)
+                    }) else {
                         continue;
                     };
                     if f.is_external {

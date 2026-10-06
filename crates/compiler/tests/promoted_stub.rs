@@ -17,12 +17,17 @@ use zyntax_typed_ast::InternedString;
 fn a_saved_stub_uses_the_promoted_entry() {
     let mut module = HirModule::new(InternedString::new_global("promoted_stub"));
     let mut ids = Vec::new();
-    for name in ["explicit_promotion", "requested_promotion"] {
-        let (mut function, _) = common::counted_loop();
+    for name in [
+        "explicit_promotion",
+        "requested_promotion",
+        "loop_promotion",
+    ] {
+        let (mut function, header) = common::counted_loop();
         function.name = InternedString::new_global(name);
         function.attributes.optimized = true;
         function.attributes.deferred = true;
-        ids.push(function.id);
+        let site = osr::osr_layout(&function, header).unwrap().site_key();
+        ids.push((function.id, site));
         module.functions.insert(function.id, function);
     }
     let mut backend = TieredBackend::new(TieredConfig {
@@ -35,14 +40,14 @@ fn a_saved_stub_uses_the_promoted_entry() {
         .compile_module_lazily(
             module,
             None,
-            ids.iter().copied().collect::<HashSet<_>>(),
-            ids.iter().copied().collect::<HashSet<_>>(),
+            ids.iter().map(|(id, _)| *id).collect::<HashSet<_>>(),
+            ids.iter().map(|(id, _)| *id).collect::<HashSet<_>>(),
             false,
         )
         .expect("lazy module");
 
     let (_, _, bead_of) = backend.interpreter_bridge();
-    for (index, id) in ids.into_iter().enumerate() {
+    for (index, (id, site)) in ids.into_iter().enumerate() {
         let bead = bead_of(id).expect("function bead");
         let stub = backend.get_function_pointer(id).expect("uncompiled stub");
         // SAFETY: the saved entry has the fixture's fn(i32) -> i32 ABI.
@@ -54,6 +59,8 @@ fn a_saved_stub_uses_the_promoted_entry() {
             backend
                 .optimize_function(id, OptimizationTier::Optimized)
                 .expect("queue LLVM promotion");
+        } else if index == 2 {
+            osr::osr_request_promotion(bead, site);
         } else {
             assert!(osr::run_promotion(
                 bead,
@@ -71,6 +78,11 @@ fn a_saved_stub_uses_the_promoted_entry() {
             std::thread::sleep(Duration::from_millis(5));
         };
 
+        if index == 2 {
+            let helper = osr::helper_for(bead, site);
+            assert!(!helper.is_null());
+            assert!(osr::is_llvm_helper(helper as usize));
+        }
         // SAFETY: this stable counter is written by baseline code on this thread.
         let counter = unsafe { &*(osr::entry_counter_addr(bead) as *const AtomicU64) };
         let before = counter.load(Ordering::Relaxed);
