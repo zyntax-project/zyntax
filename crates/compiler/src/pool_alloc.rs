@@ -8,11 +8,10 @@
 //!
 //! A general allocator has to serve any size and return memory to the
 //! OS. A language runtime allocating one small object at a time does
-//! not, so this keeps a free list per size class, carves slabs onto
-//! the lists a slab at a time, and never gives a slab back to the
-//! system. Freeing is pushing onto a list and allocating is popping
-//! off one, which is what makes it cheaper than the thing it replaces
-//! rather than merely different. The collector in [`crate::collector`]
+//! not, so this reserves a slab at a time per size class and never
+//! gives a slab back to the system. Fresh blocks are handed out by a
+//! cursor; released blocks are pushed onto a free list and popped off
+//! on reuse. The collector in [`crate::collector`]
 //! sweeps what it finds unreached onto a second list per class, and a
 //! slab it finds wholly unreached is set aside to be carved again under
 //! whatever class next needs one.
@@ -189,43 +188,58 @@ pub(crate) fn class_slot_bytes(class: usize) -> usize {
     slot_bytes(class)
 }
 
-/// Every block on this thread's free and swept lists, by address.
+/// Every unused block reserved by this thread, by address.
 pub(crate) fn for_each_free_block(mut f: impl FnMut(usize)) {
-    let mut walk = |lists: &[Cell<*mut u8>; CLASSES]| {
-        for (class, list) in lists.iter().enumerate() {
-            let mut prev: *mut u8 = std::ptr::null_mut();
-            let mut p = list.get();
-            while !p.is_null() {
-                // A link that leaves the slabs was written through a
-                // block after its release. The walk stops there: the
-                // sweep rebuilds every list, so what follows the bad
-                // link is recovered as unreached rather than followed.
-                if !in_a_slab(p) || (p as usize) & (STEP - 1) != 0 {
-                    eprintln!(
-                        "[pool] free list of class {class} holds {p:p} after {prev:p}, \
-                         which is not a block of this pool; a released block was written to"
-                    );
-                    break;
-                }
-                f(p as usize);
-                prev = p;
-                // SAFETY: a block on a free list holds the next block
-                // in its first word.
-                p = unsafe { *(p as *mut *mut u8) };
-            }
-        }
-    };
     POOL.with(|p| {
+        let mut walk = |lists: &[Cell<*mut u8>; CLASSES]| {
+            for (class, list) in lists.iter().enumerate() {
+                let mut prev: *mut u8 = std::ptr::null_mut();
+                let mut p = list.get();
+                while !p.is_null() {
+                    // A link that leaves the slabs was written through a
+                    // block after its release. The walk stops there: the
+                    // sweep rebuilds every list, so what follows the bad
+                    // link is recovered as unreached rather than followed.
+                    if !in_a_slab(p) || (p as usize) & (STEP - 1) != 0 {
+                        eprintln!(
+                            "[pool] free list of class {class} holds {p:p} after {prev:p}, \
+                         which is not a block of this pool; a released block was written to"
+                        );
+                        break;
+                    }
+                    f(p as usize);
+                    prev = p;
+                    // SAFETY: a block on a free list holds the next block
+                    // in its first word.
+                    p = unsafe { *(p as *mut *mut u8) };
+                }
+            }
+        };
         walk(&p.free);
         walk(&p.swept);
+        for class in 0..CLASSES {
+            let mut next = p.fresh[class].get();
+            let end = p.fresh_end[class].get();
+            while next != end {
+                f(next as usize);
+                // SAFETY: the cursor spans reserved blocks within one slab.
+                next = unsafe { next.add(slot_bytes(class)) };
+            }
+        }
     });
 }
 
-/// Empty this thread's free and swept lists; the collector fills the
+/// Empty this thread's lists and cursors; the collector fills the
 /// swept lists again from what its sweep finds unreached.
 pub(crate) fn clear_free_lists() {
     POOL.with(|p| {
-        for list in p.free.iter().chain(p.swept.iter()) {
+        for list in p
+            .free
+            .iter()
+            .chain(p.swept.iter())
+            .chain(p.fresh.iter())
+            .chain(p.fresh_end.iter())
+        {
             list.set(std::ptr::null_mut());
         }
     });
@@ -266,6 +280,10 @@ struct Lists {
     /// next pointer in its payload, which is why a class must be at
     /// least a pointer wide.
     free: [Cell<*mut u8>; CLASSES],
+    /// Unused reserved blocks in [fresh, fresh_end), with no payload links.
+    /// Cleared before a sweep can retire or reassign their slab.
+    fresh: [Cell<*mut u8>; CLASSES],
+    fresh_end: [Cell<*mut u8>; CLASSES],
     /// Blocks the collector's sweep found unreached, by class. Served
     /// after the free list and counted like fresh storage, since a
     /// program that lives on these is one whose garbage the collector
@@ -287,6 +305,8 @@ thread_local! {
     static POOL: Lists = const {
         Lists {
             free: NO_LISTS,
+            fresh: NO_LISTS,
+            fresh_end: NO_LISTS,
             swept: NO_LISTS,
             slab: NO_LISTS,
             mutator: Cell::new(usize::MAX),
@@ -305,6 +325,18 @@ unsafe fn pop(list: &Cell<*mut u8>) -> *mut u8 {
         list.set(*(head as *mut *mut u8));
     }
     head
+}
+
+/// Take the next reserved block without reading its uninitialized payload.
+#[inline]
+fn take_fresh(lists: &Lists, class: usize) -> *mut u8 {
+    let next = lists.fresh[class].get();
+    if next == lists.fresh_end[class].get() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: refill reserves whole blocks within one slab, including the end.
+    lists.fresh[class].set(unsafe { next.add(slot_bytes(class)) });
+    next
 }
 
 /// The collector's mark for the calling thread; see [`Lists::mutator`].
@@ -401,19 +433,27 @@ pub unsafe extern "C" fn zyntax_alloc(size: usize) -> *mut u8 {
     #[cfg(debug_assertions)]
     SERVED.fetch_add(1, Ordering::Relaxed);
 
-    // A block already on this pool's list, then one the collector
-    // reclaimed, which counts as fresh.
+    // Explicit releases and reserved storage precede swept blocks,
+    // which count toward the next collection as they are consumed.
     let reused = POOL.with(|p| {
         let head = pop(&p.free[class]);
+        if !head.is_null() {
+            return head;
+        }
+        let fresh = take_fresh(p, class);
+        if !fresh.is_null() {
+            return fresh;
+        }
         #[cfg(not(target_arch = "wasm32"))]
-        if head.is_null() {
+        {
             let swept = pop(&p.swept[class]);
             if !swept.is_null() {
                 crate::collector::note_spent(slot_bytes(class));
             }
             return swept;
         }
-        head
+        #[cfg(target_arch = "wasm32")]
+        std::ptr::null_mut()
     });
     if !reused.is_null() {
         clear_tail(reused, class);
@@ -438,9 +478,7 @@ unsafe fn clear_tail(block: *mut u8, class: usize) {
 
 /// Nothing to reuse means the heap grows. The collector gets its say
 /// first: what it finds unreached serves the request after all.
-/// Otherwise carve: the rest of a slab goes on the free list in one
-/// go, so the bookkeeping is paid once per slab and the blocks come
-/// off the list like any other.
+/// Otherwise reserve the rest of a slab, accounting for it once.
 #[inline(never)]
 unsafe fn alloc_slow(class: usize, size: usize) -> *mut u8 {
     #[cfg(not(target_arch = "wasm32"))]
@@ -456,17 +494,17 @@ unsafe fn alloc_slow(class: usize, size: usize) -> *mut u8 {
         // Out of memory for a slab; the request itself may still fit.
         return large_alloc(size);
     }
-    POOL.with(|p| pop(&p.free[class]))
+    POOL.with(|p| take_fresh(p, class))
 }
 
-/// Put the rest of `class`'s slab on the free list, taking another
+/// Reserve the rest of `class`'s slab for its cursor, taking another
 /// slab if the current one cannot fit a block or has been set aside.
 /// A slab is aligned to its own size so that masking any block in it
 /// lands on its header, which is where the carved extent lives.
 ///
 /// # Safety
-/// Called with the pool's lists consistent; the list gains blocks
-/// nothing else names.
+/// Called with the pool's lists consistent and its cursor exhausted.
+/// The reserved blocks must not be named by another list or cursor.
 unsafe fn refill(class: usize) -> bool {
     let want = slot_bytes(class);
     let (slab, used) = POOL.with(|p| {
@@ -502,25 +540,13 @@ unsafe fn refill(class: usize) -> bool {
     if slab.is_null() {
         return false;
     }
-    // Every block that fits, threaded lowest first so the lowest
-    // address is handed out first, and the header marked as carved to
-    // the end.
+    // Reserve the whole range so another cursor cannot claim it, and
+    // leave payloads untouched until an allocation consumes them.
     let count = (SLAB - used) / want;
     let first = slab.add(used);
-    let last = first.add((count - 1) * want);
-    let mut p = last;
     POOL.with(|lists| {
-        let lists = &lists.free;
-        let mut next = lists[class].get();
-        loop {
-            *(p as *mut *mut u8) = next;
-            next = p;
-            if p == first {
-                break;
-            }
-            p = p.sub(want);
-        }
-        lists[class].set(first);
+        lists.fresh[class].set(first);
+        lists.fresh_end[class].set(first.add(count * want));
     });
     (*(slab as *mut Header)).class = class | ((used + count * want) << USED_SHIFT);
     #[cfg(not(target_arch = "wasm32"))]
@@ -919,6 +945,29 @@ mod tests {
             assert_eq!(a, b, "the pool should hand back the block it just took");
             zyntax_free(b);
         }
+    }
+
+    #[test]
+    fn a_transferred_block_is_reused_before_fresh_reservations() {
+        let transferred = unsafe { zyntax_alloc(24) } as usize;
+        std::thread::spawn(move || unsafe {
+            let held = zyntax_alloc(24);
+            std::ptr::write_bytes(held, 0x79, 24);
+            let transferred = transferred as *mut u8;
+            zyntax_free(transferred);
+            let reused = zyntax_alloc(24);
+            assert_eq!(reused, transferred);
+            let fresh = zyntax_alloc(24);
+            assert_ne!(fresh, reused);
+            assert_ne!(fresh, held);
+            std::ptr::write_bytes(fresh, 0x21, 24);
+            assert_eq!(*held, 0x79);
+            zyntax_free(held);
+            zyntax_free(reused);
+            zyntax_free(fresh);
+        })
+        .join()
+        .unwrap();
     }
 
     /// Payloads stay sixteen-byte aligned, which vector loads assume.
