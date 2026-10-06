@@ -819,6 +819,46 @@ enum Compare {
     Le,
 }
 
+/// An exactly representable integer literal needs no float-to-int guard.
+fn mixed_numeric_compare(
+    int: Node,
+    float: Node,
+    how: Compare,
+    int_first: bool,
+    span: Span,
+) -> Node {
+    let bool_t = prim(PrimitiveType::Bool);
+    let op = match how {
+        Compare::Eq => BinaryOp::Eq,
+        Compare::Lt => BinaryOp::Lt,
+        Compare::Le => BinaryOp::Le,
+    };
+    if let TypedExpression::Literal(TypedLiteral::Integer(n)) = &int.node
+        && (-(1i128 << 53)..=(1i128 << 53)).contains(n)
+    {
+        let constant = float_lit(*n as f64, span);
+        let (left, right) = if int_first {
+            (constant, float)
+        } else {
+            (float, constant)
+        };
+        return binary(op, left, right, bool_t, span);
+    }
+    let helper = match (how, int_first) {
+        (Compare::Eq, _) => "zl_eq_if",
+        (Compare::Lt, true) => "zl_lt_if",
+        (Compare::Lt, false) => "zl_lt_fi",
+        (Compare::Le, true) => "zl_le_if",
+        (Compare::Le, false) => "zl_le_fi",
+    };
+    let args = if int_first || how == Compare::Eq {
+        vec![int, float]
+    } else {
+        vec![float, int]
+    };
+    call(helper, args, bool_t, span)
+}
+
 fn unsupported<T>(what: impl Into<String>, span: Span) -> Result<T> {
     Err(Error::unsupported(what, span))
 }
@@ -5402,35 +5442,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         span: Span,
     ) -> Node {
         let bool_t = prim(PrimitiveType::Bool);
-        let (op, int_float, float_int) = match how {
-            Compare::Eq => (BinaryOp::Eq, "zl_eq_if", "zl_eq_if"),
-            Compare::Lt => (BinaryOp::Lt, "zl_lt_if", "zl_lt_fi"),
-            Compare::Le => (BinaryOp::Le, "zl_le_if", "zl_le_fi"),
+        let op = match how {
+            Compare::Eq => BinaryOp::Eq,
+            Compare::Lt => BinaryOp::Lt,
+            Compare::Le => BinaryOp::Le,
         };
         let ints = binary(op, x.int.clone(), y.int.clone(), bool_t.clone(), span);
         let floats = binary(op, x.float.clone(), y.float.clone(), bool_t.clone(), span);
-        // `zl_eq_if` takes the integer first whichever side it is on.
-        let x_int = call(
-            int_float,
-            vec![x.int.clone(), y.float.clone()],
-            bool_t.clone(),
-            span,
-        );
-        let y_int = if how == Compare::Eq {
-            call(
-                float_int,
-                vec![y.int.clone(), x.float.clone()],
-                bool_t.clone(),
-                span,
-            )
-        } else {
-            call(
-                float_int,
-                vec![x.float.clone(), y.int.clone()],
-                bool_t.clone(),
-                span,
-            )
-        };
+        let x_int = mixed_numeric_compare(x.int.clone(), y.float.clone(), how, true, span);
+        let y_int = mixed_numeric_compare(y.int.clone(), x.float.clone(), how, false, span);
         // Two numbers of one kind compare by a select; an integer
         // against a float takes the exact helper.
         let same = if_value(x.is_int(span), ints, floats, bool_t.clone(), span);
@@ -5494,8 +5514,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) | (Ty::Bool, Ty::Bool) => {
                 binary(BinaryOp::Eq, a.node, b.node, bool_t, span)
             }
-            (Ty::Int, Ty::Float) => call("zl_eq_if", vec![a.node, b.node], bool_t, span),
-            (Ty::Float, Ty::Int) => call("zl_eq_if", vec![b.node, a.node], bool_t, span),
+            (Ty::Int, Ty::Float) => mixed_numeric_compare(a.node, b.node, Compare::Eq, true, span),
+            (Ty::Float, Ty::Int) => mixed_numeric_compare(b.node, a.node, Compare::Eq, false, span),
             (x, y) if x.is_number() && y.is_number() => {
                 self.number_compare(a, b, Compare::Eq, span)
             }
@@ -5569,14 +5589,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             if a.ty == b.ty {
                 return binary(op, a.node, b.node, bool_t, span);
             }
-            // An integer against a float compares exactly.
-            let f = match (a.ty, or_equal) {
-                (Ty::Int, false) => "zl_lt_if",
-                (Ty::Int, true) => "zl_le_if",
-                (_, false) => "zl_lt_fi",
-                _ => "zl_le_fi",
+            let how = if or_equal { Compare::Le } else { Compare::Lt };
+            return if a.ty == Ty::Int {
+                mixed_numeric_compare(a.node, b.node, how, true, span)
+            } else {
+                mixed_numeric_compare(b.node, a.node, how, false, span)
             };
-            return call(f, vec![a.node, b.node], bool_t, span);
         }
         if a.ty == Ty::Str && b.ty == Ty::Str {
             let cmp = call(
