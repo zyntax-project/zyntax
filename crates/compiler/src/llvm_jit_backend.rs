@@ -435,12 +435,6 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             self.compile_module_to_ir(hir_module, self.compile_tier >= 1)?;
         let ir_ms = started.elapsed().as_secs_f64() * 1e3;
 
-        // The engine builds its own target machine and defaults to a
-        // generic CPU, where the object path tunes one from the host. Carry
-        // the host's CPU and features across as function attributes, which
-        // is what codegen consults per function.
-        Self::stamp_host_target_attributes(self.context, &backend);
-
         let engine = backend
             .module()
             .create_jit_execution_engine(self.opt_level)
@@ -760,6 +754,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         backend
             .module()
             .set_data_layout(&target_machine.get_target_data().get_data_layout());
+        // Both optimization cost models and MCJIT codegen use the host CPU.
+        Self::stamp_host_target_attributes(self.context, &backend);
 
         if std::env::var("ZYNTAX_DUMP_LLVM_IR").is_ok() {
             let ir = backend.module().print_to_string().to_string();
@@ -804,6 +800,34 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 .map_err(|e| {
                     CompilerError::Backend(format!("LLVM optimisation passes failed: {}", e))
                 })?;
+            // x86 codegen's cmov converter only handles integer selects.
+            // Price floating-point recurrences before instruction selection;
+            // modules without them need no additional analyses.
+            if cfg!(target_arch = "x86_64")
+                && matches!(
+                    self.opt_level,
+                    OptimizationLevel::Default | OptimizationLevel::Aggressive
+                )
+                && backend.module().get_functions().any(|f| {
+                    f.get_basic_blocks().iter().any(|b| {
+                        b.get_instructions().any(|i| {
+                            i.get_opcode() == inkwell::values::InstructionOpcode::Select
+                                && i.get_type().is_float_type()
+                        })
+                    })
+                })
+            {
+                backend
+                    .module()
+                    .run_passes(
+                        "require<profile-summary>,function(select-optimize)",
+                        target_machine,
+                        Self::create_pass_options(),
+                    )
+                    .map_err(|e| {
+                        CompilerError::Backend(format!("LLVM select optimisation failed: {e}"))
+                    })?;
+            }
             self.last_ir_ms.set((
                 self.last_ir_ms.get().0,
                 optimising.elapsed().as_secs_f64() * 1e3,
