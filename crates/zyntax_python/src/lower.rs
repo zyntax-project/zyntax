@@ -9249,6 +9249,34 @@ impl<'m> Lowerer<'m> {
             };
             return Ok(binary(bin, l, r, Ty::Bool, span));
         }
+        if matches!(
+            (left.ty, right.ty),
+            (Ty::Int, Ty::Object) | (Ty::Object, Ty::Int)
+        ) {
+            // Retain source evaluation order when a greater-than comparison
+            // reverses the operands for the runtime's less-than helper.
+            let mut pre = Vec::new();
+            let l = self.hold(left, &mut pre, span);
+            let r = self.hold(right, &mut pre, span);
+            let (op_name, reverse, negated) = match op {
+                py::CmpOp::Eq => ("eq", false, false),
+                py::CmpOp::NotEq => ("eq", false, true),
+                py::CmpOp::Lt => ("lt", false, false),
+                py::CmpOp::Gt => ("lt", true, false),
+                py::CmpOp::LtE => ("le", false, false),
+                py::CmpOp::GtE => ("le", true, false),
+                _ => unreachable!(),
+            };
+            let (l, r) = if reverse { (r, l) } else { (l, r) };
+            let name = if l.ty == Ty::Int {
+                format!("zb_i64_{op_name}_any")
+            } else {
+                format!("zb_any_{op_name}_i64")
+            };
+            let n = call(&name, vec![l.node, r.node], Ty::Bool, span);
+            self.hoisted.extend(pre);
+            return Ok(if negated { negate(n) } else { n });
+        }
         // Mixed with None or dynamic: `==` is answered by the runtime
         // and ordering too.
         let l = self.coerce(left, Ty::Object);

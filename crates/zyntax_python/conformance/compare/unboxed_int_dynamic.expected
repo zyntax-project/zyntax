@@ -1,0 +1,82 @@
+False True False True
+unordered
+False True False True
+False False True True
+True True False False
+False True False True
+False False True True
+True True False False
+False True False True
+False False True True
+True True False False
+True False True False
+False True False True
+False True False True
+False True False True
+False False True True
+True True False False
+False True False True
+True True False False
+False False True True
+False True False True
+False False False False
+False False False False
+False True False True
+True True False False
+False False True True
+False True False True
+False False True True
+True True False False
+False True False True
+True True False False
+False False True True
+False True False True
+unordered
+False True False True
+False False True True
+True True False False
+False True False True
+False False True True
+True True False False
+False True False True
+True True False False
+False False True True
+False True False True
+True True False False
+False False True True
+False True False True
+False False False False
+False False False False
+False True False True
+False False False False
+False False False False
+gt
+ge
+lt
+le
+False True True False
+lt
+le
+gt
+ge
+True False False True
+number
+dynamic
+True
+dynamic
+number
+False
+number
+dynamic
+False
+dynamic
+number
+True
+number
+dynamic
+lt
+True
+dynamic
+number
+ge
+True

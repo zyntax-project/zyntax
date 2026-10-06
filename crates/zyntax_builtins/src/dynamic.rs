@@ -1333,6 +1333,68 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ret(not(call("zb_any_lt", vec![b.e(), a.e()], boolean()))),
         ],
     ));
+    // Keep a known integer unboxed while comparing it with a dynamic
+    // number. Other kinds retain the language's rich-comparison path.
+    for op in ["eq", "lt", "le"] {
+        for int_left in [true, false] {
+            let n = local("n", i64());
+            let value = local("value", any());
+            let cat = local("cat", i64());
+            let name = if int_left {
+                format!("zb_i64_{op}_any")
+            } else {
+                format!("zb_any_{op}_i64")
+            };
+            let pair = |other: Expr| {
+                if int_left {
+                    (n.e(), other)
+                } else {
+                    (other, n.e())
+                }
+            };
+            let (l, r) = pair(number_i64(value.e(), cat.e()));
+            let integral = match op {
+                "eq" => eq(l, r),
+                "lt" => lt(l, r),
+                _ => le(l, r),
+            };
+            let float_cmp = if op == "eq" {
+                call("zb_eq_if", vec![n.e(), get_f64(value.e())], boolean())
+            } else {
+                let (l, r) = pair(get_f64(value.e()));
+                call(
+                    &format!("zb_{op}_{}", if int_left { "if" } else { "fi" }),
+                    vec![l, r],
+                    boolean(),
+                )
+            };
+            let boxed = box_i64(n.e());
+            let args = if int_left {
+                vec![boxed, value.e()]
+            } else {
+                vec![value.e(), boxed]
+            };
+            let params = if int_left { [&n, &value] } else { [&value, &n] };
+            d.push(define(
+                &name,
+                &params,
+                boolean(),
+                vec![
+                    cat.decl(category(value.e())),
+                    when(
+                        if policy.bool_is_number {
+                            is_integral(&cat)
+                        } else {
+                            is_int(&cat)
+                        },
+                        vec![ret(integral)],
+                    ),
+                    when(is(&cat, FLOAT), vec![ret(float_cmp)]),
+                    ret(call(&format!("zb_any_{op}"), args, boolean())),
+                ],
+            ));
+        }
+    }
     // Two boxed heap objects are the same when they hold the same
     // address; a box's own address means nothing, boxes are made freely.
     d.push(define(
