@@ -267,6 +267,81 @@ fn retains_null_tests_on_zero_and_nonzero_iteration_paths() {
         check(fixture(n, true).f, i64::from(n == 0), 1);
     }
 }
+fn cast_incoming(a: &mut Fixture, integer_ty: Option<HirType>) {
+    let incoming = a.f.blocks[&a.head].phis[0].incoming.clone();
+    for (slot, (value, block)) in incoming.into_iter().enumerate() {
+        let ptr_ty = a.f.values[&value].ty.clone();
+        let middle_ty = integer_ty
+            .clone()
+            .unwrap_or_else(|| HirType::Ptr(Box::new(HirType::U8)));
+        let encoded = instruction(&mut a.f, middle_ty.clone());
+        let restored = instruction(&mut a.f, ptr_ty.clone());
+        a.f.blocks.get_mut(&block).unwrap().instructions.extend([
+            HirInstruction::Cast {
+                result: encoded,
+                operand: value,
+                ty: middle_ty,
+                op: if integer_ty.is_some() {
+                    CastOp::PtrToInt
+                } else {
+                    CastOp::Bitcast
+                },
+            },
+            HirInstruction::Cast {
+                result: restored,
+                operand: encoded,
+                ty: ptr_ty,
+                op: if integer_ty.is_some() {
+                    CastOp::IntToPtr
+                } else {
+                    CastOp::Bitcast
+                },
+            },
+        ]);
+        a.f.blocks.get_mut(&a.head).unwrap().phis[0].incoming[slot].0 = restored;
+    }
+}
+
+#[test]
+fn follows_lossless_pointer_casts_into_phis() {
+    for integer_ty in [None, Some(HirType::I64), Some(HirType::USize)] {
+        for n in [0, 1, 20] {
+            for null in [false, true] {
+                let mut a = fixture(n, null);
+                cast_incoming(&mut a, integer_ty.clone());
+                check(
+                    a.f,
+                    if null { i64::from(n == 0) } else { 7 + n * 3 },
+                    if null { 1 } else { 2 },
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn rejects_truncated_pointer_encodings_and_escaping_casts() {
+    let mut a = fixture(3, false);
+    cast_incoming(&mut a, Some(HirType::I16));
+    assert_eq!(heap_scalarize::run_function(&mut a.f), 0);
+    let mut a = fixture(3, false);
+    cast_incoming(&mut a, Some(HirType::I64));
+    let escaped = a.f.blocks[&a.head].phis[0].incoming[1].0;
+    a.f.blocks
+        .get_mut(&a.body)
+        .unwrap()
+        .instructions
+        .push(HirInstruction::Call {
+            result: None,
+            callee: HirCallable::Symbol("observe".into()),
+            args: vec![escaped],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+    assert_eq!(heap_scalarize::run_function(&mut a.f), 0);
+}
+
 #[test]
 fn leaves_escaping_and_mutable_objects_intact() {
     let mut a = fixture(3, false);

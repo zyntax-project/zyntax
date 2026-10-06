@@ -33,6 +33,7 @@ struct Address {
 
 struct Plan {
     roots: HashMap<HirId, Root>,
+    origins: HashMap<HirId, HirId>,
     fields: BTreeMap<u64, HirType>,
     final_values: HashMap<(HirId, u64), HirId>,
     loads: Vec<(HirId, HirId, u64)>,
@@ -104,6 +105,55 @@ struct WebIndex {
 
 impl WebIndex {
     fn new(f: &HirFunction) -> Self {
+        let casts: HashMap<_, _> = f
+            .blocks
+            .values()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|i| match i {
+                HirInstruction::Cast {
+                    result,
+                    operand,
+                    op,
+                    ty,
+                } => Some((*result, (*operand, *op, ty))),
+                _ => None,
+            })
+            .collect();
+        let aliases: HashMap<_, _> = casts
+            .iter()
+            .filter_map(|(result, (operand, op, ty))| {
+                if !matches!(ty, HirType::Ptr(_)) {
+                    return None;
+                }
+                let source = match op {
+                    CastOp::Bitcast if matches!(f.values.get(operand)?.ty, HirType::Ptr(_)) => {
+                        *operand
+                    }
+                    CastOp::IntToPtr => {
+                        let (source, CastOp::PtrToInt, int_ty) = casts.get(operand)? else {
+                            return None;
+                        };
+                        if bytes(int_ty)? < crate::target_pointer_size() as u64 {
+                            return None;
+                        }
+                        *source
+                    }
+                    _ => return None,
+                };
+                Some((*result, source))
+            })
+            .collect();
+        // Only identity pointer conversions connect allocation/phi roots.
+        // Field offsets and truncated integer encodings remain opaque.
+        let origin = |mut value| {
+            for _ in 0..=aliases.len() {
+                match aliases.get(&value) {
+                    Some(source) => value = *source,
+                    None => return value,
+                }
+            }
+            value
+        };
         let mut index = Self {
             phis: HashMap::new(),
             users: HashMap::new(),
@@ -111,11 +161,12 @@ impl WebIndex {
         };
         for (bid, block) in &f.blocks {
             for phi in &block.phis {
-                index
-                    .phis
-                    .insert(phi.result, phi.incoming.iter().map(|(v, _)| *v).collect());
+                index.phis.insert(
+                    phi.result,
+                    phi.incoming.iter().map(|(v, _)| origin(*v)).collect(),
+                );
                 for (v, _) in &phi.incoming {
-                    index.users.entry(*v).or_default().push(phi.result);
+                    index.users.entry(origin(*v)).or_default().push(phi.result);
                 }
             }
             for (i, inst) in block.instructions.iter().enumerate() {
@@ -286,8 +337,20 @@ fn plan(f: &HirFunction, roots: HashMap<HirId, Root>) -> Option<Plan> {
             break;
         }
     }
+    let origins = addresses
+        .iter()
+        .filter_map(|(id, a)| (!a.encoded && a.offset == 0).then_some((*id, a.root)))
+        .collect::<HashMap<_, _>>();
+    for phi in f.blocks.values().flat_map(|b| &b.phis) {
+        if roots.contains_key(&phi.result)
+            && phi.incoming.iter().any(|(v, _)| !origins.contains_key(v))
+        {
+            return None;
+        }
+    }
     let mut p = Plan {
         roots,
+        origins,
         fields: BTreeMap::new(),
         final_values: HashMap::new(),
         loads: vec![],
@@ -517,14 +580,18 @@ fn apply(f: &mut HirFunction, p: Plan) {
                     incoming: phi
                         .incoming
                         .iter()
-                        .map(|(v, b)| (values[&(*v, *offset)], *b))
+                        .map(|(v, b)| (values[&(p.origins[v], *offset)], *b))
                         .collect(),
                 });
             }
             phis.push(HirPhi {
                 result: present[&phi.result],
                 ty: HirType::I64,
-                incoming: phi.incoming.iter().map(|(v, b)| (present[v], *b)).collect(),
+                incoming: phi
+                    .incoming
+                    .iter()
+                    .map(|(v, b)| (present[&p.origins[v]], *b))
+                    .collect(),
             });
         }
         block.phis = phis;
