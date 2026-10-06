@@ -70,6 +70,7 @@ pub mod late_symbols; // Symbols an embedder supplies after the code generators 
 pub mod licm;
 pub mod load_cse;
 pub mod loop_facts; // Static trip counts of counted loops
+pub mod loop_specialize; // Guarded copies of loops with closed scalar states
 pub mod loop_vectorize;
 pub mod lowering;
 pub mod memory_management;
@@ -2542,6 +2543,17 @@ fn run_interp_safe_opts_with(
     stats.cfg_simplify.unreachable_removed += cfg_simplify::prune_unreachable_module(module);
     timed("prune_unreachable", &mut at);
     check_hir_uses(module, "prune_unreachable");
+
+    // Closed scalar states are priced after unreachable dispatch arms
+    // have gone. These copies contain no allocations or releases.
+    let specialized = loop_specialize::run_module(module);
+    timed("loop_specialize", &mut at);
+    if specialized > 0 {
+        const_fold::fold_module(module);
+        phi_prune::run_module(module);
+        cfg_simplify::run_module(module);
+        check_hir_uses(module, "loop_specialize");
+    }
 
     stats
 }
