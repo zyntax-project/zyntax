@@ -589,11 +589,6 @@ impl<'ctx> LLVMBackend<'ctx> {
         add("mustprogress");
 
         if !is_dlsym_exported {
-            // nofree: we never emit free/realloc from internal HIR
-            // lowering — those are runtime calls, and the runtime
-            // funcs themselves stay on C cc with no attributes.
-            add("nofree");
-
             // inlinehint: small + non-recursive only. The inliner
             // has its own cycle safeguards but we don't want to pile
             // on with recursive bodies, and large bodies just bloat
@@ -5509,6 +5504,29 @@ impl<'ctx> LLVMBackend<'ctx> {
                     let fn_type = ptr_type.fn_type(&[i64_type.into()], false);
                     self.module.add_function("zyntax_alloc", fn_type, None)
                 });
+                // Allocation may collect or call a host heap, but its result
+                // is fresh storage. LLVM can scalarize an unobserved object.
+                {
+                    use inkwell::attributes::{Attribute, AttributeLoc};
+                    for (name, value, loc) in [
+                        ("noalias", 0, AttributeLoc::Return),
+                        ("allockind", 1 | 8, AttributeLoc::Function),
+                        // allocsize packs the first index above an absent
+                        // second index (UINT_MAX).
+                        ("allocsize", u32::MAX as u64, AttributeLoc::Function),
+                    ] {
+                        let kind = Attribute::get_named_enum_kind_id(name);
+                        malloc_fn.add_attribute(
+                            loc,
+                            self.context.create_enum_attribute(kind, value),
+                        );
+                    }
+                    malloc_fn.add_attribute(
+                        AttributeLoc::Function,
+                        self.context
+                            .create_string_attribute("alloc-family", "zyntax_alloc"),
+                    );
+                }
 
                 let call_site = self.builder.build_call(
                     malloc_fn,
