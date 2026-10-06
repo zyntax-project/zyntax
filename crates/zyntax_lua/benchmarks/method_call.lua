@@ -69,4 +69,6 @@ for _ = 1, n do
 end
 
 local elapsed = os.clock() - start
+local result = (toggle:value() and 4 or 0) + (val and 2 or 0) + ntoggle.count
+print(string.format("result: %d", result))
 print(string.format("elapsed: %s", elapsed))

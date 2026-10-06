@@ -4,8 +4,10 @@ local function fib(n)
 end
 
 local start = os.clock()
+local result = 0
 for _ = 1, 5 do
-  fib(28)
+  result = result + fib(28)
 end
 local elapsed = os.clock() - start
+print(string.format("result: %d", result))
 print(string.format("elapsed: %s", elapsed))

@@ -24,6 +24,7 @@ last line of its stderr.
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -75,8 +76,43 @@ def run_once(cmd, path, env):
     m = re.search(r"^elapsed:\s*([0-9.eE+-]+)", proc.stdout, re.M)
     if not m:
         return None, None, wall, "no elapsed line"
-    r = re.search(r"^(?:result|energy|checksum):\s*(-?\d+)", proc.stdout, re.M)
-    return float(m.group(1)), (r.group(1) if r else None), wall, None
+    elapsed = float(m.group(1))
+    if not math.isfinite(elapsed) or elapsed < 0:
+        return None, None, wall, "invalid elapsed time"
+    # Keep every observable output, including all binary-tree checks.
+    result = [line.strip() for line in proc.stdout.splitlines()
+              if line.strip() and not line.startswith("elapsed:")]
+    if not result:
+        return None, None, wall, "no result output"
+    return elapsed, result, wall, None
+
+
+def record(r, elapsed, result, wall, error):
+    """Retain each answer; a later correct round cannot hide a bad one."""
+    if error:
+        r["error"] = error
+        return
+    r["elapsed"].append(elapsed)
+    r["wall"].append(wall)
+    r["results"].append(result)
+    if r["result"] is not None and r["result"] != result:
+        r["error"] = "result changed between rounds"
+    r["result"] = result
+
+
+def check_answers(rows):
+    """Every successful round must agree with PUC Lua's answer."""
+    reference = rows["lua"]
+    if reference["error"] or not reference["results"]:
+        for row in rows.values():
+            row["error"] = row["error"] or "no verified Lua reference"
+        return
+    expected = reference["results"][0]
+    for row in rows.values():
+        if not row["results"]:
+            row["error"] = row["error"] or "no result output"
+        elif any(answer != expected for answer in row["results"]):
+            row["error"] = row["error"] or "result differs from Lua"
 
 
 def main():
@@ -89,6 +125,8 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--cranelift", action="store_true", help="measure zylua without the LLVM tier")
     args = ap.parse_args()
+    if args.runs < 1:
+        ap.error("--runs must be positive")
 
     root = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
     interpreters = {
@@ -119,7 +157,8 @@ def main():
     benches = args.only.split(",") if args.only else BENCHES
 
     results = {
-        b: {i: {"elapsed": [], "wall": [], "result": None, "error": None} for i in commands}
+        b: {i: {"elapsed": [], "wall": [], "result": None, "results": [], "error": None}
+            for i in commands}
         for b in benches
     }
     for round_ in range(args.runs):
@@ -130,12 +169,7 @@ def main():
                 if r["error"]:
                     continue
                 elapsed, result, wall, err = run_once(cmd, path, env)
-                if err:
-                    r["error"] = err
-                    continue
-                r["elapsed"].append(elapsed)
-                r["wall"].append(wall)
-                r["result"] = result
+                record(r, elapsed, result, wall, err)
             print(f"round {round_ + 1}/{args.runs}: {bench}", file=sys.stderr)
 
     def stat(xs):
@@ -149,25 +183,26 @@ def main():
     )
     for bench in benches:
         base = stat(results[bench]["lua"]["elapsed"])
-        answers = {results[bench][n]["result"] for n in commands if results[bench][n]["result"]}
+        check_answers(results[bench])
         report[bench] = {}
         for name in commands:
             r = results[bench][name]
             e, w = stat(r["elapsed"]), stat(r["wall"])
-            report[bench][name] = {"elapsed": e, "wall": w, "result": r["result"], "error": r["error"]}
+            report[bench][name] = {"elapsed": e, "wall": w, "result": r["result"],
+                                   "results": r["results"], "error": r["error"]}
             if r["error"]:
                 print(f"{bench:<20} {name:<7} {r['error']}")
                 continue
             ratio = f"{base['median'] / e['median']:.2f}x" if base and e["median"] else "-"
-            flag = "  (result differs)" if len(answers) > 1 else ""
             print(
                 f"{bench:<20} {name:<7} {e['median'] * 1000:11.1f} "
-                f"{e['min'] * 1000:8.1f}..{e['max'] * 1000:<8.1f} {w['median'] * 1000:9.1f} {ratio:>8}{flag}"
+                f"{e['min'] * 1000:8.1f}..{e['max'] * 1000:<8.1f} {w['median'] * 1000:9.1f} {ratio:>8}"
             )
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"interpreters": interpreters, "llvm": not args.cranelift, "results": report}, f, indent=2)
+    return int(any(r["error"] for rows in results.values() for r in rows.values()))
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
