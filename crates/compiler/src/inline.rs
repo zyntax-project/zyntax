@@ -1395,24 +1395,34 @@ fn returns_local_allocation(callee: &HirFunction) -> bool {
     if values.len() != 1 {
         return false;
     }
-    block.instructions.iter().any(|i| matches!(i,
-        HirInstruction::Call {
-            result: Some(r),
-            callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc),
-            ..
-        } if *r == values[0]
-    ))
+    block.instructions.iter().any(|i| {
+        matches!(i,
+            HirInstruction::Call {
+                result: Some(r),
+                callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc),
+                ..
+            } if *r == values[0]
+        )
+    })
 }
 
 /// A changing object, not an invariant carried through a trivial phi.
 /// Constructors outside loops are expanded when their result joins one;
 /// other call-bearing constructors keep the normal cold-site policy.
 fn feeds_object_phi(caller: &HirFunction, result: HirId) -> bool {
-    let allocations: HashSet<_> = caller.blocks.values().flat_map(|b| &b.instructions)
+    let allocations: HashSet<_> = caller
+        .blocks
+        .values()
+        .flat_map(|b| &b.instructions)
         .filter_map(|inst| match inst {
-            HirInstruction::Call { result, callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc), .. } => *result,
+            HirInstruction::Call {
+                result,
+                callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc),
+                ..
+            } => *result,
             _ => None,
-        }).collect();
+        })
+        .collect();
     caller.blocks.values().flat_map(|b| &b.phis).any(|phi| {
         matches!(phi.ty, HirType::Ptr(_))
             && phi.incoming.iter().any(|(v, _)| *v == result)

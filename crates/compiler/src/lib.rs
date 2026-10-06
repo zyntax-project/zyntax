@@ -58,6 +58,7 @@ pub mod exclusive_args; // An exclusive argument may not be a second name for an
 pub mod fiber_backend; // `FiberCfg` trait + global install slot for fiber primitives
 pub mod fiber_lowering; // First-class fiber HIR ops → Call::Symbol("krio_fiber_*") rewrite
 pub mod fma_contract; // FMA contraction: rewrite fadd(fmul a b, c) → fma(a, b, c)
+pub mod heap_scalarize; // Immutable heap objects carried by phis become scalar fields
 pub mod hir;
 pub mod hir_builder; // HIR Builder API for direct HIR construction
 pub mod hir_dump; // CLIF-inspired HIR text dump for debugging
@@ -91,7 +92,6 @@ pub mod reduction_vectorize;
 pub(crate) mod return_infer; // Return types for declarations that don't state one
 pub mod runtime;
 pub mod scalar_replace_alloc; // Eliminate non-escaping Call(Intrinsic::Malloc) allocations (heap SROA)
-pub mod heap_scalarize; // Immutable heap objects carried by phis become scalar fields
 pub mod sign_fold; // Compares against zero decided by the sign of what is compared
 pub mod ssa;
 pub mod stdlib; // Standard library implementation using HIR Builder
