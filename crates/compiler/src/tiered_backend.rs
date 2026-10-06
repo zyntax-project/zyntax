@@ -3041,11 +3041,6 @@ impl TieredBackend {
                     c.tier2_backend,
                     c.verbosity,
                 );
-                // Compiled callers reach the code through the cell.
-                if !entry.is_null() {
-                    let key = c.cranelift.with_lock(|be| be.reload_key());
-                    crate::reload::set_call_target(key, c.func_id, entry as usize);
-                }
                 entry
             })?;
             Some(code as *const u8)
@@ -3544,6 +3539,10 @@ impl TieredBackend {
         // caller's stack.
         let bead_of: HashMap<HirId, u64> =
             by_bead.iter().map(|(b, (id, _, _))| (*id, *b)).collect();
+        let published_beads: HashMap<u64, TieredBound> = by_bead
+            .iter()
+            .map(|(bead, (_, bound, _))| (*bead, bound.clone()))
+            .collect();
         let published = Arc::clone(&done);
         let held_promotions = Arc::clone(&self.held_promotions);
         let quick_baseline = QuickBaseline {
@@ -3892,6 +3891,12 @@ impl TieredBackend {
         // stub again: the entry is answered from the table then, with
         // no thread.
         osr::set_lazy_compiler(move |bead_id| {
+            if let Some(entry) = published_beads
+                .get(&bead_id)
+                .and_then(|bound| bound.bead().compiled())
+            {
+                return entry as *const u8;
+            }
             if let Some(Some((entry, _))) = published.0.lock().unwrap().get(&bead_id) {
                 return *entry as *const u8;
             }
@@ -4426,11 +4431,7 @@ impl TieredBackend {
                     tier2_backend,
                     verbosity,
                 );
-                // Callers reach the promoted code through the cell.
-                if !entry.is_null() {
-                    let key = cranelift.with_lock(|be| be.reload_key());
-                    crate::reload::set_call_target(key, func_id, entry as usize);
-                } else {
+                if entry.is_null() {
                     // No code: the answer is open again, so a later
                     // request drives the bead anew.
                     outcomes_for_install.lock().unwrap().remove(&outcome_key);
@@ -5386,6 +5387,7 @@ pub fn compile_at_tier(
                     if let Some(hook) = hook {
                         hook(bead_id, func_arc);
                     }
+                    publish_promoted_entry(cranelift, func_id, bead_id, p);
                     p
                 }
                 Err(e) => {
@@ -5404,7 +5406,12 @@ pub fn compile_at_tier(
     // request then recompiles the function with the current module.
     let _ = tier2_backend; // silence unused-variable when llvm-backend is off
     match cranelift.compile(bead, def) {
-        Ok(p) => p,
+        Ok(p) => {
+            if tier_idx == OptimizationTier::Optimized.index() {
+                publish_promoted_entry(cranelift, func_id, bead_id, p);
+            }
+            p
+        }
         Err(e) => {
             log::warn!("[TieredBackend] Cranelift compile failed: {e}");
             if verbosity >= 1 || crate::osr::osr_trace_enabled() {
@@ -5413,6 +5420,21 @@ pub fn compile_at_tier(
             ptr::null_mut()
         }
     }
+}
+
+fn publish_promoted_entry(
+    cranelift: &ZyntaxCraneliftBackend,
+    func_id: HirId,
+    bead_id: u64,
+    entry: *mut (),
+) {
+    if entry.is_null() {
+        return;
+    }
+    let key = cranelift.with_lock(|backend| backend.reload_key());
+    crate::reload::set_call_target(key, func_id, entry as usize);
+    // Saved function pointers reach the same tier through their stable stub.
+    osr::set_published_entry(bead_id, entry as usize);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
