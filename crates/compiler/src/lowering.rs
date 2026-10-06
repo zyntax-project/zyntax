@@ -773,9 +773,9 @@ impl LoweringContext {
         self.prelowered.bodies.contains(&name)
     }
 
-    /// Bring every prelowered module's globals and types into the module
-    /// being built, so its bodies are known to be well formed against
-    /// them. Functions follow as they are reached: see
+    /// Bring prelowered state and types into the module. Private string
+    /// literals follow the bodies that use them when those bodies are
+    /// adopted eagerly. Functions follow as they are reached: see
     /// [`Self::adopt_prelowered_reached`] and
     /// [`Self::adopt_all_prelowered`].
     fn adopt_prelowered(&mut self) {
@@ -783,6 +783,14 @@ impl LoweringContext {
             let prelowered = prelowered.stripped();
             for (id, global) in &prelowered.globals {
                 if self.config.linked.contains(id) {
+                    continue;
+                }
+                if self.wanted.is_some()
+                    && !self.config.defer_prelowered_bodies
+                    && global.linkage == crate::hir::Linkage::Private
+                    && global.is_const
+                    && matches!(global.initializer, Some(crate::hir::HirConstant::String(_)))
+                {
                     continue;
                 }
                 self.module.globals.insert(*id, global.clone());
@@ -797,6 +805,14 @@ impl LoweringContext {
     /// a host may call any of them.
     fn adopt_all_prelowered(&mut self) {
         for prelowered in &self.config.prelowered {
+            for (id, global) in &prelowered.stripped().globals {
+                if !self.config.linked.contains(id) {
+                    self.module
+                        .globals
+                        .entry(*id)
+                        .or_insert_with(|| global.clone());
+                }
+            }
             if self.config.defer_prelowered_bodies {
                 let mut functions = Vec::new();
                 prelowered.for_each_function(|_, id, has_body| {
@@ -838,6 +854,10 @@ impl LoweringContext {
         }
         let targets_of = |function: &crate::hir::HirFunction| -> Vec<crate::hir::HirId> {
             let mut targets = Vec::new();
+            targets.extend(function.values.values().filter_map(|v| match v.kind {
+                crate::hir::HirValueKind::Global(id) => Some(id),
+                _ => None,
+            }));
             for block in function.blocks.values() {
                 for inst in &block.instructions {
                     match inst {
@@ -882,6 +902,19 @@ impl LoweringContext {
         let mut adopted = false;
         while let Some(target) = pending.pop() {
             if self.module.functions.contains_key(&target) || self.config.linked.contains(&target) {
+                continue;
+            }
+            if self.module.globals.contains_key(&target) {
+                continue;
+            }
+            if let Some(global) = self
+                .config
+                .prelowered
+                .iter()
+                .find_map(|m| m.stripped().globals.get(&target))
+            {
+                self.module.globals.insert(target, global.clone());
+                adopted = true;
                 continue;
             }
             let Some(m) = self
@@ -1146,6 +1179,7 @@ impl AstLowering for LoweringContext {
 
         // First pass: collect all declarations
         self.collect_declarations(program)?;
+        self.wanted = self.initial_wanted(program);
         self.adopt_prelowered();
         self.declare_type_descriptors();
         let collect_ms = phase.lap();
@@ -1166,7 +1200,6 @@ impl AstLowering for LoweringContext {
         // call, until nothing is left owing. What an import brought in
         // and nothing reaches is never built.
         phase.mark();
-        self.wanted = self.initial_wanted(program);
         self.entered = self.wanted.is_some();
         if self.wanted.is_none() {
             self.adopt_all_prelowered();
@@ -1241,12 +1274,13 @@ impl AstLowering for LoweringContext {
                  method_types = {methods_ms:.2}  collect_decls = {collect_ms:.2}  \
                  declarations = {declared_ms:.2} ms ({}, {} own functions left until \
                  reached, {} never reached)  bodies = {bodies_ms:.2} ms \
-                 (adopted {} functions, decoded in {:.2} ms)",
+                 (adopted {} functions, decoded in {:.2} ms; {} globals)",
                 program.declarations.len(),
                 deferred.len(),
                 self.deferred_own.len(),
                 self.adopted.0,
-                self.adopted.1
+                self.adopted.1,
+                self.module.globals.len()
             );
         }
 
@@ -5130,9 +5164,21 @@ impl LoweringContext {
         &mut self,
         var: &zyntax_typed_ast::TypedVariable,
     ) -> CompilerResult<()> {
-        // A prelowered module's global is already in the module.
+        // A declaration explicitly exposes a prelowered global by name.
         if let Some(id) = self.prelowered.globals.get(&var.name).copied() {
             self.symbols.globals.insert(var.name, id);
+            if !self.config.linked.contains(&id)
+                && let Some(global) = self
+                    .config
+                    .prelowered
+                    .iter()
+                    .find_map(|m| m.stripped().globals.get(&id))
+            {
+                self.module
+                    .globals
+                    .entry(id)
+                    .or_insert_with(|| global.clone());
+            }
             return Ok(());
         }
         let hir_type = self.convert_type(&var.ty);

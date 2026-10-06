@@ -391,3 +391,127 @@ fn the_linked_program_runs() {
     let main: unsafe extern "C" fn() -> i64 = unsafe { std::mem::transmute(ptr) };
     assert_eq!(unsafe { main() }, 42);
 }
+
+#[test]
+fn private_library_literals_follow_reached_bodies() {
+    use zyntax_compiler::hir::{
+        HirConstant, HirGlobal, HirId, HirType, HirValueKind, Linkage, Visibility,
+    };
+    let mut source = library();
+    let mut globals = Vec::new();
+    for (text, linkage, initializer) in [
+        (
+            "reached_literal",
+            Linkage::Private,
+            HirConstant::String(InternedString::new_global("used")),
+        ),
+        (
+            "unreached_literal",
+            Linkage::Private,
+            HirConstant::String(InternedString::new_global("unused")),
+        ),
+        (
+            "host_literal",
+            Linkage::External,
+            HirConstant::String(InternedString::new_global("host")),
+        ),
+        ("private_state", Linkage::Private, HirConstant::I64(7)),
+    ] {
+        let id = HirId::new();
+        source.globals.insert(
+            id,
+            HirGlobal {
+                id,
+                name: InternedString::new_global(text),
+                ty: if matches!(initializer, HirConstant::I64(_)) {
+                    HirType::I64
+                } else {
+                    HirType::Ptr(Box::new(HirType::I8))
+                },
+                initializer: Some(initializer),
+                is_const: true,
+                is_thread_local: false,
+                linkage,
+                visibility: Visibility::Default,
+                error_flag: false,
+            },
+        );
+        globals.push(id);
+    }
+    let twice = source.functions.values_mut().next().unwrap();
+    let ptr = twice.create_value(
+        HirType::Ptr(Box::new(HirType::I8)),
+        HirValueKind::Global(globals[0]),
+    );
+    let byte = twice.create_value(HirType::I8, HirValueKind::Instruction);
+    twice
+        .blocks
+        .get_mut(&twice.entry_block)
+        .unwrap()
+        .instructions
+        .push(HirInstruction::Load {
+            result: byte,
+            ty: HirType::I8,
+            ptr,
+            align: 1,
+            volatile: true,
+        });
+    let bytes = serialize_module(&source, Format::Split).unwrap();
+    let lib = Arc::new(deserialize_module_lazy(bytes).unwrap());
+    let ids: Vec<_> = [
+        "reached_literal",
+        "unreached_literal",
+        "host_literal",
+        "private_state",
+    ]
+    .iter()
+    .map(|name| {
+        lib.stripped()
+            .globals
+            .values()
+            .find(|g| g.name.resolve_global().as_deref() == Some(name))
+            .unwrap()
+            .id
+    })
+    .collect();
+    for (has_entry, deferred) in [(true, false), (false, false), (true, true)] {
+        let module = lower(
+            "literal_client",
+            &mut client(),
+            LoweringConfig {
+                prelowered: vec![Arc::clone(&lib)],
+                defer_prelowered_bodies: deferred,
+                entry_names: if has_entry {
+                    vec!["main".into()]
+                } else {
+                    vec![]
+                },
+                ..LoweringConfig::default()
+            },
+        );
+        assert!(
+            module.globals.contains_key(&ids[0]),
+            "a reached library load needs its literal"
+        );
+        assert_eq!(
+            module.globals.contains_key(&ids[1]),
+            !has_entry || deferred,
+            "unreached literals stay available when bodies have not been inspected"
+        );
+        assert!(
+            module.globals.contains_key(&ids[2]),
+            "host-visible literals remain exposed"
+        );
+        assert!(
+            module.globals.contains_key(&ids[3]),
+            "private runtime state remains available"
+        );
+        for function in module.functions.values() {
+            for value in function.values.values() {
+                if let HirValueKind::Global(id) = value.kind {
+                    assert!(module.globals.contains_key(&id), "dangling global {id:?}");
+                }
+            }
+        }
+    }
+}
