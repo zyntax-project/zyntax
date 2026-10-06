@@ -1323,6 +1323,7 @@ pub(crate) fn is_inline_safe_intrinsic(i: crate::hir::Intrinsic) -> bool {
         i,
         Sqrt | Rsqrt
             | Fabs
+            | Floor
             | Fma
             | Sin
             | Cos
@@ -1368,7 +1369,6 @@ fn is_plain_call_intrinsic(i: crate::hir::Intrinsic) -> bool {
         Memcpy
             | Memset
             | Memmove
-            | Floor
             | AddWithOverflow
             | SubWithOverflow
             | MulWithOverflow
@@ -2517,6 +2517,77 @@ mod tests {
             panic!("caller returns");
         };
         assert_eq!(values, &vec![defined]);
+    }
+
+    #[test]
+    fn floor_is_leaf_work_when_inlining_numeric_helpers() {
+        let mut callee = HirFunction::new(
+            InternedString::new_global("round_down"),
+            sig(vec![HirType::F64], HirType::F64),
+        );
+        let entry = callee.entry_block;
+        let x = add_value_for_param(&mut callee, 0, HirType::F64);
+        let result = add_inst(&mut callee, HirType::F64);
+        let block = callee.blocks.get_mut(&entry).unwrap();
+        block.instructions.push(HirInstruction::Call {
+            result: Some(result),
+            callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Floor),
+            args: vec![x],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        block.terminator = HirTerminator::Return {
+            values: vec![result],
+        };
+        callee.attributes.optimized = true;
+        let mut caller = HirFunction::new(
+            InternedString::new_global("caller"),
+            sig(vec![], HirType::F64),
+        );
+        let entry = caller.entry_block;
+        let value = add_const(&mut caller, HirType::F64, HirConstant::F64(-1.5));
+        let result = call_to(&mut caller, entry, callee.id, value);
+        caller.values.get_mut(&result).unwrap().ty = HirType::F64;
+        caller.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Return {
+            values: vec![result],
+        };
+        let id = caller.id;
+        let mut module = HirModule::new(InternedString::new_global("floor_inline"));
+        module.functions.insert(callee.id, callee);
+        module.functions.insert(id, caller);
+        assert_eq!(run_module(&mut module).inlined, 1);
+        let f = &module.functions[&id];
+        assert!(
+            f.blocks
+                .values()
+                .flat_map(|b| &b.instructions)
+                .any(|i| matches!(
+                    i,
+                    HirInstruction::Call {
+                        callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Floor),
+                        ..
+                    }
+                ))
+        );
+        assert!(
+            f.blocks
+                .values()
+                .flat_map(|b| &b.instructions)
+                .all(|i| !matches!(
+                    i,
+                    HirInstruction::Call {
+                        callee: HirCallable::Function(_),
+                        ..
+                    }
+                ))
+        );
+        let mut interp = crate::hir_interp::HirInterpreter::new();
+        assert_eq!(
+            crate::hir_interp::value_to_f64(&interp.call(&module, "caller", vec![]).unwrap())
+                .unwrap(),
+            -2.0
+        );
     }
 
     #[test]
