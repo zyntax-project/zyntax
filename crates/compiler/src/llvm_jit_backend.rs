@@ -11,8 +11,8 @@
 //! 2. **Stamp**: give each function the host's `target-cpu` and
 //!    `target-features`, which the engine does not infer on its own.
 //! 3. **Verify**: `module.verify()`.
-//! 4. **Install**: `create_jit_execution_engine`, binding runtime symbols
-//!    with `add_global_mapping` and reading back function addresses.
+//! 4. **Install**: add a private module to the retained MCJIT engine, bind
+//!    runtime symbols, resolve code addresses, and release the module IR.
 //!
 //! Nothing outside the process is involved, so installation costs
 //! milliseconds and needs no toolchain on the machine running the code.
@@ -78,22 +78,16 @@ static DYLIB_CACHE: LazyLock<Mutex<HashMap<String, &'static HashMap<String, usiz
 /// Monotonic counter for tempfile naming uniqueness within a process.
 static AOT_TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// LLVM AOT-via-object JIT backend.
-///
-/// Compiles HIR modules to native code by writing a PIC object,
-/// linking it into a shared library through the system linker, and
-/// `dlopen`-ing the result. Function pointers are read back via
-/// `dlsym` and indexed by `HirId`.
+/// Compiles HIR to native code through MCJIT, or through the optional
+/// object-file/linker installer. Published code lives with the backend.
 pub struct LLVMJitBackend<'ctx> {
     /// LLVM context reference.
     context: &'ctx Context,
 
     /// The module a promotion recompiles out of.
     ///
-    /// A tier-up hands over one function, but a function body is not
-    /// self-contained: anything it calls has to be compiled alongside it or
-    /// the call has nothing to bind to. Set once when the module is first
-    /// compiled; promotions read it back.
+    /// Supplies callee signatures and globals for cross-tier links, or
+    /// callee bodies when compiling without those links.
     module_context: Option<std::sync::Arc<HirModule>>,
     /// Functions of the module context whose address is observable,
     /// which changes how they return an aggregate; read with the
@@ -168,10 +162,11 @@ pub struct LLVMJitBackend<'ctx> {
     /// [`Self::set_use_mcjit`].
     use_mcjit: bool,
 
-    /// Engines from MCJIT installs. Each owns its code pages, so they
-    /// are retained for as long as any handed-out pointer might be
-    /// called — that is, the lifetime of the backend.
-    engines: Vec<ExecutionEngine<'ctx>>,
+    /// Owns emitted code for the lifetime of every published pointer.
+    /// Each install releases its module IR after resolving its addresses.
+    engine: Option<ExecutionEngine<'ctx>>,
+    /// Distinguishes symbols from repeated entry and OSR installs.
+    install_serial: u64,
 
     /// Tier the next compile targets. OSR helpers are emitted at tier >= 1
     /// only; tier 0 is what back-edges are probed from.
@@ -230,7 +225,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             entry_names: Default::default(),
             cache_key: None,
             use_mcjit: Self::default_use_mcjit(),
-            engines: Vec::new(),
+            engine: None,
+            install_serial: 0,
             compile_tier: 0,
             pending_osr_helpers: Vec::new(),
             osr_helper_sites: None,
@@ -430,65 +426,78 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         // header, so a frame already running tier-0 code can finish here
         // rather than waiting for the next call. They are built with the
         // bodies, before the pass pipeline, so they are optimised like
-        // them; the engine created below consumes the module.
+        // them; the engine takes ownership until installation is complete.
         let (backend, helper_names) =
             self.compile_module_to_ir(hir_module, self.compile_tier >= 1)?;
         let ir_ms = started.elapsed().as_secs_f64() * 1e3;
 
-        let engine = backend
-            .module()
-            .create_jit_execution_engine(self.opt_level)
-            .map_err(|e| CompilerError::Backend(format!("MCJIT engine: {e}")))?;
-        let engine_ms = started.elapsed().as_secs_f64() * 1e3 - ir_ms;
-
-        // Bind host functions the module declares but does not define.
-        for (name, addr) in &self.runtime_symbols {
-            if let Some(f) = backend.module().get_function(name) {
-                if f.count_basic_blocks() == 0 {
-                    engine.add_global_mapping(&f, *addr);
-                }
+        // Resolve declarations before attaching the module: a failed install
+        // must not leave an unresolved module for a later codegen to visit.
+        let mut functions = Vec::new();
+        for func in backend.module().get_functions() {
+            if func.count_basic_blocks() != 0 {
+                continue;
             }
-        }
-        // And the globals whose storage another tier owns, those the
-        // middle end kept.
-        for (name, addr) in backend.shared_global_bindings() {
-            if let Some(global) = backend.module().get_global(name) {
-                engine.add_global_mapping(&global, *addr);
+            let name = func.get_name().to_string_lossy();
+            if name.starts_with("llvm.") {
+                continue;
             }
-        }
-
-        // Whatever is still undefined resolves from the process, the same
-        // way the ground tier's JIT does — `malloc` and the compiler's own
-        // runtime externs are found this way, not through registration. A
-        // name neither registered nor found must fail the compile here:
-        // the engine would otherwise bind it to null and the compiled code
-        // would call it.
-        let mut f = backend.module().get_first_function();
-        while let Some(func) = f {
-            let next = func.get_next_function();
-            if func.count_basic_blocks() == 0 {
-                let name = func.get_name().to_string_lossy().to_string();
-                if !name.starts_with("llvm.") && !self.runtime_symbols.contains_key(&name) {
-                    let c_name = std::ffi::CString::new(name.clone()).map_err(|_| {
+            let addr = match self.runtime_symbols.get(name.as_ref()) {
+                Some(addr) => *addr,
+                None => {
+                    let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
                         CompilerError::Backend(format!("symbol name {name:?} contains NUL"))
                     })?;
-                    let addr = crate::late_symbols::lookup(&name).map_or_else(
+                    crate::late_symbols::lookup(&name).map_or_else(
                         || unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) as usize },
                         |a| a as usize,
-                    );
-                    if addr == 0 {
-                        return Err(CompilerError::Backend(format!(
-                            "unresolved symbol {name} in MCJIT install"
-                        )));
-                    }
-                    engine.add_global_mapping(&func, addr);
+                    )
                 }
+            };
+            if addr == 0 {
+                return Err(CompilerError::Backend(format!(
+                    "unresolved symbol {name} in MCJIT install"
+                )));
             }
-            f = next;
+            functions.push((func, addr));
+        }
+        let globals: Vec<_> = backend
+            .shared_global_bindings()
+            .iter()
+            .filter_map(|(name, addr)| backend.module().get_global(name).map(|g| (g, *addr)))
+            .collect();
+
+        self.install_serial = self
+            .install_serial
+            .checked_add(1)
+            .ok_or_else(|| CompilerError::Backend("MCJIT install serial exhausted".into()))?;
+        let names = Self::namespace_install(backend.module(), self.install_serial);
+        if let Some(engine) = &self.engine {
+            engine.add_module(backend.module()).map_err(|()| {
+                CompilerError::Backend("MCJIT module already belongs to an engine".into())
+            })?;
+        } else {
+            self.engine = Some(
+                backend
+                    .module()
+                    .create_jit_execution_engine(self.opt_level)
+                    .map_err(|e| CompilerError::Backend(format!("MCJIT engine: {e}")))?,
+            );
+        }
+        let engine = self.engine.as_ref().unwrap();
+        let engine_ms = started.elapsed().as_secs_f64() * 1e3 - ir_ms;
+        for (func, addr) in functions {
+            engine.add_global_mapping(&func, addr);
+        }
+        for (global, addr) in globals {
+            engine.add_global_mapping(&global, addr);
         }
 
         for (hir_id, name) in self.get_function_symbols(hir_module) {
-            if let Ok(addr) = engine.get_function_address(&name) {
+            let Some(name) = names.get(&name) else {
+                continue;
+            };
+            if let Ok(addr) = engine.get_function_address(name) {
                 if crate::osr::osr_trace_enabled() {
                     eprintln!("[ptrs] llvm {hir_id:?} {name} -> {:#x}", addr as usize);
                 }
@@ -496,7 +505,10 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             }
         }
         for (func_id, site, name) in helper_names {
-            let resolved = engine.get_function_address(&name);
+            let Some(name) = names.get(&name) else {
+                continue;
+            };
+            let resolved = engine.get_function_address(name);
             if crate::osr::osr_trace_enabled() {
                 eprintln!(
                     "[osr] llvm helper {name} site={site:#x} -> {:?}",
@@ -520,8 +532,61 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             );
         }
 
-        self.engines.push(engine);
+        // MCJIT retains the loaded object and its code/data sections after
+        // detaching the module. Only the IR is released when backend drops.
+        if let Err(error) = engine.remove_module(backend.module()) {
+            log::warn!("MCJIT retained module IR: {error:?}");
+        }
         Ok(())
+    }
+
+    /// Give every install its own symbols, including mapped declarations:
+    /// later installs may replace their host addresses or global storage.
+    fn namespace_install(
+        module: &inkwell::module::Module<'ctx>,
+        serial: u64,
+    ) -> HashMap<String, String> {
+        use inkwell::llvm_sys::core::*;
+        let mut names = HashMap::new();
+        // SAFETY: all values belong to the live module. Renaming updates IR
+        // references without deleting values or invalidating the iterators.
+        unsafe {
+            for (first, next) in [
+                (
+                    LLVMGetFirstFunction as unsafe extern "C" fn(_) -> _,
+                    LLVMGetNextFunction as unsafe extern "C" fn(_) -> _,
+                ),
+                (LLVMGetFirstGlobal, LLVMGetNextGlobal),
+                (LLVMGetFirstGlobalAlias, LLVMGetNextGlobalAlias),
+                (LLVMGetFirstGlobalIFunc, LLVMGetNextGlobalIFunc),
+            ] {
+                let mut value = first(module.as_mut_ptr());
+                while !value.is_null() {
+                    let mut len = 0;
+                    let ptr = LLVMGetValueName2(value, &mut len);
+                    let old = if len == 0 {
+                        String::new()
+                    } else {
+                        String::from_utf8_lossy(std::slice::from_raw_parts(ptr.cast::<u8>(), len))
+                            .into_owned()
+                    };
+                    if !old.starts_with("llvm.") {
+                        let name = format!("__zyntax_install_{serial}_{}", names.len());
+                        LLVMSetValueName2(value, name.as_ptr().cast(), name.len());
+                        // LLVM may disambiguate a collision with an existing name.
+                        let ptr = LLVMGetValueName2(value, &mut len);
+                        let actual = String::from_utf8_lossy(std::slice::from_raw_parts(
+                            ptr.cast::<u8>(),
+                            len,
+                        ))
+                        .into_owned();
+                        names.insert(old, actual);
+                    }
+                    value = next(value);
+                }
+            }
+        }
+        names
     }
 
     /// Register symbol signatures for auto-boxing support.
@@ -977,9 +1042,8 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         p
     }
 
-    /// Compile a full HIR module via AOT-to-object + system linker +
-    /// dlopen. On success, `function_pointers` is populated and the
-    /// loaded library is pinned on the backend.
+    /// Compile a HIR module through the selected installer. Published
+    /// function pointers remain valid for the lifetime of the MCJIT engine.
     ///
     /// Errors:
     /// - HIR → LLVM IR lowering / verification / optimisation failure
@@ -1176,12 +1240,9 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 
-    /// Compile a single function, together with everything it calls.
-    ///
-    /// The callees come from the module context, so they are recompiled at
-    /// this tier rather than called across to another one — which also lets
-    /// the optimiser see through them. Without a context the function is
-    /// compiled alone, which only holds if it calls nothing in its module.
+    /// Compile one function using cross-tier call cells and shared globals.
+    /// Without MCJIT cross-tier links, compile its reachable callee closure
+    /// from the module context alongside it.
     pub fn compile_function(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
         use std::collections::HashSet;
 
