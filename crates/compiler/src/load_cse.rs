@@ -13,8 +13,8 @@
 //!   * On a *memory-killing* instruction (`Call`, `IndirectCall`,
 //!     `Atomic`, `Fence`), clear the map — we conservatively assume
 //!     anything in memory could have changed. A `Store` kills every
-//!     load but those of an object of another exact struct type
-//!     (`licm::MemLoc::provably_disjoint`).
+//!     load except those proven disjoint by exact struct types or
+//!     non-overlapping byte ranges relative to the same SSA pointer.
 //!   * On a redundant `Load` (its pointer is already in the map),
 //!     record a substitution from the new load result to the
 //!     previously-seen load result.
@@ -31,11 +31,156 @@
 //! references, drop the now-orphaned defining Loads).
 
 use crate::cse;
-use crate::hir::{HirFunction, HirId, HirInstruction, HirModule};
+use crate::hir::{
+    CastOp, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirType, HirValueKind,
+};
 use crate::licm::{MemLoc, extract_mem_loc, hir_ty_byte_size, value_byte_size};
 use fnv::FnvHashSet;
 use std::collections::HashMap;
 use zyntax_typed_ast::InternedString;
+
+#[derive(Clone, Copy)]
+struct Address {
+    root: HirId,
+    offset: u64,
+}
+
+/// Byte offsets only: struct layout, loaded pointers and phi identities
+/// are not inferred. A distinct SSA root may still alias this one.
+struct Addresses<'a> {
+    function: &'a HirFunction,
+    defs: HashMap<HirId, &'a HirInstruction>,
+    cache: HashMap<HirId, Option<Address>>,
+}
+
+impl Addresses<'_> {
+    fn stored_size(&self, value: HirId) -> u32 {
+        let size = value_byte_size(self.function, value);
+        match self.defs.get(&value) {
+            Some(
+                HirInstruction::Load { ty, .. }
+                | HirInstruction::ExtractValue { ty, .. }
+                | HirInstruction::InsertValue { ty, .. },
+            ) => {
+                // An aggregate's value metadata may describe its pointer carrier.
+                let declared = hir_ty_byte_size(ty);
+                if size == 0 || declared == 0 {
+                    0
+                } else {
+                    size.max(declared)
+                }
+            }
+            _ => size,
+        }
+    }
+
+    fn get(&mut self, ptr: HirId, depth: u32) -> Option<Address> {
+        if let Some(address) = self.cache.get(&ptr) {
+            return *address;
+        }
+        if depth == 0 {
+            return None;
+        }
+        let address = match self.defs.get(&ptr).copied() {
+            Some(HirInstruction::Cast {
+                op: CastOp::Bitcast | CastOp::PtrToInt | CastOp::IntToPtr,
+                operand,
+                ty,
+                ..
+            }) if matches!(
+                ty,
+                HirType::Ptr(_) | HirType::Ref { .. } | HirType::I64 | HirType::U64
+            ) && (matches!(
+                self.function.values.get(operand)?.ty,
+                HirType::Ptr(_) | HirType::Ref { .. } | HirType::I64 | HirType::U64
+            ) || matches!(
+                self.defs.get(operand),
+                Some(HirInstruction::GetElementPtr { .. })
+            )) =>
+            {
+                self.get(*operand, depth - 1)
+            }
+            Some(HirInstruction::GetElementPtr {
+                ty,
+                ptr: base,
+                indices,
+                ..
+            }) => {
+                let offset = byte_offset(self.function, ty, indices);
+                match offset {
+                    Some(offset) => self.get(*base, depth - 1).map(|a| Address {
+                        root: a.root,
+                        offset: a.offset.wrapping_add(offset),
+                    }),
+                    None => Some(Address {
+                        root: ptr,
+                        offset: 0,
+                    }),
+                }
+            }
+            _ => Some(Address {
+                root: ptr,
+                offset: 0,
+            }),
+        };
+        self.cache.insert(ptr, address);
+        address
+    }
+}
+
+fn byte_offset(function: &HirFunction, ty: &HirType, indices: &[HirId]) -> Option<u64> {
+    // Only a single scalar index has the same stride in every backend.
+    let [index] = indices else {
+        return None;
+    };
+    let HirValueKind::Constant(c) = &function.values.get(index)?.kind else {
+        return None;
+    };
+    let index = match c {
+        HirConstant::I8(n) => *n as i64 as u64,
+        HirConstant::I16(n) => *n as i64 as u64,
+        HirConstant::I32(n) => *n as i64 as u64,
+        HirConstant::I64(n) => *n as u64,
+        HirConstant::U64(n) => *n,
+        _ => return None,
+    };
+    let stride = match ty {
+        HirType::I8 | HirType::U8 => 1,
+        HirType::Ptr(inner) => {
+            // Pointer-sized strides depend on the eventual backend target.
+            if matches!(&**inner, HirType::Ptr(_) | HirType::Ref { .. }) {
+                return None;
+            }
+            let size = hir_ty_byte_size(inner);
+            if size == 0 {
+                return None;
+            }
+            u64::from(size)
+        }
+        _ => return None,
+    };
+    Some(index.wrapping_mul(stride))
+}
+
+fn separate_bytes(a: Option<Address>, a_size: u32, b: Option<Address>, b_size: u32) -> bool {
+    let (Some(a), Some(b)) = (a, b) else {
+        return false;
+    };
+    if a.root != b.root || a_size == 0 || b_size == 0 {
+        return false;
+    }
+    let (Some(a_end), Some(b_end)) = (
+        a.offset.checked_add(u64::from(a_size)),
+        b.offset.checked_add(u64::from(b_size)),
+    ) else {
+        return false;
+    };
+    // The proof must also hold when the target uses 32-bit addresses.
+    if a_end > u64::from(u32::MAX) || b_end > u64::from(u32::MAX) {
+        return false;
+    }
+    a_end <= b.offset || b_end <= a.offset
+}
 
 /// Public stats — same shape as `CseStats` so callers can compose.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -58,28 +203,68 @@ fn run_with(func: &mut HirFunction, exact: &FnvHashSet<InternedString>) -> LoadC
     let loc = |ptr: HirId, size: u32| -> MemLoc {
         extract_mem_loc(func, ptr, size, &no_subst, &addr_index, exact)
     };
+    // `ZYNTAX_DISABLE_LOAD_RANGES=1` retains reloads after disjoint stores; safe to run with.
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ranges =
+        !*DISABLED.get_or_init(|| std::env::var_os("ZYNTAX_DISABLE_LOAD_RANGES").is_some());
+    let mut addresses: Option<Addresses<'_>> = None;
 
     for block in func.blocks.values() {
-        let mut available: HashMap<HirId, (HirId, MemLoc)> = HashMap::new();
+        let mut available: HashMap<HirId, (HirId, &HirType, MemLoc, u32)> = HashMap::new();
         for inst in &block.instructions {
             match inst {
+                HirInstruction::Load { volatile: true, .. }
+                | HirInstruction::Store { volatile: true, .. } => available.clear(),
                 HirInstruction::Load {
                     result, ptr, ty, ..
                 } => {
                     let canonical_ptr = chase(*ptr, &substitutions);
                     match available.get(&canonical_ptr) {
-                        Some(&(prev_result, _)) => {
+                        Some(&(prev_result, previous_ty, _, _)) if previous_ty == ty => {
                             substitutions.insert(*result, prev_result);
                         }
-                        None => {
-                            let at = loc(*ptr, hir_ty_byte_size(ty));
-                            available.insert(canonical_ptr, (*result, at));
+                        _ => {
+                            let size = hir_ty_byte_size(ty);
+                            let at = loc(*ptr, size);
+                            available.insert(canonical_ptr, (*result, ty, at, size));
                         }
                     }
                 }
                 HirInstruction::Store { ptr, value, .. } => {
-                    let at = loc(*ptr, value_byte_size(func, *value));
-                    available.retain(|_, (_, loaded)| at.provably_disjoint(loaded));
+                    let size = value_byte_size(func, *value);
+                    let at = loc(*ptr, size);
+                    let canonical_ptr = chase(*ptr, &substitutions);
+                    available.retain(|loaded_ptr, (_, _, loaded, loaded_size)| {
+                        if at.provably_disjoint(loaded) {
+                            return true;
+                        }
+                        if !ranges || size == 0 || *loaded_size == 0 {
+                            return false;
+                        }
+                        // Build the address index only when a store could kill a load.
+                        let addresses = addresses.get_or_insert_with(|| Addresses {
+                            function: func,
+                            defs: func
+                                .blocks
+                                .values()
+                                .flat_map(|b| &b.instructions)
+                                .filter_map(|i| match i {
+                                    HirInstruction::Cast { result, .. }
+                                    | HirInstruction::GetElementPtr { result, .. }
+                                    | HirInstruction::Load { result, .. }
+                                    | HirInstruction::ExtractValue { result, .. }
+                                    | HirInstruction::InsertValue { result, .. } => {
+                                        Some((*result, i))
+                                    }
+                                    _ => None,
+                                })
+                                .collect(),
+                            cache: HashMap::new(),
+                        });
+                        let size = addresses.stored_size(*value);
+                        let address = addresses.get(canonical_ptr, 32);
+                        separate_bytes(address, size, addresses.get(*loaded_ptr, 32), *loaded_size)
+                    });
                 }
                 // Memory-killing ops invalidate everything we
                 // believe about memory contents. Conservative
@@ -153,6 +338,64 @@ mod tests {
     };
     use std::collections::HashSet;
     use zyntax_typed_ast::InternedString;
+
+    #[test]
+    fn byte_ranges_never_discard_an_overlapping_write() {
+        let root = HirId::new();
+        let offsets = [0, 1, 4, 8, 16, u64::MAX - 16, u64::MAX - 7, u64::MAX];
+        for a in offsets {
+            for b in offsets {
+                for a_size in [0, 1, 2, 4, 8, 16] {
+                    for b_size in [0, 1, 2, 4, 8, 16] {
+                        if separate_bytes(
+                            Some(Address { root, offset: a }),
+                            a_size,
+                            Some(Address { root, offset: b }),
+                            b_size,
+                        ) {
+                            assert!(a_size > 0 && b_size > 0);
+                            for i in 0..a_size {
+                                for j in 0..b_size {
+                                    assert_ne!(
+                                        a.wrapping_add(u64::from(i)),
+                                        b.wrapping_add(u64::from(j))
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_loads_compare_their_declared_types_not_their_carriers() {
+        let (mut f, entry) = mk_func();
+        let ty = HirType::Struct(crate::hir::HirStructType {
+            name: None,
+            fields: vec![HirType::I64; 3],
+            packed: false,
+        });
+        let carrier = HirType::Ptr(Box::new(ty.clone()));
+        let ptr = add_param(&mut f, carrier.clone(), 0);
+        for _ in 0..2 {
+            // An aggregate value may be carried as the address of its bytes.
+            let result = add_inst(&mut f, carrier.clone());
+            push(
+                &mut f,
+                entry,
+                HirInstruction::Load {
+                    result,
+                    ty: ty.clone(),
+                    ptr,
+                    align: 8,
+                    volatile: false,
+                },
+            );
+        }
+        assert_eq!(run(&mut f).eliminated, 1);
+    }
 
     fn sig() -> HirFunctionSignature {
         HirFunctionSignature {

@@ -2529,6 +2529,8 @@ fn run_interp_safe_opts_with(
     stats.boxes.expanded += br.expanded;
     stats.boxes.made += br.made;
     stats.boxes.released += br.released;
+    // `ZYNTAX_DISABLE_LATE_LOAD_CLEANUP=1` skips late field cleanup; safe to run with.
+    let late_load_cleanup = std::env::var_os("ZYNTAX_DISABLE_LATE_LOAD_CLEANUP").is_none();
     if br.expanded + br.made + br.released + br.shared > 0 {
         let lc = licm::run_module(module);
         stats.licm.hoisted += lc.hoisted;
@@ -2537,13 +2539,50 @@ fn run_interp_safe_opts_with(
         let cs = cse::eliminate_module(module);
         stats.cse.eliminated += cs.eliminated;
         stats.cse.rewrites += cs.rewrites;
-        timed("licm+cse", &mut at);
-        check_hir_uses(module, "licm+cse");
+        if late_load_cleanup {
+            stats.load_cse.eliminated += load_cse::run_module(module).eliminated;
+        }
+        timed("licm+cse+load_cse", &mut at);
+        check_hir_uses(module, "licm+cse+load_cse");
     }
 
-    stats.cfg_simplify.unreachable_removed += cfg_simplify::prune_unreachable_module(module);
+    let pruned = cfg_simplify::prune_unreachable_module(module);
+    stats.cfg_simplify.unreachable_removed += pruned;
     timed("prune_unreachable", &mut at);
     check_hir_uses(module, "prune_unreachable");
+    // Removing dead predecessors exposes single-entry blocks and field
+    // reads that can now be compared with the stores preceding them.
+    if late_load_cleanup && pruned > 0 {
+        let phis = phi_prune::run_module(module);
+        stats.phi_prune.removed += phis.removed;
+        stats.phi_prune.rounds = stats.phi_prune.rounds.max(phis.rounds);
+        let cfg = cfg_simplify::run_module(module);
+        stats.cfg_simplify.merged += cfg.merged;
+        stats.cfg_simplify.threaded += cfg.threaded;
+        let cs = cse::eliminate_module(module);
+        stats.cse.eliminated += cs.eliminated;
+        stats.cse.rewrites += cs.rewrites;
+        stats.load_cse.eliminated += load_cse::run_module(module).eliminated;
+        timed("pruned load cleanup", &mut at);
+        check_hir_uses(module, "pruned load cleanup");
+    }
+
+    // Box readers no longer form call barriers, and merged blocks can
+    // expose aggregate reads whose fields now stay in the same block.
+    if late_load_cleanup && pruned + br.expanded + br.made + br.released + br.shared > 0 {
+        let ags = aggregate_split::run_module(module);
+        stats.aggregate_split.round_trips_removed += ags.round_trips_removed;
+        stats.aggregate_split.field_accesses_emitted += ags.field_accesses_emitted;
+        stats.aggregate_split.field_reads_only += ags.field_reads_only;
+        if ags.field_accesses_emitted > 0 {
+            let cs = cse::eliminate_module(module);
+            stats.cse.eliminated += cs.eliminated;
+            stats.cse.rewrites += cs.rewrites;
+            stats.load_cse.eliminated += load_cse::run_module(module).eliminated;
+        }
+        timed("late aggregate_split", &mut at);
+        check_hir_uses(module, "late aggregate_split");
+    }
 
     // Closed scalar states are priced after unreachable dispatch arms
     // have gone. These copies contain no allocations or releases.
