@@ -7042,6 +7042,23 @@ impl CraneliftBackend {
             builder.finalize(frontend_config);
         }
 
+        // Cranelift appends register spills to the word-aligned explicit slot
+        // area. End it on a 16-byte boundary so XMM spills cannot straddle
+        // cache lines or pages; existing slots keep their offsets.
+        // ZYNTAX_DISABLE_SPILL_ALIGNMENT restores word alignment; safe for comparisons.
+        if self.module.isa().name() == "x64"
+            && !self.codegen_context.func.sized_stack_slots.is_empty()
+            && std::env::var_os("ZYNTAX_DISABLE_SPILL_ALIGNMENT").is_none()
+        {
+            self.codegen_context.func.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    0,
+                    4,
+                ),
+            );
+        }
+
         // Debug: Print IR after finalize
         log::debug!(
             "[Cranelift] IR after finalize (inside compile_function_body):\n{}",
