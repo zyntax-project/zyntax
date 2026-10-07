@@ -62,8 +62,8 @@
 //! 6. Remove the original Call instruction.
 
 use crate::hir::{
-    HirBlock, HirCallable, HirFunction, HirId, HirInstruction, HirModule, HirTerminator, HirType,
-    HirValue, HirValueKind,
+    HirBlock, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
+    HirTerminator, HirType, HirValue, HirValueKind,
 };
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -269,9 +269,17 @@ pub fn run_module_with(module: &mut HirModule, cycles: Option<&Cycles>) -> Inlin
         // What is known of each callee, asked once per round: no callee
         // body changes before the next.
         let mut shapes: HashMap<HirId, CalleeShape> = HashMap::new();
+        let mut specializations = ConstantCallees::default();
         let mut this_pass = 0;
         for (_, caller_id, caller) in taken.iter_mut() {
-            let stats = inline_in_function(caller, *caller_id, &callees, cycles, &mut shapes);
+            let stats = inline_in_function(
+                caller,
+                *caller_id,
+                &callees,
+                cycles,
+                &mut shapes,
+                &mut specializations,
+            );
             this_pass += stats.inlined;
             total.inlined += stats.inlined;
             total.call_sites_visited += stats.call_sites_visited;
@@ -439,6 +447,7 @@ pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
                             args: args.clone(),
                             callee_id: fid,
                             kind,
+                            specialized: None,
                         });
                     }
                 }
@@ -1028,17 +1037,128 @@ fn call_cycles(functions: &Callees<'_>) -> Cycles {
     }
 }
 
+type ConstantCallees =
+    HashMap<(HirId, Vec<(usize, HirConstant)>), Option<(Arc<HirFunction>, CalleeShape)>>;
+
+fn uses_arithmetic_argument(body: &HirFunction, bound: &HashSet<HirId>) -> bool {
+    use crate::hir::BinaryOp::*;
+    body.blocks.values().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(inst,
+            HirInstruction::Binary {
+                op: Add | Sub | Mul | Div | Rem | And | Or | Xor | Shl | Shr,
+                left, right, ..
+            } if bound.contains(left) || bound.contains(right))
+        })
+    })
+}
+
+/// Price a dispatch helper after its scalar constant arguments decide
+/// branches. The original body remains available to all other callers.
+fn specialize_constants(
+    caller: &HirFunction,
+    args: &[HirId],
+    callee: &HirFunction,
+    callees: &Callees<'_>,
+    cache: &mut ConstantCallees,
+) -> Option<(Arc<HirFunction>, CalleeShape)> {
+    if args.len() != callee.signature.params.len() || count_insts(callee) > 1024 {
+        return None;
+    }
+    let constants: Vec<_> = args
+        .iter()
+        .zip(&callee.signature.params)
+        .enumerate()
+        .filter_map(|(index, (arg, param))| {
+            let value = caller.values.get(arg)?;
+            if value.ty != param.ty {
+                return None;
+            }
+            match &value.kind {
+                HirValueKind::Constant(
+                    c @ (HirConstant::Bool(_)
+                    | HirConstant::I8(_)
+                    | HirConstant::I16(_)
+                    | HirConstant::I32(_)
+                    | HirConstant::I64(_)
+                    | HirConstant::U8(_)
+                    | HirConstant::U16(_)
+                    | HirConstant::U32(_)
+                    | HirConstant::U64(_)
+                    | HirConstant::ISize(_)
+                    | HirConstant::USize(_)),
+                ) => Some((index, c.clone())),
+                _ => None,
+            }
+        })
+        .collect();
+    if constants.is_empty() {
+        return None;
+    }
+    let key = (callee.id, constants);
+    if let Some(result) = cache.get(&key) {
+        return result.clone();
+    }
+    // Bound temporary code and analysis work even with many distinct literals.
+    if cache.len() >= 64 {
+        return None;
+    }
+    let mut bindings = HashMap::new();
+    for (index, constant) in &key.1 {
+        let id = callee.signature.params[*index].id;
+        // Lowering can give a parameter's SSA value a different id
+        // from its signature entry, as the inline substitution does.
+        for (value_id, value) in &callee.values {
+            if *value_id == id
+                || matches!(value.kind, HirValueKind::Parameter(i) if i as usize == *index)
+            {
+                bindings.insert(*value_id, constant.clone());
+            }
+        }
+    }
+    let bound = bindings.keys().copied().collect();
+    // Reject opcode-only sites before copying or analysing the body.
+    if !uses_arithmetic_argument(callee, &bound) {
+        cache.insert(key, None);
+        return None;
+    }
+    let mut body = callee.clone();
+    for (id, constant) in bindings {
+        body.values.get_mut(&id).unwrap().kind = HirValueKind::Constant(constant);
+    }
+    crate::const_fold::fold_function(&mut body);
+    let removed = crate::cfg_simplify::prune_unreachable(&mut body);
+    let result = if removed == 0 {
+        None
+    } else {
+        rebuild_cfg_edges(&mut body);
+        crate::phi_prune::run_function(&mut body);
+        crate::cfg_simplify::run(&mut body);
+        let shape = shape_of(&body, callees);
+        // A known operation alone still performs general arithmetic. Require
+        // a bound arithmetic operand too, so native code can use its value.
+        let constant_operand = uses_arithmetic_argument(&body, &bound);
+        (constant_operand && matches!(shape.class, CalleeClass::OkLeaf | CalleeClass::OkMultiBlock))
+            .then(|| (Arc::new(body), shape))
+    };
+    cache.insert(key, result.clone());
+    result
+}
+
 fn inline_in_function(
     caller: &mut HirFunction,
     caller_id: HirId,
     callees: &Callees<'_>,
     cycles: &Cycles,
     shapes: &mut HashMap<HirId, CalleeShape>,
+    specializations: &mut ConstantCallees,
 ) -> InlineStats {
     let mut stats = InlineStats::default();
     // `ZYNTAX_TRACE_INLINE=1` names every inline made and every site
     // refused for size or for where it stands.
     let trace = std::env::var_os("ZYNTAX_TRACE_INLINE").is_some();
+    // `ZYNTAX_DISABLE_CONSTANT_INLINE=1` keeps constant dispatch calls; safe to run with.
+    let specialize_dispatch = std::env::var_os("ZYNTAX_DISABLE_CONSTANT_INLINE").is_none();
 
     // A callee that carries calls of its own is inlined only where it
     // runs repeatedly, inside a loop of the caller; elsewhere the call
@@ -1121,6 +1241,17 @@ fn inline_in_function(
             let shape = *shapes
                 .entry(callee_id)
                 .or_insert_with(|| shape_of(callee, callees));
+            // Price constant dispatch only at repeated sites; setup code keeps
+            // the shared helper instead of compiling a private copy of it.
+            let specialized = (hot_blocks.contains(&block_id)
+                && specialize_dispatch
+                && matches!(shape.class, CalleeClass::TooLarge))
+            .then(|| specialize_constants(caller, &args, callee, callees, specializations))
+            .flatten();
+            let (callee, shape) = specialized
+                .as_ref()
+                .map(|(body, shape)| (body.as_ref(), *shape))
+                .unwrap_or((callee, shape));
             let refused = |why: &str| {
                 if trace {
                     eprintln!(
@@ -1175,6 +1306,7 @@ fn inline_in_function(
                 args,
                 callee_id,
                 kind,
+                specialized,
             });
         }
 
@@ -1195,11 +1327,13 @@ fn inline_in_function(
                 continue;
             }
 
-            let callee = match callees.get(&job.callee_id) {
-                Some(c) => c,
-                None => continue,
+            let (callee, shape) = match &job.specialized {
+                Some((body, shape)) => (body.as_ref(), *shape),
+                None => match callees.get(&job.callee_id) {
+                    Some(c) => (c, shapes[&job.callee_id]),
+                    None => continue,
+                },
             };
-            let shape = shapes[&job.callee_id];
             let has_calls = shape.hot.calls;
 
             // Caller-budget check: predict post-inline size as
@@ -1347,6 +1481,7 @@ struct InlineJob {
     args: Vec<HirId>,
     callee_id: HirId,
     kind: InlineKind,
+    specialized: Option<(Arc<HirFunction>, CalleeShape)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2588,6 +2723,255 @@ mod tests {
                 .unwrap(),
             -2.0
         );
+    }
+
+    #[test]
+    fn constant_dispatch_is_priced_per_call_without_changing_dynamic_calls() {
+        let mut dispatch = HirFunction::new(
+            InternedString::new_global("dispatch"),
+            sig(vec![HirType::I64, HirType::I64, HirType::I64], HirType::I64),
+        );
+        let code = add_value_for_param(&mut dispatch, 0, HirType::I64);
+        let mut value = dispatch.values.remove(&code).unwrap();
+        let code = HirId::new();
+        value.id = code;
+        dispatch.values.insert(code, value);
+        let step = add_value_for_param(&mut dispatch, 1, HirType::I64);
+        let x = add_value_for_param(&mut dispatch, 2, HirType::I64);
+        let entry = dispatch.entry_block;
+        let second = HirId::new();
+        let first_arm = HirId::new();
+        let second_arm = HirId::new();
+        let fallback = HirId::new();
+        for id in [second, first_arm, second_arm, fallback] {
+            dispatch.blocks.insert(id, HirBlock::new(id));
+        }
+        for (block, literal, yes, no) in [
+            (entry, 0, first_arm, second),
+            (second, 1, second_arm, fallback),
+        ] {
+            let k = add_const(&mut dispatch, HirType::I64, HirConstant::I64(literal));
+            let cond = add_inst(&mut dispatch, HirType::Bool);
+            let block = dispatch.blocks.get_mut(&block).unwrap();
+            block.instructions.push(HirInstruction::Binary {
+                op: BinaryOp::Eq,
+                result: cond,
+                ty: HirType::Bool,
+                left: code,
+                right: k,
+            });
+            block.terminator = HirTerminator::CondBranch {
+                condition: cond,
+                true_target: yes,
+                false_target: no,
+            };
+        }
+        let second_body = dispatch.create_block();
+        let negative = dispatch.create_block();
+        let zero = add_const(&mut dispatch, HirType::I64, HirConstant::I64(0));
+        let nonnegative = add_inst(&mut dispatch, HirType::Bool);
+        dispatch
+            .blocks
+            .get_mut(&second_arm)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Binary {
+                op: BinaryOp::Ge,
+                result: nonnegative,
+                ty: HirType::I64,
+                left: x,
+                right: zero,
+            });
+        dispatch.blocks.get_mut(&second_arm).unwrap().terminator = HirTerminator::CondBranch {
+            condition: nonnegative,
+            true_target: second_body,
+            false_target: negative,
+        };
+        dispatch.blocks.get_mut(&negative).unwrap().terminator =
+            HirTerminator::Return { values: vec![zero] };
+        let added = add_inst(&mut dispatch, HirType::I64);
+        dispatch
+            .blocks
+            .get_mut(&first_arm)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Binary {
+                op: BinaryOp::Add,
+                result: added,
+                ty: HirType::I64,
+                left: x,
+                right: step,
+            });
+        dispatch.blocks.get_mut(&first_arm).unwrap().terminator = HirTerminator::Return {
+            values: vec![added],
+        };
+        for (block, adds) in [(second_body, 2), (fallback, 300)] {
+            let result = push_adds(&mut dispatch, block, x, adds);
+            dispatch.blocks.get_mut(&block).unwrap().terminator = HirTerminator::Return {
+                values: vec![result],
+            };
+        }
+        rebuild_cfg_edges(&mut dispatch);
+        dispatch.attributes.optimized = true;
+        let dispatch_id = dispatch.id;
+        let original = format!("{dispatch:?}");
+
+        let mut caller = HirFunction::new(
+            InternedString::new_global("caller"),
+            sig(vec![HirType::I64, HirType::I64], HirType::I64),
+        );
+        let code = add_value_for_param(&mut caller, 0, HirType::I64);
+        let x = add_value_for_param(&mut caller, 1, HirType::I64);
+        let zero = add_const(&mut caller, HirType::I64, HirConstant::I64(0));
+        let one = add_const(&mut caller, HirType::I64, HirConstant::I64(1));
+        let entry = caller.entry_block;
+        let header = caller.create_block();
+        let body = caller.create_block();
+        let exit = caller.create_block();
+        let iteration = add_inst(&mut caller, HirType::I64);
+        let next_iteration = add_inst(&mut caller, HirType::I64);
+        let again = add_inst(&mut caller, HirType::Bool);
+        caller.blocks.get_mut(&entry).unwrap().terminator =
+            HirTerminator::Branch { target: header };
+        caller
+            .blocks
+            .get_mut(&header)
+            .unwrap()
+            .phis
+            .push(crate::hir::HirPhi {
+                result: iteration,
+                ty: HirType::I64,
+                incoming: vec![(zero, entry), (next_iteration, body)],
+            });
+        caller.blocks.get_mut(&header).unwrap().terminator = HirTerminator::Branch { target: body };
+        let mut result = x;
+        // Repeated zero exercises the cache. Code one retains an input check,
+        // and dynamic code still reaches the oversized fallback.
+        for arg in [zero, one, zero, code] {
+            let next = add_inst(&mut caller, HirType::I64);
+            caller
+                .blocks
+                .get_mut(&body)
+                .unwrap()
+                .instructions
+                .push(HirInstruction::Call {
+                    result: Some(next),
+                    callee: HirCallable::Function(dispatch_id),
+                    args: vec![arg, one, result],
+                    type_args: vec![],
+                    const_args: vec![],
+                    is_tail: false,
+                });
+            result = next;
+        }
+        caller.blocks.get_mut(&body).unwrap().instructions.extend([
+            HirInstruction::Binary {
+                op: BinaryOp::Add,
+                result: next_iteration,
+                ty: HirType::I64,
+                left: iteration,
+                right: one,
+            },
+            HirInstruction::Binary {
+                op: BinaryOp::Lt,
+                result: again,
+                ty: HirType::I64,
+                left: next_iteration,
+                right: one,
+            },
+        ]);
+        caller.blocks.get_mut(&body).unwrap().terminator = HirTerminator::CondBranch {
+            condition: again,
+            true_target: header,
+            false_target: exit,
+        };
+        caller.blocks.get_mut(&exit).unwrap().terminator = HirTerminator::Return {
+            values: vec![result],
+        };
+        let caller_id = caller.id;
+        let mut setup = HirFunction::new(
+            InternedString::new_global("setup"),
+            sig(vec![HirType::I64], HirType::I64),
+        );
+        let x = add_value_for_param(&mut setup, 0, HirType::I64);
+        let zero = add_const(&mut setup, HirType::I64, HirConstant::I64(0));
+        let one = add_const(&mut setup, HirType::I64, HirConstant::I64(1));
+        let result = add_inst(&mut setup, HirType::I64);
+        let block = setup.blocks.get_mut(&setup.entry_block).unwrap();
+        block.instructions.push(HirInstruction::Call {
+            result: Some(result),
+            callee: HirCallable::Function(dispatch_id),
+            args: vec![zero, one, x],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        block.terminator = HirTerminator::Return {
+            values: vec![result],
+        };
+        let setup_id = setup.id;
+        let mut module = HirModule::new(InternedString::new_global("constant_dispatch"));
+        module.functions.insert(dispatch_id, dispatch);
+        module.functions.insert(caller_id, caller);
+        module.functions.insert(setup_id, setup);
+        assert_eq!(run_module(&mut module).inlined, 2);
+        assert_eq!(format!("{:?}", module.functions[&dispatch_id]), original);
+        assert!(module.functions[&setup_id].blocks.values().any(|block| {
+            block.instructions.iter().any(|i| matches!(i,
+                HirInstruction::Call { callee: HirCallable::Function(id), .. } if *id == dispatch_id))
+        }));
+        let remaining = module.functions[&caller_id]
+            .blocks
+            .values()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| {
+                matches!(i, HirInstruction::Call {
+                callee: HirCallable::Function(id), ..
+            } if *id == dispatch_id)
+            })
+            .count();
+        assert_eq!(remaining, 2);
+        let mut interp = crate::hir_interp::HirInterpreter::new();
+        let cases = [
+            (0, 7, 12),
+            (1, 7, 13),
+            (-1, 7, 311),
+            (0, -20, 2),
+            (1, -20, 3),
+            (-1, -20, 301),
+        ];
+        for (code, seed, expected) in cases {
+            let args = vec![
+                crate::value::ZyntaxValue::Int(code),
+                crate::value::ZyntaxValue::Int(seed),
+            ];
+            assert_eq!(
+                crate::hir_interp::value_to_i64(&interp.call(&module, "caller", args).unwrap()),
+                Some(expected)
+            );
+        }
+        #[cfg(feature = "cranelift-backend")]
+        {
+            let mut backend = crate::cranelift_backend::CraneliftBackend::new().unwrap();
+            backend.compile_module(&module).unwrap();
+            backend.finalize_definitions().unwrap();
+            let call: unsafe extern "C" fn(i64, i64) -> i64 =
+                unsafe { std::mem::transmute(backend.get_function_ptr(caller_id).unwrap()) };
+            for (code, seed, expected) in cases {
+                assert_eq!(unsafe { call(code, seed) }, expected);
+            }
+        }
+        #[cfg(feature = "llvm-backend")]
+        {
+            let context = inkwell::context::Context::create();
+            let mut backend = crate::llvm_jit_backend::LLVMJitBackend::new(&context).unwrap();
+            backend.compile_module(&module).unwrap();
+            let call: unsafe extern "C" fn(i64, i64) -> i64 =
+                unsafe { std::mem::transmute(backend.get_function_pointer(caller_id).unwrap()) };
+            for (code, seed, expected) in cases {
+                assert_eq!(unsafe { call(code, seed) }, expected);
+            }
+        }
     }
 
     #[test]
