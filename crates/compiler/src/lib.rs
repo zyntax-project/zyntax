@@ -66,6 +66,7 @@ pub mod hir_interp; // HIR bytecode interpreter (universal Tier 0; always availa
 pub mod host_heap; // A host's heap and collector behind the allocation entry points
 pub mod inline;
 pub mod interned; // The boxes every program shares
+mod known_bits;
 pub mod late_symbols; // Symbols an embedder supplies after the code generators were set up
 pub mod licm;
 pub mod load_cse;

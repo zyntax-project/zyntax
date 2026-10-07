@@ -19,6 +19,7 @@
 //!   Div/Rem by zero is preserved (we skip, runtime semantics
 //!   handle the trap).
 //! * **Integer comparisons** — Eq, Ne, Lt, Le, Gt, Ge → `Bool`.
+//!   Eq/Ne also fold when known operand bits prove or disprove equality.
 //! * **Float arithmetic** — FAdd, FSub, FMul, FDiv, FRem (via
 //!   Rust's `%`). Folded for both f32 and f64.
 //! * **Float comparisons** — FEq, FNe, FLt, FLe, FGt, FGe → `Bool`.
@@ -80,7 +81,8 @@ pub fn fold_function(func: &mut HirFunction) -> FoldStats {
     let mut stats = FoldStats::default();
     for _ in 0..16 {
         stats.iterations += 1;
-        let this_pass = fold_one_pass(func) + forward_decided(func);
+        let this_pass =
+            crate::known_bits::fold_comparisons(func) + fold_one_pass(func) + forward_decided(func);
         if this_pass == 0 {
             return stats;
         }
