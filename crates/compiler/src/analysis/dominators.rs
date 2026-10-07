@@ -33,13 +33,12 @@
 //! vectorization) need a uniform analysis keyed by `HirId` directly
 //! against `HirFunction.blocks`. This module fills that gap. It does
 //! *not* cache across passes — each pass that needs it constructs a
-//! fresh `DominatorTree`; the algorithm is O(N·E·α(N)) and N is small
-//! per function, so the cost is in the noise compared to the
-//! optimization work itself.
+//! fresh `DominatorTree`. The iterative computation uses dense RPO
+//! indices; dominance frontiers are computed only when queried.
 
 use crate::hir::{HirFunction, HirId};
-use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 /// Immediate dominators + the standard derived data.
 #[derive(Debug, Clone)]
@@ -51,8 +50,7 @@ pub struct DominatorTree {
     /// should treat unreachable blocks as "dead" anyway, and walking
     /// them would make the iterative idom step incorrect.
     rpo: Vec<HirId>,
-    /// Position in `rpo`. Used by `intersect` to walk the dominator
-    /// tree upward.
+    /// Position in `rpo`, also used to index the dense idom computation.
     rpo_pos: HashMap<HirId, usize>,
     /// `idom[b]` = immediate dominator of `b`. The entry block does
     /// NOT appear here (it has no immediate dominator).
@@ -69,7 +67,9 @@ pub struct DominatorTree {
     /// blocks `y` such that `b` dominates a predecessor of `y` but
     /// does not strictly dominate `y` itself — the φ-insertion sites
     /// when `b` defines a value.
-    frontier: HashMap<HirId, HashSet<HirId>>,
+    frontier: OnceLock<HashMap<HirId, HashSet<HirId>>>,
+    /// Predecessors of joins in the analyzed CFG, for frontier queries.
+    joins: Vec<(HirId, Vec<HirId>)>,
 }
 
 impl DominatorTree {
@@ -83,7 +83,12 @@ impl DominatorTree {
 
         let idom = compute_idom(func, entry, &rpo, &rpo_pos);
         let children = build_children(&idom);
-        let frontier = compute_frontier(func, &idom, &rpo_pos);
+        let joins = func
+            .blocks
+            .iter()
+            .filter(|(b, block)| block.predecessors.len() >= 2 && idom.contains_key(b))
+            .map(|(b, block)| (*b, block.predecessors.clone()))
+            .collect();
         let interval = compute_intervals(entry, &children);
 
         Self {
@@ -92,7 +97,8 @@ impl DominatorTree {
             rpo_pos,
             idom,
             children,
-            frontier,
+            frontier: OnceLock::new(),
+            joins,
             interval,
         }
     }
@@ -145,7 +151,10 @@ impl DominatorTree {
     pub fn frontier(&self, block: HirId) -> &HashSet<HirId> {
         static EMPTY: once_cell::sync::Lazy<HashSet<HirId>> =
             once_cell::sync::Lazy::new(HashSet::new);
-        self.frontier.get(&block).unwrap_or(&EMPTY)
+        self.frontier
+            .get_or_init(|| compute_frontier(&self.joins, &self.idom))
+            .get(&block)
+            .unwrap_or(&EMPTY)
     }
 
     /// Reverse postorder of reachable blocks — the canonical
@@ -239,78 +248,68 @@ fn compute_idom(
     rpo: &[HirId],
     rpo_pos: &HashMap<HirId, usize>,
 ) -> HashMap<HirId, HirId> {
-    let mut idom: IndexMap<HirId, HirId> = IndexMap::new();
-    // Sentinel: the entry's "immediate dominator" is itself. We
-    // remove the entry from the final result so callers see `None`
-    // for it, but during the algorithm we need a marker for "has an
-    // idom" vs. "doesn't yet" — using the entry's self-pair fits.
-    idom.insert(entry, entry);
-
+    if rpo.is_empty() {
+        return HashMap::new();
+    }
+    debug_assert_eq!(rpo[0], entry);
+    // RPO positions are dense and ordered toward the root, so the inner
+    // intersection walk needs neither hashing nor HirId lookups.
+    let mut offsets = Vec::with_capacity(rpo.len() + 1);
+    let mut predecessors = Vec::new();
+    for b in rpo {
+        offsets.push(predecessors.len());
+        if let Some(block) = func.blocks.get(b) {
+            predecessors.extend(
+                block
+                    .predecessors
+                    .iter()
+                    .filter_map(|p| rpo_pos.get(p).copied()),
+            );
+        }
+    }
+    offsets.push(predecessors.len());
+    let mut idom = vec![usize::MAX; rpo.len()];
+    idom[0] = 0;
     let mut changed = true;
     while changed {
         changed = false;
-        for &b in rpo.iter().skip(1) {
-            let block = match func.blocks.get(&b) {
-                Some(blk) => blk,
-                None => continue,
-            };
-            // Pick any pred with a known idom as the seed, then fold
-            // the remaining preds in via `intersect`.
-            let mut new_idom: Option<HirId> = None;
-            for &p in &block.predecessors {
-                if !idom.contains_key(&p) {
+        for b in 1..rpo.len() {
+            let mut parent = usize::MAX;
+            for &p in &predecessors[offsets[b]..offsets[b + 1]] {
+                if idom[p] == usize::MAX {
                     continue;
                 }
-                new_idom = Some(match new_idom {
-                    None => p,
-                    Some(cur) => intersect(&idom, cur, p, rpo_pos),
-                });
+                parent = if parent == usize::MAX {
+                    p
+                } else {
+                    intersect(&idom, parent, p)
+                };
             }
-            if let Some(ni) = new_idom {
-                if idom.get(&b) != Some(&ni) {
-                    idom.insert(b, ni);
-                    changed = true;
-                }
+            if parent != usize::MAX && idom[b] != parent {
+                idom[b] = parent;
+                changed = true;
             }
         }
     }
-
-    // Strip the entry's self-pair before returning so the public
-    // `idom(entry)` is `None`, matching the standard contract.
-    let entry_self = idom.remove(&entry);
-    debug_assert!(matches!(entry_self, Some(e) if e == entry));
-    idom.into_iter().collect()
+    idom.into_iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, parent)| *parent != usize::MAX)
+        .map(|(block, parent)| (rpo[block], rpo[parent]))
+        .collect()
 }
 
-/// Find the nearest common dominator of `b1` and `b2` by walking
-/// both up the tentative dominator tree, choosing whichever side is
-/// further from the root in RPO terms each step. Classic CHK
-/// "finger" intersect.
-fn intersect(
-    idom: &IndexMap<HirId, HirId>,
-    mut b1: HirId,
-    mut b2: HirId,
-    rpo_pos: &HashMap<HirId, usize>,
-) -> HirId {
-    while b1 != b2 {
-        while rpo_pos.get(&b1).copied().unwrap_or(usize::MAX)
-            > rpo_pos.get(&b2).copied().unwrap_or(usize::MAX)
-        {
-            match idom.get(&b1) {
-                Some(&p) if p != b1 => b1 = p,
-                _ => return b2,
-            }
+/// Walk the deeper RPO position toward the root until both meet.
+fn intersect(idom: &[usize], mut a: usize, mut b: usize) -> usize {
+    while a != b {
+        while a > b {
+            a = idom[a];
         }
-        while rpo_pos.get(&b2).copied().unwrap_or(usize::MAX)
-            > rpo_pos.get(&b1).copied().unwrap_or(usize::MAX)
-        {
-            match idom.get(&b2) {
-                Some(&p) if p != b2 => b2 = p,
-                _ => return b1,
-            }
+        while b > a {
+            b = idom[b];
         }
     }
-    b1
+    a
 }
 
 /// Invert `idom` to give a children-of map.
@@ -356,21 +355,18 @@ fn build_children(idom: &HashMap<HirId, HirId>) -> HashMap<HirId, Vec<HirId>> {
 /// dominator tree adding `b` to every block's frontier until we
 /// reach `idom[b]`.
 fn compute_frontier(
-    func: &HirFunction,
+    joins: &[(HirId, Vec<HirId>)],
     idom: &HashMap<HirId, HirId>,
-    _rpo_pos: &HashMap<HirId, usize>,
 ) -> HashMap<HirId, HashSet<HirId>> {
     let mut df: HashMap<HirId, HashSet<HirId>> = HashMap::new();
 
-    for (&b, block) in &func.blocks {
-        if block.predecessors.len() < 2 {
-            continue;
-        }
+    for (b, predecessors) in joins {
+        let b = *b;
         let b_idom = match idom.get(&b) {
             Some(&id) => id,
             None => continue,
         };
-        for &p in &block.predecessors {
+        for &p in predecessors {
             // Walk runner from p up to (but not including) idom[b],
             // adding b to each runner's frontier along the way.
             let mut runner = p;
@@ -545,5 +541,110 @@ mod tests {
         // Reachable blocks unaffected.
         assert_eq!(dt.rpo()[0], a);
         assert_eq!(dt.idom(b), Some(a));
+    }
+
+    fn reachable_without(func: &HirFunction, removed: Option<HirId>) -> HashSet<HirId> {
+        let mut reached = HashSet::new();
+        let mut work = vec![func.entry_block];
+        while let Some(block) = work.pop() {
+            if Some(block) == removed || !reached.insert(block) {
+                continue;
+            }
+            work.extend(&func.blocks[&block].successors);
+        }
+        reached
+    }
+
+    #[test]
+    fn small_cyclic_graphs_match_path_removal_oracle() {
+        // Enumerate every graph on four blocks with no edge into entry or
+        // self edge. This includes disconnected and irreducible cycles.
+        let blocks: Vec<_> = (0..4).map(|_| HirId::new()).collect();
+        let possible: Vec<_> = (0..4)
+            .flat_map(|a| (1..4).filter(move |&b| a != b).map(move |b| (a, b)))
+            .collect();
+        for mask in 0..1usize << possible.len() {
+            let mut successors = vec![vec![]; blocks.len()];
+            for (bit, &(a, b)) in possible.iter().enumerate() {
+                if mask & (1 << bit) != 0 {
+                    successors[a].push(blocks[b]);
+                }
+            }
+            let edges: Vec<_> = blocks
+                .iter()
+                .copied()
+                .zip(successors.iter().map(Vec::as_slice))
+                .collect();
+            let func = build_func("exhaustive", blocks[0], &edges);
+            let reached = reachable_without(&func, None);
+            let avoiding: HashMap<_, _> = blocks
+                .iter()
+                .map(|&b| (b, reachable_without(&func, Some(b))))
+                .collect();
+            let dominates = |a, b| a == b || (reached.contains(&b) && !avoiding[&a].contains(&b));
+            let dt = DominatorTree::new(&func);
+            assert_eq!(dt.rpo().iter().copied().collect::<HashSet<_>>(), reached);
+            for &b in &blocks {
+                for &a in &blocks {
+                    assert_eq!(dt.dominates(a, b), dominates(a, b), "graph {mask}");
+                }
+                let strict: Vec<_> = blocks
+                    .iter()
+                    .copied()
+                    .filter(|&a| a != b && dominates(a, b))
+                    .collect();
+                let immediate = strict
+                    .iter()
+                    .copied()
+                    .find(|&a| strict.iter().all(|&other| dominates(other, a)));
+                assert_eq!(dt.idom(b), immediate, "graph {mask}");
+                if reached.len() == blocks.len() {
+                    let frontier: HashSet<_> = blocks
+                        .iter()
+                        .copied()
+                        .filter(|&y| {
+                            (b == y || !dominates(b, y))
+                                && func.blocks[&y]
+                                    .predecessors
+                                    .iter()
+                                    .any(|&p| dominates(b, p))
+                        })
+                        .collect();
+                    assert_eq!(dt.frontier(b), &frontier, "graph {mask}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frontier_queries_use_the_analyzed_cfg_after_mutation_and_clone() {
+        let a = HirId::new();
+        let b = HirId::new();
+        let c = HirId::new();
+        let d = HirId::new();
+        let mut func = build_func(
+            "snapshot",
+            a,
+            &[(a, &[b, c]), (b, &[d]), (c, &[d]), (d, &[])],
+        );
+        let dt = DominatorTree::new(&func);
+        let cloned = dt.clone();
+        func.blocks.clear();
+        drop(func);
+        for tree in [&dt, &cloned, &dt.clone()] {
+            assert_eq!(tree.frontier(b), &HashSet::from([d]));
+            assert_eq!(tree.frontier(c), &HashSet::from([d]));
+            assert!(tree.frontier(a).is_empty());
+        }
+        assert_eq!(dt.clone().frontier(b), &HashSet::from([d]));
+    }
+
+    #[test]
+    fn missing_entry_has_no_reachable_blocks() {
+        let entry = HirId::new();
+        let dt = DominatorTree::new(&build_func("empty", entry, &[]));
+        assert!(dt.rpo().is_empty());
+        assert_eq!(dt.idom(entry), None);
+        assert!(dt.frontier(entry).is_empty());
     }
 }
