@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1791434444,"nonce":"12FzlMJ5yV8nKB+q2fozg/mcz7o=","added":["perf","area:compiler"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":2,"timestamp":1791434845,"nonce":"RgkGdg9BRxjZsMoimbFLKJD1SUA=","title":"HIR: strength-reduce bounded integer division and remainder","was":"HIR: narrow proven bounded integer division and remainder"}]}
