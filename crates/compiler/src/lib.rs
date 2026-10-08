@@ -110,6 +110,8 @@ pub mod vtable_registry; // Vtable management and caching // Async runtime (exec
 #[cfg(feature = "cranelift-backend")]
 pub mod cranelift_backend;
 #[cfg(feature = "cranelift-backend")]
+mod clif_schedule;
+#[cfg(feature = "cranelift-backend")]
 pub mod jit_memory; // One reserved address range per Cranelift JIT module
 
 #[cfg(feature = "llvm-backend")]

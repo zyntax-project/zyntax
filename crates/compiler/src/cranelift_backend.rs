@@ -143,20 +143,20 @@ pub struct Translated {
     clif_snapshot: Option<String>,
     dump_vcode: bool,
     ctx: codegen::Context,
+    compiled: Option<codegen::CompiledCode>,
 }
 
 impl Translated {
     /// Run Cranelift's compiler over the IR.
     pub fn compile(&mut self, isa: &dyn cranelift_codegen::isa::TargetIsa) -> CompilerResult<()> {
         let name = self.name;
-        // The error borrows the context, so it is read before the context
-        // can be shown.
-        let failure = match self.ctx.compile(
-            isa,
-            &mut cranelift_codegen::control::ControlPlane::default(),
-        ) {
-            Ok(_) => return Ok(()),
-            Err(e) => format!("{}", e.inner),
+        self.compiled = None;
+        let failure = match crate::clif_schedule::compile(&mut self.ctx, isa) {
+            Ok(code) => {
+                self.compiled = Some(code);
+                return Ok(());
+            }
+            Err(e) => format!("{e}"),
         };
         error!("Function compilation failed for: {}", name);
         error!("Error: {}", failure);
@@ -7156,6 +7156,7 @@ impl CraneliftBackend {
             clif_snapshot,
             dump_vcode: dump_vcode.is_some(),
             ctx,
+            compiled: None,
         })
     }
 
@@ -7173,8 +7174,9 @@ impl CraneliftBackend {
             clif_snapshot,
             dump_vcode,
             ctx,
+            compiled,
         } = translated;
-        let compiled = ctx.compiled_code().ok_or_else(|| {
+        let compiled = compiled.ok_or_else(|| {
             CompilerError::Backend(format!(
                 "{} was installed before it was compiled",
                 name.resolve_global().unwrap_or_default()
