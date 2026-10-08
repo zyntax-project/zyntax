@@ -40,7 +40,11 @@
 //! struct-typed `load` + `store` round-trips look unconditionally
 //! necessary to the late-stage instcombine.
 //!
-//! Conditions for safety (per Load):
+//! Pure reads place every field load at the original aggregate load,
+//! preserving its snapshot across intervening calls and writes. Volatile
+//! aggregate loads and values that escape the block are left intact.
+//!
+//! Conditions for read-modify-write safety (per Load):
 //! * Load and Store live in the same basic block.
 //! * Every use of the loaded value is either an `ExtractValue` or
 //!   an `InsertValue`, and every intermediate `InsertValue` has
@@ -153,6 +157,9 @@ struct SplitPlan {
     load_result: HirId,
     ptr: HirId,
     struct_ty: HirStructType,
+    /// Pure reads capture all fields at the original snapshot point.
+    reads_at_load: bool,
+    load_align: u32,
     /// (extractvalue_idx_in_block, field_index) pairs the read path
     /// needs to be rewritten at.
     field_reads: Vec<(usize, u32)>,
@@ -171,11 +178,15 @@ fn build_plan(func: &HirFunction, bid: HirId) -> Option<SplitPlan> {
 
     // For every Load of struct type, check if the pattern holds.
     for (load_idx, inst) in block.instructions.iter().enumerate() {
-        let (load_result, load_ptr, struct_ty) = match inst {
+        let (load_result, load_ptr, struct_ty, load_align) = match inst {
             HirInstruction::Load {
-                result, ty, ptr, ..
+                result,
+                ty,
+                ptr,
+                align,
+                volatile: false,
             } => match ty {
-                HirType::Struct(s) if !s.fields.is_empty() => (*result, *ptr, s.clone()),
+                HirType::Struct(s) if !s.fields.is_empty() => (*result, *ptr, s.clone(), *align),
                 _ => continue,
             },
             _ => continue,
@@ -184,9 +195,12 @@ fn build_plan(func: &HirFunction, bid: HirId) -> Option<SplitPlan> {
         // Collect every instruction that uses `load_result` or any
         // derived InsertValue chain link. We also need to know which
         // (if any) Store consumes the chain's tail.
-        if let Some(plan) =
-            try_build_plan_for_load(block, load_idx, load_result, load_ptr, &struct_ty)
+        if let Some(mut plan) =
+            try_build_read_plan(block, load_idx, load_result, load_ptr, &struct_ty).or_else(|| {
+                try_build_plan_for_load(block, load_idx, load_result, load_ptr, &struct_ty)
+            })
         {
+            plan.load_align = load_align;
             // Cross-block escape check: every chain value (load
             // result + every InsertValue result) must not be
             // referenced outside this block, and within this block
@@ -265,13 +279,54 @@ fn chain_safe_to_remove(
 }
 
 fn terminator_uses_any(term: &crate::hir::HirTerminator, chain: &HashSet<HirId>) -> bool {
-    use crate::hir::HirTerminator;
-    match term {
-        HirTerminator::Return { values } => values.iter().any(|v| chain.contains(v)),
-        HirTerminator::CondBranch { condition, .. } => chain.contains(condition),
-        HirTerminator::Switch { value, .. } => chain.contains(value),
-        _ => false,
+    let mut any = false;
+    term.for_each_operand(|id| any |= chain.contains(&id));
+    any
+}
+
+fn try_build_read_plan(
+    block: &HirBlock,
+    load_idx: usize,
+    load_result: HirId,
+    load_ptr: HirId,
+    struct_ty: &HirStructType,
+) -> Option<SplitPlan> {
+    // `ZYNTAX_DISABLE_AGGREGATE_READS=1` retains aggregate snapshots; safe to run with.
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("ZYNTAX_DISABLE_AGGREGATE_READS").is_some()) {
+        return None;
     }
+    let mut field_reads = Vec::new();
+    for (idx, inst) in block.instructions.iter().enumerate().skip(load_idx + 1) {
+        match inst {
+            HirInstruction::ExtractValue {
+                aggregate, indices, ..
+            } if *aggregate == load_result => {
+                if indices.len() != 1 || indices[0] as usize >= struct_ty.fields.len() {
+                    return None;
+                }
+                field_reads.push((idx, indices[0]));
+            }
+            _ if inst.any_operand(|id| id == load_result) => return None,
+            _ => {}
+        }
+    }
+    if field_reads.is_empty() {
+        return None;
+    }
+    Some(SplitPlan {
+        load_idx,
+        load_result,
+        ptr: load_ptr,
+        struct_ty: struct_ty.clone(),
+        reads_at_load: true,
+        load_align: 1,
+        field_reads,
+        field_writes: Vec::new(),
+        insertvalue_idxs: Vec::new(),
+        has_store: false,
+        store_idx: 0,
+    })
 }
 
 fn try_build_plan_for_load(
@@ -434,6 +489,8 @@ fn try_build_plan_for_load(
         ptr: load_ptr,
         struct_ty: struct_ty.clone(),
         field_reads,
+        reads_at_load: false,
+        load_align: 1,
         field_writes,
         insertvalue_idxs,
         has_store,
@@ -528,11 +585,21 @@ fn apply_plan(func: &mut HirFunction, bid: HirId, plan: &SplitPlan) {
             result: new_load_id,
             ty: field_ty,
             ptr: field_ptr_id,
-            align: 8,
+            align: if offset == 0 {
+                plan.load_align
+            } else {
+                plan.load_align
+                    .min(1u32 << (offset as u64).trailing_zeros().min(31))
+            },
             volatile: false,
         };
 
-        new_extract_insts.push((*idx, vec![gep_inst, cast_inst, load_inst]));
+        let position = if plan.reads_at_load {
+            plan.load_idx
+        } else {
+            *idx
+        };
+        new_extract_insts.push((position, vec![gep_inst, cast_inst, load_inst]));
 
         // Record substitution from the OLD ExtractValue result HirId
         // to the new field-Load result.
@@ -638,7 +705,10 @@ fn apply_plan(func: &mut HirFunction, bid: HirId, plan: &SplitPlan) {
 
     let mut extract_replacement_map: HashMap<usize, Vec<HirInstruction>> = HashMap::new();
     for (idx, insts) in new_extract_insts {
-        extract_replacement_map.insert(idx, insts);
+        extract_replacement_map
+            .entry(idx)
+            .or_insert_with(Vec::new)
+            .extend(insts);
     }
 
     let store_idx_for_writes = plan.store_idx;
@@ -717,37 +787,7 @@ fn size_of_hir_ty(ty: &HirType) -> usize {
 
 fn uses_any(inst: &HirInstruction, chain: &HashSet<HirId>) -> bool {
     let mut any = false;
-    let chk = |id: &HirId| -> bool { chain.contains(id) };
-    match inst {
-        HirInstruction::Binary { left, right, .. } => any = chk(left) || chk(right),
-        HirInstruction::Unary { operand, .. } => any = chk(operand),
-        HirInstruction::Cast { operand, .. } => any = chk(operand),
-        HirInstruction::Load { ptr, .. } => any = chk(ptr),
-        HirInstruction::Store { value, ptr, .. } => any = chk(value) || chk(ptr),
-        HirInstruction::GetElementPtr { ptr, indices, .. } => {
-            any = chk(ptr) || indices.iter().any(chk);
-        }
-        HirInstruction::ExtractValue { aggregate, .. } => any = chk(aggregate),
-        HirInstruction::InsertValue {
-            aggregate, value, ..
-        } => any = chk(aggregate) || chk(value),
-        HirInstruction::Call { callee, args, .. } => {
-            if let crate::hir::HirCallable::Indirect(v) = callee {
-                any = chk(v);
-            }
-            any |= args.iter().any(chk);
-        }
-        HirInstruction::IndirectCall { func_ptr, args, .. } => {
-            any = chk(func_ptr) || args.iter().any(chk);
-        }
-        HirInstruction::Select {
-            condition,
-            true_val,
-            false_val,
-            ..
-        } => any = chk(condition) || chk(true_val) || chk(false_val),
-        _ => {}
-    }
+    inst.for_each_operand(|id| any |= chain.contains(&id));
     any
 }
 
@@ -848,8 +888,168 @@ mod tests {
         f.blocks.get_mut(&entry).unwrap().instructions.push(inst);
     }
 
-    // The pinned `eliminates_non_escaping_malloc` test that previously
-    // lived here (with `#[ignore]`) has moved to
-    // `scalar_replace_alloc::tests::eliminates_non_escaping_malloc`
-    // and no longer needs to be ignored: the new pass closes the gap.
+    fn read_fixture(volatile: bool) -> (HirFunction, HirId, HirId, HirId, HirType) {
+        let (mut f, entry) = mk_func();
+        let ty = HirType::Struct(HirStructType {
+            name: None,
+            fields: vec![HirType::I64, HirType::I64],
+            packed: false,
+        });
+        let ptr = add_inst(&mut f, HirType::Ptr(Box::new(ty.clone())));
+        f.values.get_mut(&ptr).unwrap().kind = HirValueKind::Parameter(0);
+        let loaded = add_inst(&mut f, ty.clone());
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Load {
+                result: loaded,
+                ty: ty.clone(),
+                ptr,
+                align: 4,
+                volatile,
+            },
+        );
+        (f, entry, ptr, loaded, ty)
+    }
+
+    fn extract(
+        f: &mut HirFunction,
+        block: HirId,
+        aggregate: HirId,
+        index: u32,
+        ty: HirType,
+    ) -> HirId {
+        let result = add_inst(f, ty.clone());
+        push(
+            f,
+            block,
+            HirInstruction::ExtractValue {
+                result,
+                ty,
+                aggregate,
+                indices: vec![index],
+            },
+        );
+        result
+    }
+
+    fn call(ptr: HirId) -> HirInstruction {
+        HirInstruction::Call {
+            result: None,
+            callee: HirCallable::Function(HirId::new()),
+            args: vec![ptr],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        }
+    }
+
+    #[test]
+    fn nested_reads_before_a_call_need_no_aggregate_snapshot() {
+        let (mut f, entry, ptr, loaded, inner) = read_fixture(false);
+        let outer = HirType::Struct(HirStructType {
+            name: None,
+            fields: vec![inner.clone(), inner.clone()],
+            packed: false,
+        });
+        f.values.get_mut(&loaded).unwrap().ty = outer.clone();
+        f.values.get_mut(&ptr).unwrap().ty = HirType::Ptr(Box::new(outer.clone()));
+        if let HirInstruction::Load { ty, .. } =
+            &mut f.blocks.get_mut(&entry).unwrap().instructions[0]
+        {
+            *ty = outer;
+        }
+        for i in 0..2 {
+            let pair = extract(&mut f, entry, loaded, i, inner.clone());
+            for j in 0..2 {
+                extract(&mut f, entry, pair, j, HirType::I64);
+            }
+        }
+        push(&mut f, entry, call(ptr));
+        assert_eq!(run_function(&mut f).field_reads_only, 3);
+        let insts = &f.blocks[&entry].instructions;
+        assert!(!insts.iter().any(|i| matches!(
+            i,
+            HirInstruction::Load {
+                ty: HirType::Struct(_),
+                ..
+            } | HirInstruction::ExtractValue { .. }
+        )));
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|i| matches!(i, HirInstruction::Load { .. }))
+                .count(),
+            4
+        );
+        assert!(matches!(insts.last(), Some(HirInstruction::Call { .. })));
+    }
+
+    #[test]
+    fn fields_are_captured_before_calls_and_aliasing_writes() {
+        for with_call in [false, true] {
+            let (mut f, entry, ptr, loaded, _) = read_fixture(false);
+            let update = add_const_i64(&mut f, 99);
+            let effect = if with_call {
+                call(ptr)
+            } else {
+                HirInstruction::Store {
+                    value: update,
+                    ptr,
+                    align: 4,
+                    volatile: false,
+                }
+            };
+            push(&mut f, entry, effect);
+            let field = extract(&mut f, entry, loaded, 0, HirType::I64);
+            f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Return {
+                values: vec![field],
+            };
+            assert_eq!(run_function(&mut f).field_reads_only, 1);
+            let insts = &f.blocks[&entry].instructions;
+            let (at, result) = insts
+                .iter()
+                .enumerate()
+                .find_map(|(at, i)| match i {
+                    HirInstruction::Load {
+                        result,
+                        ty: HirType::I64,
+                        align: 4,
+                        ..
+                    } => Some((at, *result)),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(at + 1, insts.len() - 1);
+            assert!(matches!(&f.blocks[&entry].terminator,
+                HirTerminator::Return { values } if values == &[result]));
+        }
+    }
+
+    #[test]
+    fn volatile_or_escaping_aggregates_keep_their_snapshot() {
+        for escape in 0..4 {
+            let (mut f, entry, _, loaded, ty) = read_fixture(escape == 0);
+            extract(&mut f, entry, loaded, 0, HirType::I64);
+            match escape {
+                1 => push(&mut f, entry, call(loaded)),
+                2 => {
+                    f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Return {
+                        values: vec![loaded],
+                    }
+                }
+                3 => {
+                    let next = f.create_block();
+                    f.blocks.get_mut(&entry).unwrap().terminator =
+                        HirTerminator::Branch { target: next };
+                    extract(&mut f, next, loaded, 1, HirType::I64);
+                }
+                _ => {}
+            }
+            assert_eq!(run_function(&mut f).field_reads_only, 0);
+            assert!(
+                matches!(&f.blocks[&entry].instructions[0], HirInstruction::Load { ty: t, .. } if t == &ty)
+            );
+        }
+    }
 }
