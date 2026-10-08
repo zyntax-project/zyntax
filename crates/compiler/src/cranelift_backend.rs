@@ -3059,7 +3059,7 @@ impl CraneliftBackend {
                                 }
                                 BinaryOp::Div => {
                                     if ty.is_float() {
-                                        builder.ins().fdiv(lhs, rhs)
+                                        crate::power2_div::emit(&mut builder, lhs, rhs)
                                     } else if ty.is_signed() {
                                         builder.ins().sdiv(lhs, rhs)
                                     } else {
@@ -3212,7 +3212,7 @@ impl CraneliftBackend {
                                 BinaryOp::FAdd => builder.ins().fadd(lhs, rhs),
                                 BinaryOp::FSub => builder.ins().fsub(lhs, rhs),
                                 BinaryOp::FMul => builder.ins().fmul(lhs, rhs),
-                                BinaryOp::FDiv => builder.ins().fdiv(lhs, rhs),
+                                BinaryOp::FDiv => crate::power2_div::emit(&mut builder, lhs, rhs),
                                 BinaryOp::FRem => {
                                     Self::call_libm_fmod(&mut self.module, &mut builder, lhs, rhs)?
                                 }
@@ -8279,7 +8279,7 @@ impl CraneliftBackend {
                     BinaryOp::FAdd => builder.ins().fadd(lhs, rhs),
                     BinaryOp::FSub => builder.ins().fsub(lhs, rhs),
                     BinaryOp::FMul => builder.ins().fmul(lhs, rhs),
-                    BinaryOp::FDiv => builder.ins().fdiv(lhs, rhs),
+                    BinaryOp::FDiv => crate::power2_div::emit(builder, lhs, rhs),
                     // Float remainder requires libm fmod function call
                     BinaryOp::FRem => Self::call_libm_fmod(&mut self.module, builder, lhs, rhs)?,
 
@@ -8407,7 +8407,7 @@ impl CraneliftBackend {
                     BinaryOp::Mul => builder.ins().imul(lhs, rhs),
                     BinaryOp::Div => {
                         if ty.is_float() {
-                            builder.ins().fdiv(lhs, rhs)
+                            crate::power2_div::emit(builder, lhs, rhs)
                         } else if ty.is_signed() {
                             builder.ins().sdiv(lhs, rhs)
                         } else {
@@ -8446,7 +8446,7 @@ impl CraneliftBackend {
                     BinaryOp::FAdd => builder.ins().fadd(lhs, rhs),
                     BinaryOp::FSub => builder.ins().fsub(lhs, rhs),
                     BinaryOp::FMul => builder.ins().fmul(lhs, rhs),
-                    BinaryOp::FDiv => builder.ins().fdiv(lhs, rhs),
+                    BinaryOp::FDiv => crate::power2_div::emit(builder, lhs, rhs),
                     BinaryOp::FRem => {
                         // Cranelift doesn't have frem, use libm fmod
                         Self::call_libm_fmod(&mut self.module, builder, lhs, rhs)?
@@ -10093,7 +10093,7 @@ impl CraneliftBackend {
                     BinaryOp::Mul => builder.ins().imul(lhs, rhs),
                     BinaryOp::Div => {
                         if ty.is_float() {
-                            builder.ins().fdiv(lhs, rhs)
+                            crate::power2_div::emit(builder, lhs, rhs)
                         } else if ty.is_signed() {
                             builder.ins().sdiv(lhs, rhs)
                         } else {
@@ -10219,7 +10219,7 @@ impl CraneliftBackend {
                     BinaryOp::FAdd => builder.ins().fadd(lhs, rhs),
                     BinaryOp::FSub => builder.ins().fsub(lhs, rhs),
                     BinaryOp::FMul => builder.ins().fmul(lhs, rhs),
-                    BinaryOp::FDiv => builder.ins().fdiv(lhs, rhs),
+                    BinaryOp::FDiv => crate::power2_div::emit(builder, lhs, rhs),
                     BinaryOp::FRem => Self::call_libm_fmod(&mut self.module, builder, lhs, rhs)?,
                     // Float comparisons - also always return bool (i8)
                     BinaryOp::FEq
