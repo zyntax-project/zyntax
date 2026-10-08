@@ -15,6 +15,128 @@ use zyntax_compiler::llvm_backend::LLVMBackend;
 use zyntax_compiler::osr;
 
 #[test]
+fn mixed_scalar_vector_frames_use_their_declared_alignment() {
+    use zyntax_compiler::{
+        cranelift_backend::CraneliftBackend, hir::*, llvm_jit_backend::LLVMJitBackend,
+    };
+    use zyntax_typed_ast::InternedString;
+
+    let (mut function, header) = counted_loop();
+    let body = function.blocks[&header].successors[0];
+    let exit = function.blocks[&header].successors[1];
+    let vt = HirType::Vector(Box::new(HirType::I64), 2);
+    let one = function.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(1)));
+    let initial = function.create_value(vt.clone(), HirValueKind::Instruction);
+    let carried = function.create_value(vt.clone(), HirValueKind::Instruction);
+    let next = function.create_value(vt.clone(), HirValueKind::Instruction);
+    function
+        .blocks
+        .get_mut(&function.entry_block)
+        .unwrap()
+        .instructions
+        .push(HirInstruction::VectorSplat {
+            result: initial,
+            ty: vt.clone(),
+            scalar: one,
+        });
+    function.blocks.get_mut(&header).unwrap().phis.push(HirPhi {
+        result: carried,
+        ty: vt.clone(),
+        incoming: vec![(initial, function.entry_block), (next, body)],
+    });
+    function
+        .blocks
+        .get_mut(&body)
+        .unwrap()
+        .instructions
+        .push(HirInstruction::Binary {
+            result: next,
+            op: BinaryOp::Add,
+            ty: vt,
+            left: carried,
+            right: initial,
+        });
+    let reduced = function.create_value(HirType::I64, HirValueKind::Instruction);
+    let narrowed = function.create_value(HirType::I32, HirValueKind::Instruction);
+    let result = function.create_value(HirType::I32, HirValueKind::Instruction);
+    let scalar = match &function.blocks[&exit].terminator {
+        HirTerminator::Return { values } => values[0],
+        _ => unreachable!(),
+    };
+    let end = function.blocks.get_mut(&exit).unwrap();
+    end.instructions.extend([
+        HirInstruction::VectorHorizontalReduce {
+            result: reduced,
+            ty: HirType::I64,
+            vector: carried,
+            op: BinaryOp::Add,
+        },
+        HirInstruction::Cast {
+            result: narrowed,
+            ty: HirType::I32,
+            op: CastOp::Trunc,
+            operand: reduced,
+        },
+        HirInstruction::Binary {
+            result,
+            ty: HirType::I32,
+            op: BinaryOp::Add,
+            left: scalar,
+            right: narrowed,
+        },
+    ]);
+    end.terminator = HirTerminator::Return {
+        values: vec![result],
+    };
+    let layout = osr::osr_layout(&function, header).unwrap();
+    assert!(
+        layout
+            .live_in_types
+            .iter()
+            .zip(&layout.frame.offsets)
+            .any(|(ty, offset)| { matches!(ty, HirType::Vector(_, _)) && offset % 16 == 8 }),
+        "fixture must include a vector at an eight-byte offset"
+    );
+    let context = Context::create();
+    let mut ir = LLVMBackend::new(&context, "frame_alignment");
+    ir.compile_osr_helper(&function, &layout).unwrap();
+    let text = ir.module().print_to_string().to_string();
+    let loads: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("load <2 x i64>"))
+        .collect();
+    assert!(
+        loads.len() >= 2,
+        "both phi and ordinary live-ins must load from the frame: {text}"
+    );
+    assert!(loads.iter().all(|line| line.contains("align 8")), "{text}");
+
+    let id = function.id;
+    let bead = osr::next_bead_id();
+    let mut clif = CraneliftBackend::with_runtime_symbols(&osr::osr_runtime_symbols()).unwrap();
+    clif.set_compile_bead_id(bead);
+    clif.compile_function(id, &function).unwrap();
+    clif.finalize_definitions().unwrap();
+    let mut module = HirModule::new(InternedString::new_global("frame_alignment"));
+    module.functions.insert(id, function);
+    let mut llvm = LLVMJitBackend::new(&context).unwrap();
+    llvm.set_compile_tier(1);
+    llvm.compile_module(&module).unwrap();
+    let (_, _, helper) = llvm
+        .take_pending_osr_helpers()
+        .into_iter()
+        .find(|(_, site, _)| *site == layout.site_key())
+        .unwrap();
+    // SAFETY: the fixture is C (i32) -> i32; both JITs remain alive.
+    let call: unsafe extern "C" fn(i32) -> i32 =
+        unsafe { std::mem::transmute(clif.get_function_ptr(id).unwrap()) };
+    assert_eq!(unsafe { call(10) }, 67);
+    osr::publish_helper(bead, layout.site_key(), helper);
+    assert_eq!(unsafe { call(10) }, 67);
+    osr::publish_helper(bead, layout.site_key(), std::ptr::null_mut());
+}
+
+#[test]
 fn the_llvm_tier_emits_a_helper_that_resumes_at_the_header() {
     let (function, header_id) = counted_loop();
     let layout =

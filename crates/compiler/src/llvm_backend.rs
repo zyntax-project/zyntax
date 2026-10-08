@@ -1354,9 +1354,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                         )
                         .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?
                 } else {
-                    self.builder
-                        .build_load(target, slot, "osr_live_in")
-                        .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?
+                    self.load_osr_slot(target, slot, hir_ty)?
                 };
                 self.value_map.insert(*hir_id, recovered);
                 self.type_map.insert(*hir_id, hir_ty.clone());
@@ -1415,9 +1413,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                         .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?
                 }
             } else {
-                self.builder
-                    .build_load(want, *slot, "osr_live_in")
-                    .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?
+                self.load_osr_slot(want, *slot, hir_ty)?
             };
             phi_seeds.push((*hir_id, seed));
         }
@@ -1474,6 +1470,25 @@ impl<'ctx> LLVMBackend<'ctx> {
                 layout.header
             )))
         }
+    }
+
+    /// Load with the frame ABI's alignment, which can be smaller than LLVM's
+    /// native alignment for a vector of the same type.
+    fn load_osr_slot(
+        &self,
+        ty: BasicTypeEnum<'ctx>,
+        slot: PointerValue<'ctx>,
+        hir_ty: &HirType,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        let value = self
+            .builder
+            .build_load(ty, slot, "osr_live_in")
+            .map_err(|e| CompilerError::CodeGen(format!("OSR frame load: {e}")))?;
+        if let Some(inst) = value.as_instruction_value() {
+            inst.set_alignment(crate::osr::frame_align_of(hir_ty) as u32)
+                .map_err(|e| CompilerError::CodeGen(format!("OSR frame alignment: {e}")))?;
+        }
+        Ok(value)
     }
 
     /// The body of `helper`: `entry` called with each parameter read
@@ -1550,10 +1565,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 } else {
                     self.direct_type(hir_ty)?
                 };
-                let value = self
-                    .builder
-                    .build_load(held, at, "osr_live_in")
-                    .map_err(load)?;
+                let value = self.load_osr_slot(held, at, hir_ty)?;
                 self.coerce_scalar(value, want)?
             };
             args.push(value.into());
