@@ -26,6 +26,8 @@
 //! * Single-body-block counted loops with header phi `i = phi[0, i+k]`,
 //!   header bound `i < n`, body branching back to header.
 //! * Stride-1 (contiguous) GEPs only — no gather/scatter.
+//! * Integer counter reductions carry consecutive lane indices. Constant
+//!   inclusive bounds are normalized only when the exclusive bound fits.
 //! * Add/FAdd accumulator reductions only (commutative + associative
 //!   under the assumption float reordering is acceptable, matching
 //!   LLVM `-ffast-math`-like semantics for these loops).
@@ -112,19 +114,34 @@ pub fn run(func: &mut HirFunction) -> AutoVectorizeStats {
 
 /// Run the pass on every function in `module`.
 pub fn run_module(module: &mut HirModule) -> AutoVectorizeStats {
+    run_module_with_counter_vectors(module, true)
+}
+
+pub(crate) fn run_module_with_counter_vectors(
+    module: &mut HirModule,
+    counter_vectors: bool,
+) -> AutoVectorizeStats {
     if std::env::var("ZYNTAX_DISABLE_AUTO_VECTORIZE").is_ok() {
         return AutoVectorizeStats::default();
     }
     let pass = AutoVectorizePass::default();
     let mut total = AutoVectorizeStats::default();
     for func in module.functions_to_optimize() {
-        total.add(pass.run(func));
+        total.add(pass.run_with_counter_vectors(func, counter_vectors));
     }
     total
 }
 
 impl AutoVectorizePass {
     pub fn run(&self, func: &mut HirFunction) -> AutoVectorizeStats {
+        self.run_with_counter_vectors(func, true)
+    }
+
+    fn run_with_counter_vectors(
+        &self,
+        func: &mut HirFunction,
+        counter_vectors: bool,
+    ) -> AutoVectorizeStats {
         let dt = DominatorTree::new(func);
         let lf = LoopForest::detect(func, &dt);
         if lf.loops().is_empty() {
@@ -140,7 +157,7 @@ impl AutoVectorizePass {
             .unwrap_or_else(|| "<anon>".to_string());
         for lp in lf.loops().to_vec() {
             stats.loops_visited += 1;
-            match self.analyze_loop(func, &lp) {
+            match self.analyze_loop(func, &lp, counter_vectors) {
                 LoopOutcome::Vectorize(plan) => {
                     if dump {
                         eprintln!(
@@ -191,7 +208,12 @@ impl AutoVectorizePass {
         stats
     }
 
-    fn analyze_loop(&self, func: &HirFunction, lp: &NaturalLoop) -> LoopOutcome {
+    fn analyze_loop(
+        &self,
+        func: &HirFunction,
+        lp: &NaturalLoop,
+        counter_vectors: bool,
+    ) -> LoopOutcome {
         // V1: header + single body block.
         if lp.body.len() != 2 {
             return LoopOutcome::RejectShape("multi-block body");
@@ -314,22 +336,46 @@ impl AutoVectorizePass {
             None => return LoopOutcome::RejectNoIv,
         };
 
-        // Condition must be `iv < n`.
-        let n = match find_inst_by_result_in(header, cond_id) {
+        // Inclusive constant bounds can become exclusive without overflowing.
+        let (n, exclusive_bound) = match find_inst_by_result_in(header, cond_id) {
             Some(HirInstruction::Binary {
                 op: BinaryOp::Lt,
                 left,
                 right,
                 ..
-            }) if *left == iv.phi => *right,
+            }) if *left == iv.phi => (*right, None),
+            Some(HirInstruction::Binary {
+                op: BinaryOp::Le,
+                left,
+                right,
+                ..
+            }) if *left == iv.phi => {
+                let bound = match func.values.get(right).map(|v| &v.kind) {
+                    Some(HirValueKind::Constant(HirConstant::I32(n))) => {
+                        n.checked_add(1).map(HirConstant::I32)
+                    }
+                    Some(HirValueKind::Constant(HirConstant::I64(n))) => {
+                        n.checked_add(1).map(HirConstant::I64)
+                    }
+                    _ => None,
+                };
+                let Some(bound) = bound else {
+                    return LoopOutcome::RejectShape("inclusive bound may overflow");
+                };
+                (*right, Some(bound))
+            }
             _ => return LoopOutcome::RejectShape("header cond not iv<n"),
         };
 
         // Trip count: known if `n` is a constant.
-        let known_trip = constant_int(func, n);
+        let known_trip = match exclusive_bound {
+            Some(HirConstant::I32(n)) => Some(i64::from(n)),
+            Some(HirConstant::I64(n)) => Some(n),
+            _ => constant_int(func, n),
+        };
         if let Some(tc) = known_trip {
-            if (tc as usize) < self.min_trip_count {
-                return LoopOutcome::RejectTripCount(tc as usize);
+            if (tc.max(0) as usize) < self.min_trip_count {
+                return LoopOutcome::RejectTripCount(tc.max(0) as usize);
             }
         }
 
@@ -340,25 +386,16 @@ impl AutoVectorizePass {
         let mut vec_stores: Vec<MemAcc> = Vec::new();
         let mut n_arith: usize = 0;
         let mut elem_ty_hint: Option<HirType> = None;
+        let mut vector_counter = false;
 
         for inst in &body.instructions {
-            // Widening something computed from the counter would need
-            // the counter itself as a vector, holding `i, i+1, i+2,
-            // i+3`. This pass never builds one: it widens an
-            // instruction by retyping its result and leaving its
-            // operands alone, which for a read of the counter leaves a
-            // scalar feeding a vector and writes one lane's answer into
-            // four.
-            //
-            // Indexing is the exception, because a GEP at the counter
-            // is precisely what the address of a vector load or store
-            // means, and so is the counter's own increment, which is
-            // rewritten to step by the lane count further down.
+            // Arithmetic uses need successive lane counters; GEPs and the
+            // scalar increment keep the scalar counter for loop control.
             if !matches!(inst, HirInstruction::GetElementPtr { .. })
                 && instruction_result(inst) != Some(iv.next)
                 && mentions(inst, iv.phi)
             {
-                return LoopOutcome::RejectShape("value computed from the counter");
+                vector_counter = true;
             }
             match inst {
                 HirInstruction::Binary { op, ty, result, .. } => {
@@ -462,9 +499,67 @@ impl AutoVectorizePass {
             }
         }
 
-        // Without a vector load or store there is nothing a lane can
-        // carry that the scalar loop does not.
-        if vec_loads.is_empty() && vec_stores.is_empty() {
+        if vector_counter {
+            if !counter_vectors {
+                return LoopOutcome::RejectShape(
+                    "counter vectors deferred to the native optimizer",
+                );
+            }
+            // Counter reductions currently use one integer width and no
+            // memory. Mixed widths need separate vector-width legalization.
+            let iv_ty = &func.values[&iv.phi].ty;
+            if !matches!(iv_ty, HirType::I32 | HirType::I64)
+                || func.values[&n].ty != *iv_ty
+                || reductions.is_empty()
+                || reductions.iter().any(|r| r.elem_ty != *iv_ty)
+                || header.instructions.len() != 1
+                || !body.phis.is_empty()
+                || body.instructions.iter().any(|inst| {
+                    !matches!(inst,
+                    HirInstruction::Binary { ty, .. } if ty == iv_ty)
+                })
+            {
+                return LoopOutcome::RejectShape("unsupported counter reduction");
+            }
+            // Only header phis have a scalar counterpart after the tail.
+            let locals: HashSet<_> = body
+                .instructions
+                .iter()
+                .filter_map(instruction_result)
+                .collect();
+            if body.instructions.iter().any(|inst| mentions(inst, iv.next))
+                || func
+                    .blocks
+                    .iter()
+                    .filter(|(id, _)| **id != header_id && **id != body_id)
+                    .any(|(_, b)| {
+                        b.instructions
+                            .iter()
+                            .flat_map(|i| i.operands())
+                            .chain(
+                                b.phis
+                                    .iter()
+                                    .flat_map(|p| p.incoming.iter().map(|(v, _)| *v)),
+                            )
+                            .any(|v| locals.contains(&v))
+                            || {
+                                let mut escapes = false;
+                                b.terminator
+                                    .for_each_operand(|v| escapes |= locals.contains(&v));
+                                escapes
+                            }
+                    })
+            {
+                return LoopOutcome::RejectShape("counter intermediate escapes loop");
+            }
+            // ZYNTAX_DISABLE_COUNTER_VECTORIZE retains scalar counter loops; safe to run with.
+            if std::env::var_os("ZYNTAX_DISABLE_COUNTER_VECTORIZE").is_some() {
+                return LoopOutcome::RejectShape("counter vectorization disabled");
+            }
+        } else if exclusive_bound.is_some() {
+            return LoopOutcome::RejectShape("inclusive bound without a counter reduction");
+        }
+        if vec_loads.is_empty() && vec_stores.is_empty() && !vector_counter {
             return LoopOutcome::RejectShape("no memory access to vectorize");
         }
         // Pick the lane element type + lane count.
@@ -524,6 +619,17 @@ impl AutoVectorizePass {
             preheader: preheader_id,
             iv,
             n,
+            exclusive_bound,
+            vector_counter,
+            unroll: if vector_counter
+                && reductions.len() == 1
+                && body.instructions.len() <= 12
+                && known_trip.is_none_or(|n| n >= i64::from(lanes * 4))
+            {
+                4
+            } else {
+                1
+            },
             reductions,
             vec_loads,
             vec_stores,
@@ -579,6 +685,9 @@ struct LoopAnalysis {
     preheader: HirId,
     iv: InductionVariable,
     n: HirId,
+    exclusive_bound: Option<HirConstant>,
+    vector_counter: bool,
+    unroll: u32,
     reductions: Vec<Reduction>,
     vec_loads: Vec<MemAcc>,
     vec_stores: Vec<MemAcc>,
@@ -765,6 +874,9 @@ fn estimate_speedup(
 
 fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
     let lanes = plan.lanes;
+    // Small register-only bodies amortize loop control across several vectors.
+    let unroll = plan.unroll;
+    let stride = lanes * unroll;
     let lane_ty = plan.lane_ty.clone();
     let vec_ty = HirType::Vector(Box::new(lane_ty.clone()), lanes);
 
@@ -773,12 +885,16 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
         .get(&plan.n)
         .map(|v| v.ty.clone())
         .unwrap_or(HirType::I64);
+    let n = match &plan.exclusive_bound {
+        Some(bound) => create_value(func, n_ty.clone(), HirValueKind::Constant(bound.clone())),
+        None => plan.n,
+    };
 
     // ── 1. Preheader: compute `vec_n = n & ~(lanes-1)` and seed
     //       vector accumulators for each reduction.
     let mask_const = match n_ty {
-        HirType::I32 | HirType::U32 => HirConstant::I32(!(lanes as i32 - 1)),
-        _ => HirConstant::I64(!(lanes as i64 - 1)),
+        HirType::I32 | HirType::U32 => HirConstant::I32(!(stride as i32 - 1)),
+        _ => HirConstant::I64(!(stride as i64 - 1)),
     };
     let mask_id = create_value(func, n_ty.clone(), HirValueKind::Constant(mask_const));
     let vec_n_id = create_value(func, n_ty.clone(), HirValueKind::Instruction);
@@ -821,19 +937,19 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
             op: BinaryOp::And,
             result: vec_n_id,
             ty: n_ty.clone(),
-            left: plan.n,
+            left: n,
             right: mask_id,
         });
     }
 
     // ── 2. Rewrite header phis + bound check.
     let new_cmp_id = create_value(func, HirType::Bool, HirValueKind::Instruction);
-    let lanes_const = create_value(
+    let stride_const = create_value(
         func,
         n_ty.clone(),
         HirValueKind::Constant(match n_ty {
-            HirType::I32 | HirType::U32 => HirConstant::I32(lanes as i32),
-            _ => HirConstant::I64(lanes as i64),
+            HirType::I32 | HirType::U32 => HirConstant::I32(stride as i32),
+            _ => HirConstant::I64(stride as i64),
         }),
     );
     let new_i_next = create_value(func, n_ty.clone(), HirValueKind::Instruction);
@@ -874,13 +990,11 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
         };
         for inst in header_blk.instructions.iter_mut() {
             if let HirInstruction::Binary {
-                op: BinaryOp::Lt,
-                result,
-                right,
-                ..
+                op, result, right, ..
             } = inst
             {
                 if *result == old_cmp {
+                    *op = BinaryOp::Lt;
                     *result = new_cmp_id;
                     *right = vec_n_id;
                 }
@@ -898,6 +1012,75 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
     let mut sub: IndexMap<HirId, HirId> = IndexMap::new();
     let mut new_insts: Vec<HirInstruction> = Vec::new();
     let mut reduction_phi_subs: IndexMap<HirId, HirId> = IndexMap::new();
+
+    if plan.vector_counter {
+        // Carry [i, i+1, ...] as a vector; no per-iteration scalar packing.
+        let zero = create_value(
+            func,
+            n_ty.clone(),
+            HirValueKind::Constant(if n_ty == HirType::I32 {
+                HirConstant::I32(0)
+            } else {
+                HirConstant::I64(0)
+            }),
+        );
+        let mut initial = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
+        let mut setup = vec![HirInstruction::VectorSplat {
+            result: initial,
+            ty: vec_ty.clone(),
+            scalar: zero,
+        }];
+        for lane in 1..lanes {
+            let scalar = create_value(
+                func,
+                n_ty.clone(),
+                HirValueKind::Constant(if n_ty == HirType::I32 {
+                    HirConstant::I32(lane as i32)
+                } else {
+                    HirConstant::I64(lane as i64)
+                }),
+            );
+            let next = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
+            setup.push(HirInstruction::VectorInsertLane {
+                result: next,
+                ty: vec_ty.clone(),
+                vector: initial,
+                scalar,
+                lane: lane as u8,
+            });
+            initial = next;
+        }
+        let step = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
+        setup.push(HirInstruction::VectorSplat {
+            result: step,
+            ty: vec_ty.clone(),
+            scalar: stride_const,
+        });
+        func.blocks
+            .get_mut(&plan.preheader)
+            .unwrap()
+            .instructions
+            .extend(setup);
+        let counter = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
+        let next = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
+        func.blocks
+            .get_mut(&plan.header)
+            .unwrap()
+            .phis
+            .push(HirPhi {
+                result: counter,
+                ty: vec_ty.clone(),
+                incoming: vec![(initial, plan.preheader), (next, plan.body)],
+            });
+        new_insts.push(HirInstruction::Binary {
+            result: next,
+            op: BinaryOp::Add,
+            ty: vec_ty.clone(),
+            left: counter,
+            right: step,
+        });
+        sub.insert(plan.iv.phi, counter);
+    }
 
     for (idx, red) in plan.reductions.iter().enumerate() {
         // Any read of the old scalar phi within the vector body now
@@ -1081,13 +1264,19 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
         }
     }
 
-    // Append the IV increment: new_i_next = iv.phi + lanes
+    let partials = if unroll > 1 {
+        interleave_counter_vectors(func, plan, &mut new_insts, sub[&plan.iv.phi], unroll)
+    } else {
+        IndexMap::new()
+    };
+
+    // The scalar counter advances by the total number of processed lanes.
     new_insts.push(HirInstruction::Binary {
         op: BinaryOp::Add,
         result: new_i_next,
         ty: n_ty.clone(),
         left: plan.iv.phi,
-        right: lanes_const,
+        right: stride_const,
     });
 
     // Install the new body.
@@ -1122,6 +1311,7 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
             true_target: plan.body,
             false_target: new_false,
         };
+        header_blk.successors = vec![plan.body, new_false];
     }
 
     // post_vec block: horizontally reduce each vector accumulator.
@@ -1133,12 +1323,27 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
         for red in &plan.reductions {
             let seed = create_value(func, red.elem_ty.clone(), HirValueKind::Instruction);
             reduction_scalar_seeds.push(seed);
+            let mut vector = red.phi;
+            if let Some(extra) = partials.get(&red.phi) {
+                for &partial in extra {
+                    let ty = func.values[&vector].ty.clone();
+                    let sum = create_value(func, ty.clone(), HirValueKind::Instruction);
+                    pv_blk.instructions.push(HirInstruction::Binary {
+                        result: sum,
+                        op: red.op,
+                        ty,
+                        left: vector,
+                        right: partial,
+                    });
+                    vector = sum;
+                }
+            }
             pv_blk
                 .instructions
                 .push(HirInstruction::VectorHorizontalReduce {
                     result: seed,
                     ty: red.elem_ty.clone(),
-                    vector: red.phi,
+                    vector,
                     op: red.op,
                 });
         }
@@ -1178,7 +1383,7 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
         result: scalar_cond,
         ty: HirType::Bool,
         left: scalar_i,
-        right: plan.n,
+        right: n,
     });
     scalar_check_blk.terminator = HirTerminator::CondBranch {
         condition: scalar_cond,
@@ -1284,8 +1489,9 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
     // the vector header and now arrives from the tail's test, so a phi
     // there naming the old block would be naming an edge that no longer
     // exists.
-    if !plan.reductions.is_empty() {
+    if !plan.reductions.is_empty() || plan.vector_counter {
         let mut onto_tail: IndexMap<HirId, HirId> = IndexMap::new();
+        onto_tail.insert(plan.iv.phi, scalar_i);
         for (idx, red) in plan.reductions.iter().enumerate() {
             onto_tail.insert(red.phi, scalar_reduction_phi[idx]);
         }
@@ -1324,6 +1530,98 @@ fn vectorize_loop(func: &mut HirFunction, plan: &LoopAnalysis) {
     let _ = reduction_phi_subs;
 }
 
+/// Give each unrolled integer reduction its own counter and accumulator.
+fn interleave_counter_vectors(
+    func: &mut HirFunction,
+    plan: &LoopAnalysis,
+    instructions: &mut Vec<HirInstruction>,
+    counter: HirId,
+    unroll: u32,
+) -> IndexMap<HirId, Vec<HirId>> {
+    let template = instructions.clone();
+    let carried: Vec<_> = func.blocks[&plan.header]
+        .phis
+        .iter()
+        .filter(|p| p.result != plan.iv.phi)
+        .cloned()
+        .collect();
+    let mut partials: IndexMap<HirId, Vec<HirId>> = IndexMap::new();
+    for part in 1..unroll {
+        let mut copies = IndexMap::new();
+        let mut phis = Vec::new();
+        for phi in &carried {
+            let mut copy = phi.clone();
+            copy.result = create_value(func, phi.ty.clone(), HirValueKind::Instruction);
+            copies.insert(phi.result, copy.result);
+            if phi.result == counter {
+                let value = part * plan.lanes;
+                let offset = create_value(
+                    func,
+                    plan.lane_ty.clone(),
+                    HirValueKind::Constant(if plan.lane_ty == HirType::I32 {
+                        HirConstant::I32(value as i32)
+                    } else {
+                        HirConstant::I64(value as i64)
+                    }),
+                );
+                let splat = create_value(func, phi.ty.clone(), HirValueKind::Instruction);
+                let initial = create_value(func, phi.ty.clone(), HirValueKind::Instruction);
+                let incoming = copy
+                    .incoming
+                    .iter_mut()
+                    .find(|(_, from)| *from == plan.preheader)
+                    .unwrap();
+                func.blocks
+                    .get_mut(&plan.preheader)
+                    .unwrap()
+                    .instructions
+                    .extend([
+                        HirInstruction::VectorSplat {
+                            result: splat,
+                            ty: phi.ty.clone(),
+                            scalar: offset,
+                        },
+                        HirInstruction::Binary {
+                            result: initial,
+                            op: BinaryOp::Add,
+                            ty: phi.ty.clone(),
+                            left: incoming.0,
+                            right: splat,
+                        },
+                    ]);
+                incoming.0 = initial;
+            } else {
+                partials.entry(phi.result).or_default().push(copy.result);
+            }
+            phis.push(copy);
+        }
+        for inst in &template {
+            let result = inst
+                .result_id()
+                .expect("counter vector instruction has a result");
+            let next = create_value(
+                func,
+                func.values[&result].ty.clone(),
+                HirValueKind::Instruction,
+            );
+            copies.insert(result, next);
+            let mut copy = inst.clone();
+            copy.replace_uses(&copies);
+            *copy.result_id_mut().unwrap() = next;
+            instructions.push(copy);
+        }
+        for phi in &mut phis {
+            for (value, from) in &mut phi.incoming {
+                if *from == plan.body {
+                    *value = copies[&*value];
+                }
+            }
+        }
+        func.blocks.get_mut(&plan.header).unwrap().phis.extend(phis);
+    }
+    partials
+}
+
 fn subbed(sub: &IndexMap<HirId, HirId>, id: HirId) -> HirId {
     sub.get(&id).copied().unwrap_or(id)
 }
@@ -1353,23 +1651,11 @@ fn create_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirI
     id
 }
 
-/// Whether `inst` reads `value`.
-///
-/// Read off the debug rendering, which names every `HirId` the
-/// instruction holds. Enumerating operands by hand would mean a new
-/// instruction shape silently reading the counter until someone
-/// remembered to add it, and the cost of that is a miscompile rather
-/// than a missed loop. A result id can appear here too, which only ever
-/// makes the answer more cautious: the caller asks about a phi result,
-/// and no instruction defines one.
+/// Whether `inst` reads `value`, excluding its result definition.
 fn mentions(inst: &HirInstruction, value: HirId) -> bool {
-    let needle = format!("{value:?}");
-    let text = format!("{inst:?}");
-    let bytes = text.as_bytes();
-    let n = needle.as_bytes();
-    // A whole-id match, so `HirId(1)` does not answer for `HirId(12)`.
-    text.match_indices(&needle)
-        .any(|(at, _)| bytes.get(at + n.len()).is_none_or(|c| !c.is_ascii_digit()))
+    let mut reads = false;
+    inst.for_each_operand(|operand| reads |= operand == value);
+    reads
 }
 
 fn instruction_result(inst: &HirInstruction) -> Option<HirId> {

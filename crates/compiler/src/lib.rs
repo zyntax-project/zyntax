@@ -1875,7 +1875,7 @@ pub fn run_native_only_opts(module: &mut HirModule) -> parallel_dispatch::Dispat
 }
 
 pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
-    run_interp_safe_opts_with(module, true, None)
+    run_interp_safe_opts_with(module, true, None, false)
 }
 
 /// What the passes learn about a module as a whole and optimising one
@@ -1906,7 +1906,17 @@ impl OptCache {
 
 /// [`run_interp_safe_opts`] over what the cache already knows.
 pub fn run_interp_safe_opts_cached(module: &mut HirModule, cache: &OptCache) -> InterpOptStats {
-    run_interp_safe_opts_with(module, true, Some(cache))
+    run_interp_safe_opts_with(module, true, Some(cache), false)
+}
+
+/// Select fixed-width counter vectors when Cranelift is the final native tier.
+/// Shared bodies destined for LLVM keep scalar reductions for its target-width
+/// vectorizer; interpreter and native resume points still use the same body.
+pub(crate) fn run_interp_safe_opts_cached_for_cranelift(
+    module: &mut HirModule,
+    cache: &OptCache,
+) -> InterpOptStats {
+    run_interp_safe_opts_with(module, true, Some(cache), true)
 }
 
 /// [`run_interp_safe_opts`] for a module whose functions other modules
@@ -1915,7 +1925,7 @@ pub fn run_interp_safe_opts_cached(module: &mut HirModule, cache: &OptCache) -> 
 /// module reads them to know what a result aliases. The program's own
 /// pass expands them.
 pub fn run_interp_safe_opts_keeping_readers(module: &mut HirModule) -> InterpOptStats {
-    run_interp_safe_opts_with(module, false, None)
+    run_interp_safe_opts_with(module, false, None, false)
 }
 
 /// Mark every function as through the pipeline, so a program that
@@ -1979,6 +1989,7 @@ fn run_interp_safe_opts_with(
     module: &mut HirModule,
     expand_box_reads: bool,
     cache: Option<&OptCache>,
+    counter_vectors: bool,
 ) -> InterpOptStats {
     let mut stats = InterpOptStats::default();
     // Every pass walks the functions still to optimise; with none, the
@@ -2348,7 +2359,7 @@ fn run_interp_safe_opts_with(
     let rv = reduction_vectorize::run_module(module);
     timed("reduction_vectorize", &mut at);
     check_hir_uses(module, "reduction_vectorize");
-    let av = auto_vectorize::run_module(module);
+    let av = auto_vectorize::run_module_with_counter_vectors(module, counter_vectors);
     timed("auto_vectorize", &mut at);
     check_hir_uses(module, "auto_vectorize");
     stats.loop_vectorize.vectorized += lv.vectorized;

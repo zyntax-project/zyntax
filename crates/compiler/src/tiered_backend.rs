@@ -3325,6 +3325,11 @@ impl TieredBackend {
         let keeps_bodies = matches!(tier2_backend, Tier2Backend::LLVM);
         #[cfg(not(feature = "llvm-backend"))]
         let keeps_bodies = false;
+        let run_opts = if keeps_bodies {
+            crate::run_interp_safe_opts_cached
+        } else {
+            crate::run_interp_safe_opts_cached_for_cranelift
+        };
         // What a body that arrived optimised (a linked snapshot's) still
         // needs, the module's own pass having skipped it: box readers to
         // loads, then what those loads let move. Incremental; never the
@@ -3417,10 +3422,7 @@ impl TieredBackend {
                                 &format!("{name}-lowered"),
                             );
                         }
-                        crate::run_interp_safe_opts_cached(
-                            &mut scratch.module,
-                            &facts.cache(module_arc),
-                        );
+                        run_opts(&mut scratch.module, &facts.cache(module_arc));
                         scratch.done.insert(*func_id);
                     }
                     let f = scratch
@@ -3488,7 +3490,7 @@ impl TieredBackend {
                 scratch.reach(callees, module_arc, &body_sources, &optimized_bodies, &lazy);
                 let id = f.id;
                 scratch.module.functions.insert(id, f);
-                crate::run_interp_safe_opts_cached(&mut scratch.module, &facts.cache(module_arc));
+                run_opts(&mut scratch.module, &facts.cache(module_arc));
                 // No pass removes a function, so it is there to take back.
                 let mut f = scratch
                     .module
