@@ -1,4 +1,4 @@
-//! Intra-block redundant-Load elimination with simple alias barriers.
+//! Redundant-load elimination within single-entry regions.
 //!
 //! Plain `cse::eliminate` skips `Load` because Loads can alias with
 //! `Store`s through a memory layer we don't model — two Loads with
@@ -19,12 +19,10 @@
 //!     record a substitution from the new load result to the
 //!     previously-seen load result.
 //!
-//! That's enough for the most common win we lose without it:
-//! repeated struct field access (`x.field`, `x.field`, …) where the
-//! intervening code doesn't write to anything aliasing. Cross-block
-//! Load CSE would need a dominator-walk-with-barrier-summary scheme;
-//! that's the natural follow-up but adds real complexity. Per-block
-//! coverage is the high-value cheap version.
+//! Carry available loads through edges whose successor has one predecessor.
+//! Joins, loop entries and effectful terminators start with an empty map.
+//! This exposes repeated checks along a success path without memory-state
+//! intersections or a fixed-point dataflow analysis.
 //!
 //! After collecting substitutions we sweep the function with the
 //! same machinery `cse::apply_substitutions` uses (rewrite operand
@@ -32,7 +30,8 @@
 
 use crate::cse;
 use crate::hir::{
-    CastOp, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirType, HirValueKind,
+    CastOp, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator, HirType,
+    HirValueKind,
 };
 use crate::licm::{MemLoc, extract_mem_loc, hir_ty_byte_size, value_byte_size};
 use fnv::FnvHashSet;
@@ -189,14 +188,69 @@ pub struct LoadCseStats {
     pub eliminated: usize,
 }
 
-/// Run intra-block Load CSE on `func`.
+type Available<'a> = HashMap<HirId, (HirId, &'a HirType, MemLoc, u32)>;
+
+/// A forest of single-predecessor edges. Cycles with no root are unreachable
+/// and are processed locally. Edges come from terminators, not cached CFGs.
+fn load_regions(func: &HirFunction, enabled: bool) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let n = func.blocks.len();
+    if !enabled {
+        return (Vec::new(), (0..n).collect());
+    }
+    let mut parent = vec![None; n];
+    let mut count = vec![0; n];
+    if enabled {
+        for (i, block) in func.blocks.values().enumerate() {
+            let mut targets = block.terminator.targets();
+            targets.sort_unstable();
+            targets.dedup();
+            for target in targets {
+                if let Some(j) = func.blocks.get_index_of(&target) {
+                    count[j] += 1;
+                    parent[j] = Some(i);
+                }
+            }
+        }
+    }
+    let mut children = vec![Vec::new(); n];
+    let mut roots = Vec::new();
+    for (i, (id, _)) in func.blocks.iter().enumerate() {
+        let from = parent[i].filter(|p| {
+            count[i] == 1
+                && *id != func.entry_block
+                && matches!(
+                    func.blocks.get_index(*p).unwrap().1.terminator,
+                    HirTerminator::Branch { .. }
+                        | HirTerminator::CondBranch { .. }
+                        | HirTerminator::Switch { .. }
+                )
+        });
+        if let Some(from) = from {
+            children[from].push(i);
+        } else {
+            roots.push(i);
+        }
+    }
+    (children, roots)
+}
+
+/// Reuse loads within each block.
 pub fn run(func: &mut HirFunction) -> LoadCseStats {
-    run_with(func, &FnvHashSet::default())
+    run_with(func, &FnvHashSet::default(), false)
+}
+
+/// Reuse loads through single-entry successors after structural optimization.
+pub fn run_regions(func: &mut HirFunction) -> LoadCseStats {
+    run_with(func, &FnvHashSet::default(), true)
 }
 
 /// [`run`], knowing the exact struct types
 /// (`licm::exact_struct_names`).
-fn run_with(func: &mut HirFunction, exact: &FnvHashSet<InternedString>) -> LoadCseStats {
+fn run_with(
+    func: &mut HirFunction,
+    exact: &FnvHashSet<InternedString>,
+    across: bool,
+) -> LoadCseStats {
     let mut substitutions: HashMap<HirId, HirId> = HashMap::new();
     let addr_index = crate::licm::build_addr_index(func, exact);
     let no_subst = indexmap::IndexMap::new();
@@ -209,89 +263,134 @@ fn run_with(func: &mut HirFunction, exact: &FnvHashSet<InternedString>) -> LoadC
         !*DISABLED.get_or_init(|| std::env::var_os("ZYNTAX_DISABLE_LOAD_RANGES").is_some());
     let mut addresses: Option<Addresses<'_>> = None;
 
-    for block in func.blocks.values() {
-        let mut available: HashMap<HirId, (HirId, &HirType, MemLoc, u32)> = HashMap::new();
-        for inst in &block.instructions {
-            match inst {
-                HirInstruction::Load { volatile: true, .. }
-                | HirInstruction::Store { volatile: true, .. } => available.clear(),
-                HirInstruction::Load {
-                    result, ptr, ty, ..
-                } => {
-                    let canonical_ptr = chase(*ptr, &substitutions);
-                    match available.get(&canonical_ptr) {
-                        Some(&(prev_result, previous_ty, _, _)) if previous_ty == ty => {
-                            substitutions.insert(*result, prev_result);
-                        }
-                        _ => {
-                            let size = hir_ty_byte_size(ty);
-                            let at = loc(*ptr, size);
-                            available.insert(canonical_ptr, (*result, ty, at, size));
+    // `ZYNTAX_DISABLE_CROSS_BLOCK_LOADS=1` keeps reuse block-local; safe to run with.
+    static LOCAL_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let across = across
+        && !*LOCAL_ONLY
+            .get_or_init(|| std::env::var_os("ZYNTAX_DISABLE_CROSS_BLOCK_LOADS").is_some());
+    let (children, roots) = load_regions(func, across);
+    let mut visited = vec![false; func.blocks.len()];
+    let mut pending: Vec<(usize, Available<'_>)> = Vec::new();
+    // The final sweep also covers unreachable cycles without reprocessing roots.
+    for root in roots.into_iter().chain(0..func.blocks.len()) {
+        if visited[root] {
+            continue;
+        }
+        pending.push((root, Available::new()));
+        while let Some((index, mut available)) = pending.pop() {
+            if std::mem::replace(&mut visited[index], true) {
+                continue;
+            }
+            let block = func.blocks.get_index(index).unwrap().1;
+            for inst in &block.instructions {
+                match inst {
+                    HirInstruction::Load { volatile: true, .. }
+                    | HirInstruction::Store { volatile: true, .. } => available.clear(),
+                    HirInstruction::Load {
+                        result, ptr, ty, ..
+                    } => {
+                        let canonical_ptr = chase(*ptr, &substitutions);
+                        match available.get(&canonical_ptr) {
+                            Some(&(prev_result, previous_ty, _, _)) if previous_ty == ty => {
+                                substitutions.insert(*result, prev_result);
+                            }
+                            _ => {
+                                let size = hir_ty_byte_size(ty);
+                                let at = loc(*ptr, size);
+                                available.insert(canonical_ptr, (*result, ty, at, size));
+                            }
                         }
                     }
-                }
-                HirInstruction::Store { ptr, value, .. } => {
-                    let size = value_byte_size(func, *value);
-                    let at = loc(*ptr, size);
-                    let canonical_ptr = chase(*ptr, &substitutions);
-                    available.retain(|loaded_ptr, (_, _, loaded, loaded_size)| {
-                        if at.provably_disjoint(loaded) {
-                            return true;
-                        }
-                        if !ranges || size == 0 || *loaded_size == 0 {
-                            return false;
-                        }
-                        // Build the address index only when a store could kill a load.
-                        let addresses = addresses.get_or_insert_with(|| Addresses {
-                            function: func,
-                            defs: func
-                                .blocks
-                                .values()
-                                .flat_map(|b| &b.instructions)
-                                .filter_map(|i| match i {
-                                    HirInstruction::Cast { result, .. }
-                                    | HirInstruction::GetElementPtr { result, .. }
-                                    | HirInstruction::Load { result, .. }
-                                    | HirInstruction::ExtractValue { result, .. }
-                                    | HirInstruction::InsertValue { result, .. } => {
-                                        Some((*result, i))
-                                    }
-                                    _ => None,
-                                })
-                                .collect(),
-                            cache: HashMap::new(),
+                    HirInstruction::Store { ptr, value, .. } => {
+                        let size = value_byte_size(func, *value);
+                        let at = loc(*ptr, size);
+                        let canonical_ptr = chase(*ptr, &substitutions);
+                        available.retain(|loaded_ptr, (_, _, loaded, loaded_size)| {
+                            if at.provably_disjoint(loaded) {
+                                return true;
+                            }
+                            if !ranges || size == 0 || *loaded_size == 0 {
+                                return false;
+                            }
+                            // Build the address index only when a store could kill a load.
+                            let addresses = addresses.get_or_insert_with(|| Addresses {
+                                function: func,
+                                defs: func
+                                    .blocks
+                                    .values()
+                                    .flat_map(|b| &b.instructions)
+                                    .filter_map(|i| match i {
+                                        HirInstruction::Cast { result, .. }
+                                        | HirInstruction::GetElementPtr { result, .. }
+                                        | HirInstruction::Load { result, .. }
+                                        | HirInstruction::ExtractValue { result, .. }
+                                        | HirInstruction::InsertValue { result, .. } => {
+                                            Some((*result, i))
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect(),
+                                cache: HashMap::new(),
+                            });
+                            let size = addresses.stored_size(*value);
+                            let address = addresses.get(canonical_ptr, 32);
+                            separate_bytes(
+                                address,
+                                size,
+                                addresses.get(*loaded_ptr, 32),
+                                *loaded_size,
+                            )
                         });
-                        let size = addresses.stored_size(*value);
-                        let address = addresses.get(canonical_ptr, 32);
-                        separate_bytes(address, size, addresses.get(*loaded_ptr, 32), *loaded_size)
-                    });
+                    }
+                    // Memory-killing ops invalidate everything we
+                    // believe about memory contents. Conservative
+                    // clearing matches what most early alias-aware CSE
+                    // implementations do before they grow up.
+                    //
+                    // `AsyncSaveSlot` writes to the SM frame so a Load
+                    // before it and a Load after it of an
+                    // overlapping-frame pointer can legitimately read
+                    // different values. Treat it as a memory barrier
+                    // (otherwise the krio-emitted state-machine poll-fn
+                    // re-uses a stale state Load between yields and
+                    // the SM keeps re-parking instead of advancing).
+                    //
+                    // `CreateClosure` may capture by reference to a
+                    // mutable environment; conservatively treat as a
+                    // barrier.
+                    HirInstruction::VectorStore { .. }
+                    | HirInstruction::Call { .. }
+                    | HirInstruction::IndirectCall { .. }
+                    | HirInstruction::Atomic { .. }
+                    | HirInstruction::Fence { .. }
+                    | HirInstruction::AsyncSaveSlot { .. }
+                    | HirInstruction::CreateClosure { .. }
+                    | HirInstruction::CallClosure { .. }
+                    | HirInstruction::TraitMethodCall { .. }
+                    | HirInstruction::PerformEffect { .. }
+                    | HirInstruction::HandleEffect { .. }
+                    | HirInstruction::Resume { .. }
+                    | HirInstruction::AbortEffect { .. }
+                    | HirInstruction::CaptureContinuation { .. }
+                    | HirInstruction::FiberNew { .. }
+                    | HirInstruction::FiberResume { .. }
+                    | HirInstruction::FiberResumeWith { .. }
+                    | HirInstruction::FiberYield { .. }
+                    | HirInstruction::FiberTransfer { .. }
+                    | HirInstruction::FiberCancel { .. }
+                    | HirInstruction::FiberDrop { .. } => {
+                        available.clear();
+                    }
+                    _ => {}
                 }
-                // Memory-killing ops invalidate everything we
-                // believe about memory contents. Conservative
-                // clearing matches what most early alias-aware CSE
-                // implementations do before they grow up.
-                //
-                // `AsyncSaveSlot` writes to the SM frame so a Load
-                // before it and a Load after it of an
-                // overlapping-frame pointer can legitimately read
-                // different values. Treat it as a memory barrier
-                // (otherwise the krio-emitted state-machine poll-fn
-                // re-uses a stale state Load between yields and
-                // the SM keeps re-parking instead of advancing).
-                //
-                // `CreateClosure` may capture by reference to a
-                // mutable environment; conservatively treat as a
-                // barrier.
-                HirInstruction::VectorStore { .. }
-                | HirInstruction::Call { .. }
-                | HirInstruction::IndirectCall { .. }
-                | HirInstruction::Atomic { .. }
-                | HirInstruction::Fence { .. }
-                | HirInstruction::AsyncSaveSlot { .. }
-                | HirInstruction::CreateClosure { .. } => {
-                    available.clear();
-                }
-                _ => {}
+            }
+            // Bound state copying at forks; straight edges can move the map.
+            if available.len() > 64 {
+                available.clear();
+            }
+            if let Some((last, rest)) = children.get(index).and_then(|c| c.split_last()) {
+                pending.extend(rest.iter().map(|child| (*child, available.clone())));
+                pending.push((*last, available));
             }
         }
     }
@@ -307,10 +406,18 @@ fn run_with(func: &mut HirFunction, exact: &FnvHashSet<InternedString>) -> LoadC
 
 /// Module-level entry.
 pub fn run_module(module: &mut HirModule) -> LoadCseStats {
+    run_module_with_regions(module, false)
+}
+
+pub fn run_module_regions(module: &mut HirModule) -> LoadCseStats {
+    run_module_with_regions(module, true)
+}
+
+fn run_module_with_regions(module: &mut HirModule, across: bool) -> LoadCseStats {
     let mut total = LoadCseStats::default();
     let exact = crate::licm::exact_struct_names(module);
     for func in module.functions_to_optimize() {
-        let s = run_with(func, &exact);
+        let s = run_with(func, &exact, across);
         total.eliminated += s.eliminated;
     }
     total

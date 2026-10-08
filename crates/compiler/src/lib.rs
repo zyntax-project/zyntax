@@ -2605,6 +2605,27 @@ fn run_interp_safe_opts_with(
         check_hir_uses(module, "late aggregate_split");
     }
 
+    // Reuse loads after inlining has settled the call boundaries.
+    if late_load_cleanup {
+        stats.load_cse.eliminated += load_cse::run_module_regions(module).eliminated;
+    }
+    // Late load reuse makes repeated checks share operands. Fold those
+    // predicates before pricing loops and lowering the remaining branches.
+    if late_load_cleanup && stats.load_cse.eliminated > 0 {
+        let cs = cse::eliminate_module(module);
+        stats.cse.eliminated += cs.eliminated;
+        stats.cse.rewrites += cs.rewrites;
+        let bf = branch_fold::run_module(module);
+        stats.branch_fold.folded += bf.folded;
+        if bf.folded > 0 {
+            let cfg = cfg_simplify::run_module(module);
+            stats.cfg_simplify.merged += cfg.merged;
+            stats.cfg_simplify.threaded += cfg.threaded;
+        }
+        timed("late branch_fold", &mut at);
+        check_hir_uses(module, "late branch_fold");
+    }
+
     // Closed scalar states are priced after unreachable dispatch arms
     // have gone. These copies contain no allocations or releases.
     let specialized = loop_specialize::run_module(module);
