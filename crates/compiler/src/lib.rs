@@ -33,6 +33,7 @@ pub mod associated_type_resolver; // Associated type resolution for trait dispat
 pub mod async_support;
 pub mod auto_vectorize;
 pub mod borrow_check; // HIR-level borrow checking pass
+pub mod bounded_div;
 pub mod bounds_version; // Counted loops versioned on the bounds of their indices
 pub mod boxes; // Dynamic boxes made, read and released in HIR
 pub mod branch_fold; // Conditional branches a dominating branch has decided
@@ -2303,6 +2304,13 @@ fn run_interp_safe_opts_with(
         timed("bounds_version cleanup", &mut at);
         check_hir_uses(module, "bounds_version cleanup");
     }
+
+    let reduced = bounded_div::run_module(module);
+    if trace && reduced > 0 {
+        eprintln!("[OPT] strength-reduced {reduced} bounded divisions/remainders");
+    }
+    timed("bounded_div", &mut at);
+    check_hir_uses(module, "bounded_div");
 
     // Affine reduction-loop closed-forming runs ONCE after the
     // fixed-point sweep, before the vectorizers. Ordering rationale:
