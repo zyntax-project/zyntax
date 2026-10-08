@@ -60,6 +60,7 @@ pub mod fiber_backend; // `FiberCfg` trait + global install slot for fiber primi
 pub mod fiber_lowering; // First-class fiber HIR ops → Call::Symbol("krio_fiber_*") rewrite
 pub mod fma_contract; // FMA contraction: rewrite fadd(fmul a b, c) → fma(a, b, c)
 pub mod heap_scalarize; // Immutable heap objects carried by phis become scalar fields
+pub mod partial_escape; // Materialize immutable temporaries at consuming escapes
 pub mod hir;
 pub mod hir_builder; // HIR Builder API for direct HIR construction
 pub mod hir_dump; // CLIF-inspired HIR text dump for debugging
@@ -2279,6 +2280,22 @@ fn run_interp_safe_opts_with(
             break;
         }
     }
+
+    // Scalar fields retain opaque inputs through a backing pointer.
+    // Run once after inlining has exposed constructors and their uses.
+    at = web_time::Instant::now();
+    let deferred = partial_escape::run_module(module);
+    if deferred > 0 {
+        for _ in 0..2 {
+            const_fold::fold_module(module);
+            branch_fold::run_module(module);
+            cse::eliminate_module(module);
+            phi_prune::run_module(module);
+            cfg_simplify::run_module(module);
+        }
+    }
+    timed("partial_escape", &mut at);
+    check_hir_uses(module, "partial_escape");
 
     // Once the sweep has hoisted what leaves the loops: a bound read
     // before the loop is what the copy's checks are decided against.
