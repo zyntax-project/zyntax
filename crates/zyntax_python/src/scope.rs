@@ -4,9 +4,10 @@
 use ruff_python_ast as py;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use rustc_hash::FxHashSet as HashSet;
+use std::rc::Rc;
 
 thread_local! {
-    static BODY_SCOPES: std::cell::RefCell<rustc_hash::FxHashMap<(usize, usize), Scope>> =
+    static BODY_SCOPES: std::cell::RefCell<rustc_hash::FxHashMap<(usize, usize), Rc<Scope>>> =
         std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
@@ -104,15 +105,21 @@ impl Scope {
     /// whose syntax trees may reuse addresses.
     pub(crate) fn of_body(params: Vec<String>, body: &[py::Stmt]) -> Scope {
         if params.is_empty() {
-            let key = (body.as_ptr() as usize, body.len());
-            if let Some(scope) = BODY_SCOPES.with(|c| c.borrow().get(&key).cloned()) {
-                return scope;
-            }
-            let scope = Self::of_body_uncached(Vec::new(), body);
-            BODY_SCOPES.with(|c| c.borrow_mut().insert(key, scope.clone()));
-            return scope;
+            return (*Self::shared(body)).clone();
         }
         Self::of_body_uncached(params, body)
+    }
+
+    /// [`Self::of_body`] with no parameters, shared rather than copied:
+    /// for a reader asking of every statement every round.
+    pub(crate) fn shared(body: &[py::Stmt]) -> Rc<Scope> {
+        let key = (body.as_ptr() as usize, body.len());
+        if let Some(scope) = BODY_SCOPES.with(|c| c.borrow().get(&key).cloned()) {
+            return scope;
+        }
+        let scope = Rc::new(Self::of_body_uncached(Vec::new(), body));
+        BODY_SCOPES.with(|c| c.borrow_mut().insert(key, Rc::clone(&scope)));
+        scope
     }
 
     fn of_body_uncached(params: Vec<String>, body: &[py::Stmt]) -> Scope {

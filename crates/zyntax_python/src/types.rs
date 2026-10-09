@@ -5085,7 +5085,7 @@ fn infer_locals_in(
     for (name, ty) in &sig.params {
         locals.vars.insert(name.clone(), *ty);
     }
-    let scope = crate::scope::Scope::of_body(Vec::new(), body);
+    let scope = crate::scope::Scope::shared(body);
     for name in &scope.globals {
         locals.global_writes.insert(name.clone(), Ty::Unknown);
     }
@@ -6213,7 +6213,7 @@ fn list_param_facts(
     vars: &HashMap<String, Ty>,
     params: &[(String, Ty)],
 ) -> Vec<ListFact> {
-    let scope = crate::scope::Scope::of_body(Vec::new(), body);
+    let scope = crate::scope::Scope::shared(body);
     let followed: Vec<String> = params
         .iter()
         .filter(|(name, _)| {
@@ -6768,7 +6768,7 @@ impl Walker<'_> {
             }
             return;
         }
-        let scope = crate::scope::Scope::of_body(Vec::new(), std::slice::from_ref(s));
+        let scope = crate::scope::Scope::shared(std::slice::from_ref(s));
         if matches!(s, py::Stmt::Try(_) | py::Stmt::Match(_)) || !scope.children.is_empty() {
             self.nonnone.clear();
         } else {
