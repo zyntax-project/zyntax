@@ -4145,8 +4145,8 @@ fn class_loop_sites(module: &Module, items: &[Item<'_>]) -> Vec<(String, Vec<Ty>
                     .iter()
                     .all(|a| module.field(k, a).is_some() || module.method_sig(k, a).is_some())
             };
-            for k in 0..module.classes.len() {
-                if !fits(k) || module.classes[k].base.is_some_and(fits) {
+            for (k, class) in module.classes.iter().enumerate() {
+                if !fits(k) || class.base.is_some_and(fits) {
                     continue;
                 }
                 let mut tys: Vec<_> = sig.params.iter().map(|(_, t)| *t).collect();
@@ -8343,21 +8343,20 @@ impl Typer<'_> {
         if let Ty::Class(k) = receiver
             && !self.module.specs.is_empty()
             && let Some((sig, _)) = self.module.method_sig(k as usize, attr)
-        {
-            if let Some(tys) = call_types(
+            && let Some(tys) = call_types(
                 self.module,
                 sig,
                 1,
                 &arguments.args,
                 &arguments.keywords,
                 |e| self.expr(e),
-            ) {
-                let owner = self.module.method_owner(k as usize, attr).unwrap();
-                return self
-                    .module
-                    .dispatched_instance_ret(owner, attr, &tys)
-                    .unwrap_or(sig.ret);
-            }
+            )
+        {
+            let owner = self.module.method_owner(k as usize, attr).unwrap();
+            return self
+                .module
+                .dispatched_instance_ret(owner, attr, &tys)
+                .unwrap_or(sig.ret);
         }
         // Of this set's kind, of the elements of every argument.
         if let Ty::Set(k) = receiver
