@@ -60,7 +60,6 @@ pub mod fiber_backend; // `FiberCfg` trait + global install slot for fiber primi
 pub mod fiber_lowering; // First-class fiber HIR ops → Call::Symbol("krio_fiber_*") rewrite
 pub mod fma_contract; // FMA contraction: rewrite fadd(fmul a b, c) → fma(a, b, c)
 pub mod heap_scalarize; // Immutable heap objects carried by phis become scalar fields
-pub mod partial_escape; // Materialize immutable temporaries at consuming escapes
 pub mod hir;
 pub mod hir_builder; // HIR Builder API for direct HIR construction
 pub mod hir_dump; // CLIF-inspired HIR text dump for debugging
@@ -87,6 +86,7 @@ pub mod opt_audit; // Per-function counts of optimiser runs, for tests
 pub mod optimization;
 pub mod parallel_dispatch; // A loop with independent iterations becomes a band dispatch
 pub mod parallel_safe; // Which counted loops have independent iterations
+pub mod partial_escape; // Materialize immutable temporaries at consuming escapes
 pub mod pattern_matching;
 pub mod phi_prune;
 pub mod pool_alloc; // Size-class pools behind the allocation intrinsics
@@ -109,9 +109,9 @@ pub mod value; // Unified runtime value type (used by interp + embed)
 pub mod vtable_registry; // Vtable management and caching // Async runtime (executor, task, waker)
 
 #[cfg(feature = "cranelift-backend")]
-pub mod cranelift_backend;
-#[cfg(feature = "cranelift-backend")]
 mod clif_schedule;
+#[cfg(feature = "cranelift-backend")]
+pub mod cranelift_backend;
 #[cfg(feature = "cranelift-backend")]
 pub mod jit_memory; // One reserved address range per Cranelift JIT module
 

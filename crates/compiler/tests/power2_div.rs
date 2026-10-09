@@ -2,7 +2,7 @@
 mod common;
 use zyntax_compiler::{
     hir::*,
-    hir_interp::{value_to_f64, HirInterpreter},
+    hir_interp::{HirInterpreter, value_to_f64},
     value::ZyntaxValue,
 };
 use zyntax_typed_ast::InternedString;
@@ -233,27 +233,31 @@ fn lowering_keeps_division_and_addition_rounding_separate() {
     let (mut m, id) = fixture(HirConstant::F64(2.0), HirType::F64, true);
     zyntax_compiler::run_interp_safe_opts(&mut m);
     zyntax_compiler::run_interp_safe_opts(&mut m);
-    assert!(m.functions[&id]
-        .blocks
-        .values()
-        .flat_map(|b| &b.instructions)
-        .any(|i| matches!(
-            i,
-            HirInstruction::Binary {
-                op: BinaryOp::FDiv,
-                ..
-            }
-        )));
-    assert!(!m.functions[&id]
-        .blocks
-        .values()
-        .flat_map(|b| &b.instructions)
-        .any(|i| matches!(
-            i,
-            HirInstruction::Call {
-                callee: HirCallable::Intrinsic(Intrinsic::Fma),
-                ..
-            }
-        )));
+    assert!(
+        m.functions[&id]
+            .blocks
+            .values()
+            .flat_map(|b| &b.instructions)
+            .any(|i| matches!(
+                i,
+                HirInstruction::Binary {
+                    op: BinaryOp::FDiv,
+                    ..
+                }
+            ))
+    );
+    assert!(
+        !m.functions[&id]
+            .blocks
+            .values()
+            .flat_map(|b| &b.instructions)
+            .any(|i| matches!(
+                i,
+                HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(Intrinsic::Fma),
+                    ..
+                }
+            ))
+    );
     check64(m, id, &[(f64::from_bits(3), 0.0)]);
 }
