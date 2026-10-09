@@ -336,7 +336,7 @@ fn keeps_writes_through_a_joined_pointer() {
 #[test]
 fn preserves_null_and_pointer_integer_tests_on_zero_trip_paths() {
     for use_null in [false, true] {
-        let mut a = fixture(0, false);
+        let mut a = two_field_fixture(0, false, ReadBarrier::None);
         let f = a.m.functions.get_mut(&a.main).unwrap();
         let entry = f.entry_block;
         let absent = f.create_block();
@@ -507,4 +507,178 @@ fn materialization_preserves_pointer_fields_and_their_pointees() {
         values: vec![total],
     };
     check(a, 45);
+}
+
+#[derive(Clone, Copy)]
+enum ReadBarrier {
+    None,
+    Store,
+    Call,
+    Volatile,
+}
+
+fn two_field_fixture(n: i64, fallback: bool, barrier: ReadBarrier) -> Fixture {
+    let mut a = fixture(n, fallback);
+    let observe =
+        a.m.functions
+            .values()
+            .find(|f| f.name.resolve_global().as_deref() == Some("observe"))
+            .unwrap()
+            .id;
+    let f = a.m.functions.get_mut(&a.main).unwrap();
+    let hot =
+        f.blocks
+            .iter()
+            .find_map(|(bid, b)| {
+                b.instructions.iter().any(|inst|
+        matches!(inst, HirInstruction::Load { ptr, .. } if *ptr == a.current)).then_some(*bid)
+            })
+            .unwrap();
+    let old = f.blocks[&hot].instructions[0].result_id().unwrap();
+    let new = f.blocks[&hot].instructions[1].result_id().unwrap();
+    let cell = val(f, ptr());
+    let two = int(f, 2);
+    let seven = int(f, 7);
+    let eleven = int(f, 11);
+    let one = int(f, 1);
+    let offset = int(f, 8);
+    let bytes = int(f, 16);
+    let before = val(f, HirType::I64);
+    let after = val(f, HirType::I64);
+    let intermediate = val(f, HirType::I64);
+    let address = val(f, ptr());
+    let second = val(f, HirType::I64);
+    let sum = val(f, HirType::I64);
+    let ignored = val(f, HirType::I64);
+    let mut entry = vec![
+        HirInstruction::Alloca {
+            result: cell,
+            ty: HirType::I64,
+            count: Some(one),
+            align: 8,
+        },
+        store(cell, two),
+    ];
+    entry.extend(std::mem::take(
+        &mut f.blocks.get_mut(&f.entry_block).unwrap().instructions,
+    ));
+    f.blocks.get_mut(&f.entry_block).unwrap().instructions = entry;
+    let blocks: Vec<_> = f.blocks.keys().copied().collect();
+    for bid in blocks {
+        let mut out = Vec::new();
+        for mut inst in std::mem::take(&mut f.blocks.get_mut(&bid).unwrap().instructions) {
+            if let HirInstruction::Call {
+                result: Some(r),
+                callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+                args,
+                ..
+            } = &mut inst
+            {
+                args[0] = bytes;
+                let root = *r;
+                let field = val(f, ptr());
+                out.push(inst);
+                out.push(HirInstruction::GetElementPtr {
+                    result: field,
+                    ptr: root,
+                    ty: HirType::U8,
+                    indices: vec![offset],
+                });
+                out.push(store(field, eleven));
+            } else {
+                out.push(inst);
+            }
+        }
+        f.blocks.get_mut(&bid).unwrap().instructions = out;
+    }
+    let old_hot = std::mem::take(&mut f.blocks.get_mut(&hot).unwrap().instructions);
+    let mut out = vec![
+        load(old, a.current),
+        load(before, cell),
+        binary(intermediate, BinaryOp::Add, old, before),
+    ];
+    match barrier {
+        ReadBarrier::Store => out.push(store(cell, seven)),
+        ReadBarrier::Call => out.push(call(
+            ignored,
+            HirCallable::Function(observe),
+            vec![cell, cell],
+        )),
+        ReadBarrier::None | ReadBarrier::Volatile => {}
+    }
+    let mut read = load(after, cell);
+    if matches!(barrier, ReadBarrier::Volatile) {
+        if let HirInstruction::Load { volatile, .. } = &mut read {
+            *volatile = true;
+        }
+    }
+    out.extend([
+        read,
+        HirInstruction::GetElementPtr {
+            result: address,
+            ptr: a.current,
+            ty: HirType::U8,
+            indices: vec![offset],
+        },
+        load(second, address),
+        binary(sum, BinaryOp::Add, intermediate, second),
+        binary(new, BinaryOp::Add, sum, after),
+    ]);
+    out.extend(old_hot.into_iter().skip(2));
+    f.blocks.get_mut(&hot).unwrap().instructions = out;
+    f.rebuild_cfg_edges();
+    a
+}
+
+#[test]
+fn grouped_reads_preserve_dependencies_and_loop_phi_outputs() {
+    for fallback in [false, true] {
+        let n = 4;
+        let a = two_field_fixture(n, fallback, ReadBarrier::None);
+        check(a, if fallback { 48 } else { 68 });
+        let mut grouped = two_field_fixture(n, fallback, ReadBarrier::None);
+        let f = grouped.m.functions.get_mut(&grouped.main).unwrap();
+        let blocks = f.blocks.len();
+        assert_eq!(partial_escape::run_function(f), 2);
+        assert_eq!(f.blocks.len(), blocks + 9);
+    }
+}
+
+#[test]
+fn grouped_reads_stop_at_memory_and_call_effects() {
+    for (barrier, expected) in [
+        (ReadBarrier::Store, 63),
+        (ReadBarrier::Call, 52),
+        (ReadBarrier::Volatile, 48),
+    ] {
+        check(two_field_fixture(4, true, barrier), expected);
+    }
+}
+
+#[test]
+fn grouped_reads_observe_mutated_fields_of_opaque_inputs() {
+    let mut a = two_field_fixture(6, true, ReadBarrier::None);
+    let echo =
+        a.m.functions
+            .values_mut()
+            .find(|f| f.name.resolve_global().as_deref() == Some("echo"))
+            .unwrap();
+    let incoming = echo.signature.params[0].id;
+    let offset = int(echo, 8);
+    let thirteen = int(echo, 13);
+    let field = val(echo, ptr());
+    echo.blocks
+        .get_mut(&echo.entry_block)
+        .unwrap()
+        .instructions
+        .extend([
+            HirInstruction::GetElementPtr {
+                result: field,
+                ptr: incoming,
+                ty: HirType::U8,
+                indices: vec![offset],
+            },
+            store(field, thirteen),
+        ]);
+    check(a, 72);
 }

@@ -644,6 +644,134 @@ fn diamond(f: &mut HirFunction, from: HirId, condition: HirId) -> (HirId, HirId,
     (yes, no, tail)
 }
 
+fn read_region(insts: &[HirInstruction], start: usize, root: HirId, p: &Plan) -> usize {
+    let mut end = start;
+    let mut reads = 0;
+    for (i, inst) in insts.iter().enumerate().skip(start).take(48) {
+        match inst {
+            HirInstruction::Load {
+                ptr,
+                volatile: false,
+                ..
+            } => {
+                if let Some(a) = p.addresses.get(ptr) {
+                    if a.root != root {
+                        break;
+                    }
+                    reads += 1;
+                    end = i + 1;
+                }
+            }
+            HirInstruction::Binary { .. }
+            | HirInstruction::Unary { .. }
+            | HirInstruction::Cast { .. }
+            | HirInstruction::GetElementPtr { .. }
+            | HirInstruction::Select { .. }
+            | HirInstruction::ExtractValue { .. }
+            | HirInstruction::InsertValue { .. } => {
+                if !inst
+                    .result_id()
+                    .is_some_and(|r| p.addresses.contains_key(&r))
+                    && inst.any_operand(|v| p.addresses.contains_key(&v))
+                {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    if reads >= 2 { end } else { start }
+}
+
+struct ReadObject<'a> {
+    root: HirId,
+    flag: HirId,
+    backing: HirId,
+    fields: &'a HashMap<(HirId, u64), HirId>,
+}
+
+/// Both arms retain instruction order; only values used outside need join phis.
+fn guarded_reads(
+    f: &mut HirFunction,
+    from: HirId,
+    site: Site,
+    insts: &[HirInstruction],
+    object: ReadObject<'_>,
+    p: &Plan,
+    uses: &HashMap<HirId, usize>,
+) -> HirId {
+    let (bid, start) = site;
+    let ReadObject {
+        root,
+        flag,
+        backing,
+        fields,
+    } = object;
+    let (hot, cold, tail) = diamond(f, from, flag);
+    let mut hot_map = indexmap::IndexMap::new();
+    let mut cold_map = indexmap::IndexMap::new();
+    let mut hot_insts = Vec::new();
+    let mut cold_insts = Vec::new();
+    let mut internal = HashMap::<HirId, usize>::new();
+    for (i, inst) in insts.iter().enumerate() {
+        if p.remove.contains(&(bid, start + i)) {
+            continue;
+        }
+        inst.for_each_operand(|v| *internal.entry(v).or_default() += 1);
+        let result = inst.result_id().unwrap();
+        let ty = f.values[&result].ty.clone();
+        if let HirInstruction::Load { ptr, align, .. } = inst
+            && let Some(a) = p.addresses.get(ptr)
+        {
+            debug_assert_eq!(a.root, root);
+            let scalar = cast(f, &mut hot_insts, fields[&(root, a.offset)], ty.clone());
+            hot_map.insert(result, scalar);
+            let ptr = pointer(
+                f,
+                &mut cold_insts,
+                backing,
+                a.offset,
+                HirType::Ptr(Box::new(ty.clone())),
+            );
+            let loaded = value(f, ty.clone());
+            cold_insts.push(HirInstruction::Load {
+                result: loaded,
+                ptr,
+                ty,
+                align: *align,
+                volatile: false,
+            });
+            cold_map.insert(result, loaded);
+        } else {
+            for (map, out) in [
+                (&mut hot_map, &mut hot_insts),
+                (&mut cold_map, &mut cold_insts),
+            ] {
+                let mut copy = inst.clone();
+                copy.replace_uses(map);
+                let renamed = value(f, ty.clone());
+                *copy.result_id_mut().unwrap() = renamed;
+                map.insert(result, renamed);
+                out.push(copy);
+            }
+        }
+    }
+    for (result, hot_value) in hot_map {
+        if uses.get(&result).copied().unwrap_or_default()
+            > internal.get(&result).copied().unwrap_or_default()
+        {
+            f.blocks.get_mut(&tail).unwrap().phis.push(HirPhi {
+                result,
+                ty: f.values[&result].ty.clone(),
+                incoming: vec![(hot_value, hot), (cold_map[&result], cold)],
+            });
+        }
+    }
+    f.blocks.get_mut(&hot).unwrap().instructions = hot_insts;
+    f.blocks.get_mut(&cold).unwrap().instructions = cold_insts;
+    tail
+}
+
 fn apply(f: &mut HirFunction, p: Plan) {
     let yes = f.create_value(
         HirType::Bool,
@@ -773,13 +901,67 @@ fn apply(f: &mut HirFunction, p: Plan) {
         }
         f.blocks.get_mut(bid).unwrap().phis = new;
     }
+    // ZYNTAX_DISABLE_GUARDED_READS keeps separate field guards; safe.
+    let combine_reads = std::env::var_os("ZYNTAX_DISABLE_GUARDED_READS").is_none();
+    let mut uses = HashMap::<HirId, usize>::new();
+    if combine_reads {
+        for block in f.blocks.values() {
+            for phi in &block.phis {
+                for (v, _) in &phi.incoming {
+                    *uses.entry(*v).or_default() += 1;
+                }
+            }
+            for inst in &block.instructions {
+                inst.for_each_operand(|v| *uses.entry(v).or_default() += 1);
+            }
+            block
+                .terminator
+                .for_each_operand(|v| *uses.entry(v).or_default() += 1);
+        }
+        // Constructor fields and removed local reads may acquire new uses later.
+        for v in fields.values().chain(p.local.values()) {
+            *uses.entry(*v).or_default() += 1;
+        }
+        for inst in init_casts.values().flatten() {
+            inst.for_each_operand(|v| *uses.entry(v).or_default() += 1);
+        }
+    }
     for bid in blocks {
         let insts = std::mem::take(&mut f.blocks.get_mut(&bid).unwrap().instructions);
         let mut current = bid;
-        for (i, mut inst) in insts.into_iter().enumerate() {
+        let mut i = 0;
+        while i < insts.len() {
             if p.remove.contains(&(bid, i)) {
+                i += 1;
                 continue;
             }
+            if combine_reads
+                && let HirInstruction::Load { ptr, .. } = &insts[i]
+                && let Some(a) = p.addresses.get(ptr)
+            {
+                let end = read_region(&insts, i, a.root, &p);
+                if end > i {
+                    current = guarded_reads(
+                        f,
+                        current,
+                        (bid, i),
+                        &insts[i..end],
+                        ReadObject {
+                            root: a.root,
+                            flag: virtuals[&a.root],
+                            backing: backing[&a.root],
+                            fields: &fields,
+                        },
+                        &p,
+                        &uses,
+                    );
+                    i = end;
+                    continue;
+                }
+            }
+            let site = (bid, i);
+            let mut inst = insts[i].clone();
+            i += 1;
             let mut out = Vec::new();
             match &mut inst {
                 HirInstruction::Load {
@@ -852,8 +1034,8 @@ fn apply(f: &mut HirFunction, p: Plan) {
                         ty: f.values[&*result].ty.clone(),
                     };
                 }
-                HirInstruction::Call { args, .. } if p.escapes.contains_key(&(bid, i)) => {
-                    let root = p.escapes[&(bid, i)];
+                HirInstruction::Call { args, .. } if p.escapes.contains_key(&site) => {
+                    let root = p.escapes[&site];
                     let (hot, cold, tail) = diamond(f, current, virtuals[&root]);
                     let allocated = value(f, raw());
                     let bytes = constant(f, p.allocs.values().next().unwrap().size);
