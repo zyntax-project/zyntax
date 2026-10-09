@@ -45,7 +45,7 @@
 
 use crate::analysis::dominators::DominatorTree;
 use crate::hir::{HirFunction, HirId};
-use std::collections::{HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 
 /// A single natural loop.
 #[derive(Debug, Clone)]
@@ -102,7 +102,7 @@ impl LoopForest {
 
         // 2. Group by header — multiple back-edges to the same header
         //    form one loop with a union of bodies.
-        let mut by_header: HashMap<HirId, Vec<HirId>> = HashMap::new();
+        let mut by_header: HashMap<HirId, Vec<HirId>> = HashMap::default();
         for (t, h) in &back_edges {
             by_header.entry(*h).or_default().push(*t);
         }
@@ -126,7 +126,7 @@ impl LoopForest {
         //    when we walk we always meet the innermost loops first.
         loops.sort_by_key(|l| l.body.len());
 
-        let mut innermost: HashMap<HirId, usize> = HashMap::new();
+        let mut innermost: HashMap<HirId, usize> = HashMap::default();
         for (i, l) in loops.iter().enumerate() {
             for &b in &l.body {
                 // Smaller-body loops are visited first so the FIRST
@@ -136,7 +136,7 @@ impl LoopForest {
         }
 
         // Parent = smallest loop whose body strictly contains ours.
-        let mut parent: HashMap<usize, usize> = HashMap::new();
+        let mut parent: HashMap<usize, usize> = HashMap::default();
         for (i, inner) in loops.iter().enumerate() {
             // Iterate outer candidates (anything larger). Take the
             // smallest container.
@@ -214,7 +214,7 @@ fn collect_body(
     header: HirId,
     latches: &[HirId],
 ) -> HashSet<HirId> {
-    let mut body: HashSet<HirId> = HashSet::new();
+    let mut body: HashSet<HirId> = HashSet::default();
     body.insert(header);
     let mut stack: Vec<HirId> = latches.to_vec();
     for &l in latches {
@@ -243,7 +243,7 @@ fn collect_body(
 /// Loop exits: any block OUTSIDE `body` that has a predecessor INSIDE
 /// `body`. The successor of an exiting branch.
 fn collect_exits(func: &HirFunction, body: &HashSet<HirId>) -> HashSet<HirId> {
-    let mut exits = HashSet::new();
+    let mut exits = HashSet::default();
     for &b in body {
         if let Some(block) = func.blocks.get(&b) {
             for &s in &block.successors {

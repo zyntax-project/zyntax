@@ -76,7 +76,7 @@
 //! worthwhile is a separate question of trip count and work per
 //! iteration, and belongs where the dispatch is chosen.
 
-use std::collections::{HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 
 use crate::analysis::{DominatorTree, LoopForest, NaturalLoop};
 use crate::hir::{
@@ -199,7 +199,7 @@ fn defines(inst: &HirInstruction, value: HirId) -> bool {
 /// Everything the loop body defines, so "does this change between
 /// iterations" is one lookup rather than a scan per question.
 fn values_defined_in(func: &HirFunction, blocks: &HashSet<HirId>) -> HashSet<HirId> {
-    let mut defined = HashSet::new();
+    let mut defined = HashSet::default();
     for b in blocks {
         let Some(blk) = func.blocks.get(b) else {
             continue;
@@ -248,7 +248,7 @@ impl<'a> Defs<'a> {
     /// defined and whether the loop can change it are separate
     /// questions.
     fn build(func: &'a HirFunction, blocks: &HashSet<HirId>) -> Self {
-        let mut by_value = HashMap::new();
+        let mut by_value = HashMap::default();
         for blk in func.blocks.values() {
             for inst in &blk.instructions {
                 if let Some(r) = result_of(inst) {
@@ -954,7 +954,7 @@ fn bands_are_disjoint(
 
     // Within one base pointer the answer is settled here, since every
     // access through it reaches the same storage by construction.
-    let mut band_of: HashMap<HirId, Band> = HashMap::new();
+    let mut band_of: HashMap<HirId, Band> = HashMap::default();
     for base in &bases {
         let through: Vec<&Access> = accesses.iter().filter(|a| a.base == *base).collect();
         if !through.iter().any(|a| a.is_write) {

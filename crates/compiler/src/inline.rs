@@ -65,8 +65,8 @@ use crate::hir::{
     HirBlock, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
     HirTerminator, HirType, HirValue, HirValueKind,
 };
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Maximum number of instructions a single-block (leaf) callee can
@@ -200,7 +200,7 @@ pub fn run_module(module: &mut HirModule) -> InlineStats {
 /// still hold for it; a module whose functions are optimised one at a
 /// time computes them once.
 pub fn cycles_of(module: &HirModule) -> Cycles {
-    let changing = HashMap::new();
+    let changing = HashMap::default();
     call_cycles(&Callees {
         stable: &module.functions,
         changing: &changing,
@@ -268,7 +268,7 @@ pub fn run_module_with(module: &mut HirModule, cycles: Option<&Cycles>) -> Inlin
 
         // What is known of each callee, asked once per round: no callee
         // body changes before the next.
-        let mut shapes: HashMap<HirId, CalleeShape> = HashMap::new();
+        let mut shapes: HashMap<HirId, CalleeShape> = HashMap::default();
         let mut specializations = ConstantCallees::default();
         let mut this_pass = 0;
         for (_, caller_id, caller) in taken.iter_mut() {
@@ -399,7 +399,7 @@ pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
             continue;
         }
 
-        let changing = HashMap::new();
+        let changing = HashMap::default();
         let callees = Callees {
             stable: &module.functions,
             changing: &changing,
@@ -467,7 +467,7 @@ pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
             Some(f) => f,
             None => continue,
         };
-        let mut subs: HashMap<HirId, HirId> = HashMap::new();
+        let mut subs: HashMap<HirId, HirId> = HashMap::default();
         for job in jobs {
             let sub = match job.kind {
                 InlineKind::Leaf => apply_inline(live, &job, &snapshot),
@@ -521,7 +521,7 @@ fn reorder_blocks_by_cfg(func: &mut HirFunction) {
     if !func.blocks.contains_key(&entry) {
         return;
     }
-    let mut visited: HashSet<HirId> = HashSet::new();
+    let mut visited: HashSet<HirId> = HashSet::default();
     let mut order: Vec<HirId> = Vec::with_capacity(func.blocks.len());
     let mut stack: Vec<HirId> = vec![entry];
     while let Some(bid) = stack.pop() {
@@ -817,7 +817,7 @@ fn blocks_in_loops(f: &HirFunction) -> HashSet<HirId> {
     // Back edges, by depth-first search from the entry: an edge to a
     // block still on the stack.
     let mut back_edges: Vec<(HirId, HirId)> = Vec::new();
-    let mut state: HashMap<HirId, u8> = HashMap::new(); // 1 on stack, 2 done
+    let mut state: HashMap<HirId, u8> = HashMap::default(); // 1 on stack, 2 done
     let mut stack: Vec<(HirId, Vec<HirId>)> = vec![(f.entry_block, successors(f, f.entry_block))];
     state.insert(f.entry_block, 1);
     while let Some((block, pending)) = stack.last_mut() {
@@ -841,15 +841,15 @@ fn blocks_in_loops(f: &HirFunction) -> HashSet<HirId> {
     // edge's source without passing through the head. Each loop walks
     // its own predecessors: a block shared with an inner loop is still
     // a way back to the outer loop's head.
-    let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for id in f.blocks.keys() {
         for s in successors(f, *id) {
             predecessors.entry(s).or_default().push(*id);
         }
     }
-    let mut in_loop = HashSet::new();
+    let mut in_loop = HashSet::default();
     for (tail, head) in back_edges {
-        let mut body = HashSet::from([head]);
+        let mut body = HashSet::from_iter([head]);
         let mut work = vec![tail];
         while let Some(b) = work.pop() {
             if !body.insert(b) {
@@ -892,10 +892,10 @@ fn blocks_leading_to_cold(f: &HirFunction, callees: &Callees<'_>) -> HashSet<Hir
         .map(|(id, _)| *id)
         .collect();
     if seeds.is_empty() {
-        return HashSet::new();
+        return HashSet::default();
     }
-    let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::new();
-    let mut warm: HashSet<HirId> = HashSet::new();
+    let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::default();
+    let mut warm: HashSet<HirId> = HashSet::default();
     for id in f.blocks.keys() {
         let succ = successors(f, *id);
         if succ.is_empty() && !seeds.contains(id) {
@@ -947,7 +947,7 @@ impl Cycles {
 }
 
 fn call_cycles(functions: &Callees<'_>) -> Cycles {
-    let mut callees_of: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut callees_of: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for (id, f) in functions.iter() {
         let mut out = Vec::new();
         for block in f.blocks.values() {
@@ -967,11 +967,11 @@ fn call_cycles(functions: &Callees<'_>) -> Cycles {
     }
     // Tarjan's algorithm, iteratively, so a long call chain cannot
     // overflow the stack.
-    let mut index: HashMap<HirId, usize> = HashMap::new();
-    let mut low: HashMap<HirId, usize> = HashMap::new();
-    let mut on_stack: HashSet<HirId> = HashSet::new();
+    let mut index: HashMap<HirId, usize> = HashMap::default();
+    let mut low: HashMap<HirId, usize> = HashMap::default();
+    let mut on_stack: HashSet<HirId> = HashSet::default();
     let mut stack: Vec<HirId> = Vec::new();
-    let mut component: HashMap<HirId, usize> = HashMap::new();
+    let mut component: HashMap<HirId, usize> = HashMap::default();
     let mut next_index = 0usize;
     let mut next_component = 0usize;
     for (&root, _) in functions.iter() {
@@ -1099,7 +1099,7 @@ fn specialize_constants(
     if cache.len() >= 64 {
         return None;
     }
-    let mut bindings = HashMap::new();
+    let mut bindings = HashMap::default();
     for (index, constant) in &key.1 {
         let id = callee.signature.params[*index].id;
         // Lowering can give a parameter's SSA value a different id
@@ -1173,7 +1173,7 @@ fn inline_in_function(
     let mut caller_inst_count: usize = count_insts(caller);
     // What every splice left to apply: the substitution of each call's
     // result, and whether the block edges need rebuilding.
-    let mut subs: HashMap<HirId, HirId> = HashMap::new();
+    let mut subs: HashMap<HirId, HirId> = HashMap::default();
     let mut spliced_blocks = false;
 
     // Walk every block; for each Call instruction, classify and
@@ -1749,7 +1749,7 @@ fn convert_args_to_params(
                 id: converted,
                 ty: param.ty.clone(),
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1782,7 +1782,7 @@ fn apply_inline(
     // caller's argument ids directly (no new value needed; the
     // caller already owns them). Other callee-defined values get
     // fresh caller-side ids.
-    let mut subs: HashMap<HirId, HirId> = HashMap::new();
+    let mut subs: HashMap<HirId, HirId> = HashMap::default();
     let mut new_values: Vec<(HirId, HirValue)> = Vec::new();
     let (call_args, arg_casts) = convert_args_to_params(caller, callee, &job.args);
 
@@ -1822,7 +1822,7 @@ fn apply_inline(
                 HirValueKind::Instruction => HirValueKind::Instruction,
                 HirValueKind::Parameter(_) => continue, // safety: handled above
             },
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         };
         subs.insert(*id, new_id);
@@ -1886,7 +1886,7 @@ fn apply_inline(
                         id: converted,
                         ty: ret_ty.clone(),
                         kind: HirValueKind::Instruction,
-                        uses: HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -1970,14 +1970,14 @@ fn apply_inline_multi_block(
     callee: &HirFunction,
 ) -> Option<(HirId, HirId)> {
     // ─── 1. Mint fresh block ids for every callee block.
-    let mut block_id_map: HashMap<HirId, HirId> = HashMap::new();
+    let mut block_id_map: HashMap<HirId, HirId> = HashMap::default();
     for &cid in callee.blocks.keys() {
         block_id_map.insert(cid, HirId::new());
     }
     let post_block_id = HirId::new();
 
     // ─── 2. Build value substitutions (params → args, locals → fresh).
-    let mut subs: HashMap<HirId, HirId> = HashMap::new();
+    let mut subs: HashMap<HirId, HirId> = HashMap::default();
     let mut new_values: Vec<(HirId, HirValue)> = Vec::new();
     let (call_args, arg_casts) = convert_args_to_params(caller, callee, &job.args);
 
@@ -2008,7 +2008,7 @@ fn apply_inline_multi_block(
                 HirValueKind::Instruction => HirValueKind::Instruction,
                 HirValueKind::Parameter(_) => continue,
             },
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         };
         subs.insert(*id, new_id);
@@ -2169,7 +2169,7 @@ fn apply_inline_multi_block(
                     id: converted,
                     ty: ret_ty.clone(),
                     kind: HirValueKind::Instruction,
-                    uses: HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -2201,7 +2201,7 @@ fn apply_inline_multi_block(
                     id: phi_result,
                     ty: ret_ty.clone(),
                     kind: HirValueKind::Instruction,
-                    uses: HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -2262,7 +2262,7 @@ fn apply_inline_multi_block(
 /// error-prone than re-derivation.
 fn rebuild_cfg_edges(func: &mut HirFunction) {
     // Successors first — per-block, derived from each terminator.
-    let mut succ_map: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut succ_map: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for (&id, block) in &func.blocks {
         let succs = match &block.terminator {
             HirTerminator::Branch { target } => vec![*target],
@@ -2289,7 +2289,7 @@ fn rebuild_cfg_edges(func: &mut HirFunction) {
     // Predecessors derived from successors.
     // In block order, so the predecessor lists come out the same on
     // every run: a function's fingerprint reads them.
-    let mut pred_map: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut pred_map: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for src in func.blocks.keys() {
         for &t in &succ_map[src] {
             pred_map.entry(t).or_default().push(*src);
@@ -2407,7 +2407,7 @@ mod tests {
                 id: param_id,
                 ty,
                 kind: HirValueKind::Parameter(param_idx),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -2422,7 +2422,7 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -2437,7 +2437,7 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Constant(c),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -3579,7 +3579,7 @@ mod tests {
         module.functions.insert(callee_id, callee);
         module.functions.insert(caller.id, caller);
 
-        let changing = HashMap::new();
+        let changing = HashMap::default();
         let callees = Callees {
             stable: &module.functions,
             changing: &changing,
@@ -3762,7 +3762,7 @@ mod tests {
         module.functions.insert(callee_id, callee);
         module.functions.insert(caller.id, caller);
 
-        let changing = HashMap::new();
+        let changing = HashMap::default();
         let callees = Callees {
             stable: &module.functions,
             changing: &changing,
@@ -3828,7 +3828,7 @@ mod tests {
         functions.insert(helper_id, build_extern("helper", false));
         functions.insert(leaf_id, allocating(6, 0, helper_id));
         functions.insert(busy_id, allocating(2, 4, helper_id));
-        let changing = HashMap::new();
+        let changing = HashMap::default();
         let callees = Callees {
             stable: &functions,
             changing: &changing,

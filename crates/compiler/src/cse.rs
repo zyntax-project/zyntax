@@ -73,7 +73,7 @@ use crate::hir::{
     BinaryOp, CastOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
     HirTerminator, HirType, HirValueKind, UnaryOp,
 };
-use std::collections::{HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 
 /// Read-only context threaded through the dominator walk: what's needed
 /// to value-number pure calls and affine integer expressions.
@@ -121,7 +121,7 @@ pub struct CseStats {
 /// value-only CSE. Prefer [`eliminate_with`] when a purity set is
 /// available.
 pub fn eliminate(func: &mut HirFunction) -> CseStats {
-    eliminate_with(func, &HashSet::new())
+    eliminate_with(func, &HashSet::default())
 }
 
 /// CSE a single function, treating calls to any function in `pure_fns`
@@ -131,7 +131,7 @@ pub fn eliminate_with(func: &mut HirFunction, pure_fns: &HashSet<HirId>) -> CseS
         pure_fns,
         bin_defs: collect_bin_defs(func),
         int_consts: collect_int_consts(func),
-        types: std::cell::RefCell::new(HashMap::new()),
+        types: std::cell::RefCell::new(HashMap::default()),
     };
     // The dominator tree is what makes a match sound: the canonical
     // instruction must run before the one it replaces. Built from the
@@ -139,7 +139,7 @@ pub fn eliminate_with(func: &mut HirFunction, pure_fns: &HashSet<HirId>) -> CseS
     // them.
     func.rebuild_cfg_edges();
     let dt = DominatorTree::new(func);
-    let mut value_table: HashMap<VnKey, HirId> = HashMap::new();
+    let mut value_table: HashMap<VnKey, HirId> = HashMap::default();
     let mut substitutions = same_constants(func);
 
     visit_block(
@@ -183,7 +183,7 @@ pub fn eliminate_module(module: &mut HirModule) -> CseStats {
 /// `result → (op, left, right)` for every integer `Add`/`Sub` binary in
 /// the function — the raw material for affine offset normalisation.
 fn collect_bin_defs(func: &HirFunction) -> HashMap<HirId, (BinaryOp, HirId, HirId)> {
-    let mut m = HashMap::new();
+    let mut m = HashMap::default();
     for block in func.blocks.values() {
         for inst in &block.instructions {
             if let HirInstruction::Binary {
@@ -206,8 +206,8 @@ fn collect_bin_defs(func: &HirFunction) -> HashMap<HirId, (BinaryOp, HirId, HirI
 /// two compares against them get one key. Floats are left alone (a zero
 /// equals a negative zero), as are aggregates and strings.
 fn same_constants(func: &HirFunction) -> HashMap<HirId, HirId> {
-    let mut first: HashMap<(HirType, HirConstant), HirId> = HashMap::new();
-    let mut duplicates = HashMap::new();
+    let mut first: HashMap<(HirType, HirConstant), HirId> = HashMap::default();
+    let mut duplicates = HashMap::default();
     for (id, v) in &func.values {
         let HirValueKind::Constant(c) = &v.kind else {
             continue;
@@ -237,7 +237,7 @@ fn same_constants(func: &HirFunction) -> HashMap<HirId, HirId> {
 
 /// `id → integer value` for every integer-constant value.
 fn collect_int_consts(func: &HirFunction) -> HashMap<HirId, i128> {
-    let mut m = HashMap::new();
+    let mut m = HashMap::default();
     for (id, v) in &func.values {
         if let HirValueKind::Constant(c) = &v.kind {
             if let Some(i) = const_as_i128(c) {
@@ -494,7 +494,10 @@ fn vn_key_for(
 /// VN key. Union-find with path compression would be classy here;
 /// the chain depth is bounded by the number of CSE-eliminated
 /// instructions, which is tiny, so iterative chasing is fine.
-fn canonical(mut id: HirId, substitutions: &HashMap<HirId, HirId>) -> HirId {
+fn canonical<S: std::hash::BuildHasher>(
+    mut id: HirId,
+    substitutions: &std::collections::HashMap<HirId, HirId, S>,
+) -> HirId {
     let mut seen = 0;
     while let Some(&next) = substitutions.get(&id) {
         if next == id || seen > 64 {
@@ -545,23 +548,26 @@ fn is_commutative(op: BinaryOp) -> bool {
 /// duplicating the operand walker. Same contract as the private
 /// helper: walks every instruction + terminator + phi-incoming and
 /// retargets ids that appear as keys in `substitutions`.
-pub fn apply_substitutions_public(
+pub fn apply_substitutions_public<S: std::hash::BuildHasher>(
     func: &mut HirFunction,
-    substitutions: &HashMap<HirId, HirId>,
+    substitutions: &std::collections::HashMap<HirId, HirId, S>,
 ) -> usize {
     apply_substitutions(func, substitutions)
 }
 
 /// Public re-export of `remove_redundant_instructions` — drops any
 /// instruction whose result HirId is a key in `substitutions`.
-pub fn remove_redundant_instructions_public(
+pub fn remove_redundant_instructions_public<S: std::hash::BuildHasher>(
     func: &mut HirFunction,
-    substitutions: &HashMap<HirId, HirId>,
+    substitutions: &std::collections::HashMap<HirId, HirId, S>,
 ) -> usize {
     remove_redundant_instructions(func, substitutions)
 }
 
-fn apply_substitutions(func: &mut HirFunction, substitutions: &HashMap<HirId, HirId>) -> usize {
+fn apply_substitutions<S: std::hash::BuildHasher>(
+    func: &mut HirFunction,
+    substitutions: &std::collections::HashMap<HirId, HirId, S>,
+) -> usize {
     if substitutions.is_empty() {
         return 0;
     }
@@ -604,9 +610,9 @@ fn apply_substitutions(func: &mut HirFunction, substitutions: &HashMap<HirId, Hi
 /// Drop any instruction whose `result` was substituted away. Returns
 /// the number of instructions removed. Phi nodes are not touched —
 /// they're handled by SSA's trivial-phi pass.
-fn remove_redundant_instructions(
+fn remove_redundant_instructions<S: std::hash::BuildHasher>(
     func: &mut HirFunction,
-    substitutions: &HashMap<HirId, HirId>,
+    substitutions: &std::collections::HashMap<HirId, HirId, S>,
 ) -> usize {
     if substitutions.is_empty() {
         return 0;

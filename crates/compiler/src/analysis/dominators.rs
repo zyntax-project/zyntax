@@ -37,7 +37,7 @@
 //! indices; dominance frontiers are computed only when queried.
 
 use crate::hir::{HirFunction, HirId};
-use std::collections::{HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 use std::sync::OnceLock;
 
 /// Immediate dominators + the standard derived data.
@@ -150,7 +150,7 @@ impl DominatorTree {
     /// unreachable or has no frontier entries.
     pub fn frontier(&self, block: HirId) -> &HashSet<HirId> {
         static EMPTY: once_cell::sync::Lazy<HashSet<HirId>> =
-            once_cell::sync::Lazy::new(HashSet::new);
+            once_cell::sync::Lazy::new(HashSet::default);
         self.frontier
             .get_or_init(|| compute_frontier(&self.joins, &self.idom))
             .get(&block)
@@ -206,7 +206,7 @@ fn compute_rpo(func: &HirFunction, entry: HirId) -> Vec<HirId> {
         Exit(HirId),
     }
     let mut stack = vec![Action::Enter(entry)];
-    let mut visited: HashSet<HirId> = HashSet::new();
+    let mut visited: HashSet<HirId> = HashSet::default();
     let mut postorder: Vec<HirId> = Vec::new();
 
     while let Some(action) = stack.pop() {
@@ -249,7 +249,7 @@ fn compute_idom(
     rpo_pos: &HashMap<HirId, usize>,
 ) -> HashMap<HirId, HirId> {
     if rpo.is_empty() {
-        return HashMap::new();
+        return HashMap::default();
     }
     debug_assert_eq!(rpo[0], entry);
     // RPO positions are dense and ordered toward the root, so the inner
@@ -319,7 +319,7 @@ fn compute_intervals(
     entry: HirId,
     children: &HashMap<HirId, Vec<HirId>>,
 ) -> HashMap<HirId, (usize, usize)> {
-    let mut interval: HashMap<HirId, (usize, usize)> = HashMap::new();
+    let mut interval: HashMap<HirId, (usize, usize)> = HashMap::default();
     let mut clock = 0;
     let mut stack: Vec<(HirId, usize)> = vec![(entry, 0)];
     interval.insert(entry, (clock, usize::MAX));
@@ -343,7 +343,7 @@ fn compute_intervals(
 }
 
 fn build_children(idom: &HashMap<HirId, HirId>) -> HashMap<HirId, Vec<HirId>> {
-    let mut out: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut out: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for (child, parent) in idom {
         out.entry(*parent).or_default().push(*child);
     }
@@ -358,7 +358,7 @@ fn compute_frontier(
     joins: &[(HirId, Vec<HirId>)],
     idom: &HashMap<HirId, HirId>,
 ) -> HashMap<HirId, HashSet<HirId>> {
-    let mut df: HashMap<HirId, HashSet<HirId>> = HashMap::new();
+    let mut df: HashMap<HirId, HashSet<HirId>> = HashMap::default();
 
     for (b, predecessors) in joins {
         let b = *b;
@@ -544,7 +544,7 @@ mod tests {
     }
 
     fn reachable_without(func: &HirFunction, removed: Option<HirId>) -> HashSet<HirId> {
-        let mut reached = HashSet::new();
+        let mut reached = HashSet::default();
         let mut work = vec![func.entry_block];
         while let Some(block) = work.pop() {
             if Some(block) == removed || !reached.insert(block) {
@@ -632,11 +632,11 @@ mod tests {
         func.blocks.clear();
         drop(func);
         for tree in [&dt, &cloned, &dt.clone()] {
-            assert_eq!(tree.frontier(b), &HashSet::from([d]));
-            assert_eq!(tree.frontier(c), &HashSet::from([d]));
+            assert_eq!(tree.frontier(b), &HashSet::from_iter([d]));
+            assert_eq!(tree.frontier(c), &HashSet::from_iter([d]));
             assert!(tree.frontier(a).is_empty());
         }
-        assert_eq!(dt.clone().frontier(b), &HashSet::from([d]));
+        assert_eq!(dt.clone().frontier(b), &HashSet::from_iter([d]));
     }
 
     #[test]

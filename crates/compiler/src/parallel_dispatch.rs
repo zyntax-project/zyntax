@@ -52,7 +52,7 @@
 //!
 //! Off unless `ZYNTAX_PARALLEL_LOOPS=1`.
 
-use std::collections::HashSet;
+use crate::hir::IdHashSet as HashSet;
 
 use crate::analysis::{DominatorTree, LoopForest, NaturalLoop};
 use crate::hir::{
@@ -314,7 +314,7 @@ fn plan_loop(func: &HirFunction, lp: &NaturalLoop, counter: HirId, grain: i64) -
 
     // What the body reads from outside has to travel with it.
     let mut captured: Vec<HirId> = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for b in &lp.body {
         let Some(blk) = func.blocks.get(b) else {
             continue;
@@ -430,7 +430,7 @@ fn fits_a_word(ty: &HirType) -> bool {
 }
 
 fn values_defined_in(func: &HirFunction, body: &HashSet<HirId>) -> HashSet<HirId> {
-    let mut defined = HashSet::new();
+    let mut defined = HashSet::default();
     for b in body {
         let Some(blk) = func.blocks.get(b) else {
             continue;
@@ -554,7 +554,7 @@ fn rewrite(func: &mut HirFunction, plan: &Plan) -> Option<HirFunction> {
 /// A value some instruction reads that nothing in the function defines,
 /// if there is one.
 fn undefined_operand(func: &HirFunction) -> Option<HirId> {
-    let mut defined: HashSet<HirId> = HashSet::new();
+    let mut defined: HashSet<HirId> = HashSet::default();
     for (id, blk) in &func.blocks {
         defined.insert(*id);
         for phi in &blk.phis {
@@ -608,7 +608,7 @@ fn new_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );

@@ -6,7 +6,8 @@
 //! is handled entirely by the runtime object.
 
 use crate::hir::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
+use std::collections::BTreeMap;
 
 type Site = (HirId, usize);
 #[derive(Clone, Copy)]
@@ -107,7 +108,7 @@ pub fn run_function(f: &mut HirFunction) -> usize {
         return 0;
     }
     let mut count = 0;
-    let mut seen: HashSet<HirId> = HashSet::new();
+    let mut seen: HashSet<HirId> = HashSet::default();
     // A rewrite changes phi uses, so rebuild the index after each accepted web.
     for _ in 0..8 {
         let defs: HashMap<_, _> = f
@@ -181,7 +182,7 @@ pub fn run_function(f: &mut HirFunction) -> usize {
             .filter(|p| matches!(p.ty, HirType::Ptr(_)))
             .map(|p| (p.result, p))
             .collect();
-        let mut users: HashMap<HirId, Vec<HirId>> = HashMap::new();
+        let mut users: HashMap<HirId, Vec<HirId>> = HashMap::default();
         for p in phis.values() {
             for (v, _) in &p.incoming {
                 users.entry(origin(*v)).or_default().push(p.result);
@@ -200,7 +201,7 @@ pub fn run_function(f: &mut HirFunction) -> usize {
             if seen.contains(&seed) || !original.contains(&seed) {
                 continue;
             }
-            let mut roots = HashSet::new();
+            let mut roots = HashSet::default();
             let mut work = vec![seed];
             while let Some(r) = work.pop() {
                 if !(allocs.contains_key(&r) || phis.contains_key(&r)) || !roots.insert(r) {
@@ -266,10 +267,10 @@ fn plan(
         roots,
         allocs,
         fields: BTreeMap::new(),
-        stores: HashMap::new(),
-        remove: HashSet::new(),
-        local: HashMap::new(),
-        escapes: HashMap::new(),
+        stores: HashMap::default(),
+        remove: HashSet::default(),
+        local: HashMap::default(),
+        escapes: HashMap::default(),
     };
     for _ in 0..32 {
         let before = p.addresses.len();
@@ -479,7 +480,7 @@ fn plan(
     if f.blocks.len() + 3 * splits > 512 {
         return None;
     }
-    let mut users: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut users: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for phi in f.blocks.values().flat_map(|b| &b.phis) {
         if p.roots.contains(&phi.result) {
             for (v, _) in &phi.incoming {
@@ -490,7 +491,7 @@ fn plan(
         }
     }
     for root in p.allocs.keys() {
-        let mut reached = HashSet::new();
+        let mut reached = HashSet::default();
         let mut work = vec![*root];
         while let Some(r) = work.pop() {
             if reached.insert(r) {
@@ -508,9 +509,9 @@ fn plan(
 
 fn consuming_escapes(f: &HirFunction, p: &Plan) -> bool {
     let mut live_in: HashMap<HirId, HashSet<HirId>> =
-        f.blocks.keys().map(|b| (*b, HashSet::new())).collect();
+        f.blocks.keys().map(|b| (*b, HashSet::default())).collect();
     let live_out = |bid: HirId, ins: &HashMap<HirId, HashSet<HirId>>| {
-        let mut out = HashSet::new();
+        let mut out = HashSet::default();
         for succ in f.blocks[&bid].terminator.targets() {
             out.extend(&ins[&succ]);
             for phi in &f.blocks[&succ].phis {
@@ -712,7 +713,7 @@ fn guarded_reads(
     let mut cold_map = indexmap::IndexMap::new();
     let mut hot_insts = Vec::new();
     let mut cold_insts = Vec::new();
-    let mut internal = HashMap::<HirId, usize>::new();
+    let mut internal = HashMap::<HirId, usize>::default();
     for (i, inst) in insts.iter().enumerate() {
         if p.remove.contains(&(bid, start + i)) {
             continue;
@@ -782,10 +783,10 @@ fn apply(f: &mut HirFunction, p: Plan) {
         HirValueKind::Constant(HirConstant::Bool(false)),
     );
     let null = f.create_value(raw(), HirValueKind::Constant(HirConstant::Null(raw())));
-    let mut virtuals = HashMap::new();
-    let mut backing = HashMap::new();
-    let mut fields = HashMap::new();
-    let mut init_casts: HashMap<HirId, Vec<HirInstruction>> = HashMap::new();
+    let mut virtuals = HashMap::default();
+    let mut backing = HashMap::default();
+    let mut fields = HashMap::default();
+    let mut init_casts: HashMap<HirId, Vec<HirInstruction>> = HashMap::default();
     // Allocate every phi result before constructing any cyclic incoming edges.
     let ordered_roots: Vec<_> = f
         .values
@@ -903,7 +904,7 @@ fn apply(f: &mut HirFunction, p: Plan) {
     }
     // ZYNTAX_DISABLE_GUARDED_READS keeps separate field guards; safe.
     let combine_reads = std::env::var_os("ZYNTAX_DISABLE_GUARDED_READS").is_none();
-    let mut uses = HashMap::<HirId, usize>::new();
+    let mut uses = HashMap::<HirId, usize>::default();
     if combine_reads {
         for block in f.blocks.values() {
             for phi in &block.phis {

@@ -20,7 +20,7 @@
 //!
 //! Turned off with `ZYNTAX_DISABLE_PHI_PRUNE=1`.
 
-use std::collections::{HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 
 use crate::hir::{HirFunction, HirId, HirInstruction, HirModule, HirTerminator};
 
@@ -82,7 +82,7 @@ pub fn run_function(func: &mut HirFunction) -> PhiPruneStats {
 /// its old phi arm. Rebuild edges from terminators and discard those stale
 /// arms before deciding whether a phi is live or trivial.
 fn rebuild_cfg_edges(func: &mut HirFunction) {
-    let mut successors: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut successors: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for (&id, block) in &func.blocks {
         let targets = match &block.terminator {
             HirTerminator::Branch { target } => vec![*target],
@@ -103,7 +103,7 @@ fn rebuild_cfg_edges(func: &mut HirFunction) {
         };
         successors.insert(id, targets);
     }
-    let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for (&source, targets) in &successors {
         for target in targets {
             predecessors.entry(*target).or_default().push(source);
@@ -116,7 +116,7 @@ fn rebuild_cfg_edges(func: &mut HirFunction) {
 }
 
 fn prune_stale_incomings(func: &mut HirFunction) {
-    let mut reachable = HashSet::new();
+    let mut reachable = HashSet::default();
     let mut work = vec![func.entry_block];
     while let Some(block_id) = work.pop() {
         if !reachable.insert(block_id) {
@@ -149,7 +149,7 @@ fn prune_stale_incomings(func: &mut HirFunction) {
 /// function allocated itself stops looking loop-invariant and a loop over
 /// it stops being recognised as one shape.
 fn collapse_trivial_phis(func: &mut HirFunction) -> usize {
-    let mut replacements: HashMap<HirId, HirId> = HashMap::new();
+    let mut replacements: HashMap<HirId, HirId> = HashMap::default();
     for block in func.blocks.values() {
         for phi in &block.phis {
             let mut distinct = phi
@@ -225,7 +225,7 @@ fn collapse_trivial_phis(func: &mut HirFunction) -> usize {
 /// no longer exists.
 fn live_phis(func: &HirFunction) -> HashSet<HirId> {
     // Where each phi result is defined, and what it names as incomings.
-    let mut incomings: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut incomings: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for block in func.blocks.values() {
         for phi in &block.phis {
             incomings.insert(phi.result, phi.incoming.iter().map(|(v, _)| *v).collect());
@@ -233,7 +233,7 @@ fn live_phis(func: &HirFunction) -> HashSet<HirId> {
     }
 
     // Seed with the phis an instruction or terminator reads directly.
-    let mut read = HashSet::new();
+    let mut read = HashSet::default();
     for block in func.blocks.values() {
         for inst in &block.instructions {
             collect_inst_operands(inst, &mut read);
@@ -241,7 +241,7 @@ fn live_phis(func: &HirFunction) -> HashSet<HirId> {
         collect_terminator_operands(&block.terminator, &mut read);
     }
 
-    let mut live: HashSet<HirId> = HashSet::new();
+    let mut live: HashSet<HirId> = HashSet::default();
     let mut work: Vec<HirId> = read
         .iter()
         .filter(|v| incomings.contains_key(v))

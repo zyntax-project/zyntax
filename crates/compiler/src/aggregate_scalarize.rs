@@ -31,7 +31,7 @@
 //! Turned off with `ZYNTAX_DISABLE_AGGREGATE_SCALARIZE=1`;
 //! `ZYNTAX_TRACE_SCALARIZE=1` prints each web found.
 
-use std::collections::{HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 
 use indexmap::IndexMap;
 
@@ -72,7 +72,7 @@ pub fn run_function(func: &mut HirFunction) -> AggregateScalarizeStats {
     // Scalarizing one web can expose another (a nested aggregate's field
     // reads become reads of the inner value), so webs are found afresh
     // after each rewrite.
-    let mut skipped: HashSet<HirId> = HashSet::new();
+    let mut skipped: HashSet<HirId> = HashSet::default();
     for _ in 0..64 {
         let Some(web) = find_web(func, &skipped) else {
             break;
@@ -170,7 +170,7 @@ fn struct_of(func: &HirFunction, id: HirId) -> Option<(HirType, Vec<HirType>)> {
 
 /// Where and how each value of the function is defined.
 fn definitions(func: &HirFunction) -> HashMap<HirId, Def> {
-    let mut defs = HashMap::new();
+    let mut defs = HashMap::default();
     for (block_id, block) in &func.blocks {
         for phi in &block.phis {
             defs.insert(phi.result, Def::Phi { block: *block_id });
@@ -231,7 +231,7 @@ fn definitions(func: &HirFunction) -> HashMap<HirId, Def> {
 /// removes something.
 fn find_web(func: &HirFunction, skipped: &HashSet<HirId>) -> Option<Web> {
     let defs = definitions(func);
-    let mut seen: HashSet<HirId> = HashSet::new();
+    let mut seen: HashSet<HirId> = HashSet::default();
     // Seeds in a stable order: the phis and instructions of each block.
     let mut seeds: Vec<HirId> = Vec::new();
     for block in func.blocks.values() {
@@ -267,7 +267,7 @@ fn collect_web(
     fields: Vec<HirType>,
 ) -> Web {
     let mut members: Vec<HirId> = vec![seed];
-    let mut set: HashSet<HirId> = HashSet::from([seed]);
+    let mut set: HashSet<HirId> = HashSet::from_iter([seed]);
     loop {
         let mut grew = false;
         let mut add = |id: HirId, members: &mut Vec<HirId>, set: &mut HashSet<HirId>| {
@@ -492,7 +492,7 @@ fn plan(func: &HirFunction, web: &Web) -> Option<Plan> {
                     if frees_root {
                         continue;
                     }
-                    let mut here = HashSet::new();
+                    let mut here = HashSet::default();
                     for a in args {
                         if uses_member(*a) && here.insert(*a) {
                             escapes.push((*a, Escape::Inst(*block_id, i)));
@@ -503,7 +503,7 @@ fn plan(func: &HirFunction, web: &Web) -> Option<Plan> {
                     if uses_member(*func_ptr) {
                         return None;
                     }
-                    let mut here = HashSet::new();
+                    let mut here = HashSet::default();
                     for a in args {
                         if uses_member(*a) && here.insert(*a) {
                             escapes.push((*a, Escape::Inst(*block_id, i)));
@@ -539,7 +539,7 @@ fn plan(func: &HirFunction, web: &Web) -> Option<Plan> {
         }
         match &block.terminator {
             HirTerminator::Return { values } => {
-                let mut here = HashSet::new();
+                let mut here = HashSet::default();
                 for v in values {
                     if members.contains(v) && here.insert(*v) {
                         escapes.push((*v, Escape::Term(*block_id)));
@@ -547,7 +547,7 @@ fn plan(func: &HirFunction, web: &Web) -> Option<Plan> {
                 }
             }
             HirTerminator::Invoke { args, .. } => {
-                let mut here = HashSet::new();
+                let mut here = HashSet::default();
                 for a in args {
                     if members.contains(a) && here.insert(*a) {
                         escapes.push((*a, Escape::Term(*block_id)));
@@ -576,7 +576,7 @@ fn new_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );
@@ -587,12 +587,12 @@ fn new_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
 fn apply(func: &mut HirFunction, web: &Web, plan: Plan) -> (usize, usize) {
     let n = web.fields.len();
     // The field values of each member.
-    let mut fields: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut fields: HashMap<HirId, Vec<HirId>> = HashMap::default();
     // New instructions, each placed before the original instruction at
     // its position; several at one position keep their order.
     let mut inserts: Vec<(HirId, usize, HirInstruction)> = Vec::new();
-    let mut delete: HashMap<HirId, HashSet<usize>> = HashMap::new();
-    let mut deleted_phis: HashSet<HirId> = HashSet::new();
+    let mut delete: HashMap<HirId, HashSet<usize>> = HashMap::default();
+    let mut deleted_phis: HashSet<HirId> = HashSet::default();
     let mut deleted_values: Vec<HirId> = Vec::new();
 
     // Roots, phis and selects get their field ids first; insertions
@@ -726,7 +726,7 @@ fn apply(func: &mut HirFunction, web: &Web, plan: Plan) -> (usize, usize) {
     }
 
     // Field phis and selects, and the removal of what they replace.
-    let mut new_phis: HashMap<HirId, Vec<HirPhi>> = HashMap::new();
+    let mut new_phis: HashMap<HirId, Vec<HirPhi>> = HashMap::default();
     for m in &web.members {
         match web.defs[m] {
             Def::Phi { block } => {
@@ -878,7 +878,7 @@ fn apply(func: &mut HirFunction, web: &Web, plan: Plan) -> (usize, usize) {
             block.phis.extend(phis);
         }
     }
-    let mut by_block: HashMap<HirId, Vec<(usize, HirInstruction)>> = HashMap::new();
+    let mut by_block: HashMap<HirId, Vec<(usize, HirInstruction)>> = HashMap::default();
     for (block, at, inst) in inserts {
         by_block.entry(block).or_default().push((at, inst));
     }

@@ -21,6 +21,12 @@ pub type IdHasher = rustc_hash::FxBuildHasher;
 
 /// An insertion-ordered map keyed by HIR ids, hashed by [`IdHasher`].
 pub type IdMap<K, V> = IndexMap<K, V, IdHasher>;
+
+/// A `HashMap` hashed by [`IdHasher`], for a pass's own id-keyed maps.
+pub type IdHashMap<K, V> = std::collections::HashMap<K, V, IdHasher>;
+
+/// A `HashSet` hashed by [`IdHasher`].
+pub type IdHashSet<K> = std::collections::HashSet<K, IdHasher>;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;

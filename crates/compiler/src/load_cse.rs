@@ -29,13 +29,13 @@
 //! references, drop the now-orphaned defining Loads).
 
 use crate::cse;
+use crate::hir::IdHashMap as HashMap;
 use crate::hir::{
     CastOp, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator, HirType,
     HirValueKind,
 };
 use crate::licm::{MemLoc, extract_mem_loc, hir_ty_byte_size, value_byte_size};
 use fnv::FnvHashSet;
-use std::collections::HashMap;
 use zyntax_typed_ast::InternedString;
 
 #[derive(Clone, Copy)]
@@ -251,7 +251,7 @@ fn run_with(
     exact: &FnvHashSet<InternedString>,
     across: bool,
 ) -> LoadCseStats {
-    let mut substitutions: HashMap<HirId, HirId> = HashMap::new();
+    let mut substitutions: HashMap<HirId, HirId> = HashMap::default();
     let addr_index = crate::licm::build_addr_index(func, exact);
     let no_subst = indexmap::IndexMap::new();
     let loc = |ptr: HirId, size: u32| -> MemLoc {
@@ -276,7 +276,7 @@ fn run_with(
         if visited[root] {
             continue;
         }
-        pending.push((root, Available::new()));
+        pending.push((root, Available::default()));
         while let Some((index, mut available)) = pending.pop() {
             if std::mem::replace(&mut visited[index], true) {
                 continue;
@@ -330,7 +330,7 @@ fn run_with(
                                         _ => None,
                                     })
                                     .collect(),
-                                cache: HashMap::new(),
+                                cache: HashMap::default(),
                             });
                             let size = addresses.stored_size(*value);
                             let address = addresses.get(canonical_ptr, 32);
@@ -536,7 +536,7 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Parameter(idx),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -551,7 +551,7 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );

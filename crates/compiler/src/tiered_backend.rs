@@ -3363,9 +3363,9 @@ impl TieredBackend {
                     .iter()
                     .filter(|(_, f)| f.signature.is_pure)
                     .map(|(id, _)| *id)
-                    .collect::<HashSet<HirId>>(),
+                    .collect::<crate::hir::IdHashSet<HirId>>(),
             ),
-            None => (HashMap::new(), HashSet::new()),
+            None => (HashMap::new(), crate::hir::IdHashSet::default()),
         };
         // The program's own bodies were left as lowered. Each is
         // optimised on its own at its first compile, in a scratch module

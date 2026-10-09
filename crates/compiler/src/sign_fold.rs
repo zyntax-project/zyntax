@@ -19,7 +19,7 @@
 use crate::hir::{
     BinaryOp, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirValueKind,
 };
-use std::collections::{HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SignFoldStats {
@@ -93,7 +93,7 @@ fn run_function(func: &mut HirFunction) -> SignFoldStats {
     stats.compares = decided.len();
 
     // A select on a constant condition is the arm it takes.
-    let mut picks: HashMap<HirId, HirId> = HashMap::new();
+    let mut picks: HashMap<HirId, HirId> = HashMap::default();
     for block in func.blocks.values() {
         for inst in &block.instructions {
             if let HirInstruction::Select {
@@ -134,8 +134,8 @@ fn run_function(func: &mut HirFunction) -> SignFoldStats {
 fn non_zero(func: &HirFunction) -> HashSet<HirId> {
     use crate::hir::{CastOp, Intrinsic};
 
-    let mut set: HashSet<HirId> = HashSet::new();
-    let mut defs: HashMap<HirId, &HirInstruction> = HashMap::new();
+    let mut set: HashSet<HirId> = HashSet::default();
+    let mut defs: HashMap<HirId, &HirInstruction> = HashMap::default();
     for (id, value) in &func.values {
         match &value.kind {
             HirValueKind::Constant(c) if const_i128(c).is_some_and(|n| n != 0) => {
@@ -218,8 +218,8 @@ fn non_zero(func: &HirFunction) -> HashSet<HirId> {
 fn non_negative(func: &HirFunction) -> HashSet<HirId> {
     // Every candidate to begin with; one whose rule fails drops out,
     // until none does. Only phis and the instructions below can stay.
-    let mut set: HashSet<HirId> = HashSet::new();
-    let mut defs: HashMap<HirId, &HirInstruction> = HashMap::new();
+    let mut set: HashSet<HirId> = HashSet::default();
+    let mut defs: HashMap<HirId, &HirInstruction> = HashMap::default();
     for (id, value) in &func.values {
         match &value.kind {
             HirValueKind::Constant(c) => {

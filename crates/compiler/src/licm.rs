@@ -98,9 +98,9 @@ use crate::hir::{
     BinaryOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
     HirTerminator, HirType,
 };
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 use crate::loop_facts::{const_int, counted_loop};
 use fnv::{FnvHashMap, FnvHashSet};
-use std::collections::{HashMap, HashSet};
 use zyntax_typed_ast::InternedString;
 
 /// Stats surfaced for callers / tests.
@@ -116,7 +116,7 @@ pub struct LicmStats {
 
 /// Run LICM over `func`.
 pub fn run(func: &mut HirFunction) -> LicmStats {
-    run_with(func, &HashSet::new(), &FnvHashSet::default())
+    run_with(func, &HashSet::default(), &FnvHashSet::default())
 }
 
 /// [`run`], knowing which functions are pure and which struct types
@@ -239,7 +239,7 @@ pub fn run_module(module: &mut HirModule) -> LicmStats {
 /// block's terminator. Idempotent; safe to call before any analysis
 /// that reads those fields.
 fn rebuild_cfg_edges(func: &mut HirFunction) {
-    let mut succ_map: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut succ_map: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for (&id, block) in &func.blocks {
         let succs = match &block.terminator {
             HirTerminator::Branch { target } => vec![*target],
@@ -264,7 +264,7 @@ fn rebuild_cfg_edges(func: &mut HirFunction) {
     }
     // In block order, so the predecessor lists come out the same on
     // every run: a function's fingerprint reads them.
-    let mut pred_map: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut pred_map: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for src in func.blocks.keys() {
         for &t in &succ_map[src] {
             pred_map.entry(t).or_default().push(*src);
@@ -891,7 +891,7 @@ pub(crate) fn build_addr_index(
     func: &HirFunction,
     exact: &FnvHashSet<InternedString>,
 ) -> HashMap<HirId, AddrLink> {
-    let mut idx: HashMap<HirId, AddrLink> = HashMap::new();
+    let mut idx: HashMap<HirId, AddrLink> = HashMap::default();
     for block in func.blocks.values() {
         for inst in &block.instructions {
             match inst {
@@ -962,7 +962,7 @@ pub(crate) fn build_addr_index(
     // through both. A list's element pointer is read from its header
     // wherever it is needed, and a hoisted read of an element must see
     // the stores to it made through another copy of that pointer.
-    let mut loaded_from: HashMap<(HirId, u64), HirId> = HashMap::new();
+    let mut loaded_from: HashMap<(HirId, u64), HirId> = HashMap::default();
     let no_subst = indexmap::IndexMap::new();
     for block in func.blocks.values() {
         for inst in &block.instructions {
