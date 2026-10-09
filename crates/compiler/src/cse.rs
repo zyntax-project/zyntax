@@ -510,9 +510,7 @@ fn canonical<S: std::hash::BuildHasher>(
 }
 
 /// Sort operand HirIds when the op is commutative so `a + b` and
-/// `b + a` get the same key. Order is HirId's natural ordering — we
-/// use `format!("{:?}", id)` as a stable sort key since `HirId`
-/// itself isn't `Ord`.
+/// `b + a` get the same key; any total order on ids does.
 fn canonical_operand_order(
     op: BinaryOp,
     left: HirId,
@@ -521,10 +519,8 @@ fn canonical_operand_order(
 ) -> (HirId, HirId) {
     let l = canonical(left, substitutions);
     let r = canonical(right, substitutions);
-    if is_commutative(op) {
-        let lk = format!("{l:?}");
-        let rk = format!("{r:?}");
-        if lk <= rk { (l, r) } else { (r, l) }
+    if is_commutative(op) && r < l {
+        (r, l)
     } else {
         (l, r)
     }
@@ -573,7 +569,7 @@ fn apply_substitutions<S: std::hash::BuildHasher>(
     }
     // Each substituted id to the end of its chain, applied with the
     // instructions' own operand walk, which knows every variant.
-    let map: indexmap::IndexMap<HirId, HirId> = substitutions
+    let map: crate::hir::IdMap<HirId, HirId> = substitutions
         .keys()
         .map(|id| (*id, canonical(*id, substitutions)))
         .collect();

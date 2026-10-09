@@ -1051,8 +1051,11 @@ pub enum HirTerminator {
 
 impl HirInstruction {
     /// Replace uses of old values with new values according to the replacement map
-    pub fn replace_uses(&mut self, replacements: &IndexMap<HirId, HirId>) {
-        fn replace(id: &mut HirId, map: &IndexMap<HirId, HirId>) {
+    pub fn replace_uses<S: std::hash::BuildHasher>(
+        &mut self,
+        replacements: &IndexMap<HirId, HirId, S>,
+    ) {
+        fn replace<S: std::hash::BuildHasher>(id: &mut HirId, map: &IndexMap<HirId, HirId, S>) {
             if let Some(&new_id) = map.get(id) {
                 *id = new_id;
             }
@@ -1660,8 +1663,11 @@ impl HirTerminator {
     }
 
     /// Replace uses of old values with new values according to the replacement map
-    pub fn replace_uses(&mut self, replacements: &IndexMap<HirId, HirId>) {
-        fn replace(id: &mut HirId, map: &IndexMap<HirId, HirId>) {
+    pub fn replace_uses<S: std::hash::BuildHasher>(
+        &mut self,
+        replacements: &IndexMap<HirId, HirId, S>,
+    ) {
+        fn replace<S: std::hash::BuildHasher>(id: &mut HirId, map: &IndexMap<HirId, HirId, S>) {
             if let Some(&new_id) = map.get(id) {
                 *id = new_id;
             }
