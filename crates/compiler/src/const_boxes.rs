@@ -237,7 +237,7 @@ fn global_ref(f: &mut HirFunction, global: HirId, ty: &HirType) -> HirId {
             id,
             ty: HirType::Ptr(Box::new(ty.clone())),
             kind: HirValueKind::Global(global),
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );
@@ -252,7 +252,7 @@ fn value(f: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );
@@ -339,7 +339,7 @@ fn make_init(
                 id: boxed,
                 ty: ty.clone(),
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );

@@ -1767,7 +1767,7 @@ pub struct HirValue {
     pub ty: HirType,
     pub kind: HirValueKind,
     /// Uses of this value for def-use chains
-    pub uses: HashSet<HirId>,
+    pub uses: IdHashSet<HirId>,
     pub span: Option<Span>,
 }
 
@@ -2772,7 +2772,7 @@ impl HirFunction {
             id: value_id,
             ty,
             kind,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         };
         self.values.insert(value_id, value);
@@ -2786,7 +2786,7 @@ impl HirFunction {
     /// value table: the interpreter a register per value, the backends
     /// a stack slot per undefined aggregate.
     pub fn sweep_unreferenced_values(&mut self) -> usize {
-        let mut named: HashSet<HirId> = HashSet::new();
+        let mut named: IdHashSet<HirId> = IdHashSet::default();
         for param in &self.signature.params {
             named.insert(param.id);
         }

@@ -12,7 +12,7 @@ use crate::hir::{
 };
 use indexmap::IndexMap;
 use petgraph::visit::EdgeRef; // For .source() method on edges
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use crate::hir::{IdHasher, IdMap};
 
@@ -473,7 +473,7 @@ struct MatchContext {
 pub struct SsaForm {
     pub function: HirFunction,
     /// Def-use chains for optimization
-    pub def_use_chains: IndexMap<HirId, HashSet<HirId>>,
+    pub def_use_chains: IndexMap<HirId, IdHashSet<HirId>>,
     /// Use-def chains for analysis
     pub use_def_chains: IndexMap<HirId, HirId>,
     /// Closure functions generated during translation
@@ -1861,7 +1861,7 @@ impl SsaBuilder {
                 id: const_id,
                 ty: HirType::U32,
                 kind: crate::hir::HirValueKind::Constant(variant_const),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -9329,7 +9329,7 @@ impl SsaBuilder {
     }
 
     /// Build def-use and use-def chains
-    fn build_def_use_chains(&self) -> (IndexMap<HirId, HashSet<HirId>>, IndexMap<HirId, HirId>) {
+    fn build_def_use_chains(&self) -> (IndexMap<HirId, IdHashSet<HirId>>, IndexMap<HirId, HirId>) {
         let mut def_use = IndexMap::new();
         let mut use_def = IndexMap::new();
 
@@ -16240,7 +16240,7 @@ impl SsaBuilder {
                     id: *param_id,
                     ty: param_ty.clone(),
                     kind: crate::hir::HirValueKind::Parameter(idx as u32),
-                    uses: HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -16336,7 +16336,7 @@ impl SsaBuilder {
                             id: new_id,
                             ty: outer_value.ty.clone(),
                             kind: outer_value.kind.clone(),
-                            uses: HashSet::new(),
+                            uses: Default::default(),
                             span: None,
                         },
                     );
@@ -16410,7 +16410,7 @@ impl SsaBuilder {
                                     kind: crate::hir::HirValueKind::Constant(default_const_for(
                                         &return_type,
                                     )),
-                                    uses: HashSet::new(),
+                                    uses: Default::default(),
                                     span: None,
                                 },
                             );
@@ -16526,7 +16526,7 @@ impl SsaBuilder {
                         id: val_id,
                         ty: result_ty.clone(),
                         kind: crate::hir::HirValueKind::Constant(constant),
-                        uses: HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -16554,7 +16554,7 @@ impl SsaBuilder {
                                 id: val_id,
                                 ty: outer_value.ty.clone(),
                                 kind: outer_value.kind.clone(),
-                                uses: HashSet::new(),
+                                uses: Default::default(),
                                 span: None,
                             },
                         );
@@ -16570,7 +16570,7 @@ impl SsaBuilder {
                         id: val_id,
                         ty: result_ty.clone(),
                         kind: crate::hir::HirValueKind::Undef,
-                        uses: HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -16611,7 +16611,7 @@ impl SsaBuilder {
                         id: result_id,
                         ty: result_ty.clone(),
                         kind: crate::hir::HirValueKind::Instruction,
-                        uses: HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -16636,7 +16636,7 @@ impl SsaBuilder {
                         id: val_id,
                         ty: result_ty.clone(),
                         kind: crate::hir::HirValueKind::Constant(crate::hir::HirConstant::I32(0)),
-                        uses: HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );

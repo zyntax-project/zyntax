@@ -1587,7 +1587,7 @@ impl AsyncCompiler {
                 id: size_const_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(HirConstant::I64(state_machine_size)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1600,7 +1600,7 @@ impl AsyncCompiler {
                 id: sm_ptr_id,
                 ty: HirType::Ptr(Box::new(HirType::U8)),
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1622,7 +1622,7 @@ impl AsyncCompiler {
                 id: state_const_id,
                 ty: HirType::U32,
                 kind: HirValueKind::Constant(HirConstant::U32(0)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1673,7 +1673,7 @@ impl AsyncCompiler {
                         id: param_value_id,
                         ty: param_ty.clone(),
                         kind: HirValueKind::Parameter(*param_idx as u32),
-                        uses: HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -1686,7 +1686,7 @@ impl AsyncCompiler {
                         id: offset_const_id,
                         ty: HirType::I64,
                         kind: HirValueKind::Constant(HirConstant::I64(current_offset)),
-                        uses: HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -1699,7 +1699,7 @@ impl AsyncCompiler {
                         id: field_ptr,
                         ty: HirType::Ptr(Box::new(param_ty.clone())),
                         kind: HirValueKind::Instruction,
-                        uses: HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -1845,7 +1845,7 @@ impl AsyncCompiler {
                             id: const_value_id,
                             ty: capture.ty.clone(),
                             kind: HirValueKind::Constant(constant.clone()),
-                            uses: HashSet::new(),
+                            uses: Default::default(),
                             span: None,
                         },
                     );
@@ -1858,7 +1858,7 @@ impl AsyncCompiler {
                             id: offset_const_id,
                             ty: HirType::I64,
                             kind: HirValueKind::Constant(HirConstant::I64(current_offset)),
-                            uses: HashSet::new(),
+                            uses: Default::default(),
                             span: None,
                         },
                     );
@@ -1871,7 +1871,7 @@ impl AsyncCompiler {
                             id: field_ptr,
                             ty: HirType::Ptr(Box::new(capture.ty.clone())),
                             kind: HirValueKind::Instruction,
-                            uses: HashSet::new(),
+                            uses: Default::default(),
                             span: None,
                         },
                     );
@@ -1921,7 +1921,7 @@ impl AsyncCompiler {
                 id: poll_fn_ptr_id,
                 ty: poll_fn_ptr_ty.clone(),
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1957,7 +1957,7 @@ impl AsyncCompiler {
                 id: promise_size_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(HirConstant::I64(16)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1969,7 +1969,7 @@ impl AsyncCompiler {
                 id: promise_ptr_id,
                 ty: HirType::Ptr(Box::new(promise_type.clone())),
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1998,7 +1998,7 @@ impl AsyncCompiler {
                 id: offset_8_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(HirConstant::I64(8)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -2010,7 +2010,7 @@ impl AsyncCompiler {
                 id: poll_fn_ptr_offset_id,
                 ty: HirType::Ptr(Box::new(HirType::U8)),
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -2178,7 +2178,7 @@ impl AsyncCompiler {
                     id: capture.id,
                     ty: capture.ty.clone(),
                     kind: HirValueKind::Instruction,
-                    uses: HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -2244,7 +2244,7 @@ impl AsyncCompiler {
                                                     id: *v,
                                                     ty: phi_ty,
                                                     kind: HirValueKind::Instruction,
-                                                    uses: HashSet::new(),
+                                                    uses: Default::default(),
                                                     span: None,
                                                 },
                                             );
@@ -2425,7 +2425,7 @@ impl AsyncCompiler {
                         id: capture.id,
                         ty: capture.ty.clone(),
                         kind: HirValueKind::Instruction,
-                        uses: HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -3040,7 +3040,7 @@ impl AsyncCompiler {
                 id: out_ptr_id,
                 ty: out_ptr_ty.clone(),
                 kind: HirValueKind::Parameter(0),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -3053,7 +3053,7 @@ impl AsyncCompiler {
                 id: state_const_id,
                 ty: HirType::U32,
                 kind: HirValueKind::Constant(HirConstant::U32(0)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -3082,7 +3082,7 @@ impl AsyncCompiler {
                         id: param_value_id,
                         ty: param.ty.clone(),
                         kind: HirValueKind::Parameter((idx + 1) as u32), // +1 for sret
-                        uses: HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -3095,7 +3095,7 @@ impl AsyncCompiler {
                         id: offset_const_id,
                         ty: HirType::I64,
                         kind: HirValueKind::Constant(HirConstant::I64(current_offset)),
-                        uses: HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -3108,7 +3108,7 @@ impl AsyncCompiler {
                         id: field_ptr,
                         ty: HirType::Ptr(Box::new(param.ty.clone())),
                         kind: HirValueKind::Instruction,
-                        uses: HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );

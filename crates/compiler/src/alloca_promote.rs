@@ -59,7 +59,6 @@ use crate::hir::{
     HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator,
     HirType, HirValue, HirValueKind, Intrinsic,
 };
-use std::collections::HashSet;
 
 /// Per-run statistics.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -278,7 +277,7 @@ fn rewrite_to_malloc(func: &mut HirFunction, site: &AllocaSite) -> bool {
             id: size_id,
             ty: HirType::I64,
             kind: HirValueKind::Constant(HirConstant::I64(size_bytes as i64)),
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );
@@ -361,7 +360,7 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -511,7 +510,7 @@ mod tests {
                 id: n,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(HirConstant::I64(5)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );

@@ -17,7 +17,7 @@ use crate::hir::{
     HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirType, HirValueKind,
     Intrinsic,
 };
-use std::collections::{HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DeadStoreStats {
@@ -90,13 +90,13 @@ fn dead_stores_in(
     types: &HashMap<HirId, HirType>,
 ) -> HashSet<usize> {
     // Pointers into an allocation made here, by allocation and offset.
-    let mut places: HashMap<HirId, Place> = HashMap::new();
+    let mut places: HashMap<HirId, Place> = HashMap::default();
     // Allocations whose address has left the block's view.
-    let mut escaped: HashSet<HirId> = HashSet::new();
+    let mut escaped: HashSet<HirId> = HashSet::default();
     // Per allocation, the stores not yet read or overwritten: index,
     // offset, width.
-    let mut pending: HashMap<HirId, Vec<(usize, i64, i64)>> = HashMap::new();
-    let mut dead = HashSet::new();
+    let mut pending: HashMap<HirId, Vec<(usize, i64, i64)>> = HashMap::default();
+    let mut dead = HashSet::default();
 
     let width_of = |v: &HirId| types.get(v).map(size_of).unwrap_or(8) as i64;
     let overlaps = |a: (i64, i64), b: (i64, i64)| a.0 < b.0 + b.1 && b.0 < a.0 + a.1;

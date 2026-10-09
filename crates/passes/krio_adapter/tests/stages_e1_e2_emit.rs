@@ -7,8 +7,6 @@
 
 mod common;
 
-use std::collections::HashSet;
-
 use krio_adapter::{HirAsyncHooks, HirCoroCfg, HirLiveness, HirSuspendingFns, emit};
 use zyntax_compiler::hir::{HirId, HirInstruction, HirTerminator, HirType, HirValue, HirValueKind};
 
@@ -56,7 +54,7 @@ fn run_through_e2(state_slot: u32, captures_slot_base: u32, emit_dispatcher: boo
             id: frame,
             ty: HirType::Ptr(Box::new(HirType::I64)),
             kind: HirValueKind::Instruction,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );

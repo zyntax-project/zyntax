@@ -69,7 +69,7 @@ use crate::hir::{
     CastOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirType,
     HirValueKind, Intrinsic,
 };
-use std::collections::{HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarReplaceAllocStats {
@@ -152,7 +152,7 @@ type BlockUses = HashMap<HirId, smallvec::SmallVec<[HirId; 2]>>;
 
 fn block_uses(func: &HirFunction) -> BlockUses {
     use crate::hir::HirTerminator;
-    let mut uses: BlockUses = HashMap::new();
+    let mut uses: BlockUses = HashMap::default();
     let mut note = |uses: &mut BlockUses, v: HirId, b: HirId| {
         let blocks = uses.entry(v).or_default();
         if !blocks.contains(&b) {
@@ -324,16 +324,16 @@ fn build_candidate(
         )
     })?;
 
-    let mut tracked: HashSet<HirId> = HashSet::new();
+    let mut tracked: HashSet<HirId> = HashSet::default();
     tracked.insert(malloc_result);
-    let mut encoded: HashSet<HirId> = HashSet::new();
-    let mut gep_field: HashMap<HirId, u64> = HashMap::new();
+    let mut encoded: HashSet<HirId> = HashSet::default();
+    let mut gep_field: HashMap<HirId, u64> = HashMap::default();
     let mut gep_iidxs: Vec<usize> = Vec::new();
     let mut cast_iidxs: Vec<usize> = Vec::new();
     let mut load_iidxs: Vec<usize> = Vec::new();
     let mut store_iidxs: Vec<usize> = Vec::new();
     let mut free_iidxs: Vec<usize> = Vec::new();
-    let mut field_ty: HashMap<u64, HirType> = HashMap::new();
+    let mut field_ty: HashMap<u64, HirType> = HashMap::default();
     let mut stores_linear: Vec<(usize, u64, HirId)> = Vec::new();
     let mut loads_linear: Vec<(usize, HirId, u64)> = Vec::new();
 
@@ -648,7 +648,7 @@ fn build_candidate(
 /// frees_removed)`.
 fn apply_candidate(func: &mut HirFunction, bid: HirId, c: &Candidate) -> (usize, usize) {
     // 1. Mint Undef registers per field offset.
-    let mut undef_for_field: HashMap<u64, HirId> = HashMap::new();
+    let mut undef_for_field: HashMap<u64, HirId> = HashMap::default();
     for (off, ty) in &c.field_ty {
         let undef_id = func.create_value(ty.clone(), HirValueKind::Undef);
         undef_for_field.insert(*off, undef_id);
@@ -707,7 +707,7 @@ fn apply_candidate(func: &mut HirFunction, bid: HirId, c: &Candidate) -> (usize,
     // 4. Build the set of instruction indices to delete:
     //    malloc + tracked GEPs + tracked Casts + tracked Loads +
     //    tracked Stores + matched Frees.
-    let mut to_remove: HashSet<usize> = HashSet::new();
+    let mut to_remove: HashSet<usize> = HashSet::default();
     to_remove.insert(c.malloc_iidx);
     for i in &c.gep_iidxs {
         to_remove.insert(*i);
@@ -834,7 +834,7 @@ mod tests {
                 id,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(HirConstant::I64(v)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -849,7 +849,7 @@ mod tests {
                 id,
                 ty: HirType::U64,
                 kind: HirValueKind::Constant(HirConstant::U64(v)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -864,7 +864,7 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -886,7 +886,7 @@ mod tests {
             imports: vec![],
             exports: vec![],
             version: 0,
-            dependencies: HashSet::new(),
+            dependencies: Default::default(),
             effects: Default::default(),
             handlers: Default::default(),
             automatic_release: false,

@@ -11,7 +11,6 @@
 
 #![cfg(feature = "cranelift-backend")]
 
-use std::collections::HashSet;
 use zyntax_compiler::bounds_version;
 use zyntax_compiler::hir::{
     BinaryOp, CastOp, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction,
@@ -52,7 +51,7 @@ fn add_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );

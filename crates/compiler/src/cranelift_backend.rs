@@ -11353,7 +11353,7 @@ mod tests {
                 id: n_id,
                 ty: i32_ty.clone(),
                 kind: HirValueKind::Parameter(0),
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -11364,7 +11364,7 @@ mod tests {
                     id,
                     ty: i32_ty.clone(),
                     kind: HirValueKind::Constant(HirConstant::I32(v)),
-                    uses: std::collections::HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -11376,7 +11376,7 @@ mod tests {
                     id,
                     ty: i32_ty.clone(),
                     kind: HirValueKind::Instruction,
-                    uses: std::collections::HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -11387,7 +11387,7 @@ mod tests {
                 id: cmp_id,
                 ty: HirType::Bool,
                 kind: HirValueKind::Instruction,
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );

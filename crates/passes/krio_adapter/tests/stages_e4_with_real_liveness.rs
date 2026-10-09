@@ -13,8 +13,6 @@
 
 mod common;
 
-use std::collections::HashSet;
-
 use krio_adapter::{HirSuspendingFns, orchestrator};
 use zyntax_compiler::analysis::AnalysisRunner;
 use zyntax_compiler::hir::{HirId, HirInstruction, HirType, HirValue, HirValueKind};
@@ -81,7 +79,7 @@ fn analysis_runner_output_drives_krio_captures_lift() {
             id: frame,
             ty: HirType::Ptr(Box::new(HirType::I64)),
             kind: HirValueKind::Instruction,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );

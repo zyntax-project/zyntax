@@ -86,7 +86,7 @@ pub struct LiveRange {
     /// Definition point
     pub def: HirId,
     /// Last use points
-    pub uses: HashSet<HirId>,
+    pub uses: crate::hir::IdHashSet<HirId>,
     /// Blocks where value is live
     pub blocks: HashSet<HirId>,
 }

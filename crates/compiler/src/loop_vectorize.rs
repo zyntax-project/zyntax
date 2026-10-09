@@ -73,7 +73,6 @@ use crate::hir::{
     HirTerminator, HirType, HirValue, HirValueKind,
 };
 use indexmap::IndexMap;
-use std::collections::HashSet;
 
 /// Stats surfaced for callers / tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -959,7 +958,7 @@ fn create_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirI
             id,
             ty,
             kind,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );
@@ -1072,7 +1071,7 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Parameter(idx),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1087,7 +1086,7 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Constant(c),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1102,7 +1101,7 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );

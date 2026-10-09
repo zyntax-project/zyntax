@@ -1056,7 +1056,7 @@ mod tests {
                 id: HirId::from_raw(big),
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1101,7 +1101,7 @@ mod tests {
                 id: HirId::from_raw(3),
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1153,7 +1153,7 @@ mod tests {
                     id: value,
                     ty: HirType::I64,
                     kind: HirValueKind::Parameter(0),
-                    uses: std::collections::HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             );

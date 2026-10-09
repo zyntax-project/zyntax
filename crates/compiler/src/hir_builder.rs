@@ -368,7 +368,7 @@ impl<'arena> HirBuilder<'arena> {
                 id: value_id,
                 ty,
                 kind: HirValueKind::Constant(HirConstant::I32(value)),
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -390,7 +390,7 @@ impl<'arena> HirBuilder<'arena> {
                 id: value_id,
                 ty,
                 kind: HirValueKind::Constant(HirConstant::Bool(value)),
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -412,7 +412,7 @@ impl<'arena> HirBuilder<'arena> {
                 id: value_id,
                 ty,
                 kind: HirValueKind::Constant(HirConstant::U64(value)),
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -434,7 +434,7 @@ impl<'arena> HirBuilder<'arena> {
                 id: value_id,
                 ty,
                 kind: HirValueKind::Constant(HirConstant::U8(value)),
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -456,7 +456,7 @@ impl<'arena> HirBuilder<'arena> {
                 id: value_id,
                 ty,
                 kind: HirValueKind::Constant(HirConstant::F64(value)),
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -501,7 +501,7 @@ impl<'arena> HirBuilder<'arena> {
                 id: value_id,
                 ty: ptr_ty,
                 kind: HirValueKind::Global(global_id),
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -807,7 +807,7 @@ impl<'arena> HirBuilder<'arena> {
                 id: value_id,
                 ty: func_ty,
                 kind: HirValueKind::Global(func_id),
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -840,7 +840,7 @@ impl<'arena> HirBuilder<'arena> {
                 id: value_id,
                 ty: ptr_ty.clone(),
                 kind: HirValueKind::Constant(HirConstant::Null(ptr_ty)),
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -861,7 +861,7 @@ impl<'arena> HirBuilder<'arena> {
                 id: value_id,
                 ty: void_ty,
                 kind: HirValueKind::Constant(HirConstant::Struct(Vec::new())), // Empty struct = unit
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -881,7 +881,7 @@ impl<'arena> HirBuilder<'arena> {
                 id: value_id,
                 ty,
                 kind: HirValueKind::Undef,
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -962,7 +962,7 @@ impl<'arena> HirBuilder<'arena> {
                 id: value_id,
                 ty,
                 kind: HirValueKind::Undef,
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1225,7 +1225,7 @@ impl<'b, 'arena> FunctionBuilder<'b, 'arena> {
                 id: param.id,
                 ty: param.ty.clone(),
                 kind: HirValueKind::Parameter(index as u32),
-                uses: std::collections::HashSet::new(),
+                uses: Default::default(),
                 span: None,
             };
             func.values.insert(param.id, param_value);

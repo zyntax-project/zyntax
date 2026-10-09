@@ -24,8 +24,6 @@
 
 mod common;
 
-use std::collections::HashSet;
-
 use krio_adapter::orchestrator;
 use zyntax_compiler::hir::{
     HirCallable, HirId, HirInstruction, HirTerminator, HirType, HirValue, HirValueKind, Intrinsic,
@@ -50,7 +48,7 @@ fn host_bridge_await_emits_register_future_and_pending_return() {
             id: frame,
             ty: HirType::Ptr(Box::new(HirType::I64)),
             kind: HirValueKind::Instruction,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );
@@ -264,7 +262,7 @@ fn host_bridge_await_value_keeps_no_ownership_ops() {
             id: frame,
             ty: HirType::Ptr(Box::new(HirType::I64)),
             kind: HirValueKind::Instruction,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );

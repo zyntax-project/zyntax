@@ -4009,7 +4009,7 @@ impl LoweringContext {
                         id,
                         ty,
                         kind,
-                        uses: std::collections::HashSet::new(),
+                        uses: Default::default(),
                         span: None,
                     },
                 );

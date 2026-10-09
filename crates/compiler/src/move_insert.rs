@@ -23,7 +23,6 @@ use crate::hir::{
     HirCallable, HirFunction, HirId, HirInstruction, HirModule, HirType, HirValue, HirValueKind,
     ParamOwnership,
 };
-use std::collections::HashSet;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MoveInsertStats {
@@ -105,7 +104,7 @@ fn create_value(func: &mut HirFunction, ty: HirType) -> HirId {
             id,
             ty,
             kind: HirValueKind::Instruction,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );

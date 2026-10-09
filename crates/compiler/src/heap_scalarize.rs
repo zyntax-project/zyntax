@@ -6,7 +6,8 @@
 //! its defining block. Its address may only be used for field accesses,
 //! null tests, releases and other phis in the same web.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
+use std::collections::BTreeMap;
 
 use crate::hir::{
     BinaryOp, CastOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
@@ -63,7 +64,7 @@ pub fn run_function(f: &mut HirFunction) -> usize {
         return 0;
     }
     let mut index = WebIndex::new(f);
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for seed in seeds {
         if seen.contains(&seed) {
             continue;
@@ -155,9 +156,9 @@ impl WebIndex {
             value
         };
         let mut index = Self {
-            phis: HashMap::new(),
-            users: HashMap::new(),
-            allocs: HashMap::new(),
+            phis: HashMap::default(),
+            users: HashMap::default(),
+            allocs: HashMap::default(),
         };
         for (bid, block) in &f.blocks {
             for phi in &block.phis {
@@ -201,7 +202,7 @@ fn web(
     seed: HirId,
     seen: &mut HashSet<HirId>,
 ) -> Option<HashMap<HirId, Root>> {
-    let mut roots = HashMap::new();
+    let mut roots = HashMap::default();
     let mut work = vec![seed];
     let mut valid = true;
     while let Some(id) = work.pop() {
@@ -268,7 +269,7 @@ fn plan(f: &HirFunction, roots: HashMap<HirId, Root>) -> Option<Plan> {
             )
         })
         .collect();
-    let mut remove = HashSet::new();
+    let mut remove = HashSet::default();
     loop {
         let before = addresses.len();
         for (bid, block) in &f.blocks {
@@ -352,13 +353,13 @@ fn plan(f: &HirFunction, roots: HashMap<HirId, Root>) -> Option<Plan> {
         roots,
         origins,
         fields: BTreeMap::new(),
-        final_values: HashMap::new(),
+        final_values: HashMap::default(),
         loads: vec![],
-        local_loads: HashMap::new(),
+        local_loads: HashMap::default(),
         null_tests: vec![],
         remove,
     };
-    let mut stores = HashMap::new();
+    let mut stores = HashMap::default();
     for (bid, block) in &f.blocks {
         for phi in &block.phis {
             if !p.roots.contains_key(&phi.result)
@@ -532,9 +533,9 @@ fn field(fields: &mut BTreeMap<u64, HirType>, offset: u64, ty: &HirType) -> Opti
 }
 
 fn apply(f: &mut HirFunction, p: Plan) {
-    let mut deleted = HashSet::new();
+    let mut deleted = HashSet::default();
     let mut values = p.final_values;
-    let mut present = HashMap::new();
+    let mut present = HashMap::default();
     let mut subs = p.local_loads;
     for (root, kind) in &p.roots {
         let value = match kind {

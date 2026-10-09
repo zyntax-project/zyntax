@@ -1162,7 +1162,7 @@ mod llvm_tests {
                 id: const_1,
                 ty: HirType::I32,
                 kind: HirValueKind::Constant(HirConstant::I32(1)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1536,7 +1536,7 @@ mod llvm_tests {
                 id: const_42,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(HirConstant::I64(42)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1686,7 +1686,7 @@ mod llvm_tests {
                 id: const_2,
                 ty: HirType::F64,
                 kind: HirValueKind::Constant(HirConstant::F64(2.0)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -2011,7 +2011,7 @@ mod llvm_tests {
                 id: undef_struct,
                 ty: struct_ty.clone(),
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );

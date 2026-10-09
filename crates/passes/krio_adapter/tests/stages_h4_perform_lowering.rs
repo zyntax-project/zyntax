@@ -45,7 +45,7 @@ fn h4_orchestrator_lowers_perform_effect_to_state_machine() {
             id: frame,
             ty: HirType::Ptr(Box::new(HirType::I64)),
             kind: HirValueKind::Instruction,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );

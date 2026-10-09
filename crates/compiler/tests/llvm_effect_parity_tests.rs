@@ -89,7 +89,7 @@ fn llvm_backend_compiles_perform_effect_with_resumable_handler() {
             id: const_42_id,
             ty: HirType::I64,
             kind: HirValueKind::Constant(HirConstant::I64(42)),
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );
@@ -147,7 +147,7 @@ fn llvm_backend_compiles_perform_effect_with_resumable_handler() {
             id: perform_result_id,
             ty: HirType::I64,
             kind: HirValueKind::Instruction,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );
@@ -247,7 +247,7 @@ fn llvm_backend_handles_handle_effect_and_resume_as_placeholders() {
                 id,
                 ty,
                 kind,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );

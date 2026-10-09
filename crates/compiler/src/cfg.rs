@@ -8,7 +8,7 @@ use crate::hir::{HirBlock, HirFunction, HirId, HirInstruction, HirTerminator, Hi
 use petgraph::algo::{all_simple_paths, dominators};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::{DfsPostOrder, Walker};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use zyntax_typed_ast::typed_ast::{TypedBlock, TypedExpression, TypedMatchArm, TypedStatement};
 use zyntax_typed_ast::{InternedString, Span, TypedNode};
 
@@ -132,7 +132,7 @@ impl CfgBuilder {
             live_in: HashSet::new(),
             live_out: HashSet::new(),
             defs: HashSet::new(),
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: block.span.clone(),
         };
 
@@ -156,7 +156,7 @@ impl CfgBuilder {
             live_in: HashSet::new(),
             live_out: HashSet::new(),
             defs: HashSet::new(),
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: block.span.clone(),
         };
 
@@ -460,7 +460,7 @@ impl CfgBuilder {
             live_in: HashSet::new(),
             live_out: HashSet::new(),
             defs: HashSet::new(),
-            uses: HashSet::new(),
+            uses: Default::default(),
             span,
         };
 

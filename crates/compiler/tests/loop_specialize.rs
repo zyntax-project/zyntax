@@ -1,7 +1,6 @@
 //! A tag can change before it enters a stable state. Both entries and
 //! all live values must agree across the interpreter and native tiers.
 #![cfg(feature = "cranelift-backend")]
-use std::collections::HashSet;
 use zyntax_compiler::hir::*;
 use zyntax_compiler::loop_specialize;
 use zyntax_typed_ast::InternedString;
@@ -39,7 +38,7 @@ fn add_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );
@@ -85,7 +84,7 @@ fn build(toggles: bool) -> (HirModule, HirId) {
                     id: p.id,
                     ty: p.ty.clone(),
                     kind: HirValueKind::Parameter(i as u32),
-                    uses: HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             )

@@ -1541,7 +1541,7 @@ mod tests {
                 id: p0_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1551,7 +1551,7 @@ mod tests {
                 id: p1_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(1),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -1562,7 +1562,7 @@ mod tests {
                 id: sum_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );

@@ -157,7 +157,7 @@ pub fn emit_save_load(
                     id: fresh_id,
                     ty: original_ty.clone(),
                     kind: HirValueKind::Instruction,
-                    uses: HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -412,7 +412,7 @@ pub fn repair_ssa_for_reloads(
                     id: pid,
                     ty: ty.clone(),
                     kind: HirValueKind::Instruction,
-                    uses: HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -465,7 +465,7 @@ pub fn repair_ssa_for_reloads(
                             id: uid,
                             ty: ty.clone(),
                             kind: HirValueKind::Undef,
-                            uses: HashSet::new(),
+                            uses: Default::default(),
                             span: None,
                         },
                     );
@@ -591,7 +591,7 @@ pub fn emit_dispatcher(
             id: state_val,
             ty: HirType::I64,
             kind: HirValueKind::Instruction,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );

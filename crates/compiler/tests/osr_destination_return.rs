@@ -10,7 +10,6 @@
 
 #![cfg(feature = "cranelift-backend")]
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use zyntax_compiler::beadie_adapter::ZyntaxCraneliftBackend;
 use zyntax_compiler::cranelift_backend::CraneliftBackend;
@@ -63,7 +62,7 @@ fn add_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );

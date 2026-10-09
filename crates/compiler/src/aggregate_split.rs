@@ -524,7 +524,7 @@ fn apply_plan(func: &mut HirFunction, bid: HirId, plan: &SplitPlan) {
                 id: offset_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(HirConstant::I64(offset)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         ));
@@ -538,7 +538,7 @@ fn apply_plan(func: &mut HirFunction, bid: HirId, plan: &SplitPlan) {
                 id: gep_id,
                 ty: gep_ty,
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         ));
@@ -551,7 +551,7 @@ fn apply_plan(func: &mut HirFunction, bid: HirId, plan: &SplitPlan) {
                 id: field_ptr_id,
                 ty: ptr_ty_for_field(&field_ty),
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         ));
@@ -564,7 +564,7 @@ fn apply_plan(func: &mut HirFunction, bid: HirId, plan: &SplitPlan) {
                 id: new_load_id,
                 ty: field_ty.clone(),
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         ));
@@ -626,7 +626,7 @@ fn apply_plan(func: &mut HirFunction, bid: HirId, plan: &SplitPlan) {
                     id: offset_id,
                     ty: HirType::I64,
                     kind: HirValueKind::Constant(HirConstant::I64(offset)),
-                    uses: HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             ));
@@ -638,7 +638,7 @@ fn apply_plan(func: &mut HirFunction, bid: HirId, plan: &SplitPlan) {
                     id: gep_id,
                     ty: ptr_ty_for_field(&HirType::U8),
                     kind: HirValueKind::Instruction,
-                    uses: HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             ));
@@ -650,7 +650,7 @@ fn apply_plan(func: &mut HirFunction, bid: HirId, plan: &SplitPlan) {
                     id: field_ptr_id,
                     ty: ptr_ty_for_field(&field_ty),
                     kind: HirValueKind::Instruction,
-                    uses: HashSet::new(),
+                    uses: Default::default(),
                     span: None,
                 },
             ));
@@ -847,7 +847,7 @@ mod tests {
                 id,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(HirConstant::I64(v)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -862,7 +862,7 @@ mod tests {
                 id,
                 ty: HirType::U64,
                 kind: HirValueKind::Constant(HirConstant::U64(v)),
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );
@@ -877,7 +877,7 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: HashSet::new(),
+                uses: Default::default(),
                 span: None,
             },
         );

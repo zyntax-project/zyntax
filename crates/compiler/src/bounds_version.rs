@@ -39,8 +39,8 @@ use crate::hir::{
     BinaryOp, CastOp, HirBlock, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirPhi,
     HirTerminator, HirType, HirValue, HirValueKind,
 };
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
 
 /// Largest loop, in instructions, that is copied.
 const MAX_VERSIONED_BODY: usize = 256;
@@ -85,7 +85,7 @@ pub fn run_module(module: &mut HirModule) -> BoundsVersionStats {
 
 pub fn run_function(func: &mut HirFunction) -> BoundsVersionStats {
     let mut stats = BoundsVersionStats::default();
-    let mut tried: HashSet<HirId> = HashSet::new();
+    let mut tried: HashSet<HirId> = HashSet::default();
     // A function with no loop to version leaves exactly as it came,
     // edge lists included.
     let edges: Vec<(HirId, Vec<HirId>, Vec<HirId>)> = func
@@ -244,8 +244,8 @@ fn recognise(func: &HirFunction, dt: &DominatorTree, lp: &NaturalLoop) -> Result
         }
     }
 
-    let mut defined_in: HashMap<HirId, HirId> = HashMap::new();
-    let mut defs: HashMap<HirId, &HirInstruction> = HashMap::new();
+    let mut defined_in: HashMap<HirId, HirId> = HashMap::default();
+    let mut defs: HashMap<HirId, &HirInstruction> = HashMap::default();
     for b in body {
         let block = &func.blocks[b];
         for p in &block.phis {
@@ -361,7 +361,7 @@ fn recognise(func: &HirFunction, dt: &DominatorTree, lp: &NaturalLoop) -> Result
     // leaves the copy fewer edges, a phi left with one value there is
     // that value, and that can make another compare one on an index.
     // The header's own compares run once more with `i == N` and are left.
-    let mut folds: HashMap<HirId, bool> = HashMap::new();
+    let mut folds: HashMap<HirId, bool> = HashMap::default();
     let mut facts: Vec<Fact> = Vec::new();
     let order: Vec<HirId> = func
         .blocks
@@ -382,7 +382,7 @@ fn recognise(func: &HirFunction, dt: &DominatorTree, lp: &NaturalLoop) -> Result
             },
             _ => true,
         };
-        let mut live: HashSet<HirId> = HashSet::from([lp.header]);
+        let mut live: HashSet<HirId> = HashSet::from_iter([lp.header]);
         let mut stack = vec![lp.header];
         while let Some(b) = stack.pop() {
             for t in func.blocks[&b].terminator.targets() {
@@ -656,7 +656,7 @@ fn new_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: HashSet::new(),
+            uses: Default::default(),
             span: None,
         },
     );
@@ -944,7 +944,7 @@ fn simplify_copy(
     header: HirId,
     preheader: HirId,
 ) -> HashMap<HirId, HirId> {
-    let mut alias: HashMap<HirId, HirId> = HashMap::new();
+    let mut alias: HashMap<HirId, HirId> = HashMap::default();
     let resolve = |alias: &HashMap<HirId, HirId>, mut v: HirId| {
         while let Some(&n) = alias.get(&v) {
             v = n;
@@ -971,7 +971,7 @@ fn simplify_copy(
                 }
             }
         }
-        let mut reached: HashSet<HirId> = HashSet::from([header]);
+        let mut reached: HashSet<HirId> = HashSet::from_iter([header]);
         let mut stack = vec![header];
         while let Some(b) = stack.pop() {
             for t in copies[&b].terminator.targets() {
@@ -1034,8 +1034,8 @@ fn simplify_copy(
 /// Rebuild every block's predecessor and successor lists from the
 /// terminators, which are what the passes keep current.
 fn rebuild_cfg_edges(func: &mut HirFunction) {
-    let mut preds: HashMap<HirId, Vec<HirId>> = HashMap::new();
-    let mut succs: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut preds: HashMap<HirId, Vec<HirId>> = HashMap::default();
+    let mut succs: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for (id, block) in &func.blocks {
         let mut targets = block.terminator.targets();
         targets.dedup();
