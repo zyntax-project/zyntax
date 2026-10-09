@@ -515,3 +515,71 @@ fn private_library_literals_follow_reached_bodies() {
         }
     }
 }
+
+#[test]
+fn configured_error_flag_marks_imported_state() {
+    use zyntax_compiler::hir::{HirConstant, HirGlobal, HirId, HirType, Linkage};
+    use zyntax_typed_ast::TypedVariable;
+    let pending = InternedString::new_global("pending");
+    for recorded in [false, true] {
+        let mut source = library();
+        let id = HirId::new();
+        source.globals.insert(
+            id,
+            HirGlobal {
+                id,
+                name: pending,
+                ty: HirType::I64,
+                initializer: Some(HirConstant::I64(0)),
+                is_const: false,
+                is_thread_local: false,
+                linkage: Linkage::External,
+                visibility: zyntax_compiler::hir::Visibility::Default,
+                error_flag: recorded,
+            },
+        );
+        let bytes = serialize_module(&source, Format::Split).unwrap();
+        let library = Arc::new(deserialize_module_lazy(bytes).unwrap());
+        for deferred in [false, true] {
+            for exposed in [false, true] {
+                for configured in [
+                    None,
+                    Some(pending),
+                    Some(InternedString::new_global("other")),
+                ] {
+                    let mut program = client();
+                    if exposed {
+                        program.declarations.push(typed_node(
+                            TypedDeclaration::Variable(TypedVariable {
+                                name: pending,
+                                ty: i64_ty(),
+                                mutability: Mutability::Mutable,
+                                initializer: None,
+                                visibility: Visibility::Public,
+                            }),
+                            Type::Primitive(PrimitiveType::Unit),
+                            SPAN,
+                        ));
+                    }
+                    let module = lower(
+                        "flag_client",
+                        &mut program,
+                        LoweringConfig {
+                            prelowered: vec![Arc::clone(&library)],
+                            defer_prelowered_bodies: deferred,
+                            error_flag_global: configured,
+                            ..LoweringConfig::default()
+                        },
+                    );
+                    let global = module.globals.values().find(|g| g.name == pending).unwrap();
+                    assert_eq!(
+                        global.error_flag,
+                        recorded || configured == Some(pending),
+                        "recorded={recorded} deferred={deferred} exposed={exposed} configured={configured:?}"
+                    );
+                    assert_eq!(global.initializer, Some(HirConstant::I64(0)));
+                }
+            }
+        }
+    }
+}

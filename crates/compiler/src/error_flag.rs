@@ -130,6 +130,9 @@ pub fn summaries(module: &HirModule) -> Summaries {
     for (&id, f) in &module.functions {
         let e = if f.attributes.sets_error_flag {
             Effect::Sets
+        } else if f.blocks.is_empty() && !f.is_external {
+            // An encoded body has no instructions here to summarise.
+            demoted(f)
         } else if f.is_external {
             // A foreign `nothrow` body reaches no hook, so it has no way
             // to the flag.
@@ -1198,6 +1201,45 @@ mod tests {
         let (m, f, entry, raise) = after_call(FunctionAttributes::default());
         assert_eq!(branch_constant(body(&m, f), entry, raise), None);
         assert_eq!(flag_loads(body(&m, f), entry), 1);
+    }
+
+    #[test]
+    fn an_encoded_callee_uses_its_contract_until_its_body_is_read() {
+        for (attributes, expected) in [
+            (FunctionAttributes::default(), None),
+            (
+                FunctionAttributes {
+                    nothrow: true,
+                    ..Default::default()
+                },
+                Some(false),
+            ),
+            (
+                FunctionAttributes {
+                    sets_error_flag: true,
+                    ..Default::default()
+                },
+                Some(true),
+            ),
+        ] {
+            let mut m = Module::new(true);
+            let callee = m.callee("encoded", attributes);
+            let encoded = m.module.functions.get_mut(&callee).unwrap();
+            encoded.is_external = false;
+            encoded.attributes.deferred = true;
+            encoded.blocks.clear();
+            let mut b = Body::new(&m);
+            let entry = b.block();
+            let raise = b.block();
+            let ok = b.block();
+            b.call(entry, callee);
+            b.check(entry, raise, ok);
+            b.ret(raise, -1);
+            b.ret(ok, 0);
+            let f = b.finish(&mut m);
+            run_all(&mut m.module);
+            assert_eq!(branch_constant(body(&m, f), entry, raise), expected);
+        }
     }
 
     /// A body that raises and catches its own error is neither a raiser

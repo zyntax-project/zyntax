@@ -1431,6 +1431,12 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
     for d in &mut lib.declarations {
         if let TypedDeclaration::Function(f) = &mut d.node {
             f.annotations.push(strict_fp());
+            // Library entries may run while an error is reported or unwound.
+            f.annotations.push(TypedAnnotation {
+                name: intern("queries_error_flag"),
+                args: Vec::new(),
+                span: SPAN,
+            });
         }
     }
     lib.fallible = fallible_functions(&lib.declarations);

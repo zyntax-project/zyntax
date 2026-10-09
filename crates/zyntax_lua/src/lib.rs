@@ -315,6 +315,7 @@ pub fn register_runtime(
     // No Lua program releases anything itself, so the compiler releases
     // what it can prove dead and the collector takes the rest.
     runtime.set_automatic_release(true);
+    runtime.set_error_flag_global(library::PENDING);
     runtime.set_collector(zyntax_embed::Collector::MarkSweep);
     // Programs declare no effects or handlers, and lower the same
     // without the structural cleanup.

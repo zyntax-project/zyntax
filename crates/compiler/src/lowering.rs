@@ -793,7 +793,9 @@ impl LoweringContext {
                 {
                     continue;
                 }
-                self.module.globals.insert(*id, global.clone());
+                let mut global = global.clone();
+                global.error_flag |= self.config.error_flag_global == Some(global.name);
+                self.module.globals.insert(*id, global);
             }
             for (id, ty) in &prelowered.types {
                 self.module.types.entry(*id).or_insert_with(|| ty.clone());
@@ -807,10 +809,12 @@ impl LoweringContext {
         for prelowered in &self.config.prelowered {
             for (id, global) in &prelowered.stripped().globals {
                 if !self.config.linked.contains(id) {
-                    self.module
+                    let global = self
+                        .module
                         .globals
                         .entry(*id)
                         .or_insert_with(|| global.clone());
+                    global.error_flag |= self.config.error_flag_global == Some(global.name);
                 }
             }
             if self.config.defer_prelowered_bodies {
@@ -5174,10 +5178,12 @@ impl LoweringContext {
                     .iter()
                     .find_map(|m| m.stripped().globals.get(&id))
             {
-                self.module
+                let global = self
+                    .module
                     .globals
                     .entry(id)
                     .or_insert_with(|| global.clone());
+                global.error_flag |= self.config.error_flag_global == Some(var.name);
             }
             return Ok(());
         }

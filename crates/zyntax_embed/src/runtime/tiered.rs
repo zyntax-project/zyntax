@@ -653,6 +653,11 @@ impl TieredRuntime {
         >,
         joining: bool,
     ) -> RuntimeResult<()> {
+        if let Some(name) = self.error_flag_global {
+            for global in module.globals.values_mut().filter(|g| g.name == name) {
+                global.error_flag = true;
+            }
+        }
         // What the entry points cannot reach is dropped before the
         // optimisers run, so they walk the program rather than the
         // library it imported.

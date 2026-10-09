@@ -93,3 +93,36 @@ fn a_runtime_without_an_error_flag_has_nothing_pending() {
         .expect("fail runs");
     assert_eq!(runtime.take_pending_error(), None);
 }
+
+#[test]
+fn a_host_configures_the_flag_of_a_prelowered_module() {
+    use std::sync::{Arc, Mutex};
+    use zyntax_compiler::lowering::{AstLowering, LoweringConfig, LoweringContext};
+    use zyntax_typed_ast::{AstArena, TypeRegistry};
+
+    let mut context = LoweringContext::new(
+        zyntax_typed_ast::InternedString::new_global("library"),
+        Arc::new(TypeRegistry::new()),
+        Arc::new(Mutex::new(AstArena::new())),
+        LoweringConfig::default(),
+    );
+    let module = context.lower_program(&mut program()).expect("lowers");
+    let flag = module.globals.values().next().expect("flag");
+    assert!(!flag.error_flag);
+
+    let mut runtime = TieredRuntime::development().expect("runtime");
+    runtime.set_error_flag_global("failure");
+    runtime.compile_module(module).expect("module compiles");
+    runtime
+        .call_raw("fail", &[ZyntaxValue::Int(23)])
+        .expect("fail runs");
+    assert_eq!(runtime.take_pending_error(), Some(23));
+    assert_eq!(runtime.take_pending_error(), None);
+    runtime.call_raw("succeed", &[]).expect("succeed runs");
+    assert_eq!(runtime.take_pending_error(), None);
+    runtime
+        .call_raw("fail", &[ZyntaxValue::Int(7)])
+        .expect("fail runs");
+    assert_eq!(runtime.take_pending_error(), Some(7));
+    assert_eq!(runtime.take_pending_error(), None);
+}
