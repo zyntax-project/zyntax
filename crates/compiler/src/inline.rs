@@ -383,23 +383,18 @@ pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
 
     let func_ids: Vec<HirId> = module.ids_to_optimize();
     for fid in func_ids {
-        // Snapshot of the body BEFORE inlining starts. Cloned self-
-        // calls inside the snapshot still reference `fid`, so when
-        // `apply_inline_multi_block` clones the snapshot at one of
-        // the live function's self-call sites, the cloned blocks
-        // bottom out as real recursive calls (no further expansion).
-        let snapshot = match module.functions.get(&fid) {
-            Some(f) => f.clone(),
+        let candidate = match module.functions.get(&fid) {
+            Some(f) => f,
             None => continue,
         };
-        if snapshot.is_external || snapshot.signature.is_async {
+        if candidate.is_external || candidate.signature.is_async {
             continue;
         }
-        if !snapshot.signature.effects.is_empty() {
+        if !candidate.signature.effects.is_empty() {
             continue;
         }
 
-        if count_insts(&snapshot) > MAX_RECURSIVE_INLINE_INSTS {
+        if count_insts(candidate) > MAX_RECURSIVE_INLINE_INSTS {
             stats.skipped_too_large += 1;
             continue;
         }
@@ -409,16 +404,16 @@ pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
             stable: &module.functions,
             changing: &changing,
         };
-        let kind = match classify_recursive(&snapshot, fid, &callees) {
+        let kind = match classify_recursive(candidate, fid, &callees) {
             CalleeClass::OkLeaf => InlineKind::Leaf,
             CalleeClass::OkMultiBlock => InlineKind::MultiBlock,
             other => {
                 if std::env::var_os("ZYNTAX_TRACE_INLINE").is_some() {
                     eprintln!(
                         "[recursive-inline] {:?}: {:?} ({} insts)",
-                        snapshot.name.resolve_global(),
+                        candidate.name.resolve_global(),
                         other,
-                        count_insts(&snapshot)
+                        count_insts(candidate)
                     );
                 }
                 stats.skipped_unsupported += 1;
@@ -426,11 +421,8 @@ pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
             }
         };
 
-        // Find self-call sites in the snapshot — the live function
-        // is structurally identical at this point so positions
-        // line up 1:1.
         let mut jobs: Vec<InlineJob> = Vec::new();
-        for (block_id, block) in &snapshot.blocks {
+        for (block_id, block) in &candidate.blocks {
             for (idx, inst) in block.instructions.iter().enumerate() {
                 if let HirInstruction::Call {
                     result,
@@ -466,6 +458,10 @@ pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
         // instruction indices remain valid as splicing inserts /
         // removes content. Different blocks are independent.
         jobs.sort_by_key(|j| std::cmp::Reverse((j.block_id, j.inst_idx)));
+
+        // The accepted body's self calls remain calls in each copy,
+        // bounding this round to one level of recursive expansion.
+        let snapshot = candidate.clone();
 
         let live = match module.functions.get_mut(&fid) {
             Some(f) => f,

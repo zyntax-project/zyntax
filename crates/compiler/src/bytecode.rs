@@ -287,6 +287,9 @@ impl LazyModule {
     }
 
     fn function_at(&self, i: usize) -> Option<HirFunction> {
+        #[cfg(feature = "allocation-audit")]
+        let _allocations =
+            crate::allocation_audit::Scope::enter(crate::allocation_audit::Phase::Decode);
         match self.directory[i].body {
             Some(body) => self.decode(body),
             None => self.shell_at(i).cloned(),
@@ -389,6 +392,19 @@ impl LazyModule {
             return self.shell().functions.get(&id).cloned();
         }
         self.function_at(self.position(id)?)
+    }
+
+    /// Read a body in place when it is already in memory, or decode it
+    /// for the duration of `read` when it came from a split image.
+    pub fn with_function<R>(
+        &self,
+        id: crate::hir::HirId,
+        read: impl FnOnce(&HirFunction) -> R,
+    ) -> Option<R> {
+        if self.in_memory {
+            return self.shell().functions.get(&id).map(read);
+        }
+        self.function_at(self.position(id)?).map(|f| read(&f))
     }
 
     /// Functions `id` names directly, without decoding its body when

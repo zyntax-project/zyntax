@@ -2818,6 +2818,9 @@ fn clone_exact<K: Clone + std::hash::Hash + Eq, V: Clone>(map: &IndexMap<K, V>) 
 
 impl Clone for HirFunction {
     fn clone(&self) -> Self {
+        #[cfg(feature = "allocation-audit")]
+        let _allocations =
+            crate::allocation_audit::Scope::enter(crate::allocation_audit::Phase::HirClone);
         let Self {
             id,
             name,

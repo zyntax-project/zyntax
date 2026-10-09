@@ -28,6 +28,8 @@ pub mod affine_loop; // Closed-form affine reduction loops (acc += invariant ove
 pub mod aggregate_scalarize; // Aggregate SSA values built by insertvalue become their fields
 pub mod aggregate_split; // Replace struct round-trips with direct field Load/Store (HIR-level SROA)
 pub mod alloca_promote; // Alloca → Malloc promotion for escaping allocations (pairs with drop_insert)
+#[cfg(feature = "allocation-audit")]
+pub mod allocation_audit;
 pub mod analysis;
 pub mod associated_type_resolver; // Associated type resolution for trait dispatch
 pub mod async_support;
@@ -2008,6 +2010,8 @@ fn run_interp_safe_opts_with(
         return stats;
     }
     opt_audit::note_pipeline(module);
+    #[cfg(feature = "allocation-audit")]
+    let _allocations = allocation_audit::Scope::enter(allocation_audit::Phase::Optimize);
 
     // Alloca → Malloc promotion runs ONCE up front, before the
     // fixed-point sweep. Two reasons it goes here:

@@ -5,6 +5,7 @@ edition = "2024"
 description = "A Lua 5.4 frontend for Zyntax: full_moon's AST to a TypedProgram"
 
 [features]
+allocation-audit = ["zyntax_compiler/allocation-audit"]
 llvm-backend = ["zyntax_embed/llvm-backend"]
 
 [[bin]]

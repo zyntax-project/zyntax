@@ -912,8 +912,17 @@ impl RegionDominators {
 /// live-in becomes a phi at the header, appended in live-in order, and
 /// the blocks the header dominates read the phi.
 pub fn resumable(function: &HirFunction, layout: &OsrLayout) -> HirFunction {
+    resumable_body(function, layout).into_owned()
+}
+
+pub(crate) fn resumable_body<'a>(
+    function: &'a HirFunction,
+    layout: &OsrLayout,
+) -> std::borrow::Cow<'a, HirFunction> {
+    #[cfg(feature = "allocation-audit")]
+    let _allocations = crate::allocation_audit::Scope::enter(crate::allocation_audit::Phase::Osr);
     if layout.repairs.is_empty() {
-        return function.clone();
+        return std::borrow::Cow::Borrowed(function);
     }
     let mut f = function.clone();
     for r in &layout.repairs {
@@ -953,7 +962,7 @@ pub fn resumable(function: &HirFunction, layout: &OsrLayout) -> HirFunction {
             });
         }
     }
-    f
+    std::borrow::Cow::Owned(f)
 }
 
 /// A resume point as a function of its own: the region `layout.header`
@@ -1051,10 +1060,12 @@ pub fn outline(
     region_id: HirId,
     region_name: zyntax_typed_ast::InternedString,
 ) -> Option<Outlined> {
+    #[cfg(feature = "allocation-audit")]
+    let _allocations = crate::allocation_audit::Scope::enter(crate::allocation_audit::Phase::Osr);
     use crate::hir::{
         HirBlock, HirFunctionSignature, HirInstruction, HirParam, HirPhi, HirValue, HirValueKind,
     };
-    let resumed = resumable(function, layout);
+    let resumed = resumable_body(function, layout);
     let reachable = reachable_from(&resumed, layout.header);
     let in_region: IdSet = reachable.iter().copied().collect();
 

@@ -474,6 +474,9 @@ struct Scratch {
 
 impl Scratch {
     fn new(module: &HirModule) -> Self {
+        #[cfg(feature = "allocation-audit")]
+        let _allocations =
+            crate::allocation_audit::Scope::enter(crate::allocation_audit::Phase::Scratch);
         let started = web_time::Instant::now();
         let externs = module
             .functions
@@ -530,24 +533,29 @@ impl Scratch {
         program: &HashSet<HirId>,
     ) {
         let mut work: Vec<HirId> = roots.into_iter().collect();
+        #[cfg(feature = "allocation-audit")]
+        let _allocations =
+            crate::allocation_audit::Scope::enter(crate::allocation_audit::Phase::Scratch);
         while let Some(id) = work.pop() {
             if self.module.functions.contains_key(&id) {
                 continue;
             }
-            let lowered = sources
-                .get(&id)
-                .and_then(|source| source.function(id))
-                .or_else(|| module.functions.get(&id).cloned());
-            let Some(lowered) = lowered else {
-                continue;
-            };
             let optimized = program.contains(&id).then(|| bodies.get(id)).flatten();
             let mut f = match optimized {
                 Some(body) => {
                     self.done.insert(id);
                     (*body).clone()
                 }
-                None => lowered,
+                None => {
+                    let lowered = sources
+                        .get(&id)
+                        .and_then(|source| source.function(id))
+                        .or_else(|| module.functions.get(&id).cloned());
+                    let Some(lowered) = lowered else {
+                        continue;
+                    };
+                    lowered
+                }
             };
             f.attributes.optimized = true;
             f.attributes.deferred = true;
@@ -3414,10 +3422,10 @@ impl TieredBackend {
                         // after its own optimisation, as
                         // `fn-<name>-lowered.hir` and `fn-<name>-body.hir`.
                         if std::env::var_os("ZYNTAX_DUMP_HIR_DIR").is_some() {
+                            let f = &scratch.module.functions[func_id];
                             let name = f.name.resolve_global().unwrap_or_default();
-                            let lowered = f.clone();
                             crate::hir_dump::dump_function_to_dir(
-                                &lowered,
+                                f,
                                 &scratch.module,
                                 &format!("{name}-lowered"),
                             );
@@ -3425,21 +3433,26 @@ impl TieredBackend {
                         run_opts(&mut scratch.module, &facts.cache(module_arc));
                         scratch.done.insert(*func_id);
                     }
-                    let f = scratch
+                    let body = scratch
                         .module
                         .functions
                         .get_mut(func_id)
                         .expect("no pass removes a function");
-                    f.attributes.optimized = true;
-                    f.attributes.deferred = true;
-                    let mut body = f.clone();
+                    body.attributes.optimized = true;
                     body.attributes.deferred = false;
-                    let name = body.name.resolve_global().unwrap_or_default();
-                    crate::hir_dump::dump_function_to_dir(
-                        &body,
-                        &scratch.module,
-                        &format!("{name}-body"),
-                    );
+                    if std::env::var_os("ZYNTAX_DUMP_HIR_DIR").is_some() {
+                        let body = &scratch.module.functions[func_id];
+                        let name = body.name.resolve_global().unwrap_or_default();
+                        crate::hir_dump::dump_function_to_dir(
+                            body,
+                            &scratch.module,
+                            &format!("{name}-body"),
+                        );
+                    }
+                    let body = scratch.module.functions.shift_remove(func_id).unwrap();
+                    // A released cell can ask for this body again; its
+                    // next scratch copy must run the pipeline if uncached.
+                    scratch.done.remove(func_id);
                     optimized.put(scratch_key, scratch);
                     Arc::new(body)
                 });
@@ -3516,6 +3529,10 @@ impl TieredBackend {
             let facts = Arc::clone(&facts);
             let body_sources = body_sources.clone();
             move |bead_id: u64| -> Option<Arc<HirFunction>> {
+                #[cfg(feature = "allocation-audit")]
+                let _allocations = crate::allocation_audit::Scope::enter(
+                    crate::allocation_audit::Phase::InterpBody,
+                );
                 let (func_id, module_arc) = by_bead.get(&bead_id)?;
                 let mut f = body_sources
                     .get(func_id)
@@ -3616,6 +3633,15 @@ impl TieredBackend {
                 }
                 return publish(0, false);
             };
+            let lazy_started = web_time::Instant::now();
+            // Finished library bodies need only their finishing passes;
+            // the same decoded body feeds scheduling and compilation.
+            let prepared = optimized_bodies.get(*func_id).or_else(|| {
+                finished
+                    .contains(func_id)
+                    .then(|| optimize_body(bead_id))
+                    .flatten()
+            });
             // What this function calls will be called from its native code
             // as soon as it runs, through stubs that compile on the spot:
             // asked of the worker now, so they are compiled first. Not
@@ -3625,13 +3651,20 @@ impl TieredBackend {
             let queue = queue_for_callees.lock().unwrap().clone();
             if let Some(queue) = &queue
                 && replacing.is_none()
-                && let Some(f) = body_sources
-                    .get(func_id)
-                    .and_then(|source| source.function(*func_id))
-                    .or_else(|| module_arc.functions.get(func_id).cloned())
             {
                 let closures = !finished.contains(func_id);
-                for callee in direct_lazy_callees(&f, closures, &bead_of) {
+                let scan = |f: &HirFunction| direct_lazy_callees(f, closures, &bead_of);
+                let callees = prepared
+                    .as_deref()
+                    .map(scan)
+                    .or_else(|| {
+                        body_sources
+                            .get(func_id)
+                            .and_then(|s| s.with_function(*func_id, scan))
+                    })
+                    .or_else(|| module_arc.functions.get(func_id).map(scan))
+                    .unwrap_or_default();
+                for callee in callees {
                     let Some((callee_id, bound, module)) = by_bead.get(&callee) else {
                         continue;
                     };
@@ -3646,8 +3679,7 @@ impl TieredBackend {
                     queue.request_compile(callee, None);
                 }
             }
-            let lazy_started = web_time::Instant::now();
-            let optimized = optimized_bodies.get(*func_id).is_some();
+            let optimized = prepared.is_some();
             if quick
                 && !optimized
                 && let Some(queue) = &queue
@@ -3699,7 +3731,7 @@ impl TieredBackend {
                 // What the backend refused as lowered goes through the
                 // pipeline below.
             }
-            let Some(body) = optimize_body(bead_id) else {
+            let Some(body) = prepared.or_else(|| optimize_body(bead_id)) else {
                 if trace {
                     eprintln!("[lazy] bead {bead_id} ({func_id:?}) has no body to compile");
                 }
@@ -5319,6 +5351,19 @@ pub fn compile_at_tier(
     tier2_backend: Tier2Backend,
     verbosity: u8,
 ) -> *mut () {
+    #[cfg(feature = "allocation-audit")]
+    let _allocations = {
+        #[allow(unused_mut)]
+        let mut phase = crate::allocation_audit::Phase::Cranelift;
+        #[cfg(feature = "llvm-backend")]
+        if tier_idx == OptimizationTier::Optimized.index()
+            && matches!(tier2_backend, Tier2Backend::LLVM)
+            && llvm.is_some()
+        {
+            phase = crate::allocation_audit::Phase::Llvm;
+        }
+        crate::allocation_audit::Scope::enter(phase)
+    };
     let def = ZyntaxFunctionDef {
         id: func_id,
         function: Arc::clone(func_arc),
@@ -5707,6 +5752,41 @@ mod tests {
         }
         assert_eq!(counter.load(Ordering::Relaxed), 3);
         assert_eq!(calls.load(Ordering::Relaxed), 25);
+    }
+
+    #[test]
+    fn scratch_reaches_cached_bodies_without_a_lowered_copy() {
+        use super::{OptimizedBodies, Scratch};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let (root, callees) = calling_100_times(HirType::I64);
+        let id = root.id;
+        let bodies = OptimizedBodies::default();
+        bodies.replace(id, OptimizedBodies::filled(Arc::new(root)));
+        let mut scratch = Scratch::new(&callees);
+        scratch.reach(
+            [id],
+            &callees,
+            &HashMap::new(),
+            &bodies,
+            &HashSet::from([id]),
+        );
+        assert!(scratch.done.contains(&id));
+        assert_eq!(
+            scratch.module.functions[&id]
+                .blocks
+                .values()
+                .map(|b| b.instructions.len())
+                .sum::<usize>(),
+            100
+        );
+        assert!(
+            callees
+                .functions
+                .keys()
+                .all(|id| scratch.module.functions.contains_key(id))
+        );
     }
 
     #[test]

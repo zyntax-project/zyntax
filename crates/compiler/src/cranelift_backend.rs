@@ -1810,7 +1810,7 @@ impl CraneliftBackend {
             // header.
             // The region as resumed: live-ins the region redefines read
             // a phi at the header.
-            let resumed = crate::osr::resumable(function, &layout);
+            let resumed = crate::osr::resumable_body(function, &layout);
             if let Err(e) = self.emit_osr_helper_via_body(id, &resumed, &layout) {
                 if trace {
                     eprintln!(
@@ -1858,7 +1858,7 @@ impl CraneliftBackend {
                 return Ok(None);
             }
         };
-        let resumed = crate::osr::resumable(function, &layout);
+        let resumed = crate::osr::resumable_body(function, &layout);
         self.translate_osr_helper(id, &resumed, &layout).map(Some)
     }
 

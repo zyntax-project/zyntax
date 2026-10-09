@@ -8,6 +8,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use zyntax_embed::{TieredConfig, TieredRuntime};
 
+#[cfg(feature = "allocation-audit")]
+use zyntax_compiler::allocation_audit::{self, Phase};
+#[cfg(feature = "allocation-audit")]
+#[global_allocator]
+static ALLOCATOR: allocation_audit::CountingAllocator = allocation_audit::CountingAllocator;
+
 /// The stack the program runs on, the same on every platform: the main
 /// thread's is 8 MB on Linux and macOS and 1 MB on Windows.
 const STACK_BYTES: usize = 1 << 30;
@@ -66,6 +72,14 @@ fn run() -> ExitCode {
     let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
     let mut phase = std::time::Instant::now();
     let mut lap = |what: &str| {
+        #[cfg(feature = "allocation-audit")]
+        allocation_audit::set_phase(match what {
+            "parse" => Phase::Runtime,
+            "runtime" => Phase::Register,
+            "register" => Phase::Lower,
+            "compile" => Phase::Execute,
+            _ => Phase::Other,
+        });
         if trace {
             eprintln!(
                 "[ZYPY] {what:<10} {:8.2} ms",
@@ -98,6 +112,8 @@ fn run() -> ExitCode {
             }
         }
     }
+    #[cfg(feature = "allocation-audit")]
+    allocation_audit::set_phase(Phase::Parse);
     let program = match zyntax_python::parse_program_with(&source, &file, &resolve) {
         Ok(p) => p,
         Err(e) => {
@@ -153,6 +169,8 @@ fn run() -> ExitCode {
     // it holds is the process's and goes with it.
     rt.stop();
     lap("shutdown");
+    #[cfg(feature = "allocation-audit")]
+    allocation_audit::report();
     exit_now(rt, code)
 }
 

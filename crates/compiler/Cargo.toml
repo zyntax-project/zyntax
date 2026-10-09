@@ -105,6 +105,7 @@ name = "simd_vectorization"
 harness = false
 
 [features]
+allocation-audit = []
 default = ["cranelift-backend", "dynamic-plugins"]
 cranelift-backend = ["cranelift", "cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "wasmtime-internal-jit-icache-coherence"]
 llvm-backend = ["inkwell", "libloading"]
