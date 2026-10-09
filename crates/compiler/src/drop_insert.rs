@@ -499,6 +499,9 @@ impl ModuleFacts {
                 callers.entry(*c).or_default().push(*key);
             }
         }
+        // Each function's structure is read once and kept for both
+        // fixed points; only the facts it is read against change.
+        let mut indices: HashMap<HirId, FnIndex> = HashMap::new();
         // Every function computed here first, then the callers of
         // whoever changed.
         let mut dirty: Vec<HirId> = unseeded.clone();
@@ -509,7 +512,8 @@ impl ModuleFacts {
                 let Some(func) = module.functions.get(key) else {
                     continue;
                 };
-                let flags = params_returned_by(func, &facts);
+                let index = indices.entry(*key).or_insert_with(|| FnIndex::of(func));
+                let flags = params_returned_by(func, index, &facts);
                 if facts.returns_param.get(key) != Some(&flags) {
                     facts.returns_param.insert(*key, flags);
                     changed.push(*key);
@@ -548,7 +552,8 @@ impl ModuleFacts {
                 let Some(func) = module.functions.get(key) else {
                     continue;
                 };
-                let owned = returns_owned_storage(func, &facts);
+                let index = indices.entry(*key).or_insert_with(|| FnIndex::of(func));
+                let owned = returns_owned_storage(func, index, &facts);
                 let was = facts.returns_owned.contains(key);
                 if owned != was {
                     if owned {
@@ -1492,46 +1497,26 @@ fn last_use_index(
 /// call to a function that returns its own parameter counts.
 /// Which of `func`'s parameters it may hand back as its result. Reads
 /// only what the facts say of its callees.
-fn params_returned_by(func: &HirFunction, facts: &ModuleFacts) -> Vec<bool> {
-    {
-        let returned: Vec<HirId> = func
-            .blocks
-            .values()
-            .filter_map(|b| match &b.terminator {
-                HirTerminator::Return { values } => Some(values.iter().copied()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        let params = func.signature.params.len();
-        // A function returning nothing, or only scalars, returns no
-        // parameter's storage.
-        let returns_storage = returned
-            .iter()
-            .any(|r| func.values.get(r).is_some_and(|v| may_be_storage(&v.ty)));
-        if !returns_storage {
-            return vec![false; params];
-        }
-        // A parameter's value is the one of `Parameter` kind at its
-        // position; the signature's own ids name nothing in the body.
-        let mut by_position: Vec<Vec<HirId>> = vec![Vec::new(); params];
-        for v in func.values.values() {
-            if let crate::hir::HirValueKind::Parameter(n) = v.kind {
-                if let Some(slot) = by_position.get_mut(n as usize) {
-                    slot.push(v.id);
-                }
-            }
-        }
-        by_position
-            .iter()
-            .map(|ids| {
-                ids.iter().any(|id| {
-                    let names = derived_values_with(func, *id, true, Some(facts));
-                    returned.iter().any(|r| names.contains(r))
-                })
-            })
-            .collect()
+fn params_returned_by(func: &HirFunction, index: &FnIndex, facts: &ModuleFacts) -> Vec<bool> {
+    // A function returning nothing, or only scalars, returns no
+    // parameter's storage.
+    let returns_storage = index
+        .returned
+        .iter()
+        .any(|r| func.values.get(r).is_some_and(|v| may_be_storage(&v.ty)));
+    if !returns_storage {
+        return vec![false; func.signature.params.len()];
     }
+    index
+        .params
+        .iter()
+        .map(|ids| {
+            ids.iter().any(|id| {
+                let names = derived_values_using(func, *id, true, Some(facts), &index.users);
+                index.returned.iter().any(|r| names.contains(r))
+            })
+        })
+        .collect()
 }
 
 /// Whether `func`'s result is storage the caller owns.
@@ -1545,13 +1530,13 @@ fn params_returned_by(func: &HirFunction, facts: &ModuleFacts) -> Vec<bool> {
 ///
 /// Of the module's facts this reads only what is known about the
 /// callees, so the answer stands until one of them changes.
-fn returns_owned_storage(func: &HirFunction, facts: &ModuleFacts) -> bool {
+fn returns_owned_storage(func: &HirFunction, index: &FnIndex, facts: &ModuleFacts) -> bool {
     {
         // A scalar result is never storage, whatever the body allocates.
         if !func.signature.returns.iter().any(may_be_storage) {
             return false;
         }
-        let sites = collect_owned_sites(func, facts);
+        let sites = owned_sites(func, &index.malloc_sites, &index.calls, facts);
         if sites.is_empty() {
             return false;
         }
@@ -1594,23 +1579,14 @@ fn returns_owned_storage(func: &HirFunction, facts: &ModuleFacts) -> bool {
         // being returned, or the caller and whoever else kept it would
         // both hold it. An allocation that never reaches a return is the
         // function's own affair.
-        let returned: Vec<HirId> = func
-            .blocks
-            .values()
-            .filter_map(|b| match &b.terminator {
-                HirTerminator::Return { values } => Some(values.iter().copied()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
         let mut derived = IdSet::default();
         let mut all_transfer = true;
         for site in &sites {
-            let d = derived_values_in(func, site.result, facts);
-            if !returned.iter().any(|r| d.contains(r)) {
+            let d = derived_values_using(func, site.result, true, Some(facts), &index.users);
+            if !index.returned.iter().any(|r| d.contains(r)) {
                 continue;
             }
-            if !escapes_only_by_return(func, &d, site, facts) {
+            if !escapes_only_by_return(func, index, &d, site, facts) {
                 all_transfer = false;
                 break;
             }
@@ -1725,38 +1701,43 @@ fn trace_enabled() -> bool {
 }
 
 /// Whether the allocation leaves this function only by being returned.
+/// Only what reads a name for it is asked, found through the index.
 fn escapes_only_by_return(
     func: &HirFunction,
+    index: &FnIndex,
     derived: &IdSet,
     site: &MallocSite,
     facts: &ModuleFacts,
 ) -> bool {
-    for (block_id, block) in &func.blocks {
-        for phi in &block.phis {
-            if phi.incoming.iter().any(|(v, _)| derived.contains(v)) {
-                return false;
-            }
-        }
-        for (idx, inst) in block.instructions.iter().enumerate() {
-            if *block_id == site.block && idx == site.inst_idx {
+    if derived
+        .iter()
+        .any(|d| index.users.phi_users.contains_key(d))
+    {
+        return false;
+    }
+    let mut asked: std::collections::HashSet<(HirId, usize)> = std::collections::HashSet::new();
+    for d in derived {
+        for &(block, idx) in index.users.by_value.get(d).into_iter().flatten() {
+            if (block == site.block && idx == site.inst_idx) || !asked.insert((block, idx)) {
                 continue;
             }
+            let inst = &func.blocks[&block].instructions[idx];
             if matches!(classify_derived_use(inst, derived, facts), UseKind::Escape) {
                 return false;
             }
         }
-        // Returning the allocation is the transfer itself; any other
-        // escaping terminator is not.
-        if let HirTerminator::Return { values } = &block.terminator {
-            if values.iter().any(|v| derived.contains(v)) {
-                continue;
+    }
+    for d in derived {
+        for block in index.term_users.get(d).into_iter().flatten() {
+            let term = &func.blocks[block].terminator;
+            // Returning the allocation is the transfer itself; any
+            // other escaping terminator is not.
+            if let HirTerminator::Return { values } = term {
+                if values.iter().any(|v| derived.contains(v)) {
+                    continue;
+                }
             }
-        }
-        for d in derived {
-            if matches!(
-                classify_terminator_use(&block.terminator, *d),
-                UseKind::Escape
-            ) {
+            if matches!(classify_terminator_use(term, *d), UseKind::Escape) {
                 return false;
             }
         }
@@ -2317,7 +2298,23 @@ fn release_for(func: &HirFunction, result: HirId, facts: &ModuleFacts) -> Releas
 }
 
 fn collect_owned_sites(func: &HirFunction, facts: &ModuleFacts) -> Vec<MallocSite> {
-    let mut sites = collect_malloc_sites(func);
+    owned_sites(
+        func,
+        &collect_malloc_sites(func),
+        &direct_calls(func),
+        facts,
+    )
+}
+
+/// [`collect_owned_sites`] from the allocations and direct calls of the
+/// function, in block order.
+fn owned_sites(
+    func: &HirFunction,
+    mallocs: &[MallocSite],
+    calls: &[DirectCall],
+    facts: &ModuleFacts,
+) -> Vec<MallocSite> {
+    let mut sites = mallocs.to_vec();
     // A malloc whose type owns another is released through that type's
     // own function. Applied after collection so both kinds of site,
     // the intrinsic and the owned-returning call, pick it up.
@@ -2329,39 +2326,111 @@ fn collect_owned_sites(func: &HirFunction, facts: &ModuleFacts) -> Vec<MallocSit
     // Calls handing back storage the caller owns: a function that
     // returns what it allocated, an extern that makes a string, and an
     // extern standing for a runtime symbol that allocates.
+    for call in calls {
+        let allocating_extern = facts
+            .extern_links
+            .get(&call.callee)
+            .and_then(|link| symbol_role(link).and_then(|r| r.allocates));
+        if let Some(free) = allocating_extern {
+            sites.push(MallocSite {
+                result: call.result,
+                block: call.block,
+                inst_idx: call.inst_idx,
+                release: Release::Symbol(free),
+            });
+        } else if facts.returns_owned.contains(&call.callee)
+            || facts.string_makers.contains(&call.callee)
+        {
+            sites.push(MallocSite {
+                result: call.result,
+                block: call.block,
+                inst_idx: call.inst_idx,
+                release: release_for(func, call.result, facts),
+            });
+        }
+    }
+    sites
+}
+
+/// A call naming a function of the module and keeping its result.
+struct DirectCall {
+    result: HirId,
+    block: HirId,
+    inst_idx: usize,
+    callee: HirId,
+}
+
+fn direct_calls(func: &HirFunction) -> Vec<DirectCall> {
+    let mut calls = Vec::new();
     for (block_id, block) in &func.blocks {
         for (idx, inst) in block.instructions.iter().enumerate() {
             if let HirInstruction::Call {
                 result: Some(result),
-                callee: HirCallable::Function(callee_id),
+                callee: HirCallable::Function(callee),
                 ..
             } = inst
             {
-                let allocating_extern = facts
-                    .extern_links
-                    .get(callee_id)
-                    .and_then(|link| symbol_role(link).and_then(|r| r.allocates));
-                if let Some(free) = allocating_extern {
-                    sites.push(MallocSite {
-                        result: *result,
-                        block: *block_id,
-                        inst_idx: idx,
-                        release: Release::Symbol(free),
-                    });
-                } else if facts.returns_owned.contains(callee_id)
-                    || facts.string_makers.contains(callee_id)
-                {
-                    sites.push(MallocSite {
-                        result: *result,
-                        block: *block_id,
-                        inst_idx: idx,
-                        release: release_for(func, *result, facts),
-                    });
-                }
+                calls.push(DirectCall {
+                    result: *result,
+                    block: *block_id,
+                    inst_idx: idx,
+                    callee: *callee,
+                });
             }
         }
     }
-    sites
+    calls
+}
+
+/// What the fact solver reads of one function, none of which depends on
+/// the module's facts: built once and asked in every fixed-point round
+/// and for every allocation site.
+struct FnIndex {
+    users: Users,
+    /// Per value, the blocks whose terminator reads it.
+    term_users: HashMap<HirId, Vec<HirId>>,
+    /// Every value a return hands back.
+    returned: Vec<HirId>,
+    /// Per parameter position, the values of `Parameter` kind there;
+    /// the signature's own ids name nothing in the body.
+    params: Vec<Vec<HirId>>,
+    malloc_sites: Vec<MallocSite>,
+    calls: Vec<DirectCall>,
+}
+
+impl FnIndex {
+    fn of(func: &HirFunction) -> Self {
+        let mut term_users: HashMap<HirId, Vec<HirId>> = HashMap::new();
+        let mut returned = Vec::new();
+        for (&bid, block) in &func.blocks {
+            let mut seen: smallvec::SmallVec<[HirId; 4]> = smallvec::SmallVec::new();
+            block.terminator.for_each_operand(|v| {
+                if !seen.contains(&v) {
+                    seen.push(v);
+                    term_users.entry(v).or_default().push(bid);
+                }
+            });
+            if let HirTerminator::Return { values } = &block.terminator {
+                returned.extend(values.iter().copied());
+            }
+        }
+        let mut params: Vec<Vec<HirId>> = vec![Vec::new(); func.signature.params.len()];
+        for v in func.values.values() {
+            if let crate::hir::HirValueKind::Parameter(n) = v.kind {
+                if let Some(slot) = params.get_mut(n as usize) {
+                    slot.push(v.id);
+                }
+            }
+        }
+        FnIndex {
+            users: Users::of(func),
+            term_users,
+            returned,
+            params,
+            malloc_sites: collect_malloc_sites(func),
+            calls: direct_calls(func),
+        }
+    }
 }
 
 fn collect_malloc_sites(func: &HirFunction) -> Vec<MallocSite> {
