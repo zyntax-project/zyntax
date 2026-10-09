@@ -503,8 +503,11 @@ fn parse_program_once(
     }
     let class_defs = classes::collect(&module.body, &origins)?;
     let (mut class_infos, mut class_index) = classes::skeletons(&class_defs)?;
-    // Record shapes are classes after the program's own.
-    for record in records::collect(&module.body, demoted, class_infos.len()) {
+    // Record shapes are classes after the program's own, less those the
+    // syntax already shows inference would demote.
+    let mut demoted = demoted.clone();
+    demoted.extend(records::foreseen(&module.body));
+    for record in records::collect(&module.body, &demoted, class_infos.len()) {
         class_index.insert(record.name.clone(), class_infos.len());
         class_infos.push(record);
     }

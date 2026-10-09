@@ -147,6 +147,191 @@ pub(crate) fn field_name(i: usize) -> String {
     format!("k${i}")
 }
 
+/// The shapes inference is sure to demote, read from the syntax so the
+/// program is typed once rather than typed, demoted and typed again:
+/// that of a dict literal a global is bound to once and nowhere
+/// rebound, when the global is used through an attribute (`d.values()`);
+/// and, when the program reads its globals as a dict (`globals()`,
+/// `exec`), those of the literals the module's own assignments hold.
+/// A shape missed here is still demoted by inference.
+pub(crate) fn foreseen(body: &[py::Stmt]) -> HashSet<Vec<String>> {
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+
+    #[derive(Default)]
+    struct Scan<'a> {
+        /// Enclosing functions, classes, lambdas and comprehensions.
+        depth: u32,
+        /// How often each name is bound at module level.
+        bound: HashMap<&'a str, u32>,
+        /// Names bound in some inner scope, or declared `global` there.
+        inner: HashSet<&'a str>,
+        /// The shape a module-level `name = {...}` binds.
+        literal: HashMap<&'a str, Vec<String>>,
+        /// Names used through an attribute, anywhere.
+        attributes: HashSet<&'a str>,
+        /// Values of module-level assignments.
+        values: Vec<&'a py::Expr>,
+        /// Whether `globals`, `locals`, `vars`, `exec` or `eval` is
+        /// called by name.
+        reads_globals: bool,
+    }
+    impl<'a> Scan<'a> {
+        fn bind(&mut self, name: &'a str) {
+            if self.depth == 0 {
+                *self.bound.entry(name).or_default() += 1;
+            } else {
+                self.inner.insert(name);
+            }
+        }
+        fn nested(&mut self, walk: impl FnOnce(&mut Self)) {
+            self.depth += 1;
+            walk(self);
+            self.depth -= 1;
+        }
+    }
+    impl<'a> Visitor<'a> for Scan<'a> {
+        fn visit_stmt(&mut self, s: &'a py::Stmt) {
+            match s {
+                py::Stmt::FunctionDef(f) => {
+                    self.bind(f.name.as_str());
+                    self.nested(|v| walk_stmt(v, s));
+                    return;
+                }
+                py::Stmt::ClassDef(c) => {
+                    self.bind(c.name.as_str());
+                    self.nested(|v| walk_stmt(v, s));
+                    return;
+                }
+                py::Stmt::Global(g) => {
+                    self.inner.extend(g.names.iter().map(|n| n.as_str()));
+                }
+                py::Stmt::Import(i) => {
+                    for a in &i.names {
+                        let name = a.asname.as_ref().unwrap_or(&a.name).as_str();
+                        self.bind(name.split('.').next().unwrap_or(name));
+                    }
+                }
+                py::Stmt::ImportFrom(i) => {
+                    for a in &i.names {
+                        self.bind(a.asname.as_ref().unwrap_or(&a.name).as_str());
+                    }
+                }
+                // Patterns bind names this scan does not follow.
+                py::Stmt::Match(_) => {
+                    self.inner.insert("*");
+                }
+                py::Stmt::Assign(a) if self.depth == 0 => {
+                    self.values.push(&a.value);
+                    if let ([py::Expr::Name(n)], py::Expr::Dict(d)) =
+                        (a.targets.as_slice(), &*a.value)
+                        && let Some(keys) = literal_keys(d)
+                    {
+                        self.literal.insert(n.id.as_str(), keys);
+                    }
+                }
+                py::Stmt::AnnAssign(a) if self.depth == 0 => {
+                    if let Some(value) = &a.value {
+                        self.values.push(value);
+                        if let (py::Expr::Name(n), py::Expr::Dict(d)) = (&*a.target, &**value)
+                            && let Some(keys) = literal_keys(d)
+                        {
+                            self.literal.insert(n.id.as_str(), keys);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            match e {
+                py::Expr::Name(n) if !matches!(n.ctx, py::ExprContext::Load) => {
+                    self.bind(n.id.as_str());
+                }
+                py::Expr::Attribute(a) => {
+                    if let py::Expr::Name(n) = &*a.value {
+                        self.attributes.insert(n.id.as_str());
+                    }
+                }
+                py::Expr::Call(c) => {
+                    if let py::Expr::Name(n) = &*c.func
+                        && matches!(
+                            n.id.as_str(),
+                            "globals" | "locals" | "vars" | "exec" | "eval"
+                        )
+                    {
+                        self.reads_globals = true;
+                    }
+                }
+                py::Expr::Lambda(_)
+                | py::Expr::ListComp(_)
+                | py::Expr::SetComp(_)
+                | py::Expr::DictComp(_)
+                | py::Expr::Generator(_) => {
+                    self.nested(|v| walk_expr(v, e));
+                    return;
+                }
+                _ => {}
+            }
+            walk_expr(self, e);
+        }
+        fn visit_parameter(&mut self, p: &'a py::Parameter) {
+            self.inner.insert(p.name.as_str());
+        }
+        fn visit_except_handler(&mut self, h: &'a py::ExceptHandler) {
+            let py::ExceptHandler::ExceptHandler(handler) = h;
+            if let Some(name) = &handler.name {
+                self.bind(name.as_str());
+            }
+            ruff_python_ast::visitor::walk_except_handler(self, h);
+        }
+    }
+
+    let mut scan = Scan::default();
+    for s in body {
+        scan.visit_stmt(s);
+    }
+    let mut found = HashSet::default();
+    if scan.inner.contains("*") {
+        return found;
+    }
+    let rebound =
+        |name: &str| scan.bound.get(name).copied().unwrap_or(0) != 1 || scan.inner.contains(name);
+    for (name, keys) in &scan.literal {
+        if scan.attributes.contains(name) && !rebound(name) {
+            found.insert(keys.clone());
+        }
+    }
+    let shadowed = |name: &str| scan.bound.contains_key(name) || scan.inner.contains(name);
+    if scan.reads_globals
+        && !["globals", "locals", "vars", "exec", "eval"]
+            .iter()
+            .any(|n| shadowed(n))
+    {
+        fn held(e: &py::Expr, found: &mut HashSet<Vec<String>>) {
+            match e {
+                py::Expr::Dict(d) => {
+                    if let Some(keys) = literal_keys(d) {
+                        found.insert(keys);
+                    }
+                    for item in &d.items {
+                        held(&item.value, found);
+                    }
+                }
+                py::Expr::Tuple(t) => t.elts.iter().for_each(|e| held(e, found)),
+                py::Expr::List(l) => l.elts.iter().for_each(|e| held(e, found)),
+                py::Expr::Set(s) => s.elts.iter().for_each(|e| held(e, found)),
+                py::Expr::Starred(s) => held(&s.value, found),
+                _ => {}
+            }
+        }
+        for value in &scan.values {
+            held(value, &mut found);
+        }
+    }
+    found
+}
+
 /// The class a literal builds, when it is a record.
 pub(crate) fn of_literal(d: &py::ExprDict) -> Option<usize> {
     if RECORDS.with(|r| r.borrow().is_empty()) {
@@ -285,4 +470,47 @@ pub(crate) fn demoted() -> Vec<Vec<String>> {
 /// Every record's key list.
 pub(crate) fn all_shapes() -> Vec<Vec<String>> {
     RECORDS.with(|r| r.borrow().iter().map(|rec| rec.keys.clone()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    fn foreseen(source: &str) -> Vec<Vec<String>> {
+        let parsed = ruff_python_parser::parse_module(source).expect("parses");
+        let mut shapes: Vec<Vec<String>> =
+            super::foreseen(&parsed.syntax().body).into_iter().collect();
+        shapes.sort();
+        shapes
+    }
+
+    #[test]
+    fn shapes_inference_would_demote_are_foreseen() {
+        let none: Vec<Vec<String>> = Vec::new();
+        // Bound once, then used through an attribute.
+        assert_eq!(
+            foreseen("D = {'a': 1, 'b': 2}\nS = D.values()\n"),
+            [["a", "b"]]
+        );
+        // Bound twice, or bound again in a function: not followed.
+        assert_eq!(foreseen("D = {'a': 1}\nD = {'a': 2}\nD.keys()\n"), none);
+        assert_eq!(
+            foreseen("D = {'a': 1}\ndef f(D):\n    return D.x\nD.keys()\n"),
+            none
+        );
+        assert_eq!(
+            foreseen("D = {'a': 1}\ndef f():\n    global D\n    D = 2\nD.keys()\n"),
+            none
+        );
+        // Read by key only.
+        assert_eq!(foreseen("D = {'a': 1}\nprint(D['a'])\n"), none);
+        // The globals read as a dict: every literal a global holds.
+        assert_eq!(
+            foreseen("X = ({'k': 1}, 2)\nY = [{'m': 1}]\nprint(globals()['X'])\n"),
+            [vec!["k".to_string()], vec!["m".to_string()]]
+        );
+        // `globals` is the program's own function.
+        assert_eq!(
+            foreseen("def globals():\n    return {}\nX = ({'k': 1}, 2)\nglobals()\n"),
+            none
+        );
+    }
 }
