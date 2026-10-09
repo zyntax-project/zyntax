@@ -23,7 +23,7 @@ use zyntax_compiler::{
     hir::{HirId, HirModule},
     hir_interp::HirInterpreter,
     lowering::AstLowering,
-    tiered_backend::{OptimizationTier, TieredBackend, TieredConfig, TieredStatistics},
+    tiered_backend::{LoadedMark, OptimizationTier, TieredBackend, TieredConfig, TieredStatistics},
     zrtl::DynamicValue,
 };
 
@@ -147,6 +147,9 @@ pub struct TieredRuntime {
     /// global, as addresses; refreshed whenever compiling or rebuilding
     /// can move them. See [`Self::take_pending_error`].
     error_flags: std::sync::RwLock<Vec<(usize, usize)>>,
+    /// Where the loaded modules stood when `error_flags` was last read,
+    /// so a compile that only adds a module reads only that module's.
+    error_flags_mark: std::sync::Mutex<Option<LoadedMark>>,
     /// Every lowered reference type with a header word, by its descriptor
     /// global, and the word a host heap gave each layout.
     type_descriptors: std::sync::Mutex<TypeDescriptors>,
@@ -517,6 +520,7 @@ impl TieredRuntime {
             automatic_release: false,
             error_flag_global: None,
             error_flags: std::sync::RwLock::new(Vec::new()),
+            error_flags_mark: std::sync::Mutex::new(None),
             type_descriptors: std::sync::Mutex::new(TypeDescriptors::default()),
             pattern_rewrites: true,
             collecting: false,
@@ -1405,16 +1409,24 @@ impl TieredRuntime {
     /// adds a module, or a rebuild or reload moves module globals.
     fn refresh_error_flags(&self) {
         self.refresh_type_descriptors();
-        let slots = if self.error_flag_global.is_some() {
-            self.backend
-                .error_flag_slots()
-                .into_iter()
-                .map(|(ptr, size)| (ptr as usize, size))
-                .collect()
+        let mut flags = self.error_flags.write().unwrap_or_else(|e| e.into_inner());
+        let mut mark = self
+            .error_flags_mark
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.error_flag_global.is_none() {
+            flags.clear();
+            *mark = None;
+            return;
+        }
+        let (slots, whole, now) = self.backend.error_flag_slots_since(*mark);
+        let slots = slots.into_iter().map(|(ptr, size)| (ptr as usize, size));
+        if whole {
+            *flags = slots.collect();
         } else {
-            Vec::new()
-        };
-        *self.error_flags.write().unwrap_or_else(|e| e.into_inner()) = slots;
+            flags.extend(slots);
+        }
+        *mark = Some(now);
     }
 
     /// Whether programs go through the pattern rewrites before lowering:

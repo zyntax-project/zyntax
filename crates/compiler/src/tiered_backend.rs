@@ -1162,6 +1162,15 @@ pub struct TieredBackend {
     /// usable for as long as it is loaded, whatever loads after it, and
     /// that needs all of them kept and all of them restored.
     loaded: Vec<Arc<HirModule>>,
+    /// The module the latest reload, or its rollback, moved every
+    /// function entry to. A later load that is not joining replaces
+    /// `current_module`, and the functions this one holds stay
+    /// installed.
+    reloaded: Option<Arc<HirModule>>,
+    /// Bumped whenever a rebuild, a reload or a rollback moves the
+    /// globals of what is loaded, which makes any address read before
+    /// it stale.
+    globals_moved: u64,
     /// Undo record for the most recent applied reload, consumed by
     /// [`Self::rollback_last_reload`].
     last_undo: Option<ReloadUndo>,
@@ -1281,6 +1290,8 @@ impl TieredBackend {
             make_interp_body: None,
             current_module: None,
             loaded: Vec::new(),
+            reloaded: None,
+            globals_moved: 0,
             last_undo: None,
             state_migration: crate::reload::StateMigration::default(),
             profile_data: ProfileData::new(config.profile_config.clone()),
@@ -1375,6 +1386,7 @@ impl TieredBackend {
             }
         })?;
         if rebuilt {
+            self.globals_moved += 1;
             // All of them, in the order they were loaded, because the
             // rebuild cleared the addresses of all of them. Restoring
             // only the newest satisfies the requirement stated above
@@ -2267,6 +2279,8 @@ impl TieredBackend {
         for entry in self.functions.values_mut() {
             entry.module = Arc::clone(&module_context);
         }
+        self.reloaded = Some(Arc::clone(&module_context));
+        self.globals_moved += 1;
         self.current_module = Some(module_context);
 
         // The promotion requester captured each function's body when it
@@ -2354,7 +2368,9 @@ impl TieredBackend {
             for entry in self.functions.values_mut() {
                 entry.module = Arc::clone(module);
             }
+            self.reloaded = Some(Arc::clone(module));
         }
+        self.globals_moved += 1;
 
         self.scratches.clear();
         self.install_promotion_requester();
@@ -2480,6 +2496,7 @@ impl TieredBackend {
     pub fn rebuild_and_restore(&mut self) -> CompilerResult<()> {
         self.cranelift
             .with_lock(|be| be.rebuild_with_accumulated_symbols())?;
+        self.globals_moved += 1;
         let previously: Vec<Arc<HirModule>> = self.loaded.clone();
         for earlier in &previously {
             self.cranelift.with_lock(|be| be.compile_module(earlier))?;
@@ -2494,22 +2511,23 @@ impl TieredBackend {
     /// keeps calling into all of them. Anything asked by name has to be
     /// looked for in all of them or it is missing for every module but
     /// the newest.
+    ///
+    /// Every function entry's module is one of these: an entry is made
+    /// with the module being loaded, which `loaded` records first, and a
+    /// reload or its rollback moves every entry to the module kept in
+    /// `reloaded`. So the entries are not walked, which a program
+    /// loading chunk after chunk would pay for on every chunk.
     fn loaded_modules(&self) -> Vec<&HirModule> {
         let mut out: Vec<&HirModule> = Vec::new();
-        if let Some(m) = self.current_module.as_ref() {
-            out.push(m);
-        }
-        for m in &self.loaded {
-            let m: &HirModule = m;
-            if !out.iter().any(|seen| std::ptr::eq(*seen, m)) {
-                out.push(m);
-            }
-        }
-        // A function entry's own module, for anything compiled through
-        // a path that did not record one.
-        for entry in self.functions.values() {
-            let m = entry.module.as_ref();
-            if !out.iter().any(|seen| std::ptr::eq(*seen, m)) {
+        let mut seen: HashSet<*const HirModule> = HashSet::new();
+        let current = self.current_module.as_deref();
+        let loaded = self.loaded.iter().map(|m| &**m);
+        for m in current
+            .into_iter()
+            .chain(loaded)
+            .chain(self.reloaded.as_deref())
+        {
+            if seen.insert(m as *const HirModule) {
                 out.push(m);
             }
         }
@@ -2898,7 +2916,48 @@ impl TieredBackend {
     }
 
     pub fn error_flag_slots(&self) -> Vec<(*mut u8, usize)> {
-        self.loaded_modules()
+        self.error_flag_slots_of(self.loaded_modules())
+    }
+
+    /// Where the loaded modules stand, for [`Self::error_flag_slots_since`].
+    fn loaded_mark(&self) -> LoadedMark {
+        LoadedMark {
+            loaded: self.loaded.len(),
+            current: self
+                .current_module
+                .as_ref()
+                .map_or(0, |m| Arc::as_ptr(m) as usize),
+            moved: self.globals_moved,
+        }
+    }
+
+    /// [`Self::error_flag_slots`] read once per module: only the slots
+    /// of the modules loaded after `since` was taken, when nothing else
+    /// has changed since, so the slots read then are where they were.
+    /// Otherwise all of them. Says which, with the mark to pass next.
+    pub fn error_flag_slots_since(
+        &self,
+        since: Option<LoadedMark>,
+    ) -> (Vec<(*mut u8, usize)>, bool, LoadedMark) {
+        let mark = self.loaded_mark();
+        match since {
+            Some(then)
+                if then.moved == mark.moved
+                    && then.current == mark.current
+                    && then.loaded <= mark.loaded =>
+            {
+                let added = self.loaded[then.loaded..].iter().map(|m| &**m);
+                (self.error_flag_slots_of(added), false, mark)
+            }
+            _ => (self.error_flag_slots(), true, mark),
+        }
+    }
+
+    fn error_flag_slots_of<'a>(
+        &self,
+        modules: impl IntoIterator<Item = &'a HirModule>,
+    ) -> Vec<(*mut u8, usize)> {
+        modules
             .into_iter()
             .flat_map(|m| {
                 m.globals
@@ -4686,6 +4745,7 @@ impl TieredBackend {
     pub fn rebuild_with_accumulated_symbols(&mut self) -> CompilerResult<()> {
         self.cranelift
             .with_lock(|be| be.rebuild_with_accumulated_symbols())?;
+        self.globals_moved += 1;
         // The rebuild discarded the JIT module the installed code was
         // declared into, taking the backend's function and global maps
         // with it. Re-declare what is still supposed to be live, or the
@@ -5482,6 +5542,16 @@ fn publish_promoted_entry(
     crate::reload::set_call_target(key, func_id, entry as usize);
     // Saved function pointers reach the same tier through their stable stub.
     osr::set_published_entry(bead_id, entry as usize);
+}
+
+/// How many modules were loaded, which was current, and how often
+/// globals had moved, when a caller last read per-module answers: see
+/// [`TieredBackend::error_flag_slots_since`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadedMark {
+    loaded: usize,
+    current: usize,
+    moved: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
