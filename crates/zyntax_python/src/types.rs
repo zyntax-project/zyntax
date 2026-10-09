@@ -2297,11 +2297,14 @@ impl Module {
         }
         let set: Vec<usize> = set.into_iter().collect();
         let first = *set.first()?;
+        // One key, its class swapped per lookup.
+        let mut key = (first, name.to_string());
+        let mut of = |c: usize| {
+            key.0 = c;
+            self.field_by_class.get(&key).copied()
+        };
         // A class whose store is still undecided leaves the read so.
-        if set
-            .iter()
-            .any(|&c| self.field_by_class.get(&(c, name.to_string())) == Some(&Ty::Unknown))
-        {
+        if set.iter().any(|&c| of(c) == Some(Ty::Unknown)) {
             return Some(Some(Ty::Unknown));
         }
         if !by_address(slot) || !self.split(first, name) {
@@ -2311,7 +2314,7 @@ impl Module {
         let mut missing = false;
         let mut mixed = false;
         for c in set {
-            let Some(&ty) = self.field_by_class.get(&(c, name.to_string())) else {
+            let Some(ty) = of(c) else {
                 missing = true;
                 continue;
             };
@@ -2341,9 +2344,11 @@ impl Module {
                 break;
             }
         }
+        let mut key = (root, name.to_string());
         self.class_range(root).all(|c| {
+            key.0 = c;
             self.field_by_class
-                .get(&(c, name.to_string()))
+                .get(&key)
                 .is_none_or(|&ty| by_address(ty))
         })
     }
@@ -5487,6 +5492,9 @@ pub(crate) fn list_sites<'ast>(
         module: &'m Module,
         typer: Typer<'m>,
         sites: HashMap<String, ListSites<'ast>>,
+        /// The field names among the followed keys: an attribute named
+        /// otherwise is no candidate whatever its receiver's type.
+        fields: HashSet<String>,
         /// Whether the current expression is one of the allowed uses.
         allowed: &'a std::cell::Cell<bool>,
         returns_read: bool,
@@ -5525,6 +5533,9 @@ pub(crate) fn list_sites<'ast>(
                     Some(n.id.to_string())
                 }
                 py::Expr::Attribute(a) => {
+                    if !self.fields.contains(a.attr.as_str()) {
+                        return None;
+                    }
                     let Ty::Class(k) = self.typer.expr(&a.value) else {
                         return None;
                     };
@@ -5869,6 +5880,10 @@ pub(crate) fn list_sites<'ast>(
             inferring: false,
             none_params: None,
         },
+        fields: names
+            .iter()
+            .filter_map(|n| n.split_once('#').map(|(_, field)| field.to_string()))
+            .collect(),
         sites: names
             .into_iter()
             .map(|n| (n, ListSites::default()))
