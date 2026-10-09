@@ -14,12 +14,13 @@ use indexmap::IndexMap;
 use petgraph::visit::EdgeRef; // For .source() method on edges
 use std::collections::{HashMap, HashSet, VecDeque};
 
-/// The builder's own maps and sets, keyed by ids and interned names:
-/// small keys that FNV hashes for a fraction of what SipHash costs, on
-/// lookups made for every variable read.
-type IdMap<K, V> = IndexMap<K, V, std::hash::BuildHasherDefault<fnv::FnvHasher>>;
-type IdHashMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<fnv::FnvHasher>>;
-type IdHashSet<K> = HashSet<K, std::hash::BuildHasherDefault<fnv::FnvHasher>>;
+use crate::hir::{IdHasher, IdMap};
+
+/// The builder's own maps and sets, keyed by ids and interned names and
+/// hashed like the HIR's own maps, on lookups made for every variable
+/// read.
+type IdHashMap<K, V> = HashMap<K, V, IdHasher>;
+type IdHashSet<K> = HashSet<K, IdHasher>;
 use std::sync::Arc;
 use zyntax_typed_ast::{
     ConstValue, InternedString, Type,
@@ -16221,9 +16222,9 @@ impl SsaBuilder {
             name: lambda_name,
             signature,
             entry_block: entry_block_id,
-            blocks: IndexMap::new(),
-            locals: IndexMap::new(),
-            values: IndexMap::new(),
+            blocks: Default::default(),
+            locals: Default::default(),
+            values: Default::default(),
             previous_version: None,
             is_external: false,
             calling_convention: crate::hir::CallingConvention::C,

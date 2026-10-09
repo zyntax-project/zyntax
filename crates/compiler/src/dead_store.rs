@@ -269,7 +269,11 @@ mod tests {
     use indexmap::IndexMap;
     use zyntax_typed_ast::InternedString;
 
-    fn value(values: &mut IndexMap<HirId, HirValue>, ty: HirType, kind: HirValueKind) -> HirId {
+    fn value(
+        values: &mut crate::hir::IdMap<HirId, HirValue>,
+        ty: HirType,
+        kind: HirValueKind,
+    ) -> HirId {
         let id = HirId::new();
         values.insert(
             id,
@@ -288,7 +292,7 @@ mod tests {
     /// first store is dead, the second is not.
     #[test]
     fn a_store_written_over_before_any_read_is_removed() {
-        let mut values = IndexMap::new();
+        let mut values = crate::hir::IdMap::default();
         let c16 = value(
             &mut values,
             HirType::I64,

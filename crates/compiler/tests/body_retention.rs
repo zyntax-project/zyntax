@@ -10,7 +10,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use indexmap::IndexMap;
 use zyntax_compiler::hir::{
     BinaryOp, HirBlock, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction,
     HirModule, HirParam, HirPhi, HirTerminator, HirType, HirValue, HirValueKind,
@@ -37,7 +36,7 @@ fn chain(mut x: i32) -> i32 {
 }
 
 struct Builder {
-    values: IndexMap<HirId, HirValue>,
+    values: zyntax_compiler::hir::IdMap<HirId, HirValue>,
 }
 
 impl Builder {
@@ -148,7 +147,7 @@ fn function(name: &str, param: HirId, b: Builder, blocks: Vec<HirBlock>) -> HirF
 /// `looped(n)`: `x = n`, then `n` times `x = chain(x)`; returns `x`.
 fn looped() -> HirFunction {
     let mut b = Builder {
-        values: IndexMap::new(),
+        values: Default::default(),
     };
     let n = b.value(HirType::I32, HirValueKind::Parameter(0));
     let zero = b.constant(0);
@@ -203,7 +202,7 @@ fn looped() -> HirFunction {
 /// `straight(n)`: `chain(n)`, with no loop.
 fn straight() -> HirFunction {
     let mut b = Builder {
-        values: IndexMap::new(),
+        values: Default::default(),
     };
     let n = b.value(HirType::I32, HirValueKind::Parameter(0));
     let entry = HirId::new();

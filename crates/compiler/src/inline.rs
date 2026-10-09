@@ -314,7 +314,7 @@ pub fn run_module_with(module: &mut HirModule, cycles: Option<&Cycles>) -> Inlin
 /// The functions a caller may inline: the module's, read in place, and
 /// copies of the ones being worked on.
 struct Callees<'a> {
-    stable: &'a IndexMap<HirId, HirFunction>,
+    stable: &'a crate::hir::IdMap<HirId, HirFunction>,
     changing: &'a HashMap<HirId, Arc<HirFunction>>,
 }
 
@@ -556,8 +556,8 @@ fn reorder_blocks_by_cfg(func: &mut HirFunction) {
         order.push(bid);
     }
 
-    let mut new_blocks: IndexMap<HirId, crate::hir::HirBlock> =
-        IndexMap::with_capacity(func.blocks.len());
+    let mut new_blocks: crate::hir::IdMap<HirId, crate::hir::HirBlock> =
+        crate::hir::IdMap::with_capacity_and_hasher(func.blocks.len(), Default::default());
     for bid in &order {
         if let Some(blk) = func.blocks.shift_remove(bid) {
             new_blocks.insert(*bid, blk);
@@ -2361,7 +2361,7 @@ fn substitute_operands(inst: &mut HirInstruction, subs: &HashMap<HirId, HirId>) 
 }
 
 #[allow(unused)]
-fn touch_types(_t: &HirType, _v: &IndexMap<HirId, HirValue>) {}
+fn touch_types(_t: &HirType, _v: &crate::hir::IdMap<HirId, HirValue>) {}
 
 // ─── tests ────────────────────────────────────────────────────────
 
@@ -3824,7 +3824,7 @@ mod tests {
         let helper_id = HirId::new();
         let leaf_id = HirId::new();
         let busy_id = HirId::new();
-        let mut functions = IndexMap::new();
+        let mut functions = crate::hir::IdMap::default();
         functions.insert(helper_id, build_extern("helper", false));
         functions.insert(leaf_id, allocating(6, 0, helper_id));
         functions.insert(busy_id, allocating(2, 4, helper_id));

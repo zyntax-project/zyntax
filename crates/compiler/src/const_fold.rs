@@ -245,7 +245,7 @@ fn fold_one_pass(func: &mut HirFunction) -> usize {
 /// result_type))` when it folds; `None` otherwise.
 fn try_fold_inst(
     inst: &HirInstruction,
-    values: &indexmap::IndexMap<HirId, crate::hir::HirValue>,
+    values: &crate::hir::IdMap<HirId, crate::hir::HirValue>,
 ) -> Option<(HirId, HirConstant, HirType)> {
     match inst {
         HirInstruction::Binary {
@@ -308,7 +308,7 @@ fn try_fold_inst(
 
 fn constant_of<'a>(
     id: HirId,
-    values: &'a indexmap::IndexMap<HirId, crate::hir::HirValue>,
+    values: &'a crate::hir::IdMap<HirId, crate::hir::HirValue>,
 ) -> Option<&'a HirConstant> {
     match &values.get(&id)?.kind {
         HirValueKind::Constant(c) => Some(c),

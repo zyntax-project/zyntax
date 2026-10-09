@@ -4,8 +4,6 @@
 //! fixture only some of them need still has to be allowed to go unused.
 #![allow(dead_code)]
 
-use indexmap::IndexMap;
-
 use zyntax_compiler::hir::{
     BinaryOp, HirBlock, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction,
     HirParam, HirPhi, HirTerminator, HirType, HirValue, HirValueKind,
@@ -101,7 +99,7 @@ pub fn counted_loop() -> (HirFunction, HirId) {
     let next_i_id = HirId::new();
     let cmp_id = HirId::new();
 
-    let mut values: IndexMap<HirId, HirValue> = IndexMap::new();
+    let mut values: zyntax_compiler::hir::IdMap<HirId, HirValue> = Default::default();
     values.insert(
         n_id,
         HirValue {
@@ -229,7 +227,7 @@ pub fn counted_loop() -> (HirFunction, HirId) {
         successors: vec![],
     };
 
-    let mut blocks: IndexMap<HirId, HirBlock> = IndexMap::new();
+    let mut blocks: zyntax_compiler::hir::IdMap<HirId, HirBlock> = Default::default();
     blocks.insert(entry_id, entry_block);
     blocks.insert(header_id, header_block);
     blocks.insert(body_id, body_block);
@@ -308,7 +306,7 @@ pub fn flagged_counted_loop() -> (HirFunction, HirId) {
     let next_i_id = HirId::new();
     let cmp_id = HirId::new();
 
-    let mut values: IndexMap<HirId, HirValue> = IndexMap::new();
+    let mut values: zyntax_compiler::hir::IdMap<HirId, HirValue> = Default::default();
     values.insert(
         n_id,
         HirValue {
@@ -384,7 +382,7 @@ pub fn flagged_counted_loop() -> (HirFunction, HirId) {
             successors,
         };
 
-    let mut blocks: IndexMap<HirId, HirBlock> = IndexMap::new();
+    let mut blocks: zyntax_compiler::hir::IdMap<HirId, HirBlock> = Default::default();
     blocks.insert(
         entry_id,
         block(

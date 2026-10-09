@@ -1073,7 +1073,7 @@ pub fn outline(
     // phis fed from the entry, every other way in gone.
     let entry = HirId::new();
     let mut params: Vec<HirParam> = Vec::with_capacity(layout.live_ins.len());
-    let mut values: indexmap::IndexMap<HirId, HirValue> = indexmap::IndexMap::new();
+    let mut values: crate::hir::IdMap<HirId, HirValue> = Default::default();
     // A live-in the region defines too, as one of the header's own phis
     // or in a block it reaches around the header (a repaired one),
     // arrives under a parameter of its own, which the phi at the header
@@ -1125,7 +1125,7 @@ pub fn outline(
         values.insert(*id, v.clone());
     }
 
-    let mut blocks: indexmap::IndexMap<HirId, HirBlock> = indexmap::IndexMap::new();
+    let mut blocks: crate::hir::IdMap<HirId, HirBlock> = Default::default();
     let mut entry_block = HirBlock::new(entry);
     entry_block.terminator = HirTerminator::Branch {
         target: layout.header,
@@ -1245,7 +1245,7 @@ pub fn outline(
     // helper's do, and go straight into the call.
     let adapter_entry = HirId::new();
     let adapter_header = HirId::new();
-    let mut adapter_values: indexmap::IndexMap<HirId, HirValue> = indexmap::IndexMap::new();
+    let mut adapter_values: crate::hir::IdMap<HirId, HirValue> = Default::default();
     for (id, ty) in layout.live_ins.iter().zip(&layout.live_in_types) {
         adapter_values.insert(
             *id,
@@ -1273,7 +1273,7 @@ pub fn outline(
         );
         id
     });
-    let mut adapter_blocks: indexmap::IndexMap<HirId, HirBlock> = indexmap::IndexMap::new();
+    let mut adapter_blocks: crate::hir::IdMap<HirId, HirBlock> = Default::default();
     let mut e = HirBlock::new(adapter_entry);
     e.terminator = HirTerminator::Branch {
         target: adapter_header,

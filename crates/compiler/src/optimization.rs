@@ -187,7 +187,7 @@ pub mod passes {
         fn is_used(
             &self,
             inst: &HirInstruction,
-            values: &IndexMap<HirId, crate::hir::HirValue>,
+            values: &crate::hir::IdMap<HirId, crate::hir::HirValue>,
         ) -> bool {
             if let Some(result) = self.get_result(inst) {
                 if let Some(value) = values.get(&result) {

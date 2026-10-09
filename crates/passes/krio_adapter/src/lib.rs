@@ -1142,7 +1142,6 @@ impl HirLiveness {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indexmap::IndexMap;
     use zyntax_compiler::hir::{
         HirFunction, HirFunctionSignature, ParamAttributes, ParamOwnership,
     };
@@ -1175,7 +1174,7 @@ mod tests {
             predecessors: vec![],
             successors: vec![],
         };
-        let mut blocks = IndexMap::new();
+        let mut blocks = zyntax_compiler::hir::IdMap::default();
         blocks.insert(entry_id, entry);
         func.blocks = blocks;
         func.entry_block = entry_id;
@@ -1335,7 +1334,7 @@ mod tests {
             const_args: vec![],
             is_tail: false,
         });
-        let mut blocks = IndexMap::new();
+        let mut blocks = zyntax_compiler::hir::IdMap::default();
         blocks.insert(bb_id, bb);
         b_fn.blocks = blocks;
         b_fn.entry_block = bb_id;

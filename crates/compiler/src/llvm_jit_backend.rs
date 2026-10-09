@@ -1246,12 +1246,12 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     pub fn compile_function(&mut self, id: HirId, function: &HirFunction) -> CompilerResult<()> {
         use std::collections::HashSet;
 
-        let mut functions: IndexMap<HirId, HirFunction> = IndexMap::new();
+        let mut functions: crate::hir::IdMap<HirId, HirFunction> = Default::default();
         functions.insert(id, function.clone());
-        let mut globals = IndexMap::new();
-        let mut types = IndexMap::new();
-        let mut effects = IndexMap::new();
-        let mut handlers = IndexMap::new();
+        let mut globals = crate::hir::IdMap::default();
+        let mut types = crate::hir::IdMap::default();
+        let mut effects = crate::hir::IdMap::default();
+        let mut handlers = crate::hir::IdMap::default();
         self.pending_cross_tier.clear();
         self.pending_shared_globals.clear();
         self.pending_entry_abi = None;

@@ -50,6 +50,7 @@ uuid = { workspace = true }
 tempfile = { workspace = true }
 rayon = { workspace = true }
 fnv = "1.0.7"  # Fast hash function
+rustc-hash = "2"
 
 # Dynamic library loading for ZRTL plugins (native targets only).
 # Optional so the crate can build for wasm32, which has no dlopen.

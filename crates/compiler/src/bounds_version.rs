@@ -768,7 +768,8 @@ fn apply(func: &mut HirFunction, lp: &NaturalLoop, mut plan: Plan, tried: &mut H
         copies.push(copy);
     }
     let header_copy = block_map[&lp.header];
-    let mut copies: IndexMap<HirId, HirBlock> = copies.into_iter().map(|c| (c.id, c)).collect();
+    let mut copies: crate::hir::IdMap<HirId, HirBlock> =
+        copies.into_iter().map(|c| (c.id, c)).collect();
     let alias = simplify_copy(func, &mut copies, header_copy, plan.preheader);
     let resolve = |mut v: HirId| {
         while let Some(&n) = alias.get(&v) {
@@ -939,7 +940,7 @@ fn apply(func: &mut HirFunction, lp: &NaturalLoop, mut plan: Plan, tried: &mut H
 /// the value it stands for, already substituted in the copy.
 fn simplify_copy(
     func: &HirFunction,
-    copies: &mut IndexMap<HirId, HirBlock>,
+    copies: &mut crate::hir::IdMap<HirId, HirBlock>,
     header: HirId,
     preheader: HirId,
 ) -> HashMap<HirId, HirId> {

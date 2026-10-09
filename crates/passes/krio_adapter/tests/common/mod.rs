@@ -10,7 +10,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use indexmap::IndexMap;
 use zyntax_compiler::hir::{
     HirBlock, HirCallable, HirFunction, HirFunctionSignature, HirId, HirInstruction, HirModule,
     HirTerminator, HirType, HirValue, HirValueKind, Intrinsic,
@@ -146,7 +145,7 @@ pub fn make_async_function_with_one_await() -> AsyncFnFixture {
         right: await_result,
     });
 
-    let mut blocks = IndexMap::new();
+    let mut blocks = zyntax_compiler::hir::IdMap::default();
     blocks.insert(entry_id, entry);
     function.blocks = blocks;
     function.entry_block = entry_id;
@@ -276,7 +275,7 @@ pub fn make_effectful_function_with_one_perform() -> EffectfulFnFixture {
         right: perform_result,
     });
 
-    let mut blocks = IndexMap::new();
+    let mut blocks = zyntax_compiler::hir::IdMap::default();
     blocks.insert(entry_id, entry);
     function.blocks = blocks;
     function.entry_block = entry_id;
@@ -411,7 +410,7 @@ pub fn make_async_function_with_host_bridge_await(symbol_name: &str) -> AsyncFnF
         right: await_result,
     });
 
-    let mut blocks = IndexMap::new();
+    let mut blocks = zyntax_compiler::hir::IdMap::default();
     blocks.insert(entry_id, entry);
     function.blocks = blocks;
     function.entry_block = entry_id;

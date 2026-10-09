@@ -9,7 +9,6 @@
 
 use std::collections::HashSet;
 
-use indexmap::IndexMap;
 use zyntax_compiler::hir::{
     BinaryOp, HirBlock, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction,
     HirModule, HirParam, HirTerminator, HirType, HirValue, HirValueKind,
@@ -31,7 +30,7 @@ fn add_one() -> HirFunction {
         uses: Default::default(),
         span: None,
     };
-    let mut values: IndexMap<HirId, HirValue> = IndexMap::new();
+    let mut values: zyntax_compiler::hir::IdMap<HirId, HirValue> = Default::default();
     values.insert(x, value(x, HirValueKind::Parameter(0)));
     values.insert(one, value(one, HirValueKind::Constant(HirConstant::I32(1))));
     values.insert(sum, value(sum, HirValueKind::Instruction));
@@ -51,7 +50,7 @@ fn add_one() -> HirFunction {
         predecessors: vec![],
         successors: vec![],
     };
-    let mut blocks = IndexMap::new();
+    let mut blocks = zyntax_compiler::hir::IdMap::default();
     blocks.insert(entry_id, block);
     let mut function = HirFunction::new(
         InternedString::new_global("add_one"),

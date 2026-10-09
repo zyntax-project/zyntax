@@ -34,15 +34,15 @@ fn create_test_module() -> HirModule {
     HirModule {
         id: HirId::new(),
         name: InternedString::new_global("test"),
-        functions: IndexMap::new(),
-        globals: IndexMap::new(),
-        types: IndexMap::new(),
+        functions: Default::default(),
+        globals: Default::default(),
+        types: Default::default(),
         imports: vec![],
         exports: vec![],
         version: 0,
         dependencies: HashSet::new(),
-        effects: IndexMap::new(),
-        handlers: IndexMap::new(),
+        effects: Default::default(),
+        handlers: Default::default(),
         automatic_release: false,
         exact_struct_types: Default::default(),
     }
@@ -78,7 +78,7 @@ fn create_test_signature() -> HirFunctionSignature {
 
 fn create_test_function(id: HirId, name: &str) -> HirFunction {
     let block_id = HirId::new();
-    let mut blocks = IndexMap::new();
+    let mut blocks = zyntax_compiler::hir::IdMap::default();
     blocks.insert(block_id, create_test_block(block_id));
 
     HirFunction {
@@ -87,8 +87,8 @@ fn create_test_function(id: HirId, name: &str) -> HirFunction {
         signature: create_test_signature(),
         entry_block: block_id,
         blocks,
-        locals: IndexMap::new(),
-        values: IndexMap::new(),
+        locals: Default::default(),
+        values: Default::default(),
         previous_version: None,
         is_external: false,
         calling_convention: CallingConvention::Fast,
@@ -220,7 +220,7 @@ fn test_effect_analysis_pure_violation() {
     let func_id = HirId::new();
     let block_id = HirId::new();
 
-    let mut blocks = IndexMap::new();
+    let mut blocks = zyntax_compiler::hir::IdMap::default();
     blocks.insert(
         block_id,
         HirBlock {
@@ -252,8 +252,8 @@ fn test_effect_analysis_pure_violation() {
             signature: sig,
             entry_block: block_id,
             blocks,
-            locals: IndexMap::new(),
-            values: IndexMap::new(),
+            locals: Default::default(),
+            values: Default::default(),
             previous_version: None,
             is_external: false,
             calling_convention: CallingConvention::Fast,
@@ -440,7 +440,7 @@ fn test_full_effect_pipeline() {
     let func_id = HirId::new();
     let block_id = HirId::new();
 
-    let mut blocks = IndexMap::new();
+    let mut blocks = zyntax_compiler::hir::IdMap::default();
     blocks.insert(
         block_id,
         HirBlock {
@@ -472,8 +472,8 @@ fn test_full_effect_pipeline() {
             signature: sig,
             entry_block: block_id,
             blocks,
-            locals: IndexMap::new(),
-            values: IndexMap::new(),
+            locals: Default::default(),
+            values: Default::default(),
             previous_version: None,
             is_external: false,
             calling_convention: CallingConvention::Fast,

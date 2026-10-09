@@ -703,15 +703,15 @@ mod tests {
         HirModule {
             id: HirId::new(),
             name: InternedString::new_global("test"),
-            functions: IndexMap::new(),
-            globals: IndexMap::new(),
-            types: IndexMap::new(),
+            functions: Default::default(),
+            globals: Default::default(),
+            types: Default::default(),
             imports: vec![],
             exports: vec![],
             version: 0,
             dependencies: HashSet::new(),
-            effects: IndexMap::new(),
-            handlers: IndexMap::new(),
+            effects: Default::default(),
+            handlers: Default::default(),
             automatic_release: false,
             exact_struct_types: Default::default(),
         }
@@ -747,7 +747,7 @@ mod tests {
 
     fn create_test_function(id: HirId, name: &str, is_pure: bool) -> HirFunction {
         let block_id = HirId::new();
-        let mut blocks = IndexMap::new();
+        let mut blocks = crate::hir::IdMap::default();
         blocks.insert(block_id, create_test_block(block_id));
 
         let mut sig = create_test_signature();
@@ -759,8 +759,8 @@ mod tests {
             signature: sig,
             entry_block: block_id,
             blocks,
-            locals: IndexMap::new(),
-            values: IndexMap::new(),
+            locals: Default::default(),
+            values: Default::default(),
             previous_version: None,
             is_external: false,
             calling_convention: CallingConvention::Fast,

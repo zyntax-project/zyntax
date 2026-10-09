@@ -460,7 +460,6 @@ fn pointer_loop_with_a_cold_call() -> (
     zyntax_compiler::hir::HirId,
     [zyntax_compiler::hir::HirId; 4],
 ) {
-    use indexmap::IndexMap;
     use zyntax_compiler::hir::{
         BinaryOp, HirBlock, HirCallable, HirConstant, HirFunction, HirFunctionSignature, HirId,
         HirInstruction, HirModule, HirParam, HirPhi, HirStructType, HirTerminator, HirType,
@@ -522,7 +521,7 @@ fn pointer_loop_with_a_cold_call() -> (
         InternedString::new_global("bump"),
         signature(vec![(x, "x", i64_ty.clone())]),
     );
-    bump.values = IndexMap::from([
+    bump.values = zyntax_compiler::hir::IdMap::from_iter([
         (x, value(x, &i64_ty, HirValueKind::Parameter(0))),
         (
             thousand,
@@ -534,7 +533,7 @@ fn pointer_loop_with_a_cold_call() -> (
         ),
         (bumped, value(bumped, &i64_ty, HirValueKind::Instruction)),
     ]);
-    bump.blocks = IndexMap::from([(
+    bump.blocks = zyntax_compiler::hir::IdMap::from_iter([(
         bump_entry,
         block(
             bump_entry,
@@ -579,7 +578,7 @@ fn pointer_loop_with_a_cold_call() -> (
             (n, "n", i64_ty.clone()),
         ]),
     );
-    walk.values = IndexMap::from([
+    walk.values = zyntax_compiler::hir::IdMap::from_iter([
         (cell, value(cell, &cell_ty, HirValueKind::Parameter(0))),
         (n, value(n, &i64_ty, HirValueKind::Parameter(1))),
         (
@@ -601,7 +600,7 @@ fn pointer_loop_with_a_cold_call() -> (
         walk.values
             .insert(id, value(id, &i64_ty, HirValueKind::Instruction));
     }
-    walk.blocks = IndexMap::from([
+    walk.blocks = zyntax_compiler::hir::IdMap::from_iter([
         (
             entry,
             block(

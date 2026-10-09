@@ -11346,7 +11346,7 @@ mod tests {
         let next_sum_id = HirId::new();
         let next_i_id = HirId::new();
 
-        let mut values: IndexMap<HirId, HirValue> = IndexMap::new();
+        let mut values: crate::hir::IdMap<HirId, HirValue> = Default::default();
         values.insert(
             n_id,
             HirValue {
@@ -11483,7 +11483,7 @@ mod tests {
             successors: vec![],
         };
 
-        let mut blocks: IndexMap<HirId, HirBlock> = IndexMap::new();
+        let mut blocks: crate::hir::IdMap<HirId, HirBlock> = Default::default();
         blocks.insert(entry_id, entry_block);
         blocks.insert(header_id, header_block);
         blocks.insert(body_id, body_block);

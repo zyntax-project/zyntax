@@ -388,7 +388,11 @@ mod tests {
     use indexmap::IndexMap;
     use zyntax_typed_ast::InternedString;
 
-    fn value(values: &mut IndexMap<HirId, HirValue>, ty: HirType, kind: HirValueKind) -> HirId {
+    fn value(
+        values: &mut crate::hir::IdMap<HirId, HirValue>,
+        ty: HirType,
+        kind: HirValueKind,
+    ) -> HirId {
         let id = HirId::new();
         values.insert(
             id,
@@ -419,8 +423,8 @@ mod tests {
     #[test]
     fn a_remainder_of_a_corrected_remainder_needs_no_correction() {
         let i64t = HirType::I64;
-        let mut values = IndexMap::new();
-        let c = |values: &mut IndexMap<HirId, HirValue>, n: i64| {
+        let mut values = crate::hir::IdMap::default();
+        let c = |values: &mut crate::hir::IdMap<HirId, HirValue>, n: i64| {
             value(
                 values,
                 HirType::I64,
@@ -434,7 +438,7 @@ mod tests {
         let three = c(&mut values, 3);
         let m = c(&mut values, 1_000_003);
         let n = value(&mut values, i64t.clone(), HirValueKind::Parameter(0));
-        let mut inst = |values: &mut IndexMap<HirId, HirValue>, ty: HirType| {
+        let mut inst = |values: &mut crate::hir::IdMap<HirId, HirValue>, ty: HirType| {
             value(values, ty, HirValueKind::Instruction)
         };
         let acc = inst(&mut values, i64t.clone());
@@ -535,7 +539,7 @@ mod tests {
 
     #[test]
     fn allocation_is_nonzero_through_pointer_integer_round_trip() {
-        let mut values = IndexMap::new();
+        let mut values = crate::hir::IdMap::default();
         let size = value(
             &mut values,
             HirType::I64,

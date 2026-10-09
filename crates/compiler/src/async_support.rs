@@ -30,7 +30,7 @@ pub struct AsyncStateMachine {
     /// Type of the final result
     pub result_type: HirType,
     /// Values from the original function (constants, etc.) needed by instructions
-    pub values: IndexMap<HirId, HirValue>,
+    pub values: crate::hir::IdMap<HirId, HirValue>,
 }
 
 /// State identifier in an async state machine
@@ -1558,8 +1558,8 @@ impl AsyncCompiler {
         arena: &mut zyntax_typed_ast::arena::AstArena,
     ) -> CompilerResult<HirFunction> {
         let entry_block_id = HirId::new();
-        let mut blocks = IndexMap::new();
-        let mut values = IndexMap::new();
+        let mut blocks = crate::hir::IdMap::default();
+        let mut values = crate::hir::IdMap::default();
         let mut instructions = Vec::new();
 
         // Calculate state machine size: 4 bytes for state + size per capture
@@ -2068,7 +2068,7 @@ impl AsyncCompiler {
             },
             entry_block: entry_block_id,
             blocks,
-            locals: IndexMap::new(),
+            locals: Default::default(),
             values,
             previous_version: None,
             is_external: false,
@@ -3027,8 +3027,8 @@ impl AsyncCompiler {
         arena: &mut zyntax_typed_ast::arena::AstArena,
     ) -> HirFunction {
         let entry_block_id = HirId::new();
-        let mut blocks = IndexMap::new();
-        let mut values = IndexMap::new();
+        let mut blocks = crate::hir::IdMap::default();
+        let mut values = crate::hir::IdMap::default();
         let mut instructions = Vec::new();
 
         // Parameter 0: output pointer (sret) - generic pointer type
@@ -3186,7 +3186,7 @@ impl AsyncCompiler {
             },
             entry_block: entry_block_id,
             blocks,
-            locals: IndexMap::new(),
+            locals: Default::default(),
             values,
             previous_version: None,
             is_external: false,
@@ -3385,7 +3385,7 @@ mod tests {
             final_state: AsyncStateId(1),
             captures: vec![capture],
             result_type: HirType::I32,
-            values: IndexMap::new(),
+            values: Default::default(),
         };
 
         let struct_type = compiler.generate_state_machine_struct(&state_machine, &mut arena);
@@ -3436,9 +3436,9 @@ mod tests {
             name: intern_str(&mut arena, "test_async"),
             signature: sig,
             entry_block: HirId::new(),
-            blocks: IndexMap::new(),
-            locals: IndexMap::new(),
-            values: IndexMap::new(),
+            blocks: Default::default(),
+            locals: Default::default(),
+            values: Default::default(),
             previous_version: None,
             is_external: false,
             calling_convention: CallingConvention::C,
@@ -3463,7 +3463,7 @@ mod tests {
             final_state: AsyncStateId(1),
             captures: vec![capture],
             result_type: HirType::I32,
-            values: IndexMap::new(),
+            values: Default::default(),
         };
 
         let struct_type = compiler.generate_state_machine_struct(&state_machine, &mut arena);
@@ -3514,7 +3514,7 @@ mod tests {
             final_state: AsyncStateId(1),
             captures: vec![], // No captures
             result_type: HirType::Void,
-            values: IndexMap::new(),
+            values: Default::default(),
         };
 
         let struct_type = compiler.generate_state_machine_struct(&state_machine, &mut arena);
@@ -3578,9 +3578,9 @@ mod tests {
             name: intern_str(&mut arena, "multi_param_async"),
             signature: sig,
             entry_block: HirId::new(),
-            blocks: IndexMap::new(),
-            locals: IndexMap::new(),
-            values: IndexMap::new(),
+            blocks: Default::default(),
+            locals: Default::default(),
+            values: Default::default(),
             previous_version: None,
             is_external: false,
             calling_convention: CallingConvention::C,
@@ -3619,7 +3619,7 @@ mod tests {
             final_state: AsyncStateId(1),
             captures,
             result_type: HirType::Void,
-            values: IndexMap::new(),
+            values: Default::default(),
         };
 
         let struct_type = compiler.generate_state_machine_struct(&state_machine, &mut arena);

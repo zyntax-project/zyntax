@@ -751,7 +751,6 @@ fn the_osr_frame_lays_out_live_ins_at_natural_alignment() {
 /// whose length says one thing and whose storage says another.
 #[test]
 fn a_transfer_keeps_writing_into_the_header_it_was_handed() {
-    use indexmap::IndexMap;
     use zyntax_compiler::cranelift_backend::CraneliftBackend;
     use zyntax_compiler::hir::{
         BinaryOp, HirBlock, HirConstant, HirFunction, HirFunctionSignature, HirId, HirInstruction,
@@ -784,7 +783,7 @@ fn a_transfer_keeps_writing_into_the_header_it_was_handed() {
         next_i,
     ] = [(); 13].map(|_| HirId::new());
 
-    let mut values: IndexMap<HirId, HirValue> = IndexMap::new();
+    let mut values = zyntax_compiler::hir::IdMap::default();
     let mut value = |id: HirId, ty: HirType, kind: HirValueKind| {
         values.insert(
             id,
@@ -824,7 +823,7 @@ fn a_transfer_keeps_writing_into_the_header_it_was_handed() {
         predecessors,
         successors,
     };
-    let mut blocks: IndexMap<HirId, HirBlock> = IndexMap::new();
+    let mut blocks = zyntax_compiler::hir::IdMap::default();
     blocks.insert(
         entry_id,
         block(

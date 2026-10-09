@@ -159,7 +159,6 @@ fn e4_full_pipeline_produces_dispatcher_save_load() {
 #[test]
 fn e4_orchestrator_no_op_for_non_async_function() {
     // Synthetic sync fn: build a one-block module with a non-async fn.
-    use indexmap::IndexMap;
     use zyntax_compiler::hir::{
         HirBlock, HirFunction, HirFunctionSignature, HirModule, HirTerminator,
     };
@@ -190,7 +189,7 @@ fn e4_orchestrator_no_op_for_non_async_function() {
         predecessors: vec![],
         successors: vec![],
     };
-    let mut blocks = IndexMap::new();
+    let mut blocks = zyntax_compiler::hir::IdMap::default();
     blocks.insert(bb_id, bb);
     function.blocks = blocks;
     function.entry_block = bb_id;

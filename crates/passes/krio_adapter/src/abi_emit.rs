@@ -882,7 +882,7 @@ pub fn strip_host_bridge_ownership_ops(function: &mut HirFunction) -> usize {
 /// Call (e.g. `promise_ptr` is loaded from a slot, or comes from a
 /// parameter — paths that don't go through a fresh extern call site).
 fn find_producing_call(
-    blocks: &indexmap::IndexMap<HirId, HirBlock>,
+    blocks: &zyntax_compiler::hir::IdMap<HirId, HirBlock>,
     yield_hir: &HirId,
     promise_ptr: HirId,
     await_idx: usize,
@@ -2109,7 +2109,7 @@ pub fn reshape_to_poll_abi(
 
     // IndexMap insertion order matters for backend iteration. Build a
     // new IndexMap with the prologue first, then all existing blocks.
-    let mut new_blocks: IndexMap<HirId, HirBlock> = IndexMap::new();
+    let mut new_blocks: zyntax_compiler::hir::IdMap<HirId, HirBlock> = Default::default();
     new_blocks.insert(prologue_id, prologue_block);
     for (id, block) in function.blocks.drain(..) {
         new_blocks.insert(id, block);
@@ -2915,7 +2915,11 @@ fn pick_i64_to_ret_cast(ret_ty: &HirType) -> CastOp {
     }
 }
 
-fn mint_value(values: &mut IndexMap<HirId, HirValue>, ty: HirType, kind: HirValueKind) -> HirId {
+fn mint_value(
+    values: &mut zyntax_compiler::hir::IdMap<HirId, HirValue>,
+    ty: HirType,
+    kind: HirValueKind,
+) -> HirId {
     let id = HirId::new();
     values.insert(
         id,
@@ -2930,7 +2934,7 @@ fn mint_value(values: &mut IndexMap<HirId, HirValue>, ty: HirType, kind: HirValu
     id
 }
 
-fn mint_const_i64(values: &mut IndexMap<HirId, HirValue>, val: i64) -> HirId {
+fn mint_const_i64(values: &mut zyntax_compiler::hir::IdMap<HirId, HirValue>, val: i64) -> HirId {
     mint_value(
         values,
         HirType::I64,

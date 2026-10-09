@@ -13,6 +13,14 @@
 //! - Memory safe with explicit lifetime tracking
 
 use indexmap::IndexMap;
+
+/// The hasher of the HIR's id-keyed maps. Ids and type ids are small
+/// integers: one multiply spreads them over the table, where SipHash
+/// runs its full rounds; every pass looks blocks and values up by id.
+pub type IdHasher = rustc_hash::FxBuildHasher;
+
+/// An insertion-ordered map keyed by HIR ids, hashed by [`IdHasher`].
+pub type IdMap<K, V> = IndexMap<K, V, IdHasher>;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -288,18 +296,18 @@ impl HirId {
 pub struct HirModule {
     pub id: HirId,
     pub name: InternedString,
-    pub functions: IndexMap<HirId, HirFunction>,
-    pub globals: IndexMap<HirId, HirGlobal>,
-    pub types: IndexMap<TypeId, HirType>,
+    pub functions: IdMap<HirId, HirFunction>,
+    pub globals: IdMap<HirId, HirGlobal>,
+    pub types: IdMap<TypeId, HirType>,
     pub imports: Vec<HirImport>,
     pub exports: Vec<HirExport>,
     /// Metadata for hot-reloading support
     pub version: u64,
     pub dependencies: HashSet<HirId>,
     /// Algebraic effect declarations
-    pub effects: IndexMap<HirId, HirEffect>,
+    pub effects: IdMap<HirId, HirEffect>,
     /// Effect handler definitions
-    pub handlers: IndexMap<HirId, HirEffectHandler>,
+    pub handlers: IdMap<HirId, HirEffectHandler>,
     /// Whether storage is released for this module across blocks and
     /// through returned storage, in addition to the release of a value
     /// that dies where it was made. For a language whose programs never
@@ -322,10 +330,10 @@ pub struct HirFunction {
     pub name: InternedString,
     pub signature: HirFunctionSignature,
     pub entry_block: HirId,
-    pub blocks: IndexMap<HirId, HirBlock>,
-    pub locals: IndexMap<HirId, HirLocal>,
+    pub blocks: IdMap<HirId, HirBlock>,
+    pub locals: IdMap<HirId, HirLocal>,
     /// SSA values defined in this function
-    pub values: IndexMap<HirId, HirValue>,
+    pub values: IdMap<HirId, HirValue>,
     /// For hot-reloading: previous version of this function
     pub previous_version: Option<HirId>,
     pub is_external: bool,
@@ -2648,15 +2656,15 @@ impl HirModule {
         Self {
             id: HirId::new(),
             name,
-            functions: IndexMap::new(),
-            globals: IndexMap::new(),
-            types: IndexMap::new(),
+            functions: IdMap::default(),
+            globals: IdMap::default(),
+            types: IdMap::default(),
             imports: Vec::new(),
             exports: Vec::new(),
             version: 0,
             dependencies: HashSet::new(),
-            effects: IndexMap::new(),
-            handlers: IndexMap::new(),
+            effects: IdMap::default(),
+            handlers: IdMap::default(),
             automatic_release: false,
             exact_struct_types: Default::default(),
         }
@@ -2717,7 +2725,7 @@ impl HirFunction {
 
     pub fn new(name: InternedString, signature: HirFunctionSignature) -> Self {
         let entry_block_id = HirId::new();
-        let mut blocks = IndexMap::new();
+        let mut blocks = IdMap::default();
         blocks.insert(entry_block_id, HirBlock::new(entry_block_id));
 
         Self {
@@ -2726,8 +2734,8 @@ impl HirFunction {
             signature,
             entry_block: entry_block_id,
             blocks,
-            locals: IndexMap::new(),
-            values: IndexMap::new(),
+            locals: IdMap::default(),
+            values: IdMap::default(),
             previous_version: None,
             is_external: false,
             // The platform C ABI, because that is what the call sites
@@ -2810,8 +2818,8 @@ impl HirFunction {
 
 /// A copy of `map` with capacity for its entries only, in the same order.
 /// `IndexMap::clone` reserves up to the source's capacity instead.
-fn clone_exact<K: Clone + std::hash::Hash + Eq, V: Clone>(map: &IndexMap<K, V>) -> IndexMap<K, V> {
-    let mut out = IndexMap::with_capacity(map.len());
+fn clone_exact<K: Clone + std::hash::Hash + Eq, V: Clone>(map: &IdMap<K, V>) -> IdMap<K, V> {
+    let mut out = IdMap::with_capacity_and_hasher(map.len(), IdHasher::default());
     out.extend(map.iter().map(|(k, v)| (k.clone(), v.clone())));
     out
 }
