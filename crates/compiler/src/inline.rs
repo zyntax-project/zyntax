@@ -240,6 +240,10 @@ pub fn run_module_with(module: &mut HirModule, cycles: Option<&Cycles>) -> Inlin
         }
     }
 
+    // Each function's copy is kept from round to round until it is
+    // inlined into, the only change a round makes to it.
+    let mut copies: HashMap<HirId, Arc<HirFunction>> = HashMap::default();
+    let mut changed: HashSet<HirId> = HashSet::default();
     for _ in 0..8 {
         // Copied only where read: a function being optimised that none
         // of them calls is never looked up, and a body alone in the set
@@ -256,11 +260,19 @@ pub fn run_module_with(module: &mut HirModule, cycles: Option<&Cycles>) -> Inlin
                 _ => None,
             })
             .collect();
-        let changing: HashMap<HirId, Arc<HirFunction>> = taken
-            .iter()
-            .filter(|(_, id, _)| called.contains(id))
-            .map(|(_, id, f)| (*id, Arc::new(f.clone())))
-            .collect();
+        let mut changing: HashMap<HirId, Arc<HirFunction>> = HashMap::default();
+        for (_, id, f) in taken.iter().filter(|(_, id, _)| called.contains(id)) {
+            let copy = match copies.get(id) {
+                Some(copy) if !changed.contains(id) => Arc::clone(copy),
+                _ => {
+                    let copy = Arc::new(f.clone());
+                    copies.insert(*id, Arc::clone(&copy));
+                    changed.remove(id);
+                    copy
+                }
+            };
+            changing.insert(*id, copy);
+        }
         let callees = Callees {
             stable: &module.functions,
             changing: &changing,
@@ -280,6 +292,9 @@ pub fn run_module_with(module: &mut HirModule, cycles: Option<&Cycles>) -> Inlin
                 &mut shapes,
                 &mut specializations,
             );
+            if stats.inlined > 0 {
+                changed.insert(*caller_id);
+            }
             this_pass += stats.inlined;
             total.inlined += stats.inlined;
             total.call_sites_visited += stats.call_sites_visited;
