@@ -2288,15 +2288,14 @@ impl Module {
     /// whose kind is not), `Some(None)` where the classes disagree.
     fn per_class(
         &self,
-        set: impl IntoIterator<Item = usize>,
+        set: impl IntoIterator<Item = usize> + Clone,
         name: &str,
         slot: Ty,
     ) -> Option<Option<Ty>> {
         if self.field_by_class.is_empty() {
             return None;
         }
-        let set: Vec<usize> = set.into_iter().collect();
-        let first = *set.first()?;
+        let first = set.clone().into_iter().next()?;
         // One key, its class swapped per lookup.
         let mut key = (first, name.to_string());
         let mut of = |c: usize| {
@@ -2304,7 +2303,7 @@ impl Module {
             self.field_by_class.get(&key).copied()
         };
         // A class whose store is still undecided leaves the read so.
-        if set.iter().any(|&c| of(c) == Some(Ty::Unknown)) {
+        if set.clone().into_iter().any(|c| of(c) == Some(Ty::Unknown)) {
             return Some(Some(Ty::Unknown));
         }
         if !by_address(slot) || !self.split(first, name) {
@@ -2368,12 +2367,16 @@ impl Module {
     /// receiver, where the body being read is that method's, its
     /// [`Self::self_set`]; anything else every class deriving from `k`.
     pub(crate) fn receiver_set(&self, receiver: &py::Expr, k: usize) -> Vec<usize> {
-        if let py::Expr::Name(n) = receiver
-            && let Some((param, owner, method)) = EXACT_SELF.with(|e| e.borrow().clone())
-            && owner == k
-            && param == n.id.as_str()
-        {
-            return self.self_set(owner, &method);
+        if let py::Expr::Name(n) = receiver {
+            let exact = EXACT_SELF.with(|e| match &*e.borrow() {
+                Some((param, owner, method)) if *owner == k && param == n.id.as_str() => {
+                    Some(self.self_set(*owner, method))
+                }
+                _ => None,
+            });
+            if let Some(set) = exact {
+                return set;
+            }
         }
         self.class_range(k).collect()
     }
@@ -7959,7 +7962,10 @@ impl Typer<'_> {
                     Ty::Class(k) => self
                         .module
                         .field_via(
-                            self.module.receiver_set(&a.value, k as usize),
+                            self.module
+                                .receiver_set(&a.value, k as usize)
+                                .iter()
+                                .copied(),
                             a.attr.as_str(),
                         )
                         .map(|(_, ty)| ty)
