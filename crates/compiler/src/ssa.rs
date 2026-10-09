@@ -13,6 +13,13 @@ use crate::hir::{
 use indexmap::IndexMap;
 use petgraph::visit::EdgeRef; // For .source() method on edges
 use std::collections::{HashMap, HashSet, VecDeque};
+
+/// The builder's own maps and sets, keyed by ids and interned names:
+/// small keys that FNV hashes for a fraction of what SipHash costs, on
+/// lookups made for every variable read.
+type IdMap<K, V> = IndexMap<K, V, std::hash::BuildHasherDefault<fnv::FnvHasher>>;
+type IdHashMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<fnv::FnvHasher>>;
+type IdHashSet<K> = HashSet<K, std::hash::BuildHasherDefault<fnv::FnvHasher>>;
 use std::sync::Arc;
 use zyntax_typed_ast::{
     ConstValue, InternedString, Type,
@@ -238,19 +245,19 @@ pub struct SsaBuilder {
     /// Current function being built
     function: HirFunction,
     /// Variable definitions per block
-    definitions: IndexMap<HirId, IndexMap<InternedString, HirId>>,
+    definitions: IdMap<HirId, IdMap<InternedString, HirId>>,
     /// Incomplete phi nodes to be filled
-    incomplete_phis: IndexMap<(HirId, InternedString), HirId>,
+    incomplete_phis: IdMap<(HirId, InternedString), HirId>,
     /// Variable counter for versioning
-    var_counter: IndexMap<InternedString, u32>,
+    var_counter: IdMap<InternedString, u32>,
     /// Type information for variables
-    var_types: IndexMap<InternedString, HirType>,
+    var_types: IdMap<InternedString, HirType>,
     /// TypedAST type information for variables (preserves nominal types for method dispatch)
-    var_typed_ast_types: IndexMap<InternedString, Type>,
+    var_typed_ast_types: IdMap<InternedString, Type>,
     /// Sealed blocks (all predecessors known)
-    sealed_blocks: HashSet<HirId>,
+    sealed_blocks: IdHashSet<HirId>,
     /// Filled blocks (all definitions complete)
-    filled_blocks: HashSet<HirId>,
+    filled_blocks: IdHashSet<HirId>,
     /// Type registry for field lookups and type information
     type_registry: Arc<zyntax_typed_ast::TypeRegistry>,
     /// Arena for interning strings
@@ -262,7 +269,7 @@ pub struct SsaBuilder {
     /// Generated string globals (collected during translation)
     string_globals: Vec<crate::hir::HirGlobal>,
     /// Track which variables are written in each block (for loop phi placement)
-    variable_writes: IndexMap<HirId, HashSet<InternedString>>,
+    variable_writes: IdMap<HirId, IdHashSet<InternedString>>,
     /// Flag: after IDF placement, don't create new phis
     idf_placement_done: bool,
     /// Values replaced by another while phis are filled, applied to
@@ -270,7 +277,7 @@ pub struct SsaBuilder {
     /// [`Self::apply_substitutions`]; a read resolves through it
     /// meanwhile. Walking the function per replaced value cost the
     /// square of a loop-heavy body.
-    pending_subst: HashMap<HirId, HirId>,
+    pending_subst: IdHashMap<HirId, HirId>,
     /// `ZYNTAX_SSA_TRACE=1` traces variable reads; read once.
     ssa_trace: bool,
     /// Set once the predecessor lists were recomputed from the
@@ -742,21 +749,21 @@ impl SsaBuilder {
     ) -> Self {
         Self {
             function,
-            definitions: IndexMap::new(),
-            incomplete_phis: IndexMap::new(),
-            var_counter: IndexMap::new(),
-            var_types: IndexMap::new(),
-            var_typed_ast_types: IndexMap::new(),
-            sealed_blocks: HashSet::new(),
-            filled_blocks: HashSet::new(),
+            definitions: IdMap::default(),
+            incomplete_phis: IdMap::default(),
+            var_counter: IdMap::default(),
+            var_types: IdMap::default(),
+            var_typed_ast_types: IdMap::default(),
+            sealed_blocks: IdHashSet::default(),
+            filled_blocks: IdHashSet::default(),
             type_registry,
             arena,
             closure_functions: Vec::new(),
             function_symbols,
             string_globals: Vec::new(),
-            variable_writes: IndexMap::new(),
+            variable_writes: IdMap::default(),
             idf_placement_done: false,
-            pending_subst: HashMap::new(),
+            pending_subst: IdHashMap::default(),
             ssa_trace: std::env::var_os("ZYNTAX_SSA_TRACE").is_some(),
             edges_exact: false,
             dominators: None,
@@ -803,21 +810,21 @@ impl SsaBuilder {
         let type_registry = Arc::new(zyntax_typed_ast::TypeRegistry::new());
         let arena = Arc::new(Mutex::new(zyntax_typed_ast::AstArena::new()));
         let mut builder = Self {
-            definitions: IndexMap::new(),
-            incomplete_phis: IndexMap::new(),
-            var_counter: IndexMap::new(),
-            var_types: IndexMap::new(),
-            var_typed_ast_types: IndexMap::new(),
-            sealed_blocks: HashSet::new(),
-            filled_blocks: HashSet::new(),
+            definitions: IdMap::default(),
+            incomplete_phis: IdMap::default(),
+            var_counter: IdMap::default(),
+            var_types: IdMap::default(),
+            var_typed_ast_types: IdMap::default(),
+            sealed_blocks: IdHashSet::default(),
+            filled_blocks: IdHashSet::default(),
             type_registry,
             arena,
             closure_functions: Vec::new(),
             function_symbols: Arc::default(),
             string_globals: Vec::new(),
-            variable_writes: IndexMap::new(),
+            variable_writes: IdMap::default(),
             idf_placement_done: false,
-            pending_subst: HashMap::new(),
+            pending_subst: IdHashMap::default(),
             ssa_trace: std::env::var_os("ZYNTAX_SSA_TRACE").is_some(),
             edges_exact: false,
             dominators: None,
@@ -855,7 +862,7 @@ impl SsaBuilder {
         // Pre-register all existing blocks in the definitions map
         let block_ids: Vec<HirId> = builder.function.blocks.keys().copied().collect();
         for blk in block_ids {
-            builder.definitions.insert(blk, IndexMap::new());
+            builder.definitions.insert(blk, IdMap::default());
         }
         builder
     }
@@ -1010,7 +1017,7 @@ impl SsaBuilder {
     pub fn build_from_cfg(mut self, cfg: &ControlFlowGraph) -> CompilerResult<SsaForm> {
         // Initialize blocks
         for (block_id, _) in &self.function.blocks {
-            self.definitions.insert(*block_id, IndexMap::new());
+            self.definitions.insert(*block_id, IdMap::default());
         }
 
         // Process blocks in dominance order
@@ -1079,7 +1086,7 @@ impl SsaBuilder {
 
         // Initialize definitions for all blocks
         for (block_id, _) in &self.function.blocks {
-            self.definitions.insert(*block_id, IndexMap::new());
+            self.definitions.insert(*block_id, IdMap::default());
         }
 
         // CRITICAL FIX: Initialize function parameters as HIR values in entry block
@@ -1481,7 +1488,7 @@ impl SsaBuilder {
             let mut hir_block = HirBlock::new(id);
             hir_block.predecessors = preds.get(&id).cloned().unwrap_or_default();
             self.function.blocks.insert(id, hir_block);
-            self.definitions.insert(id, IndexMap::new());
+            self.definitions.insert(id, IdMap::default());
         }
 
         let entry = &blocks[index[&block_id]];
@@ -3083,7 +3090,7 @@ impl SsaBuilder {
             after_block,
         ] {
             self.function.blocks.insert(blk, HirBlock::new(blk));
-            self.definitions.insert(blk, IndexMap::new());
+            self.definitions.insert(blk, IdMap::default());
         }
 
         // ----------------------------------------------------------------
@@ -4018,9 +4025,9 @@ impl SsaBuilder {
                         .blocks
                         .insert(merge_block_id, HirBlock::new(merge_block_id));
 
-                    self.definitions.insert(rhs_block_id, IndexMap::new());
-                    self.definitions.insert(short_block_id, IndexMap::new());
-                    self.definitions.insert(merge_block_id, IndexMap::new());
+                    self.definitions.insert(rhs_block_id, IdMap::default());
+                    self.definitions.insert(short_block_id, IdMap::default());
+                    self.definitions.insert(merge_block_id, IdMap::default());
 
                     let (true_target, false_target, short_value) = match op {
                         FrontendOp::And => (rhs_block_id, short_block_id, false),
@@ -6084,9 +6091,9 @@ impl SsaBuilder {
 
                 // The branch blocks read bindings through their single
                 // predecessor without copying the entire definition map.
-                self.definitions.insert(then_block_id, IndexMap::new());
-                self.definitions.insert(else_block_id, IndexMap::new());
-                self.definitions.insert(merge_block_id, IndexMap::new());
+                self.definitions.insert(then_block_id, IdMap::default());
+                self.definitions.insert(else_block_id, IdMap::default());
+                self.definitions.insert(merge_block_id, IdMap::default());
                 self.sealed_blocks.insert(then_block_id);
                 self.sealed_blocks.insert(else_block_id);
 
@@ -7561,7 +7568,7 @@ impl SsaBuilder {
         // Track variable writes for loop phi placement
         self.variable_writes
             .entry(block)
-            .or_insert_with(HashSet::new)
+            .or_insert_with(IdHashSet::default)
             .insert(var);
     }
 
@@ -11476,7 +11483,7 @@ impl SsaBuilder {
         let exit = HirId::new();
         for id in [header, body, exit] {
             self.function.blocks.insert(id, HirBlock::new(id));
-            self.definitions.insert(id, IndexMap::new());
+            self.definitions.insert(id, IdMap::default());
         }
 
         let one = self.scalar_one(ty);
@@ -11704,7 +11711,7 @@ impl SsaBuilder {
     fn new_block(&mut self) -> HirId {
         let id = HirId::new();
         self.function.blocks.insert(id, HirBlock::new(id));
-        self.definitions.insert(id, IndexMap::new());
+        self.definitions.insert(id, IdMap::default());
         id
     }
 
@@ -14559,7 +14566,7 @@ impl SsaBuilder {
         self.function
             .blocks
             .insert(end_block_id, HirBlock::new(end_block_id));
-        self.definitions.insert(end_block_id, IndexMap::new());
+        self.definitions.insert(end_block_id, IdMap::default());
 
         // Result phi node will collect values from each arm
         let result_hir_ty = self.convert_type(result_ty);
@@ -14575,21 +14582,21 @@ impl SsaBuilder {
             self.function
                 .blocks
                 .insert(test_block_id, HirBlock::new(test_block_id));
-            self.definitions.insert(test_block_id, IndexMap::new());
+            self.definitions.insert(test_block_id, IdMap::default());
 
             // Create block for executing this arm's body
             let body_block_id = HirId::new();
             self.function
                 .blocks
                 .insert(body_block_id, HirBlock::new(body_block_id));
-            self.definitions.insert(body_block_id, IndexMap::new());
+            self.definitions.insert(body_block_id, IdMap::default());
 
             // Create block for next arm (or unreachable if last)
             let next_block_id = HirId::new();
             self.function
                 .blocks
                 .insert(next_block_id, HirBlock::new(next_block_id));
-            self.definitions.insert(next_block_id, IndexMap::new());
+            self.definitions.insert(next_block_id, IdMap::default());
 
             // Current block jumps to test block
             self.function.blocks.get_mut(&block_id).unwrap().terminator = HirTerminator::Branch {
@@ -14605,7 +14612,7 @@ impl SsaBuilder {
                 self.function
                     .blocks
                     .insert(guard_block_id, HirBlock::new(guard_block_id));
-                self.definitions.insert(guard_block_id, IndexMap::new());
+                self.definitions.insert(guard_block_id, IdMap::default());
                 guard_block_id
             } else {
                 body_block_id
@@ -14766,14 +14773,14 @@ impl SsaBuilder {
         self.function
             .blocks
             .insert(err_block_id, HirBlock::new(err_block_id));
-        self.definitions.insert(err_block_id, IndexMap::new());
+        self.definitions.insert(err_block_id, IdMap::default());
 
         // Create continue block for success path
         let continue_block_id = HirId::new();
         self.function
             .blocks
             .insert(continue_block_id, HirBlock::new(continue_block_id));
-        self.definitions.insert(continue_block_id, IndexMap::new());
+        self.definitions.insert(continue_block_id, IdMap::default());
 
         // Set up predecessors/successors
         {
@@ -15250,7 +15257,7 @@ impl SsaBuilder {
         self.function
             .blocks
             .insert(block_id, HirBlock::new(block_id));
-        self.definitions.insert(block_id, IndexMap::new());
+        self.definitions.insert(block_id, IdMap::default());
         block_id
     }
 
@@ -16240,7 +16247,7 @@ impl SsaBuilder {
 
         // Collect outer scope variables for capture support
         // Get all variables defined in the current block that can be captured
-        let outer_captures: IndexMap<InternedString, HirId> =
+        let outer_captures: IdMap<InternedString, HirId> =
             self.definitions.get(&block_id).cloned().unwrap_or_default();
 
         // Translate the lambda body through the REAL translator
@@ -16298,7 +16305,7 @@ impl SsaBuilder {
             // captures (copied as fresh value-id entries inside the
             // lambda's function — same shape `translate_lambda_expr`
             // used to do for the `Variable` arm).
-            let mut entry_defs: IndexMap<InternedString, HirId> = IndexMap::new();
+            let mut entry_defs: IdMap<InternedString, HirId> = IdMap::default();
             for (idx, param) in lambda.params.iter().enumerate() {
                 if let Some((param_id, param_ty)) = param_values.get(idx) {
                     entry_defs.insert(param.name, *param_id);
