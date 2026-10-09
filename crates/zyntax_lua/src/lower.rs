@@ -9252,7 +9252,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             }
             Stmt::LocalFunction(f) => {
                 let v = self.scopes().declared(f.name());
-                self.live.push(Live::Var(v));
+                if !self.scopes().pruned.contains(&v) {
+                    self.live.push(Live::Var(v));
+                }
             }
             _ => {}
         }
@@ -9384,6 +9386,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Stmt::GenericFor(f) => self.generic_for(f, span, out)?,
             Stmt::LocalFunction(f) => {
                 let v = self.scopes().declared(f.name());
+                if self.scopes().pruned.contains(&v) {
+                    return Ok(());
+                }
                 let id = self.scopes().function_of(f.body());
                 self.lower_function(id, f.body(), false)?;
                 // The record is made once, here, and lives in the
@@ -12386,9 +12391,13 @@ pub(crate) fn loaded_program(
 
 /// The scopes and types of a chunk `load` compiles.
 pub(crate) fn loaded_types(ast: &ast::Ast) -> (Scopes, Inferred) {
-    let mut scopes = crate::scope::resolve_loaded(ast, DebugMode::program().rebinds);
+    let program = DebugMode::program();
+    let mut scopes = crate::scope::resolve_loaded(ast, program.rebinds);
     scopes.dynamic_globals = true;
     scopes.len_meta = true;
+    if !program.on && !scopes.debug {
+        scopes.prune_unused_functions();
+    }
     // The chunk is a function value, called by whoever `load` gave it to.
     scopes.funcs[CHUNK.0 as usize].escapes = true;
     let inferred = types::infer(&scopes, ast);
@@ -12572,6 +12581,12 @@ pub(crate) fn program(
     scopes.len_meta = len_meta;
     for m in &mut loaded {
         m.scopes.len_meta = len_meta;
+    }
+    if !scopes.debug && loaded.iter().all(|m| !m.scopes.debug) {
+        scopes.prune_unused_functions();
+        for m in &mut loaded {
+            m.scopes.prune_unused_functions();
+        }
     }
     crate::trace_phase("scopes", started);
     let started = std::time::Instant::now();

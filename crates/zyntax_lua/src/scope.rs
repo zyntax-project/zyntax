@@ -155,6 +155,9 @@ pub struct Scopes {
     /// Local functions: the variable a `local function` declares, and
     /// the function.
     pub local_functions: HashMap<VarId, FuncId>,
+    /// The local functions lowering leaves out: see
+    /// [`Scopes::prune_unused_functions`].
+    pub pruned: HashSet<VarId>,
     /// Each label's number, by the byte offset of its token; unique
     /// within the chunk, so two blocks may each have a `::done::`.
     pub labels: HashMap<usize, u32>,
@@ -279,6 +282,110 @@ impl Scopes {
     }
     pub fn function_of(&self, body: &FunctionBody) -> FuncId {
         self.func_at[&body_pos(body)]
+    }
+
+    /// Mark the local functions no code that can run reaches, for
+    /// lowering to leave out: declared by `local function`, never
+    /// assigned, and named only inside functions that are themselves
+    /// left out or nested in one. Found as the largest such set, so two
+    /// unused functions calling each other both go. Making one has no
+    /// effect a program sees without the debug library, whose
+    /// `getlocal` and line hooks would see the local and the statement,
+    /// so a caller asks for this only when no file reaches that library.
+    pub fn prune_unused_functions(&mut self) {
+        let candidates: HashMap<VarId, FuncId> = self
+            .local_functions
+            .iter()
+            .filter(|(v, _)| {
+                let info = self.var(**v);
+                info.is_function && !info.assigned && info.attribute.is_none()
+            })
+            .map(|(v, f)| (*v, *f))
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        // Each function's parent, from how the body spans nest.
+        let mut spans: Vec<(usize, usize, FuncId)> = self
+            .funcs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != CHUNK.0 as usize)
+            .map(|(i, f)| (f.body.0, f.body.1, FuncId(i as u32)))
+            .collect();
+        spans.sort();
+        let mut parent: HashMap<FuncId, FuncId> = HashMap::new();
+        let mut open: Vec<(usize, FuncId)> = Vec::new();
+        for &(start, end, id) in &spans {
+            while open.last().is_some_and(|(e, _)| *e < start) {
+                open.pop();
+            }
+            parent.insert(id, open.last().map_or(CHUNK, |(_, f)| *f));
+            open.push((end, id));
+        }
+        // The innermost function holding a position: the last to start
+        // before it, or the nearest of that one's parents still open.
+        let innermost = |at: usize| -> FuncId {
+            let i = spans.partition_point(|(start, _, _)| *start <= at);
+            let Some(&(_, end, mut id)) = i.checked_sub(1).map(|i| &spans[i]) else {
+                return CHUNK;
+            };
+            let mut end = end;
+            while at > end {
+                id = parent[&id];
+                if id == CHUNK {
+                    return CHUNK;
+                }
+                end = self.func(id).body.1;
+            }
+            id
+        };
+        let mut uses: HashMap<VarId, Vec<FuncId>> = HashMap::new();
+        for (at, binding) in &self.names {
+            let v = match binding {
+                Binding::Local(v) | Binding::Upvalue(v) | Binding::Field(v, ..) => *v,
+                Binding::Global(_) => continue,
+            };
+            if candidates.contains_key(&v) {
+                uses.entry(v).or_default().push(innermost(*at));
+            }
+        }
+        let mut left_out: HashSet<FuncId> = candidates.values().copied().collect();
+        let runs = |f: FuncId, left_out: &HashSet<FuncId>| {
+            let mut f = f;
+            loop {
+                if left_out.contains(&f) {
+                    return false;
+                }
+                if f == CHUNK {
+                    return true;
+                }
+                f = parent[&f];
+            }
+        };
+        loop {
+            let reached: Vec<VarId> = candidates
+                .iter()
+                .filter(|(v, f)| {
+                    left_out.contains(f)
+                        && uses
+                            .get(v)
+                            .is_some_and(|at| at.iter().any(|f| runs(*f, &left_out)))
+                })
+                .map(|(v, _)| *v)
+                .collect();
+            if reached.is_empty() {
+                break;
+            }
+            for v in reached {
+                left_out.remove(&candidates[&v]);
+            }
+        }
+        self.pruned = candidates
+            .into_iter()
+            .filter(|(_, f)| left_out.contains(f))
+            .map(|(v, _)| v)
+            .collect();
     }
 
     /// The function a global name is, when it is declared once by a
@@ -1662,6 +1769,56 @@ mod tests {
             .into_result()
             .expect("parses");
         super::resolve(&ast)
+    }
+
+    /// The local functions `prune_unused_functions` leaves out, by name.
+    fn pruned(source: &str) -> Vec<String> {
+        let mut s = scopes(source);
+        s.prune_unused_functions();
+        let mut names: Vec<String> = s.pruned.iter().map(|v| s.var(*v).name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn local_functions_nothing_running_names_are_pruned() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(pruned("local function a() end"), ["a"]);
+        // Named only by itself and by a function that is pruned.
+        assert_eq!(
+            pruned("local function a() return a() end local function b() return a() end"),
+            ["a", "b"]
+        );
+        // Named by a function that runs, through a nested one.
+        assert_eq!(
+            pruned(
+                "local function a() end \
+                 local function b() local function c() return a() end return c() end \
+                 print(b())"
+            ),
+            none
+        );
+        // Nested in a pruned function, and named only there.
+        assert_eq!(
+            pruned("local function h() local function i() end return i end"),
+            ["h", "i"]
+        );
+        // A use past a nested function's end belongs to the outer one.
+        assert_eq!(
+            pruned(
+                "local function k() end \
+                 local function outer() local function inner() end return k() end \
+                 print(outer())"
+            ),
+            ["inner"]
+        );
+        // The first of two with one name is never named again.
+        assert_eq!(
+            pruned("local function p() return 1 end local function p() return 2 end print(p())"),
+            ["p"]
+        );
+        // Assigned after its declaration: kept.
+        assert_eq!(pruned("local function a() end a = nil"), none);
     }
 
     #[test]
