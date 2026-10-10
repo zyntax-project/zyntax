@@ -21,7 +21,11 @@
 //!   reach a function something took the address of.
 
 use crate::hir::{HirCallable, HirConstant, HirId, HirInstruction, HirModule};
-use std::collections::{HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
+
+/// The sets the public walks return: callers keep and combine them with
+/// their own std sets. The walks themselves use the id hasher.
+type ResultSet = std::collections::HashSet<HirId>;
 
 /// Compute the set of function [`HirId`]s reachable from the given entry-point
 /// names. Always includes extern function declarations (those have
@@ -30,7 +34,18 @@ use std::collections::{HashMap, HashSet};
 ///
 /// If the analysis cannot prove indirect-call targets are safe to prune, it
 /// returns the full set of function ids (conservative).
-pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> HashSet<HirId> {
+pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> ResultSet {
+    reachable_function_ids_with(module, entry_names, &|_| None)
+}
+
+/// [`reachable_function_ids`] for a module some of whose functions are
+/// signature shells, their bodies kept elsewhere: `shell_callees` names
+/// the functions a shell's body calls directly or takes the address of.
+pub fn reachable_function_ids_with(
+    module: &HirModule,
+    entry_names: &[&str],
+    shell_callees: &dyn Fn(HirId) -> Option<Vec<HirId>>,
+) -> ResultSet {
     let mut roots: Vec<HirId> = Vec::new();
     for (id, function) in &module.functions {
         if let Some(name) = function.name.resolve_global() {
@@ -45,11 +60,11 @@ pub fn reachable_function_ids(module: &HirModule, entry_names: &[&str]) -> HashS
     // `call_function_raw`), there is no safe basis for pruning — fall back
     // to compiling every function in the module.
     if roots.is_empty() {
-        return all_function_ids(module);
+        return module.functions.keys().copied().collect();
     }
 
     roots.extend(host_reachable_roots(module));
-    reachable_from_roots(module, roots)
+    reachable_from_roots_with(module, roots, shell_callees)
 }
 
 /// The functions whose code has to exist before anything runs: the
@@ -69,12 +84,12 @@ fn pinned_function_ids(module: &HirModule, entry_names: &[&str]) -> HashSet<HirI
     worklist.extend(address_taken_functions(module));
     for global in module.globals.values() {
         if let Some(init) = &global.initializer {
-            let mut refs = HashSet::new();
+            let mut refs = HashSet::default();
             collect_vtable_funcs(init, &mut refs);
             worklist.extend(refs);
         }
     }
-    let mut by_name: HashMap<String, HirId> = HashMap::new();
+    let mut by_name: HashMap<String, HirId> = HashMap::default();
     for (id, f) in &module.functions {
         if let Some(name) = f.name.resolve_global() {
             by_name.insert(name, *id);
@@ -134,8 +149,8 @@ fn pinned_function_ids(module: &HirModule, entry_names: &[&str]) -> HashSet<HirI
 pub fn callable_only_function_ids(
     module: &HirModule,
     entry_names: &[&str],
-    reachable: &HashSet<HirId>,
-) -> HashSet<HirId> {
+    reachable: &ResultSet,
+) -> ResultSet {
     let pinned = pinned_function_ids(module, entry_names);
     reachable
         .iter()
@@ -152,10 +167,10 @@ pub fn callable_only_function_ids(
 pub fn cold_only_function_ids(
     module: &HirModule,
     entry_names: &[&str],
-    reachable: &HashSet<HirId>,
-) -> HashSet<HirId> {
+    reachable: &ResultSet,
+) -> ResultSet {
     let pinned = pinned_function_ids(module, entry_names);
-    let mut hot: HashSet<HirId> = HashSet::new();
+    let mut hot: HashSet<HirId> = HashSet::default();
     let worklist: Vec<HirId> = pinned.iter().copied().collect();
     // Hot code is what a direct call from hot code reaches; a cold
     // function's body is not walked, so what only it calls stays cold.
@@ -173,7 +188,7 @@ pub fn cold_only_function_ids(
         names.sort();
         eprintln!("[lazy] pinned: {}", names.join(" "));
     }
-    let mut visited: HashSet<HirId> = HashSet::new();
+    let mut visited: HashSet<HirId> = HashSet::default();
     let mut worklist: Vec<(HirId, Option<HirId>)> =
         worklist.into_iter().map(|id| (id, None)).collect();
     while let Some((id, from)) = worklist.pop() {
@@ -282,11 +297,21 @@ fn host_reachable_roots(module: &HirModule) -> Vec<HirId> {
 /// Recompiling one function at a higher tier needs the same closure: its
 /// body alone is not self-contained, and anything it calls has to come
 /// along or the call dangles.
-pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<HirId> {
+pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> ResultSet {
+    reachable_from_roots_with(module, roots, &|_| None)
+}
+
+/// [`reachable_from_roots`] for a module holding signature shells; see
+/// [`reachable_function_ids_with`].
+pub fn reachable_from_roots_with(
+    module: &HirModule,
+    roots: Vec<HirId>,
+    shell_callees: &dyn Fn(HirId) -> Option<Vec<HirId>>,
+) -> ResultSet {
     // Walk: collect direct calls, FuncRef-style escapes, and detect any
     // indirect-call site. The first indirect call seeds every function
     // whose address is taken anywhere in the module.
-    let mut reachable: HashSet<HirId> = HashSet::new();
+    let mut reachable: HashSet<HirId> = HashSet::default();
     let mut worklist: Vec<HirId> = roots;
     // Track every extern symbol name observed in a `HirCallable::Symbol`
     // call site so we can resolve them back to extern HirIds after the
@@ -296,11 +321,11 @@ pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<Hi
     // LLVM IR with hundreds of dead `declare` statements that `dlopen`
     // (with RTLD_NOW) then pays to resolve, adding ~270 ms per install
     // on macOS.
-    let mut called_extern_names: HashSet<String> = HashSet::new();
+    let mut called_extern_names: HashSet<String> = HashSet::default();
 
     // Function refs taken anywhere in the module (used to seed reachability
     // for FuncRef'd functions even if no direct call reaches them).
-    let mut escaped_funcs: HashSet<HirId> = HashSet::new();
+    let mut escaped_funcs: HashSet<HirId> = HashSet::default();
     // Whether we've already seeded escapes (we do this once when we first
     // detect an indirect call so we don't double-walk).
     let mut seeded_escapes = false;
@@ -322,6 +347,24 @@ pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<Hi
         };
         // External declarations have no body; nothing to walk.
         if func.is_external {
+            continue;
+        }
+        // A shell's body is kept elsewhere: what it calls is recorded
+        // there, and the names it calls by on the shell.
+        if func.blocks.is_empty() {
+            if let Some(callees) = shell_callees(fid) {
+                worklist.extend(callees.into_iter().filter(|c| !reachable.contains(c)));
+            }
+            if let Some(refs) = &func.attributes.shell_refs {
+                for name in &refs.named {
+                    match by_name.get_or_insert_with(|| defined_by_name(module)).get(name.as_str()) {
+                        Some(defined) => worklist.extend(defined.iter().copied()),
+                        None => {
+                            called_extern_names.insert(name.clone());
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -358,17 +401,7 @@ pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<Hi
                         // module function can be called this way too, and its
                         // body has to come along like any direct callee's.
                         HirCallable::Symbol(name) => {
-                            let by_name = by_name.get_or_insert_with(|| {
-                                let mut map: HashMap<String, Vec<HirId>> = HashMap::new();
-                                for (fid, f) in &module.functions {
-                                    if !f.is_external {
-                                        if let Some(n) = f.name.resolve_global() {
-                                            map.entry(n).or_default().push(*fid);
-                                        }
-                                    }
-                                }
-                                map
-                            });
+                            let by_name = by_name.get_or_insert_with(|| defined_by_name(module));
                             match by_name.get(name.as_str()) {
                                 Some(defined) => {
                                     for fid in defined {
@@ -482,7 +515,20 @@ pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<Hi
         }
     }
 
-    reachable
+    reachable.into_iter().collect()
+}
+
+/// The module's own functions by name, those with a body.
+fn defined_by_name(module: &HirModule) -> HashMap<String, Vec<HirId>> {
+    let mut map: HashMap<String, Vec<HirId>> = HashMap::default();
+    for (fid, f) in &module.functions {
+        if !f.is_external
+            && let Some(n) = f.name.resolve_global()
+        {
+            map.entry(n).or_default().push(*fid);
+        }
+    }
+    map
 }
 
 /// Functions whose address is observable somewhere in `module`.
@@ -499,14 +545,14 @@ pub fn reachable_from_roots(module: &HirModule, roots: Vec<HirId>) -> HashSet<Hi
 /// is called through: an `IndirectCall` can only reach a function whose
 /// address was taken by one of these, so covering the sources covers the
 /// calls.
-pub fn address_taken_functions(module: &HirModule) -> HashSet<HirId> {
-    let mut taken: HashSet<HirId> = HashSet::new();
+pub fn address_taken_functions(module: &HirModule) -> ResultSet {
+    let mut taken: HashSet<HirId> = HashSet::default();
 
     // Names resolve to ids once rather than once per lookup. A backend
     // runs this again for every function it compiles on its own, so a
     // scan that walked the function table per call site would cost the
     // square of the module's size on the tiered path.
-    let mut by_name: HashMap<String, Vec<HirId>> = HashMap::new();
+    let mut by_name: HashMap<String, Vec<HirId>> = HashMap::default();
     for (fid, f) in &module.functions {
         if f.is_external {
             continue;
@@ -567,7 +613,7 @@ pub fn address_taken_functions(module: &HirModule) -> HashSet<HirId> {
         }
     }
 
-    taken
+    taken.into_iter().collect()
 }
 
 /// Walk a HirConstant looking for VTable entries whose `function_id` fields
@@ -586,6 +632,3 @@ pub(crate) fn collect_vtable_funcs(c: &HirConstant, out: &mut impl Extend<HirId>
     }
 }
 
-fn all_function_ids(module: &HirModule) -> HashSet<HirId> {
-    module.functions.keys().copied().collect()
-}

@@ -80,43 +80,17 @@ fn decode_bodies_facts_read(
     deferred
 }
 
-/// Reach functions whose bodies may still live in split snapshots. The
-/// ordinary DCE walk sees each such function's signature shell; its direct
-/// callees come from the split directory, and any non-snapshot callees are
-/// handed back to the ordinary walk.
+/// Reach functions whose bodies may still live in split snapshots: the
+/// walk sees each such function's signature shell, and takes its direct
+/// callees from the split directory.
 fn reachable_with_body_sources(
     module: &HirModule,
     entry_names: &[&str],
     sources: &HashMap<HirId, Arc<zyntax_compiler::bytecode::LazyModule>>,
 ) -> HashSet<HirId> {
-    let mut reachable = zyntax_compiler::reachable_function_ids(module, entry_names);
-    let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
-    let initial = reachable.len();
-    let mut scanned = HashSet::new();
-    loop {
-        let roots: Vec<HirId> = reachable
-            .iter()
-            .filter(|id| sources.contains_key(id) && scanned.insert(**id))
-            .flat_map(|id| {
-                sources[id]
-                    .direct_callees(*id)
-                    .unwrap_or_default()
-                    .into_iter()
-            })
-            .collect();
-        if roots.is_empty() {
-            break;
-        }
-        reachable.extend(roots.iter().copied());
-        reachable.extend(zyntax_compiler::dce::reachable_from_roots(module, roots));
-    }
-    if trace && reachable.len() != initial {
-        eprintln!(
-            "[COMPILE] shell reach expanded {initial} to {} functions",
-            reachable.len()
-        );
-    }
-    reachable
+    zyntax_compiler::dce::reachable_function_ids_with(module, entry_names, &|id| {
+        sources.get(&id)?.direct_callees(id)
+    })
 }
 
 /// A multi-tier runtime: interpreted first, compiled as it runs.
