@@ -357,7 +357,10 @@ pub fn reachable_from_roots_with(
             }
             if let Some(refs) = &func.attributes.shell_refs {
                 for name in &refs.named {
-                    match by_name.get_or_insert_with(|| defined_by_name(module)).get(name.as_str()) {
+                    match by_name
+                        .get_or_insert_with(|| defined_by_name(module))
+                        .get(name.as_str())
+                    {
                         Some(defined) => worklist.extend(defined.iter().copied()),
                         None => {
                             called_extern_names.insert(name.clone());
@@ -631,4 +634,3 @@ pub(crate) fn collect_vtable_funcs(c: &HirConstant, out: &mut impl Extend<HirId>
         _ => {}
     }
 }
-
