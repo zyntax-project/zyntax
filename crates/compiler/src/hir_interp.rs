@@ -6298,7 +6298,6 @@ mod tests {
                 id,
                 ty,
                 kind,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -6467,7 +6466,6 @@ mod tests {
                 id: p0,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -6477,7 +6475,6 @@ mod tests {
                 id: p1,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(1),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -6695,7 +6692,6 @@ mod tests {
                     id,
                     ty: HirType::F32,
                     kind: HirValueKind::Parameter(idx),
-                    uses: Default::default(),
                     span: None,
                 },
             );

@@ -79,7 +79,6 @@ fn analysis_runner_output_drives_krio_captures_lift() {
             id: frame,
             ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             kind: HirValueKind::Instruction,
-            uses: Default::default(),
             span: None,
         },
     );

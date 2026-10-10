@@ -1067,7 +1067,6 @@ mod tests {
                     id,
                     ty,
                     kind: HirValueKind::Parameter(i),
-                    uses: Default::default(),
                     span: None,
                 },
             );

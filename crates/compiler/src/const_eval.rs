@@ -257,22 +257,19 @@ impl ConstEvaluator {
                     ty.clone()
                 }
             }
-            HirType::Generic {
-                base,
-                type_args,
-                const_args: type_const_args,
-            } => {
-                let new_base = self.substitute_const_generics(base, const_args);
-                let new_type_args = type_args
+            HirType::Generic(g) => {
+                let new_base = self.substitute_const_generics(&g.base, const_args);
+                let new_type_args = g
+                    .type_args
                     .iter()
                     .map(|t| self.substitute_const_generics(t, const_args))
                     .collect();
 
-                HirType::Generic {
-                    base: Box::new(new_base),
+                HirType::Generic(Box::new(crate::hir::HirGenericType {
+                    base: new_base,
                     type_args: new_type_args,
-                    const_args: type_const_args.clone(),
-                }
+                    const_args: g.const_args.clone(),
+                }))
             }
             _ => ty.clone(),
         }

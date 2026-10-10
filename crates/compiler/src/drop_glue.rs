@@ -120,7 +120,7 @@ fn reference_types(module: &HirModule) -> IndexMap<InternedString, Vec<HirType>>
             }) = &**inner
             {
                 if !fields.is_empty() {
-                    found.entry(*n).or_insert_with(|| fields.clone());
+                    found.entry(*n).or_insert_with(|| fields.to_vec());
                 }
             }
         }
@@ -207,7 +207,6 @@ fn constant(func: &mut HirFunction, ty: HirType, k: HirConstant) -> HirId {
             id,
             ty,
             kind: HirValueKind::Constant(k),
-            uses: Default::default(),
             span: None,
         },
     );
@@ -223,7 +222,6 @@ fn result(func: &mut HirFunction, ty: HirType) -> HirId {
             id,
             ty,
             kind: HirValueKind::Instruction,
-            uses: Default::default(),
             span: None,
         },
     );
@@ -255,7 +253,7 @@ fn build_glue(
 ) -> HirFunction {
     let self_ty = HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
         name: Some(name),
-        fields: fields.to_vec(),
+        fields: fields.into(),
         packed: false,
     })));
     let fn_id = ids[&name];
@@ -302,7 +300,6 @@ fn build_glue(
             id: self_id,
             ty: self_ty,
             kind: HirValueKind::Parameter(0),
-            uses: Default::default(),
             span: None,
         },
     );
@@ -466,16 +463,17 @@ mod tests {
             fields: vec![
                 HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
                     name: Some(name),
-                    fields: Vec::new(),
+                    fields: Vec::new().into(),
                     packed: false,
                 }))),
                 HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
                     name: Some(name),
-                    fields: Vec::new(),
+                    fields: Vec::new().into(),
                     packed: false,
                 }))),
                 HirType::I64,
-            ],
+            ]
+            .into(),
             packed: false,
         })))
     }
@@ -497,7 +495,6 @@ mod tests {
                 id: v,
                 ty: node_type(name),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -552,11 +549,10 @@ mod tests {
                 id: v,
                 ty: HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
                     name: Some(name),
-                    fields: vec![HirType::F64, HirType::F64],
+                    fields: vec![HirType::F64, HirType::F64].into(),
                     packed: false,
                 }))),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -584,11 +580,11 @@ mod tests {
                 id: v,
                 ty: HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
                     name: Some(name),
-                    fields: vec![HirType::Ptr(std::sync::Arc::new(HirType::I8)), HirType::I64],
+                    fields: vec![HirType::Ptr(std::sync::Arc::new(HirType::I8)), HirType::I64]
+                        .into(),
                     packed: false,
                 }))),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );

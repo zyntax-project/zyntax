@@ -2014,7 +2014,6 @@ pub fn reshape_to_poll_abi(
             id: sm_ptr_id,
             ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             kind: HirValueKind::Parameter(0),
-            uses: Default::default(),
             span: None,
         },
     );
@@ -2055,7 +2054,6 @@ pub fn reshape_to_poll_abi(
                 id: load_id,
                 ty: orig_ty.clone(),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2147,7 +2145,6 @@ pub fn reshape_to_poll_abi(
             id: zero_i64_id,
             ty: HirType::I64,
             kind: HirValueKind::Constant(HirConstant::I64(0)),
-            uses: Default::default(),
             span: None,
         },
     );
@@ -2180,7 +2177,6 @@ pub fn reshape_to_poll_abi(
                             id: one_id,
                             ty: HirType::I64,
                             kind: HirValueKind::Constant(HirConstant::I64(1)),
-                            uses: Default::default(),
                             span: None,
                         },
                     );
@@ -2201,7 +2197,6 @@ pub fn reshape_to_poll_abi(
                             id: cast_id,
                             ty: HirType::I64,
                             kind: HirValueKind::Instruction,
-                            uses: Default::default(),
                             span: None,
                         },
                     );
@@ -2307,7 +2302,8 @@ pub fn generate_promise_entry(
                 lifetime_params: vec![],
                 is_variadic: false,
             })), // poll_fn
-        ],
+        ]
+        .into(),
         packed: false,
     });
     let promise_ptr_ty = HirType::Ptr(std::sync::Arc::new(promise_struct_ty.clone()));
@@ -2344,7 +2340,6 @@ pub fn generate_promise_entry(
                 id: p.id,
                 ty: p.ty.clone(),
                 kind: HirValueKind::Parameter(i as u32),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2613,7 +2608,6 @@ pub fn generate_sync_entry(
                 id: p.id,
                 ty: p.ty.clone(),
                 kind: HirValueKind::Parameter(i as u32),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2927,7 +2921,6 @@ fn mint_value(
             id,
             ty,
             kind,
-            uses: Default::default(),
             span: None,
         },
     );

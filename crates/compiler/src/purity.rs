@@ -632,7 +632,6 @@ mod tests {
                 id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(idx),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -647,7 +646,6 @@ mod tests {
                 id,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(c),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -662,7 +660,6 @@ mod tests {
                 id,
                 ty: HirType::I64,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );

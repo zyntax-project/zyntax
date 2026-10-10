@@ -1712,13 +1712,13 @@ fn test_growable_list_of_tuple_values_lowering() {
     let function = module.functions.values().next().expect("function");
     assert!(function.values.values().any(|value| {
         matches!(&value.ty, zyntax_compiler::hir::HirType::Struct(s)
-            if s.fields == vec![zyntax_compiler::hir::HirType::I64, zyntax_compiler::hir::HirType::F64])
+            if s.fields == vec![zyntax_compiler::hir::HirType::I64, zyntax_compiler::hir::HirType::F64].into())
     }));
     assert!(function.blocks.values().flat_map(|block| &block.instructions).any(|instruction| {
         matches!(instruction, HirInstruction::GetElementPtr {
             ty: zyntax_compiler::hir::HirType::Ptr(inner), ..
         } if matches!(&**inner, zyntax_compiler::hir::HirType::Struct(s)
-            if s.fields == vec![zyntax_compiler::hir::HirType::I64, zyntax_compiler::hir::HirType::F64]))
+            if s.fields == vec![zyntax_compiler::hir::HirType::I64, zyntax_compiler::hir::HirType::F64].into()))
     }));
     assert!(
         function

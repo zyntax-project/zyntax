@@ -423,7 +423,7 @@ fn test_struct_pattern_basic() {
     // Create a struct type
     let struct_ty = HirStructType {
         name: Some(intern_str(&mut arena, "Point")),
-        fields: vec![HirType::I32, HirType::I32], // x, y
+        fields: vec![HirType::I32, HirType::I32].into(), // x, y
         packed: false,
     };
 
@@ -506,7 +506,7 @@ fn test_struct_pattern_with_field_destructuring() {
     // Create a Point struct type with two fields
     let struct_ty = HirStructType {
         name: Some(intern_str(&mut arena, "Point")),
-        fields: vec![HirType::I32, HirType::I32], // x, y
+        fields: vec![HirType::I32, HirType::I32].into(), // x, y
         packed: false,
     };
 
@@ -565,14 +565,14 @@ fn test_struct_pattern_nested() {
     // Create inner struct: Point { x: i32, y: i32 }
     let point_ty = HirStructType {
         name: Some(intern_str(&mut arena, "Point")),
-        fields: vec![HirType::I32, HirType::I32],
+        fields: vec![HirType::I32, HirType::I32].into(),
         packed: false,
     };
 
     // Create outer struct: Line { start: Point, end: Point }
     let line_ty = HirStructType {
         name: Some(intern_str(&mut arena, "Line")),
-        fields: vec![HirType::Struct(point_ty.clone()), HirType::Struct(point_ty)],
+        fields: vec![HirType::Struct(point_ty.clone()), HirType::Struct(point_ty)].into(),
         packed: false,
     };
 
@@ -593,7 +593,7 @@ fn test_struct_pattern_nested() {
         kind: HirPatternKind::Struct {
             struct_ty: HirType::Struct(HirStructType {
                 name: Some(intern_str(&mut arena, "Point")),
-                fields: vec![HirType::I32, HirType::I32],
+                fields: vec![HirType::I32, HirType::I32].into(),
                 packed: false,
             }),
             field_patterns: vec![(0, start_x_pattern), (1, start_y_pattern)],
@@ -650,7 +650,7 @@ fn test_struct_pattern_with_bindings() {
     // Create a struct type
     let struct_ty = HirStructType {
         name: Some(intern_str(&mut arena, "Point")),
-        fields: vec![HirType::I32, HirType::I32],
+        fields: vec![HirType::I32, HirType::I32].into(),
         packed: false,
     };
 
@@ -697,7 +697,7 @@ fn test_struct_pattern_partial_fields() {
     // Create a struct with 3 fields
     let struct_ty = HirStructType {
         name: Some(intern_str(&mut arena, "Triple")),
-        fields: vec![HirType::I32, HirType::I32, HirType::I32], // x, y, z
+        fields: vec![HirType::I32, HirType::I32, HirType::I32].into(), // x, y, z
         packed: false,
     };
 

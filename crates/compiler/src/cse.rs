@@ -730,7 +730,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Constant(c),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -745,7 +744,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -760,7 +758,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Parameter(idx),
-                uses: Default::default(),
                 span: None,
             },
         );

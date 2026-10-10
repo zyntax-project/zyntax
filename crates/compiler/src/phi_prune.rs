@@ -268,7 +268,6 @@ mod tests {
                 id,
                 ty: HirType::I64,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );

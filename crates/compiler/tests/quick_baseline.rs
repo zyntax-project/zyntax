@@ -27,7 +27,6 @@ fn add_one() -> HirFunction {
         id,
         ty: HirType::I32,
         kind,
-        uses: Default::default(),
         span: None,
     };
     let mut values: zyntax_compiler::hir::IdMap<HirId, HirValue> = Default::default();

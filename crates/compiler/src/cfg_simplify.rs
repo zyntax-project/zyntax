@@ -295,7 +295,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Constant(c),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -334,7 +333,6 @@ mod tests {
                 id: mid_inst,
                 ty: HirType::I64,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );

@@ -1226,7 +1226,6 @@ mod tests {
                 id: cond_id,
                 ty: HirType::Bool,
                 kind: HirValueKind::Constant(crate::hir::HirConstant::Bool(true)),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1250,7 +1249,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Parameter(idx),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1265,7 +1263,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1280,7 +1277,6 @@ mod tests {
                 id,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(crate::hir::HirConstant::I64(value)),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1300,7 +1296,6 @@ mod tests {
                 id: global,
                 ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
                 kind: HirValueKind::Global(HirId::new()),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1419,7 +1414,6 @@ mod tests {
                 id: one,
                 ty: HirType::I32,
                 kind: HirValueKind::Constant(crate::hir::HirConstant::I32(1)),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1694,7 +1688,6 @@ mod tests {
                 id: eight,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(crate::hir::HirConstant::I64(8)),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1897,7 +1890,6 @@ mod tests {
                 id: g,
                 ty: ptr_ty.clone(),
                 kind: HirValueKind::Global(HirId::new()),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1937,7 +1929,7 @@ mod tests {
         HirType::Ptr(std::sync::Arc::new(HirType::Struct(
             crate::hir::HirStructType {
                 name: Some(InternedString::new_global(name)),
-                fields: vec![HirType::I64, HirType::I64],
+                fields: vec![HirType::I64, HirType::I64].into(),
                 packed: false,
             },
         )))

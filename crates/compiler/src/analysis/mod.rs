@@ -345,11 +345,23 @@ impl AnalysisRunner {
             }
         }
 
+        // The instructions reading each value, by their results.
+        let mut users: HashMap<HirId, crate::hir::IdHashSet<HirId>> = HashMap::new();
+        for block in func.blocks.values() {
+            for inst in &block.instructions {
+                if let Some(result) = inst.result_id() {
+                    inst.for_each_operand(|v| {
+                        users.entry(v).or_default().insert(result);
+                    });
+                }
+            }
+        }
+
         // Compute live ranges
-        for (value_id, value) in &func.values {
+        for value_id in func.values.keys() {
             let mut range = LiveRange {
                 def: *value_id,
-                uses: value.uses.clone(),
+                uses: users.get(value_id).cloned().unwrap_or_default(),
                 blocks: HashSet::new(),
             };
 

@@ -61,7 +61,6 @@ fn add_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: Default::default(),
             span: None,
         },
     );

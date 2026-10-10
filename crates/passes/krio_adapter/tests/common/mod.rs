@@ -90,7 +90,6 @@ pub fn make_async_function_with_one_await() -> AsyncFnFixture {
                 id,
                 ty,
                 kind,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -230,7 +229,6 @@ pub fn make_effectful_function_with_one_perform() -> EffectfulFnFixture {
                 id,
                 ty,
                 kind,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -355,7 +353,6 @@ pub fn make_async_function_with_host_bridge_await(symbol_name: &str) -> AsyncFnF
                 id,
                 ty,
                 kind,
-                uses: Default::default(),
                 span: None,
             },
         );

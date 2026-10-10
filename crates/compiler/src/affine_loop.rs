@@ -434,7 +434,6 @@ fn apply(func: &mut HirFunction, lp: &NaturalLoop, plan: &FoldPlan) {
             id: i_final_id,
             ty: plan.i_final_ty.clone(),
             kind: HirValueKind::Constant(plan.i_final.clone()),
-            uses: Default::default(),
             span: None,
         },
     );
@@ -445,7 +444,6 @@ fn apply(func: &mut HirFunction, lp: &NaturalLoop, plan: &FoldPlan) {
             id: acc_final_id,
             ty: plan.acc_final_ty.clone(),
             kind: HirValueKind::Constant(plan.acc_final.clone()),
-            uses: Default::default(),
             span: None,
         },
     );
@@ -1003,7 +1001,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Constant(c),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1018,7 +1015,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1449,7 +1445,6 @@ mod tests {
                 id: bound,
                 ty: ind_ty.clone(),
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );

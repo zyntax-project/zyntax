@@ -5831,14 +5831,14 @@ mod tests {
     fn only_a_list_header_parameter_is_held_to_the_call_budget() {
         let vec3 = HirType::Struct(HirStructType {
             name: Some(InternedString::new_global("Vec3")),
-            fields: vec![HirType::F64, HirType::F64, HirType::F64],
+            fields: vec![HirType::F64, HirType::F64, HirType::F64].into(),
             packed: false,
         });
         let (f, module) = calling_100_times(vec3);
         assert!(llvm_list_entry_has_headroom(&f, &module));
         let list = HirType::Struct(HirStructType {
             name: Some(InternedString::new_global("List")),
-            fields: vec![HirType::I64, HirType::I64, HirType::I64],
+            fields: vec![HirType::I64, HirType::I64, HirType::I64].into(),
             packed: false,
         });
         let (f, module) = calling_100_times(list);

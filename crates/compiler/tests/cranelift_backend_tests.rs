@@ -960,7 +960,7 @@ fn create_extract_value_function() -> HirFunction {
     // Create a proper struct type
     let struct_ty = HirType::Struct(HirStructType {
         name: Some(create_test_string("Point")),
-        fields: vec![HirType::I32, HirType::I32], // x, y fields
+        fields: vec![HirType::I32, HirType::I32].into(), // x, y fields
         packed: false,
     });
 
@@ -1021,7 +1021,7 @@ fn create_insert_value_function() -> HirFunction {
     // Create a proper struct type
     let struct_ty = HirType::Struct(HirStructType {
         name: Some(create_test_string("Point")),
-        fields: vec![HirType::I32, HirType::I32], // x, y fields
+        fields: vec![HirType::I32, HirType::I32].into(), // x, y fields
         packed: false,
     });
 
@@ -2028,7 +2028,7 @@ fn test_simple_struct_extract() {
 
     let struct_ty = HirStructType {
         name: Some(create_test_string("Point")),
-        fields: vec![HirType::I32, HirType::I32], // x, y
+        fields: vec![HirType::I32, HirType::I32].into(), // x, y
         packed: false,
     };
 
@@ -2089,7 +2089,7 @@ fn test_simple_struct_insert() {
 
     let struct_ty = HirStructType {
         name: Some(create_test_string("Point")),
-        fields: vec![HirType::I32, HirType::I32],
+        fields: vec![HirType::I32, HirType::I32].into(),
         packed: false,
     };
 
@@ -2294,13 +2294,13 @@ fn test_nested_struct() {
 
     let inner_ty = HirStructType {
         name: Some(create_test_string("Inner")),
-        fields: vec![HirType::I32, HirType::I32],
+        fields: vec![HirType::I32, HirType::I32].into(),
         packed: false,
     };
 
     let outer_ty = HirStructType {
         name: Some(create_test_string("Outer")),
-        fields: vec![HirType::Struct(inner_ty), HirType::I32],
+        fields: vec![HirType::Struct(inner_ty), HirType::I32].into(),
         packed: false,
     };
 
@@ -2361,7 +2361,7 @@ fn test_array_of_structs() {
 
     let point_ty = HirStructType {
         name: Some(create_test_string("Point")),
-        fields: vec![HirType::I32, HirType::I32],
+        fields: vec![HirType::I32, HirType::I32].into(),
         packed: false,
     };
 
@@ -2488,7 +2488,8 @@ fn test_mixed_struct_types() {
             HirType::I64,
             HirType::F32,
             HirType::F64,
-        ],
+        ]
+        .into(),
         packed: false,
     };
 
@@ -2549,19 +2550,19 @@ fn test_deeply_nested_struct() {
 
     let level3_ty = HirStructType {
         name: Some(create_test_string("Level3")),
-        fields: vec![HirType::I32, HirType::I32],
+        fields: vec![HirType::I32, HirType::I32].into(),
         packed: false,
     };
 
     let level2_ty = HirStructType {
         name: Some(create_test_string("Level2")),
-        fields: vec![HirType::Struct(level3_ty), HirType::I32],
+        fields: vec![HirType::Struct(level3_ty), HirType::I32].into(),
         packed: false,
     };
 
     let level1_ty = HirStructType {
         name: Some(create_test_string("Level1")),
-        fields: vec![HirType::Struct(level2_ty), HirType::I32],
+        fields: vec![HirType::Struct(level2_ty), HirType::I32].into(),
         packed: false,
     };
 

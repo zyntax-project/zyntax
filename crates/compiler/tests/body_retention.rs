@@ -48,7 +48,6 @@ impl Builder {
                 id,
                 ty,
                 kind,
-                uses: Default::default(),
                 span: None,
             },
         );

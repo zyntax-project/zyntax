@@ -87,7 +87,6 @@ fn loop_with_external_exit_entry() -> (HirFunction, HirId, HirId) {
                 id,
                 ty,
                 kind,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -702,7 +701,7 @@ fn the_osr_frame_lays_out_live_ins_at_natural_alignment() {
     // nbody's Body: seven doubles, held by reference.
     let body = HirType::Struct(HirStructType {
         name: Some(InternedString::new_global("Body")),
-        fields: vec![HirType::F64; 7],
+        fields: vec![HirType::F64; 7].into(),
         packed: false,
     });
     assert!(zyntax_compiler::osr::is_held_by_reference(&body));
@@ -760,7 +759,7 @@ fn a_transfer_keeps_writing_into_the_header_it_was_handed() {
     const BEAD: u64 = 0xB0A9;
     let header_ty = HirType::Struct(HirStructType {
         name: Some(InternedString::new_global("List")),
-        fields: vec![HirType::I64; 3],
+        fields: vec![HirType::I64; 3].into(),
         packed: false,
     });
     let i64_ty = HirType::I64;
@@ -791,7 +790,6 @@ fn a_transfer_keeps_writing_into_the_header_it_was_handed() {
                 id,
                 ty,
                 kind,
-                uses: Default::default(),
                 span: None,
             },
         );

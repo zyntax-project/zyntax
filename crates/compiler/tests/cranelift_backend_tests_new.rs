@@ -183,13 +183,13 @@ fn create_multi_level_extract_function() -> HirFunction {
 
     let inner_ty = HirType::Struct(HirStructType {
         name: Some(create_test_string("Inner")),
-        fields: vec![HirType::I32, HirType::I32],
+        fields: vec![HirType::I32, HirType::I32].into(),
         packed: false,
     });
 
     let outer_ty = HirType::Struct(HirStructType {
         name: Some(create_test_string("Outer")),
-        fields: vec![inner_ty.clone(), HirType::I32],
+        fields: vec![inner_ty.clone(), HirType::I32].into(),
         packed: false,
     });
 
@@ -258,13 +258,13 @@ fn create_multi_level_insert_function() -> HirFunction {
 
     let inner_ty = HirType::Struct(HirStructType {
         name: Some(create_test_string("Inner")),
-        fields: vec![HirType::I32, HirType::I32],
+        fields: vec![HirType::I32, HirType::I32].into(),
         packed: false,
     });
 
     let outer_ty = HirType::Struct(HirStructType {
         name: Some(create_test_string("Outer")),
-        fields: vec![inner_ty.clone(), HirType::I32],
+        fields: vec![inner_ty.clone(), HirType::I32].into(),
         packed: false,
     });
 

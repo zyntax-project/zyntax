@@ -470,14 +470,13 @@ fn pointer_loop_with_a_cold_call() -> (
     let i64_ty = HirType::I64;
     let cell_ty = HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
         name: Some(InternedString::new_global("Cell")),
-        fields: vec![HirType::I64],
+        fields: vec![HirType::I64].into(),
         packed: false,
     })));
     let value = |id, ty: &HirType, kind| HirValue {
         id,
         ty: ty.clone(),
         kind,
-        uses: Default::default(),
         span: None,
     };
     let block = |id, phis, instructions, terminator| HirBlock {

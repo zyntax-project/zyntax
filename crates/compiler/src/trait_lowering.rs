@@ -258,7 +258,7 @@ pub fn convert_type(
                 });
 
             Ok(HirType::Ref {
-                lifetime: hir_lifetime,
+                lifetime: Box::new(hir_lifetime),
                 pointee: std::sync::Arc::new(pointee_ty),
                 mutable: matches!(mutability, zyntax_typed_ast::Mutability::Mutable),
             })
@@ -273,7 +273,7 @@ pub fn convert_type(
 
             Ok(HirType::Struct(crate::hir::HirStructType {
                 name: None, // Anonymous tuple
-                fields: field_types,
+                fields: field_types.into(),
                 packed: false,
             }))
         }
@@ -331,7 +331,7 @@ pub fn convert_type(
                 .collect::<CompilerResult<Vec<_>>>()?;
 
             Ok(HirType::Interface {
-                methods: hir_methods,
+                methods: hir_methods.into(),
                 is_structural: *is_structural,
             })
         }
@@ -784,7 +784,7 @@ pub fn create_vtable_global(
         id: vtable.id,
         name,
         ty: HirType::Ptr(std::sync::Arc::new(HirType::Void)), // Opaque vtable pointer
-        initializer: Some(HirConstant::VTable(vtable)),
+        initializer: Some(HirConstant::VTable(Box::new(vtable))),
         is_const: true,
         is_thread_local: false,
         error_flag: false,

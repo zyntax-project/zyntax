@@ -277,7 +277,6 @@ fn rewrite_to_malloc(func: &mut HirFunction, site: &AllocaSite) -> bool {
             id: size_id,
             ty: HirType::I64,
             kind: HirValueKind::Constant(HirConstant::I64(size_bytes as i64)),
-            uses: Default::default(),
             span: None,
         },
     );
@@ -302,14 +301,6 @@ fn rewrite_to_malloc(func: &mut HirFunction, site: &AllocaSite) -> bool {
         is_tail: false,
     };
 
-    // Record the new use on the size constant. The promoted
-    // Malloc Call has a result HirId — `site.result` — so that
-    // goes into `size_id`'s uses set per the existing def-use
-    // chain convention (`HirValue.uses` is keyed by consumer
-    // instruction *result* HirId).
-    if let Some(v) = func.values.get_mut(&size_id) {
-        v.uses.insert(site.result);
-    }
     true
 }
 
@@ -360,7 +351,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -510,7 +500,6 @@ mod tests {
                 id: n,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(HirConstant::I64(5)),
-                uses: Default::default(),
                 span: None,
             },
         );

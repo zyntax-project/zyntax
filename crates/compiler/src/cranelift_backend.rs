@@ -7876,7 +7876,7 @@ impl CraneliftBackend {
                     "Unresolved const generic parameter".into(),
                 ))
             }
-            HirType::Generic { .. } => {
+            HirType::Generic(_) => {
                 // Generic types should be monomorphized before codegen
                 Err(CompilerError::Backend(
                     "Generic types must be monomorphized before codegen".into(),
@@ -11394,7 +11394,6 @@ mod tests {
                 id: n_id,
                 ty: i32_ty.clone(),
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -11405,7 +11404,6 @@ mod tests {
                     id,
                     ty: i32_ty.clone(),
                     kind: HirValueKind::Constant(HirConstant::I32(v)),
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -11417,7 +11415,6 @@ mod tests {
                     id,
                     ty: i32_ty.clone(),
                     kind: HirValueKind::Instruction,
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -11428,7 +11425,6 @@ mod tests {
                 id: cmp_id,
                 ty: HirType::Bool,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );

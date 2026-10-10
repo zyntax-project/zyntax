@@ -109,7 +109,6 @@ pub fn apply_krio_fiber_lowering(module: &mut HirModule) {
                     id,
                     ty: HirType::I64,
                     kind: HirValueKind::Instruction,
-                    uses: Default::default(),
                     span: None,
                 },
             );

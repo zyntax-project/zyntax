@@ -2059,7 +2059,7 @@ pub fn type_tag_for_hir_type(ty: &crate::hir::HirType) -> TypeTag {
             )
         }
         HirType::ConstGeneric(_) => TypeTag::new(TypeCategory::Opaque, 1, TypeFlags::NONE),
-        HirType::Generic { .. } => TypeTag::new(TypeCategory::Custom, 0, TypeFlags::NONE),
+        HirType::Generic(_) => TypeTag::new(TypeCategory::Custom, 0, TypeFlags::NONE),
         HirType::TraitObject { .. } => TypeTag::new(TypeCategory::TraitObject, 0, TypeFlags::NONE),
         HirType::Interface { .. } => TypeTag::new(TypeCategory::TraitObject, 1, TypeFlags::NONE),
         HirType::Promise(_) => TypeTag::new(TypeCategory::Opaque, 2, TypeFlags::NONE), // Promise

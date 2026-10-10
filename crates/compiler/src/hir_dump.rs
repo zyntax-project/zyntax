@@ -158,16 +158,12 @@ fn fmt_type(ty: &HirType) -> String {
         }
         HirType::Opaque(name) => format!("opaque({})", resolve(name)),
         HirType::ConstGeneric(name) => format!("const_generic({})", resolve(name)),
-        HirType::Generic {
-            base,
-            type_args,
-            const_args,
-        } => {
-            let mut args: Vec<String> = type_args.iter().map(|t| fmt_type(t)).collect();
-            for c in const_args {
+        HirType::Generic(g) => {
+            let mut args: Vec<String> = g.type_args.iter().map(fmt_type).collect();
+            for c in &g.const_args {
                 args.push(fmt_constant(c));
             }
-            format!("{}<{}>", fmt_type(base), args.join(", "))
+            format!("{}<{}>", fmt_type(&g.base), args.join(", "))
         }
         HirType::TraitObject { trait_id, .. } => format!("dyn trait#{}", trait_id.as_u32()),
         HirType::Interface {

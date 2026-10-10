@@ -32,7 +32,7 @@ const EXPECTED: i64 = 97340;
 fn pair_ty() -> HirType {
     HirType::Struct(HirStructType {
         name: Some(InternedString::new_global("Pair")),
-        fields: vec![HirType::I64, HirType::I64],
+        fields: vec![HirType::I64, HirType::I64].into(),
         packed: false,
     })
 }
@@ -40,7 +40,7 @@ fn pair_ty() -> HirType {
 fn outer_ty() -> HirType {
     HirType::Struct(HirStructType {
         name: Some(InternedString::new_global("Outer")),
-        fields: vec![HirType::I64, pair_ty()],
+        fields: vec![HirType::I64, pair_ty()].into(),
         packed: false,
     })
 }
@@ -49,7 +49,7 @@ fn outer_ty() -> HirType {
 fn one_ty() -> HirType {
     HirType::Struct(HirStructType {
         name: Some(InternedString::new_global("One")),
-        fields: vec![HirType::F64],
+        fields: vec![HirType::F64].into(),
         packed: false,
     })
 }
@@ -57,7 +57,7 @@ fn one_ty() -> HirType {
 fn tagged_ty() -> HirType {
     HirType::Struct(HirStructType {
         name: Some(InternedString::new_global("Tagged")),
-        fields: vec![HirType::I64, one_ty()],
+        fields: vec![HirType::I64, one_ty()].into(),
         packed: false,
     })
 }
@@ -95,7 +95,6 @@ fn add_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: Default::default(),
             span: None,
         },
     );

@@ -155,12 +155,28 @@ pub mod passes {
         ) -> CompilerResult<bool> {
             let mut changed = false;
 
+            // Every value an instruction, phi or terminator reads.
+            let mut used: crate::hir::IdHashSet<HirId> = crate::hir::IdHashSet::default();
+            for block in func.blocks.values() {
+                for phi in &block.phis {
+                    used.extend(phi.incoming.iter().map(|(v, _)| *v));
+                }
+                for inst in &block.instructions {
+                    inst.for_each_operand(|v| {
+                        used.insert(v);
+                    });
+                }
+                block.terminator.for_each_operand(|v| {
+                    used.insert(v);
+                });
+            }
+
             for (_, block) in &mut func.blocks {
                 let mut new_instructions = Vec::new();
 
                 for inst in &block.instructions {
                     // Keep instruction if it has side effects or its result is used
-                    if self.has_side_effects(inst) || self.is_used(inst, &func.values) {
+                    if self.has_side_effects(inst) || self.is_used(inst, &used) {
                         new_instructions.push(inst.clone());
                     } else {
                         self.removed_instructions += 1;
@@ -184,15 +200,9 @@ pub mod passes {
             )
         }
 
-        fn is_used(
-            &self,
-            inst: &HirInstruction,
-            values: &crate::hir::IdMap<HirId, crate::hir::HirValue>,
-        ) -> bool {
+        fn is_used(&self, inst: &HirInstruction, used: &crate::hir::IdHashSet<HirId>) -> bool {
             if let Some(result) = self.get_result(inst) {
-                if let Some(value) = values.get(&result) {
-                    return !value.uses.is_empty();
-                }
+                return used.contains(&result);
             }
             true // Conservative
         }

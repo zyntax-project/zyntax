@@ -237,7 +237,6 @@ fn global_ref(f: &mut HirFunction, global: HirId, ty: &HirType) -> HirId {
             id,
             ty: HirType::Ptr(std::sync::Arc::new(ty.clone())),
             kind: HirValueKind::Global(global),
-            uses: Default::default(),
             span: None,
         },
     );
@@ -252,7 +251,6 @@ fn value(f: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: Default::default(),
             span: None,
         },
     );
@@ -339,7 +337,6 @@ fn make_init(
                 id: boxed,
                 ty: ty.clone(),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );

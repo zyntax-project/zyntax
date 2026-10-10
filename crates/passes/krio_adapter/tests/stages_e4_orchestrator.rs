@@ -40,7 +40,6 @@ fn e4_full_pipeline_produces_dispatcher_save_load() {
             id: frame,
             ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             kind: HirValueKind::Instruction,
-            uses: Default::default(),
             span: None,
         },
     );
@@ -201,7 +200,6 @@ fn e4_orchestrator_no_op_for_non_async_function() {
             id: frame,
             ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             kind: HirValueKind::Instruction,
-            uses: Default::default(),
             span: None,
         },
     );

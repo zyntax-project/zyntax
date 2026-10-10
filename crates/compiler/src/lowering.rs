@@ -4013,7 +4013,6 @@ impl LoweringContext {
                         id,
                         ty,
                         kind,
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -4755,7 +4754,7 @@ impl LoweringContext {
                 };
 
                 HirType::Ref {
-                    lifetime: hir_lifetime,
+                    lifetime: Box::new(hir_lifetime),
                     pointee: std::sync::Arc::new(self.convert_type(ty)),
                     mutable: *mutability == Mutability::Mutable,
                 }
@@ -4936,7 +4935,7 @@ impl LoweringContext {
                             if !self.converting.borrow_mut().insert(type_def.name) {
                                 let opaque = HirType::Struct(crate::hir::HirStructType {
                                     name: Some(type_def.name),
-                                    fields: Vec::new(),
+                                    fields: Vec::new().into(),
                                     packed: false,
                                 });
                                 return if type_def.metadata.is_reference {
@@ -5013,7 +5012,7 @@ impl LoweringContext {
 
                             HirType::Struct(crate::hir::HirStructType {
                                 name: Some(type_def.name),
-                                fields: field_types,
+                                fields: field_types.into(),
                                 packed: false,
                             })
                         }
@@ -5045,7 +5044,7 @@ impl LoweringContext {
                                                 .collect();
                                             HirType::Struct(crate::hir::HirStructType {
                                                 name: None,
-                                                fields,
+                                                fields: fields.into(),
                                                 packed: false,
                                             })
                                         }
@@ -5058,7 +5057,7 @@ impl LoweringContext {
                                                 .collect();
                                             HirType::Struct(crate::hir::HirStructType {
                                                 name: Some(variant.name),
-                                                fields: field_types,
+                                                fields: field_types.into(),
                                                 packed: false,
                                             })
                                         }
@@ -5090,7 +5089,7 @@ impl LoweringContext {
                             if !self.converting.borrow_mut().insert(type_def.name) {
                                 return HirType::Struct(crate::hir::HirStructType {
                                     name: Some(type_def.name),
-                                    fields: Vec::new(),
+                                    fields: Vec::new().into(),
                                     packed: false,
                                 });
                             }
@@ -5109,7 +5108,7 @@ impl LoweringContext {
 
                             HirType::Struct(crate::hir::HirStructType {
                                 name: Some(type_def.name),
-                                fields: field_types,
+                                fields: field_types.into(),
                                 packed: false,
                             })
                         }
@@ -5293,7 +5292,7 @@ impl LoweringContext {
                             field_types.iter().map(|ty| self.convert_type(ty)).collect();
                         HirType::Struct(crate::hir::HirStructType {
                             name: None, // Anonymous tuple struct
-                            fields,
+                            fields: fields.into(),
                             packed: false,
                         })
                     }
@@ -5306,7 +5305,7 @@ impl LoweringContext {
                         .collect();
                     HirType::Struct(crate::hir::HirStructType {
                         name: Some(variant.name), // Use variant name
-                        fields,
+                        fields: fields.into(),
                         packed: false,
                     })
                 }

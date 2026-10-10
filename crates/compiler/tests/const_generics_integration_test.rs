@@ -149,7 +149,8 @@ fn test_const_generic_struct_after_monomorphization() {
         fields: vec![
             HirType::Array(std::sync::Arc::new(HirType::U8), 256), // data: [u8; 256]
             HirType::U64,                                          // len: u64
-        ],
+        ]
+        .into(),
         packed: false,
     };
 

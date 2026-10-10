@@ -282,7 +282,7 @@ mod tests {
     fn vec3() -> HirType {
         HirType::Struct(HirStructType {
             name: Some(InternedString::new_global("Vec3")),
-            fields: vec![HirType::F64, HirType::F64, HirType::F64],
+            fields: vec![HirType::F64, HirType::F64, HirType::F64].into(),
             packed: false,
         })
     }
@@ -290,7 +290,7 @@ mod tests {
     fn list() -> HirType {
         HirType::Struct(HirStructType {
             name: Some(InternedString::new_global("List")),
-            fields: vec![HirType::I64, HirType::I64, HirType::I64],
+            fields: vec![HirType::I64, HirType::I64, HirType::I64].into(),
             packed: false,
         })
     }
@@ -336,7 +336,7 @@ mod tests {
         assert!(llvm_entry_abi_supported(&f, false));
         let wrapped = HirType::Struct(HirStructType {
             name: None,
-            fields: vec![HirType::I64],
+            fields: vec![HirType::I64].into(),
             packed: false,
         });
         let f = function(vec![wrapped.clone()], vec![wrapped]);
@@ -351,7 +351,7 @@ mod tests {
         assert!(!llvm_entry_abi_supported(&f, false));
         let holding_union = HirType::Struct(HirStructType {
             name: None,
-            fields: vec![HirType::I64, union],
+            fields: vec![HirType::I64, union].into(),
             packed: false,
         });
         let f = function(vec![holding_union], vec![HirType::I64]);
@@ -364,7 +364,7 @@ mod tests {
     fn scalars_and_a_wrapped_scalar_are_direct() {
         let wrapped = HirType::Struct(HirStructType {
             name: None,
-            fields: vec![HirType::I64],
+            fields: vec![HirType::I64].into(),
             packed: false,
         });
         let f = function(

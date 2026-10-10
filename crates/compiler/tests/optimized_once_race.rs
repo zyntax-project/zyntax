@@ -34,7 +34,6 @@ fn racing_callers_share_one_run_of_the_pipeline() {
                 id: bound,
                 ty: HirType::I32,
                 kind: HirValueKind::Constant(HirConstant::I32(5000)),
-                uses: Default::default(),
                 span: None,
             },
         );

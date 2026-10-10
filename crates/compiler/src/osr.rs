@@ -933,7 +933,6 @@ pub(crate) fn resumable_body<'a>(
                 id: r.phi,
                 ty: r.ty.clone(),
                 kind: crate::hir::HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1101,7 +1100,6 @@ pub fn outline(
                 id: param_id,
                 ty: ty.clone(),
                 kind: HirValueKind::Parameter(i as u32),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1254,7 +1252,6 @@ pub fn outline(
                 id: *id,
                 ty: ty.clone(),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1268,7 +1265,6 @@ pub fn outline(
                 id,
                 ty: layout.return_type.clone(),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1943,7 +1939,7 @@ mod tests {
         assert!(!type_fits_i64(&HirType::Struct(
             crate::hir::HirStructType {
                 name: Some(zyntax_typed_ast::InternedString::new_global("Empty")),
-                fields: vec![],
+                fields: vec![].into(),
                 packed: false,
             }
         )));

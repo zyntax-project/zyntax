@@ -29,7 +29,6 @@ fn constant_bound_loop() -> (HirFunction, HirId) {
             id: bound,
             ty: HirType::I32,
             kind: HirValueKind::Constant(HirConstant::I32(TRIPS)),
-            uses: Default::default(),
             span: None,
         },
     );

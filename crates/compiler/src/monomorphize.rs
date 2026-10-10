@@ -255,13 +255,10 @@ impl MonomorphizationContext {
             }
 
             // Generic type with arguments
-            HirType::Generic {
-                base,
-                type_args,
-                const_args: type_const_args,
-            } => {
-                let new_base = self.substitute_type(base, type_subst, const_subst);
-                let new_type_args = type_args
+            HirType::Generic(g) => {
+                let new_base = self.substitute_type(&g.base, type_subst, const_subst);
+                let new_type_args = g
+                    .type_args
                     .iter()
                     .map(|t| self.substitute_type(t, type_subst, const_subst))
                     .collect();
@@ -269,13 +266,13 @@ impl MonomorphizationContext {
                 // Substitute const arguments - they are already HirConstant values,
                 // so no substitution needed unless they contain references to other const params
                 // For now, just clone them (const args are concrete values by this point)
-                let new_const_args = type_const_args.clone();
+                let new_const_args = g.const_args.clone();
 
-                HirType::Generic {
-                    base: Box::new(new_base),
+                HirType::Generic(Box::new(crate::hir::HirGenericType {
+                    base: new_base,
                     type_args: new_type_args,
                     const_args: new_const_args,
-                }
+                }))
             }
 
             // Recursive cases
@@ -840,7 +837,8 @@ mod tests {
             fields: vec![
                 HirType::Ptr(std::sync::Arc::new(HirType::Opaque(t_param))),
                 HirType::Opaque(u_param),
-            ],
+            ]
+            .into(),
             packed: false,
         };
 

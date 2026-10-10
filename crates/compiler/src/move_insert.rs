@@ -104,7 +104,6 @@ fn create_value(func: &mut HirFunction, ty: HirType) -> HirId {
             id,
             ty,
             kind: HirValueKind::Instruction,
-            uses: Default::default(),
             span: None,
         },
     );

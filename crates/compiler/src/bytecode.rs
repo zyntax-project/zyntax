@@ -644,7 +644,7 @@ impl BytecodeHeader {
     // Moves with any change to a payload's layout, so a payload in an
     // older layout is refused with VersionMismatch and a cache loader
     // recompiles rather than misreading it.
-    const CURRENT_MAJOR: u16 = 7;
+    const CURRENT_MAJOR: u16 = 8;
     const CURRENT_MINOR: u16 = 0;
 
     /// Create a new header for the given module and format
@@ -1075,7 +1075,6 @@ mod tests {
                 id: HirId::from_raw(big),
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1120,7 +1119,6 @@ mod tests {
                 id: HirId::from_raw(3),
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1172,7 +1170,6 @@ mod tests {
                     id: value,
                     ty: HirType::I64,
                     kind: HirValueKind::Parameter(0),
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -1310,7 +1307,6 @@ mod tests {
                 id: read,
                 ty: HirType::I64,
                 kind: HirValueKind::Global(global),
-                uses: Default::default(),
                 span: None,
             },
         );

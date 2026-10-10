@@ -1783,7 +1783,6 @@ fn convert_args_to_params(
                 id: converted,
                 ty: param.ty.clone(),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1856,7 +1855,6 @@ fn apply_inline(
                 HirValueKind::Instruction => HirValueKind::Instruction,
                 HirValueKind::Parameter(_) => continue, // safety: handled above
             },
-            uses: Default::default(),
             span: None,
         };
         subs.insert(*id, new_id);
@@ -1920,7 +1918,6 @@ fn apply_inline(
                         id: converted,
                         ty: ret_ty.clone(),
                         kind: HirValueKind::Instruction,
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -2042,7 +2039,6 @@ fn apply_inline_multi_block(
                 HirValueKind::Instruction => HirValueKind::Instruction,
                 HirValueKind::Parameter(_) => continue,
             },
-            uses: Default::default(),
             span: None,
         };
         subs.insert(*id, new_id);
@@ -2203,7 +2199,6 @@ fn apply_inline_multi_block(
                     id: converted,
                     ty: ret_ty.clone(),
                     kind: HirValueKind::Instruction,
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -2235,7 +2230,6 @@ fn apply_inline_multi_block(
                     id: phi_result,
                     ty: ret_ty.clone(),
                     kind: HirValueKind::Instruction,
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -2440,7 +2434,6 @@ mod tests {
                 id: param_id,
                 ty,
                 kind: HirValueKind::Parameter(param_idx),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2455,7 +2448,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2470,7 +2462,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Constant(c),
-                uses: Default::default(),
                 span: None,
             },
         );

@@ -644,7 +644,6 @@ fn constant(func: &mut HirFunction, ty: HirType, c: HirConstant) -> HirId {
             id,
             ty,
             kind: HirValueKind::Constant(c),
-            uses: Default::default(),
             span: None,
         },
     );
@@ -765,7 +764,6 @@ fn value(func: &mut HirFunction, ty: HirType) -> HirId {
             id,
             ty,
             kind: HirValueKind::Instruction,
-            uses: Default::default(),
             span: None,
         },
     );

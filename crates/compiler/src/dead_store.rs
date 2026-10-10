@@ -281,7 +281,6 @@ mod tests {
                 id,
                 ty,
                 kind,
-                uses: Default::default(),
                 span: None,
             },
         );

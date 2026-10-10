@@ -39,7 +39,7 @@ fn test_struct_roundtrip() {
     let name = create_test_string("struct_roundtrip");
     let point_ty = HirStructType {
         name: Some(create_test_string("Point")),
-        fields: vec![HirType::I32, HirType::I32], // x, y
+        fields: vec![HirType::I32, HirType::I32].into(), // x, y
         packed: false,
     };
 
@@ -138,13 +138,13 @@ fn test_nested_struct_execution() {
 
     let inner_ty = HirStructType {
         name: Some(create_test_string("Inner")),
-        fields: vec![HirType::I32, HirType::I32],
+        fields: vec![HirType::I32, HirType::I32].into(),
         packed: false,
     };
 
     let outer_ty = HirStructType {
         name: Some(create_test_string("Outer")),
-        fields: vec![HirType::Struct(inner_ty), HirType::I32],
+        fields: vec![HirType::Struct(inner_ty), HirType::I32].into(),
         packed: false,
     };
 
@@ -424,7 +424,7 @@ fn test_array_of_structs_execution() {
 
     let point_ty = HirStructType {
         name: Some(create_test_string("Point")),
-        fields: vec![HirType::I32, HirType::I32],
+        fields: vec![HirType::I32, HirType::I32].into(),
         packed: false,
     };
 
@@ -509,7 +509,7 @@ fn test_mixed_size_struct() {
 
     let struct_ty = HirStructType {
         name: Some(create_test_string("Mixed")),
-        fields: vec![HirType::I8, HirType::I32, HirType::I64],
+        fields: vec![HirType::I8, HirType::I32, HirType::I64].into(),
         packed: false,
     };
 

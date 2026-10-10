@@ -71,7 +71,6 @@ fn library(functions: usize, values: usize) -> HirModule {
                     id,
                     ty: HirType::I64,
                     kind: HirValueKind::Parameter(v as u32),
-                    uses: Default::default(),
                     span: None,
                 },
             );

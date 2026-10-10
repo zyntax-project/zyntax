@@ -2347,7 +2347,6 @@ mod tests {
                 id,
                 ty,
                 kind,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2427,7 +2426,6 @@ mod tests {
                 id: p0,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2437,7 +2435,6 @@ mod tests {
                 id: p1,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(1),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2499,7 +2496,6 @@ mod tests {
                 id: p0,
                 ty: HirType::F64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2509,7 +2505,6 @@ mod tests {
                 id: p1,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(1),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2573,7 +2568,6 @@ mod tests {
                 id: p0,
                 ty: HirType::F64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2583,7 +2577,6 @@ mod tests {
                 id: p1,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(1),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2704,7 +2697,6 @@ mod tests {
                 id: cond_id,
                 ty: HirType::Bool,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2771,7 +2763,6 @@ mod tests {
                 id: cond_id,
                 ty: HirType::Bool,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2855,7 +2846,6 @@ mod tests {
                 id: cond_id,
                 ty: HirType::Bool,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2966,7 +2956,6 @@ mod tests {
                 id: tag_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3068,7 +3057,6 @@ mod tests {
                 id: x_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3154,7 +3142,6 @@ mod tests {
                     id: *id,
                     ty: HirType::I64,
                     kind: HirValueKind::Parameter(idx as u32),
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -3250,7 +3237,6 @@ mod tests {
                 id: handle_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3260,7 +3246,6 @@ mod tests {
                 id: ms_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(1),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3362,7 +3347,6 @@ mod tests {
                     id,
                     ty: HirType::I64,
                     kind: HirValueKind::Parameter(idx),
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -3597,7 +3581,6 @@ mod tests {
                 id: param_id,
                 ty: param_ty,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3702,7 +3685,6 @@ mod tests {
                 id: ptr_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3764,7 +3746,6 @@ mod tests {
                 id: ptr_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3774,7 +3755,6 @@ mod tests {
                 id: val_id,
                 ty: elem_ty.clone(),
                 kind: HirValueKind::Parameter(1),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3864,7 +3844,6 @@ mod tests {
                 id: size_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3969,7 +3948,6 @@ mod tests {
                     id,
                     ty: HirType::I64,
                     kind: HirValueKind::Parameter(idx),
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -4063,7 +4041,6 @@ mod tests {
                     id,
                     ty: HirType::I64,
                     kind: HirValueKind::Parameter(idx),
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -4179,7 +4156,6 @@ mod tests {
                 id: n_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );

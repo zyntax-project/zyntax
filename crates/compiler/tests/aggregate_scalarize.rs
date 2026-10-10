@@ -21,7 +21,7 @@ use zyntax_typed_ast::InternedString;
 fn pair_ty() -> HirType {
     HirType::Struct(HirStructType {
         name: Some(InternedString::new_global("Pair")),
-        fields: vec![HirType::I64, HirType::I64],
+        fields: vec![HirType::I64, HirType::I64].into(),
         packed: false,
     })
 }
@@ -59,7 +59,6 @@ fn add_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: Default::default(),
             span: None,
         },
     );

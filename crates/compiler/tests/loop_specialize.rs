@@ -38,7 +38,6 @@ fn add_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: Default::default(),
             span: None,
         },
     );
@@ -84,7 +83,6 @@ fn build(toggles: bool) -> (HirModule, HirId) {
                     id: p.id,
                     ty: p.ty.clone(),
                     kind: HirValueKind::Parameter(i as u32),
-                    uses: Default::default(),
                     span: None,
                 },
             )

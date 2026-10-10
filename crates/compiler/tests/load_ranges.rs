@@ -331,7 +331,7 @@ fn aggregate_store_carriers_do_not_understate_the_written_range() {
     let f = module.functions.get_mut(&id).unwrap();
     let ty = HirType::Struct(HirStructType {
         name: None,
-        fields: vec![HirType::I64; 3],
+        fields: vec![HirType::I64; 3].into(),
         packed: false,
     });
     let aggregate = f.create_value(
@@ -364,7 +364,7 @@ fn late_block_merging_splits_aggregate_reads_into_fields() {
     let ptr = f.signature.params[0].id;
     let ty = HirType::Struct(HirStructType {
         name: None,
-        fields: vec![HirType::I64; 3],
+        fields: vec![HirType::I64; 3].into(),
         packed: false,
     });
     let aggregate = f.create_value(ty.clone(), HirValueKind::Instruction);

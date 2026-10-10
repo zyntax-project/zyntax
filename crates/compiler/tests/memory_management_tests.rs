@@ -71,7 +71,7 @@ fn test_drop_manager() {
     // Register a type with a destructor
     let custom_type = HirType::Struct(HirStructType {
         name: Some(intern_str(&mut arena, "CustomType")),
-        fields: vec![HirType::Ptr(std::sync::Arc::new(HirType::I32))],
+        fields: vec![HirType::Ptr(std::sync::Arc::new(HirType::I32))].into(),
         packed: false,
     });
 
@@ -248,7 +248,7 @@ fn test_arc_needs_arc_type_checking() {
     // Test pointer and reference types (need ARC)
     assert!(arc_manager.needs_arc(&HirType::Ptr(std::sync::Arc::new(HirType::I32))));
     assert!(arc_manager.needs_arc(&HirType::Ref {
-        lifetime: HirLifetime::anonymous(),
+        lifetime: Box::new(HirLifetime::anonymous()),
         pointee: std::sync::Arc::new(HirType::I32),
         mutable: false,
     }));
@@ -256,7 +256,7 @@ fn test_arc_needs_arc_type_checking() {
     // Test composite types
     let struct_with_ptr = HirType::Struct(HirStructType {
         name: None,
-        fields: vec![HirType::I32, HirType::Ptr(std::sync::Arc::new(HirType::U8))],
+        fields: vec![HirType::I32, HirType::Ptr(std::sync::Arc::new(HirType::U8))].into(),
         packed: false,
     });
     assert!(arc_manager.needs_arc(&struct_with_ptr));

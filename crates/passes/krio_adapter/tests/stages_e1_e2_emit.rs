@@ -54,7 +54,6 @@ fn run_through_e2(state_slot: u32, captures_slot_base: u32, emit_dispatcher: boo
             id: frame,
             ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             kind: HirValueKind::Instruction,
-            uses: Default::default(),
             span: None,
         },
     );

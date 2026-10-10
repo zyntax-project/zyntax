@@ -1538,7 +1538,6 @@ mod tests {
                 id: p0_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1548,7 +1547,6 @@ mod tests {
                 id: p1_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Parameter(1),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1559,7 +1557,6 @@ mod tests {
                 id: sum_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );

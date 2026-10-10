@@ -935,7 +935,6 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
                 id: copy,
                 ty,
                 kind: crate::hir::HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3354,7 +3353,6 @@ fn release_instructions(
                     id: data,
                     ty: ty.clone(),
                     kind: crate::hir::HirValueKind::Instruction,
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -3405,7 +3403,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Constant(c),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3420,7 +3417,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -4397,7 +4393,7 @@ mod tests {
 
         let bag_ty = HirType::Struct(crate::hir::HirStructType {
             name: None,
-            fields: vec![HirType::I64],
+            fields: vec![HirType::I64].into(),
             packed: false,
         });
         let scalar = add_const(&mut f, HirType::F64, HirConstant::F64(1.5));
@@ -4698,7 +4694,6 @@ mod tests {
                 id: v,
                 ty: HirType::Ptr(std::sync::Arc::new(HirType::I8)),
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );

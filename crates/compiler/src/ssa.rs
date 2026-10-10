@@ -146,7 +146,7 @@ fn int_const_for(ty: &HirType, n: i128) -> crate::hir::HirConstant {
 pub(crate) fn list_header_type() -> HirType {
     HirType::Struct(crate::hir::HirStructType {
         name: Some(InternedString::new_global("List")),
-        fields: vec![HirType::I64, HirType::I64, HirType::I64],
+        fields: vec![HirType::I64, HirType::I64, HirType::I64].into(),
         packed: false,
     })
 }
@@ -1923,7 +1923,6 @@ impl SsaBuilder {
                 id: const_id,
                 ty: HirType::U32,
                 kind: crate::hir::HirValueKind::Constant(variant_const),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2307,7 +2306,7 @@ impl SsaBuilder {
                 let aggregate_hir_ty = self.function.values.get(&aggregate).map(|v| v.ty.clone());
 
                 let element_types: Vec<HirType> = match &aggregate_hir_ty {
-                    Some(HirType::Struct(st)) => st.fields.clone(),
+                    Some(HirType::Struct(st)) => st.fields.to_vec(),
                     _ => return Ok(()), // Can't extract — type mismatch
                 };
 
@@ -2576,9 +2575,7 @@ impl SsaBuilder {
         );
 
         // Track use
-        if !args.is_empty() {
-            self.add_use(value_id, result_id);
-        }
+        if !args.is_empty() {}
 
         log::debug!(
             "[SSA] Created union for {}: result={:?}, variant_index={}, value={:?}",
@@ -3817,7 +3814,6 @@ impl SsaBuilder {
                     operand: value,
                 },
             );
-            this.add_use(value, result);
             result
         };
         if is_int(source_ty) && header(target_ty) {
@@ -3932,7 +3928,6 @@ impl SsaBuilder {
                             volatile: false,
                         },
                     );
-                    self.add_use(ptr, result);
                     return Ok(result);
                 }
                 // Check if this is an address-taken variable - need to load from stack
@@ -3949,7 +3944,6 @@ impl SsaBuilder {
                             volatile: false,
                         },
                     );
-                    self.add_use(stack_slot, result);
                     log::debug!(
                         "[SSA] Load address-taken var {:?} from stack slot {:?} -> {:?}",
                         name,
@@ -4570,8 +4564,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, inst);
-                self.add_use(left_val, result);
-                self.add_use(right_val, result);
                 self.settle(started, block_id);
 
                 Ok(result)
@@ -4639,7 +4631,6 @@ impl SsaBuilder {
                             right: rhs,
                         },
                     );
-                    self.add_use(operand_val, result);
                     self.settle(started, block_id);
                     return Ok(result);
                 }
@@ -4668,7 +4659,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, inst);
-                self.add_use(operand_val, result);
                 self.settle(started, block_id);
 
                 Ok(result)
@@ -5459,15 +5449,11 @@ impl SsaBuilder {
                 self.add_instruction(block_id, inst);
 
                 // Add uses (for indirect calls, track callee value)
-                if let Some(callee_val) = indirect_callee_val {
-                    self.add_use(callee_val, result.unwrap_or(callee_val));
-                }
+                if let Some(callee_val) = indirect_callee_val {}
 
                 // Track argument uses
                 let result_or_void = result.unwrap_or_else(|| self.create_undef(HirType::Void));
-                for arg in &arg_vals {
-                    self.add_use(*arg, result_or_void);
-                }
+                for arg in &arg_vals {}
                 self.settle(started, block_id);
 
                 Ok(result_or_void)
@@ -5697,8 +5683,6 @@ impl SsaBuilder {
                                     indices: vec![offset_id],
                                 },
                             );
-                            self.add_use(object_val, gep_id);
-                            self.add_use(offset_id, gep_id);
 
                             let field_ptr = self.create_value(
                                 HirType::Ptr(std::sync::Arc::new(field_ty.clone())),
@@ -5713,7 +5697,6 @@ impl SsaBuilder {
                                     operand: gep_id,
                                 },
                             );
-                            self.add_use(gep_id, field_ptr);
 
                             let load_result =
                                 self.create_value(field_ty.clone(), HirValueKind::Instruction);
@@ -5727,7 +5710,6 @@ impl SsaBuilder {
                                     volatile: false,
                                 },
                             );
-                            self.add_use(field_ptr, load_result);
                             // Unbox if the field is `Type::Any` and the
                             // use-site has a concrete target type. See
                             // `maybe_unbox_for_any_field` for the
@@ -5817,7 +5799,6 @@ impl SsaBuilder {
                                     operand: object_val,
                                 },
                             );
-                            self.add_use(object_val, rebind);
                             rebind
                         } else {
                             object_val
@@ -5864,7 +5845,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, inst);
-                self.add_use(object_val, result);
 
                 // Unbox if the declared field type is `Type::Any` and
                 // the use-site has a concrete target type.
@@ -5929,7 +5909,6 @@ impl SsaBuilder {
                             indices: vec![index as u32],
                         },
                     );
-                    self.add_use(object_val, result);
                     return Ok(result);
                 }
 
@@ -6073,7 +6052,6 @@ impl SsaBuilder {
                             volatile: false,
                         },
                     );
-                    self.add_use(object_val, data_ptr);
                     data_ptr
                 } else {
                     object_val
@@ -6090,8 +6068,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, gep_inst);
-                self.add_use(gep_base, gep_result);
-                self.add_use(index_val, gep_result);
 
                 // Load the value
                 let load_result = self.create_value(elem_hir_ty.clone(), HirValueKind::Instruction);
@@ -6110,7 +6086,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, load_inst);
-                self.add_use(gep_result, load_result);
 
                 Ok(load_result)
             }
@@ -6348,7 +6323,6 @@ impl SsaBuilder {
                                     is_tail: false,
                                 },
                             );
-                            self.add_use(size_const, r);
                             r
                         };
 
@@ -6400,8 +6374,6 @@ impl SsaBuilder {
                                     indices: vec![offset_id],
                                 },
                             );
-                            self.add_use(malloc_result, gep_id);
-                            self.add_use(offset_id, gep_id);
 
                             // Cast u8 ptr → field ptr so Store sees the
                             // right pointee type. SRA tolerates the
@@ -6419,7 +6391,6 @@ impl SsaBuilder {
                                     operand: gep_id,
                                 },
                             );
-                            self.add_use(gep_id, field_ptr);
 
                             self.add_instruction(
                                 block_id,
@@ -6430,7 +6401,6 @@ impl SsaBuilder {
                                     volatile: false,
                                 },
                             );
-                            self.add_use(field_ptr, field_val);
                         }
 
                         log::trace!("[SSA STRUCT LIT REF] Returning heap-allocated struct pointer");
@@ -6494,9 +6464,6 @@ impl SsaBuilder {
                             indices: vec![i as u32],
                         },
                     );
-
-                    self.add_use(current_struct, next_struct);
-                    self.add_use(field_val, next_struct);
 
                     current_struct = next_struct;
                 }
@@ -6658,7 +6625,6 @@ impl SsaBuilder {
                                 is_tail: false,
                             },
                         );
-                        self.add_use(size_const, pool);
                         (Some(pool), slot_size)
                     } else {
                         (None, 0)
@@ -6692,8 +6658,6 @@ impl SsaBuilder {
                                 indices: vec![offset_const],
                             },
                         );
-                        self.add_use(pool, slot_ptr);
-                        self.add_use(offset_const, slot_ptr);
                         self.array_pool_placement = Some(slot_ptr);
                     }
                     let elem_val = self.translate_expression(block_id, elem_expr)?;
@@ -6744,7 +6708,7 @@ impl SsaBuilder {
                 } else {
                     HirType::Struct(crate::hir::HirStructType {
                         name: None,
-                        fields: vec![HirType::I64, HirType::I64, HirType::I64],
+                        fields: vec![HirType::I64, HirType::I64, HirType::I64].into(),
                         packed: false,
                     })
                 };
@@ -6873,7 +6837,7 @@ impl SsaBuilder {
 
                 let tuple_ty = HirType::Struct(crate::hir::HirStructType {
                     name: None,
-                    fields: field_hir.clone(),
+                    fields: field_hir.clone().into(),
                     packed: false,
                 });
 
@@ -6971,7 +6935,6 @@ impl SsaBuilder {
                     },
                 );
 
-                self.add_use(operand_val, result);
                 self.settle(started, block_id);
                 Ok(result)
             }
@@ -7016,7 +6979,6 @@ impl SsaBuilder {
                     },
                 );
 
-                self.add_use(ptr_val, result);
                 Ok(result)
             }
 
@@ -7272,9 +7234,7 @@ impl SsaBuilder {
 
                 // Track argument uses
                 let result_or_void = result.unwrap_or_else(|| self.create_undef(HirType::Void));
-                for arg in &arg_vals {
-                    self.add_use(*arg, result_or_void);
-                }
+                for arg in &arg_vals {}
 
                 Ok(result_or_void)
             }
@@ -7478,7 +7438,7 @@ impl SsaBuilder {
                 // Create a simple struct with two fields
                 let range_ty = HirType::Struct(crate::hir::HirStructType {
                     name: None,
-                    fields: vec![HirType::I64, HirType::I64],
+                    fields: vec![HirType::I64, HirType::I64].into(),
                     packed: false,
                 });
 
@@ -8093,16 +8053,6 @@ impl SsaBuilder {
                 if let Some(&to) = map.get(val) {
                     *val = to;
                 }
-            }
-        }
-        for (from, to) in &map {
-            let moved = self
-                .function
-                .values
-                .get_mut(from)
-                .map(|v| std::mem::take(&mut v.uses));
-            if let (Some(moved), Some(target)) = (moved, self.function.values.get_mut(to)) {
-                target.uses.extend(moved);
             }
         }
     }
@@ -9351,7 +9301,6 @@ impl SsaBuilder {
             operand: narrow,
         };
         self.add_instruction(block_id, cast_inst);
-        self.add_use(narrow, widened);
 
         if lw < rw {
             (widened, right)
@@ -9445,17 +9394,6 @@ impl SsaBuilder {
             .get_mut(&block)
             .unwrap()
             .add_instruction(inst);
-    }
-
-    /// Record a def-use edge in the function under construction.
-    ///
-    /// Zyntax's lowering paths use this to maintain SSA use information. It is
-    /// also available to compiler extensions that emit instructions through
-    /// this builder.
-    pub fn add_use(&mut self, value: HirId, user: HirId) {
-        if let Some(val) = self.function.values.get_mut(&value) {
-            val.uses.insert(user);
-        }
     }
 
     /// Compute dominance order for processing
@@ -9890,7 +9828,6 @@ impl SsaBuilder {
                 is_tail: false,
             },
         );
-        self.add_use(value, boxed);
         Some(boxed)
     }
 
@@ -9997,7 +9934,6 @@ impl SsaBuilder {
                 operand: value,
             },
         );
-        self.add_use(value, result);
         result
     }
 
@@ -10062,7 +9998,6 @@ impl SsaBuilder {
                 volatile: false,
             },
         );
-        self.add_use(ptr, word);
         word
     }
 
@@ -10093,8 +10028,6 @@ impl SsaBuilder {
                 indices: vec![offset_id],
             },
         );
-        self.add_use(base, gep);
-        self.add_use(offset_id, gep);
         let typed = self.create_value(
             HirType::Ptr(std::sync::Arc::new(ty.clone())),
             HirValueKind::Instruction,
@@ -10108,7 +10041,6 @@ impl SsaBuilder {
                 operand: gep,
             },
         );
-        self.add_use(gep, typed);
         self.add_instruction(
             block_id,
             HirInstruction::Store {
@@ -10118,7 +10050,6 @@ impl SsaBuilder {
                 volatile: false,
             },
         );
-        self.add_use(typed, value);
     }
 
     fn struct_body(&self, s: &crate::hir::HirStructType) -> crate::hir::HirStructType {
@@ -10133,7 +10064,7 @@ impl SsaBuilder {
         };
         crate::hir::HirStructType {
             name: Some(name),
-            fields: self.convert_fields_of(type_def),
+            fields: self.convert_fields_of(type_def).into(),
             packed: s.packed,
         }
     }
@@ -10239,7 +10170,6 @@ impl SsaBuilder {
                         union_val: value,
                     },
                 );
-                self.add_use(value, extracted);
                 let d = none.discriminant;
                 let tag_const = match &disc_ty {
                     HirType::I8 => HirConstant::I8(d as i8),
@@ -10280,8 +10210,6 @@ impl SsaBuilder {
                 right: absent,
             },
         );
-        self.add_use(subject, result);
-        self.add_use(absent, result);
         self.settle(started, block_id);
         Ok(Some(result))
     }
@@ -10446,7 +10374,6 @@ impl SsaBuilder {
                 is_tail: false,
             },
         );
-        self.add_use(ptr, boxed);
         Some(boxed)
     }
 
@@ -10581,7 +10508,6 @@ impl SsaBuilder {
                 is_tail: false,
             },
         );
-        self.add_use(boxed_value, unboxed);
         Some(unboxed)
     }
 
@@ -10675,7 +10601,6 @@ impl SsaBuilder {
                 fiber: receiver_val,
             },
         );
-        self.add_use(receiver_val, step_val);
 
         // tag = step & 3
         let three_const = self.create_value(
@@ -10693,8 +10618,6 @@ impl SsaBuilder {
                 right: three_const,
             },
         );
-        self.add_use(step_val, tag_val);
-        self.add_use(three_const, tag_val);
 
         // is_yielded = (tag == 0)
         let zero_const = self.create_value(
@@ -10712,8 +10635,6 @@ impl SsaBuilder {
                 right: zero_const,
             },
         );
-        self.add_use(tag_val, is_yielded);
-        self.add_use(zero_const, is_yielded);
 
         // payload = step >> 2 (arithmetic shift preserves sign)
         let two_const = self.create_value(
@@ -10731,8 +10652,6 @@ impl SsaBuilder {
                 right: two_const,
             },
         );
-        self.add_use(step_val, payload_val);
-        self.add_use(two_const, payload_val);
 
         // Build Some(payload) and None unconditionally, then Select
         // between them. Avoids splitting the basic block for a
@@ -10757,7 +10676,6 @@ impl SsaBuilder {
                 value: payload_val,
             },
         );
-        self.add_use(payload_val, some_val);
 
         // None has no payload — feed an i64 zero constant
         // (CreateUnion's `value` slot accepts any HirId, and an
@@ -10778,7 +10696,6 @@ impl SsaBuilder {
                 value: unit_val,
             },
         );
-        self.add_use(unit_val, none_val);
 
         let result = self.create_value(option_hir_ty.clone(), HirValueKind::Instruction);
         self.add_instruction(
@@ -10791,9 +10708,6 @@ impl SsaBuilder {
                 false_val: none_val,
             },
         );
-        self.add_use(is_yielded, result);
-        self.add_use(some_val, result);
-        self.add_use(none_val, result);
 
         Ok(result)
     }
@@ -10870,7 +10784,6 @@ impl SsaBuilder {
                 is_tail: false,
             },
         );
-        self.add_use(receiver_val, packed_val);
 
         // present = packed & 1
         let one_const = self.create_value(
@@ -10888,8 +10801,6 @@ impl SsaBuilder {
                 right: one_const,
             },
         );
-        self.add_use(packed_val, present_val);
-        self.add_use(one_const, present_val);
 
         // is_present = (present == 1)
         let is_present = self.create_value(HirType::Bool, HirValueKind::Instruction);
@@ -10903,8 +10814,6 @@ impl SsaBuilder {
                 right: one_const,
             },
         );
-        self.add_use(present_val, is_present);
-        self.add_use(one_const, is_present);
 
         // payload = packed >> 3   (string pointer for Message variant)
         let three_const = self.create_value(
@@ -10922,8 +10831,6 @@ impl SsaBuilder {
                 right: three_const,
             },
         );
-        self.add_use(packed_val, payload_i64);
-        self.add_use(three_const, payload_i64);
 
         // Construct `FiberError<String>{ payload: <string-ptr> }`.
         // Strings round-trip as `HirType::Ptr(I8)` in the HIR
@@ -10934,7 +10841,7 @@ impl SsaBuilder {
         let payload_field = self.arena.lock().unwrap().intern_string("payload");
         let fiber_error_hir = HirType::Struct(crate::hir::HirStructType {
             name: Some(fiber_error_struct),
-            fields: vec![string_hir.clone()],
+            fields: vec![string_hir.clone()].into(),
             packed: false,
         });
         let _ = payload_field; // field-name interning kept for clarity
@@ -10956,8 +10863,6 @@ impl SsaBuilder {
                 indices: vec![0],
             },
         );
-        self.add_use(fiber_error_undef, fiber_error_val);
-        self.add_use(payload_i64, fiber_error_val);
 
         // Wrap in Option<FiberError<String>>. Build the union type
         // directly here — the parser leaves `MethodCall`'s expr.ty
@@ -11000,7 +10905,6 @@ impl SsaBuilder {
                 value: fiber_error_val,
             },
         );
-        self.add_use(fiber_error_val, some_val);
 
         let zero_const = self.create_value(
             HirType::I64,
@@ -11016,7 +10920,6 @@ impl SsaBuilder {
                 value: zero_const,
             },
         );
-        self.add_use(zero_const, none_val);
 
         let result = self.create_value(option_hir.clone(), HirValueKind::Instruction);
         self.add_instruction(
@@ -11029,9 +10932,6 @@ impl SsaBuilder {
                 false_val: none_val,
             },
         );
-        self.add_use(is_present, result);
-        self.add_use(some_val, result);
-        self.add_use(none_val, result);
 
         Ok(result)
     }
@@ -11197,7 +11097,6 @@ impl SsaBuilder {
                 operand: value,
             },
         );
-        self.add_use(value, result);
         result
     }
 
@@ -11232,7 +11131,6 @@ impl SsaBuilder {
                 op,
             },
         );
-        self.add_use(vector_val, result);
         Ok(result)
     }
 
@@ -11295,8 +11193,6 @@ impl SsaBuilder {
                 right,
             },
         );
-        self.add_use(left, result);
-        self.add_use(right, result);
         result
     }
 
@@ -11406,9 +11302,6 @@ impl SsaBuilder {
                 false_val,
             },
         );
-        self.add_use(condition, result);
-        self.add_use(true_val, result);
-        self.add_use(false_val, result);
         result
     }
 
@@ -11431,9 +11324,7 @@ impl SsaBuilder {
                 is_tail: false,
             },
         );
-        for a in args {
-            self.add_use(a, result);
-        }
+        for a in args {}
         result
     }
 
@@ -11708,7 +11599,6 @@ impl SsaBuilder {
                 volatile: false,
             },
         );
-        self.add_use(ptr, result);
         result
     }
 
@@ -11745,8 +11635,6 @@ impl SsaBuilder {
                 indices: vec![bytes],
             },
         );
-        self.add_use(base, result);
-        self.add_use(bytes, result);
         result
     }
 
@@ -11765,8 +11653,6 @@ impl SsaBuilder {
                 indices: vec![index],
             },
         );
-        self.add_use(data, result);
-        self.add_use(index, result);
         result
     }
 
@@ -12281,7 +12167,6 @@ impl SsaBuilder {
                 is_tail: false,
             },
         );
-        self.add_use(operand, result);
         Ok(result)
     }
 
@@ -12318,9 +12203,6 @@ impl SsaBuilder {
                 rhs_unsigned,
             },
         );
-        self.add_use(acc, result);
-        self.add_use(a, result);
-        self.add_use(b, result);
         Ok(result)
     }
 
@@ -12354,9 +12236,6 @@ impl SsaBuilder {
                 is_tail: false,
             },
         );
-        self.add_use(a, result);
-        self.add_use(b, result);
-        self.add_use(c, result);
         Ok(result)
     }
 
@@ -12439,7 +12318,6 @@ impl SsaBuilder {
                         right: size_const,
                     },
                 );
-                self.add_use(n, byte_count);
                 let result = self.create_value(ptr_ty, HirValueKind::Instruction);
                 self.add_instruction(
                     block_id,
@@ -12452,7 +12330,6 @@ impl SsaBuilder {
                         is_tail: false,
                     },
                 );
-                self.add_use(byte_count, result);
                 Ok(Some(result))
             }
             // `vload_<vec>(p)` — aligned/unaligned SIMD load. The result
@@ -12483,7 +12360,6 @@ impl SsaBuilder {
                         align: 1,
                     },
                 );
-                self.add_use(ptr, result);
                 Ok(Some(result))
             }
             _ if name.starts_with("vstore") => {
@@ -12531,7 +12407,6 @@ impl SsaBuilder {
                 operand,
             },
         );
-        self.add_use(operand, result);
         Ok(result)
     }
 
@@ -12559,8 +12434,6 @@ impl SsaBuilder {
                 right,
             },
         );
-        self.add_use(left, result);
-        self.add_use(right, result);
         Ok(result)
     }
 
@@ -12585,7 +12458,6 @@ impl SsaBuilder {
                 lane,
             },
         );
-        self.add_use(vector_val, result);
         Ok(result)
     }
 
@@ -12618,8 +12490,6 @@ impl SsaBuilder {
                 lane,
             },
         );
-        self.add_use(vector_val, result);
-        self.add_use(scalar, result);
         Ok(result)
     }
 
@@ -12659,7 +12529,6 @@ impl SsaBuilder {
                 scalar,
             },
         );
-        self.add_use(scalar, result);
         Ok(result)
     }
 
@@ -12724,8 +12593,6 @@ impl SsaBuilder {
                 right,
             },
         );
-        self.add_use(left, result);
-        self.add_use(right, result);
         Ok(Some(result))
     }
 
@@ -12829,8 +12696,6 @@ impl SsaBuilder {
                             lane: lane as u8,
                         },
                     );
-                    self.add_use(acc, next);
-                    self.add_use(scalar, next);
                     acc = next;
                 }
                 Ok(Some(acc))
@@ -13012,7 +12877,7 @@ impl SsaBuilder {
 
                 HirType::Struct(HirStructType {
                     name: None,
-                    fields: hir_fields,
+                    fields: hir_fields.into(),
                     packed: false,
                 })
             }
@@ -13145,7 +13010,7 @@ impl SsaBuilder {
 
                         return HirType::Struct(HirStructType {
                             name: Some(type_def.name),
-                            fields: hir_fields,
+                            fields: hir_fields.into(),
                             packed: false,
                         });
                     }
@@ -13163,14 +13028,14 @@ impl SsaBuilder {
                     if type_def.metadata.is_reference {
                         return HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
                             name: Some(type_def.name),
-                            fields: hir_fields,
+                            fields: hir_fields.into(),
                             packed: false,
                         })));
                     }
 
                     HirType::Struct(HirStructType {
                         name: Some(type_def.name),
-                        fields: hir_fields,
+                        fields: hir_fields.into(),
                         packed: false,
                     })
                 } else {
@@ -13209,7 +13074,7 @@ impl SsaBuilder {
 
                         return HirType::Struct(HirStructType {
                             name: Some(type_def.name),
-                            fields: hir_fields,
+                            fields: hir_fields.into(),
                             packed: false,
                         });
                     }
@@ -13231,14 +13096,14 @@ impl SsaBuilder {
                     if type_def.metadata.is_reference {
                         return HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
                             name: Some(type_def.name),
-                            fields: hir_fields,
+                            fields: hir_fields.into(),
                             packed: false,
                         })));
                     }
 
                     HirType::Struct(HirStructType {
                         name: Some(type_def.name),
-                        fields: hir_fields,
+                        fields: hir_fields.into(),
                         packed: false,
                     })
                 } else if let Some(prim) = name
@@ -13587,8 +13452,6 @@ impl SsaBuilder {
         };
 
         self.add_instruction(block_id, inst);
-        self.add_use(left_val, result.unwrap_or(left_val));
-        self.add_use(right_val, result.unwrap_or(right_val));
 
         Ok(Some(
             result.unwrap_or_else(|| self.create_undef(HirType::Void)),
@@ -13697,7 +13560,6 @@ impl SsaBuilder {
         };
 
         self.add_instruction(block_id, inst);
-        self.add_use(operand_val, result.unwrap_or(operand_val));
 
         Ok(Some(
             result.unwrap_or_else(|| self.create_undef(HirType::Void)),
@@ -14265,7 +14127,6 @@ impl SsaBuilder {
                             volatile: false,
                         },
                     );
-                    self.add_use(value, ptr);
                     return Ok(value);
                 }
                 // Check if this is an address-taken variable - store to stack slot
@@ -14327,8 +14188,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, inst);
-                self.add_use(ptr, value);
-                self.add_use(value, value); // Value uses itself
 
                 Ok(value)
             }
@@ -14402,8 +14261,6 @@ impl SsaBuilder {
                                     indices: vec![offset_id],
                                 },
                             );
-                            self.add_use(object_val, gep_id);
-                            self.add_use(offset_id, gep_id);
 
                             let field_ptr = self.create_value(
                                 HirType::Ptr(std::sync::Arc::new(field_ty.clone())),
@@ -14418,7 +14275,6 @@ impl SsaBuilder {
                                     operand: gep_id,
                                 },
                             );
-                            self.add_use(gep_id, field_ptr);
 
                             // Match the slot's declared width: an integer
                             // literal types as i32, and storing that into an
@@ -14434,7 +14290,6 @@ impl SsaBuilder {
                                     volatile: false,
                                 },
                             );
-                            self.add_use(field_ptr, value);
                             // No write-back to the variable: the heap
                             // pointer is unchanged, only the storage at
                             // the pointee was mutated.
@@ -14467,8 +14322,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, inst);
-                self.add_use(object_val, result);
-                self.add_use(value, result);
 
                 // `InsertValue` builds a NEW aggregate, so the result has
                 // to reach whatever holds the object or the write is
@@ -14585,8 +14438,6 @@ impl SsaBuilder {
                         };
 
                         self.add_instruction(block_id, cmp_inst);
-                        self.add_use(index_val, cond_result);
-                        self.add_use(size_hir, cond_result);
 
                         // BACKEND INTEGRATION: The comparison result can be used by backends
                         // for bounds checking optimization:
@@ -14639,7 +14490,6 @@ impl SsaBuilder {
                             volatile: false,
                         },
                     );
-                    self.add_use(array_val, data_ptr);
                     data_ptr
                 } else {
                     array_val
@@ -14657,8 +14507,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, gep_inst);
-                self.add_use(gep_base, ptr);
-                self.add_use(index_val, ptr);
 
                 // Store the value at the computed address, at the width
                 // the element has rather than the one the value arrived
@@ -14675,8 +14523,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, store_inst);
-                self.add_use(ptr, value);
-                self.add_use(value, value);
 
                 Ok(())
             }
@@ -15232,7 +15078,7 @@ impl SsaBuilder {
         } else {
             HirType::Struct(crate::hir::HirStructType {
                 name: None,
-                fields: payload_hir_types.clone(),
+                fields: payload_hir_types.clone().into(),
                 packed: false,
             })
         };
@@ -15246,7 +15092,6 @@ impl SsaBuilder {
                 variant_index,
             },
         );
-        self.add_use(scrutinee_val, payload_val);
 
         let mut field_values = Vec::with_capacity(field_patterns.len());
         for (index, field_ty) in payload_hir_types.iter().enumerate() {
@@ -15263,7 +15108,6 @@ impl SsaBuilder {
                         ty: field_ty.clone(),
                     },
                 );
-                self.add_use(payload_val, field_val);
                 field_values.push(field_val);
             }
         }
@@ -15383,7 +15227,6 @@ impl SsaBuilder {
                 union_val: scrutinee_val,
             },
         );
-        self.add_use(scrutinee_val, tag_val);
         let expected_val = self.create_value(
             HirType::U32,
             HirValueKind::Constant(crate::hir::HirConstant::U32(variant_index)),
@@ -15399,8 +15242,6 @@ impl SsaBuilder {
                 right: expected_val,
             },
         );
-        self.add_use(tag_val, tag_matches);
-        self.add_use(expected_val, tag_matches);
         tag_matches
     }
 
@@ -15530,8 +15371,6 @@ impl SsaBuilder {
                         };
 
                         self.add_instruction(block_id, or_inst);
-                        self.add_use(prev_result, or_result);
-                        self.add_use(sub_result, or_result);
 
                         or_result
                     } else {
@@ -15582,7 +15421,6 @@ impl SsaBuilder {
                     };
 
                     self.add_instruction(block_id, gep_inst);
-                    self.add_use(scrutinee_val, elem_ptr);
 
                     // Load element value
                     let elem_val = self
@@ -15596,7 +15434,6 @@ impl SsaBuilder {
                     };
 
                     self.add_instruction(block_id, load_inst);
-                    self.add_use(elem_ptr, elem_val);
 
                     // Test pattern against element
                     let elem_test =
@@ -15615,8 +15452,6 @@ impl SsaBuilder {
                         };
 
                         self.add_instruction(block_id, and_inst);
-                        self.add_use(prev_result, and_result);
-                        self.add_use(elem_test, and_result);
 
                         and_result
                     } else {
@@ -15667,8 +15502,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, ge_inst);
-                self.add_use(scrutinee_val, ge_result);
-                self.add_use(start_val, ge_result);
 
                 // Get end literal value
                 let end_val = self.translate_literal_pattern_to_value(end)?;
@@ -15690,8 +15523,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, le_inst);
-                self.add_use(scrutinee_val, le_result);
-                self.add_use(end_val, le_result);
 
                 // AND both conditions
                 let final_result = self.create_value(HirType::Bool, HirValueKind::Instruction);
@@ -15704,8 +15535,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, and_inst);
-                self.add_use(ge_result, final_result);
-                self.add_use(le_result, final_result);
 
                 Ok(final_result)
             }
@@ -15728,7 +15557,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, load_inst);
-                self.add_use(scrutinee_val, deref_val);
 
                 // Test inner pattern on dereferenced value
                 self.translate_pattern_test(block_id, inner_pattern, deref_val, &inner_pattern.ty)
@@ -15854,8 +15682,6 @@ impl SsaBuilder {
         };
 
         self.add_instruction(block_id, cmp_inst);
-        self.add_use(scrutinee_val, cmp_result);
-        self.add_use(lit_val, cmp_result);
 
         Ok(cmp_result)
     }
@@ -15909,7 +15735,6 @@ impl SsaBuilder {
             };
 
             self.add_instruction(block_id, extract_inst);
-            self.add_use(scrutinee_val, elem_val);
 
             // Test pattern against element
             let elem_test = self.translate_pattern_test(block_id, pattern, elem_val, elem_ty)?;
@@ -15926,8 +15751,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, and_inst);
-                self.add_use(prev_result, and_result);
-                self.add_use(elem_test, and_result);
 
                 and_result
             } else {
@@ -15997,7 +15820,6 @@ impl SsaBuilder {
             };
 
             self.add_instruction(block_id, extract_inst);
-            self.add_use(scrutinee_val, field_val);
 
             // Recursively test the field pattern
             let field_test = self.translate_pattern_test(
@@ -16019,8 +15841,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, and_inst);
-                self.add_use(prev_result, and_result);
-                self.add_use(field_test, and_result);
 
                 and_result
             } else {
@@ -16131,7 +15951,6 @@ impl SsaBuilder {
                 union_val: scrutinee_val,
             },
         );
-        self.add_use(scrutinee_val, tag_val);
         let expected_val = self.create_value(
             HirType::U32,
             HirValueKind::Constant(crate::hir::HirConstant::U32(variant_index)),
@@ -16145,8 +15964,6 @@ impl SsaBuilder {
             right: expected_val,
         };
         self.add_instruction(block_id, tag_cmp_inst);
-        self.add_use(tag_val, tag_matches);
-        self.add_use(expected_val, tag_matches);
         if field_patterns.is_empty() {
             return Ok(tag_matches);
         }
@@ -16160,7 +15977,7 @@ impl SsaBuilder {
         } else {
             HirType::Struct(crate::hir::HirStructType {
                 name: None,
-                fields: payload_hir_types.clone(),
+                fields: payload_hir_types.clone().into(),
                 packed: false,
             })
         };
@@ -16174,7 +15991,6 @@ impl SsaBuilder {
                 variant_index,
             },
         );
-        self.add_use(scrutinee_val, payload_val);
         let mut field_result = None;
         for (index, (field_pattern, field_type)) in
             field_patterns.iter().zip(payload_types.iter()).enumerate()
@@ -16193,7 +16009,6 @@ impl SsaBuilder {
                         ty: field_ty,
                     },
                 );
-                self.add_use(payload_val, field_val);
                 field_val
             };
             let field_test =
@@ -16209,8 +16024,6 @@ impl SsaBuilder {
                 };
 
                 self.add_instruction(block_id, and_inst);
-                self.add_use(prev_result, and_result);
-                self.add_use(field_test, and_result);
                 and_result
             } else {
                 field_test
@@ -16227,8 +16040,6 @@ impl SsaBuilder {
             };
 
             self.add_instruction(block_id, final_and_inst);
-            self.add_use(tag_matches, final_result);
-            self.add_use(fields_match, final_result);
             Ok(final_result)
         } else {
             Ok(tag_matches)
@@ -16392,7 +16203,6 @@ impl SsaBuilder {
                     id: *param_id,
                     ty: param_ty.clone(),
                     kind: crate::hir::HirValueKind::Parameter(idx as u32),
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -16490,7 +16300,6 @@ impl SsaBuilder {
                             id: new_id,
                             ty: outer_value.ty.clone(),
                             kind: outer_value.kind.clone(),
-                            uses: Default::default(),
                             span: None,
                         },
                     );
@@ -16564,7 +16373,6 @@ impl SsaBuilder {
                                     kind: crate::hir::HirValueKind::Constant(default_const_for(
                                         &return_type,
                                     )),
-                                    uses: Default::default(),
                                     span: None,
                                 },
                             );
@@ -16682,7 +16490,6 @@ impl SsaBuilder {
                         id: val_id,
                         ty: result_ty.clone(),
                         kind: crate::hir::HirValueKind::Constant(constant),
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -16710,7 +16517,6 @@ impl SsaBuilder {
                                 id: val_id,
                                 ty: outer_value.ty.clone(),
                                 kind: outer_value.kind.clone(),
-                                uses: Default::default(),
                                 span: None,
                             },
                         );
@@ -16726,7 +16532,6 @@ impl SsaBuilder {
                         id: val_id,
                         ty: result_ty.clone(),
                         kind: crate::hir::HirValueKind::Undef,
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -16767,7 +16572,6 @@ impl SsaBuilder {
                         id: result_id,
                         ty: result_ty.clone(),
                         kind: crate::hir::HirValueKind::Instruction,
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -16792,7 +16596,6 @@ impl SsaBuilder {
                         id: val_id,
                         ty: result_ty.clone(),
                         kind: crate::hir::HirValueKind::Constant(crate::hir::HirConstant::I32(0)),
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -16829,7 +16632,7 @@ impl SsaBuilder {
 
         let env_struct_ty = HirType::Struct(crate::hir::HirStructType {
             name: None, // Anonymous environment struct
-            fields: env_field_types.clone(),
+            fields: env_field_types.clone().into(),
             packed: false,
         });
 
@@ -16873,8 +16676,6 @@ impl SsaBuilder {
             };
 
             self.add_instruction(block_id, insert_inst);
-            self.add_use(env_ptr_result, updated_env);
-            self.add_use(value_to_store, updated_env);
         }
 
         // Return environment pointer
@@ -16912,29 +16713,40 @@ impl SsaForm {
             }
         }
 
-        // Each use should have a definition (or be a constant/parameter):
-        // a use's definition is the last value, in value order, whose
-        // recorded uses name it.
+        // Each value an instruction, phi or terminator reads is defined in
+        // the body or is a constant, parameter, undef or global. Keyed by
+        // the value read, with what reads it.
         let mut use_def: crate::hir::IdMap<HirId, HirId> = crate::hir::IdMap::default();
-        for (value_id, value) in &self.function.values {
-            for &use_id in &value.uses {
-                use_def.insert(use_id, *value_id);
+        for block in self.function.blocks.values() {
+            for phi in &block.phis {
+                for (value, _) in &phi.incoming {
+                    use_def.entry(*value).or_insert(phi.result);
+                }
             }
+            for inst in &block.instructions {
+                let user = inst.get_result().unwrap_or(block.id);
+                inst.for_each_operand(|value| {
+                    use_def.entry(value).or_insert(user);
+                });
+            }
+            block.terminator.for_each_operand(|value| {
+                use_def.entry(value).or_insert(block.id);
+            });
         }
-        for (use_id, def_id) in &use_def {
+        for (def_id, use_id) in &use_def {
             if !defined_values.contains(def_id) {
-                // Check if it's a constant or parameter (self-defining values)
-                if let Some(value) = self.function.values.get(def_id) {
-                    match value.kind {
+                // Constants, parameters, undefs and globals define
+                // themselves; an operand naming no value of this function
+                // (a closure's function, a handler's block) is not a value.
+                match self.function.values.get(def_id).map(|v| &v.kind) {
+                    Some(
                         HirValueKind::Constant(_)
                         | HirValueKind::Parameter(_)
                         | HirValueKind::Undef
-                        | HirValueKind::Global(_) => {
-                            // These are self-defining, so it's OK
-                            continue;
-                        }
-                        _ => {}
-                    }
+                        | HirValueKind::Global(_),
+                    )
+                    | None => continue,
+                    Some(HirValueKind::Instruction) => {}
                 }
 
                 if std::env::var("ZYNTAX_TRACE_SSA_VALIDATE").is_ok() {

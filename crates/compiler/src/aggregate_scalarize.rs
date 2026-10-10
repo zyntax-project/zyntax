@@ -162,7 +162,7 @@ fn struct_of(func: &HirFunction, id: HirId) -> Option<(HirType, Vec<HirType>)> {
         HirType::Struct(st)
             if !st.fields.is_empty() && !crate::abi::is_growable_list_header(st) =>
         {
-            Some((ty.clone(), st.fields.clone()))
+            Some((ty.clone(), st.fields.to_vec()))
         }
         _ => None,
     }
@@ -576,7 +576,6 @@ fn new_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
             id,
             ty,
             kind,
-            uses: Default::default(),
             span: None,
         },
     );

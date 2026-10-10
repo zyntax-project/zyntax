@@ -36,7 +36,6 @@ pub fn aggregate_carrying_loop() -> (HirFunction, HirId) {
             id: body_param,
             ty: producer_ty.clone(),
             kind: HirValueKind::Parameter(1),
-            uses: Default::default(),
             span: None,
         },
     );
@@ -46,7 +45,6 @@ pub fn aggregate_carrying_loop() -> (HirFunction, HirId) {
             id: phi_body,
             ty: producer_ty.clone(),
             kind: HirValueKind::Instruction,
-            uses: Default::default(),
             span: None,
         },
     );
@@ -106,7 +104,6 @@ pub fn counted_loop() -> (HirFunction, HirId) {
             id: n_id,
             ty: i32_ty.clone(),
             kind: HirValueKind::Parameter(0),
-            uses: Default::default(),
             span: None,
         },
     );
@@ -117,7 +114,6 @@ pub fn counted_loop() -> (HirFunction, HirId) {
                 id,
                 ty: i32_ty.clone(),
                 kind: HirValueKind::Constant(HirConstant::I32(v)),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -129,7 +125,6 @@ pub fn counted_loop() -> (HirFunction, HirId) {
                 id,
                 ty: i32_ty.clone(),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -140,7 +135,6 @@ pub fn counted_loop() -> (HirFunction, HirId) {
             id: cmp_id,
             ty: HirType::Bool,
             kind: HirValueKind::Instruction,
-            uses: Default::default(),
             span: None,
         },
     );
@@ -313,7 +307,6 @@ pub fn flagged_counted_loop() -> (HirFunction, HirId) {
             id: n_id,
             ty: i32_ty.clone(),
             kind: HirValueKind::Parameter(0),
-            uses: Default::default(),
             span: None,
         },
     );
@@ -332,7 +325,6 @@ pub fn flagged_counted_loop() -> (HirFunction, HirId) {
                 id,
                 ty: i32_ty.clone(),
                 kind: HirValueKind::Constant(HirConstant::I32(v)),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -352,7 +344,6 @@ pub fn flagged_counted_loop() -> (HirFunction, HirId) {
                 id,
                 ty: i32_ty.clone(),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -364,7 +355,6 @@ pub fn flagged_counted_loop() -> (HirFunction, HirId) {
                 id,
                 ty: HirType::Bool,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );

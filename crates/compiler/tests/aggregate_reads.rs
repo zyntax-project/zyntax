@@ -13,7 +13,7 @@ fn fixture(call: bool) -> (HirModule, HirId) {
     let scalar_ptr = HirType::Ptr(std::sync::Arc::new(HirType::I64));
     let pair = HirType::Struct(HirStructType {
         name: None,
-        fields: vec![HirType::I64, HirType::I64],
+        fields: vec![HirType::I64, HirType::I64].into(),
         packed: false,
     });
     for (i, ty) in [

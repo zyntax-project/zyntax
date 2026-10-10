@@ -1587,7 +1587,6 @@ impl AsyncCompiler {
                 id: size_const_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(HirConstant::I64(state_machine_size)),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1600,7 +1599,6 @@ impl AsyncCompiler {
                 id: sm_ptr_id,
                 ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1622,7 +1620,6 @@ impl AsyncCompiler {
                 id: state_const_id,
                 ty: HirType::U32,
                 kind: HirValueKind::Constant(HirConstant::U32(0)),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1673,7 +1670,6 @@ impl AsyncCompiler {
                         id: param_value_id,
                         ty: param_ty.clone(),
                         kind: HirValueKind::Parameter(*param_idx as u32),
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -1686,7 +1682,6 @@ impl AsyncCompiler {
                         id: offset_const_id,
                         ty: HirType::I64,
                         kind: HirValueKind::Constant(HirConstant::I64(current_offset)),
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -1699,7 +1694,6 @@ impl AsyncCompiler {
                         id: field_ptr,
                         ty: HirType::Ptr(std::sync::Arc::new(param_ty.clone())),
                         kind: HirValueKind::Instruction,
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -1845,7 +1839,6 @@ impl AsyncCompiler {
                             id: const_value_id,
                             ty: capture.ty.clone(),
                             kind: HirValueKind::Constant(constant.clone()),
-                            uses: Default::default(),
                             span: None,
                         },
                     );
@@ -1858,7 +1851,6 @@ impl AsyncCompiler {
                             id: offset_const_id,
                             ty: HirType::I64,
                             kind: HirValueKind::Constant(HirConstant::I64(current_offset)),
-                            uses: Default::default(),
                             span: None,
                         },
                     );
@@ -1871,7 +1863,6 @@ impl AsyncCompiler {
                             id: field_ptr,
                             ty: HirType::Ptr(std::sync::Arc::new(capture.ty.clone())),
                             kind: HirValueKind::Instruction,
-                            uses: Default::default(),
                             span: None,
                         },
                     );
@@ -1921,7 +1912,6 @@ impl AsyncCompiler {
                 id: poll_fn_ptr_id,
                 ty: poll_fn_ptr_ty.clone(),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1945,7 +1935,8 @@ impl AsyncCompiler {
                     lifetime_params: vec![],
                     is_variadic: false,
                 })), // poll_fn
-            ],
+            ]
+            .into(),
             packed: false,
         });
 
@@ -1957,7 +1948,6 @@ impl AsyncCompiler {
                 id: promise_size_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(HirConstant::I64(16)),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1969,7 +1959,6 @@ impl AsyncCompiler {
                 id: promise_ptr_id,
                 ty: HirType::Ptr(std::sync::Arc::new(promise_type.clone())),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1998,7 +1987,6 @@ impl AsyncCompiler {
                 id: offset_8_id,
                 ty: HirType::I64,
                 kind: HirValueKind::Constant(HirConstant::I64(8)),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2010,7 +1998,6 @@ impl AsyncCompiler {
                 id: poll_fn_ptr_offset_id,
                 ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -2178,7 +2165,6 @@ impl AsyncCompiler {
                     id: capture.id,
                     ty: capture.ty.clone(),
                     kind: HirValueKind::Instruction,
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -2244,7 +2230,6 @@ impl AsyncCompiler {
                                                     id: *v,
                                                     ty: phi_ty,
                                                     kind: HirValueKind::Instruction,
-                                                    uses: Default::default(),
                                                     span: None,
                                                 },
                                             );
@@ -2425,7 +2410,6 @@ impl AsyncCompiler {
                         id: capture.id,
                         ty: capture.ty.clone(),
                         kind: HirValueKind::Instruction,
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -3006,7 +2990,7 @@ impl AsyncCompiler {
 
         HirType::Struct(HirStructType {
             name: Some(arena.intern_string("AsyncStateMachine")),
-            fields,
+            fields: fields.into(),
             packed: false,
         })
     }
@@ -3046,7 +3030,6 @@ impl AsyncCompiler {
                 id: out_ptr_id,
                 ty: out_ptr_ty.clone(),
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3059,7 +3042,6 @@ impl AsyncCompiler {
                 id: state_const_id,
                 ty: HirType::U32,
                 kind: HirValueKind::Constant(HirConstant::U32(0)),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -3088,7 +3070,6 @@ impl AsyncCompiler {
                         id: param_value_id,
                         ty: param.ty.clone(),
                         kind: HirValueKind::Parameter((idx + 1) as u32), // +1 for sret
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -3101,7 +3082,6 @@ impl AsyncCompiler {
                         id: offset_const_id,
                         ty: HirType::I64,
                         kind: HirValueKind::Constant(HirConstant::I64(current_offset)),
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -3114,7 +3094,6 @@ impl AsyncCompiler {
                         id: field_ptr,
                         ty: HirType::Ptr(std::sync::Arc::new(param.ty.clone())),
                         kind: HirValueKind::Instruction,
-                        uses: Default::default(),
                         span: None,
                     },
                 );
@@ -3239,11 +3218,11 @@ impl HirType {
         result_type: HirType,
         arena: &mut zyntax_typed_ast::arena::AstArena,
     ) -> Self {
-        HirType::Generic {
-            base: Box::new(HirType::Opaque(arena.intern_string("Future"))),
+        HirType::Generic(Box::new(crate::hir::HirGenericType {
+            base: HirType::Opaque(arena.intern_string("Future")),
             type_args: vec![result_type],
             const_args: vec![],
-        }
+        }))
     }
 
     /// Create an async function type with arena support
@@ -3319,12 +3298,10 @@ mod tests {
         let mut arena = create_test_arena();
         let future_i32 = HirType::future_with_arena(HirType::I32, &mut arena);
         match future_i32 {
-            HirType::Generic {
-                base, type_args, ..
-            } => match base.as_ref() {
+            HirType::Generic(g) => match &g.base {
                 HirType::Opaque(_) => {
-                    assert_eq!(type_args.len(), 1);
-                    assert_eq!(type_args[0], HirType::I32);
+                    assert_eq!(g.type_args.len(), 1);
+                    assert_eq!(g.type_args[0], HirType::I32);
                 }
                 _ => panic!("Expected opaque base type"),
             },
@@ -3340,7 +3317,7 @@ mod tests {
             HirType::Function(func_ty) => {
                 assert_eq!(func_ty.params.len(), 1);
                 assert_eq!(func_ty.returns.len(), 1);
-                assert!(matches!(func_ty.returns[0], HirType::Generic { .. }));
+                assert!(matches!(func_ty.returns[0], HirType::Generic(_)));
             }
             _ => panic!("Expected function type"),
         }

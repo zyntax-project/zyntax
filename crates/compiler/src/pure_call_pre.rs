@@ -375,7 +375,6 @@ fn fresh_inst_value(func: &mut HirFunction, ty: &HirType) -> HirId {
             id,
             ty: ty.clone(),
             kind: HirValueKind::Instruction,
-            uses: Default::default(),
             span: None,
         },
     );
@@ -391,7 +390,6 @@ fn fresh_int_const(func: &mut HirFunction, ty: &HirType, v: i128) -> HirId {
             id,
             ty: ty.clone(),
             kind: HirValueKind::Constant(c),
-            uses: Default::default(),
             span: None,
         },
     );

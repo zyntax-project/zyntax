@@ -1772,9 +1772,7 @@ pub struct HirValue {
     pub id: HirId,
     pub ty: HirType,
     pub kind: HirValueKind,
-    /// Uses of this value for def-use chains
-    pub uses: IdHashSet<HirId>,
-    pub span: Option<Span>,
+    pub span: Option<Box<Span>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1827,7 +1825,7 @@ pub enum HirType {
 
     /// Reference type with lifetime
     Ref {
-        lifetime: HirLifetime,
+        lifetime: Box<HirLifetime>,
         pointee: Arc<HirType>,
         mutable: bool,
     },
@@ -1857,11 +1855,7 @@ pub enum HirType {
     ConstGeneric(InternedString),
 
     /// Type with const generic arguments
-    Generic {
-        base: Box<HirType>,
-        type_args: Vec<HirType>,
-        const_args: Vec<HirConstant>,
-    },
+    Generic(Box<HirGenericType>),
 
     /// Trait object type (dyn Trait)
     /// Represents a trait object with dynamic dispatch
@@ -1873,7 +1867,7 @@ pub enum HirType {
     /// Interface type (structural or nominal)
     /// Used for both Go-style structural interfaces and Java-style nominal interfaces
     Interface {
-        methods: Vec<HirMethodSignature>,
+        methods: Box<[HirMethodSignature]>,
         is_structural: bool, // true for duck-typing, false for nominal
     },
 
@@ -1965,7 +1959,7 @@ pub enum HirType {
     /// Used for effect inference and checking.
     EffectRow {
         /// Known effects in the row
-        effects: Vec<InternedString>,
+        effects: Box<[InternedString]>,
         /// Optional tail variable for open effect rows
         tail: Option<InternedString>,
     },
@@ -1974,8 +1968,16 @@ pub enum HirType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HirStructType {
     pub name: Option<InternedString>,
-    pub fields: Vec<HirType>,
+    pub fields: Box<[HirType]>,
     pub packed: bool,
+}
+
+/// A generic type applied to its arguments, before monomorphization.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HirGenericType {
+    pub base: HirType,
+    pub type_args: Vec<HirType>,
+    pub const_args: Vec<HirConstant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2106,7 +2108,7 @@ pub enum HirConstant {
     Struct(Vec<HirConstant>),
     String(InternedString),
     /// Virtual method table for trait dispatch
-    VTable(HirVTable),
+    VTable(Box<HirVTable>),
 }
 
 impl Eq for HirConstant {}
@@ -2864,7 +2866,6 @@ impl HirFunction {
             id: value_id,
             ty,
             kind,
-            uses: Default::default(),
             span: None,
         };
         self.values.insert(value_id, value);

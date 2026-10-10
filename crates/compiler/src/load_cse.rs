@@ -481,7 +481,7 @@ mod tests {
         let (mut f, entry) = mk_func();
         let ty = HirType::Struct(crate::hir::HirStructType {
             name: None,
-            fields: vec![HirType::I64; 3],
+            fields: vec![HirType::I64; 3].into(),
             packed: false,
         });
         let carrier = HirType::Ptr(std::sync::Arc::new(ty.clone()));
@@ -536,7 +536,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Parameter(idx),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -551,7 +550,6 @@ mod tests {
                 id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -769,7 +767,7 @@ mod tests {
             HirType::Ptr(std::sync::Arc::new(HirType::Struct(
                 crate::hir::HirStructType {
                     name: Some(InternedString::new_global(name)),
-                    fields: vec![HirType::I64],
+                    fields: vec![HirType::I64].into(),
                     packed: false,
                 },
             )))

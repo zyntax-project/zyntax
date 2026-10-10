@@ -154,22 +154,23 @@ fn test_const_generic_in_struct() {
         fields: vec![
             HirType::Array(std::sync::Arc::new(HirType::U8), 0), // Will be substituted with SIZE
             HirType::U64,                                        // Current position
-        ],
+        ]
+        .into(),
         packed: false,
     };
 
     // Create instance with SIZE=1024
-    let concrete_buffer = HirType::Generic {
-        base: Box::new(HirType::Struct(buffer_struct)),
+    let concrete_buffer = HirType::Generic(Box::new(HirGenericType {
+        base: HirType::Struct(buffer_struct),
         type_args: vec![],
         const_args: vec![HirConstant::U64(1024)],
-    };
+    }));
 
     // Verify the structure
     match &concrete_buffer {
-        HirType::Generic { const_args, .. } => {
-            assert_eq!(const_args.len(), 1);
-            assert_eq!(const_args[0], HirConstant::U64(1024));
+        HirType::Generic(g) => {
+            assert_eq!(g.const_args.len(), 1);
+            assert_eq!(g.const_args[0], HirConstant::U64(1024));
         }
         _ => panic!("Expected generic type"),
     }

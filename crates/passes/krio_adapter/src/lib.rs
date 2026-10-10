@@ -194,7 +194,6 @@ impl<'f> HirCoroCfg<'f> {
                 id: value_id,
                 ty,
                 kind: HirValueKind::Constant(constant),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -210,7 +209,6 @@ impl<'f> HirCoroCfg<'f> {
                 id: value_id,
                 ty,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1362,7 +1360,6 @@ mod tests {
                 id: result_id,
                 ty: HirType::I32,
                 kind: HirValueKind::Instruction,
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1406,7 +1403,6 @@ mod tests {
                 id: live,
                 ty: HirType::I32,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
@@ -1512,7 +1508,6 @@ mod tests {
                     id,
                     ty: HirType::I32,
                     kind: HirValueKind::Parameter(i as u32),
-                    uses: Default::default(),
                     span: None,
                 },
             );
@@ -1727,7 +1722,6 @@ mod tests {
                 id: live,
                 ty: HirType::I32,
                 kind: HirValueKind::Parameter(0),
-                uses: Default::default(),
                 span: None,
             },
         );
