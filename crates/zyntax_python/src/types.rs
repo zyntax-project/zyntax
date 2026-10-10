@@ -418,6 +418,8 @@ thread_local! {
     /// deriving from its owner.
     static EXPLICIT_METHODS: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::default());
+    /// Where [`Module::method_sig`] spells the name it looks up.
+    static METHOD_NAME: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     /// The tuple shapes of the program being compiled, by index. A
     /// shape is interned once and its index never changes, so a
     /// `Ty::Tuple` decided in one inference round names the same shape
@@ -2169,6 +2171,15 @@ impl Module {
     }
 }
 
+/// Whether `value`, a name or a chain of attributes on one, starts at
+/// the name of an imported module: only such a chain names a member.
+pub(crate) fn rooted_at_import(imports: &HashMap<String, String>, mut value: &py::Expr) -> bool {
+    while let py::Expr::Attribute(sub) = value {
+        value = &sub.value;
+    }
+    matches!(value, py::Expr::Name(m) if imports.contains_key(m.id.as_str()))
+}
+
 /// The type of what a module member evaluates to, or of what calling it
 /// returns.
 pub(crate) fn member_ty(member: crate::stdlib::Member) -> Ty {
@@ -2427,10 +2438,19 @@ impl Module {
     }
 
     /// The signature and function name of `method` as `k` sees it.
-    pub(crate) fn method_sig(&self, k: usize, method: &str) -> Option<(&Sig, String)> {
+    pub(crate) fn method_sig(&self, k: usize, method: &str) -> Option<(&Sig, &str)> {
         let owner = self.method_owner(k, method)?;
-        let name = method_fn(&self.classes[owner].name, method);
-        self.funcs.get(&name).map(|sig| (sig, name))
+        // Spelled as [`method_fn`] does, in a buffer kept for the lookup.
+        METHOD_NAME.with(|name| {
+            let mut name = name.borrow_mut();
+            name.clear();
+            name.push_str(&self.classes[owner].name);
+            name.push('$');
+            name.push_str(method);
+            self.funcs
+                .get_key_value(name.as_str())
+                .map(|(name, sig)| (sig, name.as_str()))
+        })
     }
 
     /// What a call of `method` on an instance of `k` returns: the join
@@ -2457,15 +2477,15 @@ impl Module {
     /// override selects for the same argument types.
     pub(crate) fn dispatched_instance_ret(&self, k: usize, method: &str, tys: &[Ty]) -> Option<Ty> {
         let (sig, name) = self.method_sig(k, method)?;
-        if self.instance(&name, sig, tys).is_none() {
+        if self.instance(name, sig, tys).is_none() {
             return self.dispatched_ret(k, method);
         }
-        let mut ret = self.instance_ret(&name, sig, tys);
+        let mut ret = self.instance_ret(name, sig, tys);
         for sub in self.overriders(k, method) {
             if let Some((sig, name)) = self.method_sig(sub, method)
                 && sig.params.len() == tys.len()
             {
-                ret = self.join_classes(ret, self.instance_ret(&name, sig, tys));
+                ret = self.join_classes(ret, self.instance_ret(name, sig, tys));
             }
         }
         Some(ret)
@@ -2514,11 +2534,16 @@ impl Module {
     /// that field's list through a receiver of no known class, since such
     /// a store may put anything in.
     pub(crate) fn denest(&self, field: &str, ty: Ty) -> Ty {
-        let lists = self.dynamic_fields.contains(field)
-            || self.dynamic_fields.contains(&lists_only_key(field));
+        if self.dynamic_fields.is_empty() {
+            return ty;
+        }
+        let lists = || {
+            self.dynamic_fields.contains(field)
+                || self.dynamic_fields.contains(&lists_only_key(field))
+        };
         match ty {
-            Ty::List(Elem::List(_)) if lists => Ty::List(Elem::Object),
-            Ty::MaybeList(Elem::List(_)) if lists => Ty::MaybeList(Elem::Object),
+            Ty::List(Elem::List(_)) if lists() => Ty::List(Elem::Object),
+            Ty::MaybeList(Elem::List(_)) if lists() => Ty::MaybeList(Elem::Object),
             Ty::List(Elem::Dict(_) | Elem::Set(_)) if self.dynamic_fields.contains(field) => {
                 Ty::List(Elem::Object)
             }
@@ -2595,12 +2620,8 @@ impl Module {
 
     /// The classes deriving from `owner` that define `method` themselves.
     pub(crate) fn overriders(&self, owner: usize, method: &str) -> Vec<usize> {
-        (0..self.classes.len())
-            .filter(|&c| {
-                c != owner
-                    && self.is_subclass(c, owner)
-                    && self.classes[c].methods.iter().any(|m| m == method)
-            })
+        (owner + 1..owner + self.classes[owner].descendants)
+            .filter(|&c| self.classes[c].methods.iter().any(|m| m == method))
             .collect()
     }
 
@@ -4239,7 +4260,7 @@ impl Calls<'_> {
                 let name = n.id.as_str();
                 if let Some(&k) = self.module.class_index.get(name) {
                     let (_, init) = self.module.method_sig(k, "__init__")?;
-                    return Some((Target::Item(init), 1));
+                    return Some((Target::Item(init.to_string()), 1));
                 }
                 if self.module.funcs.contains_key(name) {
                     return Some((Target::Item(name.to_string()), 0));
@@ -4268,18 +4289,18 @@ impl Calls<'_> {
                     return None;
                 };
                 let (_, name) = self.module.method_sig(c as usize, &info.method)?;
-                Some((Target::Item(name), 1))
+                Some((Target::Item(name.to_string()), 1))
             }
             py::Expr::Attribute(a) if is_super_call(&a.value) => {
                 let base = self.module.classes[self.class?].base?;
                 let (_, name) = self.module.method_sig(base, a.attr.as_str())?;
-                Some((Target::Item(name), 1))
+                Some((Target::Item(name.to_string()), 1))
             }
             // `Class.method(obj, ...)`: every argument, the receiver first.
             py::Expr::Attribute(a) if self.typer().class_named(&a.value).is_some() => {
                 let k = self.typer().class_named(&a.value)?;
                 let (_, name) = self.module.method_sig(k, a.attr.as_str())?;
-                Some((Target::Item(name), 0))
+                Some((Target::Item(name.to_string()), 0))
             }
             // A method on an instance of a known class: the class's
             // own; each overriding one is recorded beside it, since
@@ -4289,14 +4310,14 @@ impl Calls<'_> {
                     unreachable!()
                 };
                 let (_, name) = self.module.method_sig(k as usize, a.attr.as_str())?;
-                Some((Target::Item(name), 1))
+                Some((Target::Item(name.to_string()), 1))
             }
             // `instance(...)`: its class's `__call__`.
             other => match self.arg_ty(other) {
                 Ty::Class(k) if !matches!(other, py::Expr::Name(n) if self.module.class_index.contains_key(n.id.as_str())) =>
                 {
                     let (_, name) = self.module.method_sig(k as usize, "__call__")?;
-                    Some((Target::Item(name), 1))
+                    Some((Target::Item(name.to_string()), 1))
                 }
                 _ => self.closure_of(other).map(|k| (Target::Closure(k), 0)),
             },
@@ -4474,7 +4495,8 @@ impl Calls<'_> {
                         continue;
                     };
                     for (i, ty) in args.iter().enumerate() {
-                        self.passed.push((Target::Item(name.clone()), i + 1, *ty));
+                        self.passed
+                            .push((Target::Item(name.to_string()), i + 1, *ty));
                     }
                     if sig.params.len() == args.len() + 1 {
                         let mut tys = vec![sig.params[0].1];
@@ -4530,7 +4552,7 @@ impl Calls<'_> {
             return;
         };
         let ty = self.arg_ty(right);
-        self.passed.push((Target::Item(name.clone()), 1, ty));
+        self.passed.push((Target::Item(name.to_string()), 1, ty));
         if sig.params.len() == 2 {
             let this = sig.params[0].1;
             self.site(name, vec![this, ty]);
@@ -4608,20 +4630,20 @@ impl Calls<'_> {
             *slot = *declared;
         }
         if let Target::Item(name) = callee {
-            self.site(name, tys);
+            self.site(&name, tys);
         }
     }
 
     /// A call of an item with every argument typed: a signature an
     /// instance may be made for.
-    fn site(&mut self, name: String, tys: Vec<Ty>) {
+    fn site(&mut self, name: &str, tys: Vec<Ty>) {
         let Some(sites) = self.sites.as_deref_mut() else {
             return;
         };
         if self.opaque || tys.contains(&Ty::Unknown) {
             return;
         }
-        sites.push((name, tys));
+        sites.push((name.to_string(), tys));
     }
 }
 
@@ -4684,7 +4706,7 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
                     && let Some(&k) = self.module.class_index.get(n.id.as_str())
                     && let Some((_, name)) = self.module.method_sig(k, "__init__")
                 {
-                    self.record(Target::Item(name), 1, &[], &[]);
+                    self.record(Target::Item(name.to_string()), 1, &[], &[]);
                 }
                 walk_stmt(self, stmt);
             }
@@ -4775,7 +4797,7 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
                                     self.module.method_sig(sub, a.attr.as_str())
                                 {
                                     self.record(
-                                        Target::Item(name),
+                                        Target::Item(name.to_string()),
                                         1,
                                         &c.arguments.args,
                                         &c.arguments.keywords,
@@ -5516,6 +5538,9 @@ pub(crate) fn list_sites<'ast>(
             let py::Expr::Attribute(a) = e else {
                 return Vec::new();
             };
+            if !self.fields.contains(a.attr.as_str()) {
+                return Vec::new();
+            }
             let receiver = self.typer.expr(&a.value);
             if !matches!(receiver, Ty::Unknown | Ty::Object) {
                 return Vec::new();
@@ -5777,12 +5802,10 @@ pub(crate) fn list_sites<'ast>(
                         // does with the list what that method's parameter
                         // facts say. An overridden method is left opaque:
                         // the runtime receiver may select any override.
-                        py::Expr::Attribute(a)
-                            if c.arguments.keywords.is_empty()
-                                && matches!(self.typer.expr(&a.value), Ty::Class(_)) =>
-                        {
+                        py::Expr::Attribute(a) if c.arguments.keywords.is_empty() => {
                             let Ty::Class(k) = self.typer.expr(&a.value) else {
-                                unreachable!()
+                                walk_expr(self, expr);
+                                return;
                             };
                             let method = a.attr.as_str();
                             let callee = self
@@ -5799,7 +5822,7 @@ pub(crate) fn list_sites<'ast>(
                                         Some(name) => {
                                             self.site(&name)
                                                 .passed_to
-                                                .push((callee.clone(), i + 1));
+                                                .push((callee.to_string(), i + 1));
                                         }
                                         None => self.visit_expr(arg),
                                     }
@@ -7867,11 +7890,9 @@ impl Typer<'_> {
                     && let Some((sig, name)) = self.module.method_sig(k as usize, dunder_name(b.op))
                 {
                     if sig.params.len() == 2 {
-                        return self.module.instance_ret(
-                            &name,
-                            sig,
-                            &[Ty::Unknown, r.boxed_view()],
-                        );
+                        return self
+                            .module
+                            .instance_ret(name, sig, &[Ty::Unknown, r.boxed_view()]);
                     }
                     return sig.ret;
                 }
@@ -8175,6 +8196,9 @@ impl Typer<'_> {
         value: &py::Expr,
         attr: &str,
     ) -> Option<crate::stdlib::Member> {
+        if !rooted_at_import(&self.module.imports, value) {
+            return None;
+        }
         if let py::Expr::Attribute(sub) = value {
             return self.module_member_of(&sub.value, &format!("{}.{attr}", sub.attr.as_str()));
         }
@@ -8236,7 +8260,7 @@ impl Typer<'_> {
             && let Some(k) = self.class_named(&a.value)
         {
             return match self.module.method_sig(k, a.attr.as_str()) {
-                Some((sig, name)) => self.item_call_ret(&name, sig, 0, &c.arguments),
+                Some((sig, name)) => self.item_call_ret(name, sig, 0, &c.arguments),
                 None => Ty::Object,
             };
         }
@@ -8311,7 +8335,7 @@ impl Typer<'_> {
                     Some(Ty::Class(k)) => {
                         let base = self.module.classes[k as usize].base;
                         match base.and_then(|b| self.module.method_sig(b, a.attr.as_str())) {
-                            Some((sig, name)) => self.item_call_ret(&name, sig, 1, &c.arguments),
+                            Some((sig, name)) => self.item_call_ret(name, sig, 1, &c.arguments),
                             None => Ty::Object,
                         }
                     }

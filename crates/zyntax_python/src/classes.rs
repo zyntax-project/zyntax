@@ -406,7 +406,7 @@ pub(crate) fn raise_facts(
     for (k, class) in module.classes.iter().enumerate() {
         let mut constructor = crate::types::RaiseFact::default();
         if let Some((_, init)) = module.method_sig(k, "__init__") {
-            constructor.callees.insert(init);
+            constructor.callees.insert(init.to_string());
         }
         facts.insert(lower::new_name(&class.name), constructor);
         for method in &class.methods {
@@ -440,8 +440,8 @@ pub(crate) fn raise_facts(
                 fact.callees.insert(spec.name.clone());
                 for sub in module.overriders(k, method) {
                     if let Some((sig, name)) = module.method_sig(sub, method) {
-                        let instance = module.instance(&name, sig, &tys);
-                        let target = instance.map_or(name.as_str(), |s| s.name.as_str());
+                        let instance = module.instance(name, sig, &tys);
+                        let target = instance.map_or(name, |s| s.name.as_str());
                         let sig = instance.map_or(sig, |s| &s.sig);
                         fact.own |= sig.params.len() != tys.len()
                             || sig.params.iter().skip(1).zip(tys.iter().skip(1)).any(
@@ -710,7 +710,7 @@ fn constructor(module: &Module, k: usize, span: Span) -> TypedFunction {
             params.push(param(name, *ty, span));
             args.push(var(intern(name), *ty, span));
         }
-        statements.push(stmt(call(&fn_name, args, sig.ret, span), span));
+        statements.push(stmt(call(fn_name, args, sig.ret, span), span));
     }
     statements.push(ret(var(intern("obj"), Ty::Class(k as u16), span), span));
     function(
@@ -856,8 +856,8 @@ fn dispatcher(
             continue;
         }
         let (sub_sig, sub_fn) = module.method_sig(sub, method).expect("inherited method");
-        let sub_instance = instance.and_then(|_| module.instance(&sub_fn, sub_sig, &tys));
-        let sub_target = sub_instance.map_or(sub_fn.as_str(), |s| s.name.as_str());
+        let sub_instance = instance.and_then(|_| module.instance(sub_fn, sub_sig, &tys));
+        let sub_target = sub_instance.map_or(sub_fn, |s| s.name.as_str());
         let sub_sig = sub_instance.map_or(sub_sig, |s| &s.sig);
         // An override taking another number of arguments cannot be
         // called with these; the call fails as it would in Python.

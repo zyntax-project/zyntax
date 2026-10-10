@@ -6526,6 +6526,9 @@ impl<'m> Lowerer<'m> {
     /// The member `value.attr` names when `value` is an imported
     /// module's name that no variable shadows.
     fn module_member_of(&self, value: &py::Expr, attr: &str) -> Option<stdlib::Member> {
+        if !types::rooted_at_import(&self.module.imports, value) {
+            return None;
+        }
         // `os.path.join`: the submodule's member, named through it.
         if let py::Expr::Attribute(sub) = value {
             return self.module_member_of(&sub.value, &format!("{}.{attr}", sub.attr.as_str()));
@@ -13619,9 +13622,9 @@ impl<'m> Lowerer<'m> {
         // A constructor is never dispatched: it is called by its class.
         Some(
             if method == "__init__" || self.module.overriders(owner, method).is_empty() {
-                fn_name
+                fn_name.to_string()
             } else {
-                dispatch_name(&fn_name)
+                dispatch_name(fn_name)
             },
         )
     }
@@ -13698,8 +13701,8 @@ impl<'m> Lowerer<'m> {
         // whichever it reaches.
         if sig.ret == Ty::Gen && direct {
             let sig = sig.clone();
-            let started = self.start_generator(&fn_name, &sig, all, Vec::new(), span);
-            return Some((started, fn_name));
+            let started = self.start_generator(fn_name, &sig, all, Vec::new(), span);
+            return Some((started, fn_name.to_string()));
         }
         Some((
             Val {
@@ -13733,7 +13736,7 @@ impl<'m> Lowerer<'m> {
         tys.extend(args.iter().map(|a| a.ty));
         let instance = self
             .module
-            .instance(&fn_name, sig, &tys)
+            .instance(fn_name, sig, &tys)
             .map(|spec| (spec.name.clone(), spec.sig.clone()));
         let param_sig = instance.as_ref().map(|(_, s)| s).unwrap_or(sig);
         let param_tys: Vec<Ty> = param_sig.params.iter().skip(1).map(|(_, t)| *t).collect();
@@ -13841,7 +13844,7 @@ impl<'m> Lowerer<'m> {
                 span,
             ));
         };
-        let instance = self.pick_instance(&fn_name, sig, 1, args, keywords);
+        let instance = self.pick_instance(fn_name, sig, 1, args, keywords);
         let sig = match &instance {
             Some((_, spec_sig)) => without_self(spec_sig),
             None => without_self(sig),
@@ -13858,7 +13861,9 @@ impl<'m> Lowerer<'m> {
             .module
             .method_owner(k, method)
             .expect("the method was just found");
-        let fn_name = instance.map(|(name, _)| name).unwrap_or(fn_name);
+        let fn_name = instance
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| fn_name.to_string());
         let target = self.call_target(&fn_name, &sig.params, &lowered);
         let receiver = self.coerce(receiver, Ty::Class(owner as u16));
         let mut all = vec![receiver];
@@ -13951,8 +13956,8 @@ impl<'m> Lowerer<'m> {
             .method_sig(owner, method)
             .expect("the owner defines it");
         let (fn_name, sig) = self
-            .pick_instance(&fn_name, sig, 1, args, keywords)
-            .unwrap_or((fn_name, sig.clone()));
+            .pick_instance(fn_name, sig, 1, args, keywords)
+            .unwrap_or_else(|| (fn_name.to_string(), sig.clone()));
         let ret = sig.ret;
         let sig = without_self(&sig);
         let lowered = self.arguments(method, &sig, args, keywords, c)?;
