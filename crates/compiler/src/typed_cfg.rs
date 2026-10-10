@@ -374,7 +374,7 @@ impl TypedCfgBuilder {
                     all_blocks.push(TypedBasicBlock {
                         id: current_block_id,
                         label: None,
-                        statements: current_statements.clone(),
+                        statements: std::mem::take(&mut current_statements),
                         terminator: TypedTerminator::CondBranch {
                             condition: if_stmt.condition.clone(),
                             true_target: then_id,
@@ -483,7 +483,7 @@ impl TypedCfgBuilder {
                     all_blocks.push(TypedBasicBlock {
                         id: current_block_id,
                         label: None,
-                        statements: current_statements.clone(),
+                        statements: std::mem::take(&mut current_statements),
                         terminator: TypedTerminator::Jump(header_id),
                         pattern_check: None,
                     });
@@ -560,7 +560,7 @@ impl TypedCfgBuilder {
                             all_blocks.push(TypedBasicBlock {
                                 id: current_block_id,
                                 label: None,
-                                statements: current_statements.clone(),
+                                statements: std::mem::take(&mut current_statements),
                                 terminator: TypedTerminator::Jump(header_id),
                                 pattern_check: None,
                             });
@@ -616,7 +616,7 @@ impl TypedCfgBuilder {
                             all_blocks.push(TypedBasicBlock {
                                 id: current_block_id,
                                 label: None,
-                                statements: current_statements.clone(),
+                                statements: std::mem::take(&mut current_statements),
                                 terminator: TypedTerminator::Jump(header_id),
                                 pattern_check: None,
                             });
@@ -685,7 +685,7 @@ impl TypedCfgBuilder {
                             all_blocks.push(TypedBasicBlock {
                                 id: current_block_id,
                                 label: None,
-                                statements: current_statements.clone(),
+                                statements: std::mem::take(&mut current_statements),
                                 terminator: TypedTerminator::Jump(header_id),
                                 pattern_check: None,
                             });
@@ -771,7 +771,7 @@ impl TypedCfgBuilder {
                             all_blocks.push(TypedBasicBlock {
                                 id: current_block_id,
                                 label: None,
-                                statements: current_statements.clone(),
+                                statements: std::mem::take(&mut current_statements),
                                 terminator: TypedTerminator::Jump(header_id),
                                 pattern_check: None,
                             });
@@ -819,7 +819,7 @@ impl TypedCfgBuilder {
                             all_blocks.push(TypedBasicBlock {
                                 id: current_block_id,
                                 label: None,
-                                statements: current_statements.clone(),
+                                statements: std::mem::take(&mut current_statements),
                                 terminator: TypedTerminator::Jump(body_id),
                                 pattern_check: None,
                             });
@@ -1007,7 +1007,7 @@ impl TypedCfgBuilder {
                         all_blocks.push(TypedBasicBlock {
                             id: current_block_id,
                             label: None,
-                            statements: current_statements.clone(),
+                            statements: std::mem::take(&mut current_statements),
                             terminator: TypedTerminator::Jump(header_id),
                             pattern_check: None,
                         });
@@ -1091,7 +1091,7 @@ impl TypedCfgBuilder {
                     all_blocks.push(TypedBasicBlock {
                         id: current_block_id,
                         label: None,
-                        statements: current_statements.clone(),
+                        statements: std::mem::take(&mut current_statements),
                         terminator: TypedTerminator::Jump(header_id),
                         pattern_check: None,
                     });
@@ -1164,7 +1164,7 @@ impl TypedCfgBuilder {
                     all_blocks.push(TypedBasicBlock {
                         id: current_block_id,
                         label: None,
-                        statements: current_statements.clone(),
+                        statements: std::mem::take(&mut current_statements),
                         terminator: TypedTerminator::Jump(block_entry_id),
                         pattern_check: None,
                     });
@@ -1209,7 +1209,7 @@ impl TypedCfgBuilder {
                     all_blocks.push(TypedBasicBlock {
                         id: current_block_id,
                         label: None,
-                        statements: current_statements.clone(),
+                        statements: std::mem::take(&mut current_statements),
                         terminator: TypedTerminator::Jump(with_entry_id),
                         pattern_check: None,
                     });
@@ -1261,7 +1261,7 @@ impl TypedCfgBuilder {
                         all_blocks.push(TypedBasicBlock {
                             id: current_block_id,
                             label: None,
-                            statements: current_statements.clone(),
+                            statements: std::mem::take(&mut current_statements),
                             terminator: TypedTerminator::Jump(block_entry_id),
                             pattern_check: None,
                         });
@@ -1291,7 +1291,7 @@ impl TypedCfgBuilder {
                     all_blocks.push(TypedBasicBlock {
                         id: current_block_id,
                         label: None,
-                        statements: current_statements.clone(),
+                        statements: std::mem::take(&mut current_statements),
                         terminator: TypedTerminator::Jump(label_id),
                         pattern_check: None,
                     });
@@ -1305,7 +1305,7 @@ impl TypedCfgBuilder {
                     all_blocks.push(TypedBasicBlock {
                         id: current_block_id,
                         label: None,
-                        statements: current_statements.clone(),
+                        statements: std::mem::take(&mut current_statements),
                         terminator: TypedTerminator::Jump(label_id),
                         pattern_check: None,
                     });
@@ -1320,7 +1320,7 @@ impl TypedCfgBuilder {
                         all_blocks.push(TypedBasicBlock {
                             id: current_block_id,
                             label: None,
-                            statements: current_statements.clone(),
+                            statements: std::mem::take(&mut current_statements),
                             terminator: TypedTerminator::Jump(exit_id),
                             pattern_check: None,
                         });
@@ -1349,7 +1349,7 @@ impl TypedCfgBuilder {
                         all_blocks.push(TypedBasicBlock {
                             id: current_block_id,
                             label: None,
-                            statements: current_statements.clone(),
+                            statements: std::mem::take(&mut current_statements),
                             terminator: TypedTerminator::Jump(header_id),
                             pattern_check: None,
                         });
@@ -1390,7 +1390,7 @@ impl TypedCfgBuilder {
                     let first_pattern_id = self.new_block_id();
 
                     // Add the Match statement to the entry block so SSA can process it
-                    let mut entry_statements = current_statements.clone();
+                    let mut entry_statements = std::mem::take(&mut current_statements);
                     entry_statements.push(stmt.clone());
 
                     all_blocks.push(TypedBasicBlock {
@@ -1575,7 +1575,7 @@ impl TypedCfgBuilder {
                     all_blocks.push(TypedBasicBlock {
                         id: current_block_id,
                         label: None,
-                        statements: current_statements.clone(),
+                        statements: std::mem::take(&mut current_statements),
                         terminator: TypedTerminator::Return(expr.clone()),
                         pattern_check: None,
                     });
