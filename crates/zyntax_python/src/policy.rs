@@ -30,3 +30,6 @@ pub const POLICY: zyntax_builtins::Policy = zyntax_builtins::Policy {
 
 /// The name the library is imported under.
 pub const LIBRARY_MODULE: &str = zyntax_builtins::MODULE;
+
+/// The module variable holding the exception in flight, `None` when none.
+pub const PENDING: &str = "py$exc";

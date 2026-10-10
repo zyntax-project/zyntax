@@ -70,7 +70,16 @@ pub fn infer_module(module: &mut HirModule) -> PurityStats {
     for (id, func) in &module.functions {
         // External / declaration-only functions have no body we can
         // inspect — treat as impure (we can't see what they do).
-        if func.is_external || func.blocks.is_empty() {
+        if func.is_external {
+            continue;
+        }
+        // A body left encoded keeps what was found of it when it was
+        // analysed whole.
+        if func.blocks.is_empty() {
+            if func.signature.is_pure {
+                candidate.insert(*id);
+                callee_fns.insert(*id, Vec::new());
+            }
             continue;
         }
         if let Some(callees) = locally_pure_callees(func) {
@@ -116,7 +125,7 @@ pub fn infer_module(module: &mut HirModule) -> PurityStats {
         let is_pure = pure.contains(id);
         func.signature.is_pure = is_pure;
         if func.is_external || func.blocks.is_empty() {
-            // Leave the flag as written (false); don't count declarations.
+            // Not counted: no body was analysed here.
             continue;
         }
         if is_pure {
@@ -786,6 +795,43 @@ mod tests {
             !m.functions[&cid].signature.is_pure,
             "caller of impure fn must be demoted"
         );
+    }
+
+    /// A callee whose body is left encoded counts as what was recorded
+    /// of it: a caller of one recorded pure stays pure, of one recorded
+    /// impure is demoted.
+    #[test]
+    fn an_encoded_callee_keeps_its_recorded_purity() {
+        for recorded in [true, false] {
+            let mut m = HirModule::new(InternedString::new_global("m"));
+            let mut callee = mk("encoded");
+            callee.blocks.clear();
+            callee.signature.is_pure = recorded;
+            let eid = callee.id;
+            m.functions.insert(eid, callee);
+
+            let mut caller = mk("caller");
+            let cid = caller.id;
+            let a = param(&mut caller, 0);
+            let r = result(&mut caller);
+            push(
+                &mut caller,
+                HirInstruction::Call {
+                    result: Some(r),
+                    callee: HirCallable::Function(eid),
+                    args: vec![a],
+                    type_args: vec![],
+                    const_args: vec![],
+                    is_tail: false,
+                },
+            );
+            ret(&mut caller, r);
+            m.functions.insert(cid, caller);
+
+            infer_module(&mut m);
+            assert_eq!(m.functions[&eid].signature.is_pure, recorded);
+            assert_eq!(m.functions[&cid].signature.is_pure, recorded);
+        }
     }
 
     // ─── speculation-safety (totality gate) ──────────────────────────

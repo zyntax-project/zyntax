@@ -689,18 +689,22 @@ pub fn lower_for_snapshot(
     builtins: indexmap::IndexMap<String, String>,
     prelowered: Vec<Arc<zyntax_compiler::bytecode::LazyModule>>,
 ) -> Result<HirModule, SnapshotError> {
-    lower_for_snapshot_releasing(name, program, builtins, prelowered, false)
+    lower_for_snapshot_releasing(name, program, builtins, prelowered, false, None)
 }
 
 /// [`lower_for_snapshot`] with the module's storage released as the
 /// runtime that loads it will release: a module compiled with automatic
-/// release on is optimised with it on, so the two agree.
+/// release on is optimised with it on, so the two agree. With
+/// `error_flag_global`, the name the runtime gives its error flag, each
+/// function records whether its calls leave the flag as they found it,
+/// for a program that holds the function as a shell.
 pub fn lower_for_snapshot_releasing(
     name: &str,
     program: zyntax_typed_ast::TypedProgram,
     builtins: indexmap::IndexMap<String, String>,
     prelowered: Vec<Arc<zyntax_compiler::bytecode::LazyModule>>,
     automatic_release: bool,
+    error_flag_global: Option<&str>,
 ) -> Result<HirModule, SnapshotError> {
     let none_grammars = std::collections::HashMap::new();
     let none_signatures = std::collections::HashMap::new();
@@ -747,6 +751,9 @@ pub fn lower_for_snapshot_releasing(
     zyntax_compiler::const_boxes::run_library(&mut module, name);
     let facts = zyntax_compiler::drop_insert::facts_of(&module);
     zyntax_compiler::drop_insert::record_facts(&mut module, &facts);
+    if let Some(flag) = error_flag_global {
+        zyntax_compiler::error_flag::record_keeps(&mut module, flag);
+    }
     zyntax_compiler::mark_optimized(&mut module);
     Ok(module)
 }

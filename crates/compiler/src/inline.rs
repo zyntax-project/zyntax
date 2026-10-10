@@ -184,7 +184,13 @@ fn count_insts(function: &HirFunction) -> usize {
 /// Whether `function` is small enough that some call to it may be
 /// inlined.
 pub(crate) fn may_inline(function: &HirFunction) -> bool {
-    count_insts(function) <= MAX_INLINE_INSTS_MULTI_BLOCK
+    may_inline_size(count_insts(function))
+}
+
+/// Whether a body of `insts` instructions is small enough that some
+/// call to it may be inlined.
+pub(crate) fn may_inline_size(insts: usize) -> bool {
+    insts <= MAX_INLINE_INSTS_MULTI_BLOCK
 }
 
 /// Inline every eligible direct call within `module`. Iterates a
@@ -209,7 +215,7 @@ pub fn cycles_of(module: &HirModule) -> Cycles {
 
 /// [`run_module`], with the call cycles already computed when `cycles`
 /// is given.
-pub fn run_module_with(module: &mut HirModule, cycles: Option<&Cycles>) -> InlineStats {
+pub fn run_module_with(module: &mut HirModule, cache: Option<&crate::OptCache>) -> InlineStats {
     let mut total = InlineStats::default();
 
     // The functions being optimised are taken out of the module while
@@ -225,8 +231,8 @@ pub fn run_module_with(module: &mut HirModule, cycles: Option<&Cycles>) -> Inlin
     // function's reach, so the cycles are computed once, over the
     // module as it stands.
     let computed;
-    let cycles = match cycles {
-        Some(c) => c,
+    let cycles = match cache {
+        Some(cache) => &cache.cycles,
         None => {
             computed = cycles_of(module);
             &computed
@@ -260,6 +266,11 @@ pub fn run_module_with(module: &mut HirModule, cycles: Option<&Cycles>) -> Inlin
                 _ => None,
             })
             .collect();
+        // A callee the module holds as a shell of an encoded body is
+        // decoded before it is looked at.
+        if let Some(cache) = cache {
+            cache.decode_shells(module, called.iter().copied());
+        }
         let mut changing: HashMap<HirId, Arc<HirFunction>> = HashMap::default();
         for (_, id, f) in taken.iter().filter(|(_, id, _)| called.contains(id)) {
             let copy = match copies.get(id) {

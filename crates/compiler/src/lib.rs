@@ -1897,6 +1897,9 @@ pub struct OptCache {
     cycles: inline::Cycles,
     /// Read at the first optimisation that needs them.
     error_flag: std::sync::OnceLock<error_flag::Summaries>,
+    /// Encoded library bodies, by function, that a module optimised with
+    /// this cache may hold as shells.
+    encoded: std::collections::HashMap<HirId, std::sync::Arc<bytecode::LazyModule>>,
 }
 
 impl OptCache {
@@ -1911,6 +1914,69 @@ impl OptCache {
             facts,
             cycles: inline::cycles_of(module),
             error_flag: std::sync::OnceLock::new(),
+            encoded: Default::default(),
+        }
+    }
+
+    /// The same cache, for modules that hold the functions of `encoded`
+    /// as shells: the inliner has a shell that a body it works on calls
+    /// replaced by the decoded body (see [`Self::decode_shells`]).
+    pub fn with_encoded_bodies(
+        mut self,
+        encoded: std::collections::HashMap<HirId, std::sync::Arc<bytecode::LazyModule>>,
+    ) -> Self {
+        self.encoded = encoded;
+        self
+    }
+
+    /// Replace each shell among `called` with its decoded body when that
+    /// body is small enough for some call to inline, with a shell for
+    /// each function it calls in turn, so every function in the module
+    /// keeps what it calls in it. A larger body stays a shell, whose
+    /// recorded facts are all a pass reads of it.
+    pub(crate) fn decode_shells(
+        &self,
+        module: &mut HirModule,
+        called: impl IntoIterator<Item = HirId>,
+    ) {
+        if self.encoded.is_empty() {
+            return;
+        }
+        for id in called {
+            if !module
+                .functions
+                .get(&id)
+                .is_some_and(|f| f.blocks.is_empty() && !f.is_external)
+            {
+                continue;
+            }
+            let Some(source) = self.encoded.get(&id) else {
+                continue;
+            };
+            if source
+                .body_insts(id)
+                .is_none_or(|n| !inline::may_inline_size(n))
+            {
+                continue;
+            }
+            let Some(mut body) = source.function(id) else {
+                continue;
+            };
+            body.attributes.optimized = true;
+            body.attributes.deferred = true;
+            let callees: Vec<HirId> = body.direct_call_targets().collect();
+            module.functions.insert(id, body);
+            for callee in callees {
+                if module.functions.contains_key(&callee) {
+                    continue;
+                }
+                if let Some(f) = self.encoded.get(&callee).and_then(|s| s.signature(callee)) {
+                    let mut f = f.clone();
+                    f.attributes.optimized = true;
+                    f.attributes.deferred = true;
+                    module.functions.insert(callee, f);
+                }
+            }
         }
     }
 }
@@ -2150,7 +2216,7 @@ fn run_interp_safe_opts_with(
         stats.dead_store.removed += ds.removed;
         timed("dead_store", &mut at);
         check_hir_uses(module, "dead_store");
-        let il = inline::run_module_with(module, cache.map(|c| &c.cycles));
+        let il = inline::run_module_with(module, cache);
         timed("inline", &mut at);
         check_hir_uses(module, "inline");
         // After inline, which puts a callee's raising arm and the

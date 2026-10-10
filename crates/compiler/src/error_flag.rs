@@ -117,6 +117,27 @@ pub fn summaries(module: &HirModule) -> Summaries {
     let Some(flag) = flag_of(module) else {
         return Summaries::default();
     };
+    summaries_for(module, flag)
+}
+
+/// Record on each function of `module` whose calls leave the error flag
+/// as they found it that they do (`keeps_error_flag`), for a module that
+/// links the bodies later and holds some of them as shells. `flag` names
+/// the flag's global; when `module` defines none, no body stores to it.
+pub fn record_keeps(module: &mut HirModule, flag: &str) {
+    let id = module
+        .globals
+        .iter()
+        .find(|(_, g)| g.name.resolve_global().as_deref() == Some(flag))
+        .map(|(id, _)| *id)
+        .unwrap_or_else(HirId::new);
+    let summaries = summaries_for(module, id);
+    for (id, f) in module.functions.iter_mut() {
+        f.attributes.keeps_error_flag = summaries.0.get(id) == Some(&Effect::Keeps);
+    }
+}
+
+fn summaries_for(module: &HirModule, flag: HirId) -> Summaries {
     let demoted = |f: &HirFunction| {
         if f.attributes.nothrow {
             Effect::KeepsClear
@@ -131,8 +152,13 @@ pub fn summaries(module: &HirModule) -> Summaries {
         let e = if f.attributes.sets_error_flag {
             Effect::Sets
         } else if f.blocks.is_empty() && !f.is_external {
-            // An encoded body has no instructions here to summarise.
-            demoted(f)
+            // An encoded body has no instructions here to summarise: what
+            // was found of it when its module was built stands.
+            if f.attributes.keeps_error_flag {
+                Effect::Keeps
+            } else {
+                demoted(f)
+            }
         } else if f.is_external {
             // A foreign `nothrow` body reaches no hook, so it has no way
             // to the flag.
@@ -1224,6 +1250,13 @@ mod tests {
                 },
                 Some(true),
             ),
+            (
+                FunctionAttributes {
+                    keeps_error_flag: true,
+                    ..Default::default()
+                },
+                Some(false),
+            ),
         ] {
             let mut m = Module::new(true);
             let callee = m.callee("encoded", attributes);
@@ -1243,6 +1276,44 @@ mod tests {
             run_all(&mut m.module);
             assert_eq!(branch_constant(body(&m, f), entry, raise), expected);
         }
+    }
+
+    /// The bodies of a module built with its flag unmarked are recorded
+    /// as keeping it when they leave it alone: not when they store it,
+    /// nor when they call what may.
+    #[test]
+    fn record_keeps_marks_the_bodies_that_leave_the_flag_alone() {
+        let mut m = Module::new(false);
+        let mut quiet = Body::new(&m);
+        let e = quiet.block();
+        quiet.ret(e, 0);
+        let quiet = quiet.finish(&mut m);
+        let mut stores = Body::new(&m);
+        let e = stores.block();
+        let (ptr, null) = (stores.flag_ptr, stores.null);
+        stores.push(
+            e,
+            HirInstruction::Store {
+                value: null,
+                ptr,
+                align: 8,
+                volatile: false,
+            },
+        );
+        stores.ret(e, 0);
+        let stores = stores.finish(&mut m);
+        let unknown = m.callee("unknown", FunctionAttributes::default());
+        let mut calls = Body::new(&m);
+        let e = calls.block();
+        calls.call(e, unknown);
+        calls.ret(e, 0);
+        let calls = calls.finish(&mut m);
+
+        record_keeps(&mut m.module, "flag");
+        let keeps = |id: HirId| m.module.functions[&id].attributes.keeps_error_flag;
+        assert!(keeps(quiet));
+        assert!(!keeps(stores));
+        assert!(!keeps(calls));
     }
 
     /// A body that raises and catches its own error is neither a raiser

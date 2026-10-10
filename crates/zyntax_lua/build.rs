@@ -93,6 +93,7 @@ fn build() -> Result<(), BuildError> {
         indexmap::IndexMap::new(),
         Vec::new(),
         true,
+        Some(library::PENDING),
     )?;
     SnapshotBuilder::new("lua")
         .module_lowered(policy::LIBRARY_MODULE, program, &hir)?

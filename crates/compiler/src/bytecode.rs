@@ -207,6 +207,9 @@ struct FnEntry {
     /// Functions this body names directly. Kept in the directory so a
     /// linker can follow reachability without decoding the body.
     callees: Vec<crate::hir::HirId>,
+    /// The body's instruction count, so a reader can judge the body by
+    /// its size without decoding it; 0 for an external function.
+    insts: u32,
 }
 
 /// The wire shape of [`Format::Split`]: this, then `blob_len` bytes
@@ -416,6 +419,15 @@ impl LazyModule {
         Some(self.directory.get(self.position(id)?)?.callees.clone())
     }
 
+    /// How many instructions `id`'s body holds, without decoding it when
+    /// this module came from a split image; 0 for an external function.
+    pub fn body_insts(&self, id: crate::hir::HirId) -> Option<usize> {
+        if self.in_memory {
+            return self.shell().functions.get(&id).map(function_insts);
+        }
+        Some(self.directory.get(self.position(id)?)?.insts as usize)
+    }
+
     /// Every function, decoded, in the module's order.
     pub fn functions(&self) -> Box<dyn Iterator<Item = (crate::hir::HirId, HirFunction)> + '_> {
         if self.in_memory {
@@ -448,6 +460,11 @@ impl LazyModule {
         }
         module
     }
+}
+
+/// The instructions in `function`'s blocks, as the inliner counts them.
+fn function_insts(function: &HirFunction) -> usize {
+    function.blocks.values().map(|b| b.instructions.len()).sum()
 }
 
 fn function_callees(function: &HirFunction) -> Vec<crate::hir::HirId> {
@@ -523,6 +540,7 @@ pub fn serialize_module_split(module: &HirModule) -> Result<Vec<u8>> {
             shell,
             body,
             callees: function_callees(function),
+            insts: function_insts(function) as u32,
         });
     }
     let positions = 0..directory.len() as u32;
@@ -626,7 +644,7 @@ impl BytecodeHeader {
     // Moves with any change to a payload's layout, so a payload in an
     // older layout is refused with VersionMismatch and a cache loader
     // recompiles rather than misreading it.
-    const CURRENT_MAJOR: u16 = 6;
+    const CURRENT_MAJOR: u16 = 7;
     const CURRENT_MINOR: u16 = 0;
 
     /// Create a new header for the given module and format
@@ -1232,6 +1250,12 @@ mod tests {
         assert_eq!(lazy.signature(id).map(|f| f.id), Some(id));
         let body = lazy.function(id).expect("the body decodes");
         assert_eq!(body.id, id, "the body relocates by the shell's base");
+        assert_eq!(
+            lazy.body_insts(id),
+            Some(function_insts(&body)),
+            "the directory counts the body's instructions"
+        );
+        assert_eq!(lazy.body_insts(zeta.id), Some(1));
         let (value_id, value) = body.values.iter().next().expect("a value");
         assert_eq!(*value_id, value.id);
         assert!(value_id.as_u32() > id.as_u32());
@@ -1240,6 +1264,7 @@ mod tests {
         let puts = lazy.by_name("puts").expect("an external function");
         assert!(puts.is_external);
         assert_eq!(lazy.function(puts.id).map(|f| f.id), Some(puts.id));
+        assert_eq!(lazy.body_insts(puts.id), Some(0));
 
         assert_eq!(lazy.shell().functions.len(), 3);
         assert_eq!(lazy.functions().count(), 3);

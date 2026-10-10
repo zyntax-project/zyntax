@@ -76,6 +76,7 @@ fn build() -> Result<(), BuildError> {
         indexmap::IndexMap::new(),
         Vec::new(),
         true,
+        Some(policy::PENDING),
     )?;
     SnapshotBuilder::new("python")
         .module_lowered(policy::LIBRARY_MODULE, program, &hir)?

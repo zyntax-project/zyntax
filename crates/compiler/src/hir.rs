@@ -2322,6 +2322,11 @@ pub struct FunctionAttributes {
     /// holds at its entry.
     #[serde(default)]
     pub queries_error_flag: bool,
+    /// A call leaves the error-flag global exactly as it found it, set
+    /// or clear: found of the body when its module was built, for a
+    /// module holding only the function's shell to read in its place.
+    #[serde(default)]
+    pub keeps_error_flag: bool,
     /// On a signature shell standing for a body kept elsewhere, what
     /// that body refers to.
     #[serde(default)]
@@ -2769,6 +2774,28 @@ impl HirModule {
 }
 
 impl HirFunction {
+    /// The functions this body calls by id, through a call or an invoke,
+    /// once per call site.
+    pub fn direct_call_targets(&self) -> impl Iterator<Item = HirId> + '_ {
+        self.blocks.values().flat_map(|b| {
+            let calls = b.instructions.iter().filter_map(|inst| match inst {
+                HirInstruction::Call {
+                    callee: HirCallable::Function(target),
+                    ..
+                } => Some(*target),
+                _ => None,
+            });
+            let invoke = match &b.terminator {
+                HirTerminator::Invoke {
+                    callee: HirCallable::Function(target),
+                    ..
+                } => Some(*target),
+                _ => None,
+            };
+            calls.chain(invoke)
+        })
+    }
+
     /// Set every block's successor and predecessor lists from the
     /// terminators, which are the edges that run. The lists are not
     /// kept up to date by every pass, and an analysis reading them
@@ -3089,6 +3116,7 @@ mod error_flag_tests {
         let attrs = FunctionAttributes {
             sets_error_flag: true,
             nothrow: true,
+            keeps_error_flag: true,
             ..FunctionAttributes::default()
         };
         let global: HirGlobal =
@@ -3099,7 +3127,7 @@ mod error_flag_tests {
             postcard::from_bytes(&postcard::to_allocvec(&module.exact_struct_types).unwrap())
                 .unwrap();
         assert!(global.error_flag);
-        assert!(attrs.sets_error_flag && attrs.nothrow);
+        assert!(attrs.sets_error_flag && attrs.nothrow && attrs.keeps_error_flag);
         assert!(exact.contains(&ty));
     }
 }

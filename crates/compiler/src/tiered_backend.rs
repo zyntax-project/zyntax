@@ -437,28 +437,6 @@ fn instruction_count(f: &HirFunction) -> usize {
     f.blocks.values().map(|b| b.instructions.len()).sum()
 }
 
-/// The functions `f` calls directly.
-fn direct_callees(f: &HirFunction) -> impl Iterator<Item = HirId> + '_ {
-    use crate::hir::{HirCallable, HirInstruction, HirTerminator};
-    f.blocks.values().flat_map(|b| {
-        let calls = b.instructions.iter().filter_map(|inst| match inst {
-            HirInstruction::Call {
-                callee: HirCallable::Function(target),
-                ..
-            } => Some(*target),
-            _ => None,
-        });
-        let invoke = match &b.terminator {
-            HirTerminator::Invoke {
-                callee: HirCallable::Function(target),
-                ..
-            } => Some(*target),
-            _ => None,
-        };
-        calls.chain(invoke)
-    })
-}
-
 /// A module the program's lazy functions are optimised in, one at a
 /// time: the module's declarations and extern functions, and of its
 /// defined functions those an optimised body reaches through direct
@@ -523,7 +501,12 @@ impl Scratch {
     /// optimised alone. A program function whose cell is filled goes in
     /// as its cell holds it, so a body optimised later inlines it as
     /// every tier runs it; one that arrived optimised stays as it
-    /// arrived, box readers and all, as the release pass reads it.
+    /// arrived, box readers and all, as the release pass reads it. A
+    /// function other than a root whose body a linked library holds
+    /// encoded goes in as its shell, whose recorded facts are what the
+    /// passes read of it, and what it calls is not followed: the
+    /// pipeline decodes the body once one it optimises calls it (see
+    /// [`crate::OptCache::with_encoded_bodies`]).
     fn reach(
         &mut self,
         roots: impl IntoIterator<Item = HirId>,
@@ -532,12 +515,25 @@ impl Scratch {
         bodies: &OptimizedBodies,
         program: &HashSet<HirId>,
     ) {
-        let mut work: Vec<HirId> = roots.into_iter().collect();
+        let roots: Vec<HirId> = roots.into_iter().collect();
+        let mut work = roots.clone();
         #[cfg(feature = "allocation-audit")]
         let _allocations =
             crate::allocation_audit::Scope::enter(crate::allocation_audit::Phase::Scratch);
         while let Some(id) = work.pop() {
             if self.module.functions.contains_key(&id) {
+                continue;
+            }
+            if !roots.contains(&id)
+                && let Some(shell) = sources
+                    .get(&id)
+                    .and_then(|source| source.signature(id))
+                    .filter(|f| f.blocks.is_empty())
+            {
+                let mut shell = shell.clone();
+                shell.attributes.optimized = true;
+                shell.attributes.deferred = true;
+                self.module.functions.insert(id, shell);
                 continue;
             }
             let optimized = program.contains(&id).then(|| bodies.get(id)).flatten();
@@ -559,7 +555,7 @@ impl Scratch {
             };
             f.attributes.optimized = true;
             f.attributes.deferred = true;
-            work.extend(direct_callees(&f));
+            work.extend(f.direct_call_targets());
             self.module.functions.insert(id, f);
         }
     }
@@ -674,6 +670,9 @@ impl Drop for ScratchUse<'_> {
 struct Facts {
     facts: Mutex<HashMap<usize, Arc<crate::drop_insert::ModuleFacts>>>,
     caches: Mutex<HashMap<usize, Arc<crate::OptCache>>>,
+    /// The linked libraries' encoded bodies, which a scratch holds as
+    /// shells until a body optimised in it calls one.
+    encoded: HashMap<HirId, Arc<LazyModule>>,
 }
 
 impl Facts {
@@ -702,7 +701,10 @@ impl Facts {
         if let Some(cache) = self.caches.lock().unwrap().get(&key) {
             return Arc::clone(cache);
         }
-        let cache = Arc::new(crate::OptCache::with_facts(self.of(module), module));
+        let cache = Arc::new(
+            crate::OptCache::with_facts(self.of(module), module)
+                .with_encoded_bodies(self.encoded.clone()),
+        );
         Arc::clone(self.caches.lock().unwrap().entry(key).or_insert(cache))
     }
 }
@@ -3387,7 +3389,10 @@ impl TieredBackend {
         // (see [`Scratch`]): a body optimised earlier is what a later one
         // inlines, and what the passes know about the module as a whole
         // is built once, since optimising a body changes none of it.
-        let facts: Arc<Facts> = Arc::new(Facts::default());
+        let facts: Arc<Facts> = Arc::new(Facts {
+            encoded: body_sources.clone(),
+            ..Facts::default()
+        });
         let optimized: Arc<Scratches> = Arc::new(Scratches::default());
         self.scratches = Arc::clone(&optimized);
         let scratch_shared = Arc::clone(&optimized);
@@ -3477,6 +3482,8 @@ impl TieredBackend {
                     // hands, so no other caller sees it half made.
                     let _using = optimized.enter(&*quiet);
                     let (scratch_key, mut scratch) = optimized.take(module_arc);
+                    let reaching = web_time::Instant::now();
+                    let before = scratch.module.functions.len();
                     scratch.reach(
                         [*func_id],
                         module_arc,
@@ -3484,6 +3491,19 @@ impl TieredBackend {
                         &optimized_bodies,
                         &lazy,
                     );
+                    if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                        eprintln!(
+                            "[lazy] scratch for {} took {} functions in {:.2} ms",
+                            scratch
+                                .module
+                                .functions
+                                .get(func_id)
+                                .and_then(|f| f.name.resolve_global())
+                                .unwrap_or_default(),
+                            scratch.module.functions.len() - before,
+                            reaching.elapsed().as_secs_f64() * 1e3,
+                        );
+                    }
                     if !scratch.done.contains(func_id) {
                         let f = scratch
                             .module
@@ -3573,7 +3593,7 @@ impl TieredBackend {
                 };
                 let _using = optimized.enter(&*quiet);
                 let (scratch_key, mut scratch) = optimized.take(module_arc);
-                let callees: Vec<HirId> = direct_callees(&f).collect();
+                let callees: Vec<HirId> = f.direct_call_targets().collect();
                 scratch.reach(callees, module_arc, &body_sources, &optimized_bodies, &lazy);
                 let id = f.id;
                 scratch.module.functions.insert(id, f);

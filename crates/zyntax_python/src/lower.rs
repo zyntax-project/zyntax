@@ -1363,8 +1363,7 @@ pub(crate) enum Escape {
     Break,
 }
 
-/// The module variable holding the exception in flight, `None` when none.
-pub(crate) const PENDING: &str = "py$exc";
+pub(crate) use crate::policy::PENDING;
 
 /// The function record's fixed prefix: code address and arity.
 const RECORD_CELLS_AT: usize = 2;
