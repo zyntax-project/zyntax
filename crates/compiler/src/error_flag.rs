@@ -29,7 +29,7 @@ use crate::hir::{
     BinaryOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
     HirTerminator, HirType, HirValueKind, Intrinsic,
 };
-use std::collections::{HashMap, HashSet};
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ErrorFlagStats {
@@ -145,8 +145,9 @@ fn summaries_for(module: &HirModule, flag: HirId) -> Summaries {
             Effect::Unknown
         }
     };
-    let mut effects: HashMap<HirId, Effect> = HashMap::with_capacity(module.functions.len());
-    let mut callers: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut effects: HashMap<HirId, Effect> =
+        HashMap::with_capacity_and_hasher(module.functions.len(), Default::default());
+    let mut callers: HashMap<HirId, Vec<HirId>> = HashMap::default();
     let mut work: Vec<HirId> = Vec::new();
     for (&id, f) in &module.functions {
         let e = if f.attributes.sets_error_flag {
@@ -211,7 +212,7 @@ fn body_keeps_locally(f: &HirFunction, flag: HirId, mut callee: impl FnMut(HirId
     if !ptrs.is_empty() && address_escapes(f, &ptrs) {
         return false;
     }
-    let none = HashMap::new();
+    let none = HashMap::default();
     let mut keeps = true;
     for b in f.blocks.values() {
         if matches!(b.terminator, HirTerminator::Invoke { .. }) {
@@ -275,7 +276,7 @@ fn call_effects(
     bodies: &HashSet<HirId>,
     summaries: &Summaries,
 ) -> HashMap<HirId, Effect> {
-    let mut effects = HashMap::new();
+    let mut effects = HashMap::default();
     for id in bodies {
         for b in module.functions[id].blocks.values() {
             for inst in &b.instructions {
@@ -429,7 +430,7 @@ struct Solution {
 impl Flow<'_> {
     fn new<'a>(f: &HirFunction, flag: HirId, effects: &'a HashMap<HirId, Effect>) -> Flow<'a> {
         let ptrs = flag_pointers(f, flag);
-        let mut loads = HashSet::new();
+        let mut loads = HashSet::default();
         for b in f.blocks.values() {
             for inst in &b.instructions {
                 if let HirInstruction::Load { result, ptr, .. } = inst
@@ -439,7 +440,7 @@ impl Flow<'_> {
                 }
             }
         }
-        let mut compares = HashMap::new();
+        let mut compares = HashMap::default();
         for b in f.blocks.values() {
             for inst in &b.instructions {
                 if let HirInstruction::Binary {
@@ -510,8 +511,8 @@ impl Flow<'_> {
     }
 
     fn solve(&self, f: &HirFunction) -> Solution {
-        let mut entry: HashMap<HirId, State> = HashMap::new();
-        let mut edges: HashMap<(HirId, HirId), State> = HashMap::new();
+        let mut entry: HashMap<HirId, State> = HashMap::default();
+        let mut edges: HashMap<(HirId, HirId), State> = HashMap::default();
         let rpo = &reverse_postorder(f);
         let mut changed = true;
         while changed {
@@ -537,7 +538,7 @@ impl Flow<'_> {
                 }
             }
         }
-        let mut at_load = HashMap::new();
+        let mut at_load = HashMap::default();
         for &b in rpo {
             self.transfer(f, b, entry[&b], Some(&mut at_load));
         }
@@ -609,7 +610,7 @@ fn run(func: &mut HirFunction, flag: HirId, effects: &HashMap<HirId, Effect>) ->
 /// Blocks reachable from the entry, each before its successors except
 /// along back edges.
 fn reverse_postorder(f: &HirFunction) -> Vec<HirId> {
-    let mut seen: HashSet<HirId> = HashSet::new();
+    let mut seen: HashSet<HirId> = HashSet::default();
     let mut post: Vec<HirId> = Vec::new();
     let mut stack: Vec<(HirId, usize)> = vec![(f.entry_block, 0)];
     seen.insert(f.entry_block);
@@ -793,7 +794,7 @@ fn skippable_check(func: &HirFunction, c: HirId, load: HirId) -> bool {
 /// not pass through `c`, which a threaded edge would reach without it.
 fn uses_escape_past(func: &HirFunction, c: HirId, arm: HirId) -> bool {
     let defs = defs_of(func, c);
-    let mut reach: HashSet<HirId> = HashSet::new();
+    let mut reach: HashSet<HirId> = HashSet::default();
     let mut stack = vec![arm];
     while let Some(b) = stack.pop() {
         if b == c || !reach.insert(b) {
@@ -823,7 +824,7 @@ fn uses_escape_past(func: &HirFunction, c: HirId, arm: HirId) -> bool {
 /// Every use in a reachable block is dominated by its definition.
 fn dominance_holds(func: &HirFunction) -> bool {
     let dt = DominatorTree::of(func);
-    let mut def_at: HashMap<HirId, (HirId, usize)> = HashMap::new();
+    let mut def_at: HashMap<HirId, (HirId, usize)> = HashMap::default();
     for (&b, block) in &func.blocks {
         for p in &block.phis {
             def_at.insert(p.result, (b, 0));
@@ -888,7 +889,7 @@ fn fold(func: &mut HirFunction, flow: &Flow, sol: &Solution) -> usize {
         return 0;
     }
     let mut constants: [Option<HirId>; 2] = [None, None];
-    let mut subs: HashMap<HirId, HirId> = HashMap::new();
+    let mut subs: HashMap<HirId, HirId> = HashMap::default();
     for (cmp, value) in &decided {
         let c = *constants[*value as usize].get_or_insert_with(|| {
             func.create_value(
@@ -933,7 +934,7 @@ fn fold(func: &mut HirFunction, flow: &Flow, sol: &Solution) -> usize {
     func.rebuild_cfg_edges();
 
     // Loads whose every compare folded.
-    let mut used: HashSet<HirId> = HashSet::new();
+    let mut used: HashSet<HirId> = HashSet::default();
     for block in func.blocks.values() {
         for inst in &block.instructions {
             inst.for_each_operand(|id| {

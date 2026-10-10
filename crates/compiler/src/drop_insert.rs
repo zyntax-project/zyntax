@@ -56,11 +56,11 @@
 //! * Storage handed to an owning parameter is the callee's; a callee
 //!   that stores or returns its parameter must say so with `Owned`.
 
-use std::collections::HashMap;
+use crate::hir::IdHashMap as HashMap;
 
 /// Sets of ids: the pass spends its time asking whether a value is one
 /// of a handful, so the hasher is the cheap one.
-type IdSet = fnv::FnvHashSet<HirId>;
+type IdSet = crate::hir::IdHashSet<HirId>;
 
 use crate::hir::{
     HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator,
@@ -209,8 +209,7 @@ pub fn record_facts(module: &mut HirModule, facts: &ModuleFacts) {
         .filter(|(_, f)| !f.is_external)
         .map(|(key, _)| *key)
         .collect();
-    let mut callers: std::collections::HashMap<HirId, Vec<HirId>> =
-        std::collections::HashMap::new();
+    let mut callers: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for (key, called) in callees_of(module, &defined) {
         for c in called {
             callers.entry(c).or_default().push(key);
@@ -310,22 +309,22 @@ pub struct ModuleFacts {
     /// Per function, which parameters it may hand back as its result. The
     /// result of such a call is another name for the argument, so the
     /// argument lives as long as the result does.
-    returns_param: std::collections::HashMap<HirId, Vec<bool>>,
+    returns_param: HashMap<HirId, Vec<bool>>,
     /// The runtime symbol behind each extern function.
-    extern_links: std::collections::HashMap<HirId, String>,
+    extern_links: HashMap<HirId, String>,
     /// Functions that are the copying box call on their one parameter
     /// and nothing else: a call to one boxes a string as that call does.
     string_boxers: IdSet,
     /// Function names by key, for the trace.
-    names: std::collections::HashMap<HirId, String>,
+    names: HashMap<HirId, String>,
     /// Per callee, which parameters are only borrowed. Keyed on the
     /// module's own key for the function, which is what a call names and
     /// is not always the function's `id` field.
-    borrowed_params: std::collections::HashMap<HirId, Vec<bool>>,
+    borrowed_params: HashMap<HirId, Vec<bool>>,
     /// The release function for a named type that owns another, by the
     /// type's name. An allocation of such a type is released through
     /// this rather than by a bare free.
-    glue: std::collections::HashMap<zyntax_typed_ast::InternedString, HirId>,
+    glue: HashMap<zyntax_typed_ast::InternedString, HirId>,
 }
 
 impl ModuleFacts {
@@ -392,7 +391,7 @@ impl ModuleFacts {
     fn build_seeded(module: &HirModule, use_seeds: bool) -> Self {
         let automatic_release = automatic_release_for(module);
         let seeded = |func: &HirFunction| use_seeds && Self::seeded(func, automatic_release);
-        let mut borrowed_params = std::collections::HashMap::new();
+        let mut borrowed_params = HashMap::default();
         for (key, func) in module.functions.iter() {
             // What a host does with a pointer is unknown here, so an
             // extern borrows only when its symbol is one the pass knows
@@ -422,7 +421,7 @@ impl ModuleFacts {
         }
         // Borrow facts first: deciding whether an allocation leaves a
         // function needs to know what its calls do with a pointer.
-        let mut glue = std::collections::HashMap::new();
+        let mut glue = HashMap::default();
         for (key, func) in module.functions.iter() {
             if let Some(ty) = crate::drop_glue::glue_target(func) {
                 glue.insert(ty, *key);
@@ -438,7 +437,7 @@ impl ModuleFacts {
             })
             .map(|(key, _)| *key)
             .collect();
-        let extern_links: std::collections::HashMap<HirId, String> = module
+        let extern_links: HashMap<HirId, String> = module
             .functions
             .iter()
             .filter(|(_, f)| f.is_external)
@@ -468,7 +467,7 @@ impl ModuleFacts {
             automatic_release,
             returns_owned: IdSet::default(),
             string_makers,
-            returns_param: std::collections::HashMap::new(),
+            returns_param: HashMap::default(),
             extern_links,
             string_boxers,
             names,
@@ -509,8 +508,7 @@ impl ModuleFacts {
         // Which functions call each, for asking only the callers of
         // whoever changed again. Only a function computed here is
         // asked again, so only their calls are recorded.
-        let mut callers: std::collections::HashMap<HirId, Vec<HirId>> =
-            std::collections::HashMap::new();
+        let mut callers: HashMap<HirId, Vec<HirId>> = HashMap::default();
         for (key, called) in &callees {
             for c in called {
                 callers.entry(*c).or_default().push(*key);
@@ -518,7 +516,7 @@ impl ModuleFacts {
         }
         // Each function's structure is read once and kept for both
         // fixed points; only the facts it is read against change.
-        let mut indices: HashMap<HirId, FnIndex> = HashMap::new();
+        let mut indices: HashMap<HirId, FnIndex> = HashMap::default();
         // Every function computed here first, then the callers of
         // whoever changed.
         let mut dirty: Vec<HirId> = unseeded.clone();
@@ -678,7 +676,7 @@ impl ModuleFacts {
 fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
     use crate::analysis::{DominatorTree, LoopForest};
 
-    let mut sites: std::collections::HashMap<HirId, Release> = collect_owned_sites(func, facts)
+    let mut sites: HashMap<HirId, Release> = collect_owned_sites(func, facts)
         .iter()
         .map(|s| (s.result, s.release))
         .collect();
@@ -713,12 +711,12 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
     }
     let dt = DominatorTree::of(func);
     let forest = LoopForest::detect(func, &dt);
-    let bodies: std::collections::HashMap<HirId, IdSet> = forest
+    let bodies: HashMap<HirId, IdSet> = forest
         .loops()
         .iter()
         .map(|lp| (lp.header, lp.body.iter().copied().collect()))
         .collect();
-    let phi_blocks: std::collections::HashMap<HirId, HirId> = func
+    let phi_blocks: HashMap<HirId, HirId> = func
         .blocks
         .iter()
         .flat_map(|(b, block)| block.phis.iter().map(move |p| (p.result, *b)))
@@ -840,7 +838,7 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
         // until the decisions agree.
         let incoming_release = |phi: &crate::hir::HirPhi,
                                 val: HirId,
-                                releases: &std::collections::HashMap<HirId, Release>|
+                                releases: &HashMap<HirId, Release>|
          -> IncomingRelease {
             if val == phi.result || is_null_value(func, val) {
                 IncomingRelease::Nothing
@@ -859,8 +857,7 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
                 IncomingRelease::Unknown
             }
         };
-        let mut releases: std::collections::HashMap<HirId, Release> =
-            std::collections::HashMap::new();
+        let mut releases: HashMap<HirId, Release> = HashMap::default();
         for _ in 0..candidates.len() {
             for (_, block) in &func.blocks {
                 for phi in &block.phis {
@@ -1055,25 +1052,23 @@ enum IncomingRelease {
 struct PhiIndex {
     users: Users,
     /// The phis with the value among their incomings.
-    phi_users: std::collections::HashMap<HirId, Vec<HirId>>,
+    phi_users: HashMap<HirId, Vec<HirId>>,
     /// The blocks whose terminator reads the value.
-    terminator_users: std::collections::HashMap<HirId, Vec<HirId>>,
+    terminator_users: HashMap<HirId, Vec<HirId>>,
     /// The block defining the value, by instruction or phi.
-    def_blocks: std::collections::HashMap<HirId, HirId>,
-    derived: std::collections::HashMap<HirId, IdSet>,
-    borrowed: std::collections::HashMap<HirId, bool>,
-    past_merge: std::collections::HashMap<(HirId, HirId), bool>,
+    def_blocks: HashMap<HirId, HirId>,
+    derived: HashMap<HirId, IdSet>,
+    borrowed: HashMap<HirId, bool>,
+    past_merge: HashMap<(HirId, HirId), bool>,
     /// Phi results that eventually reach an instruction or terminator.
     live_phis: IdSet,
 }
 
 impl PhiIndex {
-    fn of(func: &HirFunction, phi_blocks: &std::collections::HashMap<HirId, HirId>) -> Self {
-        let mut phi_users: std::collections::HashMap<HirId, Vec<HirId>> =
-            std::collections::HashMap::new();
-        let mut terminator_users: std::collections::HashMap<HirId, Vec<HirId>> =
-            std::collections::HashMap::new();
-        let mut def_blocks: std::collections::HashMap<HirId, HirId> = phi_blocks.clone();
+    fn of(func: &HirFunction, phi_blocks: &HashMap<HirId, HirId>) -> Self {
+        let mut phi_users: HashMap<HirId, Vec<HirId>> = HashMap::default();
+        let mut terminator_users: HashMap<HirId, Vec<HirId>> = HashMap::default();
+        let mut def_blocks: HashMap<HirId, HirId> = phi_blocks.clone();
         for (b, block) in &func.blocks {
             for phi in &block.phis {
                 for (v, _) in &phi.incoming {
@@ -1118,9 +1113,9 @@ impl PhiIndex {
             phi_users,
             terminator_users,
             def_blocks,
-            derived: std::collections::HashMap::new(),
-            borrowed: std::collections::HashMap::new(),
-            past_merge: std::collections::HashMap::new(),
+            derived: HashMap::default(),
+            borrowed: HashMap::default(),
+            past_merge: HashMap::default(),
             live_phis,
         }
     }
@@ -1140,7 +1135,7 @@ impl PhiIndex {
             return *b;
         }
         let derived = self.derived(func, facts, value).clone();
-        let mut seen: std::collections::HashSet<(HirId, usize)> = std::collections::HashSet::new();
+        let mut seen: crate::hir::IdHashSet<(HirId, usize)> = crate::hir::IdHashSet::default();
         let mut borrowed = true;
         'scan: for d in &derived {
             if let Some(sites) = self.users.by_value.get(d) {
@@ -1215,7 +1210,7 @@ impl PhiIndex {
 fn phi_incomings_owned(
     func: &HirFunction,
     facts: &ModuleFacts,
-    sites: &std::collections::HashMap<HirId, Release>,
+    sites: &HashMap<HirId, Release>,
     candidates: &IdSet,
     body: Option<&IdSet>,
     phi: &crate::hir::HirPhi,
@@ -1689,7 +1684,7 @@ fn may_be_storage(ty: &HirType) -> bool {
 }
 
 /// The functions each of `keys` calls directly.
-fn callees_of(module: &HirModule, keys: &[HirId]) -> std::collections::HashMap<HirId, Vec<HirId>> {
+fn callees_of(module: &HirModule, keys: &[HirId]) -> HashMap<HirId, Vec<HirId>> {
     keys.iter()
         .filter_map(|key| module.functions.get(key).map(|func| (key, func)))
         .map(|(key, func)| {
@@ -1732,7 +1727,7 @@ fn escapes_only_by_return(
     {
         return false;
     }
-    let mut asked: std::collections::HashSet<(HirId, usize)> = std::collections::HashSet::new();
+    let mut asked: crate::hir::IdHashSet<(HirId, usize)> = crate::hir::IdHashSet::default();
     for d in derived {
         for &(block, idx) in index.users.by_value.get(d).into_iter().flatten() {
             if (block == site.block && idx == site.inst_idx) || !asked.insert((block, idx)) {
@@ -1781,10 +1776,7 @@ fn boxes_string(callee: &HirCallable, facts: &ModuleFacts) -> bool {
 /// one block, whose only instruction boxes that parameter and whose
 /// result is returned. Such a call means what the box call means, so it
 /// can be turned into the adopting one the same way.
-fn wraps_string_boxing(
-    func: &HirFunction,
-    extern_links: &std::collections::HashMap<HirId, String>,
-) -> bool {
+fn wraps_string_boxing(func: &HirFunction, extern_links: &HashMap<HirId, String>) -> bool {
     if func.is_external || func.blocks.len() != 1 || func.signature.params.len() != 1 {
         return false;
     }
@@ -2417,7 +2409,7 @@ struct FnIndex {
 
 impl FnIndex {
     fn of(func: &HirFunction) -> Self {
-        let mut term_users: HashMap<HirId, Vec<HirId>> = HashMap::new();
+        let mut term_users: HashMap<HirId, Vec<HirId>> = HashMap::default();
         let mut returned = Vec::new();
         for (&bid, block) in &func.blocks {
             let mut seen: smallvec::SmallVec<[HirId; 4]> = smallvec::SmallVec::new();
@@ -2553,7 +2545,7 @@ fn drop_points_transferring_with_uses(
 
     // What each block does with the value: the last instruction that
     // uses it, and whether the terminator does.
-    let mut last_use: std::collections::HashMap<HirId, usize> = std::collections::HashMap::new();
+    let mut last_use: HashMap<HirId, usize> = HashMap::default();
     let mut uses_block: IdSet = implicit_uses.clone();
     for (block_id, block) in &func.blocks {
         if !reachable.contains(block_id) {
@@ -2846,8 +2838,8 @@ pub(crate) struct Users {
 
 impl Users {
     pub(crate) fn of(func: &HirFunction) -> Self {
-        let mut by_value: HashMap<HirId, Vec<(HirId, usize)>> = HashMap::new();
-        let mut phi_users: HashMap<HirId, Vec<(HirId, usize)>> = HashMap::new();
+        let mut by_value: HashMap<HirId, Vec<(HirId, usize)>> = HashMap::default();
+        let mut phi_users: HashMap<HirId, Vec<(HirId, usize)>> = HashMap::default();
         let mut instructions = 0;
         for (&bid, block) in &func.blocks {
             instructions += block.instructions.len();

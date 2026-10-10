@@ -94,15 +94,48 @@ struct CseCtx<'a> {
 }
 
 impl CseCtx<'_> {
+    /// Scalars and pointers to them are numbered without a lookup; any
+    /// other type is interned above them.
     fn type_id(&self, ty: &HirType) -> u32 {
+        const SCALARS: u32 = 16;
+        if let Some(n) = scalar_number(ty) {
+            return n;
+        }
+        if let HirType::Ptr(inner) = ty
+            && let Some(n) = scalar_number(inner)
+        {
+            return SCALARS + n;
+        }
         let mut types = self.types.borrow_mut();
         if let Some(id) = types.get(ty) {
             return *id;
         }
-        let id = types.len() as u32;
+        let id = 2 * SCALARS + types.len() as u32;
         types.insert(ty.clone(), id);
         id
     }
+}
+
+fn scalar_number(ty: &HirType) -> Option<u32> {
+    Some(match ty {
+        HirType::Void => 0,
+        HirType::Bool => 1,
+        HirType::I8 => 2,
+        HirType::I16 => 3,
+        HirType::I32 => 4,
+        HirType::I64 => 5,
+        HirType::I128 => 6,
+        HirType::U8 => 7,
+        HirType::U16 => 8,
+        HirType::U32 => 9,
+        HirType::U64 => 10,
+        HirType::U128 => 11,
+        HirType::F32 => 12,
+        HirType::F64 => 13,
+        HirType::USize => 14,
+        HirType::ISize => 15,
+        _ => return None,
+    })
 }
 
 /// Counters surfaced for callers / tests.

@@ -69,9 +69,9 @@ use crate::hir::{
     BinaryOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
     HirTerminator, HirType, HirValue, HirValueKind, Intrinsic,
 };
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 use crate::loop_facts::{NotCounted, const_int, counted_loop};
 use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
 
 /// Per-run counters surfaced for callers / tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -353,7 +353,7 @@ fn try_recognize(func: &HirFunction, lp: &NaturalLoop) -> Result<FoldPlan, Skip>
     let acc_next_inst = find_def_in(latch_block, acc_next_id).ok_or(Skip::Recurrence)?;
     // `allowed` = result ids that legitimately appear in the latch as
     // part of the recurrence (the recurrence op, plus a fused FMul).
-    let mut allowed: HashSet<HirId> = HashSet::new();
+    let mut allowed: HashSet<HirId> = HashSet::default();
     let b_id = recognize_recurrence(
         func,
         latch_block,
@@ -822,7 +822,7 @@ fn find_def_in(block: &crate::hir::HirBlock, id: HirId) -> Option<&HirInstructio
 /// globals / undef, plus any instruction or phi defined outside the
 /// loop body.
 fn loop_invariant_values(func: &HirFunction, lp: &NaturalLoop) -> HashSet<HirId> {
-    let mut inv: HashSet<HirId> = HashSet::new();
+    let mut inv: HashSet<HirId> = HashSet::default();
     for (id, val) in &func.values {
         match val.kind {
             HirValueKind::Constant(_)
@@ -857,7 +857,7 @@ fn identity_phi_map(
     header: &crate::hir::HirBlock,
     invariant: &HashSet<HirId>,
 ) -> HashMap<HirId, HirId> {
-    let mut map: HashMap<HirId, HirId> = HashMap::new();
+    let mut map: HashMap<HirId, HirId> = HashMap::default();
     // A couple of passes let an identity phi that carries another
     // identity phi resolve transitively.
     for _ in 0..8 {
@@ -939,7 +939,7 @@ fn unique_outside_predecessor(func: &HirFunction, lp: &NaturalLoop) -> Option<Hi
 /// terminator. Same shape as `licm::rebuild_cfg_edges`; kept local to
 /// avoid a cross-module dependency.
 fn rebuild_cfg_edges(func: &mut HirFunction) {
-    let mut succ_map: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut succ_map: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for (&id, block) in &func.blocks {
         let succs = match &block.terminator {
             HirTerminator::Branch { target } => vec![*target],
@@ -962,7 +962,7 @@ fn rebuild_cfg_edges(func: &mut HirFunction) {
         };
         succ_map.insert(id, succs);
     }
-    let mut pred_map: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut pred_map: HashMap<HirId, Vec<HirId>> = HashMap::default();
     for (&src, succs) in &succ_map {
         for &t in succs {
             pred_map.entry(t).or_default().push(src);

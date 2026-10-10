@@ -1,8 +1,8 @@
 //! Bounded integer bit facts for equality folding. Unknown definitions,
 //! including loop phis and memory reads, contribute no facts.
 
+use crate::hir::IdHashMap as HashMap;
 use crate::hir::*;
-use std::collections::HashMap;
 
 #[derive(Clone, Copy, Default, Debug)]
 struct Bits {
@@ -206,9 +206,9 @@ pub(crate) fn fold_comparisons(func: &mut HirFunction) -> usize {
     let mut facts = Facts {
         func,
         defs,
-        cache: HashMap::new(),
+        cache: HashMap::default(),
     };
-    let mut folded = HashMap::new();
+    let mut folded = HashMap::default();
     for (result, op, left, right) in comparisons {
         let a = facts.get(left, 16);
         let b = facts.get(right, 16);
@@ -274,7 +274,7 @@ mod tests {
                 .flat_map(|b| &b.instructions)
                 .filter_map(|i| Some((i.result_id()?, i)))
                 .collect(),
-            cache: HashMap::new(),
+            cache: HashMap::default(),
         }
         .get(id, 16)
     }

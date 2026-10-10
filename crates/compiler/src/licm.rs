@@ -100,7 +100,6 @@ use crate::hir::{
 };
 use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 use crate::loop_facts::{const_int, counted_loop};
-use fnv::{FnvHashMap, FnvHashSet};
 use zyntax_typed_ast::InternedString;
 
 /// Stats surfaced for callers / tests.
@@ -116,7 +115,7 @@ pub struct LicmStats {
 
 /// Run LICM over `func`.
 pub fn run(func: &mut HirFunction) -> LicmStats {
-    run_with(func, &HashSet::default(), &FnvHashSet::default())
+    run_with(func, &HashSet::default(), &HashSet::default())
 }
 
 /// [`run`], knowing which functions are pure and which struct types
@@ -124,7 +123,7 @@ pub fn run(func: &mut HirFunction) -> LicmStats {
 fn run_with(
     func: &mut HirFunction,
     pure: &HashSet<HirId>,
-    exact: &FnvHashSet<InternedString>,
+    exact: &HashSet<InternedString>,
 ) -> LicmStats {
     // SSA construction doesn't reliably populate `block.successors` /
     // `block.predecessors` — different lowering paths write the
@@ -152,13 +151,13 @@ fn run_with(
     // instruction into a preheader that lies in every enclosing loop's
     // body, so what the map says of it stays right for the loops still
     // to come, and hoisting makes no new value.
-    let outside: FnvHashSet<HirId> = func
+    let outside: HashSet<HirId> = func
         .values
         .iter()
         .filter(|(_, v)| !matches!(v.kind, crate::hir::HirValueKind::Instruction))
         .map(|(id, _)| *id)
         .collect();
-    let mut value_block: FnvHashMap<HirId, HirId> = FnvHashMap::default();
+    let mut value_block: HashMap<HirId, HirId> = HashMap::default();
     for (block_id, block) in &func.blocks {
         for inst in &block.instructions {
             if let Some(res) = instruction_result(inst) {
@@ -295,12 +294,12 @@ fn unique_outside_predecessor(func: &HirFunction, lp: &NaturalLoop) -> Option<Hi
 /// (`HirModule::exact_struct_types`, spelled in `module.types`): two
 /// pointers whose pointee types are two different ones never name the
 /// same bytes.
-pub(crate) fn exact_struct_names(module: &HirModule) -> FnvHashSet<InternedString> {
+pub(crate) fn exact_struct_names(module: &HirModule) -> HashSet<InternedString> {
     // ZYNTAX_DISABLE_TYPED_ALIAS=1 ignores exact struct types in alias
     // checks; safe to run with.
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *DISABLED.get_or_init(|| std::env::var_os("ZYNTAX_DISABLE_TYPED_ALIAS").is_some()) {
-        return FnvHashSet::default();
+        return HashSet::default();
     }
     module
         .exact_struct_types
@@ -320,15 +319,15 @@ pub(crate) fn exact_struct_names(module: &HirModule) -> FnvHashSet<InternedStrin
 /// its loops.
 struct Shared<'a> {
     /// Values that live in no block: parameters, constants, globals.
-    outside: FnvHashSet<HirId>,
+    outside: HashSet<HirId>,
     /// The block each instruction or phi result is defined in.
-    value_block: FnvHashMap<HirId, HirId>,
+    value_block: HashMap<HirId, HirId>,
     addr_index: HashMap<HirId, AddrLink>,
     /// Pointers made from integers (`IntToPtr`): an address a program
     /// may keep as zero when there is nothing to point at.
-    from_integer: FnvHashSet<HirId>,
+    from_integer: HashSet<HirId>,
     /// Names of the exact struct types.
-    exact: &'a FnvHashSet<InternedString>,
+    exact: &'a HashSet<InternedString>,
 }
 
 /// Whether `ptr` is made, through address arithmetic and casts, from
@@ -361,7 +360,7 @@ fn hoist_loop(
     // Seed invariant set with every value defined outside the loop
     // body: one that lives in no block, or an instruction or phi
     // result whose block is not in `lp.body`.
-    let mut invariant: FnvHashSet<HirId> = shared.outside.clone();
+    let mut invariant: HashSet<HirId> = shared.outside.clone();
     for (val_id, block_id) in &shared.value_block {
         if !lp.body.contains(block_id) {
             invariant.insert(*val_id);
@@ -617,7 +616,7 @@ fn hoist_invariant_global_store(
     func: &mut HirFunction,
     lp: &NaturalLoop,
     preheader: HirId,
-    invariant: &FnvHashSet<HirId>,
+    invariant: &HashSet<HirId>,
     identity_subst: &indexmap::IndexMap<HirId, HirId>,
     dt: &DominatorTree,
 ) -> usize {
@@ -733,7 +732,7 @@ fn is_safe_to_hoist(inst: &HirInstruction) -> bool {
 }
 
 /// Are every operand referenced by `inst` already in `invariant`?
-fn operands_all_invariant(inst: &HirInstruction, invariant: &FnvHashSet<HirId>) -> bool {
+fn operands_all_invariant(inst: &HirInstruction, invariant: &HashSet<HirId>) -> bool {
     let mut all_in = true;
     let check = |id: HirId| invariant.contains(&id);
     match inst {
@@ -889,7 +888,7 @@ pub(crate) enum AddrLink {
 /// function with N instructions and K Loads we paid O(N²·K).
 pub(crate) fn build_addr_index(
     func: &HirFunction,
-    exact: &FnvHashSet<InternedString>,
+    exact: &HashSet<InternedString>,
 ) -> HashMap<HirId, AddrLink> {
     let mut idx: HashMap<HirId, AddrLink> = HashMap::default();
     for block in func.blocks.values() {
@@ -1002,7 +1001,7 @@ pub(crate) fn extract_mem_loc(
     size: u32,
     identity_subst: &indexmap::IndexMap<HirId, HirId>,
     addr_index: &HashMap<HirId, AddrLink>,
-    exact: &FnvHashSet<InternedString>,
+    exact: &HashSet<InternedString>,
 ) -> MemLoc {
     let mut current = identity_subst.get(&ptr).copied().unwrap_or(ptr);
     let mut total_offset: u64 = 0;

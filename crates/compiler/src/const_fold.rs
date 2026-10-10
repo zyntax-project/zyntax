@@ -193,43 +193,23 @@ fn combine(a: FoldStats, b: FoldStats) -> FoldStats {
 fn fold_one_pass(func: &mut HirFunction) -> usize {
     let mut folded = 0;
 
-    // Snapshot the block ids — modifying `func.blocks` while
-    // iterating requires this to avoid aliasing borrows.
-    let block_ids: Vec<HirId> = func.blocks.keys().copied().collect();
-
-    for block_id in block_ids {
-        // Pull values out for read-only access while we mutate
-        // `func.blocks`. `values` will be re-read after each fold so
-        // a fold that produces a new Constant is visible to
-        // subsequent folds in the same block.
-        let mut keep: Vec<HirInstruction> = Vec::new();
-
-        let block_insts = match func.blocks.get(&block_id) {
-            Some(b) => b.instructions.clone(),
-            None => continue,
-        };
-
-        for inst in block_insts {
-            if let Some((result_id, new_const, new_ty)) = try_fold_inst(&inst, &func.values) {
-                // Replace the result value's kind with the new
-                // Constant. Every existing use of `result_id`
-                // automatically picks up the new value.
-                if let Some(v) = func.values.get_mut(&result_id) {
-                    v.kind = HirValueKind::Constant(new_const);
-                    v.ty = new_ty;
-                }
-                folded += 1;
-                // Drop the instruction entirely — its result is now
-                // a pure SSA constant, no inst-level evaluation
-                // needed.
-                continue;
+    // A fold turns the result's value into a constant, which a later
+    // instruction of the same block reads in the same walk.
+    let values = &mut func.values;
+    for block in func.blocks.values_mut() {
+        block.instructions.retain(|inst| {
+            let Some((result_id, new_const, new_ty)) = try_fold_inst(inst, values) else {
+                return true;
+            };
+            // Every use of `result_id` reads the constant; the
+            // instruction is dropped.
+            if let Some(v) = values.get_mut(&result_id) {
+                v.kind = HirValueKind::Constant(new_const);
+                v.ty = new_ty;
             }
-            keep.push(inst);
-        }
-
-        if let Some(block) = func.blocks.get_mut(&block_id) {
-            block.instructions = keep;
-        }
+            folded += 1;
+            false
+        });
     }
 
     // Fold terminators too — a `CondBranch` on a known constant

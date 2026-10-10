@@ -233,21 +233,19 @@ fn live_phis(func: &HirFunction) -> HashSet<HirId> {
     }
 
     // Seed with the phis an instruction or terminator reads directly.
-    let mut read = HashSet::default();
+    let mut live: HashSet<HirId> = HashSet::default();
+    let mut work: Vec<HirId> = Vec::new();
+    let mut seed = |v: HirId| {
+        if incomings.contains_key(&v) && live.insert(v) {
+            work.push(v);
+        }
+    };
     for block in func.blocks.values() {
         for inst in &block.instructions {
-            collect_inst_operands(inst, &mut read);
+            inst.for_each_operand(&mut seed);
         }
-        collect_terminator_operands(&block.terminator, &mut read);
+        block.terminator.for_each_operand(&mut seed);
     }
-
-    let mut live: HashSet<HirId> = HashSet::default();
-    let mut work: Vec<HirId> = read
-        .iter()
-        .filter(|v| incomings.contains_key(v))
-        .copied()
-        .collect();
-    live.extend(work.iter().copied());
 
     // A live phi's incomings are observable through it, so any phi among
     // them is live too.
@@ -262,103 +260,6 @@ fn live_phis(func: &HirFunction) -> HashSet<HirId> {
         }
     }
     live
-}
-
-fn collect_inst_operands(inst: &HirInstruction, used: &mut HashSet<HirId>) {
-    macro_rules! u {
-        ($($v:expr),*) => {{ $( used.insert(*$v); )* }};
-    }
-    match inst {
-        HirInstruction::Binary { left, right, .. } => u!(left, right),
-        HirInstruction::Unary { operand, .. } => u!(operand),
-        HirInstruction::Cast { operand, .. } => u!(operand),
-        HirInstruction::Load { ptr, .. } => u!(ptr),
-        HirInstruction::Store { value, ptr, .. } => u!(value, ptr),
-        HirInstruction::GetElementPtr { ptr, indices, .. } => {
-            u!(ptr);
-            used.extend(indices.iter().copied());
-        }
-        HirInstruction::Call { args, .. } => used.extend(args.iter().copied()),
-        HirInstruction::IndirectCall { func_ptr, args, .. } => {
-            u!(func_ptr);
-            used.extend(args.iter().copied());
-        }
-        HirInstruction::Select {
-            condition,
-            true_val,
-            false_val,
-            ..
-        } => u!(condition, true_val, false_val),
-        HirInstruction::ExtractValue { aggregate, .. } => u!(aggregate),
-        HirInstruction::InsertValue {
-            aggregate, value, ..
-        } => u!(aggregate, value),
-        HirInstruction::Atomic { ptr, value, .. } => {
-            u!(ptr);
-            if let Some(v) = value {
-                used.insert(*v);
-            }
-        }
-        HirInstruction::Alloca { count, .. } => {
-            if let Some(c) = count {
-                used.insert(*c);
-            }
-        }
-        HirInstruction::VectorSplat { scalar, .. } => u!(scalar),
-        HirInstruction::VectorExtractLane { vector, .. } => u!(vector),
-        HirInstruction::VectorInsertLane { vector, scalar, .. } => u!(vector, scalar),
-        HirInstruction::VectorHorizontalReduce { vector, .. } => u!(vector),
-        HirInstruction::VectorUnaryOp { operand, .. } => u!(operand),
-        HirInstruction::VectorMinMax { left, right, .. } => u!(left, right),
-        HirInstruction::VectorDot { acc, a, b, .. } => u!(acc, a, b),
-        HirInstruction::VectorLoad { ptr, .. } => u!(ptr),
-        HirInstruction::VectorStore { value, ptr, .. } => u!(value, ptr),
-        // Anything not enumerated is treated as reading nothing here. That
-        // is only safe because a missed operand can at worst let a phi
-        // survive that could have been dropped — never the reverse. The
-        // conservative direction is deliberate: this pass must not remove
-        // a phi something still reads, so unknown shapes fall back to
-        // marking every value they mention.
-        other => collect_unknown_operands(other, used),
-    }
-}
-
-/// Catch-all for instruction shapes not enumerated above: mark every value
-/// the instruction mentions as used, so a phi feeding it is never dropped.
-fn collect_unknown_operands(inst: &HirInstruction, used: &mut HashSet<HirId>) {
-    // The debug rendering names every `HirId` the instruction holds. Using
-    // it keeps this fallback correct as new instruction variants land,
-    // rather than silently under-approximating uses when one is added.
-    let text = format!("{inst:?}");
-    let mut rest = text.as_str();
-    while let Some(pos) = rest.find("HirId(") {
-        rest = &rest[pos + "HirId(".len()..];
-        let end = match rest.find(')') {
-            Some(e) => e,
-            None => break,
-        };
-        if let Ok(raw) = rest[..end].trim().parse::<u32>() {
-            used.insert(HirId::from_raw(raw));
-        }
-        rest = &rest[end..];
-    }
-}
-
-fn collect_terminator_operands(term: &HirTerminator, used: &mut HashSet<HirId>) {
-    match term {
-        HirTerminator::Return { values } => used.extend(values.iter().copied()),
-        HirTerminator::CondBranch { condition, .. } => {
-            used.insert(*condition);
-        }
-        HirTerminator::Switch { value, .. } => {
-            used.insert(*value);
-        }
-        HirTerminator::Invoke { args, .. } => used.extend(args.iter().copied()),
-        HirTerminator::PatternMatch { value, .. } => {
-            used.insert(*value);
-        }
-        HirTerminator::Branch { .. } | HirTerminator::Unreachable => {}
-    }
 }
 
 #[cfg(test)]

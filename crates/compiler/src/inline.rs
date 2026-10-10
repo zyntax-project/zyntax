@@ -1216,16 +1216,13 @@ fn inline_in_function(
     for block_id in block_ids {
         let mut jobs: Vec<InlineJob> = Vec::new();
 
-        // Collect candidates from this block. Snapshot the
-        // instruction list so we don't have to fight the borrow
-        // checker mid-traversal.
-        let block_insts = caller
-            .blocks
-            .get(&block_id)
-            .map(|b| b.instructions.clone())
-            .unwrap_or_default();
+        // Collect candidates from this block; nothing changes the
+        // caller until they are applied below.
+        let Some(block) = caller.blocks.get(&block_id) else {
+            continue;
+        };
 
-        for (idx, inst) in block_insts.iter().enumerate() {
+        for (idx, inst) in block.instructions.iter().enumerate() {
             let (result, args, callee_id) = match inst {
                 HirInstruction::Call {
                     result,

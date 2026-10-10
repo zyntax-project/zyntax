@@ -10,11 +10,11 @@
 //! None before each read, and only the first check survives.
 
 use crate::analysis::DominatorTree;
+use crate::hir::IdHashMap as HashMap;
 use crate::hir::{
     BinaryOp, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator,
     HirValueKind,
 };
-use std::collections::HashMap;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BranchFoldStats {
@@ -42,7 +42,7 @@ pub fn run(func: &mut HirFunction) -> BranchFoldStats {
     func.rebuild_cfg_edges();
     let dt = DominatorTree::of(func);
     // `xor %c, true` results by the `%c` they negate.
-    let mut negations: HashMap<HirId, HirId> = HashMap::new();
+    let mut negations: HashMap<HirId, HirId> = HashMap::default();
     for block in func.blocks.values() {
         for inst in &block.instructions {
             if let HirInstruction::Binary {

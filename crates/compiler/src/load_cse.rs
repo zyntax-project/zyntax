@@ -30,12 +30,12 @@
 
 use crate::cse;
 use crate::hir::IdHashMap as HashMap;
+use crate::hir::IdHashSet;
 use crate::hir::{
     CastOp, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator, HirType,
     HirValueKind,
 };
 use crate::licm::{MemLoc, extract_mem_loc, hir_ty_byte_size, value_byte_size};
-use fnv::FnvHashSet;
 use zyntax_typed_ast::InternedString;
 
 #[derive(Clone, Copy)]
@@ -236,19 +236,19 @@ fn load_regions(func: &HirFunction, enabled: bool) -> (Vec<Vec<usize>>, Vec<usiz
 
 /// Reuse loads within each block.
 pub fn run(func: &mut HirFunction) -> LoadCseStats {
-    run_with(func, &FnvHashSet::default(), false)
+    run_with(func, &IdHashSet::default(), false)
 }
 
 /// Reuse loads through single-entry successors after structural optimization.
 pub fn run_regions(func: &mut HirFunction) -> LoadCseStats {
-    run_with(func, &FnvHashSet::default(), true)
+    run_with(func, &IdHashSet::default(), true)
 }
 
 /// [`run`], knowing the exact struct types
 /// (`licm::exact_struct_names`).
 fn run_with(
     func: &mut HirFunction,
-    exact: &FnvHashSet<InternedString>,
+    exact: &IdHashSet<InternedString>,
     across: bool,
 ) -> LoadCseStats {
     let mut substitutions: HashMap<HirId, HirId> = HashMap::default();
