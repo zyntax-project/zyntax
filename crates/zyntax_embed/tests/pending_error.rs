@@ -162,6 +162,42 @@ fn a_flag_is_found_in_every_joined_piece() {
     }
 }
 
+/// A rebuild recompiles the pieces that joined the running program from
+/// the bodies kept for them, and their code and flags work after it.
+#[test]
+fn joined_pieces_are_compiled_again_by_a_rebuild() {
+    let mut runtime = TieredRuntime::development().expect("runtime");
+    runtime.set_error_flag_global("failure");
+    runtime
+        .compile_typed_program(program())
+        .expect("program compiles");
+    for n in 0..2 {
+        let fail = format!("fail_{n}");
+        let succeed = format!("succeed_{n}");
+        runtime
+            .join_typed_program(
+                program_named(&fail, &succeed, 10 + n),
+                &[fail.as_str(), succeed.as_str()],
+            )
+            .expect("piece joins");
+    }
+    runtime.finalize_runtime_symbols().expect("rebuild");
+
+    for (n, code) in [(0, 4), (1, 5)] {
+        let fail = runtime
+            .get_function_ptr(&format!("fail_{n}"))
+            .expect("fail is compiled");
+        let fail: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(fail) };
+        assert_eq!(fail(code), 0);
+        assert_eq!(runtime.take_pending_error(), Some(code as u64), "fail_{n}");
+        let succeed = runtime
+            .get_function_ptr(&format!("succeed_{n}"))
+            .expect("succeed is compiled");
+        let succeed: extern "C" fn() -> i64 = unsafe { std::mem::transmute(succeed) };
+        assert_eq!(succeed(), 10 + n);
+    }
+}
+
 /// A reloaded program's flag is still found once another program has
 /// loaded after it and become the current one.
 #[test]

@@ -509,9 +509,7 @@ pub fn serialize_module_split(module: &HirModule) -> Result<Vec<u8>> {
         Ok(extent)
     };
 
-    let mut stripped = module.clone();
-    stripped.functions.clear();
-    let stripped = put(&to_postcard(&stripped)?)?;
+    let stripped = put(&to_postcard(&module.without_functions())?)?;
 
     let mut directory = Vec::with_capacity(module.functions.len());
     let mut names = Vec::with_capacity(module.functions.len());
@@ -521,12 +519,7 @@ pub fn serialize_module_split(module: &HirModule) -> Result<Vec<u8>> {
         let (shell, body) = if function.is_external {
             (put(&to_postcard(function)?)?, None)
         } else {
-            let mut shell = HirFunction {
-                blocks: Default::default(),
-                locals: Default::default(),
-                values: Default::default(),
-                ..function.clone()
-            };
+            let mut shell = function.shell();
             shell.attributes.shell_refs = crate::hir::ShellRefs::of(function);
             (
                 put(&to_postcard(&shell)?)?,
@@ -571,17 +564,27 @@ fn to_postcard<T: serde::Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
 /// checking the image against its checksum first. Any other format is
 /// decoded whole and wrapped.
 pub fn deserialize_module_lazy(bytes: impl Into<Cow<'static, [u8]>>) -> Result<LazyModule> {
-    lazy_module(bytes.into(), true)
+    lazy_module(bytes.into(), true, true)
 }
 
 /// [`deserialize_module_lazy`] without the checksum, for an image this
 /// build embedded in its own executable. An image from anywhere else
 /// goes through the checked read.
 pub fn deserialize_module_lazy_trusted(bytes: &'static [u8]) -> Result<LazyModule> {
-    lazy_module(Cow::Borrowed(bytes), false)
+    lazy_module(Cow::Borrowed(bytes), false, true)
 }
 
-fn lazy_module(bytes: Cow<'static, [u8]>, checked: bool) -> Result<LazyModule> {
+/// `module` as a [`Format::Split`] image held in memory, its ids as they
+/// are: each body decodes to the function it was, for a module whose
+/// code is installed and whose HIR is rarely read again.
+pub fn encode_module_in_place(module: &HirModule) -> Result<LazyModule> {
+    lazy_module(Cow::Owned(serialize_module_split(module)?), false, false)
+}
+
+/// `relocate` shifts every id above those minted so far, for an image
+/// from elsewhere; without it the ids are the ones the image was made
+/// with.
+fn lazy_module(bytes: Cow<'static, [u8]>, checked: bool, relocate: bool) -> Result<LazyModule> {
     let (header, payload) = if checked {
         checked_payload(&bytes)?
     } else {
@@ -590,7 +593,11 @@ fn lazy_module(bytes: Cow<'static, [u8]>, checked: bool) -> Result<LazyModule> {
     if Format::from_u8(header.format)? != Format::Split {
         return deserialize_module(&bytes).map(LazyModule::eager);
     }
-    let base = crate::hir::HirId::next_unminted();
+    let base = if relocate {
+        crate::hir::HirId::next_unminted()
+    } else {
+        0
+    };
     let (split, blob): (SplitPayload, &[u8]) = crate::hir::HirId::relocated_by(base, || {
         postcard::take_from_bytes(payload)
             .map_err(|e| BytecodeError::DeserializationError(e.to_string()))
@@ -881,7 +888,7 @@ pub fn deserialize_module(bytes: &[u8]) -> Result<HirModule> {
     let (header, payload) = checked_payload(bytes)?;
     let format = Format::from_u8(header.format)?;
     if format == Format::Split {
-        return lazy_module(Cow::Owned(bytes.to_vec()), false).map(LazyModule::into_module);
+        return lazy_module(Cow::Owned(bytes.to_vec()), false, true).map(LazyModule::into_module);
     }
 
     // Deserialize payload. The module's ids were minted by whichever

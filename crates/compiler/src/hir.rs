@@ -2773,9 +2773,62 @@ impl HirModule {
     pub fn increment_version(&mut self) {
         self.version += 1;
     }
+
+    /// A copy of this module without its functions.
+    pub fn without_functions(&self) -> HirModule {
+        let Self {
+            id,
+            name,
+            functions: _,
+            globals,
+            types,
+            imports,
+            exports,
+            version,
+            dependencies,
+            effects,
+            handlers,
+            automatic_release,
+            exact_struct_types,
+        } = self;
+        HirModule {
+            id: *id,
+            name: *name,
+            functions: IdMap::default(),
+            globals: globals.clone(),
+            types: types.clone(),
+            imports: imports.clone(),
+            exports: exports.clone(),
+            version: *version,
+            dependencies: dependencies.clone(),
+            effects: effects.clone(),
+            handlers: handlers.clone(),
+            automatic_release: *automatic_release,
+            exact_struct_types: exact_struct_types.clone(),
+        }
+    }
 }
 
 impl HirFunction {
+    /// A copy of this function without its body: no blocks, locals or
+    /// values.
+    pub fn shell(&self) -> HirFunction {
+        HirFunction {
+            id: self.id,
+            name: self.name,
+            signature: self.signature.clone(),
+            entry_block: self.entry_block,
+            blocks: IdMap::default(),
+            locals: IdMap::default(),
+            values: IdMap::default(),
+            previous_version: self.previous_version,
+            is_external: self.is_external,
+            calling_convention: self.calling_convention,
+            attributes: self.attributes.clone(),
+            link_name: self.link_name.clone(),
+        }
+    }
+
     /// The functions this body calls by id, through a call or an invoke,
     /// once per call site.
     pub fn direct_call_targets(&self) -> impl Iterator<Item = HirId> + '_ {

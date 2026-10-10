@@ -229,6 +229,29 @@ impl TieredConfig {
 // Internals
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A module kept for as long as its code is installed.
+struct Loaded {
+    module: Arc<HirModule>,
+    /// The bodies of a joined module whose functions `module` holds as
+    /// shells; see [`TieredBackend::keep_bodies_encoded`].
+    bodies: Option<Arc<LazyModule>>,
+}
+
+impl Loaded {
+    /// The module with every body in it.
+    fn whole(&self) -> Arc<HirModule> {
+        let Some(bodies) = &self.bodies else {
+            return Arc::clone(&self.module);
+        };
+        let mut module = self.module.without_functions();
+        for (id, shell) in &self.module.functions {
+            let function = bodies.function(*id).unwrap_or_else(|| shell.clone());
+            module.functions.insert(*id, function);
+        }
+        Arc::new(module)
+    }
+}
+
 /// Per-function state held alongside its beadie bound bead.
 struct FunctionEntry {
     bound: TieredBound,
@@ -1163,7 +1186,7 @@ pub struct TieredBackend {
     /// installable as soon as the second file loads. A module stays
     /// usable for as long as it is loaded, whatever loads after it, and
     /// that needs all of them kept and all of them restored.
-    loaded: Vec<Arc<HirModule>>,
+    loaded: Vec<Loaded>,
     /// The module the latest reload, or its rollback, moved every
     /// function entry to. A later load that is not joining replaces
     /// `current_module`, and the functions this one holds stay
@@ -1394,10 +1417,7 @@ impl TieredBackend {
             // only the newest satisfies the requirement stated above
             // for one module and leaves every other one with code it
             // cannot resolve its own globals from.
-            let previously: Vec<Arc<HirModule>> = self.loaded.clone();
-            for earlier in &previously {
-                self.cranelift.with_lock(|be| be.compile_module(earlier))?;
-            }
+            self.restore_loaded()?;
         }
 
         // Bead ids have to exist before codegen, not after: a tier-0 probe
@@ -1463,7 +1483,10 @@ impl TieredBackend {
         if !joining || self.current_module.is_none() {
             self.current_module = Some(Arc::clone(&module_context));
         }
-        self.loaded.push(Arc::clone(&module_context));
+        self.loaded.push(Loaded {
+            module: Arc::clone(&module_context),
+            bodies: None,
+        });
 
         // Hand the LLVM tier the whole module before anything promotes out
         // of it: a promotion recompiles one function, and that function's
@@ -1608,7 +1631,64 @@ impl TieredBackend {
             }
         }
 
+        let current = self
+            .current_module
+            .as_ref()
+            .is_some_and(|m| Arc::ptr_eq(m, &module_context));
+        if joining && !current && lazy.is_empty() {
+            self.keep_bodies_encoded(&module_context);
+        }
         Ok(())
+    }
+
+    /// Keep a joined module's bodies encoded now that its code is
+    /// installed.
+    ///
+    /// A joined module stays at the tier it was compiled at, so its HIR
+    /// is read again only by a rebuild, which recompiles it whole, and
+    /// by lookups that need its signatures and globals. Its functions
+    /// stay in the module as shells, and a body is decoded from the
+    /// image when something asks for it. A program that compiles chunk
+    /// after chunk then keeps the encoded size of each, not its HIR.
+    fn keep_bodies_encoded(&mut self, module: &Arc<HirModule>) {
+        let Some(at) = self
+            .loaded
+            .iter()
+            .rposition(|l| Arc::ptr_eq(&l.module, module))
+        else {
+            return;
+        };
+        let Ok(bodies) = crate::bytecode::encode_module_in_place(module) else {
+            return;
+        };
+        let bodies = Arc::new(bodies);
+        // A shell records what its body refers to, for the readers of the
+        // module that would otherwise walk the body.
+        let mut shells = module.without_functions();
+        for (id, function) in &module.functions {
+            let mut shell = function.shell();
+            if !function.is_external {
+                shell.attributes.shell_refs = crate::hir::ShellRefs::of(function);
+            }
+            shells.functions.insert(*id, shell);
+        }
+        let shells = Arc::new(shells);
+        for id in module.functions.keys() {
+            let Some(entry) = self.functions.get_mut(id) else {
+                continue;
+            };
+            if !Arc::ptr_eq(&entry.module, module) {
+                continue;
+            }
+            entry.module = Arc::clone(&shells);
+            if entry.function.is_none() && entry.body_source.is_none() {
+                entry.body_source = Some(Arc::clone(&bodies));
+            }
+        }
+        self.loaded[at] = Loaded {
+            module: shells,
+            bodies: Some(bodies),
+        };
     }
 
     /// Replace the parts of the running module the edited one changed.
@@ -2508,9 +2588,14 @@ impl TieredBackend {
         self.cranelift
             .with_lock(|be| be.rebuild_with_accumulated_symbols())?;
         self.globals_moved += 1;
-        let previously: Vec<Arc<HirModule>> = self.loaded.clone();
-        for earlier in &previously {
-            self.cranelift.with_lock(|be| be.compile_module(earlier))?;
+        self.restore_loaded()
+    }
+
+    /// Compile every loaded module again, in the order they were loaded.
+    fn restore_loaded(&self) -> CompilerResult<()> {
+        for earlier in &self.loaded {
+            let earlier = earlier.whole();
+            self.cranelift.with_lock(|be| be.compile_module(&earlier))?;
         }
         Ok(())
     }
@@ -2532,7 +2617,7 @@ impl TieredBackend {
         let mut out: Vec<&HirModule> = Vec::new();
         let mut seen: HashSet<*const HirModule> = HashSet::new();
         let current = self.current_module.as_deref();
-        let loaded = self.loaded.iter().map(|m| &**m);
+        let loaded = self.loaded.iter().map(|l| &*l.module);
         for m in current
             .into_iter()
             .chain(loaded)
@@ -2543,6 +2628,24 @@ impl TieredBackend {
             }
         }
         out
+    }
+
+    /// Function `id` as the first loaded module holding it has it, with
+    /// its body decoded when that module keeps its bodies encoded.
+    fn loaded_function(&self, id: HirId) -> Option<std::borrow::Cow<'_, HirFunction>> {
+        let module = self
+            .loaded_modules()
+            .into_iter()
+            .find(|m| m.functions.contains_key(&id))?;
+        let decoded = self
+            .loaded
+            .iter()
+            .find(|l| std::ptr::eq(&*l.module, module))
+            .and_then(|l| l.bodies.as_ref()?.function(id));
+        match decoded {
+            Some(body) => Some(std::borrow::Cow::Owned(body)),
+            None => module.functions.get(&id).map(std::borrow::Cow::Borrowed),
+        }
     }
 
     /// The module a function was compiled as part of.
@@ -2683,13 +2786,10 @@ impl TieredBackend {
             // and resolving it against a single module ended the walk
             // there without saying so: the answer came back empty and
             // read as nothing to report.
-            let Some(func) = self
-                .loaded_modules()
-                .into_iter()
-                .find_map(|m| m.functions.get(&id))
-            else {
+            let Some(func) = self.loaded_function(id) else {
                 continue;
             };
+            let func: &HirFunction = &func;
             let name = func.name.resolve_global().unwrap_or_default();
 
             // A handler this function opens covers what it calls. The
@@ -2957,7 +3057,7 @@ impl TieredBackend {
                     && then.current == mark.current
                     && then.loaded <= mark.loaded =>
             {
-                let added = self.loaded[then.loaded..].iter().map(|m| &**m);
+                let added = self.loaded[then.loaded..].iter().map(|l| &*l.module);
                 (self.error_flag_slots_of(added), false, mark)
             }
             _ => (self.error_flag_slots(), true, mark),
@@ -3155,7 +3255,18 @@ impl TieredBackend {
             .filter(|(id, _)| finished.contains(id))
             .filter_map(|(id, entry)| Some((*id, Arc::clone(entry.body_source.as_ref()?))))
             .collect();
+        // A joined module's bodies, kept encoded once its code is
+        // installed: the only functions outside `lazy` with a source.
+        let kept: HashMap<HirId, Arc<LazyModule>> = self
+            .functions
+            .iter()
+            .filter(|(id, _)| !self.lazy.contains(id))
+            .filter_map(|(id, entry)| Some((*id, Arc::clone(entry.body_source.as_ref()?))))
+            .collect();
         Box::new(move |id: HirId| {
+            if let Some(source) = kept.get(&id) {
+                return source.function(id).map(Arc::new);
+            }
             let bead = beads.get(&id)?;
             let tier = match optimized_bodies.get(id) {
                 Some(body) => Some(body),
