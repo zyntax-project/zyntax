@@ -472,10 +472,6 @@ struct MatchContext {
 #[derive(Debug)]
 pub struct SsaForm {
     pub function: HirFunction,
-    /// Def-use chains for optimization
-    pub def_use_chains: IndexMap<HirId, IdHashSet<HirId>>,
-    /// Use-def chains for analysis
-    pub use_def_chains: IndexMap<HirId, HirId>,
     /// Closure functions generated during translation
     pub closure_functions: Vec<HirFunction>,
     /// String globals generated during translation
@@ -1033,13 +1029,8 @@ impl SsaBuilder {
         self.recompute_cfg_edges();
         self.fill_incomplete_phis();
 
-        // Build def-use chains
-        let (def_use_chains, use_def_chains) = self.build_def_use_chains();
-
         Ok(SsaForm {
             function: self.function,
-            def_use_chains,
-            use_def_chains,
             closure_functions: self.closure_functions,
             string_globals: self.string_globals,
             with_scopes: self.nested_with_scopes,
@@ -1166,7 +1157,7 @@ impl SsaBuilder {
         // For now, we use a simple worklist algorithm that processes blocks when their
         // non-back-edge predecessors are ready
         let mut worklist: Vec<_> = cfg.graph.node_indices().collect();
-        let mut processed_blocks = std::collections::HashSet::new();
+        let mut processed_blocks: IdHashSet<HirId> = IdHashSet::default();
         processed_blocks.insert(entry_block);
 
         // Process entry block statements and terminator
@@ -1292,13 +1283,8 @@ impl SsaBuilder {
         // If IDF is correct, all phis should already have all incoming values.
         // self.verify_and_fix_phi_incoming();
 
-        // Build def-use chains
-        let (def_use_chains, use_def_chains) = self.build_def_use_chains();
-
         Ok(SsaForm {
             function: self.function,
-            def_use_chains,
-            use_def_chains,
             closure_functions: self.closure_functions,
             string_globals: self.string_globals,
             with_scopes: self.nested_with_scopes,
@@ -1436,7 +1422,7 @@ impl SsaBuilder {
                 "splitting a nested statement list gave no entry block".into(),
             ));
         }
-        let mut reachable: HashSet<HirId> = HashSet::new();
+        let mut reachable: IdHashSet<HirId> = IdHashSet::default();
         let mut stack = vec![block_id];
         let mut preds: HashMap<HirId, Vec<HirId>> = HashMap::new();
         while let Some(id) = stack.pop() {
@@ -8209,7 +8195,7 @@ impl SsaBuilder {
     /// nothing. Runs once the terminators are final, before the phis
     /// are filled from the predecessor lists.
     fn remove_unreachable_blocks(&mut self) {
-        let mut reachable: HashSet<HirId> = HashSet::new();
+        let mut reachable: IdHashSet<HirId> = IdHashSet::default();
         let mut stack = vec![self.function.entry_block];
         while let Some(id) = stack.pop() {
             if !reachable.insert(id) {
@@ -9330,23 +9316,6 @@ impl SsaBuilder {
     }
 
     /// Build def-use and use-def chains
-    fn build_def_use_chains(&self) -> (IndexMap<HirId, IdHashSet<HirId>>, IndexMap<HirId, HirId>) {
-        let mut def_use = IndexMap::new();
-        let mut use_def = IndexMap::new();
-
-        // Process all values
-        for (value_id, value) in &self.function.values {
-            def_use.insert(*value_id, value.uses.clone());
-
-            // For each use, record the definition
-            for &use_id in &value.uses {
-                use_def.insert(use_id, *value_id);
-            }
-        }
-
-        (def_use, use_def)
-    }
-
     /// Resolve a method call to a mangled function name
     /// Looks up which trait impl provides the method for the receiver type
     fn resolve_method_to_function(
@@ -16735,7 +16704,7 @@ impl SsaForm {
     /// Verify SSA properties
     pub fn verify(&self) -> CompilerResult<()> {
         // Each value should be defined exactly once
-        let mut defined_values = HashSet::new();
+        let mut defined_values: IdHashSet<HirId> = IdHashSet::default();
 
         for (_, block) in &self.function.blocks {
             // Check phis
@@ -16761,8 +16730,16 @@ impl SsaForm {
             }
         }
 
-        // Each use should have a definition (or be a constant/parameter)
-        for (use_id, def_id) in &self.use_def_chains {
+        // Each use should have a definition (or be a constant/parameter):
+        // a use's definition is the last value, in value order, whose
+        // recorded uses name it.
+        let mut use_def: crate::hir::IdMap<HirId, HirId> = crate::hir::IdMap::default();
+        for (value_id, value) in &self.function.values {
+            for &use_id in &value.uses {
+                use_def.insert(use_id, *value_id);
+            }
+        }
+        for (use_id, def_id) in &use_def {
             if !defined_values.contains(def_id) {
                 // Check if it's a constant or parameter (self-defining values)
                 if let Some(value) = self.function.values.get(def_id) {

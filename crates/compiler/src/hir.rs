@@ -2802,8 +2802,7 @@ impl HirFunction {
     /// (dominators, loops) reads them as they are. Predecessors come
     /// in block order, so they are the same on every run.
     pub fn rebuild_cfg_edges(&mut self) {
-        let mut preds: std::collections::HashMap<HirId, Vec<HirId>> =
-            std::collections::HashMap::new();
+        let mut preds: IdHashMap<HirId, Vec<HirId>> = IdHashMap::default();
         let succs: Vec<(HirId, Vec<HirId>)> = self
             .blocks
             .iter()
