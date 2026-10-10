@@ -71,9 +71,13 @@ impl ZyntaxCraneliftBackend {
     }
 
     /// Run `f` with exclusive access to the wrapped backend.
+    /// The thread leaves able to run JIT code, whatever `f` left half
+    /// written.
     pub fn with_lock<R>(&self, f: impl FnOnce(&mut CraneliftBackend) -> R) -> R {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        f(&mut guard)
+        let result = f(&mut guard);
+        crate::jit_memory::end_code_writes();
+        result
     }
 
     /// The baseline's resume points for `def`'s function: one helper per

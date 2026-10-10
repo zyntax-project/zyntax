@@ -1026,7 +1026,7 @@ impl CraneliftBackend {
         }
         self.emit_wanted_stubs()?;
         // Finalize the module
-        let _ = self.module.finalize_definitions();
+        let _ = self.finalize_module();
         self.register_root_globals();
         self.publish_stubs();
 
@@ -1619,8 +1619,7 @@ impl CraneliftBackend {
             .define_function(thunk_id, &mut self.codegen_context)
             .map_err(|e| CompilerError::Backend(format!("Failed to define thunk: {e}")))?;
         self.codegen_context.clear();
-        self.module
-            .finalize_definitions()
+        self.finalize_module()
             .map_err(|e| CompilerError::Backend(format!("Failed to finalize definitions: {e}")))?;
         let p = self.module.get_finalized_function(thunk_id);
         self.interp_thunks.insert(sig.clone(), p as usize);
@@ -10010,6 +10009,17 @@ impl CraneliftBackend {
             .copied()
     }
 
+    /// Cranelift's finalization, which writes relocations into the code
+    /// it placed: with this thread able to write JIT code throughout, and
+    /// back to running it after, whatever the outcome.
+    fn finalize_module(&mut self) -> cranelift_module::ModuleResult<()> {
+        use cranelift_module::Module;
+        crate::jit_memory::begin_code_writes();
+        let finalized = self.module.finalize_definitions();
+        crate::jit_memory::end_code_writes();
+        finalized
+    }
+
     /// Finalize compiled functions and update function pointers
     /// This must be called after compile_function() before get_function_ptr() will work
     pub fn finalize_definitions(&mut self) -> CompilerResult<()> {
@@ -10017,7 +10027,7 @@ impl CraneliftBackend {
 
         self.emit_wanted_stubs()?;
         // Finalize the module
-        self.module.finalize_definitions().map_err(|e| {
+        self.finalize_module().map_err(|e| {
             CompilerError::Backend(format!("Failed to finalize definitions: {}", e))
         })?;
         self.register_root_globals();
@@ -11311,8 +11321,8 @@ mod tests {
         };
         // SAFETY: sysconf has no preconditions.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        // Each finalization starts code on a fresh page, so a few
-        // compiles fill four pages.
+        // Four pages fill after a few compiles, or a few hundred where
+        // code is packed into a range of its own.
         let mut backend =
             CraneliftBackend::with_jit_reservation(host_isa(), None, 4 * page).expect("backend");
         let first = returning(0);
@@ -11322,7 +11332,7 @@ mod tests {
         backend.finalize_definitions().expect("finalized");
         let first_code = backend.get_function_ptr(first.id).expect("compiled");
 
-        let refused = (1..64).find_map(|k| {
+        let refused = (1..4096).find_map(|k| {
             let f = returning(k);
             backend
                 .compile_function(f.id, &f)
