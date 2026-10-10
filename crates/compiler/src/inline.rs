@@ -589,7 +589,8 @@ fn reorder_blocks_by_cfg(func: &mut HirFunction) {
 /// otherwise didn't have them, and the existing infrastructure
 /// can't always splice them cleanly inside a multi-block clone.
 fn classify_recursive(callee: &HirFunction, self_id: HirId, callees: &Callees<'_>) -> CalleeClass {
-    if callee.signature.is_async || callee.is_external {
+    // A shell's body is kept out of the module: nothing here to copy.
+    if callee.signature.is_async || callee.is_external || callee.blocks.is_empty() {
         return CalleeClass::Unsupported;
     }
     if !callee.signature.effects.is_empty() {
@@ -1631,7 +1632,8 @@ fn classify(
             calls: false,
         },
     );
-    if callee.signature.is_async || callee.is_external {
+    // A shell's body is kept out of the module: nothing here to copy.
+    if callee.signature.is_async || callee.is_external || callee.blocks.is_empty() {
         return unsupported;
     }
     // A function declared cold runs rarely: a call to it costs less
@@ -2588,6 +2590,34 @@ mod tests {
             })
             .expect("Add present");
         assert_eq!(add_left, mul_result, "Add must use Mul's result");
+    }
+
+    /// A signature shell stands for a body kept out of the module: the
+    /// call to it stays, rather than being replaced by an empty body.
+    #[test]
+    fn a_call_to_a_shell_is_left_a_call() {
+        let mut module = build_module();
+        for function in module.functions.values_mut() {
+            if function.name.resolve_global().as_deref() == Some("square") {
+                function.blocks.clear();
+                function.values.clear();
+                function.attributes.deferred = true;
+            }
+        }
+        let stats = run_module(&mut module);
+        assert_eq!(stats.inlined, 0, "{stats:?}");
+        let caller = module
+            .functions
+            .values()
+            .find(|f| f.name.resolve_global().as_deref() == Some("caller"))
+            .unwrap();
+        assert!(
+            caller.blocks[&caller.entry_block]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, HirInstruction::Call { .. })),
+            "the call to the shell remains"
+        );
     }
 
     #[test]
