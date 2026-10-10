@@ -288,9 +288,9 @@ pub fn find_loop_headers(function: &HirFunction) -> Vec<HirId> {
         None => return Vec::new(),
     };
 
-    let mut visited = HashMap::<HirId, DfsColor>::new();
+    let mut visited = crate::hir::IdHashMap::<HirId, DfsColor>::default();
     let mut headers = Vec::new();
-    let mut headers_seen = std::collections::HashSet::new();
+    let mut headers_seen = IdSet::default();
 
     dfs_find_back_edges(
         function,
@@ -312,9 +312,9 @@ enum DfsColor {
 fn dfs_find_back_edges(
     function: &HirFunction,
     block_id: HirId,
-    visited: &mut HashMap<HirId, DfsColor>,
+    visited: &mut crate::hir::IdHashMap<HirId, DfsColor>,
     headers: &mut Vec<HirId>,
-    headers_seen: &mut std::collections::HashSet<HirId>,
+    headers_seen: &mut IdSet,
 ) {
     visited.insert(block_id, DfsColor::OnStack);
 
@@ -557,7 +557,7 @@ pub fn osr_layout_with(
     // does not dominate is live at the header when read outside its own
     // dominance, and is repaired below.
     let local_defs = locally_defined_in(function, &reachable);
-    let dominated: IdSet = dominators.dominated_by(header).into_iter().collect();
+    let dominated: IdSet = dominators.dominated_by(header);
 
     let mut seen_extra: IdSet = live_ins.iter().copied().collect();
 
@@ -636,8 +636,8 @@ pub fn osr_layout_with(
     // instructions or terminator use it, and the predecessors its phi
     // incomings come in on. Built once; the repairs below look up rather
     // than rescan.
-    let mut readers: HashMap<HirId, Vec<HirId>> = HashMap::new();
-    let mut phi_readers: HashMap<HirId, Vec<HirId>> = HashMap::new();
+    let mut readers: crate::hir::IdHashMap<HirId, Vec<HirId>> = Default::default();
+    let mut phi_readers: crate::hir::IdHashMap<HirId, Vec<HirId>> = Default::default();
     for &b in &reachable {
         let Some(rb) = function.blocks.get(&b) else {
             continue;
@@ -805,7 +805,7 @@ pub fn osr_layout_with(
 /// count. Immediate dominators over the region's reverse postorder,
 /// the same iteration as [`Dominators`].
 struct RegionDominators {
-    index: HashMap<HirId, usize>,
+    index: crate::hir::IdHashMap<HirId, usize>,
     idom: Vec<usize>,
 }
 
@@ -841,7 +841,8 @@ impl RegionDominators {
             }
         }
         order.reverse();
-        let index: HashMap<HirId, usize> = order.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+        let index: crate::hir::IdHashMap<HirId, usize> =
+            order.iter().enumerate().map(|(i, b)| (*b, i)).collect();
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); order.len()];
         for (i, &b) in order.iter().enumerate() {
             for s in succs(b) {
@@ -1080,7 +1081,7 @@ pub fn outline(
     // takes from the entry: the id stays the region's definition, and
     // reads that `resumable` left on it are the ones that definition
     // reaches. Any other live-in keeps its id.
-    let mut entry_values: HashMap<HirId, HirId> = HashMap::new();
+    let mut entry_values: crate::hir::IdHashMap<HirId, HirId> = Default::default();
     for (i, (id, ty)) in layout
         .live_ins
         .iter()
@@ -1339,7 +1340,7 @@ pub fn outline(
 /// rematerialized in the helper's prologue, not passed as args).
 /// A set of ids hashed by the id itself: these sets are built and
 /// probed once per instruction of a function, per header.
-type IdSet = std::collections::HashSet<HirId, std::hash::BuildHasherDefault<fnv::FnvHasher>>;
+type IdSet = crate::hir::IdHashSet<HirId>;
 
 fn consider_live_in(
     function: &HirFunction,
@@ -1373,7 +1374,7 @@ fn consider_live_in(
 
 fn reachable_from(function: &HirFunction, start: HirId) -> Vec<HirId> {
     let mut order = Vec::new();
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = IdSet::default();
     let mut stack = vec![start];
     while let Some(id) = stack.pop() {
         if !visited.insert(id) {
@@ -2194,10 +2195,7 @@ impl OsrFrame {
 /// from the header may also be reached without it (an enclosing loop's
 /// header is the common case) and anything it defines has to arrive as a
 /// live-in instead.
-pub fn blocks_dominated_by(
-    function: &HirFunction,
-    header: HirId,
-) -> std::collections::HashSet<HirId> {
+pub fn blocks_dominated_by(function: &HirFunction, header: HirId) -> IdSet {
     Dominators::compute(function).dominated_by(header)
 }
 
@@ -2213,7 +2211,7 @@ pub struct Dominators {
     /// Reachable blocks in reverse postorder.
     order: Vec<HirId>,
     /// Position in `order` of each reachable block.
-    index: HashMap<HirId, usize>,
+    index: crate::hir::IdHashMap<HirId, usize>,
     /// Immediate dominator of each block in `order`, by position; the
     /// entry is its own.
     idom: Vec<usize>,
@@ -2227,12 +2225,12 @@ impl Dominators {
         let Some(&entry) = all.first() else {
             return Dominators {
                 order: Vec::new(),
-                index: HashMap::new(),
+                index: Default::default(),
                 idom: Vec::new(),
                 all,
             };
         };
-        let mut successors: HashMap<HirId, Vec<HirId>> = HashMap::new();
+        let mut successors: crate::hir::IdHashMap<HirId, Vec<HirId>> = Default::default();
         for (&b, block) in &function.blocks {
             for &p in &block.predecessors {
                 successors.entry(p).or_default().push(b);
@@ -2240,7 +2238,7 @@ impl Dominators {
         }
         // Postorder from the entry, then reversed.
         let mut order = Vec::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = IdSet::default();
         let mut stack: Vec<(HirId, usize)> = vec![(entry, 0)];
         visited.insert(entry);
         while let Some((b, next)) = stack.last_mut() {
@@ -2257,7 +2255,8 @@ impl Dominators {
             }
         }
         order.reverse();
-        let index: HashMap<HirId, usize> = order.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+        let index: crate::hir::IdHashMap<HirId, usize> =
+            order.iter().enumerate().map(|(i, b)| (*b, i)).collect();
         let preds: Vec<Vec<usize>> = order
             .iter()
             .map(|b| {
@@ -2332,7 +2331,7 @@ impl Dominators {
     }
 
     /// Every block `header` dominates, itself included.
-    pub fn dominated_by(&self, header: HirId) -> std::collections::HashSet<HirId> {
+    pub fn dominated_by(&self, header: HirId) -> IdSet {
         self.all
             .iter()
             .copied()
@@ -2710,7 +2709,7 @@ pub fn region_params_in_frame(
     {
         return None;
     }
-    let slot_of: HashMap<HirId, usize> = layout
+    let slot_of: crate::hir::IdHashMap<HirId, usize> = layout
         .live_ins
         .iter()
         .enumerate()
@@ -2722,7 +2721,7 @@ pub fn region_params_in_frame(
     // Params seeding a header phi through the entry edge take that
     // phi's slot: the phi's value at the transfer is the state the
     // region resumes from.
-    let mut seed_slot: HashMap<HirId, usize> = HashMap::new();
+    let mut seed_slot: crate::hir::IdHashMap<HirId, usize> = Default::default();
     for phi in &function.blocks.get(&layout.header)?.phis {
         let Some(&slot) = slot_of.get(&phi.result) else {
             continue;

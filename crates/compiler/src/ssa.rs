@@ -8136,7 +8136,8 @@ impl SsaBuilder {
     /// enclosing loop every block reaches every other.
     fn edge_is_back(&mut self, block: HirId, pred: HirId) -> bool {
         if !self.edges_exact {
-            return crate::osr::blocks_dominated_by(&self.function, block).contains(&pred);
+            return self.function.blocks.contains_key(&pred)
+                && crate::osr::Dominators::compute(&self.function).dominates(block, pred);
         }
         let dominators = self
             .dominators

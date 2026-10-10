@@ -17,6 +17,7 @@ use cranelift_codegen::ir::{
 fn ba(args: &[Value]) -> Vec<BlockArg> {
     args.iter().map(|&v| BlockArg::Value(v)).collect()
 }
+use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
 use cranelift_codegen::verify_function;
@@ -24,7 +25,6 @@ use cranelift_frontend::Switch as ClifSwitch;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 use log::{debug, error, info, warn};
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -671,7 +671,7 @@ impl CraneliftBackend {
             .unwrap_or_default();
 
         Ok(Self {
-            declined_functions: std::collections::HashSet::new(),
+            declined_functions: std::collections::HashSet::default(),
             module,
             jit_reservation,
             isa: isa_shared,
@@ -680,27 +680,27 @@ impl CraneliftBackend {
             capture_ir: false,
             captured_ir: None,
             data_desc: DataDescription::new(),
-            function_map: HashMap::new(),
-            global_map: HashMap::new(),
+            function_map: HashMap::default(),
+            global_map: HashMap::default(),
             roots_to_register: Vec::new(),
-            value_map: HashMap::new(),
-            block_map: HashMap::new(),
-            compiled_functions: HashMap::new(),
+            value_map: HashMap::default(),
+            block_map: HashMap::default(),
+            compiled_functions: HashMap::default(),
             unpublished: Vec::new(),
             hot_reload: HotReloadState {
-                versions: Arc::new(RwLock::new(HashMap::new())),
-                previous_versions: Arc::new(RwLock::new(HashMap::new())),
-                function_pointers: Arc::new(RwLock::new(HashMap::new())),
+                versions: Arc::new(RwLock::new(HashMap::default())),
+                previous_versions: Arc::new(RwLock::new(HashMap::default())),
+                function_pointers: Arc::new(RwLock::new(HashMap::default())),
             },
-            exported_symbols: HashMap::new(),
+            exported_symbols: HashMap::default(),
             runtime_symbols,
             symbol_table,
-            symbol_signatures: HashMap::new(),
-            external_link_names: HashMap::new(),
-            destination_returns: HashMap::new(),
-            address_taken: HashSet::new(),
+            symbol_signatures: HashMap::default(),
+            external_link_names: HashMap::default(),
+            destination_returns: HashMap::default(),
+            address_taken: HashSet::default(),
             address_taken_from: None,
-            inferred_extern_sigs: HashMap::new(),
+            inferred_extern_sigs: HashMap::default(),
             effect_context: EffectCodegenContext::new(),
             compile_tier: 0,
             publish_osr_helpers: true,
@@ -715,14 +715,14 @@ impl CraneliftBackend {
             compile_osr_layout: None,
             compile_osr_func_id: None,
             only_compile_reachable: None,
-            lazy_functions: HashSet::new(),
+            lazy_functions: HashSet::default(),
             lazy_stubs: Vec::new(),
             wanted_stubs: Vec::new(),
-            stubbed: HashSet::new(),
-            address_owners: HashMap::new(),
-            interp_thunks: HashMap::new(),
-            compile_generation: HashMap::new(),
-            bead_ids: HashMap::new(),
+            stubbed: HashSet::default(),
+            address_owners: HashMap::default(),
+            interp_thunks: HashMap::default(),
+            compile_generation: HashMap::default(),
+            bead_ids: HashMap::default(),
             probe_sites: Vec::new(),
             last_code_len: None,
         })
@@ -828,7 +828,7 @@ impl CraneliftBackend {
     /// The bead of each function, kept across modules: a stub made
     /// for an earlier module's function after a later module compiled
     /// still names that function's own bead.
-    pub fn set_bead_ids(&mut self, bead_ids: HashMap<HirId, u64>) {
+    pub fn set_bead_ids(&mut self, bead_ids: impl IntoIterator<Item = (HirId, u64)>) {
         self.bead_ids.extend(bead_ids);
     }
 
@@ -847,8 +847,11 @@ impl CraneliftBackend {
     /// Declarations are always emitted for every function in the module —
     /// only function-body codegen is gated. This keeps cross-function
     /// symbol resolution intact for the BC interpreter's lazy fallback.
-    pub fn set_only_compile_reachable(&mut self, allowed: Option<HashSet<HirId>>) {
-        self.only_compile_reachable = allowed;
+    pub fn set_only_compile_reachable(
+        &mut self,
+        allowed: Option<std::collections::HashSet<HirId>>,
+    ) {
+        self.only_compile_reachable = allowed.map(|ids| ids.into_iter().collect());
     }
 
     /// Compile these functions on their first call rather than now. A
@@ -1406,7 +1409,7 @@ impl CraneliftBackend {
     /// Must be called BEFORE declare_function pass so the first declaration is already correct.
     fn prescan_extern_call_sites(&mut self, module: &HirModule) {
         // Collect HirIds of extern functions with 0 params
-        let mut zero_param_externs: HashSet<HirId> = HashSet::new();
+        let mut zero_param_externs: HashSet<HirId> = HashSet::default();
         for (id, function) in &module.functions {
             if function.is_external && function.signature.params.is_empty() {
                 zero_param_externs.insert(*id);
@@ -2120,13 +2123,13 @@ impl CraneliftBackend {
         // and HirType -> size (in bytes) for GEP calculations
         // and struct layouts for GEP field access
         // and constant values for GEP struct field indices
-        let mut type_cache: HashMap<HirType, cranelift_codegen::ir::Type> = HashMap::new();
-        let mut size_cache: HashMap<HirType, usize> = HashMap::new();
+        let mut type_cache: HashMap<HirType, cranelift_codegen::ir::Type> = HashMap::default();
+        let mut size_cache: HashMap<HirType, usize> = HashMap::default();
         let mut struct_layout_cache: HashMap<crate::hir::HirStructType, StructLayout> =
-            HashMap::new();
+            HashMap::default();
 
         // Build a cache of constant integer values (for struct field indices)
-        let mut const_value_cache: HashMap<HirId, i64> = HashMap::new();
+        let mut const_value_cache: HashMap<HirId, i64> = HashMap::default();
         for (value_id, value) in &function.values {
             if let HirValueKind::Constant(constant) = &value.kind {
                 let int_val = match constant {
@@ -2147,7 +2150,7 @@ impl CraneliftBackend {
         }
 
         // Build a cache of value types (for ExtractValue/InsertValue to know aggregate types)
-        let mut value_type_cache: HashMap<HirId, HirType> = HashMap::new();
+        let mut value_type_cache: HashMap<HirId, HirType> = HashMap::default();
         for (value_id, value) in &function.values {
             value_type_cache.insert(*value_id, value.ty.clone());
         }
@@ -2334,7 +2337,7 @@ impl CraneliftBackend {
             // params, etc.) that we don't put in `value_map`.
             let block_order: Vec<HirId> = if let Some(layout) = &osr_helper {
                 let reachable: std::collections::HashSet<HirId> = {
-                    let mut visited = std::collections::HashSet::new();
+                    let mut visited = std::collections::HashSet::default();
                     let mut stack = vec![layout.header];
                     while let Some(id) = stack.pop() {
                         if !visited.insert(id) {
@@ -2366,7 +2369,7 @@ impl CraneliftBackend {
                     .into_iter()
                     .collect()
             } else {
-                std::collections::HashSet::new()
+                std::collections::HashSet::default()
             };
             // Stable per-function block index (matches `osr::block_index_of`).
             let osr_block_index: HashMap<HirId, u64> = function
@@ -2437,7 +2440,7 @@ impl CraneliftBackend {
                         })
                         .collect()
                 } else {
-                    HashMap::new()
+                    HashMap::default()
                 };
             if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
                 eprintln!(
@@ -2500,7 +2503,7 @@ impl CraneliftBackend {
             let predecessor_map = self.build_predecessor_map(function);
 
             // Pre-compute type mappings for global references to avoid borrow checker issues
-            let mut global_types = HashMap::new();
+            let mut global_types = HashMap::default();
             for value in function.values.values() {
                 if let HirValueKind::Global(_) = value.kind {
                     let ptr_ty = self.translate_type(&value.ty)?;
@@ -2509,7 +2512,7 @@ impl CraneliftBackend {
             }
 
             // Pre-compute symbol parameter boxing requirements to avoid borrow checker issues
-            let mut symbol_boxing: HashMap<(String, usize), bool> = HashMap::new();
+            let mut symbol_boxing: HashMap<(String, usize), bool> = HashMap::default();
             for block in function.blocks.values() {
                 for inst in &block.instructions {
                     match inst {
@@ -2552,7 +2555,7 @@ impl CraneliftBackend {
             }
 
             // Pre-compute sizes for aggregate undef values (to avoid borrow checker issues later)
-            let mut undef_aggregate_sizes: HashMap<HirId, u32> = HashMap::new();
+            let mut undef_aggregate_sizes: HashMap<HirId, u32> = HashMap::default();
             for value in function.values.values() {
                 if let HirValueKind::Undef = value.kind {
                     match &value.ty {
@@ -2573,7 +2576,7 @@ impl CraneliftBackend {
             let mut builder =
                 FunctionBuilder::new(&mut self.codegen_context.func, &mut self.builder_context);
 
-            let mut block_map = HashMap::new();
+            let mut block_map = HashMap::default();
 
             // Create all Cranelift blocks and add phi node parameters
             for hir_block_id in &block_order {
@@ -2641,7 +2644,7 @@ impl CraneliftBackend {
                         })
                         .collect()
                 } else {
-                    HashMap::new()
+                    HashMap::default()
                 };
             // Tier-0 entry probe: a callee that compiled code reaches
             // through its cell is counted here, and asks for promotion
@@ -2862,9 +2865,9 @@ impl CraneliftBackend {
             }
 
             // Track which blocks can be sealed and which are already sealed
-            let mut seal_tracker: HashMap<HirId, usize> = HashMap::new();
+            let mut seal_tracker: HashMap<HirId, usize> = HashMap::default();
             let mut sealed_blocks: std::collections::HashSet<HirId> =
-                std::collections::HashSet::new();
+                std::collections::HashSet::default();
             for hir_block_id in &block_order {
                 let pred_count = predecessor_map
                     .get(hir_block_id)
@@ -7530,7 +7533,7 @@ impl CraneliftBackend {
         }
         let sources = block_param_sources(func);
         for (inst, site, target) in sites {
-            let mut seen = HashSet::new();
+            let mut seen = HashSet::default();
             let mut callees = Vec::new();
             self.known_callees(func, target, &sources, &mut seen, &mut callees);
             if let Some((name, conv)) = callees.into_iter().find(|(_, conv)| *conv != site) {
@@ -10416,7 +10419,7 @@ impl CraneliftBackend {
     fn compute_block_order(&self, function: &HirFunction) -> Vec<HirId> {
         use std::collections::HashSet;
 
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         let mut post_order = Vec::new();
 
         fn visit(
@@ -10454,7 +10457,7 @@ impl CraneliftBackend {
 
     /// Build predecessor map for all blocks
     fn build_predecessor_map(&self, function: &HirFunction) -> HashMap<HirId, Vec<HirId>> {
-        let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::new();
+        let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::default();
 
         for (block_id, block) in &function.blocks {
             for successor in get_successors(&block.terminator) {
@@ -11251,7 +11254,7 @@ impl HirType {
 fn block_param_sources(
     func: &cranelift_codegen::ir::Function,
 ) -> HashMap<(Block, usize), Vec<Value>> {
-    let mut sources: HashMap<(Block, usize), Vec<Value>> = HashMap::new();
+    let mut sources: HashMap<(Block, usize), Vec<Value>> = HashMap::default();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let dests = func.dfg.insts[inst]
@@ -11437,7 +11440,7 @@ mod tests {
             phis: vec![],
             instructions: vec![],
             terminator: HirTerminator::Branch { target: header_id },
-            dominance_frontier: std::collections::HashSet::new(),
+            dominance_frontier: std::collections::HashSet::default(),
             predecessors: vec![],
             successors: vec![header_id],
         };
@@ -11475,7 +11478,7 @@ mod tests {
                 true_target: body_id,
                 false_target: exit_id,
             },
-            dominance_frontier: std::collections::HashSet::new(),
+            dominance_frontier: std::collections::HashSet::default(),
             predecessors: vec![entry_id, body_id],
             successors: vec![body_id, exit_id],
         };
@@ -11502,7 +11505,7 @@ mod tests {
                 },
             ],
             terminator: HirTerminator::Branch { target: header_id },
-            dominance_frontier: std::collections::HashSet::new(),
+            dominance_frontier: std::collections::HashSet::default(),
             predecessors: vec![header_id],
             successors: vec![header_id],
         };
@@ -11516,7 +11519,7 @@ mod tests {
             terminator: HirTerminator::Return {
                 values: vec![phi_sum],
             },
-            dominance_frontier: std::collections::HashSet::new(),
+            dominance_frontier: std::collections::HashSet::default(),
             predecessors: vec![header_id],
             successors: vec![],
         };
