@@ -26,6 +26,7 @@
 //! `run_interp_safe_opts` calls each pass until none reports work, so
 //! a single pass is enough per round.
 
+use crate::hir::IdHashSet;
 use crate::hir::{HirBlock, HirFunction, HirId, HirInstruction, HirModule, HirTerminator};
 use std::collections::HashSet;
 
@@ -73,68 +74,82 @@ pub fn prune_unreachable_module(module: &mut HirModule) -> usize {
     module.functions_to_optimize().map(prune_unreachable).sum()
 }
 
-/// Run on one function. Iterates until no merge fires (covers chains
-/// of mergeable blocks; e.g. A → B → C where both pairs qualify
-/// collapses to a single block in one pass).
+/// Run on one function. A merge keeps the merged block where it was and
+/// hands it the absorbed block's successor, so one walk in block order
+/// merges every chain into its head. Threading one block can let
+/// another be threaded, so its walk repeats until one threads nothing.
+/// The blocks a walk empties leave the function together at its end.
 pub fn run(func: &mut HirFunction) -> CfgSimplifyStats {
     let mut total = CfgSimplifyStats::default();
-    // Each merge and each threading removes a block, so the function's
-    // size bounds the work; the bound only guards against a step that
-    // fails to make progress.
-    let bound = func.blocks.len() + 8;
-    for _ in 0..bound {
-        let pair = find_mergeable_pair(func);
-        let (pred, succ) = match pair {
-            Some(p) => p,
-            None => break,
-        };
-        if !merge_pair(func, pred, succ) {
+    let mut gone: IdHashSet<HirId> = IdHashSet::default();
+    let order: Vec<HirId> = func.blocks.keys().copied().collect();
+    for &pred in &order {
+        if gone.contains(&pred) {
+            continue;
+        }
+        while let Some(succ) = mergeable_successor(func, pred) {
+            absorb(func, pred, succ);
+            gone.insert(succ);
+            total.merged += 1;
+        }
+    }
+    drop_blocks(func, &mut gone);
+    loop {
+        let order: Vec<HirId> = func.blocks.keys().copied().collect();
+        let before = total.threaded;
+        for &id in &order {
+            if threadable(func, id) {
+                thread_block(func, id);
+                gone.insert(id);
+                total.threaded += 1;
+            }
+        }
+        drop_blocks(func, &mut gone);
+        if total.threaded == before {
             break;
         }
-        total.merged += 1;
-    }
-    for _ in 0..bound {
-        let Some(empty) = find_threadable_block(func) else {
-            break;
-        };
-        thread_block(func, empty);
-        total.threaded += 1;
     }
     total
 }
 
-/// An empty block, holding nothing but a branch, that every predecessor
-/// can branch past: a landing pad that costs a taken branch and nothing
-/// else. Not the entry, not a block with phis (its target would need
-/// them), and not one whose predecessor already reaches the target on
-/// another edge, since the target's phis could not tell the two apart.
-fn find_threadable_block(func: &HirFunction) -> Option<HirId> {
-    for (&id, block) in &func.blocks {
-        if id == func.entry_block || !block.instructions.is_empty() || !block.phis.is_empty() {
-            continue;
-        }
-        let HirTerminator::Branch { target } = block.terminator else {
-            continue;
-        };
-        if target == id || block.predecessors.is_empty() {
-            continue;
-        }
-        let clear = block.predecessors.iter().all(|p| {
-            func.blocks.get(p).is_some_and(|pb| {
-                let targets = pb.terminator.targets();
-                targets.iter().filter(|t| **t == id).count() == 1 && !targets.contains(&target)
-            })
-        });
-        if clear {
-            return Some(id);
-        }
+/// Remove the blocks of `gone`, which nothing reaches any more.
+fn drop_blocks(func: &mut HirFunction, gone: &mut IdHashSet<HirId>) {
+    if !gone.is_empty() {
+        func.blocks.retain(|id, _| !gone.contains(id));
+        gone.clear();
     }
-    None
 }
 
-/// Send every predecessor of `empty` to its target and drop it. The
-/// target's phis take each predecessor in the empty block's place, with
-/// the value that came through it.
+/// Whether `id` is an empty block, holding nothing but a branch, that
+/// every predecessor can branch past: a landing pad that costs a taken
+/// branch and nothing else. Not the entry, not a block with phis (its
+/// target would need them), and not one whose predecessor already
+/// reaches the target on another edge, since the target's phis could
+/// not tell the two apart.
+fn threadable(func: &HirFunction, id: HirId) -> bool {
+    let Some(block) = func.blocks.get(&id) else {
+        return false;
+    };
+    if id == func.entry_block || !block.instructions.is_empty() || !block.phis.is_empty() {
+        return false;
+    }
+    let HirTerminator::Branch { target } = block.terminator else {
+        return false;
+    };
+    if target == id || block.predecessors.is_empty() {
+        return false;
+    }
+    block.predecessors.iter().all(|p| {
+        func.blocks.get(p).is_some_and(|pb| {
+            let targets = pb.terminator.targets();
+            targets.iter().filter(|t| **t == id).count() == 1 && !targets.contains(&target)
+        })
+    })
+}
+
+/// Send every predecessor of `empty` to its target. The target's phis
+/// take each predecessor in the empty block's place, with the value
+/// that came through it. `empty` is left for the caller to remove.
 fn thread_block(func: &mut HirFunction, empty: HirId) {
     let (preds, target) = match func.blocks.get(&empty) {
         Some(b) => match b.terminator {
@@ -163,7 +178,9 @@ fn thread_block(func: &mut HirFunction, empty: HirId) {
             }
         }
     }
-    func.blocks.shift_remove(&empty);
+    if let Some(b) = func.blocks.get_mut(&empty) {
+        b.predecessors.clear();
+    }
 }
 
 /// Run on every function in a module.
@@ -177,60 +194,46 @@ pub fn run_module(module: &mut HirModule) -> CfgSimplifyStats {
     total
 }
 
-fn find_mergeable_pair(func: &HirFunction) -> Option<(HirId, HirId)> {
-    for (&pred_id, pred) in &func.blocks {
-        if pred.successors.len() != 1 {
-            continue;
-        }
-        let succ_id = pred.successors[0];
-        if succ_id == pred_id {
-            continue; // self-loop, skip
-        }
-        if succ_id == func.entry_block {
-            continue; // never merge the entry
-        }
-        let succ = match func.blocks.get(&succ_id) {
-            Some(b) => b,
-            None => continue,
-        };
-        if succ.predecessors.len() != 1 || succ.predecessors[0] != pred_id {
-            continue;
-        }
-        if !succ.phis.is_empty() {
-            continue;
-        }
-        return Some((pred_id, succ_id));
+/// The successor `pred` merges with: its only one, reached from it
+/// alone, without phis, neither `pred` itself nor the entry.
+fn mergeable_successor(func: &HirFunction, pred: HirId) -> Option<HirId> {
+    let pred_block = func.blocks.get(&pred)?;
+    if pred_block.successors.len() != 1 {
+        return None;
     }
-    None
+    let succ_id = pred_block.successors[0];
+    if succ_id == pred || succ_id == func.entry_block {
+        return None;
+    }
+    let succ = func.blocks.get(&succ_id)?;
+    if succ.predecessors.len() != 1 || succ.predecessors[0] != pred || !succ.phis.is_empty() {
+        return None;
+    }
+    Some(succ_id)
 }
 
-/// Merge `succ` into `pred`. Returns false if the merge isn't
-/// applicable (e.g., a block disappeared between pair discovery and
-/// application).
-fn merge_pair(func: &mut HirFunction, pred: HirId, succ: HirId) -> bool {
-    // Snapshot what we need from `succ` before removing it.
-    let (succ_insts, succ_term, succ_successors) = match func.blocks.get(&succ) {
-        Some(b) => (
-            b.instructions.clone(),
-            b.terminator.clone(),
-            b.successors.clone(),
-        ),
-        None => return false,
+/// Move `succ`'s instructions, terminator and successors into `pred`,
+/// and point what `succ` reached back at `pred`. `succ` is left empty
+/// for the caller to remove.
+fn absorb(func: &mut HirFunction, pred: HirId, succ: HirId) {
+    let Some(succ_block) = func.blocks.get_mut(&succ) else {
+        return;
     };
+    let succ_insts = std::mem::take(&mut succ_block.instructions);
+    let succ_term = std::mem::replace(&mut succ_block.terminator, HirTerminator::Unreachable);
+    let succ_successors = std::mem::take(&mut succ_block.successors);
+    succ_block.predecessors.clear();
 
-    // 1. Append succ's instructions to pred + adopt succ's
-    //    terminator + successor list.
-    let pred_block = match func.blocks.get_mut(&pred) {
-        Some(b) => b,
-        None => return false,
+    let Some(pred_block) = func.blocks.get_mut(&pred) else {
+        return;
     };
     pred_block.instructions.extend(succ_insts);
     pred_block.terminator = succ_term;
     pred_block.successors = succ_successors.clone();
 
-    // 2. Every block previously reached only-via-succ now reaches
-    //    only-via-pred. Update their predecessor lists.
-    let mut visited = HashSet::new();
+    // Every block reached through `succ` is now reached through `pred`:
+    // its predecessor list and its phis' source blocks say so.
+    let mut visited = IdHashSet::default();
     for &next_id in &succ_successors {
         if !visited.insert(next_id) {
             continue;
@@ -241,7 +244,6 @@ fn merge_pair(func: &mut HirFunction, pred: HirId, succ: HirId) -> bool {
                     *p = pred;
                 }
             }
-            // Also rewrite phi-incoming source-block ids.
             for phi in next.phis.iter_mut() {
                 for (_, src) in phi.incoming.iter_mut() {
                     if *src == succ {
@@ -251,10 +253,6 @@ fn merge_pair(func: &mut HirFunction, pred: HirId, succ: HirId) -> bool {
             }
         }
     }
-
-    // 3. Remove succ from the function.
-    func.blocks.shift_remove(&succ);
-    true
 }
 
 // ─── tests ────────────────────────────────────────────────────────
