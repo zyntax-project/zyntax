@@ -242,6 +242,66 @@ fn simd_alias_hir_type(name: &str) -> Option<HirType> {
     (lanes > 0).then(|| HirType::Vector(Box::new(elem), lanes))
 }
 
+/// The blocks whose terminator branches to each block, and what each
+/// block's terminator was last read to target. Only the edges
+/// `current_preds_of` counts are kept: branches, conditional branches
+/// and switches.
+#[derive(Default)]
+struct TermIndex {
+    by_target: IdHashMap<HirId, smallvec::SmallVec<[HirId; 4]>>,
+    targets_of: IdHashMap<HirId, smallvec::SmallVec<[HirId; 2]>>,
+}
+
+impl TermIndex {
+    fn targets(term: &HirTerminator) -> smallvec::SmallVec<[HirId; 2]> {
+        let mut out = smallvec::SmallVec::new();
+        match term {
+            HirTerminator::Branch { target } => out.push(*target),
+            HirTerminator::CondBranch {
+                true_target,
+                false_target,
+                ..
+            } => {
+                out.push(*true_target);
+                if false_target != true_target {
+                    out.push(*false_target);
+                }
+            }
+            HirTerminator::Switch { cases, default, .. } => {
+                out.push(*default);
+                for (_, b) in cases {
+                    if !out.contains(b) {
+                        out.push(*b);
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// Re-read `block`'s terminator.
+    fn update(&mut self, block: HirId, term: Option<&HirTerminator>) {
+        if let Some(old) = self.targets_of.remove(&block) {
+            for t in old {
+                if let Some(sources) = self.by_target.get_mut(&t) {
+                    sources.retain(|s| *s != block);
+                }
+            }
+        }
+        let Some(term) = term else {
+            return;
+        };
+        let new = Self::targets(term);
+        for t in &new {
+            self.by_target.entry(*t).or_default().push(block);
+        }
+        if !new.is_empty() {
+            self.targets_of.insert(block, new);
+        }
+    }
+}
+
 pub struct SsaBuilder {
     /// Current function being built
     function: HirFunction,
@@ -279,6 +339,13 @@ pub struct SsaBuilder {
     /// meanwhile. Walking the function per replaced value cost the
     /// square of a loop-heavy body.
     pending_subst: IdHashMap<HirId, HirId>,
+    /// Which blocks branch to each block, by their terminators, while the
+    /// predecessor lists are not yet exact. Built on the first read that
+    /// needs it; each terminator written since is listed in `term_dirty`
+    /// and re-read before the next lookup. `None` after the function
+    /// being built is swapped out, which rebuilds it.
+    term_index: Option<TermIndex>,
+    term_dirty: Vec<HirId>,
     /// `ZYNTAX_SSA_TRACE=1` traces variable reads; read once.
     ssa_trace: bool,
     /// Set once the predecessor lists were recomputed from the
@@ -495,9 +562,9 @@ pub struct PhiNode {
 #[derive(Debug, Clone)]
 struct DominanceInfo {
     /// Immediate dominator for each block
-    idom: IndexMap<HirId, HirId>,
+    idom: IdMap<HirId, HirId>,
     /// Dominance frontiers for each block
-    dom_frontier: IndexMap<HirId, HashSet<HirId>>,
+    dom_frontier: IdMap<HirId, IdHashSet<HirId>>,
     /// Reverse postorder traversal
     rpo: Vec<HirId>,
 }
@@ -515,10 +582,17 @@ impl DominanceInfo {
         rpo.reverse();
 
         // Step 2: Compute immediate dominators using Cooper-Harvey-Kennedy
-        let mut idom: IndexMap<HirId, HirId> = IndexMap::new();
+        let mut idom: IdMap<HirId, HirId> = IdMap::default();
         let entry_id = cfg.node_map[&cfg.entry];
         idom.insert(entry_id, entry_id); // Entry dominates itself
 
+        // Each block's position in the reverse postorder, which the
+        // intersections walk by.
+        let rpo_map: IdHashMap<HirId, usize> = rpo
+            .iter()
+            .enumerate()
+            .map(|(i, &idx)| (cfg.graph[idx].id, i))
+            .collect();
         let mut changed = true;
         while changed {
             changed = false;
@@ -536,7 +610,7 @@ impl DominanceInfo {
                         new_idom = match new_idom {
                             None => Some(pred_id),
                             Some(current) => {
-                                Some(Self::intersect(&idom, current, pred_id, &rpo, cfg))
+                                Some(Self::intersect(&idom, current, pred_id, &rpo_map))
                             }
                         };
                     }
@@ -585,19 +659,11 @@ impl DominanceInfo {
 
     /// Find intersection of two dominators
     fn intersect(
-        idom: &IndexMap<HirId, HirId>,
+        idom: &IdMap<HirId, HirId>,
         mut b1: HirId,
         mut b2: HirId,
-        rpo: &[petgraph::graph::NodeIndex],
-        cfg: &crate::typed_cfg::TypedControlFlowGraph,
+        rpo_map: &IdHashMap<HirId, usize>,
     ) -> HirId {
-        // Get RPO indices for blocks
-        let rpo_map: IndexMap<HirId, usize> = rpo
-            .iter()
-            .enumerate()
-            .map(|(i, &idx)| (cfg.graph[idx].id, i))
-            .collect();
-
         while b1 != b2 {
             while rpo_map.get(&b1).unwrap_or(&usize::MAX) > rpo_map.get(&b2).unwrap_or(&usize::MAX)
             {
@@ -614,11 +680,11 @@ impl DominanceInfo {
     /// Compute dominance frontiers
     fn compute_frontiers(
         cfg: &crate::typed_cfg::TypedControlFlowGraph,
-        idom: &IndexMap<HirId, HirId>,
-    ) -> IndexMap<HirId, HashSet<HirId>> {
+        idom: &IdMap<HirId, HirId>,
+    ) -> IdMap<HirId, IdHashSet<HirId>> {
         use petgraph::Direction;
 
-        let mut frontiers: IndexMap<HirId, HashSet<HirId>> = IndexMap::new();
+        let mut frontiers: IdMap<HirId, IdHashSet<HirId>> = IdMap::default();
 
         for node_idx in cfg.graph.node_indices() {
             let block = &cfg.graph[node_idx];
@@ -639,7 +705,7 @@ impl DominanceInfo {
                     while runner != idom.get(&block_id).copied().unwrap_or(block_id) {
                         frontiers
                             .entry(runner)
-                            .or_insert_with(HashSet::new)
+                            .or_insert_with(IdHashSet::default)
                             .insert(block_id);
                         let next_runner = idom.get(&runner).copied();
                         if next_runner.is_none() || next_runner == Some(runner) {
@@ -761,6 +827,8 @@ impl SsaBuilder {
             variable_writes: IdMap::default(),
             idf_placement_done: false,
             pending_subst: IdHashMap::default(),
+            term_index: None,
+            term_dirty: Vec::new(),
             ssa_trace: std::env::var_os("ZYNTAX_SSA_TRACE").is_some(),
             edges_exact: false,
             dominators: None,
@@ -822,6 +890,8 @@ impl SsaBuilder {
             variable_writes: IdMap::default(),
             idf_placement_done: false,
             pending_subst: IdHashMap::default(),
+            term_index: None,
+            term_dirty: Vec::new(),
             ssa_trace: std::env::var_os("ZYNTAX_SSA_TRACE").is_some(),
             edges_exact: false,
             dominators: None,
@@ -1637,6 +1707,7 @@ impl SsaBuilder {
                                     "Continuation block not found".into(),
                                 )
                             })?;
+                        self.term_dirty.push(continuation);
                         cont_block.terminator = if is_void_return {
                             HirTerminator::Return { values: vec![] }
                         } else {
@@ -1659,6 +1730,7 @@ impl SsaBuilder {
                         self.function.blocks.get_mut(&continuation).ok_or_else(|| {
                             crate::CompilerError::Analysis("Continuation block not found".into())
                         })?;
+                    self.term_dirty.push(continuation);
                     cont_block.terminator = HirTerminator::Return { values: vec![] };
                     return Ok(());
                 } else {
@@ -1705,6 +1777,7 @@ impl SsaBuilder {
                         {
                             let cont_block = self.function.blocks.get_mut(&continuation).unwrap();
                             cont_block.successors.push(*target);
+                            self.term_dirty.push(continuation);
                             cont_block.terminator = HirTerminator::Branch { target: *target };
                         }
                         // Return early - don't set terminator on original block
@@ -1743,6 +1816,7 @@ impl SsaBuilder {
                     }
                     let cont_block = self.function.blocks.get_mut(&continuation).unwrap();
                     cont_block.successors = vec![*true_target, *false_target];
+                    self.term_dirty.push(continuation);
                     cont_block.terminator = HirTerminator::CondBranch {
                         condition: cond_val,
                         true_target: *true_target,
@@ -1800,6 +1874,7 @@ impl SsaBuilder {
                         self.function.blocks.get_mut(&continuation).ok_or_else(|| {
                             crate::CompilerError::Analysis("Continuation block not found".into())
                         })?;
+                    self.term_dirty.push(continuation);
                     cont_block.terminator = terminator;
                     return Ok(());
                 }
@@ -1813,6 +1888,7 @@ impl SsaBuilder {
             .blocks
             .get_mut(&block_id)
             .ok_or_else(|| crate::CompilerError::Analysis("Block not found".into()))?;
+        self.term_dirty.push(block_id);
         hir_block.terminator = hir_terminator;
 
         Ok(())
@@ -2894,6 +2970,7 @@ impl SsaBuilder {
         // continuation block; the terminator goes there.
         let target_block = self.continuation_block.take().unwrap_or(block_id);
         let block = self.function.blocks.get_mut(&target_block).unwrap();
+        self.term_dirty.push(target_block);
         block.terminator = HirTerminator::Return { values };
         Ok(target_block)
     }
@@ -2918,6 +2995,7 @@ impl SsaBuilder {
                 // The CFG builder already created the branches
                 let block = self.function.blocks.get_mut(&block_id).unwrap();
                 if block.successors.len() == 2 {
+                    self.term_dirty.push(block_id);
                     block.terminator = HirTerminator::CondBranch {
                         condition: cond_value,
                         true_target: block.successors[0],
@@ -2930,6 +3008,7 @@ impl SsaBuilder {
                 // Default to branch to first successor
                 let block = self.function.blocks.get_mut(&block_id).unwrap();
                 if let Some(&target) = block.successors.first() {
+                    self.term_dirty.push(block_id);
                     block.terminator = HirTerminator::Branch { target };
                 }
             }
@@ -3110,6 +3189,7 @@ impl SsaBuilder {
         // entry_block → header
         {
             let blk = self.function.blocks.get_mut(&entry_block).unwrap();
+            self.term_dirty.push(entry_block);
             blk.terminator = HirTerminator::Branch {
                 target: header_block,
             };
@@ -3149,6 +3229,7 @@ impl SsaBuilder {
         );
         {
             let blk = self.function.blocks.get_mut(&header_block).unwrap();
+            self.term_dirty.push(header_block);
             blk.terminator = HirTerminator::CondBranch {
                 condition: cond_lt_len,
                 true_target: vec_check_block,
@@ -3197,6 +3278,7 @@ impl SsaBuilder {
         );
         {
             let blk = self.function.blocks.get_mut(&vec_check_block).unwrap();
+            self.term_dirty.push(vec_check_block);
             blk.terminator = HirTerminator::CondBranch {
                 condition: vec_cond,
                 true_target: vec_body_block,
@@ -3329,6 +3411,7 @@ impl SsaBuilder {
                 },
             );
             let blk = self.function.blocks.get_mut(&vec_body_block).unwrap();
+            self.term_dirty.push(vec_body_block);
             blk.terminator = HirTerminator::Branch {
                 target: header_block,
             };
@@ -3431,6 +3514,7 @@ impl SsaBuilder {
                 },
             );
             let blk = self.function.blocks.get_mut(&scalar_body_block).unwrap();
+            self.term_dirty.push(scalar_body_block);
             blk.terminator = HirTerminator::Branch {
                 target: header_block,
             };
@@ -4022,6 +4106,7 @@ impl SsaBuilder {
                         _ => unreachable!(),
                     };
 
+                    self.term_dirty.push(left_block_id);
                     self.function
                         .blocks
                         .get_mut(&left_block_id)
@@ -4053,6 +4138,7 @@ impl SsaBuilder {
                         HirType::Bool,
                         HirValueKind::Constant(crate::hir::HirConstant::Bool(short_value)),
                     );
+                    self.term_dirty.push(short_block_id);
                     self.function
                         .blocks
                         .get_mut(&short_block_id)
@@ -4074,6 +4160,7 @@ impl SsaBuilder {
 
                     let rhs_value = self.translate_expression(rhs_block_id, right)?;
                     let rhs_exit_block_id = self.continuation_block.take().unwrap_or(rhs_block_id);
+                    self.term_dirty.push(rhs_exit_block_id);
                     self.function
                         .blocks
                         .get_mut(&rhs_exit_block_id)
@@ -6086,6 +6173,7 @@ impl SsaBuilder {
 
                 // Set conditional branch terminator for the block the
                 // condition left control in
+                self.term_dirty.push(cond_block_id);
                 self.function
                     .blocks
                     .get_mut(&cond_block_id)
@@ -7624,9 +7712,29 @@ impl SsaBuilder {
             {
                 return v;
             }
-            let preds = self.current_preds_of(at);
-            if self.sealed_blocks.contains(&at) && preds.len() == 1 && preds[0] != at {
-                at = preds[0];
+            // Once the edges are exact the stored list is the answer, read
+            // in place.
+            let sole = if self.edges_exact {
+                match self
+                    .function
+                    .blocks
+                    .get(&at)
+                    .map(|b| b.predecessors.as_slice())
+                {
+                    Some([pred]) => Some(*pred),
+                    _ => None,
+                }
+            } else {
+                match self.current_preds_of(at).as_slice() {
+                    [pred] => Some(*pred),
+                    _ => None,
+                }
+            };
+            if let Some(pred) = sole
+                && pred != at
+                && self.sealed_blocks.contains(&at)
+            {
+                at = pred;
                 continue;
             }
             break;
@@ -8092,12 +8200,12 @@ impl SsaBuilder {
     /// elsewhere is stale: desugaring rewired it through a block of its
     /// own, which the terminators name. Keeping it would give a phi an
     /// incoming for an edge that does not exist.
-    fn current_preds_of(&self, block: HirId) -> Vec<HirId> {
-        let mut preds: Vec<HirId> = self
+    fn current_preds_of(&mut self, block: HirId) -> smallvec::SmallVec<[HirId; 4]> {
+        let mut preds: smallvec::SmallVec<[HirId; 4]> = self
             .function
             .blocks
             .get(&block)
-            .map(|b| b.predecessors.clone())
+            .map(|b| smallvec::SmallVec::from_slice(&b.predecessors))
             .unwrap_or_default();
         if self.edges_exact {
             return preds;
@@ -8108,20 +8216,74 @@ impl SsaBuilder {
                     || b.terminator.targets().contains(&block)
             })
         });
-        for (id, b) in &self.function.blocks {
-            let hits = match &b.terminator {
-                crate::hir::HirTerminator::Branch { target } => *target == block,
-                crate::hir::HirTerminator::CondBranch {
-                    true_target,
-                    false_target,
-                    ..
-                } => *true_target == block || *false_target == block,
-                crate::hir::HirTerminator::Switch { cases, default, .. } => {
-                    *default == block || cases.iter().any(|(_, b)| *b == block)
+        // The blocks whose terminator branches here, in the function's
+        // block order.
+        self.refresh_term_index();
+        let mut hits: smallvec::SmallVec<[HirId; 4]> = self
+            .term_index
+            .as_ref()
+            .and_then(|index| index.by_target.get(&block))
+            .map(|sources| {
+                sources
+                    .iter()
+                    .copied()
+                    .filter(|s| self.function.blocks.contains_key(s))
+                    .collect()
+            })
+            .unwrap_or_default();
+        hits.sort_by_key(|id| self.function.blocks.get_index_of(id));
+        for id in hits {
+            if !preds.contains(&id) {
+                preds.push(id);
+            }
+        }
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            preds,
+            self.scanned_preds_of(block),
+            "a terminator written without `term_dirty` hides an edge into {block:?}"
+        );
+        preds
+    }
+
+    /// Bring `term_index` up to date: built from every block the first
+    /// time, then from the blocks whose terminators were written since.
+    fn refresh_term_index(&mut self) {
+        match &mut self.term_index {
+            None => {
+                let mut index = TermIndex::default();
+                for (id, b) in &self.function.blocks {
+                    index.update(*id, Some(&b.terminator));
                 }
-                _ => false,
-            };
-            if hits && !preds.contains(id) {
+                self.term_index = Some(index);
+                self.term_dirty.clear();
+            }
+            Some(index) => {
+                for id in self.term_dirty.drain(..) {
+                    index.update(id, self.function.blocks.get(&id).map(|b| &b.terminator));
+                }
+            }
+        }
+    }
+
+    /// `current_preds_of` by reading every terminator, which the index
+    /// must agree with.
+    #[cfg(debug_assertions)]
+    fn scanned_preds_of(&self, block: HirId) -> smallvec::SmallVec<[HirId; 4]> {
+        let mut preds: smallvec::SmallVec<[HirId; 4]> = self
+            .function
+            .blocks
+            .get(&block)
+            .map(|b| smallvec::SmallVec::from_slice(&b.predecessors))
+            .unwrap_or_default();
+        preds.retain(|p| {
+            self.function.blocks.get(p).is_none_or(|b| {
+                matches!(b.terminator, crate::hir::HirTerminator::Unreachable)
+                    || b.terminator.targets().contains(&block)
+            })
+        });
+        for (id, b) in &self.function.blocks {
+            if TermIndex::targets(&b.terminator).contains(&block) && !preds.contains(id) {
                 preds.push(*id);
             }
         }
@@ -11500,6 +11662,7 @@ impl SsaBuilder {
             });
             h.predecessors = vec![pre, body];
             h.successors = vec![exit, body];
+            self.term_dirty.push(header);
             h.terminator = HirTerminator::CondBranch {
                 condition: done,
                 true_target: exit,
@@ -11508,6 +11671,7 @@ impl SsaBuilder {
         }
         {
             let p = self.function.blocks.get_mut(&pre).unwrap();
+            self.term_dirty.push(pre);
             p.terminator = HirTerminator::Branch { target: header };
             p.successors = vec![header];
         }
@@ -11515,6 +11679,7 @@ impl SsaBuilder {
             let bd = self.function.blocks.get_mut(&body).unwrap();
             bd.predecessors = vec![header];
             bd.successors = vec![header];
+            self.term_dirty.push(body);
             bd.terminator = HirTerminator::Branch { target: header };
         }
         self.function.blocks.get_mut(&exit).unwrap().predecessors = vec![header];
@@ -11697,6 +11862,7 @@ impl SsaBuilder {
 
     fn branch(&mut self, from: HirId, to: HirId) {
         let b = self.function.blocks.get_mut(&from).unwrap();
+        self.term_dirty.push(from);
         b.terminator = HirTerminator::Branch { target: to };
         b.successors = vec![to];
         self.function
@@ -11709,6 +11875,7 @@ impl SsaBuilder {
 
     fn cond_branch(&mut self, from: HirId, condition: HirId, t: HirId, f: HirId) {
         let b = self.function.blocks.get_mut(&from).unwrap();
+        self.term_dirty.push(from);
         b.terminator = HirTerminator::CondBranch {
             condition,
             true_target: t,
@@ -14579,6 +14746,7 @@ impl SsaBuilder {
             self.definitions.insert(next_block_id, IdMap::default());
 
             // Current block jumps to test block
+            self.term_dirty.push(block_id);
             self.function.blocks.get_mut(&block_id).unwrap().terminator = HirTerminator::Branch {
                 target: test_block_id,
             };
@@ -14615,6 +14783,7 @@ impl SsaBuilder {
             // In body block: execute arm body and jump to end
             let arm_result = self.translate_expression(body_block_id, &arm.body)?;
 
+            self.term_dirty.push(body_block_id);
             self.function
                 .blocks
                 .get_mut(&body_block_id)
@@ -14632,6 +14801,7 @@ impl SsaBuilder {
 
         // After all arms, if we reach here, no pattern matched
         // This should be unreachable if exhaustiveness checking is done by type checker
+        self.term_dirty.push(block_id);
         self.function.blocks.get_mut(&block_id).unwrap().terminator = HirTerminator::Unreachable;
 
         // Create phi node in end block to collect results
@@ -14778,6 +14948,7 @@ impl SsaBuilder {
         }
 
         // Branch: if is_ok, continue; else, go to error block
+        self.term_dirty.push(block_id);
         self.function.blocks.get_mut(&block_id).unwrap().terminator = HirTerminator::CondBranch {
             condition: is_ok,
             true_target: continue_block_id,
@@ -14837,6 +15008,7 @@ impl SsaBuilder {
         }
 
         // Early return with the constructed Err / None
+        self.term_dirty.push(err_block_id);
         self.function
             .blocks
             .get_mut(&err_block_id)
@@ -15253,6 +15425,7 @@ impl SsaBuilder {
         true_target: HirId,
         false_target: HirId,
     ) {
+        self.term_dirty.push(block_id);
         self.function.blocks.get_mut(&block_id).unwrap().terminator = HirTerminator::CondBranch {
             condition,
             true_target,
@@ -16258,6 +16431,8 @@ impl SsaBuilder {
 
             // Swap the lambda into `self.function` and save the outer.
             let saved_function = std::mem::replace(&mut self.function, lambda_func);
+            self.term_index = None;
+            self.term_dirty.clear();
             let saved_definitions = std::mem::take(&mut self.definitions);
             let saved_incomplete_phis = std::mem::take(&mut self.incomplete_phis);
             let saved_var_counter = std::mem::take(&mut self.var_counter);
@@ -16403,6 +16578,8 @@ impl SsaBuilder {
             // outer-function context, regardless of whether translation
             // succeeded or returned an error.
             lambda_func = std::mem::replace(&mut self.function, saved_function);
+            self.term_index = None;
+            self.term_dirty.clear();
             self.definitions = saved_definitions;
             self.incomplete_phis = saved_incomplete_phis;
             self.var_counter = saved_var_counter;
