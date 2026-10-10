@@ -301,13 +301,18 @@ fn a_region_taking_a_void_loop_value_gets_the_parameters_after_it() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stderr}");
         assert_eq!(stdout.trim(), "71 900854.0", "{stderr}");
-        let site = stderr
-            .lines()
-            .find(|l| l.starts_with("[osr] main site=") && l.ends_with("outlined resume point"))
-            .and_then(|l| l.split("site=").nth(1))
-            .and_then(|s| s.split(':').next());
-        let promoted = stderr.find("(main$resume0) at tier 1");
-        if let (Some(site), Some(promoted)) = (site, promoted)
+        // `main` is called through a function value, so the frame may
+        // run an instance of it (`main$s0`) rather than `main` itself.
+        let outlined = stderr.lines().find_map(|l| {
+            let (name, site) = l
+                .strip_prefix("[osr] ")?
+                .strip_suffix(": outlined resume point")?
+                .split_once(" site=")?;
+            (name == "main" || name.starts_with("main$s")).then_some((name, site))
+        });
+        let promoted =
+            outlined.and_then(|(name, _)| stderr.find(&format!("({name}$resume0) at tier 1")));
+        if let (Some((_, site)), Some(promoted)) = (outlined, promoted)
             && stderr[promoted..].contains(&format!("interpreted frame leaves at site={site} "))
         {
             entered = true;
