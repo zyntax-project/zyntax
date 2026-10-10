@@ -11051,11 +11051,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             span,
         );
         let dynamic = self.m.calls_dynamically(
-            &function
+            function
                 .body
                 .as_ref()
-                .map(|b| b.statements.clone())
-                .unwrap_or_default(),
+                .map_or(&[][..], |b| b.statements.as_slice()),
         );
         self.m.facts.borrow_mut().insert(
             id,
