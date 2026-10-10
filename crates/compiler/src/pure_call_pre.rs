@@ -169,7 +169,7 @@ fn run_function(
         groups.entry(key).or_default().push(i);
     }
 
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     // `def_block[v]` = block that defines value `v` (instruction result).
     let def_block = instruction_def_blocks(func);
 

@@ -91,7 +91,7 @@ pub struct VectorizeStats {
 
 /// Vectorize every matching loop in `func`.
 pub fn run(func: &mut HirFunction) -> VectorizeStats {
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     let lf = LoopForest::detect(func, &dt);
     if lf.loops().is_empty() {
         return VectorizeStats::default();

@@ -40,7 +40,7 @@ pub fn run(func: &mut HirFunction) -> BranchFoldStats {
         return BranchFoldStats::default();
     }
     func.rebuild_cfg_edges();
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     // `xor %c, true` results by the `%c` they negate.
     let mut negations: HashMap<HirId, HirId> = HashMap::new();
     for block in func.blocks.values() {

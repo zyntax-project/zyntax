@@ -141,7 +141,7 @@ pub fn run_function(func: &mut HirFunction) -> AffineLoopStats {
     // pathology leaving a loop "foldable" without shrinking the CFG.
     for _ in 0..256 {
         rebuild_cfg_edges(func);
-        let dt = DominatorTree::new(func);
+        let dt = DominatorTree::of(func);
         let lf = LoopForest::detect(func, &dt);
         if lf.loops().is_empty() {
             break;

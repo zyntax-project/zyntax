@@ -142,7 +142,7 @@ impl AutoVectorizePass {
         func: &mut HirFunction,
         counter_vectors: bool,
     ) -> AutoVectorizeStats {
-        let dt = DominatorTree::new(func);
+        let dt = DominatorTree::of(func);
         let lf = LoopForest::detect(func, &dt);
         if lf.loops().is_empty() {
             return AutoVectorizeStats::default();

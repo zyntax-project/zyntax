@@ -73,6 +73,30 @@ pub struct DominatorTree {
 }
 
 impl DominatorTree {
+    /// [`Self::new`] for `func` as its blocks stand, shared with the last
+    /// tree this thread built when the entry, the blocks in order and
+    /// their successor and predecessor lists, which are all a tree is
+    /// built from, are the same: consecutive passes that leave the edges
+    /// alone build one tree between them.
+    pub fn of(func: &HirFunction) -> std::sync::Arc<Self> {
+        thread_local! {
+            static LAST: std::cell::RefCell<Option<(Vec<u32>, std::sync::Arc<DominatorTree>)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let shape = cfg_shape(func);
+        LAST.with(|last| {
+            let mut last = last.borrow_mut();
+            if let Some((key, tree)) = last.as_ref()
+                && *key == shape
+            {
+                return std::sync::Arc::clone(tree);
+            }
+            let tree = std::sync::Arc::new(Self::new(func));
+            *last = Some((shape, std::sync::Arc::clone(&tree)));
+            tree
+        })
+    }
+
     /// Build dominator information for `func`. O(N·E·α(N)) in
     /// practice — the iterative loop converges in 1–3 passes for the
     /// CFG shapes the compiler emits.
@@ -193,6 +217,21 @@ impl DominatorTree {
 /// from `entry`. The result is an empty Vec only when the entry
 /// itself is missing from `func.blocks` — pathological but defended
 /// against.
+/// What a tree is built from, as a key: the entry, then each block in
+/// order with its successor and predecessor lists.
+fn cfg_shape(func: &HirFunction) -> Vec<u32> {
+    let mut key = Vec::with_capacity(1 + func.blocks.len() * 6);
+    key.push(func.entry_block.as_u32());
+    for (id, b) in &func.blocks {
+        key.push(id.as_u32());
+        key.push(b.successors.len() as u32);
+        key.extend(b.successors.iter().map(|s| s.as_u32()));
+        key.push(b.predecessors.len() as u32);
+        key.extend(b.predecessors.iter().map(|p| p.as_u32()));
+    }
+    key
+}
+
 fn compute_rpo(func: &HirFunction, entry: HirId) -> Vec<HirId> {
     if !func.blocks.contains_key(&entry) {
         return Vec::new();

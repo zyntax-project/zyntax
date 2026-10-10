@@ -711,7 +711,7 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
     if sites.is_empty() {
         return 0;
     }
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     let forest = LoopForest::detect(func, &dt);
     let bodies: std::collections::HashMap<HirId, IdSet> = forest
         .loops()
@@ -1852,7 +1852,7 @@ fn merge_repeated_boxings(func: &mut HirFunction, facts: &ModuleFacts) -> usize 
     if boxings.len() < 2 {
         return 0;
     }
-    let dom = DominatorTree::new(func);
+    let dom = DominatorTree::of(func);
     // A dominator comes before what it dominates in reverse postorder,
     // so the earlier of a pair here is the one that can be kept.
     boxings.sort_by_key(|(block, idx, _, _)| (dom.rpo_position(*block), *idx));

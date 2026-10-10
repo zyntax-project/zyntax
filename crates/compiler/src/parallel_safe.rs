@@ -1082,7 +1082,7 @@ pub fn analyze(func: &HirFunction) -> (Vec<ParallelLoop>, ParallelStats) {
     if func.is_external || func.blocks.is_empty() {
         return (Vec::new(), stats);
     }
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     let forest = LoopForest::detect(func, &dt);
     let mut found = Vec::new();
     for lp in forest.loops() {

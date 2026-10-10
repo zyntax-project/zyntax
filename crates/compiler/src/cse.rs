@@ -138,7 +138,7 @@ pub fn eliminate_with(func: &mut HirFunction, pure_fns: &HashSet<HirId>) -> CseS
     // edges as they are now, not as the last pass to rebuild them left
     // them.
     func.rebuild_cfg_edges();
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     let mut value_table: HashMap<VnKey, HirId> = HashMap::default();
     let mut substitutions = same_constants(func);
 

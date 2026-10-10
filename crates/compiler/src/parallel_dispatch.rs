@@ -187,7 +187,7 @@ fn plan_function(func: &HirFunction) -> (Vec<Plan>, DispatchStats) {
     if independent.is_empty() {
         return (Vec::new(), stats);
     }
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     let forest = LoopForest::detect(func, &dt);
 
     let mut plans = Vec::new();

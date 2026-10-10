@@ -176,7 +176,7 @@ pub fn counted_loop(
 /// The static trip count of the loop headed by `header`, or `None` when
 /// `header` heads no counted loop.
 pub fn static_trip_count(func: &HirFunction, header: HirId) -> Option<u64> {
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     let forest = LoopForest::detect(func, &dt);
     let lp = forest.loops().iter().find(|lp| lp.header == header)?;
     let defs = Defs::of(func);
@@ -200,7 +200,7 @@ pub fn hot_static_loops(func: &HirFunction) -> Vec<(HirId, u64)> {
     if !has_counted_header(func) {
         return Vec::new();
     }
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     let forest = LoopForest::detect(func, &dt);
     let defs = Defs::of(func);
     let trips: Vec<Option<u64>> = forest

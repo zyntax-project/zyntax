@@ -22,7 +22,7 @@ pub fn run_function(func: &mut HirFunction) -> usize {
         return 0;
     }
     rebuild_edges(func);
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     let forest = LoopForest::detect(func, &dt);
     // Copies are not reconsidered; only disjoint innermost loops from
     // the input can acquire a version in this pass.
@@ -70,7 +70,7 @@ pub fn run_function(func: &mut HirFunction) -> usize {
         {
             continue;
         }
-        let dt = DominatorTree::new(func);
+        let dt = DominatorTree::of(func);
         let Some(merges) = exit_merges(func, &lp, &dt) else {
             continue;
         };

@@ -139,7 +139,7 @@ fn run_with(
     // cross-module dep (LICM doesn't currently depend on `inline`).
     rebuild_cfg_edges(func);
 
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     let lf = LoopForest::detect(func, &dt);
     if lf.loops().is_empty() {
         return LicmStats::default();

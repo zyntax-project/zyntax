@@ -95,7 +95,7 @@ pub fn run_function(func: &mut HirFunction) -> BoundsVersionStats {
         .collect();
     loop {
         rebuild_cfg_edges(func);
-        let dt = DominatorTree::new(func);
+        let dt = DominatorTree::of(func);
         let lf = LoopForest::detect(func, &dt);
         let next = lf
             .loops()
@@ -805,7 +805,7 @@ fn apply(func: &mut HirFunction, lp: &NaturalLoop, mut plan: Plan, tried: &mut H
             p.incoming.extend(extra);
         }
     }
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     for (e, v) in &plan.merges {
         let ty = func
             .values

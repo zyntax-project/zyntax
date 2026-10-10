@@ -822,7 +822,7 @@ fn uses_escape_past(func: &HirFunction, c: HirId, arm: HirId) -> bool {
 
 /// Every use in a reachable block is dominated by its definition.
 fn dominance_holds(func: &HirFunction) -> bool {
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     let mut def_at: HashMap<HirId, (HirId, usize)> = HashMap::new();
     for (&b, block) in &func.blocks {
         for p in &block.phis {

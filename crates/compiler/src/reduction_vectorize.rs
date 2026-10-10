@@ -77,7 +77,7 @@ pub struct ReductionStats {
 
 /// Vectorize every matching reduction loop in `func`.
 pub fn run(func: &mut HirFunction) -> ReductionStats {
-    let dt = DominatorTree::new(func);
+    let dt = DominatorTree::of(func);
     let lf = LoopForest::detect(func, &dt);
     if lf.loops().is_empty() {
         return ReductionStats::default();
