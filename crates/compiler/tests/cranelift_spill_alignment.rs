@@ -35,7 +35,7 @@ fn fixture() -> (HirModule, HirId) {
     signature.params.push(HirParam {
         id: HirId::new(),
         name: InternedString::new_global("slot"),
-        ty: HirType::Ptr(Box::new(HirType::F64)),
+        ty: HirType::Ptr(std::sync::Arc::new(HirType::F64)),
         attributes: Default::default(),
         ownership: Default::default(),
     });
@@ -43,7 +43,7 @@ fn fixture() -> (HirModule, HirId) {
     host.is_external = true;
     host.calling_convention = CallingConvention::C;
     let slot = f.create_value(
-        HirType::Ptr(Box::new(HirType::F64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::F64)),
         HirValueKind::Instruction,
     );
     let loaded = f.create_value(HirType::F64, HirValueKind::Instruction);

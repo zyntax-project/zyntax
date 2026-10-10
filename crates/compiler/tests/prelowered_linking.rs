@@ -426,7 +426,7 @@ fn private_library_literals_follow_reached_bodies() {
                 ty: if matches!(initializer, HirConstant::I64(_)) {
                     HirType::I64
                 } else {
-                    HirType::Ptr(Box::new(HirType::I8))
+                    HirType::Ptr(std::sync::Arc::new(HirType::I8))
                 },
                 initializer: Some(initializer),
                 is_const: true,
@@ -440,7 +440,7 @@ fn private_library_literals_follow_reached_bodies() {
     }
     let twice = source.functions.values_mut().next().unwrap();
     let ptr = twice.create_value(
-        HirType::Ptr(Box::new(HirType::I8)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I8)),
         HirValueKind::Global(globals[0]),
     );
     let byte = twice.create_value(HirType::I8, HirValueKind::Instruction);

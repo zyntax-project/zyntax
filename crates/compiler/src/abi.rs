@@ -329,7 +329,10 @@ mod tests {
         assert!(llvm_entry_abi_supported(&f, false));
         let f = function(vec![vec3(), HirType::I64], vec![vec3()]);
         assert!(llvm_entry_abi_supported(&f, false));
-        let f = function(vec![HirType::Array(Box::new(HirType::F64), 4)], vec![]);
+        let f = function(
+            vec![HirType::Array(std::sync::Arc::new(HirType::F64), 4)],
+            vec![],
+        );
         assert!(llvm_entry_abi_supported(&f, false));
         let wrapped = HirType::Struct(HirStructType {
             name: None,
@@ -369,7 +372,7 @@ mod tests {
                 HirType::I64,
                 HirType::F64,
                 wrapped,
-                HirType::Ptr(Box::new(HirType::U8)),
+                HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             ],
             vec![HirType::I64],
         );

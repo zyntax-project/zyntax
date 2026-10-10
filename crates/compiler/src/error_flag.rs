@@ -942,7 +942,7 @@ mod tests {
     use zyntax_typed_ast::InternedString;
 
     fn flag_ty() -> HirType {
-        HirType::Ptr(Box::new(HirType::I8))
+        HirType::Ptr(std::sync::Arc::new(HirType::I8))
     }
 
     fn sig(params: Vec<HirType>) -> HirFunctionSignature {
@@ -1018,11 +1018,14 @@ mod tests {
         fn new(m: &Module) -> Self {
             let mut f = HirFunction::new(
                 InternedString::new_global("caller"),
-                sig(vec![HirType::Bool, HirType::Ptr(Box::new(HirType::I64))]),
+                sig(vec![
+                    HirType::Bool,
+                    HirType::Ptr(std::sync::Arc::new(HirType::I64)),
+                ]),
             );
             f.blocks.clear();
             let flag_ptr = f.create_value(
-                HirType::Ptr(Box::new(flag_ty())),
+                HirType::Ptr(std::sync::Arc::new(flag_ty())),
                 HirValueKind::Global(m.flag),
             );
             let null = f.create_value(flag_ty(), HirValueKind::Constant(HirConstant::I64(0)));
@@ -1297,7 +1300,7 @@ mod tests {
             },
         );
         let mut b = Body::new(&m);
-        let p = b.param(1, HirType::Ptr(Box::new(HirType::I64)));
+        let p = b.param(1, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let entry = b.block();
         let mid = b.block();
         let raise = b.block();

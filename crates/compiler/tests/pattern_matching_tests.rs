@@ -339,7 +339,7 @@ fn test_exhaustiveness_with_wildcard() {
             },
             HirUnionVariant {
                 name: intern_str(&mut arena, "Err"),
-                ty: HirType::Ptr(Box::new(HirType::U8)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                 discriminant: 1,
             },
         ],

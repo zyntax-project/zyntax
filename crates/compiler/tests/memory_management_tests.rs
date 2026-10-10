@@ -22,7 +22,7 @@ fn test_arc_instrumentation() {
     // Create a simple function that allocates and uses pointers
     let signature = HirFunctionSignature {
         params: vec![],
-        returns: vec![HirType::Ptr(Box::new(HirType::I32))],
+        returns: vec![HirType::Ptr(std::sync::Arc::new(HirType::I32))],
         type_params: vec![],
         const_params: vec![],
         lifetime_params: vec![],
@@ -36,7 +36,7 @@ fn test_arc_instrumentation() {
     let mut func = HirFunction::new(intern_str(&mut arena, "test_arc"), signature);
 
     // Add a malloc instruction
-    let ptr_type = HirType::Ptr(Box::new(HirType::I32));
+    let ptr_type = HirType::Ptr(std::sync::Arc::new(HirType::I32));
     let malloc_result = func.create_value(ptr_type.clone(), HirValueKind::Instruction);
     let size_const = func.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(4)));
 
@@ -71,7 +71,7 @@ fn test_drop_manager() {
     // Register a type with a destructor
     let custom_type = HirType::Struct(HirStructType {
         name: Some(intern_str(&mut arena, "CustomType")),
-        fields: vec![HirType::Ptr(Box::new(HirType::I32))],
+        fields: vec![HirType::Ptr(std::sync::Arc::new(HirType::I32))],
         packed: false,
     });
 
@@ -117,7 +117,7 @@ fn test_escape_analysis() {
     // Create a function with local and escaping values
     let signature = HirFunctionSignature {
         params: vec![],
-        returns: vec![HirType::Ptr(Box::new(HirType::I32))],
+        returns: vec![HirType::Ptr(std::sync::Arc::new(HirType::I32))],
         type_params: vec![],
         const_params: vec![],
         lifetime_params: vec![],
@@ -135,7 +135,7 @@ fn test_escape_analysis() {
 
     // Create a heap-allocated value (escapes via return)
     let heap_value = func.create_value(
-        HirType::Ptr(Box::new(HirType::I32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I32)),
         HirValueKind::Instruction,
     );
 
@@ -170,7 +170,7 @@ fn test_memory_context_reference_counting() {
     ctx.track_allocation(
         value1,
         AllocationInfo {
-            ty: HirType::Ptr(Box::new(HirType::I32)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I32)),
             size: Some(4),
             align: 4,
             is_stack: false,
@@ -181,7 +181,7 @@ fn test_memory_context_reference_counting() {
     ctx.track_allocation(
         value2,
         AllocationInfo {
-            ty: HirType::Array(Box::new(HirType::I32), 10),
+            ty: HirType::Array(std::sync::Arc::new(HirType::I32), 10),
             size: Some(40),
             align: 4,
             is_stack: true,
@@ -246,17 +246,17 @@ fn test_arc_needs_arc_type_checking() {
     assert!(!arc_manager.needs_arc(&HirType::Bool));
 
     // Test pointer and reference types (need ARC)
-    assert!(arc_manager.needs_arc(&HirType::Ptr(Box::new(HirType::I32))));
+    assert!(arc_manager.needs_arc(&HirType::Ptr(std::sync::Arc::new(HirType::I32))));
     assert!(arc_manager.needs_arc(&HirType::Ref {
         lifetime: HirLifetime::anonymous(),
-        pointee: Box::new(HirType::I32),
+        pointee: std::sync::Arc::new(HirType::I32),
         mutable: false,
     }));
 
     // Test composite types
     let struct_with_ptr = HirType::Struct(HirStructType {
         name: None,
-        fields: vec![HirType::I32, HirType::Ptr(Box::new(HirType::U8))],
+        fields: vec![HirType::I32, HirType::Ptr(std::sync::Arc::new(HirType::U8))],
         packed: false,
     });
     assert!(arc_manager.needs_arc(&struct_with_ptr));
@@ -285,10 +285,13 @@ fn test_drop_type_checking() {
     assert!(!drop_manager.needs_drop_type(&HirType::Bool));
 
     // Test pointer types (need drop - must free memory)
-    assert!(drop_manager.needs_drop_type(&HirType::Ptr(Box::new(HirType::I32))));
+    assert!(drop_manager.needs_drop_type(&HirType::Ptr(std::sync::Arc::new(HirType::I32))));
 
     // Test array of droppable types
-    let array_of_ptrs = HirType::Array(Box::new(HirType::Ptr(Box::new(HirType::I32))), 10);
+    let array_of_ptrs = HirType::Array(
+        std::sync::Arc::new(HirType::Ptr(std::sync::Arc::new(HirType::I32))),
+        10,
+    );
     assert!(drop_manager.needs_drop_type(&array_of_ptrs));
 }
 

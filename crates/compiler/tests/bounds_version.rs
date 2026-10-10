@@ -158,7 +158,7 @@ fn build(offset: i64, bound: Bound) -> (HirModule, HirId) {
 
     let slot = add_value(
         &mut f,
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirValueKind::Instruction,
     );
     let i = int(&mut f);

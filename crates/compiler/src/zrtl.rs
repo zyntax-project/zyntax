@@ -314,7 +314,7 @@ pub(crate) fn default_dynamic_box_opaque_tag_and_size() -> (u32, u32) {
 pub(crate) const DYNAMIC_BOX_TYPE: &str = "DynamicBox";
 
 pub(crate) fn dynamic_box_pointer_type() -> HirType {
-    HirType::Ptr(Box::new(HirType::Opaque(
+    HirType::Ptr(std::sync::Arc::new(HirType::Opaque(
         zyntax_typed_ast::InternedString::new_global(DYNAMIC_BOX_TYPE),
     )))
 }

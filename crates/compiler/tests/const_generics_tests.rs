@@ -27,7 +27,7 @@ fn test_const_generic_array_type() {
         params: vec![HirParam {
             id: HirId::new(),
             name: intern_str(&mut arena, "arr"),
-            ty: HirType::Array(Box::new(HirType::Opaque(t_param)), 10), // Fixed size for now
+            ty: HirType::Array(std::sync::Arc::new(HirType::Opaque(t_param)), 10), // Fixed size for now
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -98,7 +98,7 @@ fn test_monomorphization_with_const_generics() {
     let signature = HirFunctionSignature {
         params: vec![],
         returns: vec![
-            HirType::Array(Box::new(HirType::Opaque(t_param)), 0), // Placeholder size
+            HirType::Array(std::sync::Arc::new(HirType::Opaque(t_param)), 0), // Placeholder size
         ],
         type_params: vec![HirTypeParam {
             name: t_param,
@@ -152,8 +152,8 @@ fn test_const_generic_in_struct() {
     let buffer_struct = HirStructType {
         name: Some(intern_str(&mut arena, "FixedBuffer")),
         fields: vec![
-            HirType::Array(Box::new(HirType::U8), 0), // Will be substituted with SIZE
-            HirType::U64,                             // Current position
+            HirType::Array(std::sync::Arc::new(HirType::U8), 0), // Will be substituted with SIZE
+            HirType::U64,                                        // Current position
         ],
         packed: false,
     };

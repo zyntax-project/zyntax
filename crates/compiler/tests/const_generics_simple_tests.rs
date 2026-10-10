@@ -23,7 +23,7 @@ fn test_const_generic_function_signature() {
         params: vec![HirParam {
             id: HirId::new(),
             name: intern_str(&mut arena, "arr"),
-            ty: HirType::Array(Box::new(HirType::Opaque(t_param)), 10),
+            ty: HirType::Array(std::sync::Arc::new(HirType::Opaque(t_param)), 10),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],

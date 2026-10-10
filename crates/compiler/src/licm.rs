@@ -1299,7 +1299,7 @@ mod tests {
             global,
             HirValue {
                 id: global,
-                ty: HirType::Ptr(Box::new(HirType::I64)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
                 kind: HirValueKind::Global(HirId::new()),
                 uses: Default::default(),
                 span: None,
@@ -1547,7 +1547,7 @@ mod tests {
         // body: r = *p   ← p is an invariant param, body never stores
         // → Load should be hoisted into the preheader.
         let (mut f, entry, _header, body, _exit) = mk_func();
-        let p = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
+        let p = add_param(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)), 0);
         let r = add_inst(&mut f, HirType::I64);
         f.blocks
             .get_mut(&body)
@@ -1584,7 +1584,7 @@ mod tests {
         };
         f.blocks.get_mut(&guarded).unwrap().terminator = HirTerminator::Branch { target: latch };
         f.blocks.get_mut(&latch).unwrap().terminator = HirTerminator::Branch { target: header };
-        let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
         let p = if from_integer {
             let word = add_param(&mut f, HirType::I64, 0);
             let p = add_inst(&mut f, ptr_ty.clone());
@@ -1645,7 +1645,7 @@ mod tests {
         // (`body.vx = body.vx - …`) the alias check exists to
         // protect.
         let (mut f, _entry, _header, body, _exit) = mk_func();
-        let p = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
+        let p = add_param(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)), 0);
         let v = add_param(&mut f, HirType::I64, 1);
         let r = add_inst(&mut f, HirType::I64);
         f.blocks
@@ -1679,10 +1679,10 @@ mod tests {
     #[test]
     fn two_loads_of_one_pointer_slot_are_one_root() {
         let (mut f, entry, _header, body, _exit) = mk_func();
-        let h = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
+        let h = add_param(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)), 0);
         let i = add_param(&mut f, HirType::I64, 1);
         let v = add_param(&mut f, HirType::I64, 2);
-        let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
         let d1 = add_inst(&mut f, ptr_ty.clone());
         let d2 = add_inst(&mut f, ptr_ty.clone());
         let at8 = add_inst(&mut f, ptr_ty.clone());
@@ -1755,7 +1755,7 @@ mod tests {
     fn region_parameters_may_alias() {
         let (mut f, _entry, _header, body, _exit) = mk_func();
         f.attributes.osr_region = true;
-        let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
         let last = add_param(&mut f, ptr_ty.clone(), 0);
         let data = add_param(&mut f, ptr_ty.clone(), 1);
         let i = add_param(&mut f, HirType::I64, 2);
@@ -1798,7 +1798,7 @@ mod tests {
         make: impl FnOnce(&mut HirFunction, HirId, HirType) -> (HirId, HirId),
     ) -> bool {
         let (mut f, entry, _header, body, _exit) = mk_func();
-        let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
         let (stored, loaded) = make(&mut f, entry, ptr_ty);
         let v = add_param(&mut f, HirType::I64, 9);
         let r = add_inst(&mut f, HirType::I64);
@@ -1838,7 +1838,7 @@ mod tests {
     fn a_loaded_pointer_may_alias_a_parameter() {
         assert!(!hoists_past_store(|f, entry, ty| {
             let param = add_param(f, ty.clone(), 0);
-            let slot = add_param(f, HirType::Ptr(Box::new(ty.clone())), 1);
+            let slot = add_param(f, HirType::Ptr(std::sync::Arc::new(ty.clone())), 1);
             let loaded = add_inst(f, ty);
             f.blocks
                 .get_mut(&entry)
@@ -1846,7 +1846,7 @@ mod tests {
                 .instructions
                 .push(HirInstruction::Load {
                     result: loaded,
-                    ty: HirType::Ptr(Box::new(HirType::I64)),
+                    ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
                     ptr: slot,
                     align: 8,
                     volatile: false,
@@ -1887,7 +1887,7 @@ mod tests {
     fn region_parameter_store_leaves_a_global_read_free() {
         let (mut f, _entry, _header, body, _exit) = mk_func();
         f.attributes.osr_region = true;
-        let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
         let data = add_param(&mut f, ptr_ty.clone(), 0);
         let i = add_param(&mut f, HirType::I64, 1);
         let v = add_param(&mut f, HirType::I64, 2);
@@ -1935,11 +1935,13 @@ mod tests {
     }
 
     fn struct_ptr(name: &str) -> HirType {
-        HirType::Ptr(Box::new(HirType::Struct(crate::hir::HirStructType {
-            name: Some(InternedString::new_global(name)),
-            fields: vec![HirType::I64, HirType::I64],
-            packed: false,
-        })))
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(
+            crate::hir::HirStructType {
+                name: Some(InternedString::new_global(name)),
+                fields: vec![HirType::I64, HirType::I64],
+                packed: false,
+            },
+        )))
     }
 
     /// A region storing through `*store_ty` and loading through
@@ -1953,7 +1955,7 @@ mod tests {
         let loaded = add_param(&mut f, struct_ptr(load_ty), 1);
         let off = add_param(&mut f, HirType::I64, 2);
         let v = add_param(&mut f, HirType::I64, 3);
-        let field_ty = HirType::Ptr(Box::new(HirType::I64));
+        let field_ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
         let store_at = add_inst(&mut f, field_ty.clone());
         let load_at = add_inst(&mut f, field_ty.clone());
         let r = add_inst(&mut f, HirType::I64);

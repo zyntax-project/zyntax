@@ -311,7 +311,7 @@ mod tests {
         let global = HirGlobal {
             id: vtable_id,
             name: trait_name,
-            ty: HirType::Ptr(Box::new(HirType::Void)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::Void)),
             initializer: None,
             is_const: true,
             is_thread_local: false,

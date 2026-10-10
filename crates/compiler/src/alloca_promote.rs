@@ -377,7 +377,7 @@ mod tests {
         f.entry_block = entry;
         f.blocks.clear();
         f.blocks.insert(entry, HirBlock::new(entry));
-        let ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let ptr = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Alloca {
             result: ptr,
@@ -406,13 +406,13 @@ mod tests {
     fn returned_alloca_becomes_malloc() {
         let mut f = HirFunction::new(
             InternedString::new_global("escaping"),
-            empty_sig(HirType::Ptr(Box::new(HirType::I64))),
+            empty_sig(HirType::Ptr(std::sync::Arc::new(HirType::I64))),
         );
         let entry = HirId::new();
         f.entry_block = entry;
         f.blocks.clear();
         f.blocks.insert(entry, HirBlock::new(entry));
-        let ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let ptr = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Alloca {
             result: ptr,
@@ -462,8 +462,8 @@ mod tests {
         f.entry_block = entry;
         f.blocks.clear();
         f.blocks.insert(entry, HirBlock::new(entry));
-        let inner = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
-        let outer = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let inner = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
+        let outer = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Alloca {
             result: inner,
@@ -497,7 +497,7 @@ mod tests {
     fn dynamic_count_alloca_is_skipped() {
         let mut f = HirFunction::new(
             InternedString::new_global("dyn_count"),
-            empty_sig(HirType::Ptr(Box::new(HirType::I64))),
+            empty_sig(HirType::Ptr(std::sync::Arc::new(HirType::I64))),
         );
         let entry = HirId::new();
         f.entry_block = entry;
@@ -514,7 +514,7 @@ mod tests {
                 span: None,
             },
         );
-        let ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let ptr = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Alloca {
             result: ptr,
@@ -537,14 +537,14 @@ mod tests {
             HirFunctionSignature {
                 is_async: true,
                 is_fiber: false,
-                ..empty_sig(HirType::Ptr(Box::new(HirType::I64)))
+                ..empty_sig(HirType::Ptr(std::sync::Arc::new(HirType::I64)))
             },
         );
         let entry = HirId::new();
         f.entry_block = entry;
         f.blocks.clear();
         f.blocks.insert(entry, HirBlock::new(entry));
-        let ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let ptr = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Alloca {
             result: ptr,

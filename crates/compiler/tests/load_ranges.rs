@@ -17,7 +17,7 @@ fn fixture(
     sig.is_pure = false;
     let mut f = HirFunction::new(InternedString::new_global("ranges"), sig);
     for i in 0..2 {
-        let ty = HirType::Ptr(Box::new(HirType::I64));
+        let ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
         let id = f.create_value(ty.clone(), HirValueKind::Parameter(i));
         f.signature.params.push(HirParam {
             id,
@@ -30,7 +30,7 @@ fn fixture(
     let read_base = f.signature.params[0].id;
     let write_base = f.signature.params[usize::from(separate_root)].id;
     let index_ty = if scaled {
-        HirType::Ptr(Box::new(HirType::I64))
+        HirType::Ptr(std::sync::Arc::new(HirType::I64))
     } else {
         HirType::U8
     };
@@ -40,7 +40,7 @@ fn fixture(
             HirValueKind::Constant(HirConstant::I64(offset)),
         );
         let result = f.create_value(
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         f.blocks.get_mut(&f.entry_block).unwrap().instructions.push(
@@ -58,11 +58,11 @@ fn fixture(
     // Exercise the pointer casts used around byte GEPs in lowered code.
     let word = f.create_value(HirType::U64, HirValueKind::Instruction);
     let roundtrip = f.create_value(
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirValueKind::Instruction,
     );
     let cast_q = f.create_value(
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirValueKind::Instruction,
     );
     let first = f.create_value(HirType::I64, HirValueKind::Instruction);
@@ -83,13 +83,13 @@ fn fixture(
         HirInstruction::Cast {
             result: roundtrip,
             op: CastOp::IntToPtr,
-            ty: HirType::Ptr(Box::new(HirType::I64)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             operand: word,
         },
         HirInstruction::Cast {
             result: cast_q,
             op: CastOp::Bitcast,
-            ty: HirType::Ptr(Box::new(HirType::I64)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             operand: roundtrip,
         },
         HirInstruction::Load {
@@ -318,7 +318,7 @@ fn array_layouts_and_multi_index_geps_do_not_supply_range_proofs() {
             if multi_index {
                 indices.push(indices[0]);
             } else {
-                *ty = HirType::Array(Box::new(HirType::I64), 2);
+                *ty = HirType::Array(std::sync::Arc::new(HirType::I64), 2);
             }
         }
         assert_eq!(load_cse::run(f).eliminated, 0);
@@ -335,7 +335,7 @@ fn aggregate_store_carriers_do_not_understate_the_written_range() {
         packed: false,
     });
     let aggregate = f.create_value(
-        HirType::Ptr(Box::new(ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(ty.clone())),
         HirValueKind::Instruction,
     );
     let block = f.blocks.get_mut(&f.entry_block).unwrap();

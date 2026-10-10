@@ -10,15 +10,18 @@ fn fixture(call: bool) -> (HirModule, HirId) {
     signature.returns = vec![HirType::I64];
     signature.is_pure = false;
     let mut f = HirFunction::new(InternedString::new_global("snapshot"), signature.clone());
-    let scalar_ptr = HirType::Ptr(Box::new(HirType::I64));
+    let scalar_ptr = HirType::Ptr(std::sync::Arc::new(HirType::I64));
     let pair = HirType::Struct(HirStructType {
         name: None,
         fields: vec![HirType::I64, HirType::I64],
         packed: false,
     });
-    for (i, ty) in [HirType::Ptr(Box::new(pair.clone())), scalar_ptr.clone()]
-        .into_iter()
-        .enumerate()
+    for (i, ty) in [
+        HirType::Ptr(std::sync::Arc::new(pair.clone())),
+        scalar_ptr.clone(),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let id = f.create_value(ty.clone(), HirValueKind::Parameter(i as u32));
         f.signature.params.push(HirParam {

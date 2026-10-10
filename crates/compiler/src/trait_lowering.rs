@@ -143,7 +143,7 @@ pub fn convert_type(
             PrimitiveType::F32 => Ok(HirType::F32),
             PrimitiveType::F64 => Ok(HirType::F64),
             PrimitiveType::Char => Ok(HirType::U32), // Unicode scalar
-            PrimitiveType::String => Ok(HirType::Ptr(Box::new(HirType::U8))), // UTF-8 bytes
+            PrimitiveType::String => Ok(HirType::Ptr(std::sync::Arc::new(HirType::U8))), // UTF-8 bytes
             PrimitiveType::Unit => Ok(HirType::Void),
             PrimitiveType::ISize => Ok(HirType::I64), // Platform-specific
             PrimitiveType::USize => Ok(HirType::U64), // Platform-specific
@@ -222,14 +222,17 @@ pub fn convert_type(
             if let Some(size_const) = size {
                 // Fixed-size array
                 if let zyntax_typed_ast::ConstValue::Int(size_val) = size_const {
-                    Ok(HirType::Array(Box::new(elem_ty), *size_val as u64))
+                    Ok(HirType::Array(
+                        std::sync::Arc::new(elem_ty),
+                        *size_val as u64,
+                    ))
                 } else {
                     // Dynamic or non-integer size - use pointer
-                    Ok(HirType::Ptr(Box::new(elem_ty)))
+                    Ok(HirType::Ptr(std::sync::Arc::new(elem_ty)))
                 }
             } else {
                 // Dynamic array - use pointer
-                Ok(HirType::Ptr(Box::new(elem_ty)))
+                Ok(HirType::Ptr(std::sync::Arc::new(elem_ty)))
             }
         }
 
@@ -256,7 +259,7 @@ pub fn convert_type(
 
             Ok(HirType::Ref {
                 lifetime: hir_lifetime,
-                pointee: Box::new(pointee_ty),
+                pointee: std::sync::Arc::new(pointee_ty),
                 mutable: matches!(mutability, zyntax_typed_ast::Mutability::Mutable),
             })
         }
@@ -780,7 +783,7 @@ pub fn create_vtable_global(
     HirGlobal {
         id: vtable.id,
         name,
-        ty: HirType::Ptr(Box::new(HirType::Void)), // Opaque vtable pointer
+        ty: HirType::Ptr(std::sync::Arc::new(HirType::Void)), // Opaque vtable pointer
         initializer: Some(HirConstant::VTable(vtable)),
         is_const: true,
         is_thread_local: false,

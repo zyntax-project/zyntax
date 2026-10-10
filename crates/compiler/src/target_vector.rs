@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn a_type_without_a_lane_size_has_no_lane_count() {
         assert_eq!(
-            VectorProfile::portable().lanes_for(&HirType::Ptr(Box::new(HirType::F32))),
+            VectorProfile::portable().lanes_for(&HirType::Ptr(std::sync::Arc::new(HirType::F32))),
             None
         );
         assert_eq!(VectorProfile::portable().lanes_for(&HirType::Void), None);

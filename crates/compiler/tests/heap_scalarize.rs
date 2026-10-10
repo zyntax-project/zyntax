@@ -82,7 +82,7 @@ fn fixture(n: i64, null: bool) -> Fixture {
     let seven = constant(&mut f, 7);
     let size = constant(&mut f, 8);
     let limit = constant(&mut f, n);
-    let ptr = HirType::Ptr(Box::new(HirType::I64));
+    let ptr = HirType::Ptr(std::sync::Arc::new(HirType::I64));
     let initial = if null {
         f.create_value(
             ptr.clone(),
@@ -273,7 +273,7 @@ fn cast_incoming(a: &mut Fixture, integer_ty: Option<HirType>) {
         let ptr_ty = a.f.values[&value].ty.clone();
         let middle_ty = integer_ty
             .clone()
-            .unwrap_or_else(|| HirType::Ptr(Box::new(HirType::U8)));
+            .unwrap_or_else(|| HirType::Ptr(std::sync::Arc::new(HirType::U8)));
         let encoded = instruction(&mut a.f, middle_ty.clone());
         let restored = instruction(&mut a.f, ptr_ty.clone());
         a.f.blocks.get_mut(&block).unwrap().instructions.extend([
@@ -415,7 +415,7 @@ fn rejects_uninitialized_and_overlapping_fields() {
 fn does_not_snapshot_an_opaque_incoming_pointer() {
     let mut a = fixture(3, false);
     let ptr = a.f.create_value(
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirValueKind::Parameter(0),
     );
     a.f.blocks.get_mut(&a.head).unwrap().phis[0].incoming[0].0 = ptr;
@@ -487,7 +487,7 @@ fn fields_follow_cross_field_recurrences_through_byte_geps() {
     a.f.values.get_mut(&size).unwrap().kind = HirValueKind::Constant(HirConstant::I64(16));
     let offset = constant(&mut a.f, 8);
     let ten = constant(&mut a.f, 10);
-    let ty = HirType::Ptr(Box::new(HirType::I64));
+    let ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
     let initial_second = instruction(&mut a.f, ty.clone());
     let current_second = instruction(&mut a.f, ty.clone());
     let next_second = instruction(&mut a.f, ty);

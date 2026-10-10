@@ -43,7 +43,7 @@ fn h4_orchestrator_lowers_perform_effect_to_state_machine() {
         frame,
         HirValue {
             id: frame,
-            ty: HirType::Ptr(Box::new(HirType::I64)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             kind: HirValueKind::Instruction,
             uses: Default::default(),
             span: None,

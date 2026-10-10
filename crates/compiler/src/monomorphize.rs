@@ -279,7 +279,7 @@ impl MonomorphizationContext {
             }
 
             // Recursive cases
-            HirType::Ptr(inner) => HirType::Ptr(Box::new(self.substitute_type(
+            HirType::Ptr(inner) => HirType::Ptr(std::sync::Arc::new(self.substitute_type(
                 inner,
                 type_subst,
                 const_subst,
@@ -290,7 +290,7 @@ impl MonomorphizationContext {
                 let new_elem = self.substitute_type(elem, type_subst, const_subst);
                 // Array size is already a concrete u64 value
                 // (Const generic array sizes are resolved before monomorphization)
-                HirType::Array(Box::new(new_elem), *size)
+                HirType::Array(std::sync::Arc::new(new_elem), *size)
             }
 
             HirType::Struct(struct_ty) => {
@@ -496,7 +496,7 @@ mod tests {
         assert!(matches!(result, HirType::I32));
 
         // Test substituting Ptr(T) -> Ptr(I32)
-        let ptr_ty = HirType::Ptr(Box::new(HirType::Opaque(t_param)));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(HirType::Opaque(t_param)));
         let result = ctx.substitute_type(&ptr_ty, &type_subst, &const_subst);
         assert!(matches!(result, HirType::Ptr(ref inner) if **inner == HirType::I32));
     }
@@ -628,7 +628,7 @@ mod tests {
             returns: vec![
                 // Return type would be represented as Generic type in a full implementation
                 // For this test, we'll verify that const_params are properly cleared
-                HirType::Array(Box::new(HirType::Opaque(t_param)), 5),
+                HirType::Array(std::sync::Arc::new(HirType::Opaque(t_param)), 5),
             ],
             type_params: vec![HirTypeParam {
                 name: t_param,
@@ -756,8 +756,8 @@ mod tests {
 
         // Create nested generic type: Ptr(Array(Opaque(T), 5))
         // Represents: *[T; 5]
-        let nested_ty = HirType::Ptr(Box::new(HirType::Array(
-            Box::new(HirType::Opaque(t_param)),
+        let nested_ty = HirType::Ptr(std::sync::Arc::new(HirType::Array(
+            std::sync::Arc::new(HirType::Opaque(t_param)),
             5,
         )));
 
@@ -770,9 +770,9 @@ mod tests {
 
         // Should be Ptr(Array(I32, 5))
         if let HirType::Ptr(inner) = result {
-            if let HirType::Array(elem, size) = *inner {
-                assert_eq!(*elem, HirType::I32, "Element should be i32");
-                assert_eq!(size, 5, "Size should be 5");
+            if let HirType::Array(elem, size) = inner.as_ref() {
+                assert_eq!(**elem, HirType::I32, "Element should be i32");
+                assert_eq!(*size, 5, "Size should be 5");
             } else {
                 panic!("Expected Array inside Ptr");
             }
@@ -790,10 +790,12 @@ mod tests {
 
         // Create deeply nested type: Ptr(Ptr(Array(Ptr(Opaque(T)), 3)))
         // Represents: **[*T; 3]
-        let deeply_nested = HirType::Ptr(Box::new(HirType::Ptr(Box::new(HirType::Array(
-            Box::new(HirType::Ptr(Box::new(HirType::Opaque(t_param)))),
-            3,
-        )))));
+        let deeply_nested = HirType::Ptr(std::sync::Arc::new(HirType::Ptr(std::sync::Arc::new(
+            HirType::Array(
+                std::sync::Arc::new(HirType::Ptr(std::sync::Arc::new(HirType::Opaque(t_param)))),
+                3,
+            ),
+        ))));
 
         // Substitute T -> f64
         let mut type_subst = std::collections::HashMap::new();
@@ -804,11 +806,11 @@ mod tests {
 
         // Verify the deep substitution worked
         if let HirType::Ptr(l1) = result {
-            if let HirType::Ptr(l2) = *l1 {
-                if let HirType::Array(elem, size) = *l2 {
-                    if let HirType::Ptr(l3) = *elem {
-                        assert_eq!(*l3, HirType::F64, "Innermost type should be f64");
-                        assert_eq!(size, 3, "Array size should be 3");
+            if let HirType::Ptr(l2) = l1.as_ref() {
+                if let HirType::Array(elem, size) = l2.as_ref() {
+                    if let HirType::Ptr(l3) = elem.as_ref() {
+                        assert_eq!(**l3, HirType::F64, "Innermost type should be f64");
+                        assert_eq!(*size, 3, "Array size should be 3");
                     } else {
                         panic!("Expected Ptr in array element");
                     }
@@ -836,7 +838,7 @@ mod tests {
         let struct_ty = HirStructType {
             name: Some(arena.intern_string("Pair")),
             fields: vec![
-                HirType::Ptr(Box::new(HirType::Opaque(t_param))),
+                HirType::Ptr(std::sync::Arc::new(HirType::Opaque(t_param))),
                 HirType::Opaque(u_param),
             ],
             packed: false,
@@ -890,8 +892,8 @@ mod tests {
             }],
             returns: vec![
                 // Return *[T; 10]
-                HirType::Ptr(Box::new(HirType::Array(
-                    Box::new(HirType::Opaque(t_param)),
+                HirType::Ptr(std::sync::Arc::new(HirType::Array(
+                    std::sync::Arc::new(HirType::Opaque(t_param)),
                     10,
                 ))),
             ],

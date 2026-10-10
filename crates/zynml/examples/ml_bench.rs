@@ -378,7 +378,7 @@ fn registry() -> Vec<Kernel> {
 /// `for i { acc += widen(a[i]) * widen(b[i]) }`, so it folds to
 /// `vpdpbusd`/`sdot`/`i32x4.dot`/the widening fallback per host.
 fn build_qdot_u8i8_baseline() -> RealKernel {
-    let ptr_i8 = || HirType::Ptr(Box::new(HirType::I8));
+    let ptr_i8 = || HirType::Ptr(std::sync::Arc::new(HirType::I8));
     let i8x16 = HirType::Vector(Box::new(HirType::I8), 16);
     let i32x4 = HirType::Vector(Box::new(HirType::I32), 4);
 

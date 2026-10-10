@@ -2209,7 +2209,7 @@ impl SsaBuilder {
                         )),
                     );
                     let elem_ptr = self.create_value(
-                        HirType::Ptr(Box::new(elem_ty.clone())),
+                        HirType::Ptr(std::sync::Arc::new(elem_ty.clone())),
                         HirValueKind::Instruction,
                     );
                     self.add_instruction(
@@ -2662,7 +2662,7 @@ impl SsaBuilder {
                     if self.address_taken_vars.contains(&let_stmt.name) {
                         // Allocate stack slot and store value
                         let stack_slot = self.create_value(
-                            HirType::Ptr(Box::new(hir_type.clone())),
+                            HirType::Ptr(std::sync::Arc::new(hir_type.clone())),
                             HirValueKind::Instruction,
                         );
 
@@ -3098,7 +3098,7 @@ impl SsaBuilder {
         // Preamble: allocate loop-counter stack slot, initialise to 0
         // ----------------------------------------------------------------
         let i_slot = self.create_value(
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         self.add_instruction(
@@ -3258,7 +3258,7 @@ impl SsaBuilder {
                 off
             };
             let elem_ptr = self.create_value(
-                HirType::Ptr(Box::new(elem_ty.clone())),
+                HirType::Ptr(std::sync::Arc::new(elem_ty.clone())),
                 HirValueKind::Instruction,
             );
             self.add_instruction(
@@ -3380,7 +3380,7 @@ impl SsaBuilder {
                 off
             };
             let elem_ptr = self.create_value(
-                HirType::Ptr(Box::new(elem_ty.clone())),
+                HirType::Ptr(std::sync::Arc::new(elem_ty.clone())),
                 HirValueKind::Instruction,
             );
             self.add_instruction(
@@ -3644,7 +3644,7 @@ impl SsaBuilder {
         // of loop-invariant field reads in hot loops (see the nbody_ref
         // perf gap memory note). Cranelift treats Ptr and I64 identically at
         // the lowered-IR level on 64-bit targets, so no codegen change there.
-        let ptr_ty = HirType::Ptr(Box::new(elem_ty.clone()));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(elem_ty.clone()));
         let data_ptr = self.create_value(ptr_ty.clone(), HirValueKind::Instruction);
         self.add_instruction(
             block_id,
@@ -3663,7 +3663,7 @@ impl SsaBuilder {
     fn emit_list_len(&mut self, block_id: HirId, list_ptr: HirId) -> CompilerResult<HirId> {
         let offset_8 = self.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(8)));
         let len_field_ptr = self.create_value(
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         self.add_instruction(
@@ -3755,7 +3755,7 @@ impl SsaBuilder {
                 self,
                 CastOp::IntToPtr,
                 operand,
-                HirType::Ptr(Box::new(target_ty.clone())),
+                HirType::Ptr(std::sync::Arc::new(target_ty.clone())),
             );
             return Some(step(self, CastOp::Bitcast, ptr, target_ty.clone()));
         }
@@ -3764,7 +3764,7 @@ impl SsaBuilder {
                 self,
                 CastOp::Bitcast,
                 operand,
-                HirType::Ptr(Box::new(source_ty.clone())),
+                HirType::Ptr(std::sync::Arc::new(source_ty.clone())),
             );
             return Some(step(self, CastOp::PtrToInt, ptr, target_ty.clone()));
         }
@@ -4188,7 +4188,7 @@ impl SsaBuilder {
                     let left_val = self.translate_operand(&mut cur, left)?;
                     let right_val = self.translate_operand(&mut cur, right)?;
                     let result = self.create_value(
-                        HirType::Ptr(Box::new(HirType::I8)),
+                        HirType::Ptr(std::sync::Arc::new(HirType::I8)),
                         HirValueKind::Instruction,
                     );
                     let call_inst = HirInstruction::Call {
@@ -5612,7 +5612,7 @@ impl SsaBuilder {
                                 HirValueKind::Constant(crate::hir::HirConstant::I64(offset as i64)),
                             );
                             let gep_id = self.create_value(
-                                HirType::Ptr(Box::new(HirType::U8)),
+                                HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                                 HirValueKind::Instruction,
                             );
                             self.add_instruction(
@@ -5628,14 +5628,14 @@ impl SsaBuilder {
                             self.add_use(offset_id, gep_id);
 
                             let field_ptr = self.create_value(
-                                HirType::Ptr(Box::new(field_ty.clone())),
+                                HirType::Ptr(std::sync::Arc::new(field_ty.clone())),
                                 HirValueKind::Instruction,
                             );
                             self.add_instruction(
                                 block_id,
                                 HirInstruction::Cast {
                                     result: field_ptr,
-                                    ty: HirType::Ptr(Box::new(field_ty.clone())),
+                                    ty: HirType::Ptr(std::sync::Arc::new(field_ty.clone())),
                                     op: crate::hir::CastOp::Bitcast,
                                     operand: gep_id,
                                 },
@@ -5987,7 +5987,7 @@ impl SsaBuilder {
                     // Load the data pointer directly as `Ptr(elem)` — see
                     // `emit_list_data_ptr` for the AA rationale (the previous
                     // I64 + IntToPtr round-trip blocked LICM in hot loops).
-                    let data_ptr_ty = HirType::Ptr(Box::new(elem_hir_ty.clone()));
+                    let data_ptr_ty = HirType::Ptr(std::sync::Arc::new(elem_hir_ty.clone()));
                     let data_ptr =
                         self.create_value(data_ptr_ty.clone(), HirValueKind::Instruction);
                     self.add_instruction(
@@ -6006,7 +6006,7 @@ impl SsaBuilder {
                     object_val
                 };
 
-                let result_type = HirType::Ptr(Box::new(elem_hir_ty.clone()));
+                let result_type = HirType::Ptr(std::sync::Arc::new(elem_hir_ty.clone()));
                 let gep_result = self.create_value(result_type.clone(), HirValueKind::Instruction);
 
                 let gep_inst = HirInstruction::GetElementPtr {
@@ -6314,7 +6314,7 @@ impl SsaBuilder {
                                 HirValueKind::Constant(crate::hir::HirConstant::I64(offset)),
                             );
                             let gep_id = self.create_value(
-                                HirType::Ptr(Box::new(HirType::U8)),
+                                HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                                 HirValueKind::Instruction,
                             );
                             self.add_instruction(
@@ -6333,14 +6333,14 @@ impl SsaBuilder {
                             // right pointee type. SRA tolerates the
                             // pointer-typed Cast (`cast_iidxs`).
                             let field_ptr = self.create_value(
-                                HirType::Ptr(Box::new(field_ty.clone())),
+                                HirType::Ptr(std::sync::Arc::new(field_ty.clone())),
                                 HirValueKind::Instruction,
                             );
                             self.add_instruction(
                                 block_id,
                                 HirInstruction::Cast {
                                     result: field_ptr,
-                                    ty: HirType::Ptr(Box::new(field_ty.clone())),
+                                    ty: HirType::Ptr(std::sync::Arc::new(field_ty.clone())),
                                     op: crate::hir::CastOp::Bitcast,
                                     operand: gep_id,
                                 },
@@ -6500,14 +6500,15 @@ impl SsaBuilder {
 
                 // Step 1: Allocate element data buffer
                 let data_buf_size = num_elements * elem_size;
-                let data_alloc_ty = HirType::Array(Box::new(elem_ty.clone()), num_elements as u64);
+                let data_alloc_ty =
+                    HirType::Array(std::sync::Arc::new(elem_ty.clone()), num_elements as u64);
                 let data_ptr = if growable {
                     let bytes = self.i64_const((capacity * elem_size.max(1)) as i64);
                     let data = self.emit_intrinsic(
                         block_id,
                         crate::hir::Intrinsic::Malloc,
                         vec![bytes],
-                        &HirType::Ptr(Box::new(elem_ty.clone())),
+                        &HirType::Ptr(std::sync::Arc::new(elem_ty.clone())),
                     );
                     // The slots past the elements hold whatever the
                     // block held before, and the collector reads the
@@ -6522,7 +6523,7 @@ impl SsaBuilder {
                     data
                 } else {
                     let data_ptr = self.create_value(
-                        HirType::Ptr(Box::new(elem_ty.clone())),
+                        HirType::Ptr(std::sync::Arc::new(elem_ty.clone())),
                         HirValueKind::Instruction,
                     );
                     self.add_instruction(
@@ -6632,7 +6633,7 @@ impl SsaBuilder {
                         HirValueKind::Constant(crate::hir::HirConstant::I64(offset as i64)),
                     );
                     let elem_ptr = self.create_value(
-                        HirType::Ptr(Box::new(elem_ty.clone())),
+                        HirType::Ptr(std::sync::Arc::new(elem_ty.clone())),
                         HirValueKind::Instruction,
                     );
                     self.add_instruction(
@@ -6679,11 +6680,11 @@ impl SsaBuilder {
                         block_id,
                         crate::hir::Intrinsic::Malloc,
                         vec![bytes],
-                        &HirType::Ptr(Box::new(list_struct_ty.clone())),
+                        &HirType::Ptr(std::sync::Arc::new(list_struct_ty.clone())),
                     )
                 } else {
                     let list_alloc = self.create_value(
-                        HirType::Ptr(Box::new(list_struct_ty.clone())),
+                        HirType::Ptr(std::sync::Arc::new(list_struct_ty.clone())),
                         HirValueKind::Instruction,
                     );
                     self.add_instruction(
@@ -6724,7 +6725,7 @@ impl SsaBuilder {
                     HirValueKind::Constant(crate::hir::HirConstant::I64(8)),
                 );
                 let len_field_ptr = self.create_value(
-                    HirType::Ptr(Box::new(HirType::I64)),
+                    HirType::Ptr(std::sync::Arc::new(HirType::I64)),
                     HirValueKind::Instruction,
                 );
                 self.add_instruction(
@@ -6756,7 +6757,7 @@ impl SsaBuilder {
                     HirValueKind::Constant(crate::hir::HirConstant::I64(16)),
                 );
                 let cap_field_ptr = self.create_value(
-                    HirType::Ptr(Box::new(HirType::I64)),
+                    HirType::Ptr(std::sync::Arc::new(HirType::I64)),
                     HirValueKind::Instruction,
                 );
                 self.add_instruction(
@@ -7244,7 +7245,7 @@ impl SsaBuilder {
                 let result_ty = self.convert_type(&expr.ty);
 
                 // The future type is *Promise<T> - the async call returns a Promise pointer
-                let promise_ty = HirType::Ptr(Box::new(HirType::Opaque(
+                let promise_ty = HirType::Ptr(std::sync::Arc::new(HirType::Opaque(
                     InternedString::new_global("Promise"),
                 )));
 
@@ -8634,7 +8635,7 @@ impl SsaBuilder {
             Some(ptr) => *ptr,
             None => {
                 let ptr = self.create_value(
-                    HirType::Ptr(Box::new(ty.clone())),
+                    HirType::Ptr(std::sync::Arc::new(ty.clone())),
                     HirValueKind::Global(global_id),
                 );
                 self.global_refs.insert(name, ptr);
@@ -9255,7 +9256,7 @@ impl SsaBuilder {
         let global = HirGlobal {
             id: global_id,
             name: string_name, // Use the interned string name as the global name
-            ty: HirType::Ptr(Box::new(HirType::I8)), // String is a pointer to i8
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I8)), // String is a pointer to i8
             initializer: Some(HirConstant::String(string_name)),
             is_const: true,
             is_thread_local: false,
@@ -9269,7 +9270,7 @@ impl SsaBuilder {
 
         // Create a value that references this global
         let value_id = self.create_value(
-            HirType::Ptr(Box::new(HirType::I8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I8)),
             HirValueKind::Global(global_id),
         );
 
@@ -9944,7 +9945,7 @@ impl SsaBuilder {
             HirValueKind::Constant(crate::hir::HirConstant::I64(offset)),
         );
         let gep = self.create_value(
-            HirType::Ptr(Box::new(HirType::U8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             HirValueKind::Instruction,
         );
         self.add_instruction(
@@ -9959,14 +9960,14 @@ impl SsaBuilder {
         self.add_use(base, gep);
         self.add_use(offset_id, gep);
         let typed = self.create_value(
-            HirType::Ptr(Box::new(ty.clone())),
+            HirType::Ptr(std::sync::Arc::new(ty.clone())),
             HirValueKind::Instruction,
         );
         self.add_instruction(
             block_id,
             HirInstruction::Cast {
                 result: typed,
-                ty: HirType::Ptr(Box::new(ty)),
+                ty: HirType::Ptr(std::sync::Arc::new(ty)),
                 op: crate::hir::CastOp::Bitcast,
                 operand: gep,
             },
@@ -10424,9 +10425,10 @@ impl SsaBuilder {
                 let hir = self.convert_type(other);
                 match hir {
                     HirType::Ptr(_) | HirType::Opaque(_) => ("zyntax_box_get_opaque", hir),
-                    HirType::Struct(_) | HirType::Array(_, _) => {
-                        ("zyntax_box_get_opaque", HirType::Ptr(Box::new(hir)))
-                    }
+                    HirType::Struct(_) | HirType::Array(_, _) => (
+                        "zyntax_box_get_opaque",
+                        HirType::Ptr(std::sync::Arc::new(hir)),
+                    ),
                     _ => return None,
                 }
             }
@@ -10791,7 +10793,7 @@ impl SsaBuilder {
         // Strings round-trip as `HirType::Ptr(I8)` in the HIR
         // (same as the rest of the language's `String` lowering),
         // so the payload field's HIR type is `Ptr(I8)`.
-        let string_hir = HirType::Ptr(Box::new(HirType::I8));
+        let string_hir = HirType::Ptr(std::sync::Arc::new(HirType::I8));
         let fiber_error_struct = self.arena.lock().unwrap().intern_string("FiberError");
         let payload_field = self.arena.lock().unwrap().intern_string("payload");
         let fiber_error_hir = HirType::Struct(crate::hir::HirStructType {
@@ -11591,7 +11593,10 @@ impl SsaBuilder {
         bytes: HirId,
         pointee: HirType,
     ) -> HirId {
-        let result = self.create_value(HirType::Ptr(Box::new(pointee)), HirValueKind::Instruction);
+        let result = self.create_value(
+            HirType::Ptr(std::sync::Arc::new(pointee)),
+            HirValueKind::Instruction,
+        );
         self.add_instruction(
             block,
             HirInstruction::GetElementPtr {
@@ -11609,14 +11614,14 @@ impl SsaBuilder {
     /// `data + index * size_of(elem)`.
     fn emit_elem_gep(&mut self, block: HirId, data: HirId, index: HirId, elem: HirType) -> HirId {
         let result = self.create_value(
-            HirType::Ptr(Box::new(elem.clone())),
+            HirType::Ptr(std::sync::Arc::new(elem.clone())),
             HirValueKind::Instruction,
         );
         self.add_instruction(
             block,
             HirInstruction::GetElementPtr {
                 result,
-                ty: HirType::Ptr(Box::new(elem)),
+                ty: HirType::Ptr(std::sync::Arc::new(elem)),
                 ptr: data,
                 indices: vec![index],
             },
@@ -11636,7 +11641,7 @@ impl SsaBuilder {
     }
 
     fn list_data(&mut self, block: HirId, list: HirId, elem: &HirType) -> HirId {
-        self.emit_load(block, list, HirType::Ptr(Box::new(elem.clone())))
+        self.emit_load(block, list, HirType::Ptr(std::sync::Arc::new(elem.clone())))
     }
 
     fn list_len(&mut self, block: HirId, list: HirId) -> HirId {
@@ -11786,7 +11791,7 @@ impl SsaBuilder {
             grow,
             crate::hir::Intrinsic::Realloc,
             vec![data, bytes],
-            &HirType::Ptr(Box::new(elem.clone())),
+            &HirType::Ptr(std::sync::Arc::new(elem.clone())),
         );
         let past = self.emit_bin(grow, B::Gt, &HirType::I64, filled, cap);
         let from = self.emit_select(grow, past, filled, cap, &HirType::I64);
@@ -12083,7 +12088,7 @@ impl SsaBuilder {
         use crate::hir::BinaryOp as B;
         let elem = self.convert_type(elem_ty);
         let header_bytes = self.i64_const(24);
-        let list_ty = HirType::Ptr(Box::new(list_header_type()));
+        let list_ty = HirType::Ptr(std::sync::Arc::new(list_header_type()));
         let list = self.emit_intrinsic(
             block,
             crate::hir::Intrinsic::Malloc,
@@ -12099,7 +12104,7 @@ impl SsaBuilder {
             block,
             crate::hir::Intrinsic::Malloc,
             vec![bytes],
-            &HirType::Ptr(Box::new(elem.clone())),
+            &HirType::Ptr(std::sync::Arc::new(elem.clone())),
         );
         let zero = self.i64_const(0);
         self.list_zero_slots(block, data, zero, cap, &elem);
@@ -12276,7 +12281,7 @@ impl SsaBuilder {
                             "`{name}` is not a known typed allocation (expected e.g. `alloc_i8`)"
                         ))
                     })?;
-                let ptr_ty = HirType::Ptr(Box::new(elem.clone()));
+                let ptr_ty = HirType::Ptr(std::sync::Arc::new(elem.clone()));
                 let elem_size = hir_ty_size(&elem) as i64;
                 let size_const = self.create_value(
                     HirType::I64,
@@ -12749,7 +12754,7 @@ impl SsaBuilder {
                 PrimitiveType::F32 => HirType::F32,
                 PrimitiveType::F64 => HirType::F64,
                 PrimitiveType::Unit => HirType::Void,
-                PrimitiveType::String => HirType::Ptr(Box::new(HirType::I8)), // String is Ptr<i8>
+                PrimitiveType::String => HirType::Ptr(std::sync::Arc::new(HirType::I8)), // String is Ptr<i8>
                 PrimitiveType::USize => HirType::USize,
                 PrimitiveType::ISize => HirType::ISize,
                 _ => HirType::I64, // Default
@@ -12760,7 +12765,7 @@ impl SsaBuilder {
                 fields: types.iter().map(|ty| self.convert_type(ty)).collect(),
                 packed: false,
             }),
-            Type::Reference { ty, .. } => HirType::Ptr(Box::new(self.convert_type(ty))),
+            Type::Reference { ty, .. } => HirType::Ptr(std::sync::Arc::new(self.convert_type(ty))),
             Type::Array {
                 element_type,
                 size: Some(size_val),
@@ -12772,7 +12777,7 @@ impl SsaBuilder {
                     ConstValue::UInt(u) => *u,
                     _ => 0, // Default size
                 };
-                HirType::Array(Box::new(self.convert_type(element_type)), size)
+                HirType::Array(std::sync::Arc::new(self.convert_type(element_type)), size)
             }
             // An array of no fixed size is a growable list: a header the
             // value points at, with the elements behind it.
@@ -12873,7 +12878,7 @@ impl SsaBuilder {
             Type::Extern { name, .. } => {
                 // Extern/Opaque types are pointers to opaque structs at the HIR level
                 // The name is used for trait dispatch (e.g., $Tensor -> $Tensor$add)
-                HirType::Ptr(Box::new(HirType::Opaque(*name)))
+                HirType::Ptr(std::sync::Arc::new(HirType::Opaque(*name)))
             }
             Type::Named { id, type_args, .. } => {
                 // A name can reach the registry twice, once as the
@@ -12892,7 +12897,7 @@ impl SsaBuilder {
                     // as `&Resume`. See `lowering.rs::convert_type`
                     // for the design note.
                     if type_def.name.resolve_global().as_deref() == Some("Resume") {
-                        return HirType::Ptr(Box::new(HirType::U8));
+                        return HirType::Ptr(std::sync::Arc::new(HirType::U8));
                     }
 
                     // Universal top type — frontends commonly register
@@ -12914,7 +12919,7 @@ impl SsaBuilder {
                         ..
                     }) = self.type_registry.resolve_alias(type_def.name)
                     {
-                        return HirType::Ptr(Box::new(HirType::Opaque(*extern_name)));
+                        return HirType::Ptr(std::sync::Arc::new(HirType::Opaque(*extern_name)));
                     }
 
                     // Named enum instances retain their discriminated-union
@@ -13015,7 +13020,7 @@ impl SsaBuilder {
                     // this HirType shape in `TypedExpression::Struct` and
                     // `TypedExpression::Field`.
                     if type_def.metadata.is_reference {
-                        return HirType::Ptr(Box::new(HirType::Struct(HirStructType {
+                        return HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
                             name: Some(type_def.name),
                             fields: hir_fields,
                             packed: false,
@@ -13054,7 +13059,7 @@ impl SsaBuilder {
                         ..
                     }) = self.type_registry.resolve_alias(type_def.name)
                     {
-                        return HirType::Ptr(Box::new(HirType::Opaque(*extern_name)));
+                        return HirType::Ptr(std::sync::Arc::new(HirType::Opaque(*extern_name)));
                     }
 
                     // Abstract types are zero-cost wrappers with struct layout
@@ -13083,7 +13088,7 @@ impl SsaBuilder {
                     // struct value, and the LLVM backend panics at
                     // `into_pointer_value()` (llvm_backend.rs:1363).
                     if type_def.metadata.is_reference {
-                        return HirType::Ptr(Box::new(HirType::Struct(HirStructType {
+                        return HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
                             name: Some(type_def.name),
                             fields: hir_fields,
                             packed: false,
@@ -13931,7 +13936,7 @@ impl SsaBuilder {
         if crate::osr::is_held_by_reference(target_ty)
             && matches!(lit, TypedLiteral::Integer(0) | TypedLiteral::Null)
         {
-            return HirConstant::Null(HirType::Ptr(Box::new(HirType::U8)));
+            return HirConstant::Null(HirType::Ptr(std::sync::Arc::new(HirType::U8)));
         }
         match lit {
             TypedLiteral::Bool(b) => HirConstant::Bool(*b),
@@ -14244,7 +14249,7 @@ impl SsaBuilder {
                                 HirValueKind::Constant(crate::hir::HirConstant::I64(offset as i64)),
                             );
                             let gep_id = self.create_value(
-                                HirType::Ptr(Box::new(HirType::U8)),
+                                HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                                 HirValueKind::Instruction,
                             );
                             self.add_instruction(
@@ -14260,14 +14265,14 @@ impl SsaBuilder {
                             self.add_use(offset_id, gep_id);
 
                             let field_ptr = self.create_value(
-                                HirType::Ptr(Box::new(field_ty.clone())),
+                                HirType::Ptr(std::sync::Arc::new(field_ty.clone())),
                                 HirValueKind::Instruction,
                             );
                             self.add_instruction(
                                 block_id,
                                 HirInstruction::Cast {
                                     result: field_ptr,
-                                    ty: HirType::Ptr(Box::new(field_ty.clone())),
+                                    ty: HirType::Ptr(std::sync::Arc::new(field_ty.clone())),
                                     op: crate::hir::CastOp::Bitcast,
                                     operand: gep_id,
                                 },
@@ -14480,7 +14485,7 @@ impl SsaBuilder {
                     // Direct Ptr-typed load — matches the read-side change
                     // in the Index lowering and `emit_list_data_ptr` (AA
                     // can track the data pointer without inttoptr).
-                    let data_ptr_ty = HirType::Ptr(Box::new(element_type.clone()));
+                    let data_ptr_ty = HirType::Ptr(std::sync::Arc::new(element_type.clone()));
                     let data_ptr =
                         self.create_value(data_ptr_ty.clone(), HirValueKind::Instruction);
                     self.add_instruction(
@@ -14500,7 +14505,7 @@ impl SsaBuilder {
                 };
 
                 // Create GetElementPtr instruction to get pointer to element
-                let ptr_type = HirType::Ptr(Box::new(element_type.clone()));
+                let ptr_type = HirType::Ptr(std::sync::Arc::new(element_type.clone()));
                 let ptr = self.create_value(ptr_type.clone(), HirValueKind::Instruction);
 
                 let gep_inst = HirInstruction::GetElementPtr {
@@ -15415,7 +15420,7 @@ impl SsaBuilder {
                 for (idx, pattern) in element_patterns.iter().enumerate() {
                     // Extract element from array using GetElementPtr
                     let elem_ptr = self.create_value(
-                        HirType::Ptr(Box::new(self.convert_type(element_type))),
+                        HirType::Ptr(std::sync::Arc::new(self.convert_type(element_type))),
                         HirValueKind::Instruction,
                     );
 
@@ -16663,7 +16668,7 @@ impl SsaBuilder {
             let capture_ty = self.convert_type(&capture.ty);
             let field_ty = if capture.by_ref {
                 // Capture by reference: use pointer
-                HirType::Ptr(Box::new(capture_ty))
+                HirType::Ptr(std::sync::Arc::new(capture_ty))
             } else {
                 // Capture by value
                 capture_ty
@@ -16679,7 +16684,7 @@ impl SsaBuilder {
 
         // Step 2: Allocate environment struct
         let env_ptr_result = self.create_value(
-            HirType::Ptr(Box::new(env_struct_ty.clone())),
+            HirType::Ptr(std::sync::Arc::new(env_struct_ty.clone())),
             HirValueKind::Instruction,
         );
 

@@ -592,22 +592,22 @@ pub fn lower_await_calls(
         let poll_block_id = HirId::new();
         let current_promise_id = mint_value(
             &mut function.values,
-            HirType::Ptr(Box::new(HirType::U8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             HirValueKind::Instruction,
         );
         let nested_sm_id = mint_value(
             &mut function.values,
-            HirType::Ptr(Box::new(HirType::U8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             HirValueKind::Instruction,
         );
         let const_8_pb = mint_const_i64(&mut function.values, 8);
         let poll_fn_slot_id = mint_value(
             &mut function.values,
-            HirType::Ptr(Box::new(HirType::U8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             HirValueKind::Instruction,
         );
         let poll_fn_ty = HirType::Function(Box::new(HirFunctionType {
-            params: vec![HirType::Ptr(Box::new(HirType::U8))],
+            params: vec![HirType::Ptr(std::sync::Arc::new(HirType::U8))],
             returns: vec![HirType::I64],
             lifetime_params: vec![],
             is_variadic: false,
@@ -635,13 +635,13 @@ pub fn lower_await_calls(
             instructions: vec![
                 HirInstruction::AsyncLoadSlot {
                     result: current_promise_id,
-                    ty: HirType::Ptr(Box::new(HirType::U8)),
+                    ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                     frame,
                     slot: promise_slot,
                 },
                 HirInstruction::Load {
                     result: nested_sm_id,
-                    ty: HirType::Ptr(Box::new(HirType::U8)),
+                    ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                     ptr: current_promise_id,
                     align: 8,
                     volatile: false,
@@ -753,7 +753,7 @@ pub fn lower_await_calls(
         // Now the yield_block becomes a thin re-entry check.
         let existing_promise_id = mint_value(
             &mut function.values,
-            HirType::Ptr(Box::new(HirType::U8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             HirValueKind::Instruction,
         );
         let zero_check_const = mint_const_i64(&mut function.values, 0);
@@ -765,7 +765,7 @@ pub fn lower_await_calls(
         yield_block.instructions = vec![
             HirInstruction::AsyncLoadSlot {
                 result: existing_promise_id,
-                ty: HirType::Ptr(Box::new(HirType::U8)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                 frame,
                 slot: promise_slot,
             },
@@ -968,7 +968,7 @@ fn lower_host_bridge_await_site(
     let task_id_const = mint_const_i64(&mut function.values, 0);
 
     let poll_fn_ty = HirType::Function(Box::new(HirFunctionType {
-        params: vec![HirType::Ptr(Box::new(HirType::U8))],
+        params: vec![HirType::Ptr(std::sync::Arc::new(HirType::U8))],
         returns: vec![HirType::I64],
         lifetime_params: vec![],
         is_variadic: false,
@@ -1551,7 +1551,7 @@ pub fn upgrade_resume_struct_at_perform_sites(
         let scratch_offset_id = mint_const_i64(&mut function.values, scratch_offset_bytes);
         let r_ptr_id = mint_value(
             &mut function.values,
-            HirType::Ptr(Box::new(HirType::U8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             HirValueKind::Instruction,
         );
         new_insts.push(HirInstruction::Binary {
@@ -1564,7 +1564,7 @@ pub fn upgrade_resume_struct_at_perform_sites(
 
         // r_poll_fn_ptr = CreateClosure(poll_fn_id) (self-reference).
         let poll_fn_ty = HirType::Function(Box::new(HirFunctionType {
-            params: vec![HirType::Ptr(Box::new(HirType::U8))],
+            params: vec![HirType::Ptr(std::sync::Arc::new(HirType::U8))],
             returns: vec![HirType::I64],
             lifetime_params: vec![],
             is_variadic: false,
@@ -1597,27 +1597,27 @@ pub fn upgrade_resume_struct_at_perform_sites(
             mint_const_i64(&mut function.values, (refcount_slot as i64) * 8);
         let fp0 = mint_value(
             &mut function.values,
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         let fp8 = mint_value(
             &mut function.values,
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         let fp16 = mint_value(
             &mut function.values,
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         let fp24 = mint_value(
             &mut function.values,
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         let fp32 = mint_value(
             &mut function.values,
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
 
@@ -1857,14 +1857,14 @@ pub fn upgrade_resume_struct_at_perform_sites(
             // explicit state save is needed here.
             let promise_ptr = mint_value(
                 &mut function.values,
-                HirType::Ptr(Box::new(HirType::U8)),
+                HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                 HirValueKind::Instruction,
             );
             new_insts.push(HirInstruction::IndirectCall {
                 result: Some(promise_ptr),
                 func_ptr: fn_ptr,
                 args: handler_args,
-                return_ty: HirType::Ptr(Box::new(HirType::U8)),
+                return_ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             });
             // launch returns the handler's inline result if it completed
             // WITHOUT awaiting (e.g. multi-shot `k(1)+k(2)` → the handler's
@@ -2012,7 +2012,7 @@ pub fn reshape_to_poll_abi(
         sm_ptr_id,
         HirValue {
             id: sm_ptr_id,
-            ty: HirType::Ptr(Box::new(HirType::U8)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             kind: HirValueKind::Parameter(0),
             uses: Default::default(),
             span: None,
@@ -2235,7 +2235,7 @@ pub fn reshape_to_poll_abi(
     let sm_param = HirParam {
         id: sm_ptr_id,
         name: InternedString::new_global("state_machine"),
-        ty: HirType::Ptr(Box::new(HirType::U8)),
+        ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
         attributes: ParamAttributes::default(),
         ownership: Default::default(),
     };
@@ -2300,9 +2300,9 @@ pub fn generate_promise_entry(
     let promise_struct_ty = HirType::Struct(HirStructType {
         name: Some(InternedString::new_global("Promise")),
         fields: vec![
-            HirType::Ptr(Box::new(HirType::U8)), // state_machine
+            HirType::Ptr(std::sync::Arc::new(HirType::U8)), // state_machine
             HirType::Function(Box::new(HirFunctionType {
-                params: vec![HirType::Ptr(Box::new(HirType::U8))],
+                params: vec![HirType::Ptr(std::sync::Arc::new(HirType::U8))],
                 returns: vec![HirType::I64],
                 lifetime_params: vec![],
                 is_variadic: false,
@@ -2310,7 +2310,7 @@ pub fn generate_promise_entry(
         ],
         packed: false,
     });
-    let promise_ptr_ty = HirType::Ptr(Box::new(promise_struct_ty.clone()));
+    let promise_ptr_ty = HirType::Ptr(std::sync::Arc::new(promise_struct_ty.clone()));
 
     // Entry function signature: keep original params, return *Promise.
     let entry_sig = HirFunctionSignature {
@@ -2361,7 +2361,7 @@ pub fn generate_promise_entry(
     // sm = malloc(sm_size)
     let sm_ptr_id = mint_value(
         &mut entry.values,
-        HirType::Ptr(Box::new(HirType::U8)),
+        HirType::Ptr(std::sync::Arc::new(HirType::U8)),
         HirValueKind::Instruction,
     );
     instructions.push(HirInstruction::Call {
@@ -2383,7 +2383,7 @@ pub fn generate_promise_entry(
         let offset_const = mint_const_i64(&mut entry.values, slot_idx as i64 * 8);
         let slot_ptr = mint_value(
             &mut entry.values,
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         instructions.push(HirInstruction::Binary {
@@ -2407,7 +2407,7 @@ pub fn generate_promise_entry(
     let state_slot_offset_id = mint_const_i64(&mut entry.values, state_slot as i64 * 8);
     let state_field_ptr_id = mint_value(
         &mut entry.values,
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirValueKind::Instruction,
     );
     instructions.push(HirInstruction::Binary {
@@ -2449,7 +2449,7 @@ pub fn generate_promise_entry(
         let slot_offset_id = mint_const_i64(&mut entry.values, slot as i64 * 8);
         let field_ptr_id = mint_value(
             &mut entry.values,
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         instructions.push(HirInstruction::Binary {
@@ -2471,7 +2471,7 @@ pub fn generate_promise_entry(
     // pattern at async_support.rs:1898 — the backend lowers this to a
     // function-address load).
     let poll_fn_ty = HirType::Function(Box::new(HirFunctionType {
-        params: vec![HirType::Ptr(Box::new(HirType::U8))],
+        params: vec![HirType::Ptr(std::sync::Arc::new(HirType::U8))],
         returns: vec![HirType::I64],
         lifetime_params: vec![],
         is_variadic: false,
@@ -2516,7 +2516,7 @@ pub fn generate_promise_entry(
     let promise_offset_8_id = mint_const_i64(&mut entry.values, 8);
     let poll_field_ptr_id = mint_value(
         &mut entry.values,
-        HirType::Ptr(Box::new(HirType::U8)),
+        HirType::Ptr(std::sync::Arc::new(HirType::U8)),
         HirValueKind::Instruction,
     );
     instructions.push(HirInstruction::Binary {
@@ -2628,7 +2628,7 @@ pub fn generate_sync_entry(
     // sm = malloc(sm_size)
     let sm_ptr_id = mint_value(
         &mut entry.values,
-        HirType::Ptr(Box::new(HirType::U8)),
+        HirType::Ptr(std::sync::Arc::new(HirType::U8)),
         HirValueKind::Instruction,
     );
     entry_instructions.push(HirInstruction::Call {
@@ -2646,7 +2646,7 @@ pub fn generate_sync_entry(
         let offset_const = mint_const_i64(&mut entry.values, slot_idx as i64 * 8);
         let slot_ptr = mint_value(
             &mut entry.values,
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         entry_instructions.push(HirInstruction::Binary {
@@ -2669,7 +2669,7 @@ pub fn generate_sync_entry(
     let state_slot_offset_id = mint_const_i64(&mut entry.values, state_slot as i64 * 8);
     let state_field_ptr_id = mint_value(
         &mut entry.values,
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirValueKind::Instruction,
     );
     entry_instructions.push(HirInstruction::Binary {
@@ -2698,7 +2698,7 @@ pub fn generate_sync_entry(
     let refcount_slot_offset_id = mint_const_i64(&mut entry.values, refcount_slot as i64 * 8);
     let refcount_field_ptr_id = mint_value(
         &mut entry.values,
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirValueKind::Instruction,
     );
     entry_instructions.push(HirInstruction::Binary {
@@ -2734,7 +2734,7 @@ pub fn generate_sync_entry(
         let slot_offset_id = mint_const_i64(&mut entry.values, slot as i64 * 8);
         let field_ptr_id = mint_value(
             &mut entry.values,
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         entry_instructions.push(HirInstruction::Binary {
@@ -2754,7 +2754,7 @@ pub fn generate_sync_entry(
 
     // Get the poll fn pointer via CreateClosure.
     let poll_fn_ty = HirType::Function(Box::new(HirFunctionType {
-        params: vec![HirType::Ptr(Box::new(HirType::U8))],
+        params: vec![HirType::Ptr(std::sync::Arc::new(HirType::U8))],
         returns: vec![HirType::I64],
         lifetime_params: vec![],
         is_variadic: false,

@@ -509,7 +509,7 @@ fn apply_plan(func: &mut HirFunction, bid: HirId, plan: &SplitPlan) {
     let mut new_extract_insts: Vec<(usize, Vec<HirInstruction>)> = Vec::new();
     let mut new_store_insts: Vec<HirInstruction> = Vec::new();
 
-    let ptr_ty_for_field = |field_ty: &HirType| HirType::Ptr(Box::new(field_ty.clone()));
+    let ptr_ty_for_field = |field_ty: &HirType| HirType::Ptr(std::sync::Arc::new(field_ty.clone()));
 
     // Re-write each ExtractValue site.
     for (idx, field_idx) in &plan.field_reads {
@@ -895,7 +895,7 @@ mod tests {
             fields: vec![HirType::I64, HirType::I64],
             packed: false,
         });
-        let ptr = add_inst(&mut f, HirType::Ptr(Box::new(ty.clone())));
+        let ptr = add_inst(&mut f, HirType::Ptr(std::sync::Arc::new(ty.clone())));
         f.values.get_mut(&ptr).unwrap().kind = HirValueKind::Parameter(0);
         let loaded = add_inst(&mut f, ty.clone());
         push(
@@ -953,7 +953,7 @@ mod tests {
             packed: false,
         });
         f.values.get_mut(&loaded).unwrap().ty = outer.clone();
-        f.values.get_mut(&ptr).unwrap().ty = HirType::Ptr(Box::new(outer.clone()));
+        f.values.get_mut(&ptr).unwrap().ty = HirType::Ptr(std::sync::Arc::new(outer.clone()));
         if let HirInstruction::Load { ty, .. } =
             &mut f.blocks.get_mut(&entry).unwrap().instructions[0]
         {

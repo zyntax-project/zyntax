@@ -253,7 +253,7 @@ fn build_glue(
     fields: &[HirType],
     ids: &IndexMap<InternedString, HirId>,
 ) -> HirFunction {
-    let self_ty = HirType::Ptr(Box::new(HirType::Struct(HirStructType {
+    let self_ty = HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
         name: Some(name),
         fields: fields.to_vec(),
         packed: false,
@@ -329,18 +329,21 @@ fn build_glue(
             HirType::I64,
             HirConstant::I64(offsets[*idx] as i64),
         );
-        let gep = result(&mut func, HirType::Ptr(Box::new(HirType::U8)));
+        let gep = result(&mut func, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
         read.instructions.push(HirInstruction::GetElementPtr {
             result: gep,
             ty: HirType::U8,
             ptr: self_id,
             indices: vec![off],
         });
-        let slot = result(&mut func, HirType::Ptr(Box::new(field_ty.clone())));
+        let slot = result(
+            &mut func,
+            HirType::Ptr(std::sync::Arc::new(field_ty.clone())),
+        );
         read.instructions.push(HirInstruction::Cast {
             op: CastOp::Bitcast,
             result: slot,
-            ty: HirType::Ptr(Box::new(field_ty.clone())),
+            ty: HirType::Ptr(std::sync::Arc::new(field_ty.clone())),
             operand: gep,
         });
         let child = result(&mut func, field_ty.clone());
@@ -458,15 +461,15 @@ mod tests {
     }
 
     fn node_type(name: InternedString) -> HirType {
-        HirType::Ptr(Box::new(HirType::Struct(HirStructType {
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
             name: Some(name),
             fields: vec![
-                HirType::Ptr(Box::new(HirType::Struct(HirStructType {
+                HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
                     name: Some(name),
                     fields: Vec::new(),
                     packed: false,
                 }))),
-                HirType::Ptr(Box::new(HirType::Struct(HirStructType {
+                HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
                     name: Some(name),
                     fields: Vec::new(),
                     packed: false,
@@ -547,7 +550,7 @@ mod tests {
             v,
             HirValue {
                 id: v,
-                ty: HirType::Ptr(Box::new(HirType::Struct(HirStructType {
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
                     name: Some(name),
                     fields: vec![HirType::F64, HirType::F64],
                     packed: false,
@@ -579,9 +582,9 @@ mod tests {
             v,
             HirValue {
                 id: v,
-                ty: HirType::Ptr(Box::new(HirType::Struct(HirStructType {
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
                     name: Some(name),
-                    fields: vec![HirType::Ptr(Box::new(HirType::I8)), HirType::I64],
+                    fields: vec![HirType::Ptr(std::sync::Arc::new(HirType::I8)), HirType::I64],
                     packed: false,
                 }))),
                 kind: HirValueKind::Instruction,
@@ -603,8 +606,8 @@ mod tests {
     #[test]
     fn field_offsets_follow_natural_alignment() {
         let fields = vec![
-            HirType::Ptr(Box::new(HirType::I8)),
-            HirType::Ptr(Box::new(HirType::I8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I8)),
             HirType::I64,
         ];
         assert_eq!(field_offsets(&fields), vec![0, 8, 16]);

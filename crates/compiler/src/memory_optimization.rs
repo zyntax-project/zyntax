@@ -327,7 +327,7 @@ mod tests {
 
         let mut func = HirFunction::new(arena.intern_string("test"), signature);
         let value_id = func.create_value(
-            HirType::Ptr(Box::new(HirType::I32)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I32)),
             HirValueKind::Instruction,
         );
 
@@ -390,7 +390,7 @@ mod tests {
 
         let mut func = HirFunction::new(arena.intern_string("test_coalesce"), signature);
         let value_id = func.create_value(
-            HirType::Ptr(Box::new(HirType::I32)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I32)),
             HirValueKind::Instruction,
         );
 

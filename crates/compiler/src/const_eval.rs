@@ -243,14 +243,14 @@ impl ConstEvaluator {
         match ty {
             HirType::Array(elem_ty, size) => {
                 let new_elem = self.substitute_const_generics(elem_ty, const_args);
-                HirType::Array(Box::new(new_elem), *size)
+                HirType::Array(std::sync::Arc::new(new_elem), *size)
             }
             HirType::ConstGeneric(name) => {
                 // If we have a value for this const generic, we need to convert it to a type
                 // This is a simplified version - real implementation would be more complex
                 if let Some(value) = const_args.get(name) {
                     match value {
-                        HirConstant::U64(n) => HirType::Array(Box::new(HirType::U8), *n), // Example: const N -> [u8; N]
+                        HirConstant::U64(n) => HirType::Array(std::sync::Arc::new(HirType::U8), *n), // Example: const N -> [u8; N]
                         _ => ty.clone(),
                     }
                 } else {

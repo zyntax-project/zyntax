@@ -233,7 +233,7 @@ impl<'f> HirCoroCfg<'f> {
             LocalKind::StateI64 => 8,
             LocalKind::Bool | LocalKind::MutBool => 1,
         };
-        let ptr_id = self.register_inst_value(HirType::Ptr(Box::new(elem_ty.clone())));
+        let ptr_id = self.register_inst_value(HirType::Ptr(std::sync::Arc::new(elem_ty.clone())));
         let alloca = HirInstruction::Alloca {
             result: ptr_id,
             ty: elem_ty,

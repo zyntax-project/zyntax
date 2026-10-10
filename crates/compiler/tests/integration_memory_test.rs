@@ -69,7 +69,7 @@ fn test_memory_roundtrip_execution() {
 
     // Alloca i32
     let ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::I32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I32)),
         HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
@@ -158,7 +158,7 @@ fn test_memory_i64_execution() {
 
     // Alloca i64
     let ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
@@ -247,7 +247,7 @@ fn test_memory_f64_execution() {
 
     // Alloca f64
     let ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::F64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::F64)),
         HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
@@ -349,7 +349,7 @@ fn test_multiple_allocations_execution() {
 
     // Alloca for a
     let ptr_a = func.create_value(
-        HirType::Ptr(Box::new(HirType::I32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I32)),
         HirValueKind::Instruction,
     );
     let alloca_a = HirInstruction::Alloca {
@@ -361,7 +361,7 @@ fn test_multiple_allocations_execution() {
 
     // Alloca for b
     let ptr_b = func.create_value(
-        HirType::Ptr(Box::new(HirType::I32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I32)),
         HirValueKind::Instruction,
     );
     let alloca_b = HirInstruction::Alloca {
@@ -482,7 +482,7 @@ fn test_memory_update_execution() {
 
     // Alloca i32
     let ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::I32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I32)),
         HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {

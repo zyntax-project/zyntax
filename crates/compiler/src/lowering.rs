@@ -4029,14 +4029,14 @@ impl LoweringContext {
             // a null constant for a stateless one.
             let state_val = if state_new_fn.is_some() {
                 mint(
-                    HirType::Ptr(Box::new(HirType::Void)),
+                    HirType::Ptr(std::sync::Arc::new(HirType::Void)),
                     HirValueKind::Instruction,
                 )
             } else {
                 mint(HirType::I64, HirValueKind::Constant(HirConstant::I64(0)))
             };
             let op_table_addr = mint(
-                HirType::Ptr(Box::new(HirType::Void)),
+                HirType::Ptr(std::sync::Arc::new(HirType::Void)),
                 HirValueKind::Global(op_table_global_id),
             );
             let frame_id_val = mint(HirType::I64, HirValueKind::Instruction);
@@ -4723,7 +4723,7 @@ impl LoweringContext {
                 PrimitiveType::F64 => HirType::F64,
                 PrimitiveType::Unit => HirType::Void,
                 PrimitiveType::Char => HirType::U32, // Unicode scalar
-                PrimitiveType::String => HirType::Ptr(Box::new(HirType::I8)),
+                PrimitiveType::String => HirType::Ptr(std::sync::Arc::new(HirType::I8)),
                 PrimitiveType::USize => HirType::USize,
                 PrimitiveType::ISize => HirType::ISize,
                 _ => HirType::I64, // Default
@@ -4756,7 +4756,7 @@ impl LoweringContext {
 
                 HirType::Ref {
                     lifetime: hir_lifetime,
-                    pointee: Box::new(self.convert_type(ty)),
+                    pointee: std::sync::Arc::new(self.convert_type(ty)),
                     mutable: *mutability == Mutability::Mutable,
                 }
             }
@@ -4771,7 +4771,7 @@ impl LoweringContext {
                     zyntax_typed_ast::ConstValue::Int(i) => *i as u64,
                     _ => 0,
                 };
-                HirType::Array(Box::new(self.convert_type(element_type)), size)
+                HirType::Array(std::sync::Arc::new(self.convert_type(element_type)), size)
             }
 
             Type::Function {
@@ -4907,7 +4907,7 @@ impl LoweringContext {
                                 .first()
                                 .map(|t| self.convert_type(t))
                                 .unwrap_or(HirType::I64);
-                            return HirType::Array(Box::new(elem), size);
+                            return HirType::Array(std::sync::Arc::new(elem), size);
                         }
                     }
                     // Phase I.1: Resume<T> is the reified continuation
@@ -4923,7 +4923,7 @@ impl LoweringContext {
                     // value — Phase I.2 will replace the perform-site
                     // padding with real struct allocation.
                     if type_def.name.resolve_global().as_deref() == Some("Resume") {
-                        return HirType::Ptr(Box::new(HirType::U8));
+                        return HirType::Ptr(std::sync::Arc::new(HirType::U8));
                     }
 
                     match &type_def.kind {
@@ -4940,7 +4940,7 @@ impl LoweringContext {
                                     packed: false,
                                 });
                                 return if type_def.metadata.is_reference {
-                                    HirType::Ptr(Box::new(opaque))
+                                    HirType::Ptr(std::sync::Arc::new(opaque))
                                 } else {
                                     opaque
                                 };
@@ -5002,7 +5002,7 @@ impl LoweringContext {
                                     .into_iter()
                                     .chain(field_types)
                                     .collect();
-                                return HirType::Ptr(Box::new(HirType::Struct(
+                                return HirType::Ptr(std::sync::Arc::new(HirType::Struct(
                                     crate::hir::HirStructType {
                                         name: Some(type_def.name),
                                         fields,

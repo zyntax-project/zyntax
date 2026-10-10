@@ -14,7 +14,7 @@ use zyntax_compiler::zrtl::{MAX_PARAMS, RuntimeSymbolInfo, TypeTag, ZrtlSigFlags
 use zyntax_typed_ast::InternedString;
 
 fn address() -> HirType {
-    HirType::Ptr(Box::new(HirType::I8))
+    HirType::Ptr(std::sync::Arc::new(HirType::I8))
 }
 
 /// `f(p: *i8) -> *i8 { return box(p) }`, `box` registered as i64 -> i64.

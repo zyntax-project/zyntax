@@ -1954,11 +1954,11 @@ fn lower_inst(
                 match current.clone() {
                     HirType::Ptr(inner) => {
                         steps.push((size_of_hir_ty(&inner).max(1) as i64, 0));
-                        current = *inner;
+                        current = HirType::clone(&inner);
                     }
                     HirType::Array(elem, _) => {
                         steps.push((size_of_hir_ty(&elem).max(1) as i64, 0));
-                        current = *elem;
+                        current = HirType::clone(&elem);
                     }
                     HirType::Struct(st) => {
                         let field = const_ints.get(index).copied().unwrap_or(0).max(0) as usize;
@@ -2745,7 +2745,8 @@ pub fn align_of_hir_ty(ty: &HirType) -> usize {
         HirType::Ptr(_) | HirType::USize | HirType::ISize => 8,
         HirType::I128 | HirType::U128 => 16,
         HirType::Struct(s) => struct_layout(s).align,
-        HirType::Array(elem, _) | HirType::Vector(elem, _) => align_of_hir_ty(elem),
+        HirType::Array(elem, _) => align_of_hir_ty(elem),
+        HirType::Vector(elem, _) => align_of_hir_ty(elem),
         _ => 8,
     }
 }
@@ -3370,7 +3371,10 @@ impl HirInterpreter {
             }
         }
         roots.release();
-        let sig = NativeSig::of_site(vec![HirType::Ptr(Box::new(HirType::U8))], site.ret.clone());
+        let sig = NativeSig::of_site(
+            vec![HirType::Ptr(std::sync::Arc::new(HirType::U8))],
+            site.ret.clone(),
+        );
         if trace_enabled() {
             eprintln!("[interp] transfer site=0x{:x} -> {helper:?}", site.site_key);
         } else if crate::osr::osr_trace_enabled() {
@@ -5520,7 +5524,7 @@ fn field_path(ty: &HirType, indices: &[u32]) -> (usize, HirType) {
             }
             HirType::Array(elem, _) => {
                 offset += size_of_hir_ty(&elem) * i as usize;
-                current = *elem;
+                current = HirType::clone(&elem);
             }
             other => {
                 current = other;
@@ -6397,7 +6401,7 @@ mod tests {
         let mut func = mk_fn("read_global", vec![], vec![HirType::I64]);
         let global_ptr = add_value(
             &mut func,
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Global(global_id),
         );
         let loaded = add_value(&mut func, HirType::I64, HirValueKind::Instruction);
@@ -6743,7 +6747,7 @@ mod tests {
         let vec_ty = HirType::Vector(Box::new(HirType::F32), 4);
         let buf = add_value(
             &mut func,
-            HirType::Ptr(Box::new(HirType::F32)),
+            HirType::Ptr(std::sync::Arc::new(HirType::F32)),
             HirValueKind::Instruction,
         );
         let c7 = add_value(

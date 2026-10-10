@@ -27,7 +27,7 @@ fn int(f: &mut HirFunction, n: i64) -> HirId {
     f.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(n)))
 }
 fn ptr() -> HirType {
-    HirType::Ptr(Box::new(HirType::I64))
+    HirType::Ptr(std::sync::Arc::new(HirType::I64))
 }
 fn param(f: &mut HirFunction) -> HirId {
     let n = f.signature.params.len();
@@ -455,7 +455,7 @@ fn materialization_preserves_pointer_fields_and_their_pointees() {
             {
                 args[0] = bytes;
                 let root = *r;
-                let address = val(f, HirType::Ptr(Box::new(ptr())));
+                let address = val(f, HirType::Ptr(std::sync::Arc::new(ptr())));
                 out.push(inst);
                 out.push(HirInstruction::GetElementPtr {
                     result: address,
@@ -477,7 +477,7 @@ fn materialization_preserves_pointer_fields_and_their_pointees() {
             .unwrap();
     let incoming = observer.signature.params[1].id;
     let off = int(observer, 8);
-    let address = val(observer, HirType::Ptr(Box::new(ptr())));
+    let address = val(observer, HirType::Ptr(std::sync::Arc::new(ptr())));
     let pointed = val(observer, ptr());
     let loaded = val(observer, HirType::I64);
     let total = val(observer, HirType::I64);

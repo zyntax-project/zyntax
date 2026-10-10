@@ -729,7 +729,7 @@ fn rewrite_to_vector_loop(func: &mut HirFunction, pat: &SaxpyPattern) {
 
     let addr_c_vec = create_value(
         func,
-        HirType::Ptr(Box::new(elem_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(elem_ty.clone())),
         HirValueKind::Instruction,
     );
     let step = create_value(
@@ -749,7 +749,7 @@ fn rewrite_to_vector_loop(func: &mut HirFunction, pat: &SaxpyPattern) {
         body_blk.instructions.append(&mut vec_body);
         body_blk.instructions.push(HirInstruction::GetElementPtr {
             result: addr_c_vec,
-            ty: HirType::Ptr(Box::new(elem_ty.clone())),
+            ty: HirType::Ptr(std::sync::Arc::new(elem_ty.clone())),
             ptr: pat.ptr_c,
             indices: vec![pat.i_phi],
         });
@@ -907,13 +907,13 @@ fn emit_vec_expr(
         VecExpr::Load(ptr) => {
             let addr = create_value(
                 func,
-                HirType::Ptr(Box::new(elem_ty.clone())),
+                HirType::Ptr(std::sync::Arc::new(elem_ty.clone())),
                 HirValueKind::Instruction,
             );
             let out = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
             body.push(HirInstruction::GetElementPtr {
                 result: addr,
-                ty: HirType::Ptr(Box::new(elem_ty.clone())),
+                ty: HirType::Ptr(std::sync::Arc::new(elem_ty.clone())),
                 ptr: *ptr,
                 indices: vec![i_phi],
             });
@@ -1134,7 +1134,7 @@ mod tests {
         f.blocks.get_mut(&exit).unwrap().predecessors = vec![header];
 
         let n_ty = HirType::I64;
-        let ptr_ty = HirType::Ptr(Box::new(elem_ty.clone()));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(elem_ty.clone()));
         let ptr_a = add_param(&mut f, ptr_ty.clone(), 0);
         let ptr_b = add_param(&mut f, ptr_ty.clone(), 1);
         let ptr_c = add_param(&mut f, ptr_ty.clone(), 2);

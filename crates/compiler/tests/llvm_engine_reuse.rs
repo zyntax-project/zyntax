@@ -36,7 +36,7 @@ fn global_reader() -> (HirModule, HirId, HirId, HirId) {
     let id = f.id;
     let global = HirId::new();
     let ptr = f.create_value(
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirValueKind::Global(global),
     );
     let loaded = f.create_value(HirType::I64, HirValueKind::Instruction);

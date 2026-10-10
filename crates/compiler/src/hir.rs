@@ -1821,18 +1821,19 @@ pub enum HirType {
     USize,
     ISize,
 
-    /// Pointer type
-    Ptr(Box<HirType>),
+    /// Pointer type. The pointee is shared: a pointer to a struct is
+    /// cloned with every value of its type.
+    Ptr(Arc<HirType>),
 
     /// Reference type with lifetime
     Ref {
         lifetime: HirLifetime,
-        pointee: Box<HirType>,
+        pointee: Arc<HirType>,
         mutable: bool,
     },
 
     /// Array type
-    Array(Box<HirType>, u64),
+    Array(Arc<HirType>, u64),
 
     /// Vector type (SIMD)
     Vector(Box<HirType>, u32),
@@ -3077,7 +3078,7 @@ mod error_flag_tests {
         let global = HirGlobal {
             id: HirId::new(),
             name: InternedString::new_global("flag"),
-            ty: HirType::Ptr(Box::new(HirType::I8)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I8)),
             initializer: None,
             is_const: false,
             is_thread_local: false,

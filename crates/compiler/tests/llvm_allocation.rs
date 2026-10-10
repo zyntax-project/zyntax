@@ -43,7 +43,7 @@ fn llvm_eliminates_an_unobserved_pool_allocation() {
     let mut f = function("scalar", HirType::I64);
     let value = f.signature.params[0].id;
     let size = f.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(8)));
-    let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+    let ptr_ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
     let ptr = f.create_value(ptr_ty.clone(), HirValueKind::Instruction);
     let loaded = f.create_value(HirType::I64, HirValueKind::Instruction);
     let block = f.blocks.get_mut(&f.entry_block).unwrap();
@@ -120,7 +120,7 @@ fn llvm_eliminates_an_unobserved_pool_allocation() {
 
 #[test]
 fn releasing_an_argument_is_not_declared_nofree() {
-    let mut f = function("release", HirType::Ptr(Box::new(HirType::I64)));
+    let mut f = function("release", HirType::Ptr(std::sync::Arc::new(HirType::I64)));
     let ptr = f.signature.params[0].id;
     let zero = f.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(0)));
     let block = f.blocks.get_mut(&f.entry_block).unwrap();

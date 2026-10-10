@@ -14,8 +14,8 @@ fn diamond(write: bool, distinct: bool) -> (HirModule, HirId, HirId, HirId) {
     sig.is_pure = false;
     let mut f = HirFunction::new(InternedString::new_global("diamond"), sig);
     for (i, ty) in [
-        HirType::Ptr(Box::new(HirType::I64)),
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirType::I64,
     ]
     .into_iter()

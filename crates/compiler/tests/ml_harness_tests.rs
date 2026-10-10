@@ -91,7 +91,7 @@ fn host_has_avxvnni() -> bool {
 /// i32 (the correctness shape); otherwise the raw i32x4 is returned (the
 /// codegen shape, matching `test_vector_dot_i8x16_vpdpbusd`).
 fn build_dot16(rhs_unsigned: bool, reduce: bool) -> HirFunction {
-    let ptr_i8 = || HirType::Ptr(Box::new(HirType::I8));
+    let ptr_i8 = || HirType::Ptr(std::sync::Arc::new(HirType::I8));
     let i8x16 = HirType::Vector(Box::new(HirType::I8), 16);
     let i32x4 = HirType::Vector(Box::new(HirType::I32), 4);
 

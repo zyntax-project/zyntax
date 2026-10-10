@@ -235,7 +235,7 @@ fn global_ref(f: &mut HirFunction, global: HirId, ty: &HirType) -> HirId {
         id,
         HirValue {
             id,
-            ty: HirType::Ptr(Box::new(ty.clone())),
+            ty: HirType::Ptr(std::sync::Arc::new(ty.clone())),
             kind: HirValueKind::Global(global),
             uses: Default::default(),
             span: None,

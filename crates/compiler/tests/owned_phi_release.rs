@@ -143,7 +143,7 @@ fn build_module_with_values() -> (HirModule, HirId, [HirId; 3]) {
     let merge = f.create_block();
     let exit = f.create_block();
 
-    let ptr = HirType::Ptr(Box::new(HirType::I64));
+    let ptr = HirType::Ptr(std::sync::Arc::new(HirType::I64));
     let c0 = konst(&mut f, 0);
     let c1 = konst(&mut f, 1);
     let c4 = konst(&mut f, 4);

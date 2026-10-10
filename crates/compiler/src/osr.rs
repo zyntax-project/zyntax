@@ -527,9 +527,9 @@ pub fn osr_layout_with(
     let returns_through_destination = crate::abi::destination_return_type(function).is_some();
     let return_type = match function.signature.returns.as_slice() {
         [] => HirType::Void,
-        [_] if returns_through_destination => HirType::Ptr(Box::new(HirType::U8)),
+        [_] if returns_through_destination => HirType::Ptr(std::sync::Arc::new(HirType::U8)),
         [HirType::Struct(s)] if crate::abi::is_growable_list_header(s) => {
-            HirType::Ptr(Box::new(HirType::U8))
+            HirType::Ptr(std::sync::Arc::new(HirType::U8))
         }
         [ty] => ty.clone(),
         _ => return Err(OsrReject::ReturnDoesntFit),
@@ -1926,14 +1926,19 @@ mod tests {
         assert!(type_fits_i64(&HirType::I32));
         assert!(type_fits_i64(&HirType::I64));
         assert!(type_fits_i64(&HirType::F64));
-        assert!(type_fits_i64(&HirType::Ptr(Box::new(HirType::I8))));
+        assert!(type_fits_i64(&HirType::Ptr(std::sync::Arc::new(
+            HirType::I8
+        ))));
     }
 
     #[test]
     fn type_fits_i64_rejects_aggregates_and_wide() {
         assert!(!type_fits_i64(&HirType::I128));
         assert!(!type_fits_i64(&HirType::U128));
-        assert!(!type_fits_i64(&HirType::Array(Box::new(HirType::I32), 4)));
+        assert!(!type_fits_i64(&HirType::Array(
+            std::sync::Arc::new(HirType::I32),
+            4
+        )));
         assert!(!type_fits_i64(&HirType::Struct(
             crate::hir::HirStructType {
                 name: Some(zyntax_typed_ast::InternedString::new_global("Empty")),

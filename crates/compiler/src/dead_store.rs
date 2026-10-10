@@ -311,17 +311,17 @@ mod tests {
         let x = value(&mut values, HirType::F64, HirValueKind::Parameter(0));
         let p = value(
             &mut values,
-            HirType::Ptr(Box::new(HirType::U8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             HirValueKind::Instruction,
         );
         let g = value(
             &mut values,
-            HirType::Ptr(Box::new(HirType::U8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             HirValueKind::Instruction,
         );
         let f = value(
             &mut values,
-            HirType::Ptr(Box::new(HirType::F64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::F64)),
             HirValueKind::Instruction,
         );
         let r = value(&mut values, HirType::F64, HirValueKind::Instruction);
@@ -346,7 +346,7 @@ mod tests {
             HirInstruction::Cast {
                 op: crate::hir::CastOp::Bitcast,
                 result: f,
-                ty: HirType::Ptr(Box::new(HirType::F64)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::F64)),
                 operand: g,
             },
             HirInstruction::Store {

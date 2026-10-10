@@ -61,7 +61,7 @@ fn size(ty: &HirType) -> Option<u64> {
     })
 }
 fn raw() -> HirType {
-    HirType::Ptr(Box::new(HirType::U8))
+    HirType::Ptr(std::sync::Arc::new(HirType::U8))
 }
 fn field_type(ty: &HirType) -> HirType {
     if matches!(ty, HirType::Ptr(_)) {
@@ -732,7 +732,7 @@ fn guarded_reads(
                 &mut cold_insts,
                 backing,
                 a.offset,
-                HirType::Ptr(Box::new(ty.clone())),
+                HirType::Ptr(std::sync::Arc::new(ty.clone())),
             );
             let loaded = value(f, ty.clone());
             cold_insts.push(HirInstruction::Load {
@@ -982,7 +982,7 @@ fn apply(f: &mut HirFunction, p: Plan) {
                         &mut out,
                         backing[&a.root],
                         a.offset,
-                        HirType::Ptr(Box::new(ty.clone())),
+                        HirType::Ptr(std::sync::Arc::new(ty.clone())),
                     );
                     let loaded = value(f, ty.clone());
                     out.push(HirInstruction::Load {
@@ -1054,7 +1054,7 @@ fn apply(f: &mut HirFunction, p: Plan) {
                             &mut out,
                             allocated,
                             *off,
-                            HirType::Ptr(Box::new(ty.clone())),
+                            HirType::Ptr(std::sync::Arc::new(ty.clone())),
                         );
                         out.push(HirInstruction::Store {
                             value: fields[&(root, *off)],

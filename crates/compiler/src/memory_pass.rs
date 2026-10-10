@@ -284,7 +284,7 @@ mod tests {
         // Create a simple function with allocation
         let sig = HirFunctionSignature {
             params: vec![],
-            returns: vec![HirType::Ptr(Box::new(HirType::I32))],
+            returns: vec![HirType::Ptr(std::sync::Arc::new(HirType::I32))],
             type_params: vec![],
             const_params: vec![],
             lifetime_params: vec![],
@@ -298,7 +298,7 @@ mod tests {
         let mut func = HirFunction::new(intern_str(&mut arena, "alloc_test"), sig);
         let size = func.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(4)));
         let ptr = func.create_value(
-            HirType::Ptr(Box::new(HirType::I32)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I32)),
             HirValueKind::Instruction,
         );
 

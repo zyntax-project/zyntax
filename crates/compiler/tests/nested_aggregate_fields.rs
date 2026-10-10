@@ -263,7 +263,7 @@ fn build_scalar_struct() -> HirFunction {
     let w = add_value(&mut f, one_ty(), HirValueKind::Instruction);
     let cell = add_value(
         &mut f,
-        HirType::Ptr(Box::new(one_ty())),
+        HirType::Ptr(std::sync::Arc::new(one_ty())),
         HirValueKind::Instruction,
     );
     let r = add_value(&mut f, one_ty(), HirValueKind::Instruction);

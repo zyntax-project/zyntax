@@ -97,15 +97,15 @@ pub fn build_waker_functions(builder: &mut HirBuilder) {
     // Build waker_wake(waker: *Waker)
     builder
         .begin_function("waker_wake")
-        .param("waker", HirType::Ptr(Box::new(waker_ty.clone())))
+        .param("waker", HirType::Ptr(std::sync::Arc::new(waker_ty.clone())))
         .returns(HirType::Void)
         .build();
 
     // Build waker_clone(waker: *Waker) -> *Waker
     builder
         .begin_function("waker_clone")
-        .param("waker", HirType::Ptr(Box::new(waker_ty.clone())))
-        .returns(HirType::Ptr(Box::new(waker_ty)))
+        .param("waker", HirType::Ptr(std::sync::Arc::new(waker_ty.clone())))
+        .returns(HirType::Ptr(std::sync::Arc::new(waker_ty)))
         .build();
 }
 
@@ -122,8 +122,8 @@ pub fn build_context_functions(builder: &mut HirBuilder) {
     // Build context_waker(cx: *Context) -> *Waker
     builder
         .begin_function("context_waker")
-        .param("cx", HirType::Ptr(Box::new(context_ty)))
-        .returns(HirType::Ptr(Box::new(waker_ty)))
+        .param("cx", HirType::Ptr(std::sync::Arc::new(context_ty)))
+        .returns(HirType::Ptr(std::sync::Arc::new(waker_ty)))
         .build();
 }
 

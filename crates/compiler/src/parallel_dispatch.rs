@@ -629,7 +629,7 @@ fn build_band(func: &HirFunction, plan: &Plan) -> Option<HirFunction> {
         params: vec![
             word_param("lo", HirType::I64),
             word_param("hi", HirType::I64),
-            word_param("env", HirType::Ptr(Box::new(HirType::I64))),
+            word_param("env", HirType::Ptr(std::sync::Arc::new(HirType::I64))),
         ],
         returns: vec![],
         type_params: vec![],
@@ -665,7 +665,7 @@ fn build_band(func: &HirFunction, plan: &Plan) -> Option<HirFunction> {
     let hi = new_value(&mut band, HirType::I64, HirValueKind::Parameter(1));
     let env = new_value(
         &mut band,
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirValueKind::Parameter(2),
     );
     band.signature.params[0].id = lo;
@@ -684,24 +684,24 @@ fn build_band(func: &HirFunction, plan: &Plan) -> Option<HirFunction> {
         );
         let addr = new_value(
             &mut band,
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         let typed = new_value(
             &mut band,
-            HirType::Ptr(Box::new(ty.clone())),
+            HirType::Ptr(std::sync::Arc::new(ty.clone())),
             HirValueKind::Instruction,
         );
         reads.push(HirInstruction::GetElementPtr {
             result: addr,
-            ty: HirType::Ptr(Box::new(HirType::I64)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             ptr: env,
             indices: vec![index],
         });
         reads.push(HirInstruction::Cast {
             op: CastOp::Bitcast,
             result: typed,
-            ty: HirType::Ptr(Box::new(ty.clone())),
+            ty: HirType::Ptr(std::sync::Arc::new(ty.clone())),
             operand: addr,
         });
         reads.push(HirInstruction::Load {
@@ -795,7 +795,7 @@ fn install_dispatch(func: &mut HirFunction, plan: &Plan, band_id: HirId) {
     );
     let env = new_value(
         func,
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirValueKind::Instruction,
     );
     let entry = func.entry_block;
@@ -825,24 +825,24 @@ fn install_dispatch(func: &mut HirFunction, plan: &Plan, band_id: HirId) {
         );
         let addr = new_value(
             func,
-            HirType::Ptr(Box::new(HirType::I64)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             HirValueKind::Instruction,
         );
         let typed = new_value(
             func,
-            HirType::Ptr(Box::new(ty.clone())),
+            HirType::Ptr(std::sync::Arc::new(ty.clone())),
             HirValueKind::Instruction,
         );
         writes.push(HirInstruction::GetElementPtr {
             result: addr,
-            ty: HirType::Ptr(Box::new(HirType::I64)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             ptr: env,
             indices: vec![index],
         });
         writes.push(HirInstruction::Cast {
             op: CastOp::Bitcast,
             result: typed,
-            ty: HirType::Ptr(Box::new(ty)),
+            ty: HirType::Ptr(std::sync::Arc::new(ty)),
             operand: addr,
         });
         writes.push(HirInstruction::Store {
@@ -855,7 +855,7 @@ fn install_dispatch(func: &mut HirFunction, plan: &Plan, band_id: HirId) {
 
     let band_ptr = new_value(
         func,
-        HirType::Ptr(Box::new(HirType::I64)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I64)),
         HirValueKind::Instruction,
     );
     writes.push(HirInstruction::Call {

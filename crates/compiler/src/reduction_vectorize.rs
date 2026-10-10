@@ -616,12 +616,12 @@ fn rewrite(func: &mut HirFunction, pat: &ReductionPattern) {
     let vc_vec = create_value(func, vec_ty.clone(), HirValueKind::Instruction);
     let addr_a_v = create_value(
         func,
-        HirType::Ptr(Box::new(load_elem_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(load_elem_ty.clone())),
         HirValueKind::Instruction,
     );
     let addr_b_v = create_value(
         func,
-        HirType::Ptr(Box::new(load_elem_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(load_elem_ty.clone())),
         HirValueKind::Instruction,
     );
     let stride_const = create_value(
@@ -705,7 +705,7 @@ fn rewrite(func: &mut HirFunction, pat: &ReductionPattern) {
         body_blk.instructions.clear();
         body_blk.instructions.push(HirInstruction::GetElementPtr {
             result: addr_a_v,
-            ty: HirType::Ptr(Box::new(load_elem_ty.clone())),
+            ty: HirType::Ptr(std::sync::Arc::new(load_elem_ty.clone())),
             ptr: pat.ptr_a,
             indices: vec![pat.i_phi],
         });
@@ -717,7 +717,7 @@ fn rewrite(func: &mut HirFunction, pat: &ReductionPattern) {
         });
         body_blk.instructions.push(HirInstruction::GetElementPtr {
             result: addr_b_v,
-            ty: HirType::Ptr(Box::new(load_elem_ty.clone())),
+            ty: HirType::Ptr(std::sync::Arc::new(load_elem_ty.clone())),
             ptr: pat.ptr_b,
             indices: vec![pat.i_phi],
         });
@@ -1085,7 +1085,7 @@ mod tests {
         f.blocks.get_mut(&exit).unwrap().predecessors = vec![header];
 
         let n_ty = HirType::I64;
-        let ptr_ty = HirType::Ptr(Box::new(elem_ty.clone()));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(elem_ty.clone()));
         let ptr_a = add_param(&mut f, ptr_ty.clone(), 0);
         let ptr_b = add_param(&mut f, ptr_ty.clone(), 1);
         let n = add_param(&mut f, n_ty.clone(), 2);
@@ -1226,7 +1226,7 @@ mod tests {
         let n_ty = HirType::I64;
         let i8_ty = HirType::I8;
         let i32_ty = HirType::I32;
-        let ptr_ty = HirType::Ptr(Box::new(i8_ty.clone()));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(i8_ty.clone()));
         let ptr_a = add_param(&mut f, ptr_ty.clone(), 0);
         let ptr_b = add_param(&mut f, ptr_ty.clone(), 1);
         let n = add_param(&mut f, n_ty.clone(), 2);

@@ -952,9 +952,9 @@ mod tests {
 
         let (mut f, entry) = mk_func();
         let size = add_const_u64(&mut f, 8);
-        let malloc_ptr = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let malloc_ptr = add_inst(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
         let off = add_const_i64(&mut f, 0);
-        let gep = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let gep = add_inst(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
         let v42 = add_const_i64(&mut f, 42);
         let loaded = add_inst(&mut f, HirType::I64);
 
@@ -1029,9 +1029,9 @@ mod tests {
         let _arena = AstArena::new();
         let (mut f, entry) = mk_func();
         let size = add_const_u64(&mut f, 8);
-        let malloc_ptr = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let malloc_ptr = add_inst(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
         let off = add_const_i64(&mut f, 0);
-        let gep = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let gep = add_inst(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
         let v99 = add_const_i64(&mut f, 99);
         let loaded = add_inst(&mut f, HirType::I64);
 
@@ -1108,11 +1108,11 @@ mod tests {
         let _arena = AstArena::new();
         let (mut f, entry) = mk_func();
         let size = add_const_u64(&mut f, 8);
-        let malloc_ptr = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let malloc_ptr = add_inst(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
         let address = add_inst(&mut f, HirType::I64);
-        let restored = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let restored = add_inst(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
         let off = add_const_i64(&mut f, 0);
-        let gep = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let gep = add_inst(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
         let stored = add_const_i64(&mut f, 42);
         let loaded = add_inst(&mut f, HirType::I64);
 
@@ -1143,7 +1143,7 @@ mod tests {
             entry,
             HirInstruction::Cast {
                 result: restored,
-                ty: HirType::Ptr(Box::new(HirType::U8)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                 op: CastOp::IntToPtr,
                 operand: address,
             },
@@ -1201,7 +1201,7 @@ mod tests {
         let _arena = AstArena::new();
         let (mut f, entry) = mk_func();
         let size = add_const_u64(&mut f, 8);
-        let malloc_ptr = add_inst(&mut f, HirType::Ptr(Box::new(HirType::U8)));
+        let malloc_ptr = add_inst(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
 
         push(
             &mut f,

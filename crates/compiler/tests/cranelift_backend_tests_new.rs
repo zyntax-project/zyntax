@@ -197,7 +197,7 @@ fn create_multi_level_extract_function() -> HirFunction {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("s"),
-            ty: HirType::Ptr(Box::new(outer_ty.clone())),
+            ty: HirType::Ptr(std::sync::Arc::new(outer_ty.clone())),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -218,7 +218,10 @@ fn create_multi_level_extract_function() -> HirFunction {
     func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
-    let param_s = func.create_value(HirType::Ptr(Box::new(outer_ty)), HirValueKind::Parameter(0));
+    let param_s = func.create_value(
+        HirType::Ptr(std::sync::Arc::new(outer_ty)),
+        HirValueKind::Parameter(0),
+    );
 
     let result = func.create_value(HirType::I32, HirValueKind::Instruction);
     let extract_inst = HirInstruction::ExtractValue {
@@ -270,7 +273,7 @@ fn create_multi_level_insert_function() -> HirFunction {
             HirParam {
                 id: HirId::new(),
                 name: create_test_string("s"),
-                ty: HirType::Ptr(Box::new(outer_ty.clone())),
+                ty: HirType::Ptr(std::sync::Arc::new(outer_ty.clone())),
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             },
@@ -282,7 +285,7 @@ fn create_multi_level_insert_function() -> HirFunction {
                 ownership: Default::default(),
             },
         ],
-        returns: vec![HirType::Ptr(Box::new(outer_ty.clone()))],
+        returns: vec![HirType::Ptr(std::sync::Arc::new(outer_ty.clone()))],
         type_params: vec![],
         const_params: vec![],
         lifetime_params: vec![],
@@ -300,12 +303,15 @@ fn create_multi_level_insert_function() -> HirFunction {
     let entry_block_id = func.entry_block;
 
     let param_s = func.create_value(
-        HirType::Ptr(Box::new(outer_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(outer_ty.clone())),
         HirValueKind::Parameter(0),
     );
     let param_val = func.create_value(HirType::I32, HirValueKind::Parameter(1));
 
-    let result = func.create_value(HirType::Ptr(Box::new(outer_ty)), HirValueKind::Instruction);
+    let result = func.create_value(
+        HirType::Ptr(std::sync::Arc::new(outer_ty)),
+        HirValueKind::Instruction,
+    );
     let insert_inst = HirInstruction::InsertValue {
         result,
         ty: HirType::I32,

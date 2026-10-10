@@ -69,7 +69,7 @@ fn add_value(func: &mut HirFunction, ty: HirType, kind: HirValueKind) -> HirId {
 }
 
 fn byte_ptr() -> HirType {
-    HirType::Ptr(Box::new(HirType::U8))
+    HirType::Ptr(std::sync::Arc::new(HirType::U8))
 }
 
 /// The pointer's type: a function of the default convention.

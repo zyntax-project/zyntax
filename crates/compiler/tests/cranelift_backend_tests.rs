@@ -969,7 +969,7 @@ fn create_extract_value_function() -> HirFunction {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("s"),
-            ty: HirType::Ptr(Box::new(struct_ty.clone())),
+            ty: HirType::Ptr(std::sync::Arc::new(struct_ty.clone())),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -991,7 +991,7 @@ fn create_extract_value_function() -> HirFunction {
 
     let entry_block_id = func.entry_block;
     let param_s = func.create_value(
-        HirType::Ptr(Box::new(struct_ty)),
+        HirType::Ptr(std::sync::Arc::new(struct_ty)),
         HirValueKind::Parameter(0),
     );
 
@@ -1031,7 +1031,7 @@ fn create_insert_value_function() -> HirFunction {
             HirParam {
                 id: HirId::new(),
                 name: create_test_string("s"),
-                ty: HirType::Ptr(Box::new(struct_ty.clone())),
+                ty: HirType::Ptr(std::sync::Arc::new(struct_ty.clone())),
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             },
@@ -1043,7 +1043,7 @@ fn create_insert_value_function() -> HirFunction {
                 ownership: Default::default(),
             },
         ],
-        returns: vec![HirType::Ptr(Box::new(struct_ty.clone()))],
+        returns: vec![HirType::Ptr(std::sync::Arc::new(struct_ty.clone()))],
         type_params: vec![],
         const_params: vec![],
         lifetime_params: vec![],
@@ -1061,13 +1061,16 @@ fn create_insert_value_function() -> HirFunction {
 
     let entry_block_id = func.entry_block;
     let param_s = func.create_value(
-        HirType::Ptr(Box::new(struct_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(struct_ty.clone())),
         HirValueKind::Parameter(0),
     );
     let param_val = func.create_value(HirType::I32, HirValueKind::Parameter(1));
 
     // Insert value into first field (x coordinate at index 0)
-    let result = func.create_value(HirType::Ptr(Box::new(struct_ty)), HirValueKind::Instruction);
+    let result = func.create_value(
+        HirType::Ptr(std::sync::Arc::new(struct_ty)),
+        HirValueKind::Instruction,
+    );
     let insert_inst = HirInstruction::InsertValue {
         result,
         ty: HirType::I32, // Type of the value being inserted
@@ -1256,7 +1259,7 @@ fn create_malloc_intrinsic_function() -> HirFunction {
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
-        returns: vec![HirType::Ptr(Box::new(HirType::I8))], // void* as *i8
+        returns: vec![HirType::Ptr(std::sync::Arc::new(HirType::I8))], // void* as *i8
         type_params: vec![],
         const_params: vec![],
         lifetime_params: vec![],
@@ -1277,7 +1280,7 @@ fn create_malloc_intrinsic_function() -> HirFunction {
 
     // Call malloc intrinsic
     let result = func.create_value(
-        HirType::Ptr(Box::new(HirType::I8)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I8)),
         HirValueKind::Instruction,
     );
     let malloc_call = HirInstruction::Call {
@@ -1307,7 +1310,7 @@ fn create_free_intrinsic_function() -> HirFunction {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("ptr"),
-            ty: HirType::Ptr(Box::new(HirType::I8)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I8)),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -1329,7 +1332,7 @@ fn create_free_intrinsic_function() -> HirFunction {
 
     let entry_block_id = func.entry_block;
     let param_ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::I8)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I8)),
         HirValueKind::Parameter(0),
     );
 
@@ -1359,7 +1362,7 @@ fn create_incref_intrinsic_function() -> HirFunction {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("ptr"),
-            ty: HirType::Ptr(Box::new(HirType::I32)), // Simplified - ptr to refcounted struct
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I32)), // Simplified - ptr to refcounted struct
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -1381,7 +1384,7 @@ fn create_incref_intrinsic_function() -> HirFunction {
 
     let entry_block_id = func.entry_block;
     let param_ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::I32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I32)),
         HirValueKind::Parameter(0),
     );
 
@@ -1467,7 +1470,7 @@ fn create_union_test_function() -> HirFunction {
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
-        returns: vec![HirType::Ptr(Box::new(union_ty.clone()))],
+        returns: vec![HirType::Ptr(std::sync::Arc::new(union_ty.clone()))],
         type_params: vec![],
         const_params: vec![],
         lifetime_params: vec![],
@@ -1488,7 +1491,7 @@ fn create_union_test_function() -> HirFunction {
 
     // Create union with Some variant
     let result = func.create_value(
-        HirType::Ptr(Box::new(union_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(union_ty.clone())),
         HirValueKind::Instruction,
     );
     let create_union = HirInstruction::CreateUnion {
@@ -1536,7 +1539,7 @@ fn create_closure_test_function() -> HirFunction {
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
-        returns: vec![HirType::Ptr(Box::new(closure_ty.clone()))],
+        returns: vec![HirType::Ptr(std::sync::Arc::new(closure_ty.clone()))],
         type_params: vec![],
         const_params: vec![],
         lifetime_params: vec![],
@@ -1560,7 +1563,7 @@ fn create_closure_test_function() -> HirFunction {
 
     // Create closure
     let result = func.create_value(
-        HirType::Ptr(Box::new(closure_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(closure_ty.clone())),
         HirValueKind::Instruction,
     );
     let create_closure = HirInstruction::CreateClosure {
@@ -1723,7 +1726,7 @@ fn create_alloca_test_function() -> HirFunction {
     // Create function: fn test_alloca() -> *i32 { alloca i32 }
     let sig = HirFunctionSignature {
         params: vec![],
-        returns: vec![HirType::Ptr(Box::new(HirType::I32))],
+        returns: vec![HirType::Ptr(std::sync::Arc::new(HirType::I32))],
         type_params: vec![],
         const_params: vec![],
         lifetime_params: vec![],
@@ -1742,7 +1745,7 @@ fn create_alloca_test_function() -> HirFunction {
 
     // Alloca i32
     let ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::I32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I32)),
         HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
@@ -1768,7 +1771,7 @@ fn create_load_test_function() -> HirFunction {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("ptr"),
-            ty: HirType::Ptr(Box::new(HirType::I32)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I32)),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -1789,7 +1792,7 @@ fn create_load_test_function() -> HirFunction {
     func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::I32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I32)),
         HirValueKind::Parameter(0),
     );
 
@@ -1822,7 +1825,7 @@ fn create_store_test_function() -> HirFunction {
             HirParam {
                 id: HirId::new(),
                 name: create_test_string("ptr"),
-                ty: HirType::Ptr(Box::new(HirType::I32)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::I32)),
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             },
@@ -1851,7 +1854,7 @@ fn create_store_test_function() -> HirFunction {
     func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::I32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I32)),
         HirValueKind::Parameter(0),
     );
     let param_val = func.create_value(HirType::I32, HirValueKind::Parameter(1));
@@ -1876,14 +1879,14 @@ fn create_gep_test_function() -> HirFunction {
     let name = create_test_string("test_gep");
 
     // Create function: fn test_gep(arr: *[i32; 10], idx: i64) -> *i32 { gep arr, idx }
-    let array_ty = HirType::Array(Box::new(HirType::I32), 10);
+    let array_ty = HirType::Array(std::sync::Arc::new(HirType::I32), 10);
 
     let sig = HirFunctionSignature {
         params: vec![
             HirParam {
                 id: HirId::new(),
                 name: create_test_string("arr"),
-                ty: HirType::Ptr(Box::new(array_ty.clone())),
+                ty: HirType::Ptr(std::sync::Arc::new(array_ty.clone())),
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             },
@@ -1895,7 +1898,7 @@ fn create_gep_test_function() -> HirFunction {
                 ownership: Default::default(),
             },
         ],
-        returns: vec![HirType::Ptr(Box::new(HirType::I32))],
+        returns: vec![HirType::Ptr(std::sync::Arc::new(HirType::I32))],
         type_params: vec![],
         const_params: vec![],
         lifetime_params: vec![],
@@ -1912,14 +1915,14 @@ fn create_gep_test_function() -> HirFunction {
     func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
     let param_arr = func.create_value(
-        HirType::Ptr(Box::new(array_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(array_ty.clone())),
         HirValueKind::Parameter(0),
     );
     let param_idx = func.create_value(HirType::I64, HirValueKind::Parameter(1));
 
     // GEP: calculate pointer to arr[idx]
     let elem_ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::I32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I32)),
         HirValueKind::Instruction,
     );
     let gep = HirInstruction::GetElementPtr {
@@ -1976,7 +1979,7 @@ fn create_combined_memory_test_function() -> HirFunction {
 
     // Alloca i32
     let ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::I32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::I32)),
         HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
@@ -2034,7 +2037,7 @@ fn test_simple_struct_extract() {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("p"),
-            ty: HirType::Ptr(Box::new(HirType::Struct(struct_ty.clone()))),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::Struct(struct_ty.clone()))),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -2056,7 +2059,7 @@ fn test_simple_struct_extract() {
     let entry_block_id = func.entry_block;
 
     let param_p = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(struct_ty))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(struct_ty))),
         HirValueKind::Parameter(0),
     );
 
@@ -2096,7 +2099,7 @@ fn test_simple_struct_insert() {
             HirParam {
                 id: HirId::new(),
                 name: create_test_string("p"),
-                ty: HirType::Ptr(Box::new(HirType::Struct(struct_ty.clone()))),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::Struct(struct_ty.clone()))),
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             },
@@ -2108,7 +2111,9 @@ fn test_simple_struct_insert() {
                 ownership: Default::default(),
             },
         ],
-        returns: vec![HirType::Ptr(Box::new(HirType::Struct(struct_ty.clone())))],
+        returns: vec![HirType::Ptr(std::sync::Arc::new(HirType::Struct(
+            struct_ty.clone(),
+        )))],
         type_params: vec![],
         const_params: vec![],
         lifetime_params: vec![],
@@ -2126,13 +2131,13 @@ fn test_simple_struct_insert() {
     let entry_block_id = func.entry_block;
 
     let param_p = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(struct_ty.clone()))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(struct_ty.clone()))),
         HirValueKind::Parameter(0),
     );
     let param_new_y = func.create_value(HirType::I32, HirValueKind::Parameter(1));
 
     let result = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(struct_ty))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(struct_ty))),
         HirValueKind::Instruction,
     );
     let insert = HirInstruction::InsertValue {
@@ -2159,14 +2164,14 @@ fn test_simple_struct_insert() {
 fn test_array_extract() {
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
 
-    let array_ty = HirType::Array(Box::new(HirType::I32), 5);
+    let array_ty = HirType::Array(std::sync::Arc::new(HirType::I32), 5);
 
     let name = create_test_string("test_extract_array_elem");
     let sig = HirFunctionSignature {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("arr"),
-            ty: HirType::Ptr(Box::new(array_ty.clone())),
+            ty: HirType::Ptr(std::sync::Arc::new(array_ty.clone())),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -2187,7 +2192,10 @@ fn test_array_extract() {
     func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
-    let param_arr = func.create_value(HirType::Ptr(Box::new(array_ty)), HirValueKind::Parameter(0));
+    let param_arr = func.create_value(
+        HirType::Ptr(std::sync::Arc::new(array_ty)),
+        HirValueKind::Parameter(0),
+    );
 
     let elem_val = func.create_value(HirType::I32, HirValueKind::Instruction);
     let extract = HirInstruction::ExtractValue {
@@ -2213,7 +2221,7 @@ fn test_array_extract() {
 fn test_array_insert() {
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
 
-    let array_ty = HirType::Array(Box::new(HirType::I32), 5);
+    let array_ty = HirType::Array(std::sync::Arc::new(HirType::I32), 5);
 
     let name = create_test_string("test_insert_array_elem");
     let sig = HirFunctionSignature {
@@ -2221,7 +2229,7 @@ fn test_array_insert() {
             HirParam {
                 id: HirId::new(),
                 name: create_test_string("arr"),
-                ty: HirType::Ptr(Box::new(array_ty.clone())),
+                ty: HirType::Ptr(std::sync::Arc::new(array_ty.clone())),
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             },
@@ -2233,7 +2241,7 @@ fn test_array_insert() {
                 ownership: Default::default(),
             },
         ],
-        returns: vec![HirType::Ptr(Box::new(array_ty.clone()))],
+        returns: vec![HirType::Ptr(std::sync::Arc::new(array_ty.clone()))],
         type_params: vec![],
         const_params: vec![],
         lifetime_params: vec![],
@@ -2251,12 +2259,15 @@ fn test_array_insert() {
     let entry_block_id = func.entry_block;
 
     let param_arr = func.create_value(
-        HirType::Ptr(Box::new(array_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(array_ty.clone())),
         HirValueKind::Parameter(0),
     );
     let param_val = func.create_value(HirType::I32, HirValueKind::Parameter(1));
 
-    let result = func.create_value(HirType::Ptr(Box::new(array_ty)), HirValueKind::Instruction);
+    let result = func.create_value(
+        HirType::Ptr(std::sync::Arc::new(array_ty)),
+        HirValueKind::Instruction,
+    );
     let insert = HirInstruction::InsertValue {
         result,
         ty: HirType::I32,
@@ -2298,7 +2309,7 @@ fn test_nested_struct() {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("s"),
-            ty: HirType::Ptr(Box::new(HirType::Struct(outer_ty.clone()))),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::Struct(outer_ty.clone()))),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -2320,7 +2331,7 @@ fn test_nested_struct() {
     let entry_block_id = func.entry_block;
 
     let param_s = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(outer_ty))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(outer_ty))),
         HirValueKind::Parameter(0),
     );
 
@@ -2354,14 +2365,14 @@ fn test_array_of_structs() {
         packed: false,
     };
 
-    let array_ty = HirType::Array(Box::new(HirType::Struct(point_ty)), 3);
+    let array_ty = HirType::Array(std::sync::Arc::new(HirType::Struct(point_ty)), 3);
 
     let name = create_test_string("test_array_of_structs_access");
     let sig = HirFunctionSignature {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("points"),
-            ty: HirType::Ptr(Box::new(array_ty.clone())),
+            ty: HirType::Ptr(std::sync::Arc::new(array_ty.clone())),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -2382,8 +2393,10 @@ fn test_array_of_structs() {
     func.calling_convention = CallingConvention::C;
     let entry_block_id = func.entry_block;
 
-    let param_points =
-        func.create_value(HirType::Ptr(Box::new(array_ty)), HirValueKind::Parameter(0));
+    let param_points = func.create_value(
+        HirType::Ptr(std::sync::Arc::new(array_ty)),
+        HirValueKind::Parameter(0),
+    );
 
     let y_val = func.create_value(HirType::I32, HirValueKind::Instruction);
     let extract = HirInstruction::ExtractValue {
@@ -2409,15 +2422,15 @@ fn test_array_of_structs() {
 fn test_2d_array() {
     let mut backend = CraneliftBackend::new().expect("Failed to create backend");
 
-    let inner_array_ty = HirType::Array(Box::new(HirType::I32), 4);
-    let outer_array_ty = HirType::Array(Box::new(inner_array_ty), 3);
+    let inner_array_ty = HirType::Array(std::sync::Arc::new(HirType::I32), 4);
+    let outer_array_ty = HirType::Array(std::sync::Arc::new(inner_array_ty), 3);
 
     let name = create_test_string("test_2d_array_access");
     let sig = HirFunctionSignature {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("matrix"),
-            ty: HirType::Ptr(Box::new(outer_array_ty.clone())),
+            ty: HirType::Ptr(std::sync::Arc::new(outer_array_ty.clone())),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -2439,7 +2452,7 @@ fn test_2d_array() {
     let entry_block_id = func.entry_block;
 
     let param_matrix = func.create_value(
-        HirType::Ptr(Box::new(outer_array_ty)),
+        HirType::Ptr(std::sync::Arc::new(outer_array_ty)),
         HirValueKind::Parameter(0),
     );
 
@@ -2484,7 +2497,7 @@ fn test_mixed_struct_types() {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("s"),
-            ty: HirType::Ptr(Box::new(HirType::Struct(struct_ty.clone()))),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::Struct(struct_ty.clone()))),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -2506,7 +2519,7 @@ fn test_mixed_struct_types() {
     let entry_block_id = func.entry_block;
 
     let param_s = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(struct_ty))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(struct_ty))),
         HirValueKind::Parameter(0),
     );
 
@@ -2557,7 +2570,7 @@ fn test_deeply_nested_struct() {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("s"),
-            ty: HirType::Ptr(Box::new(HirType::Struct(level1_ty.clone()))),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::Struct(level1_ty.clone()))),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -2579,7 +2592,7 @@ fn test_deeply_nested_struct() {
     let entry_block_id = func.entry_block;
 
     let param_s = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(level1_ty))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(level1_ty))),
         HirValueKind::Parameter(0),
     );
 
@@ -3275,7 +3288,7 @@ fn make_ptr_to_f32_func(fn_name: &str) -> (HirFunction, HirId) {
         params: vec![HirParam {
             id: HirId::new(),
             name: create_test_string("ptr"),
-            ty: HirType::Ptr(Box::new(HirType::F32)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::F32)),
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -3294,7 +3307,7 @@ fn make_ptr_to_f32_func(fn_name: &str) -> (HirFunction, HirId) {
     // to `Fast`, which diverges from MS x64 on Windows.
     func.calling_convention = CallingConvention::C;
     let ptr_id = func.create_value(
-        HirType::Ptr(Box::new(HirType::F32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::F32)),
         HirValueKind::Parameter(0),
     );
     (func, ptr_id)
@@ -3473,7 +3486,7 @@ fn test_vector_unary_sqrt_executes() {
 #[test]
 fn test_vector_dot_i8x16_executes() {
     let name = create_test_string("exec_vdot");
-    let ptr_i8 = || HirType::Ptr(Box::new(HirType::I8));
+    let ptr_i8 = || HirType::Ptr(std::sync::Arc::new(HirType::I8));
     let sig = HirFunctionSignature {
         params: vec![
             HirParam {
@@ -3600,7 +3613,7 @@ fn test_vector_dot_i8x16_executes() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_vector_dot_i8x16_vpdpbusd() {
-    let ptr_i8 = || HirType::Ptr(Box::new(HirType::I8));
+    let ptr_i8 = || HirType::Ptr(std::sync::Arc::new(HirType::I8));
     let i8x16 = HirType::Vector(Box::new(HirType::I8), 16);
     let i32x4 = HirType::Vector(Box::new(HirType::I32), 4);
     // Opaque operands (loaded from params) — constant splats would fold the
@@ -3698,7 +3711,7 @@ fn test_vector_store_f32x4_executes() {
             HirParam {
                 id: HirId::new(),
                 name: create_test_string("ptr"),
-                ty: HirType::Ptr(Box::new(HirType::F32)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::F32)),
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             },
@@ -3725,7 +3738,7 @@ fn test_vector_store_f32x4_executes() {
     // to `Fast`, which diverges from MS x64 on Windows.
     func.calling_convention = CallingConvention::C;
     let ptr_id = func.create_value(
-        HirType::Ptr(Box::new(HirType::F32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::F32)),
         HirValueKind::Parameter(0),
     );
     let scalar_id = func.create_value(HirType::F32, HirValueKind::Parameter(1));
@@ -3794,7 +3807,7 @@ fn test_emit_elementwise_simd_loop_f32_mul() {
             HirParam {
                 id: HirId::new(),
                 name: create_test_string("ptr"),
-                ty: HirType::Ptr(Box::new(HirType::F32)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::F32)),
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             },
@@ -3831,7 +3844,7 @@ fn test_emit_elementwise_simd_loop_f32_mul() {
     let entry = func.entry_block;
 
     let data_ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::F32)),
+        HirType::Ptr(std::sync::Arc::new(HirType::F32)),
         HirValueKind::Parameter(0),
     );
     let len_val = func.create_value(HirType::I64, HirValueKind::Parameter(1));
@@ -3949,7 +3962,7 @@ fn create_effect_module() -> HirModule {
             params: vec![HirParam {
                 id: HirId::new(),
                 name: create_test_string("msg"),
-                ty: HirType::Ptr(Box::new(HirType::I8)), // str as ptr
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::I8)), // str as ptr
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             }],
@@ -3988,7 +4001,7 @@ fn create_effect_module() -> HirModule {
             params: vec![HirParam {
                 id: HirId::new(),
                 name: create_test_string("msg"),
-                ty: HirType::Ptr(Box::new(HirType::I8)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::I8)),
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             }],

@@ -531,7 +531,7 @@ impl AsyncCompiler {
                             // Get the type of the future from the values map
                             let future_ty =
                                 func.values.get(future_id).map(|v| v.ty.clone()).unwrap_or(
-                                    HirType::Ptr(Box::new(HirType::Opaque(
+                                    HirType::Ptr(std::sync::Arc::new(HirType::Opaque(
                                         InternedString::new_global("Promise"),
                                     ))),
                                 );
@@ -1283,7 +1283,7 @@ impl AsyncCompiler {
                 UnaryOp::Not => HirType::Bool,
                 _ => HirType::I64,
             },
-            HirInstruction::Alloca { ty, .. } => HirType::Ptr(Box::new(ty.clone())),
+            HirInstruction::Alloca { ty, .. } => HirType::Ptr(std::sync::Arc::new(ty.clone())),
             HirInstruction::Load { ty, .. } => ty.clone(),
             HirInstruction::GetElementPtr { ty, .. } => ty.clone(),
             HirInstruction::ExtractValue { ty, .. } => ty.clone(),
@@ -1437,7 +1437,7 @@ impl AsyncCompiler {
                     HirValueKind::Constant(HirConstant::I64(current_offset)),
                 );
                 let slot_ptr = wrapper.create_value(
-                    HirType::Ptr(Box::new(capture.ty.clone())),
+                    HirType::Ptr(std::sync::Arc::new(capture.ty.clone())),
                     HirValueKind::Instruction,
                 );
                 state_block.add_instruction(HirInstruction::Binary {
@@ -1491,7 +1491,7 @@ impl AsyncCompiler {
                 HirParam {
                     id: HirId::new(),
                     name: arena.intern_string("state_machine"),
-                    ty: HirType::Ptr(Box::new(HirType::U8)), // Generic byte pointer
+                    ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)), // Generic byte pointer
                     attributes: ParamAttributes::default(),
                     ownership: crate::hir::ParamOwnership::default(),
                 },
@@ -1598,7 +1598,7 @@ impl AsyncCompiler {
             sm_ptr_id,
             HirValue {
                 id: sm_ptr_id,
-                ty: HirType::Ptr(Box::new(HirType::U8)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                 kind: HirValueKind::Instruction,
                 uses: Default::default(),
                 span: None,
@@ -1697,7 +1697,7 @@ impl AsyncCompiler {
                     field_ptr,
                     HirValue {
                         id: field_ptr,
-                        ty: HirType::Ptr(Box::new(param_ty.clone())),
+                        ty: HirType::Ptr(std::sync::Arc::new(param_ty.clone())),
                         kind: HirValueKind::Instruction,
                         uses: Default::default(),
                         span: None,
@@ -1869,7 +1869,7 @@ impl AsyncCompiler {
                         field_ptr,
                         HirValue {
                             id: field_ptr,
-                            ty: HirType::Ptr(Box::new(capture.ty.clone())),
+                            ty: HirType::Ptr(std::sync::Arc::new(capture.ty.clone())),
                             kind: HirValueKind::Instruction,
                             uses: Default::default(),
                             span: None,
@@ -1910,7 +1910,7 @@ impl AsyncCompiler {
         // Get the poll function pointer via CreateClosure (with no captures)
         let poll_fn_ptr_id = HirId::new();
         let poll_fn_ptr_ty = HirType::Function(Box::new(HirFunctionType {
-            params: vec![HirType::Ptr(Box::new(HirType::U8))],
+            params: vec![HirType::Ptr(std::sync::Arc::new(HirType::U8))],
             returns: vec![HirType::I64],
             lifetime_params: vec![],
             is_variadic: false,
@@ -1938,9 +1938,9 @@ impl AsyncCompiler {
         let promise_type = HirType::Struct(HirStructType {
             name: Some(arena.intern_string("Promise")),
             fields: vec![
-                HirType::Ptr(Box::new(HirType::U8)), // state_machine
+                HirType::Ptr(std::sync::Arc::new(HirType::U8)), // state_machine
                 HirType::Function(Box::new(HirFunctionType {
-                    params: vec![HirType::Ptr(Box::new(HirType::U8))],
+                    params: vec![HirType::Ptr(std::sync::Arc::new(HirType::U8))],
                     returns: vec![HirType::I64],
                     lifetime_params: vec![],
                     is_variadic: false,
@@ -1967,7 +1967,7 @@ impl AsyncCompiler {
             promise_ptr_id,
             HirValue {
                 id: promise_ptr_id,
-                ty: HirType::Ptr(Box::new(promise_type.clone())),
+                ty: HirType::Ptr(std::sync::Arc::new(promise_type.clone())),
                 kind: HirValueKind::Instruction,
                 uses: Default::default(),
                 span: None,
@@ -2008,7 +2008,7 @@ impl AsyncCompiler {
             poll_fn_ptr_offset_id,
             HirValue {
                 id: poll_fn_ptr_offset_id,
-                ty: HirType::Ptr(Box::new(HirType::U8)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                 kind: HirValueKind::Instruction,
                 uses: Default::default(),
                 span: None,
@@ -2056,7 +2056,7 @@ impl AsyncCompiler {
             name: func_name,
             signature: HirFunctionSignature {
                 params,
-                returns: vec![HirType::Ptr(Box::new(promise_type))],
+                returns: vec![HirType::Ptr(std::sync::Arc::new(promise_type))],
                 type_params: Vec::new(),
                 const_params: Vec::new(),
                 lifetime_params: Vec::new(),
@@ -2123,9 +2123,9 @@ impl AsyncCompiler {
 
         // Get self parameter (state machine pointer)
         let self_param = wrapper.create_value(
-            HirType::Ptr(Box::new(HirType::Opaque(InternedString::new_global(
-                "StateMachine",
-            )))),
+            HirType::Ptr(std::sync::Arc::new(HirType::Opaque(
+                InternedString::new_global("StateMachine"),
+            ))),
             HirValueKind::Parameter(0),
         );
 
@@ -2152,7 +2152,7 @@ impl AsyncCompiler {
                 HirValueKind::Constant(HirConstant::I64(current_offset)),
             );
             let field_ptr = wrapper.create_value(
-                HirType::Ptr(Box::new(capture.ty.clone())),
+                HirType::Ptr(std::sync::Arc::new(capture.ty.clone())),
                 HirValueKind::Instruction,
             );
 
@@ -2333,9 +2333,9 @@ impl AsyncCompiler {
 
         // Get self parameter (state machine pointer) - first parameter
         let self_param = wrapper.create_value(
-            HirType::Ptr(Box::new(HirType::Opaque(InternedString::new_global(
-                "StateMachine",
-            )))),
+            HirType::Ptr(std::sync::Arc::new(HirType::Opaque(
+                InternedString::new_global("StateMachine"),
+            ))),
             HirValueKind::Parameter(0),
         );
 
@@ -2392,7 +2392,7 @@ impl AsyncCompiler {
 
                 // Calculate pointer: self_param + offset
                 let field_ptr = wrapper.create_value(
-                    HirType::Ptr(Box::new(capture.ty.clone())),
+                    HirType::Ptr(std::sync::Arc::new(capture.ty.clone())),
                     HirValueKind::Instruction,
                 );
                 state_block.add_instruction(HirInstruction::Binary {
@@ -2553,7 +2553,9 @@ impl AsyncCompiler {
                         HirValueKind::Constant(HirConstant::I64(future_offset)),
                     );
                     let future_slot_ptr = wrapper.create_value(
-                        HirType::Ptr(Box::new(HirType::Ptr(Box::new(HirType::U8)))),
+                        HirType::Ptr(std::sync::Arc::new(HirType::Ptr(std::sync::Arc::new(
+                            HirType::U8,
+                        )))),
                         HirValueKind::Instruction,
                     );
                     call_block.add_instruction(HirInstruction::Binary {
@@ -2589,7 +2591,9 @@ impl AsyncCompiler {
                         HirValueKind::Constant(HirConstant::I64(future_offset)),
                     );
                     let future_slot_ptr2 = wrapper.create_value(
-                        HirType::Ptr(Box::new(HirType::Ptr(Box::new(HirType::U8)))),
+                        HirType::Ptr(std::sync::Arc::new(HirType::Ptr(std::sync::Arc::new(
+                            HirType::U8,
+                        )))),
                         HirValueKind::Instruction,
                     );
                     poll_block.add_instruction(HirInstruction::Binary {
@@ -2601,12 +2605,12 @@ impl AsyncCompiler {
                     });
 
                     let promise_ptr = wrapper.create_value(
-                        HirType::Ptr(Box::new(HirType::U8)),
+                        HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                         HirValueKind::Instruction,
                     );
                     poll_block.add_instruction(HirInstruction::Load {
                         result: promise_ptr,
-                        ty: HirType::Ptr(Box::new(HirType::U8)),
+                        ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                         ptr: future_slot_ptr2,
                         align: 8,
                         volatile: false,
@@ -2614,12 +2618,12 @@ impl AsyncCompiler {
 
                     // Load the nested state machine pointer from Promise[0]
                     let nested_sm = wrapper.create_value(
-                        HirType::Ptr(Box::new(HirType::U8)),
+                        HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                         HirValueKind::Instruction,
                     );
                     poll_block.add_instruction(HirInstruction::Load {
                         result: nested_sm,
-                        ty: HirType::Ptr(Box::new(HirType::U8)),
+                        ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                         ptr: promise_ptr,
                         align: 8,
                         volatile: false,
@@ -2629,7 +2633,7 @@ impl AsyncCompiler {
                     let offset_8 = wrapper
                         .create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(8)));
                     let poll_fn_ptr_addr = wrapper.create_value(
-                        HirType::Ptr(Box::new(HirType::U8)),
+                        HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                         HirValueKind::Instruction,
                     );
                     poll_block.add_instruction(HirInstruction::Binary {
@@ -2642,7 +2646,7 @@ impl AsyncCompiler {
 
                     // Load the poll function pointer from Promise[8]
                     let poll_fn_ty = HirType::Function(Box::new(HirFunctionType {
-                        params: vec![HirType::Ptr(Box::new(HirType::U8))],
+                        params: vec![HirType::Ptr(std::sync::Arc::new(HirType::U8))],
                         returns: vec![HirType::I64],
                         lifetime_params: vec![],
                         is_variadic: false,
@@ -2740,7 +2744,7 @@ impl AsyncCompiler {
                                 HirValueKind::Constant(HirConstant::I64(result_offset)),
                             );
                             let result_slot_ptr = wrapper.create_value(
-                                HirType::Ptr(Box::new(HirType::I32)),
+                                HirType::Ptr(std::sync::Arc::new(HirType::I32)),
                                 HirValueKind::Instruction,
                             );
                             ready_block.add_instruction(HirInstruction::Binary {
@@ -2780,7 +2784,9 @@ impl AsyncCompiler {
                         HirValueKind::Constant(HirConstant::I64(future_offset)),
                     );
                     let clear_future_slot_ptr = wrapper.create_value(
-                        HirType::Ptr(Box::new(HirType::Ptr(Box::new(HirType::U8)))),
+                        HirType::Ptr(std::sync::Arc::new(HirType::Ptr(std::sync::Arc::new(
+                            HirType::U8,
+                        )))),
                         HirValueKind::Instruction,
                     );
                     ready_block.add_instruction(HirInstruction::Binary {
@@ -3033,7 +3039,7 @@ impl AsyncCompiler {
 
         // Parameter 0: output pointer (sret) - generic pointer type
         let out_ptr_id = HirId::new();
-        let out_ptr_ty = HirType::Ptr(Box::new(HirType::U8)); // Generic byte pointer
+        let out_ptr_ty = HirType::Ptr(std::sync::Arc::new(HirType::U8)); // Generic byte pointer
         values.insert(
             out_ptr_id,
             HirValue {
@@ -3106,7 +3112,7 @@ impl AsyncCompiler {
                     field_ptr,
                     HirValue {
                         id: field_ptr,
-                        ty: HirType::Ptr(Box::new(param.ty.clone())),
+                        ty: HirType::Ptr(std::sync::Arc::new(param.ty.clone())),
                         kind: HirValueKind::Instruction,
                         uses: Default::default(),
                         span: None,
@@ -3327,7 +3333,7 @@ mod tests {
 
         let async_fn = HirType::async_function_with_arena(
             vec![HirType::I32],
-            HirType::Ptr(Box::new(HirType::I8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I8)),
             &mut arena,
         );
         match async_fn {
@@ -3554,7 +3560,7 @@ mod tests {
             HirParam {
                 id: HirId::new(),
                 name: intern_str(&mut arena, "msg"),
-                ty: HirType::Ptr(Box::new(HirType::I8)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::I8)),
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             },
@@ -3605,7 +3611,7 @@ mod tests {
             AsyncCapture {
                 id: HirId::new(),
                 name: intern_str(&mut arena, "msg"),
-                ty: HirType::Ptr(Box::new(HirType::I8)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::I8)),
                 mode: AsyncCaptureMode::ByValue,
             },
         ];
@@ -3637,7 +3643,10 @@ mod tests {
                 assert_eq!(struct_ty.fields[0], HirType::U32); // state
                 assert_eq!(struct_ty.fields[1], HirType::I32); // x
                 assert_eq!(struct_ty.fields[2], HirType::I64); // y
-                assert_eq!(struct_ty.fields[3], HirType::Ptr(Box::new(HirType::I8)));
+                assert_eq!(
+                    struct_ty.fields[3],
+                    HirType::Ptr(std::sync::Arc::new(HirType::I8))
+                );
                 // msg
             }
             _ => panic!("Expected struct type"),

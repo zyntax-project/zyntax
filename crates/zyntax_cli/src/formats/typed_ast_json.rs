@@ -515,7 +515,7 @@ fn typed_ast_to_hir(program: &TypedProgram) -> Result<HirModule, Box<dyn std::er
                     }
                     "print_cstr" | "puts" => {
                         builder.begin_extern_function(called_name, CallingConvention::C)
-                            .param("ptr", HirType::Ptr(Box::new(HirType::I8)))
+                            .param("ptr", HirType::Ptr(std::sync::Arc::new(HirType::I8)))
                             .returns(HirType::I32)
                             .build()
                     }
@@ -524,21 +524,21 @@ fn typed_ast_to_hir(program: &TypedProgram) -> Result<HirModule, Box<dyn std::er
                         builder.begin_extern_function(called_name, CallingConvention::C)
                             .param("elem0", HirType::I32)
                             .param("elem1", HirType::I32)
-                            .returns(HirType::Ptr(Box::new(HirType::I32)))
+                            .returns(HirType::Ptr(std::sync::Arc::new(HirType::I32)))
                             .build()
                     }
                     "$Array$push" => {
                         // Push element, returns new pointer
                         builder.begin_extern_function(called_name, CallingConvention::C)
-                            .param("array", HirType::Ptr(Box::new(HirType::I32)))
+                            .param("array", HirType::Ptr(std::sync::Arc::new(HirType::I32)))
                             .param("element", HirType::I32)
-                            .returns(HirType::Ptr(Box::new(HirType::I32)))
+                            .returns(HirType::Ptr(std::sync::Arc::new(HirType::I32)))
                             .build()
                     }
                     "$Array$get" => {
                         // Get element by index
                         builder.begin_extern_function(called_name, CallingConvention::C)
-                            .param("array", HirType::Ptr(Box::new(HirType::I32)))
+                            .param("array", HirType::Ptr(std::sync::Arc::new(HirType::I32)))
                             .param("index", HirType::I32)
                             .returns(HirType::I32)
                             .build()
@@ -546,16 +546,16 @@ fn typed_ast_to_hir(program: &TypedProgram) -> Result<HirModule, Box<dyn std::er
                     "$Array$length" => {
                         // Get array length
                         builder.begin_extern_function(called_name, CallingConvention::C)
-                            .param("array", HirType::Ptr(Box::new(HirType::I32)))
+                            .param("array", HirType::Ptr(std::sync::Arc::new(HirType::I32)))
                             .returns(HirType::I32)
                             .build()
                     }
                     "$String$concat" => {
                         // String concatenation - returns new string pointer
                         builder.begin_extern_function(called_name, CallingConvention::C)
-                            .param("str1", HirType::Ptr(Box::new(HirType::I32)))
-                            .param("str2", HirType::Ptr(Box::new(HirType::I32)))
-                            .returns(HirType::Ptr(Box::new(HirType::I32)))
+                            .param("str1", HirType::Ptr(std::sync::Arc::new(HirType::I32)))
+                            .param("str2", HirType::Ptr(std::sync::Arc::new(HirType::I32)))
+                            .returns(HirType::Ptr(std::sync::Arc::new(HirType::I32)))
                             .build()
                     }
                     _ => {
@@ -946,9 +946,9 @@ fn typed_ast_to_hir(program: &TypedProgram) -> Result<HirModule, Box<dyn std::er
         // String runtime functions
         if !function_registry.contains_key("$String$concat") {
             let func_id = builder.begin_extern_function("$String$concat", CallingConvention::C)
-                .param("str1", HirType::Ptr(Box::new(HirType::I32)))
-                .param("str2", HirType::Ptr(Box::new(HirType::I32)))
-                .returns(HirType::Ptr(Box::new(HirType::I32)))
+                .param("str1", HirType::Ptr(std::sync::Arc::new(HirType::I32)))
+                .param("str2", HirType::Ptr(std::sync::Arc::new(HirType::I32)))
+                .returns(HirType::Ptr(std::sync::Arc::new(HirType::I32)))
                 .build();
             function_registry.insert("$String$concat".to_string(), func_id);
         }
@@ -956,8 +956,8 @@ fn typed_ast_to_hir(program: &TypedProgram) -> Result<HirModule, Box<dyn std::er
         // String literal conversion function
         if !function_registry.contains_key("$String$fromCString") {
             let func_id = builder.begin_extern_function("$String$fromCString", CallingConvention::C)
-                .param("cstr", HirType::Ptr(Box::new(HirType::I8)))
-                .returns(HirType::Ptr(Box::new(HirType::I32)))
+                .param("cstr", HirType::Ptr(std::sync::Arc::new(HirType::I8)))
+                .returns(HirType::Ptr(std::sync::Arc::new(HirType::I32)))
                 .build();
             function_registry.insert("$String$fromCString".to_string(), func_id);
         }
@@ -965,7 +965,7 @@ fn typed_ast_to_hir(program: &TypedProgram) -> Result<HirModule, Box<dyn std::er
         // String print function
         if !function_registry.contains_key("$String$println") {
             let func_id = builder.begin_extern_function("$String$println", CallingConvention::C)
-                .param("str", HirType::Ptr(Box::new(HirType::I32)))
+                .param("str", HirType::Ptr(std::sync::Arc::new(HirType::I32)))
                 .returns(HirType::Void)
                 .build();
             function_registry.insert("$String$println".to_string(), func_id);

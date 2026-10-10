@@ -22,8 +22,8 @@ pub fn aggregate_carrying_loop() -> (HirFunction, HirId) {
     // The phi is declared as the aggregate, but every value feeding it is
     // already a pointer to one, so the emitted phi takes the producers'
     // pointer shape rather than the declared aggregate's.
-    let aggregate_ty = HirType::Array(Box::new(HirType::F64), 3);
-    let producer_ty = HirType::Ptr(Box::new(HirType::F64));
+    let aggregate_ty = HirType::Array(std::sync::Arc::new(HirType::F64), 3);
+    let producer_ty = HirType::Ptr(std::sync::Arc::new(HirType::F64));
 
     // Carried around the loop untouched: the header phi's only other input
     // is itself, which is precisely the self-referential shape that has to

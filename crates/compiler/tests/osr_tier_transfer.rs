@@ -764,7 +764,7 @@ fn a_transfer_keeps_writing_into_the_header_it_was_handed() {
         packed: false,
     });
     let i64_ty = HirType::I64;
-    let ptr_i64 = HirType::Ptr(Box::new(HirType::I64));
+    let ptr_i64 = HirType::Ptr(std::sync::Arc::new(HirType::I64));
 
     let [entry_id, head_id, body_id, exit_id] = [(); 4].map(|_| HirId::new());
     let [

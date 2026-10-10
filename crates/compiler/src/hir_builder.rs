@@ -206,12 +206,12 @@ impl<'arena> HirBuilder<'arena> {
 
     /// Creates a pointer type
     pub fn ptr_type(&self, pointee: HirType) -> HirType {
-        HirType::Ptr(Box::new(pointee))
+        HirType::Ptr(std::sync::Arc::new(pointee))
     }
 
     /// Creates an array type
     pub fn array_type(&self, element: HirType, size: u64) -> HirType {
-        HirType::Array(Box::new(element), size)
+        HirType::Array(std::sync::Arc::new(element), size)
     }
 
     /// Creates a struct type
@@ -1005,7 +1005,7 @@ impl<'arena> HirBuilder<'arena> {
     /// Returns a pointer to the allocated space
     pub fn alloca(&mut self, ty: HirType) -> HirId {
         let result = HirId::new();
-        let ptr_ty = HirType::Ptr(Box::new(ty.clone()));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(ty.clone()));
 
         self.emit(HirInstruction::Alloca {
             result,
@@ -1025,7 +1025,7 @@ impl<'arena> HirBuilder<'arena> {
     /// * `field_ty` - Type of the field
     pub fn get_element_ptr(&mut self, ptr: HirId, field_index: u32, field_ty: HirType) -> HirId {
         let result = HirId::new();
-        let ptr_ty = HirType::Ptr(Box::new(field_ty));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(field_ty));
         let index_val = self.const_u64(field_index as u64);
 
         self.emit(HirInstruction::GetElementPtr {

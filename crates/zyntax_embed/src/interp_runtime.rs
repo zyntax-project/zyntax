@@ -1247,7 +1247,7 @@ mod tests {
             is_pure: false,
         };
         let gid = HirId::new();
-        let global_ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let global_ptr_ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
         let input = HirId::new();
         let param = HirParam {
             id: input,

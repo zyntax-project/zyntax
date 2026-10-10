@@ -46,7 +46,7 @@ fn host_bridge_await_emits_register_future_and_pending_return() {
         frame,
         HirValue {
             id: frame,
-            ty: HirType::Ptr(Box::new(HirType::I64)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             kind: HirValueKind::Instruction,
             uses: Default::default(),
             span: None,
@@ -260,7 +260,7 @@ fn host_bridge_await_value_keeps_no_ownership_ops() {
         frame,
         HirValue {
             id: frame,
-            ty: HirType::Ptr(Box::new(HirType::I64)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             kind: HirValueKind::Instruction,
             uses: Default::default(),
             span: None,

@@ -2415,7 +2415,7 @@ impl<'ctx> LLVMBackend<'ctx> {
                 self.value_map.insert(*result, alloca.into());
                 // Record the type as a pointer to the allocated type
                 self.type_map
-                    .insert(*result, HirType::Ptr(Box::new(ty.clone())));
+                    .insert(*result, HirType::Ptr(std::sync::Arc::new(ty.clone())));
             }
 
             HirInstruction::GetElementPtr {

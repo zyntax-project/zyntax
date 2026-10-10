@@ -64,7 +64,7 @@ fn test_struct_roundtrip() {
 
     // Alloca Point
     let struct_ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(point_ty.clone()))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(point_ty.clone()))),
         HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
@@ -77,7 +77,7 @@ fn test_struct_roundtrip() {
     // Insert x = 10
     let val_10 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(10)));
     let ptr_1 = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(point_ty.clone()))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(point_ty.clone()))),
         HirValueKind::Instruction,
     );
     let insert_x = HirInstruction::InsertValue {
@@ -91,7 +91,7 @@ fn test_struct_roundtrip() {
     // Insert y = 20
     let val_20 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(20)));
     let ptr_2 = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(point_ty.clone()))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(point_ty.clone()))),
         HirValueKind::Instruction,
     );
     let insert_y = HirInstruction::InsertValue {
@@ -169,7 +169,7 @@ fn test_nested_struct_execution() {
 
     // Alloca Outer
     let struct_ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(outer_ty.clone()))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(outer_ty.clone()))),
         HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
@@ -182,7 +182,7 @@ fn test_nested_struct_execution() {
     // Insert outer.inner.a = 5
     let val_5 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(5)));
     let ptr_1 = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(outer_ty.clone()))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(outer_ty.clone()))),
         HirValueKind::Instruction,
     );
     let insert_a = HirInstruction::InsertValue {
@@ -196,7 +196,7 @@ fn test_nested_struct_execution() {
     // Insert outer.inner.b = 42
     let val_42 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(42)));
     let ptr_2 = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(outer_ty.clone()))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(outer_ty.clone()))),
         HirValueKind::Instruction,
     );
     let insert_b = HirInstruction::InsertValue {
@@ -210,7 +210,7 @@ fn test_nested_struct_execution() {
     // Insert outer.c = 100
     let val_100 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(100)));
     let ptr_3 = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(outer_ty.clone()))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(outer_ty.clone()))),
         HirValueKind::Instruction,
     );
     let insert_c = HirInstruction::InsertValue {
@@ -254,7 +254,7 @@ fn test_array_roundtrip() {
     // Create array [i32; 4], initialize elements, read element 2
 
     let name = create_test_string("array_roundtrip");
-    let array_ty = HirType::Array(Box::new(HirType::I32), 4);
+    let array_ty = HirType::Array(std::sync::Arc::new(HirType::I32), 4);
 
     let sig = HirFunctionSignature {
         params: vec![],
@@ -277,7 +277,7 @@ fn test_array_roundtrip() {
 
     // Alloca array
     let array_ptr = func.create_value(
-        HirType::Ptr(Box::new(array_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(array_ty.clone())),
         HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
@@ -295,7 +295,7 @@ fn test_array_roundtrip() {
             HirValueKind::Constant(HirConstant::I32((i * 10) as i32)),
         );
         let new_ptr = func.create_value(
-            HirType::Ptr(Box::new(array_ty.clone())),
+            HirType::Ptr(std::sync::Arc::new(array_ty.clone())),
             HirValueKind::Instruction,
         );
         let insert = HirInstruction::InsertValue {
@@ -342,8 +342,8 @@ fn test_2d_array_execution() {
     // Create [[i32; 3]; 2], initialize and read [1][2]
 
     let name = create_test_string("test_2d_array");
-    let inner_array_ty = HirType::Array(Box::new(HirType::I32), 3);
-    let outer_array_ty = HirType::Array(Box::new(inner_array_ty), 2);
+    let inner_array_ty = HirType::Array(std::sync::Arc::new(HirType::I32), 3);
+    let outer_array_ty = HirType::Array(std::sync::Arc::new(inner_array_ty), 2);
 
     let sig = HirFunctionSignature {
         params: vec![],
@@ -366,7 +366,7 @@ fn test_2d_array_execution() {
 
     // Alloca 2D array
     let array_ptr = func.create_value(
-        HirType::Ptr(Box::new(outer_array_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(outer_array_ty.clone())),
         HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
@@ -379,7 +379,7 @@ fn test_2d_array_execution() {
     // Insert arr[1][2] = 99
     let val_99 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(99)));
     let ptr_1 = func.create_value(
-        HirType::Ptr(Box::new(outer_array_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(outer_array_ty.clone())),
         HirValueKind::Instruction,
     );
     let insert = HirInstruction::InsertValue {
@@ -428,7 +428,7 @@ fn test_array_of_structs_execution() {
         packed: false,
     };
 
-    let array_ty = HirType::Array(Box::new(HirType::Struct(point_ty)), 3);
+    let array_ty = HirType::Array(std::sync::Arc::new(HirType::Struct(point_ty)), 3);
 
     let sig = HirFunctionSignature {
         params: vec![],
@@ -451,7 +451,7 @@ fn test_array_of_structs_execution() {
 
     // Alloca array
     let array_ptr = func.create_value(
-        HirType::Ptr(Box::new(array_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(array_ty.clone())),
         HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
@@ -464,7 +464,7 @@ fn test_array_of_structs_execution() {
     // Insert points[1].y = 77
     let val_77 = func.create_value(HirType::I32, HirValueKind::Constant(HirConstant::I32(77)));
     let ptr_1 = func.create_value(
-        HirType::Ptr(Box::new(array_ty.clone())),
+        HirType::Ptr(std::sync::Arc::new(array_ty.clone())),
         HirValueKind::Instruction,
     );
     let insert = HirInstruction::InsertValue {
@@ -534,7 +534,7 @@ fn test_mixed_size_struct() {
 
     // Alloca struct
     let struct_ptr = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(struct_ty.clone()))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(struct_ty.clone()))),
         HirValueKind::Instruction,
     );
     let alloca = HirInstruction::Alloca {
@@ -550,7 +550,7 @@ fn test_mixed_size_struct() {
         HirValueKind::Constant(HirConstant::I64(123456789)),
     );
     let ptr_1 = func.create_value(
-        HirType::Ptr(Box::new(HirType::Struct(struct_ty.clone()))),
+        HirType::Ptr(std::sync::Arc::new(HirType::Struct(struct_ty.clone()))),
         HirValueKind::Instruction,
     );
     let insert = HirInstruction::InsertValue {

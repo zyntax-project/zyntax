@@ -931,7 +931,7 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
             .values
             .get(&val)
             .map(|v| v.ty.clone())
-            .unwrap_or(HirType::Ptr(Box::new(HirType::I8)));
+            .unwrap_or(HirType::Ptr(std::sync::Arc::new(HirType::I8)));
         func.values.insert(
             copy,
             crate::hir::HirValue {
@@ -3355,7 +3355,7 @@ fn release_instructions(
             // The element storage is whatever the header's first field
             // holds at this point, since growing the list replaces it.
             let data = HirId::new();
-            let ty = HirType::Ptr(Box::new(HirType::U8));
+            let ty = HirType::Ptr(std::sync::Arc::new(HirType::U8));
             func.values.insert(
                 data,
                 crate::hir::HirValue {
@@ -3449,7 +3449,7 @@ mod tests {
         f.blocks.insert(entry, HirBlock::new(entry));
 
         let size = add_const(&mut f, HirType::I64, HirConstant::I64(8));
-        let ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let ptr = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let val_to_store = add_const(&mut f, HirType::I64, HirConstant::I64(42));
         let loaded = add_inst_val(&mut f, HirType::I64);
 
@@ -3528,9 +3528,9 @@ mod tests {
         let size = add_const(&mut f, HirType::I64, HirConstant::I64(24));
         let zero = add_const(&mut f, HirType::I64, HirConstant::I64(0));
         let seven = add_const(&mut f, HirType::I64, HirConstant::I64(7));
-        let ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
-        let gep = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::U8)));
-        let slot = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let ptr = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
+        let gep = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
+        let slot = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
 
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Call {
@@ -3550,7 +3550,7 @@ mod tests {
         block.instructions.push(HirInstruction::Cast {
             op: crate::hir::CastOp::Bitcast,
             result: slot,
-            ty: HirType::Ptr(Box::new(HirType::I64)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             operand: gep,
         });
         block.instructions.push(HirInstruction::Store {
@@ -3591,14 +3591,14 @@ mod tests {
     fn skips_when_pointer_is_returned() {
         let mut f = HirFunction::new(
             InternedString::new_global("alloc_and_return"),
-            empty_sig(HirType::Ptr(Box::new(HirType::I64))),
+            empty_sig(HirType::Ptr(std::sync::Arc::new(HirType::I64))),
         );
         let entry = HirId::new();
         f.entry_block = entry;
         f.blocks.clear();
         f.blocks.insert(entry, HirBlock::new(entry));
         let size = add_const(&mut f, HirType::I64, HirConstant::I64(8));
-        let ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let ptr = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Call {
             result: Some(ptr),
@@ -3633,12 +3633,12 @@ mod tests {
         let entry = *f.blocks.keys().next().unwrap();
         let data_bytes = add_const(&mut f, HirType::I64, HirConstant::I64(32));
         let header_bytes = add_const(&mut f, HirType::I64, HirConstant::I64(24));
-        let data = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let data = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let header = add_inst_val(
             &mut f,
-            HirType::Ptr(Box::new(crate::ssa::list_header_type())),
+            HirType::Ptr(std::sync::Arc::new(crate::ssa::list_header_type())),
         );
-        let loaded = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let loaded = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let elem = add_inst_val(&mut f, HirType::I64);
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Call {
@@ -3665,7 +3665,7 @@ mod tests {
         });
         block.instructions.push(HirInstruction::Load {
             result: loaded,
-            ty: HirType::Ptr(Box::new(HirType::I64)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
             ptr: header,
             align: 8,
             volatile: false,
@@ -3730,8 +3730,8 @@ mod tests {
         f.blocks.clear();
         f.blocks.insert(entry, HirBlock::new(entry));
         let size = add_const(&mut f, HirType::I64, HirConstant::I64(8));
-        let data_ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
-        let stash_slot = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let data_ptr = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
+        let stash_slot = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Alloca {
             result: stash_slot,
@@ -3772,7 +3772,7 @@ mod tests {
         f.blocks.clear();
         f.blocks.insert(entry, HirBlock::new(entry));
         let size = add_const(&mut f, HirType::I64, HirConstant::I64(8));
-        let ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let ptr = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Call {
             result: Some(ptr),
@@ -3813,7 +3813,7 @@ mod tests {
         f.blocks.clear();
         f.blocks.insert(entry, HirBlock::new(entry));
         let size = add_const(&mut f, HirType::I64, HirConstant::I64(8));
-        let ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let ptr = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Call {
             result: Some(ptr),
@@ -3836,14 +3836,14 @@ mod tests {
     fn build_constructor() -> HirFunction {
         let mut f = HirFunction::new(
             InternedString::new_global("make"),
-            empty_sig(HirType::Ptr(Box::new(HirType::I64))),
+            empty_sig(HirType::Ptr(std::sync::Arc::new(HirType::I64))),
         );
         let entry = HirId::new();
         f.entry_block = entry;
         f.blocks.clear();
         f.blocks.insert(entry, HirBlock::new(entry));
         let size = add_const(&mut f, HirType::I64, HirConstant::I64(8));
-        let ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let ptr = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Call {
             result: Some(ptr),
@@ -3867,7 +3867,7 @@ mod tests {
         f.entry_block = entry;
         f.blocks.clear();
         f.blocks.insert(entry, HirBlock::new(entry));
-        let got = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let got = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let loaded = add_inst_val(&mut f, HirType::I64);
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Call {
@@ -3936,11 +3936,11 @@ mod tests {
                 params: vec![crate::hir::HirParam {
                     id: HirId::new(),
                     name: InternedString::new_global("p"),
-                    ty: HirType::Ptr(Box::new(HirType::I64)),
+                    ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
                     attributes: Default::default(),
                     ownership: crate::hir::ParamOwnership::Borrowed,
                 }],
-                returns: vec![HirType::Ptr(Box::new(HirType::I64))],
+                returns: vec![HirType::Ptr(std::sync::Arc::new(HirType::I64))],
                 type_params: vec![],
                 const_params: vec![],
                 lifetime_params: vec![],
@@ -4083,7 +4083,7 @@ mod tests {
         f.blocks.insert(body, HirBlock::new(body));
         f.blocks.insert(exit, HirBlock::new(exit));
 
-        let ptr_ty = HirType::Ptr(Box::new(HirType::I64));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
         let size = add_const(&mut f, HirType::I64, HirConstant::I64(8));
         let cond = add_const(&mut f, HirType::Bool, HirConstant::Bool(true));
         let p0 = add_inst_val(&mut f, ptr_ty.clone());
@@ -4269,7 +4269,7 @@ mod tests {
             f.blocks.insert(id, HirBlock::new(id));
         }
 
-        let ptr_ty = HirType::Ptr(Box::new(HirType::I8));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(HirType::I8));
         let cond = add_const(&mut f, HirType::Bool, HirConstant::Bool(true));
         let literal = add_const(&mut f, ptr_ty.clone(), HirConstant::Null(ptr_ty.clone()));
         let seed = add_inst_val(&mut f, ptr_ty.clone());
@@ -4637,7 +4637,7 @@ mod tests {
         f.blocks.clear();
         f.blocks.insert(entry, HirBlock::new(entry));
         let size = add_const(&mut f, HirType::I64, HirConstant::I64(8));
-        let ptr = add_inst_val(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+        let ptr = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let block = f.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Call {
             result: Some(ptr),
@@ -4670,7 +4670,7 @@ mod tests {
         crate::hir::HirParam {
             id: HirId::new(),
             name: InternedString::new_global("v"),
-            ty: HirType::Ptr(Box::new(HirType::I8)),
+            ty: HirType::Ptr(std::sync::Arc::new(HirType::I8)),
             attributes: Default::default(),
             ownership: crate::hir::ParamOwnership::Borrowed,
         }
@@ -4704,7 +4704,7 @@ mod tests {
             v,
             HirValue {
                 id: v,
-                ty: HirType::Ptr(Box::new(HirType::I8)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::I8)),
                 kind: HirValueKind::Parameter(0),
                 uses: Default::default(),
                 span: None,
@@ -4733,10 +4733,10 @@ mod tests {
         caller.blocks.insert(entry, HirBlock::new(entry));
         let a = add_const(
             &mut caller,
-            HirType::Ptr(Box::new(HirType::I8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::I8)),
             HirConstant::I64(0),
         );
-        let s = add_inst_val(&mut caller, HirType::Ptr(Box::new(HirType::I8)));
+        let s = add_inst_val(&mut caller, HirType::Ptr(std::sync::Arc::new(HirType::I8)));
         let result = add_inst_val(&mut caller, HirType::I64);
         let block = caller.blocks.get_mut(&entry).unwrap();
         block.instructions.push(HirInstruction::Call {

@@ -669,7 +669,7 @@ fn expand(
         // A value of an aggregate type is the address of the aggregate,
         // and a load of the type itself would copy it: load the address.
         Read::Data if matches!(result_ty, HirType::Struct(_) | HirType::Array(_, _)) => {
-            let addr_ty = HirType::Ptr(Box::new(result_ty.clone()));
+            let addr_ty = HirType::Ptr(std::sync::Arc::new(result_ty.clone()));
             let ptr = field_ptr(func, boxed, DATA_OFFSET, addr_ty.clone(), out);
             let addr = value(func, addr_ty.clone());
             out.push(load(addr, addr_ty, ptr));
@@ -713,7 +713,7 @@ fn data_ptr(
     pointee: HirType,
     out: &mut Vec<HirInstruction>,
 ) -> HirId {
-    let data_ty = HirType::Ptr(Box::new(pointee));
+    let data_ty = HirType::Ptr(std::sync::Arc::new(pointee));
     let ptr = field_ptr(func, boxed, DATA_OFFSET, data_ty.clone(), out);
     let data = value(func, data_ty.clone());
     out.push(load(data, data_ty, ptr));
@@ -729,14 +729,14 @@ fn field_ptr(
     out: &mut Vec<HirInstruction>,
 ) -> HirId {
     let offset_id = constant(func, HirType::I64, HirConstant::I64(offset));
-    let gep = value(func, HirType::Ptr(Box::new(HirType::U8)));
+    let gep = value(func, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
     out.push(HirInstruction::GetElementPtr {
         result: gep,
         ty: HirType::U8,
         ptr: boxed,
         indices: vec![offset_id],
     });
-    let ptr_ty = HirType::Ptr(Box::new(field_ty));
+    let ptr_ty = HirType::Ptr(std::sync::Arc::new(field_ty));
     let ptr = value(func, ptr_ty.clone());
     out.push(HirInstruction::Cast {
         result: ptr,

@@ -484,7 +484,7 @@ mod tests {
             fields: vec![HirType::I64; 3],
             packed: false,
         });
-        let carrier = HirType::Ptr(Box::new(ty.clone()));
+        let carrier = HirType::Ptr(std::sync::Arc::new(ty.clone()));
         let ptr = add_param(&mut f, carrier.clone(), 0);
         for _ in 0..2 {
             // An aggregate value may be carried as the address of its bytes.
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn two_loads_same_ptr_collapse_to_one() {
         let (mut f, entry) = mk_func();
-        let p = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
+        let p = add_param(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)), 0);
         let l1 = add_inst(&mut f, HirType::I64);
         let l2 = add_inst(&mut f, HirType::I64);
         let sum = add_inst(&mut f, HirType::I64);
@@ -639,7 +639,7 @@ mod tests {
     #[test]
     fn intervening_store_blocks_collapse() {
         let (mut f, entry) = mk_func();
-        let p = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
+        let p = add_param(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)), 0);
         let v = add_param(&mut f, HirType::I64, 1);
         let l1 = add_inst(&mut f, HirType::I64);
         let l2 = add_inst(&mut f, HirType::I64);
@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn intervening_call_blocks_collapse() {
         let (mut f, entry) = mk_func();
-        let p = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
+        let p = add_param(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)), 0);
         let l1 = add_inst(&mut f, HirType::I64);
         let l2 = add_inst(&mut f, HirType::I64);
         push(
@@ -731,8 +731,8 @@ mod tests {
     #[test]
     fn different_pointers_do_not_alias_each_other() {
         let (mut f, entry) = mk_func();
-        let p1 = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 0);
-        let p2 = add_param(&mut f, HirType::Ptr(Box::new(HirType::I64)), 1);
+        let p1 = add_param(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)), 0);
+        let p2 = add_param(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)), 1);
         let l1 = add_inst(&mut f, HirType::I64);
         let l2 = add_inst(&mut f, HirType::I64);
         push(
@@ -766,11 +766,13 @@ mod tests {
     /// loads the pass removed.
     fn typed_store_between_loads(store_ty: &str, load_ty: &str, exact: &[&str]) -> usize {
         let named = |name: &str| {
-            HirType::Ptr(Box::new(HirType::Struct(crate::hir::HirStructType {
-                name: Some(InternedString::new_global(name)),
-                fields: vec![HirType::I64],
-                packed: false,
-            })))
+            HirType::Ptr(std::sync::Arc::new(HirType::Struct(
+                crate::hir::HirStructType {
+                    name: Some(InternedString::new_global(name)),
+                    fields: vec![HirType::I64],
+                    packed: false,
+                },
+            )))
         };
         let (mut f, entry) = mk_func();
         let stored = add_param(&mut f, named(store_ty), 0);

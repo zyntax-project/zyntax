@@ -468,7 +468,7 @@ fn pointer_loop_with_a_cold_call() -> (
     use zyntax_typed_ast::InternedString;
 
     let i64_ty = HirType::I64;
-    let cell_ty = HirType::Ptr(Box::new(HirType::Struct(HirStructType {
+    let cell_ty = HirType::Ptr(std::sync::Arc::new(HirType::Struct(HirStructType {
         name: Some(InternedString::new_global("Cell")),
         fields: vec![HirType::I64],
         packed: false,

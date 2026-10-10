@@ -145,7 +145,7 @@ its fields in declaration order, encoded by these rules:
 | `Option<T>` | `00` for `None`; `01` then `T` for `Some` |
 | struct, tuple, tuple struct | each field in declaration order, nothing else |
 | newtype struct (`HirId`, `TypeId`, `LifetimeId`) | the inner value |
-| `Box<T>` | `T` |
+| `Box<T>`, `Arc<T>` | `T` |
 | `Vec<T>`, `HashSet<T>` | varint element count, then the elements |
 | `IndexMap<K, V>` | varint entry count, then key, value, key, value, ... |
 | enum | varint variant index (0-based declaration order), then the variant's fields as a struct or tuple; a unit variant is the index alone |
@@ -230,8 +230,8 @@ An empty module with id 1 named `m`, in the Postcard encoding (58 bytes):
 ## 5. Payload Data Model
 
 This is the format 6.0 schema. Types are written in Rust notation; every
-struct field is present, in the order shown. A `Box<T>` in the source is
-shown as `T`, which encodes identically.
+struct field is present, in the order shown. A `Box<T>` or `Arc<T>` in the
+source is shown as `T`, which encodes identically.
 
 ### 5.1 Identifiers and scalars
 

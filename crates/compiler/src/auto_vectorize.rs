@@ -1815,7 +1815,7 @@ mod tests {
         f.blocks.get_mut(&exit).unwrap().predecessors = vec![header];
 
         let n_ty = HirType::I64;
-        let ptr_ty = HirType::Ptr(Box::new(elem_ty.clone()));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(elem_ty.clone()));
         let ptr_a = add_param(&mut f, ptr_ty.clone(), 0);
         let ptr_b = add_param(&mut f, ptr_ty.clone(), 1);
         let ptr_c = add_param(&mut f, ptr_ty.clone(), 2);
@@ -1936,7 +1936,7 @@ mod tests {
         f.blocks.get_mut(&exit).unwrap().predecessors = vec![header];
 
         let n_ty = HirType::I64;
-        let ptr_ty = HirType::Ptr(Box::new(elem_ty.clone()));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(elem_ty.clone()));
         let ptr_a = add_param(&mut f, ptr_ty.clone(), 0);
         let ptr_b = add_param(&mut f, ptr_ty.clone(), 1);
         let n = add_const(&mut f, n_ty.clone(), HirConstant::I64(128));
@@ -2137,7 +2137,7 @@ mod tests {
 
         let elem_ty = HirType::F32;
         let n_ty = HirType::I64;
-        let ptr_ty = HirType::Ptr(Box::new(elem_ty.clone()));
+        let ptr_ty = HirType::Ptr(std::sync::Arc::new(elem_ty.clone()));
         let ptr_a = add_param(&mut f, ptr_ty.clone(), 0);
         let ptr_b = add_param(&mut f, ptr_ty.clone(), 1);
         let ptr_c = add_param(&mut f, ptr_ty.clone(), 2);

@@ -3650,7 +3650,7 @@ mod tests {
     fn a_constructor_with_a_malloc_is_inlined_outside_a_loop() {
         let mut callee = HirFunction::new(
             InternedString::new_global("make"),
-            sig(vec![], HirType::Ptr(Box::new(HirType::I64))),
+            sig(vec![], HirType::Ptr(std::sync::Arc::new(HirType::I64))),
         );
         let entry = HirId::new();
         callee.entry_block = entry;
@@ -3658,7 +3658,7 @@ mod tests {
         callee.blocks.insert(entry, HirBlock::new(entry));
         let size = add_const(&mut callee, HirType::I64, HirConstant::I64(8));
         let value = add_const(&mut callee, HirType::I64, HirConstant::I64(42));
-        let ptr = add_inst(&mut callee, HirType::Ptr(Box::new(HirType::I64)));
+        let ptr = add_inst(&mut callee, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let blk = callee.blocks.get_mut(&entry).unwrap();
         blk.instructions.push(HirInstruction::Call {
             result: Some(ptr),
@@ -3686,7 +3686,7 @@ mod tests {
         caller.entry_block = centry;
         caller.blocks.clear();
         caller.blocks.insert(centry, HirBlock::new(centry));
-        let got = add_inst(&mut caller, HirType::Ptr(Box::new(HirType::I64)));
+        let got = add_inst(&mut caller, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
         let loaded = add_inst(&mut caller, HirType::I64);
         let blk = caller.blocks.get_mut(&centry).unwrap();
         blk.instructions.push(HirInstruction::Call {
@@ -3835,7 +3835,7 @@ mod tests {
         let x = add_value_for_param(&mut f, 0, HirType::I64);
         let size = add_const(&mut f, HirType::I64, HirConstant::I64(8));
         for _ in 0..n {
-            let ptr = add_inst(&mut f, HirType::Ptr(Box::new(HirType::I64)));
+            let ptr = add_inst(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
             let blk = f.blocks.get_mut(&entry).unwrap();
             blk.instructions.push(HirInstruction::Call {
                 result: Some(ptr),

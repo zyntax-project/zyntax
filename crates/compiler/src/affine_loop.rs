@@ -1310,8 +1310,8 @@ mod tests {
         let b = add_const(&mut f0, acc_ty.clone(), HirConstant::F64(1.0));
         let ptr = add_const(
             &mut f0,
-            HirType::Ptr(Box::new(HirType::F64)),
-            HirConstant::Null(HirType::Ptr(Box::new(HirType::F64))),
+            HirType::Ptr(std::sync::Arc::new(HirType::F64)),
+            HirConstant::Null(HirType::Ptr(std::sync::Arc::new(HirType::F64))),
         );
 
         let mut s = skeleton(acc_ty.clone(), i_init, bound, ind_ty.clone());

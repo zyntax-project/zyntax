@@ -547,18 +547,20 @@ mod tests {
         );
         let null = value(
             &mut values,
-            HirType::Ptr(Box::new(HirType::U8)),
-            HirValueKind::Constant(HirConstant::Null(HirType::Ptr(Box::new(HirType::U8)))),
+            HirType::Ptr(std::sync::Arc::new(HirType::U8)),
+            HirValueKind::Constant(HirConstant::Null(HirType::Ptr(std::sync::Arc::new(
+                HirType::U8,
+            )))),
         );
         let allocation = value(
             &mut values,
-            HirType::Ptr(Box::new(HirType::U8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             HirValueKind::Instruction,
         );
         let address = value(&mut values, HirType::I64, HirValueKind::Instruction);
         let pointer = value(
             &mut values,
-            HirType::Ptr(Box::new(HirType::U8)),
+            HirType::Ptr(std::sync::Arc::new(HirType::U8)),
             HirValueKind::Instruction,
         );
         let nonnull = value(&mut values, HirType::Bool, HirValueKind::Instruction);
@@ -582,7 +584,7 @@ mod tests {
             },
             HirInstruction::Cast {
                 result: pointer,
-                ty: HirType::Ptr(Box::new(HirType::U8)),
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::U8)),
                 op: CastOp::IntToPtr,
                 operand: address,
             },

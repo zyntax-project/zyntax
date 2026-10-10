@@ -81,7 +81,7 @@ fn test_const_generic_array_compilation() {
         params: vec![HirParam {
             id: HirId::new(),
             name: intern_str(&mut arena, "arr"),
-            ty: HirType::Array(Box::new(HirType::I32), 0), // Size will be substituted
+            ty: HirType::Array(std::sync::Arc::new(HirType::I32), 0), // Size will be substituted
             attributes: ParamAttributes::default(),
             ownership: Default::default(),
         }],
@@ -147,8 +147,8 @@ fn test_const_generic_struct_after_monomorphization() {
     let buffer_struct = HirStructType {
         name: Some(intern_str(&mut arena, "Buffer")),
         fields: vec![
-            HirType::Array(Box::new(HirType::U8), 256), // data: [u8; 256]
-            HirType::U64,                               // len: u64
+            HirType::Array(std::sync::Arc::new(HirType::U8), 256), // data: [u8; 256]
+            HirType::U64,                                          // len: u64
         ],
         packed: false,
     };
@@ -184,7 +184,10 @@ fn test_nested_const_generics() {
                 id: HirId::new(),
                 name: intern_str(&mut arena, "a"),
                 // [[f32; N]; M] - will be substituted
-                ty: HirType::Array(Box::new(HirType::Array(Box::new(HirType::F32), 0)), 0),
+                ty: HirType::Array(
+                    std::sync::Arc::new(HirType::Array(std::sync::Arc::new(HirType::F32), 0)),
+                    0,
+                ),
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             },
@@ -192,14 +195,20 @@ fn test_nested_const_generics() {
                 id: HirId::new(),
                 name: intern_str(&mut arena, "b"),
                 // [[f32; P]; N] - will be substituted
-                ty: HirType::Array(Box::new(HirType::Array(Box::new(HirType::F32), 0)), 0),
+                ty: HirType::Array(
+                    std::sync::Arc::new(HirType::Array(std::sync::Arc::new(HirType::F32), 0)),
+                    0,
+                ),
                 attributes: ParamAttributes::default(),
                 ownership: Default::default(),
             },
         ],
         returns: vec![
             // [[f32; P]; M] - will be substituted
-            HirType::Array(Box::new(HirType::Array(Box::new(HirType::F32), 0)), 0),
+            HirType::Array(
+                std::sync::Arc::new(HirType::Array(std::sync::Arc::new(HirType::F32), 0)),
+                0,
+            ),
         ],
         type_params: vec![],
         const_params: vec![
@@ -244,7 +253,7 @@ fn test_const_generic_default_values() {
     let signature = HirFunctionSignature {
         params: vec![],
         returns: vec![
-            HirType::Array(Box::new(HirType::U8), 0), // Will be substituted
+            HirType::Array(std::sync::Arc::new(HirType::U8), 0), // Will be substituted
         ],
         type_params: vec![],
         const_params: vec![HirConstParam {
