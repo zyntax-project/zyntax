@@ -66,6 +66,10 @@ use crate::hir::{
     HirTerminator, HirType, HirValue, HirValueKind,
 };
 use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
+
+/// Old id to new id, as a body is copied into a caller; insertion
+/// ordered so it reaches `replace_uses` as it is.
+type Subs = crate::hir::IdMap<HirId, HirId>;
 use indexmap::IndexMap;
 use std::sync::Arc;
 
@@ -493,7 +497,7 @@ pub fn run_module_recursive(module: &mut HirModule) -> RecursiveInlineStats {
             Some(f) => f,
             None => continue,
         };
-        let mut subs: HashMap<HirId, HirId> = HashMap::default();
+        let mut subs = Subs::default();
         for job in jobs {
             let sub = match job.kind {
                 InlineKind::Leaf => apply_inline(live, &job, &snapshot),
@@ -1200,7 +1204,7 @@ fn inline_in_function(
     let mut caller_inst_count: usize = count_insts(caller);
     // What every splice left to apply: the substitution of each call's
     // result, and whether the block edges need rebuilding.
-    let mut subs: HashMap<HirId, HirId> = HashMap::default();
+    let mut subs = Subs::default();
     let mut spliced_blocks = false;
 
     // Walk every block; for each Call instruction, classify and
@@ -1810,7 +1814,7 @@ fn apply_inline(
     // caller's argument ids directly (no new value needed; the
     // caller already owns them). Other callee-defined values get
     // fresh caller-side ids.
-    let mut subs: HashMap<HirId, HirId> = HashMap::default();
+    let mut subs = Subs::default();
     let mut new_values: Vec<(HirId, HirValue)> = Vec::new();
     let (call_args, arg_casts) = convert_args_to_params(caller, callee, &job.args);
 
@@ -1947,9 +1951,9 @@ fn apply_inline(
 /// through a body that returned another call's result; the results
 /// themselves, defined by nothing now, leave the value table. Then the
 /// block edges are rebuilt if a body of several blocks went in.
-fn finish_inlines(caller: &mut HirFunction, subs: HashMap<HirId, HirId>, rebuild_edges: bool) {
+fn finish_inlines(caller: &mut HirFunction, subs: Subs, rebuild_edges: bool) {
     if !subs.is_empty() {
-        let resolved: HashMap<HirId, HirId> = subs
+        let resolved: Subs = subs
             .keys()
             .map(|&from| {
                 let mut to = subs[&from];
@@ -2005,7 +2009,7 @@ fn apply_inline_multi_block(
     let post_block_id = HirId::new();
 
     // ─── 2. Build value substitutions (params → args, locals → fresh).
-    let mut subs: HashMap<HirId, HirId> = HashMap::default();
+    let mut subs = Subs::default();
     let mut new_values: Vec<(HirId, HirValue)> = Vec::new();
     let (call_args, arg_casts) = convert_args_to_params(caller, callee, &job.args);
 
@@ -2333,7 +2337,7 @@ fn rebuild_cfg_edges(func: &mut HirFunction) {
 /// Rewrite every operand / terminator reference to the keys of
 /// `subs` so they point at the mapped value instead. Used for
 /// `call_result → callee_return_value` after splice.
-fn replace_uses_across_function(func: &mut HirFunction, subs: &HashMap<HirId, HirId>) {
+fn replace_uses_across_function(func: &mut HirFunction, subs: &Subs) {
     if subs.is_empty() {
         return;
     }
@@ -2370,7 +2374,7 @@ fn replace_uses_across_function(func: &mut HirFunction, subs: &HashMap<HirId, Hi
     }
 }
 
-fn substitute_operands(inst: &mut HirInstruction, subs: &HashMap<HirId, HirId>) {
+fn substitute_operands(inst: &mut HirInstruction, subs: &Subs) {
     // A cloned instruction defines the fresh id its result maps to, the
     // one the caller's `values` table holds and its uses were given. The
     // recursive inliner's snapshot shares every id with the live body,
@@ -2383,8 +2387,7 @@ fn substitute_operands(inst: &mut HirInstruction, subs: &HashMap<HirId, HirId>) 
 
     // Operands go through `replace_uses`, which covers every variant.
     if !subs.is_empty() {
-        let idx: IndexMap<HirId, HirId> = subs.iter().map(|(&k, &v)| (k, v)).collect();
-        inst.replace_uses(&idx);
+        inst.replace_uses(subs);
     }
 }
 
