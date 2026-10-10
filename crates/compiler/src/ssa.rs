@@ -308,7 +308,7 @@ pub struct SsaBuilder {
     /// Original return type from TypedAST (for auto-wrapping Result returns)
     original_return_type: Option<Type>,
     /// Variables that have their address taken (need stack allocation)
-    address_taken_vars: HashSet<InternedString>,
+    address_taken_vars: IdHashSet<InternedString>,
     /// Stack slots for address-taken variables (var name -> alloca result)
     stack_slots: IndexMap<InternedString, HirId>,
     /// Module globals by name, with the global's id and type. A name a
@@ -317,9 +317,9 @@ pub struct SsaBuilder {
     /// Address values for the globals this function has touched.
     global_refs: IndexMap<InternedString, HirId>,
     /// The one undefined value of each scalar type, see `create_undef`.
-    shared_undefs: HashMap<HirType, HirId>,
+    shared_undefs: IdHashMap<HirType, HirId>,
     /// Every name a `let` in this function binds, whatever its type.
-    let_names: HashSet<InternedString>,
+    let_names: IdHashSet<InternedString>,
     /// External function link names (alias -> ZRTL symbol)
     /// e.g., "tensor_add" -> "$Tensor$add"
     extern_link_names: Arc<IndexMap<InternedString, String>>,
@@ -769,12 +769,12 @@ impl SsaBuilder {
             expected_growable: false,
             continuation_block: None,
             original_return_type: None,
-            address_taken_vars: HashSet::new(),
+            address_taken_vars: IdHashSet::default(),
             stack_slots: IndexMap::new(),
             module_globals: IndexMap::new(),
             global_refs: IndexMap::new(),
-            shared_undefs: HashMap::new(),
-            let_names: HashSet::new(),
+            shared_undefs: IdHashMap::default(),
+            let_names: IdHashSet::default(),
             extern_link_names: Arc::default(),
             compute_yield_stack: Vec::new(),
             simd_continue_block: None,
@@ -830,12 +830,12 @@ impl SsaBuilder {
             expected_growable: false,
             continuation_block: None,
             original_return_type: None,
-            address_taken_vars: HashSet::new(),
+            address_taken_vars: IdHashSet::default(),
             stack_slots: IndexMap::new(),
             module_globals: IndexMap::new(),
             global_refs: IndexMap::new(),
-            shared_undefs: HashMap::new(),
-            let_names: HashSet::new(),
+            shared_undefs: IdHashMap::default(),
+            let_names: IdHashSet::default(),
             extern_link_names: Arc::default(),
             compute_yield_stack: Vec::new(),
             simd_continue_block: None,
@@ -1415,7 +1415,7 @@ impl SsaBuilder {
 
         // Only blocks reachable from the entry are lowered: the builder
         // leaves a block behind for whatever follows a jump.
-        let index: HashMap<HirId, usize> =
+        let index: IdHashMap<HirId, usize> =
             blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
         if !index.contains_key(&block_id) {
             return Err(crate::CompilerError::Analysis(
@@ -1424,7 +1424,7 @@ impl SsaBuilder {
         }
         let mut reachable: IdHashSet<HirId> = IdHashSet::default();
         let mut stack = vec![block_id];
-        let mut preds: HashMap<HirId, Vec<HirId>> = HashMap::new();
+        let mut preds: IdHashMap<HirId, Vec<HirId>> = IdHashMap::default();
         while let Some(id) = stack.pop() {
             if !reachable.insert(id) {
                 continue;
@@ -1480,12 +1480,12 @@ impl SsaBuilder {
 
         let entry = &blocks[index[&block_id]];
         let mut end = self.lower_typed_block(entry, entry.id != exit, &loops)?;
-        let mut done: HashSet<HirId> = HashSet::from([block_id]);
+        let mut done: IdHashSet<HirId> = IdHashSet::from_iter([block_id]);
         let mut pending: Vec<usize> = order
             .into_iter()
             .filter(|&i| blocks[i].id != block_id)
             .collect();
-        let all_done = |done: &HashSet<HirId>, id: HirId| {
+        let all_done = |done: &IdHashSet<HirId>, id: HirId| {
             preds
                 .get(&id)
                 .is_none_or(|ps| ps.iter().all(|p| done.contains(p)))
@@ -7744,7 +7744,7 @@ impl SsaBuilder {
                 // Undefined incomings count, as above: a value from one
                 // predecessor beside an undef from another is defined on
                 // one path only and keeps its phi.
-                let unique_vals: HashSet<HirId> = found_values
+                let unique_vals: IdHashSet<HirId> = found_values
                     .iter()
                     .map(|(v, _)| *v)
                     .filter(|&v| v != phi_val)
@@ -7959,7 +7959,7 @@ impl SsaBuilder {
         if self.pending_subst.is_empty() {
             return;
         }
-        let mut map: IndexMap<HirId, HirId> = IndexMap::new();
+        let mut map: IdMap<HirId, HirId> = IdMap::default();
         for from in self.pending_subst.keys().copied().collect::<Vec<_>>() {
             let to = self.resolve_subst(from);
             if to != from {
@@ -8267,8 +8267,8 @@ impl SsaBuilder {
             // A phi collapsed to another phi collapsed in the same round
             // resolves to what that one resolves to; a ring of them
             // names nothing and is undefined.
-            let map: HashMap<HirId, HirId> = trivial.iter().map(|(p, v, _)| (*p, *v)).collect();
-            let removed: HashSet<HirId> = map.keys().copied().collect();
+            let map: IdHashMap<HirId, HirId> = trivial.iter().map(|(p, v, _)| (*p, *v)).collect();
+            let removed: IdHashSet<HirId> = map.keys().copied().collect();
             for (phi, mut value, ty) in trivial {
                 let mut steps = 0;
                 while let Some(next) = map.get(&value).copied() {
@@ -8329,7 +8329,7 @@ impl SsaBuilder {
         // type-derivation loop can skip them when they're still at
         // the I64 fallback (otherwise a chained phi-of-phi sees its
         // upstream phi's stale I64 type and bails out as "mixed").
-        let phi_result_ids: HashSet<HirId> = phi_locations.iter().map(|(_, p)| *p).collect();
+        let phi_result_ids: IdHashSet<HirId> = phi_locations.iter().map(|(_, p)| *p).collect();
         for _ in 0..16 {
             let mut changed = false;
             for (bid, phi_result) in &phi_locations {
@@ -8930,14 +8930,14 @@ impl SsaBuilder {
 
         // Group variable writes by variable name
         // This creates a map: variable -> set of blocks that define it
-        let mut defs_per_var: IndexMap<InternedString, HashSet<HirId>> = IndexMap::new();
+        let mut defs_per_var: IndexMap<InternedString, IdHashSet<HirId>> = IndexMap::new();
 
         // Use scanned writes instead of self.variable_writes
         for (block_id, vars) in &scanned_writes {
             for &var in vars {
                 defs_per_var
                     .entry(var)
-                    .or_insert_with(HashSet::new)
+                    .or_insert_with(IdHashSet::default)
                     .insert(*block_id);
             }
         }
@@ -8988,10 +8988,14 @@ impl SsaBuilder {
     }
 
     /// Compute Iterated Dominance Frontier for a set of blocks
-    fn compute_idf(&self, def_blocks: &HashSet<HirId>, dom_info: &DominanceInfo) -> HashSet<HirId> {
+    fn compute_idf(
+        &self,
+        def_blocks: &IdHashSet<HirId>,
+        dom_info: &DominanceInfo,
+    ) -> IdHashSet<HirId> {
         let mut worklist: Vec<HirId> = def_blocks.iter().copied().collect();
-        let mut idf = HashSet::new();
-        let mut processed = HashSet::new();
+        let mut idf = IdHashSet::default();
+        let mut processed = IdHashSet::default();
 
         while let Some(block) = worklist.pop() {
             if !processed.insert(block) {
