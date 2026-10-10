@@ -311,6 +311,9 @@ pub struct CraneliftBackend {
     exported_symbols: HashMap<String, *const u8>,
     /// Runtime symbols registered for external linking
     runtime_symbols: Vec<(String, *const u8)>,
+    /// The same symbols as the JIT module looks them up; see
+    /// [`SymbolTable`].
+    symbol_table: SymbolTable,
     /// Symbol signatures for auto-boxing support (symbol_name → signature)
     symbol_signatures: HashMap<String, crate::zrtl::ZrtlSymbolSig>,
     /// External function link names (HirId → symbol name) for boxing support
@@ -560,10 +563,20 @@ fn configured_isa(
         .unwrap()
 }
 
+/// Every runtime symbol a backend was given, by name: the JIT module
+/// looks a name up here, so a symbol given after the module was made
+/// resolves without making another module.
+type SymbolTable = Arc<RwLock<std::collections::HashMap<String, usize>>>;
+
 /// A builder for a JIT module compiling for `isa`: it places its code
 /// and data in `reservation` bytes of address space of its own, and
-/// resolves the runtime symbols every module's code may call.
-fn jit_builder(isa: Arc<dyn cranelift_codegen::isa::TargetIsa>, reservation: usize) -> JITBuilder {
+/// resolves the runtime symbols every module's code may call, `table`'s
+/// ahead of any other.
+fn jit_builder(
+    isa: Arc<dyn cranelift_codegen::isa::TargetIsa>,
+    reservation: usize,
+    table: &SymbolTable,
+) -> JITBuilder {
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     if let Some(memory) = crate::jit_memory::provider(reservation) {
         builder.memory_provider(memory);
@@ -588,6 +601,15 @@ fn jit_builder(isa: Arc<dyn cranelift_codegen::isa::TargetIsa>, reservation: usi
     // Ahead of the process's own symbols: what an embedder supplied
     // after this module was set up.
     builder.symbol_lookup_fn(Box::new(crate::late_symbols::lookup));
+    // Ahead of those, what this backend was given; tried first.
+    let table = Arc::clone(table);
+    builder.symbol_lookup_fn(Box::new(move |name| {
+        table
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .map(|address| *address as *const u8)
+    }));
     builder
 }
 
@@ -630,7 +652,8 @@ impl CraneliftBackend {
         let isa_shared = Arc::clone(&isa);
 
         // Create JIT module and register runtime functions
-        let mut builder = jit_builder(isa, jit_reservation);
+        let symbol_table = SymbolTable::default();
+        let mut builder = jit_builder(isa, jit_reservation, &symbol_table);
 
         // Register all runtime symbols (both stdlib and frontend-specific)
         // All symbols are now provided via the plugin system
@@ -671,6 +694,7 @@ impl CraneliftBackend {
             },
             exported_symbols: HashMap::new(),
             runtime_symbols,
+            symbol_table,
             symbol_signatures: HashMap::new(),
             external_link_names: HashMap::new(),
             destination_returns: HashMap::new(),
@@ -10514,6 +10538,10 @@ impl CraneliftBackend {
         // Check if symbol already exists
         if !self.runtime_symbols.iter().any(|(n, _)| n == name) {
             self.runtime_symbols.push((name.to_string(), ptr));
+            self.symbol_table
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name.to_string(), ptr as usize);
         }
     }
 
@@ -10560,6 +10588,16 @@ impl CraneliftBackend {
     /// NOTE: This invalidates previously compiled function pointers!
     /// Use with caution - primarily for cross-module linking setup.
     pub fn rebuild_with_accumulated_symbols(&mut self) -> CompilerResult<()> {
+        // A module that defines nothing yet loses nothing to a rebuild and
+        // gains nothing from one: every symbol it was given resolves
+        // through the table.
+        if self.function_map.is_empty()
+            && self.global_map.is_empty()
+            && self.compiled_functions.is_empty()
+            && self.exported_symbols.is_empty()
+        {
+            return Ok(());
+        }
         // Collect all symbols (runtime + exported)
         let mut all_symbols: Vec<(&str, *const u8)> = self
             .runtime_symbols
@@ -10576,7 +10614,7 @@ impl CraneliftBackend {
         let isa = Arc::clone(&self.isa);
 
         // Create new JIT module with all symbols
-        let mut builder = jit_builder(isa, self.jit_reservation);
+        let mut builder = jit_builder(isa, self.jit_reservation, &self.symbol_table);
         for (name, ptr) in &all_symbols {
             builder.symbol(*name, *ptr);
         }
