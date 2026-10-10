@@ -3175,7 +3175,8 @@ pub(crate) fn closed_items(body: &[py::Stmt], items: &[Item<'_>]) -> HashSet<Str
 struct Inference {
     /// The change clock when the inference began.
     at: u64,
-    reads: Vec<Dep>,
+    /// The keys of the parts it read.
+    reads: Vec<u64>,
     locals: Locals,
     /// What it found done with list fields.
     field_rounds: HashMap<String, FieldRound>,
