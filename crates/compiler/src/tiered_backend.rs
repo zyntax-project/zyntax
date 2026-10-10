@@ -1450,23 +1450,7 @@ impl TieredBackend {
             );
         }
 
-        // The filter applies to this module alone; a rebuild recompiles
-        // earlier modules whole, and their ids are not in this set.
         let trace = std::env::var_os("ZYNTAX_TRACE_OPT_PHASES").is_some();
-        let started = web_time::Instant::now();
-        self.cranelift.with_lock(|be| {
-            be.set_only_compile_reachable(reachable);
-            be.add_lazy_functions(lazy.iter().copied());
-            let compiled = be.compile_module(&module);
-            be.set_only_compile_reachable(None);
-            compiled
-        })?;
-        if trace {
-            eprintln!(
-                "[OPT] codegen: cranelift    {:8.2} ms",
-                started.elapsed().as_secs_f64() * 1000.0
-            );
-        }
         let started = web_time::Instant::now();
 
         // Recorded before it becomes `current_module`, so a later
@@ -1503,31 +1487,16 @@ impl TieredBackend {
             });
         }
 
-        for (func_id, function) in module_context.functions.iter() {
+        for func_id in module_context.functions.keys() {
             // A function an earlier module brought (a library both
             // link) keeps its bead and entry: the stubs already handed
             // out name that bead.
             if self.functions.contains_key(func_id) {
                 continue;
             }
-            let bound = self.adapter.register(ptr::null_mut(), None);
-
             // The bead starts without code: interpreter calls tick it and
-            // beadie publishes the already generated baseline at tier-up.
-            if !lazy.contains(func_id)
-                && !function.is_external
-                && self
-                    .cranelift
-                    .with_lock(|be| be.get_function_ptr(*func_id))
-                    .is_none()
-                && osr::osr_trace_enabled()
-            {
-                eprintln!(
-                    "[reload] no entry pointer for {:?} ({:?}) after module compile",
-                    function.name.resolve_global().unwrap_or_default(),
-                    func_id
-                );
-            }
+            // beadie publishes the generated baseline at tier-up.
+            let bound = self.adapter.register(ptr::null_mut(), None);
 
             // Allocate a stable id and publish the bead in the OSR
             // registry so JIT'd probes can find it.
@@ -1590,13 +1559,53 @@ impl TieredBackend {
         }
         if !joining {
             self.install_promotion_requester();
-            self.precompile_static_hot(&lazy);
         }
         if trace {
             eprintln!(
                 "[OPT] codegen: registration {:8.2} ms",
                 started.elapsed().as_secs_f64() * 1000.0
             );
+        }
+
+        // The filter applies to this module alone; a rebuild recompiles
+        // earlier modules whole, and their ids are not in this set. A
+        // function whose loop is hot before its first call is asked of
+        // the worker under the backend's lock: its body is optimised
+        // while the module compiles, and its own compile, which needs the
+        // module's declarations, waits for them.
+        let started = web_time::Instant::now();
+        self.cranelift.with_lock(|be| {
+            if !joining {
+                self.precompile_static_hot(&lazy);
+            }
+            be.set_only_compile_reachable(reachable);
+            be.add_lazy_functions(lazy.iter().copied());
+            let compiled = be.compile_module(&module_context);
+            be.set_only_compile_reachable(None);
+            compiled
+        })?;
+        if trace {
+            eprintln!(
+                "[OPT] codegen: cranelift    {:8.2} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        if osr::osr_trace_enabled() {
+            for (func_id, function) in module_context.functions.iter() {
+                if !lazy.contains(func_id)
+                    && !function.is_external
+                    && self
+                        .cranelift
+                        .with_lock(|be| be.get_function_ptr(*func_id))
+                        .is_none()
+                {
+                    eprintln!(
+                        "[reload] no entry pointer for {:?} ({:?}) after module compile",
+                        function.name.resolve_global().unwrap_or_default(),
+                        func_id
+                    );
+                }
+            }
         }
 
         Ok(())
