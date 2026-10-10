@@ -217,6 +217,9 @@ pub struct LoweringContext {
     declared_in: indexmap::IndexMap<InternedString, Option<InternedString>>,
     /// Current module being lowered
     pub module: HirModule,
+    /// The string-literal global holding each text the module's own
+    /// lowered bodies spell, one per text.
+    string_literals: std::collections::HashMap<InternedString, HirId>,
     /// Bodies to lower, when lowering is skipping what nothing reaches.
     ///
     /// `None` lowers everything, which is what happens when no entry
@@ -588,6 +591,7 @@ impl LoweringContext {
                 exact_struct_types: config.exact_struct_types.clone(),
                 ..HirModule::new(module_name)
             },
+            string_literals: std::collections::HashMap::new(),
             wanted: None,
             lowered_fns: std::collections::HashSet::new(),
             skipped_at: std::collections::HashMap::new(),
@@ -1341,6 +1345,8 @@ impl AstLowering for LoweringContext {
             self.entered_names = Some(self.config.entry_names.clone());
         }
         self.entered_names = self.entered_functions();
+        // The literals' globals leave with the module.
+        self.string_literals.clear();
         let name = self.module.name;
         Ok(std::mem::replace(&mut self.module, HirModule::new(name)))
     }
@@ -3754,13 +3760,39 @@ impl LoweringContext {
         }
         self.pending_with_scopes.extend(nested_by_fn);
 
-        // Add string globals generated during SSA construction
+        // Add string globals generated during SSA construction: one per
+        // text, which every body reading that text shares.
+        let mut same: crate::hir::IdHashMap<HirId, HirId> = Default::default();
         for global in ssa.string_globals {
-            self.module.globals.insert(global.id, global);
+            let Some(crate::hir::HirConstant::String(text)) = global.initializer else {
+                self.module.globals.insert(global.id, global);
+                continue;
+            };
+            match self.string_literals.entry(text) {
+                std::collections::hash_map::Entry::Occupied(first) => {
+                    same.insert(global.id, *first.get());
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(global.id);
+                    self.module.globals.insert(global.id, global);
+                }
+            }
+        }
+        let mut closures = ssa.closure_functions;
+        if !same.is_empty() {
+            for function in std::iter::once(&mut hir_func).chain(closures.iter_mut()) {
+                for value in function.values.values_mut() {
+                    if let crate::hir::HirValueKind::Global(id) = &mut value.kind
+                        && let Some(first) = same.get(id)
+                    {
+                        *id = *first;
+                    }
+                }
+            }
         }
 
         // Add closure/lambda functions generated during SSA construction
-        for closure_func in ssa.closure_functions {
+        for closure_func in closures {
             self.module.add_function(closure_func);
         }
 
