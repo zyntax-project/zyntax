@@ -32,6 +32,7 @@ mod class_attrs;
 mod classes;
 mod format;
 mod host;
+mod infer_deps;
 mod kwargs;
 mod lower;
 mod modules;

@@ -430,6 +430,7 @@ fn reach(module: &types::Module, ty: Ty, seen: &mut HashSet<Ty>) {
                 DEMOTED.with(|d| d.borrow_mut().insert(n));
             }
             if let Some(class) = module.classes.get(k as usize) {
+                crate::infer_deps::read(crate::infer_deps::Dep::Class(k as usize));
                 for (_, t) in &class.fields {
                     reach(module, *t, seen);
                 }

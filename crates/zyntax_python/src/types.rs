@@ -19,6 +19,7 @@
 //! calls pass and what the body assigns to it, which is exact where the
 //! program is consistent and dynamic where it is not.
 
+use crate::infer_deps::{self as deps, Dep};
 use ruff_python_ast as py;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use zyntax_typed_ast::typed_ast::TypedFunction;
@@ -575,12 +576,14 @@ fn force_merge(
         if ra != rb {
             let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
             c.borrow_mut()[hi as usize] = lo;
+            deps::wrote(Dep::ShapeClasses);
         }
     });
 }
 
 /// The shapes in dict shape `k`'s class.
 fn dict_class(k: u16) -> Vec<u16> {
+    deps::read(Dep::ShapeClasses);
     DICT_CLASSES.with(|c| {
         let root = class_root(c, k);
         let n = c.borrow().len() as u16;
@@ -590,6 +593,7 @@ fn dict_class(k: u16) -> Vec<u16> {
 
 /// The shapes in set shape `k`'s class.
 fn set_class(k: u16) -> Vec<u16> {
+    deps::read(Dep::ShapeClasses);
     SET_CLASSES.with(|c| {
         let root = class_root(c, k);
         let n = c.borrow().len() as u16;
@@ -1595,7 +1599,7 @@ pub(crate) fn bound_method_arity(module: &Module, receiver: Ty, attr: &str) -> O
             _ => None,
         },
         Ty::Class(k) => module
-            .method_sig(k as usize, attr)
+            .method_sig_fixed(k as usize, attr)
             .map(|(sig, _)| (sig.params.len() - 1) as i64),
         _ => None,
     }
@@ -1999,6 +2003,7 @@ fn infer_closures_in(
 /// seeded, so a name it binds itself is its own. Returns whether its
 /// signature changed.
 fn infer_closure(module: &Module, k: u16, def: &ClosureDef, vars: &HashMap<String, Ty>) -> bool {
+    deps::read(Dep::Closure(k));
     let sig = module.closures.borrow()[k as usize].sig.clone();
     let seeds_for = |scope: &crate::scope::Scope| -> HashMap<String, Ty> {
         vars.iter()
@@ -2039,20 +2044,24 @@ fn infer_closure(module: &Module, k: u16, def: &ClosureDef, vars: &HashMap<Strin
     };
     let mut closures = module.closures.borrow_mut();
     let c = &mut closures[k as usize];
+    let mut own = false;
     if c.ret_inferred && c.sig.ret != ret {
         c.sig.ret = ret;
-        changed = true;
+        own = true;
     }
     for (i, (name, ty)) in c.sig.params.iter_mut().enumerate() {
         if let (true, Some(written)) = (c.inferred[i], param_writes.get(name)) {
             let joined = ty.join(*written);
             if joined != *ty {
                 *ty = joined;
-                changed = true;
+                own = true;
             }
         }
     }
-    changed
+    if own {
+        deps::wrote(Dep::Closure(k));
+    }
+    changed || own
 }
 
 /// A closure's definition, for inferring its body.
@@ -2144,6 +2153,7 @@ impl Module {
 
     /// What calling closure `k` returns.
     pub(crate) fn closure_ret(&self, k: u16) -> Ty {
+        deps::read(Dep::Closure(k));
         self.closures
             .borrow()
             .get(k as usize)
@@ -2265,6 +2275,7 @@ impl Module {
         name: &str,
     ) -> Option<(usize, Ty)> {
         let k = set.clone().into_iter().next()?;
+        deps::read(Dep::Field(k, deps::name_key(name)));
         let i = self.classes[k].fields.iter().position(|(f, _)| f == name)?;
         let slot = self.classes[k].fields[i].1;
         Some((
@@ -2288,6 +2299,7 @@ impl Module {
         let Some(k) = set.clone().into_iter().next() else {
             return false;
         };
+        deps::read(Dep::Field(k, deps::name_key(name)));
         let Some((_, slot)) = self.classes[k].fields.iter().find(|(f, _)| f == name) else {
             return false;
         };
@@ -2303,6 +2315,8 @@ impl Module {
         name: &str,
         slot: Ty,
     ) -> Option<Option<Ty>> {
+        // An empty table answers as one without this name's entries.
+        deps::read(Dep::FieldByClass(deps::name_key(name)));
         if self.field_by_class.is_empty() {
             return None;
         }
@@ -2346,8 +2360,11 @@ impl Module {
     /// Whether field `name` of class `k` is typed per class: every class
     /// sharing its slot holds an address in it.
     fn split(&self, k: usize, name: &str) -> bool {
+        let key = deps::name_key(name);
+        deps::read(Dep::FieldByClass(key));
         let mut root = k;
         while let Some(base) = self.classes[root].base {
+            deps::read(Dep::Field(base, key));
             if self.classes[base].fields.iter().any(|(f, _)| f == name) {
                 root = base;
             } else {
@@ -2439,6 +2456,17 @@ impl Module {
 
     /// The signature and function name of `method` as `k` sees it.
     pub(crate) fn method_sig(&self, k: usize, method: &str) -> Option<(&Sig, &str)> {
+        let (sig, name) = self.method_sig_fixed(k, method)?;
+        let key = deps::name_key(name);
+        deps::read(Dep::Ret(key));
+        deps::read(Dep::Params(key));
+        Some((sig, name))
+    }
+
+    /// [`Self::method_sig`] for a caller that reads only what inference
+    /// does not change: the name, and the parameters' names, number,
+    /// defaults and declared receiver.
+    pub(crate) fn method_sig_fixed(&self, k: usize, method: &str) -> Option<(&Sig, &str)> {
         let owner = self.method_owner(k, method)?;
         // Spelled as [`method_fn`] does, in a buffer kept for the lookup.
         METHOD_NAME.with(|name| {
@@ -2458,11 +2486,13 @@ impl Module {
     /// subclass of `k` would reach, since the call goes to whichever the
     /// instance's class holds.
     pub(crate) fn dispatched_ret(&self, k: usize, method: &str) -> Option<Ty> {
-        match self.method_sig(k, method) {
-            Some((sig, _)) => {
+        match self.method_sig_fixed(k, method) {
+            Some((sig, name)) => {
+                deps::read(Dep::Ret(deps::name_key(name)));
                 let mut ret = sig.ret;
                 for sub in self.overriders(k, method) {
-                    if let Some((sub_sig, _)) = self.method_sig(sub, method) {
+                    if let Some((sub_sig, sub_name)) = self.method_sig_fixed(sub, method) {
+                        deps::read(Dep::Ret(deps::name_key(sub_name)));
                         ret = self.join_classes(ret, sub_sig.ret);
                     }
                 }
@@ -2497,7 +2527,7 @@ impl Module {
     /// results. None when no subclass defines it or their arities
     /// differ.
     pub(crate) fn abstract_sig(&self, k: usize, method: &str) -> Option<Sig> {
-        if self.method_sig(k, method).is_some() {
+        if self.method_sig_fixed(k, method).is_some() {
             return None;
         }
         let subs = self.overriders(k, method);
@@ -2534,6 +2564,8 @@ impl Module {
     /// that field's list through a receiver of no known class, since such
     /// a store may put anything in.
     pub(crate) fn denest(&self, field: &str, ty: Ty) -> Ty {
+        // An empty set answers as one without this name.
+        deps::read(Dep::DynamicField(deps::name_key(field)));
         if self.dynamic_fields.is_empty() {
             return ty;
         }
@@ -2580,16 +2612,20 @@ impl Module {
             Ty::Set(k) if !lists_only => dynamic_set(set_shape(k).1),
             other => other,
         };
-        for class in &mut self.classes {
+        let key = deps::name_key(field);
+        for (c, class) in self.classes.iter_mut().enumerate() {
             for (name, ty) in &mut class.fields {
                 if name == field {
                     *ty = denested(*ty);
+                    deps::wrote(Dep::Field(c, key));
+                    deps::wrote(Dep::Class(c));
                 }
             }
         }
-        for ((_, name), ty) in &mut self.field_lists {
+        for ((k, name), ty) in &mut self.field_lists {
             if name == field {
                 *ty = denested(*ty);
+                deps::wrote(Dep::FieldList(*k, key));
             }
         }
         for ((_, name), ty) in &mut self.field_by_class {
@@ -2597,6 +2633,8 @@ impl Module {
                 *ty = denested(*ty);
             }
         }
+        deps::wrote(Dep::DynamicField(key));
+        deps::wrote(Dep::FieldByClass(key));
         true
     }
 
@@ -2776,7 +2814,7 @@ pub(crate) fn call_types(
 }
 
 /// One function's inferred locals.
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, PartialEq)]
 pub(crate) struct Locals {
     pub(crate) vars: HashMap<String, Ty>,
     pub(crate) ret: Ty,
@@ -3131,6 +3169,96 @@ pub(crate) fn closed_items(body: &[py::Stmt], items: &[Item<'_>]) -> HashSet<Str
         .collect()
 }
 
+/// What inferring one body gave, and the parts of the module it read:
+/// while none of those parts changes, inferring the body again gives
+/// the same, so a round keeps this instead.
+struct Inference {
+    /// The change clock when the inference began.
+    at: u64,
+    reads: Vec<Dep>,
+    locals: Locals,
+    /// What it found done with list fields.
+    field_rounds: HashMap<String, FieldRound>,
+    /// The closures it found escaping.
+    escaped: Vec<u16>,
+    /// The rest of what it gave, for [`Self::check`].
+    facts: Vec<ListFact>,
+    passed: Vec<(Target, usize, Ty)>,
+}
+
+impl Inference {
+    /// Whether nothing it read has changed since it was made.
+    fn stands(&self) -> bool {
+        deps::unchanged_since(&self.reads, self.at)
+    }
+
+    /// Give a round's tallies what this inference gave them. The rest of
+    /// what it gave, the module took when it was made and still holds,
+    /// since a round only widens what it finds.
+    fn replay(
+        &self,
+        field_rounds: &mut HashMap<String, FieldRound>,
+        untyped_stores: &mut Vec<(String, bool)>,
+        escaped: &mut Vec<u16>,
+    ) {
+        field_rounds.clone_from(&self.field_rounds);
+        untyped_stores.extend(
+            self.locals
+                .dynamic_field_stores
+                .iter()
+                .filter(|s| s.untyped)
+                .map(|s| (s.field.clone(), s.own)),
+        );
+        escaped.extend_from_slice(&self.escaped);
+    }
+
+    /// That `again`, made where this one would have been kept, gives the
+    /// same: otherwise this one read a part of the module it did not
+    /// record.
+    fn check(&self, again: &Inference, name: &str) {
+        let differs: Vec<&str> = [
+            ("locals", !same_locals(&self.locals, &again.locals)),
+            ("list fields", self.field_rounds != again.field_rounds),
+            ("escaping closures", self.escaped != again.escaped),
+            ("list facts", self.facts != again.facts),
+            ("argument types", self.passed != again.passed),
+        ]
+        .into_iter()
+        .filter(|(_, differs)| *differs)
+        .map(|(what, _)| what)
+        .collect();
+        assert!(
+            differs.is_empty(),
+            "inferring {name} again gave other {} though nothing it was recorded reading changed; it reads a part of the module it does not record (recorded {:?})",
+            differs.join(", "),
+            self.reads
+        );
+    }
+
+    /// [`Self::check`] for the locals alone.
+    fn check_locals(&self, again: &Locals, name: &str) {
+        assert!(
+            same_locals(&self.locals, again),
+            "inferring {name} again gave other locals though nothing it was recorded reading changed; it reads a part of the module it does not record (recorded {:?})",
+            self.reads
+        );
+    }
+}
+
+/// Whether two inferences' locals agree, the order fields are first
+/// written in, which lays them out, included.
+fn same_locals(a: &Locals, b: &Locals) -> bool {
+    a == b && a.field_writes.keys().eq(b.field_writes.keys())
+}
+
+/// Whether every inference a round would keep is made again and checked
+/// against the one kept (`ZYNTAX_CHECK_INFER_DEPS=1`): slow, safe to run
+/// with.
+fn check_kept_inferences() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZYNTAX_CHECK_INFER_DEPS").is_some())
+}
+
 /// Infer the module's signatures to a fixed point. Class layouts are
 /// taken from `known` and refined from what methods assign to `self`;
 /// the unannotated parameters of `known.closed` functions are the join
@@ -3245,6 +3373,13 @@ pub(crate) fn infer_module(
         .enumerate()
         .map(|(i, item)| (item.name.as_str(), i))
         .collect();
+    // Each item's latest inference, and the module body's, kept while
+    // nothing they read changes.
+    let _tracking = deps::Tracking::start();
+    let mut kept: Vec<Option<Inference>> = (0..items.len()).map(|_| None).collect();
+    let mut entry_kept: Option<Inference> = None;
+    let check_kept = check_kept_inferences();
+    let (mut inferred_count, mut kept_count) = (0usize, 0usize);
     for _ in 0..32 {
         inner_rounds += 1;
         let mut changed = false;
@@ -3271,6 +3406,20 @@ pub(crate) fn infer_module(
             if let Some(i) = queue.pop_front() {
                 queued[i] = false;
                 let item = &items[i];
+                let standing = kept[i].take().filter(Inference::stands);
+                inferred_count += 1;
+                kept_count += usize::from(standing.is_some());
+                if !check_kept && let Some(standing) = standing {
+                    standing.replay(&mut item_field_rounds[i], &mut untyped_stores, &mut escaped);
+                    kept[i] = Some(standing);
+                    continue;
+                }
+                let at = deps::now();
+                let escaped_from = escaped.len();
+                deps::start_reading();
+                // The body reads its own parameters; its return type only
+                // through calls of itself, which record it.
+                deps::read(Dep::Params(deps::name_key(&item.name)));
                 let sig = module.funcs[&item.name].clone();
                 let file = module.file_of(item.module.as_deref());
                 let locals = in_file(file, || {
@@ -3289,7 +3438,8 @@ pub(crate) fn infer_module(
                     });
                 }
                 if module.list_params.get(&item.name) != Some(&facts) {
-                    module.list_params.insert(item.name.clone(), facts);
+                    module.list_params.insert(item.name.clone(), facts.clone());
+                    deps::wrote(Dep::ListParams(deps::name_key(&item.name)));
                     changed = true;
                     if trace_rounds {
                         eprintln!("[types] inner {inner_rounds}: list params of {}", item.name);
@@ -3305,6 +3455,7 @@ pub(crate) fn infer_module(
                             );
                         }
                         module.funcs.get_mut(&item.name).unwrap().ret = ret;
+                        deps::wrote(Dep::Ret(deps::name_key(&item.name)));
                         changed = true;
                     }
                 }
@@ -3370,8 +3521,32 @@ pub(crate) fn infer_module(
                     }
                     .stmts(&item.def.body)
                 });
+                let inference = Inference {
+                    at,
+                    reads: deps::finish_reading(),
+                    locals,
+                    field_rounds: item_field_rounds[i].clone(),
+                    escaped: escaped[escaped_from..].to_vec(),
+                    facts,
+                    passed: passed.clone(),
+                };
+                if let Some(standing) = standing {
+                    standing.check(&inference, &item.name);
+                }
+                kept[i] = Some(inference);
             } else if !entry_done {
                 entry_done = true;
+                let standing = entry_kept.take().filter(Inference::stands);
+                inferred_count += 1;
+                kept_count += usize::from(standing.is_some());
+                if !check_kept && let Some(standing) = standing {
+                    standing.replay(&mut entry_field_rounds, &mut untyped_stores, &mut escaped);
+                    entry_kept = Some(standing);
+                    continue;
+                }
+                let at = deps::now();
+                let escaped_from = escaped.len();
+                deps::start_reading();
                 entry_locals = infer_locals_open(&module, &entry_sig, entry, entry_files, true);
                 for store in &entry_locals.dynamic_field_stores {
                     if store.untyped {
@@ -3412,6 +3587,19 @@ pub(crate) fn infer_module(
                     sites: None,
                 }
                 .stmts(entry);
+                let inference = Inference {
+                    at,
+                    reads: deps::finish_reading(),
+                    locals: entry_locals.clone(),
+                    field_rounds: entry_field_rounds.clone(),
+                    escaped: escaped[escaped_from..].to_vec(),
+                    facts: Vec::new(),
+                    passed: passed.clone(),
+                };
+                if let Some(standing) = standing {
+                    standing.check(&inference, "the module body");
+                }
+                entry_kept = Some(inference);
             } else {
                 break;
             }
@@ -3432,6 +3620,7 @@ pub(crate) fn infer_module(
                         let current = module.funcs[name].params[index].1;
                         let joined = module.join_classes(current, ty);
                         if joined != current {
+                            deps::wrote(Dep::Params(deps::name_key(name)));
                             if trace_rounds {
                                 eprintln!(
                                     "[types] inner {inner_rounds}: {name} param {index} {joined:?} (was {current:?})"
@@ -3463,6 +3652,7 @@ pub(crate) fn infer_module(
                 };
                 if joined != c.sig.params[index].1 {
                     c.sig.params[index].1 = joined;
+                    deps::wrote(Dep::Closure(slot));
                     changed = true;
                 }
             }
@@ -3484,6 +3674,7 @@ pub(crate) fn infer_module(
                     .unwrap_or(Ty::List(Elem::Object));
                 let decided = module.denest(&f, decided);
                 if module.field_lists.get(&(k, f.clone())) != Some(&decided) {
+                    deps::wrote(Dep::FieldList(k, deps::name_key(&f)));
                     module.field_lists.insert((k, f), decided);
                     changed = true;
                 }
@@ -3497,11 +3688,13 @@ pub(crate) fn infer_module(
             let c = &mut closures[k as usize];
             if !c.escapes {
                 c.escapes = true;
+                deps::wrote(Dep::Closure(k));
                 changed = true;
             }
             for (flag, (_, ty)) in c.inferred.iter().zip(c.sig.params.iter_mut()) {
                 if *flag && *ty != Ty::Object {
                     *ty = Ty::Object;
+                    deps::wrote(Dep::Closure(k));
                     changed = true;
                 }
             }
@@ -3529,7 +3722,7 @@ pub(crate) fn infer_module(
     }
     if trace_rounds {
         eprintln!(
-            "[types] infer_module: {inner_rounds} inner rounds over {} items",
+            "[types] infer_module: {inner_rounds} inner rounds over {} items, {kept_count} of {inferred_count} inferences kept",
             items.len()
         );
     }
@@ -3539,12 +3732,23 @@ pub(crate) fn infer_module(
     {
         let mut passed: Vec<(Target, usize, Ty)> = Vec::new();
         let mut escaped: Vec<u16> = Vec::new();
-        for item in items {
+        for (item, inference) in items.iter().zip(&kept) {
             let sig = module.funcs[&item.name].clone();
             let file = module.file_of(item.module.as_deref());
-            let locals = in_file(file, || {
-                infer_locals_open(&module, &sig, &item.def.body, &[], false)
-            });
+            let standing = inference.as_ref().filter(|k| k.stands());
+            let fresh;
+            let locals = match standing {
+                Some(standing) if !check_kept => &standing.locals,
+                _ => {
+                    fresh = in_file(file, || {
+                        infer_locals_open(&module, &sig, &item.def.body, &[], false)
+                    });
+                    if let Some(standing) = standing {
+                        standing.check_locals(&fresh, &item.name);
+                    }
+                    &fresh
+                }
+            };
             in_file(file, || {
                 Calls {
                     module: &module,
@@ -4170,9 +4374,9 @@ fn class_loop_sites(module: &Module, items: &[Item<'_>]) -> Vec<(String, Vec<Ty>
                 continue;
             }
             let fits = |k: usize| {
-                attrs
-                    .iter()
-                    .all(|a| module.field(k, a).is_some() || module.method_sig(k, a).is_some())
+                attrs.iter().all(|a| {
+                    module.field(k, a).is_some() || module.method_sig_fixed(k, a).is_some()
+                })
             };
             for (k, class) in module.classes.iter().enumerate() {
                 if !fits(k) || class.base.is_some_and(fits) {
@@ -4259,7 +4463,7 @@ impl Calls<'_> {
             py::Expr::Name(n) if !bound_here(n.id.as_str()) => {
                 let name = n.id.as_str();
                 if let Some(&k) = self.module.class_index.get(name) {
-                    let (_, init) = self.module.method_sig(k, "__init__")?;
+                    let (_, init) = self.module.method_sig_fixed(k, "__init__")?;
                     return Some((Target::Item(init.to_string()), 1));
                 }
                 if self.module.funcs.contains_key(name) {
@@ -4288,18 +4492,18 @@ impl Calls<'_> {
                 let Ty::Class(c) = self.typer().expr(&py::Expr::Name(info.receiver.clone())) else {
                     return None;
                 };
-                let (_, name) = self.module.method_sig(c as usize, &info.method)?;
+                let (_, name) = self.module.method_sig_fixed(c as usize, &info.method)?;
                 Some((Target::Item(name.to_string()), 1))
             }
             py::Expr::Attribute(a) if is_super_call(&a.value) => {
                 let base = self.module.classes[self.class?].base?;
-                let (_, name) = self.module.method_sig(base, a.attr.as_str())?;
+                let (_, name) = self.module.method_sig_fixed(base, a.attr.as_str())?;
                 Some((Target::Item(name.to_string()), 1))
             }
             // `Class.method(obj, ...)`: every argument, the receiver first.
             py::Expr::Attribute(a) if self.typer().class_named(&a.value).is_some() => {
                 let k = self.typer().class_named(&a.value)?;
-                let (_, name) = self.module.method_sig(k, a.attr.as_str())?;
+                let (_, name) = self.module.method_sig_fixed(k, a.attr.as_str())?;
                 Some((Target::Item(name.to_string()), 0))
             }
             // A method on an instance of a known class: the class's
@@ -4309,14 +4513,14 @@ impl Calls<'_> {
                 let Ty::Class(k) = self.arg_ty(&a.value) else {
                     unreachable!()
                 };
-                let (_, name) = self.module.method_sig(k as usize, a.attr.as_str())?;
+                let (_, name) = self.module.method_sig_fixed(k as usize, a.attr.as_str())?;
                 Some((Target::Item(name.to_string()), 1))
             }
             // `instance(...)`: its class's `__call__`.
             other => match self.arg_ty(other) {
                 Ty::Class(k) if !matches!(other, py::Expr::Name(n) if self.module.class_index.contains_key(n.id.as_str())) =>
                 {
-                    let (_, name) = self.module.method_sig(k as usize, "__call__")?;
+                    let (_, name) = self.module.method_sig_fixed(k as usize, "__call__")?;
                     Some((Target::Item(name.to_string()), 1))
                 }
                 _ => self.closure_of(other).map(|k| (Target::Closure(k), 0)),
@@ -4491,7 +4695,7 @@ impl Calls<'_> {
                 let mut classes = vec![k];
                 classes.extend(self.module.overriders(k, method));
                 for c in classes {
-                    let Some((sig, name)) = self.module.method_sig(c, method) else {
+                    let Some((sig, name)) = self.module.method_sig_fixed(c, method) else {
                         continue;
                     };
                     for (i, ty) in args.iter().enumerate() {
@@ -4548,7 +4752,7 @@ impl Calls<'_> {
         let Ty::Class(k) = self.typer().expr(left) else {
             return;
         };
-        let Some((sig, name)) = self.module.method_sig(k as usize, dunder_name(op)) else {
+        let Some((sig, name)) = self.module.method_sig_fixed(k as usize, dunder_name(op)) else {
             return;
         };
         let ty = self.arg_ty(right);
@@ -4578,8 +4782,8 @@ impl Calls<'_> {
         let Ty::Class(k) = self.typer().expr(receiver) else {
             return;
         };
-        let found = match self.module.method_sig(k as usize, method) {
-            None if op == py::CmpOp::NotEq => self.module.method_sig(k as usize, "__eq__"),
+        let found = match self.module.method_sig_fixed(k as usize, method) {
+            None if op == py::CmpOp::NotEq => self.module.method_sig_fixed(k as usize, "__eq__"),
             found => found,
         };
         let Some((sig, name)) = found else {
@@ -4602,6 +4806,8 @@ impl Calls<'_> {
         args: &[py::Expr],
         keywords: &[py::Keyword],
     ) {
+        // Only the parameters' names, number and defaults are read here,
+        // and the receiver's declared type: nothing inference changes.
         let sig = match &callee {
             Target::Item(name) => self.module.funcs[name].clone(),
             Target::Closure(k) => match self.module.closures.borrow().get(*k as usize) {
@@ -4704,7 +4910,7 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
             py::Stmt::Raise(r) => {
                 if let Some(py::Expr::Name(n)) = r.exc.as_deref()
                     && let Some(&k) = self.module.class_index.get(n.id.as_str())
-                    && let Some((_, name)) = self.module.method_sig(k, "__init__")
+                    && let Some((_, name)) = self.module.method_sig_fixed(k, "__init__")
                 {
                     self.record(Target::Item(name.to_string()), 1, &[], &[]);
                 }
@@ -4794,7 +5000,7 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
                         Ty::Class(k) => {
                             for sub in self.module.overriders(k as usize, a.attr.as_str()) {
                                 if let Some((_, name)) =
-                                    self.module.method_sig(sub, a.attr.as_str())
+                                    self.module.method_sig_fixed(sub, a.attr.as_str())
                                 {
                                     self.record(
                                         Target::Item(name.to_string()),
@@ -4940,6 +5146,9 @@ fn widen_by_class(module: &mut Module, set: &[usize], name: &str, ty: Ty) -> boo
             changed = true;
         }
     }
+    if changed {
+        deps::wrote(Dep::FieldByClass(deps::name_key(name)));
+    }
     changed
 }
 
@@ -5020,11 +5229,15 @@ fn widen_field(classes: &mut [ClassInfo], k: usize, name: &str, ty: Ty) -> bool 
                 let joined = join(classes[c].fields[i].1, ty);
                 if joined != classes[c].fields[i].1 {
                     classes[c].fields[i].1 = joined;
+                    deps::wrote(Dep::Field(c, deps::name_key(name)));
+                    deps::wrote(Dep::Class(c));
                     changed = true;
                 }
             }
             None => {
                 classes[c].fields.push((name.to_string(), ty));
+                deps::wrote(Dep::Field(c, deps::name_key(name)));
+                deps::wrote(Dep::Class(c));
                 changed = true;
             }
         }
@@ -5812,7 +6025,7 @@ pub(crate) fn list_sites<'ast>(
                                 .module
                                 .overriders(k as usize, method)
                                 .is_empty()
-                                .then(|| self.module.method_sig(k as usize, method))
+                                .then(|| self.module.method_sig_fixed(k as usize, method))
                                 .flatten()
                                 .map(|(_, name)| name);
                             if let Some(callee) = callee {
@@ -6150,6 +6363,7 @@ fn written_into(module: &Module, sites: &ListSites<'_>, typer: &Typer<'_>) -> Op
         take(typer.expr(e).element().unwrap_or(Ty::Object));
     }
     for (callee, index) in &sites.passed_to {
+        deps::read(Dep::ListParams(deps::name_key(callee)));
         match module
             .list_params
             .get(callee)
@@ -6179,7 +6393,7 @@ fn decide_list(module: &Module, sites: &ListSites<'_>, typer: &Typer<'_>) -> Ty 
 
 /// What the program's bodies do with a field bound to an unkinded
 /// list, gathered over one round of inference.
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, PartialEq)]
 struct FieldRound {
     kept: bool,
     none: bool,
@@ -6486,7 +6700,9 @@ impl Walker<'_> {
                     .push((k as usize, a.attr.to_string(), ty));
             }
             Ty::Object => {
+                let key = deps::name_key(a.attr.as_str());
                 for (k, class) in self.module.classes.iter().enumerate() {
+                    deps::read(Dep::Field(k, key));
                     if class.fields.iter().any(|(f, _)| f == a.attr.as_str()) {
                         self.locals
                             .other_field_writes
@@ -6638,6 +6854,7 @@ impl Walker<'_> {
                 py::Expr::Name(n) if !self.typer().is_variable(n.id.as_str()) => {
                     let name = n.id.as_str();
                     if let Some(sig) = self.module.funcs.get(name) {
+                        deps::read(Dep::Params(deps::name_key(name)));
                         (sig.clone(), 0)
                     } else if let Some(&k) = self.module.class_index.get(name) {
                         match self.module.method_sig(k, "__init__") {
@@ -6886,6 +7103,7 @@ impl Walker<'_> {
                     {
                         let key = (k as usize, attr.attr.to_string());
                         if self.module.list_fields.contains(&key) {
+                            deps::read(Dep::FieldList(key.0, deps::name_key(&key.1)));
                             let decided = self
                                 .module
                                 .field_lists
@@ -8259,8 +8477,11 @@ impl Typer<'_> {
         if let py::Expr::Attribute(a) = &*c.func
             && let Some(k) = self.class_named(&a.value)
         {
-            return match self.module.method_sig(k, a.attr.as_str()) {
-                Some((sig, name)) => self.item_call_ret(name, sig, 0, &c.arguments),
+            return match self.module.method_sig_fixed(k, a.attr.as_str()) {
+                Some((sig, name)) => {
+                    self.read_ret(name);
+                    self.item_call_ret(name, sig, 0, &c.arguments)
+                }
                 None => Ty::Object,
             };
         }
@@ -8277,6 +8498,7 @@ impl Typer<'_> {
             Ty::Closure(k) => return self.module.closure_ret(k),
             Ty::Func(k) => {
                 let name = &self.module.items_by_index[k as usize];
+                self.read_ret(name);
                 let sig = &self.module.funcs[name];
                 return match self
                     .module
@@ -8306,6 +8528,7 @@ impl Typer<'_> {
                     return Ty::Class(*k as u16);
                 }
                 if let Some(sig) = self.module.funcs.get(name) {
+                    self.read_ret(name);
                     return self.item_call_ret(name, sig, 0, &c.arguments);
                 }
                 if !self.vars.contains_key(name)
@@ -8334,8 +8557,11 @@ impl Typer<'_> {
                 match self.vars.get("self").copied() {
                     Some(Ty::Class(k)) => {
                         let base = self.module.classes[k as usize].base;
-                        match base.and_then(|b| self.module.method_sig(b, a.attr.as_str())) {
-                            Some((sig, name)) => self.item_call_ret(name, sig, 1, &c.arguments),
+                        match base.and_then(|b| self.module.method_sig_fixed(b, a.attr.as_str())) {
+                            Some((sig, name)) => {
+                                self.read_ret(name);
+                                self.item_call_ret(name, sig, 1, &c.arguments)
+                            }
                             None => Ty::Object,
                         }
                     }
@@ -8365,6 +8591,16 @@ impl Typer<'_> {
     /// What a call of item `name` returns when it passes `arguments`
     /// to the parameters from `first` on: the result of the instance
     /// made for the types passed, where there is one.
+    /// The read of item `name`'s signature by [`Self::item_call_ret`]: its
+    /// return type, and its parameters once there are instances to pick.
+    fn read_ret(&self, name: &str) {
+        let key = deps::name_key(name);
+        deps::read(Dep::Ret(key));
+        if !self.module.specs.is_empty() {
+            deps::read(Dep::Params(key));
+        }
+    }
+
     fn item_call_ret(&self, name: &str, sig: &Sig, first: usize, arguments: &py::Arguments) -> Ty {
         if self.module.specs.is_empty() {
             return sig.ret;
