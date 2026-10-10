@@ -2845,12 +2845,12 @@ impl Users {
             instructions += block.instructions.len();
             for (i, inst) in block.instructions.iter().enumerate() {
                 let mut seen: smallvec::SmallVec<[HirId; 4]> = smallvec::SmallVec::new();
-                for v in inst.operands() {
+                inst.for_each_operand(|v| {
                     if !seen.contains(&v) {
                         seen.push(v);
                         by_value.entry(v).or_default().push((bid, i));
                     }
-                }
+                });
             }
             for (i, phi) in block.phis.iter().enumerate() {
                 for (v, _) in &phi.incoming {
@@ -3024,7 +3024,7 @@ fn derived_values_using(
             // The GEP a struct literal takes to reach a field was
             // exactly that, and the store through it landed after
             // the free.
-            if inst.operands().iter().any(|o| set.contains(o))
+            if inst.any_operand(|o| set.contains(&o))
                 && let Some(result) = inst.result_id()
                 && set.insert(result)
             {

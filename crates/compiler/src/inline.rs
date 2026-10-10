@@ -254,6 +254,10 @@ pub fn run_module_with(module: &mut HirModule, cache: Option<&crate::OptCache>) 
     // inlined into, the only change a round makes to it.
     let mut copies: HashMap<HirId, Arc<HirFunction>> = HashMap::default();
     let mut changed: HashSet<HirId> = HashSet::default();
+    // What is known of each callee. A module function's body stays as
+    // it is for the whole pass; one being optimised is asked again each
+    // round, since inlining into it changes it.
+    let mut shapes: HashMap<HirId, CalleeShape> = HashMap::default();
     for _ in 0..8 {
         // Copied only where read: a function being optimised that none
         // of them calls is never looked up, and a body alone in the set
@@ -293,9 +297,7 @@ pub fn run_module_with(module: &mut HirModule, cache: Option<&crate::OptCache>) 
             changing: &changing,
         };
 
-        // What is known of each callee, asked once per round: no callee
-        // body changes before the next.
-        let mut shapes: HashMap<HirId, CalleeShape> = HashMap::default();
+        shapes.retain(|id, _| !changing.contains_key(id));
         let mut specializations = ConstantCallees::default();
         let mut this_pass = 0;
         for (_, caller_id, caller) in taken.iter_mut() {
@@ -713,10 +715,13 @@ fn is_real_call(inst: &HirInstruction, callees: &Callees<'_>) -> bool {
         } => !callees.get(fid).is_some_and(|f| {
             f.attributes.cold
                 || f.is_external
-                    && f.link_name
-                        .clone()
-                        .or_else(|| f.name.resolve_global())
-                        .is_some_and(|n| crate::boxes::is_reader(&n))
+                    && match &f.link_name {
+                        Some(name) => crate::boxes::is_reader(name),
+                        None => f
+                            .name
+                            .resolve_global()
+                            .is_some_and(|n| crate::boxes::is_reader(&n)),
+                    }
         }),
         HirInstruction::Call {
             callee: HirCallable::FuncRef(_),

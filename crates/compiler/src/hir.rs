@@ -2878,7 +2878,8 @@ impl HirFunction {
     /// value table: the interpreter a register per value, the backends
     /// a stack slot per undefined aggregate.
     pub fn sweep_unreferenced_values(&mut self) -> usize {
-        let mut named: IdHashSet<HirId> = IdHashSet::default();
+        let mut named: IdHashSet<HirId> =
+            IdHashSet::with_capacity_and_hasher(self.values.len(), IdHasher::default());
         for param in &self.signature.params {
             named.insert(param.id);
         }

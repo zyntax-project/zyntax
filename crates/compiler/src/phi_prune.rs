@@ -53,7 +53,7 @@ pub fn run_module(module: &mut HirModule) -> PhiPruneStats {
 /// Run the pass over a single function.
 pub fn run_function(func: &mut HirFunction) -> PhiPruneStats {
     let mut stats = PhiPruneStats::default();
-    rebuild_cfg_edges(func);
+    func.rebuild_cfg_edges();
     prune_stale_incomings(func);
     // Removing a phi can make a trivial phi collapsible and vice versa,
     // so iterate. The bound is generous; convergence is typically one or
@@ -79,42 +79,8 @@ pub fn run_function(func: &mut HirFunction) -> PhiPruneStats {
 }
 
 /// CFG simplification may delete or merge a predecessor without removing
-/// its old phi arm. Rebuild edges from terminators and discard those stale
-/// arms before deciding whether a phi is live or trivial.
-fn rebuild_cfg_edges(func: &mut HirFunction) {
-    let mut successors: HashMap<HirId, Vec<HirId>> = HashMap::default();
-    for (&id, block) in &func.blocks {
-        let targets = match &block.terminator {
-            HirTerminator::Branch { target } => vec![*target],
-            HirTerminator::CondBranch {
-                true_target,
-                false_target,
-                ..
-            } => vec![*true_target, *false_target],
-            HirTerminator::Switch { default, cases, .. } => {
-                let mut targets = vec![*default];
-                targets.extend(cases.iter().map(|(_, target)| *target));
-                targets
-            }
-            HirTerminator::Invoke { normal, unwind, .. } => vec![*normal, *unwind],
-            HirTerminator::PatternMatch { .. }
-            | HirTerminator::Return { .. }
-            | HirTerminator::Unreachable => Vec::new(),
-        };
-        successors.insert(id, targets);
-    }
-    let mut predecessors: HashMap<HirId, Vec<HirId>> = HashMap::default();
-    for (&source, targets) in &successors {
-        for target in targets {
-            predecessors.entry(*target).or_default().push(source);
-        }
-    }
-    for (id, block) in &mut func.blocks {
-        block.successors = successors.remove(id).unwrap_or_default();
-        block.predecessors = predecessors.remove(id).unwrap_or_default();
-    }
-}
-
+/// its old phi arm. Edges are rebuilt from terminators and those stale
+/// arms discarded before deciding whether a phi is live or trivial.
 fn prune_stale_incomings(func: &mut HirFunction) {
     let mut reachable = HashSet::default();
     let mut work = vec![func.entry_block];
@@ -127,10 +93,10 @@ fn prune_stale_incomings(func: &mut HirFunction) {
         }
     }
     for block in func.blocks.values_mut() {
-        if block.predecessors.is_empty() {
+        if block.predecessors.is_empty() || block.phis.is_empty() {
             continue;
         }
-        let predecessors: HashSet<HirId> = block.predecessors.iter().copied().collect();
+        let predecessors = &block.predecessors;
         for phi in &mut block.phis {
             phi.incoming.retain(|(_, predecessor)| {
                 predecessors.contains(predecessor) && reachable.contains(predecessor)
@@ -179,7 +145,7 @@ fn collapse_trivial_phis(func: &mut HirFunction) -> usize {
         }
         v
     };
-    let final_map: indexmap::IndexMap<HirId, HirId> = replacements
+    let final_map: crate::hir::IdMap<HirId, HirId> = replacements
         .keys()
         .map(|&k| (k, resolve(k)))
         .filter(|(k, v)| k != v)
