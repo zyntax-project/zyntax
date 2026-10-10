@@ -126,6 +126,9 @@ pub mod llvm_jit_backend; // LLVM MCJIT for hot-path optimization
 #[cfg(feature = "llvm-backend")]
 pub mod llvm_link; // AOT-via-object: trampolines + system linker + dlopen
 
+#[cfg(feature = "llvm-backend")]
+pub mod llvm_targets; // The host's LLVM target, the only one linked
+
 #[cfg(feature = "wasm-jit")]
 pub mod wasm_backend; // HIR → wasm hot-function tier-1 JIT (Phase E)
 

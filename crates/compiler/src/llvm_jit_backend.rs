@@ -50,7 +50,7 @@ use inkwell::{
     context::Context,
     execution_engine::ExecutionEngine,
     passes::PassBuilderOptions,
-    targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine},
+    targets::{CodeModel, FileType, RelocMode, Target, TargetMachine},
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -197,10 +197,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         context: &'ctx Context,
         opt_level: OptimizationLevel,
     ) -> CompilerResult<Self> {
-        // Initialise LLVM targets.
-        Target::initialize_native(&InitializationConfig::default()).map_err(|e| {
-            CompilerError::Backend(format!("Failed to initialise LLVM target: {}", e))
-        })?;
+        crate::llvm_targets::initialize_host();
         Self::parse_llvm_args();
         let target_machine = Self::host_target_machine(opt_level)?;
 

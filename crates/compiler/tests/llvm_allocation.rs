@@ -3,7 +3,7 @@
 use inkwell::OptimizationLevel;
 use inkwell::context::Context;
 use inkwell::passes::PassBuilderOptions;
-use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
+use inkwell::targets::{CodeModel, RelocMode, Target, TargetMachine};
 use zyntax_compiler::hir::{
     HirCallable, HirConstant, HirFunction, HirFunctionSignature, HirInstruction, HirModule,
     HirParam, HirTerminator, HirType, HirValueKind, Intrinsic,
@@ -90,7 +90,7 @@ fn llvm_eliminates_an_unobserved_pool_allocation() {
     );
     assert!(!before.contains("nofree"), "{before}");
 
-    Target::initialize_native(&InitializationConfig::default()).unwrap();
+    zyntax_compiler::llvm_targets::initialize_host();
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple).unwrap();
     let machine = target

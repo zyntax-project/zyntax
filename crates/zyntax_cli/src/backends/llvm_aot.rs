@@ -111,9 +111,7 @@ pub fn compile_llvm(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use inkwell::OptimizationLevel;
     use inkwell::context::Context;
-    use inkwell::targets::{
-        CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
-    };
+    use inkwell::targets::{CodeModel, FileType, RelocMode, Target, TargetMachine};
     use zyntax_compiler::llvm_backend::LLVMBackend;
 
     let output_path = output.unwrap_or_else(|| PathBuf::from("a.out"));
@@ -122,9 +120,7 @@ pub fn compile_llvm(
         info!("Initializing LLVM backend...");
     }
 
-    // Initialize LLVM targets
-    Target::initialize_native(&InitializationConfig::default())
-        .map_err(|e| format!("Failed to initialize LLVM target: {}", e))?;
+    zyntax_compiler::llvm_targets::initialize_host();
 
     // Create LLVM context and backend
     let context = Context::create();

@@ -45,6 +45,7 @@ fn jit_add(context: &Context) -> (inkwell::execution_engine::ExecutionEngine<'_>
     let sum = builder.build_int_add(a, b, "sum").unwrap();
     builder.build_return(Some(&sum)).unwrap();
 
+    zyntax_compiler::llvm_targets::initialize_host();
     let engine = module
         .create_jit_execution_engine(OptimizationLevel::Default)
         .expect("MCJIT execution engine should be creatable");

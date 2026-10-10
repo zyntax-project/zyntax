@@ -87,7 +87,10 @@ cranelift-native = { git = "https://github.com/bytecodealliance/wasmtime.git", r
 # The instruction-cache maintenance cranelift-jit does when code turns
 # executable, for the JIT memory provider in `jit_memory.rs`.
 wasmtime-internal-jit-icache-coherence = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
-inkwell = { version = "0.7.1", features = ["llvm21-1"], optional = true }  # LLVM bindings
+inkwell = { version = "0.7.1", default-features = false, features = ["llvm21-1"], optional = true }  # LLVM bindings
+# Not built: llvm-sys's C target wrappers, which link every LLVM target;
+# `llvm_targets.rs` defines them for the host target alone.
+llvm-sys = { version = "211.0.0", features = ["disable-alltargets-init"], optional = true }
 
 # Wasm encoder for the hot-function tier-1 JIT (Phase E). Optional
 # so non-wasm-target builds don't pay the dep cost.
@@ -109,7 +112,7 @@ harness = false
 allocation-audit = []
 default = ["cranelift-backend", "dynamic-plugins"]
 cranelift-backend = ["cranelift", "cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "wasmtime-internal-jit-icache-coherence"]
-llvm-backend = ["inkwell", "libloading"]
+llvm-backend = ["inkwell", "libloading", "llvm-sys"]
 # Wasm-emitting tier-1 JIT for hot HIR functions (Phase E). The
 # emitter itself works on any host; the consumer (wasm runtime)
 # turns the emitted bytes into an instantiated module.

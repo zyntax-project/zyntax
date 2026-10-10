@@ -105,10 +105,8 @@ fn llvm_vector_dot_emits_sdot_intrinsic() {
     // the intrinsic actually became an `sdot` (+ `addv`) machine instruction —
     // not just a promise in the IR.
     use inkwell::OptimizationLevel;
-    use inkwell::targets::{
-        CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
-    };
-    Target::initialize_native(&InitializationConfig::default()).expect("init native target");
+    use inkwell::targets::{CodeModel, FileType, RelocMode, Target, TargetMachine};
+    zyntax_compiler::llvm_targets::initialize_host();
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple).expect("target from triple");
     let tm = target
@@ -206,10 +204,8 @@ fn llvm_vector_dot_emits_vpdpbusd_on_vnni() {
     );
 
     use inkwell::OptimizationLevel;
-    use inkwell::targets::{
-        CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
-    };
-    Target::initialize_native(&InitializationConfig::default()).expect("init native target");
+    use inkwell::targets::{CodeModel, FileType, RelocMode, Target, TargetMachine};
+    zyntax_compiler::llvm_targets::initialize_host();
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple).expect("target from triple");
     let tm = target
@@ -356,10 +352,8 @@ fn llvm_vector_fma_emits_fma_intrinsic() {
     );
 
     use inkwell::OptimizationLevel;
-    use inkwell::targets::{
-        CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
-    };
-    Target::initialize_native(&InitializationConfig::default()).expect("init native target");
+    use inkwell::targets::{CodeModel, FileType, RelocMode, Target, TargetMachine};
+    zyntax_compiler::llvm_targets::initialize_host();
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple).expect("target from triple");
     let tm = target
