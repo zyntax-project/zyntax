@@ -64,12 +64,13 @@ mod reserved {
     /// range down, the order the system places separate mappings in,
     /// which the instruction TLB fares better with than the reverse.
     ///
-    /// Pieces are written while their pages are read-write, and a
-    /// finalization gives every segment written since the last one its
-    /// final protection and closes it, so pages that were handed out
-    /// never change protection again: another thread may be running or
-    /// reading them. The next piece of each kind starts a page of its
-    /// own.
+    /// Pieces are written while their pages are read-write. A
+    /// finalization seals the code segment written since the last one,
+    /// and the next code starts a page of its own; a data segment stays
+    /// open until a piece no longer fits, and a read-only one is sealed
+    /// at the finalization after that. Pages that were sealed never
+    /// change protection again: another thread may be running or reading
+    /// them.
     pub(super) struct Reserved {
         base: usize,
         /// Bytes reserved, a whole number of pages.
@@ -268,11 +269,14 @@ mod reserved {
 
         fn finalize(&mut self, branch_protection: BranchProtection) -> ModuleResult<()> {
             let fail = |err| ModuleError::Allocation { err };
-            for kind in [CODE, READ_ONLY, WRITABLE] {
-                let seg = std::mem::take(&mut self.open[kind]);
-                if seg.start != seg.end {
-                    self.unsealed.push((seg, kind));
-                }
+            // Code must run once finalized, so its segment is sealed and
+            // the next piece starts a page of its own. Data segments stay
+            // open for the next finalization's pieces: a writable page
+            // never changes protection, and a read-only one is sealed
+            // once a new segment replaces it, never opened again.
+            let seg = std::mem::take(&mut self.open[CODE]);
+            if seg.start != seg.end {
+                self.unsealed.push((seg, CODE));
             }
             // A segment that fails to seal stays listed for the next try.
             while let Some(&(seg, kind)) = self.unsealed.last() {
@@ -312,11 +316,11 @@ mod reserved {
     mod tests {
         use super::*;
 
-        /// Every piece lands inside the range, and after a finalization
-        /// each kind starts a page of its own, leaving what was handed
-        /// out with the protection it was given.
+        /// Every piece lands inside the range; after a finalization code
+        /// starts a page of its own while data shares its page with the
+        /// pieces before it.
         #[test]
-        fn pieces_stay_in_the_range_and_finalized_pages_stay_sealed() {
+        fn pieces_stay_in_the_range_and_data_shares_pages() {
             let mut r = Reserved::new(64 << 20).expect("reserved");
             let (base, size, page) = (r.base, r.size, r.page);
             let kinds = || {
@@ -334,7 +338,11 @@ mod reserved {
                     // SAFETY: the piece was just placed, read-write.
                     unsafe { std::ptr::write_bytes(p as *mut u8, round as u8, 24) };
                     if round > 0 {
-                        assert_ne!(p / page, last[i] / page, "kind {i}, round {round}");
+                        if i == CODE {
+                            assert_ne!(p / page, last[i] / page, "code, round {round}");
+                        } else {
+                            assert_eq!(p / page, last[i] / page, "kind {i}, round {round}");
+                        }
                     }
                     last[i] = p;
                 }
