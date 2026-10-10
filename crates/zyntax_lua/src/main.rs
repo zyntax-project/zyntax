@@ -149,6 +149,29 @@ fn run() -> ExitCode {
         }
         phase = std::time::Instant::now();
     };
+    // `ZYLUA_PROFILE_STARTUP=N` parses and compiles the program N more
+    // times before the run, so a sampling profiler sees the start-up
+    // path rather than the program; a measurement switch only.
+    if let Some(n) = std::env::var("ZYLUA_PROFILE_STARTUP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        for _ in 0..n {
+            let Ok(program) = zyntax_lua::parse_program(&source, &file) else {
+                break;
+            };
+            let Ok(mut rt) = TieredRuntime::new(TieredConfig::default()) else {
+                break;
+            };
+            if zyntax_lua::register_runtime(&mut rt).is_err() {
+                break;
+            }
+            rt.enter_only_through_entry_points();
+            if rt.compile_typed_program(program).is_err() {
+                break;
+            }
+        }
+    }
     #[cfg(feature = "allocation-audit")]
     allocation_audit::set_phase(Phase::Parse);
     let program = match zyntax_lua::parse_program(&source, &file) {
