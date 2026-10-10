@@ -2321,6 +2321,61 @@ pub struct FunctionAttributes {
     /// holds at its entry.
     #[serde(default)]
     pub queries_error_flag: bool,
+    /// On a signature shell standing for a body kept elsewhere, what
+    /// that body refers to.
+    #[serde(default)]
+    pub shell_refs: Option<Box<ShellRefs>>,
+}
+
+/// What a body refers to, recorded on the signature shell that stands
+/// for it while the body is kept out of the module: what reading the
+/// body would otherwise be needed for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellRefs {
+    /// The functions whose address the body takes; see
+    /// [`crate::dce::address_taken_functions`].
+    pub taken: Vec<HirId>,
+    /// The names the body calls functions by.
+    pub named: Vec<String>,
+    /// The globals the body reads, which have to be in the module
+    /// before the body is.
+    pub globals: Vec<HirId>,
+}
+
+impl ShellRefs {
+    /// What `function`'s body refers to; `None` for nothing.
+    pub fn of(function: &HirFunction) -> Option<Box<ShellRefs>> {
+        let mut refs = ShellRefs::default();
+        refs.globals
+            .extend(function.values.values().filter_map(|v| match v.kind {
+                HirValueKind::Global(id) => Some(id),
+                _ => None,
+            }));
+        for block in function.blocks.values() {
+            for inst in &block.instructions {
+                match inst {
+                    HirInstruction::Call {
+                        callee: HirCallable::FuncRef(target),
+                        ..
+                    } => refs.taken.push(*target),
+                    HirInstruction::Call {
+                        callee: HirCallable::Symbol(name),
+                        ..
+                    } => refs.named.push(name.clone()),
+                    HirInstruction::CreateClosure { function, .. } => refs.taken.push(*function),
+                    _ => {}
+                }
+            }
+        }
+        for ids in [&mut refs.taken, &mut refs.globals] {
+            ids.sort_unstable_by_key(|id| id.as_u32());
+            ids.dedup();
+        }
+        refs.named.sort_unstable();
+        refs.named.dedup();
+        let empty = refs.taken.is_empty() && refs.named.is_empty() && refs.globals.is_empty();
+        (!empty).then(|| Box::new(refs))
+    }
 }
 
 /// The release pass's per-function facts; see
@@ -2334,6 +2389,10 @@ pub struct ReleaseFacts {
     /// Whether the module released storage automatically when these
     /// were computed; they hold only for a module that does the same.
     pub automatic_release: bool,
+    /// The body only boxes its one string parameter, so a call means
+    /// what the copying box call means.
+    #[serde(default)]
+    pub boxes_string: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

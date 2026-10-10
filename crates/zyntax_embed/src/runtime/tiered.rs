@@ -45,6 +45,41 @@ fn release_unused_compile_pages() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn release_unused_compile_pages() {}
 
+/// Decode now the deferred library bodies the module's release facts
+/// are computed from: those whose recorded facts do not serve this
+/// module, which include every one calling a hook the program supplies.
+/// The rest stay deferred.
+fn decode_bodies_facts_read(
+    module: &mut HirModule,
+    mut deferred: HashMap<HirId, Arc<zyntax_compiler::bytecode::LazyModule>>,
+) -> HashMap<HirId, Arc<zyntax_compiler::bytecode::LazyModule>> {
+    let unserved: Vec<HirId> = deferred
+        .keys()
+        .copied()
+        .filter(|id| {
+            module.functions.get(id).is_some_and(|shell| {
+                !zyntax_compiler::drop_insert::facts_recorded_for(shell, module)
+            })
+        })
+        .collect();
+    if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
+        eprintln!(
+            "[COMPILE] deferred library bodies: {} kept, {} decoded for release facts, {} globals",
+            deferred.len() - unserved.len(),
+            unserved.len(),
+            module.globals.len()
+        );
+    }
+    for id in unserved {
+        if let Some(source) = deferred.remove(&id)
+            && let Some(body) = source.function(id)
+        {
+            module.functions.insert(id, body);
+        }
+    }
+    deferred
+}
+
 /// Reach functions whose bodies may still live in split snapshots. The
 /// ordinary DCE walk sees each such function's signature shell; its direct
 /// callees come from the split directory, and any non-snapshot callees are
@@ -1740,6 +1775,7 @@ impl TieredRuntime {
         }
         let started = web_time::Instant::now();
         hir_module.automatic_release = self.automatic_release;
+        let deferred_prelowered = decode_bodies_facts_read(&mut hir_module, deferred_prelowered);
         apply_krio_async_lowering(&mut hir_module)?;
         apply_krio_effect_lowering(&mut hir_module)?;
         apply_krio_fiber_lowering(&mut hir_module);
@@ -3055,7 +3091,7 @@ impl TieredRuntime {
                 entry_names: self.entry_names(),
                 closed,
                 prelowered: Vec::new(),
-                defer_prelowered_bodies: false,
+                defer_prelowered_bodies: closed,
                 linked: Arc::default(),
                 selective: true,
                 pattern_rewrites: self.pattern_rewrites,

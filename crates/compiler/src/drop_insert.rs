@@ -177,6 +177,13 @@ pub fn facts_of(module: &HirModule) -> ModuleFacts {
     ModuleFacts::build(module)
 }
 
+/// Whether the release facts `func` carries stand for its body in
+/// `module`: when they do not, the module's facts are computed from the
+/// body, which a signature shell does not have.
+pub fn facts_recorded_for(func: &HirFunction, module: &HirModule) -> bool {
+    ModuleFacts::seeded(func, automatic_release_for(module))
+}
+
 /// Write each function's facts into its attributes, for a module about
 /// to be stored: a module that links it later starts from them (see
 /// `FunctionAttributes::release_facts`).
@@ -252,6 +259,7 @@ pub fn record_facts(module: &mut HirModule, facts: &ModuleFacts) {
                 .cloned()
                 .unwrap_or_else(|| vec![false; func.signature.params.len()]),
             automatic_release: facts.automatic_release,
+            boxes_string: facts.string_boxers.contains(key),
         });
     }
 }
@@ -436,10 +444,19 @@ impl ModuleFacts {
             .filter(|(_, f)| f.is_external)
             .filter_map(|(key, f)| f.link_name.clone().map(|n| (*key, n)))
             .collect();
+        // A shell standing for a body kept elsewhere answers from what
+        // was recorded of the body.
         let string_boxers = module
             .functions
             .iter()
-            .filter(|(_, f)| wraps_string_boxing(f, &extern_links))
+            .filter(|(_, f)| {
+                wraps_string_boxing(f, &extern_links)
+                    || (seeded(f)
+                        && f.attributes
+                            .release_facts
+                            .as_ref()
+                            .is_some_and(|facts| facts.boxes_string))
+            })
             .map(|(key, _)| *key)
             .collect();
         let names = module
@@ -4022,6 +4039,7 @@ mod tests {
             returns_owned: false,
             returns_param: Vec::new(),
             automatic_release: false,
+            boxes_string: false,
         });
         let mut m = HirModule::new(InternedString::new_global("m"));
         m.functions.insert(ctor_key, ctor);

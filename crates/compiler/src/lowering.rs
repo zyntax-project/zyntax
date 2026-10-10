@@ -786,7 +786,6 @@ impl LoweringContext {
                     continue;
                 }
                 if self.wanted.is_some()
-                    && !self.config.defer_prelowered_bodies
                     && global.linkage == crate::hir::Linkage::Private
                     && global.is_const
                     && matches!(global.initializer, Some(crate::hir::HirConstant::String(_)))
@@ -938,6 +937,11 @@ impl LoweringContext {
                 if !function.is_external {
                     function.attributes.deferred = true;
                     self.deferred_prelowered.insert(target, Arc::clone(&source));
+                }
+                // The globals the body reads, private literals among them,
+                // follow it as they follow a body adopted whole.
+                if let Some(refs) = &function.attributes.shell_refs {
+                    pending.extend(refs.globals.iter().copied());
                 }
                 let targets = source.direct_callees(target).unwrap_or_default();
                 (function, targets)

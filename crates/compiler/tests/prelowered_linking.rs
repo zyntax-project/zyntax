@@ -495,8 +495,8 @@ fn private_library_literals_follow_reached_bodies() {
         );
         assert_eq!(
             module.globals.contains_key(&ids[1]),
-            !has_entry || deferred,
-            "unreached literals stay available when bodies have not been inspected"
+            !has_entry,
+            "an unreached literal follows no body, whether the body was read or its shell's record"
         );
         assert!(
             module.globals.contains_key(&ids[2]),

@@ -504,12 +504,13 @@ pub fn serialize_module_split(module: &HirModule) -> Result<Vec<u8>> {
         let (shell, body) = if function.is_external {
             (put(&to_postcard(function)?)?, None)
         } else {
-            let shell = HirFunction {
+            let mut shell = HirFunction {
                 blocks: Default::default(),
                 locals: Default::default(),
                 values: Default::default(),
                 ..function.clone()
             };
+            shell.attributes.shell_refs = crate::hir::ShellRefs::of(function);
             (
                 put(&to_postcard(&shell)?)?,
                 Some(put(&to_postcard(function)?)?),
@@ -625,7 +626,7 @@ impl BytecodeHeader {
     // Moves with any change to a payload's layout, so a payload in an
     // older layout is refused with VersionMismatch and a cache loader
     // recompiles rather than misreading it.
-    const CURRENT_MAJOR: u16 = 5;
+    const CURRENT_MAJOR: u16 = 6;
     const CURRENT_MINOR: u16 = 0;
 
     /// Create a new header for the given module and format
@@ -1246,6 +1247,84 @@ mod tests {
         assert_eq!(whole.functions.len(), 3);
         let names: Vec<String> = whole.functions.values().map(name_of).collect();
         assert_eq!(names, ["zeta", "alpha", "puts"]);
+    }
+
+    #[test]
+    fn a_shell_records_the_addresses_and_globals_its_body_reads() {
+        let mut module = split_test_module();
+        let id_of = |module: &HirModule, name: &str| {
+            module
+                .functions
+                .iter()
+                .find(|(_, function)| name_of(function) == name)
+                .map(|(id, _)| *id)
+                .unwrap()
+        };
+        let (zeta, alpha) = (id_of(&module, "zeta"), id_of(&module, "alpha"));
+        let mut arena = zyntax_typed_ast::AstArena::new();
+        let global = HirId::new();
+        module.globals.insert(
+            global,
+            HirGlobal {
+                id: global,
+                name: arena.intern_string("literal"),
+                ty: HirType::I64,
+                initializer: None,
+                is_const: true,
+                is_thread_local: false,
+                linkage: Linkage::Private,
+                visibility: Visibility::Default,
+                error_flag: false,
+            },
+        );
+        let caller = &mut module.functions[&zeta];
+        let read = HirId::new();
+        caller.values.insert(
+            read,
+            HirValue {
+                id: read,
+                ty: HirType::I64,
+                kind: HirValueKind::Global(global),
+                uses: Default::default(),
+                span: None,
+            },
+        );
+        let entry = caller.entry_block;
+        caller
+            .blocks
+            .get_mut(&entry)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Call {
+                result: None,
+                callee: HirCallable::FuncRef(alpha),
+                args: Vec::new(),
+                type_args: Vec::new(),
+                const_args: Vec::new(),
+                is_tail: false,
+            });
+
+        let bytes = serialize_module(&module, Format::Split).unwrap();
+        let lazy = deserialize_module_lazy(bytes).unwrap();
+        let alpha = lazy.by_name("alpha").expect("the callee").id;
+        let shell = lazy.by_name("zeta").expect("the caller's shell");
+        assert!(shell.blocks.is_empty(), "a shell has no body");
+        let refs = shell
+            .attributes
+            .shell_refs
+            .as_deref()
+            .expect("the shell records what its body refers to");
+        assert_eq!(refs.taken, vec![alpha]);
+        assert_eq!(refs.globals.len(), 1);
+        assert!(
+            crate::dce::address_taken_functions(lazy.shell()).contains(&alpha),
+            "an address only the kept body takes is still taken"
+        );
+        let body = lazy.function(shell.id).expect("the body decodes");
+        assert!(
+            body.attributes.shell_refs.is_none(),
+            "a body carries what it refers to itself"
+        );
     }
 
     #[test]

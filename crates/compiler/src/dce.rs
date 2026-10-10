@@ -517,6 +517,13 @@ pub fn address_taken_functions(module: &HirModule) -> HashSet<HirId> {
     }
 
     for function in module.functions.values() {
+        // A shell's body is kept elsewhere; what it takes is recorded.
+        if let Some(refs) = &function.attributes.shell_refs {
+            taken.extend(refs.taken.iter().copied());
+            for name in &refs.named {
+                taken.extend(by_name.get(name.as_str()).into_iter().flatten());
+            }
+        }
         for block in function.blocks.values() {
             for inst in &block.instructions {
                 match inst {

@@ -3136,11 +3136,26 @@ impl TieredBackend {
         let interp_bodies = Arc::clone(&self.interp_bodies);
         let make_interp_body = self.make_interp_body.clone();
         let finished = self.finished.clone();
+        // A finished body kept encoded is decoded as it was stored when
+        // no optimiser answers for it, as the module's own copy would be.
+        let sources: HashMap<HirId, Arc<LazyModule>> = self
+            .functions
+            .iter()
+            .filter(|(id, _)| finished.contains(id))
+            .filter_map(|(id, entry)| Some((*id, Arc::clone(entry.body_source.as_ref()?))))
+            .collect();
         Box::new(move |id: HirId| {
             let bead = beads.get(&id)?;
             let tier = match optimized_bodies.get(id) {
                 Some(body) => Some(body),
-                None if finished.contains(&id) => Some(osr::lazy_optimized_body(*bead)?),
+                None if finished.contains(&id) => {
+                    Some(osr::lazy_optimized_body(*bead).or_else(|| {
+                        sources
+                            .get(&id)
+                            .and_then(|source| source.function(id))
+                            .map(Arc::new)
+                    })?)
+                }
                 None => None,
             };
             if let Some(body) = tier {
