@@ -1193,16 +1193,11 @@ impl SsaBuilder {
         // These variables need stack allocation instead of SSA registers
         self.scan_cfg_for_address_taken_vars(cfg);
 
-        self.place_phis_using_idf(cfg);
+        let written = self.place_phis_using_idf(cfg);
         self.idf_placement_done = true;
 
         // Make each read-only parameter visible in every typed-CFG block.
         // Generated expression blocks inherit their definitions separately.
-        let written: std::collections::HashSet<InternedString> = self
-            .scan_cfg_for_variable_writes(cfg)
-            .into_values()
-            .flatten()
-            .collect();
         let param_defs: Vec<_> = self
             .definitions
             .get(&entry_block)
@@ -9036,7 +9031,11 @@ impl SsaBuilder {
 
     /// Place phis using Iterated Dominance Frontier (IDF) algorithm
     /// This is the proper SSA construction approach that places phis only where needed
-    fn place_phis_using_idf(&mut self, cfg: &crate::typed_cfg::TypedControlFlowGraph) {
+    /// Returns every variable some block of `cfg` writes.
+    fn place_phis_using_idf(
+        &mut self,
+        cfg: &crate::typed_cfg::TypedControlFlowGraph,
+    ) -> std::collections::HashSet<InternedString> {
         // CRITICAL: Scan CFG to collect variable types FIRST
         // Phis need correct types when they're created
         self.scan_cfg_for_variable_types(cfg);
@@ -9065,6 +9064,7 @@ impl SsaBuilder {
         // Other variables (let statements) will be found by scan_cfg_for_variable_writes
         // So we DON'T need to add entry block for all variables
 
+        let written = defs_per_var.keys().copied().collect();
         // For each variable, compute IDF and place phis
         for (var, def_blocks) in defs_per_var {
             // Compute iterated dominance frontier
@@ -9104,6 +9104,7 @@ impl SsaBuilder {
                     .insert(var, phi_val);
             }
         }
+        written
     }
 
     /// Compute Iterated Dominance Frontier for a set of blocks
