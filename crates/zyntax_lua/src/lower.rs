@@ -11528,10 +11528,10 @@ fn declare(module: &Module<'_>, declarations: &mut Vec<TypedNode<TypedDeclaratio
             Span::new(0, 0),
         ));
     }
-    for f in module.functions.borrow().iter() {
+    for f in module.functions.take() {
         let span = f.body.as_ref().map(|b| b.span).unwrap_or(Span::new(0, 0));
         declarations.push(TypedNode::new(
-            TypedDeclaration::Function(f.clone()),
+            TypedDeclaration::Function(f),
             Type::Unknown,
             span,
         ));
