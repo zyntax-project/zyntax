@@ -8404,6 +8404,13 @@ impl SsaBuilder {
     /// a read through a block sealed after placement leaves another
     /// incomplete phi behind.
     fn fill_incomplete_phis(&mut self) {
+        // Every edge is known once the lists are exact, so every block is
+        // sealed: a read through a merge then resolves it on the spot and
+        // places a phi only where values differ.
+        if self.edges_exact {
+            let blocks: Vec<HirId> = self.function.blocks.keys().copied().collect();
+            self.sealed_blocks.extend(blocks);
+        }
         while !self.incomplete_phis.is_empty() {
             let incomplete: Vec<_> = self.incomplete_phis.keys().cloned().collect();
             for (block, var) in incomplete {
