@@ -511,25 +511,37 @@ pub fn serialize_module_split(module: &HirModule) -> Result<Vec<u8>> {
 
     let stripped = put(&to_postcard(&module.without_functions())?)?;
 
-    let mut directory = Vec::with_capacity(module.functions.len());
-    let mut names = Vec::with_capacity(module.functions.len());
-    for (id, function) in &module.functions {
-        let name = function.name.resolve_global().unwrap_or_default();
-        let name_extent = put(name.as_bytes())?;
-        let (shell, body) = if function.is_external {
-            (put(&to_postcard(function)?)?, None)
+    // Names, then shells, then bodies: a reader that indexes the names
+    // or reads signatures touches only the front of the image.
+    let names: Vec<String> = module
+        .functions
+        .values()
+        .map(|f| f.name.resolve_global().unwrap_or_default())
+        .collect();
+    let mut name_extents = Vec::with_capacity(names.len());
+    for name in &names {
+        name_extents.push(put(name.as_bytes())?);
+    }
+    let mut shells = Vec::with_capacity(names.len());
+    for function in module.functions.values() {
+        shells.push(if function.is_external {
+            put(&to_postcard(function)?)?
         } else {
             let mut shell = function.shell();
             shell.attributes.shell_refs = crate::hir::ShellRefs::of(function);
-            (
-                put(&to_postcard(&shell)?)?,
-                Some(put(&to_postcard(function)?)?),
-            )
+            put(&to_postcard(&shell)?)?
+        });
+    }
+    let mut directory = Vec::with_capacity(names.len());
+    for (((id, function), name), shell) in module.functions.iter().zip(name_extents).zip(shells) {
+        let body = if function.is_external {
+            None
+        } else {
+            Some(put(&to_postcard(function)?)?)
         };
-        names.push(name);
         directory.push(FnEntry {
             id: *id,
-            name: name_extent,
+            name,
             shell,
             body,
             callees: function_callees(function),
