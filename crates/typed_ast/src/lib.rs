@@ -63,6 +63,7 @@ pub mod advanced_analysis;
 pub mod ast_convert;
 pub mod constraint_solver;
 pub mod import_resolver;
+pub mod names;
 pub mod type_checker;
 pub mod type_inference;
 pub mod type_registry;

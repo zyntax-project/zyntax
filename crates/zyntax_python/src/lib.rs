@@ -1149,12 +1149,23 @@ fn parse_program_once(
     }
     lap("lower");
     // The library itself arrives by import: its declarations for
-    // typing, its HIR to link against.
+    // typing, its HIR to link against. It brings the functions the
+    // program names; the rest are neither typed nor declared.
+    let mut named = HashSet::default();
+    zyntax_typed_ast::names::for_each_name(&declarations, &mut |name| {
+        named.insert(name);
+    });
     declarations.push(TypedNode::new(
         TypedDeclaration::Import(zyntax_typed_ast::typed_ast::TypedImport {
             language: Some(intern("python")),
             module_path: vec![intern(LIBRARY_MODULE)],
-            items: Vec::new(),
+            items: named
+                .into_iter()
+                .map(|name| zyntax_typed_ast::typed_ast::TypedImportItem::Named {
+                    name,
+                    alias: None,
+                })
+                .collect(),
             span: Span::new(0, 0),
         }),
         Type::Unknown,
