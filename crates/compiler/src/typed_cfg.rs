@@ -10,6 +10,7 @@
 use crate::CompilerResult;
 use crate::hir::HirId;
 use petgraph::graph::{DiGraph, NodeIndex};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use zyntax_typed_ast::{
     InternedString, Span, Type,
@@ -58,10 +59,16 @@ pub struct TypedCfgBuilder {
     pub loop_of: HashMap<HirId, (HirId, HirId)>,
 }
 
+/// A statement of a block: the body's own, borrowed, or one the
+/// builder made.
+pub type CfgStmt<'a> = Cow<'a, TypedNode<TypedStatement>>;
+/// An expression a terminator tests or returns, borrowed or made.
+pub type CfgExpr<'a> = Cow<'a, TypedNode<TypedExpression>>;
+
 /// Control flow graph with TypedAST statements (not yet converted to HIR)
-pub struct TypedControlFlowGraph {
+pub struct TypedControlFlowGraph<'a> {
     /// Graph structure: nodes are basic blocks, edges are control flow
-    pub graph: DiGraph<TypedBasicBlock, ()>,
+    pub graph: DiGraph<TypedBasicBlock<'a>, ()>,
     /// Entry block node
     pub entry: NodeIndex,
     /// Exit block node
@@ -76,15 +83,15 @@ pub struct TypedControlFlowGraph {
 
 /// A basic block containing TypedAST statements
 #[derive(Debug, Clone)]
-pub struct TypedBasicBlock {
+pub struct TypedBasicBlock<'a> {
     /// Unique ID for this block
     pub id: HirId,
     /// Label for this block (optional)
     pub label: Option<InternedString>,
     /// Statements in this block
-    pub statements: Vec<TypedNode<TypedStatement>>,
+    pub statements: Vec<CfgStmt<'a>>,
     /// How control flow exits this block
-    pub terminator: TypedTerminator,
+    pub terminator: TypedTerminator<'a>,
     /// Pattern check metadata (for pattern matching blocks)
     pub pattern_check: Option<PatternCheckInfo>,
 }
@@ -102,16 +109,23 @@ pub struct PatternCheckInfo {
     pub false_target: Option<HirId>,
 }
 
+/// What a match arm's body splits into: its own statements, or the one
+/// expression statement made for a body that is not a block.
+enum ArmBody<'a> {
+    Statements(&'a [TypedNode<TypedStatement>]),
+    Expression(TypedNode<TypedStatement>),
+}
+
 /// Control flow terminator for TypedBasicBlock
 #[derive(Debug, Clone)]
-pub enum TypedTerminator {
+pub enum TypedTerminator<'a> {
     /// Return from function
-    Return(Option<Box<TypedNode<TypedExpression>>>),
+    Return(Option<CfgExpr<'a>>),
     /// Unconditional jump to block
     Jump(HirId),
     /// Conditional branch
     CondBranch {
-        condition: Box<TypedNode<TypedExpression>>,
+        condition: CfgExpr<'a>,
         true_target: HirId,
         false_target: HirId,
     },
@@ -176,11 +190,11 @@ impl TypedCfgBuilder {
 
     /// Build CFG from a typed block
     /// entry_block_id should be the ID of the entry block from the HirFunction
-    pub fn build_from_block(
+    pub fn build_from_block<'a>(
         &mut self,
-        block: &TypedBlock,
+        block: &'a TypedBlock,
         entry_block_id: HirId,
-    ) -> CompilerResult<TypedControlFlowGraph> {
+    ) -> CompilerResult<TypedControlFlowGraph<'a>> {
         let mut graph = DiGraph::new();
         let mut block_map = HashMap::new();
         let mut node_map = HashMap::new();
@@ -270,11 +284,11 @@ impl TypedCfgBuilder {
     }
 
     /// Process a TypedBlock into a TypedBasicBlock
-    fn process_block(
+    fn process_block<'a>(
         &mut self,
-        block: &TypedBlock,
+        block: &'a TypedBlock,
         block_id: HirId,
-    ) -> CompilerResult<(TypedBasicBlock, HirId)> {
+    ) -> CompilerResult<(TypedBasicBlock<'a>, HirId)> {
         let mut statements = Vec::new();
         let mut terminator = TypedTerminator::Unreachable;
 
@@ -283,13 +297,13 @@ impl TypedCfgBuilder {
             match &stmt.node {
                 TypedStatement::Return(expr) => {
                     // Explicit return terminates the block
-                    terminator = TypedTerminator::Return(expr.clone());
+                    terminator = TypedTerminator::Return(expr.as_deref().map(Cow::Borrowed));
                     break; // No more statements after return
                 }
 
                 // For all other statements, treat as non-terminating
                 _ => {
-                    statements.push(stmt.clone());
+                    statements.push(Cow::Borrowed(stmt));
                 }
             }
         }
@@ -310,22 +324,22 @@ impl TypedCfgBuilder {
     /// Returns (all_blocks, entry_block_id, exit_block_id)
     ///
     /// `is_function_body`: if true, treat a single trailing expression as an implicit return
-    fn split_at_control_flow(
+    fn split_at_control_flow<'a>(
         &mut self,
-        block: &TypedBlock,
+        block: &'a TypedBlock,
         entry_id: HirId,
         is_function_body: bool,
-    ) -> CompilerResult<(Vec<TypedBasicBlock>, HirId, HirId)> {
+    ) -> CompilerResult<(Vec<TypedBasicBlock<'a>>, HirId, HirId)> {
         self.split_statements(&block.statements, entry_id, is_function_body)
     }
 
     /// [`Self::split_at_control_flow`] over a statement list.
-    pub(crate) fn split_statements(
+    pub(crate) fn split_statements<'a>(
         &mut self,
-        statements: &[TypedNode<TypedStatement>],
+        statements: &'a [TypedNode<TypedStatement>],
         entry_id: HirId,
         is_function_body: bool,
-    ) -> CompilerResult<(Vec<TypedBasicBlock>, HirId, HirId)> {
+    ) -> CompilerResult<(Vec<TypedBasicBlock<'a>>, HirId, HirId)> {
         let split = self.split_statements_in_loop(statements, entry_id, is_function_body)?;
         // The loop bodies split inside recorded their own blocks first.
         if let Some(&innermost) = self.loop_stack.last() {
@@ -336,12 +350,32 @@ impl TypedCfgBuilder {
         Ok(split)
     }
 
-    fn split_statements_in_loop(
+    /// One statement with no control flow of its own as a block, as
+    /// [`Self::split_statements`] makes it.
+    fn single_statement_block<'a>(
         &mut self,
-        statements: &[TypedNode<TypedStatement>],
+        statement: CfgStmt<'a>,
+        id: HirId,
+    ) -> (Vec<TypedBasicBlock<'a>>, HirId, HirId) {
+        if let Some(&innermost) = self.loop_stack.last() {
+            self.loop_of.entry(id).or_insert(innermost);
+        }
+        let block = TypedBasicBlock {
+            id,
+            label: None,
+            statements: vec![statement],
+            terminator: TypedTerminator::Unreachable,
+            pattern_check: None,
+        };
+        (vec![block], id, id)
+    }
+
+    fn split_statements_in_loop<'a>(
+        &mut self,
+        statements: &'a [TypedNode<TypedStatement>],
         entry_id: HirId,
         is_function_body: bool,
-    ) -> CompilerResult<(Vec<TypedBasicBlock>, HirId, HirId)> {
+    ) -> CompilerResult<(Vec<TypedBasicBlock<'a>>, HirId, HirId)> {
         log::debug!(
             "[CFG] split_at_control_flow: entry_id={:?}, statements={}",
             entry_id,
@@ -376,7 +410,7 @@ impl TypedCfgBuilder {
                         label: None,
                         statements: std::mem::take(&mut current_statements),
                         terminator: TypedTerminator::CondBranch {
-                            condition: if_stmt.condition.clone(),
+                            condition: Cow::Borrowed(&*if_stmt.condition),
                             true_target: then_id,
                             false_target: else_id,
                         },
@@ -494,7 +528,7 @@ impl TypedCfgBuilder {
                         label: None,
                         statements: vec![],
                         terminator: TypedTerminator::CondBranch {
-                            condition: while_stmt.condition.clone(),
+                            condition: Cow::Borrowed(&*while_stmt.condition),
                             true_target: body_id,
                             false_target: after_id,
                         },
@@ -673,7 +707,7 @@ impl TypedCfgBuilder {
 
                             // Process init statement first (if present)
                             if let Some(init_stmt) = init {
-                                current_statements.push(*init_stmt.clone());
+                                current_statements.push(Cow::Borrowed(&**init_stmt));
                             }
 
                             let header_id = self.new_block_id();
@@ -697,7 +731,7 @@ impl TypedCfgBuilder {
                                     label: None,
                                     statements: vec![],
                                     terminator: TypedTerminator::CondBranch {
-                                        condition: cond.clone(),
+                                        condition: Cow::Borrowed(&**cond),
                                         true_target: body_id,
                                         false_target: after_id,
                                     },
@@ -738,13 +772,13 @@ impl TypedCfgBuilder {
                             let mut update_statements = vec![];
                             if let Some(upd) = update {
                                 // Update expression becomes a statement in the block
-                                update_statements.push(typed_node(
+                                update_statements.push(Cow::Owned(typed_node(
                                     zyntax_typed_ast::typed_ast::TypedStatement::Expression(
                                         upd.clone(),
                                     ),
                                     upd.ty.clone(),
                                     upd.span,
-                                ));
+                                )));
                             }
 
                             all_blocks.push(TypedBasicBlock {
@@ -781,7 +815,7 @@ impl TypedCfgBuilder {
                                 label: None,
                                 statements: vec![],
                                 terminator: TypedTerminator::CondBranch {
-                                    condition: condition.clone(),
+                                    condition: Cow::Borrowed(&**condition),
                                     true_target: body_id,
                                     false_target: after_id,
                                 },
@@ -845,7 +879,7 @@ impl TypedCfgBuilder {
                                 label: None,
                                 statements: vec![],
                                 terminator: TypedTerminator::CondBranch {
-                                    condition: condition.clone(),
+                                    condition: Cow::Borrowed(&**condition),
                                     true_target: body_id,
                                     false_target: after_id,
                                 },
@@ -929,8 +963,8 @@ impl TypedCfgBuilder {
                         // into locals of the loop's own. Python and every
                         // range-loop language read them once.
                         let end_name = self.hidden_name("end", var_name);
-                        current_statements.push(bind(var_name, start_expr.clone()));
-                        current_statements.push(bind(end_name, end_expr));
+                        current_statements.push(Cow::Owned(bind(var_name, start_expr.clone())));
+                        current_statements.push(Cow::Owned(bind(end_name, end_expr)));
 
                         // A literal step decides the comparison here; any
                         // other step is bound and tested for sign at run time,
@@ -968,7 +1002,7 @@ impl TypedCfgBuilder {
                             ),
                             (Some(step), None) => {
                                 let step_name = self.hidden_name("step", var_name);
-                                current_statements.push(bind(step_name, step));
+                                current_statements.push(Cow::Owned(bind(step_name, step)));
                                 let zero = int_lit(0);
                                 let ascending = binary(
                                     Op::And,
@@ -1018,7 +1052,7 @@ impl TypedCfgBuilder {
                             label: None,
                             statements: vec![],
                             terminator: TypedTerminator::CondBranch {
-                                condition: Box::new(cond_expr),
+                                condition: Cow::Owned(cond_expr),
                                 true_target: body_id,
                                 false_target: after_id,
                             },
@@ -1045,11 +1079,11 @@ impl TypedCfgBuilder {
                         all_blocks.push(TypedBasicBlock {
                             id: update_id,
                             label: None,
-                            statements: vec![typed_node(
+                            statements: vec![Cow::Owned(typed_node(
                                 TypedStatement::Expression(Box::new(update_expr)),
                                 Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit),
                                 span,
-                            )],
+                            ))],
                             terminator: TypedTerminator::Jump(header_id),
                             pattern_check: None,
                         });
@@ -1080,7 +1114,7 @@ impl TypedCfgBuilder {
 
                     // Process init
                     if let Some(init_stmt) = &for_c_stmt.init {
-                        current_statements.push(*init_stmt.clone());
+                        current_statements.push(Cow::Borrowed(&**init_stmt));
                     }
 
                     let header_id = self.new_block_id();
@@ -1103,7 +1137,7 @@ impl TypedCfgBuilder {
                             label: None,
                             statements: vec![],
                             terminator: TypedTerminator::CondBranch {
-                                condition: cond.clone(),
+                                condition: Cow::Borrowed(&**cond),
                                 true_target: body_id,
                                 false_target: after_id,
                             },
@@ -1136,11 +1170,11 @@ impl TypedCfgBuilder {
                     // Update block
                     let mut update_statements = vec![];
                     if let Some(upd) = &for_c_stmt.update {
-                        update_statements.push(typed_node(
+                        update_statements.push(Cow::Owned(typed_node(
                             zyntax_typed_ast::typed_ast::TypedStatement::Expression(upd.clone()),
                             upd.ty.clone(),
                             upd.span,
-                        ));
+                        )));
                     }
 
                     all_blocks.push(TypedBasicBlock {
@@ -1279,7 +1313,7 @@ impl TypedCfgBuilder {
                         current_block_id = after_block_id;
                         exit_id = after_block_id;
                     } else {
-                        current_statements.push(stmt.clone());
+                        current_statements.push(Cow::Borrowed(stmt));
                     }
                 }
 
@@ -1333,7 +1367,7 @@ impl TypedCfgBuilder {
                     } else {
                         // Break outside loop - treat as error or unreachable
                         // For now, just add to current block and let type checker catch it
-                        current_statements.push(stmt.clone());
+                        current_statements.push(Cow::Borrowed(stmt));
                     }
                 }
 
@@ -1364,7 +1398,7 @@ impl TypedCfgBuilder {
                         current_block_id = unreachable_id;
                     } else {
                         // Continue outside loop
-                        current_statements.push(stmt.clone());
+                        current_statements.push(Cow::Borrowed(stmt));
                     }
                 }
 
@@ -1380,7 +1414,7 @@ impl TypedCfgBuilder {
 
                     if match_stmt.arms.is_empty() {
                         // Empty match - just treat as regular statement
-                        current_statements.push(stmt.clone());
+                        current_statements.push(Cow::Borrowed(stmt));
                         return Ok((all_blocks, entry_id, exit_id));
                     }
 
@@ -1391,7 +1425,7 @@ impl TypedCfgBuilder {
 
                     // Add the Match statement to the entry block so SSA can process it
                     let mut entry_statements = std::mem::take(&mut current_statements);
-                    entry_statements.push(stmt.clone());
+                    entry_statements.push(Cow::Borrowed(stmt));
 
                     all_blocks.push(TypedBasicBlock {
                         id: current_block_id,
@@ -1420,7 +1454,7 @@ impl TypedCfgBuilder {
                                 label: None,
                                 statements: vec![],
                                 terminator: TypedTerminator::CondBranch {
-                                    condition: guard.clone(),
+                                    condition: Cow::Borrowed(&**guard),
                                     true_target: body_id,
                                     false_target: next_pattern_id,
                                 },
@@ -1441,7 +1475,7 @@ impl TypedCfgBuilder {
                                     label: None,
                                     statements: vec![],
                                     terminator: TypedTerminator::CondBranch {
-                                        condition: Box::new(check_expr),
+                                        condition: Cow::Owned(check_expr),
                                         true_target: body_id,
                                         false_target: next_pattern_id,
                                     },
@@ -1482,12 +1516,16 @@ impl TypedCfgBuilder {
                         let (body_stmts, body_terminator) = match &arm.body.node {
                             TypedExpression::Block(block) => {
                                 if let Some(last_stmt) = block.statements.last() {
-                                    let prefix =
-                                        block.statements[..block.statements.len() - 1].to_vec();
+                                    let prefix = ArmBody::Statements(
+                                        &block.statements[..block.statements.len() - 1],
+                                    );
                                     match &last_stmt.node {
-                                        TypedStatement::Return(ret_expr) => {
-                                            (prefix, TypedTerminator::Return(ret_expr.clone()))
-                                        }
+                                        TypedStatement::Return(ret_expr) => (
+                                            prefix,
+                                            TypedTerminator::Return(
+                                                ret_expr.as_deref().map(Cow::Borrowed),
+                                            ),
+                                        ),
                                         TypedStatement::Break(_) => {
                                             let target = self
                                                 .loop_stack
@@ -1505,12 +1543,12 @@ impl TypedCfgBuilder {
                                             (prefix, TypedTerminator::Jump(target))
                                         }
                                         _ => (
-                                            block.statements.clone(),
+                                            ArmBody::Statements(&block.statements),
                                             TypedTerminator::Jump(merge_id),
                                         ),
                                     }
                                 } else {
-                                    (vec![], TypedTerminator::Jump(merge_id))
+                                    (ArmBody::Statements(&[]), TypedTerminator::Jump(merge_id))
                                 }
                             }
                             _ => {
@@ -1522,7 +1560,10 @@ impl TypedCfgBuilder {
                                     arm.body.ty.clone(),
                                     arm.body.span,
                                 );
-                                (vec![body_stmt], TypedTerminator::Jump(merge_id))
+                                (
+                                    ArmBody::Expression(body_stmt),
+                                    TypedTerminator::Jump(merge_id),
+                                )
                             }
                         };
 
@@ -1536,12 +1577,14 @@ impl TypedCfgBuilder {
                         // An arm can contain nested loops and branches. Split
                         // them into CFG blocks before attaching the arm's
                         // pattern binding to its entry block.
-                        let body_block = TypedBlock {
-                            statements: body_stmts,
-                            span: arm.body.span,
+                        let (mut body_blocks, _, body_exit) = match body_stmts {
+                            ArmBody::Statements(statements) => {
+                                self.split_statements(statements, body_id, false)?
+                            }
+                            ArmBody::Expression(statement) => {
+                                self.single_statement_block(Cow::Owned(statement), body_id)
+                            }
                         };
-                        let (mut body_blocks, _, body_exit) =
-                            self.split_at_control_flow(&body_block, body_id, false)?;
                         if let Some(entry) = body_blocks.iter_mut().find(|b| b.id == body_id) {
                             entry.pattern_check = body_pattern_info;
                         }
@@ -1576,7 +1619,7 @@ impl TypedCfgBuilder {
                         id: current_block_id,
                         label: None,
                         statements: std::mem::take(&mut current_statements),
-                        terminator: TypedTerminator::Return(expr.clone()),
+                        terminator: TypedTerminator::Return(expr.as_deref().map(Cow::Borrowed)),
                         pattern_check: None,
                     });
 
@@ -1587,7 +1630,7 @@ impl TypedCfgBuilder {
 
                 _ => {
                     // Regular statement - add to current block
-                    current_statements.push(stmt.clone());
+                    current_statements.push(Cow::Borrowed(stmt));
                 }
             }
         }
@@ -1614,24 +1657,29 @@ impl TypedCfgBuilder {
             // A statement of no value (a call for its effect) is not a
             // return: the block ends as any other, and the function's
             // own return follows.
-            let (final_statements, terminator) = if is_function_body
+            let returns_value = is_function_body
                 && current_statements.len() == 1
-            {
-                match &current_statements[0].node {
-                    TypedStatement::Expression(expr)
-                        if !matches!(
-                            expr.ty,
-                            Type::Primitive(zyntax_typed_ast::type_registry::PrimitiveType::Unit)
-                        ) =>
-                    {
-                        // Single expression in function body - implicitly return it
-                        (
-                            vec![],
-                            TypedTerminator::Return(Some(Box::new((**expr).clone()))),
-                        )
-                    }
-                    _ => (current_statements, TypedTerminator::Unreachable),
-                }
+                && matches!(
+                    &current_statements[0].node,
+                    TypedStatement::Expression(expr) if !matches!(
+                        expr.ty,
+                        Type::Primitive(zyntax_typed_ast::type_registry::PrimitiveType::Unit)
+                    )
+                );
+            let (final_statements, terminator) = if returns_value {
+                // Single expression in function body - implicitly return it
+                let value = match current_statements.pop() {
+                    Some(Cow::Borrowed(TypedNode {
+                        node: TypedStatement::Expression(expr),
+                        ..
+                    })) => Cow::Borrowed(&**expr),
+                    Some(Cow::Owned(TypedNode {
+                        node: TypedStatement::Expression(expr),
+                        ..
+                    })) => Cow::Owned(*expr),
+                    _ => unreachable!("the one statement is an expression"),
+                };
+                (vec![], TypedTerminator::Return(Some(value)))
             } else {
                 // Multiple statements, no statements, or not a function body - keep as unreachable
                 (current_statements, TypedTerminator::Unreachable)
