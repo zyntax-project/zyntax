@@ -1132,6 +1132,26 @@ fn number_type() -> Type {
     ])
 }
 
+/// Whether a number of run-time kind has its own lowering of `op`.
+fn takes_number_path(op: &BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Plus(_)
+            | BinOp::Minus(_)
+            | BinOp::Star(_)
+            | BinOp::Slash(_)
+            | BinOp::Caret(_)
+            | BinOp::DoubleSlash(_)
+            | BinOp::Percent(_)
+            | BinOp::TwoEqual(_)
+            | BinOp::TildeEqual(_)
+            | BinOp::LessThan(_)
+            | BinOp::LessThanEqual(_)
+            | BinOp::GreaterThan(_)
+            | BinOp::GreaterThanEqual(_)
+    )
+}
+
 /// Whether arithmetic or ordering on `a` and `b` takes the numbers'
 /// own operation once a nil operand has raised: each is a number of
 /// known kind or such a number or nil, and one may be nil.
@@ -4868,11 +4888,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             pow2: pow2_divisor,
         };
         // A number whose kind is not known decides it at run time.
-        if numbers
-            && (a.ty == Ty::Number || b.ty == Ty::Number)
-            && let Some(v) = self.number_binary(op, a.clone(), b.clone(), divisor, span)
-        {
-            return Ok(v);
+        if numbers && (a.ty == Ty::Number || b.ty == Ty::Number) && takes_number_path(op) {
+            return Ok(self.number_binary(op, a, b, divisor, span));
         }
         // A scalar that may not be a number: arithmetic and ordering
         // raise for nil and booleans as the dynamic value does, then
@@ -5104,9 +5121,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             node: hb.node,
             ty: Ty::Number,
         };
-        let v = self
-            .number_binary(op, na, nb, divisor, span)
-            .expect("the number path takes every arithmetic and ordering operator");
+        let v = self.number_binary(op, na, nb, divisor, span);
         Val {
             node: block_value(pre, v.node, span),
             ty: v.ty,
@@ -5290,14 +5305,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     /// time: both integers takes the integer path, anything else the
     /// float path, and the result says which it took. Bitwise
     /// operators and concatenation are not handled here.
-    fn number_binary(
-        &mut self,
-        op: &BinOp,
-        a: Val,
-        b: Val,
-        divisor: Divisor,
-        span: Span,
-    ) -> Option<Val> {
+    fn number_binary(&mut self, op: &BinOp, a: Val, b: Val, divisor: Divisor, span: Span) -> Val {
         let plain_divisor = divisor.plain;
         let i64_t = prim(PrimitiveType::I64);
         let f64_t = prim(PrimitiveType::F64);
@@ -5314,15 +5322,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let (mut pre, x) = self.number_parts(a);
         let (mut pre_b, y) = self.number_parts(b);
         pre.append(&mut pre_b);
-        let number = |int: Node, float: Node, is_int: Node| Val {
+        let number = |pre: Vec<St>, int: Node, float: Node, is_int: Node| Val {
             node: block_value(
-                pre.clone(),
+                pre,
                 number_value(tag_of_is_int(is_int, span), int, float, span),
                 span,
             ),
             ty: Ty::Number,
         };
-        Some(match op {
+        match op {
             BinOp::Plus(_) | BinOp::Minus(_) | BinOp::Star(_) => {
                 let bop = match op {
                     BinOp::Plus(_) => BinaryOp::Add,
@@ -5332,7 +5340,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 // Both paths are pure, so both run and the tag picks.
                 let int = binary(bop, x.int.clone(), y.int.clone(), i64_t, span);
                 let float = binary(bop, x.as_float(span), y.as_float(span), f64_t, span);
-                number(int, float, both_int(&x, &y))
+                number(pre, int, float, both_int(&x, &y))
             }
             BinOp::Slash(_) | BinOp::Caret(_) => {
                 let (l, r) = (x.as_float(span), y.as_float(span));
@@ -5380,7 +5388,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 );
                 // The call is below the value, where the check after a
                 // call would not find it.
-                let v = number(int, float, is_int);
+                let v = number(pre, int, float, is_int);
                 if plain_divisor { v } else { self.guard(v) }
             }
             BinOp::TwoEqual(_) | BinOp::TildeEqual(_) => {
@@ -5411,8 +5419,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     ty: Ty::Bool,
                 }
             }
-            _ => return None,
-        })
+            _ => unreachable!("the number path takes only arithmetic and comparison"),
+        }
     }
 
     /// `a` against `b`, at least one of them a number of run-time kind.
