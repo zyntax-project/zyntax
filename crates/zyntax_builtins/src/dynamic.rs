@@ -171,6 +171,7 @@ pub(crate) fn extern_instance_hooks() -> Vec<Decl> {
             None,
         ),
         extern_fn("zb_hook_instance_type", &[("x", any())], string(), None),
+        extern_fn("zb_hook_instance_truthy", &[("x", any())], boolean(), None),
         extern_fn(
             "zb_hook_instance_eq",
             &[("a", any()), ("b", any())],
@@ -201,6 +202,12 @@ pub(crate) fn default_instance_hooks(policy: &Policy) -> Vec<Decl> {
     let b = local("b", any());
     let code = local("code", i64());
     vec![
+        define(
+            "zb_hook_instance_truthy",
+            &[&x],
+            boolean(),
+            vec![ret(bool(true))],
+        ),
         define(
             "zb_hook_instance_str",
             &[&x],
@@ -880,6 +887,11 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 ),
                 vec![ret(ne(call("zb_seq_len_any", vec![x.e()], i64()), int(0)))],
             ),
+            // An instance asks its class.
+            when(
+                and(is(&cat, CUSTOM), is_instance(x.e())),
+                vec![ret(call("zb_hook_instance_truthy", vec![x.e()], boolean()))],
+            ),
             ret(bool(true)),
         ],
     ));
@@ -1519,6 +1531,8 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     cast(raw_any(b.e()), usize()),
                 ))],
             ),
+            // A heap object is never a value of another category.
+            when(or(is(&ca, CUSTOM), is(&cb, CUSTOM)), vec![ret(bool(false))]),
             when(
                 and(is(&ca, BOOL), is(&cb, BOOL)),
                 vec![ret(eq(get_bool(a.e()), get_bool(b.e())))],

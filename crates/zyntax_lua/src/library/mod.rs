@@ -756,6 +756,13 @@ fn instance_hooks(t: &Types) -> Vec<Decl> {
             boolean(),
             vec![ret(eq(addr(a.e()), addr(b.e())))],
         ),
+        // Every table is true.
+        define(
+            "zb_hook_instance_truthy",
+            &[&x],
+            boolean(),
+            vec![ret(bool(true))],
+        ),
         define(
             "zb_hook_instance_hash",
             &[&x],

@@ -1,0 +1,14 @@
+0 3 3 True True True
+1 2.5 2.5 True False False
+2 's' s True False True
+st ss
+3 [1] [1] True False True
+[1, 2] [1, 1]
+4 Money(4) Money(4) True False True
+Money(5) Money(5) True True True
+11.0
+[3, 2.5, 's', [1], Money(4)] 5
+[2.5, 3] 3
+False True
+TypeError
+9 9

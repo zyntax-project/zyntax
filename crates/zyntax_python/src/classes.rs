@@ -1769,6 +1769,44 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         statements,
         span,
     );
+    // bool(x): `__bool__` on the instance's class, else `__len__` not
+    // zero, else true.
+    let mut statements = per_class(
+        module,
+        x.clone(),
+        |c| module.method_sig(c, "__bool__").is_some() || module.method_sig(c, "__len__").is_some(),
+        |lowerer, c, obj| {
+            let truth = if module.method_sig(c, "__bool__").is_some() {
+                let result = lowerer
+                    .invoke(c, "__bool__", obj, vec![], span)
+                    .expect("picked");
+                lowerer.truthy(result)
+            } else {
+                let result = lowerer
+                    .invoke(c, "__len__", obj, vec![], span)
+                    .expect("picked");
+                let n = lowerer.coerce(result, Ty::Int);
+                binary(BinaryOp::Ne, n, int_lit(0, span), Ty::Bool, span)
+            };
+            vec![ret(truth, span)]
+        },
+        span,
+    );
+    statements.push(ret(
+        node(
+            TypedExpression::Literal(TypedLiteral::Bool(true)),
+            Ty::Bool,
+            span,
+        ),
+        span,
+    ));
+    let truthy_hook = function(
+        "zb_hook_instance_truthy",
+        vec![param("x", Ty::Object, span)],
+        Ty::Bool,
+        statements,
+        span,
+    );
     // ==: `__eq__` on the left operand's class, else identity.
     let a = var(intern("a"), Ty::Object, span);
     let b = var(intern("b"), Ty::Object, span);
@@ -1962,6 +2000,7 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         setitem_hook,
         type_hook,
         eq_hook,
+        truthy_hook,
         lt_hook,
         le_hook,
         contains_hook,
