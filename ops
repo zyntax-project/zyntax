@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1792230415,"nonce":"d9gmxNlJanV44GQsobrc8b9ckEw=","message":"Fixed in b544f755. Builtins and Python tests pass; all speed-kernel checksums match CPython.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1792230415,"nonce":"sTAWvtTSELiZZy+x5bGQqG9c4sQ=","status":2}]}
