@@ -3230,7 +3230,7 @@ impl<'m> Lowerer<'m> {
     }
 
     pub(crate) fn expr_as(&mut self, e: &py::Expr, target: Ty) -> Result<Node> {
-        let v = self.expr(e)?;
+        let v = self.expr_num(e)?;
         Ok(self.coerce(v, target))
     }
 

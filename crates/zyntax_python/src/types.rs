@@ -979,10 +979,10 @@ impl Ty {
         }
     }
 
-    /// The join of two assignments to a local: two of int, float, bool
-    /// and None make a [`Ty::Num`] of them, where [`Ty::join`] makes
-    /// them dynamic.
-    pub(crate) fn join_local(self, other: Ty) -> Ty {
+    /// The join of two values one local, parameter or result holds: two
+    /// of int, float, bool and None make a [`Ty::Num`] of them, where
+    /// [`Ty::join`] makes them dynamic.
+    pub(crate) fn join_num(self, other: Ty) -> Ty {
         match (self.mask(), other.mask()) {
             (Some(a), Some(b)) if crate::lower::num::enabled() => Ty::num(a | b),
             _ => self.join(other),
@@ -3626,7 +3626,10 @@ pub(crate) fn infer_module(
                             continue;
                         }
                         let current = module.funcs[name].params[index].1;
-                        let joined = module.join_classes(current, ty);
+                        let joined = match (current.mask(), ty.mask()) {
+                            (Some(_), Some(_)) => current.join_num(ty),
+                            _ => module.join_classes(current, ty),
+                        };
                         if joined != current {
                             deps::wrote(Dep::Params(deps::name_key(name)));
                             if trace_rounds {
@@ -3654,7 +3657,8 @@ pub(crate) fn infer_module(
                 }
                 // A parameter only ever passed None is dynamic: the IR has no
                 // value of that type to pass.
-                let joined = match c.sig.params[index].1.join(ty) {
+                // A closure's parameters hold no run-time number unboxed.
+                let joined = match c.sig.params[index].1.join(ty.boxed_view()) {
                     Ty::None => Ty::Object,
                     t => t,
                 };
@@ -4657,7 +4661,7 @@ impl Calls<'_> {
         if self.opaque {
             return Ty::Object;
         }
-        self.typer().expr(e)
+        self.typer().expr_num(e)
     }
 
     fn typer(&self) -> Typer<'_> {
@@ -5439,7 +5443,7 @@ fn infer_locals_in(
     }
     // A body control can fall off the end of returns None there too.
     if locals.returns && !terminates(body) {
-        locals.ret = locals.ret.join(Ty::None);
+        locals.ret = locals.ret.join_num(Ty::None);
     }
     locals.dynamic_field_stores = dynamic_field_stores(
         &Typer {
@@ -6706,7 +6710,7 @@ impl Walker<'_> {
         let numeric = |t: Ty| t.mask().is_some() || t == Ty::Unknown;
         let shared = self.shared.contains(name);
         let joined = if numeric(current) && value.mask().is_some() && !shared {
-            current.join_local(value)
+            current.join_num(value)
         } else if shared {
             self.module.join_classes(current, ty)
         } else {
@@ -7191,10 +7195,10 @@ impl Walker<'_> {
                 }
                 self.locals.returns_other = true;
                 let ty = match &r.value {
-                    Some(v) => self.expr(v),
+                    Some(v) => self.expr_num(v),
                     None => Ty::None,
                 };
-                self.locals.ret = self.locals.ret.join(ty);
+                self.locals.ret = self.locals.ret.join_num(ty);
             }
             py::Stmt::For(f) => {
                 self.expr(&f.iter);
