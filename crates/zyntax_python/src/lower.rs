@@ -131,7 +131,7 @@ fn list_type(elem: Type) -> Type {
 /// dynamic as the box it is.
 pub(crate) fn tuple_field_storage(ty: Ty) -> Ty {
     match ty {
-        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Class(_) | Ty::Tuple(_) => ty,
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Class(_) | Ty::Tuple(_) | Ty::Num(_) => ty,
         _ => Ty::Object,
     }
 }
@@ -141,6 +141,7 @@ pub(crate) fn tuple_field_storage(ty: Ty) -> Ty {
 fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
     use zyntax_builtins::lists::Field;
     match ty {
+        Ty::Num(m) => Field::Num { mask: i64::from(m) },
         Ty::Int => Field::Int,
         Ty::Float => Field::Float,
         Ty::Bool => Field::Bool,
@@ -191,6 +192,7 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         | Ty::Gen
         | Ty::Closure(_)
         | Ty::Func(_)
+        | Ty::Funcs(_)
         | Ty::Bound(_)
         | Ty::Builtin(_)
         | Ty::HostModule(_)
@@ -198,7 +200,6 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         | Ty::HostObject(_, _)
         | Ty::HostFunction(_, _)
         | Ty::HostFloatCallable(_)
-        | Ty::Num(_)
         | Ty::MaybeList(_)
         | Ty::Object
         | Ty::Unknown => Field::Any,
@@ -356,6 +357,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
         // value is.
         Ty::Closure(_)
         | Ty::Func(_)
+        | Ty::Funcs(_)
         | Ty::Bound(_)
         | Ty::Builtin(_)
         | Ty::HostModule(_)
@@ -973,7 +975,7 @@ fn parameter(name: &str, ty: Ty, span: Span) -> TypedParameter {
 pub(crate) fn dynamic_attribute(ty: Ty, span: Span) -> Vec<ParameterAttribute> {
     if matches!(
         ty,
-        Ty::Object | Ty::Closure(_) | Ty::Func(_) | Ty::Bound(_) | Ty::Builtin(_)
+        Ty::Object | Ty::Closure(_) | Ty::Func(_) | Ty::Funcs(_) | Ty::Bound(_) | Ty::Builtin(_)
     ) {
         vec![ParameterAttribute {
             name: intern("dynamic"),
@@ -1705,6 +1707,7 @@ impl<'m> Lowerer<'m> {
             | Ty::Unknown
             | Ty::Closure(_)
             | Ty::Func(_)
+            | Ty::Funcs(_)
             | Ty::Bound(_)
             | Ty::Builtin(_) => {
                 let none = Val {
@@ -2719,7 +2722,8 @@ impl<'m> Lowerer<'m> {
             (Ty::MaybeList(_), _) | (_, Ty::MaybeList(_)) => self.coerce_nullable_list(v, target),
             // A known function value is a dynamic value already.
             (Ty::Closure(_), Ty::Object | Ty::Closure(_)) | (Ty::Object, Ty::Closure(_)) => v.node,
-            (Ty::Func(_), Ty::Object | Ty::Func(_)) | (Ty::Object, Ty::Func(_)) => v.node,
+            (Ty::Func(_) | Ty::Funcs(_), Ty::Object | Ty::Func(_) | Ty::Funcs(_))
+            | (Ty::Object, Ty::Func(_) | Ty::Funcs(_)) => v.node,
             (Ty::Bound(_), Ty::Object | Ty::Bound(_)) | (Ty::Object, Ty::Bound(_)) => v.node,
             (Ty::Builtin(_), Ty::Object | Ty::Builtin(_)) | (Ty::Object, Ty::Builtin(_)) => v.node,
             (Ty::HostObject(_, _), Ty::Object) => call(
@@ -3674,7 +3678,12 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
                 span,
             ),
-            Ty::Gen | Ty::Closure(_) | Ty::Func(_) | Ty::Bound(_) | Ty::Builtin(_) => node(
+            Ty::Gen
+            | Ty::Closure(_)
+            | Ty::Func(_)
+            | Ty::Funcs(_)
+            | Ty::Bound(_)
+            | Ty::Builtin(_) => node(
                 TypedExpression::Literal(TypedLiteral::Bool(true)),
                 Ty::Bool,
                 span,
@@ -3872,6 +3881,7 @@ impl<'m> Lowerer<'m> {
             | Ty::HostFloatCallable(_)
             | Ty::Object
             | Ty::Func(_)
+            | Ty::Funcs(_)
             | Ty::Unknown => call("zb_any_str", vec![v.node], Ty::Str, span),
         }
     }
@@ -7652,7 +7662,7 @@ impl<'m> Lowerer<'m> {
         // A function value whose function is known is the record every
         // function value is; only a call reads the type, off the callee
         // expression itself.
-        if let Ty::Closure(_) | Ty::Func(_) | Ty::Bound(_) | Ty::Builtin(_) = v.ty {
+        if let Ty::Closure(_) | Ty::Func(_) | Ty::Funcs(_) | Ty::Bound(_) | Ty::Builtin(_) = v.ty {
             v.ty = Ty::Object;
         }
         // A library call that can raise is checked before its value is
@@ -10647,6 +10657,22 @@ impl<'m> Lowerer<'m> {
                             .is_some();
                         if fits {
                             return self.call_item(&item, sig, args, keywords, c, span);
+                        }
+                    }
+                    Ty::Funcs(k) => {
+                        let members: Vec<String> = types::func_set_members(k)
+                            .into_iter()
+                            .map(|m| self.module.items_by_index[m as usize].clone())
+                            .collect();
+                        let fits = members.iter().all(|m| {
+                            self.module
+                                .func_value_call(&self.module.funcs[m], &c.arguments, |e| {
+                                    self.ty_of(e)
+                                })
+                                .is_some()
+                        });
+                        if fits {
+                            return self.call_func_set(&members, args, keywords, c, ty, span);
                         }
                     }
                     // The method on the receiver as it is: the record
@@ -14783,6 +14809,57 @@ impl<'m> Lowerer<'m> {
             })?);
         }
         Ok(out)
+    }
+
+    /// A call through a value holding one of the module functions
+    /// `members`: the code address its record holds picks the function,
+    /// called by its name as a known function value is. The last is the
+    /// one left when none before it matched.
+    fn call_func_set(
+        &mut self,
+        members: &[String],
+        args: &[py::Expr],
+        keywords: &[py::Keyword],
+        c: &py::ExprCall,
+        ty: Ty,
+        span: Span,
+    ) -> Result<Val> {
+        let callee = self.expr(&c.func)?;
+        let mut pre = Vec::new();
+        let record = self.hold(callee, &mut pre, span);
+        let code = Val {
+            node: call("zb_func_code", vec![record.node], Ty::Int, span),
+            ty: Ty::Int,
+        };
+        let code = self.hold(code, &mut pre, span);
+        self.hoisted.extend(pre);
+        // One member's call, with what it hoists kept to its branch.
+        let branch = |this: &mut Self, name: &str| -> Result<(Vec<Stmt>, Node)> {
+            let outer = std::mem::take(&mut this.hoisted);
+            let sig = this.module.funcs[name].clone();
+            let called = this.call_item(name, sig, args, keywords, c, span);
+            let node = called.map(|v| this.coerce(v, ty));
+            let inner = std::mem::replace(&mut this.hoisted, outer);
+            Ok((inner, node?))
+        };
+        let (last, rest) = members.split_last().expect("a set of two or more");
+        let mut chosen = branch(self, last)?;
+        for name in rest.iter().rev() {
+            let then = branch(self, name)?;
+            self.module.adapters.borrow_mut().insert(name.clone());
+            let test = binary(
+                BinaryOp::Eq,
+                code.node.clone(),
+                cast(code_of(&adapter_name(name), span), Ty::Int, span),
+                Ty::Bool,
+                span,
+            );
+            let mut out = Vec::new();
+            let picked = self.conditional_value(test, then, chosen, ty, span, &mut out);
+            chosen = (out, picked);
+        }
+        self.hoisted.extend(chosen.0);
+        Ok(Val { node: chosen.1, ty })
     }
 
     /// A module function as a value, through an adapter that unboxes

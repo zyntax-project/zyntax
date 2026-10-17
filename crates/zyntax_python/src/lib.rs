@@ -760,6 +760,10 @@ fn parse_program_once(
             })
             .collect();
         writes.extend(out.widened_globals);
+        let refused_more = out.refused_more || !out.reopened.is_empty();
+        for name in &out.reopened {
+            inferred.closed.remove(name);
+        }
         for (item, writes_global) in items.iter().zip(&writes_globals) {
             if !writes_global {
                 continue;
@@ -786,7 +790,8 @@ fn parse_program_once(
             inferred.dynamic_methods.clone(),
             inferred.field_lists.clone(),
             inferred.dynamic_fields.clone(),
-        ) == before;
+        ) == before
+            && !refused_more;
         if settled && methods_settling {
             break;
         }

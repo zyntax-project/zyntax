@@ -476,6 +476,90 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ],
         ));
     }
+    // The same over the value struct itself, for a tuple field or list
+    // element of run-time numbers: its box, equality and order as the
+    // numbers they are (None equal only to None, ordered through the
+    // dynamic comparison, which raises), and a box read back as one of
+    // the kinds `mask` names.
+    {
+        let num_ty = zyntax_typed_ast::Type::Tuple(vec![i64(), i64(), f64()]);
+        let a = local("a", num_ty.clone());
+        let b = local("b", num_ty.clone());
+        let part = |v: &Local, i: i64, ty: zyntax_typed_ast::Type| idx(v.e(), int(i), ty);
+        let as_f64 = |v: &Local| {
+            if_expr(
+                eq(part(v, 0, i64()), int(4)),
+                part(v, 2, f64()),
+                cast(part(v, 1, i64()), f64()),
+            )
+        };
+        let boxed = |v: &Local| {
+            call(
+                "zb_num_box",
+                vec![part(v, 0, i64()), part(v, 1, i64()), part(v, 2, f64())],
+                any(),
+            )
+        };
+        d.push(define("zb_num_boxed", &[&a], any(), vec![ret(boxed(&a))]));
+        let neither_float = and(
+            ne(part(&a, 0, i64()), int(4)),
+            ne(part(&b, 0, i64()), int(4)),
+        );
+        let either_none = or(
+            eq(part(&a, 0, i64()), int(0)),
+            eq(part(&b, 0, i64()), int(0)),
+        );
+        d.push(define(
+            "zb_num_eq",
+            &[&a, &b],
+            boolean(),
+            vec![
+                when(
+                    either_none.clone(),
+                    vec![ret(eq(part(&a, 0, i64()), part(&b, 0, i64())))],
+                ),
+                when(
+                    neither_float.clone(),
+                    vec![ret(eq(part(&a, 1, i64()), part(&b, 1, i64())))],
+                ),
+                ret(eq(as_f64(&a), as_f64(&b))),
+            ],
+        ));
+        d.push(define(
+            "zb_num_lt",
+            &[&a, &b],
+            boolean(),
+            vec![
+                when(
+                    either_none,
+                    vec![ret(call(
+                        "zb_any_lt",
+                        vec![boxed(&a), boxed(&b)],
+                        boolean(),
+                    ))],
+                ),
+                when(
+                    neither_float,
+                    vec![ret(lt(part(&a, 1, i64()), part(&b, 1, i64())))],
+                ),
+                ret(lt(as_f64(&a), as_f64(&b))),
+            ],
+        ));
+        let mask = local("mask", i64());
+        d.push(define(
+            "zb_num_read",
+            &[&x, &mask],
+            num_ty.clone(),
+            vec![ret(tuple(
+                vec![
+                    call("zb_num_tag_in", vec![x.e(), mask.e()], i64()),
+                    call("zb_num_int", vec![x.e()], i64()),
+                    call("zb_num_float", vec![x.e()], f64()),
+                ],
+                num_ty,
+            ))],
+        ));
+    }
     d.push(define(
         "zb_num_tag",
         &[&x],

@@ -80,6 +80,11 @@ pub(crate) enum Ty {
     /// wherever a dynamic value is needed; where it is called, the call
     /// is the function's own, direct and typed.
     Func(u16),
+    /// One of a few module functions named as values: the set at this
+    /// index of the function-set table, each member a [`Ty::Func`]
+    /// index. The record every function value is; where it is called,
+    /// its code address picks the member, called as `Func` is.
+    Funcs(u16),
     /// A method of a list or an instance bound to a local, at this
     /// index of the module's table: the record every bound method is,
     /// so it is a dynamic value wherever one is needed; where it is
@@ -432,6 +437,19 @@ thread_local! {
     /// `Ty::Tuple` decided in one inference round names the same shape
     /// in the next and in the lowering.
     static TUPLE_SHAPES: std::cell::RefCell<Vec<Vec<Ty>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Parameters, by item and position, that may not take lists of
+    /// numbers of two kinds as one list of run-time numbers: a caller
+    /// passes a list of another kind the callee may change or keep, so
+    /// the copy converting it would be seen.
+    static NUMBER_LIST_REFUSED: std::cell::RefCell<HashSet<(String, usize)>> =
+        std::cell::RefCell::new(HashSet::default());
+    /// Module functions closed though named as values, each passed as an
+    /// argument only: the function, the callee and the position.
+    static PASSED_FUNCTIONS: std::cell::RefCell<Vec<(String, String, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The function sets of [`Ty::Funcs`], each sorted, interned as the
+    /// tuple shapes are.
+    static FUNC_SETS: std::cell::RefCell<Vec<Vec<u16>>> = const { std::cell::RefCell::new(Vec::new()) };
     /// The element kinds the library does not carry (a tuple shape, a
     /// list shape) that the lowering used as a list's element, in the
     /// order they were first used: each gets the list functions
@@ -486,6 +504,9 @@ thread_local! {
 /// Forget every shape: the start of a program.
 pub(crate) fn reset_tuple_shapes() {
     TUPLE_SHAPES.with(|t| t.borrow_mut().clear());
+    FUNC_SETS.with(|t| t.borrow_mut().clear());
+    NUMBER_LIST_REFUSED.with(|t| t.borrow_mut().clear());
+    PASSED_FUNCTIONS.with(|t| t.borrow_mut().clear());
     ELEM_LISTS.with(|t| t.borrow_mut().clear());
     LIST_SHAPES.with(|t| t.borrow_mut().clear());
     DICT_SHAPES.with(|t| t.borrow_mut().clear());
@@ -885,7 +906,8 @@ pub(crate) fn tuple_of(elems: Vec<Ty>) -> Ty {
     let elems: Vec<Ty> = elems
         .into_iter()
         .map(|t| match t {
-            Ty::None | Ty::Gen | Ty::Num(_) | Ty::MaybeList(_) => Ty::Object,
+            Ty::None | Ty::Gen | Ty::MaybeList(_) => Ty::Object,
+            Ty::Num(_) if !crate::lower::num::enabled() => Ty::Object,
             other => other,
         })
         .collect();
@@ -903,6 +925,99 @@ pub(crate) fn tuple_of(elems: Vec<Ty>) -> Ty {
 /// The element types of the tuple shape `k`.
 pub(crate) fn tuple_shape(k: u16) -> Vec<Ty> {
     TUPLE_SHAPES.with(|t| t.borrow()[k as usize].clone())
+}
+
+/// The most functions a [`Ty::Funcs`] tells apart; a value that may be
+/// more is dynamic.
+const MAX_FUNC_SET: usize = 8;
+
+/// The type of a value that is one of the module functions `members`
+/// (indices of [`Ty::Func`]): the function itself when there is one.
+pub(crate) fn func_set(mut members: Vec<u16>) -> Ty {
+    members.sort_unstable();
+    members.dedup();
+    match members.len() {
+        0 => Ty::Unknown,
+        1 => Ty::Func(members[0]),
+        n if n > MAX_FUNC_SET => Ty::Object,
+        _ => FUNC_SETS.with(|t| {
+            let mut table = t.borrow_mut();
+            if let Some(k) = table.iter().position(|set| *set == members) {
+                return Ty::Funcs(k as u16);
+            }
+            let k =
+                u16::try_from(table.len()).expect("fewer than 65536 function sets in a program");
+            table.push(members);
+            Ty::Funcs(k)
+        }),
+    }
+}
+
+/// The [`Ty::Func`] indices of function set `k`.
+pub(crate) fn func_set_members(k: u16) -> Vec<u16> {
+    FUNC_SETS.with(|t| t.borrow()[k as usize].clone())
+}
+
+/// The list of run-time numbers two lists of numbers of different kinds
+/// join to, and a tuple holding such lists where the tuples otherwise
+/// join element by element.
+fn number_list_join(a: Ty, b: Ty) -> Option<Ty> {
+    if !crate::lower::num::enabled() {
+        return None;
+    }
+    match (a, b) {
+        (Ty::List(x), Ty::List(y)) if x != y => {
+            Some(Ty::List(Elem::Num(x.ty().mask()? | y.ty().mask()?)))
+        }
+        (Ty::Tuple(x), Ty::Tuple(y)) if x != y => {
+            let (xs, ys) = (tuple_shape(x), tuple_shape(y));
+            if xs.len() != ys.len() {
+                return None;
+            }
+            let mut joined = Vec::with_capacity(xs.len());
+            let mut lists = false;
+            for (p, q) in xs.into_iter().zip(ys) {
+                joined.push(match number_list_join(p, q) {
+                    Some(t) => {
+                        lists = true;
+                        t
+                    }
+                    None if p.mask().is_some() && q.mask().is_some() => p.join_num(q),
+                    None => p.join(q),
+                });
+            }
+            lists.then(|| tuple_of(joined))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a value of `passed` given to a parameter of `param` is
+/// converted on the way: a list of numbers of another kind, alone or in
+/// a tuple, becomes a copy.
+fn converts_number_list(passed: Ty, param: Ty) -> bool {
+    match (passed, param) {
+        (Ty::List(Elem::Num(p)), Ty::List(Elem::Num(m))) => p & !m != 0,
+        (Ty::List(Elem::Int | Elem::Float), Ty::List(Elem::Num(_))) => true,
+        (Ty::Tuple(x), Ty::Tuple(y)) if x != y => {
+            let (xs, ys) = (tuple_shape(x), tuple_shape(y));
+            xs.len() == ys.len()
+                && xs
+                    .into_iter()
+                    .zip(ys)
+                    .any(|(p, q)| converts_number_list(p, q))
+        }
+        _ => false,
+    }
+}
+
+/// The functions a value of `ty` may be, when it is one or a set of them.
+fn funcs_of(ty: Ty) -> Option<Vec<u16>> {
+    match ty {
+        Ty::Func(k) => Some(vec![k]),
+        Ty::Funcs(k) => Some(func_set_members(k)),
+        _ => None,
+    }
 }
 
 impl Ty {
@@ -1006,6 +1121,10 @@ impl Ty {
             }
             // An instance is a pointer, and None is the null one.
             (Ty::None, Ty::Class(k)) | (Ty::Class(k), Ty::None) => Ty::Class(k),
+            // Module functions named as values make the set of them.
+            (a, b) if let (Some(x), Some(y)) = (funcs_of(a), funcs_of(b)) => {
+                func_set(x.into_iter().chain(y).collect())
+            }
             // Two shapes of one arity join element by element.
             (Ty::Tuple(a), Ty::Tuple(b)) => {
                 let (a, b) = (tuple_shape(a), tuple_shape(b));
@@ -3062,6 +3181,125 @@ pub(crate) struct Item<'a> {
     pub(crate) module: Option<String>,
 }
 
+/// The parameters of module functions, by function and position, that
+/// the body only calls or passes on to such a parameter of another: a
+/// function value given to one is never seen by code out of view.
+fn call_only_params(items: &[Item<'_>]) -> HashSet<(String, usize)> {
+    use ruff_python_ast::visitor::{Visitor, walk_expr};
+    struct Uses<'p> {
+        params: &'p [String],
+        /// Per parameter: used in a way that lets it out.
+        loose: Vec<bool>,
+        /// Per parameter: the callee parameters it is passed to.
+        passed: Vec<Vec<(String, usize)>>,
+    }
+    impl<'a> Visitor<'a> for Uses<'_> {
+        fn visit_expr(&mut self, expr: &'a py::Expr) {
+            match expr {
+                py::Expr::Call(c) => {
+                    match &*c.func {
+                        py::Expr::Name(_) => {}
+                        other => self.visit_expr(other),
+                    }
+                    for (i, a) in c.arguments.args.iter().enumerate() {
+                        if let (py::Expr::Name(callee), py::Expr::Name(arg)) = (&*c.func, a)
+                            && let Some(p) = self.params.iter().position(|p| p == arg.id.as_str())
+                        {
+                            self.passed[p].push((callee.id.to_string(), i));
+                            continue;
+                        }
+                        self.visit_expr(a);
+                    }
+                    for k in &c.arguments.keywords {
+                        self.visit_expr(&k.value);
+                    }
+                }
+                py::Expr::Name(n) => {
+                    if let Some(p) = self.params.iter().position(|p| p == n.id.as_str()) {
+                        self.loose[p] = true;
+                    }
+                }
+                _ => walk_expr(self, expr),
+            }
+        }
+    }
+    let mut facts: HashMap<(String, usize), Vec<(String, usize)>> = HashMap::default();
+    for item in items.iter().filter(|item| item.class.is_none()) {
+        let params: Vec<String> = item
+            .def
+            .parameters
+            .iter_non_variadic_params()
+            .map(|p| p.parameter.name.to_string())
+            .collect();
+        // Only the body's own bindings: a parameter it assigns again or
+        // a nested body reads is not followed.
+        let scope = crate::scope::Scope::shared(&item.def.body);
+        let mut uses = Uses {
+            params: &params,
+            loose: vec![false; params.len()],
+            passed: vec![Vec::new(); params.len()],
+        };
+        for stmt in &item.def.body {
+            uses.visit_stmt(stmt);
+        }
+        for (i, name) in params.iter().enumerate() {
+            let rebound = scope.bound.contains(name)
+                || scope.globals.contains(name)
+                || scope.nonlocals.contains(name)
+                || scope
+                    .children
+                    .iter()
+                    .any(|(_, c)| c.free.contains(name) || c.bound.contains(name));
+            if !uses.loose[i] && !rebound {
+                facts.insert((item.name.clone(), i), std::mem::take(&mut uses.passed[i]));
+            }
+        }
+    }
+    // Whatever passes a parameter on to one that lets it out lets it
+    // out too.
+    loop {
+        let out: Vec<(String, usize)> = facts
+            .iter()
+            .filter(|(_, onward)| onward.iter().any(|target| !facts.contains_key(target)))
+            .map(|(key, _)| key.clone())
+            .collect();
+        if out.is_empty() {
+            break;
+        }
+        for key in out {
+            facts.remove(&key);
+        }
+    }
+    facts.into_keys().collect()
+}
+
+/// The functions closed though passed as values whose receiving
+/// parameter did not end up holding them as a known function: a call
+/// through it is a dynamic one, out of view, so they open again.
+fn passed_functions_out_of_view(module: &Module) -> Vec<String> {
+    let mut open = Vec::new();
+    PASSED_FUNCTIONS.with(|t| {
+        for (name, callee, i) in t.borrow().iter() {
+            if !module.closed.contains(name) || open.contains(name) {
+                continue;
+            }
+            let Some(&k) = module.func_values.get(name) else {
+                open.push(name.clone());
+                continue;
+            };
+            let held = module
+                .funcs
+                .get(callee)
+                .and_then(|sig| sig.params.get(*i))
+                .and_then(|(_, ty)| funcs_of(*ty));
+            if !held.is_some_and(|members| members.contains(&k)) {
+                open.push(name.clone());
+            }
+        }
+    });
+    open
+}
+
 /// What [`infer_module`] decided.
 pub(crate) struct Inferred {
     pub(crate) funcs: HashMap<String, Sig>,
@@ -3079,6 +3317,13 @@ pub(crate) struct Inferred {
     /// What the functions' bodies widen module variables to; see
     /// [`Locals::widened_globals`].
     pub(crate) widened_globals: Vec<(String, Ty)>,
+    /// Whether this inference refused a parameter a list of run-time
+    /// numbers it had taken, so another round must type its callers.
+    pub(crate) refused_more: bool,
+    /// Functions passed as values that a call out of view may reach,
+    /// which are open from the next round; see
+    /// [`passed_functions_out_of_view`].
+    pub(crate) reopened: Vec<String>,
 }
 
 /// The items every call of which is in view: module functions never
@@ -3098,6 +3343,9 @@ pub(crate) fn closed_items(body: &[py::Stmt], items: &[Item<'_>]) -> HashSet<Str
         init: bool,
         /// Attribute names read as values rather than called.
         valued_methods: HashSet<String>,
+        /// Names passed as a positional argument to a call of a name:
+        /// the name, the callee, the position.
+        passed: Vec<(String, String, usize)>,
     }
     impl<'a> Visitor<'a> for Mentions {
         fn visit_stmt(&mut self, stmt: &'a py::Stmt) {
@@ -3120,7 +3368,12 @@ pub(crate) fn closed_items(body: &[py::Stmt], items: &[Item<'_>]) -> HashSet<Str
                         }
                         other => self.visit_expr(other),
                     }
-                    for a in &c.arguments.args {
+                    for (i, a) in c.arguments.args.iter().enumerate() {
+                        if let (py::Expr::Name(callee), py::Expr::Name(arg)) = (&*c.func, a) {
+                            self.passed
+                                .push((arg.id.to_string(), callee.id.to_string(), i));
+                            continue;
+                        }
                         self.visit_expr(a);
                     }
                     for k in &c.arguments.keywords {
@@ -3156,6 +3409,24 @@ pub(crate) fn closed_items(body: &[py::Stmt], items: &[Item<'_>]) -> HashSet<Str
     for item in items {
         *counts.entry(item.name.as_str()).or_default() += 1;
     }
+    // A name passed somewhere other than to a parameter that is only
+    // called is a value out of view.
+    let call_only = call_only_params(items);
+    let functions: HashSet<&str> = items
+        .iter()
+        .filter(|item| item.class.is_none())
+        .map(|item| item.name.as_str())
+        .collect();
+    let mut passed_functions = Vec::new();
+    for (name, callee, i) in std::mem::take(&mut seen.passed) {
+        if functions.contains(name.as_str()) && call_only.contains(&(callee.clone(), i)) {
+            passed_functions.push((name, callee, i));
+        } else {
+            seen.names.insert(name);
+        }
+    }
+    passed_functions.retain(|(name, _, _)| !seen.names.contains(name));
+    PASSED_FUNCTIONS.with(|t| *t.borrow_mut() = passed_functions);
     items
         .iter()
         .filter(|item| counts[item.name.as_str()] == 1)
@@ -3636,9 +3907,14 @@ pub(crate) fn infer_module(
                             continue;
                         }
                         let current = module.funcs[name].params[index].1;
+                        let refused = NUMBER_LIST_REFUSED
+                            .with(|t| t.borrow().contains(&(name.clone(), index)));
                         let joined = match (current.mask(), ty.mask()) {
                             (Some(_), Some(_)) => current.join_num(ty),
-                            _ => module.join_classes(current, ty),
+                            _ => match number_list_join(current, ty) {
+                                Some(list) if !refused => list,
+                                _ => module.join_classes(current, ty),
+                            },
                         };
                         if joined != current {
                             deps::wrote(Dep::Params(deps::name_key(name)));
@@ -3875,8 +4151,42 @@ pub(crate) fn infer_module(
         .flat_map(|inference| inference.locals.widened_globals.iter())
         .map(|(name, ty)| (name.clone(), *ty))
         .collect();
+    // A parameter that took lists of numbers of two kinds as one list of
+    // run-time numbers is converted from each other kind passed to it, a
+    // copy only a parameter the body only reads cannot tell apart.
+    let mut refused_more = false;
+    for inference in kept.iter().flatten().chain(entry_kept.iter()) {
+        for (callee, index, passed) in &inference.passed {
+            let Target::Item(name) = callee else {
+                continue;
+            };
+            let Some(param) = module
+                .funcs
+                .get(name)
+                .and_then(|sig| sig.params.get(*index))
+            else {
+                continue;
+            };
+            let converts = converts_number_list(*passed, param.1);
+            let reads = matches!(param.1, Ty::List(_))
+                && matches!(
+                    module
+                        .list_params
+                        .get(name)
+                        .and_then(|facts| facts.get(*index)),
+                    Some(ListFact::Reads)
+                );
+            if converts && !reads {
+                refused_more |=
+                    NUMBER_LIST_REFUSED.with(|t| t.borrow_mut().insert((name.clone(), *index)));
+            }
+        }
+    }
+    let reopened = passed_functions_out_of_view(&module);
     Inferred {
         widened_globals,
+        refused_more,
+        reopened,
         funcs: module.funcs,
         classes: module.classes,
         closures,
@@ -5019,6 +5329,21 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
             py::Expr::Call(c) => {
                 if let Some((target, first)) = self.callee(&c.func) {
                     self.record(target, first, &c.arguments.args, &c.arguments.keywords);
+                }
+                // A call through a set of functions passes its arguments
+                // to each.
+                if let py::Expr::Name(_) = &*c.func
+                    && let Ty::Funcs(k) = self.typer().callee_ty(&c.func)
+                {
+                    for member in func_set_members(k) {
+                        let name = self.module.items_by_index[member as usize].clone();
+                        self.record(
+                            Target::Item(name),
+                            0,
+                            &c.arguments.args,
+                            &c.arguments.keywords,
+                        );
+                    }
                 }
                 if let py::Expr::Attribute(a) = &*c.func
                     && !is_super_call(&a.value)
@@ -8598,6 +8923,27 @@ impl Typer<'_> {
                     Some(tys) => self.module.instance_ret(name, sig, &tys),
                     None => Ty::Object,
                 };
+            }
+            // What any of the functions returns.
+            Ty::Funcs(k) => {
+                let mut joined = Ty::Unknown;
+                for member in func_set_members(k) {
+                    let name = &self.module.items_by_index[member as usize];
+                    self.read_ret(name);
+                    let sig = &self.module.funcs[name];
+                    let ret = match self
+                        .module
+                        .func_value_call(sig, &c.arguments, |e| self.expr(e))
+                    {
+                        Some(tys) => self.module.instance_ret(name, sig, &tys),
+                        None => return Ty::Object,
+                    };
+                    joined = match (joined.mask(), ret.mask()) {
+                        (Some(_), Some(_)) => joined.join_num(ret),
+                        _ => self.module.join_classes(joined, ret),
+                    };
+                }
+                return joined;
             }
             Ty::Bound(k) => {
                 let info = &self.module.bounds[k as usize];

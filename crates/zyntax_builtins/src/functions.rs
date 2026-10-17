@@ -144,6 +144,27 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
 
     let f = local("f", any());
     let tag = local("tag", i64());
+    // The code address a function record holds, which tells the
+    // functions a frontend made records of apart.
+    d.push(extern_fn(
+        "zb_box_code_raw",
+        &[("x", any())],
+        i64(),
+        Some("zyntax_box_pointer"),
+    ));
+    d.push(define(
+        "zb_func_code",
+        &[&f],
+        i64(),
+        vec![
+            rec.decl(call("zb_func_unbox", vec![f.e()], anys.clone())),
+            ret(call(
+                "zb_box_code_raw",
+                vec![idx(rec.e(), int(0), any())],
+                i64(),
+            )),
+        ],
+    ));
     d.push(define(
         "zb_func_unbox",
         &[&f],

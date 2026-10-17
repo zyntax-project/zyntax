@@ -270,6 +270,11 @@ pub enum Field {
         suffix: String,
         ty: Type,
     },
+    /// A frontend's run-time number of the kinds `mask` names, the value
+    /// struct (tag, int, float) itself; see `zb_num_box`.
+    Num {
+        mask: i64,
+    },
 }
 
 /// The function `op` of the dict or set (`family`) shape whose functions
@@ -295,6 +300,7 @@ impl Field {
             | Field::List { .. }
             | Field::Array { .. } => any(),
             Field::Instance { ty, .. } | Field::Tuple { ty, .. } => ty.clone(),
+            Field::Num { .. } => Type::Tuple(vec![i64(), i64(), f64()]),
         }
     }
 
@@ -355,6 +361,7 @@ impl Field {
             Field::Tuple { suffix, .. } => {
                 call(&format!("zb_tuple_eq_{suffix}"), vec![a, b], boolean())
             }
+            Field::Num { .. } => call("zb_num_eq", vec![a, b], boolean()),
         }
     }
 
@@ -379,6 +386,7 @@ impl Field {
             Field::Tuple { suffix, .. } => {
                 call(&format!("zb_tuple_lt_{suffix}"), vec![a, b], boolean())
             }
+            Field::Num { .. } => call("zb_num_lt", vec![a, b], boolean()),
         }
     }
 
@@ -437,6 +445,7 @@ impl Field {
             Field::Tuple { suffix, .. } => {
                 call(&format!("zb_tuple_repr_{suffix}"), vec![x], string())
             }
+            Field::Num { .. } => call("zb_any_repr", vec![self.boxed(x)], string()),
         }
     }
 
@@ -457,6 +466,7 @@ impl Field {
                 any(),
             ),
             Field::Tuple { suffix, .. } => call(&format!("zb_tuple_box_{suffix}"), vec![x], any()),
+            Field::Num { .. } => call("zb_num_boxed", vec![x], any()),
         }
     }
 
@@ -474,7 +484,9 @@ impl Field {
             | Field::Set { .. }
             | Field::List { .. }
             | Field::Array { .. } => call("zb_any_hash", vec![x], i64()),
-            Field::Instance { .. } => call("zb_any_hash", vec![self.boxed(x)], i64()),
+            Field::Instance { .. } | Field::Num { .. } => {
+                call("zb_any_hash", vec![self.boxed(x)], i64())
+            }
         }
     }
 
@@ -524,7 +536,7 @@ impl Field {
             | Field::Set { .. }
             | Field::List { .. }
             | Field::Array { .. } => any_eq(stored, v),
-            Field::Instance { .. } => any_eq(stored, self.boxed(v)),
+            Field::Instance { .. } | Field::Num { .. } => any_eq(stored, self.boxed(v)),
         }
     }
 
@@ -585,6 +597,7 @@ impl Field {
             Field::Tuple { suffix, ty } => {
                 call(&format!("zb_tuple_read_{suffix}"), vec![x], ty.clone())
             }
+            Field::Num { mask } => call("zb_num_read", vec![x, int(*mask)], self.ty()),
         }
     }
 }
