@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1792231550,"nonce":"Tp+dslAood1hL56513UutfYVMkI=","added":["debt","area:ci","area:website"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1792231550,"nonce":"zFFlL2AqcyYxloWkzgOGSNlfBNE=","message":"Landed in 428d0fc2. Pages render from CI JSON once the workflow runs on main; verified locally with runner output and the workflow's own shell steps.","files":null}]}
