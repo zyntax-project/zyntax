@@ -251,6 +251,13 @@ pub enum Field {
         ty: Type,
         tag: i32,
     },
+    /// An instance of one of several of the frontend's classes, held by
+    /// address as `ty`: boxed under the class it reads from the
+    /// instance, and read back from a box by the function `unbox`.
+    Instances {
+        ty: Type,
+        unbox: String,
+    },
     /// A list of the kind whose functions carry `suffix`, stored as the
     /// box of the kind's tag and read raw as `ty`.
     List {
@@ -299,7 +306,9 @@ impl Field {
             | Field::Set { .. }
             | Field::List { .. }
             | Field::Array { .. } => any(),
-            Field::Instance { ty, .. } | Field::Tuple { ty, .. } => ty.clone(),
+            Field::Instance { ty, .. } | Field::Instances { ty, .. } | Field::Tuple { ty, .. } => {
+                ty.clone()
+            }
             Field::Num { .. } => Type::Tuple(vec![i64(), i64(), f64()]),
         }
     }
@@ -352,7 +361,9 @@ impl Field {
                 vec![self.raw(a), self.raw(b)],
                 boolean(),
             ),
-            Field::Instance { .. } => eq(cast(a, usize()), cast(b, usize())),
+            Field::Instance { .. } | Field::Instances { .. } => {
+                eq(cast(a, usize()), cast(b, usize()))
+            }
             Field::List { suffix, .. } | Field::Array { suffix, .. } => call(
                 &format!("zb_list_eq_{suffix}"),
                 vec![self.raw(a), self.raw(b)],
@@ -373,7 +384,7 @@ impl Field {
             Field::Any | Field::Dict { .. } | Field::Set { .. } => {
                 call("zb_any_lt", vec![a, b], boolean())
             }
-            Field::Instance { .. } => call(
+            Field::Instance { .. } | Field::Instances { .. } => call(
                 "zb_ptr_lt",
                 vec![cast(a, usize()), cast(b, usize())],
                 boolean(),
@@ -422,7 +433,9 @@ impl Field {
                     text_of
                 }
             }
-            Field::Instance { .. } => call("zb_any_repr", vec![self.boxed(x)], string()),
+            Field::Instance { .. } | Field::Instances { .. } => {
+                call("zb_any_repr", vec![self.boxed(x)], string())
+            }
             Field::List { suffix, .. } => call(
                 &format!("zb_list_repr_{suffix}"),
                 vec![self.raw(x)],
@@ -465,6 +478,7 @@ impl Field {
                 vec![cast(x, usize()), int32(*tag)],
                 any(),
             ),
+            Field::Instances { .. } => call("zb_hook_box_instance", vec![cast(x, usize())], any()),
             Field::Tuple { suffix, .. } => call(&format!("zb_tuple_box_{suffix}"), vec![x], any()),
             Field::Num { .. } => call("zb_num_boxed", vec![x], any()),
         }
@@ -484,7 +498,7 @@ impl Field {
             | Field::Set { .. }
             | Field::List { .. }
             | Field::Array { .. } => call("zb_any_hash", vec![x], i64()),
-            Field::Instance { .. } | Field::Num { .. } => {
+            Field::Instance { .. } | Field::Instances { .. } | Field::Num { .. } => {
                 call("zb_any_hash", vec![self.boxed(x)], i64())
             }
         }
@@ -536,7 +550,9 @@ impl Field {
             | Field::Set { .. }
             | Field::List { .. }
             | Field::Array { .. } => any_eq(stored, v),
-            Field::Instance { .. } | Field::Num { .. } => any_eq(stored, self.boxed(v)),
+            Field::Instance { .. } | Field::Instances { .. } | Field::Num { .. } => {
+                any_eq(stored, self.boxed(v))
+            }
         }
     }
 
@@ -566,6 +582,7 @@ impl Field {
                 call("zb_hook_unbox_instance", vec![x, int32(*tag)], usize()),
                 ty.clone(),
             ),
+            Field::Instances { ty, unbox } => call(unbox, vec![x], ty.clone()),
             Field::List { suffix, .. } => call(&format!("zb_list_as_box_{suffix}"), vec![x], any()),
             // The box itself once its tag is the array's; anything else
             // is the TypeError the check raises, and the value after it

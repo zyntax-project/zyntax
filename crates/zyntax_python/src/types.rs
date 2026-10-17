@@ -972,13 +972,32 @@ pub(crate) fn func_set_members(k: u16) -> Vec<u16> {
 }
 
 /// The list of run-time numbers two lists of numbers of different kinds
-/// join to, and a tuple holding such lists where the tuples otherwise
-/// join element by element.
+/// join to, the list of tuples two lists of tuples join to where their
+/// fields differ only in which numbers they hold, and a tuple holding
+/// such lists where the tuples otherwise join element by element.
 fn number_list_join(a: Ty, b: Ty) -> Option<Ty> {
     if !crate::lower::num::enabled() {
         return None;
     }
     match (a, b) {
+        (Ty::List(Elem::Tuple(x)), Ty::List(Elem::Tuple(y))) if x != y => {
+            let (xs, ys) = (tuple_shape(x), tuple_shape(y));
+            if xs.len() != ys.len() {
+                return None;
+            }
+            let mut joined = Vec::with_capacity(xs.len());
+            for (p, q) in xs.into_iter().zip(ys) {
+                joined.push(match (p.mask(), q.mask()) {
+                    _ if p == q => p,
+                    (Some(_), Some(_)) => p.join_num(q),
+                    _ => return None,
+                });
+            }
+            match tuple_of(joined) {
+                Ty::Tuple(k) => Some(Ty::List(Elem::Tuple(k))),
+                _ => None,
+            }
+        }
         (Ty::List(x), Ty::List(y)) if x != y => {
             Some(Ty::List(Elem::Num(x.ty().mask()? | y.ty().mask()?)))
         }
@@ -1010,6 +1029,7 @@ fn number_list_join(a: Ty, b: Ty) -> Option<Ty> {
 /// a tuple, becomes a copy.
 fn converts_number_list(passed: Ty, param: Ty) -> bool {
     match (passed, param) {
+        (Ty::List(Elem::Tuple(p)), Ty::List(Elem::Tuple(m))) => p != m,
         (Ty::List(Elem::Num(p)), Ty::List(Elem::Num(m))) => p & !m != 0,
         (Ty::List(Elem::Int | Elem::Float), Ty::List(Elem::Num(_))) => true,
         (Ty::Tuple(x), Ty::Tuple(y)) if x != y => {
@@ -1193,12 +1213,19 @@ impl Ty {
                 func_set(x.into_iter().chain(y).collect())
             }
             // Two shapes of one arity join element by element.
+            // Two tuples join field with field, a field holding a run-time
+            // number as itself.
             (Ty::Tuple(a), Ty::Tuple(b)) => {
                 let (a, b) = (tuple_shape(a), tuple_shape(b));
                 if a.len() != b.len() {
                     return Ty::Object;
                 }
-                tuple_of(a.into_iter().zip(b).map(|(x, y)| x.join(y)).collect())
+                tuple_of(
+                    a.into_iter()
+                        .zip(b)
+                        .map(|(x, y)| x.join_num(y).stored_view())
+                        .collect(),
+                )
             }
             // Two dicts join key with key and value with value.
             (Ty::Dict(a), Ty::Dict(b)) => {
@@ -4012,7 +4039,10 @@ pub(crate) fn infer_module(
                             deps::wrote(Dep::Params(deps::name_key(name)));
                             if trace_rounds {
                                 eprintln!(
-                                    "[types] inner {inner_rounds}: {name} param {index} {joined:?} (was {current:?})"
+                                    "[types] inner {inner_rounds}: {name} param {index} {} (was {}, passed {})",
+                                    joined.describe(),
+                                    current.describe(),
+                                    ty.describe()
                                 );
                             }
                             module.funcs.get_mut(name).unwrap().params[index].1 = joined;
@@ -5183,20 +5213,27 @@ impl Calls<'_> {
         let l = self.typer().expr(left);
         let r = self.typer().expr(right);
         // A number or other value on the left asks the instance on the
-        // right for the reflected method.
-        let (k, method, arg) = match (l, r) {
-            (Ty::Class(k), _) => (k, dunder_name(op), right),
-            (_, Ty::Class(k)) => (k, reflected_dunder_name(op), left),
+        // right for the reflected method; an instance of one of several
+        // classes asks each.
+        let (classes, method, arg) = match (l, r) {
+            (Ty::Class(k), _) => (vec![k], dunder_name(op), right),
+            (Ty::Classes(s), _) => (class_set_members(s), dunder_name(op), right),
+            (l, Ty::Class(k)) if l != Ty::Object => (vec![k], reflected_dunder_name(op), left),
+            (l, Ty::Classes(s)) if l != Ty::Object => {
+                (class_set_members(s), reflected_dunder_name(op), left)
+            }
             _ => return,
         };
-        let Some((sig, name)) = self.module.method_sig_fixed(k as usize, method) else {
-            return;
-        };
         let ty = self.arg_ty(arg);
-        self.passed.push((Target::Item(name.to_string()), 1, ty));
-        if sig.params.len() == 2 {
-            let this = sig.params[0].1;
-            self.site(name, vec![this, ty]);
+        for k in classes {
+            let Some((sig, name)) = self.module.method_sig_fixed(k as usize, method) else {
+                continue;
+            };
+            self.passed.push((Target::Item(name.to_string()), 1, ty));
+            if sig.params.len() == 2 {
+                let this = sig.params[0].1;
+                self.site(name, vec![this, ty]);
+            }
         }
     }
 
@@ -5257,6 +5294,13 @@ impl Calls<'_> {
         let Some(mut tys) =
             call_types(self.module, &sig, first, args, keywords, |e| self.arg_ty(e))
         else {
+            // A starred value not typed yet is spread once it is.
+            if args
+                .iter()
+                .any(|a| matches!(a, py::Expr::Starred(s) if self.arg_ty(&s.value) == Ty::Unknown))
+            {
+                return;
+            }
             for i in first..n {
                 self.passed.push((callee.clone(), i, Ty::Object));
             }
@@ -8159,6 +8203,9 @@ thread_local! {
     /// reaches with boxes.
     static HELD: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::default());
     static NEW_HOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Where the first hold [`new_hold`] answers for was made, for the
+    /// type trace.
+    static FIRST_HOLD: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Note what a value of type `from` converted to `to` makes dynamic:
@@ -8190,6 +8237,23 @@ pub(crate) fn note_held(module: &Module, from: Ty, to: Ty) {
 /// the last [`take_held`]: the program is read again.
 pub(crate) fn new_hold() -> bool {
     NEW_HOLD.with(|n| n.get())
+}
+
+/// Record `site` as where the first new hold was made, once.
+pub(crate) fn note_hold_site(site: impl FnOnce() -> String) {
+    if new_hold() {
+        FIRST_HOLD.with(|f| {
+            let mut f = f.borrow_mut();
+            if f.is_none() {
+                *f = Some(site());
+            }
+        });
+    }
+}
+
+/// Where the first new hold since the last [`take_held`] was made.
+pub(crate) fn first_hold_site() -> Option<String> {
+    FIRST_HOLD.with(|f| f.borrow().clone())
 }
 
 /// `start` with every class a dynamic value of one of them exposes,
@@ -8271,6 +8335,7 @@ fn has_boxed_entry(module: &Module, c: usize) -> bool {
 /// The classes [`note_held`] noted since the last call, by name.
 pub(crate) fn take_held() -> HashSet<String> {
     NEW_HOLD.with(|n| n.set(false));
+    FIRST_HOLD.with(|f| f.borrow_mut().take());
     HELD.with(|h| std::mem::take(&mut *h.borrow_mut()))
 }
 
@@ -8742,16 +8807,41 @@ impl Typer<'_> {
 
     /// What `l op r` and `l op= r` give: an instance takes part through
     /// its class's method, and the result is what that method returns.
+    /// An instance of one of several classes gives what their methods
+    /// do, joined; a class without one raises.
     pub(crate) fn operation(&self, op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
-        if let Ty::Class(k) = l
-            && let Some((sig, name)) = self.module.method_sig(k as usize, dunder_name(op))
-        {
-            if sig.params.len() == 2 {
-                return self
-                    .module
-                    .instance_ret(name, sig, &[Ty::Unknown, r.boxed_view()]);
+        let method = |k: u16, name: &str, arg: Ty| {
+            let (sig, fname) = self.module.method_sig(k as usize, name)?;
+            Some(if sig.params.len() == 2 {
+                self.module
+                    .instance_ret(fname, sig, &[Ty::Unknown, arg.boxed_view()])
+            } else {
+                sig.ret
+            })
+        };
+        let over_set = |s: u16, name: &str, arg: Ty| {
+            class_set_members(s)
+                .into_iter()
+                .filter_map(|k| method(k, name, arg))
+                .reduce(|a, b| self.module.join_classes(a, b))
+        };
+        match (l, r) {
+            (Ty::Class(k), _) => {
+                if let Some(ty) = method(k, dunder_name(op), r) {
+                    return ty;
+                }
             }
-            return sig.ret;
+            (Ty::Classes(s), _) => {
+                if let Some(ty) = over_set(s, dunder_name(op), r) {
+                    return ty;
+                }
+            }
+            (l, Ty::Classes(s)) if l != Ty::Object => {
+                if let Some(ty) = over_set(s, reflected_dunder_name(op), l) {
+                    return ty;
+                }
+            }
+            _ => {}
         }
         binop(op, l, r, right)
     }
@@ -9026,7 +9116,16 @@ impl Typer<'_> {
                 if t.elts.iter().any(|e| matches!(e, py::Expr::Starred(_))) {
                     Ty::Object
                 } else {
-                    tuple_of(t.elts.iter().map(|e| self.expr(e)).collect())
+                    // A field holds a run-time number as itself.
+                    tuple_of(
+                        t.elts
+                            .iter()
+                            .map(|e| match self.expr_num(e) {
+                                ty @ Ty::Num(_) => ty.stored_view(),
+                                ty => ty.boxed_view(),
+                            })
+                            .collect(),
+                    )
                 }
             }
             // A literal's shape is the join of its keys and of its values;
@@ -9607,9 +9706,9 @@ impl Typer<'_> {
             "min" | "max" if args.len() >= 2 => {
                 let mut acc = Ty::Unknown;
                 for a in args.iter() {
-                    acc = acc.join(self.expr(a));
+                    acc = acc.join_num(self.expr_num(a));
                 }
-                acc
+                acc.stored_view()
             }
             "pow" if args.len() == 2 => binop(py::Operator::Pow, arg(0), arg(1), &args[1]),
             _ => Ty::Object,

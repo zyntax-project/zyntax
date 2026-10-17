@@ -393,6 +393,7 @@ fn parse_with_host(
         }
         // Only a class the reading did not hold sends it round again.
         let grew = types::new_hold();
+        let site = types::first_hold_site();
         let newly_held: Vec<String> = types::take_held()
             .into_iter()
             .filter(|c| !held.contains(c))
@@ -401,7 +402,11 @@ fn parse_with_host(
             return result;
         }
         if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() && !newly_held.is_empty() {
-            eprintln!("[types] read again: held {}", newly_held.join(" "));
+            eprintln!(
+                "[types] read again: held {}, first in {}",
+                newly_held.join(" "),
+                site.unwrap_or_default()
+            );
         }
         demoted.extend(found);
         held.extend(newly_held);
@@ -1139,7 +1144,9 @@ fn parse_program_once(
             Span::new(0, 0),
         ));
     }
+    let mut unboxers: HashSet<u16> = HashSet::default();
     for s in types::class_set_unboxes() {
+        unboxers.insert(s);
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(classes::class_set_unboxer(&inferred, s, Span::new(0, 0))),
             Type::Unknown,
@@ -1193,6 +1200,21 @@ fn parse_program_once(
         ));
     }
     declarations.extend(lower::shape_declarations(&inferred, library.list_type));
+    // A tuple field of a class set reads its box back through the set's
+    // unboxer, which describing the shapes may have asked for.
+    for s in types::class_set_unboxes() {
+        if unboxers.insert(s) {
+            declarations.push(TypedNode::new(
+                TypedDeclaration::Function(classes::class_set_unboxer(
+                    &inferred,
+                    s,
+                    Span::new(0, 0),
+                )),
+                Type::Unknown,
+                Span::new(0, 0),
+            ));
+        }
+    }
     mark_nothrow(&mut declarations, &inferred.non_raising);
     for k in classes::exact_classes(&inferred) {
         if let Some(id) = inferred.classes[k].type_id

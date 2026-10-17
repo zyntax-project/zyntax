@@ -59,8 +59,13 @@ pub(crate) fn num_binop(
     {
         return None;
     }
+    // None among the kinds raises; the result is what the numbers give.
     let (ml, mr) = (l.mask()?, r.mask()?);
-    if (ml | mr) & !NUMBERS != 0 {
+    if (ml | mr) & !(NUMBERS | Ty::NUM_NONE) != 0 {
+        return None;
+    }
+    let (ml, mr) = (ml & NUMBERS, mr & NUMBERS);
+    if ml == 0 || mr == 0 {
         return None;
     }
     Some(if op == O::Div {
@@ -424,6 +429,59 @@ impl Lowerer<'_> {
         span: Span,
     ) -> crate::Result<Val> {
         use ruff_python_ast::Operator as O;
+        // An operand that may be None is checked first: None goes to the
+        // dynamic operation, which raises the TypeError Python does, and
+        // the numbers are computed on as they are.
+        let none_in = |t: Ty| t.mask().unwrap_or(0) & Ty::NUM_NONE != 0;
+        if none_in(left.ty) || none_in(right.ty) {
+            let mut pre = Vec::new();
+            let l = self.hold(left, &mut pre, span);
+            let r = self.hold(right, &mut pre, span);
+            self.hoisted.append(&mut pre);
+            let mut test: Option<Node> = None;
+            for v in [&l, &r] {
+                if none_in(v.ty) {
+                    let is = self.num_is_none(v.clone());
+                    test = Some(match test {
+                        Some(t) => binary(BinaryOp::Or, t, is, Ty::Bool, span),
+                        None => is,
+                    });
+                }
+            }
+            let outer = std::mem::take(&mut self.hoisted);
+            let (bl, br) = (self.boxed_num(l.clone()), self.boxed_num(r.clone()));
+            let raised = call(
+                "zb_any_arith",
+                vec![
+                    int_lit(crate::types::arith_code(op), span),
+                    bl.node,
+                    br.node,
+                ],
+                Ty::Object,
+                span,
+            );
+            let _ = self.guard(
+                Val {
+                    node: raised,
+                    ty: Ty::Object,
+                },
+                span,
+            );
+            let branch = std::mem::replace(&mut self.hoisted, outer);
+            let test = test.expect("an operand may be None");
+            self.hoisted.push(if_stmt(test, branch, None, span));
+            let l = if none_in(l.ty) {
+                self.num_not_none(l)
+            } else {
+                l
+            };
+            let r = if none_in(r.ty) {
+                self.num_not_none(r)
+            } else {
+                r
+            };
+            return self.arithmetic(op, l, r, right_expr, span);
+        }
         let ints = |t: Ty| t.mask().unwrap_or(0) & !(Ty::NUM_BOOL | Ty::NUM_INT) == 0;
         let floats = |t: Ty| t.mask() == Some(Ty::NUM_FLOAT);
         let kinds = if ints(left.ty) && ints(right.ty) {

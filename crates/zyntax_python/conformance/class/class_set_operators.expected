@@ -1,0 +1,10 @@
+Pt(1.0) Pt(-1.0) Pt(1.0) True
+TypeError unsupported operand type(s) for *: 'Pt' and 'int'
+Vec(3.0) Pt(-1.0) Pt(1.0) True
+Vec(2.0) Vec(3.0)
+Pt(5.0) Pt(-1.0) Pt(1.0) True
+TypeError unsupported operand type(s) for *: 'Pt' and 'int'
+Vec(7.0) Pt(-1.0) Pt(1.0) True
+Vec(6.0) Vec(9.0)
+3.5 [(Vec(1.0), 2.0), (Pt(3.0), 0.5)] [Vec(1.0), Pt(3.0)] True
+[(Pt(0.0), 0), (Vec(1.0), 1), (Pt(2.0), 2)] [Pt(0.0), Vec(1.0), Pt(2.0)]

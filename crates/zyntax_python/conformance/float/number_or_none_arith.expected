@@ -1,0 +1,8 @@
+0 TypeError unsupported operand type(s) for *: 'float' and 'NoneType'
+TypeError unsupported operand type(s) for +: 'NoneType' and 'NoneType'
+1 TypeError unsupported operand type(s) for *: 'float' and 'NoneType'
+TypeError unsupported operand type(s) for +: 'NoneType' and 'NoneType'
+2 3.0 3.0 0.0 0.5
+TypeError unsupported operand type(s) for +: 'float' and 'NoneType'
+3 4.0 4.5 -0.5 0.75
+TypeError unsupported operand type(s) for +: 'float' and 'NoneType'

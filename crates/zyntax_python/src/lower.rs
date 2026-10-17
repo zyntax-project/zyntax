@@ -131,8 +131,31 @@ fn list_type(elem: Type) -> Type {
 /// dynamic as the box it is.
 pub(crate) fn tuple_field_storage(ty: Ty) -> Ty {
     match ty {
-        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Class(_) | Ty::Tuple(_) | Ty::Num(_) => ty,
+        Ty::Int
+        | Ty::Float
+        | Ty::Bool
+        | Ty::Str
+        | Ty::Class(_)
+        | Ty::Classes(_)
+        | Ty::Tuple(_)
+        | Ty::Num(_) => ty,
         _ => Ty::Object,
+    }
+}
+
+/// How the library handles a tuple's field of type `ty`: as
+/// [`field_of`] says, and an instance of one of several classes by its
+/// address, read back from a box by the set's unboxer.
+fn tuple_field_of(ty: Ty) -> zyntax_builtins::lists::Field {
+    match ty {
+        Ty::Classes(s) => {
+            types::note_class_set_unbox(s);
+            zyntax_builtins::lists::Field::Instances {
+                ty: addr_type(),
+                unbox: class_set_unbox_name(s),
+            }
+        }
+        ty => field_of(ty),
     }
 }
 
@@ -226,7 +249,7 @@ pub(crate) fn shape_declarations(
         .map(|k| {
             let fields = types::tuple_shape(k)
                 .into_iter()
-                .map(|t| field_of(t.settled()))
+                .map(|t| tuple_field_of(t.settled()))
                 .collect();
             (types::tuple_suffix(k), ir(Ty::Tuple(k)), fields)
         })
@@ -2732,6 +2755,12 @@ impl<'m> Lowerer<'m> {
         }
         if v.ty != target && target != Ty::Unknown && self.in_env == 0 {
             types::note_held(self.module, v.ty, target);
+            types::note_hold_site(|| {
+                format!(
+                    "{} at {:?}, {:?} to {target:?}",
+                    self.name, v.node.span, v.ty
+                )
+            });
         }
         match (v.ty, target) {
             (a, b) if a == b => v.node,
@@ -8327,7 +8356,13 @@ impl<'m> Lowerer<'m> {
             py::Expr::Tuple(t) => {
                 let mut items = Vec::with_capacity(t.elts.len());
                 for e in &t.elts {
-                    items.push(self.expr(e)?);
+                    // A field holds a run-time number as itself.
+                    let v = self.expr_num(e)?;
+                    items.push(if matches!(v.ty, Ty::Num(_)) {
+                        v
+                    } else {
+                        self.boxed_num(v)
+                    });
                 }
                 match ty.tuple_elems() {
                     Some(shape) if shape.len() == items.len() => Val {
@@ -8603,6 +8638,16 @@ impl<'m> Lowerer<'m> {
                 ),
                 span,
             ));
+        }
+        // An instance of one of several classes: each class's method,
+        // its own operand on the left or, reflected, on the right.
+        if let Ty::Classes(s) = left.ty {
+            return self.class_set_operation(op, left, right, s, false, span);
+        }
+        if let Ty::Classes(s) = right.ty
+            && left.ty != Ty::Object
+        {
+            return self.class_set_operation(op, right, left, s, true, span);
         }
         // `3 * d` with `d` an instance: the reflected method on the right.
         if let Ty::Class(k) = right.ty
@@ -12792,24 +12837,58 @@ impl<'m> Lowerer<'m> {
             if let Some(answer) = types::isinstance_of_class(self.module, v.ty, k) {
                 return Ok(lit(answer));
             }
-            // The instance's class tag against `k` and every subclass.
-            let tag = match v.ty {
-                Ty::Class(_) => node(
+            // An instance's class tag against `k` and every subclass; an
+            // instance that is None is of no class.
+            if let Ty::Class(_) | Ty::Classes(_) = v.ty {
+                let first = match v.ty {
+                    Ty::Classes(s) => types::class_set_members(s)[0],
+                    Ty::Class(c) => c,
+                    _ => unreachable!(),
+                };
+                let mut pre = Vec::new();
+                let held = self.hold(v, &mut pre, span);
+                self.hoisted.extend(pre);
+                let tag = node(
                     TypedExpression::Field(TypedFieldAccess {
-                        object: Box::new(v.node),
+                        object: Box::new(cast(held.node.clone(), Ty::Class(first), span)),
                         field: intern("$class"),
                     }),
                     Ty::Int,
                     span,
-                ),
-                _ => binary(
-                    BinaryOp::Sub,
-                    call("zb_any_kind", vec![v.node], Ty::Int, span),
-                    int_lit(zyntax_builtins::INSTANCE_KIND_BASE, span),
-                    Ty::Int,
+                );
+                let tag = Val {
+                    node: tag,
+                    ty: Ty::Int,
+                };
+                let mut then = Vec::new();
+                let tag = self.hold(tag, &mut then, span);
+                let test = self.tag_in_classes(&tag.node, k, span);
+                let present = binary(
+                    BinaryOp::Ne,
+                    as_addr(held.node, span),
+                    int_lit(0, span),
+                    Ty::Bool,
                     span,
-                ),
-            };
+                );
+                let mut out = Vec::new();
+                let node = self.conditional_value(
+                    present,
+                    (then, test),
+                    (Vec::new(), lit(false).node),
+                    Ty::Bool,
+                    span,
+                    &mut out,
+                );
+                self.hoisted.extend(out);
+                return Ok(Val { node, ty: Ty::Bool });
+            }
+            let tag = binary(
+                BinaryOp::Sub,
+                call("zb_any_kind", vec![v.node], Ty::Int, span),
+                int_lit(zyntax_builtins::INSTANCE_KIND_BASE, span),
+                Ty::Int,
+                span,
+            );
             let mut pre = Vec::new();
             let held = self.hold(
                 Val {
@@ -12820,24 +12899,8 @@ impl<'m> Lowerer<'m> {
                 span,
             );
             self.hoisted.extend(pre);
-            let mut test: Option<Node> = None;
-            for c in 0..self.module.classes.len() {
-                if self.module.is_subclass(c, k) {
-                    let this = binary(
-                        BinaryOp::Eq,
-                        held.node.clone(),
-                        int_lit(c as i64, span),
-                        Ty::Bool,
-                        span,
-                    );
-                    test = Some(match test {
-                        None => this,
-                        Some(prev) => binary(BinaryOp::Or, prev, this, Ty::Bool, span),
-                    });
-                }
-            }
             return Ok(Val {
-                node: test.expect("a class is its own subclass"),
+                node: self.tag_in_classes(&held.node, k, span),
                 ty: Ty::Bool,
             });
         }
@@ -12870,6 +12933,19 @@ impl<'m> Lowerer<'m> {
             other => same(other),
         };
         Ok(Val { node, ty: Ty::Bool })
+    }
+
+    /// Whether the class index `tag` is class `k`'s or a subclass's.
+    fn tag_in_classes(&self, tag: &Node, k: usize, span: Span) -> Node {
+        let first = int_lit(k as i64, span);
+        let end = int_lit((k + self.module.classes[k].descendants.max(1)) as i64, span);
+        binary(
+            BinaryOp::And,
+            binary(BinaryOp::Ge, tag.clone(), first, Ty::Bool, span),
+            binary(BinaryOp::Lt, tag.clone(), end, Ty::Bool, span),
+            Ty::Bool,
+            span,
+        )
     }
 
     /// Take `name` to hold an instance from here on, as generated code
@@ -13247,6 +13323,17 @@ impl<'m> Lowerer<'m> {
         message: &str,
         span: Span,
     ) -> Val {
+        self.checked_instance_raising(object, exception, str_lit(message, span), span)
+    }
+
+    /// [`Self::checked_instance_as`] with the message a string value.
+    fn checked_instance_raising(
+        &mut self,
+        object: Val,
+        exception: &str,
+        message: Node,
+        span: Span,
+    ) -> Val {
         if self.known_instance(&object.node) {
             return object;
         }
@@ -13270,7 +13357,7 @@ impl<'m> Lowerer<'m> {
             span,
         );
         let mut raise = Vec::new();
-        self.raise_named(exception, str_lit(message, span), span, &mut raise);
+        self.raise_named(exception, message, span, &mut raise);
         self.hoisted.push(TypedNode::new(
             TypedStatement::If(TypedIf {
                 condition: Box::new(is_null),
@@ -15205,6 +15292,39 @@ impl<'m> Lowerer<'m> {
         members: &[u16],
         attr: &str,
         span: Span,
+        each: impl FnMut(&mut Self, Val) -> Result<Option<Val>>,
+    ) -> Result<Val> {
+        let none = str_lit(
+            &format!("'NoneType' object has no attribute '{attr}'"),
+            span,
+        );
+        let missing = |this: &mut Self, k: u16| {
+            let class = &this.module.classes[k as usize].name;
+            str_lit(&format!("'{class}' object has no attribute '{attr}'"), span)
+        };
+        self.class_set_dispatch_raising(
+            object,
+            members,
+            "AttributeError",
+            none,
+            missing,
+            span,
+            each,
+        )
+    }
+
+    /// [`Self::class_set_dispatch`] raising `exception` with `none` for a
+    /// None receiver and with `missing(k)` for a class `each` finds
+    /// nothing on.
+    #[allow(clippy::too_many_arguments)]
+    fn class_set_dispatch_raising(
+        &mut self,
+        object: Val,
+        members: &[u16],
+        exception: &str,
+        none: Node,
+        mut missing: impl FnMut(&mut Self, u16) -> Node,
+        span: Span,
         mut each: impl FnMut(&mut Self, Val) -> Result<Option<Val>>,
     ) -> Result<Val> {
         let first = members[0];
@@ -15212,7 +15332,7 @@ impl<'m> Lowerer<'m> {
             node: cast(object.node, Ty::Class(first), span),
             ty: Ty::Class(first),
         };
-        let checked = self.checked_instance(as_first, attr, span);
+        let checked = self.checked_instance_raising(as_first, exception, none, span);
         let mut pre = Vec::new();
         let held = self.hold(checked, &mut pre, span);
         let tag = Val {
@@ -15256,11 +15376,11 @@ impl<'m> Lowerer<'m> {
                 Some(v) => self.coerce(v, ty),
                 // A class without the attribute raises as Python does.
                 None => {
-                    let message = format!(
-                        "'{}' object has no attribute '{attr}'",
-                        self.module.classes[k as usize].name
-                    );
-                    self.raised_value(Vec::new(), "AttributeError", &message, ty, span)
+                    let message = missing(self, k);
+                    let mut pre = Vec::new();
+                    self.raise_named(exception, message, span, &mut pre);
+                    self.hoisted.extend(pre);
+                    self.zero_of(ty, span)
                 }
             };
             statements.append(&mut self.hoisted);
@@ -15290,6 +15410,95 @@ impl<'m> Lowerer<'m> {
         }
         self.hoisted.extend(chosen.0);
         Ok(Val { node: chosen.1, ty })
+    }
+
+    /// The name of `v`'s type as `type(v).__name__` gives it: known for a
+    /// static type, else read from its box.
+    fn type_name_of(&mut self, v: &Val, span: Span) -> Node {
+        let known = match v.ty {
+            Ty::Int => "int",
+            Ty::Float => "float",
+            Ty::Bool => "bool",
+            Ty::Str => "str",
+            Ty::Bytes => "bytes",
+            Ty::None => "NoneType",
+            Ty::List(_) => "list",
+            Ty::Tuple(_) => "tuple",
+            Ty::Dict(_) => "dict",
+            Ty::Set(_) if tables::frozen(v.ty) => "frozenset",
+            Ty::Set(_) => "set",
+            Ty::Class(k) => return str_lit(&self.module.classes[k as usize].name, span),
+            _ => {
+                let boxed = self.coerce(v.clone(), Ty::Object);
+                return call("zb_any_type", vec![boxed], Ty::Str, span);
+            }
+        };
+        str_lit(known, span)
+    }
+
+    /// `instance op other`, or `other op instance` when `reflected`, the
+    /// instance one of class set `s`: each class's method for `op`, and
+    /// the TypeError Python raises for a class with none.
+    fn class_set_operation(
+        &mut self,
+        op: py::Operator,
+        instance: Val,
+        other: Val,
+        s: u16,
+        reflected: bool,
+        span: Span,
+    ) -> Result<Val> {
+        let members = types::class_set_members(s);
+        let name = if reflected {
+            types::reflected_dunder_name(op)
+        } else {
+            types::dunder_name(op)
+        };
+        let mut pre = Vec::new();
+        let other = self.hold(other, &mut pre, span);
+        self.hoisted.extend(pre);
+        let other_name = self.type_name_of(&other, span);
+        let unsupported = move |class: Node| {
+            let (left, right) = if reflected {
+                (other_name.clone(), class)
+            } else {
+                (class, other_name.clone())
+            };
+            let head = format!("unsupported operand type(s) for {}: '", op_text(op));
+            let parts = [
+                str_lit(&head, span),
+                left,
+                str_lit("' and '", span),
+                right,
+                str_lit("'", span),
+            ];
+            parts
+                .into_iter()
+                .reduce(|a, b| binary(BinaryOp::Add, a, b, Ty::Str, span))
+                .expect("five parts")
+        };
+        let none = unsupported(str_lit("NoneType", span));
+        let missing = |this: &mut Self, k: u16| {
+            unsupported(str_lit(&this.module.classes[k as usize].name, span))
+        };
+        self.class_set_dispatch_raising(
+            instance,
+            &members,
+            "TypeError",
+            none,
+            missing,
+            span,
+            |this, receiver| {
+                let Ty::Class(k) = receiver.ty else {
+                    unreachable!("a member is a class");
+                };
+                let arg = Val {
+                    node: other.node.clone(),
+                    ty: other.ty,
+                };
+                Ok(this.dunder(k as usize, name, receiver.node, vec![arg], span))
+            },
+        )
     }
 
     /// A module function as a value, through an adapter that unboxes
