@@ -6141,6 +6141,103 @@ impl<'m> Lowerer<'m> {
         }))
     }
 
+    /// `for a, b, ... in zip(xs, ys, ...)` over lists: one counter, the
+    /// loop running while every list still has an element at it (each
+    /// length read again every round, as a list's iterator reads it),
+    /// each element read in place and bound to its target.
+    fn for_zip(
+        &mut self,
+        f: &py::StmtFor,
+        seqs: Vec<Val>,
+        extra: Vec<Stmt>,
+        span: Span,
+    ) -> Result<TypedStatement> {
+        let py::Expr::Tuple(targets) = &*f.target else {
+            unreachable!("a zip loop binds a tuple");
+        };
+        let mut prologue = std::mem::take(&mut self.hoisted);
+        let held: Vec<Val> = seqs
+            .into_iter()
+            .map(|seq| self.hold(seq, &mut prologue, span))
+            .collect();
+        let counter = self.temp();
+        let i = || var(counter, Ty::Int, span);
+        prologue.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: counter,
+                ty: ir(Ty::Int),
+                mutability: Mutability::Mutable,
+                initializer: Some(Box::new(int_lit(0, span))),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        let mut test: Option<Node> = None;
+        for seq in &held {
+            let more = binary(
+                BinaryOp::Lt,
+                i(),
+                method_call(seq.node.clone(), "len", vec![], Ty::Int, span),
+                Ty::Bool,
+                span,
+            );
+            test = Some(match test {
+                None => more,
+                Some(t) => binary(BinaryOp::And, t, more, Ty::Bool, span),
+            });
+        }
+        let mut body = Vec::new();
+        let mut items = Vec::with_capacity(held.len());
+        for seq in &held {
+            let Ty::List(e) = seq.ty else {
+                unreachable!("a zip loop over lists");
+            };
+            let read = Val {
+                node: list_slot(seq.node.clone(), i(), e, span),
+                ty: e.ty(),
+            };
+            items.push(self.hold(read, &mut body, span));
+        }
+        body.push(TypedNode::new(
+            TypedStatement::Expression(Box::new(binary(
+                BinaryOp::Assign,
+                i(),
+                binary(BinaryOp::Add, i(), int_lit(1, span), Ty::Int, span),
+                Ty::None,
+                span,
+            ))),
+            Type::Unknown,
+            span,
+        ));
+        for (target, item) in targets.elts.iter().zip(items) {
+            self.bind_after(target, item, span, &mut body)?;
+        }
+        self.in_loop(|this| -> Result<()> {
+            for s in &f.body {
+                this.stmt(s, &mut body)?;
+            }
+            Ok(())
+        })?;
+        body.extend(extra);
+        prologue.push(TypedNode::new(
+            TypedStatement::While(TypedWhile {
+                condition: Box::new(test.expect("two or more sequences")),
+                body: TypedBlock {
+                    statements: body,
+                    span,
+                },
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        Ok(TypedStatement::Block(TypedBlock {
+            statements: prologue,
+            span,
+        }))
+    }
+
     fn for_loop(&mut self, f: &py::StmtFor, span: Span) -> Result<TypedStatement> {
         if f.orelse.is_empty() {
             return self.for_with_body(f, Vec::new(), span);
@@ -6267,6 +6364,27 @@ impl<'m> Lowerer<'m> {
                 (None, None) => int_lit(0, span),
             };
             return self.for_items(f, seq, Some(start), extra, span);
+        }
+        // `for a, b in zip(xs, ys)` over lists counts along them all: no
+        // list of pairs is built.
+        if let py::Expr::Call(c) = &*f.iter
+            && types::is_name(&c.func, "zip")
+            && !self.is_variable("zip")
+            && c.arguments.keywords.is_empty()
+            && (2..=4).contains(&c.arguments.args.len())
+            && c.arguments
+                .args
+                .iter()
+                .all(|a| matches!(self.ty_of(a), Ty::List(_)))
+            && matches!(&*f.target, py::Expr::Tuple(t)
+                if t.elts.len() == c.arguments.args.len()
+                    && !t.elts.iter().any(|e| matches!(e, py::Expr::Starred(_))))
+        {
+            let mut seqs = Vec::with_capacity(c.arguments.args.len());
+            for a in c.arguments.args.iter() {
+                seqs.push(self.expr(a)?);
+            }
+            return self.for_zip(f, seqs, extra, span);
         }
         // A dict's keys, values or pairs, or a set's values, read in
         // place.

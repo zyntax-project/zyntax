@@ -8412,6 +8412,22 @@ impl Typer<'_> {
                         .unwrap_or(Ty::Object);
                     return tuple_of(vec![Ty::Int, item]);
                 }
+                // One element of each sequence, while all last.
+                ("zip", 2..=4)
+                    if !c
+                        .arguments
+                        .args
+                        .iter()
+                        .any(|a| matches!(a, py::Expr::Starred(_))) =>
+                {
+                    let items = c
+                        .arguments
+                        .args
+                        .iter()
+                        .map(|a| self.expr(a).element().unwrap_or(Ty::Object))
+                        .collect();
+                    return tuple_of(items);
+                }
                 _ => {}
             }
         }
