@@ -1092,6 +1092,13 @@ fn parse_program_once(
             Span::new(0, 0),
         ));
     }
+    for s in types::class_set_unboxes() {
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(classes::class_set_unboxer(&inferred, s, Span::new(0, 0))),
+            Type::Unknown,
+            Span::new(0, 0),
+        ));
+    }
     for &k in inferred.class_adapters.borrow().iter() {
         declarations.push(TypedNode::new(
             TypedDeclaration::Function(lower::class_adapter(&inferred, k)),

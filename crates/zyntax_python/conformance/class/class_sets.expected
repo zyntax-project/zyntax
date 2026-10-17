@@ -1,0 +1,13 @@
+Vec(4, 3) Pt(4, 3) 7 vec pt
+vec 1 Vec(2, 4) True Vec(1, 2)
+pt 3.5 Pt(7.0, 8) True Pt(3.5, 4)
+none True False
+Pt(9, 4) 9
+vec 1
+pt 3.5
+7 4
+7 3 3
+1
+21
+4
+43

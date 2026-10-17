@@ -201,6 +201,7 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         | Ty::HostFunction(_, _)
         | Ty::HostFloatCallable(_)
         | Ty::MaybeList(_)
+        | Ty::Classes(_)
         | Ty::Object
         | Ty::Unknown => Field::Any,
     }
@@ -351,6 +352,8 @@ pub(crate) fn ir(ty: Ty) -> Type {
         // A file is the record the library keeps: a list of its parts.
         Ty::File(_) => list_type(Type::Any),
         Ty::Class(k) => class_type(k as usize),
+        // An instance of one of several classes, by its address.
+        Ty::Classes(_) => addr_type(),
         Ty::HostObject(_, _) => prim(PrimitiveType::I64),
         Ty::Gen => Type::Fiber(Box::new(Type::Any)),
         // A known function value is still the record every function
@@ -835,6 +838,11 @@ pub(crate) fn addr_type() -> Type {
 /// The address of function `name`.
 pub(crate) fn code_of(name: &str, span: Span) -> Node {
     TypedNode::new(TypedExpression::Variable(intern(name)), addr_type(), span)
+}
+
+/// The function reading a box back as an instance of class set `s`.
+pub(crate) fn class_set_unbox_name(s: u16) -> String {
+    format!("py$classes$unbox${s}")
 }
 
 /// `value` as an address.
@@ -2894,7 +2902,7 @@ impl<'m> Lowerer<'m> {
             }
             (Ty::Object, Ty::Dict(_) | Ty::Set(_)) => self.unbox_table(v, target, span),
             // Evaluate a None-producing expression before representing its result.
-            (Ty::None, Ty::Class(_) | Ty::Object) => {
+            (Ty::None, Ty::Class(_) | Ty::Classes(_) | Ty::Object) => {
                 let result = if target == Ty::Object {
                     node(TypedExpression::Literal(TypedLiteral::Null), target, span)
                 } else {
@@ -2910,6 +2918,27 @@ impl<'m> Lowerer<'m> {
                     target,
                     span,
                 )
+            }
+            // An instance of one of several classes: the same address as a
+            // single class holds, boxed under the tag its own class index
+            // gives, and read back checked against every class of the set.
+            (Ty::Class(_), Ty::Classes(_)) => as_addr(v.node, span),
+            (Ty::Classes(_), Ty::Classes(_)) => v.node,
+            (Ty::Classes(_), Ty::Class(_)) => cast(v.node, target, span),
+            (Ty::Classes(_), Ty::Object) => {
+                call("zb_hook_box_instance", vec![v.node], Ty::Object, span)
+            }
+            (Ty::Object, Ty::Classes(s)) => {
+                types::note_class_set_unbox(s);
+                let checked = Val {
+                    node: addr_call(&class_set_unbox_name(s), vec![v.node], span),
+                    ty: target,
+                };
+                if self.guards {
+                    self.guard(checked, span).node
+                } else {
+                    checked.node
+                }
             }
             // An instance is boxed as its address under its class's tag,
             // and read back with a check; a subclass instance is its base.
@@ -3227,6 +3256,9 @@ impl<'m> Lowerer<'m> {
             (Ty::Object, Ty::Class(_)) => {
                 let address = addr_call("zb_unbox_instance", vec![v.node], span);
                 return cast(address, target, span);
+            }
+            (Ty::Object, Ty::Classes(_)) => {
+                return addr_call("zb_unbox_instance", vec![v.node], span);
             }
             (Ty::Object, Ty::Tuple(k)) => return self.unbox_tuple(v, k, true, span),
             // The box is known to hold a list of the kind, or the
@@ -3688,6 +3720,22 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
                 span,
             ),
+            // None is false; an instance is true unless a class says, in
+            // which case its box asks.
+            Ty::Classes(s) => {
+                let dunder = types::class_set_members(s).into_iter().any(|k| {
+                    self.module.method_sig(k as usize, "__bool__").is_some()
+                        || self.module.method_sig(k as usize, "__len__").is_some()
+                });
+                if dunder {
+                    let boxed = Val {
+                        node: self.coerce(v, Ty::Object),
+                        ty: Ty::Object,
+                    };
+                    return self.truthy(boxed);
+                }
+                binary(BinaryOp::Ne, v.node, int_lit(0, span), Ty::Bool, span)
+            }
             // None is false; an instance is true unless its class says.
             Ty::Class(k) => {
                 let k = k as usize;
@@ -3802,6 +3850,13 @@ impl<'m> Lowerer<'m> {
         match v.ty {
             Ty::Num(_) | Ty::MaybeList(_) => {
                 let boxed = self.boxed_num(v);
+                self.str_of(boxed)
+            }
+            Ty::Classes(_) => {
+                let boxed = Val {
+                    node: self.coerce(v, Ty::Object),
+                    ty: Ty::Object,
+                };
                 self.str_of(boxed)
             }
             Ty::Int => call("zb_str_of_int", vec![v.node], Ty::Str, span),
@@ -9124,6 +9179,21 @@ impl<'m> Lowerer<'m> {
                         Ty::Bool,
                         span,
                     ),
+                    // Instances of class sets are the same when their
+                    // addresses are; None is the null one.
+                    (Ty::None, Ty::Classes(_)) => {
+                        binary(BinaryOp::Eq, right.node, int_lit(0, span), Ty::Bool, span)
+                    }
+                    (Ty::Classes(_), Ty::None) => {
+                        binary(BinaryOp::Eq, left.node, int_lit(0, span), Ty::Bool, span)
+                    }
+                    (Ty::Classes(_) | Ty::Class(_), Ty::Classes(_) | Ty::Class(_)) => binary(
+                        BinaryOp::Eq,
+                        as_addr(left.node, span),
+                        as_addr(right.node, span),
+                        Ty::Bool,
+                        span,
+                    ),
                     (Ty::None, t) | (t, Ty::None) if t != Ty::Object => node(
                         TypedExpression::Literal(TypedLiteral::Bool(false)),
                         Ty::Bool,
@@ -10936,6 +11006,25 @@ impl<'m> Lowerer<'m> {
                     c,
                     span,
                 );
+            }
+            // The method of whichever class the instance is.
+            if let Ty::Classes(s) = receiver.ty {
+                let members = types::class_set_members(s);
+                let method = a.attr.as_str();
+                return self.class_set_dispatch(receiver, &members, method, span, |this, r| {
+                    let Ty::Class(k) = r.ty else { unreachable!() };
+                    let has = this.module.method_sig(k as usize, method).is_some()
+                        || this.module.abstract_sig(k as usize, method).is_some()
+                        || this
+                            .module
+                            .field_via(this.module.class_range(k as usize), method)
+                            .is_some();
+                    if !has {
+                        return Ok(None);
+                    }
+                    this.method_on(k as usize, r, method, args, keywords, c, span)
+                        .map(Some)
+                });
             }
             if let Ty::HostObject(module, class) = receiver.ty {
                 let signature = self
@@ -13274,6 +13363,31 @@ impl<'m> Lowerer<'m> {
         if let Some(arity) = types::bound_method_arity(self.module, object.ty, attr) {
             return self.bound_method(object, attr, arity, span);
         }
+        if let Ty::Classes(s) = object.ty {
+            let members = types::class_set_members(s);
+            if let Some(first) = self.shared_field(&members, attr) {
+                let receiver = Val {
+                    node: cast(object.node, Ty::Class(first), span),
+                    ty: Ty::Class(first),
+                };
+                return self.attribute_via(receiver, attr, None, span);
+            }
+            return self.class_set_dispatch(object, &members, attr, span, |this, receiver| {
+                let Ty::Class(k) = receiver.ty else {
+                    unreachable!()
+                };
+                let has = this
+                    .module
+                    .field_via(this.module.class_range(k as usize), attr)
+                    .is_some()
+                    || this.module.class_attr(k as usize, attr).is_some()
+                    || types::bound_method_arity(this.module, receiver.ty, attr).is_some();
+                if !has {
+                    return Ok(None);
+                }
+                this.attribute_via(receiver, attr, None, span).map(Some)
+            });
+        }
         match object.ty {
             Ty::Class(k) => {
                 let set = set.unwrap_or_else(|| self.module.class_range(k as usize).collect());
@@ -13666,6 +13780,38 @@ impl<'m> Lowerer<'m> {
         } else {
             object
         };
+        if let Ty::Classes(s) = object.ty {
+            let members = types::class_set_members(s);
+            if let Some(first) = self.shared_field(&members, attr) {
+                let receiver = Val {
+                    node: cast(object.node, Ty::Class(first), span),
+                    ty: Ty::Class(first),
+                };
+                return self.set_attribute_via(receiver, attr, value, None, span);
+            }
+            let mut pre = Vec::new();
+            let value = self.hold(value, &mut pre, span);
+            self.hoisted.extend(pre);
+            let done =
+                self.class_set_dispatch(object, &members, attr, span, |this, receiver| {
+                    let write =
+                        this.set_attribute_via(receiver, attr, value.clone(), None, span)?;
+                    Ok(Some(Val {
+                        node: Self::block_value(
+                            vec![TypedNode::new(
+                                TypedStatement::Expression(Box::new(write)),
+                                Type::Unknown,
+                                span,
+                            )],
+                            node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+                            Ty::None,
+                            span,
+                        ),
+                        ty: Ty::None,
+                    }))
+                })?;
+            return Ok(done.node);
+        }
         match object.ty {
             Ty::Class(k) => {
                 if crate::records::is_record(k as usize) {
@@ -14974,6 +15120,137 @@ impl<'m> Lowerer<'m> {
             );
             let mut out = Vec::new();
             let picked = self.conditional_value(test, then, chosen, ty, span, &mut out);
+            chosen = (out, picked);
+        }
+        self.hoisted.extend(chosen.0);
+        Ok(Val { node: chosen.1, ty })
+    }
+
+    /// The class whose layout every class of `members` shares up to and
+    /// including field `attr`, so the field sits at one offset in each
+    /// and holds one kind: a read or write through it is that class's.
+    fn shared_field(&self, members: &[u16], attr: &str) -> Option<u16> {
+        let layout = |k: u16| -> Option<Vec<Ty>> {
+            let fields = &self.module.classes[k as usize].fields;
+            let i = fields.iter().position(|(f, _)| f == attr)?;
+            Some(
+                fields[..=i]
+                    .iter()
+                    .map(|(_, t)| field_storage(*t))
+                    .collect(),
+            )
+        };
+        let first = *members.first()?;
+        let shape = layout(first)?;
+        for &k in &members[1..] {
+            let fields = &self.module.classes[k as usize].fields;
+            let names = |c: u16| -> Vec<String> {
+                self.module.classes[c as usize]
+                    .fields
+                    .iter()
+                    .take(shape.len())
+                    .map(|(f, _)| f.clone())
+                    .collect()
+            };
+            if fields.len() < shape.len() || layout(k)? != shape || names(k) != names(first) {
+                return None;
+            }
+        }
+        Some(first)
+    }
+
+    /// `each` on an instance of one of the classes `members`, chosen by
+    /// the class index the instance holds: one branch per class with the
+    /// receiver as that class, the results joined, the last class the
+    /// one left. A None receiver, or one of a class `each` finds without
+    /// `attr` (it gives `None`), raises the AttributeError of `attr`.
+    fn class_set_dispatch(
+        &mut self,
+        object: Val,
+        members: &[u16],
+        attr: &str,
+        span: Span,
+        mut each: impl FnMut(&mut Self, Val) -> Result<Option<Val>>,
+    ) -> Result<Val> {
+        let first = members[0];
+        let as_first = Val {
+            node: cast(object.node, Ty::Class(first), span),
+            ty: Ty::Class(first),
+        };
+        let checked = self.checked_instance(as_first, attr, span);
+        let mut pre = Vec::new();
+        let held = self.hold(checked, &mut pre, span);
+        let tag = Val {
+            node: node(
+                TypedExpression::Field(TypedFieldAccess {
+                    object: Box::new(held.node.clone()),
+                    field: intern("$class"),
+                }),
+                Ty::Int,
+                span,
+            ),
+            ty: Ty::Int,
+        };
+        let tag = self.hold(tag, &mut pre, span);
+        self.hoisted.extend(pre);
+        let mut branches = Vec::with_capacity(members.len());
+        for &k in members {
+            let outer = std::mem::take(&mut self.hoisted);
+            let receiver = Val {
+                node: cast(held.node.clone(), Ty::Class(k), span),
+                ty: Ty::Class(k),
+            };
+            let result = each(self, receiver);
+            let inner = std::mem::replace(&mut self.hoisted, outer);
+            branches.push((k, inner, result?));
+        }
+        let mut ty = Ty::Unknown;
+        for (_, _, v) in &branches {
+            if let Some(v) = v {
+                ty = match (ty.mask(), v.ty.mask()) {
+                    (Some(_), Some(_)) => ty.join_num(v.ty),
+                    _ => self.module.join_classes(ty, v.ty),
+                };
+            }
+        }
+        let ty = ty.settled();
+        let mut coerced = Vec::with_capacity(branches.len());
+        for (k, mut statements, v) in branches {
+            let outer = std::mem::take(&mut self.hoisted);
+            let node = match v {
+                Some(v) => self.coerce(v, ty),
+                // A class without the attribute raises as Python does.
+                None => {
+                    let message = format!(
+                        "'{}' object has no attribute '{attr}'",
+                        self.module.classes[k as usize].name
+                    );
+                    self.raised_value(Vec::new(), "AttributeError", &message, ty, span)
+                }
+            };
+            statements.append(&mut self.hoisted);
+            self.hoisted = outer;
+            coerced.push((k, statements, node));
+        }
+        let (_, last_statements, last_node) = coerced.pop().expect("two or more classes");
+        let mut chosen = (last_statements, last_node);
+        while let Some((k, statements, node)) = coerced.pop() {
+            // The class and its subclasses are one range of class indices.
+            let first = int_lit(k as i64, span);
+            let end = int_lit(
+                k as i64 + self.module.classes[k as usize].descendants as i64,
+                span,
+            );
+            let test = binary(
+                BinaryOp::And,
+                binary(BinaryOp::Ge, tag.node.clone(), first, Ty::Bool, span),
+                binary(BinaryOp::Lt, tag.node.clone(), end, Ty::Bool, span),
+                Ty::Bool,
+                span,
+            );
+            let mut out = Vec::new();
+            let picked =
+                self.conditional_value(test, (statements, node), chosen, ty, span, &mut out);
             chosen = (out, picked);
         }
         self.hoisted.extend(chosen.0);

@@ -85,6 +85,11 @@ pub(crate) enum Ty {
     /// index. The record every function value is; where it is called,
     /// its code address picks the member, called as `Func` is.
     Funcs(u16),
+    /// An instance of one of a few unrelated module classes, or None:
+    /// the set at this index of the class-set table. Held by address as
+    /// a [`Ty::Class`] is; a field or method of it goes by the
+    /// instance's class tag where the members disagree.
+    Classes(u16),
     /// A method of a list or an instance bound to a local, at this
     /// index of the module's table: the record every bound method is,
     /// so it is a dynamic value wherever one is needed; where it is
@@ -447,6 +452,12 @@ thread_local! {
     /// argument only: the function, the callee and the position.
     static PASSED_FUNCTIONS: std::cell::RefCell<Vec<(String, String, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The class sets of [`Ty::Classes`], each sorted.
+    static CLASS_SETS: std::cell::RefCell<Vec<Vec<u16>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The class sets a box is read back as somewhere, each needing its
+    /// checked unboxing function.
+    static CLASS_SET_UNBOXES: std::cell::RefCell<std::collections::BTreeSet<u16>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
     /// The function sets of [`Ty::Funcs`], each sorted, interned as the
     /// tuple shapes are.
     static FUNC_SETS: std::cell::RefCell<Vec<Vec<u16>>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -505,6 +516,8 @@ thread_local! {
 pub(crate) fn reset_tuple_shapes() {
     TUPLE_SHAPES.with(|t| t.borrow_mut().clear());
     FUNC_SETS.with(|t| t.borrow_mut().clear());
+    CLASS_SETS.with(|t| t.borrow_mut().clear());
+    CLASS_SET_UNBOXES.with(|t| t.borrow_mut().clear());
     NUMBER_LIST_REFUSED.with(|t| t.borrow_mut().clear());
     PASSED_FUNCTIONS.with(|t| t.borrow_mut().clear());
     ELEM_LISTS.with(|t| t.borrow_mut().clear());
@@ -1011,6 +1024,55 @@ fn converts_number_list(passed: Ty, param: Ty) -> bool {
     }
 }
 
+/// The most classes a [`Ty::Classes`] tells apart; an instance that may
+/// be of more is dynamic.
+const MAX_CLASS_SET: usize = 8;
+
+/// The type of an instance of one of the classes `members`: the class
+/// itself when there is one.
+pub(crate) fn class_set(mut members: Vec<u16>) -> Ty {
+    members.sort_unstable();
+    members.dedup();
+    match members.len() {
+        0 => Ty::Unknown,
+        1 => Ty::Class(members[0]),
+        n if n > MAX_CLASS_SET => Ty::Object,
+        _ => CLASS_SETS.with(|t| {
+            let mut table = t.borrow_mut();
+            if let Some(k) = table.iter().position(|set| *set == members) {
+                return Ty::Classes(k as u16);
+            }
+            let k = u16::try_from(table.len()).expect("fewer than 65536 class sets in a program");
+            table.push(members);
+            Ty::Classes(k)
+        }),
+    }
+}
+
+/// Record that a box is read back as an instance of class set `k`.
+pub(crate) fn note_class_set_unbox(k: u16) {
+    CLASS_SET_UNBOXES.with(|t| t.borrow_mut().insert(k));
+}
+
+/// The class sets boxes are read back as.
+pub(crate) fn class_set_unboxes() -> Vec<u16> {
+    CLASS_SET_UNBOXES.with(|t| t.borrow().iter().copied().collect())
+}
+
+/// The classes of class set `k`.
+pub(crate) fn class_set_members(k: u16) -> Vec<u16> {
+    CLASS_SETS.with(|t| t.borrow()[k as usize].clone())
+}
+
+/// The classes an instance of `ty` may be of, when it is one or a set.
+pub(crate) fn classes_of(ty: Ty) -> Option<Vec<u16>> {
+    match ty {
+        Ty::Class(k) => Some(vec![k]),
+        Ty::Classes(k) => Some(class_set_members(k)),
+        _ => None,
+    }
+}
+
 /// The functions a value of `ty` may be, when it is one or a set of them.
 fn funcs_of(ty: Ty) -> Option<Vec<u16>> {
     match ty {
@@ -1121,6 +1183,11 @@ impl Ty {
             }
             // An instance is a pointer, and None is the null one.
             (Ty::None, Ty::Class(k)) | (Ty::Class(k), Ty::None) => Ty::Class(k),
+            (Ty::None, Ty::Classes(k)) | (Ty::Classes(k), Ty::None) => Ty::Classes(k),
+            // Instances of unrelated classes make the set of them.
+            (a, b) if let (Some(x), Some(y)) = (classes_of(a), classes_of(b)) => {
+                class_set(x.into_iter().chain(y).collect())
+            }
             // Module functions named as values make the set of them.
             (a, b) if let (Some(x), Some(y)) = (funcs_of(a), funcs_of(b)) => {
                 func_set(x.into_iter().chain(y).collect())
@@ -2772,6 +2839,19 @@ impl Module {
                 }
                 at = self.classes[c].base;
             }
+        }
+        // A set keeps a class only where no other member is its base.
+        if let (Some(x), Some(y)) = (classes_of(a), classes_of(b)) {
+            let all: Vec<u16> = x.into_iter().chain(y).collect();
+            let kept = all
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    !all.iter()
+                        .any(|&d| d != c && self.is_subclass(c as usize, d as usize))
+                })
+                .collect();
+            return class_set(kept);
         }
         a.join(b)
     }
@@ -5330,6 +5410,25 @@ impl<'ast> ruff_python_ast::visitor::Visitor<'ast> for Calls<'_> {
                 if let Some((target, first)) = self.callee(&c.func) {
                     self.record(target, first, &c.arguments.args, &c.arguments.keywords);
                 }
+                // A method of an instance of one of several classes is
+                // called on any of them.
+                if let py::Expr::Attribute(a) = &*c.func
+                    && !self.opaque
+                    && let Ty::Classes(s) = self.arg_ty(&a.value)
+                {
+                    for k in class_set_members(s) {
+                        if let Some((_, name)) =
+                            self.module.method_sig_fixed(k as usize, a.attr.as_str())
+                        {
+                            self.record(
+                                Target::Item(name.to_string()),
+                                1,
+                                &c.arguments.args,
+                                &c.arguments.keywords,
+                            );
+                        }
+                    }
+                }
                 // A call through a set of functions passes its arguments
                 // to each.
                 if let py::Expr::Name(_) = &*c.func
@@ -7090,6 +7189,13 @@ impl Walker<'_> {
                     .other_field_writes
                     .push((k as usize, a.attr.to_string(), ty));
             }
+            Ty::Classes(s) => {
+                for k in class_set_members(s) {
+                    self.locals
+                        .other_field_writes
+                        .push((k as usize, a.attr.to_string(), ty));
+                }
+            }
             Ty::Object => {
                 let key = deps::name_key(a.attr.as_str());
                 for (k, class) in self.module.classes.iter().enumerate() {
@@ -7907,6 +8013,12 @@ pub(crate) fn isinstance_of_class(module: &Module, ty: Ty, k: usize) -> Option<b
                 Some(false)
             }
         }
+        Ty::Classes(s) => {
+            let related = class_set_members(s)
+                .into_iter()
+                .any(|c| module.is_subclass(c as usize, k) || module.is_subclass(k, c as usize));
+            if related { None } else { Some(false) }
+        }
         Ty::Object | Ty::Unknown => None,
         _ => Some(false),
     }
@@ -8629,26 +8741,28 @@ impl Typer<'_> {
                         .find(|field| !field.is_static && field.name == a.attr.as_str())
                         .map(|field| self.module.host_type(&field.ty))
                         .unwrap_or(Ty::Object),
-                    Ty::Class(k) => self
-                        .module
-                        .field_via(
+                    Ty::Class(k) => self.class_member_ty(&a.value, k, a.attr.as_str()),
+                    // What any of the classes holds there.
+                    Ty::Classes(s) => {
+                        let mut joined = Ty::Unknown;
+                        // A class without the attribute raises there.
+                        for k in class_set_members(s).into_iter().filter(|&k| {
                             self.module
-                                .receiver_set(&a.value, k as usize)
-                                .iter()
-                                .copied(),
-                            a.attr.as_str(),
-                        )
-                        .map(|(_, ty)| ty)
-                        .or_else(|| {
-                            self.module
-                                .class_attr(k as usize, a.attr.as_str())
-                                .map(|attr| self.module.class_attr_ty(attr))
-                        })
-                        .unwrap_or(if self.module.settled.get() {
-                            Ty::Object
-                        } else {
-                            Ty::Unknown
-                        }),
+                                .field_via(self.module.class_range(k as usize), a.attr.as_str())
+                                .is_some()
+                                || self
+                                    .module
+                                    .class_attr(k as usize, a.attr.as_str())
+                                    .is_some()
+                        }) {
+                            let ty = self.class_member_ty(&a.value, k, a.attr.as_str());
+                            joined = match (joined.mask(), ty.mask()) {
+                                (Some(_), Some(_)) => joined.join_num(ty),
+                                _ => self.module.join_classes(joined, ty),
+                            };
+                        }
+                        joined
+                    }
                     // An attribute of None raises; its type is what the
                     // other paths to the name decide.
                     Ty::Unknown | Ty::None => Ty::Unknown,
@@ -9041,6 +9155,30 @@ impl Typer<'_> {
         }
     }
 
+    /// The type of attribute `attr` read from `receiver`, an instance of
+    /// class `k`: its field, else its class attribute.
+    fn class_member_ty(&self, receiver: &py::Expr, k: u16, attr: &str) -> Ty {
+        self.module
+            .field_via(
+                self.module
+                    .receiver_set(receiver, k as usize)
+                    .iter()
+                    .copied(),
+                attr,
+            )
+            .map(|(_, ty)| ty)
+            .or_else(|| {
+                self.module
+                    .class_attr(k as usize, attr)
+                    .map(|a| self.module.class_attr_ty(a))
+            })
+            .unwrap_or(if self.module.settled.get() {
+                Ty::Object
+            } else {
+                Ty::Unknown
+            })
+    }
+
     /// What a call of item `name` returns when it passes `arguments`
     /// to the parameters from `first` on: the result of the instance
     /// made for the types passed, where there is one.
@@ -9074,6 +9212,22 @@ impl Typer<'_> {
     /// [`Self::method_ret`] with the arguments passed: a method of a
     /// known class joins the instances its overrides may reach.
     fn method_call_ret(&self, receiver: Ty, attr: &str, arguments: &py::Arguments) -> Ty {
+        // What the method of any of the classes returns.
+        if let Ty::Classes(s) = receiver {
+            let mut joined = Ty::Unknown;
+            // A class without the method raises there.
+            for k in class_set_members(s)
+                .into_iter()
+                .filter(|&k| self.module.method_sig(k as usize, attr).is_some())
+            {
+                let ret = self.method_call_ret(Ty::Class(k), attr, arguments);
+                joined = match (joined.mask(), ret.mask()) {
+                    (Some(_), Some(_)) => joined.join_num(ret),
+                    _ => self.module.join_classes(joined, ret),
+                };
+            }
+            return joined;
+        }
         if let Ty::Class(k) = receiver
             && !self.module.specs.is_empty()
             && let Some((sig, _)) = self.module.method_sig(k as usize, attr)

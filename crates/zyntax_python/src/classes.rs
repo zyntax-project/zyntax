@@ -726,6 +726,42 @@ fn constructor(module: &Module, k: usize, span: Span) -> TypedFunction {
 /// `C$unbox(x)`: the address in a box tagged as `C` or a subclass.
 fn unboxer(module: &Module, k: usize, span: Span) -> TypedFunction {
     let class = &module.classes[k];
+    // The class and everything deriving from it are one range of kinds.
+    let first = zyntax_builtins::INSTANCE_KIND_BASE + k as i64;
+    range_unboxer(
+        &format!("{}$unbox", class.name),
+        &[(first, first + class.descendants as i64)],
+        &class.name,
+        span,
+    )
+}
+
+/// The checked unboxing of an instance of class set `s`: a box of any
+/// of its classes, or of a class deriving from one.
+pub(crate) fn class_set_unboxer(module: &Module, s: u16, span: Span) -> TypedFunction {
+    let members = crate::types::class_set_members(s);
+    let ranges: Vec<(i64, i64)> = members
+        .iter()
+        .map(|&k| {
+            let first = zyntax_builtins::INSTANCE_KIND_BASE + k as i64;
+            (first, first + module.classes[k as usize].descendants as i64)
+        })
+        .collect();
+    let names: Vec<&str> = members
+        .iter()
+        .map(|&k| module.classes[k as usize].name.as_str())
+        .collect();
+    range_unboxer(
+        &lower::class_set_unbox_name(s),
+        &ranges,
+        &names.join(" or "),
+        span,
+    )
+}
+
+/// `name(x)`: the address in a box whose kind lies in one of `ranges`,
+/// null for None, else the TypeError naming what was `expected`.
+fn range_unboxer(name: &str, ranges: &[(i64, i64)], expected: &str, span: Span) -> TypedFunction {
     let x = var(intern("x"), Ty::Object, span);
     // None is the null instance of any class.
     let is_none = binary(
@@ -739,39 +775,44 @@ fn unboxer(module: &Module, k: usize, span: Span) -> TypedFunction {
         Ty::Bool,
         span,
     );
-    // The class and everything deriving from it are one range of kinds.
     let kind = call("zb_any_kind", vec![x.clone()], Ty::Int, span);
-    let first = zyntax_builtins::INSTANCE_KIND_BASE + k as i64;
-    let accepted = binary(
-        BinaryOp::And,
-        binary(
-            BinaryOp::Ge,
-            kind.clone(),
-            int_lit(first, span),
+    let mut accepted: Option<Node> = None;
+    for &(first, end) in ranges {
+        let within = binary(
+            BinaryOp::And,
+            binary(
+                BinaryOp::Ge,
+                kind.clone(),
+                int_lit(first, span),
+                Ty::Bool,
+                span,
+            ),
+            binary(
+                BinaryOp::Lt,
+                kind.clone(),
+                int_lit(end, span),
+                Ty::Bool,
+                span,
+            ),
             Ty::Bool,
             span,
-        ),
-        binary(
-            BinaryOp::Lt,
-            kind,
-            int_lit(first + class.descendants as i64, span),
-            Ty::Bool,
-            span,
-        ),
-        Ty::Bool,
-        span,
-    );
+        );
+        accepted = Some(match accepted {
+            None => within,
+            Some(a) => binary(BinaryOp::Or, a, within, Ty::Bool, span),
+        });
+    }
     let not_accepted = node(
         TypedExpression::Unary(zyntax_typed_ast::typed_ast::TypedUnary {
             op: zyntax_typed_ast::UnaryOp::Not,
-            operand: Box::new(accepted),
+            operand: Box::new(accepted.expect("a class to accept")),
         }),
         Ty::Bool,
         span,
     );
     let message = binary(
         BinaryOp::Add,
-        str_lit(&format!("expected {}, got ", class.name), span),
+        str_lit(&format!("expected {expected}, got "), span),
         call("zb_any_type", vec![x.clone()], Ty::Str, span),
         Ty::Str,
         span,
@@ -806,7 +847,7 @@ fn unboxer(module: &Module, k: usize, span: Span) -> TypedFunction {
         ),
     ];
     let mut f = function(
-        &format!("{}$unbox", class.name),
+        name,
         vec![param("x", Ty::Object, span)],
         Ty::Int,
         statements,
