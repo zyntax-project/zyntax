@@ -12,6 +12,7 @@
 //!   body defined above, is that method again under the new name.
 //! - `map(f, xs)` with `f` a name is `[f(x) for x in xs]`, so the
 //!   elements are typed as the calls are.
+//! - `list()` is `[]`, a list whose kind is what the program puts in.
 //! - `functools.reduce(f, xs, start)` is a call of a module function
 //!   that folds `xs` in a loop: `acc op x` for `f` an `operator`
 //!   function, `f(acc, x)` otherwise, so the fold is typed as the
@@ -123,6 +124,7 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
         statics,
         method_of: RefCell::new(None),
         map_is_builtin: !binds_module_name(body, "map"),
+        list_is_builtin: !binds_module_name(body, "list"),
         map_items: Cell::new(0),
         folds: Folds::of(body, origins),
         origin: RefCell::new(None),
@@ -206,6 +208,8 @@ struct Rewriter {
     method_of: RefCell<Option<(String, String)>>,
     /// No module-level binding shadows the builtin `map`.
     map_is_builtin: bool,
+    /// No module-level binding shadows the builtin `list`.
+    list_is_builtin: bool,
     /// Comprehension targets made for `map` calls so far.
     map_items: Cell<u32>,
     /// What names `functools.reduce` and the `operator` functions, by
@@ -590,6 +594,22 @@ impl Transformer for Rewriter {
                 if let Some(class) = class {
                     *outer.value = name_expr(&class, inner.range());
                 }
+            }
+            // `list()` is `[]`.
+            py::Expr::Call(c)
+                if self.list_is_builtin
+                    && let py::Expr::Name(f) = &*c.func
+                    && (f.id.as_str() == "list"
+                        || self.aliases.get(f.id.as_str()).is_some_and(|b| b == "list"))
+                    && c.arguments.args.is_empty()
+                    && c.arguments.keywords.is_empty() =>
+            {
+                *e = py::Expr::List(py::ExprList {
+                    node_index: Default::default(),
+                    range: c.range(),
+                    elts: Vec::new(),
+                    ctx: py::ExprContext::Load,
+                });
             }
             // `reduce(f, xs, start)` is a call of a fold function.
             py::Expr::Call(c)

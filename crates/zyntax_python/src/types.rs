@@ -4154,7 +4154,7 @@ pub(crate) fn infer_module(
             for (k, f) in module.list_fields.clone() {
                 let decided = field_rounds
                     .get(&field_key(k, &f))
-                    .map(FieldRound::decide)
+                    .map(|r| r.decide(&module))
                     .unwrap_or(Ty::List(Elem::Object));
                 let decided = module.denest(&f, decided);
                 if module.field_lists.get(&(k, f.clone())) != Some(&decided) {
@@ -6324,6 +6324,9 @@ pub(crate) fn list_sites<'ast>(
         /// Whether the current expression is one of the allowed uses.
         allowed: &'a std::cell::Cell<bool>,
         returns_read: bool,
+        /// Locals bound to a followed field, `cc = v.constraints`: their
+        /// uses are the field's.
+        aliases: HashMap<String, String>,
     }
     impl<'ast> Uses<'_, '_, 'ast> {
         fn site(&mut self, name: &str) -> &mut ListSites<'ast> {
@@ -6361,6 +6364,7 @@ pub(crate) fn list_sites<'ast>(
                 py::Expr::Name(n) if self.sites.contains_key(n.id.as_str()) => {
                     Some(n.id.to_string())
                 }
+                py::Expr::Name(n) => self.aliases.get(n.id.as_str()).cloned(),
                 py::Expr::Attribute(a) => {
                     if !self.fields.contains(a.attr.as_str()) {
                         return None;
@@ -6399,6 +6403,20 @@ pub(crate) fn list_sites<'ast>(
     impl<'ast> Visitor<'ast> for Uses<'_, '_, 'ast> {
         fn visit_stmt(&mut self, stmt: &'ast py::Stmt) {
             match stmt {
+                // A local bound to a followed field once is another name
+                // for the field.
+                py::Stmt::Assign(a)
+                    if let [py::Expr::Name(n)] = a.targets.as_slice()
+                        && !self.sites.contains_key(n.id.as_str())
+                        && !self.aliases.contains_key(n.id.as_str())
+                        && let py::Expr::Attribute(_) = &*a.value
+                        && let Some(key) = self.is_candidate(&a.value) =>
+                {
+                    self.aliases.insert(n.id.to_string(), key);
+                    if let py::Expr::Attribute(attr) = &*a.value {
+                        self.visit_expr(&attr.value);
+                    }
+                }
                 py::Stmt::Assign(a) => {
                     for t in &a.targets {
                         if let Some(name) = self.is_candidate(t) {
@@ -6717,6 +6735,7 @@ pub(crate) fn list_sites<'ast>(
             .collect(),
         allowed: &allowed,
         returns_read,
+        aliases: HashMap::default(),
     };
     for s in body {
         if let py::Stmt::FunctionDef(_) | py::Stmt::ClassDef(_) = s {
@@ -6941,7 +6960,7 @@ fn written_into(module: &Module, sites: &ListSites<'_>, typer: &Typer<'_>) -> Op
         if ty == Ty::Unknown {
             undecided = true;
         } else {
-            written = Some(written.unwrap_or(Ty::Unknown).join(ty));
+            written = Some(module.join_classes(written.unwrap_or(Ty::Unknown), ty));
         }
     };
     for e in &sites.elements {
@@ -6992,7 +7011,7 @@ struct FieldRound {
 
 impl FieldRound {
     /// The list's kind: as [`decide_list`] decides a local's.
-    fn decide(&self) -> Ty {
+    fn decide(&self, module: &Module) -> Ty {
         if self.kept {
             return Ty::List(Elem::Object);
         }
@@ -7001,7 +7020,7 @@ impl FieldRound {
             if *ty == Ty::Unknown {
                 return Ty::Unknown;
             }
-            joined = Some(joined.unwrap_or(Ty::Unknown).join(*ty));
+            joined = Some(module.join_classes(joined.unwrap_or(Ty::Unknown), *ty));
         }
         match joined {
             None => Ty::List(Elem::Object),

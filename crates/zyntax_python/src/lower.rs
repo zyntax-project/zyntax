@@ -13751,6 +13751,33 @@ impl<'m> Lowerer<'m> {
                     return self.attribute_via(boxed, attr, None, span);
                 }
                 let Some((_, ty)) = self.module.field_via(set.iter().copied(), attr) else {
+                    // A field only some subclasses have: each of them
+                    // reads it, and any other class raises.
+                    if self.module.class_attr(k as usize, attr).is_none() {
+                        let has = |c: usize| self.module.field(c, attr).is_some();
+                        let mut members: Vec<u16> = set
+                            .iter()
+                            .copied()
+                            .filter(|&c| has(c) && !self.module.classes[c].base.is_some_and(&has))
+                            .map(|c| c as u16)
+                            .collect();
+                        if !members.is_empty() {
+                            members.push(k);
+                            let default = k;
+                            return self.class_set_dispatch(
+                                object,
+                                &members,
+                                attr,
+                                span,
+                                |this, receiver| {
+                                    if receiver.ty == Ty::Class(default) {
+                                        return Ok(None);
+                                    }
+                                    this.attribute_via(receiver, attr, None, span).map(Some)
+                                },
+                            );
+                        }
+                    }
                     // The class's attribute, once the instance is known
                     // not to be None.
                     let class_attr = self.class_attr_of(k as usize, attr, span)?;
