@@ -8,12 +8,14 @@
 //!   named `C$m`; `cls` in a classmethod is the class, and `C.m(...)`
 //!   or `cls.m(...)` calls the function.
 //! - `self.__class__.X` in a method of `C` is `C.X`.
+//! - `map(f, xs)` with `f` a name is `[f(x) for x in xs]`, so the
+//!   elements are typed as the calls are.
 
 use ruff_python_ast as py;
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr, walk_stmt};
 use ruff_text_size::Ranged;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 const BUILTIN_BASES: &[&str] = &["list", "dict", "set", "object"];
 
@@ -87,6 +89,8 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
         aliases,
         statics,
         method_of: RefCell::new(None),
+        map_is_builtin: !binds_module_name(body, "map"),
+        map_items: Cell::new(0),
     };
     for s in body.iter_mut() {
         rewriter.visit_stmt(s);
@@ -159,6 +163,10 @@ struct Rewriter {
     statics: HashMap<String, HashSet<String>>,
     /// The class and `self` name of the method being walked.
     method_of: RefCell<Option<(String, String)>>,
+    /// No module-level binding shadows the builtin `map`.
+    map_is_builtin: bool,
+    /// Comprehension targets made for `map` calls so far.
+    map_items: Cell<u32>,
 }
 
 impl Rewriter {
@@ -251,9 +259,74 @@ impl Transformer for Rewriter {
                     *outer.value = name_expr(&class, inner.range());
                 }
             }
+            // `map(f, xs)` is `[f(x) for x in xs]`: eager, as the
+            // frontend's `map` is, with `f` named once per element.
+            py::Expr::Call(c)
+                if self.map_is_builtin
+                    && is_name(&c.func, "map")
+                    && c.arguments.keywords.is_empty()
+                    && let [py::Expr::Name(_), xs] = &*c.arguments.args
+                    && !matches!(xs, py::Expr::Starred(_)) =>
+            {
+                let range = c.range();
+                let n = self.map_items.get();
+                self.map_items.set(n + 1);
+                let item = format!("map$item{n}");
+                let mut args = std::mem::take(&mut c.arguments.args).into_vec();
+                let mut iter = args.pop().expect("two arguments");
+                let f = args.pop().expect("two arguments");
+                self.visit_expr(&mut iter);
+                let mut target = name_expr(&item, range);
+                if let py::Expr::Name(t) = &mut target {
+                    t.ctx = py::ExprContext::Store;
+                }
+                let elt = py::Expr::Call(py::ExprCall {
+                    node_index: Default::default(),
+                    range_start: range.start(),
+                    func: Box::new(f),
+                    arguments: py::Arguments {
+                        node_index: Default::default(),
+                        range,
+                        args: vec![name_expr(&item, range)].into_boxed_slice(),
+                        keywords: Default::default(),
+                    },
+                });
+                *e = py::Expr::ListComp(py::ExprListComp {
+                    node_index: Default::default(),
+                    range,
+                    elt: Box::new(elt),
+                    generators: vec![py::Comprehension {
+                        range,
+                        node_index: Default::default(),
+                        target,
+                        iter,
+                        ifs: Vec::new(),
+                        is_async: false,
+                    }],
+                });
+            }
             _ => walk_expr(self, e),
         }
     }
+}
+
+/// Whether a module-level statement binds `name`.
+fn binds_module_name(body: &[py::Stmt], name: &str) -> bool {
+    body.iter().any(|s| match s {
+        py::Stmt::FunctionDef(f) => f.name.as_str() == name,
+        py::Stmt::ClassDef(c) => c.name.as_str() == name,
+        py::Stmt::Assign(a) => a.targets.iter().any(|t| is_name(t, name)),
+        py::Stmt::AnnAssign(a) => is_name(&a.target, name),
+        py::Stmt::Import(i) => i
+            .names
+            .iter()
+            .any(|a| a.asname.as_ref().map_or(a.name.as_str(), |n| n.as_str()) == name),
+        py::Stmt::ImportFrom(i) => i
+            .names
+            .iter()
+            .any(|a| a.asname.as_ref().map_or(a.name.as_str(), |n| n.as_str()) == name),
+        _ => false,
+    })
 }
 
 fn is_name(e: &py::Expr, name: &str) -> bool {
