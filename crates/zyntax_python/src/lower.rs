@@ -107,7 +107,7 @@ pub(crate) fn class_type(k: usize) -> Type {
 /// one shared header; anything else on the heap is stored boxed.
 pub(crate) fn field_storage(ty: Ty) -> Ty {
     match ty {
-        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Class(_) => ty,
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Class(_) | Ty::Num(_) => ty,
         Ty::Dict(_) | Ty::Set(_) | Ty::List(_) | Ty::MaybeList(_) => Ty::Int,
         _ => Ty::Object,
     }

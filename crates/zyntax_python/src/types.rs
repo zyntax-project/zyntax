@@ -941,13 +941,13 @@ impl Ty {
         }
     }
 
-    /// The type as a field or a local stores it: a run-time number as
-    /// its box, a list or None as itself.
+    /// The type as a field or a local stores it: a run-time number, a
+    /// list or None as itself.
     pub(crate) fn stored_view(self) -> Ty {
-        match self {
-            Ty::Num(_) => Ty::Object,
-            t => t,
+        if !crate::lower::num::enabled() {
+            return self.boxed_view();
         }
+        self
     }
 
     /// The join of two values of a local or a field when one may be None
@@ -5157,9 +5157,12 @@ fn widen_by_class(module: &mut Module, set: &[usize], name: &str, ty: Ty) -> boo
             changed = true;
             continue;
         };
-        let joined = current
-            .join_nullable(ty)
-            .unwrap_or_else(|| module.join_classes(current, ty));
+        let joined = match (current.mask(), ty.mask()) {
+            (Some(_), Some(_)) => current.join_num(ty),
+            _ => current
+                .join_nullable(ty)
+                .unwrap_or_else(|| module.join_classes(current, ty)),
+        };
         if joined != current {
             module.field_by_class.insert(key, joined);
             changed = true;
@@ -5234,7 +5237,7 @@ fn widen_field(classes: &mut [ClassInfo], k: usize, name: &str, ty: Ty) -> bool 
                 at = bases[c];
             }
         }
-        let joined = a.join_nullable(b).unwrap_or_else(|| a.join(b));
+        let joined = a.join_nullable(b).unwrap_or_else(|| a.join_num(b));
         // Kinds held by address share the slot's storage; the classes
         // storing each read it typed through their own receivers.
         if by_address(a) && by_address(b) && !by_address(joined) {
@@ -7178,7 +7181,8 @@ impl Walker<'_> {
                 }
             }
             py::Stmt::AugAssign(a) => {
-                let (lhs, rhs) = if matches!(&*a.target, py::Expr::Name(_)) {
+                let (lhs, rhs) = if matches!(&*a.target, py::Expr::Name(_) | py::Expr::Attribute(_))
+                {
                     (self.expr_num(&a.target), self.expr_num(&a.value))
                 } else {
                     (self.expr(&a.target), self.expr(&a.value))

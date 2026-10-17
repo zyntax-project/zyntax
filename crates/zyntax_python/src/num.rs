@@ -251,7 +251,9 @@ impl Lowerer<'_> {
     /// the Num does not admit.
     fn num_of_box(&mut self, boxed: Node, target: Ty, span: Span) -> Node {
         let mask = target.mask().unwrap_or(0);
-        let mut pre = Vec::new();
+        // What lowering `boxed` hoisted computes what it reads, so it
+        // runs ahead of the hold; the tag check's guard follows it.
+        let mut pre = std::mem::take(&mut self.hoisted);
         let held = self
             .hold(
                 Val {

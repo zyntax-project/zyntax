@@ -678,6 +678,7 @@ fn constructor(module: &Module, k: usize, span: Span) -> TypedFunction {
                 ),
                 Ty::Str => str_lit("", span),
                 Ty::Class(c) => lowerer.coerce(none(span), Ty::Class(c)),
+                t @ Ty::Num(_) => lowerer.coerce(none(span), t),
                 _ => lowerer.coerce(none(span), Ty::Object),
             }
         };

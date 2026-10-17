@@ -52,26 +52,33 @@ pub fn header_field() -> HirType {
 }
 
 /// Byte offsets of `fields` laid out on the heap, and the object's size:
-/// each field aligned to its own size, the total padded to the largest.
-/// Every reader and writer of a reference object's fields uses this.
+/// each field at its natural alignment (a scalar's is its size, a nested
+/// struct's or array's that of its widest member), the total padded to
+/// the largest. Every reader and writer of a reference object's fields
+/// uses this.
 pub fn field_layout(fields: &[HirType]) -> (Vec<u64>, u64) {
     let mut offsets = Vec::with_capacity(fields.len());
     let mut running: u64 = 0;
     let mut max_align: u64 = 1;
     for ty in fields {
         let size = crate::ssa::hir_ty_size(ty) as u64;
-        let align = size.max(1);
+        let align = field_align(ty);
         max_align = max_align.max(align);
-        if align > 1 {
-            running = (running + align - 1) & !(align - 1);
-        }
+        running = running.div_ceil(align) * align;
         offsets.push(running);
         running += size.max(1);
     }
-    if max_align > 1 {
-        running = (running + max_align - 1) & !(max_align - 1);
-    }
+    running = running.div_ceil(max_align) * max_align;
     (offsets, running.max(1))
+}
+
+/// The alignment a field of `ty` takes in [`field_layout`].
+fn field_align(ty: &HirType) -> u64 {
+    match ty {
+        HirType::Struct(s) => s.fields.iter().map(field_align).max().unwrap_or(1),
+        HirType::Array(elem, _) => field_align(elem),
+        other => (crate::ssa::hir_ty_size(other) as u64).max(1),
+    }
 }
 
 /// What a field holds, as a host reads it.
