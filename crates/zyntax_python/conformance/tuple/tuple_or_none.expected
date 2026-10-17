@@ -1,0 +1,12 @@
+1 2.5 c 2 1.5 b none
+(1, 1.5, 'c') False True True 1.5 None (1, 1.5, 'c') None
+True True [None, (1, 1.5, 'c'), (2, 0.5, 'b'), None]
+(1, 1.5, 'c')
+None
+(2, 0.5, 'b')
+[None, (1, 0.5), (2, 1.0), None, (4, 2.0)] [(1, 0.5), (2, 1.0), (4, 2.0)] {0: None, 1: (1, 0.5), 2: (2, 1.0)}
+18.0 (None, 1) True [(None, 0), (None, 1)]
+TypeError 'NoneType' object is not subscriptable
+TypeError cannot unpack non-iterable NoneType object
+TypeError 'NoneType' object is not iterable
+TypeError object of type 'NoneType' has no len()

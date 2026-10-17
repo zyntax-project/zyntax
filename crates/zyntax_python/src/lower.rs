@@ -224,6 +224,7 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         | Ty::HostFunction(_, _)
         | Ty::HostFloatCallable(_)
         | Ty::MaybeList(_)
+        | Ty::MaybeTuple(_)
         | Ty::Classes(_)
         | Ty::Object
         | Ty::Unknown => Field::Any,
@@ -371,6 +372,8 @@ pub(crate) fn ir(ty: Ty) -> Type {
                 .map(|t| ir(tuple_field_storage(t)))
                 .collect(),
         ),
+        // A tuple or None: whether it is there, then the tuple.
+        Ty::MaybeTuple(k) => Type::Tuple(vec![prim(PrimitiveType::I64), ir(Ty::Tuple(k))]),
         Ty::Dict(_) | Ty::Set(_) => tables::table_ir(ty),
         // A file is the record the library keeps: a list of its parts.
         Ty::File(_) => list_type(Type::Any),
@@ -1760,6 +1763,11 @@ impl<'m> Lowerer<'m> {
                     .collect();
                 tuple_value(fields, ty, span)
             }
+            // A tuple or None's nothing is None.
+            Ty::MaybeTuple(k) => {
+                let tuple = self.zero_of(Ty::Tuple(k), span);
+                tuple_value(vec![int_lit(0, span), tuple], ty, span)
+            }
             // A run-time number's nothing is None's parts.
             Ty::Num(_) => {
                 let none = Val {
@@ -2768,6 +2776,9 @@ impl<'m> Lowerer<'m> {
             (Ty::Num(_), _) => self.coerce_from_num(v, target),
             (_, Ty::Num(_)) => self.coerce_to_num(v, target),
             (Ty::MaybeList(_), _) | (_, Ty::MaybeList(_)) => self.coerce_nullable_list(v, target),
+            (Ty::MaybeTuple(_), _) | (_, Ty::MaybeTuple(_)) => {
+                self.coerce_nullable_tuple(v, target)
+            }
             // A known function value is a dynamic value already.
             (Ty::Closure(_), Ty::Object | Ty::Closure(_)) | (Ty::Object, Ty::Closure(_)) => v.node,
             (Ty::Func(_) | Ty::Funcs(_), Ty::Object | Ty::Func(_) | Ty::Funcs(_))
@@ -3185,7 +3196,176 @@ impl<'m> Lowerer<'m> {
                     ty: Ty::List(elem),
                 })
             }
+            Ty::MaybeTuple(_) => Ok(self.tuple_present(v, message)),
             _ => Ok(self.boxed_num(v)),
+        }
+    }
+
+    /// The tuple a tuple or None (`v`) holds, with the raise of
+    /// TypeError(`message`) ahead of it for None.
+    fn tuple_present(&mut self, v: Val, message: &str) -> Val {
+        let span = v.node.span;
+        let Ty::MaybeTuple(k) = v.ty else {
+            return v;
+        };
+        let mut pre = Vec::new();
+        let held = self.hold(v, &mut pre, span);
+        let absent = binary(
+            BinaryOp::Eq,
+            slot(held.node.clone(), 0, Ty::Int, span),
+            int_lit(0, span),
+            Ty::Bool,
+            span,
+        );
+        let mut raise = Vec::new();
+        self.raise_named("TypeError", str_lit(message, span), span, &mut raise);
+        pre.push(TypedNode::new(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(absent),
+                then_block: TypedBlock {
+                    statements: raise,
+                    span,
+                },
+                else_block: None,
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        self.hoisted.extend(pre);
+        Val {
+            node: slot(held.node, 1, Ty::Tuple(k), span),
+            ty: Ty::Tuple(k),
+        }
+    }
+
+    /// A conversion from or to a tuple or None ([`Ty::MaybeTuple`]): the
+    /// word says whether the tuple is there; a box is None or the
+    /// tuple's box.
+    fn coerce_nullable_tuple(&mut self, v: Val, target: Ty) -> Node {
+        let span = v.node.span;
+        let make = |present: i64, tuple: Node, ty: Ty| {
+            tuple_value(vec![int_lit(present, span), tuple], ty, span)
+        };
+        match (v.ty, target) {
+            (Ty::MaybeTuple(k), _)
+                if target != Ty::Object && !matches!(target, Ty::MaybeTuple(_)) =>
+            {
+                let tuple = self.tuple_present(v, "'NoneType' object is not subscriptable");
+                let _ = k;
+                self.coerce(tuple, target)
+            }
+            (Ty::Tuple(_), Ty::MaybeTuple(k)) => {
+                let tuple = self.coerce(v, Ty::Tuple(k));
+                make(1, tuple, target)
+            }
+            (Ty::None, Ty::MaybeTuple(k)) => {
+                let tuple = self.zero_of(Ty::Tuple(k), span);
+                Self::after_none(v.node, make(0, tuple, target), target)
+            }
+            (Ty::MaybeTuple(a), Ty::MaybeTuple(b)) => {
+                let mut pre = Vec::new();
+                let held = self.hold(v, &mut pre, span);
+                self.hoisted.extend(pre);
+                let present = binary(
+                    BinaryOp::Ne,
+                    slot(held.node.clone(), 0, Ty::Int, span),
+                    int_lit(0, span),
+                    Ty::Bool,
+                    span,
+                );
+                let outer = std::mem::take(&mut self.hoisted);
+                let inner = Val {
+                    node: slot(held.node, 1, Ty::Tuple(a), span),
+                    ty: Ty::Tuple(a),
+                };
+                let converted = self.coerce(inner, Ty::Tuple(b));
+                let then = std::mem::replace(&mut self.hoisted, outer);
+                let none = self.zero_of(target, span);
+                let mut out = Vec::new();
+                let node = self.conditional_value(
+                    present,
+                    (then, make(1, converted, target)),
+                    (Vec::new(), none),
+                    target,
+                    span,
+                    &mut out,
+                );
+                self.hoisted.extend(out);
+                node
+            }
+            (Ty::MaybeTuple(k), _) => {
+                let mut pre = Vec::new();
+                let held = self.hold(v, &mut pre, span);
+                self.hoisted.extend(pre);
+                let present = binary(
+                    BinaryOp::Ne,
+                    slot(held.node.clone(), 0, Ty::Int, span),
+                    int_lit(0, span),
+                    Ty::Bool,
+                    span,
+                );
+                let outer = std::mem::take(&mut self.hoisted);
+                let inner = Val {
+                    node: slot(held.node, 1, Ty::Tuple(k), span),
+                    ty: Ty::Tuple(k),
+                };
+                let boxed = self.coerce(inner, Ty::Object);
+                let then = std::mem::replace(&mut self.hoisted, outer);
+                let none = node(
+                    TypedExpression::Literal(TypedLiteral::Null),
+                    Ty::Object,
+                    span,
+                );
+                let mut out = Vec::new();
+                let node = self.conditional_value(
+                    present,
+                    (then, boxed),
+                    (Vec::new(), none),
+                    Ty::Object,
+                    span,
+                    &mut out,
+                );
+                self.hoisted.extend(out);
+                node
+            }
+            (_, Ty::MaybeTuple(k)) => {
+                // A box: None, or the tuple read back from it.
+                let boxed = self.coerce(v, Ty::Object);
+                let mut pre = Vec::new();
+                let held = self.hold(
+                    Val {
+                        node: boxed,
+                        ty: Ty::Object,
+                    },
+                    &mut pre,
+                    span,
+                );
+                self.hoisted.extend(pre);
+                let is_none = binary(
+                    BinaryOp::Eq,
+                    call("zb_any_category", vec![held.node.clone()], Ty::Int, span),
+                    int_lit(zyntax_builtins::NONE_CATEGORY, span),
+                    Ty::Bool,
+                    span,
+                );
+                let none = self.zero_of(target, span);
+                let outer = std::mem::take(&mut self.hoisted);
+                let tuple = self.coerce(held, Ty::Tuple(k));
+                let then = std::mem::replace(&mut self.hoisted, outer);
+                let mut out = Vec::new();
+                let node = self.conditional_value(
+                    is_none,
+                    (Vec::new(), none),
+                    (then, make(1, tuple, target)),
+                    target,
+                    span,
+                    &mut out,
+                );
+                self.hoisted.extend(out);
+                node
+            }
+            _ => v.node,
         }
     }
 
@@ -3843,6 +4023,14 @@ impl<'m> Lowerer<'m> {
             | Ty::Object
             | Ty::Unknown => call("zb_any_truthy", vec![v.node], Ty::Bool, span),
             Ty::Num(_) => self.num_truthy(v),
+            // None is false; a tuple of a shape has elements.
+            Ty::MaybeTuple(_) => binary(
+                BinaryOp::Ne,
+                slot(v.node, 0, Ty::Int, span),
+                int_lit(0, span),
+                Ty::Bool,
+                span,
+            ),
             // None is false; a list is true when it has elements.
             Ty::MaybeList(e) => {
                 let no = node(
@@ -3888,7 +4076,7 @@ impl<'m> Lowerer<'m> {
         let span = v.node.span;
         crate::records::demote_reached(self.module, v.ty);
         match v.ty {
-            Ty::Num(_) | Ty::MaybeList(_) => {
+            Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_) => {
                 let boxed = self.boxed_num(v);
                 self.str_of(boxed)
             }
@@ -4558,6 +4746,19 @@ impl<'m> Lowerer<'m> {
                         self.boxed_num(v)
                     } else {
                         v
+                    }
+                } else if a
+                    .targets
+                    .iter()
+                    .all(|t| matches!(t, py::Expr::Tuple(_) | py::Expr::List(_)))
+                {
+                    // A tuple or None unpacked is the tuple: None raises.
+                    let v = self.expr_num(&a.value)?;
+                    match v.ty {
+                        Ty::MaybeTuple(_) => {
+                            self.tuple_present(v, "cannot unpack non-iterable NoneType object")
+                        }
+                        _ => self.boxed_num(v),
                     }
                 } else {
                     self.expr(&a.value)?
@@ -7868,7 +8069,7 @@ impl<'m> Lowerer<'m> {
 
     pub(crate) fn expr(&mut self, e: &py::Expr) -> Result<Val> {
         let v = self.expr_num(e)?;
-        if let Ty::Num(_) | Ty::MaybeList(_) = v.ty {
+        if let Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_) = v.ty {
             let node = self.coerce(v, Ty::Object);
             return Ok(Val {
                 node,
@@ -8232,6 +8433,11 @@ impl<'m> Lowerer<'m> {
                             ty: stored,
                         })
                     }
+                    // A tuple or None a test has shown is there.
+                    Some(stored @ Ty::MaybeTuple(k)) if self.nonnull.contains(&name) => Val {
+                        node: slot(var(name, stored, span), 1, Ty::Tuple(k), span),
+                        ty: Ty::Tuple(k),
+                    },
                     _ => Val {
                         node: var(name, ty, span),
                         ty,
@@ -9176,8 +9382,10 @@ impl<'m> Lowerer<'m> {
             }
             py::CmpOp::Is | py::CmpOp::IsNot => {
                 let (left, right) = match (left.ty, right.ty) {
-                    (Ty::Num(_) | Ty::MaybeList(_), Ty::None)
-                    | (Ty::None, Ty::Num(_) | Ty::MaybeList(_)) => (left, right),
+                    (Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_), Ty::None)
+                    | (Ty::None, Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_)) => {
+                        (left, right)
+                    }
                     _ => (self.boxed_num(left), self.boxed_num(right)),
                 };
                 let n = match (left.ty, right.ty) {
@@ -9212,6 +9420,27 @@ impl<'m> Lowerer<'m> {
                         Ty::Bool,
                         span,
                     ),
+                    // A tuple or None is None when its word says so.
+                    (Ty::MaybeTuple(_), Ty::None) => {
+                        let test = binary(
+                            BinaryOp::Eq,
+                            slot(left.node, 0, Ty::Int, span),
+                            int_lit(0, span),
+                            Ty::Bool,
+                            span,
+                        );
+                        Self::after_none(right.node, test, Ty::Bool)
+                    }
+                    (Ty::None, Ty::MaybeTuple(_)) => {
+                        let test = binary(
+                            BinaryOp::Eq,
+                            slot(right.node, 0, Ty::Int, span),
+                            int_lit(0, span),
+                            Ty::Bool,
+                            span,
+                        );
+                        Self::after_none(left.node, test, Ty::Bool)
+                    }
                     // A list or None is None when its address is null.
                     (Ty::MaybeList(_), Ty::None) => {
                         let test = binary(

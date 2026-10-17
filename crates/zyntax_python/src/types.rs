@@ -107,6 +107,10 @@ pub(crate) enum Ty {
     /// A local of one body or a field holds it as itself; every other
     /// reader sees its box (see [`Ty::boxed_view`]).
     MaybeList(Elem),
+    /// A tuple of this shape or None: a value struct of a word saying
+    /// whether the tuple is there and the tuple. A local, a parameter or
+    /// a result holds it as itself; every other reader sees its box.
+    MaybeTuple(u16),
     /// A dynamic value: a boxed `Any`.
     Object,
     #[default]
@@ -395,6 +399,14 @@ pub(crate) const BUILTIN_VALUES: &[&str] = &[
     "divmod",
     "id",
 ];
+
+/// Whether a value may be a [`Ty::MaybeTuple`].
+/// `ZYNTAX_DISABLE_NULLABLE_TUPLES=1` makes a tuple or None dynamic, as
+/// it was before; safe to run with.
+pub(crate) fn nullable_tuples() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZYNTAX_DISABLE_NULLABLE_TUPLES").is_none())
+}
 
 /// Whether a local or a field may be a [`Ty::MaybeList`].
 /// `ZYNTAX_DISABLE_NULLABLE_LISTS=1` makes a list or None dynamic, as it
@@ -919,7 +931,7 @@ pub(crate) fn tuple_of(elems: Vec<Ty>) -> Ty {
     let elems: Vec<Ty> = elems
         .into_iter()
         .map(|t| match t {
-            Ty::None | Ty::Gen | Ty::MaybeList(_) => Ty::Object,
+            Ty::Gen | Ty::MaybeList(_) | Ty::MaybeTuple(_) => Ty::Object,
             Ty::Num(_) if !crate::lower::num::enabled() => Ty::Object,
             other => other,
         })
@@ -1139,7 +1151,7 @@ impl Ty {
     /// wherever the reader has no arm of its own for it.
     pub(crate) fn boxed_view(self) -> Ty {
         match self {
-            Ty::Num(_) | Ty::MaybeList(_) => Ty::Object,
+            Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_) => Ty::Object,
             t => t,
         }
     }
@@ -1154,9 +1166,13 @@ impl Ty {
     }
 
     /// The join of two values of a local or a field when one may be None
-    /// and the rest are lists of one kind: a [`Ty::MaybeList`]. `None`
-    /// for any other pair, which [`Ty::join`] decides.
+    /// and the rest are lists of one kind, a [`Ty::MaybeList`], or
+    /// tuples, a [`Ty::MaybeTuple`]. `None` for any other pair, which
+    /// [`Ty::join`] decides.
     pub(crate) fn join_nullable(self, other: Ty) -> Option<Ty> {
+        if let Some(t) = self.join_maybe_tuple(other) {
+            return Some(t);
+        }
         if !nullable_lists() {
             return None;
         }
@@ -1182,10 +1198,42 @@ impl Ty {
         }
     }
 
+    /// The join of two values when one may be None and the rest are
+    /// tuples whose shapes join: a [`Ty::MaybeTuple`]. `None` for any
+    /// other pair.
+    pub(crate) fn join_maybe_tuple(self, other: Ty) -> Option<Ty> {
+        if !nullable_tuples() {
+            return None;
+        }
+        let part = |t: Ty| match t {
+            Ty::None => Some((true, None)),
+            Ty::Tuple(k) => Some((false, Some(Ty::Tuple(k)))),
+            Ty::MaybeTuple(k) => Some((true, Some(Ty::Tuple(k)))),
+            _ => None,
+        };
+        let (none_a, tuple_a) = part(self)?;
+        let (none_b, tuple_b) = part(other)?;
+        if !(none_a || none_b) {
+            return None;
+        }
+        let tuple = match (tuple_a, tuple_b) {
+            (Some(a), Some(b)) => a.join(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return None,
+        };
+        match tuple {
+            Ty::Tuple(k) => Some(Ty::MaybeTuple(k)),
+            _ => None,
+        }
+    }
+
     /// The join of two values one local, parameter or result holds: two
     /// of int, float, bool and None make a [`Ty::Num`] of them, where
     /// [`Ty::join`] makes them dynamic.
     pub(crate) fn join_num(self, other: Ty) -> Ty {
+        if let Some(t) = self.join_maybe_tuple(other) {
+            return t;
+        }
         match (self.mask(), other.mask()) {
             (Some(a), Some(b)) if crate::lower::num::enabled() => Ty::num(a | b),
             _ => self.join(other),
@@ -1317,6 +1365,7 @@ impl Ty {
             Ty::List(Elem::Set(k)) => format!("List({})", Ty::Set(k).describe()),
             Ty::List(Elem::Array(c)) => format!("Array({})", c.letter()),
             Ty::MaybeList(e) => format!("{}|None", Ty::List(e).describe()),
+            Ty::MaybeTuple(k) => format!("{}|None", Ty::Tuple(k).describe()),
             Ty::Num(m) => {
                 let names: Vec<&str> = [
                     (Ty::NUM_INT, "int"),
@@ -1339,6 +1388,16 @@ impl Ty {
         match self {
             Ty::Tuple(k) => Some(tuple_shape(k)),
             _ => None,
+        }
+    }
+
+    /// The list or tuple a list or tuple or None is read as where None
+    /// raises.
+    pub(crate) fn present(self) -> Ty {
+        match self {
+            Ty::MaybeTuple(k) => Ty::Tuple(k),
+            Ty::MaybeList(e) => Ty::List(e),
+            t => t,
         }
     }
 
@@ -1387,6 +1446,10 @@ impl Ty {
             Ty::MaybeList(e) => match Ty::List(e).settled() {
                 Ty::List(e) => Ty::MaybeList(e),
                 other => other,
+            },
+            Ty::MaybeTuple(k) => match Ty::Tuple(k).settled() {
+                Ty::Tuple(k) => Ty::MaybeTuple(k),
+                _ => Ty::Object,
             },
             other => other,
         }
@@ -4030,6 +4093,7 @@ pub(crate) fn infer_module(
                             .with(|t| t.borrow().contains(&(name.clone(), index)));
                         let joined = match (current.mask(), ty.mask()) {
                             (Some(_), Some(_)) => current.join_num(ty),
+                            _ if current.join_maybe_tuple(ty).is_some() => current.join_num(ty),
                             _ => match number_list_join(current, ty) {
                                 Some(list) if !refused => list,
                                 _ => module.join_classes(current, ty),
@@ -5656,6 +5720,7 @@ fn widen_by_class(module: &mut Module, set: &[usize], name: &str, ty: Ty) -> boo
         };
         let joined = match (current.mask(), ty.mask()) {
             (Some(_), Some(_)) => current.join_num(ty),
+            _ if current.join_maybe_tuple(ty).is_some() => current.join_num(ty),
             _ => current
                 .join_nullable(ty)
                 .unwrap_or_else(|| module.join_classes(current, ty)),
@@ -7646,7 +7711,8 @@ impl Walker<'_> {
         match s {
             py::Stmt::Assign(a) => {
                 // A local takes a run-time number as itself, a field a
-                // list or None; any other target reads it as its box.
+                // list or None, an unpacking a tuple or None as the tuple
+                // (None raises); any other target reads it as its box.
                 let ty = if a.targets.iter().all(|t| matches!(t, py::Expr::Name(_))) {
                     self.expr_num(&a.value)
                 } else if a
@@ -7655,6 +7721,15 @@ impl Walker<'_> {
                     .all(|t| matches!(t, py::Expr::Attribute(_)))
                 {
                     self.expr_num(&a.value).stored_view()
+                } else if a
+                    .targets
+                    .iter()
+                    .all(|t| matches!(t, py::Expr::Tuple(_) | py::Expr::List(_)))
+                {
+                    match self.expr_num(&a.value) {
+                        t @ Ty::MaybeTuple(_) => t.present(),
+                        t => t.boxed_view(),
+                    }
                 } else {
                     self.expr(&a.value)
                 };
@@ -8305,6 +8380,7 @@ fn held_classes(module: &Module, ty: Ty, seen: &mut HashSet<Ty>, each: &mut impl
             }
         }
         Ty::List(e) | Ty::MaybeList(e) => held_classes(module, e.ty(), seen, each),
+        Ty::MaybeTuple(k) => held_classes(module, Ty::Tuple(k), seen, each),
         Ty::Tuple(k) => {
             for t in tuple_shape(k) {
                 held_classes(module, t, seen, each);
@@ -8790,9 +8866,10 @@ impl Typer<'_> {
                 _ => {}
             }
         }
-        // A list or None iterates as the list: None raises there.
+        // A list or tuple or None iterates as the list or the tuple:
+        // None raises there.
         let seq = match self.expr_num(iter) {
-            Ty::MaybeList(e) => Ty::List(e),
+            t @ (Ty::MaybeList(_) | Ty::MaybeTuple(_)) => t.present(),
             t => t.boxed_view(),
         };
         seq.element().unwrap_or(Ty::Object)
@@ -8851,6 +8928,7 @@ impl Typer<'_> {
         match t {
             Ty::Num(m) => Ty::num(m & !Ty::NUM_NONE),
             Ty::MaybeList(e) => Ty::List(e),
+            Ty::MaybeTuple(k) => Ty::Tuple(k),
             Ty::None if self.inferring => Ty::Unknown,
             t => t,
         }
@@ -9049,9 +9127,10 @@ impl Typer<'_> {
                 }
             }
             py::Expr::Subscript(s) => {
-                // A list or None is read as the list: None raises there.
+                // A list or tuple or None is read as the list or the
+                // tuple: None raises there.
                 let seq = match self.expr_num(&s.value) {
-                    Ty::MaybeList(e) => Ty::List(e),
+                    t @ (Ty::MaybeList(_) | Ty::MaybeTuple(_)) => t.present(),
                     t => t.boxed_view(),
                 };
                 if seq == Ty::Unknown {
