@@ -56,7 +56,6 @@
       font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
       min-height: 100vh;
-      overflow: hidden;
       color: var(--text-primary);
     }
 
@@ -157,6 +156,9 @@
       align-items: center;
       position: relative;
       padding: 72px clamp(1.5rem, 5vw, 4rem) 0;
+      /* The canvas is larger than its box; it stays inside the hero so
+         it never lies over the sections below. */
+      overflow: clip;
     }
 
     .hero-content {
@@ -367,8 +369,105 @@
       transition: 0.2s;
     }
 
+    /* ── Featured languages ── */
+    .languages {
+      padding: clamp(3.5rem, 9vh, 6rem) clamp(1.5rem, 5vw, 4rem) clamp(4rem, 10vh, 7rem);
+      border-top: 1px solid var(--border);
+    }
+    .languages-inner { max-width: 1400px; margin: 0 auto; }
+    .section-eyebrow {
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 0.75rem;
+    }
+    .section-title {
+      font-size: clamp(1.9rem, 3.4vw, 2.75rem);
+      font-weight: 700;
+      line-height: 1.1;
+      letter-spacing: -0.025em;
+      margin-bottom: 1rem;
+    }
+    .section-lede {
+      font-size: clamp(0.98rem, 1.1vw, 1.08rem);
+      line-height: 1.7;
+      color: var(--text-secondary);
+      max-width: 620px;
+      margin-bottom: 2.5rem;
+    }
+    .lang-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1.25rem;
+    }
+    .lang-card {
+      display: flex;
+      flex-direction: column;
+      gap: 0.9rem;
+      padding: 1.6rem 1.6rem 1.5rem;
+      background: rgba(255, 255, 255, 0.55);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.04);
+      transition: transform 0.2s, box-shadow 0.2s, background 0.2s;
+    }
+    .lang-card:hover {
+      transform: translateY(-2px);
+      background: rgba(255, 255, 255, 0.72);
+      box-shadow: 0 10px 32px rgba(0, 0, 0, 0.08);
+    }
+    .lang-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+    .lang-name {
+      font-family: 'Unbounded', sans-serif;
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+    }
+    .lang-ext {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      padding: 0.15rem 0.5rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .lang-kicker {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .lang-card p.lang-text {
+      font-size: 0.92rem;
+      line-height: 1.65;
+      color: var(--text-secondary);
+      flex: 1;
+    }
+    .lang-cta {
+      align-self: flex-start;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      margin-top: 0.4rem;
+      padding: 0.6rem 1.1rem;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 10px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-decoration: none;
+      transition: background 0.2s, transform 0.2s;
+    }
+    .lang-cta:hover { background: var(--accent-hover); transform: translateY(-1px); }
+    .lang-cta svg { width: 15px; height: 15px; }
+
     /* ── Responsive ── */
     @media (max-width: 1024px) {
+      .lang-grid { grid-template-columns: 1fr; max-width: 640px; }
       .hero-content {
         grid-template-columns: 1fr;
         text-align: center;
@@ -525,6 +624,9 @@
       }
 
       .hero-feature { align-items: center; }
+
+      .languages { padding-left: 1.25rem; padding-right: 1.25rem; }
+      .lang-cta { align-self: stretch; justify-content: center; }
     }
   </style>
 
@@ -644,6 +746,51 @@
         </noscript>
       </div>
 
+    </div>
+  </section>
+
+  <!-- ── Featured Languages ── -->
+  <section class="languages" id="languages" aria-labelledby="languages-title">
+    <div class="languages-inner">
+      <p class="section-eyebrow">Featured languages</p>
+      <h2 class="section-title" id="languages-title">Three languages. One compiler.</h2>
+      <p class="section-lede">
+        These languages use the same Zyntax type system, compiler and runtime.
+        Each language has its own parser and type rules.
+        Each program starts in the interpreter. Zyntax compiles frequently used code to machine code.
+      </p>
+      <div class="lang-grid">
+        <article class="lang-card">
+          <div class="lang-head"><h3 class="lang-name">ZynML</h3><span class="lang-ext">.zynml</span></div>
+          <p class="lang-kicker">A typed language for machine learning</p>
+          <p class="lang-text">
+            ZynML compiles tensor operations and model code to machine code.
+            Its standard library is ZynML source. Its kernels use no vendor library.
+            The benchmark page shows each compiler tier on the same kernels.
+          </p>
+          <a class="lang-cta" href="/benchmark/">ZynML benchmarks <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg></a>
+        </article>
+        <article class="lang-card">
+          <div class="lang-head"><h3 class="lang-name">zylua</h3><span class="lang-ext">.lua</span></div>
+          <p class="lang-kicker">Lua 5.4 on Zyntax</p>
+          <p class="lang-text">
+            zylua runs Lua 5.4 programs. It finds the types of values and keeps them in typed form.
+            CI compares zylua with LuaJIT and PUC Lua on the same benchmarks.
+            Each benchmark must give the same result as PUC Lua.
+          </p>
+          <a class="lang-cta" href="/zylua/">zylua benchmarks <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg></a>
+        </article>
+        <article class="lang-card">
+          <div class="lang-head"><h3 class="lang-name">zypy</h3><span class="lang-ext">.py</span></div>
+          <p class="lang-kicker">Python 3 on Zyntax</p>
+          <p class="lang-text">
+            zypy runs Python 3 programs. It finds the types of values from the full program.
+            CI compares zypy with PyPy and CPython on the PyPy speed-center kernels.
+            Each kernel must give the same result as CPython.
+          </p>
+          <a class="lang-cta" href="/zypy/">zypy benchmarks <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg></a>
+        </article>
+      </div>
     </div>
   </section>
   </main>

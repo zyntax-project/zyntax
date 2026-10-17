@@ -196,9 +196,149 @@ jobs:
           path: bench-out/results-${{ matrix.kernel }}.json
           retention-days: 90
 
+  # The language runtimes against the interpreters people compare them
+  # with: zylua against LuaJIT and PUC Lua 5.4, zypy against PyPy and
+  # CPython on the PyPy speed-center kernels. Each suite's own runner
+  # interleaves the interpreters and checks every answer against the
+  # reference, so a row that disagrees carries an error and the page
+  # leaves it out. One job per suite and runner: a suite runs end to
+  # end on one machine, so its rows compare like with like.
+  lang-bench:
+    name: lang bench (${{ matrix.suite }} · ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+        suite:
+          - zylua
+          - zypy
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: lang-bench-${{ matrix.os }}-${{ matrix.suite }}
+
+      - name: Install LLVM 21 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21 all
+          echo "LLVM_SYS_211_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+
+      - name: Install LLVM 21 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm@21
+          echo "LLVM_SYS_211_PREFIX=$(brew --prefix llvm@21)" >> "$GITHUB_ENV"
+
+      # The reference interpreters, by the paths the runners are given.
+      - name: Install reference interpreters (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luajit lua5.4 pypy3
+          echo "LUAJIT=$(command -v luajit)" >> "$GITHUB_ENV"
+          echo "LUA54=$(command -v lua5.4)" >> "$GITHUB_ENV"
+          echo "PYPY=$(command -v pypy3)" >> "$GITHUB_ENV"
+
+      - name: Install reference interpreters (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install luajit lua@5.4 pypy3.11
+          lua54="$(brew --prefix lua@5.4)/bin/lua5.4"
+          [ -x "$lua54" ] || lua54="$(brew --prefix lua@5.4)/bin/lua"
+          echo "LUAJIT=$(command -v luajit)" >> "$GITHUB_ENV"
+          echo "LUA54=$lua54" >> "$GITHUB_ENV"
+          echo "PYPY=$(command -v pypy3.11 || command -v pypy3)" >> "$GITHUB_ENV"
+
+      # A performance release: the llvm-backend build, so the full tier
+      # ladder runs. Both runners refuse a build without it.
+      - name: Build ${{ matrix.suite }}
+        run: |
+          case "${{ matrix.suite }}" in
+            zylua) cargo build --release -p zyntax_lua --features llvm-backend --bin zylua ;;
+            zypy) cargo build --release -p zyntax_python --features llvm-backend --bin zypy ;;
+          esac
+
+      # A row that fails is recorded in the JSON with its error, and the
+      # Lua runner exits non-zero for it; the run still publishes.
+      - name: Run ${{ matrix.suite }} benchmarks
+        env:
+          RUST_MIN_STACK: 134217728
+        run: |
+          mkdir -p bench-out
+          case "${{ matrix.suite }}" in
+            zylua)
+              python3 crates/zyntax_lua/benchmarks/run.py --runs 5 \
+                --zylua target/release/zylua --luajit "$LUAJIT" --lua "$LUA54" \
+                --out bench-out/raw.json || echo "::warning::some zylua rows failed"
+              ;;
+            zypy)
+              python3 crates/zyntax_python/benchmarks/speed/run.py --fast \
+                --zypy target/release/zypy --pypy "$PYPY" --python "$(command -v python3)" \
+                --out bench-out/raw.json
+              ;;
+          esac
+          test -s bench-out/raw.json
+
+      # Where and with what the numbers were measured, as the ZynML
+      # runner records it, plus each interpreter's own version line.
+      - name: Record run metadata
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cpu="$(sysctl -n machdep.cpu.brand_string)"
+            ram=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+            os=macos
+          else
+            cpu="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')"
+            ram=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1048576 ))
+            os=linux
+          fi
+          case "${{ matrix.suite }}" in
+            zylua)
+              versions=$(jq -n --arg luajit "$("$LUAJIT" -v 2>&1 | head -1 | cut -d' ' -f2)" \
+                --arg lua "$("$LUA54" -v 2>&1 | head -1 | cut -d' ' -f2)" '{LuaJIT: $luajit, "PUC Lua": $lua}')
+              ;;
+            zypy)
+              pypy="$("$PYPY" --version 2>&1 | tr '\n' ' ' | sed -n 's/.*\[PyPy \([0-9.]*\).*/\1/p')"
+              versions=$(jq -n --arg pypy "$pypy" \
+                --arg cpython "$(python3 --version 2>&1 | cut -d' ' -f2)" '{PyPy: $pypy, CPython: $cpython}')
+              ;;
+          esac
+          jq --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+             --arg commit "${GITHUB_SHA::8}" \
+             --arg os "$os" \
+             --arg arch "$(uname -m)" \
+             --arg cpu "$cpu" \
+             --argjson cores "$(getconf _NPROCESSORS_ONLN)" \
+             --argjson ram "$ram" \
+             --arg host "$(hostname)" \
+             --argjson versions "$versions" \
+             '. + {meta: {date: $date, commit: $commit, os: $os, arch: $arch, cpu: $cpu,
+                          cpu_cores: $cores, ram_gb: $ram, host: $host, versions: $versions}}' \
+             bench-out/raw.json > bench-out/${{ matrix.suite }}.json
+
+      - name: Upload ${{ matrix.suite }} results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lang-${{ matrix.suite }}-${{ matrix.os }}
+          path: bench-out/${{ matrix.suite }}.json
+          retention-days: 90
+
   benchmark-aggregate:
     name: Aggregate benchmark results
-    needs: benchmark
+    needs: [benchmark, lang-bench]
     # `needs` alone would skip this whenever any matrix leg failed, and a
     # skipped aggregate skips the deploy, so one crashing kernel takes the
     # whole published page down with it rather than just its own row. Run
@@ -251,6 +391,31 @@ jobs:
           else
             echo "no macOS partials; publishing x86_64 only"
           fi
+
+      # Each language page reads results.json (x86_64) and
+      # results-macos.json beside it, as the ZynML page does. A suite
+      # whose run produced nothing leaves its page without that file.
+      - name: Download language benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lang-*
+          path: lang-parts
+
+      - name: Place language benchmark results
+        run: |
+          for suite in zylua zypy; do
+            mkdir -p "bench-out/$suite"
+            for pair in "ubuntu-latest:results.json" "macos-latest:results-macos.json"; do
+              os="${pair%%:*}"; file="${pair#*:}"
+              src="lang-parts/lang-$suite-$os/$suite.json"
+              if [ -f "$src" ]; then
+                cp "$src" "bench-out/$suite/$file"
+              else
+                echo "no $suite results from $os"
+              fi
+            done
+          done
+          ls -R bench-out
 
       - name: Upload merged benchmark results
         uses: actions/upload-artifact@v4
@@ -306,9 +471,20 @@ jobs:
             cp bench-out/results-macos.json site/benchmark/results-macos.json
           fi
 
+          # The language pages, each with its CI results.
+          for suite in zylua zypy; do
+            mkdir -p "site/$suite"
+            cp "website/$suite/index.html" "site/$suite/index.html"
+            for file in results.json results-macos.json; do
+              if [ -f "bench-out/$suite/$file" ]; then
+                cp "bench-out/$suite/$file" "site/$suite/$file"
+              fi
+            done
+          done
+
           # Verify book output exists
           ls -la site/book/
-          ls -la site/benchmark/
+          ls -la site/benchmark/ site/zylua/ site/zypy/
 
       - name: Configure Pages
         uses: actions/configure-pages@v5

@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>zylua · Lua on Zyntax</title>
+
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="zylua · Lua on Zyntax">
+  <meta property="og:description" content="zylua is a Lua 5.4 runtime on Zyntax. This page shows the CI benchmark results of zylua, LuaJIT and PUC Lua 5.4.">
+  <meta property="og:url" content="https://zyntax.org/zylua/">
+  <meta property="og:image" content="https://zyntax.org/og-image.png">
+  <meta property="og:site_name" content="Zyntax">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="zylua · Lua on Zyntax">
+  <meta name="twitter:description" content="zylua is a Lua 5.4 runtime on Zyntax. This page shows the CI benchmark results of zylua, LuaJIT and PUC Lua 5.4.">
+  <meta name="twitter:image" content="https://zyntax.org/og-image.png">
+
+  <meta name="description" content="zylua is a Lua 5.4 runtime on Zyntax. This page shows the CI benchmark results of zylua, LuaJIT and PUC Lua 5.4.">
+  <meta name="theme-color" content="#eaeaf2">
+  <link rel="canonical" href="https://zyntax.org/zylua/">
+
+  <link rel="icon" href="/favicon.ico" sizes="32x32">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="32x32">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Unbounded:wght@200..900&display=swap" rel="stylesheet">
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg-top: #eaeaf2;
+      --bg-bottom: #ccc8d8;
+      --text-primary: #111118;
+      --text-secondary: #555566;
+      --text-muted: #888899;
+      --accent: #1a1a1a;
+      --accent-hover: #333340;
+      --border: rgba(0, 0, 0, 0.08);
+      --rule: rgba(0, 0, 0, 0.10);
+      --card-bg: rgba(255, 255, 255, 0.55);
+      --card-bg-strong: rgba(255, 255, 255, 0.72);
+      --bar: var(--accent);
+      --bar-other: rgba(26, 26, 26, 0.32);
+      --bar-track: rgba(26, 26, 26, 0.07);
+      --status-ok: #22c55e;
+    }
+
+    html, body { overflow-x: hidden; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
+      min-height: 100vh;
+      color: var(--text-primary);
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--accent-hover); }
+    code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.92em;
+      background: rgba(0, 0, 0, 0.06);
+      padding: 0.05em 0.4em;
+      border-radius: 0.3em;
+    }
+
+    /* ── Navigation (matches the benchmark page) ── */
+    nav {
+      position: sticky; top: 0; z-index: 100;
+      padding: 0 clamp(1rem, 5vw, 4rem);
+      height: 72px;
+      display: flex; align-items: center; justify-content: space-between;
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      background: rgba(234, 234, 242, 0.7);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav-logo {
+      color: var(--text-primary);
+      font-family: 'Unbounded', sans-serif;
+      font-weight: 700; font-size: 1.05rem; letter-spacing: -0.01em;
+    }
+    .nav-links { display: flex; gap: 1.6rem; list-style: none; align-items: center; }
+    .nav-links a { font-size: 0.875rem; color: var(--text-secondary); font-weight: 500; transition: color 0.15s; }
+    .nav-links a:hover, .nav-links a[aria-current="page"] { color: var(--text-primary); }
+    .nav-cta {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      padding: 0.45rem 0.85rem;
+      background: var(--accent); color: white !important;
+      border-radius: 0.5rem; font-size: 0.825rem; font-weight: 600;
+    }
+    .nav-cta:hover { background: var(--accent-hover); }
+    .nav-cta svg { width: 14px; height: 14px; }
+    @media (max-width: 640px) {
+      .nav-links { gap: 1rem; }
+      .nav-links .wide { display: none; }
+    }
+
+    .container { max-width: 920px; margin: 0 auto; padding: 0 clamp(1rem, 4vw, 2rem); }
+
+    header.page-head {
+      padding-top: clamp(3rem, 8vh, 5rem);
+      padding-bottom: clamp(1rem, 3vh, 1.5rem);
+    }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 0.55rem;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 0.72rem; font-weight: 600;
+      color: var(--text-secondary);
+      background: var(--card-bg-strong);
+      border: 1px solid var(--border);
+      padding: 0.4rem 0.75rem;
+      border-radius: 999px;
+      max-width: 100%;
+    }
+    .eyebrow .dot {
+      width: 7px; height: 7px; flex: none;
+      background: var(--status-ok); border-radius: 50%;
+      box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.16);
+    }
+    h1 {
+      font-family: 'Unbounded', sans-serif;
+      font-weight: 700;
+      font-size: clamp(2.2rem, 5vw, 3.4rem);
+      letter-spacing: -0.025em; line-height: 1.05;
+      margin: 1rem 0 0.85rem;
+      max-width: 24ch;
+    }
+    h1 em {
+      font-style: italic;
+      background: linear-gradient(135deg, #333 0%, #888 100%);
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent; color: transparent;
+    }
+    .lede { color: var(--text-secondary); font-size: 1.02rem; max-width: 60ch; }
+    .lede + .lede { margin-top: 0.75rem; }
+    .lede a { color: var(--text-primary); border-bottom: 1px dashed rgba(0, 0, 0, 0.25); }
+
+    .method {
+      margin: 2rem 0 1.5rem;
+      padding: 1rem 1.4rem;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 0.85rem;
+      display: flex; gap: 0.75rem 1.5rem; flex-wrap: wrap;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+    }
+    .method span { display: inline-flex; align-items: center; gap: 0.45rem; }
+    .method b { color: var(--text-primary); font-weight: 600; }
+    .method svg { width: 14px; height: 14px; flex: none; stroke: var(--text-secondary); fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+    /* ── Switches: architecture and metric ── */
+    .controls { display: flex; flex-wrap: wrap; gap: 0.6rem 1.4rem; align-items: center; margin-bottom: 0.9rem; }
+    .switch { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+    .switch:empty { display: none; }
+    .switch button {
+      font: inherit; font-size: 0.83rem;
+      padding: 0.4rem 0.85rem;
+      border-radius: 0.45rem;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .switch button:hover { color: var(--text-primary); }
+    .switch button[aria-pressed="true"] {
+      background: var(--card-bg-strong);
+      border-color: var(--accent);
+      color: var(--text-primary);
+      font-weight: 600;
+    }
+
+    /* ── Results table ── */
+    .summary {
+      font-size: 0.95rem;
+      color: var(--text-secondary);
+      margin: 0 0 1rem;
+    }
+    .summary b { color: var(--text-primary); }
+    .table-card {
+      background: var(--card-bg-strong);
+      border: 1px solid var(--border);
+      border-radius: 1rem;
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.04);
+      overflow-x: auto;
+    }
+    table { width: 100%; border-collapse: collapse; min-width: 620px; }
+    th, td { padding: 0.7rem 0.9rem; text-align: left; vertical-align: middle; }
+    thead th {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.7rem; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text-muted);
+      border-bottom: 1px dashed var(--rule);
+    }
+    tbody tr + tr td { border-top: 1px solid var(--border); }
+    td.name a { font-weight: 600; color: var(--text-primary); }
+    td.name small { display: block; color: var(--text-muted); font-size: 0.75rem; }
+    .cell { min-width: 120px; }
+    .cell .num {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-primary);
+    }
+    .cell .num .unit { color: var(--text-muted); margin-left: 0.15rem; }
+    .cell .track { margin-top: 0.3rem; height: 6px; border-radius: 3px; background: var(--bar-track); overflow: hidden; }
+    .cell .fill { height: 100%; background: var(--bar-other); border-radius: 3px; }
+    .cell.ours .fill { background: var(--bar); }
+    .cell.ours .num { font-weight: 700; }
+    .cell.none .num { color: var(--text-muted); }
+    td.ratio {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    td.ratio.faster { color: var(--text-primary); font-weight: 700; }
+    td.ratio.slower { color: var(--text-secondary); }
+    /* A phone keeps the ratio in view: the third interpreter, the
+       slowest reference, gives way first. */
+    @media (max-width: 640px) {
+      table { min-width: 0; }
+      th, td { padding: 0.6rem 0.5rem; }
+      .cell { min-width: 64px; }
+      .minor { display: none; }
+      td.ratio { white-space: normal; }
+    }
+
+    .loading {
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem; font-style: italic;
+      padding: 2rem 1rem;
+    }
+
+    .footnote {
+      margin: 1.2rem 0 0;
+      padding: 1.2rem 0 0;
+      border-top: 1px dashed var(--rule);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+      line-height: 1.75;
+    }
+    .footnote strong { color: var(--text-primary); font-weight: 600; }
+    .meta {
+      margin-top: 1.1rem;
+      display: flex; flex-wrap: wrap; gap: 0.5rem 0.9rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      color: var(--text-muted);
+    }
+    .meta code { color: var(--text-primary); font-size: 1em; }
+
+    footer {
+      margin-top: 4rem;
+      background: rgba(255, 255, 255, 0.3);
+      border-top: 1px solid var(--border);
+      padding: 2.2rem 0 1.6rem;
+    }
+    footer .foot-inner {
+      max-width: 920px; margin: 0 auto;
+      padding: 0 clamp(1rem, 4vw, 2rem);
+      display: flex; flex-wrap: wrap; gap: 1.2rem;
+      justify-content: space-between; align-items: center;
+    }
+    footer .foot-brand { font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 1rem; }
+    footer .foot-links { display: flex; flex-wrap: wrap; gap: 1.4rem; font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; }
+    footer .foot-links a { color: var(--text-secondary); }
+    footer .foot-links a:hover { color: var(--text-primary); }
+    footer .foot-bottom {
+      max-width: 920px; margin: 1.4rem auto 0;
+      padding: 1rem clamp(1rem, 4vw, 2rem) 0;
+      border-top: 1px dashed var(--rule);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem; color: var(--text-muted);
+      display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: space-between;
+    }
+  </style>
+</head>
+<body>
+
+  <nav role="navigation" aria-label="Main navigation">
+    <a href="/" class="nav-logo">zyntax</a>
+    <ul class="nav-links" role="list">
+      <li class="wide"><a href="https://zyntax.org/book/">The Zyn Book</a></li>
+      <li class="wide"><a href="/benchmark/">ZynML</a></li>
+      <li><a href="/zylua/" aria-current="page">zylua</a></li>
+      <li><a href="/zypy/">zypy</a></li>
+      <li>
+        <a href="https://github.com/zyntax-project/zyntax" class="nav-cta" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+          GitHub
+        </a>
+      </li>
+    </ul>
+  </nav>
+
+  <header class="page-head container">
+    <span class="eyebrow"><span class="dot"></span>results from the CI benchmark workflow</span>
+    <h1>zylua: <em>Lua on Zyntax</em></h1>
+    <p class="lede">
+      zylua is a Lua 5.4 runtime. It compiles Lua source to the typed AST of Zyntax.
+      It finds the types of values. When it knows a type, it keeps the value in typed form.
+      Each function starts in the interpreter.
+      zylua compiles a frequently used function to machine code with Cranelift, and then with LLVM.
+    </p>
+    <p class="lede">
+      This page shows the benchmark results from CI.
+      The CI workflow runs each benchmark on zylua, LuaJIT and PUC Lua 5.4.
+      All three must print the same result as PUC Lua. A row that does not agree is not on this page.
+      The source of each benchmark is in
+      <a href="https://github.com/zyntax-project/zyntax/tree/main/crates/zyntax_lua/benchmarks">crates/zyntax_lua/benchmarks</a>.
+    </p>
+  </header>
+
+  <section class="container">
+    <div class="method">
+      <span><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg><b>Median of 5</b> · interleaved rounds</span>
+      <span><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg><b>Two times</b> · benchmark and full process</span>
+      <span><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg><b>Result checked</b> · against PUC Lua</span>
+      <span><svg viewBox="0 0 24 24"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg><b>Tiered</b> · interpreter → Cranelift → LLVM</span>
+    </div>
+  </section>
+
+  <main class="container">
+    <div class="controls">
+      <div class="switch" id="arch-switch" role="group" aria-label="Machine"></div>
+      <div class="switch" id="metric-switch" role="group" aria-label="Time">
+        <button type="button" data-metric="elapsed" aria-pressed="true">Benchmark time</button>
+        <button type="button" data-metric="wall" aria-pressed="false">Full process</button>
+      </div>
+    </div>
+    <p class="summary" id="summary"></p>
+    <div class="table-card" id="table">
+      <p class="loading">Loading benchmark results…</p>
+    </div>
+  </main>
+
+  <section class="container">
+    <div id="meta-row"></div>
+    <p class="footnote">
+      <strong>Shorter bars are faster.</strong>
+      The benchmark time is the time that the benchmark program measures with its own clock.
+      The full process time also includes start-up, compilation that occurs before the benchmark starts, and exit.
+      A program that runs one time pays the full process time.
+      The ratio column compares zylua with LuaJIT. The bars in a row use the slowest interpreter in that row as the full length.
+    </p>
+  </section>
+
+  <footer>
+    <div class="foot-inner">
+      <div class="foot-brand">zyntax</div>
+      <div class="foot-links">
+        <a href="/">Home</a>
+        <a href="https://zyntax.org/book/">Book</a>
+        <a href="/benchmark/">ZynML</a>
+        <a href="/zylua/">zylua</a>
+        <a href="/zypy/">zypy</a>
+        <a href="https://github.com/zyntax-project/zyntax">GitHub</a>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>© 2026 The Zyntax contributors · Apache 2.0</span>
+      <span>zylua benchmarks · refreshed by CI</span>
+    </div>
+  </footer>
+
+  <script>
+    // Display names, in table order. A benchmark the runner adds that
+    // is not listed here still shows, after these, under its file name.
+    const BENCHES = {
+      fib: 'Recursive Fibonacci',
+      binary_trees: 'Binary trees',
+      mandelbrot: 'Mandelbrot',
+      mandelbrot_strip: 'Mandelbrot strip',
+      nbody: 'N-body',
+      method_call: 'Method call',
+      inlined_call: 'Inlined call',
+      free_function_call: 'Free function call',
+      lambda_call: 'Lambda call',
+      closure_call: 'Closure call',
+      op_overload: 'Operator metamethods',
+      any_field: 'Dynamic field',
+      branchy: 'Branches',
+      collatz: 'Collatz',
+      records: 'Records',
+      pipeline: 'Pipeline',
+      tokenize: 'Tokenizer',
+    };
+    const OURS = 'zylua';
+    const BASELINE = 'luajit';
+    const COLUMNS = [
+      { key: 'zylua', label: 'zylua' },
+      { key: 'luajit', label: 'LuaJIT' },
+      { key: 'lua', label: 'PUC Lua 5.4' },
+    ];
+    const SOURCE = 'https://github.com/zyntax-project/zyntax/blob/main/crates/zyntax_lua/benchmarks/';
+
+    const escape = (t) => String(t).replace(/[&<>"]/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+    function formatMs(ms) {
+      if (ms < 1) return ms.toFixed(2);
+      if (ms < 10) return ms.toFixed(1);
+      return Math.round(ms).toLocaleString('en-US');
+    }
+
+    // Milliseconds for one interpreter's row, or null when it has no
+    // time: an interpreter that failed or disagreed is left blank.
+    function timeOf(row, metric) {
+      if (!row || row.error || !row[metric]) return null;
+      return row[metric].median * 1000;
+    }
+
+    function ratioText(ours, base) {
+      if (ours == null || base == null || ours <= 0) return { text: '—', cls: '' };
+      const r = base / ours;
+      if (r >= 1) return { text: `${r.toFixed(2)}× faster`, cls: 'faster' };
+      return { text: `${(1 / r).toFixed(2)}× slower`, cls: 'slower' };
+    }
+
+    function render(data, metric) {
+      const results = data.results || {};
+      const known = Object.keys(BENCHES).filter((b) => results[b]);
+      const extra = Object.keys(results).filter((b) => !BENCHES[b]);
+      let rows = '';
+      let shown = 0, faster = 0;
+      for (const bench of [...known, ...extra]) {
+        const r = results[bench];
+        const ours = timeOf(r[OURS], metric);
+        // A benchmark zylua did not finish correctly is not published.
+        if (ours == null) continue;
+        const times = COLUMNS.map((c) => timeOf(r[c.key], metric));
+        const max = Math.max(...times.filter((t) => t != null));
+        const cells = COLUMNS.map((c, i) => {
+          const t = times[i];
+          const cls = ['cell', c.key === OURS ? 'ours' : '', i === 2 ? 'minor' : '', t == null ? 'none' : ''].join(' ');
+          if (t == null) return `<td class="${cls}"><div class="num">—</div></td>`;
+          const pct = max > 0 ? Math.max(2, (t / max) * 100) : 0;
+          return `<td class="${cls}"><div class="num">${formatMs(t)}<span class="unit">ms</span></div>` +
+            `<div class="track"><div class="fill" style="width:${pct}%"></div></div></td>`;
+        }).join('');
+        const base = times[COLUMNS.findIndex((c) => c.key === BASELINE)];
+        const ratio = ratioText(ours, base);
+        if (ratio.cls === 'faster') faster++;
+        if (base != null) shown++;
+        rows += `<tr><td class="name"><a href="${SOURCE}${encodeURIComponent(bench)}.lua">${escape(BENCHES[bench] || bench)}</a>` +
+          `<small>${escape(bench)}.lua</small></td>${cells}<td class="ratio ${ratio.cls}">${ratio.text}</td></tr>`;
+      }
+      const table = document.getElementById('table');
+      if (!rows) {
+        table.innerHTML = '<p class="loading">No benchmark results in this file.</p>';
+        document.getElementById('summary').textContent = '';
+        return;
+      }
+      table.innerHTML = `<table><thead><tr><th>Benchmark</th>${
+        COLUMNS.map((c, i) => `<th${i === 2 ? ' class="minor"' : ''}>${escape(c.label)}</th>`).join('')
+      }<th>zylua vs LuaJIT</th></tr></thead><tbody>${rows}</tbody></table>`;
+      const what = metric === 'wall' ? 'full process time' : 'benchmark time';
+      document.getElementById('summary').innerHTML =
+        `zylua is faster than LuaJIT on <b>${faster} of ${shown}</b> benchmarks by ${what}.`;
+
+      const m = data.meta || {};
+      const chips = [];
+      if (m.date) chips.push(`<span>updated <code>${escape(m.date.replace('T', ' ').replace('Z', ' UTC'))}</code></span>`);
+      if (m.commit) chips.push(`<span>commit <code>${escape(m.commit)}</code></span>`);
+      if (m.os) chips.push(`<span>os <code>${escape(m.os)}</code></span>`);
+      if (m.arch) chips.push(`<span>arch <code>${escape(m.arch)}</code></span>`);
+      if (m.cpu) chips.push(`<span>cpu <code>${escape(m.cpu)}</code></span>`);
+      if (m.cpu_cores) chips.push(`<span>cores <code>${escape(m.cpu_cores)}</code></span>`);
+      if (m.ram_gb) chips.push(`<span>ram <code>${escape(m.ram_gb)} GiB</code></span>`);
+      for (const [name, version] of Object.entries(m.versions || {})) {
+        chips.push(`<span>${escape(name)} <code>${escape(version)}</code></span>`);
+      }
+      document.getElementById('meta-row').innerHTML = chips.length ? `<div class="meta">${chips.join('')}</div>` : '';
+    }
+
+    async function main() {
+      const load = async (file) => {
+        try {
+          const resp = await fetch(file, { cache: 'no-cache' });
+          return resp.ok ? await resp.json() : null;
+        } catch (_) {
+          return null;
+        }
+      };
+      const datasets = (await Promise.all(
+        ['results.json', 'results-macos.json'].map(async (file) => ({ file, data: await load(file) }))
+      )).filter((d) => d.data && d.data.results);
+      if (!datasets.length) {
+        document.getElementById('table').innerHTML =
+          '<p class="loading">No results yet. The CI benchmark workflow publishes them.</p>';
+        return;
+      }
+      let current = datasets[0].data;
+      let metric = 'elapsed';
+
+      const label = (d) => {
+        const m = d.data.meta || {};
+        if (m.cpu) return m.cpu;
+        if (m.arch && m.os) return `${m.arch} · ${m.os}`;
+        return d.file;
+      };
+      const arch = document.getElementById('arch-switch');
+      if (datasets.length > 1) {
+        datasets.forEach((d, i) => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.textContent = label(d);
+          b.setAttribute('aria-pressed', String(i === 0));
+          b.addEventListener('click', () => {
+            for (const other of arch.children) other.setAttribute('aria-pressed', String(other === b));
+            current = d.data;
+            render(current, metric);
+          });
+          arch.appendChild(b);
+        });
+      }
+      const metrics = document.getElementById('metric-switch');
+      for (const b of metrics.children) {
+        b.addEventListener('click', () => {
+          for (const other of metrics.children) other.setAttribute('aria-pressed', String(other === b));
+          metric = b.dataset.metric;
+          render(current, metric);
+        });
+      }
+      render(current, metric);
+    }
+
+    main();
+  </script>
+</body>
+</html>

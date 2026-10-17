@@ -206,7 +206,7 @@ def main():
     for name in names:
         kernel, extra, scaling, files = SUITE[name]
         trials = max(1, int(base * scaling))
-        results[name] = {"trials": trials}
+        results[name] = {"trials": trials, "script": kernel, "args": extra}
         print(f"==> {name} ({kernel} -n {trials} {' '.join(extra)})", file=sys.stderr)
         for interp, prefix, shim in interps:
             if interp == "zypy" and name in UNMET:
