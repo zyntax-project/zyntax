@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1792268957,"nonce":"vORcNwI7v83h6YUnYuV6/MJ3QIw=","added":["perf","area:python"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1792269714,"nonce":"CFGX2TcgrsX8v2cEShqJNoy3Jk4=","message":"The fixes listed landed in 0489dba89d4dcfc8c8b0ec53f12f5eafc7f9da27; raytrace itself stays dynamic for the reason in the last paragraph, so this stays open.","files":null}]}
