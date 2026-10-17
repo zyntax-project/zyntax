@@ -2515,6 +2515,41 @@ fn dynamic_set(list_type: TypeId) -> Vec<Decl> {
         st.push(ret(bool(true)));
         st
     }));
+    // Whether every value of `s` is a set: the library's own or one of a
+    // shape the frontend registered. An empty set is not.
+    let category = |x: Expr| call("zb_any_category", vec![x], i64());
+    d.push(define("zb_set_all_sets", &[&s], boolean(), {
+        let mut st = vec![
+            when(
+                eq(call("zb_set_len", vec![s.e()], i64()), int(0)),
+                vec![ret(bool(false))],
+            ),
+            n.decl(len(s.e())),
+        ];
+        st.extend(for_range(
+            &i,
+            t.first(t.ctrl(s.e())),
+            n.e(),
+            vec![when(
+                ne(t.hash_of(t.entry(s.e(), i.e())), int(TOMB)),
+                vec![
+                    x.decl(t.key_of(t.entry(s.e(), i.e()))),
+                    when(
+                        not(and(
+                            eq(category(x.e()), int(SET_TAG & 255)),
+                            or(
+                                eq(kind(x.e()), int(SET_TAG >> 8)),
+                                call("zb_any_is_keyed_set", vec![x.e()], boolean()),
+                            ),
+                        )),
+                        vec![ret(bool(false))],
+                    ),
+                ],
+            )],
+        ));
+        st.push(ret(bool(true)));
+        st
+    }));
     // Two sets one of which holds only sets and the other only tuples:
     // no value of one equals a value of the other.
     // Out of line: the kinds are looked at only when the masks do not
@@ -2536,7 +2571,7 @@ fn dynamic_set(list_type: TypeId) -> Vec<Decl> {
                 vec![ret(bool(false))],
             ),
             when(
-                call("zb_set_all_kind", vec![s.e(), int(SET_TAG >> 8)], boolean()),
+                call("zb_set_all_sets", vec![s.e()], boolean()),
                 vec![ret(call(
                     "zb_set_all_kind",
                     vec![other.e(), int(TUPLE_TAG >> 8)],
@@ -2549,11 +2584,7 @@ fn dynamic_set(list_type: TypeId) -> Vec<Decl> {
                     vec![s.e(), int(TUPLE_TAG >> 8)],
                     boolean(),
                 ),
-                vec![ret(call(
-                    "zb_set_all_kind",
-                    vec![other.e(), int(SET_TAG >> 8)],
-                    boolean(),
-                ))],
+                vec![ret(call("zb_set_all_sets", vec![other.e()], boolean()))],
             ),
             ret(bool(false)),
         ],
