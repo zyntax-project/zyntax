@@ -4520,9 +4520,12 @@ impl<'m> Lowerer<'m> {
                     .iter()
                     .all(|t| matches!(t, py::Expr::Attribute(_)))
                 {
-                    // A field holds a list or None as itself.
+                    // A field holds a list or None as itself, and a
+                    // run-time number as itself where the field is one.
                     let v = self.expr_num(&a.value)?;
-                    if let Ty::Num(_) = v.ty {
+                    if let Ty::Num(_) = v.ty
+                        && !a.targets.iter().all(|t| self.is_num_field(t))
+                    {
                         self.boxed_num(v)
                     } else {
                         v
@@ -5018,6 +5021,21 @@ impl<'m> Lowerer<'m> {
                 Ok(())
             }
             Place::Target => self.bind(&a.target, combined, span, out),
+        }
+    }
+
+    /// Whether `target` is a field of an instance of known class that
+    /// holds a run-time number.
+    fn is_num_field(&self, target: &py::Expr) -> bool {
+        let py::Expr::Attribute(attr) = target else {
+            return false;
+        };
+        match self.ty_of(&attr.value) {
+            Ty::Class(k) => matches!(
+                self.module.field(k as usize, attr.attr.as_str()),
+                Some((_, Ty::Num(_)))
+            ),
+            _ => false,
         }
     }
 
