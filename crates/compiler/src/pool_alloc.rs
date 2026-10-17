@@ -190,7 +190,7 @@ pub(crate) fn class_slot_bytes(class: usize) -> usize {
 
 /// Every unused block reserved by this thread, by address.
 pub(crate) fn for_each_free_block(mut f: impl FnMut(usize)) {
-    POOL.with(|p| {
+    with_pool(|p| {
         let mut walk = |lists: &[Cell<*mut u8>; CLASSES]| {
             for (class, list) in lists.iter().enumerate() {
                 let mut prev: *mut u8 = std::ptr::null_mut();
@@ -232,7 +232,7 @@ pub(crate) fn for_each_free_block(mut f: impl FnMut(usize)) {
 /// Empty this thread's lists and cursors; the collector fills the
 /// swept lists again from what its sweep finds unreached.
 pub(crate) fn clear_free_lists() {
-    POOL.with(|p| {
+    with_pool(|p| {
         for list in p
             .free
             .iter()
@@ -253,7 +253,7 @@ pub(crate) fn clear_free_lists() {
 /// Every block on the chain must be one of `class` from this pool
 /// that nothing reads any more.
 pub(crate) unsafe fn push_free_chain(class: usize, head: usize, tail: usize) {
-    POOL.with(|p| {
+    with_pool(|p| {
         *(tail as *mut *mut u8) = p.swept[class].get();
         p.swept[class].set(head as *mut u8);
     });
@@ -301,17 +301,67 @@ struct Lists {
 
 const NO_LISTS: [Cell<*mut u8>; CLASSES] = [const { Cell::new(std::ptr::null_mut()) }; CLASSES];
 
+const fn new_lists() -> Lists {
+    Lists {
+        free: NO_LISTS,
+        fresh: NO_LISTS,
+        fresh_end: NO_LISTS,
+        swept: NO_LISTS,
+        slab: NO_LISTS,
+        mutator: Cell::new(usize::MAX),
+    }
+}
+
 thread_local! {
-    static POOL: Lists = const {
-        Lists {
-            free: NO_LISTS,
-            fresh: NO_LISTS,
-            fresh_end: NO_LISTS,
-            swept: NO_LISTS,
-            slab: NO_LISTS,
-            mutator: Cell::new(usize::MAX),
+    static POOL: Lists = const { new_lists() };
+}
+
+/// The share of the pool of the first thread that allocates, which that
+/// thread reaches without a thread-local lookup: on Apple targets each
+/// such lookup is a call, one per allocation and per release.
+struct Owned(Lists);
+
+// SAFETY: only the thread recorded in `OWNER` ever reaches it.
+unsafe impl Sync for Owned {}
+
+static OWNED: Owned = Owned(new_lists());
+
+/// The [`thread_word`] of the thread `OWNED` belongs to; zero until a
+/// thread claims it. A thread that ends leaves it claimed, and a later
+/// thread given the same word takes it over, never two at once.
+static OWNER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A word that tells the calling thread from every other live one, read
+/// from a register: the thread's own data pointer, whose low bits the
+/// system uses for the CPU number.
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+#[inline(always)]
+fn thread_word() -> usize {
+    let tsd: usize;
+    // SAFETY: reads the thread's read-only system register.
+    unsafe {
+        std::arch::asm!(
+            "mrs {}, tpidrro_el0",
+            out(reg) tsd,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    tsd & !7
+}
+
+/// The calling thread's share of the pool.
+#[inline(always)]
+fn with_pool<R>(f: impl FnOnce(&Lists) -> R) -> R {
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let me = thread_word();
+        let owner = OWNER.load(Relaxed);
+        if owner == me || (owner == 0 && OWNER.compare_exchange(0, me, Relaxed, Relaxed).is_ok()) {
+            return f(&OWNED.0);
         }
-    };
+    }
+    POOL.with(f)
 }
 
 /// Take the head of a list, or null.
@@ -341,7 +391,7 @@ fn take_fresh(lists: &Lists, class: usize) -> *mut u8 {
 
 /// The collector's mark for the calling thread; see [`Lists::mutator`].
 pub(crate) fn with_mutator_mark<R>(f: impl FnOnce(&Cell<usize>) -> R) -> R {
-    POOL.with(|p| f(&p.mutator))
+    with_pool(|p| f(&p.mutator))
 }
 
 /// Slabs the collector found empty, waiting to be carved again.
@@ -435,7 +485,7 @@ pub unsafe extern "C" fn zyntax_alloc(size: usize) -> *mut u8 {
 
     // Explicit releases and reserved storage precede swept blocks,
     // which count toward the next collection as they are consumed.
-    let reused = POOL.with(|p| {
+    let reused = with_pool(|p| {
         let head = pop(&p.free[class]);
         if !head.is_null() {
             return head;
@@ -484,7 +534,7 @@ unsafe fn alloc_slow(class: usize, size: usize) -> *mut u8 {
     #[cfg(not(target_arch = "wasm32"))]
     if crate::collector::wants_collection() {
         crate::collector::collect();
-        let swept = POOL.with(|p| pop(&p.swept[class]));
+        let swept = with_pool(|p| pop(&p.swept[class]));
         if !swept.is_null() {
             crate::collector::note_spent(slot_bytes(class));
             return swept;
@@ -494,7 +544,7 @@ unsafe fn alloc_slow(class: usize, size: usize) -> *mut u8 {
         // Out of memory for a slab; the request itself may still fit.
         return large_alloc(size);
     }
-    POOL.with(|p| take_fresh(p, class))
+    with_pool(|p| take_fresh(p, class))
 }
 
 /// Reserve the rest of `class`'s slab for its cursor, taking another
@@ -507,7 +557,7 @@ unsafe fn alloc_slow(class: usize, size: usize) -> *mut u8 {
 /// The reserved blocks must not be named by another list or cursor.
 unsafe fn refill(class: usize) -> bool {
     let want = slot_bytes(class);
-    let (slab, used) = POOL.with(|p| {
+    let (slab, used) = with_pool(|p| {
         let sp = &p.slab;
         let mut slab = sp[class].get();
         let (slab_class, mut used) = if slab.is_null() {
@@ -544,7 +594,7 @@ unsafe fn refill(class: usize) -> bool {
     // leave payloads untouched until an allocation consumes them.
     let count = (SLAB - used) / want;
     let first = slab.add(used);
-    POOL.with(|lists| {
+    with_pool(|lists| {
         lists.fresh[class].set(first);
         lists.fresh_end[class].set(first.add(count * want));
     });
@@ -772,7 +822,7 @@ pub unsafe extern "C" fn zyntax_free(ptr: *mut u8) {
     #[cfg(debug_assertions)]
     std::ptr::write_bytes(block, POISON, slot_bytes(class));
 
-    POOL.with(|p| {
+    with_pool(|p| {
         // A thread that frees will allocate from its own list without
         // ever carving, which is the other way a second mutator
         // appears; the mark is read here, where the lists already are.
