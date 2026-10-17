@@ -252,7 +252,9 @@ impl Lowerer<'_> {
     fn num_of_box(&mut self, boxed: Node, target: Ty, span: Span) -> Node {
         let mask = target.mask().unwrap_or(0);
         // What lowering `boxed` hoisted computes what it reads, so it
-        // runs ahead of the hold; the tag check's guard follows it.
+        // runs ahead of the hold; the tag check's guard follows it. All
+        // of it stays hoisted: what earlier operands hoisted is in there
+        // too, and they read it before this value is built.
         let mut pre = std::mem::take(&mut self.hoisted);
         let held = self
             .hold(
@@ -280,14 +282,14 @@ impl Lowerer<'_> {
             )
             .node;
         pre.append(&mut self.hoisted);
-        let built = value(
+        self.hoisted = pre;
+        value(
             tag,
             call("zb_num_int", vec![held.clone()], Ty::Int, span),
             call("zb_num_float", vec![held], Ty::Float, span),
             target,
             span,
-        );
-        Self::with_pre(pre, built, target, span)
+        )
     }
 
     /// A Num as `target`: its box, a float or an int where every kind it
