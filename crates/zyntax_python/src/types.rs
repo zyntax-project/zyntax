@@ -1553,6 +1553,11 @@ pub(crate) struct Module {
     /// from out of view passes what it has. The others are typed by
     /// the calls in view, as module functions are.
     pub(crate) dynamic_methods: HashSet<String>,
+    /// Classes an instance of which the program holds as a dynamic
+    /// value, as the last reading's lowering found: the dynamic dispatch
+    /// reaches their dunders with any operands, so those keep dynamic
+    /// parameters. Every other class's dunders are typed by their calls.
+    pub(crate) held: HashSet<usize>,
     /// Fields a constructor binds to an unkinded list literal, by class
     /// and name, and the kind the program's writes into them decided
     /// last round (`Unknown` while undecided); see [`decide_list`].
@@ -2870,12 +2875,18 @@ impl Module {
 
     /// Whether the unannotated parameters of `item` are typed by its
     /// calls: a closed item, unless it is a method a call on an unknown
-    /// receiver reaches or one the library reaches with boxes.
+    /// receiver reaches, or a dunder of a class held as a dynamic value,
+    /// which the library reaches with boxes.
     pub(crate) fn infers_params(&self, item: &Item<'_>) -> bool {
-        self.closed.contains(&item.name)
-            && !(item.class.is_some()
-                && (self.dynamic_methods.contains(item.def.name.as_str())
-                    || boxed_entry(item.def.name.as_str())))
+        let name = item.def.name.as_str();
+        let dynamic = match item.class {
+            None => false,
+            Some(owner) if boxed_entry(name) => {
+                self.class_range(owner).any(|c| self.held.contains(&c))
+            }
+            Some(_) => self.dynamic_methods.contains(name),
+        };
+        self.closed.contains(&item.name) && !dynamic
     }
 
     /// The instance key of a call of item `name` passing `tys`, one
@@ -3660,6 +3671,7 @@ pub(crate) fn infer_module(
         func_values: known.func_values.clone(),
         list_params: known.list_params.clone(),
         dynamic_methods: known.dynamic_methods.clone(),
+        held: known.held.clone(),
         list_fields: known.list_fields.clone(),
         field_lists: known.field_lists.clone(),
         dynamic_fields: known.dynamic_fields.clone(),
@@ -5168,13 +5180,19 @@ impl Calls<'_> {
         if self.opaque {
             return;
         }
-        let Ty::Class(k) = self.typer().expr(left) else {
+        let l = self.typer().expr(left);
+        let r = self.typer().expr(right);
+        // A number or other value on the left asks the instance on the
+        // right for the reflected method.
+        let (k, method, arg) = match (l, r) {
+            (Ty::Class(k), _) => (k, dunder_name(op), right),
+            (_, Ty::Class(k)) => (k, reflected_dunder_name(op), left),
+            _ => return,
+        };
+        let Some((sig, name)) = self.module.method_sig_fixed(k as usize, method) else {
             return;
         };
-        let Some((sig, name)) = self.module.method_sig_fixed(k as usize, dunder_name(op)) else {
-            return;
-        };
-        let ty = self.arg_ty(right);
+        let ty = self.arg_ty(arg);
         self.passed.push((Target::Item(name.to_string()), 1, ty));
         if sig.params.len() == 2 {
             let this = sig.params[0].1;
@@ -5211,6 +5229,7 @@ impl Calls<'_> {
         if sig.params.len() == 2 {
             let this = sig.params[0].1;
             let ty = self.arg_ty(arg);
+            self.passed.push((Target::Item(name.to_string()), 1, ty));
             self.site(name, vec![this, ty]);
         }
     }
@@ -6903,8 +6922,21 @@ fn field_sites_into(
     };
     for (key, site) in sites {
         let round = rounds.entry(key).or_default();
-        // A field handed to a function is out of sight.
-        round.kept |= site.kept || !site.passed_to.is_empty();
+        round.kept |= site.kept;
+        // A field handed to a function is as the function treats its
+        // parameter: read, written with a kind, or kept out of sight.
+        for (callee, index) in &site.passed_to {
+            deps::read(Dep::ListParams(deps::name_key(callee)));
+            match module
+                .list_params
+                .get(callee)
+                .and_then(|facts| facts.get(*index).copied())
+            {
+                Some(ListFact::Reads) => {}
+                Some(ListFact::Writes(ty)) => round.written.push(ty),
+                Some(ListFact::Kept) | None => round.kept = true,
+            }
+        }
         round.none |= site.none;
         if site.undecided {
             round.written.push(Ty::Unknown);
@@ -7649,7 +7681,7 @@ impl Walker<'_> {
                 } else {
                     (self.expr(&a.target), self.expr(&a.value))
                 };
-                let ty = binop(a.op, lhs, rhs, &a.value);
+                let ty = self.typer().operation(a.op, lhs, rhs, &a.value);
                 self.target(&a.target, ty);
             }
             py::Stmt::Expr(e) => self.container_write(&e.value),
@@ -8121,11 +8153,158 @@ pub(crate) fn is_operator_method(name: &str) -> bool {
     OPERATORS.iter().any(|op| dunder_name(*op) == name)
 }
 
+thread_local! {
+    /// Names of the classes the program's lowering made an instance of
+    /// a dynamic value, that define or inherit a dunder the library
+    /// reaches with boxes.
+    static HELD: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::default());
+    static NEW_HOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Note what a value of type `from` converted to `to` makes dynamic:
+/// the instances it holds, by class, that `to` does not type. A held
+/// instance exposes its fields and what its methods return.
+pub(crate) fn note_held(module: &Module, from: Ty, to: Ty) {
+    if !crate::records::watching() {
+        return;
+    }
+    let mut typed = HashSet::default();
+    held_classes(module, to, &mut HashSet::default(), &mut |c| {
+        typed.insert(c);
+    });
+    let mut work = Vec::new();
+    held_classes(module, from, &mut HashSet::default(), &mut |c| {
+        if !typed.contains(&c) {
+            work.push(c);
+        }
+    });
+    for c in exposed_classes(module, work) {
+        if !module.held.contains(&c) {
+            NEW_HOLD.with(|n| n.set(true));
+        }
+        HELD.with(|h| h.borrow_mut().insert(module.classes[c].name.clone()));
+    }
+}
+
+/// Whether [`note_held`] noted a class the reading did not hold, since
+/// the last [`take_held`]: the program is read again.
+pub(crate) fn new_hold() -> bool {
+    NEW_HOLD.with(|n| n.get())
+}
+
+/// `start` with every class a dynamic value of one of them exposes,
+/// through its fields and what its methods return, kept where the class
+/// has a dunder the library reaches with boxes.
+fn exposed_classes(module: &Module, mut work: Vec<usize>) -> Vec<usize> {
+    let mut done = HashSet::default();
+    let mut exposed = HashSet::default();
+    let mut out = Vec::new();
+    while let Some(c) = work.pop() {
+        if c >= module.classes.len() || !done.insert(c) {
+            continue;
+        }
+        if has_boxed_entry(module, c) {
+            out.push(c);
+        }
+        let mut more: Vec<Ty> = module.classes[c].fields.iter().map(|(_, t)| *t).collect();
+        let mut k = Some(c);
+        while let Some(at) = k {
+            for m in &module.classes[at].methods {
+                if let Some((sig, _)) = module.method_sig_fixed(c, m) {
+                    more.push(sig.ret);
+                }
+            }
+            k = module.classes[at].base;
+        }
+        for t in more {
+            held_classes(module, t, &mut exposed, &mut |d| work.push(d));
+        }
+    }
+    out
+}
+
+/// Every class whose instances a value of `ty` holds directly or in a
+/// container, with the classes deriving from it.
+fn held_classes(module: &Module, ty: Ty, seen: &mut HashSet<Ty>, each: &mut impl FnMut(usize)) {
+    if !seen.insert(ty) {
+        return;
+    }
+    match ty {
+        Ty::Class(k) => {
+            for c in module.class_range(k as usize) {
+                each(c);
+            }
+        }
+        Ty::Classes(s) => {
+            for k in class_set_members(s) {
+                held_classes(module, Ty::Class(k), seen, each);
+            }
+        }
+        Ty::List(e) | Ty::MaybeList(e) => held_classes(module, e.ty(), seen, each),
+        Ty::Tuple(k) => {
+            for t in tuple_shape(k) {
+                held_classes(module, t, seen, each);
+            }
+        }
+        Ty::Dict(k) => {
+            let (key, value) = dict_shape(k);
+            held_classes(module, key, seen, each);
+            held_classes(module, value, seen, each);
+        }
+        Ty::Set(k) => held_classes(module, set_shape(k).0, seen, each),
+        _ => {}
+    }
+}
+
+/// Whether class `c` defines or inherits a method [`boxed_entry`] names.
+fn has_boxed_entry(module: &Module, c: usize) -> bool {
+    let mut k = Some(c);
+    while let Some(at) = k {
+        if module.classes[at].methods.iter().any(|m| boxed_entry(m)) {
+            return true;
+        }
+        k = module.classes[at].base;
+    }
+    false
+}
+
+/// The classes [`note_held`] noted since the last call, by name.
+pub(crate) fn take_held() -> HashSet<String> {
+    NEW_HOLD.with(|n| n.set(false));
+    HELD.with(|h| std::mem::take(&mut *h.borrow_mut()))
+}
+
+/// Whether `body` reads names by their text: `eval`, `exec`,
+/// `globals()`, `vars()` or `locals()`, through which any class may
+/// become a dynamic value.
+pub(crate) fn reads_names_by_text(body: &[py::Stmt]) -> bool {
+    use ruff_python_ast::visitor::{Visitor, walk_expr};
+    struct Finds(bool);
+    impl<'a> Visitor<'a> for Finds {
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            if let py::Expr::Name(n) = e
+                && matches!(
+                    n.id.as_str(),
+                    "eval" | "exec" | "globals" | "vars" | "locals"
+                )
+            {
+                self.0 = true;
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut finds = Finds(false);
+    finds.visit_body(body);
+    finds.0
+}
+
 /// The methods the library and the generated dispatchers reach with
-/// boxed arguments besides the calls in view: the operator, comparison
-/// and item methods, and `__call__`. Their own function keeps dynamic
-/// parameters whatever the calls pass; a typed call goes to an
-/// instance for its types.
+/// boxed arguments besides the calls in view: the operator methods and
+/// their reflected forms, the comparison and item methods, and
+/// `__call__`. For a class held as a dynamic
+/// value their own function keeps dynamic parameters whatever the calls
+/// pass, and a typed call goes to an instance for its types; any other
+/// class's are typed by the calls in view, see [`Module::held`].
 pub(crate) fn boxed_entry(name: &str) -> bool {
     matches!(
         name,
@@ -8141,6 +8320,9 @@ pub(crate) fn boxed_entry(name: &str) -> bool {
             | "__gt__"
             | "__ge__"
     ) || is_operator_method(name)
+        || OPERATORS
+            .iter()
+            .any(|op| reflected_dunder_name(*op) == name)
 }
 
 /// The method a class defines to take part in `op`.
@@ -8558,6 +8740,22 @@ impl Typer<'_> {
         self.none_params?.contains(name).then_some(holds_means_none)
     }
 
+    /// What `l op r` and `l op= r` give: an instance takes part through
+    /// its class's method, and the result is what that method returns.
+    pub(crate) fn operation(&self, op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
+        if let Ty::Class(k) = l
+            && let Some((sig, name)) = self.module.method_sig(k as usize, dunder_name(op))
+        {
+            if sig.params.len() == 2 {
+                return self
+                    .module
+                    .instance_ret(name, sig, &[Ty::Unknown, r.boxed_view()]);
+            }
+            return sig.ret;
+        }
+        binop(op, l, r, right)
+    }
+
     /// A value of type `t` a test has shown is not None.
     pub(crate) fn not_none(&self, t: Ty) -> Ty {
         match t {
@@ -8642,19 +8840,7 @@ impl Typer<'_> {
             py::Expr::BinOp(b) => {
                 let l = self.expr_num(&b.left);
                 let r = self.expr_num(&b.right);
-                // An instance takes part through its class's method, and
-                // the result is what that method returns.
-                if let Ty::Class(k) = l
-                    && let Some((sig, name)) = self.module.method_sig(k as usize, dunder_name(b.op))
-                {
-                    if sig.params.len() == 2 {
-                        return self
-                            .module
-                            .instance_ret(name, sig, &[Ty::Unknown, r.boxed_view()]);
-                    }
-                    return sig.ret;
-                }
-                binop(b.op, l, r, &b.right)
+                self.operation(b.op, l, r, &b.right)
             }
             py::Expr::UnaryOp(u) => match u.op {
                 py::UnaryOp::Not => Ty::Bool,

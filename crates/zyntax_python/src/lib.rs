@@ -370,13 +370,20 @@ fn parse_with_host(
     // A record shape the lowering demotes is typed again as a dict, so
     // the program is read again without it; shapes only ever leave.
     let mut demoted: HashSet<Vec<String>> = HashSet::default();
+    // Classes a lowering found held as dynamic values: the program is
+    // read again with their dunders dynamic. Classes only ever join.
+    let mut held: HashSet<String> = HashSet::default();
     // The library a reading left untouched serves the next one, so a
     // program read again is built from the same library a single reading
     // would use.
     let mut kept: Option<Library> = None;
     loop {
+        let readings = Readings {
+            demoted: &demoted,
+            held: &held,
+        };
         let result =
-            parse_program_once(source, file, modules, hosts, &demoted, &mut kept, uncaught);
+            parse_program_once(source, file, modules, hosts, readings, &mut kept, uncaught);
         records::watch(false);
         let mut found = records::demoted();
         // A lowering that failed with records in the program is read
@@ -384,11 +391,31 @@ fn parse_with_host(
         if found.is_empty() && result.is_err() {
             found = records::all_shapes();
         }
-        if found.is_empty() {
+        // Only a class the reading did not hold sends it round again.
+        let grew = types::new_hold();
+        let newly_held: Vec<String> = types::take_held()
+            .into_iter()
+            .filter(|c| !held.contains(c))
+            .collect();
+        if found.is_empty() && !grew {
             return result;
         }
+        if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() && !newly_held.is_empty() {
+            eprintln!("[types] read again: held {}", newly_held.join(" "));
+        }
         demoted.extend(found);
+        held.extend(newly_held);
     }
+}
+
+/// What earlier readings of a program found, which the next reading
+/// starts from.
+#[derive(Clone, Copy)]
+struct Readings<'a> {
+    /// Record shapes typed as dicts instead.
+    demoted: &'a HashSet<Vec<String>>,
+    /// Classes held as dynamic values, by name.
+    held: &'a HashSet<String>,
 }
 
 fn parse_program_once(
@@ -396,10 +423,11 @@ fn parse_program_once(
     file: &str,
     modules: &modules::Resolver<'_>,
     hosts: &HostResolver<'_>,
-    demoted: &HashSet<Vec<String>>,
+    readings: Readings<'_>,
     kept: &mut Option<Library>,
     uncaught: Uncaught,
 ) -> Result<TypedProgram> {
+    let Readings { demoted, held } = readings;
     // `ZYNTAX_TRACE_LOWER_PHASES=1` times the frontend's steps on stderr,
     // the same switch the embedder's phase trace reads.
     let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
@@ -570,6 +598,18 @@ fn parse_program_once(
         hosts: linked.hosts,
         ..Default::default()
     };
+    inferred.held = inferred
+        .classes
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| held.contains(&c.name))
+        .map(|(k, _)| k)
+        .collect();
+    // A program that reads names by their text may make any class a
+    // value.
+    if types::reads_names_by_text(&module.body) {
+        inferred.held.extend(0..inferred.classes.len());
+    }
     let def_stmts: Vec<&py::StmtFunctionDef> = defs.iter().map(|(f, _)| *f).collect();
     let mut global_names = module_globals(&module.body, &def_stmts, &inferred.class_index);
     // A class attribute not fixed as a constant is a module variable.
@@ -968,6 +1008,13 @@ fn parse_program_once(
                 Err(e) => return Err(e),
             }
             out.extend(lower_specs(inferred, item, &unpack_shapes));
+            // So does a class newly held as a dynamic value.
+            if types::new_hold() {
+                return Err(Error::unsupported(
+                    "an instance held as a dynamic value",
+                    item.def,
+                ));
+            }
             // A demoted record means the program is read again: the rest
             // of this lowering would be discarded.
             if records::any_demoted() {

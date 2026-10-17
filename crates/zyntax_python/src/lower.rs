@@ -1358,6 +1358,10 @@ pub(crate) struct Lowerer<'m> {
     /// pending check. A lowerer building a function by hand drains no
     /// hoisted statements; its callers check after calling it.
     pub(crate) guards: bool,
+    /// Above zero while boxing into a cell or a generator's environment,
+    /// which only this program's code reads back, as the type it was:
+    /// such a box does not hold an instance as a dynamic value.
+    in_env: u32,
     /// Whether the function carries its parameters' defaults. Every
     /// call the lowering makes fills a default at the call site; an
     /// instance made for other argument types than a default's does
@@ -1455,6 +1459,7 @@ impl<'m> Lowerer<'m> {
             trusted: false,
             defaults_after_cells: 0,
             guards: true,
+            in_env: 0,
             callee_defaults: true,
             cells: cells
                 .into_iter()
@@ -2229,7 +2234,10 @@ impl<'m> Lowerer<'m> {
                     node: var(intern(&name), *ty, span),
                     ty: *ty,
                 };
-                self.list_of(vec![value], Elem::Object, span)
+                self.in_env += 1;
+                let cell = self.list_of(vec![value], Elem::Object, span);
+                self.in_env -= 1;
+                cell
             } else {
                 let none = Val {
                     node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
@@ -2721,6 +2729,9 @@ impl<'m> Lowerer<'m> {
         let span = v.node.span;
         if target == Ty::Object && v.ty != Ty::Object {
             crate::records::demote_reached(self.module, v.ty);
+        }
+        if v.ty != target && target != Ty::Unknown && self.in_env == 0 {
+            types::note_held(self.module, v.ty, target);
         }
         match (v.ty, target) {
             (a, b) if a == b => v.node,
@@ -5553,7 +5564,9 @@ impl<'m> Lowerer<'m> {
             if check_after {
                 self.guards = true;
             }
+            self.in_env += 1;
             let boxed = self.coerce(Val { node: value, ty }, Ty::Object);
+            self.in_env -= 1;
             let set = binary(
                 BinaryOp::Assign,
                 slot(var(cell, Ty::List(Elem::Object), span), 0, Ty::Object, span),
@@ -12677,7 +12690,9 @@ impl<'m> Lowerer<'m> {
             .zip(&sig.params)
             .map(|(a, (_, ty))| Val { node: a, ty: *ty })
             .collect();
+        self.in_env += 1;
         let rest = self.list_of(items, Elem::Object, span);
+        self.in_env -= 1;
         let env = call(
             "zb_list_concat_any",
             vec![record, rest],
@@ -12721,7 +12736,9 @@ impl<'m> Lowerer<'m> {
         for (a, (_, ty)) in args.into_iter().zip(&sig.params) {
             items.push(Val { node: a, ty: *ty });
         }
+        self.in_env += 1;
         let env = self.list_of(items, Elem::Object, span);
+        self.in_env -= 1;
         let env = self.coerce(
             Val {
                 node: env,

@@ -1,0 +1,7 @@
+-0.5 3.5 3.0 4.5 True False True False 6.0
+1.0 2.5 -2.0
+[1, 2, 3] 9
+Held(2) Held(2) Held(11) True
+3 3 Held(12) False
+Held(4.5) Held(4.5) Held(13.5) False
+Held(3.5) Held(3) [Held(1), Held(3)]

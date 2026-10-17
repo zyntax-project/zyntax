@@ -381,6 +381,11 @@ pub(crate) fn watch(on: bool) {
     WATCH.with(|w| w.set(on));
 }
 
+/// Whether the lowering in progress is the program's; see [`watch`].
+pub(crate) fn watching() -> bool {
+    WATCH.with(|w| w.get())
+}
+
 /// Whether the program has any record shape.
 pub(crate) fn any() -> bool {
     RECORDS.with(|r| !r.borrow().is_empty())
