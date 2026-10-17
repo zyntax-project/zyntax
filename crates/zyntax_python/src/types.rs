@@ -2822,6 +2822,10 @@ pub(crate) struct Locals {
     pub(crate) global_writes: HashMap<String, Ty>,
     /// Names this body declares `nonlocal`, and what it assigns to them.
     pub(crate) nonlocal_writes: HashMap<String, Ty>,
+    /// Module variables this body does not bind but widens: a dict or
+    /// set passed to a parameter that takes a wider one, or changed in
+    /// place. The module's type for each takes this in.
+    pub(crate) widened_globals: HashMap<String, Ty>,
     /// Attributes assigned on the first parameter (`self.x = ...`), and
     /// what is assigned to them.
     /// Fields written through `self`, in the order first written, which
@@ -3062,6 +3066,9 @@ pub(crate) struct Inferred {
     pub(crate) field_lists: HashMap<(usize, String), Ty>,
     pub(crate) dynamic_fields: std::collections::BTreeSet<String>,
     pub(crate) field_by_class: HashMap<(usize, String), Ty>,
+    /// What the functions' bodies widen module variables to; see
+    /// [`Locals::widened_globals`].
+    pub(crate) widened_globals: Vec<(String, Ty)>,
 }
 
 /// The items every call of which is in view: module functions never
@@ -3848,7 +3855,14 @@ pub(crate) fn infer_module(
     // joined across rounds, and a value decided from less than the
     // next round knows must refine there rather than pin the join.
     normalize_layouts(&mut module.classes);
+    let widened_globals = kept
+        .iter()
+        .flatten()
+        .flat_map(|inference| inference.locals.widened_globals.iter())
+        .map(|(name, ty)| (name.clone(), *ty))
+        .collect();
     Inferred {
+        widened_globals,
         funcs: module.funcs,
         classes: module.classes,
         closures,
@@ -5385,6 +5399,7 @@ fn infer_locals_in(
             fills: &fills,
             nonnone: HashSet::default(),
             none_params: &none_params,
+            bound: &scope.bound,
         };
         for (i, s) in body.iter().enumerate() {
             match files.get(i) {
@@ -5407,6 +5422,7 @@ fn infer_locals_in(
             && locals.ret == before.ret
             && locals.global_writes == before.global_writes
             && locals.nonlocal_writes == before.nonlocal_writes
+            && locals.widened_globals == before.widened_globals
         {
             break;
         }
@@ -6605,6 +6621,8 @@ struct Walker<'a> {
     nonnone: HashSet<crate::InternedString>,
     /// See [`Typer::none_params`].
     none_params: &'a HashSet<String>,
+    /// The names this body binds, which are its locals.
+    bound: &'a HashSet<String>,
 }
 
 impl Walker<'_> {
@@ -6626,6 +6644,17 @@ impl Walker<'_> {
             nonnone: None,
             ..self.typer()
         }
+    }
+
+    /// Whether `name` here is a module variable this body neither binds
+    /// nor declares.
+    fn is_module_variable(&self, name: &str) -> bool {
+        !self.bound.contains(name)
+            && !self.params.iter().any(|(p, _)| p == name)
+            && !self.seeds.contains_key(name)
+            && !self.locals.global_writes.contains_key(name)
+            && !self.locals.nonlocal_writes.contains_key(name)
+            && self.module.globals.contains_key(name)
     }
 
     fn assign(&mut self, name: &str, value: Ty) {
@@ -6796,6 +6825,15 @@ impl Walker<'_> {
     /// by what the body puts in it.
     fn widen_holder(&mut self, holder: &py::Expr, ty: Ty) {
         match holder {
+            // A module variable read here is widened as the module's.
+            py::Expr::Name(n) if self.is_module_variable(n.id.as_str()) => {
+                let widened = self
+                    .locals
+                    .widened_globals
+                    .entry(n.id.to_string())
+                    .or_insert(Ty::Unknown);
+                *widened = widened.join(ty);
+            }
             py::Expr::Name(n) => self.assign(n.id.as_str(), ty),
             py::Expr::Attribute(a)
                 if matches!(&*a.value, py::Expr::Name(n)

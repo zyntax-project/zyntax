@@ -759,6 +759,7 @@ fn parse_program_once(
                 (name.clone(), ty)
             })
             .collect();
+        writes.extend(out.widened_globals);
         for (item, writes_global) in items.iter().zip(&writes_globals) {
             if !writes_global {
                 continue;
