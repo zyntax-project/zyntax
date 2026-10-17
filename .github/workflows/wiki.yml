@@ -281,12 +281,12 @@ jobs:
           case "${{ matrix.suite }}" in
             zylua)
               python3 crates/zyntax_lua/benchmarks/run.py --runs 5 \
-                --zylua target/release/zylua --luajit "$LUAJIT" --lua "$LUA54" \
+                --zylua "$PWD/target/release/zylua" --luajit "$LUAJIT" --lua "$LUA54" \
                 --out bench-out/raw.json || echo "::warning::some zylua rows failed"
               ;;
             zypy)
               python3 crates/zyntax_python/benchmarks/speed/run.py --fast \
-                --zypy target/release/zypy --pypy "$PYPY" --python "$(command -v python3)" \
+                --zypy "$PWD/target/release/zypy" --pypy "$PYPY" --python "$(command -v python3)" \
                 --out bench-out/raw.json
               ;;
           esac
