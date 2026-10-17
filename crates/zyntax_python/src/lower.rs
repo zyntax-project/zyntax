@@ -305,6 +305,14 @@ pub(crate) fn shape_declarations(
                     ir(Ty::Tuple(k)),
                 ));
             }
+            (Elem::Num(m), _) => {
+                out.extend(zyntax_builtins::lists::num_list_declarations(
+                    list_type,
+                    i as u16,
+                    &suffix,
+                    i64::from(m),
+                ));
+            }
             (Elem::List(_), Some(inner)) => {
                 out.extend(zyntax_builtins::lists::nested_list_declarations(
                     list_type, i as u16, &suffix, &inner,
@@ -374,6 +382,10 @@ pub(crate) fn elem_ir(e: Elem) -> Type {
         Elem::Tuple(k) => {
             types::note_elem_list(e);
             ir(Ty::Tuple(k))
+        }
+        Elem::Num(m) => {
+            types::note_elem_list(e);
+            ir(Ty::Num(m))
         }
         Elem::List(_) | Elem::Dict(_) | Elem::Set(_) => {
             types::note_elem_list(e);
@@ -460,6 +472,12 @@ pub(crate) fn box_element(e: Elem, value: Node, span: Span) -> Node {
         ),
         Elem::List(k) => box_list(types::list_shape(k), value, span),
         Elem::Dict(_) | Elem::Set(_) => tables::box_table_node(e.ty(), value, span),
+        Elem::Num(_) => call(
+            &format!("zb_num_box_{}", e.suffix()),
+            vec![value],
+            Ty::Object,
+            span,
+        ),
         other => unreachable!("an element boxed by its kind's functions, not {other:?}"),
     }
 }
@@ -485,6 +503,12 @@ pub(crate) fn read_element(e: Elem, v: Node, span: Span) -> Node {
             );
             as_addr(raw, span)
         }
+        Elem::Num(m) => call(
+            &format!("zb_num_read_{}", e.suffix()),
+            vec![v],
+            Ty::Num(m),
+            span,
+        ),
         other => unreachable!("an element read by its kind's functions, not {other:?}"),
     }
 }
@@ -530,7 +554,7 @@ pub(crate) fn list_fn(op: &str, elem: Elem) -> String {
 /// they are generated with the program.
 fn note_list_kind(elem: Elem) {
     match elem {
-        Elem::Tuple(_) | Elem::List(_) => {
+        Elem::Tuple(_) | Elem::List(_) | Elem::Num(_) => {
             types::note_elem_list(elem);
         }
         Elem::Array(c) => types::note_array_kind(c.storage()),
@@ -2943,6 +2967,12 @@ impl<'m> Lowerer<'m> {
                 }
             }
             (Ty::Gen, Ty::List(Elem::Object)) => self.generator_to_list(v.node, span),
+            // Run-time numbers of fewer kinds are stored as those of more.
+            (Ty::List(Elem::Num(from)), Ty::List(Elem::Num(to))) if from & !to == 0 => {
+                let mut n = v.node;
+                n.ty = ir(target);
+                n
+            }
             // Lists of one kind into lists of dynamic values.
             (Ty::List(e), Ty::List(Elem::Object)) => {
                 call(&list_fn("to_any", e), vec![v.node], target, span)
@@ -8527,6 +8557,18 @@ impl<'m> Lowerer<'m> {
                 let node =
                     self.raised_value(vec![left.node, right.node], "TypeError", &message, ty, span);
                 return Ok(Val { node, ty });
+            }
+            // Lists of numbers of two kinds, each as the list of run-time
+            // numbers the result is.
+            (py::Operator::Add, Ty::List(_), Ty::List(_))
+                if matches!(ty, Ty::List(Elem::Num(_))) && (left.ty != ty || right.ty != ty) =>
+            {
+                let (l, r) = (self.coerce(left, ty), self.coerce(right, ty));
+                let Ty::List(e) = ty else { unreachable!() };
+                return Ok(Val {
+                    node: call(&list_fn("concat", e), vec![l, r], ty, span),
+                    ty,
+                });
             }
             (py::Operator::Add, Ty::List(e), Ty::List(_)) if ty == left.ty => {
                 return Ok(Val {

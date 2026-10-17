@@ -810,6 +810,117 @@ pub fn tuple_list_declarations(
 }
 
 /// The list functions (`zb_list_*_<suffix>`) of a list whose elements
+/// are a frontend's run-time numbers, kind `index` among those it
+/// registers: the value struct (tag, int, float) with the tags NONE 0,
+/// FALSE 1, TRUE 2, INT 3, FLOAT 4 and `mask` the kinds an element may
+/// be (bits NONE 1, BOOL 2, INT 4, FLOAT 8). Elements compare as the
+/// numbers they are; None equals only None and orders through the
+/// dynamic comparison, which raises.
+pub fn num_list_declarations(list_type: TypeId, index: u16, suffix: &str, mask: i64) -> Vec<Decl> {
+    let elem = Type::Tuple(vec![i64(), i64(), f64()]);
+    let a = local("a", elem.clone());
+    let b = local("b", elem.clone());
+    let tag = |v: Expr| idx(v, int(0), i64());
+    let int_of = |v: Expr| idx(v, int(1), i64());
+    let as_f64 = |v: Expr| {
+        if_expr(
+            eq(idx(v.clone(), int(0), i64()), int(4)),
+            idx(v.clone(), int(2), f64()),
+            cast(idx(v, int(1), i64()), f64()),
+        )
+    };
+    fn boxed_of(v: Expr) -> Expr {
+        call(
+            "zb_num_box",
+            vec![
+                idx(v.clone(), int(0), i64()),
+                idx(v.clone(), int(1), i64()),
+                idx(v, int(2), f64()),
+            ],
+            any(),
+        )
+    }
+    let neither_float = and(ne(tag(a.e()), int(4)), ne(tag(b.e()), int(4)));
+    let eq_name = format!("zb_num_eq_{suffix}");
+    let lt_name = format!("zb_num_lt_{suffix}");
+    let mut d = vec![
+        define(
+            &eq_name,
+            &[&a, &b],
+            boolean(),
+            vec![
+                when(
+                    or(eq(tag(a.e()), int(0)), eq(tag(b.e()), int(0))),
+                    vec![ret(eq(tag(a.e()), tag(b.e())))],
+                ),
+                when(
+                    neither_float.clone(),
+                    vec![ret(eq(int_of(a.e()), int_of(b.e())))],
+                ),
+                ret(eq(as_f64(a.e()), as_f64(b.e()))),
+            ],
+        ),
+        define(
+            &lt_name,
+            &[&a, &b],
+            boolean(),
+            vec![
+                when(
+                    or(eq(tag(a.e()), int(0)), eq(tag(b.e()), int(0))),
+                    vec![ret(call(
+                        "zb_any_lt",
+                        vec![boxed_of(a.e()), boxed_of(b.e())],
+                        boolean(),
+                    ))],
+                ),
+                when(neither_float, vec![ret(lt(int_of(a.e()), int_of(b.e())))]),
+                ret(lt(as_f64(a.e()), as_f64(b.e()))),
+            ],
+        ),
+    ];
+    // One element boxed, and a box read back as one, for callers that
+    // hold an element apart from its list.
+    let x = local("x", any());
+    let read_of = move |x: Expr| {
+        tuple(
+            vec![
+                call("zb_num_tag_in", vec![x.clone(), int(mask)], i64()),
+                call("zb_num_int", vec![x.clone()], i64()),
+                call("zb_num_float", vec![x], f64()),
+            ],
+            Type::Tuple(vec![i64(), i64(), f64()]),
+        )
+    };
+    d.push(define(
+        &format!("zb_num_box_{suffix}"),
+        &[&a],
+        any(),
+        vec![ret(boxed_of(a.e()))],
+    ));
+    d.push(define(
+        &format!("zb_num_read_{suffix}"),
+        &[&x],
+        elem.clone(),
+        vec![ret(read_of(x.e()))],
+    ));
+    let k = KindOps {
+        kind: None,
+        suffix: suffix.to_string(),
+        tag: shape_list_tag(index),
+        list: list_of(list_type, elem.clone()),
+        strs: list_of(list_type, string()),
+        elem: elem.clone(),
+        eq: Box::new(move |x, y| call(&eq_name, vec![x, y], boolean())),
+        lt: Box::new(move |x, y| call(&lt_name, vec![x, y], boolean())),
+        repr: Box::new(move |x| call("zb_any_repr", vec![boxed_of(x)], string())),
+        boxed: Box::new(boxed_of),
+        read: Box::new(read_of),
+    };
+    d.extend(kind_declarations(&k));
+    generated(d)
+}
+
+/// The list functions (`zb_list_*_<suffix>`) of a list whose elements
 /// are lists, kind `index` among those a frontend registers. An element
 /// is held as the address of its header, so the inner list is the one
 /// every holder sees; `inner` says how that list, of kind

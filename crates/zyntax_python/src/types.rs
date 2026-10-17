@@ -155,6 +155,9 @@ pub(crate) enum Elem {
     /// held by address as an inner list is.
     Dict(u16),
     Set(u16),
+    /// Run-time numbers of the kinds the mask names (see [`Ty::Num`]),
+    /// each held as the value struct itself.
+    Num(u8),
     Object,
 }
 
@@ -276,6 +279,7 @@ impl Elem {
             Ty::List(e) if e != Elem::Object => Elem::List(list_shape_of(e)),
             Ty::Dict(k) => Elem::Dict(k),
             Ty::Set(k) => Elem::Set(k),
+            Ty::Num(m) => Elem::Num(m),
             _ => Elem::Object,
         }
     }
@@ -292,6 +296,7 @@ impl Elem {
             Elem::List(k) => Ty::List(list_shape(k)),
             Elem::Dict(k) => Ty::Dict(k),
             Elem::Set(k) => Ty::Set(k),
+            Elem::Num(m) => Ty::Num(m),
             Elem::Object => Ty::Object,
         }
     }
@@ -316,6 +321,7 @@ impl Elem {
             Elem::List(k) => format!("l{k}"),
             Elem::Dict(k) => format!("kd{k}"),
             Elem::Set(k) => format!("ks{k}"),
+            Elem::Num(m) => format!("num{m}"),
             Elem::Object => "any".to_string(),
         }
     }
@@ -327,7 +333,7 @@ impl Elem {
             Elem::Float => zyntax_builtins::Kind::Float.list_tag(),
             Elem::Str => zyntax_builtins::Kind::Str.list_tag(),
             Elem::Class(_) => zyntax_builtins::Kind::Ptr.list_tag(),
-            Elem::Tuple(_) | Elem::List(_) | Elem::Dict(_) | Elem::Set(_) => {
+            Elem::Tuple(_) | Elem::List(_) | Elem::Dict(_) | Elem::Set(_) | Elem::Num(_) => {
                 zyntax_builtins::lists::shape_list_tag(note_elem_list(self))
             }
             Elem::Array(c) => c.tag(),
@@ -2826,6 +2832,10 @@ pub(crate) struct Locals {
     /// set passed to a parameter that takes a wider one, or changed in
     /// place. The module's type for each takes this in.
     pub(crate) widened_globals: HashMap<String, Ty>,
+    /// Locals assigned a list of ints or of floats that another name may
+    /// hold too. They keep that kind: a list of run-time numbers would
+    /// be a copy the other holder does not see.
+    pub(crate) held_number_lists: std::collections::BTreeSet<String>,
     /// Attributes assigned on the first parameter (`self.x = ...`), and
     /// what is assigned to them.
     /// Fields written through `self`, in the order first written, which
@@ -5407,6 +5417,7 @@ fn infer_locals_in(
             nonnone: HashSet::default(),
             none_params: &none_params,
             bound: &scope.bound,
+            fresh_value: false,
         };
         for (i, s) in body.iter().enumerate() {
             match files.get(i) {
@@ -5430,6 +5441,7 @@ fn infer_locals_in(
             && locals.global_writes == before.global_writes
             && locals.nonlocal_writes == before.nonlocal_writes
             && locals.widened_globals == before.widened_globals
+            && locals.held_number_lists == before.held_number_lists
         {
             break;
         }
@@ -6630,6 +6642,8 @@ struct Walker<'a> {
     none_params: &'a HashSet<String>,
     /// The names this body binds, which are its locals.
     bound: &'a HashSet<String>,
+    /// Whether the value being assigned is a list no other name holds.
+    fresh_value: bool,
 }
 
 impl Walker<'_> {
@@ -6712,8 +6726,23 @@ impl Walker<'_> {
         let current = self.locals.vars.get(name).copied().unwrap_or(Ty::Unknown);
         let numeric = |t: Ty| t.mask().is_some() || t == Ty::Unknown;
         let shared = self.shared.contains(name);
+        let number_list = |t: Ty| match t {
+            Ty::List(e) => e.ty().mask().filter(|_| crate::lower::num::enabled()),
+            _ => None,
+        };
+        if matches!(value, Ty::List(Elem::Int | Elem::Float)) && !self.fresh_value {
+            self.locals.held_number_lists.insert(name.to_string());
+        }
         let joined = if numeric(current) && value.mask().is_some() && !shared {
             current.join_num(value)
+        } else if let (Some(a), Some(b)) = (number_list(current), number_list(value))
+            && current != value
+            && !shared
+            && !self.locals.held_number_lists.contains(name)
+        {
+            // Lists of numbers of two kinds are one list of run-time
+            // numbers, each list of ints or floats built as one.
+            Ty::List(Elem::Num(a | b))
         } else if shared {
             self.module.join_classes(current, ty)
         } else {
@@ -7160,7 +7189,9 @@ impl Walker<'_> {
                             continue;
                         }
                     }
+                    self.fresh_value = fresh_list(&a.value);
                     self.target(t, ty);
+                    self.fresh_value = false;
                     self.widen_alias(t, &a.value);
                 }
             }
@@ -7770,6 +7801,15 @@ pub(crate) fn binop(op: py::Operator, l: Ty, r: Ty, right: &py::Expr) -> Ty {
             l
         }
         py::Operator::Add if matches!(l, Ty::List(_)) && l == r => l,
+        // Lists of numbers of two kinds concatenate into a list of
+        // run-time numbers.
+        py::Operator::Add
+            if let (Ty::List(a), Ty::List(b)) = (l, r)
+                && let (Some(ma), Some(mb)) = (a.ty().mask(), b.ty().mask())
+                && crate::lower::num::enabled() =>
+        {
+            Ty::List(Elem::Num(ma | mb))
+        }
         // Two shapes concatenate into one.
         py::Operator::Add if let (Ty::Tuple(a), Ty::Tuple(b)) = (l, r) => {
             let mut elems = tuple_shape(a);
@@ -7946,7 +7986,7 @@ impl Typer<'_> {
             inferring: false,
             none_params: None,
         };
-        inner.expr(elt)
+        inner.expr_num(elt)
     }
 
     /// The key and value types of a dict comprehension.
@@ -8200,6 +8240,9 @@ impl Typer<'_> {
                 };
                 let a = arm(&i.body, false).stored_view();
                 let b = arm(&i.orelse, true).stored_view();
+                if a.mask().is_some() && b.mask().is_some() && crate::lower::num::enabled() {
+                    return a.join_num(b);
+                }
                 a.join_nullable(b)
                     .unwrap_or_else(|| a.boxed_view().join(b.boxed_view()))
             }
@@ -8423,20 +8466,21 @@ impl Typer<'_> {
     /// or dynamic when they differ; `None` while an element is not yet
     /// typed.
     fn elem_of<'e>(&self, elts: impl Iterator<Item = &'e py::Expr>) -> Option<Elem> {
-        let mut kind: Option<Elem> = None;
+        let mut kind: Option<Ty> = None;
         for e in elts {
-            let ty = self.expr(e);
+            let ty = self.expr_num(e);
             if ty == Ty::Unknown {
                 return None;
             }
-            let k = Elem::of(ty);
             kind = Some(match kind {
-                None => k,
-                Some(prev) if prev == k => k,
+                None => ty,
+                // Numbers of two kinds are a list of run-time numbers.
+                Some(prev) if prev.mask().is_some() && ty.mask().is_some() => prev.join_num(ty),
+                Some(prev) if Elem::of(prev) == Elem::of(ty) => prev,
                 Some(_) => return Some(Elem::Object),
             });
         }
-        Some(kind.unwrap_or(Elem::Object))
+        Some(kind.map(Elem::of).unwrap_or(Elem::Object))
     }
 
     /// The class a bare name is, when no variable shadows it.
