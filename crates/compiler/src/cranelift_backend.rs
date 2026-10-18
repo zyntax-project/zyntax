@@ -2422,7 +2422,7 @@ impl CraneliftBackend {
                             {
                                 return Some((*h, own.clone()));
                             }
-                            match crate::osr::osr_layout_with(function, *h, &dominators) {
+                            match crate::osr::osr_probe_layout_with(function, *h, &dominators) {
                                 Ok(layout) => Some((*h, layout)),
                                 Err(reason) => {
                                     if crate::osr::osr_trace_enabled() {

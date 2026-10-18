@@ -303,6 +303,51 @@ pub fn find_loop_headers(function: &HirFunction) -> Vec<HirId> {
     headers
 }
 
+/// For each of `headers`, the nearest other of them whose natural loop
+/// holds it: the loop it sits directly in, among those given.
+pub fn enclosing_headers(
+    function: &HirFunction,
+    headers: &[HirId],
+    dominators: &Dominators,
+) -> crate::hir::IdHashMap<HirId, HirId> {
+    let mut preds: crate::hir::IdHashMap<HirId, Vec<HirId>> = Default::default();
+    for (id, block) in &function.blocks {
+        for s in successors_of(&block.terminator) {
+            preds.entry(s).or_default().push(*id);
+        }
+    }
+    let bodies: Vec<IdSet> = headers
+        .iter()
+        .map(|&h| {
+            let mut body = IdSet::default();
+            body.insert(h);
+            let mut stack: Vec<HirId> = preds
+                .get(&h)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|p| dominators.dominates(h, *p))
+                .collect();
+            while let Some(b) = stack.pop() {
+                if body.insert(b) {
+                    stack.extend(preds.get(&b).into_iter().flatten().copied());
+                }
+            }
+            body
+        })
+        .collect();
+    let mut enclosing = crate::hir::IdHashMap::default();
+    for (i, &h) in headers.iter().enumerate() {
+        let nearest = (0..headers.len())
+            .filter(|&j| j != i && bodies[j].contains(&h))
+            .min_by_key(|&j| bodies[j].len());
+        if let Some(j) = nearest {
+            enclosing.insert(h, headers[j]);
+        }
+    }
+    enclosing
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum DfsColor {
     OnStack,
@@ -431,12 +476,13 @@ pub struct OsrLayout {
     /// Live-ins the region defines again on its way back to the header
     /// (an enclosing loop's counter, say): the resumed code reads each
     /// as a phi at the header, made by [`resumable`], that merges the
-    /// frame's value with the region's own.
+    /// frame's value with the region's own, and as a phi at each join
+    /// where the two meet again.
     pub repairs: Vec<Repair>,
 }
 
-/// One live-in the resumed region redefines, and the phi that stands
-/// for it at the header.
+/// One live-in the resumed region redefines, and the phis that stand
+/// for it where the region's definition does not reach.
 #[derive(Debug, Clone)]
 pub struct Repair {
     /// The live-in as the frame carries it.
@@ -445,12 +491,25 @@ pub struct Repair {
     pub phi: HirId,
     pub ty: HirType,
     /// The phi's incomings, one per predecessor of the header inside the
-    /// region: the live-in itself where the region's definition reaches,
-    /// the phi where the header's own does.
+    /// region, each the definition that reaches the end of it.
     pub incoming: Vec<(HirId, HirId)>,
-    /// Blocks whose uses of the live-in read the phi: those the region's
-    /// definition does not reach.
-    pub rename_in: Vec<HirId>,
+    /// Phis at the region's other joins where the header's phi and the
+    /// region's definition meet, each as its block, result and incomings.
+    pub joins: Vec<(HirId, HirId, Vec<(HirId, HirId)>)>,
+    /// Blocks whose uses of the live-in read another definition, each
+    /// with the phi that reaches it.
+    pub rename_in: Vec<(HirId, HirId)>,
+    /// Whether a read of the live-in, the header's phi included, takes
+    /// one of `joins`.
+    pub joined: bool,
+}
+
+impl OsrLayout {
+    /// Whether the resumed code reads a repaired live-in through a phi
+    /// at a join other than the header.
+    pub fn reads_joins(&self) -> bool {
+        self.repairs.iter().any(|r| r.joined)
+    }
 }
 
 impl OsrLayout {
@@ -485,7 +544,8 @@ pub enum OsrReject {
     /// method calls, etc.). Helper compile would mishandle it.
     UnsupportedInstruction,
     /// A nonterminal block in the resumed region can also be entered from
-    /// outside it. Resuming there needs more than one entry point.
+    /// outside it, and a probe in compiled code would carry what that
+    /// asks for (see [`osr_probe_layout_with`]).
     RegionHasExternalEntry,
 }
 
@@ -506,6 +566,22 @@ pub enum OsrReject {
 /// The combined live-in count must be ≤ [`OSR_MAX_LIVE_INS`].
 pub fn osr_layout(function: &HirFunction, header: HirId) -> Result<OsrLayout, OsrReject> {
     osr_layout_with(function, header, &Dominators::compute(function))
+}
+
+/// [`osr_layout_with`] for a probe in compiled code: a layout whose
+/// resumed code reads a repaired live-in through a join is refused. The
+/// probe would hold every such live-in at the header on every pass,
+/// where the interpreter, which leaves through it, pays nothing.
+pub fn osr_probe_layout_with(
+    function: &HirFunction,
+    header: HirId,
+    dominators: &Dominators,
+) -> Result<OsrLayout, OsrReject> {
+    let layout = osr_layout_with(function, header, dominators)?;
+    if layout.reads_joins() {
+        return Err(OsrReject::RegionHasExternalEntry);
+    }
+    Ok(layout)
 }
 
 /// [`osr_layout`] given the function's dominator tree, so a function
@@ -620,8 +696,9 @@ pub fn osr_layout_with(
     // resumed code never takes (an enclosing loop's header, reached from
     // before the loop). What it defines and the loop body reads is live
     // at the header, arrives in the frame, and is defined again when the
-    // block runs; the resumed code reads a phi at the header merging the
-    // two, so every read must be reached by one of them alone.
+    // block runs. The resumed code reads a phi at the header merging the
+    // two, and one at each join where they meet again: the definition's
+    // iterated dominance frontier in the region entered at the header.
     let header_preds: Vec<HirId> = reachable
         .iter()
         .copied()
@@ -662,6 +739,7 @@ pub fn osr_layout_with(
             }
         }
     }
+    let mut frontiers: Option<RegionFrontiers> = None;
     let mut repairs = Vec::new();
     for &def_block in &reachable {
         // Entered from outside the region: not on every path to the
@@ -670,6 +748,9 @@ pub fn osr_layout_with(
             continue;
         }
         let Some(block) = function.blocks.get(&def_block) else {
+            continue;
+        };
+        let Some(&d) = region_dom.index.get(&def_block) else {
             continue;
         };
         let defs: Vec<(HirId, HirType)> = block
@@ -682,83 +763,92 @@ pub fn osr_layout_with(
             }))
             .collect();
         let reached_by_def = |b: &HirId| region_dom.dominates(def_block, *b);
-        // The region blocks the definition reaches without passing the
-        // header. Shared by every value the block defines, and needed
-        // only once one of them is read where the definition does not
-        // dominate.
-        let mut around: Option<IdSet> = None;
-        let mut mixed = |b: &HirId| {
-            let around = around.get_or_insert_with(|| {
-                let mut around: IdSet = IdSet::default();
-                let mut stack: Vec<HirId> = vec![def_block];
-                while let Some(b) = stack.pop() {
-                    let Some(bb) = function.blocks.get(&b) else {
-                        continue;
-                    };
-                    for succ in successors_of(&bb.terminator) {
-                        if succ != header && in_region.contains(&succ) && around.insert(succ) {
-                            stack.push(succ);
-                        }
-                    }
-                }
-                around
-            });
-            !reached_by_def(b) && around.contains(b)
-        };
         for (value, ty) in defs {
-            // A block the definition does not dominate reads the header's
-            // phi. That is the value there only if every path from the
-            // definition to the block passes the header, where the phi
-            // merges again; a block the definition reaches around the
-            // header would need a phi of its own.
-            let mut escapes = false;
-            for b in readers.get(&value).map(Vec::as_slice).unwrap_or(&[]) {
-                if !reached_by_def(b) {
-                    if mixed(b) {
-                        return Err(OsrReject::RegionHasExternalEntry);
-                    }
-                    escapes = true;
-                }
-            }
-            for pred in phi_readers.get(&value).map(Vec::as_slice).unwrap_or(&[]) {
-                if !reached_by_def(pred) {
-                    if mixed(pred) {
-                        return Err(OsrReject::RegionHasExternalEntry);
-                    }
-                    escapes = true;
-                }
-            }
+            let escapes = readers
+                .get(&value)
+                .into_iter()
+                .chain(phi_readers.get(&value))
+                .flatten()
+                .any(|b| !reached_by_def(b));
             if !escapes {
                 continue;
             }
+            let frontiers =
+                frontiers.get_or_insert_with(|| RegionFrontiers::of(function, &region_dom));
+            let n = region_dom.order.len();
+            // A phi at the header, and at every block of the definition's
+            // iterated frontier but its own.
             let phi = HirId::new();
-            let mut incoming = Vec::with_capacity(header_preds.len());
-            for &pred in &header_preds {
-                if reached_by_def(&pred) {
-                    incoming.push((value, pred));
-                } else if mixed(&pred) {
-                    return Err(OsrReject::RegionHasExternalEntry);
-                } else {
-                    incoming.push((phi, pred));
+            let mut phi_at: Vec<Option<HirId>> = vec![None; n];
+            phi_at[0] = Some(phi);
+            let mut queued = vec![false; n];
+            queued[d] = true;
+            let mut work = vec![d];
+            while let Some(x) = work.pop() {
+                for &y in &frontiers.frontier[x] {
+                    if y != d && phi_at[y].is_none() {
+                        phi_at[y] = Some(HirId::new());
+                    }
+                    if !queued[y] {
+                        queued[y] = true;
+                        work.push(y);
+                    }
                 }
             }
+            // The definition that reaches the end of each block. Reverse
+            // postorder settles a block's immediate dominator first.
+            let mut out: Vec<HirId> = vec![value; n];
+            for i in 0..n {
+                out[i] = if i == d {
+                    value
+                } else if let Some(phi) = phi_at[i] {
+                    phi
+                } else {
+                    let idom = region_dom.idom[i];
+                    if idom >= i {
+                        return Err(OsrReject::RegionHasExternalEntry);
+                    }
+                    out[idom]
+                };
+            }
+            let at = |b: &HirId| region_dom.index.get(b).map(|&i| out[i]).unwrap_or(value);
+            let incoming: Vec<(HirId, HirId)> =
+                header_preds.iter().map(|pred| (at(pred), *pred)).collect();
+            let joins: Vec<(HirId, HirId, Vec<(HirId, HirId)>)> = (1..n)
+                .filter_map(|i| {
+                    let phi = phi_at[i]?;
+                    let incoming = frontiers.preds[i]
+                        .iter()
+                        .map(|&p| (out[p], region_dom.order[p]))
+                        .collect();
+                    Some((region_dom.order[i], phi, incoming))
+                })
+                .collect();
+            let rename_in: Vec<(HirId, HirId)> = (0..n)
+                .filter(|&i| out[i] != value)
+                .map(|i| (region_dom.order[i], out[i]))
+                .collect();
+            let is_join = |id: HirId| id != value && id != phi;
+            let joined = incoming.iter().any(|(v, _)| is_join(*v))
+                || readers
+                    .get(&value)
+                    .into_iter()
+                    .chain(phi_readers.get(&value))
+                    .flatten()
+                    .any(|b| is_join(at(b)));
             if !live_ins.contains(&value) {
                 live_ins.push(value);
                 live_in_types.push(ty.clone());
             }
-            let rename_in: Vec<HirId> = reachable
-                .iter()
-                .copied()
-                .filter(|b| !reached_by_def(b))
-                .collect();
             if osr_trace_enabled() {
                 eprintln!(
-                    "[osr] {} header {}: live-in {:?} defined in block {} is read again after the header; renamed in {} blocks",
+                    "[osr] {} header {}: live-in {:?} defined in block {} is read again after the header; renamed in {} blocks, {} joins",
                     function.name.resolve_global().unwrap_or_default(),
                     block_index_of(function, header).unwrap_or(u64::MAX),
                     value,
                     block_index_of(function, def_block).unwrap_or(u64::MAX),
-                    rename_in.len()
+                    rename_in.len(),
+                    joins.len()
                 );
             }
             repairs.push(Repair {
@@ -766,7 +856,9 @@ pub fn osr_layout_with(
                 phi,
                 ty,
                 incoming,
+                joins,
                 rename_in,
+                joined,
             });
         }
     }
@@ -805,8 +897,58 @@ pub fn osr_layout_with(
 /// count. Immediate dominators over the region's reverse postorder,
 /// the same iteration as [`Dominators`].
 struct RegionDominators {
+    order: Vec<HirId>,
     index: crate::hir::IdHashMap<HirId, usize>,
     idom: Vec<usize>,
+}
+
+/// Each region block's predecessors inside the region, edges into the
+/// header included, and its dominance frontier there, by its index in
+/// [`RegionDominators`]. The header counts as a join: the frame enters
+/// it besides its predecessors.
+struct RegionFrontiers {
+    preds: Vec<Vec<usize>>,
+    frontier: Vec<Vec<usize>>,
+}
+
+impl RegionFrontiers {
+    fn of(function: &HirFunction, dom: &RegionDominators) -> Self {
+        let n = dom.order.len();
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, b) in dom.order.iter().enumerate() {
+            let Some(block) = function.blocks.get(b) else {
+                continue;
+            };
+            for s in successors_of(&block.terminator) {
+                if let Some(&j) = dom.index.get(&s)
+                    && !preds[j].contains(&i)
+                {
+                    preds[j].push(i);
+                }
+            }
+        }
+        let mut frontier: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for b in 0..n {
+            if preds[b].len() + usize::from(b == 0) < 2 {
+                continue;
+            }
+            for &p in &preds[b] {
+                // Up from the predecessor to the block's immediate
+                // dominator, or for the header to the header itself.
+                let mut runner = p;
+                while b == 0 || runner != dom.idom[b] {
+                    if !frontier[runner].contains(&b) {
+                        frontier[runner].push(b);
+                    }
+                    if runner == 0 {
+                        break;
+                    }
+                    runner = dom.idom[runner];
+                }
+            }
+        }
+        Self { preds, frontier }
+    }
 }
 
 impl RegionDominators {
@@ -887,7 +1029,7 @@ impl RegionDominators {
                 }
             }
         }
-        RegionDominators { index, idom }
+        RegionDominators { order, index, idom }
     }
 
     /// Whether `a` dominates `b` within the region; false for a block
@@ -911,7 +1053,8 @@ impl RegionDominators {
 
 /// `function` as a helper resumes it at `layout.header`: each repaired
 /// live-in becomes a phi at the header, appended in live-in order, and
-/// the blocks the header dominates read the phi.
+/// one at each join the repair names; the blocks the region's definition
+/// does not reach read the phi that does.
 pub fn resumable(function: &HirFunction, layout: &OsrLayout) -> HirFunction {
     resumable_body(function, layout).into_owned()
 }
@@ -927,19 +1070,22 @@ pub(crate) fn resumable_body<'a>(
     }
     let mut f = function.clone();
     for r in &layout.repairs {
-        f.values.insert(
-            r.phi,
-            crate::hir::HirValue {
-                id: r.phi,
-                ty: r.ty.clone(),
-                kind: crate::hir::HirValueKind::Instruction,
-                span: None,
-            },
-        );
-        let map: indexmap::IndexMap<HirId, HirId> = std::iter::once((r.value, r.phi)).collect();
-        let renamed: IdSet = r.rename_in.iter().copied().collect();
+        for phi in std::iter::once(r.phi).chain(r.joins.iter().map(|(_, phi, _)| *phi)) {
+            f.values.insert(
+                phi,
+                crate::hir::HirValue {
+                    id: phi,
+                    ty: r.ty.clone(),
+                    kind: crate::hir::HirValueKind::Instruction,
+                    span: None,
+                },
+            );
+        }
+        let renamed: crate::hir::IdHashMap<HirId, HirId> = r.rename_in.iter().copied().collect();
         for (b, block) in f.blocks.iter_mut() {
-            if renamed.contains(b) {
+            if let Some(&read) = renamed.get(b) {
+                let map: indexmap::IndexMap<HirId, HirId> =
+                    std::iter::once((r.value, read)).collect();
                 for inst in &mut block.instructions {
                     inst.replace_uses(&map);
                 }
@@ -948,8 +1094,10 @@ pub(crate) fn resumable_body<'a>(
             // A phi reads by the edge it comes in on.
             for p in &mut block.phis {
                 for (v, pred) in &mut p.incoming {
-                    if *v == r.value && renamed.contains(pred) {
-                        *v = r.phi;
+                    if *v == r.value
+                        && let Some(&read) = renamed.get(pred)
+                    {
+                        *v = read;
                     }
                 }
             }
@@ -960,6 +1108,15 @@ pub(crate) fn resumable_body<'a>(
                 ty: r.ty.clone(),
                 incoming: r.incoming.clone(),
             });
+        }
+        for (block, phi, incoming) in &r.joins {
+            if let Some(block) = f.blocks.get_mut(block) {
+                block.phis.push(crate::hir::HirPhi {
+                    result: *phi,
+                    ty: r.ty.clone(),
+                    incoming: incoming.clone(),
+                });
+            }
         }
     }
     std::borrow::Cow::Owned(f)

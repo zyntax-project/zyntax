@@ -51,6 +51,36 @@ fn a_frame_leaves_an_inner_loop_into_the_outlined_region() {
     );
 }
 
+/// An inner loop over a range taken from the outer counter is skipped
+/// when the range is empty, and the outer pass reads after it what it
+/// computed before it. The frame leaves through the inner loop's header,
+/// the outer loop passing its own too few times to ask, and the region
+/// merges the frame's values with its own at that join as well as at
+/// the header.
+#[test]
+fn a_frame_leaves_an_inner_loop_the_outer_pass_reads_around() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/guarded_inner_loop.py");
+    let output = Command::new(env!("CARGO_BIN_EXE_zypy"))
+        .arg("run")
+        .arg(script)
+        .env("ZYNTAX_OSR_TRACE", "1")
+        .env("ZYNTAX_TRACE_INTERP", "1")
+        .output()
+        .expect("zypy starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout.trim(), "180003299983\n34", "{stderr}");
+    assert!(
+        stderr.contains(", 1 joins"),
+        "no live-in was repaired at a join:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("[interp] transfer site="),
+        "the frame never left through a resume point:\n{stderr}"
+    );
+}
+
 /// The frame resumed into the outlined region moves on to the
 /// optimizing tier mid-loop: the region is compiled there too, and its
 /// resume points answer the probes of the region's baseline code.

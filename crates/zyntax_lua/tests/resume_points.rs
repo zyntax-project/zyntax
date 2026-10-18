@@ -90,9 +90,10 @@ fn a_site_asked_during_an_entry_count_promotion_gets_the_optimizing_tier() {
 }
 
 /// A loop whose number is an integer on one path and a float on the
-/// other runs in an outlined region taking a Number aggregate. LLVM
-/// compiles that region with the aggregate by address, and the frame
-/// transfers into it.
+/// other runs in an outlined region taking a Number aggregate: the frame
+/// stays in it long enough to leave through its header. LLVM compiles
+/// that region with the aggregate by address, and the frame transfers
+/// into it.
 #[cfg(feature = "llvm-backend")]
 #[test]
 fn a_region_taking_a_number_aggregate_runs_on_llvm() {
@@ -108,7 +109,7 @@ fn a_region_taking_a_number_aggregate_runs_on_llvm() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     // lua5.4 prints the same.
-    assert_eq!(stdout.trim(), "16757736", "{stderr}");
+    assert_eq!(stdout.trim(), "60000010.0", "{stderr}");
     assert!(
         stderr.contains("(lua$main$1$resume0) at tier 1"),
         "the region was not recompiled at tier 1:\n{stderr}"

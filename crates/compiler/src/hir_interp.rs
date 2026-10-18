@@ -888,6 +888,10 @@ pub struct CompiledFunction {
     pub destination_size: usize,
     /// Loop headers a promoted helper can resume at.
     pub osr_sites: Vec<OsrSite>,
+    /// For each site of an innermost loop whose resumed code reads
+    /// through a join, the site of the loop it sits directly in, if that
+    /// loop has one.
+    pub osr_enclosing: Vec<Option<u32>>,
     /// Per-register hint of the SSA value's HirType. Used to size
     /// extern-call returns and width-correct integer ops.
     pub reg_types: Vec<HirType>,
@@ -1097,6 +1101,12 @@ const OSR_REQUEST_VISITS: u32 = 64;
 /// its promoted code then, when there is a worker to take the request,
 /// so the code is there by the time the loop is hot.
 const OSR_WARM_VISITS: u32 = 16;
+/// Loop header visits, at any site, after which a frame that left its
+/// ask to an enclosing loop's site and has not reached that header since
+/// asks for the site of the loop it is in. One that has reached it waits
+/// [`OSR_UNANSWERED_VISITS`] for the enclosing site's code instead.
+const OSR_STUCK_VISITS: u32 = 2048;
+const OSR_UNANSWERED_VISITS: u32 = 32 * OSR_STUCK_VISITS;
 
 /// Which memory intrinsic an [`Op::MemOp`] performs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1328,6 +1338,8 @@ pub fn compile_function_with(
 
     // Loop headers promoted code can resume at, keyed by block.
     let mut header_sites: HashMap<HirId, u32> = HashMap::new();
+    // Headers whose resumed code reads a repaired live-in through a join.
+    let mut joined: std::collections::HashSet<HirId> = std::collections::HashSet::new();
     if !address_taken {
         let headers = crate::osr::find_loop_headers(func);
         if !headers.is_empty() {
@@ -1361,6 +1373,9 @@ pub fn compile_function_with(
                     }
                     continue;
                 };
+                if layout.reads_joins() {
+                    joined.insert(header);
+                }
                 header_sites.insert(header, cf.osr_sites.len() as u32);
                 cf.osr_sites.push(OsrSite {
                     site_key: layout.site_key(),
@@ -1371,6 +1386,26 @@ pub fn compile_function_with(
                     destination: layout.destination,
                 });
             }
+            let mut by_site = vec![HirId::new(); cf.osr_sites.len()];
+            for (header, site) in &header_sites {
+                by_site[*site as usize] = *header;
+            }
+            let enclosing = crate::osr::enclosing_headers(func, &by_site, &dominators);
+            // Only an innermost loop whose resumed code reads through a
+            // join asks for the loop it sits in: a region resumed at such
+            // a header merges the frame's values with the region's at
+            // every join, and one with a site inside it is the loop its
+            // frames spend their time in.
+            let encloses: std::collections::HashSet<HirId> = enclosing.values().copied().collect();
+            cf.osr_enclosing = by_site
+                .iter()
+                .map(|h| {
+                    enclosing
+                        .get(h)
+                        .filter(|_| joined.contains(h) && !encloses.contains(h))
+                        .map(|e| header_sites[e])
+                })
+                .collect();
         }
     }
 
@@ -4103,6 +4138,12 @@ impl HirInterpreter {
         let mut visits: Vec<u32> = vec![0; cf.osr_sites.len()];
         let mut slots: Vec<*const std::sync::atomic::AtomicU64> =
             vec![core::ptr::null(); cf.osr_sites.len()];
+        // Header visits at every site; for a site that left its ask to
+        // its enclosing loop's, that count and the enclosing site's visits
+        // when it did; and the sites an inner loop left its ask to.
+        let mut header_visits: u32 = 0;
+        let mut deferred: Vec<Option<(u32, u32)>> = vec![None; cf.osr_sites.len()];
+        let mut wanted: Vec<bool> = vec![false; cf.osr_sites.len()];
         // Whether this frame has asked for resume points; it is counted
         // as waiting until `run` sees it leave.
         let mut waits = false;
@@ -4915,34 +4956,61 @@ impl HirInterpreter {
                     let Some(bead) = bead else { continue };
                     let i = *site as usize;
                     visits[i] = visits[i].saturating_add(1);
+                    header_visits = header_visits.saturating_add(1);
                     let osr_site = &cf.osr_sites[i];
                     // Ask once: early while the loop is warm when a worker
-                    // will take it, else when it is hot. From then on the
-                    // slot is watched.
-                    let asks = if slots[i].is_null() {
-                        visits[i] == OSR_REQUEST_VISITS
+                    // will take it, else when it is hot. An innermost loop
+                    // inside another with a site leaves its ask to that
+                    // one, made when the frame reaches its header: the
+                    // region resumed there keeps this loop a loop of its
+                    // own, where one resumed here heads every enclosing
+                    // cycle at this header. It asks for its own if the
+                    // frame stays in it instead. From then on the slot is
+                    // watched.
+                    let mut asks = None;
+                    if slots[i].is_null() {
+                        let warm = visits[i] == OSR_REQUEST_VISITS
                             || (visits[i] == OSR_WARM_VISITS
-                                && crate::osr::compile_worker_present())
-                    } else {
-                        false
-                    };
-                    if asks {
+                                && crate::osr::compile_worker_present());
+                        match (deferred[i], cf.osr_enclosing.get(i).copied().flatten()) {
+                            _ if wanted[i] => asks = Some(i),
+                            (None, Some(e)) if warm => {
+                                deferred[i] = Some((header_visits, visits[e as usize]));
+                                wanted[e as usize] = true;
+                            }
+                            (None, None) if warm => asks = Some(i),
+                            (Some((at, outer)), Some(e)) => {
+                                let wait = if visits[e as usize] == outer {
+                                    OSR_STUCK_VISITS
+                                } else {
+                                    OSR_UNANSWERED_VISITS
+                                };
+                                if header_visits - at >= wait {
+                                    asks = Some(i);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(a) = asks {
                         // Waiting from here until this frame leaves `run`.
                         if !waits {
                             waits = true;
                             self.waiting_marks.push(bead);
                             crate::osr::frame_waits(bead);
                         }
+                        let site_key = cf.osr_sites[a].site_key;
                         if trace_enabled() {
                             eprintln!(
-                                "[interp] asks at site=0x{:x} after {} visits",
-                                osr_site.site_key, visits[i]
+                                "[interp] asks at site=0x{:x} after {} visits of site=0x{:x}",
+                                site_key, visits[i], osr_site.site_key
                             );
                         }
-                        crate::osr::osr_request_promotion_interpreted(bead, osr_site.site_key);
-                        slots[i] = crate::osr::helper_slot_addr(bead, osr_site.site_key)
+                        crate::osr::osr_request_promotion_interpreted(bead, site_key);
+                        slots[a] = crate::osr::helper_slot_addr(bead, site_key)
                             as *const std::sync::atomic::AtomicU64;
-                    } else if slots[i].is_null() {
+                    }
+                    if slots[i].is_null() {
                         continue;
                     }
                     // SAFETY: the slot lives for the process.

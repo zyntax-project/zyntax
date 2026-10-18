@@ -5533,7 +5533,7 @@ fn promote_static_hot(bead_id: u64, body: &HirFunction) {
     let resumable: Vec<(u64, u64)> = crate::loop_facts::hot_static_loops(body)
         .into_iter()
         .filter_map(|(header, runs)| {
-            let layout = osr::osr_layout_with(body, header, &dominators).ok()?;
+            let layout = osr::osr_probe_layout_with(body, header, &dominators).ok()?;
             Some((layout.site_key(), runs))
         })
         .collect();
