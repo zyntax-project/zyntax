@@ -598,6 +598,16 @@ fn run(func: &mut HirFunction, flag: HirId, effects: &HashMap<HirId, Effect>) ->
     }
     func.rebuild_cfg_edges();
     let mut sol = flow.solve(func);
+    // A raising arm usually reaches its check through the blocks that
+    // merge the value it would have produced; it skips them first, so
+    // the thread below sees it at the check.
+    for _ in 0..MAX_MERGE_BYPASSES {
+        if bypass_merges(func, &flow, &sol) == 0 {
+            break;
+        }
+        func.rebuild_cfg_edges();
+        sol = flow.solve(func);
+    }
     stats.threaded = thread(func, &flow, &sol);
     if stats.threaded > 0 {
         func.rebuild_cfg_edges();
@@ -749,6 +759,127 @@ fn thread(func: &mut HirFunction, flow: &Flow, sol: &Solution) -> usize {
         return 0;
     }
     threaded
+}
+
+/// Merge blocks a raising arm skips on its way to a check: one per
+/// level of call it was inlined from, as a rule.
+const MAX_MERGE_BYPASSES: usize = 4;
+
+/// A block that only merges values with phis and branches on to a flag
+/// check is skipped by each predecessor that reaches it with the flag
+/// Set: the predecessor branches to the check itself, whose phis take
+/// from it what the merge's phis took. Only where the merge's phis feed
+/// the check's and nothing else, so the merge still dominates every
+/// other use of what it defines.
+fn bypass_merges(func: &mut HirFunction, flow: &Flow, sol: &Solution) -> usize {
+    // (pred, merge, check)
+    let mut plan: Vec<(HirId, HirId, HirId)> = Vec::new();
+    for (&m, block) in &func.blocks {
+        if !block.instructions.is_empty() {
+            continue;
+        }
+        let HirTerminator::Branch { target: c } = block.terminator else {
+            continue;
+        };
+        if c == m {
+            continue;
+        }
+        let Some(check) = func.blocks.get(&c) else {
+            continue;
+        };
+        let HirTerminator::CondBranch { condition, .. } = check.terminator else {
+            continue;
+        };
+        if !flow.compares.contains_key(&condition) {
+            continue;
+        }
+        let merged: HashSet<HirId> = block.phis.iter().map(|p| p.result).collect();
+        if !merged.is_empty() && used_beyond_phis_of(func, &merged, c) {
+            continue;
+        }
+        for &p in &block.predecessors {
+            if sol.edges.get(&(p, m)) != Some(&State::Set)
+                || p == c
+                || check.predecessors.contains(&p)
+                || plan.iter().any(|(q, _, _)| *q == p)
+                || !matches!(
+                    func.blocks[&p].terminator,
+                    HirTerminator::Branch { .. } | HirTerminator::CondBranch { .. }
+                )
+            {
+                continue;
+            }
+            plan.push((p, m, c));
+        }
+    }
+    if plan.is_empty() {
+        return 0;
+    }
+    let saved = func.blocks.clone();
+    for &(p, m, c) in &plan {
+        let from_p: HashMap<HirId, HirId> = func.blocks[&m]
+            .phis
+            .iter()
+            .filter_map(|phi| {
+                phi.incoming
+                    .iter()
+                    .find(|(_, from)| *from == p)
+                    .map(|(v, _)| (phi.result, *v))
+            })
+            .collect();
+        let check = func.blocks.get_mut(&c).expect("check");
+        for phi in &mut check.phis {
+            if let Some(&(v, _)) = phi.incoming.iter().find(|(_, from)| *from == m) {
+                phi.incoming.push((from_p.get(&v).copied().unwrap_or(v), p));
+            }
+        }
+        let merge = func.blocks.get_mut(&m).expect("merge");
+        for phi in &mut merge.phis {
+            phi.incoming.retain(|(_, from)| *from != p);
+        }
+        match &mut func.blocks.get_mut(&p).expect("pred").terminator {
+            HirTerminator::Branch { target } => *target = c,
+            HirTerminator::CondBranch {
+                true_target,
+                false_target,
+                ..
+            } => {
+                if *true_target == m {
+                    *true_target = c;
+                }
+                if *false_target == m {
+                    *false_target = c;
+                }
+            }
+            _ => unreachable!("planned only for branches"),
+        }
+    }
+    func.rebuild_cfg_edges();
+    if !dominance_holds(func) {
+        func.blocks = saved;
+        return 0;
+    }
+    plan.len()
+}
+
+/// Whether any of `values` is read other than by a phi of `block`.
+fn used_beyond_phis_of(func: &HirFunction, values: &HashSet<HirId>, block: HirId) -> bool {
+    func.blocks.iter().any(|(&b, blk)| {
+        blk.instructions.iter().any(|inst| {
+            let mut used = false;
+            inst.for_each_operand(|v| used |= values.contains(&v));
+            used
+        }) || {
+            let mut used = false;
+            blk.terminator
+                .for_each_operand(|v| used |= values.contains(&v));
+            used
+        } || (b != block
+            && blk
+                .phis
+                .iter()
+                .any(|phi| phi.incoming.iter().any(|(v, _)| values.contains(v))))
+    })
 }
 
 /// The values `block` defines.
@@ -1223,6 +1354,74 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(branch_constant(body(&m, f), entry, raise), Some(true));
+    }
+
+    /// An inlined accessor: its raising arm and its normal path merge the
+    /// value they produce, and the merge feeds the check after it. The
+    /// raising arm skips the merge and the check, and the check folds for
+    /// the normal path alone.
+    #[test]
+    fn a_raising_arm_skips_the_merge_before_its_check() {
+        let mut m = Module::new(true);
+        let raiser = m.callee(
+            "raiser",
+            FunctionAttributes {
+                sets_error_flag: true,
+                ..Default::default()
+            },
+        );
+        let mut b = Body::new(&m);
+        let entry = b.block();
+        let arm = b.block();
+        let normal = b.block();
+        let merge = b.block();
+        let check = b.block();
+        let raise = b.block();
+        let ok = b.block();
+        let cond = b.param(0, HirType::Bool);
+        b.term(
+            entry,
+            HirTerminator::CondBranch {
+                condition: cond,
+                true_target: arm,
+                false_target: normal,
+            },
+        );
+        b.call(arm, raiser);
+        b.term(arm, HirTerminator::Branch { target: merge });
+        b.term(normal, HirTerminator::Branch { target: merge });
+        let (placeholder, value) = (b.int(-1), b.int(7));
+        let merged = b.f.create_value(HirType::I64, HirValueKind::Instruction);
+        b.f.blocks[&merge].phis.push(HirPhi {
+            result: merged,
+            ty: HirType::I64,
+            incoming: vec![(placeholder, arm), (value, normal)],
+        });
+        b.term(merge, HirTerminator::Branch { target: check });
+        let checked = b.f.create_value(HirType::I64, HirValueKind::Instruction);
+        b.f.blocks[&check].phis.push(HirPhi {
+            result: checked,
+            ty: HirType::I64,
+            incoming: vec![(merged, merge)],
+        });
+        b.check(check, raise, ok);
+        b.ret(raise, -1);
+        b.term(
+            ok,
+            HirTerminator::Return {
+                values: vec![checked],
+            },
+        );
+        let f = b.finish(&mut m);
+        let stats = run_all(&mut m.module);
+        let f = body(&m, f);
+        assert_eq!(stats.threaded, 1);
+        assert!(matches!(
+            f.blocks[&arm].terminator,
+            HirTerminator::Branch { target } if target == raise
+        ));
+        assert_eq!(branch_constant(f, check, raise), Some(false));
+        assert_eq!(flag_loads(f, check), 0);
     }
 
     #[test]
