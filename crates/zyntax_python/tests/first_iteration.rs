@@ -1,7 +1,8 @@
 //! A kernel's first iteration pays for the compiles its calls make. A
 //! loop-free function first called from native code runs its body as
-//! lowered until the worker's optimised compile replaces it, so no call
-//! waits on the per-function pipeline for one.
+//! lowered until the worker's optimised compile replaces it, or the
+//! optimised body when one is ready, so no call waits on the
+//! per-function pipeline for one.
 #![cfg(all(feature = "llvm-backend", not(debug_assertions)))]
 
 use std::fs;

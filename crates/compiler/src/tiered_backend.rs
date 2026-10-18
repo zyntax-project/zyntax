@@ -3561,11 +3561,16 @@ impl TieredBackend {
         // comes first; any other asking meanwhile waits for it.
         self.optimized_bodies
             .add(by_bead.values().map(|(id, _, _)| *id));
+        // `ZYNTAX_DISABLE_CALLEES_FIRST=1` optimises a body without first
+        // optimising the callees it may inline; safe to run with.
+        let callees_first = std::env::var_os("ZYNTAX_DISABLE_CALLEES_FIRST").is_none();
         let optimize_body = {
             let by_bead: HashMap<u64, (HirId, Arc<HirModule>)> = by_bead
                 .iter()
                 .map(|(bead, (id, _, module))| (*bead, (*id, Arc::clone(module))))
                 .collect();
+            let bead_of: HashMap<HirId, u64> =
+                by_bead.iter().map(|(bead, (id, _))| (*id, *bead)).collect();
             let optimized_bodies = Arc::clone(&optimized_bodies);
             let optimized = Arc::clone(&optimized);
             let facts = Arc::clone(&facts);
@@ -3586,6 +3591,49 @@ impl TieredBackend {
                     || (!finished && !lazy.contains(func_id))
                 {
                     return None;
+                }
+                // The callees this body may inline are optimised first,
+                // so it inlines what they run whichever was called first.
+                // Only those outside its call cycle: a body waits on its
+                // callees' cells, never on a caller's. Only off a waiting
+                // caller's path: a first call takes the body it can have
+                // now.
+                if callees_first && !finished && ON_WARM_UP.with(|on| on.get()) {
+                    let cache = facts.cache(module_arc);
+                    let callees: Vec<HirId> = body_sources
+                        .get(func_id)
+                        .and_then(|s| {
+                            s.with_function(*func_id, |f| f.direct_call_targets().collect())
+                        })
+                        .or_else(|| {
+                            module_arc
+                                .functions
+                                .get(func_id)
+                                .map(|f| f.direct_call_targets().collect())
+                        })
+                        .unwrap_or_default();
+                    for callee in callees {
+                        if callee == *func_id
+                            || !lazy.contains(&callee)
+                            || cache.shares_cycle(*func_id, callee)
+                            || optimized_bodies.get(callee).is_some()
+                        {
+                            continue;
+                        }
+                        let small = body_sources
+                            .get(&callee)
+                            .and_then(|s| s.with_function(callee, crate::inline::may_inline))
+                            .or_else(|| {
+                                module_arc
+                                    .functions
+                                    .get(&callee)
+                                    .map(crate::inline::may_inline)
+                            })
+                            .unwrap_or(false);
+                        if small && let Some(bead) = bead_of.get(&callee) {
+                            let _ = osr::lazy_optimized_body(*bead);
+                        }
+                    }
                 }
                 let body = cell.get_or_init(|| {
                     if finished {
@@ -3850,6 +3898,9 @@ impl TieredBackend {
             let lazy_started = web_time::Instant::now();
             // Finished library bodies need only their finishing passes;
             // the same decoded body feeds scheduling and compilation.
+            // Optimised before this compile asked: the call waits on no
+            // pipeline for it.
+            let ready = optimized_bodies.get(*func_id).is_some();
             let prepared = optimized_bodies.get(*func_id).or_else(|| {
                 finished
                     .contains(func_id)
@@ -4045,7 +4096,13 @@ impl TieredBackend {
                 let kind = if finished.contains(func_id) {
                     "finished"
                 } else if osr::find_loop_headers(&body).is_empty() {
-                    "loop-free"
+                    if ready {
+                        "loop-free, ready"
+                    } else {
+                        "loop-free"
+                    }
+                } else if ready {
+                    "loops, ready"
                 } else {
                     "loops"
                 };

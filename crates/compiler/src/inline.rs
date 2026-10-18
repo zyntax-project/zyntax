@@ -970,7 +970,7 @@ pub struct Cycles {
 
 impl Cycles {
     /// Whether `callee` is in `caller`'s cycle.
-    fn shares(&self, caller: HirId, callee: HirId) -> bool {
+    pub(crate) fn shares(&self, caller: HirId, callee: HirId) -> bool {
         self.component.get(&callee) == self.component.get(&caller)
     }
 

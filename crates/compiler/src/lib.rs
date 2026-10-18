@@ -1903,6 +1903,11 @@ pub struct OptCache {
 }
 
 impl OptCache {
+    /// Whether `callee` is in `caller`'s call cycle, or reaches it.
+    pub(crate) fn shares_cycle(&self, caller: HirId, callee: HirId) -> bool {
+        self.cycles.shares(caller, callee)
+    }
+
     pub fn build(module: &HirModule) -> Self {
         Self::with_facts(std::sync::Arc::new(drop_insert::facts_of(module)), module)
     }
