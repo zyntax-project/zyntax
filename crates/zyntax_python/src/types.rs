@@ -3505,6 +3505,10 @@ pub(crate) struct Inferred {
     /// which are open from the next round; see
     /// [`passed_functions_out_of_view`].
     pub(crate) reopened: Vec<String>,
+    /// Closed module functions nothing calls: no call is in view and
+    /// none can be out of view, so they never run, and their settled
+    /// parameters say nothing of what they write.
+    pub(crate) uncalled: HashSet<String>,
 }
 
 /// The items every call of which is in view: module functions never
@@ -4269,6 +4273,34 @@ pub(crate) fn infer_module(
         }
         .stmts(entry);
     }
+    let uncalled: HashSet<String> = {
+        let called: HashSet<&str> = kept
+            .iter()
+            .flatten()
+            .chain(entry_kept.iter())
+            .flat_map(|inference| inference.passed.iter())
+            .filter_map(|(target, _, _)| match target {
+                Target::Item(name) => Some(name.as_str()),
+                Target::Closure(_) => None,
+            })
+            .collect();
+        items
+            .iter()
+            .filter(|item| item.class.is_none() && !called.contains(item.name.as_str()))
+            .filter(|item| {
+                let Some(flags) = inferring.get(&item.name) else {
+                    return false;
+                };
+                let sig = &module.funcs[&item.name];
+                flags.iter().any(|f| *f)
+                    && flags
+                        .iter()
+                        .zip(&sig.params)
+                        .all(|(flag, (_, ty))| !*flag || *ty == Ty::Unknown)
+            })
+            .map(|item| item.name.clone())
+            .collect()
+    };
     // Whatever recursion left undecided is dynamic. So is a parameter
     // only ever passed None: the IR has no value of that type to pass.
     for (name, sig) in module.funcs.iter_mut() {
@@ -4370,6 +4402,7 @@ pub(crate) fn infer_module(
     }
     let reopened = passed_functions_out_of_view(&module);
     Inferred {
+        uncalled,
         widened_globals,
         refused_more,
         reopened,

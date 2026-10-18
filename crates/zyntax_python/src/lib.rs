@@ -810,7 +810,7 @@ fn parse_program_once(
             inferred.closed.remove(name);
         }
         for (item, writes_global) in items.iter().zip(&writes_globals) {
-            if !writes_global {
+            if !writes_global || out.uncalled.contains(&item.name) {
                 continue;
             }
             let sig = inferred.funcs[&item.name].clone();

@@ -118,7 +118,15 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
         }
         c.body = kept.into_iter().collect();
     }
+    let classes: HashSet<String> = body
+        .iter()
+        .filter_map(|s| match s {
+            py::Stmt::ClassDef(c) => Some(c.name.to_string()),
+            _ => None,
+        })
+        .collect();
     let rewriter = Rewriter {
+        classes,
         rootless,
         aliases,
         statics,
@@ -201,6 +209,8 @@ impl Transformer for ClsRenamer {
 }
 
 struct Rewriter {
+    /// The classes the module defines.
+    classes: HashSet<String>,
     rootless: HashSet<String>,
     aliases: HashMap<String, String>,
     statics: HashMap<String, HashSet<String>>,
@@ -513,6 +523,7 @@ impl Transformer for Rewriter {
         match s {
             py::Stmt::FunctionDef(f) => {
                 bind_none_defaults(f);
+                narrow_isinstance_branches(f, &self.classes);
                 walk_stmt(self, s);
             }
             py::Stmt::ClassDef(c) => {
@@ -520,6 +531,7 @@ impl Transformer for Rewriter {
                 for m in c.body.iter_mut() {
                     if let py::Stmt::FunctionDef(f) = m {
                         bind_none_defaults(f);
+                        narrow_isinstance_branches(f, &self.classes);
                         let this = f
                             .parameters
                             .args
@@ -780,6 +792,204 @@ fn bind_none_defaults(f: &mut py::StmtFunctionDef) {
         }
         i += 1;
     }
+}
+
+/// `if isinstance(x, C):` and `elif isinstance(x, C):` in `f`, with `x` a
+/// name the branch does not bind and `C` a class of the module: the branch
+/// starts with `x$isN = x` and `assert isinstance(x$isN, C)`, the pair the
+/// typer reads as an instance of `C`, and reads `x$isN` for `x`. Skipped
+/// where renaming could change what a name means (see [`Renamable`]).
+fn narrow_isinstance_branches(f: &mut py::StmtFunctionDef, classes: &HashSet<String>) {
+    let mut renamable: HashMap<String, bool> = HashMap::default();
+    let mut tested = Vec::new();
+    isinstance_tests(&f.body, classes, &mut tested);
+    for name in tested {
+        if renamable.contains_key(&name) {
+            continue;
+        }
+        let mut check = Renamable {
+            name: &name,
+            nested: 0,
+            ok: true,
+        };
+        for stmt in &f.body {
+            py::visitor::Visitor::visit_stmt(&mut check, stmt);
+        }
+        let ok = check.ok;
+        renamable.insert(name, ok);
+    }
+    let mut count = 0;
+    narrow_in(&mut f.body, classes, &renamable, &mut count);
+}
+
+/// The narrowed name of an `isinstance(x, C)` test, `C` a class of the
+/// module.
+fn isinstance_test<'e>(test: &'e py::Expr, classes: &HashSet<String>) -> Option<&'e str> {
+    let py::Expr::Call(c) = test else {
+        return None;
+    };
+    if !is_name(&c.func, "isinstance") || !c.arguments.keywords.is_empty() {
+        return None;
+    }
+    match &c.arguments.args[..] {
+        [py::Expr::Name(x), py::Expr::Name(class)] if classes.contains(class.id.as_str()) => {
+            Some(x.id.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// The names `isinstance` tests narrow in `stmts`, outside nested scopes.
+fn isinstance_tests(stmts: &[py::Stmt], classes: &HashSet<String>, out: &mut Vec<String>) {
+    for s in stmts {
+        match s {
+            py::Stmt::If(i) => {
+                out.extend(isinstance_test(&i.test, classes).map(str::to_string));
+                isinstance_tests(&i.body, classes, out);
+                for c in &i.elif_else_clauses {
+                    if let Some(t) = &c.test {
+                        out.extend(isinstance_test(t, classes).map(str::to_string));
+                    }
+                    isinstance_tests(&c.body, classes, out);
+                }
+            }
+            py::Stmt::While(w) => {
+                isinstance_tests(&w.body, classes, out);
+                isinstance_tests(&w.orelse, classes, out);
+            }
+            py::Stmt::For(f) => {
+                isinstance_tests(&f.body, classes, out);
+                isinstance_tests(&f.orelse, classes, out);
+            }
+            py::Stmt::With(w) => isinstance_tests(&w.body, classes, out),
+            py::Stmt::Try(t) => {
+                isinstance_tests(&t.body, classes, out);
+                for h in &t.handlers {
+                    let py::ExceptHandler::ExceptHandler(h) = h;
+                    isinstance_tests(&h.body, classes, out);
+                }
+                isinstance_tests(&t.orelse, classes, out);
+                isinstance_tests(&t.finalbody, classes, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn narrow_in(
+    stmts: &mut [py::Stmt],
+    classes: &HashSet<String>,
+    renamable: &HashMap<String, bool>,
+    count: &mut u32,
+) {
+    for s in stmts.iter_mut() {
+        match s {
+            py::Stmt::If(i) => {
+                narrow_branch(&i.test, &mut i.body, classes, renamable, count);
+                narrow_in(&mut i.body, classes, renamable, count);
+                for c in i.elif_else_clauses.iter_mut() {
+                    if let Some(t) = &c.test {
+                        narrow_branch(t, &mut c.body, classes, renamable, count);
+                    }
+                    narrow_in(&mut c.body, classes, renamable, count);
+                }
+            }
+            py::Stmt::While(w) => {
+                narrow_in(&mut w.body, classes, renamable, count);
+                narrow_in(&mut w.orelse, classes, renamable, count);
+            }
+            py::Stmt::For(f) => {
+                narrow_in(&mut f.body, classes, renamable, count);
+                narrow_in(&mut f.orelse, classes, renamable, count);
+            }
+            py::Stmt::With(w) => narrow_in(&mut w.body, classes, renamable, count),
+            py::Stmt::Try(t) => {
+                narrow_in(&mut t.body, classes, renamable, count);
+                for h in t.handlers.iter_mut() {
+                    let py::ExceptHandler::ExceptHandler(h) = h;
+                    narrow_in(&mut h.body, classes, renamable, count);
+                }
+                narrow_in(&mut t.orelse, classes, renamable, count);
+                narrow_in(&mut t.finalbody, classes, renamable, count);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn narrow_branch<B>(
+    test: &py::Expr,
+    body: &mut B,
+    classes: &HashSet<String>,
+    renamable: &HashMap<String, bool>,
+    count: &mut u32,
+) where
+    B: Default
+        + FromIterator<py::Stmt>
+        + IntoIterator<Item = py::Stmt>
+        + std::ops::DerefMut<Target = [py::Stmt]>,
+{
+    let Some(x) = isinstance_test(test, classes) else {
+        return;
+    };
+    if !renamable.get(x).copied().unwrap_or(false) || binds_name(body, x) {
+        return;
+    }
+    let to = format!("{x}$is{count}");
+    *count += 1;
+    let renamer = Renamer { from: x, to: &to };
+    for stmt in body.iter_mut() {
+        renamer.visit_stmt(stmt);
+    }
+    let range = test.range();
+    let mut target = name_expr(&to, range);
+    if let py::Expr::Name(t) = &mut target {
+        t.ctx = py::ExprContext::Store;
+    }
+    let mut asserted = test.clone();
+    renamer.visit_expr(&mut asserted);
+    let rest = std::mem::take(body);
+    *body = [
+        py::Stmt::Assign(py::StmtAssign {
+            node_index: Default::default(),
+            range,
+            targets: vec![target],
+            value: Box::new(name_expr(x, range)),
+        }),
+        py::Stmt::Assert(py::StmtAssert {
+            node_index: Default::default(),
+            range,
+            test: Box::new(asserted),
+            msg: None,
+        }),
+    ]
+    .into_iter()
+    .chain(rest)
+    .collect();
+}
+
+/// Whether `stmts` bind `name` anywhere, nested blocks included.
+fn binds_name(stmts: &[py::Stmt], name: &str) -> bool {
+    struct Binds<'n> {
+        name: &'n str,
+        found: bool,
+    }
+    impl<'a> py::visitor::Visitor<'a> for Binds<'_> {
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            if let py::Expr::Name(n) = e
+                && n.id.as_str() == self.name
+                && !n.ctx.is_load()
+            {
+                self.found = true;
+            }
+            py::visitor::walk_expr(self, e);
+        }
+    }
+    let mut b = Binds { name, found: false };
+    for s in stmts {
+        py::visitor::Visitor::visit_stmt(&mut b, s);
+    }
+    b.found
 }
 
 /// Whether every use of `name` in a function body is an expression
