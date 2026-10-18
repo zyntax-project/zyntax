@@ -1,8 +1,11 @@
 -- The loop's number is an integer on one path and a float on the
 -- other, so the outlined region takes a Number aggregate as a live-in.
-local function main()
+-- The bound arrives as an argument: a function whose loop count is
+-- known is compiled before its first call, and never leaves the
+-- interpreter through a region.
+local function main(count)
   local total = 0
-  for n = 1, 150000 do
+  for n = 1, count do
     local x = n
     local steps = 0
     while x > 1 do
@@ -18,4 +21,4 @@ local function main()
   return total
 end
 
-print(main())
+print(main(150000))
