@@ -18,6 +18,9 @@ static ALLOCATOR: allocation_audit::CountingAllocator = allocation_audit::Counti
 /// thread's is 8 MB on Linux and macOS and 1 MB on Windows.
 const STACK_BYTES: usize = 1 << 30;
 
+/// Interpreted calls of a function before its baseline compiles.
+const PYTHON_BASELINE_THRESHOLD: u32 = 80;
+
 fn main() -> ExitCode {
     std::thread::Builder::new()
         .stack_size(STACK_BYTES)
@@ -129,9 +132,16 @@ fn run() -> ExitCode {
         }
     };
     lap("parse");
-    // Only the LLVM build changes the default.
+    // Only the LLVM build changes the default backend.
     #[allow(unused_mut)]
     let mut config = TieredConfig::default();
+    // A program's functions are many and most run briefly: the interpreter
+    // takes their first calls, and the baseline compiles once a function
+    // has shown it will keep being called. `ZYNTAX_BASELINE_THRESHOLD`
+    // still overrides it.
+    if std::env::var_os("ZYNTAX_BASELINE_THRESHOLD").is_none() {
+        config.baseline_threshold = PYTHON_BASELINE_THRESHOLD;
+    }
     #[cfg(feature = "llvm-backend")]
     if llvm {
         config.tier2_backend = zyntax_compiler::tiered_backend::Tier2Backend::LLVM;
