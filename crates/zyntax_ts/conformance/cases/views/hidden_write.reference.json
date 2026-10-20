@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2339,
+      "start": 70,
+      "length": 1,
+      "file": "hidden_write.ts",
+      "message": "Property 'y' does not exist on type 'X'."
+    }
+  ],
+  "source_sha256": "99972798b98377353c3a530206dc24cdde9326a2f4cf21ecf67cc89dd5b881bd",
+  "options": {}
+}

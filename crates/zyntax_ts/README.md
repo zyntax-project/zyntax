@@ -19,6 +19,14 @@ parameters do not acquire ownership, and fresh returned objects transfer their
 lifetime to the caller. Property initializers run in source order even when
 physical field order differs.
 
+Scalar-record width views retain the concrete allocation and expose only the
+declared properties. Local views can select any subset of fields without copying
+storage. Calls and annotated returns accept a view when every required field has
+the same native offset; these conversions use ordinary pointer casts and share
+the existing drop analysis. Offset checks are cached by layout pair. Other layout
+adaptations and assignments that change a binding's concrete layout still need
+implementation. Object literals retain TypeScript's excess-property checks.
+
 Return types are inferred for primitives, strings, fixed-layout objects and void
 functions. Callees can appear later in the source: their signatures are resolved
 from an iterative dependency worklist, and each body is checked and lowered once.

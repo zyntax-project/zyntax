@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2353,
+      "start": 73,
+      "length": 1,
+      "file": "fresh_conditional.ts",
+      "message": "Object literal may only specify known properties, and 'y' does not exist in type 'X'."
+    }
+  ],
+  "source_sha256": "48ab304e7671377a7ebdbfbd990a82fa36ffc4b00fbf67fd8ff0a484bcd0769c",
+  "options": {}
+}

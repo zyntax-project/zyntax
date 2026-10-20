@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2339,
+      "start": 133,
+      "length": 1,
+      "file": "inferred_hidden.ts",
+      "message": "Property 'a' does not exist on type 'Z'."
+    }
+  ],
+  "source_sha256": "4145886e82868f2023ab150e4e675d778687a28d2758af124282b026dff11aa1",
+  "options": {}
+}

@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2353,
+      "start": 90,
+      "length": 1,
+      "file": "fresh_generic.ts",
+      "message": "Object literal may only specify known properties, and 'y' does not exist in type 'X'."
+    }
+  ],
+  "source_sha256": "4eae59b1e78f9e7205ea431a73c6dd8ae1e0faea4ec5bebba6c4369917c435e7",
+  "options": {}
+}

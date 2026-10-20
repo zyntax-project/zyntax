@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2345,
+      "start": 172,
+      "length": 1,
+      "file": "call_hidden.ts",
+      "message": "Argument of type 'X' is not assignable to parameter of type 'XY'.\n  Property 'y' is missing in type 'X' but required in type 'XY'."
+    }
+  ],
+  "source_sha256": "1e7e5cb71744ad8f815aec8f7ee6cf83391b36a3b50e2ddc22b9eb099742d19e",
+  "options": {}
+}

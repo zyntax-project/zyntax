@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2741,
+      "start": 90,
+      "length": 6,
+      "file": "return_hidden.ts",
+      "message": "Property 'y' is missing in type 'X' but required in type 'XY'."
+    }
+  ],
+  "source_sha256": "e1f50aadd9599bbb5e4e930319d03736d196cbb19712bd1135c23f72794124be",
+  "options": {}
+}

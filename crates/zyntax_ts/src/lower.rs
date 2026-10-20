@@ -264,6 +264,7 @@ struct Lowerer<'ast, 'program> {
     aliases: FxHashMap<InternedString, (Type, Option<InternedString>)>,
     views: FxHashMap<InternedString, BTreeMap<&'ast str, Field>>,
     layouts: FxHashMap<Vec<(InternedString, PrimitiveType)>, TypeId>,
+    compatible_layouts: FxHashMap<(TypeId, TypeId), bool>,
     signatures: FxHashMap<InternedString, Rc<Signature<'ast>>>,
     active_types: SmallVec<[(InternedString, Type); 2]>,
     functions: FxHashMap<InternedString, &'program js::Function<'ast>>,
@@ -287,6 +288,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             aliases: FxHashMap::default(),
             views: FxHashMap::default(),
             layouts: FxHashMap::default(),
+            compatible_layouts: FxHashMap::default(),
             signatures: FxHashMap::default(),
             active_types: SmallVec::new(),
             functions: FxHashMap::default(),
@@ -909,6 +911,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if first != ty {
             return self.unsupported("inferred union return types", at);
         }
+        let logical = |view: Option<InternedString>| {
+            view.and_then(|name| self.aliases.get(&name))
+                .map(|(ty, _)| ty)
+        };
+        if logical(*first_view).unwrap_or(first) != logical(view).unwrap_or(ty) {
+            return self.unsupported("inferred returns with different property views", at);
+        }
         let readonly = |view: Option<InternedString>| {
             view.and_then(|name| self.views.get(&name))
                 .into_iter()
@@ -1085,20 +1094,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     return self.unsupported("function parameter-count adaptation", at);
                 }
             }
-            if let (Type::Named { id: a, .. }, Type::Named { id: b, .. }) = (actual, expected) {
-                if let (Some(a), Some(b)) = (
-                    self.registry.get_type_by_id(*a),
-                    self.registry.get_type_by_id(*b),
-                ) {
-                    if b.fields.iter().all(|needed| {
-                        a.fields
-                            .iter()
-                            .any(|field| field.name == needed.name && field.ty == needed.ty)
-                    }) {
-                        return self
-                            .unsupported("structural views with different physical layouts", at);
-                    }
-                }
+            if self.record_subtype(actual, expected) {
+                return Ok(());
             }
             self.error(
                 ErrorKind::Type,
@@ -1110,6 +1107,130 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 at,
             )
         }
+    }
+
+    fn record_subtype(&self, actual: &Type, expected: &Type) -> bool {
+        let (Type::Named { id: a, .. }, Type::Named { id: b, .. }) = (actual, expected) else {
+            return false;
+        };
+        let (Some(a), Some(b)) = (
+            self.registry.get_type_by_id(*a),
+            self.registry.get_type_by_id(*b),
+        ) else {
+            return false;
+        };
+        a.metadata.is_reference
+            && b.metadata.is_reference
+            && b.fields.iter().all(|needed| {
+                a.fields
+                    .iter()
+                    .any(|field| field.name == needed.name && field.ty == needed.ty)
+            })
+    }
+
+    // Source views constrain properties; the expression still carries its concrete layout.
+    fn source_type<'s>(&'s self, source: &js::Expression<'ast>, physical: &'s Type) -> &'s Type {
+        self.view_of(source)
+            .and_then(|view| self.aliases.get(&view))
+            .map_or(physical, |(ty, _)| ty)
+    }
+
+    fn fresh_properties(&self, source: &js::Expression<'ast>, expected: &Type) -> Result<()> {
+        let source = match source {
+            js::Expression::ParenthesizedExpression(p) => {
+                return self.fresh_properties(&p.expression, expected);
+            }
+            js::Expression::ConditionalExpression(c) => {
+                self.fresh_properties(&c.consequent, expected)?;
+                return self.fresh_properties(&c.alternate, expected);
+            }
+            js::Expression::TSNonNullExpression(n) => {
+                return self.fresh_properties(&n.expression, expected);
+            }
+            js::Expression::ObjectExpression(object) => object,
+            _ => return Ok(()),
+        };
+        let Type::Named { id, .. } = expected else {
+            return Ok(());
+        };
+        let Some(definition) = self.registry.get_type_by_id(*id) else {
+            return Ok(());
+        };
+        if definition.fields.is_empty() {
+            return Ok(());
+        }
+        for property in &source.properties {
+            if let js::ObjectPropertyKind::ObjectProperty(property) = property {
+                let name = self.key(&property.key)?;
+                if !definition.fields.iter().any(|f| f.name == self.name(name)) {
+                    return self.error(
+                        ErrorKind::Type,
+                        format!("object literal has an excess property `{name}`"),
+                        property.span,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn adapt_record(&mut self, value: Expr, expected: &Type, at: oxc_span::Span) -> Result<Expr> {
+        if value.ty == *expected || !matches!(expected, Type::Named { .. }) {
+            return Ok(value);
+        }
+        let (
+            Type::Named { id: actual, .. },
+            Type::Named {
+                id: expected_id, ..
+            },
+        ) = (&value.ty, expected)
+        else {
+            return self.unsupported("this record layout adaptation", at);
+        };
+        let key = (*actual, *expected_id);
+        let compatible = if let Some(compatible) = self.compatible_layouts.get(&key) {
+            *compatible
+        } else {
+            let offsets = |id| {
+                use zyntax_compiler::{hir::HirType, object_header};
+                let definition = self.registry.get_type_by_id(id).unwrap();
+                let fields: SmallVec<[HirType; 5]> = std::iter::once(object_header::header_field())
+                    .chain(definition.fields.iter().map(|field| match field.ty {
+                        Type::Primitive(PrimitiveType::F64) => HirType::F64,
+                        Type::Primitive(PrimitiveType::Bool) => HirType::Bool,
+                        _ => unreachable!("TS records have scalar fields"),
+                    }))
+                    .collect();
+                object_header::field_layout(&fields).0
+            };
+            let a_offsets = offsets(*actual);
+            let b_offsets = offsets(*expected_id);
+            let a = self.registry.get_type_by_id(*actual).unwrap();
+            let b = self.registry.get_type_by_id(*expected_id).unwrap();
+            let compatible = b.fields.iter().enumerate().all(|(index, needed)| {
+                a.fields.iter().enumerate().any(|(i, field)| {
+                    field.name == needed.name
+                        && field.ty == needed.ty
+                        && a_offsets[i + 1] == b_offsets[index + 1]
+                })
+            });
+            self.compatible_layouts.insert(key, compatible);
+            compatible
+        };
+        if !compatible {
+            return self.unsupported(
+                "record views requiring different field offsets at a call or return",
+                at,
+            );
+        }
+        Ok(node(
+            TypedExpression::Cast(TypedCast {
+                expr: Box::new(value),
+                target_type: expected.clone(),
+            }),
+            expected.clone(),
+            at,
+        ))
     }
 
     fn type_description(&self, ty: &Type) -> String {
@@ -1202,6 +1323,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::Expression::ParenthesizedExpression(p) => self.view_of(&p.expression),
             js::Expression::TSNonNullExpression(n) => self.view_of(&n.expression),
             js::Expression::ConditionalExpression(c) => self.view_of(&c.consequent),
+            js::Expression::AssignmentExpression(a) => self.view_of(&a.right),
             js::Expression::TSAsExpression(a) => {
                 self.ty(&a.type_annotation).ok().and_then(|(_, view)| view)
             }
@@ -1272,7 +1394,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     .expected
                     .as_ref()
                     .map(|(ty, _)| ty.clone());
-                let value = r
+                let mut value = r
                     .argument
                     .as_ref()
                     .map(|arg| match &hint {
@@ -1283,9 +1405,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let view = r.argument.as_ref().and_then(|arg| self.view_of(arg));
                 let unit = unit();
                 let actual = value.as_ref().map_or(&unit, |value| &value.ty);
-                if let Some((ret, expected_view)) = &self.returns.as_ref().unwrap().expected {
-                    self.expect(actual, ret, at)?;
-                    self.check_view(view, *expected_view, at)?;
+                if let Some((ret, expected_view)) = self.returns.as_ref().unwrap().expected.clone()
+                {
+                    let logical = r
+                        .argument
+                        .as_ref()
+                        .map_or(actual, |arg| self.source_type(arg, actual));
+                    self.expect(logical, &ret, at)?;
+                    self.check_view(view, expected_view, at)?;
+                    if let (Some(source), Some(returned)) = (&r.argument, value.take()) {
+                        self.fresh_properties(source, &ret)?;
+                        value = Some(self.adapt_record(returned, &ret, at)?);
+                    }
                 } else {
                     self.record_return(actual, view, at)?;
                 }
@@ -1407,9 +1538,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 Some((ty, _)) => self.expr_expected(init, ty)?,
                 None => self.expr(init)?,
             };
-            let (ty, view) = declared.unwrap_or_else(|| (value.ty.clone(), self.view_of(init)));
-            self.expect(&value.ty, &ty, d.span)?;
+            if let Some((ty, _)) = &declared {
+                self.expect(self.source_type(init, &value.ty), ty, d.span)?;
+                self.fresh_properties(init, ty)?;
+            }
+            let (mut ty, view) = declared.unwrap_or_else(|| (value.ty.clone(), self.view_of(init)));
             self.check_view(self.view_of(init), view, d.span)?;
+            if matches!(ty, Type::Named { .. }) {
+                ty = value.ty.clone();
+            }
             let unique = self.fresh(id.name.as_str());
             self.scopes.last_mut().unwrap().insert(
                 name,
@@ -1770,14 +1907,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let condition = self.condition(&c.test)?;
                 let a = self.expr(&c.consequent)?;
                 let b = self.expr(&c.alternate)?;
+                if a.ty != b.ty
+                    && matches!((&a.ty, &b.ty), (Type::Named { .. }, Type::Named { .. }))
+                {
+                    return self
+                        .unsupported("conditional objects with different physical layouts", at);
+                }
                 self.expect(&b.ty, &a.ty, at)?;
                 if matches!(a.ty, Type::Named { .. })
                     && self.view_of(&c.consequent) != self.view_of(&c.alternate)
                 {
-                    return self.unsupported(
-                        "conditional object views with different readonly fields",
-                        at,
-                    );
+                    return self
+                        .unsupported("conditional objects with different property views", at);
                 }
                 let ty = a.ty.clone();
                 node(
@@ -1792,7 +1933,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             js::Expression::StaticMemberExpression(m) if !m.optional => {
                 let object = self.expr(&m.object)?;
-                let ty = self.field_type(&object.ty, m.property.name.as_str(), at)?;
+                let ty = self.field_type(
+                    self.source_type(&m.object, &object.ty),
+                    m.property.name.as_str(),
+                    at,
+                )?;
                 node(
                     TypedExpression::Field(TypedFieldAccess {
                         object: Box::new(object),
@@ -1850,9 +1995,21 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::Expression::TSAsExpression(a) => {
                 let (ty, view) = self.ty(&a.type_annotation)?;
                 let mut value = self.expr_expected(&a.expression, &ty)?;
-                self.expect(&value.ty, &ty, at)?;
+                let logical = self.source_type(&a.expression, &value.ty);
+                if self.record_subtype(&ty, logical) {
+                    if !self.record_subtype(&value.ty, &ty) {
+                        return self.unsupported(
+                            "record assertions requiring unknown physical fields",
+                            at,
+                        );
+                    }
+                } else {
+                    self.expect(logical, &ty, at)?;
+                }
                 self.check_view(self.view_of(&a.expression), view, at)?;
-                value.ty = ty;
+                if !matches!(ty, Type::Named { .. }) {
+                    value.ty = ty;
+                }
                 value
             }
             js::Expression::TSNonNullExpression(n) => self.expr(&n.expression)?,
@@ -2113,7 +2270,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 if let Some(index) = sig.type_params.iter().position(|(_, ty)| ty == expected) {
                     if types[index].is_none() {
                         types[index] = Some((
-                            arg.ty.clone(),
+                            source
+                                .as_expression()
+                                .map_or(&arg.ty, |e| self.source_type(e, &arg.ty))
+                                .clone(),
                             source.as_expression().and_then(|e| self.view_of(e)),
                         ));
                     }
@@ -2134,15 +2294,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     Ok((ty.clone(), view))
                 }
             };
-        for ((arg, source), (_, expected, view)) in args.iter().zip(&c.arguments).zip(&sig.params) {
-            let (expected, view) = instantiate(expected, *view)?;
-            self.expect(&arg.ty, &expected, at)?;
-            self.check_view(
-                source.as_expression().and_then(|e| self.view_of(e)),
-                view,
-                at,
-            )?;
-        }
+        let args = args
+            .into_iter()
+            .zip(&c.arguments)
+            .zip(&sig.params)
+            .map(|((arg, source), (_, expected, view))| {
+                let (expected, view) = instantiate(expected, *view)?;
+                let source = source.as_expression().unwrap();
+                self.expect(self.source_type(source, &arg.ty), &expected, at)?;
+                self.fresh_properties(source, &expected)?;
+                self.check_view(self.view_of(source), view, at)?;
+                self.adapt_record(arg, &expected, at)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let ret = sig.ret.clone().ok_or_else(|| {
             Error::new(
                 ErrorKind::Unsupported,
@@ -2255,7 +2419,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             return self.unsupported("assignment through a computed receiver", m.span);
         }
         let object = self.expr(&m.object)?;
-        let ty = self.field_type(&object.ty, m.property.name.as_str(), m.span)?;
+        let ty = self.field_type(
+            self.source_type(&m.object, &object.ty),
+            m.property.name.as_str(),
+            m.span,
+        )?;
         Ok(node(
             TypedExpression::Field(TypedFieldAccess {
                 object: Box::new(object),
@@ -2279,11 +2447,28 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             _ => return self.unsupported("this assignment target", a.span),
         };
         let (mut statements, target) = self.capture_target(target, a.span);
-        let mut value = self.expr_expected(&a.right, &target.ty)?;
-        self.expect(&value.ty, &target.ty, a.span)?;
-        if let js::AssignmentTarget::AssignmentTargetIdentifier(i) = &a.left {
-            let b = self.binding(i.name.as_str(), a.span)?;
-            self.check_view(self.view_of(&a.right), b.view, a.span)?;
+        let target_view = if let js::AssignmentTarget::AssignmentTargetIdentifier(i) = &a.left {
+            self.binding(i.name.as_str(), a.span)?.view
+        } else {
+            None
+        };
+        let logical_target = target_view
+            .and_then(|view| self.aliases.get(&view))
+            .map_or(&target.ty, |(ty, _)| ty)
+            .clone();
+        let mut value = self.expr_expected(&a.right, &logical_target)?;
+        self.expect(
+            self.source_type(&a.right, &value.ty),
+            &logical_target,
+            a.span,
+        )?;
+        self.fresh_properties(&a.right, &logical_target)?;
+        self.check_view(self.view_of(&a.right), target_view, a.span)?;
+        if matches!(target.ty, Type::Named { .. }) && value.ty != target.ty {
+            return self.unsupported(
+                "assignment changing a binding's physical record layout",
+                a.span,
+            );
         }
         let op = a.operator.as_str();
         if op != "=" {

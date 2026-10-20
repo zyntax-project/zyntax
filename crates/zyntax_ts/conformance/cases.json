@@ -668,5 +668,145 @@
     "id": "recursion/error_argument",
     "file": "cases/recursion/error_argument.ts",
     "mode": "check"
+  },
+  {
+    "id": "views/local_nonprefix",
+    "file": "cases/views/local_nonprefix.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/alias_chain",
+    "file": "cases/views/alias_chain.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/call_prefix",
+    "file": "cases/views/call_prefix.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/return_alias",
+    "file": "cases/views/return_alias.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/return_fresh",
+    "file": "cases/views/return_fresh.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/inferred_nonprefix",
+    "file": "cases/views/inferred_nonprefix.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/generic_view",
+    "file": "cases/views/generic_view.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/assert_narrow",
+    "file": "cases/views/assert_narrow.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/assert_reveal",
+    "file": "cases/views/assert_reveal.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/reassign_same_layout",
+    "file": "cases/views/reassign_same_layout.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/readonly_width",
+    "file": "cases/views/readonly_width.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/padding_compatible",
+    "file": "cases/views/padding_compatible.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/empty_view",
+    "file": "cases/views/empty_view.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/hidden_read",
+    "file": "cases/views/hidden_read.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/hidden_write",
+    "file": "cases/views/hidden_write.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/implicit_widen",
+    "file": "cases/views/implicit_widen.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/call_hidden",
+    "file": "cases/views/call_hidden.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/return_hidden",
+    "file": "cases/views/return_hidden.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/generic_hidden",
+    "file": "cases/views/generic_hidden.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/inferred_hidden",
+    "file": "cases/views/inferred_hidden.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/fresh_local",
+    "file": "cases/views/fresh_local.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/fresh_call",
+    "file": "cases/views/fresh_call.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/fresh_return",
+    "file": "cases/views/fresh_return.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/fresh_assignment",
+    "file": "cases/views/fresh_assignment.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/fresh_generic",
+    "file": "cases/views/fresh_generic.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/fresh_conditional",
+    "file": "cases/views/fresh_conditional.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/fresh_nonnull",
+    "file": "cases/views/fresh_nonnull.ts",
+    "mode": "run"
+  },
+  {
+    "id": "views/empty_literal",
+    "file": "cases/views/empty_literal.ts",
+    "mode": "run"
   }
 ]

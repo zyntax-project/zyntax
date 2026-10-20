@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2339,
+      "start": 82,
+      "length": 1,
+      "file": "hidden_read.ts",
+      "message": "Property 'y' does not exist on type 'X'."
+    }
+  ],
+  "source_sha256": "a3e3db4224309ce137d09cd2722b2bf214aa0e12f9536a53731825e7b19e757e",
+  "options": {}
+}

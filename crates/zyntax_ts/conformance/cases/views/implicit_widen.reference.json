@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2741,
+      "start": 116,
+      "length": 1,
+      "file": "implicit_widen.ts",
+      "message": "Property 'y' is missing in type 'X' but required in type 'XY'."
+    }
+  ],
+  "source_sha256": "e05b4bc6eed6bd406c47d39cdb641fa00a2242cb450449f1023c8803d284d525",
+  "options": {}
+}
