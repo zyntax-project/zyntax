@@ -6084,16 +6084,41 @@ pub fn jit_float_mask(params: &[HirType]) -> u8 {
     mask
 }
 
-/// Typed marshalling of an FFI symbol call.
+/// Call a native scalar function using the interpreter's typed ABI bridge.
 ///
-/// Routes each argument through the correct register file based on
-/// its declared `TypeTag` — float categories take the float ABI
-/// (`f64` / `f32` register), everything else flows through the
-/// integer register file via `value_to_i64`. The return is decoded
-/// from the matching register according to `sig.return_type`.
+/// Unsupported register layouts return an error before entering native code.
 ///
-/// Shapes the bridge cannot represent return an interpreter error before
-/// entering a function with the wrong C ABI.
+/// # Safety
+/// `ptr` must name a live C ABI function whose parameter and return types match
+/// `sig`. Any pointer arguments must satisfy that function's requirements.
+pub unsafe fn call_scalar_native(
+    ptr: *const u8,
+    args: &[ZyntaxValue],
+    sig: &crate::zrtl::ZrtlSymbolSig,
+) -> Result<ZyntaxValue, InterpError> {
+    if ptr.is_null() {
+        return Err(InterpError::UnsupportedInstruction(
+            "null native function pointer".to_string(),
+        ));
+    }
+    if !matches!(
+        sig.return_type.category(),
+        crate::zrtl::TypeCategory::Void
+            | crate::zrtl::TypeCategory::Bool
+            | crate::zrtl::TypeCategory::Int
+            | crate::zrtl::TypeCategory::UInt
+            | crate::zrtl::TypeCategory::Float
+            | crate::zrtl::TypeCategory::Pointer
+            | crate::zrtl::TypeCategory::Opaque
+    ) {
+        return Err(InterpError::UnsupportedInstruction(
+            "native scalar ABI with aggregate return".to_string(),
+        ));
+    }
+    call_extern_symbol_typed(ptr, args, sig)
+}
+
+/// Marshal scalars through their declared integer or floating register class.
 fn call_extern_symbol_typed(
     ptr: *const u8,
     args: &[ZyntaxValue],
@@ -6191,6 +6216,9 @@ fn call_extern_symbol_typed(
                     call_positional::<()>(ptr, pcount, float_mask, &words).unwrap();
                     Ok(ZyntaxValue::Void)
                 }
+                TypeCategory::Bool => Ok(ZyntaxValue::Bool(
+                    call_positional::<u8>(ptr, pcount, float_mask, &words).unwrap() != 0,
+                )),
                 TypeCategory::Float if sig.return_type.type_id() == TypeTag::F32.type_id() => {
                     Ok(ZyntaxValue::F32(
                         call_positional::<f32>(ptr, pcount, float_mask, &words).unwrap(),
@@ -6214,7 +6242,12 @@ fn call_extern_symbol_typed(
                     .to_string(),
             ));
         }
-        return Ok(value_from_i64_as(&ret_hir, call_extern_symbol(ptr, args)));
+        let raw = call_extern_symbol(ptr, args);
+        return Ok(if ret_cat == TypeCategory::Bool {
+            ZyntaxValue::Bool(raw as u8 != 0)
+        } else {
+            value_from_i64_as(&ret_hir, raw)
+        });
     }
 
     // SAFETY: the signature supplies the C register classes and the
@@ -6225,6 +6258,9 @@ fn call_extern_symbol_typed(
                 call_extern_mixed::<()>(ptr, n_i64, n_f64, &i, &f).unwrap();
                 Ok(ZyntaxValue::Void)
             }
+            TypeCategory::Bool => Ok(ZyntaxValue::Bool(
+                call_extern_mixed::<u8>(ptr, n_i64, n_f64, &i, &f).unwrap() != 0,
+            )),
             TypeCategory::Float if sig.return_type.type_id() == TypeTag::F32.type_id() => Ok(
                 ZyntaxValue::F32(call_extern_mixed::<f32>(ptr, n_i64, n_f64, &i, &f).unwrap()),
             ),
