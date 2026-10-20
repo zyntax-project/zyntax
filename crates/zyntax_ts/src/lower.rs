@@ -20,6 +20,7 @@ use crate::{Error, ErrorKind, Options, Soundness};
 
 mod arrays;
 mod generics;
+mod unions;
 use arrays::{ArrayResult, FlowState, array_type, element_type};
 
 type Result<T> = std::result::Result<T, Error>;
@@ -65,13 +66,15 @@ fn optional_join(a: &Type, b: &Type) -> Option<Type> {
             }
         }
     }
-    None
+    unions::primitive_join(a, b)
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScalarFlow {
     Number,
     Boolean,
+    String,
     Undefined,
+    Alternatives(u8),
 }
 impl ScalarFlow {
     fn of(ty: &Type) -> Option<Self> {
@@ -79,8 +82,15 @@ impl ScalarFlow {
             Some(Self::Number)
         } else if *ty == boolean() {
             Some(Self::Boolean)
+        } else if *ty == string() {
+            Some(Self::String)
         } else if is_undefined(ty) {
             Some(Self::Undefined)
+        } else if let Type::Union(members) = ty {
+            let mask = members
+                .iter()
+                .try_fold(0, |mask, ty| Self::of(ty).map(|v| mask | v.mask()))?;
+            Self::from_mask(mask)
         } else {
             None
         }
@@ -89,8 +99,29 @@ impl ScalarFlow {
         match self {
             Self::Number => number(),
             Self::Boolean => boolean(),
+            Self::String => string(),
             Self::Undefined => undefined(),
+            Self::Alternatives(mask) => unions::primitive_type(mask),
         }
+    }
+    fn mask(self) -> u8 {
+        match self {
+            Self::Number => 1,
+            Self::Boolean => 2,
+            Self::String => 4,
+            Self::Undefined => 8,
+            Self::Alternatives(mask) => mask,
+        }
+    }
+    fn from_mask(mask: u8) -> Option<Self> {
+        Some(match mask {
+            0 => return None,
+            1 => Self::Number,
+            2 => Self::Boolean,
+            4 => Self::String,
+            8 => Self::Undefined,
+            mask => Self::Alternatives(mask),
+        })
     }
 }
 fn number() -> Type {
@@ -173,6 +204,7 @@ struct ReturnContext {
     value_returned: bool,
     array_parameters: SmallVec<[Option<arrays::ArrayRoot>; 4]>,
     array_result: Option<ArrayResult>,
+    unproven_string: bool,
 }
 
 struct WritePositions<'s> {
@@ -980,6 +1012,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             value_returned: false,
             array_parameters,
             array_result: None,
+            unproven_string: false,
         });
         let mut statements = vec![];
         self.reserve(&f.body.as_ref().unwrap().statements)?;
@@ -1072,6 +1105,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
         if first != ty {
             if let Some(joined) = optional_join(first, ty) {
+                if matches!(joined, Type::Union(_))
+                    && self.returns.as_ref().unwrap().unproven_string
+                {
+                    return self.unsupported(
+                        "inferred union string payload without a proven static lifetime",
+                        at,
+                    );
+                }
                 self.returns.as_mut().unwrap().inferred = Some((joined, None));
                 return Ok(());
             }
@@ -1236,6 +1277,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn expect(&self, actual: &Type, expected: &Type, at: oxc_span::Span) -> Result<()> {
         if actual == expected
+            || unions::accepts(actual, expected)
             || (is_undefined(actual) && *expected == unit())
             || matches!(expected, Type::Optional(inner) if actual == inner.as_ref() || is_undefined(actual))
         {
@@ -1346,6 +1388,27 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn adapt_value(&mut self, value: Expr, expected: &Type, at: oxc_span::Span) -> Result<Expr> {
         if value.ty != *expected {
+            if let Type::Union(members) = expected {
+                if matches!(value.ty, Type::Union(_)) {
+                    return self.union_match(
+                        value,
+                        u8::MAX,
+                        expected.clone(),
+                        at,
+                        |this, payload| this.adapt_value(payload, expected, at),
+                    );
+                }
+                if members.contains(&value.ty) {
+                    return Ok(node(
+                        TypedExpression::Cast(TypedCast {
+                            expr: Box::new(value),
+                            target_type: expected.clone(),
+                        }),
+                        expected.clone(),
+                        at,
+                    ));
+                }
+            }
             if let Type::Optional(inner) = expected {
                 if is_undefined(&value.ty) {
                     let none = var(self.name("None"), expected.clone(), at);
@@ -1508,13 +1571,21 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if flow == ScalarFlow::Undefined {
             return Ok(self.sequence(value, var(self.name("None"), undefined(), at), at));
         }
+        if matches!(value.ty, Type::Union(_)) {
+            let result = flow.ty();
+            return self.union_match(value, flow.mask(), result.clone(), at, |this, payload| {
+                this.adapt_value(payload, &result, at)
+            });
+        }
         self.optional_match(value, |_, payload| Ok(payload), None, flow.ty(), at)
     }
 
     fn normalize_returns(&mut self, statements: &mut [Stmt], result: &Type) -> Result<()> {
         for statement in statements {
             match &mut statement.node {
-                TypedStatement::Return(value) if matches!(result, Type::Optional(_)) => {
+                TypedStatement::Return(value)
+                    if matches!(result, Type::Optional(_) | Type::Union(_)) =>
+                {
                     let at =
                         oxc_span::Span::new(statement.span.start as u32, statement.span.end as u32);
                     let returned = value
@@ -1543,6 +1614,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn typeof_value(&mut self, value: Expr, at: oxc_span::Span) -> Result<Expr> {
+        if matches!(value.ty, Type::Union(_)) {
+            return self.union_match(value, u8::MAX, string(), at, |this, payload| {
+                this.typeof_value(payload, at)
+            });
+        }
         if matches!(value.ty, Type::Optional(_)) && !is_undefined(&value.ty) {
             let none = node(
                 TypedExpression::Literal(TypedLiteral::String(self.name("undefined"))),
@@ -1581,6 +1657,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn format_value(&mut self, value: Expr, at: oxc_span::Span) -> Result<Expr> {
+        if matches!(value.ty, Type::Union(_)) {
+            return self.union_match(value, u8::MAX, unit(), at, |this, payload| {
+                this.format_value(payload, at)
+            });
+        }
         if is_undefined(&value.ty) || value.ty == unit() {
             let print = self.call("$TS$print_undefined", vec![], unit(), at);
             return Ok(self.sequence(value, print, at));
@@ -1692,21 +1773,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         {
                             if u.operator.as_str() == "typeof" {
                                 if let js::Expression::Identifier(i) = &u.argument {
-                                    if let Ok(binding) = self.binding(i.name.as_str(), i.span) {
-                                        if let Type::Optional(inner) = &binding.ty {
-                                            let scalar = match text.value.as_str() {
-                                                "number" => **inner == number(),
-                                                "boolean" => **inner == boolean(),
-                                                _ => false,
-                                            };
-                                            if scalar || text.value == "undefined" {
-                                                self.narrow_name(
-                                                    i,
-                                                    if scalar { equality } else { !equality },
-                                                );
-                                            }
-                                        }
-                                    }
+                                    self.narrow_type_name(i, text.value.as_str(), equality);
                                 }
                             }
                         }
@@ -1789,6 +1856,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             Type::Primitive(PrimitiveType::Unit) => "void".into(),
             Type::Optional(inner) if **inner == Type::Never => "undefined".into(),
             Type::Optional(inner) => format!("{} | undefined", self.type_description(inner)),
+            Type::Union(members) => members
+                .iter()
+                .map(|ty| self.type_description(ty))
+                .collect::<Vec<_>>()
+                .join(" | "),
             Type::Array { element_type, .. } => {
                 format!("{}[]", self.type_description(element_type))
             }
@@ -1970,6 +2042,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     }
                 }
                 let view = r.argument.as_ref().and_then(|arg| self.view_of(arg));
+                if value.as_ref().is_some_and(|v| v.ty == string())
+                    && r.argument
+                        .as_ref()
+                        .is_some_and(|source| !self.immortal_string(source))
+                {
+                    self.returns.as_mut().unwrap().unproven_string = true;
+                }
                 let unit = unit();
                 let actual = value.as_ref().map_or(&unit, |value| &value.ty);
                 if let Some((ret, expected_view)) = self.returns.as_ref().unwrap().expected.clone()
@@ -2158,7 +2237,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 ty = value.ty.clone();
             }
             let unique = self.fresh(id.name.as_str());
-            if matches!(ty, Type::Optional(_)) {
+            if matches!(ty, Type::Optional(_) | Type::Union(_)) {
                 if let Some(flow) = ScalarFlow::of(&value.ty) {
                     self.flow.insert(unique, flow);
                 }
@@ -2196,6 +2275,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn truthy(&mut self, value: Expr, at: oxc_span::Span) -> Result<Expr> {
+        if matches!(value.ty, Type::Union(_)) {
+            return self.union_match(value, u8::MAX, boolean(), at, |this, payload| {
+                this.truthy(payload, at)
+            });
+        }
         if value.ty == unit() {
             return self.error(
                 ErrorKind::Type,
@@ -2227,6 +2311,22 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
         if value.ty == boolean() {
             return Ok(value);
+        }
+        if value.ty == string() {
+            let empty = node(
+                TypedExpression::Literal(TypedLiteral::String(self.name(""))),
+                string(),
+                at,
+            );
+            let equal = self.call("$String$equals", vec![value, empty], boolean(), at);
+            return Ok(node(
+                TypedExpression::Unary(TypedUnary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(equal),
+                }),
+                boolean(),
+                at,
+            ));
         }
         if value.ty == number() {
             // The ordered self-comparison rejects NaN as well as zero.
@@ -2304,14 +2404,16 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn expr_expected(&mut self, e: &js::Expression<'ast>, expected: &Type) -> Result<Expr> {
-        match e {
+        let value = match e {
             js::Expression::ArrayExpression(a) => self.array_literal(a, Some(expected)),
             js::Expression::ArrowFunctionExpression(a) => self.arrow(a, Some(expected)),
             js::Expression::ParenthesizedExpression(p) => {
                 self.expr_expected(&p.expression, expected)
             }
             _ => self.expr(e),
-        }
+        }?;
+        self.check_union_source(e, &value.ty, expected)?;
+        Ok(value)
     }
 
     fn arrow(
@@ -2344,6 +2446,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             value_returned: false,
             array_parameters: SmallVec::new(),
             array_result: None,
+            unproven_string: false,
         });
         let outer_loop = std::mem::replace(&mut self.loop_depth, 0);
         let outer_floor = std::mem::replace(&mut self.scope_floor, self.scopes.len());
@@ -2630,9 +2733,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let before = self.flow.clone();
                 self.narrow(&c.test, true);
                 let a = self.expr(&c.consequent)?;
+                let a_static = a.ty != string() || self.immortal_string(&c.consequent);
                 let then_flow = std::mem::replace(&mut self.flow, before);
                 self.narrow(&c.test, false);
                 let b = self.expr(&c.alternate)?;
+                let b_static = b.ty != string() || self.immortal_string(&c.alternate);
                 self.merge_flow(&then_flow);
                 if a.ty != b.ty
                     && matches!((&a.ty, &b.ty), (Type::Named { .. }, Type::Named { .. }))
@@ -2651,6 +2756,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         .unsupported("conditional objects with different property views", at);
                 }
                 let ty = joined.unwrap_or_else(|| a.ty.clone());
+                if matches!(ty, Type::Union(_)) && (!a_static || !b_static) {
+                    return self.unsupported(
+                        "conditional union string payload without a proven static lifetime",
+                        at,
+                    );
+                }
                 let a = self.adapt_value(a, &ty, at)?;
                 let b = self.adapt_value(b, &ty, at)?;
                 node(
@@ -2763,7 +2874,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     self.expect(logical, &ty, at)?;
                 }
                 self.check_view(self.view_of(&a.expression), view, at)?;
-                if matches!(ty, Type::Optional(_)) || is_undefined(&value.ty) {
+                if matches!(ty, Type::Optional(_) | Type::Union(_)) || is_undefined(&value.ty) {
                     self.adapt_value(value, &ty, at)?
                 } else {
                     if !matches!(ty, Type::Named { .. }) {
@@ -2855,6 +2966,26 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
         if matches!(left.ty, Type::Optional(_)) || matches!(right.ty, Type::Optional(_)) {
             return self.error(ErrorKind::Type, "operand is possibly undefined", at);
+        }
+        if matches!(left.ty, Type::Union(_)) || matches!(right.ty, Type::Union(_)) {
+            if matches!(op, "===" | "!==") {
+                return self.union_comparison(left, right, op == "!==", at);
+            }
+            if op == "+" && (left.ty == string() || right.ty == string()) {
+                return self.unsupported("string coercion of union values", at);
+            }
+            if matches!(op, "+" | "-" | "*" | "/" | "%" | "**") {
+                return self.error(
+                    ErrorKind::Type,
+                    "arithmetic requires a narrowed union operand",
+                    at,
+                );
+            }
+            return self.unsupported("this operator on union values", at);
+        }
+        if matches!(op, "-" | "*" | "/" | "%") {
+            self.expect(&left.ty, &number(), at)?;
+            self.expect(&right.ty, &number(), at)?;
         }
         if matches!(left.ty, Type::Function { .. }) || matches!(right.ty, Type::Function { .. }) {
             return self.unsupported("function object identity and operators", at);
@@ -3006,16 +3137,21 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         &mut self,
         c: &js::CallExpression<'ast>,
         mut hints: impl Iterator<Item = &'hint Type>,
+        mut static_strings: Option<&mut SmallVec<[bool; 4]>>,
     ) -> Result<Vec<Expr>> {
         let mut args = Vec::with_capacity(c.arguments.len());
         for arg in &c.arguments {
             let Some(e) = arg.as_expression() else {
                 return self.unsupported("spread arguments", c.span);
             };
-            args.push(match hints.next() {
+            let value = match hints.next() {
                 Some(ty) if !generics::unresolved(ty) => self.expr_expected(e, ty)?,
                 _ => self.expr(e)?,
-            });
+            };
+            if let Some(proofs) = &mut static_strings {
+                proofs.push(value.ty != string() || self.immortal_string(e));
+            }
+            args.push(value);
         }
         Ok(args)
     }
@@ -3038,7 +3174,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                             at,
                         );
                     }
-                    let args = self.arguments(c, std::iter::empty())?;
+                    let args = self.arguments(c, std::iter::empty(), None)?;
                     return self.log(args, at);
                 }
             }
@@ -3078,7 +3214,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             if c.type_arguments.is_some() || c.arguments.len() != params.len() {
                 return self.error(ErrorKind::Type, "wrong function argument count", at);
             }
-            let args = self.arguments(c, params.iter().map(|p| &p.ty))?;
+            let args = self.arguments(c, params.iter().map(|p| &p.ty), None)?;
             for (arg, expected) in args.iter().zip(params) {
                 self.expect(&arg.ty, &expected.ty, at)?;
             }
@@ -3122,7 +3258,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
             })
             .collect::<Result<_>>()?;
-        let args = self.arguments(c, hints.iter())?;
+        let mut static_strings = SmallVec::new();
+        let args = self.arguments(c, hints.iter(), Some(&mut static_strings))?;
         if !explicit {
             for ((arg, source), (_, expected, _)) in args.iter().zip(&c.arguments).zip(&sig.params)
             {
@@ -3140,11 +3277,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             .into_iter()
             .zip(&c.arguments)
             .zip(&sig.params)
-            .map(|((arg, source), (_, expected, view))| {
+            .zip(static_strings)
+            .map(|(((arg, source), (_, expected, view)), static_string)| {
                 let (expected, view) =
                     self.instantiate_type(expected, *view, &sig.type_params, &types, at)?;
                 let source = source.as_expression().unwrap();
                 self.expect(self.source_type(source, &arg.ty), &expected, at)?;
+                if matches!(expected, Type::Union(_)) && !static_string {
+                    return self.unsupported(
+                        "union string argument without a proven static lifetime",
+                        source.span(),
+                    );
+                }
                 self.fresh_properties(source, &expected)?;
                 self.check_view(self.view_of(source), view, at)?;
                 self.adapt_value(arg, &expected, at)
@@ -3238,8 +3382,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     fn record_write(&mut self, target: &Expr, ty: &Type) {
         if let TypedExpression::Variable(name) = target.node {
             self.flow.forget(name);
-            if matches!(target.ty, Type::Optional(_)) {
-                self.flow.remove(&name);
+            if matches!(target.ty, Type::Optional(_) | Type::Union(_)) {
                 if let Some(flow) = ScalarFlow::of(ty) {
                     self.flow.insert(name, flow);
                 }

@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 4,
+      "length": 1,
+      "file": "error_assignment.ts",
+      "message": "Type '\"s\"' is not assignable to type 'number | boolean'."
+    }
+  ],
+  "source_sha256": "2f0e933edbb35fd06ec9ed7366faedfe1274e755ecd6c0c9c5fa82f02c9df467",
+  "options": {}
+}

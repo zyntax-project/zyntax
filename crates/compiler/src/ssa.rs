@@ -6909,6 +6909,31 @@ impl SsaBuilder {
                 let mut block_id = block_id;
                 let operand_val = self.translate_operand(&mut block_id, &cast.expr)?;
 
+                if let Type::Union(members) = &cast.target_type {
+                    if let Some(index) = members.iter().position(|t| t == &cast.expr.ty) {
+                        let ty = self.convert_type(&cast.target_type);
+                        let result = self.create_value(ty.clone(), HirValueKind::Instruction);
+                        self.add_instruction(
+                            block_id,
+                            HirInstruction::CreateUnion {
+                                result,
+                                union_ty: ty,
+                                variant_index: index as u32,
+                                value: operand_val,
+                            },
+                        );
+                        self.settle(started, block_id);
+                        return Ok(result);
+                    }
+                    if cast.expr.ty != cast.target_type {
+                        return Err(crate::CompilerError::Analysis(
+                            "union conversion requires a member value or an explicit match".into(),
+                        ));
+                    }
+                    self.settle(started, block_id);
+                    return Ok(operand_val);
+                }
+
                 // Route the cast through the universal coercion
                 // funnel first. For Any↔T pairs the classifier picks
                 // UpcastBox / DowncastUnbox and emits the right
@@ -12862,6 +12887,9 @@ impl SsaBuilder {
             // value points at, with the elements behind it.
             Type::Array { size: None, .. } => list_header_type(),
             Type::Optional(inner_ty) => crate::hir::optional_type(self.convert_type(inner_ty)),
+            Type::Union(members) => {
+                crate::hir::anonymous_union_type(members.iter().map(|t| self.convert_type(t)))
+            }
             Type::Result { ok_type, err_type } => {
                 // Convert Result<T, E> to a tagged union: enum { Ok(T), Err(E) }
                 use crate::hir::{HirUnionType, HirUnionVariant};
@@ -15238,6 +15266,16 @@ impl SsaBuilder {
                     .collect();
                 Ok((u32::try_from(index).unwrap_or(u32::MAX), payload_types))
             }
+            Type::Union(members) => members
+                .iter()
+                .enumerate()
+                .find(|(index, _)| crate::hir::union_variant_name(*index) == *variant_name)
+                .map(|(index, ty)| (index as u32, vec![ty.clone()]))
+                .ok_or_else(|| {
+                    crate::CompilerError::Analysis(format!(
+                        "unknown union alternative `{variant_name}`"
+                    ))
+                }),
             Type::Optional(inner) => match variant_name.resolve_global().as_deref() {
                 Some("Some") => Ok((1, vec![inner.as_ref().clone()])),
                 Some("None") => Ok((0, vec![])),

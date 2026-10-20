@@ -79,7 +79,13 @@ storage currently requires a proven static string lifetime; owned reference
 containers and generic element mutation require additional lifetime analysis.
 These checks preserve direct element access without introducing a collector.
 
-General or reference-bearing unions, capturing closures, classes, multi-file linking and other
+Primitive `number | boolean | string` alternatives use shared native tagged unions.
+Declared and inferred returns, forwarding, widening, `typeof` narrowing, mutation,
+strict equality, truthiness and formatting preserve their payload types across
+tiers without heap boxes. String construction requires a proven static lifetime;
+owned/reference payloads and combinations with nullable values need further work.
+
+General reference-bearing unions, capturing closures, classes, multi-file linking and other
 unimplemented constructs produce `Unsupported` diagnostics. These are implementation gaps, measured by
 the conformance suite; they are not permanent language restrictions.
 

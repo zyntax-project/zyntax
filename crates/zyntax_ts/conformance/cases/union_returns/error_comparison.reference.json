@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2367,
+      "start": 35,
+      "length": 8,
+      "file": "error_comparison.ts",
+      "message": "This comparison appears to be unintentional because the types 'string | number' and 'boolean' have no overlap."
+    }
+  ],
+  "source_sha256": "2ecc607f8669acab3b7b9156ddc2e91434a5eef825779b28e7683f47e1bfe769",
+  "options": {}
+}

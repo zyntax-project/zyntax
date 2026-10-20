@@ -988,5 +988,80 @@
     "id": "arrays/error_type",
     "file": "cases/arrays/error_type.ts",
     "mode": "check"
+  },
+  {
+    "id": "union_returns/inferred",
+    "file": "cases/union_returns/inferred.ts",
+    "mode": "run"
+  },
+  {
+    "id": "union_returns/declared",
+    "file": "cases/union_returns/declared.ts",
+    "mode": "run"
+  },
+  {
+    "id": "union_returns/narrowing",
+    "file": "cases/union_returns/narrowing.ts",
+    "mode": "run"
+  },
+  {
+    "id": "union_returns/widening",
+    "file": "cases/union_returns/widening.ts",
+    "mode": "run"
+  },
+  {
+    "id": "union_returns/conditional",
+    "file": "cases/union_returns/conditional.ts",
+    "mode": "run"
+  },
+  {
+    "id": "union_returns/mutation",
+    "file": "cases/union_returns/mutation.ts",
+    "mode": "run"
+  },
+  {
+    "id": "union_returns/truthiness",
+    "file": "cases/union_returns/truthiness.ts",
+    "mode": "run"
+  },
+  {
+    "id": "union_returns/generic",
+    "file": "cases/union_returns/generic.ts",
+    "mode": "run"
+  },
+  {
+    "id": "union_returns/comparison",
+    "file": "cases/union_returns/comparison.ts",
+    "mode": "run"
+  },
+  {
+    "id": "union_returns/evaluation_order",
+    "file": "cases/union_returns/evaluation_order.ts",
+    "mode": "run"
+  },
+  {
+    "id": "union_returns/error_member",
+    "file": "cases/union_returns/error_member.ts",
+    "mode": "check"
+  },
+  {
+    "id": "union_returns/error_narrow",
+    "file": "cases/union_returns/error_narrow.ts",
+    "mode": "check"
+  },
+  {
+    "id": "union_returns/error_arithmetic",
+    "file": "cases/union_returns/error_arithmetic.ts",
+    "mode": "check"
+  },
+  {
+    "id": "union_returns/error_assignment",
+    "file": "cases/union_returns/error_assignment.ts",
+    "mode": "check"
+  },
+  {
+    "id": "union_returns/error_comparison",
+    "file": "cases/union_returns/error_comparison.ts",
+    "mode": "check"
   }
 ]

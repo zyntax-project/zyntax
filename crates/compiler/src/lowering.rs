@@ -4762,6 +4762,9 @@ impl LoweringContext {
             },
 
             Type::Optional(inner) => crate::hir::optional_type(self.convert_type(inner)),
+            Type::Union(members) => {
+                crate::hir::anonymous_union_type(members.iter().map(|t| self.convert_type(t)))
+            }
             Type::Tuple(types) if types.is_empty() => HirType::Void,
             Type::Tuple(types) => HirType::Struct(crate::hir::HirStructType {
                 name: None,

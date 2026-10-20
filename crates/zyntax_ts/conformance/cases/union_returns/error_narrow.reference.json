@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2362,
+      "start": 65,
+      "length": 1,
+      "file": "error_narrow.ts",
+      "message": "The left-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type."
+    }
+  ],
+  "source_sha256": "aa1597bcaa8c55b41570065413fcd66db396b3586cd91e53154bb3a4679bf229",
+  "options": {}
+}

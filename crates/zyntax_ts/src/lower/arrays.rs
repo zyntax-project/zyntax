@@ -152,9 +152,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     pub(super) fn immortal_string(&self, source: &js::Expression<'ast>) -> bool {
         match source {
             js::Expression::StringLiteral(s) => !s.lone_surrogates,
-            js::Expression::Identifier(i) => self
-                .binding(i.name.as_str(), i.span)
-                .is_ok_and(|b| self.flow.strings.contains(&b.name)),
+            js::Expression::Identifier(i) => self.binding(i.name.as_str(), i.span).is_ok_and(|b| {
+                self.flow.strings.contains(&b.name)
+                    || (matches!(b.ty, Type::Union(_))
+                        && self.flow.get(&b.name) == Some(&ScalarFlow::String))
+            }),
             js::Expression::ParenthesizedExpression(p) => self.immortal_string(&p.expression),
             js::Expression::CallExpression(c) => self
                 .array_call(c)

@@ -54,6 +54,35 @@ pub fn optional_type(payload: HirType) -> HirType {
     }))
 }
 
+/// Stable names for the positional alternatives of an anonymous union.
+pub fn union_variant_name(index: usize) -> InternedString {
+    match index {
+        0 => InternedString::new_global("Union0"),
+        1 => InternedString::new_global("Union1"),
+        2 => InternedString::new_global("Union2"),
+        3 => InternedString::new_global("Union3"),
+        _ => InternedString::new_global(&format!("Union{index}")),
+    }
+}
+
+/// `Type::Union` uses the same tagged storage in signatures and SSA values.
+pub fn anonymous_union_type(members: impl IntoIterator<Item = HirType>) -> HirType {
+    HirType::Union(Box::new(HirUnionType {
+        name: None,
+        variants: members
+            .into_iter()
+            .enumerate()
+            .map(|(index, ty)| HirUnionVariant {
+                name: union_variant_name(index),
+                ty,
+                discriminant: index as u64,
+            })
+            .collect(),
+        discriminant_type: Box::new(HirType::U32),
+        is_c_union: false,
+    }))
+}
+
 // ============================================================================
 // Algebraic Effects - HIR Types
 // ============================================================================

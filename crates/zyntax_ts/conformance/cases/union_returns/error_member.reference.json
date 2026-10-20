@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2345,
+      "start": 37,
+      "length": 4,
+      "file": "error_member.ts",
+      "message": "Argument of type 'boolean' is not assignable to parameter of type 'string | number'."
+    }
+  ],
+  "source_sha256": "46903f305531c720ef48f4f3547be19e4504133884eca9f49b48922b54aa6316",
+  "options": {}
+}
