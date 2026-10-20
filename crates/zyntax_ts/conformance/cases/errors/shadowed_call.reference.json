@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2349,
+      "start": 67,
+      "length": 1,
+      "file": "shadowed_call.ts",
+      "message": "This expression is not callable.\n  Type 'Number' has no call signatures."
+    }
+  ],
+  "source_sha256": "38a5a578c1095fa1b5d356f429797260c5e89fa403b4fe61ccee6a2871f62159",
+  "options": {}
+}

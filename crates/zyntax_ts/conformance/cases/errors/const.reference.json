@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2588,
+      "start": 21,
+      "length": 1,
+      "file": "const.ts",
+      "message": "Cannot assign to 'x' because it is a constant."
+    }
+  ],
+  "source_sha256": "8701e189038a7f710583d291f05918efc9d04404edb3cfa3516aed2bf084c401",
+  "options": {}
+}

@@ -1,0 +1,49 @@
+//! Native primitives; storage lifetimes are handled by the shared drop pass.
+
+extern "C" fn print_number(value: f64) {
+    if value == 0.0 {
+        print!("{}", if value.is_sign_negative() { "-0" } else { "0" });
+    } else {
+        print!("{}", dragonbox_ecma::Buffer::new().format(value));
+    }
+}
+
+extern "C" fn number_pow(base: f64, exponent: f64) -> f64 {
+    if base.abs() == 1.0 && exponent.is_infinite() {
+        f64::NAN
+    } else {
+        base.powf(exponent)
+    }
+}
+
+extern "C" fn print_space() {
+    print!(" ");
+}
+extern "C" fn print_newline() {
+    println!();
+}
+
+zrtl::zrtl_plugin! {
+    name: "typescript_native",
+    symbols: [
+        ("$TS$print_number", print_number),
+        ("$TS$pow", number_pow),
+        ("$TS$space", print_space),
+        ("$TS$newline", print_newline),
+    ]
+}
+
+/// Install native primitives and enable proven releases without a collector.
+pub fn register_runtime(
+    runtime: &mut zyntax_embed::TieredRuntime,
+) -> Result<(), zyntax_embed::RuntimeError> {
+    runtime.set_collector(zyntax_embed::Collector::None);
+    runtime.set_automatic_release(true);
+    runtime.set_pattern_rewrites(false);
+    runtime.declare_entry_points([crate::ENTRY]);
+    runtime.register_static_plugins([
+        zrtl_io::static_plugin(),
+        zrtl_string::static_plugin(),
+        static_plugin(),
+    ])
+}

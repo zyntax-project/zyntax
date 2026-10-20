@@ -1,0 +1,23 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2451,
+      "start": 4,
+      "length": 1,
+      "file": "duplicate_binding.ts",
+      "message": "Cannot redeclare block-scoped variable 'x'."
+    },
+    {
+      "code": 2451,
+      "start": 23,
+      "length": 1,
+      "file": "duplicate_binding.ts",
+      "message": "Cannot redeclare block-scoped variable 'x'."
+    }
+  ],
+  "source_sha256": "ccc46e407b3da55198cae07205cf84f6a8152e581a2f1d2c6c9036163ad4e5cb",
+  "options": {}
+}

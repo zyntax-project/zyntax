@@ -1,0 +1,326 @@
+[
+  {
+    "id": "numeric/arithmetic",
+    "file": "cases/numeric/arithmetic.ts",
+    "mode": "run"
+  },
+  {
+    "id": "numeric/division_zero",
+    "file": "cases/numeric/division_zero.ts",
+    "mode": "run"
+  },
+  {
+    "id": "numeric/negative_zero",
+    "file": "cases/numeric/negative_zero.ts",
+    "mode": "run"
+  },
+  {
+    "id": "numeric/rounding",
+    "file": "cases/numeric/rounding.ts",
+    "mode": "run"
+  },
+  {
+    "id": "numeric/safe_integer_boundary",
+    "file": "cases/numeric/safe_integer_boundary.ts",
+    "mode": "run"
+  },
+  {
+    "id": "numeric/format",
+    "file": "cases/numeric/format.ts",
+    "mode": "run"
+  },
+  {
+    "id": "numeric/remainder",
+    "file": "cases/numeric/remainder.ts",
+    "mode": "run"
+  },
+  {
+    "id": "control/for",
+    "file": "cases/control/for.ts",
+    "mode": "run"
+  },
+  {
+    "id": "control/while",
+    "file": "cases/control/while.ts",
+    "mode": "run"
+  },
+  {
+    "id": "control/break_continue",
+    "file": "cases/control/break_continue.ts",
+    "mode": "run"
+  },
+  {
+    "id": "control/shadowing",
+    "file": "cases/control/shadowing.ts",
+    "mode": "run"
+  },
+  {
+    "id": "control/ternary",
+    "file": "cases/control/ternary.ts",
+    "mode": "run"
+  },
+  {
+    "id": "control/truthiness",
+    "file": "cases/control/truthiness.ts",
+    "mode": "run"
+  },
+  {
+    "id": "control/short_circuit",
+    "file": "cases/control/short_circuit.ts",
+    "mode": "run"
+  },
+  {
+    "id": "functions/forward",
+    "file": "cases/functions/forward.ts",
+    "mode": "run"
+  },
+  {
+    "id": "functions/recursion",
+    "file": "cases/functions/recursion.ts",
+    "mode": "run"
+  },
+  {
+    "id": "functions/returns",
+    "file": "cases/functions/returns.ts",
+    "mode": "run"
+  },
+  {
+    "id": "functions/argument_order",
+    "file": "cases/functions/argument_order.ts",
+    "mode": "run"
+  },
+  {
+    "id": "functions/hot_calls",
+    "file": "cases/functions/hot_calls.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/local_alias",
+    "file": "cases/objects/local_alias.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/return_owned",
+    "file": "cases/objects/return_owned.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/borrowed_return",
+    "file": "cases/objects/borrowed_return.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/borrow_twice",
+    "file": "cases/objects/borrow_twice.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/layout_order",
+    "file": "cases/objects/layout_order.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/early_return",
+    "file": "cases/objects/early_return.ts",
+    "mode": "run"
+  },
+  {
+    "id": "policy/typescript_readonly_alias",
+    "file": "cases/policy/typescript_readonly_alias.ts",
+    "mode": "run"
+  },
+  {
+    "id": "policy/checked_readonly_alias",
+    "file": "cases/policy/checked_readonly_alias.ts",
+    "mode": "check",
+    "soundness": "checked",
+    "policy_error": true
+  },
+  {
+    "id": "strings/concat",
+    "file": "cases/strings/concat.ts",
+    "mode": "run"
+  },
+  {
+    "id": "strings/returned",
+    "file": "cases/strings/returned.ts",
+    "mode": "run"
+  },
+  {
+    "id": "types/primitive_alias",
+    "file": "cases/types/primitive_alias.ts",
+    "mode": "run"
+  },
+  {
+    "id": "errors/initializer",
+    "file": "cases/errors/initializer.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/argument",
+    "file": "cases/errors/argument.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/return",
+    "file": "cases/errors/return.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/implicit_any",
+    "file": "cases/errors/implicit_any.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/const",
+    "file": "cases/errors/const.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/readonly",
+    "file": "cases/errors/readonly.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/missing_field",
+    "file": "cases/errors/missing_field.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/missing_return",
+    "file": "cases/errors/missing_return.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/duplicate_binding",
+    "file": "cases/errors/duplicate_binding.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/syntax",
+    "file": "cases/errors/syntax.ts",
+    "mode": "check"
+  },
+  {
+    "id": "pending/inferred_return",
+    "file": "cases/pending/inferred_return.ts",
+    "mode": "run"
+  },
+  {
+    "id": "pending/union",
+    "file": "cases/pending/union.ts",
+    "mode": "run"
+  },
+  {
+    "id": "pending/generic",
+    "file": "cases/pending/generic.ts",
+    "mode": "run"
+  },
+  {
+    "id": "pending/arrays",
+    "file": "cases/pending/arrays.ts",
+    "mode": "run"
+  },
+  {
+    "id": "pending/closure",
+    "file": "cases/pending/closure.ts",
+    "mode": "run"
+  },
+  {
+    "id": "errors/temporal_dead_zone",
+    "file": "cases/errors/temporal_dead_zone.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/read_before_declaration",
+    "file": "cases/errors/read_before_declaration.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/shadowed_call",
+    "file": "cases/errors/shadowed_call.ts",
+    "mode": "check"
+  },
+  {
+    "id": "functions/shadow_builtin",
+    "file": "cases/functions/shadow_builtin.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/evaluation_order",
+    "file": "cases/objects/evaluation_order.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/identity",
+    "file": "cases/objects/identity.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/hot_allocations",
+    "file": "cases/objects/hot_allocations.ts",
+    "mode": "run"
+  },
+  {
+    "id": "policy/checked_readonly_assignment",
+    "file": "cases/policy/checked_readonly_assignment.ts",
+    "mode": "check",
+    "soundness": "checked",
+    "policy_error": true
+  },
+  {
+    "id": "policy/checked_readonly_argument",
+    "file": "cases/policy/checked_readonly_argument.ts",
+    "mode": "check",
+    "soundness": "checked",
+    "policy_error": true
+  },
+  {
+    "id": "policy/checked_readonly_return",
+    "file": "cases/policy/checked_readonly_return.ts",
+    "mode": "check",
+    "soundness": "checked",
+    "policy_error": true
+  },
+  {
+    "id": "policy/checked_readonly_assertion",
+    "file": "cases/policy/checked_readonly_assertion.ts",
+    "mode": "check",
+    "soundness": "checked",
+    "policy_error": true
+  },
+  {
+    "id": "policy/checked_readonly_inferred_assignment",
+    "file": "cases/policy/checked_readonly_inferred_assignment.ts",
+    "mode": "check",
+    "soundness": "checked",
+    "policy_error": true
+  },
+  {
+    "id": "strings/hot_calls",
+    "file": "cases/strings/hot_calls.ts",
+    "mode": "run"
+  },
+  {
+    "id": "pending/structural_width",
+    "file": "cases/pending/structural_width.ts",
+    "mode": "run"
+  },
+  {
+    "id": "numeric/power",
+    "file": "cases/numeric/power.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/assignment_receiver",
+    "file": "cases/objects/assignment_receiver.ts",
+    "mode": "run"
+  },
+  {
+    "id": "policy/checked_readonly_nonnull",
+    "file": "cases/policy/checked_readonly_nonnull.ts",
+    "mode": "check",
+    "soundness": "checked",
+    "policy_error": true
+  }
+]

@@ -1,0 +1,37 @@
+[package]
+name = "zyntax_ts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+description = "Native statically typed TypeScript frontend for Zyntax"
+
+[features]
+llvm-backend = ["zyntax_embed/llvm-backend"]
+
+[[bin]]
+name = "zynode"
+path = "src/main.rs"
+
+[dependencies]
+zyntax_typed_ast = { path = "../typed_ast" }
+zyntax_embed = { path = "../zyntax_embed" }
+zyntax_compiler = { path = "../compiler" }
+zrtl = { path = "../../sdk/zrtl" }
+zrtl_io = { path = "../../plugins/zrtl_io", features = ["linked-into-host"] }
+zrtl_string = { path = "../../plugins/zrtl_string", features = ["linked-into-host"] }
+oxc_allocator = "=0.150.0"
+oxc_ast = "=0.150.0"
+oxc_parser = "=0.150.0"
+oxc_span = "=0.150.0"
+oxc_semantic = "=0.150.0"
+dragonbox_ecma = { version = "=0.1.12", features = ["ecma"] }
+thiserror = "2"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+sha2 = "0.10"
+
+[lints]
+workspace = true

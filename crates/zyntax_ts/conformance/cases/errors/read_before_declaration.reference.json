@@ -1,0 +1,23 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2448,
+      "start": 12,
+      "length": 1,
+      "file": "read_before_declaration.ts",
+      "message": "Block-scoped variable 'x' used before its declaration."
+    },
+    {
+      "code": 2454,
+      "start": 12,
+      "length": 1,
+      "file": "read_before_declaration.ts",
+      "message": "Variable 'x' is used before being assigned."
+    }
+  ],
+  "source_sha256": "978784a0142f8864f0bdffa9de657ab30416fb13882f35b9ee574b73791ea25a",
+  "options": {}
+}

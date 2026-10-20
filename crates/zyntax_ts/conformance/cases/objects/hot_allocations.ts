@@ -1,0 +1,1 @@
+type Point = { x: number }; function value(x: number): number { const p: Point = { x: x }; return p.x + 1; } let sum: number = 0; for (let i: number = 0; i < 1000; i++) { sum += value(i); } console.log(sum);

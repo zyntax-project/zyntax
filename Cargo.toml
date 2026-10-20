@@ -12,6 +12,7 @@ members = [
     "crates/zynml",
     "crates/pattern_engine",
     "crates/zyntax_python",
+    "crates/zyntax_ts",
     "crates/zyntax_lua",
     "crates/zyntax_lua/capi",
     "crates/zyntax_builtins",

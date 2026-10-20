@@ -1,0 +1,10 @@
+{
+  "compiler": "6.0.2",
+  "accepted": true,
+  "kind": "Accept",
+  "diagnostics": [],
+  "stdout": "8 -8 1 1 NaN NaN -Infinity\n",
+  "exit": 0,
+  "source_sha256": "2b9978e57baf2ed07983a0a14f9ea3af4a6cb878ff6dd3b22f41b53b29570880",
+  "options": {}
+}

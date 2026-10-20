@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2741,
+      "start": 48,
+      "length": 1,
+      "file": "missing_field.ts",
+      "message": "Property 'y' is missing in type '{ x: number; }' but required in type 'Point'."
+    }
+  ],
+  "source_sha256": "732e7b52fa051d5088a060a5083664f9c40f571a8ba032d8051af4c9b0e15be2",
+  "options": {}
+}

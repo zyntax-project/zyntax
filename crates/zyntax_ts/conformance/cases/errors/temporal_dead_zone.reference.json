@@ -1,0 +1,23 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2448,
+      "start": 41,
+      "length": 1,
+      "file": "temporal_dead_zone.ts",
+      "message": "Block-scoped variable 'x' used before its declaration."
+    },
+    {
+      "code": 2454,
+      "start": 41,
+      "length": 1,
+      "file": "temporal_dead_zone.ts",
+      "message": "Variable 'x' is used before being assigned."
+    }
+  ],
+  "source_sha256": "da6c3da892be52615126080ae6b5e38bfa495a34a22b9de78cf0e2e8ed017e49",
+  "options": {}
+}

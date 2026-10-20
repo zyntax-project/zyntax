@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 6,
+      "length": 1,
+      "file": "initializer.ts",
+      "message": "Type 'string' is not assignable to type 'number'."
+    }
+  ],
+  "source_sha256": "99068d74495d2a2f7ac6b351941308bb897e7e67e175649c2e08201bd6970d42",
+  "options": {}
+}

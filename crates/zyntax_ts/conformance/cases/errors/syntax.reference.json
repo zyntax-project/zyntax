@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Syntax",
+  "diagnostics": [
+    {
+      "code": 1109,
+      "start": 18,
+      "length": 1,
+      "file": "syntax.ts",
+      "message": "Expression expected."
+    }
+  ],
+  "source_sha256": "e55d27b056cfb94f2a1f9a9aa87bee6173fda82df5d21afb62d81cf1374ead58",
+  "options": {}
+}

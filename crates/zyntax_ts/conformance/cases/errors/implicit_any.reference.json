@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 7006,
+      "start": 11,
+      "length": 1,
+      "file": "implicit_any.ts",
+      "message": "Parameter 'x' implicitly has an 'any' type."
+    }
+  ],
+  "source_sha256": "b920789f1880d77f15a7d6027d5125acfcfecfa58af27dd9736c84f67424bd9b",
+  "options": {}
+}
