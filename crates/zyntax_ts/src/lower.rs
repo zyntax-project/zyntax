@@ -34,6 +34,61 @@ fn node<T>(value: T, ty: Type, at: oxc_span::Span) -> TypedNode<T> {
 fn unit() -> Type {
     Type::Primitive(PrimitiveType::Unit)
 }
+// Only the empty variant is inhabited; `void` remains a distinct type.
+fn undefined() -> Type {
+    Type::Optional(Box::new(Type::Never))
+}
+fn is_undefined(ty: &Type) -> bool {
+    matches!(ty, Type::Optional(inner) if **inner == Type::Never)
+}
+fn is_scalar(ty: &Type) -> bool {
+    *ty == number() || *ty == boolean()
+}
+fn optional_join(a: &Type, b: &Type) -> Option<Type> {
+    if a == b {
+        return Some(a.clone());
+    }
+    if is_undefined(a) && is_scalar(b) {
+        return Some(Type::Optional(Box::new(b.clone())));
+    }
+    if is_undefined(b) && is_scalar(a) {
+        return Some(Type::Optional(Box::new(a.clone())));
+    }
+    for (optional, other) in [(a, b), (b, a)] {
+        if let Type::Optional(inner) = optional {
+            if inner.as_ref() == other || is_undefined(other) {
+                return Some(optional.clone());
+            }
+        }
+    }
+    None
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalarFlow {
+    Number,
+    Boolean,
+    Undefined,
+}
+impl ScalarFlow {
+    fn of(ty: &Type) -> Option<Self> {
+        if *ty == number() {
+            Some(Self::Number)
+        } else if *ty == boolean() {
+            Some(Self::Boolean)
+        } else if is_undefined(ty) {
+            Some(Self::Undefined)
+        } else {
+            None
+        }
+    }
+    fn ty(self) -> Type {
+        match self {
+            Self::Number => number(),
+            Self::Boolean => boolean(),
+            Self::Undefined => undefined(),
+        }
+    }
+}
 fn number() -> Type {
     Type::Primitive(PrimitiveType::F64)
 }
@@ -93,6 +148,7 @@ struct Field {
 }
 struct Binding {
     name: InternedString,
+    symbol: Option<oxc_semantic::SymbolId>,
     ty: Type,
     view: Option<InternedString>,
     mutable: bool,
@@ -109,6 +165,25 @@ struct Signature<'ast> {
 struct ReturnContext {
     expected: Option<(Type, Option<InternedString>)>,
     inferred: Option<(Type, Option<InternedString>)>,
+    value_returned: bool,
+}
+
+struct WritePositions<'s> {
+    scoping: &'s oxc_semantic::Scoping,
+    positions: &'s mut FxHashMap<oxc_semantic::SymbolId, SmallVec<[u32; 2]>>,
+}
+impl<'ast> Visit<'ast> for WritePositions<'_> {
+    fn visit_identifier_reference(&mut self, id: &js::IdentifierReference<'ast>) {
+        let reference = self.scoping.get_reference(id.reference_id.get().unwrap());
+        if reference.is_write() {
+            if let Some(symbol) = reference.symbol_id() {
+                self.positions
+                    .entry(symbol)
+                    .or_default()
+                    .push(id.span.start);
+            }
+        }
+    }
 }
 
 struct Dependency {
@@ -272,6 +347,8 @@ struct Lowerer<'ast, 'program> {
     self_recursive: FxHashSet<InternedString>,
     scopes: Vec<FxHashMap<InternedString, Binding>>,
     scope_floor: usize,
+    flow: FxHashMap<InternedString, ScalarFlow>,
+    writes: FxHashMap<oxc_semantic::SymbolId, SmallVec<[u32; 2]>>,
     declarations: Vec<TypedNode<TypedDeclaration>>,
     returns: Option<ReturnContext>,
     loop_depth: usize,
@@ -296,6 +373,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             self_recursive: FxHashSet::default(),
             scopes: vec![],
             scope_floor: 0,
+            flow: FxHashMap::default(),
+            writes: FxHashMap::default(),
             declarations: vec![],
             returns: None,
             loop_depth: 0,
@@ -348,6 +427,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         source: &str,
         file: &str,
     ) -> Result<TypedProgram> {
+        WritePositions {
+            scoping: semantic.scoping(),
+            positions: &mut self.writes,
+        }
+        .visit_program(program);
         // Declare types before signatures; resolve forward aliases to a fixed point.
         let mut pending: Vec<_> = program
             .body
@@ -422,7 +506,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 body.extend(self.statement(item)?);
             }
         }
-        self.scopes.pop();
+        self.pop_scope();
         self.declarations.push(node(
             TypedDeclaration::Function(TypedFunction {
                 name: intern(crate::ENTRY),
@@ -645,6 +729,28 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::TSType::TSBooleanKeyword(_) => (boolean(), None),
             js::TSType::TSStringKeyword(_) => (string(), None),
             js::TSType::TSVoidKeyword(_) => (unit(), None),
+            js::TSType::TSUndefinedKeyword(_) => (undefined(), None),
+            js::TSType::TSUnionType(u) => {
+                let mut members = u.types.iter();
+                let (mut ty, view) = self.ty(members.next().unwrap())?;
+                if view.is_some() {
+                    return self.unsupported("reference-bearing unions", u.span);
+                }
+                for member in members {
+                    let (other, view) = self.ty(member)?;
+                    if view.is_some() {
+                        return self.unsupported("reference-bearing unions", u.span);
+                    }
+                    ty = optional_join(&ty, &other).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::Unsupported,
+                            "this union payload combination is not implemented yet",
+                            u.span,
+                        )
+                    })?;
+                }
+                (ty, None)
+            }
             js::TSType::TSFunctionType(f) => {
                 if f.type_parameters.is_some() || f.this_param.is_some() || f.params.rest.is_some()
                 {
@@ -805,13 +911,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.active_types.extend(sig.type_params.iter().cloned());
         self.scopes.push(FxHashMap::default());
         let mut params = vec![];
-        for (name, ty, view) in &sig.params {
+        for ((name, ty, view), parameter) in sig.params.iter().zip(&f.params.items) {
+            let js::BindingPattern::BindingIdentifier(id) = &parameter.pattern else {
+                unreachable!()
+            };
             let unique = self.fresh(name);
             let source_name = self.name(name);
             self.scopes.last_mut().unwrap().insert(
                 source_name,
                 Binding {
                     name: unique,
+                    symbol: id.symbol_id.get(),
                     ty: ty.clone(),
                     view: *view,
                     mutable: true,
@@ -830,6 +940,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 sig.ret.clone().map(|ty| (ty, sig.ret_view))
             },
             inferred: None,
+            value_returned: false,
         });
         let mut statements = vec![];
         self.reserve(&f.body.as_ref().unwrap().statements)?;
@@ -839,6 +950,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let context = self.returns.take().unwrap();
         let (mut ret, ret_view) = match context.expected {
             Some(result) => result,
+            None if !context.value_returned => (unit(), None),
             None => context.inferred.unwrap_or((unit(), None)),
         };
         let complete = Self::returns(&f.body.as_ref().unwrap().statements);
@@ -847,14 +959,23 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
         if ret != unit() && !complete {
             if inferred {
-                return self.unsupported("possibly undefined inferred return types", f.span);
+                ret = optional_join(&ret, &undefined()).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unsupported,
+                        "possibly undefined reference return types are not implemented yet",
+                        f.span,
+                    )
+                })?;
+            } else if !matches!(ret, Type::Optional(_)) {
+                return self.error(ErrorKind::Type, "function lacks an ending return", f.span);
             }
-            return self.error(ErrorKind::Type, "function lacks an ending return", f.span);
+            statements.push(stmt(TypedStatement::Return(None), f.span));
         }
         let native = sig.native;
         if recursive {
             Self::settle_self_calls(&mut statements, native, &ret);
         }
+        self.normalize_returns(&mut statements, &ret)?;
         let type_params = sig
             .type_params
             .iter()
@@ -869,7 +990,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             .expect("signature handles do not escape body lowering");
         sig.ret = Some(ret.clone());
         sig.ret_view = ret_view;
-        self.scopes.pop();
+        self.pop_scope();
         self.active_types.clear();
         self.declarations.push(node(
             TypedDeclaration::Function(TypedFunction {
@@ -909,6 +1030,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             return Ok(());
         }
         if first != ty {
+            if let Some(joined) = optional_join(first, ty) {
+                self.returns.as_mut().unwrap().inferred = Some((joined, None));
+                return Ok(());
+            }
             return self.unsupported("inferred union return types", at);
         }
         let logical = |view: Option<InternedString>| {
@@ -1034,6 +1159,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     name,
                     Binding {
                         name: unique,
+                        symbol: id.symbol_id.get(),
                         ty: Type::Never,
                         view: None,
                         mutable: true,
@@ -1068,7 +1194,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn expect(&self, actual: &Type, expected: &Type, at: oxc_span::Span) -> Result<()> {
-        if actual == expected {
+        if actual == expected
+            || (is_undefined(actual) && *expected == unit())
+            || matches!(expected, Type::Optional(inner) if actual == inner.as_ref() || is_undefined(actual))
+        {
             Ok(())
         } else {
             if *actual == Type::Never {
@@ -1174,7 +1303,26 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         Ok(())
     }
 
-    fn adapt_record(&mut self, value: Expr, expected: &Type, at: oxc_span::Span) -> Result<Expr> {
+    fn adapt_value(&mut self, value: Expr, expected: &Type, at: oxc_span::Span) -> Result<Expr> {
+        if value.ty != *expected {
+            if let Type::Optional(inner) = expected {
+                if is_undefined(&value.ty) {
+                    let none = var(self.name("None"), expected.clone(), at);
+                    if matches!(value.node, TypedExpression::Variable(name) if name == self.name("None"))
+                    {
+                        return Ok(none);
+                    }
+                    return Ok(self.sequence(value, none, at));
+                }
+                if value.ty == **inner {
+                    return Ok(call(self.name("Some"), vec![value], expected.clone(), at));
+                }
+            }
+            if *expected == unit() && is_undefined(&value.ty) {
+                let unit = node(TypedExpression::Literal(TypedLiteral::Unit), unit(), at);
+                return Ok(self.sequence(value, unit, at));
+            }
+        }
         if value.ty == *expected || !matches!(expected, Type::Named { .. }) {
             return Ok(value);
         }
@@ -1233,12 +1381,363 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         ))
     }
 
+    fn sequence(&self, value: Expr, result: Expr, at: oxc_span::Span) -> Expr {
+        let ty = result.ty.clone();
+        node(
+            TypedExpression::Block(TypedBlock {
+                statements: vec![expression(value), expression(result)],
+                span: span(at),
+            }),
+            ty,
+            at,
+        )
+    }
+
+    fn optional_match(
+        &mut self,
+        value: Expr,
+        some: impl FnOnce(&mut Self, Expr) -> Result<Expr>,
+        none: Option<Expr>,
+        result: Type,
+        at: oxc_span::Span,
+    ) -> Result<Expr> {
+        let Type::Optional(inner) = &value.ty else {
+            unreachable!()
+        };
+        let name = self.fresh("present");
+        let body = some(self, var(name, inner.as_ref().clone(), at))?;
+        let mut arms = Vec::with_capacity(1 + usize::from(none.is_some()));
+        arms.push(TypedMatchArm {
+            pattern: Box::new(node(
+                TypedPattern::Enum {
+                    name: self.name("Option"),
+                    variant: self.name("Some"),
+                    fields: vec![node(
+                        TypedPattern::Identifier {
+                            name,
+                            mutability: Mutability::Immutable,
+                        },
+                        inner.as_ref().clone(),
+                        at,
+                    )],
+                },
+                value.ty.clone(),
+                at,
+            )),
+            guard: None,
+            body: Box::new(body),
+        });
+        if let Some(body) = none {
+            arms.push(TypedMatchArm {
+                pattern: Box::new(node(
+                    TypedPattern::Enum {
+                        name: self.name("Option"),
+                        variant: self.name("None"),
+                        fields: vec![],
+                    },
+                    value.ty.clone(),
+                    at,
+                )),
+                guard: None,
+                body: Box::new(body),
+            });
+        }
+        Ok(node(
+            TypedExpression::Match(TypedMatchExpr {
+                scrutinee: Box::new(value),
+                arms,
+            }),
+            result,
+            at,
+        ))
+    }
+
+    fn flow_read(
+        &mut self,
+        value: Expr,
+        flow: Option<ScalarFlow>,
+        at: oxc_span::Span,
+    ) -> Result<Expr> {
+        let Some(flow) = flow else {
+            return Ok(value);
+        };
+        if ScalarFlow::of(&value.ty) == Some(flow) {
+            return Ok(value);
+        }
+        if flow == ScalarFlow::Undefined {
+            return Ok(self.sequence(value, var(self.name("None"), undefined(), at), at));
+        }
+        self.optional_match(value, |_, payload| Ok(payload), None, flow.ty(), at)
+    }
+
+    fn normalize_returns(&mut self, statements: &mut [Stmt], result: &Type) -> Result<()> {
+        for statement in statements {
+            match &mut statement.node {
+                TypedStatement::Return(value) if matches!(result, Type::Optional(_)) => {
+                    let at =
+                        oxc_span::Span::new(statement.span.start as u32, statement.span.end as u32);
+                    let returned = value
+                        .take()
+                        .map(|e| *e)
+                        .unwrap_or_else(|| var(self.name("None"), undefined(), at));
+                    *value = Some(Box::new(self.adapt_value(returned, result, at)?));
+                }
+                TypedStatement::Block(b) => self.normalize_returns(&mut b.statements, result)?,
+                TypedStatement::If(i) => {
+                    self.normalize_returns(&mut i.then_block.statements, result)?;
+                    if let Some(b) = &mut i.else_block {
+                        self.normalize_returns(&mut b.statements, result)?;
+                    }
+                }
+                TypedStatement::While(w) => {
+                    self.normalize_returns(&mut w.body.statements, result)?
+                }
+                TypedStatement::ForCStyle(f) => {
+                    self.normalize_returns(&mut f.body.statements, result)?
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn typeof_value(&mut self, value: Expr, at: oxc_span::Span) -> Result<Expr> {
+        if matches!(value.ty, Type::Optional(_)) && !is_undefined(&value.ty) {
+            let none = node(
+                TypedExpression::Literal(TypedLiteral::String(self.name("undefined"))),
+                string(),
+                at,
+            );
+            return self.optional_match(
+                value,
+                |this, payload| this.typeof_value(payload, at),
+                Some(none),
+                string(),
+                at,
+            );
+        }
+        let text = if value.ty == number() {
+            "number"
+        } else if value.ty == boolean() {
+            "boolean"
+        } else if is_undefined(&value.ty) || value.ty == unit() {
+            "undefined"
+        } else if value.ty == string() {
+            "string"
+        } else if matches!(value.ty, Type::Function { .. }) {
+            "function"
+        } else if matches!(value.ty, Type::Named { .. }) {
+            "object"
+        } else {
+            return self.unsupported("typeof this type", at);
+        };
+        let text = node(
+            TypedExpression::Literal(TypedLiteral::String(self.name(text))),
+            string(),
+            at,
+        );
+        Ok(self.sequence(value, text, at))
+    }
+
+    fn format_value(&mut self, value: Expr, at: oxc_span::Span) -> Result<Expr> {
+        if is_undefined(&value.ty) || value.ty == unit() {
+            let print = self.call("$TS$print_undefined", vec![], unit(), at);
+            return Ok(self.sequence(value, print, at));
+        }
+        if matches!(value.ty, Type::Optional(_)) {
+            let none = self.call("$TS$print_undefined", vec![], unit(), at);
+            return self.optional_match(
+                value,
+                |this, payload| this.format_value(payload, at),
+                Some(none),
+                unit(),
+                at,
+            );
+        }
+        let symbol = if value.ty == number() {
+            "$TS$print_number"
+        } else if value.ty == boolean() {
+            "$IO$print_bool"
+        } else if value.ty == string() {
+            "$IO$print"
+        } else {
+            return self.unsupported("console formatting of this type", at);
+        };
+        Ok(self.call(symbol, vec![value], unit(), at))
+    }
+
+    fn pop_scope(&mut self) {
+        for binding in self.scopes.pop().unwrap().values() {
+            self.flow.remove(&binding.name);
+        }
+    }
+
+    fn clear_written_flow(&mut self, at: oxc_span::Span) {
+        if self.flow.is_empty() {
+            return;
+        }
+        for scope in &self.scopes {
+            for binding in scope.values() {
+                if binding
+                    .symbol
+                    .and_then(|id| self.writes.get(&id))
+                    .is_some_and(|writes| writes.iter().any(|p| at.start <= *p && *p < at.end))
+                {
+                    self.flow.remove(&binding.name);
+                }
+            }
+        }
+    }
+
+    fn merge_flow(&mut self, other: &FxHashMap<InternedString, ScalarFlow>) {
+        self.flow
+            .retain(|name, value| other.get(name) == Some(value));
+    }
+
+    fn global_undefined(&self, e: &js::Expression<'ast>) -> bool {
+        match e {
+            js::Expression::Identifier(i) if i.name == "undefined" => !self
+                .scopes
+                .iter()
+                .any(|s| s.contains_key(&self.name("undefined"))),
+            js::Expression::ParenthesizedExpression(p) => self.global_undefined(&p.expression),
+            _ => false,
+        }
+    }
+
+    fn narrow(&mut self, test: &js::Expression<'ast>, truth: bool) {
+        match test {
+            js::Expression::ParenthesizedExpression(p) => self.narrow(&p.expression, truth),
+            js::Expression::UnaryExpression(u) if u.operator.as_str() == "!" => {
+                self.narrow(&u.argument, !truth)
+            }
+            js::Expression::Identifier(i) if truth => self.narrow_name(i, true),
+            js::Expression::LogicalExpression(l)
+                if (truth && l.operator.as_str() == "&&")
+                    || (!truth && l.operator.as_str() == "||") =>
+            {
+                self.narrow(&l.left, truth);
+                self.clear_written_flow(l.right.span());
+                self.narrow(&l.right, truth);
+            }
+            js::Expression::BinaryExpression(b)
+                if matches!(b.operator.as_str(), "===" | "!==" | "==" | "!=") =>
+            {
+                let present = truth == matches!(b.operator.as_str(), "!==" | "!=");
+                if self.global_undefined(&b.right) {
+                    if let js::Expression::Identifier(i) = &b.left {
+                        self.narrow_name(i, present);
+                    }
+                } else if self.global_undefined(&b.left) {
+                    if let js::Expression::Identifier(i) = &b.right {
+                        self.narrow_name(i, present);
+                    }
+                } else {
+                    let equality = truth == matches!(b.operator.as_str(), "===" | "==");
+                    for (operand, text) in [(&b.left, &b.right), (&b.right, &b.left)] {
+                        if let (
+                            js::Expression::UnaryExpression(u),
+                            js::Expression::StringLiteral(text),
+                        ) = (operand, text)
+                        {
+                            if u.operator.as_str() == "typeof" {
+                                if let js::Expression::Identifier(i) = &u.argument {
+                                    if let Ok(binding) = self.binding(i.name.as_str(), i.span) {
+                                        if let Type::Optional(inner) = &binding.ty {
+                                            let scalar = match text.value.as_str() {
+                                                "number" => **inner == number(),
+                                                "boolean" => **inner == boolean(),
+                                                _ => false,
+                                            };
+                                            if scalar || text.value == "undefined" {
+                                                self.narrow_name(
+                                                    i,
+                                                    if scalar { equality } else { !equality },
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn narrow_name(&mut self, id: &js::IdentifierReference<'ast>, present: bool) {
+        if let Ok(binding) = self.binding(id.name.as_str(), id.span) {
+            if let Type::Optional(inner) = &binding.ty {
+                let flow = if present {
+                    ScalarFlow::of(inner)
+                } else {
+                    Some(ScalarFlow::Undefined)
+                };
+                if let Some(flow) = flow {
+                    self.flow.insert(binding.name, flow);
+                }
+            }
+        }
+    }
+
+    fn optional_equal(&mut self, left: Expr, right: Expr, at: oxc_span::Span) -> Result<Expr> {
+        if is_undefined(&left.ty) || left.ty == unit() {
+            if is_undefined(&right.ty) || right.ty == unit() {
+                return Ok(node(
+                    TypedExpression::Literal(TypedLiteral::Bool(true)),
+                    boolean(),
+                    at,
+                ));
+            }
+            if matches!(right.ty, Type::Optional(_)) {
+                let no = node(
+                    TypedExpression::Literal(TypedLiteral::Bool(false)),
+                    boolean(),
+                    at,
+                );
+                let yes = node(
+                    TypedExpression::Literal(TypedLiteral::Bool(true)),
+                    boolean(),
+                    at,
+                );
+                return self.optional_match(right, |_, _| Ok(no), Some(yes), boolean(), at);
+            }
+            return Ok(node(
+                TypedExpression::Literal(TypedLiteral::Bool(false)),
+                boolean(),
+                at,
+            ));
+        }
+        if is_undefined(&right.ty) || right.ty == unit() {
+            return self.optional_equal(right, left, at);
+        }
+        if matches!(left.ty, Type::Optional(_)) {
+            let no =
+                self.optional_equal(var(self.name("None"), undefined(), at), right.clone(), at)?;
+            return self.optional_match(
+                left,
+                |this, payload| this.optional_equal(payload, right, at),
+                Some(no),
+                boolean(),
+                at,
+            );
+        }
+        if matches!(right.ty, Type::Optional(_)) {
+            return self.optional_equal(right, left, at);
+        }
+        Ok(binary(BinaryOp::Eq, left, right, boolean(), at))
+    }
+
     fn type_description(&self, ty: &Type) -> String {
         match ty {
             Type::Primitive(PrimitiveType::F64) => "number".into(),
             Type::Primitive(PrimitiveType::Bool) => "boolean".into(),
             Type::Primitive(PrimitiveType::String) => "string".into(),
             Type::Primitive(PrimitiveType::Unit) => "void".into(),
+            Type::Optional(inner) if **inner == Type::Never => "undefined".into(),
+            Type::Optional(inner) => format!("{} | undefined", self.type_description(inner)),
             Type::Never => "never".into(),
             Type::TypeVar(t) => t.name.and_then(|n| n.resolve_global()).unwrap_or_default(),
             Type::Function {
@@ -1367,7 +1866,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             s => self.statement(s)?,
         };
-        self.scopes.pop();
+        self.pop_scope();
         Ok(TypedBlock {
             statements,
             span: span(statement.span()),
@@ -1402,6 +1901,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         None => self.expr(arg),
                     })
                     .transpose()?;
+                if value.is_none()
+                    && hint
+                        .as_ref()
+                        .is_some_and(|t| matches!(t, Type::Optional(_)))
+                {
+                    value = Some(var(self.name("None"), undefined(), at));
+                }
                 let view = r.argument.as_ref().and_then(|arg| self.view_of(arg));
                 let unit = unit();
                 let actual = value.as_ref().map_or(&unit, |value| &value.ty);
@@ -1415,17 +1921,37 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     self.check_view(view, expected_view, at)?;
                     if let (Some(source), Some(returned)) = (&r.argument, value.take()) {
                         self.fresh_properties(source, &ret)?;
-                        value = Some(self.adapt_record(returned, &ret, at)?);
+                        value = Some(self.adapt_value(returned, &ret, at)?);
                     }
                 } else {
+                    self.returns.as_mut().unwrap().value_returned |= value.is_some();
+                    let actual = if value.is_none() {
+                        &undefined()
+                    } else {
+                        actual
+                    };
                     self.record_return(actual, view, at)?;
                 }
                 vec![stmt(TypedStatement::Return(value.map(Box::new)), at)]
             }
             js::Statement::IfStatement(i) => {
                 let condition = self.condition(&i.test)?;
+                let before = self.flow.clone();
+                self.narrow(&i.test, true);
                 let then_block = self.block(&i.consequent)?;
+                let then_flow = std::mem::replace(&mut self.flow, before);
+                self.narrow(&i.test, false);
                 let else_block = i.alternate.as_ref().map(|s| self.block(s)).transpose()?;
+                let then_returns = Self::returns(std::slice::from_ref(&i.consequent));
+                let else_returns = i
+                    .alternate
+                    .as_ref()
+                    .is_some_and(|s| Self::returns(std::slice::from_ref(s)));
+                if else_returns {
+                    self.flow = then_flow;
+                } else if !then_returns {
+                    self.merge_flow(&then_flow);
+                }
                 vec![stmt(
                     TypedStatement::If(TypedIf {
                         condition: Box::new(condition),
@@ -1437,10 +1963,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 )]
             }
             js::Statement::WhileStatement(w) => {
+                self.clear_written_flow(w.span);
                 let condition = self.condition(&w.test)?;
+                self.narrow(&w.test, true);
                 self.loop_depth += 1;
                 let body = self.block(&w.body)?;
                 self.loop_depth -= 1;
+                self.clear_written_flow(w.span);
                 vec![stmt(
                     TypedStatement::While(TypedWhile {
                         condition: Box::new(condition),
@@ -1463,22 +1992,33 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         return self.unsupported("for initializer", at);
                     }
                 }
+                let repeated = oxc_span::Span::new(
+                    f.init.as_ref().map_or(f.span.start, |i| i.span().end),
+                    f.span.end,
+                );
+                self.clear_written_flow(repeated);
                 let condition = f
                     .test
                     .as_ref()
                     .map(|e| self.condition(e))
                     .transpose()?
                     .map(Box::new);
+                self.clear_written_flow(repeated);
                 let update = f
                     .update
                     .as_ref()
                     .map(|e| self.expr(e))
                     .transpose()?
                     .map(Box::new);
+                self.clear_written_flow(repeated);
+                if let Some(test) = &f.test {
+                    self.narrow(test, true);
+                }
                 self.loop_depth += 1;
                 let body = self.block(&f.body)?;
                 self.loop_depth -= 1;
-                self.scopes.pop();
+                self.clear_written_flow(repeated);
+                self.pop_scope();
                 vec![stmt(
                     TypedStatement::ForCStyle(TypedForCStyle {
                         init: Some(Box::new(stmt(
@@ -1548,10 +2088,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 ty = value.ty.clone();
             }
             let unique = self.fresh(id.name.as_str());
+            if matches!(ty, Type::Optional(_)) {
+                if let Some(flow) = ScalarFlow::of(&value.ty) {
+                    self.flow.insert(unique, flow);
+                }
+            }
+            let value = self.adapt_value(value, &ty, d.span)?;
             self.scopes.last_mut().unwrap().insert(
                 name,
                 Binding {
                     name: unique,
+                    symbol: id.symbol_id.get(),
                     ty: ty.clone(),
                     view,
                     mutable: kind == "let",
@@ -1574,13 +2121,45 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn condition(&mut self, e: &js::Expression<'ast>) -> Result<Expr> {
         let value = self.expr(e)?;
+        self.truthy(value, e.span())
+    }
+
+    fn truthy(&mut self, value: Expr, at: oxc_span::Span) -> Result<Expr> {
+        if value.ty == unit() {
+            return self.error(
+                ErrorKind::Type,
+                "an expression of type void cannot be tested for truthiness",
+                at,
+            );
+        }
+        if is_undefined(&value.ty) {
+            let no = node(
+                TypedExpression::Literal(TypedLiteral::Bool(false)),
+                boolean(),
+                at,
+            );
+            return Ok(self.sequence(value, no, at));
+        }
+        if matches!(value.ty, Type::Optional(_)) {
+            let no = node(
+                TypedExpression::Literal(TypedLiteral::Bool(false)),
+                boolean(),
+                at,
+            );
+            return self.optional_match(
+                value,
+                |this, payload| this.truthy(payload, at),
+                Some(no),
+                boolean(),
+                at,
+            );
+        }
         if value.ty == boolean() {
             return Ok(value);
         }
         if value.ty == number() {
             // The ordered self-comparison rejects NaN as well as zero.
             let unique = self.fresh("truthy");
-            let at = e.span();
             let binding = stmt(
                 TypedStatement::Let(TypedLet {
                     name: unique,
@@ -1606,7 +2185,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 at,
             ));
         }
-        self.unsupported("truthiness of this type", e.span())
+        self.unsupported("truthiness of this type", at)
     }
 
     fn function_type(
@@ -1624,7 +2203,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let mut parameters = Vec::with_capacity(params.size_hint().0);
         for ty in params {
             if !scalar(&ty) {
-                return self.unsupported("reference-bearing callback parameters", at);
+                return self.unsupported("aggregate callback parameters", at);
             }
             parameters.push(zyntax_typed_ast::ParamInfo {
                 name: None,
@@ -1639,7 +2218,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             });
         }
         if !scalar(&ret) && ret != unit() {
-            return self.unsupported("reference-bearing callback results", at);
+            return self.unsupported("aggregate callback results", at);
         }
         Ok(Type::Function {
             params: parameters,
@@ -1690,6 +2269,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let outer_returns = self.returns.replace(ReturnContext {
             expected,
             inferred: None,
+            value_returned: false,
         });
         let outer_loop = std::mem::replace(&mut self.loop_depth, 0);
         let outer_floor = std::mem::replace(&mut self.scope_floor, self.scopes.len());
@@ -1726,6 +2306,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     source_name,
                     Binding {
                         name: unique,
+                        symbol: id.symbol_id.get(),
                         ty: ty.clone(),
                         view,
                         mutable: true,
@@ -1755,14 +2336,16 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     .expected
                     .as_ref()
                     .map(|(ty, _)| ty.clone());
-                let value = match hint {
+                let mut value = match hint {
                     Some(ty) => self.expr_expected(e, &ty)?,
                     None => self.expr(e)?,
                 };
-                if let Some((ret, view)) = &self.returns.as_ref().unwrap().expected {
-                    self.expect(&value.ty, ret, at)?;
-                    self.check_view(self.view_of(e), *view, at)?;
+                if let Some((ret, view)) = self.returns.as_ref().unwrap().expected.clone() {
+                    self.expect(&value.ty, &ret, at)?;
+                    self.check_view(self.view_of(e), view, at)?;
+                    value = self.adapt_value(value, &ret, at)?;
                 } else {
+                    self.returns.as_mut().unwrap().value_returned = true;
                     self.record_return(&value.ty, self.view_of(e), at)?;
                 }
                 statements.push(stmt(TypedStatement::Return(Some(Box::new(value))), at));
@@ -1770,10 +2353,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             };
             let context = self.returns.take().unwrap();
             let declared_result = context.expected.is_some();
-            let (ret, _) = context
-                .expected
-                .or(context.inferred)
-                .unwrap_or((unit(), None));
+            let (ret, _) = match context.expected {
+                Some(result) => result,
+                None if !context.value_returned => (unit(), None),
+                None => context.inferred.unwrap_or((unit(), None)),
+            };
             if ret != unit() && !complete {
                 if declared_result {
                     return self.error(
@@ -1787,7 +2371,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             let ty = self.function_type(params.iter().map(|p| p.ty.clone()), ret.clone(), at)?;
             Ok((params, statements, ret, ty))
         })();
-        self.scopes.pop();
+        self.pop_scope();
         self.scope_floor = outer_floor;
         self.loop_depth = outer_loop;
         self.returns = outer_returns;
@@ -1833,9 +2417,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     .any(|s| s.contains_key(&self.name(i.name.as_str())))
                 {
                     let b = self.binding(i.name.as_str(), at)?;
-                    var(b.name, b.ty.clone(), at)
+                    let value = var(b.name, b.ty.clone(), at);
+                    let flow = self.flow.get(&b.name).copied();
+                    self.flow_read(value, flow, at)?
                 } else {
                     match i.name.as_str() {
+                        "undefined" => var(self.name("None"), undefined(), at),
                         "NaN" => num(f64::NAN, at),
                         "Infinity" => num(f64::INFINITY, at),
                         name if self.signatures.contains_key(&self.name(name)) => {
@@ -1863,7 +2450,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::Expression::ParenthesizedExpression(p) => self.expr(&p.expression)?,
             js::Expression::ArrowFunctionExpression(a) => self.arrow(a, None)?,
             js::Expression::UnaryExpression(u) => {
-                if u.operator.as_str() == "!" {
+                if u.operator.as_str() == "void" {
+                    let value = self.expr(&u.argument)?;
+                    self.sequence(value, var(self.name("None"), undefined(), at), at)
+                } else if u.operator.as_str() == "typeof" {
+                    let value = self.expr(&u.argument)?;
+                    self.typeof_value(value, at)?
+                } else if u.operator.as_str() == "!" {
                     node(
                         TypedExpression::Unary(TypedUnary {
                             op: UnaryOp::Not,
@@ -1893,34 +2486,87 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::Expression::BinaryExpression(b) => self.binary_expr(b)?,
             js::Expression::LogicalExpression(l) => {
                 let left = self.expr(&l.left)?;
-                let right = self.expr(&l.right)?;
-                self.expect(&left.ty, &boolean(), at)?;
-                self.expect(&right.ty, &boolean(), at)?;
-                let op = match l.operator.as_str() {
-                    "&&" => BinaryOp::And,
-                    "||" => BinaryOp::Or,
-                    _ => return self.unsupported("nullish coalescing", at),
-                };
-                binary(op, left, right, boolean(), at)
+                let before = self.flow.clone();
+                let op = l.operator.as_str();
+                if op == "??" {
+                    self.narrow(&l.left, false);
+                    let right = self.expr(&l.right)?;
+                    self.merge_flow(&before);
+                    if is_undefined(&left.ty) {
+                        self.sequence(left, right, at)
+                    } else if let Type::Optional(inner) = &left.ty {
+                        let ty = optional_join(inner, &right.ty).ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::Unsupported,
+                                "this nullish result union is not implemented yet",
+                                at,
+                            )
+                        })?;
+                        let right = self.adapt_value(right, &ty, at)?;
+                        self.optional_match(
+                            left,
+                            |this, payload| this.adapt_value(payload, &ty, at),
+                            Some(right),
+                            ty.clone(),
+                            at,
+                        )?
+                    } else {
+                        left
+                    }
+                } else {
+                    if matches!(left.ty, Type::Optional(_)) {
+                        return self.unsupported(
+                            "value-selecting logical operations on optional values",
+                            at,
+                        );
+                    }
+                    self.expect(&left.ty, &boolean(), at)?;
+                    self.narrow(&l.left, op == "&&");
+                    let right = self.expr(&l.right)?;
+                    if matches!(right.ty, Type::Optional(_)) {
+                        return self.unsupported(
+                            "value-selecting logical operations on optional values",
+                            at,
+                        );
+                    }
+                    self.expect(&right.ty, &boolean(), at)?;
+                    self.merge_flow(&before);
+                    let op = match op {
+                        "&&" => BinaryOp::And,
+                        "||" => BinaryOp::Or,
+                        _ => unreachable!(),
+                    };
+                    binary(op, left, right, boolean(), at)
+                }
             }
             js::Expression::ConditionalExpression(c) => {
                 let condition = self.condition(&c.test)?;
+                let before = self.flow.clone();
+                self.narrow(&c.test, true);
                 let a = self.expr(&c.consequent)?;
+                let then_flow = std::mem::replace(&mut self.flow, before);
+                self.narrow(&c.test, false);
                 let b = self.expr(&c.alternate)?;
+                self.merge_flow(&then_flow);
                 if a.ty != b.ty
                     && matches!((&a.ty, &b.ty), (Type::Named { .. }, Type::Named { .. }))
                 {
                     return self
                         .unsupported("conditional objects with different physical layouts", at);
                 }
-                self.expect(&b.ty, &a.ty, at)?;
+                let joined = optional_join(&a.ty, &b.ty);
+                if joined.is_none() {
+                    self.expect(&b.ty, &a.ty, at)?;
+                }
                 if matches!(a.ty, Type::Named { .. })
                     && self.view_of(&c.consequent) != self.view_of(&c.alternate)
                 {
                     return self
                         .unsupported("conditional objects with different property views", at);
                 }
-                let ty = a.ty.clone();
+                let ty = joined.unwrap_or_else(|| a.ty.clone());
+                let a = self.adapt_value(a, &ty, at)?;
+                let b = self.adapt_value(b, &ty, at)?;
                 node(
                     TypedExpression::If(TypedIfExpr {
                         condition: Box::new(condition),
@@ -1952,15 +2598,21 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::Expression::AssignmentExpression(a) => self.assignment(a)?,
             js::Expression::UpdateExpression(u) => {
                 let target = self.simple_target(&u.argument, at)?;
-                self.expect(&target.ty, &number(), at)?;
+                let read = self.read_target(&target, at)?;
+                self.expect(&read.ty, &number(), at)?;
                 let (mut statements, target) = self.capture_target(target, at);
+                let read = if matches!(target.node, TypedExpression::Field(_)) {
+                    target.clone()
+                } else {
+                    read
+                };
                 let old = self.fresh("old");
                 let save = stmt(
                     TypedStatement::Let(TypedLet {
                         name: old,
                         ty: number(),
                         mutability: Mutability::Immutable,
-                        initializer: Some(Box::new(target.clone())),
+                        initializer: Some(Box::new(read)),
                         span: span(at),
                     }),
                     at,
@@ -1976,9 +2628,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     number(),
                     at,
                 );
+                let value = self.adapt_value(value, &target.ty, at)?;
+                self.record_write(&target, &number());
                 let assign = binary(BinaryOp::Assign, target.clone(), value, unit(), at);
                 let result = if u.prefix {
-                    target
+                    self.read_target(&target, at)?
                 } else {
                     var(old, number(), at)
                 };
@@ -2004,15 +2658,31 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         );
                     }
                 } else {
+                    if matches!(logical, Type::Optional(_))
+                        && optional_join(logical, &ty).is_some()
+                        && *logical != ty
+                    {
+                        return self.unsupported("unproven optional narrowing assertions", at);
+                    }
                     self.expect(logical, &ty, at)?;
                 }
                 self.check_view(self.view_of(&a.expression), view, at)?;
-                if !matches!(ty, Type::Named { .. }) {
-                    value.ty = ty;
+                if matches!(ty, Type::Optional(_)) || is_undefined(&value.ty) {
+                    self.adapt_value(value, &ty, at)?
+                } else {
+                    if !matches!(ty, Type::Named { .. }) {
+                        value.ty = ty;
+                    }
+                    value
+                }
+            }
+            js::Expression::TSNonNullExpression(n) => {
+                let value = self.expr(&n.expression)?;
+                if matches!(value.ty, Type::Optional(_)) {
+                    return self.unsupported("unproven non-null assertions on optional values", at);
                 }
                 value
             }
-            js::Expression::TSNonNullExpression(n) => self.expr(&n.expression)?,
             _ => return self.unsupported("this expression", at),
         })
     }
@@ -2022,6 +2692,74 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let left = self.expr(&b.left)?;
         let right = self.expr(&b.right)?;
         let op = b.operator.as_str();
+        if matches!(op, "===" | "!==" | "==" | "!=")
+            && (matches!(left.ty, Type::Optional(_))
+                || matches!(right.ty, Type::Optional(_))
+                || left.ty == unit()
+                || right.ty == unit())
+        {
+            let compatible = if left.ty == unit() || right.ty == unit() {
+                (left.ty == unit() && (matches!(right.ty, Type::Optional(_)) || right.ty == unit()))
+                    || (right.ty == unit() && matches!(left.ty, Type::Optional(_)))
+            } else {
+                is_undefined(&left.ty)
+                    || is_undefined(&right.ty)
+                    || optional_join(&left.ty, &right.ty).is_some()
+            };
+            if !compatible {
+                return self.error(ErrorKind::Type, "comparison has no overlapping types", at);
+            }
+            let mut statements = vec![];
+            let mut reads = vec![];
+            for value in [left, right] {
+                if value.ty == unit() {
+                    statements.push(expression(value));
+                    reads.push(node(
+                        TypedExpression::Literal(TypedLiteral::Unit),
+                        unit(),
+                        at,
+                    ));
+                    continue;
+                }
+                let name = self.fresh("comparison");
+                let ty = value.ty.clone();
+                statements.push(stmt(
+                    TypedStatement::Let(TypedLet {
+                        name,
+                        ty: ty.clone(),
+                        mutability: Mutability::Immutable,
+                        initializer: Some(Box::new(value)),
+                        span: span(at),
+                    }),
+                    at,
+                ));
+                reads.push(var(name, ty, at));
+            }
+            let right = reads.pop().unwrap();
+            let mut value = self.optional_equal(reads.pop().unwrap(), right, at)?;
+            if matches!(op, "!==" | "!=") {
+                value = node(
+                    TypedExpression::Unary(TypedUnary {
+                        op: UnaryOp::Not,
+                        operand: Box::new(value),
+                    }),
+                    boolean(),
+                    at,
+                );
+            }
+            statements.push(expression(value));
+            return Ok(node(
+                TypedExpression::Block(TypedBlock {
+                    statements,
+                    span: span(at),
+                }),
+                boolean(),
+                at,
+            ));
+        }
+        if matches!(left.ty, Type::Optional(_)) || matches!(right.ty, Type::Optional(_)) {
+            return self.error(ErrorKind::Type, "operand is possibly undefined", at);
+        }
         if matches!(left.ty, Type::Function { .. }) || matches!(right.ty, Type::Function { .. }) {
             return self.unsupported("function object identity and operators", at);
         }
@@ -2304,7 +3042,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 self.expect(self.source_type(source, &arg.ty), &expected, at)?;
                 self.fresh_properties(source, &expected)?;
                 self.check_view(self.view_of(source), view, at)?;
-                self.adapt_record(arg, &expected, at)
+                self.adapt_value(arg, &expected, at)
             })
             .collect::<Result<Vec<_>>>()?;
         let ret = sig.ret.clone().ok_or_else(|| {
@@ -2345,6 +3083,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         for arg in args {
             let name = self.fresh("log");
             let ty = arg.ty.clone();
+            if ty == unit() {
+                statements.push(expression(arg));
+                reads.push(node(
+                    TypedExpression::Literal(TypedLiteral::Unit),
+                    unit(),
+                    at,
+                ));
+                continue;
+            }
             statements.push(stmt(
                 TypedStatement::Let(TypedLet {
                     name,
@@ -2358,19 +3105,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             reads.push(var(name, ty, at));
         }
         for (i, value) in reads.into_iter().enumerate() {
-            let symbol = if value.ty == number() {
-                "$TS$print_number"
-            } else if value.ty == boolean() {
-                "$IO$print_bool"
-            } else if value.ty == string() {
-                "$IO$print"
-            } else {
-                return self.unsupported("console formatting of this type", at);
-            };
             if i != 0 {
                 statements.push(expression(self.call("$TS$space", vec![], unit(), at)));
             }
-            statements.push(expression(self.call(symbol, vec![value], unit(), at)));
+            statements.push(expression(self.format_value(value, at)?));
         }
         statements.push(expression(self.call("$TS$newline", vec![], unit(), at)));
         Ok(node(
@@ -2381,6 +3119,26 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             unit(),
             at,
         ))
+    }
+
+    fn read_target(&mut self, target: &Expr, at: oxc_span::Span) -> Result<Expr> {
+        let flow = if let TypedExpression::Variable(name) = target.node {
+            self.flow.get(&name).copied()
+        } else {
+            None
+        };
+        self.flow_read(target.clone(), flow, at)
+    }
+
+    fn record_write(&mut self, target: &Expr, ty: &Type) {
+        if let TypedExpression::Variable(name) = target.node {
+            if matches!(target.ty, Type::Optional(_)) {
+                self.flow.remove(&name);
+                if let Some(flow) = ScalarFlow::of(ty) {
+                    self.flow.insert(name, flow);
+                }
+            }
+        }
     }
 
     fn simple_target(
@@ -2456,6 +3214,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             .and_then(|view| self.aliases.get(&view))
             .map_or(&target.ty, |(ty, _)| ty)
             .clone();
+        let op = a.operator.as_str();
+        let read = if op == "=" {
+            None
+        } else {
+            Some(self.read_target(&target, a.span)?)
+        };
         let mut value = self.expr_expected(&a.right, &logical_target)?;
         self.expect(
             self.source_type(&a.right, &value.ty),
@@ -2470,9 +3234,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 a.span,
             );
         }
-        let op = a.operator.as_str();
-        if op != "=" {
-            self.expect(&target.ty, &number(), a.span)?;
+        if let Some(read) = read {
+            self.expect(&read.ty, &number(), a.span)?;
+            self.expect(&value.ty, &number(), a.span)?;
             let operation = match op {
                 "+=" => BinaryOp::Add,
                 "-=" => BinaryOp::Sub,
@@ -2481,7 +3245,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 "%=" => BinaryOp::Rem,
                 _ => return self.unsupported("this compound assignment", a.span),
             };
-            value = binary(operation, target.clone(), value, number(), a.span);
+            value = binary(operation, read, value, number(), a.span);
         }
         let name = self.fresh("assigned");
         let ty = value.ty.clone();
@@ -2495,13 +3259,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }),
             a.span,
         );
-        let assignment = binary(
-            BinaryOp::Assign,
-            target,
-            var(name, ty.clone(), a.span),
-            unit(),
-            a.span,
-        );
+        self.record_write(&target, &ty);
+        let stored = self.adapt_value(var(name, ty.clone(), a.span), &target.ty, a.span)?;
+        let assignment = binary(BinaryOp::Assign, target, stored, unit(), a.span);
         statements.extend([
             save,
             expression(assignment),

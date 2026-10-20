@@ -36,9 +36,17 @@ result. Without another candidate, fallthrough gives void and a function with
 only recursive returns has type `never`. Native `never` calls carry no result,
 and their returned paths end in `unreachable`. Arithmetic, conditional and mutual return cycles produce strict
 type diagnostics with an annotation hint. Recursive function-value types,
-inference through local aliases, unannotated recursive generics, heterogeneous
-return unions, possibly undefined returns and differing readonly result views
-remain gaps.
+inference through local aliases, unannotated recursive generics, general heterogeneous
+return unions and differing readonly result views remain gaps.
+
+Scalar `number | undefined` and `boolean | undefined` values use the compiler's
+native tagged unions. Explicit and inferred optional returns, direct calls,
+conditional expressions, nullish coalescing, equality, `typeof`, truthiness and
+console output preserve `undefined` without heap boxing. Branches narrow lexical
+bindings while retaining their declared storage type; assignments and loop writes
+invalidate stale facts. `void` remains distinct from `undefined`. Optional callback
+signatures and assertions that remove an unproven `undefined` alternative still
+need implementation.
 
 Unconstrained generic functions support inferred and explicit type arguments,
 including forward calls, nested generic calls and recursion. Each body is checked
@@ -54,9 +62,9 @@ returned functions and higher-order calls support numbers, booleans, void
 results and other scalar-signature functions. These references allocate no
 environment and retain their signatures through interpreter, Cranelift and LLVM
 calls. Lexical captures, function object identity/properties, parameter-count
-adaptation and reference-bearing callback signatures need further implementation.
+adaptation and aggregate callback signatures need further implementation.
 
-Arrays, unions, capturing closures, classes, multi-file linking and other
+Arrays, general or reference-bearing unions, capturing closures, classes, multi-file linking and other
 unimplemented constructs produce `Unsupported` diagnostics. These are implementation gaps, measured by
 the conformance suite; they are not permanent language restrictions.
 

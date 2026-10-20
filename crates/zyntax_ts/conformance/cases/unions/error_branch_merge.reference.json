@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 18048,
+      "start": 69,
+      "length": 1,
+      "file": "error_branch_merge.ts",
+      "message": "'n' is possibly 'undefined'."
+    }
+  ],
+  "source_sha256": "da2112ae7e47ab4fc82ab22e3247dc5fcbf32b9701995781cf60449974378708",
+  "options": {}
+}

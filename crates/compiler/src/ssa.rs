@@ -2380,6 +2380,7 @@ impl SsaBuilder {
         result_ty: &Type,
     ) -> CompilerResult<HirId> {
         use crate::hir::{HirInstruction, HirType, HirUnionType, HirUnionVariant};
+        let started = block_id;
 
         // Determine variant index and extract inner type
         let (variant_index, inner_ty, union_type) = match constructor_name {
@@ -2562,9 +2563,11 @@ impl SsaBuilder {
             self.translate_expression(block_id, &args[0])?
         };
 
+        let block_id = self.continuation_block.take().unwrap_or(block_id);
+
         // Create the union value - must register in values map with Ptr type
         // Union values are represented as pointers to stack-allocated memory
-        let union_hir_ty = HirType::Union(Box::new(union_type.clone()));
+        let union_hir_ty = HirType::Union(Box::new(union_type));
         let result_id = self.create_value(union_hir_ty.clone(), HirValueKind::Instruction);
 
         self.add_instruction(
@@ -2588,6 +2591,7 @@ impl SsaBuilder {
             value_id
         );
 
+        self.settle(started, block_id);
         Ok(result_id)
     }
 
@@ -6206,6 +6210,7 @@ impl SsaBuilder {
                 let then_tail = self.continuation_block.take().unwrap_or(then_block_id);
                 self.continuation_block = saved_cont_before_then;
                 let then_val = self.meet_declared_any(then_tail, then_val, then_branch, &expr.ty);
+                self.term_dirty.push(then_tail);
                 self.function.blocks.get_mut(&then_tail).unwrap().terminator =
                     HirTerminator::Branch {
                         target: merge_block_id,
@@ -6225,6 +6230,7 @@ impl SsaBuilder {
                 let else_tail = self.continuation_block.take().unwrap_or(else_block_id);
                 self.continuation_block = saved_cont_before_else;
                 let else_val = self.meet_declared_any(else_tail, else_val, else_branch, &expr.ty);
+                self.term_dirty.push(else_tail);
                 self.function.blocks.get_mut(&else_tail).unwrap().terminator =
                     HirTerminator::Branch {
                         target: merge_block_id,
@@ -12840,36 +12846,7 @@ impl SsaBuilder {
             // An array of no fixed size is a growable list: a header the
             // value points at, with the elements behind it.
             Type::Array { size: None, .. } => list_header_type(),
-            Type::Optional(inner_ty) => {
-                // Convert Optional<T> to a tagged union: enum { None, Some(T) }
-                use crate::hir::{HirUnionType, HirUnionVariant};
-
-                // Convert inner type FIRST before locking arena
-                let inner_hir_type = self.convert_type(inner_ty);
-
-                let mut arena = self.arena.lock().unwrap();
-                let none_name = arena.intern_string("None");
-                let some_name = arena.intern_string("Some");
-                drop(arena);
-
-                HirType::Union(Box::new(HirUnionType {
-                    name: None,
-                    variants: vec![
-                        HirUnionVariant {
-                            name: none_name,
-                            ty: HirType::Void,
-                            discriminant: 0,
-                        },
-                        HirUnionVariant {
-                            name: some_name,
-                            ty: inner_hir_type,
-                            discriminant: 1,
-                        },
-                    ],
-                    discriminant_type: Box::new(HirType::U32),
-                    is_c_union: false,
-                }))
-            }
+            Type::Optional(inner_ty) => crate::hir::optional_type(self.convert_type(inner_ty)),
             Type::Result { ok_type, err_type } => {
                 // Convert Result<T, E> to a tagged union: enum { Ok(T), Err(E) }
                 use crate::hir::{HirUnionType, HirUnionVariant};
@@ -14604,6 +14581,7 @@ impl SsaBuilder {
 
         // Evaluate scrutinee
         let scrutinee_val = self.translate_expression(block_id, &match_expr.scrutinee)?;
+        block_id = self.continuation_block.take().unwrap_or(block_id);
         let scrutinee_ty = self.convert_type(&match_expr.scrutinee.ty);
 
         // Create end block for all arms to converge
@@ -14681,17 +14659,14 @@ impl SsaBuilder {
             // In body block: execute arm body and jump to end
             let arm_result = self.translate_expression(body_block_id, &arm.body)?;
 
-            self.term_dirty.push(body_block_id);
-            self.function
-                .blocks
-                .get_mut(&body_block_id)
-                .unwrap()
-                .terminator = HirTerminator::Branch {
+            let body_exit = self.continuation_block.take().unwrap_or(body_block_id);
+            self.term_dirty.push(body_exit);
+            self.function.blocks.get_mut(&body_exit).unwrap().terminator = HirTerminator::Branch {
                 target: end_block_id,
             };
 
             // Record this arm's result for phi node
-            phi_operands.push((arm_result, body_block_id));
+            phi_operands.push((arm_result, body_exit));
 
             // Continue with next block
             block_id = next_block_id;
@@ -14703,7 +14678,7 @@ impl SsaBuilder {
         self.function.blocks.get_mut(&block_id).unwrap().terminator = HirTerminator::Unreachable;
 
         // Create phi node in end block to collect results
-        if !phi_operands.is_empty() {
+        if !phi_operands.is_empty() && result_hir_ty != HirType::Void {
             let phi = HirPhi {
                 result,
                 ty: result_hir_ty,
@@ -15307,6 +15282,7 @@ impl SsaBuilder {
     }
 
     fn set_pattern_branch(&mut self, block_id: HirId, target: HirId) {
+        self.term_dirty.push(block_id);
         self.function.blocks.get_mut(&block_id).unwrap().terminator =
             HirTerminator::Branch { target };
     }

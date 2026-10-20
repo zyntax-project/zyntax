@@ -1,0 +1,10 @@
+{
+  "compiler": "6.0.2",
+  "accepted": true,
+  "kind": "Accept",
+  "diagnostics": [],
+  "stdout": "4\nundefined\nnumber\nundefined\n3 0\ntrue true boolean string\nundefined undefined\n",
+  "exit": 0,
+  "source_sha256": "6a87e01490610f7dc08c0a3f8d5153758ea2294400f1c3719f7a4083f5f923bd",
+  "options": {}
+}

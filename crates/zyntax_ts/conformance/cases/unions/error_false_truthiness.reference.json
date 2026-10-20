@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 18048,
+      "start": 47,
+      "length": 1,
+      "file": "error_false_truthiness.ts",
+      "message": "'n' is possibly 'undefined'."
+    }
+  ],
+  "source_sha256": "777983bd85a494fef813f4e7a3fc2742f360cddfe41e66e3ef03ae1a3113aa3d",
+  "options": {}
+}

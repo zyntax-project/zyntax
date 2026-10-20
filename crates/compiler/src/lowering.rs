@@ -4761,6 +4761,7 @@ impl LoweringContext {
                 _ => HirType::I64, // Default
             },
 
+            Type::Optional(inner) => crate::hir::optional_type(self.convert_type(inner)),
             Type::Tuple(types) if types.is_empty() => HirType::Void,
             Type::Tuple(types) => HirType::Struct(crate::hir::HirStructType {
                 name: None,

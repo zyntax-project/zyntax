@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 6,
+      "length": 1,
+      "file": "error_undefined_to_number.ts",
+      "message": "Type 'undefined' is not assignable to type 'number'."
+    }
+  ],
+  "source_sha256": "fae5ee1521f624c84da902e65d8d9e7ff2021f8cc704f3301900887c1c4b6df4",
+  "options": {}
+}

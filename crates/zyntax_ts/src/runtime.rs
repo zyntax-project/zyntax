@@ -16,6 +16,10 @@ extern "C" fn number_pow(base: f64, exponent: f64) -> f64 {
     }
 }
 
+extern "C" fn print_undefined() {
+    print!("undefined");
+}
+
 extern "C" fn print_space() {
     print!(" ");
 }
@@ -27,6 +31,7 @@ zrtl::zrtl_plugin! {
     name: "typescript_native",
     symbols: [
         ("$TS$print_number", print_number),
+        ("$TS$print_undefined", print_undefined),
         ("$TS$pow", number_pow),
         ("$TS$space", print_space),
         ("$TS$newline", print_newline),

@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 18048,
+      "start": 40,
+      "length": 1,
+      "file": "error_read.ts",
+      "message": "'n' is possibly 'undefined'."
+    }
+  ],
+  "source_sha256": "b90dda033ac572d70e678876f2f28eaf033cd9f0d7324da5da94656b7e1fd62e",
+  "options": {}
+}

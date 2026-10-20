@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 18048,
+      "start": 73,
+      "length": 1,
+      "file": "error_narrowing_reset.ts",
+      "message": "'n' is possibly 'undefined'."
+    }
+  ],
+  "source_sha256": "01e2e0e4e7f809d9bfe66bbcbf4e8e717522bfc83a34e86babe9ef0e3947a04e",
+  "options": {}
+}

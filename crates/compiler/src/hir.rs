@@ -33,6 +33,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use zyntax_typed_ast::{InternedString, Span, Type, TypeId};
 
+/// Shared representation for `Type::Optional` in signatures and SSA values.
+pub fn optional_type(payload: HirType) -> HirType {
+    HirType::Union(Box::new(HirUnionType {
+        name: None,
+        variants: vec![
+            HirUnionVariant {
+                name: InternedString::new_global("None"),
+                ty: HirType::Void,
+                discriminant: 0,
+            },
+            HirUnionVariant {
+                name: InternedString::new_global("Some"),
+                ty: payload,
+                discriminant: 1,
+            },
+        ],
+        discriminant_type: Box::new(HirType::U32),
+        is_c_union: false,
+    }))
+}
+
 // ============================================================================
 // Algebraic Effects - HIR Types
 // ============================================================================

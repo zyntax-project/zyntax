@@ -808,5 +808,110 @@
     "id": "views/empty_literal",
     "file": "cases/views/empty_literal.ts",
     "mode": "run"
+  },
+  {
+    "id": "unions/calls",
+    "file": "cases/unions/calls.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/inferred_returns",
+    "file": "cases/unions/inferred_returns.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/boolean",
+    "file": "cases/unions/boolean.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/flow",
+    "file": "cases/unions/flow.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/conditional",
+    "file": "cases/unions/conditional.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/equality",
+    "file": "cases/unions/equality.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/evaluation_order",
+    "file": "cases/unions/evaluation_order.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/nullish",
+    "file": "cases/unions/nullish.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/loops",
+    "file": "cases/unions/loops.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/void_typeof",
+    "file": "cases/unions/void_typeof.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/generic",
+    "file": "cases/unions/generic.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/recursive",
+    "file": "cases/unions/recursive.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/shadowing",
+    "file": "cases/unions/shadowing.ts",
+    "mode": "run"
+  },
+  {
+    "id": "unions/error_assignment",
+    "file": "cases/unions/error_assignment.ts",
+    "mode": "check"
+  },
+  {
+    "id": "unions/error_read",
+    "file": "cases/unions/error_read.ts",
+    "mode": "check"
+  },
+  {
+    "id": "unions/error_undefined_to_number",
+    "file": "cases/unions/error_undefined_to_number.ts",
+    "mode": "check"
+  },
+  {
+    "id": "unions/error_void_to_undefined",
+    "file": "cases/unions/error_void_to_undefined.ts",
+    "mode": "check"
+  },
+  {
+    "id": "unions/error_missing_return",
+    "file": "cases/unions/error_missing_return.ts",
+    "mode": "check"
+  },
+  {
+    "id": "unions/error_narrowing_reset",
+    "file": "cases/unions/error_narrowing_reset.ts",
+    "mode": "check"
+  },
+  {
+    "id": "unions/error_branch_merge",
+    "file": "cases/unions/error_branch_merge.ts",
+    "mode": "check"
+  },
+  {
+    "id": "unions/error_false_truthiness",
+    "file": "cases/unions/error_false_truthiness.ts",
+    "mode": "check"
   }
 ]

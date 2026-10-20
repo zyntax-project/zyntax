@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 27,
+      "length": 1,
+      "file": "error_void_to_undefined.ts",
+      "message": "Type 'void' is not assignable to type 'undefined'."
+    }
+  ],
+  "source_sha256": "6ac09daaacceb43802e4b9c2f594c89c12978699b5782b9c7a0cdb955a7dfb25",
+  "options": {}
+}
