@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 6,
+      "length": 1,
+      "file": "error_contextual_return.ts",
+      "message": "Type '() => void' is not assignable to type '() => number'.\n  Type 'void' is not assignable to type 'number'."
+    }
+  ],
+  "source_sha256": "4ea52ddb80348f23b7f0f8b855fb3df8fd1634261dca17e504af9c909173a8ea",
+  "options": {}
+}

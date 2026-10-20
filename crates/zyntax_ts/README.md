@@ -32,8 +32,17 @@ Object arguments retain reference identity and their readonly views. Generic
 constraints, defaults, const type parameters and operators whose operands remain
 generic still need implementation.
 
-Arrays, unions, closures, classes, multi-file linking and other unimplemented constructs
-produce `Unsupported` diagnostics. These are implementation gaps, measured by
+Capture-free arrows and named function values use typed native function
+references. Parameters can be annotated or receive contextual types from a
+variable, argument, assignment or return. Expression and block bodies, aliases,
+returned functions and higher-order calls support numbers, booleans, void
+results and other scalar-signature functions. These references allocate no
+environment and retain their signatures through interpreter, Cranelift and LLVM
+calls. Lexical captures, function object identity/properties, parameter-count
+adaptation and reference-bearing callback signatures need further implementation.
+
+Arrays, unions, capturing closures, classes, multi-file linking and other
+unimplemented constructs produce `Unsupported` diagnostics. These are implementation gaps, measured by
 the conformance suite; they are not permanent language restrictions.
 
 Diagnostics use Zyntax's shared Ariadne formatter, including source labels and

@@ -2175,6 +2175,14 @@ impl CraneliftBackend {
             // Pre-translate instruction types
             for inst in &block.instructions {
                 match inst {
+                    HirInstruction::Call {
+                        result: Some(result),
+                        callee: HirCallable::Indirect(_),
+                        ..
+                    } => {
+                        let ty = &function.values[result].ty;
+                        type_cache.insert(ty.clone(), self.translate_type(ty)?);
+                    }
                     HirInstruction::ExtractValue { ty, aggregate, .. } => {
                         if let Ok(cranelift_ty) = self.translate_type(ty) {
                             type_cache.insert(ty.clone(), cranelift_ty);
@@ -4189,9 +4197,18 @@ impl CraneliftBackend {
                                         sig.params
                                             .push(cranelift_codegen::ir::AbiParam::new(arg_ty));
                                     }
-                                    // Use i64 for return type (pointer-sized for opaque types)
-                                    sig.returns
-                                        .push(cranelift_codegen::ir::AbiParam::new(types::I64));
+                                    if let Some(result) = result {
+                                        let ty = &function.values[result].ty;
+                                        if *ty != HirType::Void {
+                                            sig.returns.push(cranelift_codegen::ir::AbiParam::new(
+                                                *type_cache.get(ty).ok_or_else(|| {
+                                                    CompilerError::Backend(format!(
+                                                        "missing indirect return type {ty:?}"
+                                                    ))
+                                                })?,
+                                            ));
+                                        }
+                                    }
 
                                     let sig_ref = builder.import_signature(sig);
                                     let call = builder.ins().call_indirect(

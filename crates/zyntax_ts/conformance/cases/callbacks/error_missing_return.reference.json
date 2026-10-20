@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2366,
+      "start": 24,
+      "length": 6,
+      "file": "error_missing_return.ts",
+      "message": "Function lacks ending return statement and return type does not include 'undefined'."
+    }
+  ],
+  "source_sha256": "98ebe23c44c74ec496dc4785c3e732678ea9b18edc695ffb9bc5926644c1b895",
+  "options": {}
+}

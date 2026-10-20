@@ -119,22 +119,24 @@ struct CallDependencies<'s> {
 }
 
 impl<'ast> Visit<'ast> for CallDependencies<'_> {
-    fn visit_call_expression(&mut self, call: &js::CallExpression<'ast>) {
-        if let js::Expression::Identifier(id) = &call.callee {
-            let reference = self.scoping.get_reference(id.reference_id.get().unwrap());
-            if let Some(symbol) = reference.symbol_id() {
-                if let Some(name) = self.inferred.get(&symbol) {
-                    if self.seen.insert(symbol) {
-                        self.callees.push(*name);
-                    }
+    fn visit_identifier_reference(&mut self, id: &js::IdentifierReference<'ast>) {
+        let reference = self.scoping.get_reference(id.reference_id.get().unwrap());
+        if !reference.is_value() {
+            return;
+        }
+        if let Some(symbol) = reference.symbol_id() {
+            if let Some(name) = self.inferred.get(&symbol) {
+                if self.seen.insert(symbol) {
+                    self.callees.push(*name);
                 }
             }
         }
-        walk::walk_call_expression(self, call);
     }
 
     fn visit_function(&mut self, _: &js::Function<'ast>, _: oxc_semantic::ScopeFlags) {}
-    fn visit_arrow_function_expression(&mut self, _: &js::ArrowFunctionExpression<'ast>) {}
+    fn visit_arrow_function_expression(&mut self, arrow: &js::ArrowFunctionExpression<'ast>) {
+        walk::walk_arrow_function_expression(self, arrow);
+    }
 }
 
 /// Parse and type the supported TypeScript constructs without JavaScript emission.
@@ -166,6 +168,7 @@ struct Lowerer<'ast, 'program> {
     functions: FxHashMap<InternedString, &'program js::Function<'ast>>,
     lowered: FxHashSet<InternedString>,
     scopes: Vec<FxHashMap<InternedString, Binding>>,
+    scope_floor: usize,
     declarations: Vec<TypedNode<TypedDeclaration>>,
     returns: Option<ReturnContext>,
     loop_depth: usize,
@@ -187,6 +190,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             functions: FxHashMap::default(),
             lowered: FxHashSet::default(),
             scopes: vec![],
+            scope_floor: 0,
             declarations: vec![],
             returns: None,
             loop_depth: 0,
@@ -490,6 +494,28 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::TSType::TSBooleanKeyword(_) => (boolean(), None),
             js::TSType::TSStringKeyword(_) => (string(), None),
             js::TSType::TSVoidKeyword(_) => (unit(), None),
+            js::TSType::TSFunctionType(f) => {
+                if f.type_parameters.is_some() || f.this_param.is_some() || f.params.rest.is_some()
+                {
+                    return self.unsupported("generic, this or rest function types", f.span);
+                }
+                let mut params = Vec::with_capacity(f.params.items.len());
+                for p in &f.params.items {
+                    if p.optional || p.initializer.is_some() {
+                        return self.unsupported("optional function parameters", p.span);
+                    }
+                    let Some(annotation) = &p.type_annotation else {
+                        return self.error(
+                            ErrorKind::Type,
+                            "parameter implicitly has type any",
+                            p.span,
+                        );
+                    };
+                    params.push(self.ty(&annotation.type_annotation)?.0);
+                }
+                let ret = self.ty(&f.return_type.type_annotation)?.0;
+                (self.function_type(params.into_iter(), ret, f.span)?, None)
+            }
             js::TSType::TSTypeReference(r) if r.type_arguments.is_none() => {
                 let js::TSTypeName::IdentifierReference(name) = &r.type_name else {
                     return self.unsupported("qualified type names", r.span);
@@ -803,12 +829,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn binding(&self, name: &'ast str, at: oxc_span::Span) -> Result<&Binding> {
-        let b = self
+        let key = self.name(name);
+        let (scope, b) = self
             .scopes
             .iter()
+            .enumerate()
             .rev()
-            .find_map(|s| s.get(&self.name(name)))
+            .find_map(|(index, s)| s.get(&key).map(|b| (index, b)))
             .ok_or_else(|| Error::new(ErrorKind::Type, format!("cannot find name `{name}`"), at))?;
+        if scope < self.scope_floor {
+            return self.unsupported("lexical captures in arrow functions", at);
+        }
         if !b.initialized {
             return self.error(
                 ErrorKind::Type,
@@ -823,6 +854,26 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if actual == expected {
             Ok(())
         } else {
+            if let (
+                Type::Function {
+                    params: a,
+                    return_type: ar,
+                    ..
+                },
+                Type::Function {
+                    params: b,
+                    return_type: br,
+                    ..
+                },
+            ) = (actual, expected)
+            {
+                if a == b && (**br == unit() || ar == br) {
+                    return Ok(());
+                }
+                if a.len() < b.len() {
+                    return self.unsupported("function parameter-count adaptation", at);
+                }
+            }
             if let (Type::Named { id: a, .. }, Type::Named { id: b, .. }) = (actual, expected) {
                 if let (Some(a), Some(b)) = (
                     self.registry.get_type_by_id(*a),
@@ -857,6 +908,26 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             Type::Primitive(PrimitiveType::String) => "string".into(),
             Type::Primitive(PrimitiveType::Unit) => "void".into(),
             Type::TypeVar(t) => t.name.and_then(|n| n.resolve_global()).unwrap_or_default(),
+            Type::Function {
+                params,
+                return_type,
+                ..
+            } => {
+                let mut description = String::from("(");
+                for (index, param) in params.iter().enumerate() {
+                    if index != 0 {
+                        description.push_str(", ");
+                    }
+                    description.push_str(&self.type_description(&param.ty));
+                }
+                write!(
+                    &mut description,
+                    ") => {}",
+                    self.type_description(return_type)
+                )
+                .unwrap();
+                description
+            }
             Type::Named { id, .. } => {
                 let mut description = String::from("{ ");
                 if let Some(definition) = self.registry.get_type_by_id(*id) {
@@ -982,7 +1053,21 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 if self.returns.is_none() {
                     return self.error(ErrorKind::Syntax, "return outside function", at);
                 }
-                let value = r.argument.as_ref().map(|arg| self.expr(arg)).transpose()?;
+                let hint = self
+                    .returns
+                    .as_ref()
+                    .unwrap()
+                    .expected
+                    .as_ref()
+                    .map(|(ty, _)| ty.clone());
+                let value = r
+                    .argument
+                    .as_ref()
+                    .map(|arg| match &hint {
+                        Some(hint) => self.expr_expected(arg, hint),
+                        None => self.expr(arg),
+                    })
+                    .transpose()?;
                 let view = r.argument.as_ref().and_then(|arg| self.view_of(arg));
                 let unit = unit();
                 let actual = value.as_ref().map_or(&unit, |value| &value.ty);
@@ -1101,12 +1186,16 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             let Some(init) = &d.init else {
                 return self.unsupported("uninitialized bindings", d.span);
             };
-            let value = self.expr(init)?;
-            let (ty, view) = if let Some(annotation) = &d.type_annotation {
-                self.ty(&annotation.type_annotation)?
-            } else {
-                (value.ty.clone(), self.view_of(init))
+            let declared = d
+                .type_annotation
+                .as_ref()
+                .map(|a| self.ty(&a.type_annotation))
+                .transpose()?;
+            let value = match &declared {
+                Some((ty, _)) => self.expr_expected(init, ty)?,
+                None => self.expr(init)?,
             };
+            let (ty, view) = declared.unwrap_or_else(|| (value.ty.clone(), self.view_of(init)));
             self.expect(&value.ty, &ty, d.span)?;
             self.check_view(self.view_of(init), view, d.span)?;
             let unique = self.fresh(id.name.as_str());
@@ -1171,6 +1260,209 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.unsupported("truthiness of this type", e.span())
     }
 
+    fn function_type(
+        &self,
+        params: impl Iterator<Item = Type>,
+        ret: Type,
+        at: oxc_span::Span,
+    ) -> Result<Type> {
+        let scalar = |ty: &Type| {
+            matches!(
+                ty,
+                Type::Primitive(PrimitiveType::F64 | PrimitiveType::Bool) | Type::Function { .. }
+            )
+        };
+        let mut parameters = Vec::with_capacity(params.size_hint().0);
+        for ty in params {
+            if !scalar(&ty) {
+                return self.unsupported("reference-bearing callback parameters", at);
+            }
+            parameters.push(zyntax_typed_ast::ParamInfo {
+                name: None,
+                ty,
+                is_optional: false,
+                is_varargs: false,
+                is_keyword_only: false,
+                is_positional_only: false,
+                is_out: false,
+                is_ref: false,
+                is_inout: false,
+            });
+        }
+        if !scalar(&ret) && ret != unit() {
+            return self.unsupported("reference-bearing callback results", at);
+        }
+        Ok(Type::Function {
+            params: parameters,
+            return_type: Box::new(ret),
+            is_varargs: false,
+            has_named_params: false,
+            has_default_params: false,
+            async_kind: zyntax_typed_ast::AsyncKind::Sync,
+            calling_convention: CallingConvention::Default,
+            nullability: NullabilityKind::NonNull,
+        })
+    }
+
+    fn expr_expected(&mut self, e: &js::Expression<'ast>, expected: &Type) -> Result<Expr> {
+        match e {
+            js::Expression::ArrowFunctionExpression(a) => self.arrow(a, Some(expected)),
+            js::Expression::ParenthesizedExpression(p) => {
+                self.expr_expected(&p.expression, expected)
+            }
+            _ => self.expr(e),
+        }
+    }
+
+    fn arrow(
+        &mut self,
+        arrow: &js::ArrowFunctionExpression<'ast>,
+        hint: Option<&Type>,
+    ) -> Result<Expr> {
+        let at = arrow.span;
+        if arrow.r#async || arrow.type_parameters.is_some() || arrow.params.rest.is_some() {
+            return self.unsupported("async, generic or rest arrow functions", at);
+        }
+        let (hints, result_hint) = match hint {
+            Some(Type::Function {
+                params,
+                return_type,
+                ..
+            }) => (params.as_slice(), Some(return_type.as_ref())),
+            _ => (&[][..], None),
+        };
+        let expected = if let Some(annotation) = &arrow.return_type {
+            Some(self.ty(&annotation.type_annotation)?)
+        } else {
+            result_hint
+                .filter(|ty| **ty != unit())
+                .map(|ty| (ty.clone(), None))
+        };
+        let outer_returns = self.returns.replace(ReturnContext {
+            expected,
+            inferred: None,
+        });
+        let outer_loop = std::mem::replace(&mut self.loop_depth, 0);
+        let outer_floor = std::mem::replace(&mut self.scope_floor, self.scopes.len());
+        self.scopes.push(FxHashMap::default());
+        let result = (|| {
+            let mut params = Vec::with_capacity(arrow.params.items.len());
+            for (index, p) in arrow.params.items.iter().enumerate() {
+                let js::BindingPattern::BindingIdentifier(id) = &p.pattern else {
+                    return self.unsupported("destructuring arrow parameters", p.span);
+                };
+                if p.optional || p.initializer.is_some() {
+                    return self.unsupported("optional or default arrow parameters", p.span);
+                }
+                let (ty, view) = match &p.type_annotation {
+                    Some(annotation) => self.ty(&annotation.type_annotation)?,
+                    None => (
+                        hints
+                            .get(index)
+                            .ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::Type,
+                                    "parameter implicitly has type any",
+                                    p.span,
+                                )
+                            })?
+                            .ty
+                            .clone(),
+                        None,
+                    ),
+                };
+                let unique = self.fresh(id.name.as_str());
+                let source_name = self.name(id.name.as_str());
+                self.scopes.last_mut().unwrap().insert(
+                    source_name,
+                    Binding {
+                        name: unique,
+                        ty: ty.clone(),
+                        view,
+                        mutable: true,
+                        initialized: true,
+                    },
+                );
+                params.push(TypedParameter::regular(
+                    unique,
+                    ty,
+                    Mutability::Mutable,
+                    span(p.span),
+                ));
+            }
+            let mut statements = vec![];
+            let complete = if let js::ArrowFunctionBody::FunctionBody(body) = &arrow.body {
+                self.reserve(&body.statements)?;
+                for statement in &body.statements {
+                    statements.extend(self.statement(statement)?);
+                }
+                Self::returns(&body.statements)
+            } else {
+                let e = arrow.body.as_expression().unwrap();
+                let hint = self
+                    .returns
+                    .as_ref()
+                    .unwrap()
+                    .expected
+                    .as_ref()
+                    .map(|(ty, _)| ty.clone());
+                let value = match hint {
+                    Some(ty) => self.expr_expected(e, &ty)?,
+                    None => self.expr(e)?,
+                };
+                if let Some((ret, view)) = &self.returns.as_ref().unwrap().expected {
+                    self.expect(&value.ty, ret, at)?;
+                    self.check_view(self.view_of(e), *view, at)?;
+                } else {
+                    self.record_return(&value.ty, self.view_of(e), at)?;
+                }
+                statements.push(stmt(TypedStatement::Return(Some(Box::new(value))), at));
+                true
+            };
+            let context = self.returns.take().unwrap();
+            let declared_result = context.expected.is_some();
+            let (ret, _) = context
+                .expected
+                .or(context.inferred)
+                .unwrap_or((unit(), None));
+            if ret != unit() && !complete {
+                if declared_result {
+                    return self.error(
+                        ErrorKind::Type,
+                        "arrow function lacks an ending return",
+                        at,
+                    );
+                }
+                return self.unsupported("possibly undefined arrow results", at);
+            }
+            let ty = self.function_type(params.iter().map(|p| p.ty.clone()), ret.clone(), at)?;
+            Ok((params, statements, ret, ty))
+        })();
+        self.scopes.pop();
+        self.scope_floor = outer_floor;
+        self.loop_depth = outer_loop;
+        self.returns = outer_returns;
+        let (params, statements, ret, ty) = result?;
+        let native = self.fresh("arrow");
+        self.declarations.push(node(
+            TypedDeclaration::Function(TypedFunction {
+                name: native,
+                params,
+                return_type: ret,
+                body: Some(TypedBlock {
+                    statements,
+                    span: span(at),
+                }),
+                annotations: vec![strict_fp(self.name("strict_fp"))],
+                visibility: Visibility::Private,
+                ..Default::default()
+            }),
+            unit(),
+            at,
+        ));
+        Ok(var(native, ty, at))
+    }
+
     fn expr(&mut self, e: &js::Expression<'ast>) -> Result<Expr> {
         let at = e.span();
         Ok(match e {
@@ -1197,6 +1489,21 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     match i.name.as_str() {
                         "NaN" => num(f64::NAN, at),
                         "Infinity" => num(f64::INFINITY, at),
+                        name if self.signatures.contains_key(&self.name(name)) => {
+                            let sig = &self.signatures[&self.name(name)];
+                            if !sig.type_params.is_empty() {
+                                return self.unsupported("generic function values", at);
+                            }
+                            let ret = sig.ret.as_ref().ok_or_else(|| {
+                                Error::new(ErrorKind::Unsupported, "unresolved function result", at)
+                            })?;
+                            let ty = self.function_type(
+                                sig.params.iter().map(|(_, ty, _)| ty.clone()),
+                                ret.clone(),
+                                at,
+                            )?;
+                            var(sig.native, ty, at)
+                        }
                         name => {
                             let b = self.binding(name, at)?;
                             var(b.name, b.ty.clone(), at)
@@ -1205,6 +1512,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
             }
             js::Expression::ParenthesizedExpression(p) => self.expr(&p.expression)?,
+            js::Expression::ArrowFunctionExpression(a) => self.arrow(a, None)?,
             js::Expression::UnaryExpression(u) => {
                 if u.operator.as_str() == "!" {
                     node(
@@ -1328,10 +1636,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 )
             }
             js::Expression::TSAsExpression(a) => {
-                let value = self.expr(&a.expression)?;
                 let (ty, view) = self.ty(&a.type_annotation)?;
+                let mut value = self.expr_expected(&a.expression, &ty)?;
                 self.expect(&value.ty, &ty, at)?;
                 self.check_view(self.view_of(&a.expression), view, at)?;
+                value.ty = ty;
                 value
             }
             js::Expression::TSNonNullExpression(n) => self.expr(&n.expression)?,
@@ -1344,6 +1653,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let left = self.expr(&b.left)?;
         let right = self.expr(&b.right)?;
         let op = b.operator.as_str();
+        if matches!(left.ty, Type::Function { .. }) || matches!(right.ty, Type::Function { .. }) {
+            return self.unsupported("function object identity and operators", at);
+        }
         if matches!(left.ty, Type::TypeVar(_)) || matches!(right.ty, Type::TypeVar(_)) {
             if matches!(op, "+" | "-" | "*" | "/" | "%" | "**") {
                 return self.error(
@@ -1404,6 +1716,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn field_type(&self, ty: &Type, field: &'ast str, at: oxc_span::Span) -> Result<Type> {
+        if matches!(ty, Type::Function { .. }) {
+            return self.unsupported("function object properties", at);
+        }
         let Type::Named { id, .. } = ty else {
             return self.error(ErrorKind::Type, "receiver has no fields", at);
         };
@@ -1484,15 +1799,26 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         ))
     }
 
-    fn call_expr(&mut self, c: &js::CallExpression<'ast>) -> Result<Expr> {
-        let at = c.span;
-        let mut args = vec![];
+    fn arguments<'hint>(
+        &mut self,
+        c: &js::CallExpression<'ast>,
+        mut hints: impl Iterator<Item = &'hint Type>,
+    ) -> Result<Vec<Expr>> {
+        let mut args = Vec::with_capacity(c.arguments.len());
         for arg in &c.arguments {
             let Some(e) = arg.as_expression() else {
-                return self.unsupported("spread arguments", at);
+                return self.unsupported("spread arguments", c.span);
             };
-            args.push(self.expr(e)?);
+            args.push(match hints.next() {
+                Some(ty) => self.expr_expected(e, ty)?,
+                None => self.expr(e)?,
+            });
         }
+        Ok(args)
+    }
+
+    fn call_expr(&mut self, c: &js::CallExpression<'ast>) -> Result<Expr> {
+        let at = c.span;
         if let js::Expression::StaticMemberExpression(m) = &c.callee {
             if let js::Expression::Identifier(receiver) = &m.object {
                 if receiver.name == "console"
@@ -1509,20 +1835,46 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                             at,
                         );
                     }
+                    let args = self.arguments(c, std::iter::empty())?;
                     return self.log(args, at);
                 }
             }
         }
-        let js::Expression::Identifier(id) = &c.callee else {
-            return self.unsupported("indirect or receiver calls", at);
+        let direct = match &c.callee {
+            js::Expression::Identifier(id)
+                if !self
+                    .scopes
+                    .iter()
+                    .any(|s| s.contains_key(&self.name(id.name.as_str()))) =>
+            {
+                Some(id)
+            }
+            _ => None,
         };
-        if self
-            .scopes
-            .iter()
-            .any(|s| s.contains_key(&self.name(id.name.as_str())))
-        {
-            return self.error(ErrorKind::Type, "value is not callable", at);
-        }
+        let Some(id) = direct else {
+            let callee = self.expr(&c.callee)?;
+            let Type::Function {
+                params,
+                return_type,
+                ..
+            } = &callee.ty
+            else {
+                return self.error(ErrorKind::Type, "value is not callable", at);
+            };
+            if c.type_arguments.is_some() || c.arguments.len() != params.len() {
+                return self.error(ErrorKind::Type, "wrong function argument count", at);
+            }
+            let args = self.arguments(c, params.iter().map(|p| &p.ty))?;
+            for (arg, expected) in args.iter().zip(params) {
+                self.expect(&arg.ty, &expected.ty, at)?;
+            }
+            let ret = return_type.as_ref().clone();
+            return Ok(node(
+                TypedExpression::Call(TypedCall::positional(callee, args)),
+                ret,
+                at,
+            ));
+        };
         let Some(sig) = self.signatures.get(&self.name(id.name.as_str())).cloned() else {
             return self.error(
                 ErrorKind::Type,
@@ -1530,9 +1882,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 at,
             );
         };
-        if args.len() != sig.params.len() {
+        if c.arguments.len() != sig.params.len() {
             return self.error(ErrorKind::Type, "wrong argument count", at);
         }
+        let args = self.arguments(c, sig.params.iter().map(|(_, ty, _)| ty))?;
         let mut types: SmallVec<[Option<(Type, Option<InternedString>)>; 2]> =
             std::iter::repeat_n(None, sig.type_params.len()).collect();
         if let Some(arguments) = &c.type_arguments {
@@ -1714,7 +2067,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             _ => return self.unsupported("this assignment target", a.span),
         };
         let (mut statements, target) = self.capture_target(target, a.span);
-        let mut value = self.expr(&a.right)?;
+        let mut value = self.expr_expected(&a.right, &target.ty)?;
         self.expect(&value.ty, &target.ty, a.span)?;
         if let js::AssignmentTarget::AssignmentTargetIdentifier(i) = &a.left {
             let b = self.binding(i.name.as_str(), a.span)?;

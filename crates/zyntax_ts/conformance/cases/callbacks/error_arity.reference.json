@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2554,
+      "start": 32,
+      "length": 1,
+      "file": "error_arity.ts",
+      "message": "Expected 1 arguments, but got 0."
+    }
+  ],
+  "source_sha256": "ad7b985b0a84259f5d2043c6566f56087aea3ec45967395bc93ea7b895b8a3c9",
+  "options": {}
+}

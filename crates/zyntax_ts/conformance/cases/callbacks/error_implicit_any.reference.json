@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 7006,
+      "start": 10,
+      "length": 1,
+      "file": "error_implicit_any.ts",
+      "message": "Parameter 'n' implicitly has an 'any' type."
+    }
+  ],
+  "source_sha256": "85f363ef9dc4d5a080b2e399af15599f3c9a30e5ce0b7dc3c4d624882b4c2a12",
+  "options": {}
+}

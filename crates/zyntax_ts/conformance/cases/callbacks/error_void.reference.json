@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 63,
+      "length": 5,
+      "file": "error_void.ts",
+      "message": "Type 'void' is not assignable to type 'number'."
+    }
+  ],
+  "source_sha256": "3ae89e94712a28a7aa4f78c35953447c4abf7c38415502d3ddea055eef780a79",
+  "options": {}
+}

@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 6,
+      "length": 1,
+      "file": "error_parameter.ts",
+      "message": "Type '(n: boolean) => number' is not assignable to type '(n: number) => number'.\n  Types of parameters 'n' and 'n' are incompatible.\n    Type 'number' is not assignable to type 'boolean'."
+    }
+  ],
+  "source_sha256": "37dab81b036d0065acb3a7632c54b6751f088a82f1ea11b45fa4f47caeb1a878",
+  "options": {}
+}

@@ -81,7 +81,8 @@ impl MonomorphizationContext {
             ));
         }
 
-        let instance = self.monomorphize_function(&generic_func, &key.type_args, &key.const_args)?;
+        let instance =
+            self.monomorphize_function(&generic_func, &key.type_args, &key.const_args)?;
         let instance_id = instance.id;
 
         self.instances.insert(key, instance_id);

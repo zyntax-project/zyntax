@@ -488,5 +488,105 @@
     "mode": "run",
     "soundness": "checked",
     "policy_error": true
+  },
+  {
+    "id": "callbacks/expression",
+    "file": "cases/callbacks/expression.ts",
+    "mode": "run"
+  },
+  {
+    "id": "callbacks/block",
+    "file": "cases/callbacks/block.ts",
+    "mode": "run"
+  },
+  {
+    "id": "callbacks/contextual",
+    "file": "cases/callbacks/contextual.ts",
+    "mode": "run"
+  },
+  {
+    "id": "callbacks/forward",
+    "file": "cases/callbacks/forward.ts",
+    "mode": "run"
+  },
+  {
+    "id": "callbacks/aliases",
+    "file": "cases/callbacks/aliases.ts",
+    "mode": "run"
+  },
+  {
+    "id": "callbacks/nested",
+    "file": "cases/callbacks/nested.ts",
+    "mode": "run"
+  },
+  {
+    "id": "callbacks/immediate",
+    "file": "cases/callbacks/immediate.ts",
+    "mode": "run"
+  },
+  {
+    "id": "callbacks/evaluation_order",
+    "file": "cases/callbacks/evaluation_order.ts",
+    "mode": "run"
+  },
+  {
+    "id": "callbacks/void",
+    "file": "cases/callbacks/void.ts",
+    "mode": "run"
+  },
+  {
+    "id": "callbacks/boolean",
+    "file": "cases/callbacks/boolean.ts",
+    "mode": "run"
+  },
+  {
+    "id": "callbacks/generic",
+    "file": "cases/callbacks/generic.ts",
+    "mode": "run"
+  },
+  {
+    "id": "callbacks/hot_calls",
+    "file": "cases/callbacks/hot_calls.ts",
+    "mode": "run"
+  },
+  {
+    "id": "callbacks/error_argument",
+    "file": "cases/callbacks/error_argument.ts",
+    "mode": "check"
+  },
+  {
+    "id": "callbacks/error_arity",
+    "file": "cases/callbacks/error_arity.ts",
+    "mode": "check"
+  },
+  {
+    "id": "callbacks/error_parameter",
+    "file": "cases/callbacks/error_parameter.ts",
+    "mode": "check"
+  },
+  {
+    "id": "callbacks/error_return",
+    "file": "cases/callbacks/error_return.ts",
+    "mode": "check"
+  },
+  {
+    "id": "callbacks/error_implicit_any",
+    "file": "cases/callbacks/error_implicit_any.ts",
+    "mode": "check"
+  },
+  {
+    "id": "callbacks/error_missing_return",
+    "file": "cases/callbacks/error_missing_return.ts",
+    "mode": "check"
+  },
+  {
+    "id": "callbacks/error_void",
+    "file": "cases/callbacks/error_void.ts",
+    "mode": "check"
+  },
+  {
+    "id": "callbacks/error_contextual_return",
+    "file": "cases/callbacks/error_contextual_return.ts",
+    "mode": "check"
   }
 ]

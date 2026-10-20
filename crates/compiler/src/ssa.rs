@@ -4009,8 +4009,13 @@ impl SsaBuilder {
                                 "[SSA] Variable '{}' is a function — emitting function ref",
                                 name_str
                             );
-                            // A code address is pointer-wide.
-                            let addr = self.create_value(HirType::USize, HirValueKind::Instruction);
+                            // Preserve the callable signature on the code address.
+                            let ty = if matches!(expr.ty, Type::Function { .. }) {
+                                self.convert_type(&expr.ty)
+                            } else {
+                                HirType::USize
+                            };
+                            let addr = self.create_value(ty, HirValueKind::Instruction);
                             self.add_instruction(
                                 block_id,
                                 HirInstruction::Call {
@@ -12753,6 +12758,24 @@ impl SsaBuilder {
         use zyntax_typed_ast::PrimitiveType;
 
         match ty {
+            Type::Function {
+                params,
+                return_type,
+                is_varargs,
+                ..
+            } => {
+                let ret = self.convert_type(return_type);
+                HirType::Function(Box::new(crate::hir::HirFunctionType {
+                    params: params.iter().map(|p| self.convert_type(&p.ty)).collect(),
+                    returns: if ret == HirType::Void {
+                        vec![]
+                    } else {
+                        vec![ret]
+                    },
+                    lifetime_params: vec![],
+                    is_variadic: *is_varargs,
+                }))
+            }
             Type::TypeVar(tv)
                 if tv.kind == zyntax_typed_ast::TypeVarKind::Parameter && tv.name.is_some() =>
             {

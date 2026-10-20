@@ -4814,9 +4814,14 @@ impl LoweringContext {
                 // Note: Lifetime parameters are embedded in the parameter types themselves
                 // (e.g., Type::Reference contains lifetime information). They are preserved
                 // during convert_type() and don't need separate tracking here.
+                let ret = self.convert_type(return_type);
                 HirType::Function(Box::new(crate::hir::HirFunctionType {
                     params: params.iter().map(|p| self.convert_type(&p.ty)).collect(),
-                    returns: vec![self.convert_type(return_type)],
+                    returns: if ret == HirType::Void {
+                        vec![]
+                    } else {
+                        vec![ret]
+                    },
                     lifetime_params: vec![], // Lifetimes tracked in parameter types
                     is_variadic: *is_varargs,
                 }))
