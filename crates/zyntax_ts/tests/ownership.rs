@@ -16,6 +16,7 @@ fn lower(source: &str) -> HirModule {
         LoweringConfig::default(),
     );
     let mut module = context.lower_program(&mut program).unwrap();
+    zyntax_compiler::monomorphize_module(&mut module).unwrap();
     module.automatic_release = true;
     module
 }
@@ -98,4 +99,34 @@ fn native_registration_does_not_enable_the_collector() {
     zyntax_ts::register_runtime(&mut runtime).unwrap();
     assert!(!zyntax_compiler::collector::is_enabled());
     runtime.stop();
+}
+
+#[test]
+fn generic_alias_results_share_the_callers_single_release() {
+    let mut module = lower(
+        r#"
+        function identity<T>(x: T): T { return x; }
+        const p = { x: 3, y: 4 };
+        const q = identity(p); q.x = 9;
+        console.log(p.x, q.x);
+    "#,
+    );
+    zyntax_compiler::drop_insert::run_module(&mut module);
+    assert_eq!(frees(&module, zyntax_ts::ENTRY), 1);
+    let alias = module
+        .functions
+        .values()
+        .find(|f| {
+            f.name
+                .resolve_global()
+                .unwrap()
+                .starts_with("ts$fn$identity__mono_")
+        })
+        .unwrap()
+        .name
+        .resolve_global()
+        .unwrap();
+    assert_eq!(frees(&module, &alias), 0);
+    zyntax_compiler::drop_insert::run_module(&mut module);
+    assert_eq!(frees(&module, zyntax_ts::ENTRY), 1);
 }

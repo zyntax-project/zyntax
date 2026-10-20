@@ -141,6 +141,23 @@ impl InferenceContext {
         let t2 = self.apply_substitutions(&t2);
 
         match (&t1, &t2) {
+            (Type::TypeVar(a), Type::TypeVar(b)) if a.id == b.id => Ok(t1),
+            (Type::TypeVar(v), t) | (t, Type::TypeVar(v)) if v.kind == TypeVarKind::Parameter => {
+                match t {
+                    Type::TypeVar(infer) if infer.kind != TypeVarKind::Parameter => {
+                        self.substitutions
+                            .insert(infer.id, Type::TypeVar(v.clone()));
+                        Ok(Type::TypeVar(v.clone()))
+                    }
+                    Type::Never | Type::Any | Type::Unknown | Type::Dynamic => {
+                        Ok(Type::TypeVar(v.clone()))
+                    }
+                    _ => Err(InferenceError::TypeMismatch {
+                        expected: t1,
+                        found: t2,
+                    }),
+                }
+            }
             // Same type
             (Type::Primitive(p1), Type::Primitive(p2)) if p1 == p2 => Ok(t1),
 
@@ -480,6 +497,7 @@ impl InferenceContext {
     /// Apply type substitutions
     pub fn apply_substitutions(&self, ty: &Type) -> Type {
         match ty {
+            Type::TypeVar(v) if v.kind == TypeVarKind::Parameter => ty.clone(),
             Type::TypeVar(v) => {
                 if let Some(subst) = self.substitutions.get(&v.id) {
                     self.apply_substitutions(subst)

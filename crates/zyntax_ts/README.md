@@ -25,7 +25,14 @@ from an iterative dependency worklist, and each body is checked and lowered once
 anchor a recursive call group. Cyclic inference, heterogeneous return unions,
 possibly undefined returns and differing readonly result views remain gaps.
 
-Arrays, generic functions, unions, closures, classes, multi-file linking and other unimplemented constructs
+Unconstrained generic functions support inferred and explicit type arguments,
+including forward calls, nested generic calls and recursion. Each body is checked
+once, then Zyntax's shared HIR specializer caches concrete native instances.
+Object arguments retain reference identity and their readonly views. Generic
+constraints, defaults, const type parameters and operators whose operands remain
+generic still need implementation.
+
+Arrays, unions, closures, classes, multi-file linking and other unimplemented constructs
 produce `Unsupported` diagnostics. These are implementation gaps, measured by
 the conformance suite; they are not permanent language restrictions.
 

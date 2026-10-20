@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 31,
+      "length": 6,
+      "file": "error_body.ts",
+      "message": "Type 'number' is not assignable to type 'T'.\n  'T' could be instantiated with an arbitrary type which could be unrelated to 'number'."
+    }
+  ],
+  "source_sha256": "7bb8703c703eeda80841e10bffa7637a187928c36b299eb38057247a5c6cc088",
+  "options": {}
+}

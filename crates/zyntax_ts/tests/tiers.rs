@@ -8,9 +8,10 @@ fn typed_object_aliases_agree_across_tiers_without_collection() {
     let source = r#"
         type Point = { x: number; y: number };
         function make(x: number) { return { y: 2, x: x }; }
+        function identity<T>(x: T): T { return x; }
         function score(x: number) {
             const p: Point = make(x);
-            const q: Point = p;
+            const q: Point = identity(p);
             q.x += 1;
             return p.x * 10 + q.y;
         }
@@ -23,7 +24,11 @@ fn typed_object_aliases_agree_across_tiers_without_collection() {
     };
     let mut runtime = TieredRuntime::new(config).unwrap();
     zyntax_ts::register_runtime(&mut runtime).unwrap();
-    runtime.compile_typed_program(program).unwrap();
+    let names = runtime.compile_typed_program(program).unwrap();
+    let generic = names
+        .iter()
+        .find(|name| name.starts_with("ts$fn$identity__mono_"))
+        .unwrap();
     assert_eq!(runtime.statistics().baseline_functions, 0);
     assert_eq!(runtime.statistics().optimized_functions, 0);
     assert_eq!(
@@ -32,6 +37,9 @@ fn typed_object_aliases_agree_across_tiers_without_collection() {
             .unwrap(),
         ZyntaxValue::Float(42.0)
     );
+    runtime
+        .optimize_function(generic, OptimizationTier::Baseline)
+        .unwrap();
     runtime
         .optimize_function("ts$fn$score", OptimizationTier::Baseline)
         .unwrap();
@@ -44,10 +52,13 @@ fn typed_object_aliases_agree_across_tiers_without_collection() {
     #[cfg(feature = "llvm-backend")]
     {
         runtime
+            .optimize_function(generic, OptimizationTier::Optimized)
+            .unwrap();
+        runtime
             .optimize_function("ts$fn$score", OptimizationTier::Optimized)
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while runtime.statistics().optimized_functions == 0 {
+        while runtime.statistics().optimized_functions < 2 {
             assert!(std::time::Instant::now() < deadline, "LLVM did not install");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

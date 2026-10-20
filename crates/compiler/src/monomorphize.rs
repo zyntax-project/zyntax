@@ -6,15 +6,18 @@
 use crate::const_eval::ConstEvaluator;
 use crate::hir::*;
 use crate::{CompilerError, CompilerResult};
-use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
+use std::collections::HashMap;
+use std::sync::Arc;
 use zyntax_typed_ast::InternedString;
 
 /// Monomorphization context
 pub struct MonomorphizationContext {
     /// Original generic functions
-    generic_functions: HashMap<HirId, HirFunction>,
+    generic_functions: FxHashMap<HirId, Arc<HirFunction>>,
     /// Monomorphized instances (key is (generic_id, type_args, const_args))
-    instances: HashMap<MonomorphizationKey, HirId>,
+    instances: FxHashMap<MonomorphizationKey, HirId>,
+    pending: Vec<HirFunction>,
     /// Next instance ID
     next_instance_id: u64,
     /// Const evaluator for const generic substitution
@@ -32,8 +35,9 @@ struct MonomorphizationKey {
 impl MonomorphizationContext {
     pub fn new() -> Self {
         Self {
-            generic_functions: HashMap::new(),
-            instances: HashMap::new(),
+            generic_functions: FxHashMap::default(),
+            instances: FxHashMap::default(),
+            pending: Vec::new(),
             next_instance_id: 0,
             const_eval: ConstEvaluator::new(),
         }
@@ -41,7 +45,7 @@ impl MonomorphizationContext {
 
     /// Register a generic function
     pub fn register_generic(&mut self, func: HirFunction) {
-        self.generic_functions.insert(func.id, func);
+        self.generic_functions.insert(func.id, Arc::new(func));
     }
 
     /// Get or create a monomorphized instance
@@ -53,8 +57,8 @@ impl MonomorphizationContext {
     ) -> CompilerResult<HirId> {
         let key = MonomorphizationKey {
             generic_id,
-            type_args: type_args.clone(),
-            const_args: const_args.clone(),
+            type_args,
+            const_args,
         };
 
         // Check if we already have this instance
@@ -69,10 +73,19 @@ impl MonomorphizationContext {
             .ok_or_else(|| CompilerError::Analysis("Generic function not found".into()))?
             .clone();
 
-        let instance = self.monomorphize_function(&generic_func, &type_args, &const_args)?;
+        if key.type_args.len() != generic_func.signature.type_params.len()
+            || key.const_args.len() != generic_func.signature.const_params.len()
+        {
+            return Err(CompilerError::Analysis(
+                "wrong generic argument count".into(),
+            ));
+        }
+
+        let instance = self.monomorphize_function(&generic_func, &key.type_args, &key.const_args)?;
         let instance_id = instance.id;
 
         self.instances.insert(key, instance_id);
+        self.pending.push(instance);
         Ok(instance_id)
     }
 
@@ -102,7 +115,7 @@ impl MonomorphizationContext {
         }
 
         // Create new function with substituted signature
-        let new_name = self.generate_instance_name(&func.name, type_args, const_args);
+        let new_name = self.generate_instance_name(func.name);
         let new_sig = self.substitute_signature(&func.signature, &type_subst, &const_subst)?;
         let mut new_func = HirFunction::new(new_name, new_sig);
 
@@ -112,6 +125,8 @@ impl MonomorphizationContext {
         new_func.blocks = func.blocks.clone();
         // Important: copy the original entry_block ID since we're copying all blocks
         new_func.entry_block = func.entry_block;
+        new_func.attributes = func.attributes.clone();
+        new_func.calling_convention = func.calling_convention;
 
         // Substitute types in the function body
         self.substitute_function_body(&mut new_func, &type_subst, &const_subst)?;
@@ -120,21 +135,15 @@ impl MonomorphizationContext {
     }
 
     /// Generate a unique name for a monomorphized instance
-    fn generate_instance_name(
-        &mut self,
-        base_name: &InternedString,
-        type_args: &[HirType],
-        const_args: &[HirConstant],
-    ) -> InternedString {
-        // Create a mangled name that includes type and const information
-        let mut name = format!("{}__mono_{}", base_name, self.next_instance_id);
+    fn generate_instance_name(&mut self, base_name: InternedString) -> InternedString {
+        let name = format!(
+            "{}__mono_{}",
+            base_name.resolve_global().unwrap_or_default(),
+            self.next_instance_id
+        );
         self.next_instance_id += 1;
 
-        // Create a proper interned string name
-        // This would use the interner from the typed AST crate
-        // For now, we'll create a valid string by using the arena from testing
-        let mut arena = zyntax_typed_ast::arena::AstArena::new();
-        arena.intern_string(&name)
+        InternedString::new_global(&name)
     }
 
     /// Substitute types and consts in a function signature
@@ -206,6 +215,11 @@ impl MonomorphizationContext {
         const_subst: &HashMap<InternedString, HirConstant>,
     ) -> CompilerResult<()> {
         match inst {
+            HirInstruction::Call { type_args, .. } => {
+                for ty in type_args {
+                    *ty = self.substitute_type(ty, type_subst, const_subst);
+                }
+            }
             HirInstruction::Binary { ty, .. }
             | HirInstruction::Unary { ty, .. }
             | HirInstruction::Alloca { ty, .. }
@@ -349,127 +363,52 @@ impl MonomorphizationContext {
     }
 }
 
-/// Monomorphization pass for a module
+/// Specialize reachable calls, including calls introduced by specialization.
 pub fn monomorphize_module(module: &mut HirModule) -> CompilerResult<()> {
     let mut ctx = MonomorphizationContext::new();
-
-    // First pass: identify generic functions
-    let generic_funcs: Vec<_> = module
+    let templates: Vec<_> = module
         .functions
         .iter()
         .filter(|(_, f)| {
             !f.signature.type_params.is_empty() || !f.signature.const_params.is_empty()
         })
-        .map(|(id, f)| (*id, f.clone()))
+        .map(|(id, _)| *id)
         .collect();
-
-    for (_, func) in generic_funcs {
-        ctx.register_generic(func);
+    if templates.is_empty() {
+        return Ok(());
     }
-
-    // Second pass: find all generic instantiations needed
-    let instantiations = find_instantiations(module)?;
-
-    // Third pass: create monomorphized instances
-    let mut new_functions = Vec::new();
-    let mut call_rewrites: HashMap<(HirId, usize), HirId> = HashMap::new(); // (block_id, inst_index) -> new_func_id
-
-    for (func_id, type_args, const_args, call_site) in instantiations {
-        // Check if this is a registered generic function
-        if ctx.generic_functions.contains_key(&func_id) {
-            // Get or create monomorphized instance
-            let instance_id =
-                ctx.get_or_create_instance(func_id, type_args.clone(), const_args.clone())?;
-
-            // Check if we need to add this instance to the module
-            if !module.functions.contains_key(&instance_id) {
-                // Get the monomorphized function from context
-                // Note: get_or_create_instance already created it, we need to retrieve it
-                // For now, we'll regenerate it (TODO: cache instances in context)
-                let generic_func = ctx.generic_functions.get(&func_id).unwrap().clone();
-                let instance = ctx.monomorphize_function(&generic_func, &type_args, &const_args)?;
-                new_functions.push((instance_id, instance));
-            }
-
-            // Record that this call site should be rewritten
-            call_rewrites.insert(call_site, instance_id);
-        }
+    for id in templates {
+        ctx.register_generic(module.functions.remove(&id).unwrap());
     }
-
-    // Fourth pass: add new functions to module
-    for (id, func) in new_functions {
-        module.functions.insert(id, func);
-    }
-
-    // Fifth pass: rewrite call sites to use concrete instances
-    for func in module.functions.values_mut() {
-        for block in func.blocks.values_mut() {
-            for (inst_idx, inst) in block.instructions.iter_mut().enumerate() {
+    let mut work: Vec<_> = module.functions.keys().copied().collect();
+    while let Some(id) = work.pop() {
+        let function = module.functions.get_mut(&id).unwrap();
+        for block in function.blocks.values_mut() {
+            for inst in &mut block.instructions {
                 if let HirInstruction::Call {
-                    callee, type_args, ..
-                } = inst
-                {
-                    // If this call has type args and targets a generic function, rewrite it
-                    if !type_args.is_empty() {
-                        if let HirCallable::Function(func_id) = callee {
-                            let call_site = (block.id, inst_idx);
-                            if let Some(&instance_id) = call_rewrites.get(&call_site) {
-                                *callee = HirCallable::Function(instance_id);
-                                // Clear type_args since the instance is now concrete
-                                *type_args = vec![];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Find all generic function instantiations needed in the module
-fn find_instantiations(
-    module: &HirModule,
-) -> CompilerResult<Vec<(HirId, Vec<HirType>, Vec<HirConstant>, (HirId, usize))>> {
-    let mut instantiations = Vec::new();
-
-    // Traverse all functions to find Call instructions with type_args
-    for func in module.functions.values() {
-        for block in func.blocks.values() {
-            for (inst_idx, inst) in block.instructions.iter().enumerate() {
-                if let HirInstruction::Call {
-                    callee,
+                    callee: HirCallable::Function(callee),
                     type_args,
                     const_args,
                     ..
                 } = inst
                 {
-                    // Only care about direct function calls with type arguments
-                    if !type_args.is_empty() {
-                        if let HirCallable::Function(func_id) = callee {
-                            // Check if this function is generic
-                            if let Some(target_func) = module.functions.get(func_id) {
-                                if !target_func.signature.type_params.is_empty()
-                                    || !target_func.signature.const_params.is_empty()
-                                {
-                                    // This is a generic call that needs instantiation
-                                    instantiations.push((
-                                        *func_id,
-                                        type_args.clone(),
-                                        const_args.clone(),
-                                        (block.id, inst_idx), // call site location
-                                    ));
-                                }
-                            }
-                        }
+                    if ctx.generic_functions.contains_key(callee) {
+                        *callee = ctx.get_or_create_instance(
+                            *callee,
+                            std::mem::take(type_args),
+                            std::mem::take(const_args),
+                        )?;
                     }
                 }
             }
         }
+        // Each key produces one owned body; recursive calls reuse its installed ID.
+        for instance in ctx.pending.drain(..) {
+            work.push(instance.id);
+            module.functions.insert(instance.id, instance);
+        }
     }
-
-    Ok(instantiations)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1097,12 +1036,13 @@ mod tests {
             result.err()
         );
 
-        // AFTER: 3 functions (generic + i32 instance + caller)
+        // Only concrete code is left for execution.
         assert_eq!(
             module.functions.len(),
-            3,
+            2,
             "Should create monomorphized instance"
         );
+        assert!(!module.functions.contains_key(&generic_id));
 
         // Verify call was REWRITTEN to call the instance
         let caller_after = module.functions.get(&caller_id).unwrap();

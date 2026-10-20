@@ -25,6 +25,8 @@ pub struct TypeChecker {
     constraint_solver: ConstraintSolver,
     /// Local variable types and mutability
     locals: Vec<HashMap<InternedString, (Type, Mutability)>>,
+    function_type_params:
+        rustc_hash::FxHashMap<InternedString, Vec<crate::type_registry::TypeParam>>,
     /// Return type of current function
     return_type: Option<Type>,
     /// Current loop type (for break expressions)
@@ -138,6 +140,7 @@ impl TypeChecker {
             inference: InferenceContext::new(registry),
             constraint_solver: ConstraintSolver::with_type_registry(registry_for_solver),
             locals: vec![HashMap::new()],
+            function_type_params: rustc_hash::FxHashMap::default(),
             return_type: None,
             loop_type: None,
             options: TypeCheckOptions::default(),
@@ -159,6 +162,7 @@ impl TypeChecker {
             inference: InferenceContext::new(registry),
             constraint_solver: ConstraintSolver::with_type_registry(registry_for_solver),
             locals: vec![HashMap::new()],
+            function_type_params: rustc_hash::FxHashMap::default(),
             return_type: None,
             loop_type: None,
             options,
@@ -729,9 +733,28 @@ impl TypeChecker {
     /// Type check a program
     /// Returns () on success, diagnostics are collected in self.diagnostics
     pub fn check_program(&mut self, program: &TypedProgram) {
+        self.function_type_params.clear();
         // First pass: Add all function declarations to scope
         for decl_node in &program.declarations {
             if let TypedDeclaration::Function(func) = &decl_node.node {
+                if !func.type_params.is_empty() {
+                    self.function_type_params.insert(
+                        func.name,
+                        func.type_params
+                            .iter()
+                            .filter(|p| !p.is_const)
+                            .map(|p| crate::type_registry::TypeParam {
+                                name: p.name,
+                                bounds: vec![],
+                                variance: crate::type_registry::Variance::Invariant,
+                                default: p.default.clone(),
+                                span: p.span,
+                                is_const: false,
+                                const_ty: None,
+                            })
+                            .collect(),
+                    );
+                }
                 // Create function type from the function signature
                 let func_type = Type::Function {
                     params: func
@@ -1552,7 +1575,30 @@ impl TypeChecker {
         }
 
         // Type check the callee
-        let callee_type = self.check_expression(&call.callee.node)?;
+        let mut callee_type = self.check_expression(&call.callee.node)?;
+        if let TypedExpression::Variable(name) = &call.callee.node {
+            if let Some(params) = self.function_type_params.get(name) {
+                let inferred;
+                let args = if call.type_args.is_empty() {
+                    inferred = params
+                        .iter()
+                        .map(|_| self.inference.fresh_type_var())
+                        .collect::<Vec<_>>();
+                    &inferred
+                } else {
+                    &call.type_args
+                };
+                if args.len() != params.len() {
+                    return Err(TypeError::ArityMismatch {
+                        expected: params.len(),
+                        found: args.len(),
+                        span: call.callee.span,
+                    });
+                }
+                callee_type =
+                    crate::TypeRegistry::substitute_type_params(&callee_type, params, args);
+            }
+        }
 
         // Extract function type
         let func_type = match &callee_type {

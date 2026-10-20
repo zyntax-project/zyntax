@@ -100,6 +100,7 @@ struct Binding {
 }
 struct Signature<'ast> {
     native: InternedString,
+    type_params: Vec<(InternedString, Type)>,
     params: Vec<(&'ast str, Type, Option<InternedString>)>,
     ret: Option<Type>,
     ret_view: Option<InternedString>,
@@ -161,6 +162,7 @@ struct Lowerer<'ast, 'program> {
     views: FxHashMap<InternedString, BTreeMap<&'ast str, Field>>,
     layouts: FxHashMap<Vec<(InternedString, PrimitiveType)>, TypeId>,
     signatures: FxHashMap<InternedString, Rc<Signature<'ast>>>,
+    active_types: SmallVec<[(InternedString, Type); 2]>,
     functions: FxHashMap<InternedString, &'program js::Function<'ast>>,
     lowered: FxHashSet<InternedString>,
     scopes: Vec<FxHashMap<InternedString, Binding>>,
@@ -181,6 +183,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             views: FxHashMap::default(),
             layouts: FxHashMap::default(),
             signatures: FxHashMap::default(),
+            active_types: SmallVec::new(),
             functions: FxHashMap::default(),
             lowered: FxHashSet::default(),
             scopes: vec![],
@@ -491,16 +494,20 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let js::TSTypeName::IdentifierReference(name) = &r.type_name else {
                     return self.unsupported("qualified type names", r.span);
                 };
-                self.aliases
-                    .get(&self.name(name.name.as_str()))
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::Type,
-                            format!("unknown type `{}`", name.name),
-                            r.span,
-                        )
-                    })?
+                let name = self.name(name.name.as_str());
+                if let Some((_, ty)) = self.active_types.iter().find(|(n, _)| *n == name) {
+                    return Ok((ty.clone(), None));
+                }
+                self.aliases.get(&name).cloned().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Type,
+                        format!(
+                            "unknown type `{}`",
+                            name.resolve_global().unwrap_or_default()
+                        ),
+                        r.span,
+                    )
+                })?
             }
             js::TSType::TSParenthesizedType(p) => self.ty(&p.type_annotation)?,
             _ => return self.unsupported("this type representation", ty.span()),
@@ -521,18 +528,31 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         };
         if f.r#async
             || f.generator
-            || f.type_parameters.is_some()
             || f.params.rest.is_some()
             || f.this_param.is_some()
             || f.body.is_none()
         {
-            return self.unsupported(
-                "async, generator, generic, rest or ambient functions",
-                f.span,
-            );
+            return self.unsupported("async, generator, rest or ambient functions", f.span);
         }
         if self.signatures.contains_key(&self.name(id.name.as_str())) {
             return self.unsupported("function overloads", f.span);
+        }
+        self.active_types.clear();
+        let mut type_params = vec![];
+        if let Some(parameters) = &f.type_parameters {
+            for p in &parameters.params {
+                if p.constraint.is_some() || p.default.is_some() || p.r#const {
+                    return self
+                        .unsupported("constrained, default or const type parameters", p.span);
+                }
+                let name = self.name(p.name.name.as_str());
+                if self.active_types.iter().any(|(n, _)| *n == name) {
+                    return self.error(ErrorKind::Type, "duplicate type parameter", p.span);
+                }
+                let ty = Type::TypeVar(zyntax_typed_ast::TypeVar::parameter(name));
+                self.active_types.push((name, ty.clone()));
+                type_params.push((name, ty));
+            }
         }
         let mut params = vec![];
         let mut names = FxHashSet::default();
@@ -568,11 +588,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             name,
             Rc::new(Signature {
                 native,
+                type_params,
                 params,
                 ret,
                 ret_view,
             }),
         );
+        self.active_types.clear();
         Ok(())
     }
 
@@ -591,6 +613,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     fn function_body(&mut self, f: &js::Function<'ast>) -> Result<()> {
         let name = self.name(f.id.as_ref().unwrap().name.as_str());
         let sig = self.signatures[&name].clone();
+        self.active_types.clear();
+        self.active_types.extend(sig.type_params.iter().cloned());
         self.scopes.push(FxHashMap::default());
         let mut params = vec![];
         for (name, ty, view) in &sig.params {
@@ -633,15 +657,26 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             return self.error(ErrorKind::Type, "function lacks an ending return", f.span);
         }
         let native = sig.native;
+        let type_params = sig
+            .type_params
+            .iter()
+            .map(|(name, _)| TypedTypeParam {
+                name: *name,
+                span: span(f.span),
+                ..Default::default()
+            })
+            .collect();
         drop(sig);
         let sig = Rc::get_mut(self.signatures.get_mut(&name).unwrap())
             .expect("signature handles do not escape body lowering");
         sig.ret = Some(ret.clone());
         sig.ret_view = ret_view;
         self.scopes.pop();
+        self.active_types.clear();
         self.declarations.push(node(
             TypedDeclaration::Function(TypedFunction {
                 name: native,
+                type_params,
                 annotations: vec![strict_fp(self.name("strict_fp"))],
                 params,
                 return_type: ret,
@@ -821,6 +856,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             Type::Primitive(PrimitiveType::Bool) => "boolean".into(),
             Type::Primitive(PrimitiveType::String) => "string".into(),
             Type::Primitive(PrimitiveType::Unit) => "void".into(),
+            Type::TypeVar(t) => t.name.and_then(|n| n.resolve_global()).unwrap_or_default(),
             Type::Named { id, .. } => {
                 let mut description = String::from("{ ");
                 if let Some(definition) = self.registry.get_type_by_id(*id) {
@@ -852,9 +888,30 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 .and_then(|b| b.view),
             js::Expression::CallExpression(c) => {
                 if let js::Expression::Identifier(i) = &c.callee {
-                    self.signatures
-                        .get(&self.name(i.name.as_str()))
-                        .and_then(|s| s.ret_view)
+                    let sig = self.signatures.get(&self.name(i.name.as_str()))?;
+                    if let Some(index) = sig
+                        .type_params
+                        .iter()
+                        .position(|(_, ty)| Some(ty) == sig.ret.as_ref())
+                    {
+                        if let Some(arguments) = &c.type_arguments {
+                            return arguments
+                                .params
+                                .get(index)
+                                .and_then(|ty| self.ty(ty).ok())
+                                .and_then(|(_, view)| view);
+                        }
+                        let arg = sig
+                            .params
+                            .iter()
+                            .position(|(_, ty, _)| Some(ty) == sig.ret.as_ref())?;
+                        return c
+                            .arguments
+                            .get(arg)
+                            .and_then(|a| a.as_expression())
+                            .and_then(|e| self.view_of(e));
+                    }
+                    sig.ret_view
                 } else {
                     None
                 }
@@ -1287,6 +1344,16 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let left = self.expr(&b.left)?;
         let right = self.expr(&b.right)?;
         let op = b.operator.as_str();
+        if matches!(left.ty, Type::TypeVar(_)) || matches!(right.ty, Type::TypeVar(_)) {
+            if matches!(op, "+" | "-" | "*" | "/" | "%" | "**") {
+                return self.error(
+                    ErrorKind::Type,
+                    "arithmetic requires a concrete numeric or string type",
+                    at,
+                );
+            }
+            return self.unsupported("operators on unconstrained type parameters", at);
+        }
         if left.ty == string() && right.ty == string() {
             return match op {
                 "+" => Ok(self.call("$String$concat", vec![left, right], string(), at)),
@@ -1419,9 +1486,6 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn call_expr(&mut self, c: &js::CallExpression<'ast>) -> Result<Expr> {
         let at = c.span;
-        if c.type_arguments.is_some() {
-            return self.unsupported("generic calls", at);
-        }
         let mut args = vec![];
         for arg in &c.arguments {
             let Some(e) = arg.as_expression() else {
@@ -1438,6 +1502,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         .iter()
                         .any(|s| s.contains_key(&self.name("console")))
                 {
+                    if c.type_arguments.is_some() {
+                        return self.error(
+                            ErrorKind::Type,
+                            "console.log does not take type arguments",
+                            at,
+                        );
+                    }
                     return self.log(args, at);
                 }
             }
@@ -1462,11 +1533,48 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if args.len() != sig.params.len() {
             return self.error(ErrorKind::Type, "wrong argument count", at);
         }
+        let mut types: SmallVec<[Option<(Type, Option<InternedString>)>; 2]> =
+            std::iter::repeat_n(None, sig.type_params.len()).collect();
+        if let Some(arguments) = &c.type_arguments {
+            if arguments.params.len() != types.len() {
+                return self.error(ErrorKind::Type, "wrong type argument count", at);
+            }
+            for (slot, ty) in types.iter_mut().zip(&arguments.params) {
+                *slot = Some(self.ty(ty)?);
+            }
+        } else {
+            for ((arg, source), (_, expected, _)) in args.iter().zip(&c.arguments).zip(&sig.params)
+            {
+                if let Some(index) = sig.type_params.iter().position(|(_, ty)| ty == expected) {
+                    if types[index].is_none() {
+                        types[index] = Some((
+                            arg.ty.clone(),
+                            source.as_expression().and_then(|e| self.view_of(e)),
+                        ));
+                    }
+                }
+            }
+        }
+        let instantiate =
+            |ty: &Type, view: Option<InternedString>| -> Result<(Type, Option<InternedString>)> {
+                if let Some(index) = sig.type_params.iter().position(|(_, param)| param == ty) {
+                    types[index].clone().ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::Unsupported,
+                            "unresolved generic type argument",
+                            at,
+                        )
+                    })
+                } else {
+                    Ok((ty.clone(), view))
+                }
+            };
         for ((arg, source), (_, expected, view)) in args.iter().zip(&c.arguments).zip(&sig.params) {
-            self.expect(&arg.ty, expected, at)?;
+            let (expected, view) = instantiate(expected, *view)?;
+            self.expect(&arg.ty, &expected, at)?;
             self.check_view(
                 source.as_expression().and_then(|e| self.view_of(e)),
-                *view,
+                view,
                 at,
             )?;
         }
@@ -1477,7 +1585,29 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 at,
             )
         })?;
-        Ok(call(sig.native, args, ret, at))
+        let (ret, _) = instantiate(&ret, sig.ret_view)?;
+        let type_args = types
+            .into_iter()
+            .map(|ty| {
+                ty.map(|(ty, _)| ty).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unsupported,
+                        "unresolved generic type argument",
+                        at,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(node(
+            TypedExpression::Call(TypedCall {
+                callee: Box::new(var(sig.native, Type::Any, at)),
+                positional_args: args,
+                named_args: vec![],
+                type_args,
+            }),
+            ret,
+            at,
+        ))
     }
 
     fn log(&mut self, args: Vec<Expr>, at: oxc_span::Span) -> Result<Expr> {

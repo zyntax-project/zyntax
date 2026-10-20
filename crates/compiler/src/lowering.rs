@@ -5165,6 +5165,11 @@ impl LoweringContext {
                 }
             }
 
+            Type::TypeVar(tv)
+                if tv.kind == zyntax_typed_ast::TypeVarKind::Parameter && tv.name.is_some() =>
+            {
+                HirType::Opaque(tv.name.unwrap())
+            }
             Type::Any => crate::zrtl::dynamic_box_pointer_type(),
             Type::Vector(inner, lanes) => {
                 // First-class SIMD surface type lowers directly to the

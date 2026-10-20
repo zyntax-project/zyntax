@@ -12753,6 +12753,11 @@ impl SsaBuilder {
         use zyntax_typed_ast::PrimitiveType;
 
         match ty {
+            Type::TypeVar(tv)
+                if tv.kind == zyntax_typed_ast::TypeVarKind::Parameter && tv.name.is_some() =>
+            {
+                HirType::Opaque(tv.name.unwrap())
+            }
             Type::Primitive(prim) => match prim {
                 PrimitiveType::Bool => HirType::Bool,
                 PrimitiveType::I8 => HirType::I8,

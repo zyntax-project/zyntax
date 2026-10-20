@@ -750,6 +750,14 @@ pub(crate) fn resolve_in_expr(
             resolve_in_expr(&mut un.operand, type_registry, function_returns);
         }
         TypedExpression::Call(call) => {
+            // A generic call carries its instantiated result, not the template's return type.
+            let instantiated = !call.type_args.is_empty()
+                && !matches!(
+                    expr.ty,
+                    Type::Any
+                        | Type::Unknown
+                        | Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit)
+                );
             resolve_in_expr(&mut call.callee, type_registry, function_returns);
             for arg in &mut call.positional_args {
                 resolve_in_expr(arg, type_registry, function_returns);
@@ -779,7 +787,7 @@ pub(crate) fn resolve_in_expr(
                 if let Some(return_type) = function_returns.get(&mangled_interned) {
                     let mut resolved_return_type = return_type.clone();
                     resolve_in_type(&mut resolved_return_type, type_registry);
-                    if !matches!(resolved_return_type, Type::Any | Type::Unknown) {
+                    if !instantiated && !matches!(resolved_return_type, Type::Any | Type::Unknown) {
                         expr.ty = resolved_return_type;
                         log::debug!(
                             "[RESOLVE_TYPES] Path call '{}' resolved to return type {:?}",
@@ -797,7 +805,7 @@ pub(crate) fn resolve_in_expr(
                 if let Some(return_type) = function_returns.get(func_name) {
                     let mut resolved_return_type = return_type.clone();
                     resolve_in_type(&mut resolved_return_type, type_registry);
-                    if !matches!(resolved_return_type, Type::Any | Type::Unknown) {
+                    if !instantiated && !matches!(resolved_return_type, Type::Any | Type::Unknown) {
                         expr.ty = resolved_return_type;
                     }
                 }

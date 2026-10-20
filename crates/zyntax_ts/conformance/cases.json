@@ -404,5 +404,89 @@
     "mode": "check",
     "soundness": "checked",
     "policy_error": true
+  },
+  {
+    "id": "generics/identity",
+    "file": "cases/generics/identity.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/nested",
+    "file": "cases/generics/nested.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/recursion",
+    "file": "cases/generics/recursion.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/objects",
+    "file": "cases/generics/objects.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/inferred_result",
+    "file": "cases/generics/inferred_result.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/multiple",
+    "file": "cases/generics/multiple.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/hot_calls",
+    "file": "cases/generics/hot_calls.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/readonly",
+    "file": "cases/generics/readonly.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/error_argument",
+    "file": "cases/generics/error_argument.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/error_return",
+    "file": "cases/generics/error_return.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/error_count",
+    "file": "cases/generics/error_count.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/error_body",
+    "file": "cases/generics/error_body.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/error_scope",
+    "file": "cases/generics/error_scope.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/error_readonly",
+    "file": "cases/generics/error_readonly.ts",
+    "mode": "check"
+  },
+  {
+    "id": "policy/checked_generic_readonly",
+    "file": "cases/policy/checked_generic_readonly.ts",
+    "mode": "run",
+    "soundness": "checked",
+    "policy_error": true
+  },
+  {
+    "id": "policy/checked_generic_explicit",
+    "file": "cases/policy/checked_generic_explicit.ts",
+    "mode": "run",
+    "soundness": "checked",
+    "policy_error": true
   }
 ]

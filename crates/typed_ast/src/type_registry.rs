@@ -574,6 +574,15 @@ impl TypeVarId {
 }
 
 impl TypeVar {
+    /// A bound generic parameter, instantiated at calls rather than inferred in its body.
+    pub fn parameter(name: InternedString) -> Self {
+        Self {
+            id: TypeVarId::next(),
+            name: Some(name),
+            kind: TypeVarKind::Parameter,
+        }
+    }
+
     /// Create a new unbound type variable with the given name
     pub fn unbound(name: InternedString) -> Self {
         Self {
@@ -608,6 +617,8 @@ pub enum TypeVarKind {
     Floating,
     /// Any numeric type variable
     Numeric,
+    /// A rigid type parameter bound by a generic declaration.
+    Parameter,
 }
 
 /// Definition of a registered type

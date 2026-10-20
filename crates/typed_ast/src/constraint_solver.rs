@@ -111,6 +111,7 @@ impl Substitution {
     /// Apply substitution to a type
     pub fn apply(&self, ty: &Type) -> Type {
         match ty {
+            Type::TypeVar(var) if var.kind == TypeVarKind::Parameter => ty.clone(),
             Type::TypeVar(var) => self.map.get(&var.id).cloned().unwrap_or_else(|| ty.clone()),
             Type::Function {
                 params,
@@ -589,6 +590,30 @@ impl ConstraintSolver {
             // Type variable cases
             (Type::TypeVar(v1), Type::TypeVar(v2)) if v1.id == v2.id => {
                 Ok(ConstraintResult::Solved)
+            }
+            (Type::TypeVar(infer), Type::TypeVar(parameter))
+                if infer.kind != TypeVarKind::Parameter
+                    && parameter.kind == TypeVarKind::Parameter =>
+            {
+                let mut subst = Substitution::new();
+                subst.bind(infer.id, t2);
+                Ok(ConstraintResult::Substitution(subst))
+            }
+            (Type::TypeVar(v), t) | (t, Type::TypeVar(v)) if v.kind == TypeVarKind::Parameter => {
+                match t {
+                    Type::TypeVar(infer) if infer.kind != TypeVarKind::Parameter => {
+                        let mut subst = Substitution::new();
+                        subst.bind(infer.id, Type::TypeVar(v.clone()));
+                        Ok(ConstraintResult::Substitution(subst))
+                    }
+                    Type::Never | Type::Any | Type::Unknown | Type::Dynamic => {
+                        Ok(ConstraintResult::Solved)
+                    }
+                    _ => {
+                        self.errors.push(SolverError::CannotUnify(t1, t2, span));
+                        Err(self.errors.clone())
+                    }
+                }
             }
             (Type::TypeVar(v1), Type::TypeVar(v2)) => {
                 // Merge trait bounds from both type variables

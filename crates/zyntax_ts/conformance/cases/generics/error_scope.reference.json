@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2304,
+      "start": 64,
+      "length": 1,
+      "file": "error_scope.ts",
+      "message": "Cannot find name 'T'."
+    }
+  ],
+  "source_sha256": "90d0b6b0137358aab2cbd9139a471849d1e4072b6834e22b9ff7e6cc389a0559",
+  "options": {}
+}

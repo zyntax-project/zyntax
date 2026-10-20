@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2558,
+      "start": 53,
+      "length": 14,
+      "file": "error_count.ts",
+      "message": "Expected 1 type arguments, but got 2."
+    }
+  ],
+  "source_sha256": "b93357f82c0a33077a0cb345d6828fc6330299a7c3e4b93fabef7afa8ac49f3f",
+  "options": {}
+}
