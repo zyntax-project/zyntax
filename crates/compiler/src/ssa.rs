@@ -177,8 +177,9 @@ pub(crate) fn hir_ty_size(ty: &HirType) -> usize {
         HirType::I64 | HirType::U64 | HirType::F64 => 8,
         HirType::Ptr(_) | HirType::USize | HirType::ISize => crate::target_pointer_size(),
         HirType::I128 | HirType::U128 => 16,
-        HirType::Struct(s) => s.fields.iter().map(hir_ty_size).sum::<usize>().max(1),
+        HirType::Struct(_) => crate::value_layout::size_of_hir_ty(ty).max(1),
         HirType::Array(elem, n) => hir_ty_size(elem).saturating_mul(*n as usize),
+        HirType::Union(u) => crate::value_layout::union_layout(u).size,
         _ => 8,
     }
 }

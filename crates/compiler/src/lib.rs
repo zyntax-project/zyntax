@@ -108,6 +108,7 @@ pub mod tco; // Tail-call optimisation marker
 pub mod trait_lowering; // Trait/interface lowering to HIR
 pub mod typed_cfg; // New: TypedAST-aware CFG builder
 pub mod value; // Unified runtime value type (used by interp + embed)
+pub mod value_layout;
 pub mod vtable_registry; // Vtable management and caching // Async runtime (executor, task, waker)
 
 #[cfg(feature = "cranelift-backend")]

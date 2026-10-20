@@ -631,6 +631,21 @@ pub enum Op {
         val: Reg,
         ty: u32,
     },
+    MakeUnion {
+        dst: Reg,
+        src: Reg,
+        size: u32,
+        offset: u32,
+        payload_ty: u32,
+        tag: u64,
+        tag_ty: Option<u32>,
+    },
+    UnionPayload {
+        dst: Reg,
+        src: Reg,
+        offset: u32,
+        ty: u32,
+    },
 
     // ── aggregates (held as the address of their storage) ──
     /// `dst` = the field of the aggregate at `src` named by the index
@@ -1733,6 +1748,9 @@ fn inst_result(inst: &HirInstruction) -> Option<HirId> {
         | HirInstruction::Alloca { result, .. }
         | HirInstruction::Load { result, .. }
         | HirInstruction::ExtractValue { result, .. }
+        | HirInstruction::CreateUnion { result, .. }
+        | HirInstruction::GetUnionDiscriminant { result, .. }
+        | HirInstruction::ExtractUnionValue { result, .. }
         | HirInstruction::InsertValue { result, .. } => Some(*result),
         HirInstruction::Call { result, .. } => *result,
         _ => None,
@@ -1753,6 +1771,8 @@ fn inst_result_ty(inst: &HirInstruction) -> Option<HirType> {
         HirInstruction::ExtractValue { ty, .. } | HirInstruction::InsertValue { ty, .. } => {
             Some(ty.clone())
         }
+        HirInstruction::CreateUnion { union_ty, .. } => Some(union_ty.clone()),
+        HirInstruction::ExtractUnionValue { ty, .. } => Some(ty.clone()),
         _ => None,
     }
 }
@@ -1911,6 +1931,74 @@ fn lower_inst(
                 cond: reg(*condition)?,
                 yes: reg(*true_val)?,
                 no: reg(*false_val)?,
+            });
+        }
+        HirInstruction::CreateUnion {
+            result,
+            union_ty,
+            variant_index,
+            value,
+        } => {
+            let HirType::Union(u) = union_ty else {
+                return Err(InterpError::UnsupportedInstruction(
+                    "CreateUnion needs a union type".into(),
+                ));
+            };
+            let variant = u.variants.get(*variant_index as usize).ok_or_else(|| {
+                InterpError::UnsupportedInstruction("union variant index out of range".into())
+            })?;
+            let layout = crate::value_layout::union_layout(u);
+            let payload_ty = type_idx(cf, &variant.ty);
+            let tag_ty = (!u.is_c_union).then(|| type_idx(cf, &u.discriminant_type));
+            cf.code.push(Op::MakeUnion {
+                dst: reg(*result)?,
+                src: reg(*value)?,
+                size: layout.size as u32,
+                offset: layout.payload_offset as u32,
+                payload_ty,
+                tag: variant.discriminant,
+                tag_ty,
+            });
+        }
+        HirInstruction::GetUnionDiscriminant { result, union_val } => {
+            let src = reg(*union_val)?;
+            let HirType::Union(u) = &cf.reg_types[src as usize] else {
+                return Err(InterpError::UnsupportedInstruction(
+                    "union tag needs a union operand".into(),
+                ));
+            };
+            if u.is_c_union {
+                return Err(InterpError::UnsupportedInstruction(
+                    "C union has no discriminant".into(),
+                ));
+            }
+            let ty = u.discriminant_type.as_ref().clone();
+            let ty = type_idx(cf, &ty);
+            cf.code.push(Op::Load {
+                dst: reg(*result)?,
+                ptr: src,
+                ty,
+            });
+        }
+        HirInstruction::ExtractUnionValue {
+            result,
+            ty,
+            union_val,
+            ..
+        } => {
+            let src = reg(*union_val)?;
+            let HirType::Union(u) = &cf.reg_types[src as usize] else {
+                return Err(InterpError::UnsupportedInstruction(
+                    "union payload needs a union operand".into(),
+                ));
+            };
+            let offset = crate::value_layout::union_layout(u).payload_offset as u32;
+            let ty = type_idx(cf, ty);
+            cf.code.push(Op::UnionPayload {
+                dst: reg(*result)?,
+                src,
+                offset,
+                ty,
             });
         }
         HirInstruction::Alloca {
@@ -2750,69 +2838,7 @@ fn lower_terminator(
     Ok(())
 }
 
-/// Byte size of a value of `ty` in memory, laid out as the native
-/// backends lay it out: fields at their natural alignment, the total
-/// rounded up to the struct's alignment.
-pub fn size_of_hir_ty(ty: &HirType) -> usize {
-    match ty {
-        HirType::Void => 0,
-        HirType::Bool | HirType::I8 | HirType::U8 => 1,
-        HirType::I16 | HirType::U16 => 2,
-        HirType::I32 | HirType::U32 | HirType::F32 => 4,
-        HirType::I64 | HirType::U64 | HirType::F64 => 8,
-        HirType::Ptr(_) | HirType::USize | HirType::ISize => 8,
-        HirType::I128 | HirType::U128 => 16,
-        HirType::Struct(s) => struct_layout(s).size,
-        HirType::Array(elem, n) => size_of_hir_ty(elem).saturating_mul((*n) as usize),
-        HirType::Vector(elem, n) => size_of_hir_ty(elem).saturating_mul((*n) as usize),
-        _ => 8,
-    }
-}
-
-/// Alignment of a value of `ty` in memory.
-pub fn align_of_hir_ty(ty: &HirType) -> usize {
-    match ty {
-        HirType::Void => 1,
-        HirType::Bool | HirType::I8 | HirType::U8 => 1,
-        HirType::I16 | HirType::U16 => 2,
-        HirType::I32 | HirType::U32 | HirType::F32 => 4,
-        HirType::I64 | HirType::U64 | HirType::F64 => 8,
-        HirType::Ptr(_) | HirType::USize | HirType::ISize => 8,
-        HirType::I128 | HirType::U128 => 16,
-        HirType::Struct(s) => struct_layout(s).align,
-        HirType::Array(elem, _) => align_of_hir_ty(elem),
-        HirType::Vector(elem, _) => align_of_hir_ty(elem),
-        _ => 8,
-    }
-}
-
-/// Where a struct's fields sit.
-pub struct StructLayout {
-    pub offsets: Vec<usize>,
-    pub size: usize,
-    pub align: usize,
-}
-
-/// The layout of `s`: each field at its natural alignment unless the
-/// struct is packed, the size rounded up to the struct's alignment.
-pub fn struct_layout(s: &crate::hir::HirStructType) -> StructLayout {
-    let mut offset = 0usize;
-    let mut offsets = Vec::with_capacity(s.fields.len());
-    let mut align = 1usize;
-    for field in &s.fields {
-        let a = if s.packed { 1 } else { align_of_hir_ty(field) };
-        align = align.max(a);
-        offset = offset.div_ceil(a) * a;
-        offsets.push(offset);
-        offset += size_of_hir_ty(field);
-    }
-    let size = offset.div_ceil(align) * align;
-    StructLayout {
-        offsets,
-        size,
-        align,
-    }
-}
+pub use crate::value_layout::{StructLayout, align_of_hir_ty, size_of_hir_ty, struct_layout};
 
 /// How the interpreter holds a value of `ty` in a register.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4501,6 +4527,54 @@ impl HirInterpreter {
                 Op::Cast { dst, src, op, ty } => {
                     let target = &cf.type_pool[*ty as usize];
                     regs[*dst as usize] = eval_cast(*op, regs[*src as usize].clone(), target)?;
+                    pc += 1;
+                }
+                Op::MakeUnion {
+                    dst,
+                    src,
+                    size,
+                    offset,
+                    payload_ty,
+                    tag,
+                    tag_ty,
+                } => {
+                    let ptr = self.frame_alloc(scratch, *size as usize);
+                    if let Some(ty) = tag_ty {
+                        unsafe {
+                            write_typed(ptr, &ZyntaxValue::UInt(*tag), &cf.type_pool[*ty as usize]);
+                        }
+                    }
+                    let ty = &cf.type_pool[*payload_ty as usize];
+                    if *ty != HirType::Void {
+                        unsafe {
+                            write_typed(ptr.add(*offset as usize), &regs[*src as usize], ty);
+                        }
+                    }
+                    regs[*dst as usize] = ZyntaxValue::Pointer(ptr);
+                    pc += 1;
+                }
+                Op::UnionPayload {
+                    dst,
+                    src,
+                    offset,
+                    ty,
+                } => {
+                    let ptr = ptr_of(&regs[*src as usize])?;
+                    let ty = &cf.type_pool[*ty as usize];
+                    let value = if *ty == HirType::Void {
+                        ZyntaxValue::Void
+                    } else {
+                        unsafe { read_typed(ptr.add(*offset as usize), ty) }
+                    };
+                    regs[*dst as usize] = if held(ty) == Held::ByReference {
+                        let copy = self.frame_alloc(scratch, size_of_hir_ty(ty));
+                        unsafe {
+                            write_typed(copy, &value, ty);
+                        }
+                        ZyntaxValue::Pointer(copy)
+                    } else {
+                        value
+                    };
                     pc += 1;
                 }
                 Op::Alloca { dst, size_bytes } => {

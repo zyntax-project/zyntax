@@ -12,9 +12,9 @@
 //! * a `Void` parameter travels as a byte nothing reads, so the
 //!   parameters after it keep their registers;
 //! * a struct of one scalar field travels as that scalar;
-//! * any other struct, and an array, travels as the address of its
+//! * any other struct, an array, and a union travel as the address of their
 //!   storage;
-//! * a struct returned by value is written through a destination the
+//! * a struct or union returned by value is written through a destination the
 //!   caller provides as a leading parameter, and that address is also
 //!   the return value; a growable list header is returned as the
 //!   address it already lives at; a function whose address is taken, or
@@ -42,7 +42,7 @@ pub enum Pass {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionAbi {
     /// A leading parameter holding the caller's storage for the returned
-    /// struct, which the function fills and returns; `None` when the
+    /// value, which the function fills and returns; `None` when the
     /// function returns nothing that way.
     pub destination: Option<HirType>,
     /// How each declared parameter travels, in declaration order.
@@ -95,11 +95,11 @@ pub fn function_abi(function: &HirFunction, address_taken: bool) -> FunctionAbi 
 /// Whether LLVM can compile `function` to the convention above, so its
 /// entry can stand in a call cell Cranelift callers read.
 ///
-/// A struct or array parameter arrives as the address of the caller's
+/// A struct, array or union parameter arrives as the address of the caller's
 /// storage, which the body reads and writes in place; a struct of one
-/// scalar field arrives as that scalar; a struct returned by value is
-/// written through the destination. A union, several return values, an
-/// array returned by value, and a struct returned by value from a
+/// scalar field arrives as that scalar; a struct or union returned by value is
+/// written through the destination. Several return values, an
+/// array returned by value, and a struct or union returned by value from a
 /// function whose address is taken (which returns it directly) are
 /// refused, as is any aggregate whose fields the two backends might lay
 /// out differently.
@@ -113,17 +113,19 @@ pub fn llvm_entry_abi_supported(function: &HirFunction, address_taken: bool) -> 
         .collect();
     let param = |ty: &HirType, pass: &Pass| match (ty, pass) {
         (HirType::Struct(s), Pass::Direct) => struct_carried_as_its_field(s).is_some(),
-        (HirType::Struct(_) | HirType::Array(_, _), Pass::Pointer) => laid_out_alike(ty),
-        (HirType::Union(_) | HirType::Array(_, _), _) => false,
+        (HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_), Pass::Pointer) => {
+            laid_out_alike(ty)
+        }
+        (HirType::Array(_, _), _) => false,
         _ => true,
     };
     let ret = |ty: &HirType, pass: &Pass| match (ty, pass) {
         (HirType::Struct(s), Pass::Direct) => struct_carried_as_its_field(s).is_some(),
         (HirType::Struct(s), Pass::Pointer) if is_growable_list_header(s) => true,
-        (HirType::Struct(_), Pass::Pointer) => {
+        (HirType::Struct(_) | HirType::Union(_), Pass::Pointer) => {
             abi.destination.as_ref() == Some(ty) && laid_out_alike(ty)
         }
-        (HirType::Union(_) | HirType::Array(_, _), _) => false,
+        (HirType::Array(_, _), _) => false,
         _ => true,
     };
     returns.len() <= 1
@@ -139,10 +141,27 @@ pub fn llvm_entry_abi_supported(function: &HirFunction, address_taken: bool) -> 
 /// Whether both backends put the bytes of a value of `ty` in the same
 /// places: fields at their natural alignment, nested structs and arrays
 /// inline, every leaf a scalar or an address.
-fn laid_out_alike(ty: &HirType) -> bool {
+pub(crate) fn laid_out_alike(ty: &HirType) -> bool {
     match ty {
         HirType::Struct(s) => s.fields.iter().all(laid_out_alike),
         HirType::Array(elem, _) => laid_out_alike(elem),
+        HirType::Union(u) => {
+            (u.is_c_union
+                || matches!(
+                    *u.discriminant_type,
+                    HirType::I8
+                        | HirType::U8
+                        | HirType::I16
+                        | HirType::U16
+                        | HirType::I32
+                        | HirType::U32
+                        | HirType::I64
+                        | HirType::U64
+                ))
+                && u.variants
+                    .iter()
+                    .all(|v| v.ty == HirType::Void || laid_out_alike(&v.ty))
+        }
         HirType::Bool
         | HirType::I8
         | HirType::I16
@@ -170,7 +189,7 @@ fn laid_out_alike(ty: &HirType) -> bool {
 pub fn pass_of(ty: &HirType) -> Pass {
     match ty {
         HirType::Struct(s) if struct_carried_as_its_field(s).is_some() => Pass::Direct,
-        HirType::Struct(_) | HirType::Array(_, _) => Pass::Pointer,
+        HirType::Struct(_) | HirType::Array(_, _) | HirType::Union(_) => Pass::Pointer,
         _ => Pass::Direct,
     }
 }
@@ -204,15 +223,15 @@ pub fn struct_carried_as_its_field(struct_ty: &HirStructType) -> Option<&HirType
     .then_some(field)
 }
 
-/// The struct a function hands back through a destination its caller
+/// The value a function hands back through a destination its caller
 /// provides, if it hands one back that way.
 ///
-/// The only memory a function can put a struct's bytes in on its own is
+/// The only memory a function can put a value's bytes in on its own is
 /// its frame, which its caller outlives, so the caller supplies the
 /// memory and the function writes through it. Anything with a shape
 /// that fits in a register is returned in one and is not covered here.
 ///
-/// Only structs. `Array` and `Union` travel as pointers too, but an
+/// Structs and unions have value semantics. `Array` travels as a pointer too, but an
 /// array-typed value is not reliably the frame memory a struct's is:
 /// copying one that already points at a buffer would hand back a copy
 /// where the buffer itself was meant. A growable list is excluded for
@@ -231,6 +250,7 @@ pub fn destination_return_type(function: &HirFunction) -> Option<&HirType> {
         {
             Some(ret)
         }
+        ret @ HirType::Union(_) => Some(ret),
         _ => None,
     }
 }
@@ -324,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn llvm_entry_takes_aggregates_by_address_and_refuses_unions() {
+    fn llvm_entry_takes_aggregates_and_unions_by_address() {
         let f = function(vec![list(), HirType::I64], vec![HirType::I64]);
         assert!(llvm_entry_abi_supported(&f, false));
         let f = function(vec![vec3(), HirType::I64], vec![vec3()]);
@@ -348,16 +368,33 @@ mod tests {
             is_c_union: false,
         }));
         let f = function(vec![union.clone()], vec![HirType::I64]);
-        assert!(!llvm_entry_abi_supported(&f, false));
+        assert!(llvm_entry_abi_supported(&f, false));
         let holding_union = HirType::Struct(HirStructType {
             name: None,
             fields: vec![HirType::I64, union].into(),
             packed: false,
         });
         let f = function(vec![holding_union], vec![HirType::I64]);
-        assert!(!llvm_entry_abi_supported(&f, false));
+        assert!(llvm_entry_abi_supported(&f, false));
         let f = function(vec![HirType::I64], vec![HirType::I64, HirType::I64]);
         assert!(!llvm_entry_abi_supported(&f, false));
+    }
+
+    #[test]
+    fn a_union_returns_through_a_destination_and_cannot_promote_with_an_observable_address() {
+        let union = HirType::Union(Box::new(crate::hir::HirUnionType {
+            name: None,
+            variants: vec![],
+            discriminant_type: Box::new(HirType::U32),
+            is_c_union: false,
+        }));
+        let f = function(vec![union.clone()], vec![union.clone()]);
+        let abi = function_abi(&f, false);
+        assert_eq!(abi.params, vec![Pass::Pointer]);
+        assert_eq!(abi.returns, vec![Pass::Pointer]);
+        assert_eq!(abi.destination, Some(union));
+        assert!(llvm_entry_abi_supported(&f, false));
+        assert!(!llvm_entry_abi_supported(&f, true));
     }
 
     #[test]

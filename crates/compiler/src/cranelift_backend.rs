@@ -46,6 +46,116 @@ use crate::{CompilerError, CompilerResult};
 
 static CRANELIFT_SKIPPED_FUNCTIONS: AtomicUsize = AtomicUsize::new(0);
 
+fn union_tag_type(ty: &HirType) -> CompilerResult<types::Type> {
+    Ok(match ty {
+        HirType::I8 | HirType::U8 => types::I8,
+        HirType::I16 | HirType::U16 => types::I16,
+        HirType::I32 | HirType::U32 => types::I32,
+        HirType::I64 | HirType::U64 => types::I64,
+        _ => {
+            return Err(CompilerError::Backend(
+                "union discriminant must be an integer up to 64 bits".into(),
+            ));
+        }
+    })
+}
+
+fn emit_union_create(
+    builder: &mut FunctionBuilder,
+    ty: &HirType,
+    index: u32,
+    value: Option<Value>,
+    config: cranelift_codegen::isa::TargetFrontendConfig,
+) -> CompilerResult<Value> {
+    let HirType::Union(u) = ty else {
+        return Err(CompilerError::Backend(
+            "CreateUnion needs a union type".into(),
+        ));
+    };
+    if !crate::abi::laid_out_alike(ty) {
+        return Err(CompilerError::Backend(
+            "unsupported union storage layout".into(),
+        ));
+    }
+    let variant = u
+        .variants
+        .get(index as usize)
+        .ok_or_else(|| CompilerError::Backend("union variant index out of range".into()))?;
+    let layout = crate::value_layout::union_layout(u);
+    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        layout.size as u32,
+        layout.align.trailing_zeros() as u8,
+    ));
+    let ptr = builder.ins().stack_addr(config.pointer_type(), slot, 0);
+    if layout.size <= INLINE_COPY_MAX_BYTES as usize {
+        let mut offset = 0;
+        while offset < layout.size {
+            let remaining = layout.size - offset;
+            let (ty, bytes) = if remaining >= 8 {
+                (types::I64, 8)
+            } else if remaining >= 4 {
+                (types::I32, 4)
+            } else if remaining >= 2 {
+                (types::I16, 2)
+            } else {
+                (types::I8, 1)
+            };
+            let zero = builder.ins().iconst(ty, 0);
+            builder
+                .ins()
+                .store(MemFlags::new(), zero, ptr, offset as i32);
+            offset += bytes;
+        }
+    } else {
+        let zero = builder.ins().iconst(types::I8, 0);
+        let size = builder
+            .ins()
+            .iconst(config.pointer_type(), layout.size as i64);
+        builder.call_memset(config, ptr, zero, size);
+    }
+    if !u.is_c_union {
+        let tag = builder.ins().iconst(
+            union_tag_type(&u.discriminant_type)?,
+            variant.discriminant as i64,
+        );
+        builder.ins().store(MemFlags::new(), tag, ptr, 0);
+    }
+    if variant.ty != HirType::Void {
+        let value = value.ok_or_else(|| CompilerError::Backend("missing union payload".into()))?;
+        if crate::abi::pass_of(&variant.ty) == crate::abi::Pass::Pointer {
+            let dest = builder.ins().iadd_imm(ptr, layout.payload_offset as i64);
+            emit_union_copy(
+                builder,
+                config,
+                dest,
+                value,
+                crate::value_layout::size_of_hir_ty(&variant.ty) as u32,
+            );
+        } else {
+            builder
+                .ins()
+                .store(MemFlags::new(), value, ptr, layout.payload_offset as i32);
+        }
+    }
+    Ok(ptr)
+}
+
+fn emit_union_copy(
+    builder: &mut FunctionBuilder,
+    config: cranelift_codegen::isa::TargetFrontendConfig,
+    dest: Value,
+    src: Value,
+    size: u32,
+) {
+    if size <= INLINE_COPY_MAX_BYTES {
+        emit_inline_aggregate_copy(builder, dest, src, size);
+    } else {
+        let size = builder.ins().iconst(config.pointer_type(), size as i64);
+        builder.call_memcpy(config, dest, src, size);
+    }
+}
+
 /// Maximum aggregate size (in bytes) for which inline scalar copy is
 /// emitted in place of a libc `memcpy` thunk. Above this threshold the
 /// per-byte amortised cost of the call/return is negligible and the
@@ -2932,6 +3042,37 @@ impl CraneliftBackend {
                     }
                 }
 
+                // Capture all incoming union values before reusing any phi storage.
+                let mut union_phis = Vec::new();
+                for (i, phi) in hir_block.phis.iter().enumerate() {
+                    if let HirType::Union(u) = &phi.ty {
+                        let layout = crate::value_layout::union_layout(u);
+                        let mut slot = || {
+                            builder.create_sized_stack_slot(StackSlotData::new(
+                                StackSlotKind::ExplicitSlot,
+                                layout.size as u32,
+                                layout.align.trailing_zeros() as u8,
+                            ))
+                        };
+                        let stage = slot();
+                        let dest = slot();
+                        let stage = builder.ins().stack_addr(pointer_type, stage, 0);
+                        let dest = builder.ins().stack_addr(pointer_type, dest, 0);
+                        emit_union_copy(
+                            &mut builder,
+                            self.module.target_config(),
+                            stage,
+                            block_params[i],
+                            layout.size as u32,
+                        );
+                        union_phis.push((phi.result, stage, dest, layout.size as u32));
+                    }
+                }
+                for (result, stage, dest, size) in union_phis {
+                    emit_union_copy(&mut builder, self.module.target_config(), dest, stage, size);
+                    self.value_map.insert(result, dest);
+                }
+
                 // Tier-0 OSR probe: count visits to resumable loop headers
                 // and request promotion only when this invocation stays
                 // hot. Each header reads its helper slot and dispatches
@@ -4992,91 +5133,77 @@ impl CraneliftBackend {
                             variant_index,
                             value,
                         } => {
-                            // Compute union layout without calling &self methods
-                            // (avoids E0502 while builder holds &mut into self).
-                            // Tagged layout: [discriminant:i32][pad][max_variant_data], 8-byte aligned.
-                            let union_size: u32 = if let HirType::Union(u) = union_ty {
-                                let discrim_sz: u32 = match u.discriminant_type.as_ref() {
-                                    HirType::I64 | HirType::U64 | HirType::F64 => 8,
-                                    HirType::I16 | HirType::U16 => 2,
-                                    HirType::I8 | HirType::U8 | HirType::Bool => 1,
-                                    _ => 4, // i32/u32/f32 and default
-                                };
-                                let max_var: u32 = u
-                                    .variants
-                                    .iter()
-                                    .map(|v| match &v.ty {
-                                        HirType::Void => 0,
-                                        HirType::Bool | HirType::I8 | HirType::U8 => 1,
-                                        HirType::I16 | HirType::U16 => 2,
-                                        HirType::I32 | HirType::U32 | HirType::F32 => 4,
-                                        HirType::I128 | HirType::U128 => 16,
-                                        _ => 8, // i64/u64/f64/ptr/complex → 8 bytes
-                                    })
-                                    .max()
-                                    .unwrap_or(0);
-                                let data_offset = (discrim_sz + 7) & !7;
-                                ((data_offset + max_var) + 7) & !7
-                            } else {
-                                16 // non-union fallback
-                            };
-                            let ptr_ty = self.module.target_config().pointer_type();
-
-                            // Allocate space for the union on the stack
-                            let union_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                                StackSlotKind::ExplicitSlot,
-                                union_size,
-                                0,
-                            ));
-                            let union_ptr = builder.ins().stack_addr(ptr_ty, union_slot, 0);
-
-                            // Store the discriminant in the first field
-                            let discriminant =
-                                builder.ins().iconst(types::I32, *variant_index as i64);
-                            builder
-                                .ins()
-                                .store(MemFlags::new(), discriminant, union_ptr, 0);
-
-                            // Store the value in the data field (after discriminant)
-                            let value_val = self.value_map[value];
-                            let data_offset = 4; // Assuming 4-byte discriminant
-                            builder
-                                .ins()
-                                .store(MemFlags::new(), value_val, union_ptr, data_offset);
-
-                            self.value_map.insert(*result, union_ptr);
+                            let ptr = emit_union_create(
+                                &mut builder,
+                                union_ty,
+                                *variant_index,
+                                self.value_map.get(value).copied(),
+                                self.module.target_config(),
+                            )?;
+                            self.value_map.insert(*result, ptr);
                         }
-
                         HirInstruction::GetUnionDiscriminant { result, union_val } => {
-                            // Extract discriminant from union
-                            let union_ptr = self.value_map[union_val];
-                            let discriminant = builder.ins().load(
-                                types::I32,
+                            let HirType::Union(u) = &value_type_cache[union_val] else {
+                                return Err(CompilerError::Backend(
+                                    "union tag needs a union operand".into(),
+                                ));
+                            };
+                            if u.is_c_union {
+                                return Err(CompilerError::Backend(
+                                    "C union has no discriminant".into(),
+                                ));
+                            }
+                            let tag = builder.ins().load(
+                                union_tag_type(&u.discriminant_type)?,
                                 MemFlags::new(),
-                                union_ptr,
-                                0, // Discriminant is at offset 0
+                                self.value_map[union_val],
+                                0,
                             );
-                            self.value_map.insert(*result, discriminant);
+                            self.value_map.insert(*result, tag);
                         }
-
                         HirInstruction::ExtractUnionValue {
                             result,
                             ty,
                             union_val,
-                            variant_index: _,
+                            ..
                         } => {
-                            // Extract value from union variant (unsafe - assumes correct variant)
-                            let union_ptr = self.value_map[union_val];
-                            // Use type_cache if available, otherwise default to i64
-                            let cranelift_ty = type_cache.get(ty).copied().unwrap_or(types::I64);
-                            let data_offset = 4; // Skip discriminant
-
-                            let value = builder.ins().load(
-                                cranelift_ty,
-                                MemFlags::new(),
-                                union_ptr,
-                                data_offset,
-                            );
+                            let HirType::Union(u) = &value_type_cache[union_val] else {
+                                return Err(CompilerError::Backend(
+                                    "union payload needs a union operand".into(),
+                                ));
+                            };
+                            let offset = crate::value_layout::union_layout(u).payload_offset as i32;
+                            let ptr = self.value_map[union_val];
+                            let value = if crate::abi::pass_of(ty) == crate::abi::Pass::Pointer {
+                                let size = crate::value_layout::size_of_hir_ty(ty) as u32;
+                                let align = crate::value_layout::align_of_hir_ty(ty);
+                                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                                    StackSlotKind::ExplicitSlot,
+                                    size.max(1),
+                                    align.trailing_zeros() as u8,
+                                ));
+                                let copy = builder.ins().stack_addr(
+                                    self.module.target_config().pointer_type(),
+                                    slot,
+                                    0,
+                                );
+                                let src = builder.ins().iadd_imm(ptr, offset as i64);
+                                emit_union_copy(
+                                    &mut builder,
+                                    self.module.target_config(),
+                                    copy,
+                                    src,
+                                    size,
+                                );
+                                copy
+                            } else {
+                                builder.ins().load(
+                                    type_cache.get(ty).copied().unwrap_or(types::I64),
+                                    MemFlags::new(),
+                                    ptr,
+                                    offset,
+                                )
+                            };
                             self.value_map.insert(*result, value);
                         }
 
@@ -5516,11 +5643,12 @@ impl CraneliftBackend {
                                             // Union field access: index 0 = discriminant, index 1 = data
                                             let field_index = index_u32 as usize;
 
-                                            // Calculate union layout inline
-                                            // Tagged union layout: [discriminant][padding][data]
-                                            // Discriminant is always 4 bytes (u32), data starts at offset 4
+                                            // The tag starts at zero; the payload follows its alignment padding.
                                             let discriminant_offset = 0u32;
-                                            let data_offset = 4u32; // u32 discriminant size
+                                            let data_offset =
+                                                crate::value_layout::union_layout(union_def)
+                                                    .payload_offset
+                                                    as u32;
 
                                             let field_offset = if field_index == 0 {
                                                 discriminant_offset
@@ -9763,68 +9891,12 @@ impl CraneliftBackend {
                 // In a real implementation, this might emit platform-specific barrier instructions
             }
 
-            HirInstruction::CreateUnion {
-                result,
-                union_ty,
-                variant_index,
-                value,
-            } => {
-                // Create a tagged union value
-                let union_layout = self.calculate_union_layout(union_ty)?;
-                let ptr_ty = self.module.target_config().pointer_type();
-
-                // Allocate space for the union on the stack
-                let union_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    union_layout.total_size,
-                    0,
+            HirInstruction::CreateUnion { .. }
+            | HirInstruction::GetUnionDiscriminant { .. }
+            | HirInstruction::ExtractUnionValue { .. } => {
+                return Err(CompilerError::Backend(
+                    "union operations require typed function lowering".into(),
                 ));
-                let union_ptr = builder.ins().stack_addr(ptr_ty, union_slot, 0);
-
-                // Store the discriminant in the first field
-                let discriminant = builder.ins().iconst(types::I32, *variant_index as i64);
-                builder
-                    .ins()
-                    .store(MemFlags::new(), discriminant, union_ptr, 0);
-
-                // Store the value in the data field (after discriminant)
-                let value_val = self.value_map[value];
-                let data_offset = 4; // Assuming 4-byte discriminant
-                builder
-                    .ins()
-                    .store(MemFlags::new(), value_val, union_ptr, data_offset);
-
-                self.value_map.insert(*result, union_ptr);
-            }
-
-            HirInstruction::GetUnionDiscriminant { result, union_val } => {
-                // Extract discriminant from union
-                let union_ptr = self.value_map[union_val];
-                let discriminant = builder.ins().load(
-                    types::I32,
-                    MemFlags::new(),
-                    union_ptr,
-                    0, // Discriminant is at offset 0
-                );
-                self.value_map.insert(*result, discriminant);
-            }
-
-            HirInstruction::ExtractUnionValue {
-                result,
-                ty,
-                union_val,
-                variant_index: _,
-            } => {
-                // Extract value from union variant (unsafe - assumes correct variant)
-                let union_ptr = self.value_map[union_val];
-                let cranelift_ty = self.translate_type(ty)?;
-                let data_offset = 4; // Skip discriminant
-
-                let value =
-                    builder
-                        .ins()
-                        .load(cranelift_ty, MemFlags::new(), union_ptr, data_offset);
-                self.value_map.insert(*result, value);
             }
 
             HirInstruction::CreateClosure {
@@ -11169,55 +11241,19 @@ impl CraneliftBackend {
 
     /// Calculate union layout (discriminant + largest variant)
     fn calculate_union_layout(&self, union_ty: &HirType) -> CompilerResult<StructLayout> {
-        if let HirType::Union(union_def) = union_ty {
-            let discriminant_size = self.type_size(union_def.discriminant_type.as_ref())? as u32;
-            let discriminant_align =
-                self.type_alignment(union_def.discriminant_type.as_ref())? as u32;
-
-            if union_def.is_c_union {
-                // C-style union: no discriminant, just largest variant
-                let mut max_size = 0u32;
-                let mut max_align = 1u32;
-
-                for variant in &union_def.variants {
-                    let variant_size = self.type_size(&variant.ty)? as u32;
-                    let variant_align = self.type_alignment(&variant.ty)? as u32;
-                    max_size = max_size.max(variant_size);
-                    max_align = max_align.max(variant_align);
-                }
-
-                Ok(StructLayout {
-                    field_offsets: vec![0], // Single field at offset 0
-                    total_size: max_size,
-                    alignment: max_align,
-                })
+        let HirType::Union(u) = union_ty else {
+            return Err(CompilerError::Backend("Expected union type".into()));
+        };
+        let layout = crate::value_layout::union_layout(u);
+        Ok(StructLayout {
+            field_offsets: if u.is_c_union {
+                vec![0]
             } else {
-                // Tagged union: discriminant + data
-                let mut max_variant_size = 0u32;
-                let mut max_variant_align = 1u32;
-
-                for variant in &union_def.variants {
-                    let variant_size = self.type_size(&variant.ty)? as u32;
-                    let variant_align = self.type_alignment(&variant.ty)? as u32;
-                    max_variant_size = max_variant_size.max(variant_size);
-                    max_variant_align = max_variant_align.max(variant_align);
-                }
-
-                // Layout: [discriminant][padding][data]
-                let data_align = max_variant_align.max(discriminant_align);
-                let data_offset = (discriminant_size + data_align - 1) & !(data_align - 1);
-                let total_size =
-                    (data_offset + max_variant_size + data_align - 1) & !(data_align - 1);
-
-                Ok(StructLayout {
-                    field_offsets: vec![0, data_offset], // [discriminant_offset, data_offset]
-                    total_size,
-                    alignment: data_align,
-                })
-            }
-        } else {
-            Err(CompilerError::Backend("Expected union type".into()))
-        }
+                vec![0, layout.payload_offset as u32]
+            },
+            total_size: layout.size as u32,
+            alignment: layout.align as u32,
+        })
     }
 
     /// Calculate closure layout (function pointer + captured values)

@@ -203,48 +203,6 @@ pub struct LLVMBackend<'ctx> {
     x86_target_vnni: bool,
 }
 
-/// Approximate byte size of a `HirType` for laying out union payloads
-/// in the LLVM backend.
-///
-/// We only need this for the `Union` arm of `translate_type` — picking
-/// the widest non-Void variant's storage size so the payload slot can
-/// hold any of them. Goes through the fixed-width primitive sizes,
-/// recurses into composites by summing fields, and falls back to a
-/// conservative 8 bytes (one pointer's worth) for everything else
-/// (Opaque, named structs we haven't walked yet, function pointers,
-/// vectors with non-standard lane shapes). Conservative wins here:
-/// over-allocating the union payload is a layout no-op; under-
-/// allocating corrupts whichever variant is widest.
-fn hir_type_size_bytes(ty: &HirType) -> u32 {
-    match ty {
-        HirType::Void => 0,
-        HirType::Bool | HirType::I8 | HirType::U8 => 1,
-        HirType::I16 | HirType::U16 => 2,
-        HirType::I32 | HirType::U32 | HirType::F32 => 4,
-        HirType::I64 | HirType::U64 | HirType::F64 => 8,
-        HirType::I128 | HirType::U128 => 16,
-        HirType::Ptr(_) | HirType::Ref { .. } => 8,
-        HirType::Array(elem, n) => hir_type_size_bytes(elem) * (*n as u32),
-        HirType::Struct(s) => s.fields.iter().map(hir_type_size_bytes).sum(),
-        HirType::Vector(elem, n) => hir_type_size_bytes(elem) * (*n),
-        HirType::Union(u) => {
-            let disc = hir_type_size_bytes(&u.discriminant_type);
-            let payload = u
-                .variants
-                .iter()
-                .map(|v| hir_type_size_bytes(&v.ty))
-                .max()
-                .unwrap_or(0);
-            disc + payload
-        }
-        // Conservative pointer-width fallback for variants whose
-        // layout we can't easily compute here (Function, Opaque,
-        // closures, named/forward types). Wider-than-needed payload
-        // is harmless; under-sized would corrupt.
-        _ => 8,
-    }
-}
-
 impl<'ctx> LLVMBackend<'ctx> {
     /// Create a new LLVM backend
     ///
@@ -1147,6 +1105,16 @@ impl<'ctx> LLVMBackend<'ctx> {
         Ok(())
     }
 
+    fn union_address(&self, id: HirId) -> CompilerResult<PointerValue<'ctx>> {
+        let value = self.get_value(id)?;
+        if let BasicValueEnum::PointerValue(ptr) = value {
+            return Ok(ptr);
+        }
+        let ptr = self.entry_alloca(value.get_type(), "union_value")?;
+        self.builder.build_store(ptr, value)?;
+        Ok(ptr)
+    }
+
     /// Write the value `id` to `ptr`. An aggregate held by address has
     /// its bytes copied, never the address itself.
     fn store_value(&self, ptr: PointerValue<'ctx>, id: HirId) -> CompilerResult<()> {
@@ -1931,17 +1899,19 @@ impl<'ctx> LLVMBackend<'ctx> {
             (HirType::Array(_, _), Some(p @ HirType::Ptr(_))) => p.clone(),
             _ => phi.ty.clone(),
         };
-        // An aggregate held by reference meets here as its address:
+        // A union meets as a value so loop-carried bytes outlive reused slots.
+        // Other aggregates held by reference meet here as their address:
         // its incomings are addresses (a parameter, a box read, a call
         // result) or values spilled to one when the edge is filled in.
-        let llvm_ty = if crate::osr::is_held_by_reference(&chosen) {
-            self.context
-                .i8_type()
-                .ptr_type(AddressSpace::default())
-                .into()
-        } else {
-            self.translate_type(&chosen)?
-        };
+        let llvm_ty =
+            if crate::osr::is_held_by_reference(&chosen) && !matches!(chosen, HirType::Union(_)) {
+                self.context
+                    .i8_type()
+                    .ptr_type(AddressSpace::default())
+                    .into()
+            } else {
+                self.translate_type(&chosen)?
+            };
 
         // Create the phi node
         let phi_value = self.builder.build_phi(llvm_ty, "phi")?;
@@ -1996,6 +1966,16 @@ impl<'ctx> LLVMBackend<'ctx> {
                         && let Some(field) = self.carried_field(val, et)?
                     {
                         self.builder.build_return(Some(&field))?;
+                    } else if needs_fixup
+                        && val.is_pointer_value()
+                        && expected.is_some_and(|ty| ty.is_array_type() || ty.is_struct_type())
+                    {
+                        let aggregate = self.builder.build_load(
+                            expected.unwrap(),
+                            val.into_pointer_value(),
+                            "returned_value",
+                        )?;
+                        self.builder.build_return(Some(&aggregate))?;
                     } else if needs_fixup {
                         if let Some(et) = expected {
                             // An aggregate returned as its address must be
@@ -2962,120 +2942,96 @@ impl<'ctx> LLVMBackend<'ctx> {
             // ========== Union Type Operations ==========
             HirInstruction::CreateUnion {
                 result,
-                union_ty: _,
+                union_ty,
                 variant_index,
                 value,
             } => {
-                // Create a tagged union value
-                // Union layout: 16 bytes (4 bytes discriminant + 12 bytes data)
-                // This matches Cranelift's implementation for backend parity
-
-                // Create union type: struct { i32 discriminant, [12 x i8] data }
-                let i32_type = self.context.i32_type();
-                let data_array_type = self.context.i8_type().array_type(12);
-                let union_type = self
-                    .context
-                    .struct_type(&[i32_type.into(), data_array_type.into()], false);
-
-                // Allocate space for the union on the stack
-                let union_alloca = self.builder.build_alloca(union_type, "union")?;
-
-                // Store the discriminant at offset 0
-                let discriminant = self
-                    .context
-                    .i32_type()
-                    .const_int(*variant_index as u64, false);
-                let discriminant_ptr = self.builder.build_struct_gep(
-                    union_type,
-                    union_alloca,
-                    0,
-                    "union_discriminant_ptr",
+                if !crate::abi::laid_out_alike(union_ty) {
+                    return Err(CompilerError::CodeGen(
+                        "unsupported union storage layout".into(),
+                    ));
+                }
+                let HirType::Union(u) = union_ty else {
+                    return Err(CompilerError::CodeGen(
+                        "CreateUnion needs a union type".into(),
+                    ));
+                };
+                let variant = u.variants.get(*variant_index as usize).ok_or_else(|| {
+                    CompilerError::CodeGen("union variant index out of range".into())
+                })?;
+                let layout = crate::value_layout::union_layout(u);
+                let ptr = self.entry_alloca(self.translate_type(union_ty)?, "union")?;
+                self.builder.build_memset(
+                    ptr,
+                    layout.align as u32,
+                    self.context.i8_type().const_zero(),
+                    self.context.i64_type().const_int(layout.size as u64, false),
                 )?;
-                self.builder.build_store(discriminant_ptr, discriminant)?;
-
-                // Store the value at offset 4 (in the data field)
-                // We need to bitcast the data field pointer to the value's type
-                let value_val = self.get_value(*value)?;
-                let data_ptr =
+                if !u.is_c_union {
+                    let tag_ty = self.translate_type(&u.discriminant_type)?.into_int_type();
                     self.builder
-                        .build_struct_gep(union_type, union_alloca, 1, "union_data_ptr")?;
-
-                // Cast data pointer to the value's type pointer and store
-                let value_type = value_val.get_type();
-                let typed_data_ptr = self.builder.build_pointer_cast(
-                    data_ptr,
-                    value_type.ptr_type(AddressSpace::default()),
-                    "typed_data_ptr",
-                )?;
-                self.builder.build_store(typed_data_ptr, value_val)?;
-
-                // Store the union pointer as the result
-                self.value_map.insert(*result, union_alloca.into());
+                        .build_store(ptr, tag_ty.const_int(variant.discriminant, false))?;
+                }
+                if variant.ty != HirType::Void {
+                    let offset = self
+                        .context
+                        .i64_type()
+                        .const_int(layout.payload_offset as u64, false);
+                    let payload = unsafe {
+                        self.builder.build_gep(
+                            self.context.i8_type(),
+                            ptr,
+                            &[offset],
+                            "union_payload",
+                        )?
+                    };
+                    self.store_value(payload, *value)?;
+                }
+                self.value_map.insert(*result, ptr.into());
             }
-
             HirInstruction::GetUnionDiscriminant { result, union_val } => {
-                // Extract discriminant from union (at offset 0)
-                let union_ptr = self.get_value(*union_val)?.into_pointer_value();
-
-                // Union type for GEP
-                let i32_type = self.context.i32_type();
-                let data_array_type = self.context.i8_type().array_type(12);
-                let union_type = self
-                    .context
-                    .struct_type(&[i32_type.into(), data_array_type.into()], false);
-
-                // Get pointer to discriminant field
-                let discriminant_ptr = self.builder.build_struct_gep(
-                    union_type,
-                    union_ptr,
-                    0,
-                    "union_discriminant_ptr",
+                let HirType::Union(u) = &self.type_map[union_val] else {
+                    return Err(CompilerError::CodeGen(
+                        "union tag needs a union operand".into(),
+                    ));
+                };
+                if u.is_c_union {
+                    return Err(CompilerError::CodeGen("C union has no discriminant".into()));
+                }
+                let ptr = self.union_address(*union_val)?;
+                let tag = self.builder.build_load(
+                    self.translate_type(&u.discriminant_type)?,
+                    ptr,
+                    "union_tag",
                 )?;
-
-                // Load the discriminant value
-                let discriminant =
-                    self.builder
-                        .build_load(i32_type, discriminant_ptr, "union_discriminant")?;
-
-                self.value_map.insert(*result, discriminant);
+                self.value_map.insert(*result, tag);
             }
-
             HirInstruction::ExtractUnionValue {
                 result,
                 ty,
                 union_val,
-                variant_index: _,
+                ..
             } => {
-                // Extract value from union variant (unsafe - assumes correct variant)
-                let union_ptr = self.get_value(*union_val)?.into_pointer_value();
-
-                // Union type for GEP
-                let i32_type = self.context.i32_type();
-                let data_array_type = self.context.i8_type().array_type(12);
-                let union_type = self
-                    .context
-                    .struct_type(&[i32_type.into(), data_array_type.into()], false);
-
-                // Get pointer to data field (offset 4, after discriminant)
-                let data_ptr =
+                let HirType::Union(u) = &self.type_map[union_val] else {
+                    return Err(CompilerError::CodeGen(
+                        "union payload needs a union operand".into(),
+                    ));
+                };
+                let offset = crate::value_layout::union_layout(u).payload_offset;
+                let ptr = self.union_address(*union_val)?;
+                let offset = self.context.i64_type().const_int(offset as u64, false);
+                let ptr = unsafe {
+                    self.builder.build_gep(
+                        self.context.i8_type(),
+                        ptr,
+                        &[offset],
+                        "union_payload",
+                    )?
+                };
+                let payload =
                     self.builder
-                        .build_struct_gep(union_type, union_ptr, 1, "union_data_ptr")?;
-
-                // Translate the target type
-                let llvm_ty = self.translate_type(ty)?;
-
-                // Cast data pointer to the expected type and load
-                let typed_data_ptr = self.builder.build_pointer_cast(
-                    data_ptr,
-                    llvm_ty.ptr_type(AddressSpace::default()),
-                    "typed_data_ptr",
-                )?;
-
-                let value = self
-                    .builder
-                    .build_load(llvm_ty, typed_data_ptr, "union_value")?;
-
-                self.value_map.insert(*result, value);
+                        .build_load(self.translate_type(ty)?, ptr, "union_value")?;
+                self.value_map.insert(*result, payload);
             }
 
             // ========== Closure Operations ==========
@@ -6472,34 +6428,11 @@ impl<'ctx> LLVMBackend<'ctx> {
                 }
             },
             Union(union_ty) => {
-                // LLVM has no native tagged-union type. Lower a HIR
-                // Union as a struct of `{ discriminant_ty,
-                // [N x i8] }` where N is the widest non-Void variant's
-                // size in bytes. Backends store the discriminant
-                // first, then bitcast the payload bytes to the variant
-                // type they want. For C-style unions
-                // (`is_c_union: true`) the discriminant slot is still
-                // emitted but unused — codegen sites read/write only
-                // the payload.
-                //
-                // This shape covers Option<T>, Result<T, E>, ZynML
-                // enums with payloads, etc. — every kernel importing
-                // the prelude trips it before this arm landed.
-                let disc_ty = self.translate_type(&union_ty.discriminant_type)?;
-                let mut max_payload_bytes: u32 = 0;
-                for variant in &union_ty.variants {
-                    if matches!(variant.ty, HirType::Void) {
-                        continue;
-                    }
-                    let variant_bytes = hir_type_size_bytes(&variant.ty);
-                    if variant_bytes > max_payload_bytes {
-                        max_payload_bytes = variant_bytes;
-                    }
-                }
-                let payload_ty = self.context.i8_type().array_type(max_payload_bytes);
-                self.context
-                    .struct_type(&[disc_ty, payload_ty.into()], false)
-                    .into()
+                let layout = crate::value_layout::union_layout(union_ty);
+                let word = self
+                    .context
+                    .custom_width_int_type((layout.align * 8) as u32);
+                word.array_type((layout.size / layout.align) as u32).into()
             }
             Opaque(name) => {
                 // Opaque HIR types (forward declarations, prelude

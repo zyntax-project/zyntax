@@ -77,6 +77,7 @@ fn field_align(ty: &HirType) -> u64 {
     match ty {
         HirType::Struct(s) => s.fields.iter().map(field_align).max().unwrap_or(1),
         HirType::Array(elem, _) => field_align(elem),
+        HirType::Union(u) => crate::value_layout::union_layout(u).align as u64,
         other => (crate::ssa::hir_ty_size(other) as u64).max(1),
     }
 }
