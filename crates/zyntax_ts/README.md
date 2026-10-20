@@ -29,6 +29,11 @@ Arrays, generic functions, unions, closures, classes, multi-file linking and oth
 produce `Unsupported` diagnostics. These are implementation gaps, measured by
 the conformance suite; they are not permanent language restrictions.
 
+Diagnostics use Zyntax's shared Ariadne formatter, including source labels and
+related declaration locations. `NO_COLOR` disables colors; `CLICOLOR_FORCE`
+enables them. Use `--diagnostics=json` for structured diagnostic categories and
+byte ranges.
+
 ## Type and soundness policies
 
 Strict static checking is enabled. Ordinary supported TypeScript assignment

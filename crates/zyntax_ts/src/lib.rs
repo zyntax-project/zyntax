@@ -40,6 +40,7 @@ pub struct Error {
     pub message: String,
     pub start: usize,
     pub end: usize,
+    diagnostic: Option<Box<zyntax_typed_ast::diagnostics::Diagnostic>>,
 }
 
 impl Error {
@@ -49,19 +50,64 @@ impl Error {
             message: message.into(),
             start: span.start as usize,
             end: span.end as usize,
+            diagnostic: None,
         }
     }
 
-    pub fn render(&self, file: &str, source: &str) -> String {
-        let at = self.start.min(source.len());
-        let line = source[..at].bytes().filter(|&b| b == b'\n').count() + 1;
-        let column = source[..at]
-            .rsplit('\n')
-            .next()
-            .unwrap_or("")
-            .chars()
-            .count()
-            + 1;
-        format!("{file}:{line}:{column}: {:?}: {}", self.kind, self.message)
+    pub(crate) fn from_oxc(kind: ErrorKind, error: &oxc_diagnostics::OxcDiagnostic) -> Self {
+        use zyntax_typed_ast::Span;
+        use zyntax_typed_ast::diagnostics::Diagnostic;
+        let primary = error
+            .labels
+            .iter()
+            .position(|label| label.primary())
+            .unwrap_or(0);
+        let at = error
+            .labels
+            .get(primary)
+            .map_or(oxc_span::Span::default(), |label| label.span());
+        let mut diagnostic = Diagnostic::error(error.to_string());
+        for (index, label) in error.labels.iter().enumerate() {
+            let span = Span::new(
+                label.offset() as usize,
+                (label.offset() + label.len()) as usize,
+            );
+            let message = label.label().unwrap_or("here");
+            diagnostic = if index == primary {
+                diagnostic.with_primary(span, message)
+            } else {
+                diagnostic.with_secondary(span, message)
+            };
+        }
+        if let Some(help) = &error.help {
+            diagnostic = diagnostic.with_help(help.as_ref());
+        }
+        if let Some(note) = &error.note {
+            diagnostic = diagnostic.with_note(note.as_ref());
+        }
+        let mut result = Self::new(kind, diagnostic.message.clone(), at);
+        result.diagnostic = Some(Box::new(diagnostic));
+        result
+    }
+
+    /// Render with the compiler's shared Ariadne source formatter.
+    pub fn render(&self, file: &str, source: &str, use_colors: bool) -> String {
+        use zyntax_typed_ast::Span;
+        use zyntax_typed_ast::diagnostics::{Diagnostic, render_diagnostic};
+        let diagnostic;
+        let diagnostic = if let Some(details) = &self.diagnostic {
+            details.as_ref()
+        } else {
+            let label = match self.kind {
+                ErrorKind::Syntax => "syntax error",
+                ErrorKind::Type => "type error",
+                ErrorKind::Soundness => "additional soundness check",
+                ErrorKind::Unsupported => "native support is not implemented yet",
+            };
+            diagnostic = Diagnostic::error(&self.message)
+                .with_primary(Span::new(self.start, self.end), label);
+            &diagnostic
+        };
+        render_diagnostic(diagnostic, file, source, use_colors)
     }
 }

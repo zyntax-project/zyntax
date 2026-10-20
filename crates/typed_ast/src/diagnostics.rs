@@ -547,6 +547,23 @@ impl AriadneDiagnosticDisplay {
     }
 }
 
+// Byte spans must stay within the source and on UTF-8 boundaries; EOF is empty.
+fn bounded_span(span: Span, source_map: &SourceMap) -> Span {
+    let Some(source) = source_map.get_file_by_id(span.file as usize) else {
+        return span;
+    };
+    let text = &source.content;
+    let mut start = span.start.min(text.len());
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = span.end.max(start).min(text.len());
+    while !text.is_char_boundary(end) {
+        end += 1;
+    }
+    Span::in_file(start, end, span.file)
+}
+
 impl DiagnosticDisplay for AriadneDiagnosticDisplay {
     fn fmt_diagnostic(
         &self,
@@ -568,30 +585,26 @@ impl DiagnosticDisplay for AriadneDiagnosticDisplay {
             .iter()
             .find(|a| a.style == AnnotationStyle::Primary)
             .or_else(|| diagnostic.annotations.first())
-            .map(|a| a.span)
+            .map(|a| bounded_span(a.span, source_map))
             .unwrap_or_default();
         let anchor_file = file_name_of(source_map, anchor.file);
 
         let mut builder = ariadne::Report::build(kind, (anchor_file, anchor.start..anchor.start))
             .with_message(header)
-            .with_config(ariadne::Config::new().with_color(self.use_colors));
+            .with_config(
+                ariadne::Config::new()
+                    .with_color(self.use_colors)
+                    .with_index_type(ariadne::IndexType::Byte),
+            );
 
         if let Some(code) = diagnostic.code {
             builder = builder.with_code(code.0);
         }
 
         for annotation in &diagnostic.annotations {
-            // ariadne dislikes zero-length ranges in labels (no
-            // visible underline); pad by 1 char so the caret still
-            // appears at the right column.
-            let start = annotation.span.start;
-            let end = if annotation.span.end > annotation.span.start {
-                annotation.span.end
-            } else {
-                annotation.span.start + 1
-            };
+            let span = bounded_span(annotation.span, source_map);
             let file = file_name_of(source_map, annotation.span.file);
-            let mut label = ariadne::Label::new((file, start..end))
+            let mut label = ariadne::Label::new((file, span.start..span.end))
                 .with_color(Self::style_to_color(annotation.style));
             if let Some(msg) = &annotation.message {
                 label = label.with_message(msg.clone());
@@ -938,6 +951,27 @@ mod tests {
         assert!(rendered.contains("helper.py:2:"), "got: {rendered}");
         assert!(rendered.contains("return x +"), "got: {rendered}");
         assert!(!rendered.contains("import helper"), "got: {rendered}");
+    }
+
+    #[test]
+    fn byte_spans_and_empty_eof_labels_render_on_utf8_boundaries() {
+        let source = "// 🦀\nlet value = 3;";
+        let at = source.find("value").unwrap();
+        let diagnostic =
+            Diagnostic::error("byte location").with_primary(Span::new(at, at + 5), "here");
+        let rendered = render_diagnostic(&diagnostic, "unicode.zy", source, false);
+        assert!(rendered.contains("unicode.zy:2:5"), "{rendered}");
+        for (source, span) in [
+            ("", Span::empty(0)),
+            ("π", Span::empty(2)),
+            ("π", Span::new(1, 2)),
+            ("π", Span::new(100, 101)),
+        ] {
+            let diagnostic = Diagnostic::error("bounded span").with_primary(span, "here");
+            let rendered = render_diagnostic(&diagnostic, "bounded.zy", source, false);
+            assert!(rendered.contains("bounded span"), "{rendered}");
+            assert!(rendered.contains("bounded.zy"), "{rendered}");
+        }
     }
 
     #[test]

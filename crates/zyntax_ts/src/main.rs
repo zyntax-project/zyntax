@@ -57,7 +57,8 @@ fn run() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let program = match zyntax_ts::parse_program(&source, &file.display().to_string(), options) {
+    let filename = file.to_string_lossy();
+    let program = match zyntax_ts::parse_program(&source, &filename, options) {
         Ok(program) => program,
         Err(e) => {
             if json {
@@ -66,7 +67,14 @@ fn run() -> ExitCode {
                     serde_json::json!({"kind": format!("{:?}", e.kind), "message": e.message, "start": e.start, "end": e.end})
                 );
             } else {
-                eprintln!("{}", e.render(&file.display().to_string(), &source));
+                eprint!(
+                    "{}",
+                    e.render(
+                        &filename,
+                        &source,
+                        zyntax_typed_ast::diagnostics::colors_enabled()
+                    )
+                );
             }
             return ExitCode::from(match e.kind {
                 ErrorKind::Unsupported => 3,

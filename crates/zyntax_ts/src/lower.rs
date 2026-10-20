@@ -141,21 +141,13 @@ pub fn parse_program(source: &str, file: &str, options: Options) -> Result<Typed
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, SourceType::ts()).parse();
     if let Some(error) = parsed.diagnostics.first() {
-        return Err(Error::new(
-            ErrorKind::Syntax,
-            error.to_string(),
-            oxc_span::Span::new(0, 0),
-        ));
+        return Err(Error::from_oxc(ErrorKind::Syntax, error));
     }
     let semantic = oxc_semantic::SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&parsed.program);
     if let Some(error) = semantic.diagnostics.first() {
-        return Err(Error::new(
-            ErrorKind::Type,
-            error.to_string(),
-            oxc_span::Span::new(0, 0),
-        ));
+        return Err(Error::from_oxc(ErrorKind::Type, error));
     }
     Lowerer::new(options).program(&parsed.program, &semantic.semantic, source, file)
 }
@@ -813,9 +805,42 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             self.error(
                 ErrorKind::Type,
-                format!("type {actual:?} is not assignable to {expected:?}"),
+                format!(
+                    "type `{}` is not assignable to `{}`",
+                    self.type_description(actual),
+                    self.type_description(expected)
+                ),
                 at,
             )
+        }
+    }
+
+    fn type_description(&self, ty: &Type) -> String {
+        match ty {
+            Type::Primitive(PrimitiveType::F64) => "number".into(),
+            Type::Primitive(PrimitiveType::Bool) => "boolean".into(),
+            Type::Primitive(PrimitiveType::String) => "string".into(),
+            Type::Primitive(PrimitiveType::Unit) => "void".into(),
+            Type::Named { id, .. } => {
+                let mut description = String::from("{ ");
+                if let Some(definition) = self.registry.get_type_by_id(*id) {
+                    for (index, field) in definition.fields.iter().enumerate() {
+                        if index != 0 {
+                            description.push_str("; ");
+                        }
+                        write!(
+                            &mut description,
+                            "{}: {}",
+                            field.name.resolve_global().unwrap_or_default(),
+                            self.type_description(&field.ty)
+                        )
+                        .unwrap();
+                    }
+                }
+                description.push_str(" }");
+                description
+            }
+            _ => format!("{ty:?}"),
         }
     }
 
