@@ -123,7 +123,7 @@ fn casts_preserve_one_allocation_and_one_release() {
                 matches!(i, HirInstruction::Call { callee:HirCallable::Intrinsic(i), .. } if *i==intrinsic)
             }).count()
         };
-        if name == zyntax_ts::ENTRY {
+        if module.initializers.contains(&function.id) {
             assert_eq!(count(Intrinsic::Malloc), 1, "no view wrapper or copy");
             assert_eq!(count(Intrinsic::Free), 1, "one shared owner");
         } else if name == "ts$fn$borrow" || name.starts_with("ts$fn$identity__mono_") {

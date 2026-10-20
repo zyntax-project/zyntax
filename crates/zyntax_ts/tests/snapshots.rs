@@ -27,10 +27,7 @@ const LIBRARY: &str = r#"
 "#;
 
 fn library_program() -> TypedProgram {
-    let mut program = zyntax_ts::parse_program(LIBRARY, "library.ts", Default::default()).unwrap();
-    // A pure library has no entry; module initializer naming belongs to the frontend.
-    program.declarations.retain(|d| !matches!(&d.node, TypedDeclaration::Function(f) if f.name.resolve_global().as_deref()==Some(zyntax_ts::ENTRY)));
-    program
+    zyntax_ts::parse_program(LIBRARY, "library.ts", Default::default()).unwrap()
 }
 
 fn library() -> Arc<Snapshot> {

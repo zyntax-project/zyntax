@@ -120,6 +120,7 @@ impl<'arena> HirBuilder<'arena> {
                 types: Default::default(),
                 imports: Vec::new(),
                 exports: Vec::new(),
+                initializers: Vec::new(),
                 version: 0,
                 dependencies: std::collections::HashSet::new(),
                 effects: Default::default(),

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use zyntax_compiler::hir::HirModule;
 
 const MAGIC: &[u8; 5] = b"ZSNAP";
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 /// magic, schema, and the length of the directory that follows.
 const HEADER_LEN: usize = MAGIC.len() + 2 * std::mem::size_of::<u32>();
 
@@ -704,12 +704,15 @@ pub fn lower_for_snapshot(
 /// for a program that holds the function as a shell.
 pub fn lower_for_snapshot_releasing(
     name: &str,
-    program: zyntax_typed_ast::TypedProgram,
+    mut program: zyntax_typed_ast::TypedProgram,
     builtins: indexmap::IndexMap<String, String>,
     prelowered: Vec<Arc<zyntax_compiler::bytecode::LazyModule>>,
     automatic_release: bool,
     error_flag_global: Option<&str>,
 ) -> Result<HirModule, SnapshotError> {
+    program
+        .type_registry
+        .set_current_module(Some(zyntax_typed_ast::InternedString::new_global(name)));
     let none_grammars = std::collections::HashMap::new();
     let none_signatures = std::collections::HashMap::new();
     let none_modules = crate::import_chain::SnapshotModules::default();
@@ -775,6 +778,8 @@ pub fn lower_for_snapshot_releasing(
 /// What remains types a caller; nothing lowers it.
 fn strip_bodies(program: &mut zyntax_typed_ast::TypedProgram) {
     use zyntax_typed_ast::TypedDeclaration;
+    program.declarations.retain(|d| !matches!(d.node, TypedDeclaration::Initializer(_))
+        && !matches!(&d.node, TypedDeclaration::Function(f) if zyntax_compiler::module_init::is_initializer(f)));
     for decl in &mut program.declarations {
         match &mut decl.node {
             TypedDeclaration::Function(function) => function.body = None,

@@ -188,7 +188,9 @@ pub struct TieredRuntime {
     /// The functions and globals compiled modules installed, which a
     /// program joining the running module links rather than brings.
     installed: Arc<std::collections::HashSet<HirId>>,
-    /// Whether the host enters programs only through `entry_points`.
+    initialized: std::collections::HashSet<HirId>,
+    initialization_error: Option<String>,
+    /// Whether the host enters programs only through explicit entries and initialization.
     closed: bool,
     /// Captured runtime semantic events (render/stream).
     runtime_events: Vec<RuntimeEvent>,
@@ -539,6 +541,8 @@ impl TieredRuntime {
             snapshot_modules: Default::default(),
             entry_points: Vec::new(),
             installed: Arc::default(),
+            initialized: Default::default(),
+            initialization_error: None,
             closed: false,
             runtime_events: Vec::new(),
             event_sink: None,
@@ -666,6 +670,15 @@ impl TieredRuntime {
         >,
         joining: bool,
     ) -> RuntimeResult<()> {
+        if let Some(error) = &self.initialization_error {
+            return Err(RuntimeError::Execution(error.clone()));
+        }
+        let initializers = zyntax_compiler::module_init::entries(&module)?;
+        if let Some(entries) = &mut entered {
+            entries.extend(initializers.iter().map(|(_, name)| name.clone()));
+            entries.sort_unstable();
+            entries.dedup();
+        }
         if let Some(name) = self.error_flag_global {
             for global in module.globals.values_mut().filter(|g| g.name == name) {
                 global.error_flag = true;
@@ -880,9 +893,16 @@ impl TieredRuntime {
                 )));
             }
         };
-        for init in &box_inits {
-            if interpreter_bound {
-                self.call::<()>(init, &[])?;
+        for (id, init) in box_inits
+            .iter()
+            .map(|name| (None, name))
+            .chain(initializers.iter().map(|(id, name)| (Some(*id), name)))
+        {
+            if id.is_some_and(|id| self.initialized.contains(&id)) {
+                continue;
+            }
+            let result = if interpreter_bound {
+                self.call::<()>(init, &[])
             } else {
                 let ptr = self
                     .get_function_ptr(init)
@@ -896,7 +916,15 @@ impl TieredRuntime {
                         ret: NativeType::Void,
                     });
                 // SAFETY: the initializer was compiled with this signature.
-                unsafe { call_native_with_signature(ptr, &[], &sig)? };
+                unsafe { call_native_with_signature(ptr, &[], &sig).map(|_| ()) }
+            };
+            if let Err(error) = result {
+                self.initialization_error =
+                    Some(format!("module initialization failed in {init}: {error}"));
+                return Err(error);
+            }
+            if let Some(id) = id {
+                self.initialized.insert(id);
             }
         }
         if trace {
@@ -955,6 +983,9 @@ impl TieredRuntime {
 
     /// Call a function and get the raw ZyntaxValue result
     pub fn call_raw(&self, name: &str, args: &[ZyntaxValue]) -> RuntimeResult<ZyntaxValue> {
+        if let Some(error) = &self.initialization_error {
+            return Err(RuntimeError::Execution(error.clone()));
+        }
         let func_id = self
             .function_ids
             .get(name)
@@ -1356,6 +1387,8 @@ impl TieredRuntime {
     /// then built only when a built body calls it or takes its address,
     /// so one nothing reaches costs nothing; calling it by name finds no
     /// function.
+    /// Module initializers are implicit entry points. A script needs no
+    /// declared entry; a closed program with neither performs no work.
     pub fn enter_only_through_entry_points(&mut self) {
         self.closed = true;
     }
@@ -3051,7 +3084,7 @@ impl TieredRuntime {
         Option<Vec<String>>,
         std::collections::HashMap<HirId, Arc<zyntax_compiler::bytecode::LazyModule>>,
     )> {
-        let closed = self.closed && !self.entry_points.is_empty();
+        let closed = self.closed;
         let lowered = crate::lower::lower_typed_program(
             program,
             crate::lower::Inputs {

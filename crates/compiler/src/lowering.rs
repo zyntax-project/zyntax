@@ -1182,6 +1182,27 @@ impl PhaseTimer {
 
 impl AstLowering for LoweringContext {
     fn lower_program(&mut self, program: &mut TypedProgram) -> CompilerResult<HirModule> {
+        crate::module_init::prepare(program);
+        if self.config.closed || !self.config.entry_names.is_empty() {
+            self.config
+                .entry_names
+                .extend(program.declarations.iter().filter_map(|d| match &d.node {
+                    TypedDeclaration::Function(f) if crate::module_init::is_initializer(f) => {
+                        f.name.resolve_global()
+                    }
+                    _ => None,
+                }));
+            self.config
+                .entry_names
+                .extend(self.config.prelowered.iter().flat_map(|m| {
+                    m.stripped()
+                        .initializers
+                        .iter()
+                        .filter_map(|id| m.signature(*id).and_then(|f| f.name.resolve_global()))
+                }));
+            self.config.entry_names.sort_unstable();
+            self.config.entry_names.dedup();
+        }
         // Phase -1: Initialize Copy types from the type registry
         // Types that implement the Copy trait can be duplicated instead of moved
         // Phase timings, behind the same env var the embedder's phase
@@ -1208,6 +1229,38 @@ impl AstLowering for LoweringContext {
         self.collect_declarations(program)?;
         self.wanted = self.initial_wanted(program);
         self.adopt_prelowered();
+        let named_initializers: rustc_hash::FxHashSet<_> = program
+            .declarations
+            .iter()
+            .filter_map(|d| match &d.node {
+                TypedDeclaration::Function(f) if crate::module_init::is_initializer(f) => {
+                    Some(f.name)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut seen_initializers: crate::hir::IdHashSet<_> =
+            self.module.initializers.iter().copied().collect();
+        for source in &self.config.prelowered {
+            for id in &source.stripped().initializers {
+                let named = source
+                    .signature(*id)
+                    .is_some_and(|f| named_initializers.contains(&f.name));
+                if !named && !self.config.linked.contains(id) && seen_initializers.insert(*id) {
+                    self.module.initializers.push(*id);
+                }
+            }
+        }
+        for declaration in &program.declarations {
+            if let TypedDeclaration::Function(f) = &declaration.node
+                && crate::module_init::is_initializer(f)
+            {
+                let id = self.symbols.functions[&f.name];
+                if !self.config.linked.contains(&id) && seen_initializers.insert(id) {
+                    self.module.initializers.push(id);
+                }
+            }
+        }
         self.declare_type_descriptors();
         let collect_ms = phase.lap();
 
@@ -1352,6 +1405,13 @@ impl AstLowering for LoweringContext {
         // Checked here because only now is every call in the module
         // present, and because every backend is downstream of it.
         self.report_calls_with_wrong_arity()?;
+        for id in &self.module.initializers {
+            if !self.module.functions.contains_key(id) {
+                return Err(crate::CompilerError::Analysis(
+                    "module initializer has no body".into(),
+                ));
+            }
+        }
         self.record_exact_struct_types();
 
         // The module leaves the context rather than being copied out;
@@ -3158,7 +3218,7 @@ impl LoweringContext {
         program: &TypedProgram,
     ) -> Option<std::collections::HashSet<InternedString>> {
         if self.config.entry_names.is_empty() {
-            return None;
+            return self.config.closed.then(Default::default);
         }
         // An escape hatch for deciding whether a miscompile is this.
         if std::env::var_os("ZYNTAX_LOWER_ALL").is_some() {
@@ -3168,10 +3228,13 @@ impl LoweringContext {
         for name in &self.config.entry_names {
             roots.insert(InternedString::new_global(name));
         }
-        let declared = program.declarations.iter().any(|d| match &d.node {
-            TypedDeclaration::Function(f) => roots.contains(&f.name),
-            _ => false,
-        });
+        let declared = roots
+            .iter()
+            .any(|name| self.prelowered.functions.contains_key(name))
+            || program.declarations.iter().any(|d| match &d.node {
+                TypedDeclaration::Function(f) => roots.contains(&f.name),
+                _ => false,
+            });
         if !declared {
             return None;
         }

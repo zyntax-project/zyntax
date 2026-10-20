@@ -231,6 +231,8 @@ pub(crate) fn lower_typed_program(
         ..LoweringConfig::default()
     };
 
+    zyntax_compiler::module_init::prepare(&mut program);
+
     if inputs.pattern_rewrites || declares_effects(&program) {
         rewrite_patterns(&mut program, &type_registry)?;
     }

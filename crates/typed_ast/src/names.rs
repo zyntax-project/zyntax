@@ -33,6 +33,13 @@ impl<F: FnMut(InternedString)> Walk<'_, F> {
     fn declaration(&mut self, declaration: &TypedDeclaration) {
         match declaration {
             TypedDeclaration::Function(f) => self.function(f),
+            TypedDeclaration::Initializer(i) => {
+                self.annotations(&i.annotations);
+                if let Some(module) = i.module {
+                    self.name(module);
+                }
+                self.block(&i.body);
+            }
             TypedDeclaration::Variable(v) => {
                 self.name(v.name);
                 self.opt_expr(&v.initializer);

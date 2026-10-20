@@ -80,6 +80,7 @@ pub mod lowering;
 pub mod memory_management;
 pub mod memory_optimization; // Memory-aware optimizations
 pub mod memory_pass;
+pub mod module_init;
 pub mod monomorphize;
 pub mod move_insert; // Owning parameters become `Move` the borrow check can see
 pub mod object_header; // The word a reference object carries ahead of its fields

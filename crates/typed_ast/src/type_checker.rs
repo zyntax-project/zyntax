@@ -989,6 +989,11 @@ impl TypeChecker {
     /// Type check a declaration
     pub fn check_declaration(&mut self, decl: &TypedDeclaration, span: Span) {
         match decl {
+            TypedDeclaration::Initializer(initializer) => {
+                if let Err(error) = self.check_block(&initializer.body) {
+                    self.emit_type_error(error, span);
+                }
+            }
             TypedDeclaration::Function(func) => {
                 if let Err(err) = self.check_function(func) {
                     self.emit_type_error(err, span);

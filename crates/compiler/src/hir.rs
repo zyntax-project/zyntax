@@ -357,6 +357,9 @@ pub struct HirModule {
     pub types: IdMap<TypeId, HirType>,
     pub imports: Vec<HirImport>,
     pub exports: Vec<HirExport>,
+    /// Host-entered initialization functions in dependency order, before ordinary entry points.
+    #[serde(default)]
+    pub initializers: Vec<HirId>,
     /// Metadata for hot-reloading support
     pub version: u64,
     pub dependencies: HashSet<HirId>,
@@ -2790,6 +2793,7 @@ impl HirModule {
             types: IdMap::default(),
             imports: Vec::new(),
             exports: Vec::new(),
+            initializers: Vec::new(),
             version: 0,
             dependencies: HashSet::new(),
             effects: IdMap::default(),
@@ -2834,6 +2838,7 @@ impl HirModule {
             types,
             imports,
             exports,
+            initializers,
             version,
             dependencies,
             effects,
@@ -2849,6 +2854,7 @@ impl HirModule {
             types: types.clone(),
             imports: imports.clone(),
             exports: exports.clone(),
+            initializers: initializers.clone(),
             version: *version,
             dependencies: dependencies.clone(),
             effects: effects.clone(),

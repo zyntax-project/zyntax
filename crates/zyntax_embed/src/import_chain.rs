@@ -199,6 +199,13 @@ fn process_imports_inner(
 ) -> RuntimeResult<()> {
     use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedImportItem};
 
+    // Dependencies initialize before the importing module's own top-level code.
+    let own_initializers: Vec<_> = program
+        .declarations
+        .extract_if(.., |d| matches!(d.node, TypedDeclaration::Initializer(_))
+            || matches!(&d.node, TypedDeclaration::Function(f) if zyntax_compiler::module_init::is_initializer(f)))
+        .collect();
+
     // Collect imports to process (can't mutate while iterating)
     let importing_language = program.language.and_then(|l| l.resolve_global());
     let mut imports_to_process = Vec::new();
@@ -274,7 +281,20 @@ fn process_imports_inner(
             // A module that arrived lowered is linked rather than
             // lowered again; its declarations still type the caller.
             let lowered = compiled_import.hir().is_some();
+            let mut initializer_references = Vec::new();
             if let Some(hir) = compiled_import.hir() {
+                for id in &hir.stripped().initializers {
+                    let signature = hir.signature(*id).ok_or_else(|| {
+                        RuntimeError::Execution("imported module initializer is missing".into())
+                    })?;
+                    initializer_references.push(zyntax_typed_ast::TypedNode::new(
+                        TypedDeclaration::Function(zyntax_compiler::module_init::reference(
+                            signature.name,
+                        )),
+                        zyntax_typed_ast::Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit),
+                        Default::default(),
+                    ));
+                }
                 if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some() {
                     let started = web_time::Instant::now();
                     let stripped = hir.stripped();
@@ -292,11 +312,15 @@ fn process_imports_inner(
             // and then has no builtin aliases to inject either.
             let grammar = grammars.get(compiled_import.language());
             let mut imported_program = compiled_import.into_program();
+            imported_program.declarations.extend(initializer_references);
             if lowered && let Some(named) = &named {
                 imported_program
                     .declarations
                     .retain(|decl| match &decl.node {
-                        TypedDeclaration::Function(function) => named.contains(&function.name),
+                        TypedDeclaration::Function(function) => {
+                            named.contains(&function.name)
+                                || zyntax_compiler::module_init::is_initializer(function)
+                        }
                         _ => true,
                     });
             }
@@ -419,6 +443,9 @@ fn process_imports_inner(
                     TypedDeclaration::Function(function) => {
                         function.module.get_or_insert(origin);
                     }
+                    TypedDeclaration::Initializer(initializer) => {
+                        initializer.module.get_or_insert(origin);
+                    }
                     // An implementation's methods become functions of
                     // the program that imported it, so it has to carry
                     // where it came from too.
@@ -438,6 +465,7 @@ fn process_imports_inner(
         }
     }
 
+    program.declarations.extend(own_initializers);
     Ok(())
 }
 

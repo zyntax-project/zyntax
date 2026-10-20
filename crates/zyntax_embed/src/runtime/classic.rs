@@ -102,6 +102,8 @@ pub struct ZyntaxRuntime {
     /// registration API can mutate while compilation reads a clone
     /// of the `Arc<BuiltinRegistry>` snapshot.
     builtin_registry: Arc<std::sync::Mutex<zyntax_compiler::builtin_class::BuiltinRegistry>>,
+    initialized: std::collections::HashSet<zyntax_compiler::hir::HirId>,
+    initialization_error: Option<String>,
 }
 
 /// An external function that can be called from Zyntax code
@@ -157,6 +159,8 @@ impl ZyntaxRuntime {
             async_functions: std::collections::HashSet::new(),
             plugin_signatures: HashMap::new(),
             loaded_plugins: Vec::new(),
+            initialized: Default::default(),
+            initialization_error: None,
             run_interp_opts: true,
             runtime_events: Vec::new(),
             event_sink: None,
@@ -211,6 +215,8 @@ impl ZyntaxRuntime {
             async_functions: std::collections::HashSet::new(),
             plugin_signatures: HashMap::new(),
             loaded_plugins: Vec::new(),
+            initialized: Default::default(),
+            initialization_error: None,
             run_interp_opts: true,
             runtime_events: Vec::new(),
             event_sink: None,
@@ -243,6 +249,10 @@ impl ZyntaxRuntime {
     }
 
     pub fn compile_module(&mut self, module: &zyntax_compiler::HirModule) -> RuntimeResult<()> {
+        if let Some(error) = &self.initialization_error {
+            return Err(RuntimeError::Execution(error.clone()));
+        }
+        let initializers = zyntax_compiler::module_init::entries(module)?;
         // Run interp-safe HIR opts before backend installation. Without this,
         // user programs run through `compile_module` never get CSE / LICM /
         // inline / const_fold / aggregate_split — the bench-only
@@ -321,6 +331,17 @@ impl ZyntaxRuntime {
         }
         for init in &box_inits {
             self.call::<()>(init, &[])?;
+        }
+        for (id, name) in initializers {
+            if self.initialized.contains(&id) {
+                continue;
+            }
+            if let Err(error) = self.call::<()>(&name, &[]) {
+                self.initialization_error =
+                    Some(format!("module initialization failed in {name}: {error}"));
+                return Err(error);
+            }
+            self.initialized.insert(id);
         }
 
         Ok(())
@@ -749,6 +770,7 @@ impl ZyntaxRuntime {
         let engine_start = web_time::Instant::now();
 
         // Run pattern engine (term-rewriting passes on TypedAST)
+        zyntax_compiler::module_init::prepare(&mut program);
         {
             let mut engine = pattern_engine::PatternEngine::new(pattern_engine::EngineConfig {
                 target: pattern_engine::LoweringTarget::Cpu,
@@ -934,6 +956,9 @@ impl ZyntaxRuntime {
     /// For void functions, it uses a void-returning call. For native (i32, i64) functions,
     /// use `call_native` with a signature instead.
     pub fn call_raw(&self, name: &str, args: &[ZyntaxValue]) -> RuntimeResult<ZyntaxValue> {
+        if let Some(error) = &self.initialization_error {
+            return Err(RuntimeError::Execution(error.clone()));
+        }
         let ptr = self
             .get_function_ptr(name)
             .ok_or_else(|| RuntimeError::FunctionNotFound(name.to_string()))?;

@@ -104,12 +104,10 @@ fn run() -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    let result = zyntax_ts::register_runtime(&mut runtime)
-        .and_then(|()| {
-            runtime.enter_only_through_entry_points();
-            runtime.compile_typed_program(program)
-        })
-        .and_then(|_| runtime.call_raw(zyntax_ts::ENTRY, &[]));
+    let result = zyntax_ts::register_runtime(&mut runtime).and_then(|()| {
+        runtime.enter_only_through_entry_points();
+        runtime.compile_typed_program(program)
+    });
     let code = match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {

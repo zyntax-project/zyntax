@@ -194,6 +194,7 @@ pub use typed_ast::{
     TypedImportItem,
     TypedImportModifier,
     TypedIndex,
+    TypedInitializer,
     TypedInterface,
     TypedKernelAttr,
     // Lambda types

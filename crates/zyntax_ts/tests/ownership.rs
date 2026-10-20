@@ -42,6 +42,14 @@ fn frees(module: &HirModule, name: &str) -> usize {
         .count()
 }
 
+fn initializer_frees(module: &HirModule) -> usize {
+    let name = module.functions[&module.initializers[0]]
+        .name
+        .resolve_global()
+        .unwrap();
+    frees(module, &name)
+}
+
 #[test]
 fn returned_storage_is_freed_by_the_caller_and_borrowed_aliases_are_not_double_freed() {
     let mut module = lower(
@@ -64,16 +72,12 @@ fn returned_storage_is_freed_by_the_caller_and_borrowed_aliases_are_not_double_f
     );
     assert_eq!(frees(&module, "ts$fn$alias"), 0, "the argument is borrowed");
     assert_eq!(
-        frees(&module, zyntax_ts::ENTRY),
+        initializer_frees(&module),
         1,
         "aliases share one owned allocation"
     );
     zyntax_compiler::drop_insert::run_module(&mut module);
-    assert_eq!(
-        frees(&module, zyntax_ts::ENTRY),
-        1,
-        "reanalysis is idempotent"
-    );
+    assert_eq!(initializer_frees(&module), 1, "reanalysis is idempotent");
 }
 
 #[test]
@@ -112,7 +116,7 @@ fn generic_alias_results_share_the_callers_single_release() {
     "#,
     );
     zyntax_compiler::drop_insert::run_module(&mut module);
-    assert_eq!(frees(&module, zyntax_ts::ENTRY), 1);
+    assert_eq!(initializer_frees(&module), 1);
     let alias = module
         .functions
         .values()
@@ -128,7 +132,7 @@ fn generic_alias_results_share_the_callers_single_release() {
         .unwrap();
     assert_eq!(frees(&module, &alias), 0);
     zyntax_compiler::drop_insert::run_module(&mut module);
-    assert_eq!(frees(&module, zyntax_ts::ENTRY), 1);
+    assert_eq!(initializer_frees(&module), 1);
 }
 
 #[test]
@@ -145,7 +149,7 @@ fn recursive_fresh_and_borrowed_results_keep_one_owner() {
     zyntax_compiler::drop_insert::run_module(&mut module);
     assert_eq!(frees(&module, "ts$fn$make"), 0);
     assert_eq!(frees(&module, "ts$fn$alias"), 0);
-    assert_eq!(frees(&module, zyntax_ts::ENTRY), 1);
+    assert_eq!(initializer_frees(&module), 1);
 }
 
 #[test]
@@ -162,5 +166,5 @@ fn borrowed_results_propagate_through_a_mutual_cycle() {
     zyntax_compiler::drop_insert::run_module(&mut module);
     assert_eq!(frees(&module, "ts$fn$first"), 0);
     assert_eq!(frees(&module, "ts$fn$second"), 0);
-    assert_eq!(frees(&module, zyntax_ts::ENTRY), 1);
+    assert_eq!(initializer_frees(&module), 1);
 }

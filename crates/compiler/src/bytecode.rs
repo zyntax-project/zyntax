@@ -125,6 +125,9 @@ impl LinkIndex {
     /// no function of a module that was read is decoded.
     fn of(module: &LazyModule) -> Self {
         let mut index = Self::default();
+        index
+            .inits
+            .extend(module.stripped().initializers.iter().copied());
         if module.in_memory {
             let module = module.shell();
             for f in module.functions.values() {
@@ -663,7 +666,7 @@ impl BytecodeHeader {
     // Moves with any change to a payload's layout, so a payload in an
     // older layout is refused with VersionMismatch and a cache loader
     // recompiles rather than misreading it.
-    const CURRENT_MAJOR: u16 = 8;
+    const CURRENT_MAJOR: u16 = 9;
     const CURRENT_MINOR: u16 = 0;
 
     /// Create a new header for the given module and format
@@ -1040,6 +1043,7 @@ mod tests {
             types: Default::default(),
             imports: Vec::new(),
             exports: Vec::new(),
+            initializers: Vec::new(),
             version: 1,
             dependencies: std::collections::HashSet::new(),
             effects: Default::default(),

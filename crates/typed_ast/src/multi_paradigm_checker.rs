@@ -369,6 +369,12 @@ impl TypeChecker {
         use crate::typed_ast::TypedDeclaration;
 
         match decl {
+            TypedDeclaration::Initializer(initializer) => {
+                for statement in &initializer.body.statements {
+                    self.check_statement(statement)?;
+                }
+                Ok(())
+            }
             TypedDeclaration::Function(func) => {
                 // Check function body
                 if let Some(ref body) = func.body {

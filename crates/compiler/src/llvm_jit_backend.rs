@@ -1360,6 +1360,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             types,
             imports: Vec::new(),
             exports: Vec::new(),
+            initializers: Vec::new(),
             version: 0,
             dependencies: HashSet::new(),
             effects,

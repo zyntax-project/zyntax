@@ -161,7 +161,11 @@ fn array_headers_and_buffers_share_one_owner_through_returns_and_aliases() {
         let name = f.name.resolve_global().unwrap();
         assert_eq!(
             frees,
-            if name == zyntax_ts::ENTRY { 2 } else { 0 },
+            if module.initializers.contains(&f.id) {
+                2
+            } else {
+                0
+            },
             "{name}: one buffer and one header"
         );
     }

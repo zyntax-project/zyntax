@@ -552,21 +552,20 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
         }
         self.pop_scope();
-        self.declarations.push(node(
-            TypedDeclaration::Function(TypedFunction {
-                name: intern(crate::ENTRY),
-                body: Some(TypedBlock {
-                    statements: body,
-                    span: span(program.span),
+        if !body.is_empty() {
+            self.declarations.push(node(
+                TypedDeclaration::Initializer(TypedInitializer {
+                    body: TypedBlock {
+                        statements: body,
+                        span: span(program.span),
+                    },
+                    annotations: vec![strict_fp(self.name("strict_fp"))],
+                    module: None,
                 }),
-                return_type: unit(),
-                annotations: vec![strict_fp(self.name("strict_fp"))],
-                visibility: Visibility::Public,
-                ..Default::default()
-            }),
-            unit(),
-            program.span,
-        ));
+                unit(),
+                program.span,
+            ));
+        }
         Ok(TypedProgram {
             declarations: self.declarations,
             language: Some(intern("typescript")),

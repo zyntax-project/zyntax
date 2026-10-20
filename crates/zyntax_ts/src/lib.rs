@@ -6,9 +6,6 @@ mod runtime;
 pub use lower::parse_program;
 pub use runtime::register_runtime;
 
-/// The module body the host enters.
-pub const ENTRY: &str = "ts$main";
-
 /// Additional checks beyond TypeScript's strict static checking.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Soundness {

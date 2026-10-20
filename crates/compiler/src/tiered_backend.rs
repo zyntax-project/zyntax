@@ -498,6 +498,7 @@ impl Scratch {
             types: module.types.clone(),
             imports: module.imports.clone(),
             exports: module.exports.clone(),
+            initializers: Vec::new(),
             version: module.version,
             dependencies: module.dependencies.clone(),
             effects: module.effects.clone(),

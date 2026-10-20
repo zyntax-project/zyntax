@@ -708,6 +708,7 @@ mod tests {
             types: Default::default(),
             imports: vec![],
             exports: vec![],
+            initializers: vec![],
             version: 0,
             dependencies: HashSet::new(),
             effects: Default::default(),

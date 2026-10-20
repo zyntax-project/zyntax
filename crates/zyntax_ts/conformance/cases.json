@@ -1063,5 +1063,30 @@
     "id": "union_returns/error_comparison",
     "file": "cases/union_returns/error_comparison.ts",
     "mode": "check"
+  },
+  {
+    "id": "no_main/empty",
+    "file": "cases/no_main/empty.ts",
+    "mode": "run"
+  },
+  {
+    "id": "no_main/library_only",
+    "file": "cases/no_main/library_only.ts",
+    "mode": "run"
+  },
+  {
+    "id": "no_main/main_is_ordinary",
+    "file": "cases/no_main/main_is_ordinary.ts",
+    "mode": "run"
+  },
+  {
+    "id": "no_main/top_level_order",
+    "file": "cases/no_main/top_level_order.ts",
+    "mode": "run"
+  },
+  {
+    "id": "no_main/top_level_loop",
+    "file": "cases/no_main/top_level_loop.ts",
+    "mode": "run"
   }
 ]

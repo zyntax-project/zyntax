@@ -45,7 +45,6 @@ pub fn register_runtime(
     runtime.set_collector(zyntax_embed::Collector::None);
     runtime.set_automatic_release(true);
     runtime.set_pattern_rewrites(false);
-    runtime.declare_entry_points([crate::ENTRY]);
     runtime.register_static_plugins([
         zrtl_io::static_plugin(),
         zrtl_string::static_plugin(),

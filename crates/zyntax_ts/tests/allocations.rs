@@ -31,7 +31,7 @@ fn frontend_allocations() {
                     &d.node, TypedDeclaration::Function(f) if !f.is_external
                 ))
                 .count(),
-            1001
+            1000
         );
         println!(
             "{pass}: allocations={}, reallocations={}, requested_bytes={}",

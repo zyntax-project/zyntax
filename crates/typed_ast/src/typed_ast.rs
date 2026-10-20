@@ -91,6 +91,18 @@ pub enum TypedDeclaration {
     Effect(TypedEffect),
     /// Effect handler declaration: handler MCMC for Probabilistic { ... }
     EffectHandler(TypedEffectHandler),
+    /// Top-level code executed when the module is loaded, without a source entry function.
+    Initializer(TypedInitializer),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypedInitializer {
+    pub body: TypedBlock,
+    #[serde(default)]
+    pub annotations: Vec<TypedAnnotation>,
+    /// Set when imports merge this declaration into another program.
+    #[serde(default)]
+    pub module: Option<InternedString>,
 }
 
 /// External type declaration - represents types defined outside the compilation unit

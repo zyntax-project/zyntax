@@ -248,7 +248,7 @@ pub fn cold_only_function_ids(
 ///
 /// They are entry points, so they are roots.
 fn host_reachable_roots(module: &HirModule) -> Vec<HirId> {
-    let mut roots = Vec::new();
+    let mut roots = module.initializers.clone();
     let mut root_named = |want: &str, roots: &mut Vec<HirId>| {
         for (id, f) in &module.functions {
             if f.name.resolve_global().as_deref() == Some(want) {
