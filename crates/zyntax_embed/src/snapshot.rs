@@ -683,6 +683,10 @@ struct PendingModule {
 /// would have inlined. A module declaring effects or handlers is
 /// refused: their ids are also baked into constants the loader cannot
 /// relocate.
+///
+/// Generic bodies remain unoptimized templates for importing callers to
+/// specialize. Unlike whole-program monomorphization, library packaging
+/// retains those templates even when no local call instantiates them.
 pub fn lower_for_snapshot(
     name: &str,
     program: zyntax_typed_ast::TypedProgram,
@@ -726,6 +730,7 @@ pub fn lower_for_snapshot_releasing(
             closed: false,
             prelowered,
             defer_prelowered_bodies: false,
+            keep_generic_templates: true,
             linked: Arc::default(),
             selective: false,
             pattern_rewrites: true,
@@ -743,6 +748,13 @@ pub fn lower_for_snapshot_releasing(
         });
     }
     module.automatic_release = automatic_release;
+    // Opaque template bodies become executable only after type substitution.
+    let templates: Vec<_> = module
+        .functions
+        .extract_if(.., |_, f| {
+            !f.signature.type_params.is_empty() || !f.signature.const_params.is_empty()
+        })
+        .collect();
     let _ = zyntax_compiler::run_interp_safe_opts_keeping_readers(&mut module);
     zyntax_compiler::run_native_only_opts(&mut module);
     // The bodies as every program adopts them, then the facts of those
@@ -755,6 +767,7 @@ pub fn lower_for_snapshot_releasing(
         zyntax_compiler::error_flag::record_keeps(&mut module, flag);
     }
     zyntax_compiler::mark_optimized(&mut module);
+    module.functions.extend(templates);
     Ok(module)
 }
 

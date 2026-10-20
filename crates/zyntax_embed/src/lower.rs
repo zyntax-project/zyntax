@@ -41,6 +41,8 @@ pub(crate) struct Inputs<'a> {
     /// Keep reached snapshot bodies encoded for TieredRuntime's lazy
     /// interpreter and compiler path.
     pub defer_prelowered_bodies: bool,
+    /// Retain generic templates when producing a reusable library snapshot.
+    pub keep_generic_templates: bool,
     /// Functions and globals of lowered imports already installed where
     /// the program is going, which it links rather than brings.
     pub linked: Arc<std::collections::HashSet<zyntax_compiler::hir::HirId>>,
@@ -249,7 +251,12 @@ pub(crate) fn lower_typed_program(
     lowering_ctx.display_diagnostics(&program);
     lap("lower_program", &mut at);
 
-    zyntax_compiler::monomorphize_module(&mut module)
+    let specialize = if inputs.keep_generic_templates {
+        zyntax_compiler::monomorphize_library
+    } else {
+        zyntax_compiler::monomorphize_module
+    };
+    specialize(&mut module)
         .map_err(|e| RuntimeError::Execution(format!("Monomorphization error: {:?}", e)))?;
     lap("monomorphize", &mut at);
 

@@ -6,7 +6,7 @@
 use crate::const_eval::ConstEvaluator;
 use crate::hir::*;
 use crate::{CompilerError, CompilerResult};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 use zyntax_typed_ast::InternedString;
 
@@ -19,6 +19,7 @@ pub struct MonomorphizationContext {
     pending: Vec<HirFunction>,
     /// Next instance ID
     next_instance_id: u64,
+    names: FxHashSet<InternedString>,
     /// Const evaluator for const generic substitution
     const_eval: ConstEvaluator,
 }
@@ -38,6 +39,7 @@ impl MonomorphizationContext {
             instances: FxHashMap::default(),
             pending: Vec::new(),
             next_instance_id: 0,
+            names: FxHashSet::default(),
             const_eval: ConstEvaluator::new(),
         }
     }
@@ -71,6 +73,13 @@ impl MonomorphizationContext {
             .get(&generic_id)
             .ok_or_else(|| CompilerError::Analysis("Generic function not found".into()))?
             .clone();
+
+        if generic_func.is_external || generic_func.blocks.is_empty() {
+            return Err(CompilerError::Analysis(format!(
+                "generic template body unavailable: {}",
+                generic_func.name.resolve_global().unwrap_or_default()
+            )));
+        }
 
         if key.type_args.len() != generic_func.signature.type_params.len()
             || key.const_args.len() != generic_func.signature.const_params.len()
@@ -136,14 +145,15 @@ impl MonomorphizationContext {
 
     /// Generate a unique name for a monomorphized instance
     fn generate_instance_name(&mut self, base_name: InternedString) -> InternedString {
-        let name = format!(
-            "{}__mono_{}",
-            base_name.resolve_global().unwrap_or_default(),
-            self.next_instance_id
-        );
-        self.next_instance_id += 1;
-
-        InternedString::new_global(&name)
+        let base = base_name.resolve_global().unwrap_or_default();
+        loop {
+            let name =
+                InternedString::new_global(&format!("{base}__mono_{}", self.next_instance_id));
+            self.next_instance_id += 1;
+            if self.names.insert(name) {
+                return name;
+            }
+        }
     }
 
     /// Substitute types and consts in a function signature
@@ -374,21 +384,28 @@ impl MonomorphizationContext {
 
 /// Specialize reachable calls, including calls introduced by specialization.
 pub fn monomorphize_module(module: &mut HirModule) -> CompilerResult<()> {
+    monomorphize(module, false)
+}
+
+/// Specialize concrete calls while retaining library templates for future callers.
+/// Templates must be excluded from executable optimization until instantiated.
+pub fn monomorphize_library(module: &mut HirModule) -> CompilerResult<()> {
+    monomorphize(module, true)
+}
+
+fn monomorphize(module: &mut HirModule, keep_templates: bool) -> CompilerResult<()> {
     let mut ctx = MonomorphizationContext::new();
-    let templates: Vec<_> = module
-        .functions
-        .iter()
-        .filter(|(_, f)| {
-            !f.signature.type_params.is_empty() || !f.signature.const_params.is_empty()
-        })
-        .map(|(id, _)| *id)
-        .collect();
-    if templates.is_empty() {
+    for (_, template) in module.functions.extract_if(.., |_, f| {
+        !f.signature.type_params.is_empty() || !f.signature.const_params.is_empty()
+    }) {
+        ctx.register_generic(template);
+    }
+    if ctx.generic_functions.is_empty() {
         return Ok(());
     }
-    for id in templates {
-        ctx.register_generic(module.functions.remove(&id).unwrap());
-    }
+    ctx.names.extend(module.functions.values().map(|f| f.name));
+    ctx.names
+        .extend(ctx.generic_functions.values().map(|f| f.name));
     let mut work: Vec<_> = module.functions.keys().copied().collect();
     while let Some(id) = work.pop() {
         let function = module.functions.get_mut(&id).unwrap();
@@ -415,6 +432,14 @@ pub fn monomorphize_module(module: &mut HirModule) -> CompilerResult<()> {
         for instance in ctx.pending.drain(..) {
             work.push(instance.id);
             module.functions.insert(instance.id, instance);
+        }
+    }
+    if keep_templates {
+        for (id, template) in ctx.generic_functions {
+            module.functions.insert(
+                id,
+                Arc::try_unwrap(template).expect("specialization has released the template"),
+            );
         }
     }
     Ok(())

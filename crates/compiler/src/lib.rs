@@ -223,7 +223,7 @@ pub use memory_management::{
 };
 pub use memory_optimization::MemoryOptimizationPass;
 pub use memory_pass::MemoryManagementPass;
-pub use monomorphize::{MonomorphizationContext, monomorphize_module};
+pub use monomorphize::{MonomorphizationContext, monomorphize_library, monomorphize_module};
 pub use pattern_matching::{DecisionNode, PatternMatchCompiler, check_exhaustiveness};
 pub use ssa::{PhiNode, SsaBuilder, SsaForm};
 pub use typed_cfg::{TypedBasicBlock, TypedCfgBuilder, TypedControlFlowGraph, TypedTerminator};

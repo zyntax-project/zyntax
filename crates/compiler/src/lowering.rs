@@ -829,9 +829,18 @@ impl LoweringContext {
                     if self.config.linked.contains(&id) {
                         continue;
                     }
-                    let Some(mut function) = prelowered.signature(id).cloned() else {
+                    let Some(signature) = prelowered.signature(id) else {
                         continue;
                     };
+                    if !signature.signature.type_params.is_empty()
+                        || !signature.signature.const_params.is_empty()
+                    {
+                        if let Some(function) = prelowered.function(id) {
+                            self.module.functions.insert(id, function);
+                        }
+                        continue;
+                    }
+                    let mut function = signature.clone();
                     function.attributes.deferred |= has_body;
                     self.module.functions.insert(id, function);
                     if has_body {
@@ -934,7 +943,13 @@ impl LoweringContext {
             };
             let decoding = self.trace_phases.then(web_time::Instant::now);
             let source = Arc::clone(&self.config.prelowered[m]);
-            let (function, targets) = if self.config.defer_prelowered_bodies {
+            // Specialization needs a template's instructions; concrete callees
+            // can remain encoded until execution or native compilation needs them.
+            let generic = self.config.defer_prelowered_bodies
+                && source.signature(target).is_some_and(|f| {
+                    !f.signature.type_params.is_empty() || !f.signature.const_params.is_empty()
+                });
+            let (function, targets) = if self.config.defer_prelowered_bodies && !generic {
                 let Some(mut function) = source.signature(target).cloned() else {
                     continue;
                 };
