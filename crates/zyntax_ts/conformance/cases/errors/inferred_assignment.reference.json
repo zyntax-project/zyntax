@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 50,
+      "length": 1,
+      "file": "inferred_assignment.ts",
+      "message": "Type 'number' is not assignable to type 'boolean'."
+    }
+  ],
+  "source_sha256": "6d1f2ba9ce8ded852d49faf2787e2ed84acd678e1cdebd45aff9d14b9a31648e",
+  "options": {}
+}

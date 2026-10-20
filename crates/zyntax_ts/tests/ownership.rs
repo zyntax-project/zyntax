@@ -46,8 +46,8 @@ fn returned_storage_is_freed_by_the_caller_and_borrowed_aliases_are_not_double_f
     let mut module = lower(
         r#"
         type Point = { x: number };
-        function make(x: number): Point { return { x: x }; }
-        function alias(p: Point): Point { return p; }
+        function make(x: number) { return { x: x }; }
+        function alias(p: Point) { return p; }
         const p: Point = make(3);
         const q: Point = alias(p);
         q.x = 9;

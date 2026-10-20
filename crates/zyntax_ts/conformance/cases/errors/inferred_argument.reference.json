@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2345,
+      "start": 110,
+      "length": 8,
+      "file": "inferred_argument.ts",
+      "message": "Argument of type 'number' is not assignable to parameter of type 'boolean'."
+    }
+  ],
+  "source_sha256": "2af95dbab9385c81db68d067ac8692c16b84e8f341236a67aa40e4e2b31351bc",
+  "options": {}
+}

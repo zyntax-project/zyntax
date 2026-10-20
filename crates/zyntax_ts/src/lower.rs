@@ -1,7 +1,13 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::fmt::Write;
+use std::rc::Rc;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast as js;
+use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 use zyntax_typed_ast::typed_ast::*;
@@ -44,8 +50,8 @@ fn num(value: f64, at: oxc_span::Span) -> Expr {
         at,
     )
 }
-fn var(name: &str, ty: Type, at: oxc_span::Span) -> Expr {
-    node(TypedExpression::Variable(intern(name)), ty, at)
+fn var(name: InternedString, ty: Type, at: oxc_span::Span) -> Expr {
+    node(TypedExpression::Variable(name), ty, at)
 }
 fn stmt(value: TypedStatement, at: oxc_span::Span) -> Stmt {
     node(value, unit(), at)
@@ -65,16 +71,16 @@ fn binary(op: BinaryOp, left: Expr, right: Expr, ty: Type, at: oxc_span::Span) -
         at,
     )
 }
-fn call(name: &str, args: Vec<Expr>, ret: Type, at: oxc_span::Span) -> Expr {
+fn call(name: InternedString, args: Vec<Expr>, ret: Type, at: oxc_span::Span) -> Expr {
     node(
         TypedExpression::Call(TypedCall::positional(var(name, Type::Any, at), args)),
         ret,
         at,
     )
 }
-fn strict_fp() -> TypedAnnotation {
+fn strict_fp(name: InternedString) -> TypedAnnotation {
     TypedAnnotation {
-        name: intern("strict_fp"),
+        name,
         args: vec![],
         span: Span::default(),
     }
@@ -82,22 +88,52 @@ fn strict_fp() -> TypedAnnotation {
 
 #[derive(Clone, Debug)]
 struct Field {
-    ty: Type,
+    ty: PrimitiveType,
     readonly: bool,
 }
-#[derive(Clone)]
 struct Binding {
-    name: String,
+    name: InternedString,
     ty: Type,
-    view: Option<String>,
+    view: Option<InternedString>,
     mutable: bool,
     initialized: bool,
 }
-#[derive(Clone)]
-struct Signature {
-    params: Vec<(String, Type, Option<String>)>,
-    ret: Type,
-    ret_view: Option<String>,
+struct Signature<'ast> {
+    native: InternedString,
+    params: Vec<(&'ast str, Type, Option<InternedString>)>,
+    ret: Option<Type>,
+    ret_view: Option<InternedString>,
+}
+
+struct ReturnContext {
+    expected: Option<(Type, Option<InternedString>)>,
+    inferred: Option<(Type, Option<InternedString>)>,
+}
+
+struct CallDependencies<'s> {
+    scoping: &'s oxc_semantic::Scoping,
+    inferred: &'s FxHashMap<oxc_semantic::SymbolId, InternedString>,
+    seen: FxHashSet<oxc_semantic::SymbolId>,
+    callees: Vec<InternedString>,
+}
+
+impl<'ast> Visit<'ast> for CallDependencies<'_> {
+    fn visit_call_expression(&mut self, call: &js::CallExpression<'ast>) {
+        if let js::Expression::Identifier(id) = &call.callee {
+            let reference = self.scoping.get_reference(id.reference_id.get().unwrap());
+            if let Some(symbol) = reference.symbol_id() {
+                if let Some(name) = self.inferred.get(&symbol) {
+                    if self.seen.insert(symbol) {
+                        self.callees.push(*name);
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_function(&mut self, _: &js::Function<'ast>, _: oxc_semantic::ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &js::ArrowFunctionExpression<'ast>) {}
 }
 
 /// Parse and type the supported TypeScript constructs without JavaScript emission.
@@ -121,32 +157,40 @@ pub fn parse_program(source: &str, file: &str, options: Options) -> Result<Typed
             oxc_span::Span::new(0, 0),
         ));
     }
-    Lowerer::new(options).program(&parsed.program, source, file)
+    Lowerer::new(options).program(&parsed.program, &semantic.semantic, source, file)
 }
 
-struct Lowerer {
+struct Lowerer<'ast, 'program> {
     options: Options,
+    names: RefCell<FxHashMap<&'ast str, InternedString>>,
+    name_buffer: String,
     registry: TypeRegistry,
-    aliases: HashMap<String, (Type, Option<String>)>,
-    views: HashMap<String, BTreeMap<String, Field>>,
-    layouts: Vec<(Vec<(String, Type)>, TypeId, String)>,
-    signatures: HashMap<String, Signature>,
-    scopes: Vec<HashMap<String, Binding>>,
+    aliases: FxHashMap<InternedString, (Type, Option<InternedString>)>,
+    views: FxHashMap<InternedString, BTreeMap<&'ast str, Field>>,
+    layouts: FxHashMap<Vec<(InternedString, PrimitiveType)>, TypeId>,
+    signatures: FxHashMap<InternedString, Rc<Signature<'ast>>>,
+    functions: FxHashMap<InternedString, &'program js::Function<'ast>>,
+    lowered: FxHashSet<InternedString>,
+    scopes: Vec<FxHashMap<InternedString, Binding>>,
     declarations: Vec<TypedNode<TypedDeclaration>>,
-    returns: Option<(Type, Option<String>)>,
+    returns: Option<ReturnContext>,
     loop_depth: usize,
     next_name: usize,
 }
 
-impl Lowerer {
+impl<'ast, 'program> Lowerer<'ast, 'program> {
     fn new(options: Options) -> Self {
         Self {
             options,
+            names: RefCell::new(FxHashMap::default()),
+            name_buffer: String::new(),
             registry: TypeRegistry::new(),
-            aliases: HashMap::new(),
-            views: HashMap::new(),
-            layouts: vec![],
-            signatures: HashMap::new(),
+            aliases: FxHashMap::default(),
+            views: FxHashMap::default(),
+            layouts: FxHashMap::default(),
+            signatures: FxHashMap::default(),
+            functions: FxHashMap::default(),
+            lowered: FxHashSet::default(),
             scopes: vec![],
             declarations: vec![],
             returns: None,
@@ -170,14 +214,33 @@ impl Lowerer {
             at,
         )
     }
-    fn fresh(&mut self, name: &str) -> String {
+    fn name(&self, name: &'ast str) -> InternedString {
+        *self
+            .names
+            .borrow_mut()
+            .entry(name)
+            .or_insert_with(|| intern(name))
+    }
+
+    fn generated_name(&mut self, prefix: &str, index: usize) -> InternedString {
+        self.name_buffer.clear();
+        write!(&mut self.name_buffer, "ts${prefix}${index}").unwrap();
+        intern(&self.name_buffer)
+    }
+
+    fn fresh(&mut self, name: &str) -> InternedString {
         self.next_name += 1;
-        format!("ts${name}${}", self.next_name)
+        self.generated_name(name, self.next_name)
+    }
+
+    fn call(&self, name: &'ast str, args: Vec<Expr>, ret: Type, at: oxc_span::Span) -> Expr {
+        call(self.name(name), args, ret, at)
     }
 
     fn program(
         mut self,
-        program: &js::Program<'_>,
+        program: &'program js::Program<'ast>,
+        semantic: &oxc_semantic::Semantic<'_>,
         source: &str,
         file: &str,
     ) -> Result<TypedProgram> {
@@ -217,12 +280,32 @@ impl Lowerer {
             }
         }
         self.externs();
+        let dependencies = self.dependencies(semantic);
+        let mut visiting = FxHashSet::default();
         for item in &program.body {
             if let js::Statement::FunctionDeclaration(f) = item {
-                self.function(f)?;
+                let mut pending = vec![(self.name(f.id.as_ref().unwrap().name.as_str()), false)];
+                while let Some((name, ready)) = pending.pop() {
+                    if self.lowered.contains(&name) {
+                        continue;
+                    }
+                    let function = self.functions[&name];
+                    if ready {
+                        self.function(function)?;
+                        visiting.remove(&name);
+                    } else {
+                        if !visiting.insert(name) {
+                            return self.unsupported("cyclic inferred return types", function.span);
+                        }
+                        pending.push((name, true));
+                        if let Some(callees) = dependencies.get(&name) {
+                            pending.extend(callees.iter().rev().map(|n| (*n, false)));
+                        }
+                    }
+                }
             }
         }
-        self.scopes.push(HashMap::new());
+        self.scopes.push(FxHashMap::default());
         self.reserve(&program.body)?;
         let mut body = vec![];
         for item in &program.body {
@@ -244,7 +327,7 @@ impl Lowerer {
                     span: span(program.span),
                 }),
                 return_type: unit(),
-                annotations: vec![strict_fp()],
+                annotations: vec![strict_fp(self.name("strict_fp"))],
                 visibility: Visibility::Public,
                 ..Default::default()
             }),
@@ -263,34 +346,61 @@ impl Lowerer {
         })
     }
 
-    fn type_declaration(&mut self, item: &js::Statement<'_>) -> Result<()> {
+    fn dependencies(
+        &self,
+        semantic: &oxc_semantic::Semantic<'_>,
+    ) -> FxHashMap<InternedString, Vec<InternedString>> {
+        let inferred = self
+            .functions
+            .iter()
+            .filter(|(name, _)| self.signatures[*name].ret.is_none())
+            .map(|(name, f)| (f.id.as_ref().unwrap().symbol_id.get().unwrap(), *name))
+            .collect();
+        let mut calls = CallDependencies {
+            scoping: semantic.scoping(),
+            inferred: &inferred,
+            seen: FxHashSet::default(),
+            callees: vec![],
+        };
+        let mut dependencies = FxHashMap::default();
+        for (name, function) in &self.functions {
+            calls.seen.clear();
+            calls.visit_function_body(function.body.as_ref().unwrap());
+            if !calls.callees.is_empty() {
+                dependencies.insert(*name, std::mem::take(&mut calls.callees));
+            }
+        }
+        dependencies
+    }
+
+    fn type_declaration(&mut self, item: &js::Statement<'ast>) -> Result<()> {
         match item {
             js::Statement::TSInterfaceDeclaration(i) => {
                 if i.type_parameters.is_some() || !i.extends.is_empty() {
                     return self.unsupported("generic or extending interfaces", i.span);
                 }
-                let name = i.id.name.to_string();
+                let name = self.name(i.id.name.as_str());
                 if self.aliases.contains_key(&name) {
                     return self.unsupported("declaration merging", i.span);
                 }
                 let fields = self.fields(&i.body.body)?;
-                let ty = self.layout(&fields);
-                self.views.insert(name.clone(), fields);
-                self.aliases.insert(name.clone(), (ty, Some(name)));
+                let ty = self.layout(fields.iter().map(|(name, field)| (*name, field.ty)));
+                self.views.insert(name, fields);
+                self.aliases.insert(name, (ty, Some(name)));
             }
             js::Statement::TSTypeAliasDeclaration(a) => {
                 if a.type_parameters.is_some() {
                     return self.unsupported("generic aliases", a.span);
                 }
-                let name = a.id.name.to_string();
+                let name = self.name(a.id.name.as_str());
                 if self.aliases.contains_key(&name) {
                     return self.error(ErrorKind::Type, "duplicate type declaration", a.span);
                 }
                 let (ty, view) = if let js::TSType::TSTypeLiteral(literal) = &a.type_annotation {
                     let fields = self.fields(&literal.members)?;
-                    let ty = self.layout(&fields);
-                    self.views.insert(name.clone(), fields);
-                    (ty, Some(name.clone()))
+                    let ty = self.layout(fields.iter().map(|(name, field)| (*name, field.ty)));
+                    self.views.insert(name, fields);
+                    (ty, Some(name))
                 } else {
                     self.ty(&a.type_annotation)?
                 };
@@ -301,7 +411,7 @@ impl Lowerer {
         Ok(())
     }
 
-    fn fields(&mut self, members: &[js::TSSignature<'_>]) -> Result<BTreeMap<String, Field>> {
+    fn fields(&mut self, members: &[js::TSSignature<'ast>]) -> Result<BTreeMap<&'ast str, Field>> {
         let mut fields = BTreeMap::new();
         for member in members {
             let js::TSSignature::TSPropertySignature(p) = member else {
@@ -315,12 +425,9 @@ impl Lowerer {
                 return self.error(ErrorKind::Type, "field requires a type", p.span);
             };
             let (ty, _) = self.ty(&annotation.type_annotation)?;
-            if !matches!(
-                ty,
-                Type::Primitive(PrimitiveType::F64 | PrimitiveType::Bool)
-            ) {
+            let Type::Primitive(ty @ (PrimitiveType::F64 | PrimitiveType::Bool)) = ty else {
                 return self.unsupported("reference-valued object fields", p.span);
-            }
+            };
             if fields
                 .insert(
                     name,
@@ -337,20 +444,18 @@ impl Lowerer {
         Ok(fields)
     }
 
-    fn layout(&mut self, fields: &BTreeMap<String, Field>) -> Type {
-        let key: Vec<_> = fields
-            .iter()
-            .map(|(n, f)| (n.clone(), f.ty.clone()))
-            .collect();
-        let id = if let Some((_, id, _)) = self.layouts.iter().find(|(k, _, _)| k == &key) {
+    fn layout(&mut self, fields: impl Iterator<Item = (&'ast str, PrimitiveType)>) -> Type {
+        let key: SmallVec<[(InternedString, PrimitiveType); 4]> =
+            fields.map(|(name, ty)| (self.name(name), ty)).collect();
+        let id = if let Some(id) = self.layouts.get(key.as_slice()) {
             *id
         } else {
-            let name = format!("ts$record${}", self.layouts.len());
+            let name = self.generated_name("record", self.layouts.len());
             let definitions = key
                 .iter()
-                .map(|(n, ty)| FieldDef {
-                    name: intern(n),
-                    ty: ty.clone(),
+                .map(|(name, ty)| FieldDef {
+                    name: *name,
+                    ty: Type::Primitive(*ty),
                     visibility: Visibility::Public,
                     mutability: Mutability::Mutable,
                     is_static: false,
@@ -361,7 +466,7 @@ impl Lowerer {
                 })
                 .collect();
             let id = self.registry.register_struct_type(
-                intern(&name),
+                name,
                 vec![],
                 definitions,
                 vec![],
@@ -372,7 +477,7 @@ impl Lowerer {
                 },
                 Span::default(),
             );
-            self.layouts.push((key, id, name));
+            self.layouts.insert(key.into_vec(), id);
             id
         };
         Type::Named {
@@ -384,7 +489,7 @@ impl Lowerer {
         }
     }
 
-    fn ty(&self, ty: &js::TSType<'_>) -> Result<(Type, Option<String>)> {
+    fn ty(&self, ty: &js::TSType<'ast>) -> Result<(Type, Option<InternedString>)> {
         Ok(match ty {
             js::TSType::TSNumberKeyword(_) => (number(), None),
             js::TSType::TSBooleanKeyword(_) => (boolean(), None),
@@ -395,7 +500,7 @@ impl Lowerer {
                     return self.unsupported("qualified type names", r.span);
                 };
                 self.aliases
-                    .get(name.name.as_str())
+                    .get(&self.name(name.name.as_str()))
                     .cloned()
                     .ok_or_else(|| {
                         Error::new(
@@ -410,15 +515,15 @@ impl Lowerer {
         })
     }
 
-    fn key(&self, key: &js::PropertyKey<'_>) -> Result<String> {
+    fn key(&self, key: &js::PropertyKey<'ast>) -> Result<&'ast str> {
         match key {
-            js::PropertyKey::StaticIdentifier(i) => Ok(i.name.to_string()),
-            js::PropertyKey::StringLiteral(s) if !s.lone_surrogates => Ok(s.value.to_string()),
+            js::PropertyKey::StaticIdentifier(i) => Ok(i.name.as_str()),
+            js::PropertyKey::StringLiteral(s) if !s.lone_surrogates => Ok(s.value.as_str()),
             _ => self.unsupported("computed property names", key.span()),
         }
     }
 
-    fn signature(&mut self, f: &js::Function<'_>) -> Result<()> {
+    fn signature(&mut self, f: &'program js::Function<'ast>) -> Result<()> {
         let Some(id) = &f.id else {
             return self.unsupported("anonymous declarations", f.span);
         };
@@ -434,11 +539,11 @@ impl Lowerer {
                 f.span,
             );
         }
-        if self.signatures.contains_key(id.name.as_str()) {
+        if self.signatures.contains_key(&self.name(id.name.as_str())) {
             return self.unsupported("function overloads", f.span);
         }
         let mut params = vec![];
-        let mut names = HashSet::new();
+        let mut names = FxHashSet::default();
         for p in &f.params.items {
             let js::BindingPattern::BindingIdentifier(name) = &p.pattern else {
                 return self.unsupported("destructuring parameters", p.span);
@@ -450,69 +555,104 @@ impl Lowerer {
                 return self.error(ErrorKind::Type, "parameter implicitly has type any", p.span);
             };
             let (ty, view) = self.ty(&annotation.type_annotation)?;
-            if !names.insert(name.name.to_string()) {
+            if !names.insert(self.name(name.name.as_str())) {
                 return self.error(ErrorKind::Type, "duplicate parameter", p.span);
             }
-            params.push((name.name.to_string(), ty, view));
+            params.push((name.name.as_str(), ty, view));
         }
-        let Some(ret) = &f.return_type else {
-            return self.unsupported("inferred function return types", f.span);
+        let (ret, ret_view) = match &f.return_type {
+            Some(ret) => {
+                let (ty, view) = self.ty(&ret.type_annotation)?;
+                (Some(ty), view)
+            }
+            None => (None, None),
         };
-        let (ret, ret_view) = self.ty(&ret.type_annotation)?;
+        let name = self.name(id.name.as_str());
+        self.functions.insert(name, f);
+        self.name_buffer.clear();
+        write!(&mut self.name_buffer, "ts$fn${}", id.name).unwrap();
+        let native = intern(&self.name_buffer);
         self.signatures.insert(
-            id.name.to_string(),
-            Signature {
+            name,
+            Rc::new(Signature {
+                native,
                 params,
                 ret,
                 ret_view,
-            },
+            }),
         );
         Ok(())
     }
 
-    fn function(&mut self, f: &js::Function<'_>) -> Result<()> {
-        let name = f.id.as_ref().unwrap().name.as_str();
-        let sig = self.signatures[name].clone();
-        self.scopes.push(HashMap::new());
+    fn function(&mut self, f: &js::Function<'ast>) -> Result<()> {
+        let name = self.name(f.id.as_ref().unwrap().name.as_str());
+        if self.lowered.contains(&name) {
+            return Ok(());
+        }
+        let result = self.function_body(f);
+        if result.is_ok() {
+            self.lowered.insert(name);
+        }
+        result
+    }
+
+    fn function_body(&mut self, f: &js::Function<'ast>) -> Result<()> {
+        let name = self.name(f.id.as_ref().unwrap().name.as_str());
+        let sig = self.signatures[&name].clone();
+        self.scopes.push(FxHashMap::default());
         let mut params = vec![];
         for (name, ty, view) in &sig.params {
             let unique = self.fresh(name);
+            let source_name = self.name(name);
             self.scopes.last_mut().unwrap().insert(
-                name.clone(),
+                source_name,
                 Binding {
-                    name: unique.clone(),
+                    name: unique,
                     ty: ty.clone(),
-                    view: view.clone(),
+                    view: *view,
                     mutable: true,
                     initialized: true,
                 },
             );
-            let mut param = TypedParameter::regular(
-                intern(&unique),
-                ty.clone(),
-                Mutability::Mutable,
-                span(f.span),
-            );
+            let mut param =
+                TypedParameter::regular(unique, ty.clone(), Mutability::Mutable, span(f.span));
             param.ownership = ParamOwnership::Borrowed;
             params.push(param);
         }
-        self.returns = Some((sig.ret.clone(), sig.ret_view.clone()));
+        self.returns = Some(ReturnContext {
+            expected: sig.ret.clone().map(|ty| (ty, sig.ret_view)),
+            inferred: None,
+        });
         let mut statements = vec![];
         self.reserve(&f.body.as_ref().unwrap().statements)?;
         for s in &f.body.as_ref().unwrap().statements {
             statements.extend(self.statement(s)?);
         }
-        if sig.ret != unit() && !Self::returns(&f.body.as_ref().unwrap().statements) {
+        let context = self.returns.take().unwrap();
+        let inferred = sig.ret.is_none();
+        let (ret, ret_view) = match context.expected {
+            Some(result) => result,
+            None => context.inferred.unwrap_or((unit(), None)),
+        };
+        if ret != unit() && !Self::returns(&f.body.as_ref().unwrap().statements) {
+            if inferred {
+                return self.unsupported("possibly undefined inferred return types", f.span);
+            }
             return self.error(ErrorKind::Type, "function lacks an ending return", f.span);
         }
-        self.returns = None;
+        let native = sig.native;
+        drop(sig);
+        let sig = Rc::get_mut(self.signatures.get_mut(&name).unwrap())
+            .expect("signature handles do not escape body lowering");
+        sig.ret = Some(ret.clone());
+        sig.ret_view = ret_view;
         self.scopes.pop();
         self.declarations.push(node(
             TypedDeclaration::Function(TypedFunction {
-                name: intern(&format!("ts$fn${name}")),
-                annotations: vec![strict_fp()],
+                name: native,
+                annotations: vec![strict_fp(self.name("strict_fp"))],
                 params,
-                return_type: sig.ret,
+                return_type: ret,
                 body: Some(TypedBlock {
                     statements,
                     span: span(f.span),
@@ -526,7 +666,31 @@ impl Lowerer {
         Ok(())
     }
 
-    fn returns(statements: &[js::Statement<'_>]) -> bool {
+    fn record_return(
+        &mut self,
+        ty: &Type,
+        view: Option<InternedString>,
+        at: oxc_span::Span,
+    ) -> Result<()> {
+        let Some((first, first_view)) = &self.returns.as_ref().unwrap().inferred else {
+            self.returns.as_mut().unwrap().inferred = Some((ty.clone(), view));
+            return Ok(());
+        };
+        if first != ty {
+            return self.unsupported("inferred union return types", at);
+        }
+        let readonly = |view: Option<InternedString>| {
+            view.and_then(|name| self.views.get(&name))
+                .into_iter()
+                .flat_map(|fields| fields.iter().filter(|(_, f)| f.readonly).map(|(n, _)| n))
+        };
+        if !readonly(*first_view).eq(readonly(view)) {
+            return self.unsupported("inferred returns with different readonly views", at);
+        }
+        Ok(())
+    }
+
+    fn returns(statements: &[js::Statement<'ast>]) -> bool {
         statements.iter().any(|s| match s {
             js::Statement::ReturnStatement(_) => true,
             js::Statement::BlockStatement(b) => Self::returns(&b.body),
@@ -554,7 +718,7 @@ impl Lowerer {
                 .enumerate()
                 .map(|(i, ty)| {
                     let mut p = TypedParameter::regular(
-                        intern(&format!("p{i}")),
+                        self.generated_name("p", i),
                         ty,
                         Mutability::Immutable,
                         Span::default(),
@@ -565,12 +729,12 @@ impl Lowerer {
                 .collect();
             self.declarations.push(TypedNode::new(
                 TypedDeclaration::Function(TypedFunction {
-                    name: intern(name),
+                    name: self.name(name),
                     params,
                     return_type: ret,
                     is_external: true,
                     calling_convention: CallingConvention::Cdecl,
-                    link_name: Some(intern(name)),
+                    link_name: Some(self.name(name)),
                     ..Default::default()
                 }),
                 unit(),
@@ -579,7 +743,7 @@ impl Lowerer {
         }
     }
 
-    fn reserve(&mut self, statements: &[js::Statement<'_>]) -> Result<()> {
+    fn reserve(&mut self, statements: &[js::Statement<'ast>]) -> Result<()> {
         for statement in statements {
             if let js::Statement::VariableDeclaration(d) = statement {
                 self.reserve_variables(d)?;
@@ -588,14 +752,14 @@ impl Lowerer {
         Ok(())
     }
 
-    fn reserve_variables(&mut self, declaration: &js::VariableDeclaration<'_>) -> Result<()> {
+    fn reserve_variables(&mut self, declaration: &js::VariableDeclaration<'ast>) -> Result<()> {
         for d in &declaration.declarations {
             if let js::BindingPattern::BindingIdentifier(id) = &d.id {
-                let name = id.name.to_string();
+                let name = self.name(id.name.as_str());
                 if self.scopes.last().unwrap().contains_key(&name) {
                     return self.error(ErrorKind::Type, "duplicate variable", d.span);
                 }
-                let unique = self.fresh(&name);
+                let unique = name;
                 self.scopes.last_mut().unwrap().insert(
                     name,
                     Binding {
@@ -611,13 +775,12 @@ impl Lowerer {
         Ok(())
     }
 
-    fn binding(&self, name: &str, at: oxc_span::Span) -> Result<Binding> {
+    fn binding(&self, name: &'ast str, at: oxc_span::Span) -> Result<&Binding> {
         let b = self
             .scopes
             .iter()
             .rev()
-            .find_map(|s| s.get(name))
-            .cloned()
+            .find_map(|s| s.get(&self.name(name)))
             .ok_or_else(|| Error::new(ErrorKind::Type, format!("cannot find name `{name}`"), at))?;
         if !b.initialized {
             return self.error(
@@ -656,7 +819,7 @@ impl Lowerer {
         }
     }
 
-    fn view_of(&self, e: &js::Expression<'_>) -> Option<String> {
+    fn view_of(&self, e: &js::Expression<'ast>) -> Option<InternedString> {
         match e {
             js::Expression::Identifier(i) => self
                 .binding(i.name.as_str(), i.span)
@@ -665,8 +828,8 @@ impl Lowerer {
             js::Expression::CallExpression(c) => {
                 if let js::Expression::Identifier(i) = &c.callee {
                     self.signatures
-                        .get(i.name.as_str())
-                        .and_then(|s| s.ret_view.clone())
+                        .get(&self.name(i.name.as_str()))
+                        .and_then(|s| s.ret_view)
                 } else {
                     None
                 }
@@ -681,10 +844,15 @@ impl Lowerer {
         }
     }
 
-    fn check_view(&self, from: Option<&str>, to: Option<&str>, at: oxc_span::Span) -> Result<()> {
+    fn check_view(
+        &self,
+        from: Option<InternedString>,
+        to: Option<InternedString>,
+        at: oxc_span::Span,
+    ) -> Result<()> {
         if self.options.soundness == Soundness::Checked {
-            if let Some(from) = from.and_then(|n| self.views.get(n)) {
-                let to = to.and_then(|n| self.views.get(n));
+            if let Some(from) = from.and_then(|n| self.views.get(&n)) {
+                let to = to.and_then(|n| self.views.get(&n));
                 for (name, field) in from {
                     if field.readonly
                         && !to
@@ -699,8 +867,8 @@ impl Lowerer {
         Ok(())
     }
 
-    fn block(&mut self, statement: &js::Statement<'_>) -> Result<TypedBlock> {
-        self.scopes.push(HashMap::new());
+    fn block(&mut self, statement: &js::Statement<'ast>) -> Result<TypedBlock> {
+        self.scopes.push(FxHashMap::default());
         let statements = match statement {
             js::Statement::BlockStatement(b) => {
                 self.reserve(&b.body)?;
@@ -719,7 +887,7 @@ impl Lowerer {
         })
     }
 
-    fn statement(&mut self, s: &js::Statement<'_>) -> Result<Vec<Stmt>> {
+    fn statement(&mut self, s: &js::Statement<'ast>) -> Result<Vec<Stmt>> {
         let at = s.span();
         Ok(match s {
             js::Statement::EmptyStatement(_) => vec![],
@@ -729,19 +897,20 @@ impl Lowerer {
                 vec![stmt(TypedStatement::Block(self.block(s)?), at)]
             }
             js::Statement::ReturnStatement(r) => {
-                let Some((ret, view)) = self.returns.clone() else {
+                if self.returns.is_none() {
                     return self.error(ErrorKind::Syntax, "return outside function", at);
-                };
-                let value = if let Some(arg) = &r.argument {
-                    let value = self.expr(arg)?;
-                    self.expect(&value.ty, &ret, at)?;
-                    self.check_view(self.view_of(arg).as_deref(), view.as_deref(), at)?;
-                    Some(Box::new(value))
+                }
+                let value = r.argument.as_ref().map(|arg| self.expr(arg)).transpose()?;
+                let view = r.argument.as_ref().and_then(|arg| self.view_of(arg));
+                let unit = unit();
+                let actual = value.as_ref().map_or(&unit, |value| &value.ty);
+                if let Some((ret, expected_view)) = &self.returns.as_ref().unwrap().expected {
+                    self.expect(actual, ret, at)?;
+                    self.check_view(view, *expected_view, at)?;
                 } else {
-                    self.expect(&unit(), &ret, at)?;
-                    None
-                };
-                vec![stmt(TypedStatement::Return(value), at)]
+                    self.record_return(actual, view, at)?;
+                }
+                vec![stmt(TypedStatement::Return(value.map(Box::new)), at)]
             }
             js::Statement::IfStatement(i) => {
                 let condition = self.condition(&i.test)?;
@@ -772,7 +941,7 @@ impl Lowerer {
                 )]
             }
             js::Statement::ForStatement(f) => {
-                self.scopes.push(HashMap::new());
+                self.scopes.push(FxHashMap::default());
                 let mut init = vec![];
                 if let Some(value) = &f.init {
                     if let js::ForStatementInit::VariableDeclaration(d) = value {
@@ -827,7 +996,7 @@ impl Lowerer {
         })
     }
 
-    fn variables(&mut self, declaration: &js::VariableDeclaration<'_>) -> Result<Vec<Stmt>> {
+    fn variables(&mut self, declaration: &js::VariableDeclaration<'ast>) -> Result<Vec<Stmt>> {
         let kind = declaration.kind.as_str();
         if !matches!(kind, "let" | "const") {
             return self.unsupported("var or using declarations", declaration.span);
@@ -837,7 +1006,7 @@ impl Lowerer {
             let js::BindingPattern::BindingIdentifier(id) = &d.id else {
                 return self.unsupported("destructuring declarations", d.span);
             };
-            let name = id.name.to_string();
+            let name = self.name(id.name.as_str());
             if self
                 .scopes
                 .last()
@@ -857,12 +1026,12 @@ impl Lowerer {
                 (value.ty.clone(), self.view_of(init))
             };
             self.expect(&value.ty, &ty, d.span)?;
-            self.check_view(self.view_of(init).as_deref(), view.as_deref(), d.span)?;
-            let unique = self.fresh(&name);
+            self.check_view(self.view_of(init), view, d.span)?;
+            let unique = self.fresh(id.name.as_str());
             self.scopes.last_mut().unwrap().insert(
                 name,
                 Binding {
-                    name: unique.clone(),
+                    name: unique,
                     ty: ty.clone(),
                     view,
                     mutable: kind == "let",
@@ -871,7 +1040,7 @@ impl Lowerer {
             );
             out.push(stmt(
                 TypedStatement::Let(TypedLet {
-                    name: intern(&unique),
+                    name: unique,
                     ty,
                     mutability: Mutability::Mutable,
                     initializer: Some(Box::new(value)),
@@ -883,7 +1052,7 @@ impl Lowerer {
         Ok(out)
     }
 
-    fn condition(&mut self, e: &js::Expression<'_>) -> Result<Expr> {
+    fn condition(&mut self, e: &js::Expression<'ast>) -> Result<Expr> {
         let value = self.expr(e)?;
         if value.ty == boolean() {
             return Ok(value);
@@ -894,7 +1063,7 @@ impl Lowerer {
             let at = e.span();
             let binding = stmt(
                 TypedStatement::Let(TypedLet {
-                    name: intern(&unique),
+                    name: unique,
                     ty: number(),
                     mutability: Mutability::Immutable,
                     initializer: Some(Box::new(value)),
@@ -902,7 +1071,7 @@ impl Lowerer {
                 }),
                 at,
             );
-            let read = var(&unique, number(), at);
+            let read = var(unique, number(), at);
             let nonzero = binary(BinaryOp::Ne, read.clone(), num(0.0, at), boolean(), at);
             let ordered = binary(BinaryOp::Eq, read.clone(), read, boolean(), at);
             return Ok(node(
@@ -920,7 +1089,7 @@ impl Lowerer {
         self.unsupported("truthiness of this type", e.span())
     }
 
-    fn expr(&mut self, e: &js::Expression<'_>) -> Result<Expr> {
+    fn expr(&mut self, e: &js::Expression<'ast>) -> Result<Expr> {
         let at = e.span();
         Ok(match e {
             js::Expression::NumericLiteral(n) => num(n.value, at),
@@ -930,21 +1099,25 @@ impl Lowerer {
                 at,
             ),
             js::Expression::StringLiteral(s) if !s.lone_surrogates => node(
-                TypedExpression::Literal(TypedLiteral::String(intern(s.value.as_str()))),
+                TypedExpression::Literal(TypedLiteral::String(self.name(s.value.as_str()))),
                 string(),
                 at,
             ),
             js::Expression::Identifier(i) => {
-                if self.scopes.iter().any(|s| s.contains_key(i.name.as_str())) {
+                if self
+                    .scopes
+                    .iter()
+                    .any(|s| s.contains_key(&self.name(i.name.as_str())))
+                {
                     let b = self.binding(i.name.as_str(), at)?;
-                    var(&b.name, b.ty, at)
+                    var(b.name, b.ty.clone(), at)
                 } else {
                     match i.name.as_str() {
                         "NaN" => num(f64::NAN, at),
                         "Infinity" => num(f64::INFINITY, at),
                         name => {
                             let b = self.binding(name, at)?;
-                            var(&b.name, b.ty, at)
+                            var(b.name, b.ty.clone(), at)
                         }
                     }
                 }
@@ -1021,7 +1194,7 @@ impl Lowerer {
                 node(
                     TypedExpression::Field(TypedFieldAccess {
                         object: Box::new(object),
-                        field: intern(m.property.name.as_str()),
+                        field: self.name(m.property.name.as_str()),
                     }),
                     ty,
                     at,
@@ -1037,7 +1210,7 @@ impl Lowerer {
                 let old = self.fresh("old");
                 let save = stmt(
                     TypedStatement::Let(TypedLet {
-                        name: intern(&old),
+                        name: old,
                         ty: number(),
                         mutability: Mutability::Immutable,
                         initializer: Some(Box::new(target.clone())),
@@ -1051,7 +1224,7 @@ impl Lowerer {
                     } else {
                         BinaryOp::Sub
                     },
-                    var(&old, number(), at),
+                    var(old, number(), at),
                     num(1.0, at),
                     number(),
                     at,
@@ -1060,7 +1233,7 @@ impl Lowerer {
                 let result = if u.prefix {
                     target
                 } else {
-                    var(&old, number(), at)
+                    var(old, number(), at)
                 };
                 statements.extend([save, expression(assign), expression(result)]);
                 node(
@@ -1076,7 +1249,7 @@ impl Lowerer {
                 let value = self.expr(&a.expression)?;
                 let (ty, view) = self.ty(&a.type_annotation)?;
                 self.expect(&value.ty, &ty, at)?;
-                self.check_view(self.view_of(&a.expression).as_deref(), view.as_deref(), at)?;
+                self.check_view(self.view_of(&a.expression), view, at)?;
                 value
             }
             js::Expression::TSNonNullExpression(n) => self.expr(&n.expression)?,
@@ -1084,19 +1257,24 @@ impl Lowerer {
         })
     }
 
-    fn binary_expr(&mut self, b: &js::BinaryExpression<'_>) -> Result<Expr> {
+    fn binary_expr(&mut self, b: &js::BinaryExpression<'ast>) -> Result<Expr> {
         let at = b.span;
         let left = self.expr(&b.left)?;
         let right = self.expr(&b.right)?;
         let op = b.operator.as_str();
         if left.ty == string() && right.ty == string() {
             return match op {
-                "+" => Ok(call("$String$concat", vec![left, right], string(), at)),
-                "===" | "==" => Ok(call("$String$equals", vec![left, right], boolean(), at)),
+                "+" => Ok(self.call("$String$concat", vec![left, right], string(), at)),
+                "===" | "==" => Ok(self.call("$String$equals", vec![left, right], boolean(), at)),
                 "!==" | "!=" => Ok(node(
                     TypedExpression::Unary(TypedUnary {
                         op: UnaryOp::Not,
-                        operand: Box::new(call("$String$equals", vec![left, right], boolean(), at)),
+                        operand: Box::new(self.call(
+                            "$String$equals",
+                            vec![left, right],
+                            boolean(),
+                            at,
+                        )),
                     }),
                     boolean(),
                     at,
@@ -1107,7 +1285,7 @@ impl Lowerer {
         if op == "**" {
             self.expect(&left.ty, &number(), at)?;
             self.expect(&right.ty, &number(), at)?;
-            return Ok(call("$TS$pow", vec![left, right], number(), at));
+            return Ok(self.call("$TS$pow", vec![left, right], number(), at));
         }
         if left.ty != right.ty {
             return self.unsupported("mixed-type operator coercion", at);
@@ -1133,24 +1311,20 @@ impl Lowerer {
         Ok(binary(operator, left, right, ty, at))
     }
 
-    fn field_type(&self, ty: &Type, field: &str, at: oxc_span::Span) -> Result<Type> {
+    fn field_type(&self, ty: &Type, field: &'ast str, at: oxc_span::Span) -> Result<Type> {
         let Type::Named { id, .. } = ty else {
             return self.error(ErrorKind::Type, "receiver has no fields", at);
         };
+        let field_name = self.name(field);
         self.registry
             .get_type_by_id(*id)
-            .and_then(|d| {
-                d.fields
-                    .iter()
-                    .find(|f| f.name.resolve_global().as_deref() == Some(field))
-            })
+            .and_then(|d| d.fields.iter().find(|f| f.name == field_name))
             .map(|f| f.ty.clone())
             .ok_or_else(|| Error::new(ErrorKind::Type, format!("no field `{field}`"), at))
     }
 
-    fn object(&mut self, object: &js::ObjectExpression<'_>) -> Result<Expr> {
-        let mut fields = BTreeMap::new();
-        let mut values = vec![];
+    fn object(&mut self, object: &js::ObjectExpression<'ast>) -> Result<Expr> {
+        let mut values: SmallVec<[(&'ast str, Expr); 4]> = SmallVec::new();
         let mut statements = vec![];
         for property in &object.properties {
             let js::ObjectPropertyKind::ObjectProperty(p) = property else {
@@ -1167,23 +1341,11 @@ impl Lowerer {
             ) {
                 return self.unsupported("reference-valued object fields", p.span);
             }
-            if fields
-                .insert(
-                    name.clone(),
-                    Field {
-                        ty: value.ty.clone(),
-                        readonly: false,
-                    },
-                )
-                .is_some()
-            {
-                return self.unsupported("duplicate object keys", p.span);
-            }
             let temporary = self.fresh("field");
             let ty = value.ty.clone();
             statements.push(stmt(
                 TypedStatement::Let(TypedLet {
-                    name: intern(&temporary),
+                    name: temporary,
                     ty: ty.clone(),
                     mutability: Mutability::Immutable,
                     initializer: Some(Box::new(value)),
@@ -1191,19 +1353,27 @@ impl Lowerer {
                 }),
                 p.span,
             ));
-            values.push((name, var(&temporary, ty, p.span)));
+            values.push((name, var(temporary, ty, p.span)));
         }
-        let ty = self.layout(&fields);
+        // Evaluate in source order, then arrange values in the physical layout.
+        values.sort_unstable_by_key(|(name, _)| *name);
+        if values.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return self.unsupported("duplicate object keys", object.span);
+        }
+        let ty = self.layout(values.iter().map(|(name, value)| {
+            let Type::Primitive(ty) = value.ty else {
+                unreachable!()
+            };
+            (*name, ty)
+        }));
         let Type::Named { id, .. } = &ty else {
             unreachable!()
         };
         let name = self.registry.get_type_by_id(*id).unwrap().name;
-        // Evaluate in source order, then arrange values in the physical layout.
-        values.sort_by(|a, b| a.0.cmp(&b.0));
         let fields = values
             .into_iter()
             .map(|(name, value)| TypedFieldInit {
-                name: intern(&name),
+                name: self.name(name),
                 value: Box::new(value),
             })
             .collect();
@@ -1222,7 +1392,7 @@ impl Lowerer {
         ))
     }
 
-    fn call_expr(&mut self, c: &js::CallExpression<'_>) -> Result<Expr> {
+    fn call_expr(&mut self, c: &js::CallExpression<'ast>) -> Result<Expr> {
         let at = c.span;
         if c.type_arguments.is_some() {
             return self.unsupported("generic calls", at);
@@ -1238,7 +1408,10 @@ impl Lowerer {
             if let js::Expression::Identifier(receiver) = &m.object {
                 if receiver.name == "console"
                     && m.property.name == "log"
-                    && !self.scopes.iter().any(|s| s.contains_key("console"))
+                    && !self
+                        .scopes
+                        .iter()
+                        .any(|s| s.contains_key(&self.name("console")))
                 {
                     return self.log(args, at);
                 }
@@ -1247,10 +1420,14 @@ impl Lowerer {
         let js::Expression::Identifier(id) = &c.callee else {
             return self.unsupported("indirect or receiver calls", at);
         };
-        if self.scopes.iter().any(|s| s.contains_key(id.name.as_str())) {
+        if self
+            .scopes
+            .iter()
+            .any(|s| s.contains_key(&self.name(id.name.as_str())))
+        {
             return self.error(ErrorKind::Type, "value is not callable", at);
         }
-        let Some(sig) = self.signatures.get(id.name.as_str()).cloned() else {
+        let Some(sig) = self.signatures.get(&self.name(id.name.as_str())).cloned() else {
             return self.error(
                 ErrorKind::Type,
                 format!("cannot find function `{}`", id.name),
@@ -1263,15 +1440,19 @@ impl Lowerer {
         for ((arg, source), (_, expected, view)) in args.iter().zip(&c.arguments).zip(&sig.params) {
             self.expect(&arg.ty, expected, at)?;
             self.check_view(
-                source
-                    .as_expression()
-                    .and_then(|e| self.view_of(e))
-                    .as_deref(),
-                view.as_deref(),
+                source.as_expression().and_then(|e| self.view_of(e)),
+                *view,
                 at,
             )?;
         }
-        Ok(call(&format!("ts$fn${}", id.name), args, sig.ret, at))
+        let ret = sig.ret.clone().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unsupported,
+                "unresolved inferred return type",
+                at,
+            )
+        })?;
+        Ok(call(sig.native, args, ret, at))
     }
 
     fn log(&mut self, args: Vec<Expr>, at: oxc_span::Span) -> Result<Expr> {
@@ -1282,7 +1463,7 @@ impl Lowerer {
             let ty = arg.ty.clone();
             statements.push(stmt(
                 TypedStatement::Let(TypedLet {
-                    name: intern(&name),
+                    name,
                     ty: ty.clone(),
                     mutability: Mutability::Immutable,
                     initializer: Some(Box::new(arg)),
@@ -1290,7 +1471,7 @@ impl Lowerer {
                 }),
                 at,
             ));
-            reads.push(var(&name, ty, at));
+            reads.push(var(name, ty, at));
         }
         for (i, value) in reads.into_iter().enumerate() {
             let symbol = if value.ty == number() {
@@ -1303,11 +1484,11 @@ impl Lowerer {
                 return self.unsupported("console formatting of this type", at);
             };
             if i != 0 {
-                statements.push(expression(call("$TS$space", vec![], unit(), at)));
+                statements.push(expression(self.call("$TS$space", vec![], unit(), at)));
             }
-            statements.push(expression(call(symbol, vec![value], unit(), at)));
+            statements.push(expression(self.call(symbol, vec![value], unit(), at)));
         }
-        statements.push(expression(call("$TS$newline", vec![], unit(), at)));
+        statements.push(expression(self.call("$TS$newline", vec![], unit(), at)));
         Ok(node(
             TypedExpression::Block(TypedBlock {
                 statements,
@@ -1320,7 +1501,7 @@ impl Lowerer {
 
     fn simple_target(
         &mut self,
-        target: &js::SimpleAssignmentTarget<'_>,
+        target: &js::SimpleAssignmentTarget<'ast>,
         at: oxc_span::Span,
     ) -> Result<Expr> {
         match target {
@@ -1329,14 +1510,14 @@ impl Lowerer {
                 if !b.mutable {
                     return self.error(ErrorKind::Type, "cannot assign to const", at);
                 }
-                Ok(var(&b.name, b.ty, at))
+                Ok(var(b.name, b.ty.clone(), at))
             }
             js::SimpleAssignmentTarget::StaticMemberExpression(m) => self.field_target(m),
             _ => self.unsupported("this assignment target", at),
         }
     }
 
-    fn field_target(&mut self, m: &js::StaticMemberExpression<'_>) -> Result<Expr> {
+    fn field_target(&mut self, m: &js::StaticMemberExpression<'ast>) -> Result<Expr> {
         if self
             .view_of(&m.object)
             .and_then(|n| self.views.get(&n))
@@ -1358,21 +1539,21 @@ impl Lowerer {
         Ok(node(
             TypedExpression::Field(TypedFieldAccess {
                 object: Box::new(object),
-                field: intern(m.property.name.as_str()),
+                field: self.name(m.property.name.as_str()),
             }),
             ty,
             m.span,
         ))
     }
 
-    fn assignment(&mut self, a: &js::AssignmentExpression<'_>) -> Result<Expr> {
+    fn assignment(&mut self, a: &js::AssignmentExpression<'ast>) -> Result<Expr> {
         let target = match &a.left {
             js::AssignmentTarget::AssignmentTargetIdentifier(i) => {
                 let b = self.binding(i.name.as_str(), a.span)?;
                 if !b.mutable {
                     return self.error(ErrorKind::Type, "cannot assign to const", a.span);
                 }
-                var(&b.name, b.ty, a.span)
+                var(b.name, b.ty.clone(), a.span)
             }
             js::AssignmentTarget::StaticMemberExpression(m) => self.field_target(m)?,
             _ => return self.unsupported("this assignment target", a.span),
@@ -1382,7 +1563,7 @@ impl Lowerer {
         self.expect(&value.ty, &target.ty, a.span)?;
         if let js::AssignmentTarget::AssignmentTargetIdentifier(i) = &a.left {
             let b = self.binding(i.name.as_str(), a.span)?;
-            self.check_view(self.view_of(&a.right).as_deref(), b.view.as_deref(), a.span)?;
+            self.check_view(self.view_of(&a.right), b.view, a.span)?;
         }
         let op = a.operator.as_str();
         if op != "=" {
@@ -1401,7 +1582,7 @@ impl Lowerer {
         let ty = value.ty.clone();
         let save = stmt(
             TypedStatement::Let(TypedLet {
-                name: intern(&name),
+                name,
                 ty: ty.clone(),
                 mutability: Mutability::Immutable,
                 initializer: Some(Box::new(value)),
@@ -1412,14 +1593,14 @@ impl Lowerer {
         let assignment = binary(
             BinaryOp::Assign,
             target,
-            var(&name, ty.clone(), a.span),
+            var(name, ty.clone(), a.span),
             unit(),
             a.span,
         );
         statements.extend([
             save,
             expression(assignment),
-            expression(var(&name, ty.clone(), a.span)),
+            expression(var(name, ty.clone(), a.span)),
         ]);
         Ok(node(
             TypedExpression::Block(TypedBlock {
@@ -1441,7 +1622,7 @@ impl Lowerer {
         let ty = object.ty.clone();
         let save = stmt(
             TypedStatement::Let(TypedLet {
-                name: intern(&name),
+                name,
                 ty: ty.clone(),
                 mutability: Mutability::Immutable,
                 initializer: Some(Box::new(object)),
@@ -1451,7 +1632,7 @@ impl Lowerer {
         );
         let captured = node(
             TypedExpression::Field(TypedFieldAccess {
-                object: Box::new(var(&name, ty, at)),
+                object: Box::new(var(name, ty, at)),
                 field: field.field,
             }),
             target.ty,

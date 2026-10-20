@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2304,
+      "start": 75,
+      "length": 1,
+      "file": "inferred_scope.ts",
+      "message": "Cannot find name 'x'."
+    }
+  ],
+  "source_sha256": "fae101eb95d5030e7579988e54b3e02add2f8f8735f90acc2ab069661a797a9e",
+  "options": {}
+}

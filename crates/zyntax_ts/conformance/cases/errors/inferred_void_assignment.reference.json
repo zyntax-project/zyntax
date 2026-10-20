@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 26,
+      "length": 1,
+      "file": "inferred_void_assignment.ts",
+      "message": "Type 'void' is not assignable to type 'number'."
+    }
+  ],
+  "source_sha256": "64902d28201856dffe1aa7ab4baf5b25c87d5df3726382c876315565f41a3281",
+  "options": {}
+}

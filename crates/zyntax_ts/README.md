@@ -11,16 +11,21 @@ target/release/zynode run example.ts
 target/release/zynode run --soundness checked example.ts
 ```
 
-The initial frontend implements annotated functions, inferred local variables,
-primitive aliases, numeric and boolean operators, string concatenation and
+The initial frontend implements functions with typed parameters, inferred local
+variables, primitive aliases, numeric and boolean operators, string concatenation and
 equality, branches, loops, and fixed-layout objects with scalar fields.
 Objects have reference identity: aliases observe the same mutations, borrowed
 parameters do not acquire ownership, and fresh returned objects transfer their
 lifetime to the caller. Property initializers run in source order even when
 physical field order differs.
 
-Functions currently require return annotations. Arrays, generic functions,
-unions, closures, classes, multi-file linking and other unimplemented constructs
+Return types are inferred for primitives, strings, fixed-layout objects and void
+functions. Callees can appear later in the source: their signatures are resolved
+from an iterative dependency worklist, and each body is checked and lowered once. An annotated return can
+anchor a recursive call group. Cyclic inference, heterogeneous return unions,
+possibly undefined returns and differing readonly result views remain gaps.
+
+Arrays, generic functions, unions, closures, classes, multi-file linking and other unimplemented constructs
 produce `Unsupported` diagnostics. These are implementation gaps, measured by
 the conformance suite; they are not permanent language restrictions.
 
@@ -129,3 +134,17 @@ compatibility passes. Unimplemented syntax and representations in runnable
 single-file tests report `UNSUPPORTED`. Selecting no cases or only skipped
 cases does not produce a successful suite result. This is a starting harness
 for growing compatibility, not a claim to pass the upstream suite.
+
+## Frontend allocation audit
+
+The frontend uses interned identity, borrowed source spellings, shared immutable
+signatures and cached layouts. Use the compiler's Rust allocation counters to
+profile parsing and typing independently of JIT compilation:
+
+```sh
+cargo test -p zyntax_ts --features allocation-audit --test allocations -- --ignored --nocapture
+```
+
+This reports cold and warm Rust heap requests for a fixed synthetic input.
+It excludes direct native-library, slab and libc allocations, and is not an
+execution benchmark.

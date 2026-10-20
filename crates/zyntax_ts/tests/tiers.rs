@@ -7,8 +7,8 @@ use zyntax_embed::{TieredRuntime, ZyntaxValue};
 fn typed_object_aliases_agree_across_tiers_without_collection() {
     let source = r#"
         type Point = { x: number; y: number };
-        function make(x: number): Point { return { y: 2, x: x }; }
-        function score(x: number): number {
+        function make(x: number) { return { y: 2, x: x }; }
+        function score(x: number) {
             const p: Point = make(x);
             const q: Point = p;
             q.x += 1;

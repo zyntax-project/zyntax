@@ -322,5 +322,87 @@
     "mode": "check",
     "soundness": "checked",
     "policy_error": true
+  },
+  {
+    "id": "functions/inferred_forward",
+    "file": "cases/functions/inferred_forward.ts",
+    "mode": "run"
+  },
+  {
+    "id": "functions/inferred_primitives",
+    "file": "cases/functions/inferred_primitives.ts",
+    "mode": "run"
+  },
+  {
+    "id": "functions/inferred_void",
+    "file": "cases/functions/inferred_void.ts",
+    "mode": "run"
+  },
+  {
+    "id": "functions/inferred_objects",
+    "file": "cases/functions/inferred_objects.ts",
+    "mode": "run"
+  },
+  {
+    "id": "functions/inferred_anchored_recursion",
+    "file": "cases/functions/inferred_anchored_recursion.ts",
+    "mode": "run"
+  },
+  {
+    "id": "functions/inferred_readonly",
+    "file": "cases/functions/inferred_readonly.ts",
+    "mode": "run"
+  },
+  {
+    "id": "functions/inferred_view_aliases",
+    "file": "cases/functions/inferred_view_aliases.ts",
+    "mode": "run"
+  },
+  {
+    "id": "errors/inferred_assignment",
+    "file": "cases/errors/inferred_assignment.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/inferred_argument",
+    "file": "cases/errors/inferred_argument.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/inferred_scope",
+    "file": "cases/errors/inferred_scope.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/inferred_void_assignment",
+    "file": "cases/errors/inferred_void_assignment.ts",
+    "mode": "check"
+  },
+  {
+    "id": "pending/inferred_union",
+    "file": "cases/pending/inferred_union.ts",
+    "mode": "run"
+  },
+  {
+    "id": "pending/inferred_partial",
+    "file": "cases/pending/inferred_partial.ts",
+    "mode": "run"
+  },
+  {
+    "id": "pending/inferred_cycle",
+    "file": "cases/pending/inferred_cycle.ts",
+    "mode": "check"
+  },
+  {
+    "id": "pending/inferred_recursive_strict",
+    "file": "cases/pending/inferred_recursive_strict.ts",
+    "mode": "check"
+  },
+  {
+    "id": "policy/checked_inferred_readonly_return",
+    "file": "cases/policy/checked_inferred_readonly_return.ts",
+    "mode": "check",
+    "soundness": "checked",
+    "policy_error": true
   }
 ]
