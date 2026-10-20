@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2345,
+      "start": 103,
+      "length": 3,
+      "file": "error_generic.ts",
+      "message": "Argument of type 'string' is not assignable to parameter of type 'number'."
+    }
+  ],
+  "source_sha256": "2accff8dff92e156c4d8c72b450685c381911950796aae1748a540aeb3e87b87",
+  "options": {}
+}

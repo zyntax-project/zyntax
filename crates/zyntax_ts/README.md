@@ -64,7 +64,22 @@ environment and retain their signatures through interpreter, Cranelift and LLVM
 calls. Lexical captures, function object identity/properties, parameter-count
 adaptation and aggregate callback signatures need further implementation.
 
-Arrays, general or reference-bearing unions, capturing closures, classes, multi-file linking and other
+Dense `number[]`, `boolean[]`, `string[]` and `Array<T>` values use shared native
+list storage. Reads and writes emit typed GEPs and loads/stores; length and push
+use the compiler's inline list operations. Generic array helpers specialize once
+per concrete element type, including native integer, float and string layouts in
+the shared compiler. TypeScript `number` keeps its `f64` representation. Canonical
+array loops use integer induction and convert to `number` where the source uses
+the counter as a value.
+
+Bounds proofs follow literals, aliases, returned array summaries, length guards
+and canonical loops. Unproven reads that could yield `undefined`, sparse extension,
+length mutation and other array methods need further implementation. String array
+storage currently requires a proven static string lifetime; owned reference
+containers and generic element mutation require additional lifetime analysis.
+These checks preserve direct element access without introducing a collector.
+
+General or reference-bearing unions, capturing closures, classes, multi-file linking and other
 unimplemented constructs produce `Unsupported` diagnostics. These are implementation gaps, measured by
 the conformance suite; they are not permanent language restrictions.
 

@@ -5877,10 +5877,12 @@ impl SsaBuilder {
             }
 
             TypedExpression::Index(index_expr) => {
+                let started = block_id;
+                let mut block_id = block_id;
                 let object = &index_expr.object;
                 let index = &index_expr.index;
-                let object_val = self.translate_expression(block_id, object)?;
-                let index_val = self.translate_expression(block_id, index)?;
+                let object_val = self.translate_operand(&mut block_id, object)?;
+                let index_val = self.translate_operand(&mut block_id, index)?;
 
                 // First-class SIMD: `v[i]` on a vector value is a static
                 // lane extract, not a memory load. The lane index must
@@ -5891,7 +5893,9 @@ impl SsaBuilder {
                             "vector lane index must be a constant".to_string(),
                         )
                     })?;
-                    return self.emit_vector_extract_lane(block_id, object_val, lane);
+                    let result = self.emit_vector_extract_lane(block_id, object_val, lane)?;
+                    self.settle(started, block_id);
+                    return Ok(result);
                 }
 
                 // A tuple is an aggregate value. Its fields must be extracted
@@ -5928,6 +5932,7 @@ impl SsaBuilder {
                             indices: vec![index as u32],
                         },
                     );
+                    self.settle(started, block_id);
                     return Ok(result);
                 }
 
@@ -6091,21 +6096,18 @@ impl SsaBuilder {
                 // Load the value
                 let load_result = self.create_value(elem_hir_ty.clone(), HirValueKind::Instruction);
 
+                let alignment = crate::value_layout::align_of_hir_ty(&elem_hir_ty) as u32;
                 let load_inst = HirInstruction::Load {
                     result: load_result,
                     ty: elem_hir_ty,
                     ptr: gep_result,
-                    // NOTE: Proper alignment calculation requires type layout information.
-                    // Need TypeRegistry or TargetData to compute alignment from type.
-                    // WORKAROUND: Fixed 4-byte alignment (works for most common types: i32, f32, pointers)
-                    // FUTURE (v2.0): Calculate from type using target data layout
-                    // Estimated effort: 3-4 hours (add alignment calculation utility)
-                    align: 4,
+                    align: alignment,
                     volatile: false,
                 };
 
                 self.add_instruction(block_id, load_inst);
 
+                self.settle(started, block_id);
                 Ok(load_result)
             }
 
@@ -6496,6 +6498,8 @@ impl SsaBuilder {
             }
 
             TypedExpression::Array(elements) => {
+                let started = block_id;
+                let mut block_id = block_id;
                 // Lower array literal as List<T> struct: { data: i64 (ptr), len: i64, capacity: i64 }
                 // This matches the List<T> struct definition in prelude.zynml and allows
                 // field access (shape.data, shape.len) via extractvalue to work correctly.
@@ -6681,7 +6685,7 @@ impl SsaBuilder {
                         );
                         self.array_pool_placement = Some(slot_ptr);
                     }
-                    let elem_val = self.translate_expression(block_id, elem_expr)?;
+                    let elem_val = self.translate_operand(&mut block_id, elem_expr)?;
                     // Clear immediately so it doesn't leak into nested
                     // struct literals inside subsequent elements.
                     self.array_pool_placement = None;
@@ -6839,6 +6843,7 @@ impl SsaBuilder {
                 );
 
                 // Return pointer to the List struct
+                self.settle(started, block_id);
                 Ok(list_alloc)
             }
 
@@ -11622,6 +11627,7 @@ impl SsaBuilder {
     // searching, sorting, printing) is written in the language.
 
     fn emit_load(&mut self, block: HirId, ptr: HirId, ty: HirType) -> HirId {
+        let align = crate::value_layout::align_of_hir_ty(&ty) as u32;
         let result = self.create_value(ty.clone(), HirValueKind::Instruction);
         self.add_instruction(
             block,
@@ -11629,7 +11635,7 @@ impl SsaBuilder {
                 result,
                 ty,
                 ptr,
-                align: 8,
+                align,
                 volatile: false,
             },
         );
@@ -11637,12 +11643,21 @@ impl SsaBuilder {
     }
 
     fn emit_store(&mut self, block: HirId, ptr: HirId, value: HirId) {
+        let align = self
+            .function
+            .values
+            .get(&ptr)
+            .and_then(|v| match &v.ty {
+                HirType::Ptr(inner) => Some(crate::value_layout::align_of_hir_ty(inner) as u32),
+                _ => None,
+            })
+            .unwrap_or(1);
         self.add_instruction(
             block,
             HirInstruction::Store {
                 value,
                 ptr,
-                align: 8,
+                align,
                 volatile: false,
             },
         );
@@ -14374,12 +14389,14 @@ impl SsaBuilder {
                 // Array assignment: arr[index] = value
                 // Strategy: Bounds check, load array, compute GEP, store value
 
+                let started = block_id;
+                let mut block_id = block_id;
                 let array = &index_expr.object;
                 let index = &index_expr.index;
 
                 // Evaluate the array and index expressions
-                let array_val = self.translate_expression(block_id, array)?;
-                let index_val = self.translate_expression(block_id, index)?;
+                let array_val = self.translate_operand(&mut block_id, array)?;
+                let index_val = self.translate_operand(&mut block_id, index)?;
 
                 // Resolve through `var_typed_ast_types` so a variable
                 // bound to an array (e.g. `let bodies = [a]; bodies[i]
@@ -14547,12 +14564,13 @@ impl SsaBuilder {
                 let store_inst = HirInstruction::Store {
                     value,
                     ptr,
-                    align: 8, // Default alignment
+                    align: crate::value_layout::align_of_hir_ty(&element_type) as u32,
                     volatile: false,
                 };
 
                 self.add_instruction(block_id, store_inst);
 
+                self.settle(started, block_id);
                 Ok(())
             }
             _ => Ok(()),

@@ -18,6 +18,10 @@ use zyntax_typed_ast::{
 
 use crate::{Error, ErrorKind, Options, Soundness};
 
+mod arrays;
+mod generics;
+use arrays::{ArrayResult, FlowState, array_type, element_type};
+
 type Result<T> = std::result::Result<T, Error>;
 type Expr = TypedNode<TypedExpression>;
 type Stmt = TypedNode<TypedStatement>;
@@ -160,12 +164,15 @@ struct Signature<'ast> {
     params: Vec<(&'ast str, Type, Option<InternedString>)>,
     ret: Option<Type>,
     ret_view: Option<InternedString>,
+    array_result: Option<ArrayResult>,
 }
 
 struct ReturnContext {
     expected: Option<(Type, Option<InternedString>)>,
     inferred: Option<(Type, Option<InternedString>)>,
     value_returned: bool,
+    array_parameters: SmallVec<[Option<arrays::ArrayRoot>; 4]>,
+    array_result: Option<ArrayResult>,
 }
 
 struct WritePositions<'s> {
@@ -347,12 +354,14 @@ struct Lowerer<'ast, 'program> {
     self_recursive: FxHashSet<InternedString>,
     scopes: Vec<FxHashMap<InternedString, Binding>>,
     scope_floor: usize,
-    flow: FxHashMap<InternedString, ScalarFlow>,
+    flow: FlowState,
     writes: FxHashMap<oxc_semantic::SymbolId, SmallVec<[u32; 2]>>,
+    write_offsets: Vec<u32>,
     declarations: Vec<TypedNode<TypedDeclaration>>,
     returns: Option<ReturnContext>,
     loop_depth: usize,
     next_name: usize,
+    next_array_identity: usize,
 }
 
 impl<'ast, 'program> Lowerer<'ast, 'program> {
@@ -373,12 +382,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             self_recursive: FxHashSet::default(),
             scopes: vec![],
             scope_floor: 0,
-            flow: FxHashMap::default(),
+            flow: FlowState::default(),
             writes: FxHashMap::default(),
+            write_offsets: Vec::new(),
             declarations: vec![],
             returns: None,
             loop_depth: 0,
             next_name: 0,
+            next_array_identity: 0,
         }
     }
 
@@ -432,6 +443,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             positions: &mut self.writes,
         }
         .visit_program(program);
+        self.write_offsets = self.writes.values().flatten().copied().collect();
+        self.write_offsets.sort_unstable();
         // Declare types before signatures; resolve forward aliases to a fixed point.
         let mut pending: Vec<_> = program
             .body
@@ -751,6 +764,25 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
                 (ty, None)
             }
+            js::TSType::TSArrayType(a) => {
+                let (element, _) = self.ty(&a.element_type)?;
+                self.check_array_element(&element, a.span)?;
+                (array_type(element), None)
+            }
+            js::TSType::TSTypeReference(r) if r.type_arguments.is_some() => {
+                let js::TSTypeName::IdentifierReference(name) = &r.type_name else {
+                    return self.unsupported("qualified type names", r.span);
+                };
+                if name.name != "Array" {
+                    return self.unsupported("this generic type reference", r.span);
+                }
+                if r.type_arguments.as_ref().unwrap().params.len() != 1 {
+                    return self.error(ErrorKind::Type, "Array requires one type argument", r.span);
+                }
+                let (element, _) = self.ty(&r.type_arguments.as_ref().unwrap().params[0])?;
+                self.check_array_element(&element, r.span)?;
+                (array_type(element), None)
+            }
             js::TSType::TSFunctionType(f) => {
                 if f.type_parameters.is_some() || f.this_param.is_some() || f.params.rest.is_some()
                 {
@@ -875,6 +907,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 params,
                 ret,
                 ret_view,
+                array_result: None,
             }),
         );
         self.active_types.clear();
@@ -933,6 +966,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             param.ownership = ParamOwnership::Borrowed;
             params.push(param);
         }
+        let array_parameters = params
+            .iter()
+            .map(|p| self.array_parameter(p.name, &p.ty))
+            .collect();
         self.returns = Some(ReturnContext {
             expected: if inferred {
                 None
@@ -941,6 +978,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             },
             inferred: None,
             value_returned: false,
+            array_parameters,
+            array_result: None,
         });
         let mut statements = vec![];
         self.reserve(&f.body.as_ref().unwrap().statements)?;
@@ -948,6 +987,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             statements.extend(self.statement(s)?);
         }
         let context = self.returns.take().unwrap();
+        let array_result = context.array_result;
         let (mut ret, ret_view) = match context.expected {
             Some(result) => result,
             None if !context.value_returned => (unit(), None),
@@ -990,6 +1030,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             .expect("signature handles do not escape body lowering");
         sig.ret = Some(ret.clone());
         sig.ret_view = ret_view;
+        sig.array_result = array_result;
         self.pop_scope();
         self.active_types.clear();
         self.declarations.push(node(
@@ -1526,7 +1567,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             "string"
         } else if matches!(value.ty, Type::Function { .. }) {
             "function"
-        } else if matches!(value.ty, Type::Named { .. }) {
+        } else if matches!(value.ty, Type::Named { .. } | Type::Array { .. }) {
             "object"
         } else {
             return self.unsupported("typeof this type", at);
@@ -1568,14 +1609,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn pop_scope(&mut self) {
         for binding in self.scopes.pop().unwrap().values() {
-            self.flow.remove(&binding.name);
+            self.flow.forget(binding.name);
         }
     }
 
     fn clear_written_flow(&mut self, at: oxc_span::Span) {
-        if self.flow.is_empty() {
-            return;
-        }
         for scope in &self.scopes {
             for binding in scope.values() {
                 if binding
@@ -1583,15 +1621,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     .and_then(|id| self.writes.get(&id))
                     .is_some_and(|writes| writes.iter().any(|p| at.start <= *p && *p < at.end))
                 {
-                    self.flow.remove(&binding.name);
+                    self.flow.forget(binding.name);
                 }
             }
         }
     }
 
-    fn merge_flow(&mut self, other: &FxHashMap<InternedString, ScalarFlow>) {
-        self.flow
-            .retain(|name, value| other.get(name) == Some(value));
+    fn has_binding_write(&self, at: oxc_span::Span) -> bool {
+        let start = self.write_offsets.partition_point(|p| *p < at.start);
+        self.write_offsets.get(start).is_some_and(|p| *p < at.end)
+    }
+
+    fn merge_flow(&mut self, other: &FlowState) {
+        self.flow.merge(other);
     }
 
     fn global_undefined(&self, e: &js::Expression<'ast>) -> bool {
@@ -1606,6 +1648,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn narrow(&mut self, test: &js::Expression<'ast>, truth: bool) {
+        // Replaying a guard after a write would refine a different value.
+        if self.has_binding_write(test.span()) {
+            return;
+        }
+        self.narrow_array_truthiness(test, truth);
+        if let js::Expression::BinaryExpression(binary) = test {
+            self.narrow_array(binary, truth);
+        }
         match test {
             js::Expression::ParenthesizedExpression(p) => self.narrow(&p.expression, truth),
             js::Expression::UnaryExpression(u) if u.operator.as_str() == "!" => {
@@ -1676,7 +1726,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     Some(ScalarFlow::Undefined)
                 };
                 if let Some(flow) = flow {
-                    self.flow.insert(binding.name, flow);
+                    let name = binding.name;
+                    self.flow.insert(name, flow);
                 }
             }
         }
@@ -1738,6 +1789,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             Type::Primitive(PrimitiveType::Unit) => "void".into(),
             Type::Optional(inner) if **inner == Type::Never => "undefined".into(),
             Type::Optional(inner) => format!("{} | undefined", self.type_description(inner)),
+            Type::Array { element_type, .. } => {
+                format!("{}[]", self.type_description(element_type))
+            }
             Type::Never => "never".into(),
             Type::TypeVar(t) => t.name.and_then(|n| n.resolve_global()).unwrap_or_default(),
             Type::Function {
@@ -1908,6 +1962,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 {
                     value = Some(var(self.name("None"), undefined(), at));
                 }
+                if value.as_ref().is_some_and(|v| {
+                    element_type(&v.ty).is_some() || matches!(v.ty, Type::TypeVar(_))
+                }) {
+                    if let Some(source) = &r.argument {
+                        self.record_array_return(source);
+                    }
+                }
                 let view = r.argument.as_ref().and_then(|arg| self.view_of(arg));
                 let unit = unit();
                 let actual = value.as_ref().map_or(&unit, |value| &value.ty);
@@ -1996,21 +2057,30 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     f.init.as_ref().map_or(f.span.start, |i| i.span().end),
                     f.span.end,
                 );
+                let induction = self.for_induction(f);
+                let native_induction = self.native_array_induction(f, induction, &mut init)?;
                 self.clear_written_flow(repeated);
-                let condition = f
-                    .test
-                    .as_ref()
-                    .map(|e| self.condition(e))
-                    .transpose()?
-                    .map(Box::new);
+                self.set_induction(induction);
+                let (condition, update) = if let Some((condition, update)) = native_induction {
+                    (Some(Box::new(condition)), Some(Box::new(update)))
+                } else {
+                    let condition = f
+                        .test
+                        .as_ref()
+                        .map(|e| self.condition(e))
+                        .transpose()?
+                        .map(Box::new);
+                    self.clear_written_flow(repeated);
+                    let update = f
+                        .update
+                        .as_ref()
+                        .map(|e| self.expr(e))
+                        .transpose()?
+                        .map(Box::new);
+                    (condition, update)
+                };
                 self.clear_written_flow(repeated);
-                let update = f
-                    .update
-                    .as_ref()
-                    .map(|e| self.expr(e))
-                    .transpose()?
-                    .map(Box::new);
-                self.clear_written_flow(repeated);
+                self.set_induction(induction);
                 if let Some(test) = &f.test {
                     self.narrow(test, true);
                 }
@@ -2093,6 +2163,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     self.flow.insert(unique, flow);
                 }
             }
+            self.value_facts(unique, &ty, init);
             let value = self.adapt_value(value, &ty, d.span)?;
             self.scopes.last_mut().unwrap().insert(
                 name,
@@ -2234,6 +2305,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn expr_expected(&mut self, e: &js::Expression<'ast>, expected: &Type) -> Result<Expr> {
         match e {
+            js::Expression::ArrayExpression(a) => self.array_literal(a, Some(expected)),
             js::Expression::ArrowFunctionExpression(a) => self.arrow(a, Some(expected)),
             js::Expression::ParenthesizedExpression(p) => {
                 self.expr_expected(&p.expression, expected)
@@ -2270,6 +2342,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             expected,
             inferred: None,
             value_returned: false,
+            array_parameters: SmallVec::new(),
+            array_result: None,
         });
         let outer_loop = std::mem::replace(&mut self.loop_depth, 0);
         let outer_floor = std::mem::replace(&mut self.scope_floor, self.scopes.len());
@@ -2419,7 +2493,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     let b = self.binding(i.name.as_str(), at)?;
                     let value = var(b.name, b.ty.clone(), at);
                     let flow = self.flow.get(&b.name).copied();
-                    self.flow_read(value, flow, at)?
+                    let value = self.flow_read(value, flow, at)?;
+                    if value.ty == Type::Primitive(PrimitiveType::I64) {
+                        node(
+                            TypedExpression::Cast(TypedCast {
+                                expr: Box::new(value),
+                                target_type: number(),
+                            }),
+                            number(),
+                            at,
+                        )
+                    } else {
+                        value
+                    }
                 } else {
                     match i.name.as_str() {
                         "undefined" => var(self.name("None"), undefined(), at),
@@ -2579,6 +2665,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             js::Expression::StaticMemberExpression(m) if !m.optional => {
                 let object = self.expr(&m.object)?;
+                if element_type(&object.ty).is_some() && m.property.name == "length" {
+                    return Ok(self.array_length(object, at));
+                }
                 let ty = self.field_type(
                     self.source_type(&m.object, &object.ty),
                     m.property.name.as_str(),
@@ -2593,6 +2682,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     at,
                 )
             }
+            js::Expression::ArrayExpression(a) => self.array_literal(a, None)?,
+            js::Expression::ComputedMemberExpression(m) if !m.optional => {
+                self.array_index(&m.object, &m.expression, at)?
+            }
             js::Expression::ObjectExpression(o) => self.object(o)?,
             js::Expression::CallExpression(c) if !c.optional => self.call_expr(c)?,
             js::Expression::AssignmentExpression(a) => self.assignment(a)?,
@@ -2601,7 +2694,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let read = self.read_target(&target, at)?;
                 self.expect(&read.ty, &number(), at)?;
                 let (mut statements, target) = self.capture_target(target, at);
-                let read = if matches!(target.node, TypedExpression::Field(_)) {
+                let read = if matches!(
+                    target.node,
+                    TypedExpression::Field(_) | TypedExpression::Index(_)
+                ) {
                     target.clone()
                 } else {
                     read
@@ -2917,8 +3013,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 return self.unsupported("spread arguments", c.span);
             };
             args.push(match hints.next() {
-                Some(ty) => self.expr_expected(e, ty)?,
-                None => self.expr(e)?,
+                Some(ty) if !generics::unresolved(ty) => self.expr_expected(e, ty)?,
+                _ => self.expr(e)?,
             });
         }
         Ok(args)
@@ -2945,6 +3041,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     let args = self.arguments(c, std::iter::empty())?;
                     return self.log(args, at);
                 }
+            }
+        }
+        if let js::Expression::StaticMemberExpression(m) = &c.callee {
+            let is_array = if let js::Expression::Identifier(id) = &m.object {
+                self.binding(id.name.as_str(), id.span)
+                    .is_ok_and(|b| element_type(&b.ty).is_some())
+            } else {
+                false
+            };
+            if is_array && !m.optional {
+                return self.array_method(c, m);
             }
         }
         let direct = match &c.callee {
@@ -2992,9 +3099,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if c.arguments.len() != sig.params.len() {
             return self.error(ErrorKind::Type, "wrong argument count", at);
         }
-        let args = self.arguments(c, sig.params.iter().map(|(_, ty, _)| ty))?;
         let mut types: SmallVec<[Option<(Type, Option<InternedString>)>; 2]> =
             std::iter::repeat_n(None, sig.type_params.len()).collect();
+        let explicit = c.type_arguments.is_some();
         if let Some(arguments) = &c.type_arguments {
             if arguments.params.len() != types.len() {
                 return self.error(ErrorKind::Type, "wrong type argument count", at);
@@ -3002,42 +3109,40 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             for (slot, ty) in types.iter_mut().zip(&arguments.params) {
                 *slot = Some(self.ty(ty)?);
             }
-        } else {
+        }
+        let hints: SmallVec<[Type; 4]> = sig
+            .params
+            .iter()
+            .map(|(_, ty, view)| {
+                if explicit {
+                    self.instantiate_type(ty, *view, &sig.type_params, &types, at)
+                        .map(|(ty, _)| ty)
+                } else {
+                    Ok(ty.clone())
+                }
+            })
+            .collect::<Result<_>>()?;
+        let args = self.arguments(c, hints.iter())?;
+        if !explicit {
             for ((arg, source), (_, expected, _)) in args.iter().zip(&c.arguments).zip(&sig.params)
             {
-                if let Some(index) = sig.type_params.iter().position(|(_, ty)| ty == expected) {
-                    if types[index].is_none() {
-                        types[index] = Some((
-                            source
-                                .as_expression()
-                                .map_or(&arg.ty, |e| self.source_type(e, &arg.ty))
-                                .clone(),
-                            source.as_expression().and_then(|e| self.view_of(e)),
-                        ));
-                    }
-                }
+                let source = source.as_expression().unwrap();
+                self.infer_arguments(
+                    expected,
+                    self.source_type(source, &arg.ty),
+                    self.view_of(source),
+                    &sig.type_params,
+                    &mut types,
+                );
             }
         }
-        let instantiate =
-            |ty: &Type, view: Option<InternedString>| -> Result<(Type, Option<InternedString>)> {
-                if let Some(index) = sig.type_params.iter().position(|(_, param)| param == ty) {
-                    types[index].clone().ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::Unsupported,
-                            "unresolved generic type argument",
-                            at,
-                        )
-                    })
-                } else {
-                    Ok((ty.clone(), view))
-                }
-            };
         let args = args
             .into_iter()
             .zip(&c.arguments)
             .zip(&sig.params)
             .map(|((arg, source), (_, expected, view))| {
-                let (expected, view) = instantiate(expected, *view)?;
+                let (expected, view) =
+                    self.instantiate_type(expected, *view, &sig.type_params, &types, at)?;
                 let source = source.as_expression().unwrap();
                 self.expect(self.source_type(source, &arg.ty), &expected, at)?;
                 self.fresh_properties(source, &expected)?;
@@ -3052,7 +3157,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 at,
             )
         })?;
-        let (ret, _) = instantiate(&ret, sig.ret_view)?;
+        let (ret, _) = self.instantiate_type(&ret, sig.ret_view, &sig.type_params, &types, at)?;
         let type_args = types
             .into_iter()
             .map(|ty| {
@@ -3132,6 +3237,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn record_write(&mut self, target: &Expr, ty: &Type) {
         if let TypedExpression::Variable(name) = target.node {
+            self.flow.forget(name);
             if matches!(target.ty, Type::Optional(_)) {
                 self.flow.remove(&name);
                 if let Some(flow) = ScalarFlow::of(ty) {
@@ -3155,11 +3261,25 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 Ok(var(b.name, b.ty.clone(), at))
             }
             js::SimpleAssignmentTarget::StaticMemberExpression(m) => self.field_target(m),
+            js::SimpleAssignmentTarget::ComputedMemberExpression(m) if !m.optional => {
+                self.array_index(&m.object, &m.expression, at)
+            }
             _ => self.unsupported("this assignment target", at),
         }
     }
 
     fn field_target(&mut self, m: &js::StaticMemberExpression<'ast>) -> Result<Expr> {
+        if let js::Expression::Identifier(id) = &m.object {
+            if self
+                .binding(id.name.as_str(), id.span)
+                .is_ok_and(|b| element_type(&b.ty).is_some())
+            {
+                return self.unsupported(
+                    "array property mutation, including sparse length changes",
+                    m.span,
+                );
+            }
+        }
         if self
             .view_of(&m.object)
             .and_then(|n| self.views.get(&n))
@@ -3202,8 +3322,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 var(b.name, b.ty.clone(), a.span)
             }
             js::AssignmentTarget::StaticMemberExpression(m) => self.field_target(m)?,
+            js::AssignmentTarget::ComputedMemberExpression(m) if !m.optional => {
+                self.array_index(&m.object, &m.expression, a.span)?
+            }
             _ => return self.unsupported("this assignment target", a.span),
         };
+        if matches!(target.node, TypedExpression::Index(_)) && matches!(target.ty, Type::TypeVar(_))
+        {
+            return self.unsupported(
+                "generic array mutation before element ownership is known",
+                a.span,
+            );
+        }
         let (mut statements, target) = self.capture_target(target, a.span);
         let target_view = if let js::AssignmentTarget::AssignmentTargetIdentifier(i) = &a.left {
             self.binding(i.name.as_str(), a.span)?.view
@@ -3259,7 +3389,20 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }),
             a.span,
         );
-        self.record_write(&target, &ty);
+        if let TypedExpression::Variable(name) = target.node {
+            self.record_write(&target, &ty);
+            if op == "=" {
+                self.value_facts(name, &ty, &a.right);
+            }
+        } else if target.ty == string()
+            && matches!(target.node, TypedExpression::Index(_))
+            && !self.immortal_string(&a.right)
+        {
+            return self.unsupported(
+                "array storage of strings without a proven static lifetime",
+                a.span,
+            );
+        }
         let stored = self.adapt_value(var(name, ty.clone(), a.span), &target.ty, a.span)?;
         let assignment = binary(BinaryOp::Assign, target, stored, unit(), a.span);
         statements.extend([
@@ -3277,32 +3420,67 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         ))
     }
 
-    // A property reference captures its receiver before evaluating the right side.
+    // A reference captures its receiver and index before evaluating the right side.
     fn capture_target(&mut self, target: Expr, at: oxc_span::Span) -> (Vec<Stmt>, Expr) {
-        let TypedExpression::Field(field) = &target.node else {
-            return (vec![], target);
-        };
-        let name = self.fresh("receiver");
-        let object = field.object.as_ref().clone();
-        let ty = object.ty.clone();
+        let TypedNode {
+            node: target,
+            ty,
+            span: original_span,
+        } = target;
+        match target {
+            TypedExpression::Index(index) => {
+                let (object_save, object) = self.capture_reference_value(index.object, at);
+                let (index_save, index) = self.capture_reference_value(index.index, at);
+                (
+                    vec![object_save, index_save],
+                    node(
+                        TypedExpression::Index(TypedIndex {
+                            object: Box::new(object),
+                            index: Box::new(index),
+                        }),
+                        ty,
+                        at,
+                    ),
+                )
+            }
+            TypedExpression::Field(field) => {
+                let (save, object) = self.capture_reference_value(field.object, at);
+                (
+                    vec![save],
+                    node(
+                        TypedExpression::Field(TypedFieldAccess {
+                            object: Box::new(object),
+                            field: field.field,
+                        }),
+                        ty,
+                        at,
+                    ),
+                )
+            }
+            node => (
+                vec![],
+                TypedNode {
+                    node,
+                    ty,
+                    span: original_span,
+                },
+            ),
+        }
+    }
+
+    fn capture_reference_value(&mut self, value: Box<Expr>, at: oxc_span::Span) -> (Stmt, Expr) {
+        let name = self.fresh("reference");
+        let ty = value.ty.clone();
         let save = stmt(
             TypedStatement::Let(TypedLet {
                 name,
                 ty: ty.clone(),
                 mutability: Mutability::Immutable,
-                initializer: Some(Box::new(object)),
+                initializer: Some(value),
                 span: span(at),
             }),
             at,
         );
-        let captured = node(
-            TypedExpression::Field(TypedFieldAccess {
-                object: Box::new(var(name, ty, at)),
-                field: field.field,
-            }),
-            target.ty,
-            at,
-        );
-        (vec![save], captured)
+        (save, var(name, ty, at))
     }
 }

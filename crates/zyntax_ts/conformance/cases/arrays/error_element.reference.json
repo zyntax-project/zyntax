@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 20,
+      "length": 4,
+      "file": "error_element.ts",
+      "message": "Type 'boolean' is not assignable to type 'number'."
+    }
+  ],
+  "source_sha256": "cc9ece722e936a1911baeb8b1a93e7f2cf72b1c743950093ead477e6ad85a2fb",
+  "options": {}
+}

@@ -7,7 +7,6 @@ use crate::const_eval::ConstEvaluator;
 use crate::hir::*;
 use crate::{CompilerError, CompilerResult};
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
 use std::sync::Arc;
 use zyntax_typed_ast::InternedString;
 
@@ -98,8 +97,8 @@ impl MonomorphizationContext {
         const_args: &[HirConstant],
     ) -> CompilerResult<HirFunction> {
         // Create substitution maps
-        let mut type_subst = HashMap::new();
-        let mut const_subst = HashMap::new();
+        let mut type_subst = FxHashMap::default();
+        let mut const_subst = FxHashMap::default();
 
         // Build type substitution map
         for (i, param) in func.signature.type_params.iter().enumerate() {
@@ -151,8 +150,8 @@ impl MonomorphizationContext {
     fn substitute_signature(
         &self,
         sig: &HirFunctionSignature,
-        type_subst: &HashMap<InternedString, HirType>,
-        const_subst: &HashMap<InternedString, HirConstant>,
+        type_subst: &FxHashMap<InternedString, HirType>,
+        const_subst: &FxHashMap<InternedString, HirConstant>,
     ) -> CompilerResult<HirFunctionSignature> {
         let mut new_sig = sig.clone();
 
@@ -179,8 +178,8 @@ impl MonomorphizationContext {
     fn substitute_function_body(
         &self,
         func: &mut HirFunction,
-        type_subst: &HashMap<InternedString, HirType>,
-        const_subst: &HashMap<InternedString, HirConstant>,
+        type_subst: &FxHashMap<InternedString, HirType>,
+        const_subst: &FxHashMap<InternedString, HirConstant>,
     ) -> CompilerResult<()> {
         // Substitute types in values
         for value in func.values.values_mut() {
@@ -202,6 +201,11 @@ impl MonomorphizationContext {
             // Substitute in instructions
             for inst in &mut block.instructions {
                 self.substitute_instruction(inst, type_subst, const_subst)?;
+                if let HirInstruction::Store { ptr, align, .. } = inst {
+                    if let Some(HirType::Ptr(pointee)) = func.values.get(ptr).map(|v| &v.ty) {
+                        *align = (*align).min(crate::value_layout::align_of_hir_ty(pointee) as u32);
+                    }
+                }
             }
         }
 
@@ -212,8 +216,8 @@ impl MonomorphizationContext {
     fn substitute_instruction(
         &self,
         inst: &mut HirInstruction,
-        type_subst: &HashMap<InternedString, HirType>,
-        const_subst: &HashMap<InternedString, HirConstant>,
+        type_subst: &FxHashMap<InternedString, HirType>,
+        const_subst: &FxHashMap<InternedString, HirConstant>,
     ) -> CompilerResult<()> {
         match inst {
             HirInstruction::Call { type_args, .. } => {
@@ -224,7 +228,6 @@ impl MonomorphizationContext {
             HirInstruction::Binary { ty, .. }
             | HirInstruction::Unary { ty, .. }
             | HirInstruction::Alloca { ty, .. }
-            | HirInstruction::Load { ty, .. }
             | HirInstruction::GetElementPtr { ty, .. }
             | HirInstruction::Cast { ty, .. }
             | HirInstruction::Select { ty, .. }
@@ -233,6 +236,11 @@ impl MonomorphizationContext {
             | HirInstruction::Atomic { ty, .. }
             | HirInstruction::ExtractUnionValue { ty, .. } => {
                 *ty = self.substitute_type(ty, type_subst, const_subst);
+            }
+
+            HirInstruction::Load { ty, align, .. } => {
+                *ty = self.substitute_type(ty, type_subst, const_subst);
+                *align = (*align).min(crate::value_layout::align_of_hir_ty(ty) as u32);
             }
 
             HirInstruction::CreateUnion { union_ty, .. } => {
@@ -253,8 +261,8 @@ impl MonomorphizationContext {
     fn substitute_type(
         &self,
         ty: &HirType,
-        type_subst: &HashMap<InternedString, HirType>,
-        const_subst: &HashMap<InternedString, HirConstant>,
+        type_subst: &FxHashMap<InternedString, HirType>,
+        const_subst: &FxHashMap<InternedString, HirConstant>,
     ) -> HirType {
         match ty {
             // Type parameter reference - substitute if found
@@ -419,8 +427,8 @@ mod tests {
     #[test]
     fn test_type_substitution() {
         let ctx = MonomorphizationContext::new();
-        let mut type_subst = HashMap::new();
-        let const_subst = HashMap::new();
+        let mut type_subst = FxHashMap::default();
+        let const_subst = FxHashMap::default();
 
         // Create a type parameter substitution T -> I32
         let mut arena = zyntax_typed_ast::arena::AstArena::new();
@@ -699,9 +707,9 @@ mod tests {
         )));
 
         // Substitute T -> i32
-        let mut type_subst = std::collections::HashMap::new();
+        let mut type_subst = FxHashMap::default();
         type_subst.insert(t_param, HirType::I32);
-        let const_subst = std::collections::HashMap::new();
+        let const_subst = FxHashMap::default();
 
         let result = ctx.substitute_type(&nested_ty, &type_subst, &const_subst);
 
@@ -735,9 +743,9 @@ mod tests {
         ))));
 
         // Substitute T -> f64
-        let mut type_subst = std::collections::HashMap::new();
+        let mut type_subst = FxHashMap::default();
         type_subst.insert(t_param, HirType::F64);
-        let const_subst = std::collections::HashMap::new();
+        let const_subst = FxHashMap::default();
 
         let result = ctx.substitute_type(&deeply_nested, &type_subst, &const_subst);
 
@@ -785,10 +793,10 @@ mod tests {
         let nested_ty = HirType::Struct(struct_ty);
 
         // Substitute T -> i32, U -> f64
-        let mut type_subst = std::collections::HashMap::new();
+        let mut type_subst = FxHashMap::default();
         type_subst.insert(t_param, HirType::I32);
         type_subst.insert(u_param, HirType::F64);
-        let const_subst = std::collections::HashMap::new();
+        let const_subst = FxHashMap::default();
 
         let result = ctx.substitute_type(&nested_ty, &type_subst, &const_subst);
 

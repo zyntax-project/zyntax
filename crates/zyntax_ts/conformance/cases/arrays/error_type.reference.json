@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2314,
+      "start": 8,
+      "length": 21,
+      "file": "error_type.ts",
+      "message": "Generic type 'Array<T>' requires 1 type argument(s)."
+    }
+  ],
+  "source_sha256": "44bf5b0f43e9c610c3ed7bfe3add2887eb4f2d4b6d8e40e98fc2841a62df5e2d",
+  "options": {}
+}

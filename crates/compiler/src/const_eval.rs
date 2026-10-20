@@ -235,10 +235,10 @@ impl ConstEvaluator {
     }
 
     /// Substitute const generic parameters in a type
-    pub fn substitute_const_generics(
+    pub fn substitute_const_generics<S: std::hash::BuildHasher>(
         &self,
         ty: &HirType,
-        const_args: &HashMap<InternedString, HirConstant>,
+        const_args: &HashMap<InternedString, HirConstant, S>,
     ) -> HirType {
         match ty {
             HirType::Array(elem_ty, size) => {

@@ -4806,6 +4806,7 @@ impl LoweringContext {
                 };
                 HirType::Array(std::sync::Arc::new(self.convert_type(element_type)), size)
             }
+            Type::Array { size: None, .. } => crate::ssa::list_header_type(),
 
             Type::Function {
                 params,

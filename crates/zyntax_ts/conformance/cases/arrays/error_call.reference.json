@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 29,
+      "length": 3,
+      "file": "error_call.ts",
+      "message": "Type 'string' is not assignable to type 'number'."
+    }
+  ],
+  "source_sha256": "e1d47f6a3e1d0f74fe1ade0b9a7dbe06ffca189c0e4cfe9fb41a9db477cef7d2",
+  "options": {}
+}

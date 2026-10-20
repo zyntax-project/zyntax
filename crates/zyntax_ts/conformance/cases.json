@@ -913,5 +913,80 @@
     "id": "unions/error_false_truthiness",
     "file": "cases/unions/error_false_truthiness.ts",
     "mode": "check"
+  },
+  {
+    "id": "arrays/literals",
+    "file": "cases/arrays/literals.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/aliases",
+    "file": "cases/arrays/aliases.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/loops",
+    "file": "cases/arrays/loops.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/generic",
+    "file": "cases/arrays/generic.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/returns",
+    "file": "cases/arrays/returns.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/push",
+    "file": "cases/arrays/push.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/evaluation_order",
+    "file": "cases/arrays/evaluation_order.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/guards",
+    "file": "cases/arrays/guards.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/strings",
+    "file": "cases/arrays/strings.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/branches",
+    "file": "cases/arrays/branches.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/error_element",
+    "file": "cases/arrays/error_element.ts",
+    "mode": "check"
+  },
+  {
+    "id": "arrays/error_write",
+    "file": "cases/arrays/error_write.ts",
+    "mode": "check"
+  },
+  {
+    "id": "arrays/error_call",
+    "file": "cases/arrays/error_call.ts",
+    "mode": "check"
+  },
+  {
+    "id": "arrays/error_generic",
+    "file": "cases/arrays/error_generic.ts",
+    "mode": "check"
+  },
+  {
+    "id": "arrays/error_type",
+    "file": "cases/arrays/error_type.ts",
+    "mode": "check"
   }
 ]

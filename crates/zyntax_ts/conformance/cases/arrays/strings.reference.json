@@ -1,0 +1,10 @@
+{
+  "compiler": "6.0.2",
+  "accepted": true,
+  "kind": "Accept",
+  "diagnostics": [],
+  "stdout": "hello world\nnew world\nworld \n",
+  "exit": 0,
+  "source_sha256": "0e56a9610f44139f8b84cf847af035c21d69fc70d7320b2717b118ae8443732d",
+  "options": {}
+}
