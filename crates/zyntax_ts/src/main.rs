@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use zyntax_embed::{TieredConfig, TieredRuntime};
-use zyntax_ts::{ErrorKind, Options, Soundness};
+use zyntax_ts::{ErrorKind, ModuleId, Options, Soundness};
 
 fn main() -> ExitCode {
     std::thread::Builder::new()
@@ -58,7 +58,15 @@ fn run() -> ExitCode {
         }
     };
     let filename = file.to_string_lossy();
-    let program = match zyntax_ts::parse_program(&source, &filename, options) {
+    let identity = match file.canonicalize() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("{}: {e}", file.display());
+            return ExitCode::from(2);
+        }
+    };
+    let module = ModuleId::new(&identity.to_string_lossy());
+    let program = match zyntax_ts::parse_module(&source, &filename, module, options) {
         Ok(program) => program,
         Err(e) => {
             if json {

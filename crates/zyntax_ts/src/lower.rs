@@ -16,7 +16,7 @@ use zyntax_typed_ast::{
     Type, TypeId, TypeMetadata, TypeRegistry, Visibility,
 };
 
-use crate::{Error, ErrorKind, Options, Soundness};
+use crate::{Error, ErrorKind, ModuleId, Options, Soundness};
 
 mod arrays;
 mod generics;
@@ -354,8 +354,21 @@ impl<'ast> Visit<'ast> for CallDependencies<'_> {
     }
 }
 
-/// Parse and type the supported TypeScript constructs without JavaScript emission.
+/// Parse a source file, using `file` as its module identity.
+///
+/// Resolvers should use [`parse_module`] to separate canonical identity from
+/// diagnostic filenames and avoid treating alternate paths as separate modules.
 pub fn parse_program(source: &str, file: &str, options: Options) -> Result<TypedProgram> {
+    parse_module(source, file, ModuleId::new(file), options)
+}
+
+/// Parse using a resolver-provided identity instead of the diagnostic filename.
+pub fn parse_module(
+    source: &str,
+    file: &str,
+    module: ModuleId,
+    options: Options,
+) -> Result<TypedProgram> {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, SourceType::ts()).parse();
     if let Some(error) = parsed.diagnostics.first() {
@@ -367,13 +380,15 @@ pub fn parse_program(source: &str, file: &str, options: Options) -> Result<Typed
     if let Some(error) = semantic.diagnostics.first() {
         return Err(Error::from_oxc(ErrorKind::Type, error));
     }
-    Lowerer::new(options).program(&parsed.program, &semantic.semantic, source, file)
+    Lowerer::new(options, module).program(&parsed.program, &semantic.semantic, source, file)
 }
 
 struct Lowerer<'ast, 'program> {
     options: Options,
+    module: ModuleId,
     names: RefCell<FxHashMap<&'ast str, InternedString>>,
     name_buffer: String,
+    prefix_len: usize,
     registry: TypeRegistry,
     aliases: FxHashMap<InternedString, (Type, Option<InternedString>)>,
     views: FxHashMap<InternedString, BTreeMap<&'ast str, Field>>,
@@ -397,12 +412,18 @@ struct Lowerer<'ast, 'program> {
 }
 
 impl<'ast, 'program> Lowerer<'ast, 'program> {
-    fn new(options: Options) -> Self {
+    fn new(options: Options, module: ModuleId) -> Self {
+        let name_buffer = module.prefix();
+        let prefix_len = name_buffer.len();
+        let mut registry = TypeRegistry::new();
+        registry.set_current_module(Some(module.name()));
         Self {
             options,
+            module,
             names: RefCell::new(FxHashMap::default()),
-            name_buffer: String::new(),
-            registry: TypeRegistry::new(),
+            name_buffer,
+            prefix_len,
+            registry,
             aliases: FxHashMap::default(),
             views: FxHashMap::default(),
             layouts: FxHashMap::default(),
@@ -449,8 +470,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn generated_name(&mut self, prefix: &str, index: usize) -> InternedString {
-        self.name_buffer.clear();
-        write!(&mut self.name_buffer, "ts${prefix}${index}").unwrap();
+        self.name_buffer.truncate(self.prefix_len);
+        crate::modules::append_component(&mut self.name_buffer, prefix);
+        write!(&mut self.name_buffer, "${index}").unwrap();
         intern(&self.name_buffer)
     }
 
@@ -560,7 +582,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         span: span(program.span),
                     },
                     annotations: vec![strict_fp(self.name("strict_fp"))],
-                    module: None,
+                    module: Some(self.module.name()),
                 }),
                 unit(),
                 program.span,
@@ -927,8 +949,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         };
         let name = self.name(id.name.as_str());
         self.functions.insert(name, f);
-        self.name_buffer.clear();
-        write!(&mut self.name_buffer, "ts$fn${}", id.name).unwrap();
+        self.name_buffer.truncate(self.prefix_len);
+        self.name_buffer.push_str("fn$");
+        crate::modules::append_component(&mut self.name_buffer, id.name.as_str());
         let native = intern(&self.name_buffer);
         self.signatures.insert(
             name,

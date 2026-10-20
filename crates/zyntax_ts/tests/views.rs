@@ -126,10 +126,12 @@ fn casts_preserve_one_allocation_and_one_release() {
         if module.initializers.contains(&function.id) {
             assert_eq!(count(Intrinsic::Malloc), 1, "no view wrapper or copy");
             assert_eq!(count(Intrinsic::Free), 1, "one shared owner");
-        } else if name == "ts$fn$borrow" || name.starts_with("ts$fn$identity__mono_") {
+        } else if name == "ts$m$drops_2ets$fn$borrow"
+            || name.starts_with("ts$m$drops_2ets$fn$identity__mono_")
+        {
             assert_eq!(count(Intrinsic::Malloc), 0);
             assert_eq!(count(Intrinsic::Free), 0, "borrowed storage stays borrowed");
-        } else if name == "ts$fn$make" || name == "ts$fn$inferred" {
+        } else if name == "ts$m$drops_2ets$fn$make" || name == "ts$m$drops_2ets$fn$inferred" {
             assert_eq!(count(Intrinsic::Malloc), 1);
             assert_eq!(
                 count(Intrinsic::Free),
@@ -158,25 +160,28 @@ fn width_views_agree_before_and_after_native_promotions() {
         .compile_typed_program(program)
         .unwrap()
         .into_iter()
-        .filter(|name| name.starts_with("ts$fn$"))
+        .filter(|name| name.starts_with("ts$m$tiers_2ets$fn$"))
         .collect();
     let check = |runtime: &mut TieredRuntime, input, expected| {
         assert_eq!(
             runtime
-                .call_raw("ts$fn$score", &[ZyntaxValue::Float(input)])
+                .call_raw("ts$m$tiers_2ets$fn$score", &[ZyntaxValue::Float(input)])
                 .unwrap(),
             ZyntaxValue::Float(expected)
         );
         assert_eq!(
             runtime
-                .call_raw("ts$fn$paddingScore", &[ZyntaxValue::Float(input)])
+                .call_raw(
+                    "ts$m$tiers_2ets$fn$paddingScore",
+                    &[ZyntaxValue::Float(input)]
+                )
                 .unwrap(),
             ZyntaxValue::Float(input * 2.0 + 14.0)
         );
     };
     check(&mut runtime, 3.0, 782.0);
     assert_eq!(runtime.statistics().baseline_functions, 0);
-    for name in ["ts$fn$borrow", "ts$fn$make"] {
+    for name in ["ts$m$tiers_2ets$fn$borrow", "ts$m$tiers_2ets$fn$make"] {
         runtime
             .optimize_function(name, OptimizationTier::Baseline)
             .unwrap();
@@ -200,7 +205,7 @@ fn width_views_agree_before_and_after_native_promotions() {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         };
-        for name in ["ts$fn$borrow", "ts$fn$make"] {
+        for name in ["ts$m$tiers_2ets$fn$borrow", "ts$m$tiers_2ets$fn$make"] {
             runtime
                 .optimize_function(name, OptimizationTier::Optimized)
                 .unwrap();
@@ -208,14 +213,18 @@ fn width_views_agree_before_and_after_native_promotions() {
         wait(&runtime, 2);
         check(&mut runtime, 4.0, 894.0);
         runtime
-            .optimize_function("ts$fn$score", OptimizationTier::Optimized)
+            .optimize_function("ts$m$tiers_2ets$fn$score", OptimizationTier::Optimized)
             .unwrap();
         wait(&runtime, 3);
         check(&mut runtime, 5.0, 1006.0);
-        for name in names
-            .iter()
-            .filter(|name| !["ts$fn$borrow", "ts$fn$make", "ts$fn$score"].contains(&name.as_str()))
-        {
+        for name in names.iter().filter(|name| {
+            ![
+                "ts$m$tiers_2ets$fn$borrow",
+                "ts$m$tiers_2ets$fn$make",
+                "ts$m$tiers_2ets$fn$score",
+            ]
+            .contains(&name.as_str())
+        }) {
             runtime
                 .optimize_function(name, OptimizationTier::Optimized)
                 .unwrap();

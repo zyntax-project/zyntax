@@ -54,13 +54,13 @@ fn optionals_keep_tagged_storage_without_heap_boxes() {
     for function in module.functions.values() {
         let name = function.name.resolve_global().unwrap();
         if [
-            "ts$fn$make",
-            "ts$fn$echo",
-            "ts$fn$partial",
-            "ts$fn$flag",
-            "ts$fn$absent",
-            "ts$fn$nested",
-            "ts$fn$branches",
+            "ts$m$optionals_2ets$fn$make",
+            "ts$m$optionals_2ets$fn$echo",
+            "ts$m$optionals_2ets$fn$partial",
+            "ts$m$optionals_2ets$fn$flag",
+            "ts$m$optionals_2ets$fn$absent",
+            "ts$m$optionals_2ets$fn$nested",
+            "ts$m$optionals_2ets$fn$branches",
         ]
         .contains(&name.as_str())
         {
@@ -109,23 +109,28 @@ fn optional_calls_agree_during_mixed_native_promotions() {
         .compile_typed_program(program)
         .unwrap()
         .into_iter()
-        .filter(|name| name.starts_with("ts$fn$"))
+        .filter(|name| name.starts_with("ts$m$tiers_2ets$fn$"))
         .collect();
     let check = |runtime: &mut TieredRuntime| {
         assert_eq!(
-            runtime.call_raw("ts$fn$absenceScore", &[]).unwrap(),
+            runtime
+                .call_raw("ts$m$tiers_2ets$fn$absenceScore", &[])
+                .unwrap(),
             ZyntaxValue::Float(1.0)
         );
         for (input, expected) in [(3.0, 13.0), (0.0, -21.0), (-2.0, -21.0), (7.0, 21.0)] {
             assert_eq!(
                 runtime
-                    .call_raw("ts$fn$score", &[ZyntaxValue::Float(input)])
+                    .call_raw("ts$m$tiers_2ets$fn$score", &[ZyntaxValue::Float(input)])
                     .unwrap(),
                 ZyntaxValue::Float(expected)
             );
             assert_eq!(
                 runtime
-                    .call_raw("ts$fn$changeScore", &[ZyntaxValue::Float(input)])
+                    .call_raw(
+                        "ts$m$tiers_2ets$fn$changeScore",
+                        &[ZyntaxValue::Float(input)]
+                    )
                     .unwrap(),
                 ZyntaxValue::Float(if input > 0.0 {
                     2.0 * input + 5.0
@@ -135,19 +140,25 @@ fn optional_calls_agree_during_mixed_native_promotions() {
             );
             assert_eq!(
                 runtime
-                    .call_raw("ts$fn$nestedScore", &[ZyntaxValue::Float(input)])
+                    .call_raw(
+                        "ts$m$tiers_2ets$fn$nestedScore",
+                        &[ZyntaxValue::Float(input)]
+                    )
                     .unwrap(),
                 ZyntaxValue::Float(if input > 1.0 { input + 1.0 } else { -10.0 })
             );
             assert_eq!(
                 runtime
-                    .call_raw("ts$fn$branchScore", &[ZyntaxValue::Float(input)])
+                    .call_raw(
+                        "ts$m$tiers_2ets$fn$branchScore",
+                        &[ZyntaxValue::Float(input)]
+                    )
                     .unwrap(),
                 ZyntaxValue::Float(input.abs() + 1.0)
             );
             assert_eq!(
                 runtime
-                    .call_raw("ts$fn$loop", &[ZyntaxValue::Float(input)])
+                    .call_raw("ts$m$tiers_2ets$fn$loop", &[ZyntaxValue::Float(input)])
                     .unwrap(),
                 ZyntaxValue::Float(if input > 0.0 { input } else { 0.0 })
             );
@@ -155,7 +166,11 @@ fn optional_calls_agree_during_mixed_native_promotions() {
     };
     check(&mut runtime);
     assert_eq!(runtime.statistics().baseline_functions, 0);
-    for name in ["ts$fn$make", "ts$fn$echo", "ts$fn$flag"] {
+    for name in [
+        "ts$m$tiers_2ets$fn$make",
+        "ts$m$tiers_2ets$fn$echo",
+        "ts$m$tiers_2ets$fn$flag",
+    ] {
         runtime
             .optimize_function(name, OptimizationTier::Baseline)
             .unwrap();
@@ -179,7 +194,11 @@ fn optional_calls_agree_during_mixed_native_promotions() {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         };
-        for name in ["ts$fn$make", "ts$fn$echo", "ts$fn$flag"] {
+        for name in [
+            "ts$m$tiers_2ets$fn$make",
+            "ts$m$tiers_2ets$fn$echo",
+            "ts$m$tiers_2ets$fn$flag",
+        ] {
             runtime
                 .optimize_function(name, OptimizationTier::Optimized)
                 .unwrap();
@@ -187,12 +206,18 @@ fn optional_calls_agree_during_mixed_native_promotions() {
         wait(&runtime, 3);
         check(&mut runtime);
         runtime
-            .optimize_function("ts$fn$score", OptimizationTier::Optimized)
+            .optimize_function("ts$m$tiers_2ets$fn$score", OptimizationTier::Optimized)
             .unwrap();
         wait(&runtime, 4);
         check(&mut runtime);
         for name in names.iter().filter(|name| {
-            !["ts$fn$make", "ts$fn$echo", "ts$fn$flag", "ts$fn$score"].contains(&name.as_str())
+            ![
+                "ts$m$tiers_2ets$fn$make",
+                "ts$m$tiers_2ets$fn$echo",
+                "ts$m$tiers_2ets$fn$flag",
+                "ts$m$tiers_2ets$fn$score",
+            ]
+            .contains(&name.as_str())
         }) {
             runtime
                 .optimize_function(name, OptimizationTier::Optimized)

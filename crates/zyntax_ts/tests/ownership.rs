@@ -66,11 +66,15 @@ fn returned_storage_is_freed_by_the_caller_and_borrowed_aliases_are_not_double_f
     let first = zyntax_compiler::drop_insert::run_module(&mut module);
     assert!(first.frees_inserted > 0);
     assert_eq!(
-        frees(&module, "ts$fn$make"),
+        frees(&module, "ts$m$ownership_2ets$fn$make"),
         0,
         "return transfers the allocation"
     );
-    assert_eq!(frees(&module, "ts$fn$alias"), 0, "the argument is borrowed");
+    assert_eq!(
+        frees(&module, "ts$m$ownership_2ets$fn$alias"),
+        0,
+        "the argument is borrowed"
+    );
     assert_eq!(
         initializer_frees(&module),
         1,
@@ -94,7 +98,7 @@ fn local_allocation_is_released_on_both_return_paths() {
     "#,
     );
     zyntax_compiler::drop_insert::run_module(&mut module);
-    assert_eq!(frees(&module, "ts$fn$value"), 2);
+    assert_eq!(frees(&module, "ts$m$ownership_2ets$fn$value"), 2);
 }
 
 #[test]
@@ -124,7 +128,7 @@ fn generic_alias_results_share_the_callers_single_release() {
             f.name
                 .resolve_global()
                 .unwrap()
-                .starts_with("ts$fn$identity__mono_")
+                .starts_with("ts$m$ownership_2ets$fn$identity__mono_")
         })
         .unwrap()
         .name
@@ -147,8 +151,8 @@ fn recursive_fresh_and_borrowed_results_keep_one_owner() {
     "#,
     );
     zyntax_compiler::drop_insert::run_module(&mut module);
-    assert_eq!(frees(&module, "ts$fn$make"), 0);
-    assert_eq!(frees(&module, "ts$fn$alias"), 0);
+    assert_eq!(frees(&module, "ts$m$ownership_2ets$fn$make"), 0);
+    assert_eq!(frees(&module, "ts$m$ownership_2ets$fn$alias"), 0);
     assert_eq!(initializer_frees(&module), 1);
 }
 
@@ -164,7 +168,7 @@ fn borrowed_results_propagate_through_a_mutual_cycle() {
     "#,
     );
     zyntax_compiler::drop_insert::run_module(&mut module);
-    assert_eq!(frees(&module, "ts$fn$first"), 0);
-    assert_eq!(frees(&module, "ts$fn$second"), 0);
+    assert_eq!(frees(&module, "ts$m$ownership_2ets$fn$first"), 0);
+    assert_eq!(frees(&module, "ts$m$ownership_2ets$fn$second"), 0);
     assert_eq!(initializer_frees(&module), 1);
 }

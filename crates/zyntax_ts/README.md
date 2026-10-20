@@ -89,6 +89,15 @@ General reference-bearing unions, capturing closures, classes, multi-file linkin
 unimplemented constructs produce `Unsupported` diagnostics. These are implementation gaps, measured by
 the conformance suite; they are not permanent language restrictions.
 
+Native symbols are qualified by an interned module identity. `parse_program`
+uses the supplied filename; resolvers can use `parse_module` with a canonical
+`ModuleId` and a separate diagnostic filename. `zynode` canonicalizes its input
+path. Hosts obtain callable names with `ModuleId::function_name`, rather than
+constructing native names. Functions, lifted arrows, bindings and record layouts
+retain separate identities when libraries are linked through shared imports or
+snapshots. TypeScript import/export syntax and exported checker interfaces still
+need integration.
+
 Diagnostics use Zyntax's shared Ariadne formatter, including source labels and
 related declaration locations. `NO_COLOR` disables colors; `CLICOLOR_FORCE`
 enables them. Use `--diagnostics=json` for structured diagnostic categories and

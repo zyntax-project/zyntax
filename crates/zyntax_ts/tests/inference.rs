@@ -20,7 +20,7 @@ fn shared_forward_dependencies_have_one_concrete_body_each() {
     for declaration in &program.declarations {
         if let TypedDeclaration::Function(f) = &declaration.node {
             let name = f.name.resolve_global().unwrap();
-            if name.starts_with("ts$fn$") {
+            if name.starts_with("ts$m$dependencies_2ets$fn$") {
                 assert!(names.insert(name), "duplicate function body");
                 assert_eq!(f.return_type, Type::Primitive(PrimitiveType::F64));
             }
@@ -42,7 +42,11 @@ fn annotated_return_anchors_a_recursive_group_in_either_source_order() {
             zyntax_ts::parse_program(&source, "recursion.ts", Default::default()).unwrap();
         for declaration in &program.declarations {
             if let TypedDeclaration::Function(f) = &declaration.node {
-                if f.name.resolve_global().unwrap().starts_with("ts$fn$") {
+                if f.name
+                    .resolve_global()
+                    .unwrap()
+                    .starts_with("ts$m$recursion_2ets$fn$")
+                {
                     assert_eq!(f.return_type, Type::Primitive(PrimitiveType::Bool));
                 }
             }

@@ -44,17 +44,19 @@ fn union_calls_agree_before_and_after_each_native_promotion() {
         .compile_typed_program(program)
         .unwrap()
         .into_iter()
-        .filter(|n| n.starts_with("ts$fn$"))
+        .filter(|n| n.starts_with("ts$m$union_2ets$fn$"))
         .collect();
     let check = |runtime: &mut TieredRuntime| {
         assert_eq!(
-            runtime.call_raw("ts$fn$equalText", &[]).unwrap(),
+            runtime
+                .call_raw("ts$m$union_2ets$fn$equalText", &[])
+                .unwrap(),
             ZyntaxValue::Float(1.0)
         );
         for (n, expected) in [(0.0, 1.0), (-0.0, 1.0), (3.0, 1.0), (f64::NAN, 0.0)] {
             assert_eq!(
                 runtime
-                    .call_raw("ts$fn$equalNumber", &[ZyntaxValue::Float(n)])
+                    .call_raw("ts$m$union_2ets$fn$equalNumber", &[ZyntaxValue::Float(n)])
                     .unwrap(),
                 ZyntaxValue::Float(expected)
             );
@@ -62,20 +64,20 @@ fn union_calls_agree_before_and_after_each_native_promotion() {
         for (n, expected) in [(2.0, 10.5), (0.0, -13.0), (-2.0, 0.0)] {
             assert_eq!(
                 runtime
-                    .call_raw("ts$fn$score", &[ZyntaxValue::Float(n)])
+                    .call_raw("ts$m$union_2ets$fn$score", &[ZyntaxValue::Float(n)])
                     .unwrap(),
                 ZyntaxValue::Float(expected),
                 "score({n})"
             );
             assert_eq!(
                 runtime
-                    .call_raw("ts$fn$conditional", &[ZyntaxValue::Float(n)])
+                    .call_raw("ts$m$union_2ets$fn$conditional", &[ZyntaxValue::Float(n)])
                     .unwrap(),
                 ZyntaxValue::Float(if n > 0.0 { n * 2.0 } else { -5.0 })
             );
             assert_eq!(
                 runtime
-                    .call_raw("ts$fn$truth", &[ZyntaxValue::Float(n)])
+                    .call_raw("ts$m$union_2ets$fn$truth", &[ZyntaxValue::Float(n)])
                     .unwrap(),
                 ZyntaxValue::Float(if n == 0.0 { 0.0 } else { 1.0 })
             );
@@ -83,7 +85,11 @@ fn union_calls_agree_before_and_after_each_native_promotion() {
     };
     check(&mut runtime);
     assert_eq!(runtime.statistics().baseline_functions, 0);
-    let leaves = ["ts$fn$choose", "ts$fn$echo", "ts$fn$three"];
+    let leaves = [
+        "ts$m$union_2ets$fn$choose",
+        "ts$m$union_2ets$fn$echo",
+        "ts$m$union_2ets$fn$three",
+    ];
     for name in leaves {
         runtime
             .optimize_function(name, OptimizationTier::Baseline)
@@ -116,13 +122,13 @@ fn union_calls_agree_before_and_after_each_native_promotion() {
         wait(&runtime, leaves.len());
         check(&mut runtime);
         runtime
-            .optimize_function("ts$fn$score", OptimizationTier::Optimized)
+            .optimize_function("ts$m$union_2ets$fn$score", OptimizationTier::Optimized)
             .unwrap();
         wait(&runtime, leaves.len() + 1);
         check(&mut runtime);
         for name in names
             .iter()
-            .filter(|n| !leaves.contains(&n.as_str()) && n.as_str() != "ts$fn$score")
+            .filter(|n| !leaves.contains(&n.as_str()) && n.as_str() != "ts$m$union_2ets$fn$score")
         {
             runtime
                 .optimize_function(name, OptimizationTier::Optimized)

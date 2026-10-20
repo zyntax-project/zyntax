@@ -85,6 +85,11 @@
     "mode": "run"
   },
   {
+    "id": "functions/identifier_names",
+    "file": "cases/functions/identifier_names.ts",
+    "mode": "run"
+  },
+  {
     "id": "functions/argument_order",
     "file": "cases/functions/argument_order.ts",
     "mode": "run"

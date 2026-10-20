@@ -55,16 +55,18 @@ fn library() -> Arc<Snapshot> {
 
 // Parse against the library's signatures until the native frontend has import syntax.
 // Runtime linking must use the snapshot; none of these source bodies reach it.
+// The combined source uses the library identity so its references match the image.
 fn client(source: &str) -> TypedProgram {
-    let mut program = zyntax_ts::parse_program(
+    let mut program = zyntax_ts::parse_module(
         &format!("{LIBRARY}\n{source}"),
         "client.ts",
+        zyntax_ts::ModuleId::new("library.ts"),
         Default::default(),
     )
     .unwrap();
     let mut items = Vec::new();
     program.declarations.retain(|d| {
-        if matches!(&d.node, TypedDeclaration::Function(f) if f.name.resolve_global().as_deref()==Some("ts$fn$bump")) {
+        if matches!(&d.node, TypedDeclaration::Function(f) if f.name.resolve_global().as_deref()==Some("ts$m$library_2ets$fn$bump")) {
             return false;
         }
         if let TypedDeclaration::Function(f) = &d.node
@@ -105,7 +107,10 @@ fn snapshot_preserves_uninstantiated_generic_bodies() {
     let hir =
         zyntax_embed::lower_for_snapshot("library", program.clone(), Default::default(), vec![])
             .unwrap();
-    for name in ["ts$fn$identity", "ts$fn$second"] {
+    for name in [
+        "ts$m$library_2ets$fn$identity",
+        "ts$m$library_2ets$fn$second",
+    ] {
         let function = hir
             .functions
             .values()
@@ -123,7 +128,10 @@ fn snapshot_preserves_uninstantiated_generic_bodies() {
     let snapshot = Snapshot::load_owned(bytes).unwrap();
     let import = snapshot.module("library").unwrap().unwrap();
     let encoded = import.hir().unwrap();
-    for name in ["ts$fn$identity", "ts$fn$second"] {
+    for name in [
+        "ts$m$library_2ets$fn$identity",
+        "ts$m$library_2ets$fn$second",
+    ] {
         let shell = encoded.by_name(name).unwrap();
         assert_eq!(shell.signature.type_params.len(), 1);
         assert!(shell.blocks.is_empty());
@@ -164,12 +172,16 @@ fn imported_generics_run_across_interpreter_native_and_mixed_tiers() {
         "#,
         );
         let names = runtime.compile_typed_program(program).unwrap();
-        assert!(!names.iter().any(|n| n.starts_with("ts$fn$unused")));
-        assert!(!names.iter().any(|n| n == "ts$fn$second"));
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.starts_with("ts$m$library_2ets$fn$unused"))
+        );
+        assert!(!names.iter().any(|n| n == "ts$m$library_2ets$fn$second"));
         assert_eq!(
             names
                 .iter()
-                .filter(|n| n.starts_with("ts$fn$second__mono_"))
+                .filter(|n| n.starts_with("ts$m$library_2ets$fn$second__mono_"))
                 .count(),
             3
         );
@@ -177,12 +189,12 @@ fn imported_generics_run_across_interpreter_native_and_mixed_tiers() {
             for n in [-2.0, 0.0, 3.0, 7.0] {
                 assert_eq!(
                     runtime
-                        .call_raw("ts$fn$score", &[ZyntaxValue::Float(n)])
+                        .call_raw("ts$m$library_2ets$fn$score", &[ZyntaxValue::Float(n)])
                         .unwrap(),
                     ZyntaxValue::Float(4.0 * n + 8.0)
                 );
             }
-            for name in ["ts$fn$words", "ts$fn$flags"] {
+            for name in ["ts$m$library_2ets$fn$words", "ts$m$library_2ets$fn$flags"] {
                 assert_eq!(
                     runtime.call_raw(name, &[]).unwrap(),
                     ZyntaxValue::Float(1.0)
@@ -192,11 +204,14 @@ fn imported_generics_run_across_interpreter_native_and_mixed_tiers() {
         check(&mut runtime);
         assert_eq!(runtime.statistics().baseline_functions, 0);
         assert_eq!(runtime.statistics().optimized_functions, 0);
-        let natives: Vec<_> = names.iter().filter(|n| n.starts_with("ts$fn$")).collect();
+        let natives: Vec<_> = names
+            .iter()
+            .filter(|n| n.starts_with("ts$m$library_2ets$fn$"))
+            .collect();
         let leaves: Vec<_> = natives
             .iter()
             .copied()
-            .filter(|n| n.starts_with("ts$fn$second__mono_"))
+            .filter(|n| n.starts_with("ts$m$library_2ets$fn$second__mono_"))
             .collect();
         for name in &leaves {
             runtime
@@ -277,7 +292,7 @@ fn snapshotted_arrays_specialize_with_native_strides_and_reuse() {
     let import = snapshot.module("library").unwrap().unwrap();
     let encoded = import.hir().unwrap();
     let template = encoded
-        .function(encoded.by_name("ts$fn$second").unwrap().id)
+        .function(encoded.by_name("ts$m$library_2ets$fn$second").unwrap().id)
         .unwrap();
     let mut module = HirModule::new(InternedString::new_global("snapshot_strides"));
     let mut callers = Vec::new();
@@ -299,7 +314,7 @@ fn snapshotted_arrays_specialize_with_native_strides_and_reuse() {
         f.name
             .resolve_global()
             .unwrap()
-            .starts_with("ts$fn$second__mono_")
+            .starts_with("ts$m$library_2ets$fn$second__mono_")
     }) {
         let element = &f.signature.returns[0];
         assert!(f.blocks.values().flat_map(|b| &b.instructions).any(|i| matches!(i,HirInstruction::GetElementPtr{ty:HirType::Ptr(t),..} if t.as_ref()==element)));
@@ -357,7 +372,7 @@ fn snapshotted_arrays_specialize_with_native_strides_and_reuse() {
             f.name
                 .resolve_global()
                 .unwrap()
-                .starts_with("ts$fn$second__mono_")
+                .starts_with("ts$m$library_2ets$fn$second__mono_")
                 && f.signature.returns == [HirType::I64]
         })
         .unwrap()
@@ -419,7 +434,11 @@ fn snapshotted_arrays_specialize_with_native_strides_and_reuse() {
 fn a_generic_signature_without_a_body_cannot_be_specialized() {
     let snapshot = library();
     let import = snapshot.module("library").unwrap().unwrap();
-    let template = import.hir().unwrap().by_name("ts$fn$identity").unwrap();
+    let template = import
+        .hir()
+        .unwrap()
+        .by_name("ts$m$library_2ets$fn$identity")
+        .unwrap();
     let f = caller(template, "missing_body", HirType::I64);
     let mut module = HirModule::new(InternedString::new_global("missing_template"));
     module.functions.insert(f.id, f);
@@ -462,7 +481,7 @@ fn library_concrete_instances_do_not_consume_templates_or_reuse_names() {
             .filter(|n| n
                 .resolve_global()
                 .unwrap()
-                .starts_with("ts$fn$identity__mono_"))
+                .starts_with("ts$m$concrete_2ets$fn$identity__mono_"))
             .count(),
         2
     );
@@ -489,7 +508,7 @@ fn unused_snapshot_template_stays_encoded() {
     let unused = module
         .functions
         .values_mut()
-        .find(|f| f.name.resolve_global().as_deref() == Some("ts$fn$unused"))
+        .find(|f| f.name.resolve_global().as_deref() == Some("ts$m$library_2ets$fn$unused"))
         .unwrap();
     for i in 0..65536 {
         unused.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(i)));
@@ -509,13 +528,12 @@ fn unused_snapshot_template_stays_encoded() {
     let before = allocation_audit::for_phase(Phase::Decode);
     let hir = runtime.lower_to_hir(program).unwrap();
     let after = allocation_audit::for_phase(Phase::Decode);
-    assert!(
-        !hir.functions.values().any(|f| f
-            .name
+    assert!(!hir.functions.values().any(|f| {
+        f.name
             .resolve_global()
             .unwrap()
-            .starts_with("ts$fn$unused"))
-    );
+            .starts_with("ts$m$library_2ets$fn$unused")
+    }));
     assert_eq!(
         after.entries - before.entries,
         2,

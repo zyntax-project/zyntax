@@ -42,7 +42,10 @@ fn lower(source: &str) -> HirModule {
 #[test]
 fn generic_array_elements_specialize_once_without_dynamic_helpers() {
     let mut module = lower(SOURCE);
-    for prefix in ["ts$fn$first__mono_", "ts$fn$through__mono_"] {
+    for prefix in [
+        "ts$m$arrays_2ets$fn$first__mono_",
+        "ts$m$arrays_2ets$fn$through__mono_",
+    ] {
         let functions: Vec<_> = module
             .functions
             .values()
@@ -102,7 +105,7 @@ fn optimized_hir_and_clif_keep_typed_geps_and_integer_induction() {
     let scale = module
         .functions
         .values()
-        .find(|f| f.name.resolve_global().as_deref() == Some("ts$fn$scale"))
+        .find(|f| f.name.resolve_global().as_deref() == Some("ts$m$arrays_2ets$fn$scale"))
         .unwrap()
         .clone();
     let mut module = HirModule::new(InternedString::new_global("scale"));
@@ -222,11 +225,11 @@ fn arrays_agree_across_interpreter_native_and_mixed_tiers() {
         .compile_typed_program(program)
         .unwrap()
         .into_iter()
-        .filter(|n| n.starts_with("ts$fn$"))
+        .filter(|n| n.starts_with("ts$m$tiers_2ets$fn$"))
         .collect();
     let check = |runtime: &mut TieredRuntime| {
         assert_eq!(
-            runtime.call_raw("ts$fn$probe", &[]).unwrap(),
+            runtime.call_raw("ts$m$tiers_2ets$fn$probe", &[]).unwrap(),
             ZyntaxValue::Float(302.0)
         );
         for n in [-2.0, 0.0, 3.0, 7.0] {
@@ -237,7 +240,10 @@ fn arrays_agree_across_interpreter_native_and_mixed_tiers() {
             ] {
                 assert_eq!(
                     runtime
-                        .call_raw(&format!("ts$fn${function}"), &[ZyntaxValue::Float(n)])
+                        .call_raw(
+                            &format!("ts$m$tiers_2ets$fn${function}"),
+                            &[ZyntaxValue::Float(n)]
+                        )
                         .unwrap(),
                     ZyntaxValue::Float(expected),
                     "{function}({n})"
@@ -247,10 +253,9 @@ fn arrays_agree_across_interpreter_native_and_mixed_tiers() {
     };
     check(&mut runtime);
     assert_eq!(runtime.statistics().baseline_functions, 0);
-    for name in names
-        .iter()
-        .filter(|n| n.starts_with("ts$fn$first__mono_") || n.as_str() == "ts$fn$make")
-    {
+    for name in names.iter().filter(|n| {
+        n.starts_with("ts$m$tiers_2ets$fn$first__mono_") || n.as_str() == "ts$m$tiers_2ets$fn$make"
+    }) {
         runtime
             .optimize_function(name, OptimizationTier::Baseline)
             .unwrap();
@@ -276,7 +281,10 @@ fn arrays_agree_across_interpreter_native_and_mixed_tiers() {
         };
         let leaves: Vec<_> = names
             .iter()
-            .filter(|n| n.starts_with("ts$fn$first__mono_") || n.as_str() == "ts$fn$make")
+            .filter(|n| {
+                n.starts_with("ts$m$tiers_2ets$fn$first__mono_")
+                    || n.as_str() == "ts$m$tiers_2ets$fn$make"
+            })
             .collect();
         for name in &leaves {
             runtime
@@ -286,13 +294,13 @@ fn arrays_agree_across_interpreter_native_and_mixed_tiers() {
         wait(&runtime, leaves.len());
         check(&mut runtime);
         runtime
-            .optimize_function("ts$fn$score", OptimizationTier::Optimized)
+            .optimize_function("ts$m$tiers_2ets$fn$score", OptimizationTier::Optimized)
             .unwrap();
         wait(&runtime, leaves.len() + 1);
         check(&mut runtime);
         for name in names
             .iter()
-            .filter(|n| !leaves.contains(n) && n.as_str() != "ts$fn$score")
+            .filter(|n| !leaves.contains(n) && n.as_str() != "ts$m$tiers_2ets$fn$score")
         {
             runtime
                 .optimize_function(name, OptimizationTier::Optimized)
@@ -412,7 +420,7 @@ fn shared_array_monomorphization_has_native_integer_float_and_string_strides() {
                 .name
                 .resolve_global()
                 .unwrap()
-                .starts_with("ts$fn$second__mono_"))
+                .starts_with("ts$m$second_2ets$fn$second__mono_"))
             .count(),
         3
     );

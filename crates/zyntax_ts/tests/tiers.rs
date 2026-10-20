@@ -27,13 +27,13 @@ fn typed_object_aliases_agree_across_tiers_without_collection() {
     let names = runtime.compile_typed_program(program).unwrap();
     let generic = names
         .iter()
-        .find(|name| name.starts_with("ts$fn$identity__mono_"))
+        .find(|name| name.starts_with("ts$m$tiers_2ets$fn$identity__mono_"))
         .unwrap();
     assert_eq!(runtime.statistics().baseline_functions, 0);
     assert_eq!(runtime.statistics().optimized_functions, 0);
     assert_eq!(
         runtime
-            .call_raw("ts$fn$score", &[ZyntaxValue::Float(3.0)])
+            .call_raw("ts$m$tiers_2ets$fn$score", &[ZyntaxValue::Float(3.0)])
             .unwrap(),
         ZyntaxValue::Float(42.0)
     );
@@ -41,11 +41,11 @@ fn typed_object_aliases_agree_across_tiers_without_collection() {
         .optimize_function(generic, OptimizationTier::Baseline)
         .unwrap();
     runtime
-        .optimize_function("ts$fn$score", OptimizationTier::Baseline)
+        .optimize_function("ts$m$tiers_2ets$fn$score", OptimizationTier::Baseline)
         .unwrap();
     assert_eq!(
         runtime
-            .call_raw("ts$fn$score", &[ZyntaxValue::Float(5.0)])
+            .call_raw("ts$m$tiers_2ets$fn$score", &[ZyntaxValue::Float(5.0)])
             .unwrap(),
         ZyntaxValue::Float(62.0)
     );
@@ -55,7 +55,7 @@ fn typed_object_aliases_agree_across_tiers_without_collection() {
             .optimize_function(generic, OptimizationTier::Optimized)
             .unwrap();
         runtime
-            .optimize_function("ts$fn$score", OptimizationTier::Optimized)
+            .optimize_function("ts$m$tiers_2ets$fn$score", OptimizationTier::Optimized)
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while runtime.statistics().optimized_functions < 2 {
@@ -64,7 +64,7 @@ fn typed_object_aliases_agree_across_tiers_without_collection() {
         }
         assert_eq!(
             runtime
-                .call_raw("ts$fn$score", &[ZyntaxValue::Float(7.0)])
+                .call_raw("ts$m$tiers_2ets$fn$score", &[ZyntaxValue::Float(7.0)])
                 .unwrap(),
             ZyntaxValue::Float(82.0)
         );

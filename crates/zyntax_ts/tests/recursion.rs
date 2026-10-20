@@ -42,13 +42,17 @@ fn recursive_bodies_and_calls_have_their_settled_types() {
         if let TypedDeclaration::Function(f) = &declaration.node {
             let name = f.name.resolve_global().unwrap();
             let expected = match name.as_str() {
-                "ts$fn$down" | "ts$fn$reverse" | "ts$fn$score" => {
-                    Type::Primitive(PrimitiveType::F64)
+                "ts$m$recursion_2ets$fn$down"
+                | "ts$m$recursion_2ets$fn$reverse"
+                | "ts$m$recursion_2ets$fn$score" => Type::Primitive(PrimitiveType::F64),
+                "ts$m$recursion_2ets$fn$flag" => Type::Primitive(PrimitiveType::Bool),
+                "ts$m$recursion_2ets$fn$text" => Type::Primitive(PrimitiveType::String),
+                "ts$m$recursion_2ets$fn$recurseVoid" | "ts$m$recursion_2ets$fn$partial" => {
+                    Type::Primitive(PrimitiveType::Unit)
                 }
-                "ts$fn$flag" => Type::Primitive(PrimitiveType::Bool),
-                "ts$fn$text" => Type::Primitive(PrimitiveType::String),
-                "ts$fn$recurseVoid" | "ts$fn$partial" => Type::Primitive(PrimitiveType::Unit),
-                "ts$fn$forever" | "ts$fn$delegated" => Type::Never,
+                "ts$m$recursion_2ets$fn$forever" | "ts$m$recursion_2ets$fn$delegated" => {
+                    Type::Never
+                }
                 _ => continue,
             };
             assert_eq!(f.return_type, expected, "{name}");
@@ -60,27 +64,30 @@ fn recursive_bodies_and_calls_have_their_settled_types() {
 fn check(runtime: &mut TieredRuntime) {
     assert_eq!(
         runtime
-            .call_raw("ts$fn$finite", &[ZyntaxValue::Float(1.0)])
+            .call_raw("ts$m$recursion_2ets$fn$finite", &[ZyntaxValue::Float(1.0)])
             .unwrap(),
         ZyntaxValue::Float(6.5)
     );
     assert_eq!(
         runtime
-            .call_raw("ts$fn$score", &[ZyntaxValue::Float(5.0)])
+            .call_raw("ts$m$recursion_2ets$fn$score", &[ZyntaxValue::Float(5.0)])
             .unwrap(),
         ZyntaxValue::Float(8.0)
     );
     assert_eq!(
         runtime
-            .call_raw("ts$fn$flag", &[ZyntaxValue::Float(5.0)])
+            .call_raw("ts$m$recursion_2ets$fn$flag", &[ZyntaxValue::Float(5.0)])
             .unwrap(),
         ZyntaxValue::Bool(true)
     );
     runtime
-        .call_raw("ts$fn$recurseVoid", &[ZyntaxValue::Float(5.0)])
+        .call_raw(
+            "ts$m$recursion_2ets$fn$recurseVoid",
+            &[ZyntaxValue::Float(5.0)],
+        )
         .unwrap();
     runtime
-        .call_raw("ts$fn$partial", &[ZyntaxValue::Float(0.0)])
+        .call_raw("ts$m$recursion_2ets$fn$partial", &[ZyntaxValue::Float(0.0)])
         .unwrap();
 }
 
@@ -98,7 +105,10 @@ fn never_returns_have_no_fabricated_native_value() {
         LoweringConfig::default(),
     );
     let module = context.lower_program(&mut program).unwrap();
-    for name in ["ts$fn$forever", "ts$fn$delegated"] {
+    for name in [
+        "ts$m$recursion_2ets$fn$forever",
+        "ts$m$recursion_2ets$fn$delegated",
+    ] {
         let f = module
             .functions
             .values()
@@ -164,7 +174,7 @@ fn recursive_functions_and_never_signatures_compile_on_each_tier() {
         .compile_typed_program(program)
         .unwrap()
         .into_iter()
-        .filter(|name| name.starts_with("ts$fn$"))
+        .filter(|name| name.starts_with("ts$m$recursion_2ets$fn$"))
         .collect();
     check(&mut runtime);
     assert_eq!(runtime.statistics().baseline_functions, 0);

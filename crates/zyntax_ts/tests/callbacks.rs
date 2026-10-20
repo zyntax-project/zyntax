@@ -19,27 +19,36 @@ const SOURCE: &str = r#"
 fn check(runtime: &mut TieredRuntime) {
     assert_eq!(
         runtime
-            .call_raw("ts$fn$score", &[ZyntaxValue::Float(1.5)])
+            .call_raw("ts$m$callbacks_2ets$fn$score", &[ZyntaxValue::Float(1.5)])
             .unwrap(),
         ZyntaxValue::Float(2.0)
     );
     for (input, expected) in [(false, true), (true, false)] {
         assert_eq!(
             runtime
-                .call_raw("ts$fn$boolScore", &[ZyntaxValue::Bool(input)])
+                .call_raw(
+                    "ts$m$callbacks_2ets$fn$boolScore",
+                    &[ZyntaxValue::Bool(input)]
+                )
                 .unwrap(),
             ZyntaxValue::Bool(expected)
         );
     }
     assert_eq!(
         runtime
-            .call_raw("ts$fn$voidScore", &[ZyntaxValue::Float(4.0)])
+            .call_raw(
+                "ts$m$callbacks_2ets$fn$voidScore",
+                &[ZyntaxValue::Float(4.0)]
+            )
             .unwrap(),
         ZyntaxValue::Float(6.0)
     );
     assert_eq!(
         runtime
-            .call_raw("ts$fn$mixedScore", &[ZyntaxValue::Float(2.0)])
+            .call_raw(
+                "ts$m$callbacks_2ets$fn$mixedScore",
+                &[ZyntaxValue::Float(2.0)]
+            )
             .unwrap(),
         ZyntaxValue::Float(2.25)
     );
@@ -73,10 +82,10 @@ fn callbacks_agree_before_and_after_each_native_promotion() {
     assert_eq!(runtime.statistics().baseline_functions, 0);
     // Native callers can enter callback targets that have not been promoted.
     for name in [
-        "ts$fn$apply",
-        "ts$fn$boolApply",
-        "ts$fn$mixedApply",
-        "ts$fn$invoke",
+        "ts$m$callbacks_2ets$fn$apply",
+        "ts$m$callbacks_2ets$fn$boolApply",
+        "ts$m$callbacks_2ets$fn$mixedApply",
+        "ts$m$callbacks_2ets$fn$invoke",
     ] {
         runtime
             .optimize_function(name, OptimizationTier::Baseline)
@@ -85,7 +94,10 @@ fn callbacks_agree_before_and_after_each_native_promotion() {
     check(&mut runtime);
     let names: Vec<_> = names
         .into_iter()
-        .filter(|name| name.starts_with("ts$fn$") || name.starts_with("ts$arrow$"))
+        .filter(|name| {
+            name.starts_with("ts$m$callbacks_2ets$fn$")
+                || name.starts_with("ts$m$callbacks_2ets$arrow$")
+        })
         .collect();
     for name in &names {
         runtime
@@ -96,11 +108,14 @@ fn callbacks_agree_before_and_after_each_native_promotion() {
     #[cfg(feature = "llvm-backend")]
     {
         runtime
-            .optimize_function("ts$fn$apply", OptimizationTier::Optimized)
+            .optimize_function("ts$m$callbacks_2ets$fn$apply", OptimizationTier::Optimized)
             .unwrap();
         wait_optimized(&runtime, 1);
         check(&mut runtime);
-        for name in names.iter().filter(|name| *name != "ts$fn$apply") {
+        for name in names
+            .iter()
+            .filter(|name| *name != "ts$m$callbacks_2ets$fn$apply")
+        {
             runtime
                 .optimize_function(name, OptimizationTier::Optimized)
                 .unwrap();
@@ -132,7 +147,9 @@ fn lifted_functions_use_typed_code_references_without_heap_environments() {
     let mut references = 0;
     for function in module.functions.values() {
         let name = function.name.resolve_global().unwrap();
-        if name.starts_with("ts$fn$") || name.starts_with("ts$arrow$") {
+        if name.starts_with("ts$m$callbacks_2ets$fn$")
+            || name.starts_with("ts$m$callbacks_2ets$arrow$")
+        {
             assert!(function.attributes.strict_fp, "{name}");
         }
         for instruction in function.blocks.values().flat_map(|b| &b.instructions) {

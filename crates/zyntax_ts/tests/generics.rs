@@ -100,8 +100,8 @@ fn nested_calls_reuse_each_concrete_body() {
             .filter(|f| f.name.resolve_global().unwrap().starts_with(prefix))
             .count()
     };
-    assert_eq!(count("ts$fn$identity__mono_"), 4);
-    assert_eq!(count("ts$fn$through__mono_"), 2);
+    assert_eq!(count("ts$m$generics_2ets$fn$identity__mono_"), 4);
+    assert_eq!(count("ts$m$generics_2ets$fn$through__mono_"), 2);
     for (id, f) in &module.functions {
         assert_eq!(*id, f.id);
         assert!(f.signature.type_params.is_empty());

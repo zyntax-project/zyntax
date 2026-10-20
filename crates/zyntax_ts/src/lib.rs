@@ -1,9 +1,11 @@
 //! TypeScript source to Zyntax's typed AST, with compile-time release analysis.
 
 mod lower;
+mod modules;
 mod runtime;
 
-pub use lower::parse_program;
+pub use lower::{parse_module, parse_program};
+pub use modules::ModuleId;
 pub use runtime::register_runtime;
 
 /// Additional checks beyond TypeScript's strict static checking.
