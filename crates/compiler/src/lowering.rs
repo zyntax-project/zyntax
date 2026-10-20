@@ -4738,6 +4738,7 @@ impl LoweringContext {
         use zyntax_typed_ast::PrimitiveType;
 
         match ty {
+            Type::Never => HirType::Void,
             Type::Primitive(prim) => match prim {
                 PrimitiveType::Bool => HirType::Bool,
                 PrimitiveType::I8 => HirType::I8,

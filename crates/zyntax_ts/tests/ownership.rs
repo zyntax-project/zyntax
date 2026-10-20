@@ -130,3 +130,37 @@ fn generic_alias_results_share_the_callers_single_release() {
     zyntax_compiler::drop_insert::run_module(&mut module);
     assert_eq!(frees(&module, zyntax_ts::ENTRY), 1);
 }
+
+#[test]
+fn recursive_fresh_and_borrowed_results_keep_one_owner() {
+    let mut module = lower(
+        r#"
+        type Point = { x: number; y: number };
+        function make(n: number) { if (n <= 0) return { x: 3, y: 4 }; return make(n - 1); }
+        function alias(n: number, p: Point) { if (n <= 0) return p; return alias(n - 1, p); }
+        const p = make(5); const q = alias(5, p); q.x = 9;
+        console.log(p.x, q.y);
+    "#,
+    );
+    zyntax_compiler::drop_insert::run_module(&mut module);
+    assert_eq!(frees(&module, "ts$fn$make"), 0);
+    assert_eq!(frees(&module, "ts$fn$alias"), 0);
+    assert_eq!(frees(&module, zyntax_ts::ENTRY), 1);
+}
+
+#[test]
+fn borrowed_results_propagate_through_a_mutual_cycle() {
+    let mut module = lower(
+        r#"
+        type Point = { x: number; y: number };
+        function first(n: number, p: Point): Point { if (n <= 0) return p; return second(n - 1, p); }
+        function second(n: number, p: Point): Point { return first(n, p); }
+        const p: Point = { x: 3, y: 4 }; const q = second(5, p); q.x = 9;
+        console.log(p.x, q.y);
+    "#,
+    );
+    zyntax_compiler::drop_insert::run_module(&mut module);
+    assert_eq!(frees(&module, "ts$fn$first"), 0);
+    assert_eq!(frees(&module, "ts$fn$second"), 0);
+    assert_eq!(frees(&module, zyntax_ts::ENTRY), 1);
+}

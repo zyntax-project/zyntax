@@ -111,11 +111,40 @@ struct ReturnContext {
     inferred: Option<(Type, Option<InternedString>)>,
 }
 
+struct Dependency {
+    name: InternedString,
+    returned: bool,
+}
+
 struct CallDependencies<'s> {
     scoping: &'s oxc_semantic::Scoping,
     inferred: &'s FxHashMap<oxc_semantic::SymbolId, InternedString>,
     seen: FxHashSet<oxc_semantic::SymbolId>,
-    callees: Vec<InternedString>,
+    callees: Vec<Dependency>,
+    owner: Option<oxc_semantic::SymbolId>,
+    skip_self: bool,
+    in_return: bool,
+    return_callees: FxHashSet<InternedString>,
+    self_calls: bool,
+    arrow_depth: usize,
+}
+
+impl CallDependencies<'_> {
+    fn is_self_call(&self, mut expression: &js::Expression<'_>) -> bool {
+        while let js::Expression::ParenthesizedExpression(p) = expression {
+            expression = &p.expression;
+        }
+        let js::Expression::CallExpression(call) = expression else {
+            return false;
+        };
+        let js::Expression::Identifier(id) = &call.callee else {
+            return false;
+        };
+        self.scoping
+            .get_reference(id.reference_id.get().unwrap())
+            .symbol_id()
+            == self.owner
+    }
 }
 
 impl<'ast> Visit<'ast> for CallDependencies<'_> {
@@ -125,17 +154,89 @@ impl<'ast> Visit<'ast> for CallDependencies<'_> {
             return;
         }
         if let Some(symbol) = reference.symbol_id() {
+            if Some(symbol) == self.owner && self.skip_self {
+                return;
+            }
             if let Some(name) = self.inferred.get(&symbol) {
                 if self.seen.insert(symbol) {
-                    self.callees.push(*name);
+                    self.callees.push(Dependency {
+                        name: *name,
+                        returned: false,
+                    });
                 }
             }
         }
     }
 
+    fn visit_call_expression(&mut self, call: &js::CallExpression<'ast>) {
+        if self.in_return {
+            let mut callee = &call.callee;
+            loop {
+                callee = match callee {
+                    js::Expression::ParenthesizedExpression(p) => &p.expression,
+                    js::Expression::TSNonNullExpression(n) => &n.expression,
+                    _ => break,
+                };
+            }
+            if let js::Expression::Identifier(id) = callee {
+                if let Some(symbol) = self
+                    .scoping
+                    .get_reference(id.reference_id.get().unwrap())
+                    .symbol_id()
+                {
+                    if !(self.skip_self && Some(symbol) == self.owner) {
+                        if let Some(name) = self.inferred.get(&symbol) {
+                            self.return_callees.insert(*name);
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+
     fn visit_function(&mut self, _: &js::Function<'ast>, _: oxc_semantic::ScopeFlags) {}
+    fn visit_unary_expression(&mut self, unary: &js::UnaryExpression<'ast>) {
+        let saved = self.in_return;
+        if unary.operator.as_str() == "void" {
+            self.in_return = false;
+        }
+        walk::walk_unary_expression(self, unary);
+        self.in_return = saved;
+    }
+
     fn visit_arrow_function_expression(&mut self, arrow: &js::ArrowFunctionExpression<'ast>) {
+        let saved = (self.in_return, self.skip_self);
+        self.in_return = false;
+        self.skip_self = false;
+        self.arrow_depth += 1;
         walk::walk_arrow_function_expression(self, arrow);
+        self.arrow_depth -= 1;
+        (self.in_return, self.skip_self) = saved;
+    }
+
+    fn visit_return_statement(&mut self, statement: &js::ReturnStatement<'ast>) {
+        let direct_self = self.arrow_depth == 0
+            && statement
+                .argument
+                .as_ref()
+                .is_some_and(|e| self.is_self_call(e));
+        let saved = (self.in_return, self.skip_self);
+        self.in_return = self.arrow_depth == 0 && !direct_self;
+        self.skip_self = direct_self;
+        self.self_calls |= direct_self;
+        walk::walk_return_statement(self, statement);
+        (self.in_return, self.skip_self) = saved;
+    }
+
+    fn visit_expression_statement(&mut self, statement: &js::ExpressionStatement<'ast>) {
+        let saved = self.skip_self;
+        if self.arrow_depth == 0 && self.is_self_call(&statement.expression) {
+            self.skip_self = true;
+            self.self_calls = true;
+        }
+        walk::walk_expression_statement(self, statement);
+        self.skip_self = saved;
     }
 }
 
@@ -167,6 +268,7 @@ struct Lowerer<'ast, 'program> {
     active_types: SmallVec<[(InternedString, Type); 2]>,
     functions: FxHashMap<InternedString, &'program js::Function<'ast>>,
     lowered: FxHashSet<InternedString>,
+    self_recursive: FxHashSet<InternedString>,
     scopes: Vec<FxHashMap<InternedString, Binding>>,
     scope_floor: usize,
     declarations: Vec<TypedNode<TypedDeclaration>>,
@@ -189,6 +291,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             active_types: SmallVec::new(),
             functions: FxHashMap::default(),
             lowered: FxHashSet::default(),
+            self_recursive: FxHashSet::default(),
             scopes: vec![],
             scope_floor: 0,
             declarations: vec![],
@@ -279,7 +382,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
         }
         self.externs();
-        let dependencies = self.dependencies(semantic);
+        let dependencies = self.dependencies(semantic)?;
         let mut visiting = FxHashSet::default();
         for item in &program.body {
             if let js::Statement::FunctionDeclaration(f) = item {
@@ -298,7 +401,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         }
                         pending.push((name, true));
                         if let Some(callees) = dependencies.get(&name) {
-                            pending.extend(callees.iter().rev().map(|n| (*n, false)));
+                            pending.extend(callees.iter().rev().map(|d| (d.name, false)));
                         }
                     }
                 }
@@ -346,9 +449,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn dependencies(
-        &self,
+        &mut self,
         semantic: &oxc_semantic::Semantic<'_>,
-    ) -> FxHashMap<InternedString, Vec<InternedString>> {
+    ) -> Result<FxHashMap<InternedString, Vec<Dependency>>> {
         let inferred = self
             .functions
             .iter()
@@ -360,16 +463,62 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             inferred: &inferred,
             seen: FxHashSet::default(),
             callees: vec![],
+            owner: None,
+            skip_self: false,
+            in_return: false,
+            return_callees: FxHashSet::default(),
+            self_calls: false,
+            arrow_depth: 0,
         };
         let mut dependencies = FxHashMap::default();
         for (name, function) in &self.functions {
             calls.seen.clear();
+            calls.owner = function.id.as_ref().unwrap().symbol_id.get();
+            calls.self_calls = false;
             calls.visit_function_body(function.body.as_ref().unwrap());
+            if self.signatures[name].ret.is_none() {
+                if calls.self_calls {
+                    self.self_recursive.insert(*name);
+                }
+                for dependency in &mut calls.callees {
+                    dependency.returned = calls.return_callees.contains(&dependency.name);
+                }
+            }
+            calls.return_callees.clear();
             if !calls.callees.is_empty() {
                 dependencies.insert(*name, std::mem::take(&mut calls.callees));
             }
         }
-        dependencies
+        let mut done = FxHashSet::default();
+        let mut visiting = FxHashSet::default();
+        for &name in dependencies.keys() {
+            let mut pending = vec![(name, false)];
+            while let Some((name, ready)) = pending.pop() {
+                if done.contains(&name) {
+                    continue;
+                }
+                if ready {
+                    visiting.remove(&name);
+                    done.insert(name);
+                } else {
+                    if !visiting.insert(name) {
+                        let id = self.functions[&name].id.as_ref().unwrap();
+                        return self.error(ErrorKind::Type,
+                            format!("`{}` implicitly has return type any because its return expressions form a cycle; add a return type annotation", id.name), id.span);
+                    }
+                    pending.push((name, true));
+                    if let Some(callees) = dependencies.get(&name) {
+                        pending.extend(
+                            callees
+                                .iter()
+                                .filter(|d| d.returned)
+                                .map(|d| (d.name, false)),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(dependencies)
     }
 
     fn type_declaration(&mut self, item: &js::Statement<'ast>) -> Result<()> {
@@ -638,6 +787,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn function_body(&mut self, f: &js::Function<'ast>) -> Result<()> {
         let name = self.name(f.id.as_ref().unwrap().name.as_str());
+        let inferred = self.signatures[&name].ret.is_none();
+        let recursive = inferred && self.self_recursive.contains(&name);
+        if recursive {
+            let sig = Rc::get_mut(self.signatures.get_mut(&name).unwrap()).unwrap();
+            if !sig.type_params.is_empty() {
+                return self.unsupported("recursive generic return inference", f.span);
+            }
+            // Direct self returns contribute no candidate to TypeScript inference.
+            // Their types are settled after the other returns, without re-lowering.
+            sig.ret = Some(Type::Never);
+        }
         let sig = self.signatures[&name].clone();
         self.active_types.clear();
         self.active_types.extend(sig.type_params.iter().cloned());
@@ -662,7 +822,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             params.push(param);
         }
         self.returns = Some(ReturnContext {
-            expected: sig.ret.clone().map(|ty| (ty, sig.ret_view)),
+            expected: if inferred {
+                None
+            } else {
+                sig.ret.clone().map(|ty| (ty, sig.ret_view))
+            },
             inferred: None,
         });
         let mut statements = vec![];
@@ -671,18 +835,24 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             statements.extend(self.statement(s)?);
         }
         let context = self.returns.take().unwrap();
-        let inferred = sig.ret.is_none();
-        let (ret, ret_view) = match context.expected {
+        let (mut ret, ret_view) = match context.expected {
             Some(result) => result,
             None => context.inferred.unwrap_or((unit(), None)),
         };
-        if ret != unit() && !Self::returns(&f.body.as_ref().unwrap().statements) {
+        let complete = Self::returns(&f.body.as_ref().unwrap().statements);
+        if inferred && ret == Type::Never && !complete {
+            ret = unit();
+        }
+        if ret != unit() && !complete {
             if inferred {
                 return self.unsupported("possibly undefined inferred return types", f.span);
             }
             return self.error(ErrorKind::Type, "function lacks an ending return", f.span);
         }
         let native = sig.native;
+        if recursive {
+            Self::settle_self_calls(&mut statements, native, &ret);
+        }
         let type_params = sig
             .type_params
             .iter()
@@ -729,6 +899,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             self.returns.as_mut().unwrap().inferred = Some((ty.clone(), view));
             return Ok(());
         };
+        if *ty == Type::Never {
+            return Ok(());
+        }
+        if *first == Type::Never {
+            self.returns.as_mut().unwrap().inferred = Some((ty.clone(), view));
+            return Ok(());
+        }
         if first != ty {
             return self.unsupported("inferred union return types", at);
         }
@@ -741,6 +918,37 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             return self.unsupported("inferred returns with different readonly views", at);
         }
         Ok(())
+    }
+
+    fn settle_self_calls(statements: &mut [Stmt], native: InternedString, result: &Type) {
+        for statement in statements {
+            match &mut statement.node {
+                TypedStatement::Return(Some(e)) | TypedStatement::Expression(e) => {
+                    if let TypedExpression::Call(call) = &e.node {
+                        if matches!(call.callee.node, TypedExpression::Variable(name) if name == native)
+                        {
+                            e.ty = result.clone();
+                        }
+                    }
+                }
+                TypedStatement::Block(b) => {
+                    Self::settle_self_calls(&mut b.statements, native, result)
+                }
+                TypedStatement::If(i) => {
+                    Self::settle_self_calls(&mut i.then_block.statements, native, result);
+                    if let Some(b) = &mut i.else_block {
+                        Self::settle_self_calls(&mut b.statements, native, result);
+                    }
+                }
+                TypedStatement::While(w) => {
+                    Self::settle_self_calls(&mut w.body.statements, native, result)
+                }
+                TypedStatement::ForCStyle(f) => {
+                    Self::settle_self_calls(&mut f.body.statements, native, result)
+                }
+                _ => {}
+            }
+        }
     }
 
     fn returns(statements: &[js::Statement<'ast>]) -> bool {
@@ -854,6 +1062,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if actual == expected {
             Ok(())
         } else {
+            if *actual == Type::Never {
+                return self.unsupported("diverging expressions used as values", at);
+            }
             if let (
                 Type::Function {
                     params: a,
@@ -907,6 +1118,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             Type::Primitive(PrimitiveType::Bool) => "boolean".into(),
             Type::Primitive(PrimitiveType::String) => "string".into(),
             Type::Primitive(PrimitiveType::Unit) => "void".into(),
+            Type::Never => "never".into(),
             Type::TypeVar(t) => t.name.and_then(|n| n.resolve_global()).unwrap_or_default(),
             Type::Function {
                 params,

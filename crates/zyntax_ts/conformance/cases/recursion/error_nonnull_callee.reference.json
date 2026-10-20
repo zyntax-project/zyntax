@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 7023,
+      "start": 9,
+      "length": 4,
+      "file": "error_nonnull_callee.ts",
+      "message": "'tail' implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions."
+    }
+  ],
+  "source_sha256": "d148e4e7e06d6652360d8c30d4d312cf75312bf3e0585519f1e62c8d4414872b",
+  "options": {}
+}

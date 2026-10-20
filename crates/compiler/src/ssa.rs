@@ -1619,6 +1619,13 @@ impl SsaBuilder {
             TypedTerminator::Return(expr_opt) => {
                 if let Some(expr) = expr_opt {
                     let mut value_id = self.translate_expression(block_id, expr)?;
+                    if expr.ty == Type::Never {
+                        let target = self.continuation_block.take().unwrap_or(block_id);
+                        self.term_dirty.push(target);
+                        self.function.blocks.get_mut(&target).unwrap().terminator =
+                            HirTerminator::Unreachable;
+                        return Ok(());
+                    }
 
                     // Auto-wrap return value in Result::Ok if function returns error union (!T)
                     // and the expression is not already a Result type
@@ -2947,6 +2954,13 @@ impl SsaBuilder {
             let value = self.translate_expression(block_id, expr);
             self.expected_growable = saved_growable;
             let value = value?;
+            if expr.ty == Type::Never {
+                let target = self.continuation_block.take().unwrap_or(block_id);
+                self.term_dirty.push(target);
+                self.function.blocks.get_mut(&target).unwrap().terminator =
+                    HirTerminator::Unreachable;
+                return Ok(target);
+            }
             let value = match self.original_return_type.clone() {
                 Some(declared) if !matches!(declared, Type::Result { .. }) => {
                     let at = self.continuation_block.unwrap_or(block_id);
@@ -12758,6 +12772,7 @@ impl SsaBuilder {
         use zyntax_typed_ast::PrimitiveType;
 
         match ty {
+            Type::Never => HirType::Void,
             Type::Function {
                 params,
                 return_type,

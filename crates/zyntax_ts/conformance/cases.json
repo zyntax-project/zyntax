@@ -588,5 +588,85 @@
     "id": "callbacks/error_contextual_return",
     "file": "cases/callbacks/error_contextual_return.ts",
     "mode": "check"
+  },
+  {
+    "id": "recursion/tail_number",
+    "file": "cases/recursion/tail_number.ts",
+    "mode": "run"
+  },
+  {
+    "id": "recursion/tail_boolean",
+    "file": "cases/recursion/tail_boolean.ts",
+    "mode": "run"
+  },
+  {
+    "id": "recursion/tail_string",
+    "file": "cases/recursion/tail_string.ts",
+    "mode": "run"
+  },
+  {
+    "id": "recursion/object_ownership",
+    "file": "cases/recursion/object_ownership.ts",
+    "mode": "run"
+  },
+  {
+    "id": "recursion/void",
+    "file": "cases/recursion/void.ts",
+    "mode": "run"
+  },
+  {
+    "id": "recursion/parentheses",
+    "file": "cases/recursion/parentheses.ts",
+    "mode": "run"
+  },
+  {
+    "id": "recursion/nested_blocks",
+    "file": "cases/recursion/nested_blocks.ts",
+    "mode": "run"
+  },
+  {
+    "id": "recursion/dependency",
+    "file": "cases/recursion/dependency.ts",
+    "mode": "run"
+  },
+  {
+    "id": "recursion/shadowing",
+    "file": "cases/recursion/shadowing.ts",
+    "mode": "run"
+  },
+  {
+    "id": "recursion/never",
+    "file": "cases/recursion/never.ts",
+    "mode": "run"
+  },
+  {
+    "id": "recursion/error_arithmetic",
+    "file": "cases/recursion/error_arithmetic.ts",
+    "mode": "check"
+  },
+  {
+    "id": "recursion/error_conditional",
+    "file": "cases/recursion/error_conditional.ts",
+    "mode": "check"
+  },
+  {
+    "id": "recursion/error_mutual",
+    "file": "cases/recursion/error_mutual.ts",
+    "mode": "check"
+  },
+  {
+    "id": "recursion/error_wrapped_callee",
+    "file": "cases/recursion/error_wrapped_callee.ts",
+    "mode": "check"
+  },
+  {
+    "id": "recursion/error_nonnull_callee",
+    "file": "cases/recursion/error_nonnull_callee.ts",
+    "mode": "check"
+  },
+  {
+    "id": "recursion/error_argument",
+    "file": "cases/recursion/error_argument.ts",
+    "mode": "check"
   }
 ]

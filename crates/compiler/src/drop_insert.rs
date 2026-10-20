@@ -500,7 +500,7 @@ impl ModuleFacts {
         }
         // A function returning a callee's result that is itself an
         // argument returns its own parameter, so this grows until it
-        // stops; owned-returning functions likewise.
+        // stops.
         let tprof = std::env::var_os("ZYNTAX_TRACE_DROP_TIME").is_some();
         let t = web_time::Instant::now();
         let mut rounds = 0;
@@ -554,9 +554,24 @@ impl ModuleFacts {
                 module.functions.len()
             );
         }
-        // Owned-returning functions, to a fixed point. A function's
-        // answer reads only its callees' facts, so after the first pass
-        // only the callers of whoever changed are asked again.
+        // A recursive constructor transfers storage if every returning
+        // path produces owned storage. Start storage-returning functions
+        // as candidates and prune those whose paths fail that proof;
+        // starting empty cannot establish a recursive transfer. This is
+        // for automatic release; manual release keeps its conservative
+        // single-allocation policy. Recorded facts stay fixed.
+        if automatic_release {
+            for key in &unseeded {
+                if module.functions[key]
+                    .signature
+                    .returns
+                    .iter()
+                    .any(may_be_storage)
+                {
+                    facts.returns_owned.insert(*key);
+                }
+            }
+        }
         let t = web_time::Instant::now();
         let mut rounds = 0;
         let mut dirty: Vec<HirId> = unseeded;
@@ -567,9 +582,12 @@ impl ModuleFacts {
                 let Some(func) = module.functions.get(key) else {
                     continue;
                 };
+                let was = facts.returns_owned.contains(key);
+                if automatic_release && !was {
+                    continue;
+                }
                 let index = indices.entry(*key).or_insert_with(|| FnIndex::of(func));
                 let owned = returns_owned_storage(func, index, &facts);
-                let was = facts.returns_owned.contains(key);
                 if owned != was {
                     if owned {
                         facts.returns_owned.insert(*key);

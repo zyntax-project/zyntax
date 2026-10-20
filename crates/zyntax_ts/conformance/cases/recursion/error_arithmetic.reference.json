@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 7023,
+      "start": 9,
+      "length": 9,
+      "file": "error_arithmetic.ts",
+      "message": "'factorial' implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions."
+    }
+  ],
+  "source_sha256": "bbd7c6d9817b3b29b87e3037b757ce37a584149d61557ba04e0c943f749a59d8",
+  "options": {}
+}

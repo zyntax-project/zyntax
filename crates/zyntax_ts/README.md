@@ -21,9 +21,16 @@ physical field order differs.
 
 Return types are inferred for primitives, strings, fixed-layout objects and void
 functions. Callees can appear later in the source: their signatures are resolved
-from an iterative dependency worklist, and each body is checked and lowered once. An annotated return can
-anchor a recursive call group. Cyclic inference, heterogeneous return unions,
-possibly undefined returns and differing readonly result views remain gaps.
+from an iterative dependency worklist, and each body is checked and lowered once.
+An annotated return can anchor a recursive call group. Direct self-calls used as whole return expressions
+do not contribute an inference candidate: concrete base returns determine the
+result. Without another candidate, fallthrough gives void and a function with
+only recursive returns has type `never`. Native `never` calls carry no result,
+and their returned paths end in `unreachable`. Arithmetic, conditional and mutual return cycles produce strict
+type diagnostics with an annotation hint. Recursive function-value types,
+inference through local aliases, unannotated recursive generics, heterogeneous
+return unions, possibly undefined returns and differing readonly result views
+remain gaps.
 
 Unconstrained generic functions support inferred and explicit type arguments,
 including forward calls, nested generic calls and recursion. Each body is checked
@@ -81,6 +88,7 @@ type that has no native representation is not silently lowered to an integer.
 The frontend enables automatic release and selects `Collector::None`.
 Zyntax's shared `drop_insert` analysis tracks derived aliases, returned
 parameters, fresh owned returns, retention and liveness before inserting frees.
+Recursive constructors and borrowed forwarding calls use the same ownership proof.
 This follows the separation used by Rayzor's `insert_free`: a borrow that
 retains nothing is distinct from a function that returns an alias, and fresh
 storage is distinct from both. Static typing alone is not a lifetime proof.

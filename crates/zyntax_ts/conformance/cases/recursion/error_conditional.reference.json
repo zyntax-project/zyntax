@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 7023,
+      "start": 9,
+      "length": 5,
+      "file": "error_conditional.ts",
+      "message": "'count' implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions."
+    }
+  ],
+  "source_sha256": "0ca5118b4158d65baffd849906289280413b103f92b3d785d9dba2a596d6ac3e",
+  "options": {}
+}
