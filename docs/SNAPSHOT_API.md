@@ -311,9 +311,11 @@ checked on load. A snapshot built against a compiler whose HIR has
 since changed should be rejected on sight, not decoded into something
 that looks plausible.
 
-Given that, a snapshot carries both sections: the typed AST it has
-always had, and lowered HIR beside it. HIR that the running compiler
-accepts is used and the lowering is skipped. HIR it rejects is
-discarded, and the typed AST is lowered as it is today. That is slower
-and correct, and it means a language does not have to rebuild in
-lockstep with a compiler release to keep working.
+`module_lowered` carries typed declarations alongside HIR and strips their
+executable bodies. A mismatch in compiler identity or target pointer size is
+therefore rejected when loading the snapshot, before any typed payload is
+decoded. Runtime installation and module/interface access also validate against
+the current target. Errors identify the module and the incompatible build or
+pointer size. A host can rebuild the snapshot or check its original source;
+body-stripped declarations cannot serve as a source fallback. Raw typed-AST
+snapshots retain their bodies and continue through normal native lowering.

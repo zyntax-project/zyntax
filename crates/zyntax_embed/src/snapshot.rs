@@ -14,7 +14,8 @@
 //! then links against that HIR instead of lowering the module again,
 //! which is most of what compiling a small program costs. The HIR is
 //! only read by the compiler that produced it, for the pointer width
-//! it was produced for; anything else falls back to the parsed module.
+//! it was produced for. An incompatible artifact must be rebuilt or
+//! replaced by checking its original source.
 
 use crate::compiled_artifact::{CompiledArtifactError, CompiledImport};
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,24 @@ pub enum SnapshotError {
 
     #[error("unsupported snapshot schema {found}; expected {expected}")]
     UnsupportedSchema { found: u32, expected: u32 },
+
+    #[error(
+        "module '{module}' has HIR from compiler {found}; this compiler is {expected}; rebuild the snapshot or compile its original source"
+    )]
+    IncompatibleBuild {
+        module: String,
+        found: String,
+        expected: &'static str,
+    },
+
+    #[error(
+        "module '{module}' has HIR for {found}-byte pointers; this target uses {expected}-byte pointers; rebuild the snapshot for this target"
+    )]
+    IncompatiblePointerSize {
+        module: String,
+        found: u8,
+        expected: usize,
+    },
 
     #[error("failed to encode snapshot: {0}")]
     Encode(String),
@@ -202,6 +221,33 @@ impl LoweredEntry {
         self.build_id == zyntax_compiler::BUILD_ID
             && usize::from(self.pointer_size) == zyntax_compiler::target_pointer_size()
     }
+
+    fn validate(&self, module: &str) -> Result<(), SnapshotError> {
+        if self.build_id != zyntax_compiler::BUILD_ID {
+            return Err(SnapshotError::IncompatibleBuild {
+                module: module.to_owned(),
+                found: self.build_id.clone(),
+                expected: zyntax_compiler::BUILD_ID,
+            });
+        }
+        let expected = zyntax_compiler::target_pointer_size();
+        if usize::from(self.pointer_size) != expected {
+            return Err(SnapshotError::IncompatiblePointerSize {
+                module: module.to_owned(),
+                found: self.pointer_size,
+                expected,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl DirectoryEntry {
+    fn validate(&self) -> Result<(), SnapshotError> {
+        self.lowered
+            .as_ref()
+            .map_or(Ok(()), |hir| hir.validate(&self.name))
+    }
 }
 
 /// A language's grammar and standard library, ready to install.
@@ -287,6 +333,10 @@ impl Snapshot {
         let directory: Directory = ciborium::from_reader(directory_bytes)
             .map_err(|e| SnapshotError::Decode(e.to_string()))?;
 
+        for module in &directory.modules {
+            module.validate()?;
+        }
+
         let decoded = directory
             .modules
             .iter()
@@ -370,9 +420,17 @@ impl Snapshot {
         self.modules.iter().map(|m| m.name.as_str())
     }
 
-    /// One module, decoded on first use and kept after. Its HIR comes
-    /// with it when this compiler can use it; otherwise the module
-    /// arrives parsed only and is lowered like any other import.
+    /// Check lowered modules against this compiler and its current target.
+    /// Reads only directory metadata, leaving typed declarations and HIR encoded.
+    pub fn validate_compatibility(&self) -> Result<(), SnapshotError> {
+        for module in &self.modules {
+            module.validate()?;
+        }
+        Ok(())
+    }
+
+    /// One module, decoded on first use and kept after. Incompatible lowered
+    /// artifacts are rejected; their typed declarations have no executable bodies.
     pub fn module(&self, name: &str) -> Result<Option<CompiledImport>, SnapshotError> {
         self.module_selecting(name, None)
     }
@@ -391,6 +449,7 @@ impl Snapshot {
     }
 
     fn interface_at(&self, index: usize) -> Result<CompiledImport, SnapshotError> {
+        self.modules[index].validate()?;
         self.interfaces[index]
             .get_or_init(|| {
                 let entry = &self.modules[index];
@@ -421,10 +480,11 @@ impl Snapshot {
         &self,
         index: usize,
     ) -> Result<Option<Arc<zyntax_compiler::bytecode::LazyModule>>, SnapshotError> {
+        self.modules[index].validate()?;
         self.decoded_hir[index]
             .get_or_init(|| {
                 let entry = &self.modules[index];
-                let Some(lowered) = entry.lowered.as_ref().filter(|l| l.usable_here()) else {
+                let Some(lowered) = entry.lowered.as_ref() else {
                     return Ok(None);
                 };
                 let t0 = web_time::Instant::now();
@@ -457,6 +517,7 @@ impl Snapshot {
         let Some(index) = self.modules.iter().position(|m| m.name == name) else {
             return Ok(None);
         };
+        self.modules[index].validate()?;
         if let Some(named) = named
             && self.modules[index].interface.is_some()
             && let Some(hir) = self.hir_at(index)?
@@ -505,6 +566,7 @@ impl Snapshot {
 
     fn decode_at(&self, index: usize) -> Result<CompiledImport, SnapshotError> {
         let entry = &self.modules[index];
+        entry.validate()?;
         let bytes = entry.artifact.slice(self.blobs(), &entry.name)?;
         let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
         let t0 = web_time::Instant::now();
@@ -553,6 +615,7 @@ impl Snapshot {
         at: usize,
     ) -> Result<Option<(&SignatureIndex, usize, &[u8])>, SnapshotError> {
         let entry = &self.modules[at];
+        entry.validate()?;
         let Some(extent) = entry.signatures else {
             return Ok(None);
         };
@@ -653,6 +716,7 @@ impl Snapshot {
 
     /// Consume the snapshot, moving decoded modules rather than cloning their bodies.
     pub fn into_modules(mut self) -> Result<Vec<CompiledImport>, SnapshotError> {
+        self.validate_compatibility()?;
         let mut modules = Vec::with_capacity(self.modules.len());
         for index in 0..self.modules.len() {
             modules.push(match self.decoded[index].take() {
@@ -1315,26 +1379,101 @@ mod tests {
         assert!(snapshot.module("lib").is_err());
     }
 
-    #[test]
-    fn hir_from_another_compiler_is_left_behind() {
+    fn compatibility_builder() -> SnapshotBuilder {
         let mut arena = zyntax_typed_ast::AstArena::new();
         let hir = HirModule::new(arena.intern_string("lib"));
-        let mut builder = SnapshotBuilder::new("demo")
-            .module_lowered("lib", empty_program(), &hir)
-            .expect("module");
-        // The build id is the compiler's own; a snapshot built by a
-        // different one says so and its HIR is not read.
-        if let Some((_, build_id, _)) = builder.modules[0].lowered.as_mut() {
-            build_id.push('x');
+        let mut program = empty_program();
+        program.declarations.push(zyntax_typed_ast::TypedNode::new(
+            zyntax_typed_ast::TypedDeclaration::Function(zyntax_typed_ast::TypedFunction {
+                name: arena.intern_string("keep"),
+                body: Some(zyntax_typed_ast::TypedBlock {
+                    statements: vec![],
+                    span: Default::default(),
+                }),
+                ..Default::default()
+            }),
+            zyntax_typed_ast::Type::Unknown,
+            Default::default(),
+        ));
+        SnapshotBuilder::new("demo")
+            .module_lowered("lib", program, &hir)
+            .unwrap()
+    }
+
+    #[test]
+    fn incompatible_hir_is_rejected_before_decoding_payloads() {
+        for pointer_mismatch in [false, true] {
+            let mut builder = compatibility_builder();
+            let (_, build, pointer) = builder.modules[0].lowered.as_mut().unwrap();
+            if pointer_mismatch {
+                *pointer = 0;
+            } else {
+                build.push('x');
+            }
+            // The compatibility error takes precedence over malformed typed bodies.
+            builder.modules[0].artifact = vec![0];
+            let bytes = builder.encode().unwrap();
+            let check = |result: Result<Snapshot, SnapshotError>| {
+                let error = result.err().expect("incompatible HIR must be refused");
+                if pointer_mismatch {
+                    assert!(
+                        matches!(&error,SnapshotError::IncompatiblePointerSize {module,found:0,expected} if module=="lib" && *expected==zyntax_compiler::target_pointer_size())
+                    );
+                } else {
+                    assert!(
+                        matches!(&error,SnapshotError::IncompatibleBuild {module,found,expected} if module=="lib" && found.ends_with('x') && *expected==zyntax_compiler::BUILD_ID)
+                    );
+                }
+                assert!(error.to_string().contains("rebuild the snapshot"));
+            };
+            check(Snapshot::load_owned(bytes.clone()));
+            check(Snapshot::load(Box::leak(bytes.into_boxed_slice())));
         }
-        let bytes = builder.encode().expect("encode");
-        let snapshot = Snapshot::load_owned(bytes).expect("load");
+    }
+
+    #[test]
+    fn cached_interfaces_and_bodies_cannot_bypass_compatibility_checks() {
+        let mut snapshot = Snapshot::load_owned(compatibility_builder().encode().unwrap()).unwrap();
+        snapshot.module("lib").unwrap().unwrap();
+        snapshot.module_interface("lib").unwrap().unwrap();
+        snapshot.function_signature("lib", "keep").unwrap().unwrap();
+        snapshot.modules[0]
+            .lowered
+            .as_mut()
+            .unwrap()
+            .build_id
+            .push('x');
+        let named =
+            std::collections::HashSet::from([zyntax_typed_ast::InternedString::new_global("keep")]);
+        assert!(snapshot.validate_compatibility().is_err());
         assert!(!snapshot.carries_hir("lib"));
-        let module = snapshot.module("lib").expect("decodes").expect("present");
-        assert!(
-            module.hir().is_none(),
-            "the parsed module is all that is used"
-        );
+        assert!(snapshot.module("lib").is_err());
+        assert!(snapshot.module_interface("lib").is_err());
+        assert!(snapshot.function_signature("lib", "keep").is_err());
+        assert!(snapshot.module_selecting("lib", Some(&named)).is_err());
+        assert!(snapshot.hir_at(0).is_err());
+        assert!(snapshot.modules().is_err());
+        assert!(snapshot.into_modules().is_err());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn runtimes_reject_incompatible_snapshots_before_installing_a_grammar() {
+        let mut snapshot =
+            Snapshot::load_owned(compatibility_builder().grammar(vec![0]).encode().unwrap())
+                .unwrap();
+        snapshot.modules[0].lowered.as_mut().unwrap().pointer_size = 0;
+        let snapshot = Arc::new(snapshot);
+        let mut classic = crate::ZyntaxRuntime::new().unwrap();
+        let error = classic
+            .install_snapshot(Arc::clone(&snapshot))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("0-byte pointers"), "{error}");
+        let mut tiered = crate::TieredRuntime::new(Default::default()).unwrap();
+        let error = tiered.install_snapshot(snapshot).err().unwrap();
+        assert!(error.to_string().contains("0-byte pointers"), "{error}");
+        tiered.stop();
     }
 
     #[test]

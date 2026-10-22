@@ -112,12 +112,7 @@ impl SnapshotCache {
         if inputs.key != self.key
             || snapshot.language() != self.key.language
             || digest(snapshot.blobs()) != inputs.blobs_hash
-            || snapshot.modules.iter().any(|module| {
-                module
-                    .lowered
-                    .as_ref()
-                    .is_some_and(|lowered| !lowered.usable_here())
-            })
+            || snapshot.validate_compatibility().is_err()
             || !self.validate_sources(&inputs.sources, resolve)
         {
             return None;

@@ -1768,6 +1768,9 @@ impl ZyntaxRuntime {
         &mut self,
         snapshot: Arc<crate::Snapshot>,
     ) -> RuntimeResult<Option<LanguageGrammar>> {
+        snapshot
+            .validate_compatibility()
+            .map_err(|error| RuntimeError::Execution(error.to_string()))?;
         // A language that parses on its own ships no grammar.
         let grammar = match snapshot.grammar_bytes() {
             Some(bytes) => {
