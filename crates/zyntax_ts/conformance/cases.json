@@ -1749,5 +1749,10 @@
     "id": "strings/templates",
     "file": "cases/strings/templates.ts",
     "mode": "run"
+  },
+  {
+    "id": "variables/var_hoisted",
+    "file": "cases/variables/var_hoisted.ts",
+    "mode": "run"
   }
 ]

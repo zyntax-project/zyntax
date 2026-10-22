@@ -40,6 +40,8 @@ pub(super) struct FlowState {
     integers: FxHashMap<InternedString, Integral>,
     bounds: FxHashSet<(ArrayRoot, InternedString)>,
     strings: FxHashSet<InternedString>,
+    /// Bindings declared without a value that every path to here has assigned.
+    assigned: FxHashSet<InternedString>,
 }
 impl Deref for FlowState {
     type Target = FxHashMap<InternedString, ScalarFlow>;
@@ -60,7 +62,21 @@ impl FlowState {
         self.strings.remove(&name);
         self.bounds.retain(|(_, i)| *i != name);
     }
+    pub(super) fn assign(&mut self, name: InternedString) {
+        self.assigned.insert(name);
+    }
+    pub(super) fn is_assigned(&self, name: InternedString) -> bool {
+        self.assigned.contains(&name)
+    }
+    /// Assignments made in a loop body do not hold once the loop may run zero times.
+    pub(super) fn assigned(&self) -> FxHashSet<InternedString> {
+        self.assigned.clone()
+    }
+    pub(super) fn restore_assigned(&mut self, assigned: FxHashSet<InternedString>) {
+        self.assigned = assigned;
+    }
     pub(super) fn merge(&mut self, other: &Self) {
+        self.assigned.retain(|n| other.assigned.contains(n));
         self.scalars.retain(|n, v| other.scalars.get(n) == Some(v));
         self.arrays.retain(|n, v| {
             if let Some(b) = other.arrays.get(n).filter(|b| b.root == v.root) {
