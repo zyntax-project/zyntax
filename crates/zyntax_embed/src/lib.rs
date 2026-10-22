@@ -143,6 +143,8 @@ pub use snapshot::{
     SnapshotError, SnapshotSource, lower_for_snapshot, lower_for_snapshot_releasing,
     snapshot_file_name,
 };
+
+pub use zyntax_compiler::track_snapshot_build_inputs;
 // Re-export the BC interpreter so embedders that want a bare
 // HirInterpreter without the beadie wrapper can grab it directly.
 pub use convert::{FromZyntax, IntoZyntax, TryFromZyntax, TryIntoZyntax};

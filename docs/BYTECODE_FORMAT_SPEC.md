@@ -1,15 +1,15 @@
 # Zyntax Bytecode Format Specification
 
-**Version**: 8.0
+**Version**: 10.0
 **Status**: Stable
-**Last Updated**: 2026-09-30
+**Last Updated**: 2026-10-20
 
 ---
 
 ## Overview
 
 A Zyntax bytecode file (`.zbc`) holds one HIR module (`HirModule`): a fixed
-44-byte header followed by a payload. The header is a hand-written
+76-byte header followed by a payload. The header is a hand-written
 little-endian record. The payload is the serde encoding of the HIR data model
 in one of four encodings, chosen by the header's format byte.
 
@@ -27,7 +27,7 @@ on values.
 | CLI loader | `crates/zyntax_cli/src/formats/hir_bytecode.rs` |
 
 The payload layout is defined by the codec applied to the declarations in
-those files. Section 5 transcribes them for format 8.0; where the two
+those files. Section 5 transcribes them for format 10.0; where the two
 disagree, the source is authoritative.
 
 ### Where the format is used
@@ -44,8 +44,8 @@ disagree, the source is authoritative.
 ## 1. File Layout
 
 ```
-offset 0    header   44 bytes
-offset 44   payload  every remaining byte of the file
+offset 0    header   76 bytes
+offset 76   payload  every remaining byte of the file
 ```
 
 The payload always runs to the end of the file. Nothing may follow it: the
@@ -60,7 +60,7 @@ All multi-byte fields are little-endian.
 | Offset | Size | Field | Written as | Checked on read |
 |--------|------|-------|------------|-----------------|
 | 0x00 | 4 | `magic` | u32 `0x5A424300`, bytes `00 43 42 5A` | must match |
-| 0x04 | 2 | `major_version` | u16 `8` | must equal 8 |
+| 0x04 | 2 | `major_version` | u16 `10` | must equal 10 |
 | 0x06 | 2 | `minor_version` | u16 `0` | not checked |
 | 0x08 | 1 | `format` | u8 payload encoding, section 3 | must be 0 to 3 |
 | 0x09 | 3 | padding | zero | not checked |
@@ -68,6 +68,7 @@ All multi-byte fields are little-endian.
 | 0x10 | 16 | `module_id` | the module's `HirId` as u32, then 12 zero bytes | not checked |
 | 0x20 | 8 | `payload_size` | u64 payload length in bytes | not checked |
 | 0x28 | 4 | `checksum` | u32 CRC-32 of the payload | must match, except on a trusted read |
+| 0x2C | 32 | `build_id` | compiler fingerprint as raw SHA-256 bytes | must match this compiler |
 
 **Magic.** The constant is `0x5A424300` written little-endian, so a file
 starts with the bytes `00 43 42 5A`. Writing the ASCII bytes `Z B C \0` gives
@@ -79,35 +80,43 @@ a different u32 and the file is refused.
 numbered it, before relocation (section 5.1). Only `bytecode_stats` reports
 it; decoding takes the module id from the payload.
 
-**Payload size.** Informational. Readers take the payload as bytes 44 to the
+**Payload size.** Informational. Readers take the payload as bytes 76 to the
 end of the file whatever this field says.
 
 **Checksum.** CRC-32 as computed by `crc32fast` and zlib (reflected
 polynomial `0xEDB88320`, initial value `0xFFFFFFFF`, final XOR `0xFFFFFFFF`)
-over bytes 44 to the end of the file. The header is not covered.
+over bytes 76 to the end of the file. The header is not covered.
 
 ### 2.1 What a reader checks
 
 `deserialize_module` checks, in order:
 
-1. The file is at least 44 bytes, else `InvalidFormat`.
+1. At least the eight-byte magic/version prefix is present, else `InvalidFormat`.
 2. `magic` matches, else `InvalidFormat`.
-3. `major_version` is 8, else `VersionMismatch`. The minor version is not
-   compared.
-4. The CRC-32 of bytes 44 to the end matches `checksum`, else
+3. `major_version` is 10, else `VersionMismatch`. The minor version is not
+   compared. Older headers are refused before reading new fields.
+4. The complete 76-byte header is present, else `InvalidFormat`.
+5. `build_id` matches the running compiler, else `CompilerMismatch`.
+6. The CRC-32 of bytes 76 to the end matches `checksum`, else
    `ChecksumMismatch`.
-5. `format` is 0 to 3, else `InvalidFormat`.
-6. The payload decodes with that encoding, else `DeserializationError`. A
-   Split image that fails its structural checks (section 6) gives
-   `InvalidFormat`.
+7. `format` is 0 to 3, else `InvalidFormat`.
+8. The payload decodes with that encoding, else `DeserializationError`.
 
-The other entry points differ only as follows:
+**Compiler identity.** The build computes SHA-256 over ordered, length-prefixed
+relative paths and contents of compiler, shared typed-AST, artifact-codec,
+lowering-pass and ZRTL sources, their manifests, build scripts and the workspace
+manifest/lockfile.
+A change to serialized types or codec dependencies changes this identity without
+relying on a manual major-version bump. Absolute checkout paths, build profile
+and host/target feature selection do not enter the identity: build-time
+cross-lowering and target readers must agree. Snapshots additionally check the
+target pointer size. Missing fingerprint inputs fail the build.
 
 | Entry point | Difference |
 |-------------|------------|
 | `deserialize_module_lazy` | A Split image stays encoded and decodes one function at a time; any other format decodes whole. |
-| `deserialize_module_lazy_trusted` | Skips step 4 for a Split image. For images the running build embedded in its own executable. |
-| `bytecode_stats` | Steps 1, 2, 3 and 5; no checksum, no payload decode. |
+| `deserialize_module_lazy_trusted` | Skips the checksum for a Split image, while still checking version and compiler identity. For images the running build embedded in its own executable. |
+| `bytecode_stats` | Checks the header, compiler identity and format; no checksum or payload decode. |
 
 The reader does not check that the decoded HIR is well formed (section 5.4).
 
@@ -188,27 +197,31 @@ as in Postcard.
 
 ### 4.1 A complete file
 
-An empty module with id 1 named `m`, in the Postcard encoding (58 bytes):
+An empty module with id 1 named `m`, in the Postcard encoding (91 bytes).
+`B` is the current compiler's 32-byte fingerprint, supplied by
+`zyntax_compiler::BUILD_ID_BYTES`:
 
 ```
-0000  00 43 42 5a 07 00 00 00 00 00 00 00 00 00 00 00
+0000  00 43 42 5a 0a 00 00 00 00 00 00 00 00 00 00 00
 0010  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-0020  0e 00 00 00 00 00 00 00 d2 2c df 27 01 01 6d 00
-0030  00 00 00 00 00 00 00 00 00 00
+0020  0f 00 00 00 00 00 00 00 59 83 f8 ba
+002c  B (32 bytes)
+004c  01 01 6d 00 00 00 00 00 00 00 00 00 00 00 00
 ```
 
 | Bytes | Meaning |
 |-------|---------|
 | `00 43 42 5a` | magic |
-| `08 00` `00 00` | version 8.0 |
+| `0a 00` `00 00` | version 10.0 |
 | `00` `00 00 00` | format 0 (Postcard), padding |
 | `00 00 00 00` | flags |
 | `01 00 00 00` + 12 zero bytes | module_id: module id 1 |
-| `0e 00 00 00 00 00 00 00` | payload_size 14 |
-| `d2 2c df 27` | checksum `0x27DF2CD2` |
+| `0f 00 00 00 00 00 00 00` | payload_size 15 |
+| `59 83 f8 ba` | checksum `0xBAF88359` |
+| `B` | compiler fingerprint |
 | `01` | `HirModule.id` = 1 |
 | `01 6d` | `name` = `"m"` |
-| `00` x 11 | `functions`, `globals`, `types`, `imports`, `exports` empty; `version` 0; `dependencies`, `effects`, `handlers` empty; `automatic_release` false; `exact_struct_types` empty |
+| `00` x 12 | `functions`, `globals`, `types`, `imports`, `exports` empty; `version` 0; `dependencies`, `effects`, `handlers` empty; `automatic_release` false; `exact_struct_types` and `initializers` empty |
 
 ### 4.2 Instructions and terminators
 
@@ -229,7 +242,7 @@ An empty module with id 1 named `m`, in the Postcard encoding (58 bytes):
 
 ## 5. Payload Data Model
 
-This is the format 8.0 schema. Types are written in Rust notation; every
+This is the format 10.0 schema. Types are written in Rust notation; every
 struct field is present, in the order shown. A `Box<T>` or `Arc<T>` in the
 source is shown as `T`, which encodes identically.
 
@@ -273,6 +286,7 @@ HirModule {
     types: IndexMap<TypeId, HirType>,
     imports: Vec<HirImport>,
     exports: Vec<HirExport>,
+    initializers: Vec<HirId>,             // ordered module startup roots
     version: u64,                         // hot-reload generation
     dependencies: HashSet<HirId>,
     effects: IndexMap<HirId, HirEffect>,
@@ -666,7 +680,7 @@ it has no body), keyed by the entry's id.
 2. Encode it with the chosen codec (section 3). For Split, lay out the blob
    and directory as in section 6.1.
 3. Compute the CRC-32 of the encoded payload.
-4. Write the 44-byte header (section 2) with version 8.0, the format byte,
+4. Write the 76-byte header (section 2) with version 10.0, the format byte,
    flags 0, the module id, the payload length and the checksum; then the
    payload; then nothing else.
 
@@ -681,9 +695,11 @@ The Rust entry points are `serialize_module(&module, Format)`,
 ## 8. Versioning
 
 A reader accepts a file only when its major version equals the reader's own,
-4. The minor version is written as 0 and not compared. A file of any other
-major version is refused with `VersionMismatch`; there is no reading of older
-or newer majors. The HIR caches in this repository treat any read error,
+10, and its compiler fingerprint matches. The minor version is written as 0
+and not compared. A file of any other
+major version is refused with `VersionMismatch`; a compiler mismatch produces
+`CompilerMismatch`. There is no reading of older or newer majors. The HIR
+caches in this repository treat any read error,
 `VersionMismatch` included, as a miss and recompile.
 
 The major version moves with any change to the payload layout: the header,
@@ -709,3 +725,5 @@ recorded by a different build or for a different width.
 | 6.0 | 2026-10-10 | A split shell records what its body refers to (`FunctionAttributes.shell_refs`: functions whose address it takes, names it calls by, globals it reads), and `ReleaseFacts.boxes_string` records a wrapper of the copying string box. |
 | 7.0 | 2026-10-10 | Split function-directory entries record each body's instruction count (`FnEntry.insts`), so a reader can judge a body by its size without decoding it, and `FunctionAttributes.keeps_error_flag` records a body found to leave the error flag as it found it. |
 | 8.0 | 2026-10-10 | `HirValue` no longer carries a set of its uses; a reader that needs def-use information derives it from the operands. |
+| 9.0 | 2026-10-20 | `HirModule.initializers` records ordered startup roots. |
+| 10.0 | 2026-10-20 | Header grows to 76 bytes with the shared compiler/source fingerprint, checked before any payload decoding. |

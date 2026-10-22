@@ -1,42 +1,30 @@
-//! Records which compiler this is, so an artifact of lowered HIR can say
-//! which compiler produced it and be refused by any other.
+//! Fingerprints the compiler, serialized types and lowering dependencies.
+
+mod build_fingerprint;
 
 use std::path::Path;
 
-fn main() {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
-    let src = Path::new(&manifest).join("src");
-    println!("cargo:rerun-if-changed={}", src.display());
-
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut feed = |bytes: &[u8]| {
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100_0000_01b3);
-        }
-    };
-    let mut files = Vec::new();
-    collect(&src, &mut files);
-    files.sort();
-    for file in files {
-        feed(file.to_string_lossy().as_bytes());
-        if let Ok(bytes) = std::fs::read(&file) {
-            feed(&bytes);
-        }
+fn main() -> std::io::Result<()> {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
+    let root = Path::new(&manifest).join("../..");
+    let mut watched = String::new();
+    for input in build_fingerprint::watched_inputs(&root) {
+        let path = input.to_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "build inputs must have UTF-8 paths",
+            )
+        })?;
+        println!("cargo:rerun-if-changed={path}");
+        watched.push_str(path);
+        watched.push('\n');
     }
-    println!("cargo:rustc-env=ZYNTAX_COMPILER_BUILD_ID={hash:016x}");
-}
-
-fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
+    // Build-time cross-lowering and the target runtime share this source identity.
+    // Target pointer size is checked separately by snapshots.
+    let id = build_fingerprint::fingerprint(&root)?;
+    let hex: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
+    println!("cargo:rustc-env=ZYNTAX_COMPILER_BUILD_ID={hex}");
+    let output = std::env::var_os("OUT_DIR").unwrap();
+    std::fs::write(Path::new(&output).join("build_id.bin"), id)?;
+    std::fs::write(Path::new(&output).join("build_inputs.txt"), watched)
 }

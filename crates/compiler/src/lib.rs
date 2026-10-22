@@ -2765,10 +2765,21 @@ pub fn compile_to_jit(
     Ok(backend)
 }
 
-/// Which compiler this is, as a digest of its sources. Lowered HIR
+/// Which compiler this is, as a digest of its sources and shared dependencies. Lowered HIR
 /// carried between processes records the id that produced it, and is
 /// only read back by the same one.
 pub const BUILD_ID: &str = env!("ZYNTAX_COMPILER_BUILD_ID");
+
+/// The same compiler fingerprint in the bytecode header's binary representation.
+pub const BUILD_ID_BYTES: [u8; 32] = *include_bytes!(concat!(env!("OUT_DIR"), "/build_id.bin"));
+
+/// Track the compiler inputs used by a build script that produces lowered snapshots.
+/// Call before building artifacts so shared type or lowering changes regenerate them.
+pub fn track_snapshot_build_inputs() {
+    for path in include_str!(concat!(env!("OUT_DIR"), "/build_inputs.txt")).lines() {
+        println!("cargo:rerun-if-changed={path}");
+    }
+}
 
 /// The pointer size of the code being produced, in bytes. The JIT
 /// targets the host; a cross-compiling backend sets it for its target

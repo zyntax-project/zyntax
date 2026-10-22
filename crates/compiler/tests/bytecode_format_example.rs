@@ -6,12 +6,22 @@ use zyntax_compiler::hir::{BinaryOp, HirId, HirInstruction, HirModule, HirTermin
 use zyntax_typed_ast::InternedString;
 
 /// Section 4.1: an empty module with id 1 named `m`, Postcard payload.
-const EMPTY_MODULE_FILE: [u8; 58] = [
-    0x00, 0x43, 0x42, 0x5a, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+const EXAMPLE_HEADER_PREFIX: [u8; 44] = [
+    0x00, 0x43, 0x42, 0x5a, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd2, 0x2c, 0xdf, 0x27, 0x01, 0x01, 0x6d, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x59, 0x83, 0xf8, 0xba,
 ];
+
+const EXAMPLE_PAYLOAD: [u8; 15] = [1, 1, 0x6d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+fn empty_module_file() -> Vec<u8> {
+    [
+        EXAMPLE_HEADER_PREFIX.as_slice(),
+        &zyntax_compiler::BUILD_ID_BYTES,
+        &EXAMPLE_PAYLOAD,
+    ]
+    .concat()
+}
 
 fn empty_module() -> HirModule {
     let mut module = HirModule::new(InternedString::new_global("m"));
@@ -22,12 +32,12 @@ fn empty_module() -> HirModule {
 #[test]
 fn the_empty_module_example_is_what_the_serializer_writes() {
     let bytes = serialize_module(&empty_module(), Format::Postcard).expect("serializes");
-    assert_eq!(bytes, EMPTY_MODULE_FILE);
+    assert_eq!(bytes, empty_module_file());
 }
 
 #[test]
 fn the_empty_module_example_reads_back() {
-    let module = deserialize_module(&EMPTY_MODULE_FILE).expect("deserializes");
+    let module = deserialize_module(&empty_module_file()).expect("deserializes");
     assert_eq!(module.name.resolve_global().as_deref(), Some("m"));
     // The id is relocated on read, so only its presence is fixed.
     assert_ne!(module.id.as_u32(), 0);
@@ -41,6 +51,7 @@ fn the_empty_module_example_reads_back() {
     assert!(module.effects.is_empty());
     assert!(module.handlers.is_empty());
     assert!(!module.automatic_release);
+    assert!(module.initializers.is_empty());
 }
 
 /// Section 4.2. Postcard is the codec `serialize_module` applies to the

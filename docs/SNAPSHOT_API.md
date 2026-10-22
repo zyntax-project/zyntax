@@ -246,6 +246,18 @@ allow persistence without cloning typed function bodies. A frontend caching
 typed AST still performs native lowering and optimization at startup; skipping
 those stages requires a compatible lowered HIR section.
 
+Compiled import schema 7 records the shared compiler fingerprint before its
+typed payload. Bytecode version 10 records the same identity before its HIR
+payload. Readers check these identities before deserialization, including lazy
+and embedded reads. Changes to shared serialized types and lowering dependencies
+therefore invalidate artifacts even without a manual schema-version edit.
+Rebuild artifacts from older versions.
+
+Build scripts generating lowered snapshots call
+`zyntax_compiler::track_snapshot_build_inputs()` to watch the same source roots
+and manifests that determine the fingerprint. This keeps incremental snapshot
+generation synchronized with the compiler that will read it.
+
 ## Lowered HIR, symbol and sourcemap aware
 
 A snapshot carries lowered HIR, not only the typed AST. A compile today

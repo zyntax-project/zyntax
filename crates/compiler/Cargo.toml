@@ -100,9 +100,13 @@ wasm-encoder = { version = "0.213", optional = true }
 wasmparser = { version = "0.213", optional = true }
 
 [dev-dependencies]
+sha2 = "0.10"
 env_logger = "0.11"
 criterion = "0.5"
 wasmprinter = "0.213"
+
+[build-dependencies]
+sha2 = "0.10"
 
 [[bench]]
 name = "simd_vectorization"

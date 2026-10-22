@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use zyntax_typed_ast::{InternedString, TypedProgram};
 
 const MAGIC: &[u8; 4] = b"ZAST";
-const SCHEMA_VERSION: u32 = 6;
-const HEADER_LEN: usize = MAGIC.len() + std::mem::size_of::<u32>();
+const SCHEMA_VERSION: u32 = 7;
+const VERSION_END: usize = MAGIC.len() + std::mem::size_of::<u32>();
+const HEADER_LEN: usize = VERSION_END + zyntax_compiler::BUILD_ID_BYTES.len();
 
 /// A parsed import packaged by the application at build time.
 ///
@@ -46,6 +47,14 @@ pub enum CompiledArtifactError {
 
     #[error("unsupported compiled import schema {found}; expected {expected}")]
     UnsupportedSchema { found: u32, expected: u32 },
+
+    #[error(
+        "compiled import was produced by compiler {actual}; expected {expected}; rebuild the artifact from its original source"
+    )]
+    IncompatibleCompiler {
+        expected: &'static str,
+        actual: String,
+    },
 
     #[error("failed to encode compiled import: {0}")]
     Encode(String),
@@ -157,17 +166,18 @@ impl CompiledImport {
         let mut bytes = Vec::with_capacity(HEADER_LEN + encoded.len());
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&zyntax_compiler::BUILD_ID_BYTES);
         bytes.extend_from_slice(&encoded);
         Ok(bytes)
     }
 
     /// Decode a build-time artifact without invoking a source parser.
     pub fn decode(bytes: &[u8]) -> Result<Self, CompiledArtifactError> {
-        if bytes.len() < HEADER_LEN || &bytes[..MAGIC.len()] != MAGIC {
+        if bytes.len() < VERSION_END || &bytes[..MAGIC.len()] != MAGIC {
             return Err(CompiledArtifactError::InvalidHeader);
         }
         let found = u32::from_le_bytes(
-            bytes[MAGIC.len()..HEADER_LEN]
+            bytes[MAGIC.len()..VERSION_END]
                 .try_into()
                 .expect("compiled artifact header length is fixed"),
         );
@@ -175,6 +185,15 @@ impl CompiledImport {
             return Err(CompiledArtifactError::UnsupportedSchema {
                 found,
                 expected: SCHEMA_VERSION,
+            });
+        }
+        let build_id = bytes
+            .get(VERSION_END..HEADER_LEN)
+            .ok_or(CompiledArtifactError::InvalidHeader)?;
+        if build_id != zyntax_compiler::BUILD_ID_BYTES {
+            return Err(CompiledArtifactError::IncompatibleCompiler {
+                expected: zyntax_compiler::BUILD_ID,
+                actual: build_id.iter().map(|byte| format!("{byte:02x}")).collect(),
             });
         }
         let payload: CompiledImportPayload = postcard::from_bytes(&bytes[HEADER_LEN..])
@@ -225,7 +244,7 @@ mod tests {
     fn rejects_unknown_schema() {
         let artifact = CompiledImport::new("test", "prelude", TypedProgram::default());
         let mut bytes = artifact.encode().unwrap();
-        bytes[MAGIC.len()..HEADER_LEN].copy_from_slice(&(SCHEMA_VERSION + 1).to_le_bytes());
+        bytes[MAGIC.len()..VERSION_END].copy_from_slice(&(SCHEMA_VERSION + 1).to_le_bytes());
         assert!(matches!(
             CompiledImport::decode(&bytes),
             Err(CompiledArtifactError::UnsupportedSchema { .. })
@@ -245,5 +264,23 @@ mod tests {
             &artifact.encode().unwrap()[HEADER_LEN..],
             postcard::to_allocvec(&payload).unwrap(),
         );
+    }
+
+    #[test]
+    fn compiler_identity_is_checked_before_typed_payloads() {
+        let artifact = CompiledImport::new("test", "library", TypedProgram::default());
+        let mut bytes = artifact.encode().unwrap();
+        bytes[VERSION_END] ^= 1;
+        bytes.truncate(HEADER_LEN);
+        assert!(matches!(
+            CompiledImport::decode(&bytes),
+            Err(CompiledArtifactError::IncompatibleCompiler { .. })
+        ));
+        bytes.truncate(VERSION_END);
+        bytes[MAGIC.len()..VERSION_END].copy_from_slice(&6u32.to_le_bytes());
+        assert!(matches!(
+            CompiledImport::decode(&bytes),
+            Err(CompiledArtifactError::UnsupportedSchema { found: 6, .. })
+        ));
     }
 }

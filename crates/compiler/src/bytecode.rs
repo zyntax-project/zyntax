@@ -44,6 +44,11 @@ pub enum BytecodeError {
     #[error("Version mismatch: expected {expected}, got {actual}")]
     VersionMismatch { expected: String, actual: String },
 
+    #[error(
+        "bytecode was produced by compiler {actual}; expected {expected}; recompile the original source"
+    )]
+    CompilerMismatch { expected: String, actual: String },
+
     #[error("Checksum mismatch")]
     ChecksumMismatch,
 }
@@ -659,14 +664,19 @@ pub struct BytecodeHeader {
     pub payload_size: u64,
     /// CRC32 checksum of payload
     pub checksum: u32,
+    /// Source identity of the compiler and serialized type dependencies.
+    pub build_id: [u8; 32],
 }
+
+/// Fixed wire-header size, including the compiler fingerprint.
+pub const HEADER_SIZE: usize = 76;
 
 impl BytecodeHeader {
     const MAGIC: u32 = 0x5A424300; // on disk, little-endian: 00 43 42 5A ("\0CBZ")
     // Moves with any change to a payload's layout, so a payload in an
     // older layout is refused with VersionMismatch and a cache loader
     // recompiles rather than misreading it.
-    const CURRENT_MAJOR: u16 = 9;
+    const CURRENT_MAJOR: u16 = 10;
     const CURRENT_MINOR: u16 = 0;
 
     /// Create a new header for the given module and format
@@ -685,6 +695,7 @@ impl BytecodeHeader {
             module_id: uuid::Uuid::from_bytes(id_bytes),
             payload_size: 0, // Will be filled in during serialization
             checksum: 0,     // Will be calculated during serialization
+            build_id: crate::BUILD_ID_BYTES,
         }
     }
 
@@ -694,10 +705,25 @@ impl BytecodeHeader {
             return Err(BytecodeError::InvalidFormat);
         }
 
-        if self.major_version != Self::CURRENT_MAJOR {
+        Self::validate_version(self.major_version, self.minor_version)?;
+        if self.build_id != crate::BUILD_ID_BYTES {
+            return Err(BytecodeError::CompilerMismatch {
+                expected: crate::BUILD_ID.to_owned(),
+                actual: self
+                    .build_id
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_version(major: u16, minor: u16) -> Result<()> {
+        if major != Self::CURRENT_MAJOR {
             return Err(BytecodeError::VersionMismatch {
                 expected: format!("{}.x", Self::CURRENT_MAJOR),
-                actual: format!("{}.{}", self.major_version, self.minor_version),
+                actual: format!("{major}.{minor}"),
             });
         }
 
@@ -729,9 +755,8 @@ impl Format {
 // (The old AsUuid helper trait is gone; HirId is now u32 and we encode
 // it directly into the fixed-width header slot in `BytecodeHeader::new`.)
 
-/// Serialize header to raw 44-byte format (matches deserialize_raw_header)
+/// Serialize the fixed wire header (matches deserialize_raw_header).
 fn serialize_raw_header(header: &BytecodeHeader) -> Vec<u8> {
-    const HEADER_SIZE: usize = 44;
     let mut bytes = Vec::with_capacity(HEADER_SIZE);
 
     // magic (u32 little-endian)
@@ -752,6 +777,7 @@ fn serialize_raw_header(header: &BytecodeHeader) -> Vec<u8> {
     bytes.extend_from_slice(&header.payload_size.to_le_bytes());
     // checksum (u32 little-endian)
     bytes.extend_from_slice(&header.checksum.to_le_bytes());
+    bytes.extend_from_slice(&header.build_id);
 
     debug_assert_eq!(bytes.len(), HEADER_SIZE);
     bytes
@@ -798,10 +824,6 @@ fn checked_payload(bytes: &[u8]) -> Result<(BytecodeHeader, &[u8])> {
 /// The header and the payload it covers, once the header has been
 /// validated; the payload is not checked against its checksum.
 fn header_and_payload(bytes: &[u8]) -> Result<(BytecodeHeader, &[u8])> {
-    const HEADER_SIZE: usize = 44;
-    if bytes.len() < HEADER_SIZE {
-        return Err(BytecodeError::InvalidFormat);
-    }
     let (header, header_size) = deserialize_raw_header(bytes)?;
     header.validate()?;
     Ok((header, &bytes[header_size..]))
@@ -828,10 +850,9 @@ pub fn serialize_module_to_file(
     serialize_module_to_writer(module, format, &mut file)
 }
 
-/// Deserialize raw header (44 bytes fixed format, no bincode)
+/// Deserialize the fixed wire header, rejecting old layouts before reading further.
 fn deserialize_raw_header(bytes: &[u8]) -> Result<(BytecodeHeader, usize)> {
-    const HEADER_SIZE: usize = 44;
-    if bytes.len() < HEADER_SIZE {
+    if bytes.len() < 8 {
         return Err(BytecodeError::InvalidFormat);
     }
 
@@ -856,6 +877,10 @@ fn deserialize_raw_header(bytes: &[u8]) -> Result<(BytecodeHeader, usize)> {
     // Read minor_version (u16 little-endian)
     cursor.read_exact(&mut buf2)?;
     let minor_version = u16::from_le_bytes(buf2);
+    BytecodeHeader::validate_version(major_version, minor_version)?;
+    if bytes.len() < HEADER_SIZE {
+        return Err(BytecodeError::InvalidFormat);
+    }
 
     // Read format (u8)
     let mut buf1 = [0u8; 1];
@@ -883,6 +908,8 @@ fn deserialize_raw_header(bytes: &[u8]) -> Result<(BytecodeHeader, usize)> {
     // Read checksum (u32 little-endian)
     cursor.read_exact(&mut buf4)?;
     let checksum = u32::from_le_bytes(buf4);
+    let mut build_id = [0; 32];
+    cursor.read_exact(&mut build_id)?;
 
     let header = BytecodeHeader {
         magic,
@@ -893,6 +920,7 @@ fn deserialize_raw_header(bytes: &[u8]) -> Result<(BytecodeHeader, usize)> {
         module_id,
         payload_size,
         checksum,
+        build_id,
     };
 
     Ok((header, HEADER_SIZE))
@@ -977,11 +1005,6 @@ pub fn deserialize_module_from_file(path: &std::path::Path) -> Result<HirModule>
 
 /// Get bytecode statistics
 pub fn bytecode_stats(bytes: &[u8]) -> Result<BytecodeStats> {
-    const HEADER_SIZE: usize = 44;
-    if bytes.len() < HEADER_SIZE {
-        return Err(BytecodeError::InvalidFormat);
-    }
-
     // Use raw header format (matches serialize_raw_header)
     let (header, header_size) = deserialize_raw_header(bytes)?;
 
@@ -1419,6 +1442,53 @@ mod tests {
         ));
         assert!(matches!(
             deserialize_module(&bytes),
+            Err(BytecodeError::VersionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn compiler_identity_is_checked_before_every_payload_decoder() {
+        for format in [
+            Format::Postcard,
+            Format::Bincode,
+            Format::Json,
+            Format::Split,
+        ] {
+            let mut bytes = serialize_module(&split_test_module(), format).unwrap();
+            bytes[HEADER_SIZE - 1] ^= 1;
+            // A malformed payload must not mask an incompatible compiler identity.
+            *bytes.last_mut().unwrap() ^= 1;
+            assert!(matches!(
+                deserialize_module(&bytes),
+                Err(BytecodeError::CompilerMismatch { .. })
+            ));
+            assert!(matches!(
+                deserialize_module_lazy(bytes.clone()),
+                Err(BytecodeError::CompilerMismatch { .. })
+            ));
+            assert!(matches!(
+                bytecode_stats(&bytes),
+                Err(BytecodeError::CompilerMismatch { .. })
+            ));
+            let bytes = Box::leak(bytes.into_boxed_slice());
+            assert!(matches!(
+                deserialize_module_lazy_trusted(bytes),
+                Err(BytecodeError::CompilerMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn older_short_headers_report_the_version_before_reading_new_fields() {
+        let mut bytes = vec![0; 44];
+        bytes[..4].copy_from_slice(&BytecodeHeader::MAGIC.to_le_bytes());
+        bytes[4..6].copy_from_slice(&9u16.to_le_bytes());
+        assert!(matches!(
+            deserialize_module(&bytes),
+            Err(BytecodeError::VersionMismatch { .. })
+        ));
+        assert!(matches!(
+            deserialize_module_lazy(bytes),
             Err(BytecodeError::VersionMismatch { .. })
         ));
     }
