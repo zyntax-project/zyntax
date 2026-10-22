@@ -1257,10 +1257,22 @@ fn constant_as_u64(k: &crate::hir::HirConstant) -> Option<u64> {
 impl TieredBackend {
     /// Build the tiered backend.
     pub fn new(config: TieredConfig) -> CompilerResult<Self> {
+        let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
+        let mut phase = web_time::Instant::now();
+        let mut lap = |name: &str| {
+            if trace {
+                eprintln!(
+                    "[TIERED] {name:<10} {:8.2} ms",
+                    phase.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            phase = web_time::Instant::now();
+        };
         // Wire OSR runtime symbols so JIT'd back-edge code resolves them.
         let osr_syms = osr::osr_runtime_symbols();
         let cranelift_inner = CraneliftBackend::with_runtime_symbols(&osr_syms)?;
         let cranelift = Arc::new(ZyntaxCraneliftBackend::new(cranelift_inner));
+        lap("cranelift");
 
         #[cfg(feature = "llvm-backend")]
         let (_llvm_context, llvm) = if matches!(config.tier2_backend, Tier2Backend::LLVM) {
@@ -1275,6 +1287,7 @@ impl TieredBackend {
         } else {
             (None, None)
         };
+        lap("llvm");
 
         // Every call between compiled functions goes through the callee's
         // cell, so a function compiled again at a higher tier, or on its
@@ -1297,6 +1310,7 @@ impl TieredBackend {
         }
 
         let adapter = Arc::new(TieredAdapter::new(make_policies(&config)));
+        lap("brokers");
 
         Ok(Self {
             adapter,

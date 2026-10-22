@@ -5,6 +5,12 @@ use std::process::ExitCode;
 use zyntax_embed::{TieredConfig, TieredRuntime};
 use zyntax_ts::{ErrorKind, Options, ProjectError, Soundness};
 
+#[cfg(feature = "allocation-audit")]
+use zyntax_compiler::allocation_audit::{self, Phase};
+#[cfg(feature = "allocation-audit")]
+#[global_allocator]
+static ALLOCATOR: allocation_audit::CountingAllocator = allocation_audit::CountingAllocator;
+
 fn main() -> ExitCode {
     std::thread::Builder::new()
         .stack_size(64 << 20)
@@ -66,6 +72,20 @@ fn run() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    // `ZYNTAX_TRACE_LOWER_PHASES=1` times frontend and runtime phases on stderr.
+    let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
+    let mut phase = std::time::Instant::now();
+    let mut lap = |name: &str| {
+        if trace {
+            eprintln!(
+                "[ZYNODE] {name:<10} {:8.2} ms",
+                phase.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        phase = std::time::Instant::now();
+    };
+    #[cfg(feature = "allocation-audit")]
+    allocation_audit::set_phase(Phase::Runtime);
     let mut runtime = if command == "run" {
         match TieredRuntime::new(config) {
             Ok(mut runtime) => {
@@ -80,6 +100,9 @@ fn run() -> ExitCode {
     } else {
         None
     };
+    lap("runtime");
+    #[cfg(feature = "allocation-audit")]
+    allocation_audit::set_phase(Phase::Parse);
     let using_cache = cache_dir.is_some();
     let mut preparation = None;
     let loaded = match cache_dir {
@@ -135,21 +158,30 @@ fn run() -> ExitCode {
             });
         }
     };
+    lap("project");
     if command == "check" {
+        #[cfg(feature = "allocation-audit")]
+        allocation_audit::report();
         return ExitCode::SUCCESS;
     }
     let mut runtime = runtime.expect("run command has a runtime");
+    #[cfg(feature = "allocation-audit")]
+    allocation_audit::set_phase(Phase::Register);
     let registered = if using_cache {
         Ok(())
     } else {
         zyntax_ts::register_runtime(&mut runtime)
     };
+    lap("register");
+    #[cfg(feature = "allocation-audit")]
+    allocation_audit::set_phase(Phase::Lower);
     let result = registered.and_then(|()| {
         let (program, resolver) = project.into_parts();
         runtime.add_compiled_import_resolver(resolver);
         runtime.enter_only_through_entry_points();
         runtime.compile_typed_program(program)
     });
+    lap("compile+run");
     let code = match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
@@ -162,6 +194,9 @@ fn run() -> ExitCode {
     // Compiling workers can still hold code; process exit owns their storage.
     std::mem::forget(runtime);
     let _ = std::io::stdout().flush();
+    lap("shutdown");
+    #[cfg(feature = "allocation-audit")]
+    allocation_audit::report();
     code
 }
 

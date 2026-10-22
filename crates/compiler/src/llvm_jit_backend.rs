@@ -125,9 +125,9 @@ pub struct LLVMJitBackend<'ctx> {
     /// Optimization level.
     opt_level: OptimizationLevel,
 
-    /// The host-tuned target machine the middle end runs under, made
-    /// once: it caches the subtarget every module's passes consult.
-    target_machine: TargetMachine,
+    /// The host-tuned target machine, created by the first LLVM compile and
+    /// reused for subsequent modules and resume points.
+    target_machine: once_cell::unsync::OnceCell<TargetMachine>,
     /// Milliseconds the last compile spent lowering to IR and in the
     /// optimisation passes, for the trace.
     last_ir_ms: std::cell::Cell<(f64, f64)>,
@@ -197,10 +197,6 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         context: &'ctx Context,
         opt_level: OptimizationLevel,
     ) -> CompilerResult<Self> {
-        crate::llvm_targets::initialize_host();
-        Self::parse_llvm_args();
-        let target_machine = Self::host_target_machine(opt_level)?;
-
         let mut backend = Self {
             context,
             module_context: None,
@@ -214,7 +210,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             loaded_lib: None,
             function_pointers: IndexMap::new(),
             opt_level,
-            target_machine,
+            target_machine: once_cell::unsync::OnceCell::new(),
             last_ir_ms: std::cell::Cell::new((0.0, 0.0)),
             runtime_symbols: IndexMap::new(),
             symbol_signatures: Vec::new(),
@@ -365,6 +361,16 @@ impl<'ctx> LLVMJitBackend<'ctx> {
                 CodeModel::Default,
             )
             .ok_or_else(|| CompilerError::Backend("Failed to create host target machine".into()))
+    }
+
+    /// Interpreter and baseline execution need no LLVM target registration or
+    /// machine. Configuration is retained until the first LLVM compilation.
+    fn target_machine(&self) -> CompilerResult<&TargetMachine> {
+        self.target_machine.get_or_try_init(|| {
+            crate::llvm_targets::initialize_host();
+            Self::parse_llvm_args();
+            Self::host_target_machine(self.opt_level)
+        })
     }
 
     /// The pass pipeline for an optimisation level.
@@ -758,6 +764,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         hir_module: &HirModule,
         with_osr_helpers: bool,
     ) -> CompilerResult<(LLVMBackend<'ctx>, Vec<(HirId, u64, String)>)> {
+        let target_machine = self.target_machine()?;
         // Step 1: Lower HIR → LLVM IR.
         let mut backend = LLVMBackend::new(self.context, "zyntax_jit");
         backend.register_symbol_signatures(&self.symbol_signatures);
@@ -811,7 +818,6 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             .set((lowering.elapsed().as_secs_f64() * 1e3, 0.0));
 
         // Step 2: the module targets the host machine.
-        let target_machine = &self.target_machine;
         backend.module().set_triple(&target_machine.get_triple());
         backend
             .module()
@@ -1102,7 +1108,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         let triple = Triple::host();
         let obj_path = Self::build_temp_path("o");
         let dylib_path = Self::build_temp_path(triple.dylib_ext());
-        self.compile_to_object_file(&backend, &self.target_machine, &obj_path)?;
+        self.compile_to_object_file(&backend, self.target_machine()?, &obj_path)?;
         // The module is no longer needed; drop it so the LLVM
         // resources are freed before the slow linker stage.
         drop(backend);
@@ -1436,8 +1442,10 @@ mod tests {
     #[test]
     fn test_llvm_jit_backend_creation() {
         let context = Context::create();
-        let backend = LLVMJitBackend::new(&context);
-        assert!(backend.is_ok());
+        let mut backend = LLVMJitBackend::new(&context).unwrap();
+        backend.register_symbol("cold_symbol", std::ptr::null());
+        backend.set_entry_names(std::collections::HashSet::from(["main".into()]));
+        assert!(backend.target_machine.get().is_none());
     }
 
     #[test]
@@ -1581,9 +1589,11 @@ mod tests {
         // Drive the AOT pipeline.
         let context = Context::create();
         let mut backend = LLVMJitBackend::new(&context).expect("backend init");
+        assert!(backend.target_machine.get().is_none());
         backend
             .compile_module(&module)
             .expect("AOT compile_module should succeed for trivial add");
+        assert!(backend.target_machine.get().is_some());
 
         let ptr = backend
             .get_function_pointer(func_id)

@@ -77,3 +77,11 @@ These isolated diagnostic fixtures record frontend and project-cache Rust heap
 requests. They exclude direct native-library, slab and libc allocations; requested
 bytes are not RSS. Keep allocation diagnostics separate from execution benchmarks
 and record measurements in git-bug.
+
+For whole-process diagnostics, build `zynode` with `allocation-audit`; it reports
+Rust requests to stderr by phase. `ZYNTAX_TRACE_LOWER_PHASES=1` also reports runtime
+setup, project loading, primitive registration, compile-and-run, and shutdown
+times. Cached project loading includes registration and cache preparation on a
+miss. Compiler phases appear nested within these totals; do not add them twice.
+Use an ordinary release build for wall-time comparisons, with no Cargo jobs
+running during samples.

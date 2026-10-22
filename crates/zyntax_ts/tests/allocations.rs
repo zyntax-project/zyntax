@@ -144,6 +144,8 @@ fn lowered_project_cache_allocations() {
         "checked-hit",
         "hir-store",
         "hir-hit",
+        "execution-store",
+        "execution-hit",
     ] {
         let mut runtime = TieredRuntime::new(TieredConfig {
             baseline_threshold: u32::MAX,
@@ -151,8 +153,12 @@ fn lowered_project_cache_allocations() {
             ..Default::default()
         })
         .unwrap();
+        if pass.starts_with("execution") {
+            runtime.enter_only_through_entry_points();
+        }
         let before = totals();
         let start = std::time::Instant::now();
+        let mut preparation = None;
         let project = if pass == "uncached" {
             zyntax_ts::register_runtime(&mut runtime).unwrap();
             zyntax_ts::load_project(&entry, Default::default()).unwrap()
@@ -161,6 +167,24 @@ fn lowered_project_cache_allocations() {
             zyntax_ts::load_project_cached(&entry, Default::default(), &cache)
                 .unwrap()
                 .0
+        } else if pass.starts_with("execution") {
+            let (project, status, worker) = zyntax_ts::load_project_for_runtime_background(
+                &entry,
+                Default::default(),
+                cache.join("execution"),
+                &mut runtime,
+            )
+            .unwrap();
+            preparation = worker;
+            assert_eq!(
+                status,
+                if pass == "execution-store" {
+                    zyntax_ts::CacheStatus::Stored
+                } else {
+                    zyntax_ts::CacheStatus::Hit
+                }
+            );
+            project
         } else {
             let (project, status) = zyntax_ts::load_project_for_runtime(
                 &entry,
@@ -194,6 +218,7 @@ fn lowered_project_cache_allocations() {
             after.1 - before.1,
             after.2 - before.2
         );
+        drop(preparation);
         runtime.stop();
     }
 }
