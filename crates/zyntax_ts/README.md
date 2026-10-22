@@ -122,6 +122,18 @@ Package resolution, default/namespace objects and cyclic/live-binding semantics
 still need integration. Cycles report `Unsupported`.
 Snapshot and compiled import schema versions have changed; rebuild older artifacts.
 
+Pass `--cache-dir DIR` to `check` or `run` to reuse checked filesystem projects
+across processes. Hosts can use `load_project_cached`, which also reports whether
+the cache was reused, written or unavailable. The directory holds trusted local
+build artifacts. Source contents, transitive and type-only dependencies, import
+resolution, soundness policy and compiler/frontend/target identity are validated
+before reuse. Missing or invalid entries are rebuilt; an unavailable cache does
+not prevent source checking or execution.
+
+This cache stores checked typed AST in Zyntax snapshots and skips parsing and
+type checking on a hit. Native lowering, optimization, release analysis and
+interpreter-first tiering still run for each process.
+
 Diagnostics use Zyntax's shared Ariadne formatter, including source labels and
 related declaration locations. `NO_COLOR` disables colors; `CLICOLOR_FORCE`
 enables them. Use `--diagnostics=json` for structured diagnostic categories,

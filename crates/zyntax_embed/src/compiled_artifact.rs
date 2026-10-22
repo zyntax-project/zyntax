@@ -31,6 +31,14 @@ struct CompiledImportPayload {
     type_registry: zyntax_typed_ast::TypeRegistry,
 }
 
+#[derive(Serialize)]
+struct CompiledImportPayloadRef<'a> {
+    language: &'a str,
+    module_name: &'a str,
+    program: &'a TypedProgram,
+    type_registry: &'a zyntax_typed_ast::TypeRegistry,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CompiledArtifactError {
     #[error("compiled import has an invalid header")]
@@ -92,7 +100,8 @@ impl CompiledImport {
         &self.program
     }
 
-    pub(crate) fn into_program(self) -> TypedProgram {
+    /// Move out the checked program without cloning its declarations.
+    pub fn into_program(self) -> TypedProgram {
         self.program
     }
 
@@ -127,11 +136,19 @@ impl CompiledImport {
 
     /// Encode an artifact for `include_bytes!` or another deployment bundle.
     pub fn encode(&self) -> Result<Vec<u8>, CompiledArtifactError> {
-        let payload = CompiledImportPayload {
-            language: self.language.clone(),
-            module_name: self.module_name.clone(),
-            program: self.program.clone(),
-            type_registry: self.program.type_registry.clone(),
+        Self::encode_program(&self.language, &self.module_name, &self.program)
+    }
+
+    pub(crate) fn encode_program(
+        language: &str,
+        module_name: &str,
+        program: &TypedProgram,
+    ) -> Result<Vec<u8>, CompiledArtifactError> {
+        let payload = CompiledImportPayloadRef {
+            language,
+            module_name,
+            program,
+            type_registry: &program.type_registry,
         };
         // Postcard: a fixed field order and no field names, decoded in
         // a fraction of the time a self-describing format takes.
@@ -213,5 +230,20 @@ mod tests {
             CompiledImport::decode(&bytes),
             Err(CompiledArtifactError::UnsupportedSchema { .. })
         ));
+    }
+
+    #[test]
+    fn borrowed_encoding_keeps_the_owned_payload_format() {
+        let artifact = CompiledImport::new("demo", "library", TypedProgram::default());
+        let payload = CompiledImportPayload {
+            language: artifact.language.clone(),
+            module_name: artifact.module_name.clone(),
+            program: artifact.program.clone(),
+            type_registry: artifact.program.type_registry.clone(),
+        };
+        assert_eq!(
+            &artifact.encode().unwrap()[HEADER_LEN..],
+            postcard::to_allocvec(&payload).unwrap(),
+        );
     }
 }

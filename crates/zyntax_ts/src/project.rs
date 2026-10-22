@@ -2,11 +2,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use zyntax_embed::{CompiledImport, CompiledImportResolverCallback};
+use zyntax_embed::{
+    CompiledImport, CompiledImportResolverCallback, SnapshotDependency, SnapshotSource,
+};
 use zyntax_typed_ast::import_resolver::ModuleArchitecture;
 use zyntax_typed_ast::{InternedString, TypedDeclaration, TypedProgram};
 
 use crate::{Error, ErrorKind, ModuleDependency, ModuleId, Options, lower};
+
+mod snapshot;
+pub use snapshot::{CacheStatus, load_project_cached};
 
 /// A filesystem failure or a diagnostic in the source file that caused it.
 #[derive(Debug, thiserror::Error)]
@@ -87,14 +92,23 @@ pub fn load_project(
     options: Options,
 ) -> Result<SourceProject, ProjectError> {
     let path = canonicalize(path.as_ref())?;
+    load_canonical(&path, options, None)
+}
+
+fn load_canonical(
+    path: &Path,
+    options: Options,
+    records: Option<&mut Vec<SnapshotSource>>,
+) -> Result<SourceProject, ProjectError> {
     let mut loader = Loader {
         options,
         architecture: ModuleArchitecture::typescript(),
         modules: FxHashMap::default(),
         active: FxHashSet::default(),
         stack: vec![],
+        records,
     };
-    let identity = loader.load(&path)?;
+    let identity = loader.load(path)?;
     Ok(SourceProject {
         entry: loader.modules.remove(&identity).unwrap(),
         dependencies: loader.modules,
@@ -108,15 +122,16 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ProjectError> {
     })
 }
 
-struct Loader {
+struct Loader<'a> {
     options: Options,
     architecture: ModuleArchitecture,
     modules: FxHashMap<InternedString, TypedProgram>,
     active: FxHashSet<InternedString>,
     stack: Vec<InternedString>,
+    records: Option<&'a mut Vec<SnapshotSource>>,
 }
 
-impl Loader {
+impl Loader<'_> {
     fn load(&mut self, file: &Path) -> Result<InternedString, ProjectError> {
         let filename = file.to_str().ok_or_else(|| ProjectError::Io {
             file: file.to_owned(),
@@ -191,8 +206,23 @@ impl Loader {
                     program: &self.modules[id],
                 })
                 .collect();
-            lower::lower_parsed(program, semantic, module, self.options, &dependencies)
-                .map_err(diagnostic)
+            let program =
+                lower::lower_parsed(program, semantic, module, self.options, &dependencies)
+                    .map_err(diagnostic)?;
+            if let Some(records) = self.records.as_mut() {
+                records.push(SnapshotSource::new(
+                    filename,
+                    source.as_bytes(),
+                    requests
+                        .iter()
+                        .map(|(specifier, target)| SnapshotDependency {
+                            specifier: (*specifier).to_owned(),
+                            target: target.resolve_global().unwrap(),
+                        })
+                        .collect(),
+                ));
+            }
+            Ok(program)
         });
         self.stack.pop();
         self.active.remove(&identity);
@@ -208,64 +238,69 @@ impl Loader {
     }
 
     fn resolve(&self, importer: &Path, specifier: &str) -> Result<PathBuf, (ErrorKind, String)> {
-        if !(specifier.starts_with("./")
-            || specifier.starts_with("../")
-            || matches!(specifier, "." | ".."))
-        {
-            return Err((
-                ErrorKind::Unsupported,
-                format!("package and absolute module resolution: `{specifier}`"),
-            ));
-        }
-        if matches!(
-            Path::new(specifier).extension().and_then(|s| s.to_str()),
-            Some("mts" | "cts" | "mjs" | "cjs" | "json")
-        ) {
-            return Err((
-                ErrorKind::Unsupported,
-                format!("native imports require executable .ts sources: `{specifier}`"),
-            ));
-        }
-        let base = importer.parent().unwrap().to_owned();
-        for candidate in self
-            .architecture
-            .module_to_paths(&[specifier.to_owned()], &base)
-        {
-            match std::fs::metadata(&candidate) {
-                Ok(metadata) if metadata.is_file() => {
-                    if candidate.extension().is_none_or(|s| s != "ts")
-                        || candidate.to_string_lossy().ends_with(".d.ts")
-                    {
-                        return Err((
-                            ErrorKind::Unsupported,
-                            format!(
-                                "native imports require executable .ts sources: {}",
-                                candidate.display()
-                            ),
-                        ));
-                    }
-                    let path = candidate.canonicalize().map_err(|error| {
-                        (ErrorKind::Type, format!("{}: {error}", candidate.display()))
-                    })?;
-                    if path.to_str().is_none() {
-                        return Err((ErrorKind::Unsupported, "module paths must be UTF-8".into()));
-                    }
-                    return Ok(path);
+        resolve(&self.architecture, importer, specifier)
+    }
+}
+
+fn resolve(
+    architecture: &ModuleArchitecture,
+    importer: &Path,
+    specifier: &str,
+) -> Result<PathBuf, (ErrorKind, String)> {
+    if !(specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || matches!(specifier, "." | ".."))
+    {
+        return Err((
+            ErrorKind::Unsupported,
+            format!("package and absolute module resolution: `{specifier}`"),
+        ));
+    }
+    if matches!(
+        Path::new(specifier).extension().and_then(|s| s.to_str()),
+        Some("mts" | "cts" | "mjs" | "cjs" | "json")
+    ) {
+        return Err((
+            ErrorKind::Unsupported,
+            format!("native imports require executable .ts sources: `{specifier}`"),
+        ));
+    }
+    let base = importer.parent().unwrap().to_owned();
+    for candidate in architecture.module_to_paths(&[specifier.to_owned()], &base) {
+        match std::fs::metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => {
+                if candidate.extension().is_none_or(|s| s != "ts")
+                    || candidate.to_string_lossy().ends_with(".d.ts")
+                {
+                    return Err((
+                        ErrorKind::Unsupported,
+                        format!(
+                            "native imports require executable .ts sources: {}",
+                            candidate.display()
+                        ),
+                    ));
                 }
-                Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) => {}
-                Err(error) => {
-                    return Err((ErrorKind::Type, format!("{}: {error}", candidate.display())));
+                let path = candidate.canonicalize().map_err(|error| {
+                    (ErrorKind::Type, format!("{}: {error}", candidate.display()))
+                })?;
+                if path.to_str().is_none() {
+                    return Err((ErrorKind::Unsupported, "module paths must be UTF-8".into()));
                 }
+                return Ok(path);
+            }
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => {
+                return Err((ErrorKind::Type, format!("{}: {error}", candidate.display())));
             }
         }
-        Err((
-            ErrorKind::Type,
-            format!("cannot resolve module `{specifier}`"),
-        ))
     }
+    Err((
+        ErrorKind::Type,
+        format!("cannot resolve module `{specifier}`"),
+    ))
 }

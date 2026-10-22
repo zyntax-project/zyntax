@@ -48,6 +48,11 @@ beadie = { git = "https://github.com/darmie/beadie.git", rev = "c403f29c8dd66635
 # implemented on this platform"). web-time is API-compatible with
 # std::time on native and routes through performance.now() on wasm.
 web-time = "1"
+sha2 = "0.10"
+rustc-hash = "2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tempfile = "3"
 
 [dev-dependencies]
 

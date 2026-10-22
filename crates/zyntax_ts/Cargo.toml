@@ -37,6 +37,10 @@ rustc-hash = "2"
 [dev-dependencies]
 tempfile = "3"
 sha2 = "0.10"
+ciborium = "0.2"
+
+[build-dependencies]
+sha2 = "0.10"
 
 [lints]
 workspace = true

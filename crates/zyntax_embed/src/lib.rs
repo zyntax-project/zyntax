@@ -139,8 +139,9 @@ pub use host_futures::{__zyntax_register_future, __zyntax_reject_future, __zynta
 pub use array::ZyntaxArray;
 pub use compiled_artifact::{CompiledArtifactError, CompiledImport};
 pub use snapshot::{
-    SNAPSHOT_EXTENSION, Snapshot, SnapshotBuilder, SnapshotError, lower_for_snapshot,
-    lower_for_snapshot_releasing, snapshot_file_name,
+    SNAPSHOT_EXTENSION, Snapshot, SnapshotBuilder, SnapshotCache, SnapshotDependency,
+    SnapshotError, SnapshotSource, lower_for_snapshot, lower_for_snapshot_releasing,
+    snapshot_file_name,
 };
 // Re-export the BC interpreter so embedders that want a bare
 // HirInterpreter without the beadie wrapper can grab it directly.

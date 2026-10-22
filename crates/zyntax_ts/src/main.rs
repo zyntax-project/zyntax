@@ -26,6 +26,7 @@ fn run() -> ExitCode {
     let mut llvm = false;
     let mut config = TieredConfig::default();
     let mut file = None;
+    let mut cache_dir = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--soundness" => match args.next().as_deref() {
@@ -34,6 +35,10 @@ fn run() -> ExitCode {
                 _ => return usage(),
             },
             "--diagnostics=json" => json = true,
+            "--cache-dir" => match args.next() {
+                Some(path) => cache_dir = Some(PathBuf::from(path)),
+                None => return usage(),
+            },
             "--llvm" => llvm = true,
             "--no-osr" => config.enable_osr = false,
             "--baseline-threshold" => match args.next().and_then(|s| s.parse::<u32>().ok()) {
@@ -50,7 +55,13 @@ fn run() -> ExitCode {
     let Some(file) = file else {
         return usage();
     };
-    let project = match zyntax_ts::load_project(&file, options) {
+    let loaded = match cache_dir {
+        Some(directory) => {
+            zyntax_ts::load_project_cached(&file, options, directory).map(|(project, _)| project)
+        }
+        None => zyntax_ts::load_project(&file, options),
+    };
+    let project = match loaded {
         Ok(project) => project,
         Err(ProjectError::Io { file, error }) => {
             eprintln!("{}: {error}", file.display());
@@ -127,7 +138,7 @@ fn run() -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: zynode <check|run> [--soundness typescript|checked] [--diagnostics=json] [--llvm] [--baseline-threshold N] [--no-osr] <file.ts>"
+        "usage: zynode <check|run> [--soundness typescript|checked] [--cache-dir DIR] [--diagnostics=json] [--llvm] [--baseline-threshold N] [--no-osr] <file.ts>"
     );
     ExitCode::from(2)
 }

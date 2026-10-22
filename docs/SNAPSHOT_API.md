@@ -224,6 +224,28 @@ the callee raises where the caller expects a rejected promise is a
 question for the languages, and the runtime's answer is the effect
 system, which is already language-neutral at HIR.
 
+## Validated project snapshots
+
+`SnapshotCache` persists checked source graphs as ordinary `.zsnap` files.
+It uses `SnapshotBuilder` and the existing module encodings. Snapshot schema 13
+adds optional input metadata to the directory: canonical entry and source
+identities, content hashes, resolved dependency edges, frontend/compiler/target
+identity, compilation options and a checksum of the payload sections.
+
+A frontend records every checked file with `SnapshotSource`, including type-only
+dependencies, and supplies its resolver to `SnapshotCache::load`. Loading checks
+source contents and resolves each recorded import again. A changed source,
+resolution, option or build produces a miss. Missing, corrupt and incompatible
+lowered artifacts also produce misses. `store` publishes a complete snapshot
+through an atomic rename. A host can fall back to source compilation on read or
+write failure.
+
+`SnapshotBuilder::module_ref` encodes a borrowed checked program, and
+`Snapshot::into_modules` moves decoded programs to their owner. Together they
+allow persistence without cloning typed function bodies. A frontend caching
+typed AST still performs native lowering and optimization at startup; skipping
+those stages requires a compatible lowered HIR section.
+
 ## Lowered HIR, symbol and sourcemap aware
 
 A snapshot carries lowered HIR, not only the typed AST. A compile today

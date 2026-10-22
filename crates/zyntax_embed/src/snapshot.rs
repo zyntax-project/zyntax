@@ -21,8 +21,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use zyntax_compiler::hir::HirModule;
 
+mod cache;
+use cache::CachedInputs;
+pub use cache::{SnapshotCache, SnapshotDependency, SnapshotSource};
+
 const MAGIC: &[u8; 5] = b"ZSNAP";
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 /// magic, schema, and the length of the directory that follows.
 const HEADER_LEN: usize = MAGIC.len() + 2 * std::mem::size_of::<u32>();
 
@@ -101,6 +105,7 @@ struct Directory {
     /// Absent for a language that parses on its own.
     grammar: Option<Extent>,
     modules: Vec<DirectoryEntry>,
+    cache: Option<CachedInputs>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -215,6 +220,7 @@ pub struct Snapshot {
     language: String,
     grammar: Option<Extent>,
     modules: Vec<DirectoryEntry>,
+    cache: Option<CachedInputs>,
     /// Each module, decoded when something first asks for it. A module
     /// nobody imports is never decoded.
     decoded: Vec<std::sync::OnceLock<Result<CompiledImport, String>>>,
@@ -307,6 +313,7 @@ impl Snapshot {
             language: directory.language,
             grammar: directory.grammar,
             modules: directory.modules,
+            cache: directory.cache,
             decoded,
             interfaces,
             decoded_hir,
@@ -483,30 +490,7 @@ impl Snapshot {
             ));
         }
         self.decoded[index]
-            .get_or_init(|| {
-                let entry = &self.modules[index];
-                let bytes = entry
-                    .artifact
-                    .slice(self.blobs(), &entry.name)
-                    .map_err(|e| e.to_string())?;
-                let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
-                let t0 = web_time::Instant::now();
-                let import = CompiledImport::decode(bytes).map_err(|e| e.to_string())?;
-                let elapsed = t0.elapsed();
-                let hir = self.hir_at(index).map_err(|e| e.to_string())?;
-                if trace {
-                    eprintln!(
-                        "[SNAPSHOT] {}: program {:.2} ms ({} bytes)",
-                        entry.name,
-                        elapsed.as_secs_f64() * 1000.0,
-                        bytes.len(),
-                    );
-                }
-                Ok(match hir {
-                    Some(hir) => import.with_hir(hir),
-                    None => import,
-                })
-            })
+            .get_or_init(|| self.decode_at(index).map_err(|e| e.to_string()))
             .as_ref()
             .map(|module| {
                 // A module lowered here is linked, so what it does not
@@ -517,6 +501,28 @@ impl Snapshot {
                 })
             })
             .map_err(|e| SnapshotError::Decode(e.clone()))
+    }
+
+    fn decode_at(&self, index: usize) -> Result<CompiledImport, SnapshotError> {
+        let entry = &self.modules[index];
+        let bytes = entry.artifact.slice(self.blobs(), &entry.name)?;
+        let trace = std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
+        let t0 = web_time::Instant::now();
+        let import = CompiledImport::decode(bytes)?;
+        let elapsed = t0.elapsed();
+        let hir = self.hir_at(index)?;
+        if trace {
+            eprintln!(
+                "[SNAPSHOT] {}: program {:.2} ms ({} bytes)",
+                entry.name,
+                elapsed.as_secs_f64() * 1000.0,
+                bytes.len(),
+            );
+        }
+        Ok(match hir {
+            Some(hir) => import.with_hir(hir),
+            None => import,
+        })
     }
 
     /// Function `name` as module `module` declares it, without a body:
@@ -644,6 +650,18 @@ impl Snapshot {
             })
             .collect()
     }
+
+    /// Consume the snapshot, moving decoded modules rather than cloning their bodies.
+    pub fn into_modules(mut self) -> Result<Vec<CompiledImport>, SnapshotError> {
+        let mut modules = Vec::with_capacity(self.modules.len());
+        for index in 0..self.modules.len() {
+            modules.push(match self.decoded[index].take() {
+                Some(result) => result.map_err(SnapshotError::Decode)?,
+                None => self.decode_at(index)?,
+            });
+        }
+        Ok(modules)
+    }
 }
 
 /// Builds a snapshot, for a language's build script.
@@ -658,6 +676,7 @@ pub struct SnapshotBuilder {
     language: String,
     grammar: Option<Vec<u8>>,
     modules: Vec<PendingModule>,
+    cache: Option<CachedInputs>,
 }
 
 /// A module waiting to be written into a snapshot.
@@ -799,6 +818,7 @@ impl SnapshotBuilder {
             language: language.into(),
             grammar: None,
             modules: Vec::new(),
+            cache: None,
         }
     }
 
@@ -819,6 +839,26 @@ impl SnapshotBuilder {
         program: zyntax_typed_ast::TypedProgram,
     ) -> Result<Self, SnapshotError> {
         self.push(name, program, None)
+    }
+
+    /// Encode a checked module while the caller retains its program for execution.
+    pub fn module_ref(
+        mut self,
+        name: impl Into<String>,
+        program: &zyntax_typed_ast::TypedProgram,
+    ) -> Result<Self, SnapshotError> {
+        let name = name.into();
+        let artifact = CompiledImport::encode_program(&self.language, &name, program)?;
+        self.modules.push(PendingModule {
+            name,
+            max_type_id: program.type_registry.max_type_id(),
+            artifact,
+            interface: None,
+            source: None,
+            lowered: None,
+            signatures: None,
+        });
+        Ok(self)
     }
 
     /// Add a parsed module, keeping its source for hosts that want to
@@ -953,10 +993,15 @@ impl SnapshotBuilder {
             });
         }
 
+        let mut cache = self.cache;
+        if let Some(inputs) = &mut cache {
+            inputs.blobs_hash = cache::digest(&blobs);
+        }
         let directory = Directory {
             language: self.language,
             grammar: grammar_extent,
             modules: entries,
+            cache,
         };
         let mut encoded_directory = Vec::new();
         ciborium::into_writer(&directory, &mut encoded_directory)
@@ -1014,6 +1059,46 @@ mod tests {
         assert_eq!(snapshot.language(), "demo");
         assert_eq!(snapshot.grammar_bytes(), Some(&[1u8, 2, 3][..]));
         assert_eq!(snapshot.module_names().collect::<Vec<_>>(), vec!["prelude"]);
+    }
+
+    #[test]
+    fn borrowed_programs_encode_and_decoded_programs_move() {
+        let mut program = empty_program();
+        program
+            .source_files
+            .push(zyntax_typed_ast::source::SourceFile::new(
+                "source.ts".into(),
+                "source body".into(),
+            ));
+        let bytes = SnapshotBuilder::new("demo")
+            .module_ref("library", &program)
+            .unwrap()
+            .module_ref("other", &program)
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert_eq!(program.source_files[0].content, "source body");
+        let snapshot = Snapshot::load_owned(bytes).unwrap();
+        // Populate one lazy slot; consuming it must retain the same source allocation.
+        snapshot.module("library").unwrap();
+        let pointer = snapshot.decoded[0]
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .program()
+            .source_files[0]
+            .content
+            .as_ptr();
+        let modules = snapshot.into_modules().unwrap();
+        assert_eq!(modules.len(), 2);
+        assert_eq!(
+            modules[0].program().source_files[0].content.as_ptr(),
+            pointer
+        );
+        assert_eq!(modules[1].program().source_files[0].content, "source body");
+        assert_eq!(modules[0].module_name(), "library");
+        assert_eq!(modules[1].module_name(), "other");
     }
 
     #[test]
