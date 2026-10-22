@@ -9,9 +9,8 @@
 //!   return. The jump crosses only the foreign frames between the raise
 //!   and the protect frame, so the protect frame must sit below every
 //!   compiled or Rust frame the foreign code was called from.
-//! - [`build::export_link_args`]: the link arguments that export a list
-//!   of symbols from an executable, so a library opened later binds to
-//!   them.
+//! - [`build`]: export symbols for libraries opened later and group native
+//!   startup code without reordering constructors.
 //!
 //! Foreign functions are called from C, through their real prototypes,
 //! by whoever links this crate; nothing here calls a foreign pointer.

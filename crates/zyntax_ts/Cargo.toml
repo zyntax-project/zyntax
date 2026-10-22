@@ -41,6 +41,7 @@ ciborium = "0.2"
 
 [build-dependencies]
 sha2 = "0.10"
+zrtl_native = { path = "../../sdk/zrtl_native" }
 
 [lints]
 workspace = true

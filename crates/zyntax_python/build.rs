@@ -22,7 +22,11 @@ mod policy;
 /// coalesce or bind is time before `main`. Linux exports nothing from
 /// an executable by default and drops unused dylibs on its own.
 fn emit_link_flags(out: &std::path::Path) -> Result<(), BuildError> {
-    if env::var("CARGO_CFG_TARGET_OS")? != "macos" {
+    let os = env::var("CARGO_CFG_TARGET_OS")?;
+    if cfg!(feature = "llvm-backend") {
+        zrtl_native::build::emit_startup_layout(out)?;
+    }
+    if os != "macos" {
         return Ok(());
     }
     let exports = out.join("exported_symbols.txt");

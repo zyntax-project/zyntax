@@ -1,5 +1,4 @@
-//! For build scripts: the link arguments that export symbols from an
-//! executable.
+//! For build scripts: native executable exports and startup text placement.
 //!
 //! An executable exports nothing a library opened later can bind to
 //! unless it is told to. These write the list in the form each linker
@@ -8,6 +7,38 @@
 
 use std::io;
 use std::path::Path;
+
+/// Emit startup placement for a Cargo binary build. Setting
+/// `ZYNTAX_KEEP_LINKER_LAYOUT` retains a custom linker's original layout.
+pub fn emit_startup_layout(dir: &Path) -> io::Result<()> {
+    println!("cargo:rerun-if-env-changed=ZYNTAX_KEEP_LINKER_LAYOUT");
+    if std::env::var_os("ZYNTAX_KEEP_LINKER_LAYOUT").is_some() {
+        return Ok(());
+    }
+    let os = std::env::var("CARGO_CFG_TARGET_OS")
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    for arg in startup_link_args(&os, dir)? {
+        println!("cargo:rustc-link-arg-bins={arg}");
+    }
+    Ok(())
+}
+
+/// Group ELF startup text without changing constructor-array order or the
+/// loader ABI. Other targets retain their native linker's layout.
+pub fn startup_link_args(target_os: &str, dir: &Path) -> io::Result<Vec<String>> {
+    if target_os != "linux" {
+        return Ok(Vec::new());
+    }
+    let path = dir.join("native_startup.ld");
+    std::fs::write(
+        &path,
+        "SECTIONS {\n  .text.startup : { *(.text.startup .text.startup.*) }\n}\nINSERT BEFORE .text;\n",
+    )?;
+    Ok(vec![
+        "-Xlinker".into(),
+        format!("--script={}", path.display()),
+    ])
+}
 
 /// Write `names` as an export list under `dir` for a target of
 /// `target_os` and `target_env` (`CARGO_CFG_TARGET_OS` and
@@ -77,6 +108,15 @@ mod tests {
             std::env::temp_dir().join(format!("zrtl_native_exports_{name}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn startup_layout_leaves_non_linux_targets_untouched() {
+        let dir = scratch("startup_other_targets");
+        for os in ["macos", "windows", "unknown", "freebsd", "android"] {
+            assert!(startup_link_args(os, &dir).unwrap().is_empty());
+        }
+        assert!(!dir.join("native_startup.ld").exists());
     }
 
     #[test]

@@ -7,6 +7,10 @@ fn main() {
         .join("../..")
         .canonicalize()
         .unwrap();
+    if cfg!(feature = "llvm-backend") {
+        let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        zrtl_native::build::emit_startup_layout(&out).unwrap();
+    }
     let mut files = vec![
         root.join("Cargo.toml"),
         root.join("Cargo.lock"),

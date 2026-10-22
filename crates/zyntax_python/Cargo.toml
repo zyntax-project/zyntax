@@ -36,6 +36,7 @@ rustc-hash = "2"
 libc = "0.2"
 
 [build-dependencies]
+zrtl_native = { path = "../../sdk/zrtl_native" }
 zyntax_typed_ast = { path = "../typed_ast" }
 zyntax_embed = { path = "../zyntax_embed", default-features = false, features = ["parse-only"] }
 zyntax_compiler = { path = "../compiler", default-features = false }
