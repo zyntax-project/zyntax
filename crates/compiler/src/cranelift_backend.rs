@@ -321,6 +321,31 @@ pub fn reset_cranelift_skipped_function_count() {
 }
 
 /// Convert ZRTL TypeTag to Cranelift type
+/// A parameter of a native symbol: arguments narrower than 32 bits are extended by the
+/// caller, as an external declaration of the same symbol also says.
+fn narrow_abi_param(
+    ty: types::Type,
+    extension: Option<cranelift_codegen::ir::ArgumentExtension>,
+) -> cranelift_codegen::ir::AbiParam {
+    use cranelift_codegen::ir::ArgumentExtension;
+    let abi = cranelift_codegen::ir::AbiParam::new(ty);
+    match extension {
+        Some(ArgumentExtension::Sext) if ty.bits() < 32 => abi.sext(),
+        Some(ArgumentExtension::Uext) if ty.bits() < 32 => abi.uext(),
+        _ => abi,
+    }
+}
+
+fn tag_extension(tag: &crate::zrtl::TypeTag) -> Option<cranelift_codegen::ir::ArgumentExtension> {
+    use crate::zrtl::TypeCategory;
+    use cranelift_codegen::ir::ArgumentExtension;
+    match tag.category() {
+        TypeCategory::Bool | TypeCategory::UInt => Some(ArgumentExtension::Uext),
+        TypeCategory::Int => Some(ArgumentExtension::Sext),
+        _ => None,
+    }
+}
+
 fn type_tag_to_cranelift_type(tag: &crate::zrtl::TypeTag) -> types::Type {
     use crate::zrtl::{PrimitiveSize, TypeCategory};
 
@@ -4620,8 +4645,9 @@ impl CraneliftBackend {
                                             // Convert ZRTL TypeTag to Cranelift type
                                             let type_tag = &sym_sig.params[i as usize];
                                             let cranelift_ty = type_tag_to_cranelift_type(type_tag);
-                                            sig.params.push(cranelift_codegen::ir::AbiParam::new(
+                                            sig.params.push(narrow_abi_param(
                                                 cranelift_ty,
+                                                tag_extension(type_tag),
                                             ));
                                         }
 
@@ -4634,10 +4660,21 @@ impl CraneliftBackend {
                                         }
                                     } else {
                                         // No ZRTL signature - infer from boxed args
-                                        for arg_val in &boxed_args {
+                                        for (index, arg_val) in boxed_args.iter().enumerate() {
                                             let arg_ty = builder.func.dfg.value_type(*arg_val);
-                                            sig.params
-                                                .push(cranelift_codegen::ir::AbiParam::new(arg_ty));
+                                            let extension = args
+                                                .get(index)
+                                                .and_then(|id| function.values.get(id))
+                                                .and_then(|value| match value.ty {
+                                                    HirType::I8 | HirType::I16 => Some(
+                                                        cranelift_codegen::ir::ArgumentExtension::Sext,
+                                                    ),
+                                                    HirType::U8 | HirType::U16 | HirType::Bool => Some(
+                                                        cranelift_codegen::ir::ArgumentExtension::Uext,
+                                                    ),
+                                                    _ => None,
+                                                });
+                                            sig.params.push(narrow_abi_param(arg_ty, extension));
                                         }
 
                                         // Determine return type from HIR
