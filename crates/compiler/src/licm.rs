@@ -19,7 +19,7 @@
 //!                         comparisons, excluding `Div` and `Rem`
 //!                         to avoid changing trap semantics)
 //!   * `Unary`            (Neg / Not / FNeg)
-//!   * `Cast`
+//!   * `Cast`             (except float-to-integer, which can trap)
 //!   * `GetElementPtr`    — pure address arithmetic
 //!   * `ExtractValue`     — pure aggregate field read
 //!   * `Select`           — pure ternary
@@ -717,6 +717,12 @@ fn is_safe_to_hoist(inst: &HirInstruction) -> bool {
             BinaryOp::Div | BinaryOp::Rem => false,
             _ => true,
         },
+        // A float-to-integer conversion traps in compiled code when the value is out of range,
+        // so it may not run before the test that guards it.
+        HirInstruction::Cast {
+            op: crate::hir::CastOp::FpToSi | crate::hir::CastOp::FpToUi,
+            ..
+        } => false,
         HirInstruction::Unary { .. } | HirInstruction::Cast { .. } => true,
         HirInstruction::GetElementPtr { .. } | HirInstruction::ExtractValue { .. } => true,
         HirInstruction::Select { .. } => true,
@@ -1181,6 +1187,23 @@ mod tests {
         BinaryOp, HirBlock, HirFunctionSignature, HirTerminator, HirType, HirValue, HirValueKind,
     };
     use zyntax_typed_ast::InternedString;
+
+    #[test]
+    fn a_float_to_integer_conversion_is_not_speculated_but_other_casts_are() {
+        use crate::hir::CastOp;
+        let cast = |op, ty| HirInstruction::Cast {
+            result: HirId::new(),
+            ty,
+            op,
+            operand: HirId::new(),
+        };
+        // It traps in compiled code when the value is out of range, so it cannot run before
+        // the test that guards it.
+        assert!(!is_safe_to_hoist(&cast(CastOp::FpToSi, HirType::I64)));
+        assert!(!is_safe_to_hoist(&cast(CastOp::FpToUi, HirType::U64)));
+        assert!(is_safe_to_hoist(&cast(CastOp::SiToFp, HirType::F64)));
+        assert!(is_safe_to_hoist(&cast(CastOp::SExt, HirType::I64)));
+    }
 
     fn empty_sig(ret: HirType) -> HirFunctionSignature {
         HirFunctionSignature {
