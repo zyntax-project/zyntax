@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2403,
+      "start": 15,
+      "length": 1,
+      "file": "var_redeclared_type.ts",
+      "message": "Subsequent variable declarations must have the same type.  Variable 's' must be of type 'number', but here has type 'string'."
+    }
+  ],
+  "source_sha256": "9de18ae4a89e8cb8fdf380392f1df02e9a26044b8590883443bbf0ad8c307761",
+  "options": {}
+}

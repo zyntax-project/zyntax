@@ -1734,5 +1734,15 @@
       "cases/namespaces/invalid_generic/library.ts"
     ],
     "mode": "check"
+  },
+  {
+    "id": "variables/var_function_scope",
+    "file": "cases/variables/var_function_scope.ts",
+    "mode": "run"
+  },
+  {
+    "id": "variables/var_redeclared_type",
+    "file": "cases/variables/var_redeclared_type.ts",
+    "mode": "check"
   }
 ]

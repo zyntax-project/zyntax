@@ -224,6 +224,90 @@ impl<'ast> Visit<'ast> for WritePositions<'_> {
     }
 }
 
+/// Finds `var` bindings that are not confined to the block holding their declaration.
+struct VarExtents<'s> {
+    scoping: &'s oxc_semantic::Scoping,
+    containers: Vec<oxc_span::Span>,
+    declarations:
+        FxHashMap<oxc_semantic::SymbolId, SmallVec<[(oxc_span::Span, oxc_span::Span); 1]>>,
+    references: FxHashMap<oxc_semantic::SymbolId, SmallVec<[u32; 2]>>,
+}
+
+impl VarExtents<'_> {
+    /// The span of a `var` symbol that escapes its block or is used before its declaration.
+    fn escaping(&self) -> Option<oxc_span::Span> {
+        self.declarations.iter().find_map(|(symbol, declarations)| {
+            let (first, container) = declarations
+                .iter()
+                .min_by_key(|(at, _)| at.start)
+                .copied()?;
+            let confined = declarations.iter().all(|(_, c)| *c == container)
+                && self.references.get(symbol).is_none_or(|references| {
+                    references
+                        .iter()
+                        .all(|at| *at > first.start && *at < container.end)
+                });
+            (!confined).then_some(first)
+        })
+    }
+
+    fn contained<T>(&mut self, span: oxc_span::Span, walk: impl FnOnce(&mut Self) -> T) -> T {
+        self.containers.push(span);
+        let result = walk(self);
+        self.containers.pop();
+        result
+    }
+}
+
+impl<'ast> Visit<'ast> for VarExtents<'_> {
+    fn visit_program(&mut self, it: &js::Program<'ast>) {
+        self.contained(it.span, |this| walk::walk_program(this, it));
+    }
+    fn visit_block_statement(&mut self, it: &js::BlockStatement<'ast>) {
+        self.contained(it.span, |this| walk::walk_block_statement(this, it));
+    }
+    fn visit_function_body(&mut self, it: &js::FunctionBody<'ast>) {
+        self.contained(it.span, |this| walk::walk_function_body(this, it));
+    }
+    fn visit_for_statement(&mut self, it: &js::ForStatement<'ast>) {
+        self.contained(it.span, |this| walk::walk_for_statement(this, it));
+    }
+    fn visit_for_in_statement(&mut self, it: &js::ForInStatement<'ast>) {
+        self.contained(it.span, |this| walk::walk_for_in_statement(this, it));
+    }
+    fn visit_for_of_statement(&mut self, it: &js::ForOfStatement<'ast>) {
+        self.contained(it.span, |this| walk::walk_for_of_statement(this, it));
+    }
+    fn visit_switch_statement(&mut self, it: &js::SwitchStatement<'ast>) {
+        self.contained(it.span, |this| walk::walk_switch_statement(this, it));
+    }
+    fn visit_variable_declaration(&mut self, it: &js::VariableDeclaration<'ast>) {
+        if it.kind.as_str() == "var" {
+            let container = *self.containers.last().unwrap();
+            for d in &it.declarations {
+                if let js::BindingPattern::BindingIdentifier(id) = &d.id {
+                    if let Some(symbol) = id.symbol_id.get() {
+                        self.declarations
+                            .entry(symbol)
+                            .or_default()
+                            .push((d.span, container));
+                    }
+                }
+            }
+        }
+        walk::walk_variable_declaration(self, it);
+    }
+    fn visit_identifier_reference(&mut self, id: &js::IdentifierReference<'ast>) {
+        let reference = self.scoping.get_reference(id.reference_id.get().unwrap());
+        if let Some(symbol) = reference.symbol_id() {
+            self.references
+                .entry(symbol)
+                .or_default()
+                .push(id.span.start);
+        }
+    }
+}
+
 struct Dependency {
     name: InternedString,
     returned: bool,
@@ -628,6 +712,16 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         .visit_program(program);
         self.write_offsets = self.writes.values().flatten().copied().collect();
         self.write_offsets.sort_unstable();
+        let mut extents = VarExtents {
+            scoping: semantic.scoping(),
+            containers: vec![],
+            declarations: FxHashMap::default(),
+            references: FxHashMap::default(),
+        };
+        extents.visit_program(program);
+        if let Some(at) = extents.escaping() {
+            return self.unsupported("var declarations used outside their block", at);
+        }
         let reexports = self.imports(program, semantic, dependencies)?;
         // Declare types before signatures; resolve forward aliases to a fixed point.
         let mut pending: Vec<_> = program
@@ -1440,6 +1534,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn reserve_variables(&mut self, declaration: &js::VariableDeclaration<'ast>) -> Result<()> {
+        // `var` bindings are confined to their block and declared where they appear.
+        if declaration.kind.as_str() == "var" {
+            return Ok(());
+        }
         for d in &declaration.declarations {
             if let js::BindingPattern::BindingIdentifier(id) = &d.id {
                 let name = self.name(id.name.as_str());
@@ -2407,8 +2505,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn variables(&mut self, declaration: &js::VariableDeclaration<'ast>) -> Result<Vec<Stmt>> {
         let kind = declaration.kind.as_str();
-        if !matches!(kind, "let" | "const") {
-            return self.unsupported("var or using declarations", declaration.span);
+        if !matches!(kind, "let" | "const" | "var") {
+            return self.unsupported("using declarations", declaration.span);
         }
         let mut out = vec![];
         for d in &declaration.declarations {
@@ -2416,12 +2514,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 return self.unsupported("destructuring declarations", d.span);
             };
             let name = self.name(id.name.as_str());
-            if self
+            let redeclared = self
                 .scopes
                 .last()
                 .unwrap()
                 .get(&name)
-                .is_some_and(|b| b.initialized)
+                .filter(|b| b.initialized)
+                .map(|b| (b.symbol, b.ty.clone()));
+            if let Some((symbol, _)) = &redeclared
+                && !(kind == "var" && *symbol == id.symbol_id.get())
             {
                 return self.error(ErrorKind::Type, "duplicate variable", d.span);
             }
@@ -2446,6 +2547,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             if matches!(ty, Type::Named { .. }) {
                 ty = value.ty.clone();
             }
+            if let Some((_, earlier)) = &redeclared
+                && *earlier != ty
+            {
+                return self.error(
+                    ErrorKind::Type,
+                    "subsequent variable declarations must have the same type",
+                    d.span,
+                );
+            }
             let unique = self.fresh(id.name.as_str());
             if matches!(ty, Type::Optional(_) | Type::Union(_)) {
                 if let Some(flow) = ScalarFlow::of(&value.ty) {
@@ -2461,7 +2571,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     symbol: id.symbol_id.get(),
                     ty: ty.clone(),
                     view,
-                    mutable: kind == "let",
+                    mutable: kind != "const",
                     initialized: true,
                 },
             );
