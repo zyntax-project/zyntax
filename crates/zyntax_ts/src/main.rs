@@ -188,10 +188,10 @@ fn run() -> ExitCode {
     });
     lap("compile+run");
     let code = match result {
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(_) => 0u8,
         Err(e) => {
             eprintln!("zynode: {e}");
-            ExitCode::from(4)
+            4u8
         }
     };
     drop(preparation);
@@ -202,7 +202,21 @@ fn run() -> ExitCode {
     lap("shutdown");
     #[cfg(feature = "allocation-audit")]
     allocation_audit::report();
-    code
+    leave(code)
+}
+
+/// Ends the process without running exit handlers. A tier-up compile may still be in flight,
+/// and the exit handlers of the LLVM library wait for it, which delays a short program by the
+/// length of that compile; its output is already flushed and the system reclaims everything.
+fn leave(code: u8) -> ExitCode {
+    #[cfg(unix)]
+    {
+        let _ = std::io::stderr().flush();
+        // SAFETY: `_exit` takes no pointers and never returns.
+        unsafe { libc::_exit(i32::from(code)) }
+    }
+    #[cfg(not(unix))]
+    ExitCode::from(code)
 }
 
 fn usage() -> ExitCode {
