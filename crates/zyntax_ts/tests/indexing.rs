@@ -46,11 +46,12 @@ fn proven_indexing_refuses_the_unproven_index_at_compile_time() {
 }
 
 /// Runs a program with a deadline: an index conversion that traps in compiled code hangs.
-fn run_source(source: &str) -> std::process::Output {
+fn run_source(source: &str, extra: &[&str]) -> std::process::Output {
     let mut file = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
     file.write_all(source.as_bytes()).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_zynode"))
         .arg("run")
+        .args(extra)
         .arg(file.path())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -69,25 +70,43 @@ fn run_source(source: &str) -> std::process::Output {
 
 #[test]
 fn unrepresentable_indexes_stop_cleanly_in_compiled_code() {
-    for index in ["NaN", "1e19", "-1e300", "Infinity", "2.5"] {
-        let output = run_source(&format!(
-            "function at(xs: number[], i: number): number {{ return xs[i]; }}\n\
-             const xs: number[] = [1, 2, 3];\n\
-             let sum = 0;\n\
-             for (let i = 0; i < 300000; i++) {{ sum += at(xs, i % 3); }}\n\
-             console.log(sum);\n\
-             console.log(at(xs, {index}));\n"
-        ));
-        assert!(!output.status.success(), "{index}");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            "600000\n",
-            "{index}"
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("is outside 0..3"),
-            "{index}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    // The conversion of the index is total in every tier; the second pass uses LLVM when built.
+    let mut modes: Vec<&[&str]> = vec![&[]];
+    if cfg!(feature = "llvm-backend") {
+        modes.push(&["--llvm"]);
+    }
+    for mode in modes {
+        for index in [
+            "NaN",
+            "1e19",
+            "-1e300",
+            "Infinity",
+            "-Infinity",
+            "2.5",
+            "-0.5",
+        ] {
+            let output = run_source(
+                &format!(
+                    "function at(xs: number[], i: number): number {{ return xs[i]; }}\n\
+                     const xs: number[] = [1, 2, 3];\n\
+                     let sum = 0;\n\
+                     for (let i = 0; i < 300000; i++) {{ sum += at(xs, i % 3); }}\n\
+                     console.log(sum);\n\
+                     console.log(at(xs, {index}));\n"
+                ),
+                mode,
+            );
+            assert!(!output.status.success(), "{index} {mode:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "600000\n",
+                "{index} {mode:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("is outside 0..3"),
+                "{index} {mode:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

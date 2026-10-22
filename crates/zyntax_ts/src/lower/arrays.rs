@@ -411,9 +411,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         ))
     }
     /// An index that is not proven in range: guard it, since TypeScript would read
-    /// `undefined` (or grow the array) where a native element read cannot. A written float is
-    /// range-tested before it is converted, because converting an out-of-range or NaN float
-    /// traps in compiled code.
+    /// `undefined` (or grow the array) where a native element read cannot.
+    ///
+    /// The index is converted once; the conversion is total, so a NaN, infinite or huge float
+    /// saturates to a value that fails the bound. A float must also convert back to itself,
+    /// which rejects a fraction, and one unsigned compare covers both ends of the range.
     fn checked_index(
         &mut self,
         object: Expr,
@@ -430,13 +432,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             return self.unsupported("unproven array indexing on this receiver", at);
         }
         let integer = Type::Primitive(PrimitiveType::I64);
-        let int = |value: i128| {
-            node(
-                TypedExpression::Literal(TypedLiteral::Integer(value)),
-                integer.clone(),
-                at,
-            )
-        };
+        let unsigned = Type::Primitive(PrimitiveType::U64);
         let cast = |value: Expr, ty: &Type| {
             node(
                 TypedExpression::Cast(TypedCast {
@@ -447,7 +443,6 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 at,
             )
         };
-        let and = |a: Expr, b: Expr| binary(BinaryOp::And, a, b, boolean(), at);
         let integral_source = index.ty == integer;
         if !integral_source {
             self.expect(&index.ty, &number(), at)?;
@@ -466,8 +461,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         };
         let slot = self.fresh("slot");
         let length = self.fresh("length");
-        let length_value = || var(length, integer.clone(), at);
-        let length_float = || cast(length_value(), &number());
+        let slot_value = || var(slot, integer.clone(), at);
         let mut statements = vec![let_(
             length,
             &integer,
@@ -481,49 +475,35 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 at,
             ),
         )];
+        // In range as an unsigned number: a negative slot is a huge one.
+        let below = || {
+            binary(
+                BinaryOp::Lt,
+                cast(slot_value(), &unsigned),
+                cast(var(length, integer.clone(), at), &unsigned),
+                boolean(),
+                at,
+            )
+        };
         let (valid, written) = if integral_source {
             statements.push(let_(slot, &integer, index));
-            let slot_value = var(slot, integer.clone(), at);
-            let valid = and(
-                binary(BinaryOp::Ge, slot_value.clone(), int(0), boolean(), at),
-                binary(
-                    BinaryOp::Lt,
-                    slot_value.clone(),
-                    length_value(),
-                    boolean(),
-                    at,
-                ),
-            );
-            (valid, cast(slot_value, &number()))
+            (below(), cast(slot_value(), &number()))
         } else {
             let written = self.fresh("index");
             statements.push(let_(written, &number(), index));
             let written_value = || var(written, number(), at);
-            let in_range = || {
-                and(
-                    binary(BinaryOp::Ge, written_value(), num(0.0, at), boolean(), at),
-                    binary(BinaryOp::Lt, written_value(), length_float(), boolean(), at),
-                )
-            };
-            // Only an in-range float reaches the conversion.
-            let converted = node(
-                TypedExpression::If(TypedIfExpr {
-                    condition: Box::new(in_range()),
-                    then_branch: Box::new(cast(written_value(), &integer)),
-                    else_branch: Box::new(int(0)),
-                }),
-                integer.clone(),
-                at,
-            );
-            statements.push(let_(slot, &integer, converted));
+            statements.push(let_(slot, &integer, cast(written_value(), &integer)));
             let whole = binary(
                 BinaryOp::Eq,
-                cast(var(slot, integer.clone(), at), &number()),
+                cast(slot_value(), &number()),
                 written_value(),
                 boolean(),
                 at,
             );
-            (and(in_range(), whole), written_value())
+            (
+                binary(BinaryOp::And, below(), whole, boolean(), at),
+                written_value(),
+            )
         };
         let invalid = node(
             TypedExpression::Unary(TypedUnary {
@@ -533,7 +513,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             boolean(),
             at,
         );
-        let trap = self.call("$TS$index_trap", vec![written, length_float()], unit(), at);
+        let length_float = cast(var(length, integer.clone(), at), &number());
+        let trap = self.call("$TS$index_trap", vec![written, length_float], unit(), at);
         statements.push(stmt(
             TypedStatement::If(TypedIf {
                 condition: Box::new(invalid),
@@ -546,7 +527,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }),
             at,
         ));
-        statements.push(expression(var(slot, integer.clone(), at)));
+        statements.push(expression(slot_value()));
         let guarded = node(
             TypedExpression::Block(TypedBlock {
                 statements,
