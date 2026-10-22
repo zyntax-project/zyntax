@@ -1207,5 +1207,185 @@
       "cases/modules/missing/entry.ts"
     ],
     "mode": "check"
+  },
+  {
+    "id": "reexports/named",
+    "file": "cases/reexports/named/entry.ts",
+    "files": [
+      "cases/reexports/named/entry.ts",
+      "cases/reexports/named/barrel.ts",
+      "cases/reexports/named/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "reexports/diamond",
+    "file": "cases/reexports/diamond/entry.ts",
+    "files": [
+      "cases/reexports/diamond/entry.ts",
+      "cases/reexports/diamond/barrel.ts",
+      "cases/reexports/diamond/left.ts",
+      "cases/reexports/diamond/right.ts",
+      "cases/reexports/diamond/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "reexports/local_shadow",
+    "file": "cases/reexports/local_shadow/entry.ts",
+    "files": [
+      "cases/reexports/local_shadow/entry.ts",
+      "cases/reexports/local_shadow/barrel.ts",
+      "cases/reexports/local_shadow/a.ts",
+      "cases/reexports/local_shadow/b.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "reexports/explicit_shadow",
+    "file": "cases/reexports/explicit_shadow/entry.ts",
+    "files": [
+      "cases/reexports/explicit_shadow/entry.ts",
+      "cases/reexports/explicit_shadow/barrel.ts",
+      "cases/reexports/explicit_shadow/a.ts",
+      "cases/reexports/explicit_shadow/b.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "reexports/value_conflict",
+    "file": "cases/reexports/value_conflict/entry.ts",
+    "files": [
+      "cases/reexports/value_conflict/entry.ts",
+      "cases/reexports/value_conflict/barrel.ts",
+      "cases/reexports/value_conflict/a.ts",
+      "cases/reexports/value_conflict/b.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "reexports/type_conflict",
+    "file": "cases/reexports/type_conflict/entry.ts",
+    "files": [
+      "cases/reexports/type_conflict/entry.ts",
+      "cases/reexports/type_conflict/barrel.ts",
+      "cases/reexports/type_conflict/a.ts",
+      "cases/reexports/type_conflict/b.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "reexports/namespace_conflict",
+    "file": "cases/reexports/namespace_conflict/entry.ts",
+    "files": [
+      "cases/reexports/namespace_conflict/entry.ts",
+      "cases/reexports/namespace_conflict/barrel.ts",
+      "cases/reexports/namespace_conflict/a.ts",
+      "cases/reexports/namespace_conflict/b.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "reexports/type_elision",
+    "file": "cases/reexports/type_elision/entry.ts",
+    "files": [
+      "cases/reexports/type_elision/entry.ts",
+      "cases/reexports/type_elision/barrel.ts",
+      "cases/reexports/type_elision/types.ts",
+      "cases/reexports/type_elision/functions.ts",
+      "cases/reexports/type_elision/empty.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "reexports/type_star",
+    "file": "cases/reexports/type_star/entry.ts",
+    "files": [
+      "cases/reexports/type_star/entry.ts",
+      "cases/reexports/type_star/barrel.ts",
+      "cases/reexports/type_star/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "reexports/type_call",
+    "file": "cases/reexports/type_call/entry.ts",
+    "files": [
+      "cases/reexports/type_call/entry.ts",
+      "cases/reexports/type_call/barrel.ts",
+      "cases/reexports/type_call/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "reexports/star_upgrade",
+    "file": "cases/reexports/star_upgrade/entry.ts",
+    "files": [
+      "cases/reexports/star_upgrade/entry.ts",
+      "cases/reexports/star_upgrade/left.ts",
+      "cases/reexports/star_upgrade/right.ts",
+      "cases/reexports/star_upgrade/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "reexports/string_name",
+    "file": "cases/reexports/string_name/entry.ts",
+    "files": [
+      "cases/reexports/string_name/entry.ts",
+      "cases/reexports/string_name/barrel.ts",
+      "cases/reexports/string_name/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "reexports/default_excluded",
+    "file": "cases/reexports/default_excluded/entry.ts",
+    "files": [
+      "cases/reexports/default_excluded/entry.ts",
+      "cases/reexports/default_excluded/barrel.ts",
+      "cases/reexports/default_excluded/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "reexports/new_alias_conflict",
+    "file": "cases/reexports/new_alias_conflict/entry.ts",
+    "files": [
+      "cases/reexports/new_alias_conflict/entry.ts",
+      "cases/reexports/new_alias_conflict/barrel.ts",
+      "cases/reexports/new_alias_conflict/a.ts",
+      "cases/reexports/new_alias_conflict/b.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "reexports/missing_name",
+    "file": "cases/reexports/missing_name/entry.ts",
+    "files": [
+      "cases/reexports/missing_name/entry.ts",
+      "cases/reexports/missing_name/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "reexports/local_type_forward",
+    "file": "cases/reexports/local_type_forward/entry.ts",
+    "files": [
+      "cases/reexports/local_type_forward/entry.ts",
+      "cases/reexports/local_type_forward/barrel.ts",
+      "cases/reexports/local_type_forward/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "reexports/type_value_names",
+    "file": "cases/reexports/type_value_names/entry.ts",
+    "files": [
+      "cases/reexports/type_value_names/entry.ts",
+      "cases/reexports/type_value_names/barrel.ts",
+      "cases/reexports/type_value_names/library.ts"
+    ],
+    "mode": "run"
   }
 ]

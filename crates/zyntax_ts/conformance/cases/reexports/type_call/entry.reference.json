@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 1362,
+      "start": 39,
+      "length": 1,
+      "file": "entry.ts",
+      "message": "'f' cannot be used as a value because it was exported using 'export type'."
+    }
+  ],
+  "source_sha256": "b0fe6c3567257ac045a2904547d26b9c7091c513fe35204f1e66afd72792c792",
+  "options": {}
+}

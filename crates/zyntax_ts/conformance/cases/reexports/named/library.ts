@@ -1,0 +1,1 @@
+console.log(1);export type Point={readonly x:number};export function keep<T>(x:T):T{return x;}export function make(n:number):number[]{return [n,n+2];}export function alias(xs:number[]):number[]{return xs;}

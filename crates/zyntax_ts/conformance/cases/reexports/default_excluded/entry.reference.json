@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2305,
+      "start": 8,
+      "length": 7,
+      "file": "entry.ts",
+      "message": "Module '\"./barrel\"' has no exported member 'default'."
+    }
+  ],
+  "source_sha256": "9ee27d83e03f2fa32bfae2582075f9cc64864e93dcbf86632e72834806afafcb",
+  "options": {}
+}

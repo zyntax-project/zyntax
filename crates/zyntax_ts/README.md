@@ -112,8 +112,14 @@ Each canonical file is checked once, including type-only dependencies. Runtime
 bodies move into the shared compiled-import linker; type-only bodies are dropped.
 Dependency initializers run once before their importers. Diagnostics identify
 the file that failed, including errors in transitive dependencies.
-Package resolution, default/namespace imports, `export ... from`, `export *` and
-cyclic/live-binding semantics still need integration. Cycles report `Unsupported`.
+Named `export ... from`, `export *` and their `export type` forms forward the
+original binding and shared signatures. Explicit exports shadow star exports;
+different declarations with the same star-exported name produce a type error.
+Repeated paths to the same declaration remain valid, and stars exclude `default`.
+Binding identity and type-only provenance survive compiled imports and snapshots.
+Implicit type re-exports are erased; ordinary stars still evaluate their source.
+Package resolution, default/namespace objects and cyclic/live-binding semantics
+still need integration. Cycles report `Unsupported`.
 Snapshot and compiled import schema versions have changed; rebuild older artifacts.
 
 Diagnostics use Zyntax's shared Ariadne formatter, including source labels and
@@ -174,7 +180,7 @@ python3 crates/zyntax_ts/conformance/run.py --zynode target/debug/zynode
 ```
 
 The reference pins are produced by **TypeScript 6.0.2** with strict checking
-and Node.js execution. The reference alone transpiles test programs; that
+and Node.js execution. The reference checker emits test programs for Node; that
 code is never used by the native frontend. To verify or refresh pins:
 
 ```sh

@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2305,
+      "start": 8,
+      "length": 7,
+      "file": "entry.ts",
+      "message": "Module '\"./library\"' has no exported member 'missing'."
+    }
+  ],
+  "source_sha256": "76ef983e748aebc03e5e9633297e1af809e823b23a112b41fce3bc0b37ab3442",
+  "options": {}
+}

@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use oxc_ast::ast as js;
 use rustc_hash::{FxHashMap, FxHashSet};
 use zyntax_embed::{CompiledImport, CompiledImportResolverCallback};
 use zyntax_typed_ast::import_resolver::ModuleArchitecture;
@@ -145,20 +144,20 @@ impl Loader {
         let result = lower::with_parsed(&source, diagnostic, |program, semantic| {
             let mut requests = vec![];
             for statement in &program.body {
-                let js::Statement::ImportDeclaration(import) = statement else {
+                let Some(source) = lower::dependency_source(statement) else {
                     continue;
                 };
-                if import.source.lone_surrogates {
+                if source.lone_surrogates {
                     return Err(diagnostic(Error::new(
                         ErrorKind::Unsupported,
                         "module specifiers with unpaired surrogates",
-                        import.source.span,
+                        source.span,
                     )));
                 }
-                let specifier = import.source.value.as_str();
-                let dependency = self.resolve(file, specifier).map_err(|error| {
-                    diagnostic(Error::new(error.0, error.1, import.source.span))
-                })?;
+                let specifier = source.value.as_str();
+                let dependency = self
+                    .resolve(file, specifier)
+                    .map_err(|error| diagnostic(Error::new(error.0, error.1, source.span)))?;
                 let dependency_id = InternedString::new_global(&dependency.to_string_lossy());
                 if self.active.contains(&dependency_id) {
                     let mut cycle: Vec<_> = self
@@ -171,7 +170,7 @@ impl Loader {
                     return Err(diagnostic(Error::new(
                         ErrorKind::Unsupported,
                         format!("cyclic module initialization: {}", cycle.join(" -> ")),
-                        import.source.span,
+                        source.span,
                     )));
                 }
                 // Retained parser arenas are bounded along the active dependency chain.
@@ -179,7 +178,7 @@ impl Loader {
                     return Err(diagnostic(Error::new(
                         ErrorKind::Unsupported,
                         "module dependency depth exceeds 128",
-                        import.source.span,
+                        source.span,
                     )));
                 }
                 self.load(&dependency)?;

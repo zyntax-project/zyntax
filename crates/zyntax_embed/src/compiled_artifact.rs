@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use zyntax_typed_ast::{InternedString, TypedProgram};
 
 const MAGIC: &[u8; 4] = b"ZAST";
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 const HEADER_LEN: usize = MAGIC.len() + std::mem::size_of::<u32>();
 
 /// A parsed import packaged by the application at build time.

@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2308,
+      "start": 20,
+      "length": 20,
+      "file": "barrel.ts",
+      "message": "Module './a' has already exported a member named 'X'. Consider explicitly re-exporting to resolve the ambiguity."
+    }
+  ],
+  "source_sha256": "1a97618a01df7006181f36ae67c057d37969d8a83d485a9f133c129c27171a12",
+  "options": {}
+}

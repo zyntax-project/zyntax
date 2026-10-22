@@ -29,6 +29,17 @@ if (action === "check") {
       message: ts.flattenDiagnosticMessageText(d.messageText, "\n")})),
   }));
 } else if (action === "run") {
+  const emitted = new Map();
+  const program = ts.createProgram(request.files, {
+    ...converted.options, noEmit: false, declaration: false, emitDeclarationOnly: false,
+    rewriteRelativeImportExtensions: true,
+  });
+  const result = program.emit(undefined, (filename, text, _bom, _error, sources) => {
+    if (filename.endsWith(".js") && sources?.length === 1) {
+      emitted.set(fs.realpathSync(sources[0].fileName), text);
+    }
+  });
+  if (result.emitSkipped) throw new Error("reference emission was skipped");
   const resolve = Module._resolveFilename;
   Module._resolveFilename = function(specifier, parent, ...rest) {
     if (parent?.filename.endsWith(".ts") && /^\.\.?\//.test(specifier)) {
@@ -38,9 +49,9 @@ if (action === "check") {
     return resolve.call(this, specifier, parent, ...rest);
   };
   Module._extensions[".ts"] = (module, filename) => {
-    const source = fs.readFileSync(filename, "utf8");
-    const output = ts.transpileModule(source, {compilerOptions: {...converted.options, noEmit: false}});
-    module._compile(output.outputText, filename);
+    const output = emitted.get(fs.realpathSync(filename));
+    if (output === undefined) throw new Error(`reference did not emit ${filename}`);
+    module._compile(output, filename);
   };
   require(path.resolve(request.files[0]));
 } else {

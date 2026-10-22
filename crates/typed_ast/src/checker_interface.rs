@@ -9,9 +9,17 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CheckerInterface {
     pub module: InternedString,
+    pub exports: FxHashMap<InternedString, CheckerExport>,
     pub types: FxHashMap<InternedString, CheckerType>,
     pub functions: FxHashMap<InternedString, Arc<CheckerFunction>>,
     pub views: FxHashMap<InternedString, Arc<CheckerView>>,
+}
+
+/// The original declaration behind an exported name, shared across forwarding paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckerExport {
+    pub origin: InternedString,
+    pub type_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -10,8 +10,8 @@ use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 use zyntax_typed_ast::checker_interface::{
-    CheckerField, CheckerFunction as Signature, CheckerInterface, CheckerParameter, CheckerType,
-    CheckerView,
+    CheckerExport, CheckerField, CheckerFunction as Signature, CheckerInterface, CheckerParameter,
+    CheckerType, CheckerView,
 };
 use zyntax_typed_ast::typed_ast::*;
 use zyntax_typed_ast::{
@@ -24,6 +24,7 @@ use crate::{Error, ErrorKind, ModuleDependency, ModuleId, Options, Soundness};
 mod arrays;
 mod generics;
 mod modules;
+pub(crate) use modules::dependency_source;
 mod unions;
 use arrays::{ArrayResult, FlowState, array_type, element_type};
 
@@ -429,6 +430,7 @@ struct Lowerer<'ast, 'program> {
     prefix_len: usize,
     registry: TypeRegistry,
     aliases: FxHashMap<InternedString, (Type, Option<InternedString>)>,
+    imported_exports: FxHashMap<InternedString, CheckerExport>,
     views: FxHashMap<InternedString, Arc<CheckerView>>,
     layouts: FxHashMap<Vec<(InternedString, PrimitiveType)>, TypeId>,
     compatible_layouts: FxHashMap<(TypeId, TypeId), bool>,
@@ -463,6 +465,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             prefix_len,
             registry,
             aliases: FxHashMap::default(),
+            imported_exports: FxHashMap::default(),
             views: FxHashMap::default(),
             layouts: FxHashMap::default(),
             compatible_layouts: FxHashMap::default(),
@@ -536,7 +539,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         .visit_program(program);
         self.write_offsets = self.writes.values().flatten().copied().collect();
         self.write_offsets.sort_unstable();
-        self.imports(program, semantic, dependencies)?;
+        let reexports = self.imports(program, semantic, dependencies)?;
         // Declare types before signatures; resolve forward aliases to a fixed point.
         let mut pending: Vec<_> = program
             .body
@@ -605,7 +608,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         for item in &program.body {
             if matches!(
                 item,
-                js::Statement::ImportDeclaration(_) | js::Statement::ExportNamedDeclaration(_)
+                js::Statement::ImportDeclaration(_)
+                    | js::Statement::ExportNamedDeclaration(_)
+                    | js::Statement::ExportFromDeclaration(_)
+                    | js::Statement::ExportAllDeclaration(_)
             ) {
                 continue;
             }
@@ -644,7 +650,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 program.span,
             ));
         }
-        let checker_interface = self.export_interface(program)?;
+        let checker_interface = self.export_interface(program, reexports)?;
         Ok(TypedProgram {
             checker_interface,
             declarations: self.declarations,
@@ -2695,6 +2701,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 at,
             ),
             js::Expression::Identifier(i) => {
+                self.require_value(i.name.as_str(), at)?;
                 if self
                     .scopes
                     .iter()
@@ -3267,6 +3274,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let at = c.span;
         if let js::Expression::StaticMemberExpression(m) = &c.callee {
             if let js::Expression::Identifier(receiver) = &m.object {
+                self.require_value(receiver.name.as_str(), receiver.span)?;
                 if receiver.name == "console"
                     && m.property.name == "log"
                     && !self
@@ -3332,6 +3340,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 at,
             ));
         };
+        self.require_value(id.name.as_str(), id.span)?;
         let Some(sig) = self.signatures.get(&self.name(id.name.as_str())).cloned() else {
             return self.error(
                 ErrorKind::Type,

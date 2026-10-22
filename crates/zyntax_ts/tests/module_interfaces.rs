@@ -264,17 +264,29 @@ fn imports_preserve_readonly_policy_and_diagnose_inaccessible_or_invalid_names()
     .unwrap();
 }
 
-fn execute(snapshot_mode: bool) {
+fn execute(snapshot_mode: bool, reexport: bool) {
     let source = library();
     let image = snapshot(source.clone());
     let compact = image.module_interface("library").unwrap().unwrap();
+    let dependency = if snapshot_mode {
+        compact.program()
+    } else {
+        &source
+    };
+    let barrel = parse_module_with_dependencies(
+        "export * from './original'; export {keep} from './original';",
+        "barrel.ts",
+        ModuleId::new("barrel"),
+        Options::default(),
+        &[ModuleDependency {
+            specifier: "./original",
+            program: dependency,
+        }],
+    )
+    .unwrap();
     let program = client(
         CLIENT,
-        if snapshot_mode {
-            compact.program()
-        } else {
-            &source
-        },
+        if reexport { &barrel } else { dependency },
         Options::default(),
     )
     .unwrap();
@@ -287,6 +299,11 @@ fn execute(snapshot_mode: bool) {
     })
     .unwrap();
     zyntax_ts::register_runtime(&mut runtime).unwrap();
+    if reexport {
+        runtime.add_compiled_import_resolver(Box::new(move |name| {
+            Ok((name == "barrel").then(|| CompiledImport::new("typescript", name, barrel.clone())))
+        }));
+    }
     if snapshot_mode {
         runtime.install_snapshot(image).unwrap();
     } else {
@@ -384,13 +401,25 @@ fn wait(runtime: &TieredRuntime, count: usize) {
 #[test]
 fn source_interfaces_run_with_native_layouts_and_array_aliases_in_each_tier() {
     let _test = TEST.lock().unwrap();
-    execute(false);
+    execute(false, false);
 }
 
 #[test]
 fn snapshot_interfaces_run_with_native_layouts_and_array_aliases_in_each_tier() {
     let _test = TEST.lock().unwrap();
-    execute(true);
+    execute(true, false);
+}
+
+#[test]
+fn source_reexports_preserve_native_geps_release_sites_and_each_promotion() {
+    let _test = TEST.lock().unwrap();
+    execute(false, true);
+}
+
+#[test]
+fn snapshot_reexports_preserve_native_geps_release_sites_and_each_promotion() {
+    let _test = TEST.lock().unwrap();
+    execute(true, true);
 }
 
 #[test]
