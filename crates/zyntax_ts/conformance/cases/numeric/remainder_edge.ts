@@ -1,0 +1,33 @@
+function r(a: number, b: number): number { return a % b; }
+let warm = 0;
+for (let i = 0; i < 400000; i++) { warm += r(i, 7); }
+console.log(warm);
+console.log(7, 3, r(7, 3));
+console.log(-7, 3, r(-7, 3));
+console.log(7, -3, r(7, -3));
+console.log(-7, -3, r(-7, -3));
+console.log(6, 3, r(6, 3));
+console.log(-6, 3, r(-6, 3));
+console.log(0, 5, r(0, 5));
+console.log(5, 0, r(5, 0));
+console.log(0, 0, r(0, 0));
+console.log(5.5, 2, r(5.5, 2));
+console.log(-5.5, 2, r(-5.5, 2));
+console.log(5, 0.5, r(5, 0.5));
+console.log(1e19, 7, r(1e19, 7));
+console.log(2 ** 53 + 2, 3, r(2 ** 53 + 2, 3));
+console.log(9007199254740993, 10, r(9007199254740993, 10));
+console.log(NaN, 3, r(NaN, 3));
+console.log(3, NaN, r(3, NaN));
+console.log(Infinity, 3, r(Infinity, 3));
+console.log(3, Infinity, r(3, Infinity));
+console.log(-Infinity, 3, r(-Infinity, 3));
+console.log(4, 1, r(4, 1));
+console.log(1, 4, r(1, 4));
+console.log(9.3e18, 1000003, r(9.3e18, 1000003));
+console.log(-9.3e18, 1000003, r(-9.3e18, 1000003));
+console.log(123456789, 1000, r(123456789, 1000));
+console.log(-0, 5, r(-0, 5));
+console.log(5, -0, r(5, -0));
+let m = 17; m %= 5; let n = -17; n %= 5; let z = -0; z %= 3;
+console.log(m, n, z, 5 % 3 * 2, 10 % 4 % 3);

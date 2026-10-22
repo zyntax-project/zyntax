@@ -1,0 +1,10 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": true,
+  "kind": "Accept",
+  "diagnostics": [],
+  "stdout": "1199997\n7 3 1\n-7 3 -1\n7 -3 1\n-7 -3 -1\n6 3 0\n-6 3 -0\n0 5 0\n5 0 NaN\n0 0 NaN\n5.5 2 1.5\n-5.5 2 -1.5\n5 0.5 0\n10000000000000000000 7 3\n9007199254740994 3 1\n9007199254740992 10 2\nNaN 3 NaN\n3 NaN NaN\nInfinity 3 NaN\n3 Infinity 3\n-Infinity 3 NaN\n4 1 0\n1 4 1\n9300000000000000000 1000003 699751\n-9300000000000000000 1000003 -699751\n123456789 1000 789\n-0 5 -0\n5 -0 NaN\n2 -2 -0 4 2\n",
+  "exit": 0,
+  "source_sha256": "0479a5a8cd8dae3ecaed8ebf6e3e4146f0768276235cbfdacf4cccdfc8128117",
+  "options": {}
+}

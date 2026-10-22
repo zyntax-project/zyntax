@@ -1869,5 +1869,10 @@
     "id": "timing/clocks",
     "file": "cases/timing/clocks.ts",
     "mode": "run"
+  },
+  {
+    "id": "numeric/remainder_edge",
+    "file": "cases/numeric/remainder_edge.ts",
+    "mode": "run"
   }
 ]

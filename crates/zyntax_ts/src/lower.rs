@@ -3863,6 +3863,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if left.ty != right.ty {
             return self.unsupported("mixed-type operator coercion", at);
         }
+        if op == "%" && left.ty == number() && right.ty == number() {
+            return Ok(self.remainder(left, right, at));
+        }
         let (operator, ty) = match op {
             "+" => (BinaryOp::Add, number()),
             "-" => (BinaryOp::Sub, number()),
@@ -4393,6 +4396,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 _ => return self.unsupported("this compound assignment", a.span),
             };
             value = match arithmetic {
+                Some(BinaryOp::Rem) => self.remainder(read, value, a.span),
                 Some(operation) => binary(operation, read, value, number(), a.span),
                 None => self.bitwise(&op[..op.len() - 1], read, value, a.span)?,
             };
