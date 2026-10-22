@@ -19,7 +19,8 @@ const LIBRARY: &str = r#"
     type Private = {x:number;y:number};
     export type Read = {readonly x:number};
     export function make(n:number):Read {const p:Private={x:n,y:4};return p;}
-    export function keep<T>(x:T):T{return x;}
+    export default function keep<T>(x:T):T{return x;}
+    export {keep};
     export function alias(xs:number[]):number[]{return xs;}
     export function numbers(n:number):number[]{return [n,n+2];}
     function second<T>(xs:T[],fallback:T):T{if(xs.length>1)return xs[1];return fallback;}
@@ -28,7 +29,7 @@ const LIBRARY: &str = r#"
 "#;
 const CLIENT: &str = r#"
     import type {Read as ImportedRead} from "./library";
-    import {make as build,keep,alias,numbers} from "./library";
+    import keep, {make as build,alias,numbers} from "./library";
     import {pick} from "./library";
     export function score(n:number):number {
         const p:ImportedRead=build(n);const q=keep(p);
@@ -274,7 +275,7 @@ fn execute(snapshot_mode: bool, reexport: bool) {
         &source
     };
     let barrel = parse_module_with_dependencies(
-        "export * from './original'; export {keep} from './original';",
+        "export * from './original'; export {default} from './original'; export {keep} from './original';",
         "barrel.ts",
         ModuleId::new("barrel"),
         Options::default(),

@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 1192,
+      "start": 7,
+      "length": 6,
+      "file": "entry.ts",
+      "message": "Module '\"/Users/amaterasu/Vibranium/zyntax/crates/zyntax_ts/conformance/cases/defaults/star_excludes/barrel\"' has no default export."
+    }
+  ],
+  "source_sha256": "56622622aa5d805fbcaf461d3a7104c7eea956ad1a194c4b1c122492cc7c14e1",
+  "options": {}
+}

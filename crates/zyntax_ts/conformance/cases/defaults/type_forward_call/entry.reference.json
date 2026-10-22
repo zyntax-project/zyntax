@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 1361,
+      "start": 37,
+      "length": 1,
+      "file": "entry.ts",
+      "message": "'f' cannot be used as a value because it was imported using 'import type'."
+    }
+  ],
+  "source_sha256": "44117ff4e82afb38f3fdd4827e0b52b1200438f0e26f3a3c01053733c215b2ae",
+  "options": {}
+}

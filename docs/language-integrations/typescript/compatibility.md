@@ -18,7 +18,7 @@ gaps against TypeScript rather than treating them as compatibility passes.
 | Objects | Scalar fields, reference identity, aliases, source-order initializers, readonly views and excess-property checks | Reference-valued fields, general layout adaptation and assignments that change concrete layout |
 | Arrays | Dense `number[]`, `boolean[]`, `string[]`, `Array<T>`, proven index access, length and push | Sparse extension, length mutation, other methods and reads that may yield `undefined` |
 | Unions | Scalar alternatives among number, boolean and string; number/boolean with `undefined`; narrowing, equality, truthiness and formatting | Owned/reference payloads, broader nullable combinations and optional callback signatures |
-| Modules | Named/type-only/side-effect imports; function/type/interface exports; aliases; named and star re-exports; relative filesystem projects | Default/namespace objects, exported variables/live bindings, cycles/TDZ and package resolution |
+| Modules | Named/default/type-only/side-effect imports; function/type/interface exports; default function declarations and bindings; aliases; named and star re-exports; relative filesystem projects | Other default values, namespace objects, exported variables/live bindings, cycles/TDZ and package resolution |
 
 String arrays and string union payloads require a proven static string lifetime.
 Generic element mutation and owned reference containers need additional lifetime
@@ -56,13 +56,18 @@ separate source arithmetic rounding.
 
 Relative imports accept `.ts`, extensionless files, directory indexes and `.js`
 specifiers backed by TypeScript source. Each canonical file is checked once.
-Explicit type-only and unused named imports do not evaluate dependencies; bare
+Explicit type-only and unused named/default imports do not evaluate dependencies; bare
 imports retain side effects. Dependency initializers run once before importers.
 
 Re-exports retain original binding identity and type-only provenance. Explicit
 exports shadow stars; conflicting star bindings are errors, while repeated paths
 to the same binding remain valid. Stars exclude `default`. Ordinary stars evaluate
 their source; type-only forwarding is erased. Cycles report `Unsupported`.
+
+Default function declarations may be named or anonymous. Import aliases and
+re-exports retain the same native signature, including generic parameters and
+array ownership facts. Default exports of type bindings remain type-only and
+are erased. Other default expression values need module binding support.
 
 Diagnostics use the shared Ariadne formatter, including source labels and related
 locations. `NO_COLOR` disables colors; `CLICOLOR_FORCE` enables them.

@@ -653,13 +653,17 @@ fn cached_cli_preserves_initializers_arrays_and_generic_calls_across_tiers() {
     write(
         root,
         "lib.ts",
-        "console.log('library'); export function id<T>(x:T):T{return x;} export function array():number[]{return [2,4,8];}",
+        "console.log('library'); export default function<T>(x:T):T{return x;} export function array():number[]{return [2,4,8];}",
     );
-    write(root, "barrel.ts", "export * from './lib';");
+    write(
+        root,
+        "barrel.ts",
+        "export * from './lib'; export {default} from './lib';",
+    );
     write(
         root,
         "entry.ts",
-        "import {id,array} from './barrel'; const a=array(); console.log(id(a[1])); console.log(id('text')); console.log('entry');",
+        "import id,{array} from './barrel'; const a=array(); console.log(id(a[1])); console.log(id('text')); console.log('entry');",
     );
     let mut profiles = vec![
         vec!["--baseline-threshold", "2000000000"],
@@ -700,7 +704,7 @@ fn cached_cli_preserves_initializers_arrays_and_generic_calls_across_tiers() {
     write(
         root,
         "lib.ts",
-        "console.log('library'); export function id<T>(x:T):T{return x;} export function array():number[]{return [2,6,8];}",
+        "console.log('library'); export default function id<T>(x:T):T{return x;} export function array():number[]{return [2,6,8];}",
     );
     let output = Command::new(env!("CARGO_BIN_EXE_zynode"))
         .arg("run")

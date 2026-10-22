@@ -243,6 +243,9 @@ struct CallDependencies<'s> {
 
 impl CallDependencies<'_> {
     fn is_self_call(&self, mut expression: &js::Expression<'_>) -> bool {
+        let Some(owner) = self.owner else {
+            return false;
+        };
         while let js::Expression::ParenthesizedExpression(p) = expression {
             expression = &p.expression;
         }
@@ -255,7 +258,7 @@ impl CallDependencies<'_> {
         self.scoping
             .get_reference(id.reference_id.get().unwrap())
             .symbol_id()
-            == self.owner
+            == Some(owner)
     }
 }
 
@@ -581,7 +584,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let mut visiting = FxHashSet::default();
         for item in &program.body {
             if let Some(f) = modules::function(item) {
-                let mut pending = vec![(self.name(f.id.as_ref().unwrap().name.as_str()), false)];
+                let mut pending = vec![(self.name(modules::function_name(f)), false)];
                 while let Some((name, ready)) = pending.pop() {
                     if self.lowered.contains(&name) {
                         continue;
@@ -612,6 +615,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     | js::Statement::ExportNamedDeclaration(_)
                     | js::Statement::ExportFromDeclaration(_)
                     | js::Statement::ExportAllDeclaration(_)
+                    | js::Statement::ExportDefaultDeclaration(_)
             ) {
                 continue;
             }
@@ -669,7 +673,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             .functions
             .iter()
             .filter(|(name, _)| self.signatures[*name].ret.is_none())
-            .map(|(name, f)| (f.id.as_ref().unwrap().symbol_id.get().unwrap(), *name))
+            .filter_map(|(name, f)| Some((f.id.as_ref()?.symbol_id.get()?, *name)))
             .collect();
         let mut calls = CallDependencies {
             scoping: semantic.scoping(),
@@ -686,7 +690,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let mut dependencies = FxHashMap::default();
         for (name, function) in &self.functions {
             calls.seen.clear();
-            calls.owner = function.id.as_ref().unwrap().symbol_id.get();
+            calls.owner = function.id.as_ref().and_then(|id| id.symbol_id.get());
             calls.self_calls = false;
             calls.visit_function_body(function.body.as_ref().unwrap());
             if self.signatures[name].ret.is_none() {
@@ -975,9 +979,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn signature(&mut self, f: &'program js::Function<'ast>) -> Result<()> {
-        let Some(id) = &f.id else {
-            return self.unsupported("anonymous declarations", f.span);
-        };
+        let source_name = modules::function_name(f);
         if f.r#async
             || f.generator
             || f.params.rest.is_some()
@@ -986,7 +988,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         {
             return self.unsupported("async, generator, rest or ambient functions", f.span);
         }
-        if self.signatures.contains_key(&self.name(id.name.as_str())) {
+        if self.signatures.contains_key(&self.name(source_name)) {
             return self.unsupported("function overloads", f.span);
         }
         self.active_types.clear();
@@ -1036,11 +1038,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             None => (None, None),
         };
-        let name = self.name(id.name.as_str());
+        let name = self.name(source_name);
         self.functions.insert(name, f);
         self.name_buffer.truncate(self.prefix_len);
         self.name_buffer.push_str("fn$");
-        crate::modules::append_component(&mut self.name_buffer, id.name.as_str());
+        crate::modules::append_component(&mut self.name_buffer, source_name);
         let native = intern(&self.name_buffer);
         self.signatures.insert(
             name,
@@ -1058,7 +1060,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn function(&mut self, f: &js::Function<'ast>) -> Result<()> {
-        let name = self.name(f.id.as_ref().unwrap().name.as_str());
+        let name = self.name(modules::function_name(f));
         if self.lowered.contains(&name) {
             return Ok(());
         }
@@ -1070,7 +1072,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn function_body(&mut self, f: &js::Function<'ast>) -> Result<()> {
-        let name = self.name(f.id.as_ref().unwrap().name.as_str());
+        let name = self.name(modules::function_name(f));
         let inferred = self.signatures[&name].ret.is_none();
         let recursive = inferred && self.self_recursive.contains(&name);
         if recursive {

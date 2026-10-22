@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 1192,
+      "start": 7,
+      "length": 6,
+      "file": "entry.ts",
+      "message": "Module '\"/Users/amaterasu/Vibranium/zyntax/crates/zyntax_ts/conformance/cases/defaults/missing/library\"' has no default export."
+    }
+  ],
+  "source_sha256": "e3d213e31fc11c00c3d3047df9243ae1ae3dfb98463e0db95da081aaf4444b0a",
+  "options": {}
+}

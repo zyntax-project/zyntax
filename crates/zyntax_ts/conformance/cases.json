@@ -1387,5 +1387,153 @@
       "cases/reexports/type_value_names/library.ts"
     ],
     "mode": "run"
+  },
+  {
+    "id": "defaults/named",
+    "file": "cases/defaults/named/entry.ts",
+    "files": [
+      "cases/defaults/named/entry.ts",
+      "cases/defaults/named/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "defaults/anonymous_inference",
+    "file": "cases/defaults/anonymous_inference/entry.ts",
+    "files": [
+      "cases/defaults/anonymous_inference/entry.ts",
+      "cases/defaults/anonymous_inference/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "defaults/anonymous_generic_arrays",
+    "file": "cases/defaults/anonymous_generic_arrays/entry.ts",
+    "files": [
+      "cases/defaults/anonymous_generic_arrays/entry.ts",
+      "cases/defaults/anonymous_generic_arrays/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "defaults/binding",
+    "file": "cases/defaults/binding/entry.ts",
+    "files": [
+      "cases/defaults/binding/entry.ts",
+      "cases/defaults/binding/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "defaults/forwarded_binding",
+    "file": "cases/defaults/forwarded_binding/entry.ts",
+    "files": [
+      "cases/defaults/forwarded_binding/entry.ts",
+      "cases/defaults/forwarded_binding/barrel.ts",
+      "cases/defaults/forwarded_binding/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "defaults/reexport",
+    "file": "cases/defaults/reexport/entry.ts",
+    "files": [
+      "cases/defaults/reexport/entry.ts",
+      "cases/defaults/reexport/barrel.ts",
+      "cases/defaults/reexport/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "defaults/unused",
+    "file": "cases/defaults/unused/entry.ts",
+    "files": [
+      "cases/defaults/unused/entry.ts",
+      "cases/defaults/unused/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "defaults/type_only",
+    "file": "cases/defaults/type_only/entry.ts",
+    "files": [
+      "cases/defaults/type_only/entry.ts",
+      "cases/defaults/type_only/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "defaults/bare_and_used",
+    "file": "cases/defaults/bare_and_used/entry.ts",
+    "files": [
+      "cases/defaults/bare_and_used/entry.ts",
+      "cases/defaults/bare_and_used/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "defaults/missing",
+    "file": "cases/defaults/missing/entry.ts",
+    "files": [
+      "cases/defaults/missing/entry.ts",
+      "cases/defaults/missing/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "defaults/type_only_call",
+    "file": "cases/defaults/type_only_call/entry.ts",
+    "files": [
+      "cases/defaults/type_only_call/entry.ts",
+      "cases/defaults/type_only_call/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "defaults/type_only_expression",
+    "file": "cases/defaults/type_only_expression/entry.ts",
+    "files": [
+      "cases/defaults/type_only_expression/entry.ts",
+      "cases/defaults/type_only_expression/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "defaults/wrong_argument",
+    "file": "cases/defaults/wrong_argument/entry.ts",
+    "files": [
+      "cases/defaults/wrong_argument/entry.ts",
+      "cases/defaults/wrong_argument/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "defaults/star_excludes",
+    "file": "cases/defaults/star_excludes/entry.ts",
+    "files": [
+      "cases/defaults/star_excludes/entry.ts",
+      "cases/defaults/star_excludes/barrel.ts",
+      "cases/defaults/star_excludes/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "defaults/type_binding",
+    "file": "cases/defaults/type_binding/entry.ts",
+    "files": [
+      "cases/defaults/type_binding/entry.ts",
+      "cases/defaults/type_binding/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "defaults/type_forward_call",
+    "file": "cases/defaults/type_forward_call/entry.ts",
+    "files": [
+      "cases/defaults/type_forward_call/entry.ts",
+      "cases/defaults/type_forward_call/barrel.ts",
+      "cases/defaults/type_forward_call/library.ts"
+    ],
+    "mode": "check"
   }
 ]

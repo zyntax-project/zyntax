@@ -10,10 +10,24 @@ pub(super) fn declaration<'a, 's>(
 }
 
 pub(super) fn function<'a, 's>(statement: &'s js::Statement<'a>) -> Option<&'s js::Function<'a>> {
+    if let js::Statement::ExportDefaultDeclaration(export) = statement {
+        return match &export.declaration {
+            js::ExportDefaultDeclarationKind::FunctionDeclaration(f) => Some(f),
+            _ => None,
+        };
+    }
     match declaration(statement)? {
         js::Declaration::FunctionDeclaration(f) => Some(f),
         _ => None,
     }
+}
+
+pub(super) fn function_name<'a>(function: &js::Function<'a>) -> &'a str {
+    // Anonymous default declarations need a key that no source identifier can use.
+    function
+        .id
+        .as_ref()
+        .map_or("\0default", |id| id.name.as_str())
 }
 
 pub(crate) fn dependency_source<'a, 's>(
@@ -94,6 +108,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         explicit.insert(self.export_name(&specifier.exported)?);
                     }
                 }
+                js::Statement::ExportDefaultDeclaration(e) => {
+                    explicit.insert(default_export);
+                    if let js::ExportDefaultDeclarationKind::Identifier(local) = &e.declaration {
+                        export_uses.insert(local.node_id.get(), true);
+                    }
+                }
                 _ => {}
             }
         }
@@ -156,28 +176,35 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     if let Some(specifiers) = &import.specifiers {
                         let interface = self.require_interface(interface, source.span)?;
                         for specifier in specifiers {
-                            let js::ImportDeclarationSpecifier::ImportSpecifier(specifier) =
-                                specifier
-                            else {
-                                return self
-                                    .unsupported("default or namespace imports", import.span);
+                            let (name, identifier, type_only) = match specifier {
+                                js::ImportDeclarationSpecifier::ImportSpecifier(s) => (
+                                    self.export_name(&s.imported)?,
+                                    &s.local,
+                                    s.import_kind == js::ImportOrExportKind::Type,
+                                ),
+                                js::ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                                    (default_export, &s.local, false)
+                                }
+                                js::ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => {
+                                    return self
+                                        .unsupported("namespace import objects", import.span);
+                                }
                             };
-                            let name = self.export_name(&specifier.imported)?;
-                            let local = self.name(specifier.local.name.as_str());
+                            let local = self.name(identifier.name.as_str());
                             let mut binding =
-                                self.export_binding(interface, name, specifier.span)?;
-                            binding.type_only |= import.import_kind == js::ImportOrExportKind::Type
-                                || specifier.import_kind == js::ImportOrExportKind::Type;
+                                self.export_binding(interface, name, specifier.span())?;
+                            binding.type_only |=
+                                import.import_kind == js::ImportOrExportKind::Type || type_only;
                             self.imported_exports.insert(local, binding);
                             if let Some(ty) = interface.types.get(&name) {
                                 self.aliases.insert(local, (ty.ty.clone(), ty.view));
                             }
                             if let Some(signature) = interface.functions.get(&name) {
-                                self.validate_signature(signature, specifier.span)?;
+                                self.validate_signature(signature, specifier.span())?;
                                 self.signatures.insert(local, Arc::clone(signature));
                             }
                             let mut used = false;
-                            if let Some(symbol) = specifier.local.symbol_id.get() {
+                            if let Some(symbol) = identifier.symbol_id.get() {
                                 for reference in semantic
                                     .scoping()
                                     .get_resolved_references(symbol)
@@ -402,6 +429,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     | js::Statement::ExportNamedDeclaration(_)
                     | js::Statement::ExportFromDeclaration(_)
                     | js::Statement::ExportAllDeclaration(_)
+                    | js::Statement::ExportDefaultDeclaration(_)
             )
         }) {
             return Ok(None);
@@ -436,6 +464,28 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                             specifier.span,
                         )?;
                     }
+                }
+                js::Statement::ExportDefaultDeclaration(export) => {
+                    let local = match &export.declaration {
+                        js::ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                            self.name(function_name(f))
+                        }
+                        js::ExportDefaultDeclarationKind::Identifier(id) => {
+                            self.name(id.name.as_str())
+                        }
+                        _ => return self.unsupported("this default export value", export.span),
+                    };
+                    if !self.signatures.contains_key(&local) && !self.aliases.contains_key(&local) {
+                        return self
+                            .unsupported("default export of a non-function value", export.span);
+                    }
+                    self.publish(
+                        &mut interface,
+                        local,
+                        self.name("default"),
+                        false,
+                        export.span,
+                    )?;
                 }
                 _ => {}
             }
