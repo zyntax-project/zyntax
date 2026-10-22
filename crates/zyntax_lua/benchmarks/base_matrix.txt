@@ -1,0 +1,4 @@
+tokenize.lua default rss_max=110MB fp_peak=89MB real=0.26s user=0.28s rc=0
+tokenize.lua llvm rss_max=146MB fp_peak=101MB real=0.51s user=0.53s rc=0
+tokenize.lua nowarm rss_max=105MB fp_peak=84MB real=0.43s user=0.25s rc=0
+tokenize.lua llvm+nowarm rss_max=142MB fp_peak=98MB real=0.38s user=0.52s rc=0

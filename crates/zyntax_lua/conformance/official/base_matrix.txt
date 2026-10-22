@@ -1,0 +1,16 @@
+api.lua default rss_max=346MB fp_peak=310MB real=2.17s user=0.68s rc=0
+api.lua llvm rss_max=322MB fp_peak=283MB real=2.53s user=0.71s rc=0
+api.lua nowarm rss_max=316MB fp_peak=308MB real=2.26s user=0.66s rc=0
+api.lua llvm+nowarm rss_max=354MB fp_peak=256MB real=2.54s user=0.68s rc=0
+files.lua default rss_max=787MB fp_peak=863MB real=22.84s user=9.27s rc=1
+files.lua llvm rss_max=842MB fp_peak=866MB real=29.45s user=9.70s rc=1
+files.lua nowarm rss_max=937MB fp_peak=882MB real=21.37s user=8.99s rc=1
+files.lua llvm+nowarm rss_max=1077MB fp_peak=1270MB real=13.12s user=8.92s rc=1
+bitwise.lua default rss_max=180MB fp_peak=141MB real=1.08s user=0.52s rc=0
+bitwise.lua llvm rss_max=208MB fp_peak=148MB real=1.13s user=0.57s rc=0
+bitwise.lua nowarm rss_max=194MB fp_peak=153MB real=1.35s user=0.75s rc=0
+bitwise.lua llvm+nowarm rss_max=190MB fp_peak=169MB real=1.92s user=0.85s rc=0
+nextvar.lua default rss_max=324MB fp_peak=365MB real=5.97s user=2.49s rc=0
+nextvar.lua llvm rss_max=446MB fp_peak=398MB real=3.34s user=3.41s rc=0
+nextvar.lua nowarm rss_max=326MB fp_peak=323MB real=4.25s user=2.27s rc=0
+nextvar.lua llvm+nowarm rss_max=385MB fp_peak=356MB real=4.39s user=2.88s rc=0

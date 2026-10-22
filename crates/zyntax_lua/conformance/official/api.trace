@@ -1,0 +1,42 @@
+  0.265 [ZYLUA] full_moon      8.41 ms
+  0.277 [SNAPSHOT] builtins: program 7.14 ms (133213 bytes), hir 2.17 ms (2270737 bytes)
+  0.283 [ZYLUA] library       18.03 ms
+  0.288 [ZYLUA] scopes         4.94 ms
+  0.311 [ZYLUA] infer         22.56 ms
+  0.374 [ZYLUA] lower 1       62.86 ms
+  0.498 [ZYLUA] lower 2      124.56 ms
+  0.713 [ZYLUA] parse        455.90 ms
+  0.718 [ZYLUA] runtime        5.40 ms
+  0.719 [ZYLUA] register       0.51 ms
+  0.725 [LOWER] registry                 0.07 ms
+  0.727 [IMPORT-LINK] builtins arrives lowered (1374 functions; 2355 globals and 0 types decoded in 2.66 ms)
+  0.727 [IMPORT-PARSE] builtins loaded from build artifact (1460 declarations)
+  0.728 [LOWER] imports                  4.31 ms
+  0.733 [LOWER] externs+resolve          5.02 ms
+  0.734 [LOWER] impl blocks              0.62 ms
+  0.734 [LOWER] pattern engine           0.44 ms
+  0.772 [LOWER-PROGRAM]       3.38 ms fn lua$main
+  2.267 [LOWER-PROGRAM] copy_types = 0.00  typecheck = 5.64  method_types = 13.57  collect_decls = 1.32  declarations = 4.88 ms (1707, 151 own functions left until reached, 0 never reached)  bodies = 1497.49 ms (adopted 732 functions, decoded in 13.85 ms)
+  2.282 [LOWER] lower_program         1546.08 ms
+  2.358 [LOWER] monomorphize            77.44 ms
+  2.385 [COMPILE] lower               1663.42 ms
+  2.401 [COMPILE] krio passes           16.53 ms
+  2.413 [COMPILE] prune                  8.40 ms (884 functions kept, 672 left for their first call, 0 still to optimise: )
+  2.439 [OPT] all passes                0.06 ms
+  2.447 [COMPILE] names+reach            8.04 ms
+  2.447 [OPT] codegen: 673 functions compiled on first call; compiled now: 
+  2.568 [OPT] codegen: cranelift      120.74 ms
+  2.597 [OPT] codegen: registration    25.65 ms
+  2.618 [INTERP] body of __zyntax_box_constants$builtins     8.35 ms
+  2.635 [OPT] codegen                 186.50 ms
+  2.635 [ZYLUA] compile     1915.44 ms
+  2.800 [INTERP] body of lua$main   149.64 ms
+  2.804 [INTERP] body of zb_any_eq     1.06 ms
+  2.865 [INTERP] body of lua$chunk$0    26.02 ms
+  2.938 [INTERP] body of zb_box_bool     2.66 ms
+  2.958 [INTERP] body of zl_eq    19.06 ms
+  2.963 
+  2.963  >>> testC not active: skipping API tests <<<
+  2.963 
+  2.963 [ZYLUA] run          328.99 ms
+  2.963 [ZYLUA] shutdown       0.01 ms
