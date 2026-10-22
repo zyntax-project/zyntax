@@ -33,7 +33,7 @@ pub(super) fn primitive_externs() -> impl Iterator<Item = (String, usize)> {
         .map(|(name, arity)| (format!("$TS$math_{name}"), *arity))
 }
 
-fn constant(name: &str) -> Option<f64> {
+pub(super) fn constant(name: &str) -> Option<f64> {
     use std::f64::consts;
     Some(match name {
         "PI" => consts::PI,
@@ -50,7 +50,7 @@ fn constant(name: &str) -> Option<f64> {
 
 impl<'ast, 'program> Lowerer<'ast, 'program> {
     /// True when `Math` names the global, not a local, import or namespace.
-    fn is_math_global(&self, object: &js::Expression<'ast>) -> bool {
+    pub(super) fn is_math_global(&self, object: &js::Expression<'ast>) -> bool {
         let js::Expression::Identifier(id) = object else {
             return false;
         };
@@ -63,11 +63,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 .any(|s| s.contains_key(&self.name("Math")))
     }
 
-    pub(super) fn math_constant(&self, m: &js::StaticMemberExpression<'ast>) -> Option<Expr> {
+    pub(super) fn math_constant_value(&self, m: &js::StaticMemberExpression<'ast>) -> Option<f64> {
         if !self.is_math_global(&m.object) {
             return None;
         }
-        constant(m.property.name.as_str()).map(|value| num(value, m.span))
+        constant(m.property.name.as_str())
+    }
+
+    pub(super) fn math_constant(&self, m: &js::StaticMemberExpression<'ast>) -> Option<Expr> {
+        self.math_constant_value(m).map(|value| num(value, m.span))
     }
 
     /// `Math.name(...)`; `None` when the callee is not the `Math` global.

@@ -90,6 +90,7 @@ fn readonly_policy_survives_width_aliases_and_assertions() {
         "readonly.ts",
         Options {
             soundness: Soundness::Checked,
+            ..Default::default()
         },
     )
     .unwrap_err();

@@ -92,10 +92,16 @@ fn load_cached(
             "module paths must be UTF-8",
         ),
     })?;
-    let policy = match options.soundness {
+    let soundness = match options.soundness {
         Soundness::TypeScript => "typescript",
         Soundness::Checked => "checked",
     };
+    let indexing = match options.indexing {
+        crate::Indexing::Checked => "checked",
+        crate::Indexing::Proven => "proven",
+    };
+    let policy = format!("{soundness};index:{indexing}");
+    let policy = policy.as_str();
     let entries = background
         .then(|| runtime.as_ref().and_then(|r| r.closed_entry_points()))
         .flatten();

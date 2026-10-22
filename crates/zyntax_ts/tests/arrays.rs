@@ -198,7 +198,12 @@ fn unproven_indexing_and_reference_lifetimes_are_explicit_gaps() {
         "let a=[1];if(a.length>0 && (a=[]).length===0)console.log(a[0]);",
         "let i=0;const a=[1];if(i<a.length && (i=3)===3)console.log(a[i]);",
     ] {
-        let error = zyntax_ts::parse_program(source, "gap.ts", Default::default()).unwrap_err();
+        // The strict policy keeps every unproven index a compile-time gap.
+        let strict = zyntax_ts::Options {
+            indexing: zyntax_ts::Indexing::Proven,
+            ..Default::default()
+        };
+        let error = zyntax_ts::parse_program(source, "gap.ts", strict).unwrap_err();
         assert_eq!(
             error.kind,
             zyntax_ts::ErrorKind::Unsupported,

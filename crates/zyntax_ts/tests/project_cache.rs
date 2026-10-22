@@ -216,6 +216,7 @@ fn soundness_options_and_unavailable_cache_never_bypass_checking() {
         root.join("entry.ts"),
         Options {
             soundness: Soundness::Checked,
+            ..Default::default()
         },
         root.join("cache"),
     )

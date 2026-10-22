@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2588,
+      "start": 34,
+      "length": 1,
+      "file": "assign.ts",
+      "message": "Cannot assign to 'N' because it is a constant."
+    }
+  ],
+  "source_sha256": "cb9a9807a5ffbc87b93e52b14b6a54e0d9b63c7e1c7a6aab00aa10984f0b33b3",
+  "options": {}
+}

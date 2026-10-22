@@ -1824,5 +1824,40 @@
     "id": "math/math",
     "file": "cases/math/math.ts",
     "mode": "run"
+  },
+  {
+    "id": "bench/fib",
+    "file": "cases/bench/fib.ts",
+    "mode": "run"
+  },
+  {
+    "id": "bench/sieve",
+    "file": "cases/bench/sieve.ts",
+    "mode": "run"
+  },
+  {
+    "id": "bench/mandelbrot",
+    "file": "cases/bench/mandelbrot.ts",
+    "mode": "run"
+  },
+  {
+    "id": "bench/spectral_norm",
+    "file": "cases/bench/spectral_norm.ts",
+    "mode": "run"
+  },
+  {
+    "id": "bench/fannkuch",
+    "file": "cases/bench/fannkuch.ts",
+    "mode": "run"
+  },
+  {
+    "id": "constants/inlined",
+    "file": "cases/constants/inlined.ts",
+    "mode": "run"
+  },
+  {
+    "id": "constants/assign",
+    "file": "cases/constants/assign.ts",
+    "mode": "check"
   }
 ]

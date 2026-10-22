@@ -86,6 +86,21 @@ extern "C" fn math_max(a: f64, b: f64) -> f64 {
     }
 }
 
+/// An index TypeScript would read as `undefined` (or use to grow the array).
+extern "C" fn index_trap(index: f64, length: f64) {
+    let shown = if index.is_nan() {
+        "NaN".to_string()
+    } else if index == 0.0 {
+        "0".to_string()
+    } else {
+        dragonbox_ecma::Buffer::new().format(index).to_string()
+    };
+    eprintln!(
+        "RangeError: array index {shown} is outside 0..{length}; TypeScript would read undefined or grow the array"
+    );
+    std::process::exit(1);
+}
+
 extern "C" fn print_undefined() {
     print!("undefined");
 }
@@ -104,6 +119,7 @@ zrtl::zrtl_plugin! {
         ("$TS$print_undefined", print_undefined),
         ("$TS$number_to_string", number_to_string),
         ("$TS$pow", number_pow),
+        ("$TS$index_trap", index_trap),
         ("$TS$math_ceil", math_ceil),
         ("$TS$math_trunc", math_trunc),
         ("$TS$math_round", math_round),

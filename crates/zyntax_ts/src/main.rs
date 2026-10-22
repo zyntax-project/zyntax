@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use zyntax_embed::{TieredConfig, TieredRuntime};
-use zyntax_ts::{ErrorKind, Options, ProjectError, Soundness};
+use zyntax_ts::{ErrorKind, Indexing, Options, ProjectError, Soundness};
 
 #[cfg(feature = "allocation-audit")]
 use zyntax_compiler::allocation_audit::{self, Phase};
@@ -38,6 +38,11 @@ fn run() -> ExitCode {
             "--soundness" => match args.next().as_deref() {
                 Some("typescript") => options.soundness = Soundness::TypeScript,
                 Some("checked") => options.soundness = Soundness::Checked,
+                _ => return usage(),
+            },
+            "--indexing" => match args.next().as_deref() {
+                Some("checked") => options.indexing = Indexing::Checked,
+                Some("proven") => options.indexing = Indexing::Proven,
                 _ => return usage(),
             },
             "--diagnostics=json" => json = true,
@@ -202,7 +207,7 @@ fn run() -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: zynode <check|run> [--soundness typescript|checked] [--cache-dir DIR] [--diagnostics=json] [--llvm] [--baseline-threshold N] [--no-osr] <file.ts>"
+        "usage: zynode <check|run> [--soundness typescript|checked] [--indexing checked|proven] [--cache-dir DIR] [--diagnostics=json] [--llvm] [--baseline-threshold N] [--no-osr] <file.ts>"
     );
     ExitCode::from(2)
 }

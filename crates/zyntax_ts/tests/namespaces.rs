@@ -109,6 +109,7 @@ fn generic_namespace_results_preserve_readonly_policy() {
         ModuleId::new("client"),
         Options {
             soundness: zyntax_ts::Soundness::Checked,
+            ..Default::default()
         },
         &[ModuleDependency {
             specifier: "./library",

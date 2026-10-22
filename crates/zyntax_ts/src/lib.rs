@@ -24,9 +24,21 @@ pub enum Soundness {
     Checked,
 }
 
+/// How an array index that cannot be proven in range is handled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Indexing {
+    /// Guard the access: an out-of-range index stops the program with an error, where
+    /// TypeScript would read `undefined` or grow the array. Proven indexes are unguarded.
+    #[default]
+    Checked,
+    /// Refuse to compile any index that is not proven in range.
+    Proven,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Options {
     pub soundness: Soundness,
+    pub indexing: Indexing,
 }
 
 /// Diagnostic category, kept separate from an unimplemented language feature.

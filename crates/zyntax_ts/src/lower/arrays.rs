@@ -168,6 +168,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     pub(super) fn immortal_string(&self, source: &js::Expression<'ast>) -> bool {
         match source {
             js::Expression::StringLiteral(s) => !s.lone_surrogates,
+            js::Expression::Identifier(i) if self.constant_text(i.name.as_str()) => true,
             js::Expression::Identifier(i) => self.binding(i.name.as_str(), i.span).is_ok_and(|b| {
                 self.flow.strings.contains(&b.name)
                     || (matches!(b.ty, Type::Union(_))
@@ -328,7 +329,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::Expression::Identifier(i) => self
                 .binding(i.name.as_str(), i.span)
                 .ok()
-                .and_then(|b| self.flow.integers.get(&b.name).copied()),
+                .and_then(|b| self.flow.integers.get(&b.name).copied())
+                .or_else(|| self.constant_integral(i.name.as_str())),
             js::Expression::ParenthesizedExpression(p) => self.integral(&p.expression),
             js::Expression::BinaryExpression(b) if b.operator.as_str() == "+" => {
                 match (self.integral(&b.left)?, self.integral(&b.right)?) {
@@ -381,10 +383,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             self.expr(index)?
         };
         if !bounded {
-            return self.unsupported(
-                "array indexing without proven integer bounds (the result may be undefined)",
-                at,
-            );
+            return self.checked_index(object, index, element, at);
         }
         let index = if index.ty == Type::Primitive(PrimitiveType::I64) {
             index
@@ -404,6 +403,171 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             TypedExpression::Index(TypedIndex {
                 object: Box::new(object),
                 index: Box::new(index),
+            }),
+            element,
+            at,
+        ))
+    }
+    /// An index that is not proven in range: guard it, since TypeScript would read
+    /// `undefined` (or grow the array) where a native element read cannot.
+    fn checked_index(
+        &mut self,
+        object: Expr,
+        index: Expr,
+        element: Type,
+        at: oxc_span::Span,
+    ) -> Result<Expr> {
+        const REASON: &str =
+            "array indexing without proven integer bounds (the result may be undefined)";
+        if self.options.indexing == Indexing::Proven {
+            return self.unsupported(REASON, at);
+        }
+        if !matches!(object.node, TypedExpression::Variable(_)) {
+            return self.unsupported("unproven array indexing on this receiver", at);
+        }
+        let integer = Type::Primitive(PrimitiveType::I64);
+        let int = |value: i128| {
+            node(
+                TypedExpression::Literal(TypedLiteral::Integer(value)),
+                integer.clone(),
+                at,
+            )
+        };
+        let cast = |value: Expr, ty: &Type| {
+            node(
+                TypedExpression::Cast(TypedCast {
+                    expr: Box::new(value),
+                    target_type: ty.clone(),
+                }),
+                ty.clone(),
+                at,
+            )
+        };
+        let integral_source = index.ty == integer;
+        if !integral_source {
+            self.expect(&index.ty, &number(), at)?;
+        }
+        let mut statements = vec![];
+        let slot = self.fresh("slot");
+        let length = self.fresh("length");
+        // The f64 the index was written as; a fractional or NaN index is not an element.
+        let written = if integral_source {
+            cast(index.clone(), &number())
+        } else {
+            let written = self.fresh("index");
+            statements.push(stmt(
+                TypedStatement::Let(TypedLet {
+                    name: written,
+                    ty: number(),
+                    mutability: Mutability::Immutable,
+                    initializer: Some(Box::new(index.clone())),
+                    span: span(at),
+                }),
+                at,
+            ));
+            var(written, number(), at)
+        };
+        let slot_value = if integral_source {
+            index
+        } else {
+            cast(written.clone(), &integer)
+        };
+        statements.push(stmt(
+            TypedStatement::Let(TypedLet {
+                name: slot,
+                ty: integer.clone(),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(slot_value)),
+                span: span(at),
+            }),
+            at,
+        ));
+        statements.push(stmt(
+            TypedStatement::Let(TypedLet {
+                name: length,
+                ty: integer.clone(),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(node(
+                    TypedExpression::MethodCall(TypedMethodCall::positional(
+                        object.clone(),
+                        self.name("len"),
+                        vec![],
+                    )),
+                    integer.clone(),
+                    at,
+                ))),
+                span: span(at),
+            }),
+            at,
+        ));
+        let slot_value = || var(slot, integer.clone(), at);
+        let mut valid = binary(
+            BinaryOp::And,
+            binary(BinaryOp::Ge, slot_value(), int(0), boolean(), at),
+            binary(
+                BinaryOp::Lt,
+                slot_value(),
+                var(length, integer.clone(), at),
+                boolean(),
+                at,
+            ),
+            boolean(),
+            at,
+        );
+        if !integral_source {
+            valid = binary(
+                BinaryOp::And,
+                valid,
+                binary(
+                    BinaryOp::Eq,
+                    cast(slot_value(), &number()),
+                    written.clone(),
+                    boolean(),
+                    at,
+                ),
+                boolean(),
+                at,
+            );
+        }
+        let invalid = node(
+            TypedExpression::Unary(TypedUnary {
+                op: UnaryOp::Not,
+                operand: Box::new(valid),
+            }),
+            boolean(),
+            at,
+        );
+        let trap = self.call(
+            "$TS$index_trap",
+            vec![written, cast(var(length, integer.clone(), at), &number())],
+            unit(),
+            at,
+        );
+        statements.push(stmt(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(invalid),
+                then_block: TypedBlock {
+                    statements: vec![expression(trap)],
+                    span: span(at),
+                },
+                else_block: None,
+                span: span(at),
+            }),
+            at,
+        ));
+        statements.push(expression(slot_value()));
+        let guarded = node(
+            TypedExpression::Block(TypedBlock {
+                statements,
+                span: span(at),
+            }),
+            integer,
+            at,
+        );
+        Ok(node(
+            TypedExpression::Index(TypedIndex {
+                object: Box::new(object),
+                index: Box::new(guarded),
             }),
             element,
             at,

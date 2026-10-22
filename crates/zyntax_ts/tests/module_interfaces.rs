@@ -260,7 +260,8 @@ fn imports_preserve_readonly_policy_and_diagnose_inaccessible_or_invalid_names()
             weaken,
             &library,
             Options {
-                soundness: Soundness::Checked
+                soundness: Soundness::Checked,
+                ..Default::default()
             }
         )
         .unwrap_err()
@@ -272,6 +273,7 @@ fn imports_preserve_readonly_policy_and_diagnose_inaccessible_or_invalid_names()
         &library,
         Options {
             soundness: Soundness::Checked,
+            ..Default::default()
         },
     )
     .unwrap();

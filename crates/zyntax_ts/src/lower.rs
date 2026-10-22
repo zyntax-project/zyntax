@@ -19,18 +19,21 @@ use zyntax_typed_ast::{
     Type, TypeId, TypeMetadata, TypeRegistry, Visibility,
 };
 
-use crate::{Error, ErrorKind, ModuleDependency, ModuleId, Options, Soundness};
+use crate::{Error, ErrorKind, Indexing, ModuleDependency, ModuleId, Options, Soundness};
 
 mod arrays;
 mod classes;
+mod constants;
 mod generics;
 mod math;
 mod modules;
 mod namespaces;
 pub(crate) use modules::dependency_source;
 mod unions;
+use arrays::Integral;
 use arrays::{ArrayResult, FlowState, array_type, element_type};
 use classes::FunctionRole;
+use constants::Constant;
 
 type Result<T> = std::result::Result<T, Error>;
 type Expr = TypedNode<TypedExpression>;
@@ -54,6 +57,9 @@ fn undefined() -> Type {
 }
 fn is_undefined(ty: &Type) -> bool {
     matches!(ty, Type::Optional(inner) if **inner == Type::Never)
+}
+fn is_true(test: &js::Expression<'_>) -> bool {
+    matches!(test, js::Expression::BooleanLiteral(b) if b.value)
 }
 fn is_scalar(ty: &Type) -> bool {
     *ty == number() || *ty == boolean()
@@ -670,6 +676,7 @@ struct Lowerer<'ast, 'program> {
     self_recursive: FxHashSet<InternedString>,
     scopes: Vec<FxHashMap<InternedString, Binding>>,
     scope_floor: usize,
+    constants: FxHashMap<InternedString, Constant>,
     classes: FxHashMap<InternedString, classes::Class<'ast, 'program>>,
     class_names: FxHashMap<InternedString, InternedString>,
     class_order: Vec<InternedString>,
@@ -716,6 +723,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             self_recursive: FxHashSet::default(),
             scopes: vec![],
             scope_floor: 0,
+            constants: FxHashMap::default(),
             classes: FxHashMap::default(),
             class_names: FxHashMap::default(),
             class_order: vec![],
@@ -832,6 +840,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             pending = next;
         }
+        self.collect_constants(program);
         for item in &program.body {
             if let Some(f) = modules::function(item) {
                 self.signature(f)?;
@@ -1636,8 +1645,68 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 Self::returns(std::slice::from_ref(&i.consequent))
                     && Self::returns(std::slice::from_ref(other))
             }),
+            js::Statement::WhileStatement(w) => {
+                is_true(&w.test) && !Self::may_break(std::slice::from_ref(&w.body))
+            }
+            js::Statement::ForStatement(f) => {
+                f.test.as_ref().is_none_or(is_true)
+                    && !Self::may_break(std::slice::from_ref(&f.body))
+            }
             _ => false,
         })
+    }
+
+    /// Whether a `break` can leave the loop whose body this is.
+    fn may_break(body: &[js::Statement<'ast>]) -> bool {
+        struct Breaks {
+            nested: usize,
+            found: bool,
+        }
+        impl<'a> Visit<'a> for Breaks {
+            fn visit_break_statement(&mut self, it: &js::BreakStatement<'a>) {
+                self.found |= it.label.is_some() || self.nested == 0;
+            }
+            fn visit_while_statement(&mut self, it: &js::WhileStatement<'a>) {
+                self.nested += 1;
+                walk::walk_while_statement(self, it);
+                self.nested -= 1;
+            }
+            fn visit_for_statement(&mut self, it: &js::ForStatement<'a>) {
+                self.nested += 1;
+                walk::walk_for_statement(self, it);
+                self.nested -= 1;
+            }
+            fn visit_do_while_statement(&mut self, it: &js::DoWhileStatement<'a>) {
+                self.nested += 1;
+                walk::walk_do_while_statement(self, it);
+                self.nested -= 1;
+            }
+            fn visit_for_in_statement(&mut self, it: &js::ForInStatement<'a>) {
+                self.nested += 1;
+                walk::walk_for_in_statement(self, it);
+                self.nested -= 1;
+            }
+            fn visit_for_of_statement(&mut self, it: &js::ForOfStatement<'a>) {
+                self.nested += 1;
+                walk::walk_for_of_statement(self, it);
+                self.nested -= 1;
+            }
+            fn visit_switch_statement(&mut self, it: &js::SwitchStatement<'a>) {
+                self.nested += 1;
+                walk::walk_switch_statement(self, it);
+                self.nested -= 1;
+            }
+            fn visit_function(&mut self, _: &js::Function<'a>, _: oxc_semantic::ScopeFlags) {}
+            fn visit_arrow_function_expression(&mut self, _: &js::ArrowFunctionExpression<'a>) {}
+        }
+        let mut breaks = Breaks {
+            nested: 0,
+            found: false,
+        };
+        for statement in body {
+            breaks.visit_statement(statement);
+        }
+        breaks.found
     }
 
     fn externs(&mut self) {
@@ -1646,6 +1715,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let primitives = [
             ("$TS$print_number", vec![number()], unit()),
             ("$TS$pow", vec![number(), number()], number()),
+            ("$TS$index_trap", vec![number(), number()], unit()),
             ("$TS$space", vec![], unit()),
             ("$TS$newline", vec![], unit()),
             ("$IO$print", vec![string()], unit()),
@@ -1732,7 +1802,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             .enumerate()
             .rev()
             .find_map(|(index, s)| s.get(&key).map(|b| (index, b)))
-            .ok_or_else(|| Error::new(ErrorKind::Type, format!("cannot find name `{name}`"), at))?;
+            .ok_or_else(|| {
+                // Substituted constants have no binding; only a write reaches this lookup.
+                if self.constants.contains_key(&key) {
+                    return Error::new(ErrorKind::Type, "cannot assign to const", at);
+                }
+                Error::new(ErrorKind::Type, format!("cannot find name `{name}`"), at)
+            })?;
         if scope < self.scope_floor {
             return self.unsupported("lexical captures in arrow functions", at);
         }
@@ -3349,6 +3425,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         "undefined" => var(self.name("None"), undefined(), at),
                         "NaN" => num(f64::NAN, at),
                         "Infinity" => num(f64::INFINITY, at),
+                        name if self.constant_expr(name, at).is_some() => {
+                            self.constant_expr(name, at).unwrap()
+                        }
                         name if self.signatures.contains_key(&self.name(name)) => {
                             let sig = &self.signatures[&self.name(name)];
                             self.function_value(sig, at)?

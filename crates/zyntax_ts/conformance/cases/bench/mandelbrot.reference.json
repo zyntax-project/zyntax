@@ -1,0 +1,10 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": true,
+  "kind": "Accept",
+  "diagnostics": [],
+  "stdout": "38956\n",
+  "exit": 0,
+  "source_sha256": "2f2f84b864e894abfbc256cb2e633bfc739405f9918d91a6a0eaab0b77b67243",
+  "options": {}
+}
