@@ -13,7 +13,7 @@ cargo build -p zyntax_ts --bin zynode
 python3 crates/zyntax_ts/conformance/run.py --zynode target/debug/zynode
 ```
 
-Pins use **TypeScript 6.0.2** with strict checking and Node.js execution. Running
+Pins use **TypeScript 7.1.0-beta** with strict checking and Node.js execution. Running
 against saved pins requires neither tool. Node executes only reference programs;
 the native frontend does not consume their emitted JavaScript.
 
@@ -38,7 +38,10 @@ python3 -m unittest discover -s crates/zyntax_ts/conformance -p test_harness.py
 ```
 
 `--typescript PATH` and `--node PATH` select reference tools; a compiler version
-other than the pin is rejected. Pins include compiler options and source hashes.
+other than the exact `package.json` pin is rejected. The oracle uses TypeScript's
+native synchronous API and in-memory emitter, disposing programs, resolvers and
+the compiler client after each request. POSIX timeouts stop the whole child
+process group. Pins include compiler options and source hashes.
 Multi-file fixtures list the entry first in `files` and hash every file's relative
 path and contents. Refresh pins after changing fixtures. Use `--only TEXT` to
 filter cases and `--out PATH` to save a JSON report.

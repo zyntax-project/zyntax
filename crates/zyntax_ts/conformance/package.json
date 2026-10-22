@@ -2,5 +2,7 @@
   "name": "zynode-conformance-reference",
   "private": true,
   "description": "Development-only TypeScript reference for native conformance tests",
-  "devDependencies": { "typescript": "6.0.2" }
+  "devDependencies": {
+    "typescript": "7.1.0-beta"
+  }
 }

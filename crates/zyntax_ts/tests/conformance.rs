@@ -68,6 +68,8 @@ fn bounded(action: &str, file: &Path, soundness: &str, interpreter: bool) -> (i3
 
 #[test]
 fn reference_pins_match_native_acceptance_and_execution() {
+    let package: Value = serde_json::from_str(include_str!("../conformance/package.json")).unwrap();
+    let compiler = package["devDependencies"]["typescript"].as_str().unwrap();
     let cases: Vec<Value> =
         serde_json::from_str(&std::fs::read_to_string(root().join("cases.json")).unwrap()).unwrap();
     let known: HashMap<_, _> = std::fs::read_to_string(root().join("KNOWN_FAILURES"))
@@ -89,7 +91,7 @@ fn reference_pins_match_native_acceptance_and_execution() {
             &std::fs::read_to_string(file.with_extension("reference.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(reference["compiler"], "6.0.2");
+        assert_eq!(reference["compiler"], compiler);
         let mut hash = Sha256::new();
         let files: Vec<_> = case["files"].as_array().map_or_else(
             || vec![file.clone()],

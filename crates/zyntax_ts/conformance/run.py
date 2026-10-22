@@ -9,21 +9,35 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent
 PROFILES = ("interpreter", "baseline", "llvm")
+REFERENCE_COMPILER = json.loads((ROOT / "package.json").read_text())["devDependencies"]["typescript"]
 
 
 def bounded(argv, timeout, env=None):
     try:
-        run = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
-        return {"code": run.returncode, "stdout": run.stdout.replace("\r\n", "\n"),
-                "stderr": run.stderr.replace("\r\n", "\n")}
-    except subprocess.TimeoutExpired:
-        return {"code": None, "stdout": "", "stderr": f"timed out after {timeout}s"}
+        with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              env=env, start_new_session=os.name == "posix") as run:
+            try:
+                stdout, stderr = run.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # The reference API owns a native compiler child in the same session.
+                if os.name == "posix":
+                    try:
+                        os.killpg(run.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    run.kill()
+                run.communicate()
+                return {"code": None, "stdout": "", "stderr": f"timed out after {timeout}s"}
+            return {"code": run.returncode, "stdout": stdout.replace("\r\n", "\n"),
+                    "stderr": stderr.replace("\r\n", "\n")}
     except OSError as error:
         return {"code": None, "stdout": "", "stderr": str(error)}
 
@@ -182,7 +196,7 @@ def execute_case(args, case, files, options, pins, known):
             pins.write_text(json.dumps(reference, indent=2) + "\n")
     else:
         reference = json.loads(pins.read_text())
-        if reference["source_sha256"] != stamp or reference["options"] != options or reference["compiler"] != "6.0.2":
+        if reference["source_sha256"] != stamp or reference["options"] != options or reference["compiler"] != REFERENCE_COMPILER:
             raise RuntimeError(f"stale reference for {case['id']}; use --update with the pinned compiler")
     rows = []
     for profile in args.profile:
@@ -205,7 +219,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zynode", type=Path, default=ROOT.parents[2] / "target/debug/zynode")
     parser.add_argument("--node", default="node")
-    parser.add_argument("--typescript", type=Path, default=ROOT / "node_modules/typescript")
+    parser.add_argument("--typescript", type=Path, default=ROOT / "node_modules/typescript",
+                        help="pinned TypeScript package directory")
     parser.add_argument("--profile", action="append", choices=PROFILES)
     parser.add_argument("--live", action="store_true", help="verify against the pinned compiler and Node")
     parser.add_argument("--update", action="store_true", help="refresh reference pins from the oracle")
@@ -273,7 +288,7 @@ def main():
     if not rows:
         raise ValueError("no cases selected")
     counts = dict(collections.Counter(r["status"] for r in rows))
-    report = {"reference_compiler": "6.0.2", "binary": str(args.zynode),
+    report = {"reference_compiler": REFERENCE_COMPILER, "binary": str(args.zynode),
               "binary_sha256": binary_hash,
               "profiles": args.profile, "live_reference": bool(args.live or args.update or args.upstream),
               "counts": counts, "results": rows}
