@@ -345,6 +345,15 @@ impl<'ast> Visit<'ast> for VarExtents<'_> {
     }
 }
 
+/// How a read that may precede its assignment is reported.
+#[derive(Clone, Copy)]
+enum Unassigned {
+    /// Declared without a value: TypeScript rejects the read.
+    Declared,
+    /// Hoisted out of its block: the read would observe `undefined`.
+    Hoisted,
+}
+
 /// Function-level storage for `var` bindings declared in nested blocks.
 #[derive(Default)]
 struct FunctionVars {
@@ -661,7 +670,7 @@ struct Lowerer<'ast, 'program> {
     hoist: FxHashSet<oxc_semantic::SymbolId>,
     vars: FunctionVars,
     /// Hoisted bindings whose reads need a proven assignment on every path.
-    unassigned: FxHashSet<InternedString>,
+    unassigned: FxHashMap<InternedString, Unassigned>,
     flow: FlowState,
     writes: FxHashMap<oxc_semantic::SymbolId, SmallVec<[u32; 2]>>,
     write_offsets: Vec<u32>,
@@ -701,7 +710,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             scope_floor: 0,
             hoist: FxHashSet::default(),
             vars: FunctionVars::default(),
-            unassigned: FxHashSet::default(),
+            unassigned: FxHashMap::default(),
             flow: FlowState::default(),
             writes: FxHashMap::default(),
             write_offsets: Vec::new(),
@@ -2602,7 +2611,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 return self.error(ErrorKind::Type, "duplicate variable", d.span);
             }
             let Some(init) = &d.init else {
-                return self.unsupported("uninitialized bindings", d.span);
+                let hoisted = id
+                    .symbol_id
+                    .get()
+                    .is_some_and(|symbol| self.hoist.contains(&symbol));
+                out.extend(self.uninitialized(id, d, kind, hoisted, redeclared.map(|r| r.1))?);
+                continue;
             };
             let declared = d
                 .type_annotation
@@ -2774,7 +2788,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     }),
                     at,
                 ));
-                self.unassigned.insert(unique);
+                self.unassigned.insert(unique, Unassigned::Hoisted);
                 unique
             }
         };
@@ -2789,11 +2803,74 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         )))
     }
 
-    fn require_assigned(&self, name: InternedString, at: oxc_span::Span) -> Result<()> {
-        if self.unassigned.contains(&name) && !self.flow.is_assigned(name) {
-            return self.unsupported("a var read that may precede its assignment", at);
+    /// A declaration with a type and no value: an uninitialized mutable binding
+    /// whose reads must follow an assignment on every path.
+    fn uninitialized(
+        &mut self,
+        id: &js::BindingIdentifier<'ast>,
+        d: &js::VariableDeclarator<'ast>,
+        kind: &str,
+        hoisted: bool,
+        earlier: Option<Type>,
+    ) -> Result<Option<Stmt>> {
+        let Some(annotation) = &d.type_annotation else {
+            return self.unsupported("uninitialized bindings without a type annotation", d.span);
+        };
+        let (ty, view) = self.ty(&annotation.type_annotation)?;
+        if ty != number() && ty != boolean() {
+            return self.unsupported("uninitialized bindings of this type", d.span);
         }
-        Ok(())
+        if let Some(earlier) = earlier {
+            if earlier != ty {
+                return self.error(
+                    ErrorKind::Type,
+                    "subsequent variable declarations must have the same type",
+                    d.span,
+                );
+            }
+            return Ok(None);
+        }
+        if hoisted {
+            return self.unsupported("uninitialized var used outside its block", d.span);
+        }
+        let unique = self.fresh(id.name.as_str());
+        let name = self.name(id.name.as_str());
+        self.scopes.last_mut().unwrap().insert(
+            name,
+            Binding {
+                name: unique,
+                symbol: id.symbol_id.get(),
+                ty: ty.clone(),
+                view,
+                mutable: kind != "const",
+                initialized: true,
+            },
+        );
+        self.unassigned.insert(unique, Unassigned::Declared);
+        Ok(Some(stmt(
+            TypedStatement::Let(TypedLet {
+                name: unique,
+                ty,
+                mutability: Mutability::Mutable,
+                initializer: None,
+                span: span(d.span),
+            }),
+            d.span,
+        )))
+    }
+
+    fn require_assigned(&self, name: InternedString, at: oxc_span::Span) -> Result<()> {
+        match self.unassigned.get(&name) {
+            Some(Unassigned::Declared) if !self.flow.is_assigned(name) => self.error(
+                ErrorKind::Type,
+                "variable is used before being assigned",
+                at,
+            ),
+            Some(Unassigned::Hoisted) if !self.flow.is_assigned(name) => {
+                self.unsupported("a var read that may precede its assignment", at)
+            }
+            _ => Ok(()),
+        }
     }
 
     fn condition(&mut self, e: &js::Expression<'ast>) -> Result<Expr> {
@@ -3925,7 +4002,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn record_write(&mut self, target: &Expr, ty: &Type) {
         if let TypedExpression::Variable(name) = target.node {
-            if self.unassigned.contains(&name) {
+            if self.unassigned.contains_key(&name) {
                 self.flow.assign(name);
             }
             self.flow.forget(name);

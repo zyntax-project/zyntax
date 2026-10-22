@@ -1754,5 +1754,15 @@
     "id": "variables/var_hoisted",
     "file": "cases/variables/var_hoisted.ts",
     "mode": "run"
+  },
+  {
+    "id": "variables/uninitialized",
+    "file": "cases/variables/uninitialized.ts",
+    "mode": "run"
+  },
+  {
+    "id": "variables/uninitialized_read",
+    "file": "cases/variables/uninitialized_read.ts",
+    "mode": "check"
   }
 ]

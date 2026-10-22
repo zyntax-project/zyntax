@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2454,
+      "start": 79,
+      "length": 1,
+      "file": "uninitialized_read.ts",
+      "message": "Variable 'r' is used before being assigned."
+    }
+  ],
+  "source_sha256": "7809bde033b7bd47e22b740b0a066b6dc4d57455b88aff958e77cbd37214f006",
+  "options": {}
+}
